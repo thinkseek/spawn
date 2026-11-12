@@ -651,7 +651,7 @@ mod tests {
             Some(now - 10 * 3_600_000 + DAY_MS)
         );
         let first = json!({"archive_bytes": young, "projects_bytes": old, "database_bytes": old});
-        assert_eq!(persistent_from(&first), Some(now - 10 * 3_600_000 + DAY_MS));
+        assert_eq!(persistent_from(&first, BACKUPS_LEFT_OUT), Some(now - 10 * 3_600_000 + DAY_MS));
         let samples = json!({"oldest": old, "carrying": carrying, "before": null});
         let pending = with_free(
             sizes(now, &walked, &samples, &json!({"bytes": 900}), &json!([])),
