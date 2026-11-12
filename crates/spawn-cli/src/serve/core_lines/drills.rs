@@ -393,6 +393,8 @@ mod tests {
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
 
+    use crate::storage::tests::scratch;
+
     const HOUR: i64 = 3_600_000;
     const DAY: i64 = 24 * HOUR;
 
@@ -579,13 +581,13 @@ mod tests {
 
     #[test]
     fn the_status_files_at_is_in_seconds() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let path = dir.path().join("status.json");
+        let dir = scratch("drills");
+        let path = dir.as_path().join("status.json");
         std::fs::write(&path, r#"{"at": 1731400000, "accounts": []}"#).expect("write");
         assert_eq!(status_at_ms(Some(&path)), Some(1_731_400_000_000));
         std::fs::write(&path, "nope").expect("write");
         assert_eq!(status_at_ms(Some(&path)), None);
-        assert_eq!(status_at_ms(Some(&dir.path().join("none.json"))), None);
+        assert_eq!(status_at_ms(Some(&dir.as_path().join("none.json"))), None);
         assert_eq!(status_at_ms(None), None);
     }
 
@@ -599,10 +601,10 @@ mod tests {
 
     #[test]
     fn a_unit_call_is_argv_with_the_unit_after_the_double_dash() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let calls = dir.path().join("calls");
+        let dir = scratch("drills");
+        let calls = dir.as_path().join("calls");
         let program = script(
-            dir.path(),
+            dir.as_path(),
             &format!(
                 "printf '%s\\n' \"$@\" >{}\nprintf 'Result=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@5\\n'",
                 calls.display()
@@ -618,8 +620,8 @@ mod tests {
 
     #[test]
     fn a_unit_call_that_runs_over_is_killed_and_no_pass() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let program = script(dir.path(), "sleep 30\necho Result=success");
+        let dir = scratch("drills");
+        let program = script(dir.as_path(), "sleep 30\necho Result=success");
         let started = Instant::now();
         let shown = show(&program, "a.service", Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5), "bounded");
@@ -631,9 +633,9 @@ mod tests {
 
     #[test]
     fn a_refused_name_is_never_run() {
-        let dir = tempfile::tempdir().expect("a directory");
-        let ran = dir.path().join("ran");
-        let program = script(dir.path(), &format!("touch {}", ran.display()));
+        let dir = scratch("drills");
+        let ran = dir.as_path().join("ran");
+        let program = script(dir.as_path(), &format!("touch {}", ran.display()));
         for bad in [
             "-Hbb.invalid.service",
             "--host=bb.invalid.service",
