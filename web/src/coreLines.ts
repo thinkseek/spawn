@@ -24,6 +24,10 @@ export interface CoreFigure {
   /** The last 7 UTC days (objective 090): each day's last sample carrying
    * the figure, oldest first; empty without one. */
   trend?: CoreTrendPoint[];
+  /** While the figure's window is not yet covered by its record (objective
+   * 095, the performance north star): where the measuring began, epoch ms.
+   * The value is then null. */
+  measuring_since_ms?: number | null;
 }
 
 /** One day of a figure's trend. */
@@ -146,13 +150,28 @@ export function rangeWords(unit: string, range: CoreRange | null | undefined): s
   return "no range set";
 }
 
+const two = (value: number) => String(value).padStart(2, "0");
+
+/** An instant in local time as "MM-DD HH:MM", every field two digits. */
+export function localStamp(ms: number): string {
+  const at = new Date(ms);
+  return `${two(at.getMonth() + 1)}-${two(at.getDate())} ${two(at.getHours())}:${two(at.getMinutes())}`;
+}
+
+/** A figure with no value: "measuring since <MM-DD HH:MM>" while its record
+ * does not cover its window yet (objective 095), else "not collected yet". */
+function noValueWords(figure: Partial<CoreFigure>): string {
+  const since = finite(figure.measuring_since_ms);
+  return since === null ? "not collected yet" : `measuring since ${localStamp(since)}`;
+}
+
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
   const value = finite(figure.value);
   return {
     name: typeof figure.name === "string" ? figure.name : String(figure.key ?? ""),
-    value: value === null ? "not collected yet" : unitWords(unit, value),
+    value: value === null ? noValueWords(figure) : unitWords(unit, value),
     range: rangeWords(unit, figure.range),
     tone: figure.state === "in" ? "plain" : figure.state === "out" ? "warning" : "muted",
   };
