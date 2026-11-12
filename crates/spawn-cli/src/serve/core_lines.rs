@@ -154,7 +154,9 @@ pub(super) fn parse_ranges(text: Option<&str>, known: &[&str]) -> Ranges {
             max: bound("max"),
         };
         if range.min.is_none() && range.max.is_none() {
-            ranges.ignored.push((key.clone(), "needs a number min or max"));
+            ranges
+                .ignored
+                .push((key.clone(), "needs a number min or max"));
             continue;
         }
         ranges.ranges.insert(key.clone(), range);
@@ -317,7 +319,10 @@ pub(super) fn answer(
 fn ranges_path() -> Option<PathBuf> {
     crate::env_value("SPAWN_CORE_LINES_FILE")
         .map(PathBuf::from)
-        .or_else(|| crate::env_value("SPAWN_WORKSPACE_ROOT").map(|root| PathBuf::from(root).join(RANGES_FILE)))
+        .or_else(|| {
+            crate::env_value("SPAWN_WORKSPACE_ROOT")
+                .map(|root| PathBuf::from(root).join(RANGES_FILE))
+        })
 }
 
 /// The file's contents: `Ok(None)` when there is none.
@@ -357,7 +362,10 @@ mod tests {
     const KNOWN: [&str; 3] = ["a.one", "a.two", "a.three"];
 
     fn state(value: Value, range: &str) -> String {
-        let ranges = parse_ranges(Some(&format!(r#"{{"ranges": {{"a.one": {range}}}}}"#)), &KNOWN);
+        let ranges = parse_ranges(
+            Some(&format!(r#"{{"ranges": {{"a.one": {range}}}}}"#)),
+            &KNOWN,
+        );
         let figure = Figure::new("a.one", "One", "count", value);
         figure_json(&figure, ranges.ranges.get("a.one").copied())["state"]
             .as_str()
@@ -423,10 +431,18 @@ mod tests {
     #[test]
     fn a_missing_file_is_no_ranges_and_a_broken_one_says_why() {
         assert_eq!(parse_ranges(None, &KNOWN), super::Ranges::default());
-        for broken in ["{\"ranges\": ", "[1, 2]", r#"{"ranges": [1]}"#, r#"{"other": {}}"#] {
+        for broken in [
+            "{\"ranges\": ",
+            "[1, 2]",
+            r#"{"ranges": [1]}"#,
+            r#"{"other": {}}"#,
+        ] {
             let ranges = parse_ranges(Some(broken), &KNOWN);
             assert!(ranges.error.is_some(), "{broken}");
-            assert!(ranges.ranges.is_empty() && ranges.ignored.is_empty(), "{broken}");
+            assert!(
+                ranges.ranges.is_empty() && ranges.ignored.is_empty(),
+                "{broken}"
+            );
         }
         let dir = std::env::temp_dir().join(format!("spawn-core-lines-{}", std::process::id()));
         assert_eq!(read_ranges(Some(&dir.join("absent.json"))), Ok(None));
@@ -451,11 +467,19 @@ mod tests {
             .iter()
             .map(|line| line["line"].as_str().expect("a name"))
             .collect();
-        assert_eq!(names, ["performance", "storage", "observability", "recoverability"]);
+        assert_eq!(
+            names,
+            ["performance", "storage", "observability", "recoverability"]
+        );
         let storage_line = &view["lines"][1];
         let values: Vec<(&str, Value)> = std::iter::once(&storage_line["north_star"])
             .chain(storage_line["guardrails"].as_array().expect("guardrails"))
-            .map(|figure| (figure["key"].as_str().expect("a key"), figure["value"].clone()))
+            .map(|figure| {
+                (
+                    figure["key"].as_str().expect("a key"),
+                    figure["value"].clone(),
+                )
+            })
             .collect();
         assert_eq!(
             values,
@@ -469,7 +493,8 @@ mod tests {
             ]
         );
         // No log size: no ratio; no readable test database: none.
-        let bare = lines(&json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}));
+        let bare =
+            lines(&json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}));
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
         // The other north stars are not collected, with no guardrails.

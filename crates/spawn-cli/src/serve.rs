@@ -3317,18 +3317,16 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).expect("a directory");
             let file = dir.join("core-lines.json");
-            let read = || {
-                super::core_lines::core_lines_at(store, Some(file.clone())).expect("the answer")
-            };
+            let read =
+                || super::core_lines::core_lines_at(store, Some(file.clone())).expect("the answer");
             let figure = |view: &Value, key: &str| {
                 view["lines"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .flat_map(|line| {
-                        std::iter::once(line["north_star"].clone()).chain(
-                            line["guardrails"].as_array().cloned().unwrap_or_default(),
-                        )
+                        std::iter::once(line["north_star"].clone())
+                            .chain(line["guardrails"].as_array().cloned().unwrap_or_default())
                     })
                     .find(|figure| figure["key"] == key)
                     .unwrap_or_else(|| panic!("no {key}: {view}"))
@@ -3360,9 +3358,16 @@ mod tests {
                        {"key": "storage.free_bites", "reason": "unknown figure"}])
             );
             let ratio = figure(&ranged, "storage.database_ratio");
-            assert_eq!(ratio["range"], json!({"min": 0, "max": 1_000_000_000_000_i64}));
+            assert_eq!(
+                ratio["range"],
+                json!({"min": 0, "max": 1_000_000_000_000_i64})
+            );
             // The test schema's database has a size; its log may have none.
-            let expected = if ratio["value"].is_null() { "not_collected" } else { "in" };
+            let expected = if ratio["value"].is_null() {
+                "not_collected"
+            } else {
+                "in"
+            };
             assert_eq!(ratio["state"], json!(expected), "{ratio}");
             let restores = figure(&ranged, "recoverability.restores_passed");
             assert_eq!(restores["range"], json!({"min": 6}));
@@ -3370,9 +3375,16 @@ mod tests {
             // A broken file: no ranges, and why.
             std::fs::write(&file, "{\"ranges\": ").expect("the file");
             let broken = read();
-            assert!(broken["ranges_error"].as_str().is_some_and(|why| !why.is_empty()));
+            assert!(
+                broken["ranges_error"]
+                    .as_str()
+                    .is_some_and(|why| !why.is_empty())
+            );
             assert_eq!(broken["ignored_ranges"], json!([]));
-            assert_eq!(figure(&broken, "storage.database_ratio")["range"], Value::Null);
+            assert_eq!(
+                figure(&broken, "storage.database_ratio")["range"],
+                Value::Null
+            );
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
