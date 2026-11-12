@@ -302,3 +302,69 @@ export function storageView(value: unknown): StorageView {
   const days = storage?.days_left ?? null;
   return { rows, lasts: days === null ? null : `about ${count(days)} days at the archive's growth` };
 }
+
+// The newest off-host backups, as `/api/fleet`'s `health.backups` reports
+// them (objective 82): the database's hourly copy (`backup.dumped`) and the
+// daily bundle of transcripts and sources (`backup.bundled`). The alert step
+// calls a dump older than 2 h, or a bundle older than 26 h, stale.
+
+/** One upload: when it was recorded, its first key and its bytes. */
+export interface BackupRecord {
+  at_ms: number;
+  key: string | null;
+  bytes: number | null;
+}
+
+export interface Backups {
+  dump: BackupRecord | null;
+  bundle: BackupRecord | null;
+}
+
+function normalizeBackupRecord(value: unknown): BackupRecord | null {
+  if (value === null || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.at_ms !== "number" || !Number.isFinite(raw.at_ms)) return null;
+  return {
+    at_ms: raw.at_ms,
+    key: typeof raw.key === "string" ? raw.key : null,
+    bytes: typeof raw.bytes === "number" && Number.isFinite(raw.bytes) ? raw.bytes : null,
+  };
+}
+
+/** The health's `backups`; null when the server reports none (an older one). */
+export function normalizeBackups(value: unknown): Backups | null {
+  if (value === null || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  return { dump: normalizeBackupRecord(raw.dump), bundle: normalizeBackupRecord(raw.bundle) };
+}
+
+export interface BackupRow {
+  name: string;
+  /** `now` less the newest record's time; null when there is none. */
+  age_ms: number | null;
+  /** The newest record's first uploaded key; null when there is none. */
+  key: string | null;
+}
+
+/** The Storage card's backup rows: the database copy, then the transcripts
+ * and sources, each with its newest upload's age and key. Takes the
+ * server's `health.backups` as it is or normalized. */
+export function backupView(value: unknown, now: number): BackupRow[] {
+  const backups = normalizeBackups(value);
+  const row = (name: string, record: BackupRecord | null | undefined): BackupRow => ({
+    name,
+    age_ms: record ? now - record.at_ms : null,
+    key: record ? record.key : null,
+  });
+  return [row("Database copy", backups?.dump), row("Transcripts and sources", backups?.bundle)];
+}
+
+/** A backup's age said as a span ("32 min", "10 h", "3 d"), or "no backup
+ * yet" when there is none. */
+export function backupAge(ageMs: number | null): string {
+  if (ageMs === null) return "no backup yet";
+  const minutes = Math.max(0, Math.round(ageMs / 60_000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} d`;
+}
