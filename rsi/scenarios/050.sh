@@ -436,8 +436,15 @@ note() { echo "050: $*" >&2; }
 # --- the records --------------------------------------------------------------------
 
 # rec <hours before now> <record JSON>: a control record as the store holds it.
+# The loop under test appends to session_control too, so the next
+# session_seq is taken under the store's own append lock
+# (spawn_append_trusted's pg_advisory_xact_lock), in a statement of its own
+# before the insert: the insert's snapshot then sees every append that
+# committed before the lock was granted, and none can commit meanwhile.
+# psql runs the -c string as one transaction; the id is its one number line.
 rec_sql() {
-    printf "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id, kind, session_seq, recorded_at_ms)
+    printf "select pg_advisory_xact_lock(1399957335);
+      insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id, kind, session_seq, recorded_at_ms)
       select 'agent_control', 'session_control', null, 'control', null,
              jsonb_build_object('name', 'control.recorded', 'detail', jsonb_build_object('record', '%s'::jsonb)),
              coalesce((select max(session_seq) from spawn_events where session_id = 'session_control'), 0) + 1,
@@ -445,8 +452,18 @@ rec_sql() {
       returning id;\n" "$2" "$1"
 }
 rec() { # <hours> <json>: prints the event id
-    id=$(psql -d "$SPAWN_DB_NAME" -tA -v ON_ERROR_STOP=1 -c "$(rec_sql "$1" "$2")" 2>"$WORK/rec.err" | head -n 1)
-    case "$id" in '' | *[!0-9]*) harness "writing $2 failed: $(head -c 300 "$WORK/rec.err")" ;; esac
+    # Should the store's lock ever change, a collision on the session's
+    # sequence is retried (a few times), never taken for a failure.
+    rec_tries=0
+    while :; do
+        id=$(psql -d "$SPAWN_DB_NAME" -tA -v ON_ERROR_STOP=1 -c "$(rec_sql "$1" "$2")" 2>"$WORK/rec.err" | grep -E "^[0-9]+$" | tail -n 1)
+        case "$id" in '' | *[!0-9]*) ;; *) break ;; esac
+        rec_tries=$((rec_tries + 1))
+        if [ "$rec_tries" -ge 5 ] || ! grep -q 'spawn_events_session_seq' "$WORK/rec.err"; then
+            harness "writing $2 failed: $(head -c 300 "$WORK/rec.err")"
+        fi
+        sleep 0.2
+    done
     echo "$id"
 }
 refold() {

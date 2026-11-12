@@ -450,11 +450,52 @@ q() { scalar "$1"; }
 put() { printf '%s\n' "$3" >"$WORK/state/$1.$2"; }
 get() { cat "$WORK/state/$1.$2" 2>/dev/null || true; }
 # api <path> <file>: GET from serve; its status code.
-api() { curl -s --noproxy '*' -o "$2" -w '%{http_code}' "$base$1" 2>/dev/null || echo 000; }
+# Prints the status code once (000 when curl got no answer). Why it got
+# none goes to <file>.why: curl's exit code and error text, whether serve
+# still runs, and whether a retry was made. A connection-level failure
+# (curl exit 7, 52 or 56: refused, empty reply, reset) is retried once, and
+# said; a serve that has died fails the retry too.
+api() {
+    api_try=1
+    api_first=""
+    while :; do
+        api_rc=0
+        api_code=$(curl -sS --noproxy '*' -o "$2" -w '%{http_code}' "$base$1" 2>"$2.curl") || api_rc=$?
+        if [ "$api_rc" -eq 0 ]; then
+            if [ -n "$api_first" ]; then
+                printf 'answered on a retry; the first try: %s\n' "$api_first" >"$2.why"
+            else
+                : >"$2.why"
+            fi
+            break
+        fi
+        api_text=$(tr '\n' ' ' <"$2.curl" | head -c 300)
+        api_alive=no
+        [ -n "$serve_pid" ] && kill -0 "$serve_pid" 2>/dev/null && api_alive=yes
+        case $api_rc in
+        7 | 52 | 56)
+            if [ "$api_try" -eq 1 ]; then
+                api_first="curl exit $api_rc: $api_text (serve running: $api_alive)"
+                echo "046: GET $1: $api_first; retrying once" >&2
+                api_try=2
+                sleep 1
+                continue
+            fi
+            ;;
+        esac
+        printf 'curl exit %s: %s (serve running: %s)%s\n' "$api_rc" "$api_text" "$api_alive" \
+            "${api_first:+; it failed on the retry too, the first try: $api_first}" >"$2.why"
+        api_code=000
+        break
+    done
+    printf '%s\n' "${api_code:-000}"
+}
+# api_why <file>: " (why)" after a GET whose answer was not 200, if curl said.
+api_why() { [ -s "$1.why" ] && printf ' (%s)' "$(cat "$1.why")"; }
 # commands <label>: the session's commands into $WORK/commands-<label>.json.
 commands() {
     code=$(api "/api/fleet/$(get "$1" session)/commands?limit=100" "$WORK/commands-$1.json")
-    [ "$code" = 200 ] || harness "GET /api/fleet/$(get "$1" session)/commands answered $code"
+    [ "$code" = 200 ] || harness "GET /api/fleet/$(get "$1" session)/commands answered $code$(api_why "$WORK/commands-$1.json")"
     jq -e 'type == "array"' "$WORK/commands-$1.json" >/dev/null 2>&1 ||
         harness "the commands of $1 are no JSON array: $(head -c 200 "$WORK/commands-$1.json")"
 }

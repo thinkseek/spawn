@@ -516,6 +516,10 @@ done
 cat >"$WORK/seed.sql" <<SQL
 \\set ON_ERROR_STOP 1
 begin;
+-- The store's own append lock (spawn_append_trusted's advisory lock),
+-- held to commit: no append can take a session_seq between the max
+-- read below and these inserts.
+select pg_advisory_xact_lock(1399957335);
 create function pg_temp.event(at_ms bigint, src text, key text, kind jsonb) returns void
 language sql as \$\$
     insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
