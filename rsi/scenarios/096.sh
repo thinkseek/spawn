@@ -38,15 +38,20 @@
 #       never ended.
 #   (3) a second integrator on the same root starts a warm of L within
 #       30 s.
-#   (4) while it holds, the source's main moves by a push nothing recorded
-#       (by hand) and the second integrator gets TERM; a third integrator
-#       halts the mission (main is not the last landing's), and starts no
-#       warm, of L or of the new main, over three passes and more: a
-#       source whose missions are all halted is warmed for no gate.
-#   Not covered here, but in the required unit tests: main moved with a
-#   mission not halted (the new main is warmed, not L), and the take-over
-#   that stops a warm still running (the parent-death signal ends it first
-#   wherever setpriv exists).
+#   (4) while it holds, the owner lands a commit M (`spawn mission push`:
+#       a request the integrator applies; the mission is not halted). The
+#       second integrator applies it and starts the warm of M; TERM. A
+#       third integrator starts a warm of M within 30 s, and none of L.
+#       Released, it ends, and M's listing and result entries are in the
+#       base cache.
+#   (5) the owner lands M2 and its warm starts; a push nothing recorded (by
+#       hand) moves main, which halts the mission; TERM. A fourth
+#       integrator halts the mission (or finds it halted) and starts no
+#       warm over three passes and more: a halted mission runs no gate.
+#   Not covered here, but in the required unit tests: main moved between
+#   two integrators by a move neither saw (the new main is warmed, never the
+#   recorded commit), and the take-over that stops a warm still running (the
+#   parent-death signal ends it first wherever setpriv exists).
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -363,35 +368,89 @@ else
     check_failed "(3) the next integrator started no warm of $L within 30 s (warm runs: $(warms); its words: $(grep -i 'warm' "$WORK/integrate.log" | grep -v '^| ' | tail -n 3 | tr '\n' ' ' | head -c 400))"
 fi
 
-# --- (4) an unrecorded move halts the mission: no warm while it is halted ------------------
+# --- (4) the owner lands a commit meanwhile: the warm is of main as it is ------------------
 
-# The source's main moves by a push no landing or owner request recorded
-# (a hand push): the mission halts ("the source's main is M, but the last
-# landing left L"), and its gates wait for a human. A warm for a source
-# whose missions are all halted is warmed for no gate (the rule the
-# landings' and the owner's warms keep), so the lost warm is not warmed
-# again, of L or of M, while the mission is halted.
-git -C "$WORK/seed" pull -q "$source_repo" main
+# The owner's landing, as the owner makes one: a commit in a clone of the
+# source, landed with `spawn mission push` (a request the integrator
+# applies; the mission is not halted). Sets `commit`.
+git clone -q "$source_repo" "$WORK/owner"
+owner_push() { # <file> <what>
+    git -C "$WORK/owner" fetch -q origin main
+    git -C "$WORK/owner" merge -q --ff-only origin/main
+    printf 'owner\n' >"$WORK/owner/$1"
+    git -C "$WORK/owner" add -A
+    git -C "$WORK/owner" commit -qm "owner: $1"
+    commit=$(git -C "$WORK/owner" rev-parse HEAD)
+    status=0
+    (cd "$WORK/owner" && "$SPAWN_BIN" mission push --source "$source_repo" --commit "$commit") \
+        >"$WORK/out.txt" 2>"$WORK/err.txt" || status=$?
+    [ "$status" -eq 0 ] || harness "$2: spawn mission push exited $status: $(head -c 300 "$WORK/err.txt")"
+    on_main() { [ "$(git --git-dir="$source_repo" rev-parse main)" = "$commit" ]; }
+    wait_for 60 "the owner's landing" on_main ||
+        harness "$2: the owner's push of $commit was not applied within 60 s (integrate: $(grep -v '^| ' "$WORK/integrate.log" | tail -n 3 | tr '\n' ' '))"
+}
+not_halted() { [ -z "$(q "select halted from mission_missions where id = $mission and halted is not null")" ]; }
+
+# The second integrator applies the owner's landing (main M) and starts the
+# warm of M, which holds; then a restart.
+owner_push OWNER.txt "(4)"
+M=$commit
+warm_of_m() { [ "$(warm_runs "$M")" -ge 1 ]; }
+wait_for 30 "the warm of M" warm_of_m || harness "(4) the integrator that applied the owner's landing started no warm of $M"
+not_halted || harness "(4) the owner's landing halted mission $mission"
+held=$(warms)
+restart_stop
+pid=$(cat "$WORK/warm-$held.pid")
+wait_for 10 "warm $held" gone "$pid" || harness "warm $held outlived its integrator"
+before_l=$(warm_runs "$L")
+start_integrator
+second_m() { [ "$(warm_runs "$M")" -ge 2 ]; }
+if wait_for 30 "a warm of M again" second_m; then
+    n=$(awk -v c="$M" '$2 == "warm-start" && $4 == c { n = $3 } END { print n }' "$WORK/judged.log")
+    : >"$WORK/release-$n"
+    ended_m() { [ "$(warm_ends "$M")" -ge 1 ]; }
+    wait_for 30 "the warm of M to end" ended_m || check_failed "(4) warm $n of $M did not end within 30 s of its release"
+    listing=$(printf 'listing %s' "$M" | sha256sum | cut -c1-64)
+    result=$(printf 'result %s check-ok' "$M" | sha256sum | cut -c1-64)
+    [ -f "$cache/spawn/gate-base/$listing" ] && [ -f "$cache/spawn/gate-base/$result" ] ||
+        check_failed "(4) M's listing and result entries are not in the base cache: $(ls "$cache/spawn/gate-base" 2>/dev/null | tr '\n' ' ')"
+    expect_eq "$(warm_runs "$L")" "$before_l" "(4) no warm of L, which main has moved past"
+    note "(4) checked: warm $n of the owner's main $M, started by the next integrator, ran to its end"
+else
+    check_failed "(4) the next integrator started no warm of main $M (the owner's landing) within 30 s (warm runs: $(awk '$2 == "warm-start"' "$WORK/judged.log" | tr '\n' ' '))"
+fi
+
+# --- (5) a halted mission's source is not warmed again ---------------------------------------
+
+# Another owner's landing (main M2) and its warm, held; then a push nothing
+# recorded (by hand) moves main, which halts the mission ("the source's
+# main is ..., but the last landing left ..."), and a restart. A halted
+# mission runs no gate: its source is not warmed again, of any commit.
+owner_push OWNER2.txt "(5)"
+M2=$commit
+warm_of_m2() { [ "$(warm_runs "$M2")" -ge 1 ]; }
+wait_for 30 "the warm of M2" warm_of_m2 || harness "(5) the integrator that applied the owner's landing started no warm of $M2"
+git -C "$WORK/seed" fetch -q "$source_repo" main
+git -C "$WORK/seed" checkout -q -B hand FETCH_HEAD
 printf 'by hand\n' >"$WORK/seed/HAND.txt"
 git -C "$WORK/seed" add -A
 git -C "$WORK/seed" commit -qm "main moved by hand"
-git -C "$WORK/seed" push -q "$source_repo" main:main
-M=$(git --git-dir="$source_repo" rev-parse main)
-[ "$M" != "$L" ] || harness "main did not move"
+git -C "$WORK/seed" push -q "$source_repo" hand:main
 held=$(warms)
 restart_stop
-[ "$held" -eq 0 ] || { pid=$(cat "$WORK/warm-$held.pid"); wait_for 10 "warm $held" gone "$pid" || harness "warm $held outlived its integrator"; }
+pid=$(cat "$WORK/warm-$held.pid")
+wait_for 10 "warm $held" gone "$pid" || harness "warm $held outlived its integrator"
 launched=$(warms)
 start_integrator
-halted() { [ -n "$(q "select halted from mission_missions where id = $mission and halted is not null")" ]; }
+halted() { ! not_halted; }
 if wait_for 30 "the halt" halted; then
     # Three passes and more (an integrator passes every 5 s at the least).
     sleep 16
     expect_eq "$(warms)" "$launched" \
-        "(4) no warm started (of L or of M) while the source's only mission is halted: $(awk '$2 == "warm-start"' "$WORK/judged.log" | tail -n 2 | tr '\n' ' ')"
-    note "(4) checked: mission $mission halted on the unrecorded move, no warm started"
+        "(5) no warm started after the restart while the source's only mission is halted: $(awk '$2 == "warm-start"' "$WORK/judged.log" | tail -n 2 | tr '\n' ' ')"
+    note "(5) checked: mission $mission halted on the push by hand, nothing warmed again"
 else
-    check_failed "(4) mission $mission did not halt within 30 s of main's unrecorded move to $M"
+    check_failed "(5) mission $mission did not halt within 30 s of main's push by hand"
 fi
 restart_stop
 
