@@ -319,7 +319,7 @@ pub(super) fn figures(
     let age =
         |at: Option<i64>| at.map_or(Value::Null, |at| json!(now_ms.saturating_sub(at).max(0)));
     let since = now_ms.saturating_sub(WEEK_MS);
-    let passed = if passes.is_empty() {
+    let within = if passes.is_empty() {
         Value::Null
     } else {
         json!(passes.iter().flatten().filter(|at| **at >= since).count())
@@ -329,7 +329,7 @@ pub(super) fn figures(
             "recoverability.restores_passed",
             "Critical resources with a restore passed in 7 days",
             "count",
-            passed,
+            within,
         ),
         vec![
             Figure::new(
