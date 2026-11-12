@@ -228,6 +228,21 @@ const TEST_DATABASE_NAMES: Record<string, string> = {
   fleet_test: "Fleet test database",
 };
 
+/** The log's size is said from what a size shows as 0.1 MB: "log 0.0 MB"
+ * would say nothing (a fresh install's log is a few kilobytes). */
+export const LOG_SHOWN_BYTES = 0.05 * MB;
+
+/** The test databases the card shows: all of them once one holds a schema
+ * (what tests leave behind, objective 074) or could not be read, so the
+ * gates' and the fleet's can be compared; none while every one is a fresh
+ * database with no schema (its few MB are the template's catalog, nothing
+ * that uses the disk). */
+export function shownTestDatabases(databases: readonly TestDatabase[]): TestDatabase[] {
+  return databases.some((database) => database.schemas === null || database.schemas > 0)
+    ? [...databases]
+    : [];
+}
+
 export interface StorageRow {
   name: string;
   size: string;
@@ -251,6 +266,7 @@ export function storageView(value: unknown): StorageView {
   const before = projects?.before ?? null;
   const largest = storage?.database?.tables[0] ?? null;
   const logBytes = storage?.database?.log_bytes ?? null;
+  const tests = shownTestDatabases(storage?.test_databases ?? []);
   const count = (n: number) => n.toLocaleString("en-US");
   const rows: StorageRow[] = [
     {
@@ -272,12 +288,12 @@ export function storageView(value: unknown): StorageView {
       size: storageSize(storage?.database?.bytes),
       note: [
         largest ? `largest: ${largest.name} ${storageSize(largest.bytes)}` : null,
-        logBytes !== null ? `log ${storageSize(logBytes)}` : null,
+        logBytes !== null && logBytes >= LOG_SHOWN_BYTES ? `log ${storageSize(logBytes)}` : null,
       ]
         .filter((part) => part !== null)
         .join(", "),
     },
-    ...(storage?.test_databases ?? []).map((database) => ({
+    ...tests.map((database) => ({
       name: TEST_DATABASE_NAMES[database.role] ?? `Test database (${database.role})`,
       size: storageSize(database.bytes),
       note: database.schemas === null ? "unreadable" : `${count(database.schemas)} schemas`,
