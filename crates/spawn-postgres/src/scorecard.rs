@@ -24,7 +24,9 @@ use crate::PostgresStore;
 /// starts) and a deploy as its `ok` (`deploy.finished`, objective 081). `owner_runs_from_ms` is the
 /// time of the earliest owner judging (`source.moved`,
 /// `source.push_refused`) that names its gate's wall clock, read over the
-/// whole log, not up to `$1`; null when none does.
+/// whole log, not up to `$1`; null when none does. `live_from_ms` is the
+/// time of the first `deploy.finished` of any outcome before `$1`, where
+/// report to live's record begins (objective 095); null with none.
 const FACTS: &str = r"
 with h as materialized (
   select u.id, i.intent, i.at_ms
@@ -124,7 +126,17 @@ select jsonb_build_object(
      cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
      where e.session_id = 'session_control' and e.event_name = 'control.recorded'
        and x.r ->> 'type' in ('source.moved', 'source.push_refused')
-       and jsonb_typeof(x.r -> 'gate_ms') = 'number'))";
+       and jsonb_typeof(x.r -> 'gate_ms') = 'number'),
+  -- Where the live record begins (objective 095): the first
+  -- `deploy.finished` of any outcome, over the whole log before `$1`
+  -- (whatever the window); null when there is none.
+  'live_from_ms', (
+    select min(e.recorded_at_ms)
+      from spawn_events e
+     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.recorded_at_ms < $1
+       and x.r ->> 'type' = 'deploy.finished'))";
 
 impl PostgresStore {
     /// The database's clock (`spawn_now_ms()`), in epoch milliseconds: the

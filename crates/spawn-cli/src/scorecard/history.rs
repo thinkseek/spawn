@@ -149,6 +149,11 @@ pub(crate) struct History {
     /// finished, in stream order: it ships the then-current main, every
     /// landing before it.
     pub(crate) deploys: Vec<i64>,
+    /// Where the live record begins (objective 095): the first
+    /// `deploy.finished` record of any outcome, read over the whole log;
+    /// `None` with no deploy record. A landing before it is in no part of
+    /// report to live: nothing recorded when it went live.
+    pub(crate) live_from: Option<i64>,
 }
 
 /// One control record, as the store projects it (spawn-postgres,
@@ -244,6 +249,10 @@ pub(crate) struct Facts {
     /// the whole log (objective 076); null when none does.
     #[serde(default)]
     pub(crate) owner_runs_from_ms: Option<i64>,
+    /// The first `deploy.finished` record of any outcome (objective 095),
+    /// over the whole log before the facts' end; null when there is none.
+    #[serde(default)]
+    pub(crate) live_from_ms: Option<i64>,
 }
 
 fn int(value: &Value) -> Option<i64> {
@@ -386,9 +395,14 @@ impl Fold {
                     task.reported_at = Some(record.at);
                 }
             }
-            // A failed deploy ships nothing.
-            "deploy.finished" if boolean(&record.ok) == Some(true) => {
-                self.history.deploys.push(record.at);
+            // Any deploy record begins the live record (objective 095); a
+            // failed deploy ships nothing.
+            "deploy.finished" => {
+                let from = self.history.live_from.get_or_insert(record.at);
+                *from = (*from).min(record.at);
+                if boolean(&record.ok) == Some(true) {
+                    self.history.deploys.push(record.at);
+                }
             }
             "task.delivered" => {
                 if let Some(task) = id.and_then(|id| self.history.tasks.get_mut(&id)) {
@@ -641,6 +655,10 @@ impl History {
             fold.apply(record);
         }
         let mut history = fold.history;
+        history.live_from = match (history.live_from, facts.live_from_ms) {
+            (Some(folded), Some(read)) => Some(folded.min(read)),
+            (folded, read) => folded.or(read),
+        };
         history.live();
         history.commands(&facts.commands);
         history.messages(messages);
@@ -786,9 +804,6 @@ impl History {
         self.tokens = tokens;
     }
 
-    /// Only what counts in `[since, until)`: the landings, marks, gate runs
-    /// and tokens in it, and the tasks open in it. Every count of a window
-    /// inside it is the same after; there is less to read for each.
     /// Each landing's wait from its report to live: to the first deploy that
     /// succeeded at or after it. A deploy is known only by when it finished,
     /// so a landing made while one ran counts as shipped by it (optimistic
@@ -805,6 +820,9 @@ impl History {
         }
     }
 
+    /// Only what counts in `[since, until)`: the landings, marks, gate runs
+    /// and tokens in it, and the tasks open in it. Every count of a window
+    /// inside it is the same after; there is less to read for each.
     pub(crate) fn clip(&mut self, since: i64, until: i64) {
         let inside = |at: i64| since <= at && at < until;
         self.landings.retain(|landing| inside(landing.at));

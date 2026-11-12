@@ -67,6 +67,11 @@ pub(crate) struct Counts {
     /// (objective 081). A landing with no report counts in neither.
     pub(crate) report_to_live_ms: Vec<i64>,
     pub(crate) not_live: usize,
+    /// Where report to live is measured from (objective 095): the later of
+    /// the window's start and the live record's; `None` with no deploy
+    /// record. `live_covered`: the record starts at or before the window.
+    pub(crate) live_measured_from: Option<i64>,
+    pub(crate) live_covered: bool,
     pub(crate) first_pass: usize,
     pub(crate) marks: BTreeMap<Kind, usize>,
     pub(crate) tokens: i64,
@@ -130,14 +135,19 @@ pub(crate) fn union_ms(intervals: &[(i64, Option<i64>)], window: Window) -> i64 
 pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts {
     let mut counts = Counts {
         open_ms: union_ms(&history.open_intervals(scope.mission()), window),
+        live_measured_from: history.live_from.map(|from| from.max(window.since)),
+        live_covered: history.live_from.is_some_and(|from| from <= window.since),
         ..Counts::default()
     };
+    // A landing before the live record began is neither live nor not live.
+    let seen = |at: i64| history.live_from.is_some_and(|from| from <= at);
     for landing in &history.landings {
         if scope.holds(Some(landing.mission)) && window.holds(landing.at) {
             counts.landed += 1;
             counts.lead_ms.push(landing.lead_ms);
             counts.first_pass += usize::from(landing.first_pass);
             match (landing.report_to_live_ms, landing.reported_at) {
+                _ if !seen(landing.at) => {}
                 (Some(ms), _) => counts.report_to_live_ms.push(ms),
                 (None, Some(_)) => counts.not_live += 1,
                 (None, None) => {}
@@ -389,7 +399,10 @@ fn lead_time(counts: &Counts, enough: bool) -> Dimension {
 /// from its task's last report to the deploy that puts it live, the median
 /// and p90 by nearest rank over the window's live landings; `n` is how
 /// many are live, `not_live` how many have no deploy yet (left out of the
-/// figures). Enough at [`MIN_N`] live landings.
+/// figures). Enough at [`MIN_N`] live landings. Only landings at or after
+/// the live record's start count (objective 095): `measured_from_ms` is
+/// where the window's measuring starts (null with no deploy record), and
+/// `covered` whether the record covers the whole window.
 fn report_to_live(counts: &Counts) -> Dimension {
     let live = counts.report_to_live_ms.len();
     let rank = |percent| {
@@ -402,6 +415,11 @@ fn report_to_live(counts: &Counts) -> Dimension {
     let mut parts = Map::new();
     parts.insert("p90".into(), number(rank(90)));
     parts.insert("not_live".into(), usize_json(counts.not_live));
+    parts.insert(
+        "measured_from_ms".into(),
+        counts.live_measured_from.map_or(Value::Null, Value::from),
+    );
+    parts.insert("covered".into(), json!(counts.live_covered));
     Dimension {
         value: rank(50),
         n: live,
