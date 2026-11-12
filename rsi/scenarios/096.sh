@@ -20,10 +20,11 @@
 # whether gone or stopped by the take-over, warms the base of that warm's
 # source's main as it is now, with that warm's scenarios, at its first
 # passes: the lost warm's commit when main has not moved, main's new
-# commit when it has. The warm runs as any warm does (one at a time,
-# abandoned when main moves on, under the parent-death signal). A pid file
-# that names no source (an older integrator's) re-warms nothing, and the
-# integrator says so.
+# commit when it has; only for a source with a mission that is not halted
+# (the rule every warm keeps). The warm runs as any warm does (one at a
+# time, abandoned when main moves on, under the parent-death signal). A pid
+# file that names no source (an older integrator's) re-warms nothing, and
+# the integrator says so.
 #
 # The world: a gated mission on one source, judged by a recording gate
 # (SPAWN_GATE). A candidate is `accepted`. A base warm (`--base-only`)
@@ -37,10 +38,15 @@
 #       never ended.
 #   (3) a second integrator on the same root starts a warm of L within
 #       30 s.
-#   (4) while it holds, the source's main moves to M (an owner's commit)
-#       and the second integrator gets TERM; a third integrator starts a
-#       warm of M within 30 s, and none of L. Released, it ends, and M's
-#       listing and result entries are in the base cache.
+#   (4) while it holds, the source's main moves by a push nothing recorded
+#       (by hand) and the second integrator gets TERM; a third integrator
+#       halts the mission (main is not the last landing's), and starts no
+#       warm, of L or of the new main, over three passes and more: a
+#       source whose missions are all halted is warmed for no gate.
+#   Not covered here, but in the required unit tests: main moved with a
+#   mission not halted (the new main is warmed, not L), and the take-over
+#   that stops a warm still running (the parent-death signal ends it first
+#   wherever setpriv exists).
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -357,34 +363,35 @@ else
     check_failed "(3) the next integrator started no warm of $L within 30 s (warm runs: $(warms); its words: $(grep -i 'warm' "$WORK/integrate.log" | grep -v '^| ' | tail -n 3 | tr '\n' ' ' | head -c 400))"
 fi
 
-# --- (4) main moves meanwhile: the warm is of main as it is ----------------------------------
+# --- (4) an unrecorded move halts the mission: no warm while it is halted ------------------
 
+# The source's main moves by a push no landing or owner request recorded
+# (a hand push): the mission halts ("the source's main is M, but the last
+# landing left L"), and its gates wait for a human. A warm for a source
+# whose missions are all halted is warmed for no gate (the rule the
+# landings' and the owner's warms keep), so the lost warm is not warmed
+# again, of L or of M, while the mission is halted.
 git -C "$WORK/seed" pull -q "$source_repo" main
-printf 'owner\n' >"$WORK/seed/OWNER.txt"
+printf 'by hand\n' >"$WORK/seed/HAND.txt"
 git -C "$WORK/seed" add -A
-git -C "$WORK/seed" commit -qm "the owner moves main"
+git -C "$WORK/seed" commit -qm "main moved by hand"
 git -C "$WORK/seed" push -q "$source_repo" main:main
 M=$(git --git-dir="$source_repo" rev-parse main)
 [ "$M" != "$L" ] || harness "main did not move"
-before_l=$(warm_runs "$L")
 held=$(warms)
 restart_stop
 [ "$held" -eq 0 ] || { pid=$(cat "$WORK/warm-$held.pid"); wait_for 10 "warm $held" gone "$pid" || harness "warm $held outlived its integrator"; }
+launched=$(warms)
 start_integrator
-warm_of_m() { [ "$(warm_runs "$M")" -ge 1 ]; }
-if wait_for 30 "a warm of M" warm_of_m; then
-    n=$(awk -v c="$M" '$2 == "warm-start" && $4 == c { print $3; exit }' "$WORK/judged.log")
-    : >"$WORK/release-$n"
-    ended_m() { [ "$(warm_ends "$M")" -ge 1 ]; }
-    wait_for 30 "the warm of M to end" ended_m || check_failed "(4) the warm of $M did not end within 30 s of its release"
-    listing=$(printf 'listing %s' "$M" | sha256sum | cut -c1-64)
-    result=$(printf 'result %s check-ok' "$M" | sha256sum | cut -c1-64)
-    [ -f "$cache/spawn/gate-base/$listing" ] && [ -f "$cache/spawn/gate-base/$result" ] ||
-        check_failed "(4) M's listing and result entries are not in the base cache: $(ls "$cache/spawn/gate-base" 2>/dev/null | tr '\n' ' ')"
-    expect_eq "$(warm_runs "$L")" "$before_l" "(4) the third integrator warms main as it is (M), not the lost warm's L"
-    note "(4) checked: the warm of $M ran to its end, its entries in the cache"
+halted() { [ -n "$(q "select halted from mission_missions where id = $mission and halted is not null")" ]; }
+if wait_for 30 "the halt" halted; then
+    # Three passes and more (an integrator passes every 5 s at the least).
+    sleep 16
+    expect_eq "$(warms)" "$launched" \
+        "(4) no warm started (of L or of M) while the source's only mission is halted: $(awk '$2 == "warm-start"' "$WORK/judged.log" | tail -n 2 | tr '\n' ' ')"
+    note "(4) checked: mission $mission halted on the unrecorded move, no warm started"
 else
-    check_failed "(4) the third integrator started no warm of main $M within 30 s (warm runs: $(cat "$WORK/judged.log" | awk '$2 == "warm-start"' | tr '\n' ' '))"
+    check_failed "(4) mission $mission did not halt within 30 s of main's unrecorded move to $M"
 fi
 restart_stop
 
@@ -393,5 +400,5 @@ if [ -s "$WORK/failures" ]; then
     echo "096: $(wc -l <"$WORK/failures") check(s) failed" >&2
     exit 1
 fi
-echo "096: a base warm cut off by an integrator restart is warmed again, for main as it is, by the next integrator"
+echo "096: a base warm cut off by an integrator restart is warmed again by the next integrator, and not for a halted mission"
 exit 0
