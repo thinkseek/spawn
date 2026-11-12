@@ -95,7 +95,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # Observer has judged that turn's end WAITING), or for 120 s at most; the
 # engine's log says which (`settled` or `unsettled`). Any other turn shows
 # its prompt at once.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -116,7 +116,7 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 work=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

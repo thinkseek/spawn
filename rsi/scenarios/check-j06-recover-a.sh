@@ -359,7 +359,7 @@ EOF
 # data/big.bin and data/notes.txt before its first step; ctl/<agent>.edit
 # (removed) rewrites 1 MiB of data/big.bin in place, then exits 0, as 003's
 # `edit-large` does. Both are logged in engine.log (`wrote`, `edited`).
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 mode=new
@@ -463,7 +463,7 @@ turn() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

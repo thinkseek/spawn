@@ -182,11 +182,11 @@ git -C "$WORK/seed" push -q "$repo" main:main
 
 # A quiet engine: the loop may deliver the tasks below to a worker; this
 # one shows a prompt, takes what is typed and does nothing with it.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 printf 'Welcome to Claude Code\n\n❯ '
 while :; do
-  if IFS= read -r -t 1 typed; then printf 'you: %s\n\nidle\n❯ ' "$typed"; fi
+  if bb_read_line typed; then printf 'you: %s\n\nidle\n❯ ' "$typed"; fi
 done
 ENGINE
 chmod 755 "$WORK/claude"

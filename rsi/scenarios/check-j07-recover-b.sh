@@ -421,7 +421,7 @@ chmod 755 "$WORK/bin/df"
 # lines work.txt holds and whether they are exactly `work 1..n` (turns.log).
 # Control files: ctl/<agent>.exit (removed, then exit 0), ctl/<agent>.enospc
 # (exit 1 as Node does on a full disk). Its PID is in pid-<agent>.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 mode=new
@@ -511,7 +511,7 @@ turn() {
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'

@@ -200,7 +200,7 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # opens the turn and goes silent for good: nothing more in the transcript
 # or on the screen, except one tool call each time the harness creates
 # $BB_WORK/wake-<name>.
-cat >"$WORK/claude" <<'ENGINE'
+bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
@@ -227,7 +227,7 @@ pending=0
 work=
 silent=
 while :; do
-  if IFS= read -r -t 1 typed; then
+  if bb_read_line typed; then
     printf 'you: %s\n' "$typed"
     if [ "$pending" = 0 ]; then
       line '"type":"user","message":{"role":"user","content":"prompt"}'
