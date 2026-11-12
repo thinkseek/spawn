@@ -88,13 +88,11 @@ function openObjective(mission: RsiMission) {
   return mission.objectives.find((objective) => objective.id === mission.next_objective) ?? null;
 }
 
-/** The mission's last landing the scene has seen, by scene time: in
- * replay it agrees with the clock, not with the wall. */
+/** The mission's last landing by scene time, from its whole history (the
+ * answer) and what the scene has seen since: in replay it agrees with the
+ * clock, not with the wall. */
 function lastLanding(mission: RsiMission, numbers: ShowNumbers): number | null {
-  const times = mission.tasks
-    .map((task) => numbers.landings.get(task.id))
-    .filter((at): at is number => at !== undefined);
-  return times.length > 0 ? Math.max(...times) : null;
+  return missionLastLanding(mission, numbers.landings, numbers.at);
 }
 
 function landedText(at: number | null, now: number): string {

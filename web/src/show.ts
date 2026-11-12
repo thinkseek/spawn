@@ -366,6 +366,33 @@ export function landings(events: readonly LogEvent[], nowMs: number): Map<number
   return landed;
 }
 
+/** The part of a `/api/rsi` mission its last landing is read from. */
+export interface LandingMission {
+  objectives?: readonly { landings?: readonly { at_ms: number }[] | null }[] | null;
+  tasks?: readonly { id: number }[] | null;
+}
+
+/** The mission's latest landing at or before `atMs` (the scene's time, the
+ * replay clock in replay): the latest of its own landings in the answer,
+ * which hold its whole history, and the scene's `seen` landings (task id to
+ * time, as `landings` returns them) of its tasks. Null when it has none. */
+export function missionLastLanding(
+  mission: LandingMission,
+  seen: ReadonlyMap<number, number>,
+  atMs: number,
+): number | null {
+  let last: number | null = null;
+  const consider = (at: number | undefined) => {
+    if (typeof at !== "number" || !Number.isFinite(at) || at > atMs) return;
+    if (last === null || at > last) last = at;
+  };
+  for (const objective of mission.objectives ?? []) {
+    for (const landing of objective.landings ?? []) consider(landing.at_ms);
+  }
+  for (const task of mission.tasks ?? []) consider(seen.get(task.id));
+  return last;
+}
+
 // --- Time -------------------------------------------------------------------
 
 export type Mode = "live" | "replay";
