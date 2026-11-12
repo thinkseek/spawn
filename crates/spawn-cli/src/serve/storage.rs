@@ -218,8 +218,8 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, growth_from, kept_or_read,
-        sizes, test_databases, with_free,
+        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth, growth_from, kept_or_read, sizes,
+        test_databases, with_free,
     };
     use crate::storage::tests::{file, scratch};
     use serde_json::{Value, json};
@@ -353,7 +353,10 @@ mod tests {
             "oldest": {"at_ms": now - ten_hours, "archive_bytes": 1000, "projects_files": 0},
             "before": {"at_ms": now - 7_200_000, "archive_bytes": 2000, "projects_files": 0},
         });
-        assert_eq!(growth_from(&samples["oldest"]), Some(now - ten_hours + DAY_MS));
+        assert_eq!(
+            growth_from(&samples["oldest"]),
+            Some(now - ten_hours + DAY_MS)
+        );
         assert_eq!(growth_from(&Value::Null), None);
         let pending = sizes(now, &walked, &samples, &Value::Null, &json!([]));
         assert_eq!(pending["growth_bytes_per_day"], Value::Null);
