@@ -95,13 +95,16 @@ pub fn connect_as(schema: &str, role: &str, password: &str) -> Client {
 
 /// A schema holding the first shape of every table (tests/first-shapes.sql),
 /// not migrated yet, and an owner connection in it; the schema is dropped
-/// with its guard, as [`store`]'s is.
+/// with its guard, as [`store`]'s is. Made as every test schema is
+/// ([`spawn_postgres::made_schema_sql`]): its comment dates it and the
+/// connection carries its name (objective 094).
 pub fn first_shapes(case: &str) -> (Schema, Client) {
     let schema = Schema::new(case);
     let mut client = Client::connect(&url(), NoTls).expect("admin connection");
     client
         .batch_execute(&format!(
-            "create schema {schema}; set search_path to {schema}; {}",
+            "{}; set search_path to {schema}; {}",
+            spawn_postgres::made_schema_sql(&schema),
             include_str!("../first-shapes.sql")
         ))
         .expect("the first shapes");
