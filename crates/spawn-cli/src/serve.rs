@@ -3444,7 +3444,8 @@ mod tests {
     }
 
     /// The per-part timing, through the real store: a reading says how
-    /// long each of its parts took. The archive and the cost are the kept
+    /// long each of its parts took, and the parts do not overlap (rev-e F1:
+    /// every read inside it is in one part). The archive and the cost are the kept
     /// performance values' (another test may have computed them within the
     /// minute), so they are both timed or both not, never one alone.
     #[test]
@@ -3457,6 +3458,7 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).expect("a directory");
             let mut parts = super::core_lines::Parts::default();
+            let begun = std::time::Instant::now();
             super::core_lines::core_lines_timed(
                 store,
                 Some(&dir.join("core-lines.json")),
@@ -3464,11 +3466,22 @@ mod tests {
                 &mut parts,
             )
             .expect("the answer");
+            let whole = begun.elapsed();
             assert!(
-                parts.facts.is_some() && parts.storage.is_some() && parts.health.is_some(),
+                [
+                    parts.open,
+                    parts.trends,
+                    parts.facts,
+                    parts.storage,
+                    parts.health
+                ]
+                .iter()
+                .all(Option::is_some),
                 "{parts:?}"
             );
             assert_eq!(parts.archive.is_some(), parts.cost.is_some(), "{parts:?}");
+            // Disjoint parts: their sum is never more than the whole.
+            assert!(parts.sum() <= whole, "{parts:?} over {whole:?}");
             std::fs::remove_dir_all(&dir).expect("clean up");
         });
     }

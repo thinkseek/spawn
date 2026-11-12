@@ -364,11 +364,18 @@ fn nightly_dir() -> Option<PathBuf> {
 /// computed, and a reading that failed ends before its later parts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Parts {
+    /// The dashboard's connection opened and the ranges file read
+    /// (`reading` alone: the API's answer is given its store).
+    pub(crate) open: Option<Duration>,
+    /// The 7-day samples the trends are drawn from (`host.core_lines`)
+    /// and the first deploy that holds report to live back.
+    pub(crate) trends: Option<Duration>,
     /// The recoverability line's facts: the newest backups, the nightly's
     /// fact files and the drills.
     pub(crate) facts: Option<Duration>,
     /// The 7-day Scorecard (`scorecard::measure`, which reads the
-    /// transcript archive).
+    /// transcript archive) and the two reads that place report to live
+    /// (the first deploy and the database's clock).
     pub(crate) archive: Option<Duration>,
     /// The 7-day cost window (`cost::summary`).
     pub(crate) cost: Option<Duration>,
@@ -380,13 +387,33 @@ pub(crate) struct Parts {
 }
 
 impl Parts {
-    /// `facts_ms=<n|none> archive_ms=… cost_ms=… storage_ms=… health_ms=…`.
+    /// Every part's time added up: never more than the whole reading's.
+    #[cfg(test)]
+    pub(crate) fn sum(&self) -> Duration {
+        [
+            self.open,
+            self.trends,
+            self.facts,
+            self.archive,
+            self.cost,
+            self.storage,
+            self.health,
+        ]
+        .into_iter()
+        .flatten()
+        .sum()
+    }
+
+    /// `open_ms=<n|none> trends_ms=… facts_ms=… archive_ms=… cost_ms=…
+    /// storage_ms=… health_ms=…`.
     pub(crate) fn text(&self) -> String {
         let ms = |part: Option<Duration>| {
             part.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string())
         };
         format!(
-            "facts_ms={} archive_ms={} cost_ms={} storage_ms={} health_ms={}",
+            "open_ms={} trends_ms={} facts_ms={} archive_ms={} cost_ms={} storage_ms={} health_ms={}",
+            ms(self.open),
+            ms(self.trends),
             ms(self.facts),
             ms(self.archive),
             ms(self.cost),
@@ -396,11 +423,11 @@ impl Parts {
     }
 }
 
-/// `work`'s result, its time put in `part`.
+/// `work`'s result, its time added to `part`.
 fn timed<T>(part: &mut Option<Duration>, work: impl FnOnce() -> T) -> T {
     let begun = Instant::now();
     let result = work();
-    *part = Some(begun.elapsed());
+    *part = Some(part.unwrap_or_default() + begun.elapsed());
     result
 }
 
@@ -423,8 +450,9 @@ pub(super) fn core_lines() -> Result<Value, String> {
 /// each of its parts took.
 pub(crate) fn reading() -> Result<(Value, Parts), String> {
     let mut parts = Parts::default();
+    let store = timed(&mut parts.open, super::open_store)?;
     let view = core_lines_timed(
-        &super::open_store()?,
+        &store,
         ranges_path().as_deref(),
         nightly_dir().as_deref(),
         &mut parts,
@@ -450,13 +478,16 @@ pub(super) fn core_lines_timed(
     parts: &mut Parts,
 ) -> Result<Value, String> {
     let now_ms = super::now_ms();
-    let contents = read_ranges(path);
+    let contents = timed(&mut parts.open, || read_ranges(path));
     let text = contents.as_ref().ok().and_then(Option::as_deref);
     let (figures, extras) = lines_at(store, nightly, text, now_ms, parts)?;
-    let samples = store
-        .host_core_lines(trend_since(now_ms))
-        .map_err(super::err)?;
-    let samples = measured_samples(samples, store.first_deploy_finished_ms().ok().flatten());
+    let samples = timed(&mut parts.trends, || {
+        store
+            .host_core_lines(trend_since(now_ms))
+            .map(|samples| (samples, store.first_deploy_finished_ms().ok().flatten()))
+    })
+    .map_err(super::err)?;
+    let samples = measured_samples(samples.0, samples.1);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
     view["drills"] = extras.drills;

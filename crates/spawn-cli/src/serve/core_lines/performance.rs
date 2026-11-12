@@ -120,8 +120,12 @@ pub(super) fn performance_now(
             .and_then(|(name, length_ms)| crate::cost::summary(store, name, length_ms))
     })
     .unwrap_or(Value::Null);
-    let first_deploy_ms = store.first_deploy_finished_ms().ok().flatten();
-    let database_now_ms = store.database_now_ms().unwrap_or(now_ms);
+    let (first_deploy_ms, database_now_ms) = super::timed(&mut parts.archive, || {
+        (
+            store.first_deploy_finished_ms().ok().flatten(),
+            store.database_now_ms().unwrap_or(now_ms),
+        )
+    });
     let values = measured(
         performance(&scorecard, &cost),
         first_deploy_ms,
