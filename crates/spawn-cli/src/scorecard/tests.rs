@@ -1236,6 +1236,109 @@ fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
     );
 }
 
+/// Objective 095: report to live counts only the landings the live record
+/// can see. The record begins at the first `deploy.finished` of any outcome
+/// (a failed one too); a landing before it is neither live nor not live,
+/// while its other dimensions are unchanged. `measured_from_ms` is the later
+/// of the window's start and the record's, `covered` whether the record
+/// starts at or before the window; with no deploy record nothing counts.
+#[test]
+fn report_to_live_counts_only_landings_from_the_live_records_start() {
+    let minutes = |m: i64| at(0) + m * 60_000;
+    let story_with = |first_ok: bool| {
+        let mut story = Story::default();
+        story.mission(1, true);
+        for task in 1..=5 {
+            story.assign(minutes(0), task, 1, None, "spawn-integrate");
+        }
+        // T1 lands before the record begins (at 120).
+        story
+            .task(1, "task.reported", minutes(60))
+            .task(1, "task.landed", minutes(100));
+        story.rec(
+            minutes(120),
+            json!({"type": "deploy.finished", "ok": first_ok, "head": "h"}),
+        );
+        // T2, T3 and T4 land after it; the deploy at 300 ships them.
+        story
+            .task(2, "task.reported", minutes(130))
+            .task(2, "task.landed", minutes(140))
+            .task(3, "task.reported", minutes(200))
+            .task(3, "task.landed", minutes(210))
+            .task(4, "task.reported", minutes(240))
+            .task(4, "task.landed", minutes(270));
+        story.rec(
+            minutes(300),
+            json!({"type": "deploy.finished", "ok": true, "head": "h"}),
+        );
+        // T5: landed after the last deploy, not live.
+        story
+            .task(5, "task.reported", minutes(320))
+            .task(5, "task.landed", minutes(330));
+        story
+    };
+    let rtl = |history: &History, window: Window| {
+        let counts = counts(history, Scope::Fleet, window);
+        let d = dimension(&counts, None, "report_to_live");
+        json!({"value": d["value"], "n": d["n"], "not_live": d["not_live"],
+               "measured_from_ms": d["measured_from_ms"], "covered": d["covered"],
+               "lead_n": dimension(&counts, None, "lead_time")["n"]})
+    };
+    // A window from before the record: T1 is left out of report to live
+    // (and in lead time). Waits 170 (T2), 100 (T3), 60 (T4); median 100.
+    // The first record is a failed deploy: it begins the record all the
+    // same, and T1 is still not shipped by it.
+    for first_ok in [false, true] {
+        let history = story_with(first_ok).history();
+        assert_eq!(history.live_from, Some(minutes(120)));
+        assert_eq!(
+            rtl(&history, window_hours(0, 24)),
+            json!({"value": 6_000_000, "n": 3, "not_live": 1,
+                   "measured_from_ms": minutes(120), "covered": false, "lead_n": 5}),
+            "first deploy ok: {first_ok}"
+        );
+    }
+    let history = story_with(false).history();
+    // A window that starts at the record's start: covered.
+    assert_eq!(
+        rtl(&history, Window { since: minutes(120), until: at(24) })["covered"],
+        json!(true)
+    );
+    // A window starting after the record: covered, measured from its own start.
+    assert_eq!(
+        rtl(&history, Window { since: minutes(135), until: at(24) }),
+        json!({"value": 6_000_000, "n": 3, "not_live": 1,
+               "measured_from_ms": minutes(135), "covered": true, "lead_n": 4})
+    );
+    // The record's start read from the facts over the whole log stands even
+    // when the folded records begin later.
+    let mut story = story_with(false);
+    let facts = Facts {
+        control: story.control.clone(),
+        commands: Vec::new(),
+        owner_runs_from_ms: None,
+        live_from_ms: Some(minutes(-60)),
+    };
+    let read = History::from_record(&facts, &[]);
+    assert_eq!(read.live_from, Some(minutes(-60)));
+    assert_eq!(rtl(&read, window_hours(0, 24))["n"], json!(4));
+    assert_eq!(rtl(&read, window_hours(0, 24))["covered"], json!(true));
+    // No deploy record at all: no landing counts in either part.
+    let mut bare = Story::default();
+    bare.mission(1, true);
+    bare.assign(minutes(0), 1, 1, None, "spawn-integrate")
+        .task(1, "task.reported", minutes(60))
+        .task(1, "task.landed", minutes(100));
+    story = bare;
+    let history = story.history();
+    assert_eq!(history.live_from, None);
+    assert_eq!(
+        rtl(&history, window_hours(0, 24)),
+        json!({"value": null, "n": 0, "not_live": 0,
+               "measured_from_ms": null, "covered": false, "lead_n": 1})
+    );
+}
+
 #[test]
 fn keys_and_tags_name_their_task() {
     assert_eq!(delivery_of("deliver-6-0"), Some((6, "deliver-6-0")));
