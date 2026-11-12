@@ -251,6 +251,10 @@ cat >"$ranges" <<'JSON'
   "storage.free_bites": {"min": 1}
 }}
 JSON
+# The test databases are shared and move all the time, so /api/fleet is
+# read on both sides of the answer, and their figures must lie between.
+fleet_code=$(get /api/fleet "$WORK/api-before.json")
+[ "$fleet_code" = 200 ] || harness "GET /api/fleet answered $fleet_code"
 code=$(get /api/core-lines "$WORK/lines.json")
 fleet_code=$(get /api/fleet "$WORK/api.json")
 [ "$fleet_code" = 200 ] || harness "GET /api/fleet answered $fleet_code"
@@ -292,15 +296,26 @@ else
         near "$ratio" "$ratio_want" 0.01 || check_failed "(1) the database against its log [$ratio]: /api/fleet's bytes over log_bytes [$ratio_want]"
         expect_eq "$(figure storage.database_ratio | jq -c '{unit, state}')" '{"unit":"ratio","state":"in"}' "(1)(2) the database ratio: in its range"
     fi
-    tbytes=$(fleet '[.test_databases[].bytes | numbers] | max')
-    tschemas=$(fleet '[.test_databases[].schemas | numbers] | max')
-    state_of() { if [ "$1" = null ]; then echo not_collected; else echo no_range; fi; }
-    expect_eq "$(figure storage.test_database_bytes | jq -c '{unit, value, range, state}')" \
-        "{\"unit\":\"bytes\",\"value\":$tbytes,\"range\":null,\"state\":\"$(state_of "$tbytes")\"}" \
-        "(1)(2) the largest test database, no range set"
-    expect_eq "$(figure storage.test_database_schemas | jq -c '{unit, value, range, state}')" \
-        "{\"unit\":\"count\",\"value\":$tschemas,\"range\":null,\"state\":\"$(state_of "$tschemas")\"}" \
-        "(1)(2) the most test schemas: its entry has no number, so no range"
+    # <field> <unit> <what>: the figure is null when /api/fleet had none on
+    # both sides, else a number between the two sides' largest.
+    bracketed() {
+        before=$(jq -c "[.health.storage.test_databases[].$1 | numbers] | max" "$WORK/api-before.json")
+        after=$(jq -c "[.health.storage.test_databases[].$1 | numbers] | max" "$WORK/api.json")
+        got=$(figure "storage.test_database_$1" | jq -c '{unit, value, range, state}')
+        value=$(printf '%s' "$got" | jq -c '.value')
+        if [ "$before" = null ] && [ "$after" = null ]; then
+            expect_eq "$got" "{\"unit\":\"$2\",\"value\":null,\"range\":null,\"state\":\"not_collected\"}" "$3, with no readable test database"
+        else
+            expect_eq "$(printf '%s' "$got" | jq -c '{unit, range, state}')" "{\"unit\":\"$2\",\"range\":null,\"state\":\"no_range\"}" "$3: no range set"
+            lo=$before hi=$after
+            [ "$lo" != null ] || lo=$hi
+            [ "$hi" != null ] || hi=$lo
+            awk -v v="$value" -v a="$lo" -v b="$hi" 'BEGIN { lo = a < b ? a : b; hi = a < b ? b : a; exit !(v != "null" && v + 0 >= lo && v + 0 <= hi) }' ||
+                check_failed "$3 [$value]: between /api/fleet's before [$before] and after [$after]"
+        fi
+    }
+    bracketed bytes bytes "(1)(2) the largest test database"
+    bracketed schemas count "(1)(2) the most test schemas (its entry has no number, so no range)"
     expect_eq "$(lines '{ranges_file, ranges_error, ignored_ranges}')" \
         "{\"ranges_file\":\"$ranges\",\"ranges_error\":null,\"ignored_ranges\":[{\"key\":\"storage.free_bites\",\"reason\":\"unknown figure\"},{\"key\":\"storage.test_database_schemas\",\"reason\":\"needs a number min or max\"}]}" \
         "(2) the file, no error, and the two ranges left out"
