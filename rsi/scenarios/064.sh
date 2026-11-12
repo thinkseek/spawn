@@ -446,7 +446,10 @@ states=$(q "select string_agg(id || ':' || state, ' ' order by id) from mission_
 said() { grep -qs "$1" "$SPAWN_CLAUDE_PROJECTS"/*/*.jsonl; }
 line_turn() { # <tag> <words> <pattern>
     say "$1" "$2"
-    wait_until 60 said "$3" || harness "the supervisor's line ($3) was not in a transcript within 60 s"
+    wait_until 60 said "$3" || {
+        supervisor_turn_dump "$3"
+        harness "the supervisor's line ($3) was not in a transcript within 60 s"
+    }
 }
 line_turn one "For the owner: deploy main to pick up the new cost page." 'deploy main to pick'
 line_turn two "For the owner: mission #3 has no backlog yet." 'mission #3 has no'
