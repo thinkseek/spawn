@@ -731,7 +731,10 @@ it, on the same ladder.
   asks nothing, whatever Jev judged, unless a `HUMAN:` question of an
   old-style turn is still open. Those lines are listed apart, below the
   queue ("For the owner", `supervisor.for_owner`: newest first, each once,
-  at most 10, from the end of its transcript): items to read, counted in no
+  at most 10, from the end of its transcript; a bare "For the owner:"
+  heading gives each item of the list right under it, an item wrapped onto
+  an indented line as one, to a blank line or other text): items to read,
+  counted in no
   queue; an owner's message clears none of them, since nothing waits on
   them. Nothing waits on a person: a person reads the queue when they
   choose. Also apart, and counted in no queue: the workers working on a

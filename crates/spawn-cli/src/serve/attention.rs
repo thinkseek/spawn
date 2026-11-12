@@ -779,7 +779,7 @@ fn said(bytes: &[u8]) -> Said {
                 let words = owner_lines(&text);
                 if !words.is_empty() {
                     let at = line_time(&line);
-                    notes.extend(words.into_iter().map(|words| (words.to_string(), at, turn)));
+                    notes.extend(words.into_iter().map(|words| (words, at, turn)));
                 }
             }
             _ => {}
@@ -828,13 +828,18 @@ fn for_owner(line: &str) -> Option<&str> {
 /// The lines a reply's `text` has for the owner, in its order: each inline
 /// [`FOR_OWNER`] line's words, and each list item right under a heading (a
 /// [`FOR_OWNER`] line with no words after it: `**For the owner:**`), up to
-/// a blank line or a line that is no item ([`list_item`]). The heading
-/// itself is none, and a list under any other heading is not the owner's
-/// (objective 070: 19 of the supervisor's 217 owner blocks were headings
-/// over lists, and none of their items reached Home).
-fn owner_lines(text: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
+/// a blank line or a line that is no item ([`list_item`]). An indented line
+/// that is no item goes on with the item above it (an item wrapped over two
+/// lines is one line for the owner, S18). The heading itself is none, and a
+/// list under any other heading is not the owner's (objective 070: 19 of
+/// the supervisor's 217 owner blocks were headings over lists, and none of
+/// their items reached Home).
+fn owner_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
     let mut under_heading = false;
+    // The last line pushed is this heading's item, so an indented line can
+    // go on with it.
+    let mut item_open = false;
     for line in text.lines() {
         if under_heading {
             if let Some(item) = list_item(line) {
@@ -842,36 +847,64 @@ fn owner_lines(text: &str) -> Vec<&str> {
                 let words = for_owner(item)
                     .filter(|words| !words.is_empty())
                     .unwrap_or(item);
-                if !words.is_empty() {
-                    lines.push(words);
+                item_open = !words.is_empty();
+                if item_open {
+                    lines.push(words.to_string());
                 }
                 continue;
             }
+            if item_open
+                && line.starts_with(char::is_whitespace)
+                && !line.trim().is_empty()
+                && let Some(last) = lines.last_mut()
+            {
+                last.push(' ');
+                last.push_str(line.trim());
+                continue;
+            }
             under_heading = false;
+            item_open = false;
         }
         match for_owner(line) {
             Some("") => under_heading = true,
-            Some(words) => lines.push(words),
+            Some(words) => lines.push(words.to_string()),
             None => {}
         }
     }
     lines
 }
 
-/// A list item's words without its marker (`- `, `* ` or `<n>. `, after
-/// any indent); `None` for a line that is no item, a blank one included.
+/// A list item's words without its marker (`-`, `*`, `+`, `<n>.` or `<n>)`
+/// and the space after it, after any indent), and without an emphasis that
+/// wraps all of them (`- **Deploy main.**`; one that opens a label, as in
+/// `- **Task 271:** restart it`, stays); `None` for a line that is no item,
+/// a blank one included.
 fn list_item(line: &str) -> Option<&str> {
     let rest = line.trim_start();
-    let words = if let Some(words) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+    let words = if let Some(words) = rest.strip_prefix(['-', '*', '+']) {
         words
     } else {
         let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
         if digits == 0 {
             return None;
         }
-        rest[digits..].strip_prefix(". ")?
+        rest[digits..].strip_prefix(['.', ')'])?
     };
-    Some(words.trim())
+    if !words.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let words = words.trim();
+    for wrapper in ["**", "__", "*", "_"] {
+        if let Some(inner) = words
+            .strip_prefix(wrapper)
+            .and_then(|inner| inner.strip_suffix(wrapper))
+            && !inner.is_empty()
+            && !inner.contains(wrapper)
+        {
+            return Some(inner.trim());
+        }
+    }
+    Some(words)
 }
 
 /// Whether a transcript's prompt line is a dispatcher digest
@@ -1811,6 +1844,47 @@ mod tests {
             at,
         );
         assert_eq!(said(bare.as_bytes()).current, 2);
+    }
+
+    /// S18 on 070: `+` and `<n>)` items, an emphasis around a whole item
+    /// trimmed (a label's stays), and an item wrapped onto an indented line
+    /// is one line; an indented line after a blank, or under no item, is not.
+    #[test]
+    fn s18_items_take_more_markers_whole_emphasis_and_wrapped_lines() {
+        assert_eq!(list_item("+ a"), Some("a"));
+        assert_eq!(list_item("3) a"), Some("a"));
+        assert_eq!(list_item("3)a"), None);
+        assert_eq!(list_item("+a"), None);
+        assert_eq!(list_item("---"), None);
+        assert_eq!(list_item("- **Deploy main.**"), Some("Deploy main."));
+        assert_eq!(list_item("- __Deploy main.__"), Some("Deploy main."));
+        assert_eq!(list_item("- *Deploy main.*"), Some("Deploy main."));
+        assert_eq!(list_item("- _Deploy main._"), Some("Deploy main."));
+        assert_eq!(
+            list_item("- **Task 271:** restart it"),
+            Some("**Task 271:** restart it")
+        );
+        assert_eq!(list_item("- **a** and **b**"), Some("**a** and **b**"));
+        assert_eq!(list_item("- ****"), Some("****"));
+        assert_eq!(
+            owner_lines(
+                "For the owner:\n- If the resident stays idle on task 271, restart it\n  or \
+                 reassign the task.\n+ **Set SPAWN_WORKSPACE on the host.**\n1) Deploy \
+                 main.\n\n  not wrapped: after the blank\nNext:\n- mine"
+            ),
+            [
+                "If the resident stays idle on task 271, restart it or reassign the task.",
+                "Set SPAWN_WORKSPACE on the host.",
+                "Deploy main.",
+            ]
+        );
+        assert!(owner_lines("For the owner:\n  indented, under no item\n- later").is_empty());
+        // An empty item has no words to go on with: the line ends the list.
+        assert!(owner_lines("For the owner:\n- \n  not the empty item's\n- x").is_empty());
+        assert_eq!(
+            owner_lines("For the owner: inline\n  not wrapped onto an inline line"),
+            ["inline"]
+        );
     }
 
     /// Objective 070 through the transcript reader, with 064's `tasks` and
