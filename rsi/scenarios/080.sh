@@ -21,9 +21,11 @@
 #       and the time it fired.
 #   (2) a `mission_idle` alert's words count on ("31 h", then "3 d"); an
 #       alert of any other kind keeps its own text.
-# The banner renders from openAlertsLine, and the Alerts page's rows say
-# alertWords(alert, now); both are read off a screenshot (no check here
-# reads the page's source).
+# The banner (open alerts only) renders from openAlertsLine, and the Alerts
+# page's open rows say alertWords(alert, now); a cleared or notice row keeps
+# its stored text (its mission is no longer without work, so its time must
+# not count on). Both are read off a screenshot (no check here reads the
+# page's source).
 #
 # The history is seeded as the store holds it (071's way: control records
 # folded by spawn_control_refold(); the alert as the loop's alert step
