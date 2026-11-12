@@ -81,6 +81,10 @@ test("each unit in words, and each range form", () => {
   assert.equal(unitWords("ratio", 10), "10.0×");
   assert.equal(unitWords("count", 1_234_567), "1,234,567");
   assert.equal(unitWords("ms", 5_400_000), "1.5 h");
+  assert.equal(unitWords("ms", 1_920_000), "32 min");
+  assert.equal(unitWords("ms", 108_000_000), "30 h");
+  assert.equal(unitWords("ms", 7_200_000), "2 h");
+  assert.equal(rangeWords("ms", { max: 93_600_000 }), "26 h or less");
   assert.equal(unitWords("share", 0.954), "95%");
   assert.equal(rangeWords("count", { min: 6 }), "6 or more");
   assert.equal(rangeWords("count", { max: 200 }), "200 or less");

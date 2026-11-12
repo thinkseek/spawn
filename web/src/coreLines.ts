@@ -74,10 +74,26 @@ function finite(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+/** Milliseconds as a span: "450 ms", "12 s", "32 min", then hours ("1.5 h"
+ * below ten, whole from ten: "30 h"), then days from three ("4 days"). */
+export function spanWords(ms: number): string {
+  const abs = Math.abs(ms);
+  if (abs < 1_000) return `${Math.round(ms)} ms`;
+  if (abs < 60_000) return `${Math.round(ms / 1_000)} s`;
+  if (abs < 3_600_000) return `${Math.round(ms / 60_000)} min`;
+  const hours = ms / 3_600_000;
+  if (Math.abs(hours) < 10) {
+    const tenths = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(tenths) ? tenths.toFixed(0) : tenths.toFixed(1)} h`;
+  }
+  if (Math.abs(hours) < 72) return `${Math.round(hours)} h`;
+  return `${GROUPED.format(ms / 86_400_000)} days`;
+}
+
 /** A number in a unit's words: bytes as storageSize ("104.0 GB"), a day's
  * growth "<size> a day", days "1,234 days", a ratio "4.7×", a count
- * grouped ("1,214"), milliseconds in hours ("1.5 h"), a share as a whole
- * percent ("95%"). */
+ * grouped ("1,214"), milliseconds as a span ("32 min", "1.5 h", "30 h":
+ * spanWords), a share as a whole percent ("95%"). */
 export function unitWords(unit: string, value: number): string {
   switch (unit) {
     case "bytes":
@@ -89,7 +105,7 @@ export function unitWords(unit: string, value: number): string {
     case "ratio":
       return `${value.toFixed(1)}×`;
     case "ms":
-      return `${(value / 3_600_000).toFixed(1)} h`;
+      return spanWords(value);
     case "share":
       return `${Math.round(value * 100)}%`;
     default:
