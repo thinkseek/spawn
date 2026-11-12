@@ -226,6 +226,17 @@ export function foldedDefects(alerts: readonly Alert[]): Map<string, string | nu
   return folded;
 }
 
+/** An alert's words as of `now`. A `mission_idle` alert's text says how
+ * long the mission had been without work when it fired; said from its
+ * evidence's `since_ms`, it says how long as of now (objective 071). Any
+ * other alert, or one without a numeric `since_ms`, keeps its text. */
+export function alertWords(alert: Pick<Alert, "kind" | "subject" | "text" | "evidence">, now: number): string {
+  if (alert.kind !== "mission_idle") return alert.text;
+  const since = (alert.evidence as { since_ms?: unknown } | null)?.since_ms;
+  if (typeof since !== "number" || !Number.isFinite(since)) return alert.text;
+  return `${alert.subject} has had no task in work for ${ageText(now - since)} since its last task ended: its objective backlog has nothing open to assign`;
+}
+
 /** Every item that needs the owner, actions first, oldest first within. */
 export function needsYou(input: NeedsInput): NeedItem[] {
   const items: NeedItem[] = [];
@@ -304,7 +315,7 @@ export function needsYou(input: NeedsInput): NeedItem[] {
       title: fold !== undefined ? alertTitle({ kind: alert.kind, subject: fold }) : alertTitle(alert, named),
       detail: stale
         ? `scored stuck${typeof score === "number" ? ` ${score.toFixed(2)}` : ""} ${ageText(input.now - alert.fired_at_ms)} ago; not scored since (its latest judgement, ${ageText(input.now - (stale.judged_at_ms ?? input.now))} ago, has no score${stale.judgement?.reason ? `: ${stale.judgement.reason}` : ""})`
-        : alert.text,
+        : alertWords(alert, input.now),
       since_ms: alert.fired_at_ms,
       command,
       // A session's alert opens that agent's page.
