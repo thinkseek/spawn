@@ -35,6 +35,12 @@ with h as materialized (
    cross join lateral unnest(i.commands) as u(id)
    where i.at_ms < $1)
 select jsonb_build_object(
+  -- The newest event of the log in this statement's snapshot (MARK): the
+  -- boundary a later kept reading checks is still there (`spawn_events_pkey`
+  -- read backward, one row).
+  'mark', (select jsonb_build_object('id', m.id, 'at', m.recorded_at_ms,
+                                     'session', m.session_id, 'seq', m.session_seq)
+             from spawn_events m order by m.id desc limit 1),
   -- Each record's small object is built first and only then sorted and
   -- aggregated: sorted with its record (a gate's log, a brief) the rows
   -- spilled 28 MB to disk on every reading (the lead's plan on the live
@@ -151,18 +157,32 @@ select min(e.recorded_at_ms)
 /// (`id = any(...)` in the Index Cond of `spawn_events_session_name`, the
 /// lead's plan): as one `or`, a generic plan walked every control record,
 /// and joined back it scanned the table.
-/// It is made from [`FACTS`]'s text, so the projections are one.
+/// It is made from [`FACTS`]'s text, so the projections are one. It also
+/// says, in its own snapshot, whether the kept reading's mark is still
+/// there (`still`, [`Mark`]).
 static FACTS_SINCE: LazyLock<String> = LazyLock::new(|| {
     let control = "      from spawn_events e\n";
     let commands = "     where c.created_at_ms < $1\n";
     let control_where =
         "     where e.session_id = 'session_control' and e.event_name = 'control.recorded'\n";
+    let mark = "  'mark', (select";
     assert!(
         FACTS.matches(control).count() == 1
             && FACTS.matches(control_where).count() == 1
             && FACTS.matches(commands).count() == 1
+            && FACTS.matches(mark).count() == 1
     );
     FACTS
+        .replace(
+            mark,
+            "  -- STILL: whether the kept reading's mark ($5 id, $6 recorded_at, $7
+  -- session, $8 seq) is still that event, in this same snapshot as the
+  -- window (`spawn_events_pkey`, one probe).
+  'still', exists (select 1 from spawn_events s
+                    where s.id = $5 and s.recorded_at_ms = $6
+                      and s.session_id = $7 and s.session_seq = $8),
+  'mark', (select",
+        )
         .replace(
             control,
             "      from spawn_events e
@@ -202,21 +222,65 @@ const OVERLAP: i64 = 256;
 /// on the readings' own ends, so a test passes its clock in.
 const FULL_EVERY_MS: i64 = 3_600_000;
 
-/// Whether the last kept control fact is still the same record (seq,
-/// recorded_at and the record's id; the facts carry no event id): a store
-/// restored in place to an earlier point, under the same URL and name,
-/// fails it, and its kept facts are dropped for a whole reading rather than
-/// left as facts no whole reading would give (rev-e's F2). One probe of
-/// `spawn_events_session_seq` per kept reading.
-const KEPT_STILL_THERE: &str = r"
-select exists (
-  select 1
-    from spawn_events e
-   cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
-   where e.session_id = 'session_control' and e.session_seq = $1
-     and e.event_name = 'control.recorded' and e.recorded_at_ms = $2
-     and nullif(coalesce(x.r -> 'id', x.r -> 'row' -> 'id'), 'null'::jsonb)
-         is not distinct from $3::jsonb)";
+/// The newest event of the log a reading saw (its id, recorded_at,
+/// session and seq), read in the same snapshot as the facts (cc-astra
+/// A46): the one boundary of both kept maps.
+///
+/// Every write the facts read commits with an event of the log, in the same
+/// transaction, under the append lock that hands out event ids
+/// (`pg_advisory_xact_lock(1399957335)` held to commit): a control record
+/// is its `control.recorded` event, a command's creation commits with
+/// `command.accepted` (`spawn_submit`) and its finish with
+/// `command.finished` (`spawn_finish`). So events commit in id order, and a
+/// restore in place to any earlier point of the log (a point-in-time
+/// restore, a dump of an earlier moment loaded under the same name) that
+/// takes away anything a kept reading saw (a control record, a command, a
+/// finish) takes away that reading's newest event too: the next kept
+/// reading finds its mark gone or another event under its id, drops the
+/// kept facts and reads them whole.
+///
+/// It cannot notice, and needs not: a restore to a point after the mark
+/// (it takes away nothing kept). It does not notice: a change made around
+/// the append lock (a row edited or deleted by hand, which is no restore);
+/// a restored log whose event under the mark's id has the same recorded_at
+/// in ms, session and seq (another history agreeing on all four). A
+/// database dropped and made again under the name is another store by its
+/// oid ([`PostgresStore::facts_key`]).
+///
+/// What it rests on, for whoever adds a writer: a new write of anything the
+/// facts read (a control record, a command, its finish, a person's intent)
+/// must append its event in the same transaction under that lock, the
+/// append lock `pg_advisory_xact_lock(1399957335)` that `spawn_append`,
+/// `spawn_append_trusted` and `spawn_submit` take. A writer outside it can
+/// commit an event below one already seen, and a restore that takes that
+/// write away would leave the mark in place: its kept fact would stay until
+/// the hourly whole reading.
+///
+/// The check is in the kept reading's own statement ([`FACTS_SINCE`]'s
+/// `still`), not a statement before it, so no restore can fall between the
+/// check and the window: both see one snapshot. A restore after that
+/// statement is the next reading's to notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mark {
+    id: i64,
+    at: i64,
+    session: String,
+    seq: i64,
+}
+
+impl Mark {
+    /// The mark of a [`FACTS`] (or [`FACTS_SINCE`]) answer; `None` for an
+    /// empty log.
+    fn of(read: &Value) -> Option<Self> {
+        let mark = &read["mark"];
+        Some(Mark {
+            id: mark["id"].as_i64()?,
+            at: mark["at"].as_i64()?,
+            session: mark["session"].as_str()?.to_string(),
+            seq: mark["seq"].as_i64()?,
+        })
+    }
+}
 
 /// One store's facts as its last reading left them: its end, its control
 /// facts by seq, its command facts by id.
@@ -224,6 +288,8 @@ struct Kept {
     until: i64,
     /// The end of the whole reading these facts began with.
     full_until: i64,
+    /// The newest event the last reading saw ([`Mark`]).
+    mark: Option<Mark>,
     control: BTreeMap<i64, Value>,
     commands: BTreeMap<i64, Value>,
 }
@@ -292,8 +358,8 @@ impl PostgresStore {
     /// earlier end, a first reading or one after a failed one reads them all
     /// ([`FACTS`]), and an earlier end leaves the kept facts as they were.
     /// Kept facts are read again whole when their whole reading's end is an
-    /// hour ([`FULL_EVERY_MS`]) behind, or when their last control fact is
-    /// no longer the same record ([`KEPT_STILL_THERE`]: a restore in place).
+    /// hour ([`FULL_EVERY_MS`]) behind, or when the newest event the last
+    /// reading saw is no longer there ([`Mark`]: a restore in place).
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
         self.scorecard_facts_with_overlap(until_ms, OVERLAP)
     }
@@ -314,8 +380,7 @@ impl PostgresStore {
         let mut kept = all.remove(&key);
         if let Some(stale) = &kept
             && until_ms >= stale.until
-            && (until_ms.saturating_sub(stale.full_until) >= FULL_EVERY_MS
-                || !self.kept_still_there(stale)?)
+            && until_ms.saturating_sub(stale.full_until) >= FULL_EVERY_MS
         {
             kept = None;
         }
@@ -325,7 +390,13 @@ impl PostgresStore {
                 all.insert(key, kept);
                 facts?
             }
-            Some(mut kept) => {
+            Some(mut kept) => 'since: {
+                let Some(mark) = kept.mark.clone() else {
+                    // Kept from an empty log: nothing to check against.
+                    let (read, whole) = self.facts_whole(until_ms)?;
+                    all.insert(key, whole);
+                    break 'since read;
+                };
                 let since_seq = kept
                     .control
                     .keys()
@@ -338,28 +409,41 @@ impl PostgresStore {
                     .map_or(i64::MIN, |id| id - overlap);
                 let read = self.query_json(
                     &FACTS_SINCE,
-                    &[&until_ms, &kept.until, &since_seq, &since_id],
+                    &[
+                        &until_ms,
+                        &kept.until,
+                        &since_seq,
+                        &since_id,
+                        &mark.id,
+                        &mark.at,
+                        &mark.session,
+                        &mark.seq,
+                    ],
                 )?;
+                if read["still"] != true {
+                    // The mark is gone: a restore took away something kept.
+                    let (read, whole) = self.facts_whole(until_ms)?;
+                    all.insert(key, whole);
+                    break 'since read;
+                }
                 kept.merge(&read);
+                kept.mark = Mark::of(&read);
                 kept.until = until_ms;
                 let facts = kept.answer();
                 all.insert(key, kept);
                 facts
             }
             None => {
-                let read = self.query_json(FACTS, &[&until_ms])?;
-                let mut kept = Kept {
-                    until: until_ms,
-                    full_until: until_ms,
-                    control: BTreeMap::new(),
-                    commands: BTreeMap::new(),
-                };
-                kept.merge(&read);
-                all.insert(key, kept);
+                let (read, whole) = self.facts_whole(until_ms)?;
+                all.insert(key, whole);
                 read
             }
         };
         drop(all);
+        if let Some(object) = facts.as_object_mut() {
+            object.remove("mark");
+            object.remove("still");
+        }
         let earliest = |types: &[&str], gated: bool| {
             facts["control"]
                 .as_array()
@@ -386,22 +470,26 @@ impl PostgresStore {
 
     /// The statement a kept reading runs ([`FACTS_SINCE`]): `$1` the end,
     /// `$2` the kept reading's end, `$3` and `$4` the last kept seq and
-    /// command id less the overlap. For timing it at live size, and for the
+    /// command id less the overlap, `$5` to `$8` the kept mark's id,
+    /// recorded_at, session and seq ([`Mark`]). For timing it at live size, and for the
     /// tests that read its plan.
     pub fn scorecard_facts_since_statement() -> &'static str {
         &FACTS_SINCE
     }
 
-    /// Whether `kept`'s last control fact is still the same record
-    /// ([`KEPT_STILL_THERE`]); kept facts with no control fact are not
-    /// trusted (a whole reading of such a store is small).
-    fn kept_still_there(&self, kept: &Kept) -> Result<bool, StoreError> {
-        let Some((seq, fact)) = kept.control.last_key_value() else {
-            return Ok(false);
+    /// The facts before `until_ms` read whole ([`FACTS`]), and kept from
+    /// them, with the mark of the same snapshot.
+    fn facts_whole(&self, until_ms: i64) -> Result<(Value, Kept), StoreError> {
+        let read = self.query_json(FACTS, &[&until_ms])?;
+        let mut kept = Kept {
+            until: until_ms,
+            full_until: until_ms,
+            mark: Mark::of(&read),
+            control: BTreeMap::new(),
+            commands: BTreeMap::new(),
         };
-        let at = fact["at"].as_i64();
-        let id = fact.get("id").cloned();
-        Ok(self.query_one(KEPT_STILL_THERE, &[seq, &at, &id])?.get(0))
+        kept.merge(&read);
+        Ok((read, kept))
     }
 
     /// Which store this is, for [`KEPT`]: a hash of the URL it connected

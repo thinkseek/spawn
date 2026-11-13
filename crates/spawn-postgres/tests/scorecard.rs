@@ -1267,9 +1267,10 @@ fn kept_facts_are_read_whole_again_after_an_hour() {
 
 /// A store restored in place to an earlier point (the same URL, database
 /// and schema): when the last kept control record is gone, or its seq now
-/// holds another record, the next reading drops the kept facts and reads
-/// them whole, so no fact of the lost records stays (rev-e's F2). Overlap
-/// 0, so a window alone would keep them.
+/// holds another record (so the newest event the kept reading saw is gone,
+/// the mark), the next reading drops the kept facts and reads them whole,
+/// so no fact of the lost records stays (rev-e's F2). Overlap 0, so a
+/// window alone would keep them.
 #[test]
 fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
     for replaced in [false, true] {
@@ -1411,6 +1412,127 @@ fn a_database_made_again_under_its_name_is_another_store() {
     }
 }
 
+/// The newest event of the log, its id.
+fn newest_event(client: &mut Client) -> i64 {
+    client
+        .query_one("select coalesce(max(id), 0) from spawn_events", &[])
+        .expect("the newest event")
+        .get(0)
+}
+
+/// A person's command as the gateway makes it (`spawn_submit`, with its
+/// `command.accepted` event), its id.
+fn submit(client: &mut Client, key: &str) -> i64 {
+    client
+        .query_one(
+            "select out_id from spawn_submit('human', $1, 'agent_resident_r1',
+                                             'session_resident_r1', '{\"type\":\"stop\"}')",
+            &[&key],
+        )
+        .expect("submit")
+        .get(0)
+}
+
+/// The database's clock, as the gateway stamps a command.
+fn database_now(client: &mut Client) -> i64 {
+    client
+        .query_one("select spawn_now_ms()", &[])
+        .expect("the clock")
+        .get(0)
+}
+
+/// The mark's premise (cc-astra A46): every write a command fact reads
+/// commits with an event of the log, its creation (`spawn_submit`) and its
+/// finish (`spawn_finish`); a control record is an event itself.
+#[test]
+fn a_commands_creation_and_its_finish_each_write_an_event() {
+    let (_store, schema) = store("scorecard_mark_writes");
+    let mut client = admin(&schema);
+    let before = newest_event(&mut client);
+    let command = submit(&mut client, "made");
+    let made = newest_event(&mut client);
+    assert!(made > before, "the creation wrote an event");
+    let finished: String = client
+        .query_one("select spawn_finish($1, 0, false, 'no')", &[&command])
+        .expect("finish")
+        .get(0);
+    assert_eq!(finished, "done");
+    assert!(
+        newest_event(&mut client) > made,
+        "the finish wrote an event"
+    );
+}
+
+/// cc-astra A46: a restore in place to a point after a kept control fact
+/// but before a later kept command (and, apart, before a kept command's
+/// finish) takes away the newest event the kept reading saw, so the next
+/// kept reading reads whole and equals the whole reading. Overlap 0. The
+/// command is kept by an incremental reading (so its mark is the one that
+/// moved), and after the restore a new record takes the lost mark's id (the
+/// log's sequence restored with it), so the id alone would not tell.
+#[test]
+fn a_restore_that_takes_away_only_a_kept_command_or_its_finish_is_read_whole() {
+    for finish in [false, true] {
+        let (store, schema) = store(&format!("scorecard_mark_restore_{finish}"));
+        let mut client = admin(&schema);
+        record(&mut client, 100, &json!({"type": "task.landed", "id": 1}));
+        let control = newest_event(&mut client);
+        let first = database_now(&mut client);
+        assert_eq!(
+            store.scorecard_facts_with_overlap(first, 0).expect("facts"),
+            oracle(&mut client, first)
+        );
+        let command = submit(&mut client, "later");
+        // The point restored to: after the control fact, and (finish) after
+        // the command's creation.
+        let point = if finish {
+            newest_event(&mut client)
+        } else {
+            control
+        };
+        if finish {
+            let done: String = client
+                .query_one("select spawn_finish($1, 0, false, 'no')", &[&command])
+                .expect("finish")
+                .get(0);
+            assert_eq!(done, "done");
+        }
+        let until = database_now(&mut client).max(first) + 1_000;
+        let kept = store.scorecard_facts_with_overlap(until, 0).expect("facts");
+        assert_eq!(kept, oracle(&mut client, until));
+        assert_eq!(kept["commands"].as_array().map(Vec::len), Some(1));
+        // The restore: every event after the point, and what committed
+        // with them (the command, or its finish).
+        client
+            .execute("delete from spawn_events where id > $1", &[&point])
+            .expect("events after the point");
+        if finish {
+            client
+                .execute(
+                    "update spawn_commands set state = 'pending', succeeded = null, error = null,
+                            finished_at_ms = null where id = $1",
+                    &[&command],
+                )
+                .expect("the finish undone");
+        } else {
+            client
+                .execute("delete from spawn_commands where id = $1", &[&command])
+                .expect("the command undone");
+        }
+        client
+            .query_one(
+                "select setval(pg_get_serial_sequence('spawn_events', 'id'), $1)",
+                &[&point],
+            )
+            .expect("the log's sequence restored with it");
+        record(&mut client, 150, &json!({"type": "task.landed", "id": 2}));
+        let read = store
+            .scorecard_facts_with_overlap(until + 1, 0)
+            .expect("facts");
+        assert_eq!(read, oracle(&mut client, until + 1), "finish {finish}");
+    }
+}
+
 /// A kept reading's statement reads what is new, not the log: the buffers
 /// of a steady reading (the last 256 seqs again, nothing else new) over a
 /// control log four times as long are within 10% of the shorter one's,
@@ -1450,7 +1572,16 @@ fn a_kept_reading_costs_what_is_new_not_the_log() {
         let plan: Value = client
             .query_one(
                 &statement,
-                &[&(end + 1), &(end - 2_000), &(records - 256), &0_i64],
+                &[
+                    &(end + 1),
+                    &(end - 2_000),
+                    &(records - 256),
+                    &0_i64,
+                    &records,
+                    &end,
+                    &"session_control",
+                    &records,
+                ],
             )
             .expect("the plan")
             .get(0);
