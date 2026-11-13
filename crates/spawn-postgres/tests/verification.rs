@@ -381,3 +381,38 @@ fn the_unverified_landings_read_counts_the_window_and_the_old() {
         "nothing in the window"
     );
 }
+
+/// Objective 140: which claimed folders' objectives landed, read once for
+/// all of them: one landed, one assigned and not landed, another mission's
+/// landing, one landed twice, an objective never assigned; none asked reads
+/// nothing.
+#[test]
+fn the_claimed_folders_landings_are_read_once() {
+    let (store, schema) = store("verification_claimed_landed");
+    let mut client = admin(&schema);
+    mission(&mut client, 1);
+    mission(&mut client, 2);
+    assigned(&mut client, 1, 1, 10, "Objective.");
+    landed(&mut client, 1);
+    assigned(&mut client, 2, 1, 11, "Objective.");
+    assigned(&mut client, 3, 2, 12, "Objective.");
+    landed(&mut client, 3);
+    assigned(&mut client, 4, 1, 13, "Objective.");
+    landed(&mut client, 4);
+    assigned(&mut client, 5, 1, 13, "Objective.");
+    landed(&mut client, 5);
+
+    assert_eq!(
+        store
+            .claimed_landed(&[(1, 13), (1, 10), (1, 11), (1, 12), (2, 12), (1, 99)])
+            .expect("the read"),
+        [(1, 10), (1, 13), (2, 12)],
+        "10 landed; 11 assigned only; 12 landed in mission 2 only; 13 landed twice, once here"
+    );
+    assert_eq!(
+        store.claimed_landed(&[(1, 12)]).expect("the read"),
+        [],
+        "another mission's landing is not this one's"
+    );
+    assert_eq!(store.claimed_landed(&[]).expect("none asked"), []);
+}
