@@ -223,7 +223,13 @@ impl PgUrl {
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
     pub(crate) root: PathBuf,
+    /// The file the store seals with ([`seal`]): the sealing key's when it
+    /// is required (the store), else k1's as a stand-in nothing seals with.
     pub(crate) key_file: PathBuf,
+    /// The key new dumps and bundles are sealed with, or why there is none
+    /// ([`sealing_key`]): a run that seals refuses on the reason; a reader
+    /// never needs it.
+    pub(crate) seal: Result<Key, String>,
     pub(crate) r2: R2,
     pub(crate) pg_bin: Option<PathBuf>,
     pub(crate) compress: String,
@@ -291,6 +297,150 @@ fn private_file(path: &Path, what: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// What a value that is not a backup key name is refused with: the rule
+/// alone. The value is never echoed: it may hold anything, a key's content
+/// included (cc-astra A53). Each caller puts the source before it.
+pub(crate) const KEY_NAME_RULE: &str = "is not a backup key name (k and a number from 1, as k2)";
+
+/// The one place that holds the default key (objective 114): `None` gives
+/// `k1`; a name `k` and a number from 1 (`^k[1-9][0-9]*$`) gives itself;
+/// anything else is refused with [`KEY_NAME_RULE`].
+pub(crate) fn key_name(named: Option<&str>) -> Result<String, String> {
+    let Some(name) = named else {
+        return Ok("k1".to_string());
+    };
+    let mut digits = name.strip_prefix('k').unwrap_or("").bytes();
+    let well_formed = digits
+        .next()
+        .is_some_and(|first| (b'1'..=b'9').contains(&first))
+        && digits.all(|digit| digit.is_ascii_digit());
+    if well_formed {
+        Ok(name.to_string())
+    } else {
+        Err(KEY_NAME_RULE.to_string())
+    }
+}
+
+/// A backup key: its name and the file that holds its passphrase (given to
+/// gpg by path; its content is never read here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Key {
+    pub(crate) name: String,
+    pub(crate) file: PathBuf,
+}
+
+/// Where the key files are: `SPAWN_BACKUP_KEY_DIR`, else `~/.config/spawn`.
+fn key_dir() -> PathBuf {
+    env_value("SPAWN_BACKUP_KEY_DIR").map_or_else(|| home().join(".config/spawn"), PathBuf::from)
+}
+
+/// The file of the key `name` (a name [`key_name`] gave) in `dir`, or the
+/// path the lookup would use, in words, when there is none. k1's is
+/// `explicit` (`SPAWN_BACKUP_KEY_FILE`) when set, else `backup.key.k1`, else
+/// the old `backup.key`; every other key's is only `backup.key.<name>`.
+fn find_key(name: &str, explicit: Option<PathBuf>, dir: &Path) -> Result<Key, String> {
+    let found = |file: PathBuf| Key {
+        name: name.to_string(),
+        file,
+    };
+    let named = dir.join(format!("backup.key.{name}"));
+    if name != "k1" {
+        return if named.exists() {
+            Ok(found(named))
+        } else {
+            Err(named.display().to_string())
+        };
+    }
+    if let Some(file) = explicit {
+        return if file.exists() {
+            Ok(found(file))
+        } else {
+            Err(file.display().to_string())
+        };
+    }
+    let old = dir.join("backup.key");
+    if named.exists() {
+        Ok(found(named))
+    } else if old.exists() {
+        Ok(found(old))
+    } else {
+        Err(format!("{} (or backup.key)", named.display()))
+    }
+}
+
+/// [`find_key`] in this host's key directory.
+fn key_on_host(name: &str) -> Result<Key, String> {
+    find_key(
+        name,
+        env_value("SPAWN_BACKUP_KEY_FILE").map(PathBuf::from),
+        &key_dir(),
+    )
+}
+
+/// The key that reads what `what` names ("the dump", "the bundle", "the
+/// bundle chain"), sealed with `name`: its file on this host, mode 600.
+fn reading_key(name: &str, what: &str) -> Result<Key, String> {
+    let key = key_on_host(name).map_err(|path| {
+        format!("{what} is sealed with {name}; its key file {path} is not on this host")
+    })?;
+    private_file(&key.file, "the backup key")?;
+    Ok(key)
+}
+
+/// The key every new dump and bundle is sealed with: `SPAWN_BACKUP_SEAL_KEY`
+/// (unset: k1), its file present and mode 600. Never k1 in its place.
+fn sealing_key() -> Result<Key, String> {
+    let name = key_name(env_value("SPAWN_BACKUP_SEAL_KEY").as_deref())
+        .map_err(|rule| format!("SPAWN_BACKUP_SEAL_KEY {rule}"))?;
+    let key = key_on_host(&name)
+        .map_err(|path| format!("the sealing key {name}: its key file {path} is not on this host"))?;
+    private_file(&key.file, "the backup key")?;
+    Ok(key)
+}
+
+/// The key a `backup.dumped` or `backup.bundled` record says sealed it: its
+/// `sealed_with` (absent: k1, as every record before objective 114).
+fn record_key(record_type: &str, event_id: i64, record: &Value) -> Result<String, String> {
+    let refused = |rule: String| format!("the sealed_with of {record_type} record {event_id} {rule}");
+    match &record["sealed_with"] {
+        Value::Null => key_name(None),
+        Value::String(name) => key_name(Some(name)).map_err(refused),
+        _ => Err(refused(KEY_NAME_RULE.to_string())),
+    }
+}
+
+/// The key an object says sealed it: its `x-amz-meta-spawn-seal` (absent:
+/// k1, as every object before objective 114).
+fn object_key(object: &str, headers: &str) -> Result<String, String> {
+    key_name(header_value(headers, "x-amz-meta-spawn-seal").as_deref())
+        .map_err(|rule| format!("the x-amz-meta-spawn-seal of {object} {rule}"))
+}
+
+/// The record's key and its object's, which must be one.
+fn same_key(record: &str, object: &str) -> Result<(), String> {
+    if record == object {
+        Ok(())
+    } else {
+        Err(format!("record says {record}, object says {object}"))
+    }
+}
+
+/// The store's key file: the sealing key's, which a run that `required` it
+/// cannot do without (a bad name or a missing file refuses it, never k1's
+/// file in its place); not required, the sealing key's when there is one,
+/// else k1's (`stand_in`), which nothing seals with.
+fn store_key_file(
+    seal: &Result<Key, String>,
+    required: bool,
+    stand_in: impl FnOnce() -> PathBuf,
+) -> Result<PathBuf, String> {
+    match seal {
+        Ok(key) => Ok(key.file.clone()),
+        Err(reason) if required => Err(reason.clone()),
+        Err(_) => Ok(stand_in()),
+    }
 }
 
 /// The `NAME=value` lines of an environment file, parsed, never sourced.
