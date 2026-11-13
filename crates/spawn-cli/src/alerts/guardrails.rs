@@ -36,6 +36,20 @@
 //! up and decides nothing, and no other starts until its thread has ended,
 //! so a slow reading never piles up threads; the pass never waits on it nor
 //! on the performance figures' lock it may hold.
+//!
+//! A figure of a kept group past its stale line (`stale`, crate
+//! serve/core_lines/kept.rs) neither raises nor counts toward clearing: its
+//! value is not current. The group itself is seen instead
+//! (sync/design-core-lines-kept-figures.md): `core_lines_stale`, one per
+//! group of the answer's `groups`, subject `core lines <group>`, key
+//! `core_lines_stale:<group>:<stale since ms>`, evidence `{group, as_of_ms,
+//! age_ms, every_ms, stale_ms, last_error, reading_ms}`, raised at the first
+//! reading that finds the group stale (no hold: stale is already its stale
+//! line of failures), once per occurrence. It clears at the first reading
+//! that finds the group not stale (`{group, state: "fresh", as_of_ms,
+//! reading_ms}`), or no longer in the answer (`state: "gone"`). A restarted
+//! loop adopts an open one from the record, by its subject, as the range
+//! alerts are.
 
 use serde_json::{Value, json};
 
@@ -80,6 +94,9 @@ impl Reads {
 /// The alert's kind.
 pub(super) const KIND: &str = "guardrail_out_of_range";
 
+/// A kept group past its stale line.
+pub(super) const STALE_KIND: &str = "core_lines_stale";
+
 /// One figure of a reading, as the step reads it.
 #[derive(Debug, Clone, PartialEq)]
 struct Reading {
@@ -90,6 +107,8 @@ struct Reading {
     value: Value,
     range: Value,
     state: String,
+    /// Its kept group is past its stale line.
+    stale: bool,
 }
 
 /// Every figure of an answer of `GET /api/core-lines`, north stars and
@@ -112,6 +131,7 @@ fn figures(answer: &Value) -> Vec<Reading> {
                         value: figure["value"].clone(),
                         range: figure["range"].clone(),
                         state: figure["state"].as_str().unwrap_or_default().to_string(),
+                        stale: figure["stale"] == true,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -294,6 +314,11 @@ impl Monitor {
         };
         let figures = figures(&answer);
         for figure in &figures {
+            if figure.stale {
+                // Not current: it neither raises nor clears; the stale
+                // group's own alert says so.
+                continue;
+            }
             let subject = format!("guardrail {}", figure.key);
             let open = self.open_keys(KIND, &subject);
             if figure.state == "out" {
@@ -368,13 +393,89 @@ impl Monitor {
                 evidence: json!({"key": figure, "state": "gone", "reading_ms": now}),
             });
         }
+        self.stale_events(now, &answer, out);
+    }
+
+    /// `core_lines_stale`, from one reading's `groups`.
+    fn stale_events(&self, now: i64, answer: &Value, out: &mut Vec<Event>) {
+        let groups: Vec<&Value> = answer["groups"].as_array().into_iter().flatten().collect();
+        for group in &groups {
+            let Some(name) = group["group"].as_str() else {
+                continue;
+            };
+            let subject = format!("core lines {name}");
+            let open = self.open_keys(STALE_KIND, &subject);
+            if group["stale"] == true {
+                let since = group["stale_since_ms"].as_i64().unwrap_or(now);
+                let key = format!("{STALE_KIND}:{name}:{since}");
+                if !open.is_empty() || self.known.contains_key(&key) {
+                    continue;
+                }
+                let as_of = group["as_of_ms"].as_i64();
+                let error = group["last_error"].as_str().map(super::scrub);
+                out.push(Event::Fire {
+                    key,
+                    kind: STALE_KIND,
+                    text: format!(
+                        "core lines: the {name} figures are stale: {}; the refresh {}",
+                        as_of.map_or_else(
+                            || "none has been read since the start".to_string(),
+                            |at| format!(
+                                "last read {} ({} min ago)",
+                                crate::scorecard::time::format_rfc3339(at),
+                                now.saturating_sub(at) / 60_000
+                            )
+                        ),
+                        error.as_deref().map_or_else(
+                            || "said no error".to_string(),
+                            |error| format!("failed: {error}")
+                        )
+                    ),
+                    subject,
+                    evidence: json!({
+                        "group": name, "as_of_ms": as_of, "age_ms": group["age_ms"],
+                        "every_ms": group["every_ms"], "stale_ms": group["stale_ms"],
+                        "last_error": error, "reading_ms": now,
+                    }),
+                    notice: false,
+                });
+            } else {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({
+                            "group": name, "state": "fresh",
+                            "as_of_ms": group["as_of_ms"], "reading_ms": now,
+                        }),
+                    });
+                }
+            }
+        }
+        let present: std::collections::BTreeSet<String> = groups
+            .iter()
+            .filter_map(|group| group["group"].as_str())
+            .map(|name| format!("core lines {name}"))
+            .collect();
+        for (key, row) in &self.known {
+            if row.open() && row.kind == STALE_KIND && !present.contains(&row.subject) {
+                out.push(Event::Clear {
+                    key: key.clone(),
+                    evidence: json!({
+                        "group": row.subject.strip_prefix("core lines ").unwrap_or(&row.subject),
+                        "state": "gone", "reading_ms": now,
+                    }),
+                });
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{Event, Monitor, Row, Settings};
-    use super::{KIND, POLL_MS, Parts, Pending, READ_LIMIT_MS, range_words, read_line, words};
+    use super::{
+        KIND, POLL_MS, Parts, Pending, READ_LIMIT_MS, STALE_KIND, range_words, read_line, words,
+    };
     use serde_json::{Value, json};
 
     const RAISE: i64 = 7_200_000;
@@ -897,7 +998,7 @@ mod tests {
         assert_eq!(
             read_line(None, std::time::Duration::from_millis(7), &Parts::default()),
             "alerts: core lines read: compute_ms=none observed_ms=7 \
-             open_ms=none trends_ms=none facts_ms=none archive_ms=none cost_ms=none storage_ms=none health_ms=none \
+             open_ms=none trends_ms=none facts_ms=none archive_ms=none cost_ms=none storage_ms=none unowned_ms=none health_ms=none \
              lock_wait_ms=none performance=none"
         );
         let ms = |n| Some(std::time::Duration::from_millis(n));
@@ -912,15 +1013,157 @@ mod tests {
                     archive: None,
                     cost: None,
                     storage: ms(500),
+                    unowned: ms(7),
                     health: ms(40),
                     lock_wait: None,
                     performance: Some("kept"),
+                    performance_age_ms: Some(30_000),
+                    storage_age_ms: None,
+                    aged: true,
                 }
             ),
             "alerts: core lines read: compute_ms=900 observed_ms=4000 \
-             open_ms=20 trends_ms=300 facts_ms=3 archive_ms=none cost_ms=none storage_ms=500 health_ms=40 \
-             lock_wait_ms=none performance=kept",
+             open_ms=20 trends_ms=300 facts_ms=3 archive_ms=none cost_ms=none storage_ms=500 unowned_ms=7 health_ms=40 \
+             lock_wait_ms=none performance=kept performance_age_ms=30000 storage_age_ms=none",
             "a part kept by performance_now is none, not 0"
         );
+    }
+
+    /// `answer` with its free disk figure stale or not, and the `storage`
+    /// group as `group` (stale since 5000 when stale).
+    fn aged_answer(state: &str, figure_stale: bool, group: &Value) -> Value {
+        let mut view = answer(state, &json!(2 * GIB));
+        view["lines"][1]["guardrails"][0]["stale"] = json!(figure_stale);
+        view["groups"] = json!([group]);
+        view
+    }
+
+    fn group(stale: bool, error: Option<&str>) -> Value {
+        json!({"group": "storage", "as_of_ms": 1000, "age_ms": 4000, "every_ms": 600_000,
+               "stale_ms": 1_800_000, "stale": stale, "stale_since_ms": 5000,
+               "last_error": error, "refresh_ms": 12})
+    }
+
+    #[test]
+    fn a_stale_figure_neither_raises_nor_clears_its_range_alert() {
+        let mut monitor = monitor();
+        let fresh = group(false, None);
+        // Out and stale the whole hold: no range alert.
+        for at in [1000, 1000 + RAISE, 1000 + 2 * RAISE] {
+            let (events, _) = read(&mut monitor, at, Ok(aged_answer("out", true, &fresh)));
+            assert!(
+                events.iter().all(
+                    |event| !matches!(event, super::Event::Fire { kind, .. } if *kind == KIND)
+                ),
+                "{:?}",
+                keys(&events)
+            );
+        }
+        // Raised while current; then stale and "in" for the clear's hold:
+        // it stays open.
+        let low = || Ok(aged_answer("out", false, &fresh));
+        read(&mut monitor, 10 * RAISE, low());
+        let (fired, _) = read(&mut monitor, 11 * RAISE, low());
+        assert_eq!(keys(&fired).len(), 1, "{:?}", keys(&fired));
+        commit(&mut monitor, &fired);
+        for at in [
+            11 * RAISE + 1,
+            11 * RAISE + CLEAR + 1,
+            11 * RAISE + 2 * CLEAR,
+        ] {
+            let (events, _) = read(&mut monitor, at, Ok(aged_answer("in", true, &fresh)));
+            assert!(events.is_empty(), "{:?}", keys(&events));
+        }
+    }
+
+    #[test]
+    fn a_stale_group_raises_once_and_a_good_refresh_clears_it() {
+        let mut monitor = monitor();
+        let (fired, _) = read(
+            &mut monitor,
+            6000,
+            Ok(aged_answer("in", true, &group(true, Some("walk failed")))),
+        );
+        assert_eq!(keys(&fired), [format!("fire {STALE_KIND}:storage:5000")]);
+        let super::Event::Fire {
+            subject,
+            evidence,
+            text,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "core lines storage");
+        assert_eq!(
+            evidence,
+            &json!({"group": "storage", "as_of_ms": 1000, "age_ms": 4000, "every_ms": 600_000,
+                    "stale_ms": 1_800_000, "last_error": "walk failed", "reading_ms": 6000})
+        );
+        assert!(
+            text.contains("stale") && text.contains("walk failed"),
+            "{text}"
+        );
+        commit(&mut monitor, &fired);
+        // Still stale: no second.
+        let (again, _) = read(
+            &mut monitor,
+            7000,
+            Ok(aged_answer("in", true, &group(true, Some("walk failed")))),
+        );
+        assert!(again.is_empty(), "{:?}", keys(&again));
+        // A good refresh: cleared.
+        let (cleared, _) = read(
+            &mut monitor,
+            8000,
+            Ok(aged_answer("in", false, &group(false, None))),
+        );
+        assert_eq!(keys(&cleared), [format!("clear {STALE_KIND}:storage:5000")]);
+        commit(&mut monitor, &cleared);
+        assert!(!monitor.known[&format!("{STALE_KIND}:storage:5000")].open());
+    }
+
+    #[test]
+    fn a_restarted_loop_adopts_an_open_stale_alert_and_clears_it_at_a_good_refresh() {
+        let open = |monitor: &mut Monitor| {
+            monitor.known.insert(
+                format!("{STALE_KIND}:storage:5000"),
+                Row {
+                    kind: STALE_KIND.to_string(),
+                    subject: "core lines storage".to_string(),
+                    state: "open".to_string(),
+                    evidence: json!({"group": "storage", "reading_ms": 6000}),
+                    fired_event_id: 1,
+                    fired_at_ms: 6000,
+                },
+            );
+        };
+        // Restarted, still stale (a new stale since, its first try): the
+        // open one stands, no second.
+        let mut restarted = monitor();
+        open(&mut restarted);
+        let mut stale = group(true, Some("down"));
+        stale["as_of_ms"] = Value::Null;
+        stale["stale_since_ms"] = json!(9000);
+        let (events, _) = read(&mut restarted, 9500, Ok(aged_answer("in", true, &stale)));
+        assert!(events.is_empty(), "{:?}", keys(&events));
+        // Its first good refresh clears it.
+        let (cleared, _) = read(
+            &mut restarted,
+            9600,
+            Ok(aged_answer("in", false, &group(false, None))),
+        );
+        assert_eq!(keys(&cleared), [format!("clear {STALE_KIND}:storage:5000")]);
+        // A group no longer in the answer clears it as gone.
+        let mut gone_one = monitor();
+        open(&mut gone_one);
+        let mut none = answer("in", &json!(50 * GIB));
+        none["groups"] = json!([]);
+        let (gone, _) = read(&mut gone_one, 9700, Ok(none));
+        assert_eq!(keys(&gone), [format!("clear {STALE_KIND}:storage:5000")]);
+        let super::Event::Clear { evidence, .. } = &gone[0] else {
+            panic!("a clear");
+        };
+        assert_eq!(evidence["state"], "gone");
     }
 }
