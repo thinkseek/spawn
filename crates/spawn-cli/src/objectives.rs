@@ -860,6 +860,28 @@ pub(crate) fn continuation_note(over: &Overrun) -> String {
     note
 }
 
+/// The working rules every objective brief carries after its objective.
+const STANDING_RULES: &str = "\nWork only inside this workspace. Do not run git commands and do not create \
+     commits: the host commits your workspace. Do not edit `rsi/`, `scripts/rsi/`, \
+     `scripts/blackbox/` or `scripts/e2e.sh`: the gate refuses any change there. \
+     A crate new in your tree must carry `[lints]` with `workspace = true` (and \
+     nothing else under it) in its Cargo.toml: the gate refuses one without it, and \
+     any other change to the lint configuration (`[lints]` tables, clippy.toml, a \
+     crate-level `#![allow]`). \
+     Keep every test the current main has, under its full name as cargo lists it \
+     (`module::path::test_name`): the gate lists the tests cargo runs on main and on \
+     your tree, and refuses your tree if it runs fewer, or if one of main's is gone \
+     by that name. A test renamed, moved to another module path (its name is its \
+     module path), marked `#[ignore]`, deleted or left in a file no `mod` includes \
+     is gone; a move that keeps the module path (the same `mod tests` in another \
+     file) keeps the name. A test that must go is the objective's to retire \
+     (`rsi/scenarios/retired-tests`, which you may not edit): if you believe one \
+     must go, leave it in and say which and why in your delivery. \
+     The gate builds your tree, runs this objective's scenario (it must fail on the \
+     current main and pass on yours) and every other check (clippy, the tests, the \
+     e2e, the black-box scenarios, the web build). If it rejects your work, you get \
+     the task back with its output.\n";
+
 /// The brief of an objective task: the objective, the working rules, the
 /// work earlier tasks of it left without landing, and what the gate said
 /// about earlier attempts.
@@ -871,19 +893,7 @@ pub(crate) fn brief(
     continues: Option<&Overrun>,
 ) -> String {
     let mut brief = format!("Objective {}: {}\n\n{}\n", task.id, task.title, task.prompt);
-    brief.push_str(
-        "\nWork only inside this workspace. Do not run git commands and do not create \
-         commits: the host commits your workspace. Do not edit `rsi/`, `scripts/rsi/`, \
-         `scripts/blackbox/` or `scripts/e2e.sh`: the gate refuses any change there. \
-         A crate new in your tree must carry `[lints]` with `workspace = true` (and \
-         nothing else under it) in its Cargo.toml: the gate refuses one without it, and \
-         any other change to the lint configuration (`[lints]` tables, clippy.toml, a \
-         crate-level `#![allow]`). \
-         The gate builds your tree, runs this objective's scenario (it must fail on the \
-         current main and pass on yours) and every other check (clippy, the tests, the \
-         e2e, the black-box scenarios, the web build). If it rejects your work, you get \
-         the task back with its output.\n",
-    );
+    brief.push_str(STANDING_RULES);
     if task.recurring
         && let Some(name) = &task.metric
     {
@@ -1855,6 +1865,31 @@ mod tests {
             ),
             "every brief carries the lint rule the gate holds a new crate to: {first}"
         );
+    }
+
+    /// Every brief says, before a worker renames anything, what the gate's
+    /// test listing holds a tree to (scripts/rsi/gate.sh, "The candidate may
+    /// not run fewer tests than the base, nor stop running one of the base's
+    /// by name"): a renamed or moved test is a dropped one, and a test that
+    /// must go is the objective's to retire, never the worker's (T304, T328:
+    /// two gates rejected for a rename).
+    #[test]
+    fn every_brief_says_a_renamed_test_is_a_dropped_one() {
+        let text = brief(&objective(59, false), None, &[], &[], None);
+        for wanted in [
+            "Keep every test the current main has, under its full name as cargo lists it \
+             (`module::path::test_name`)",
+            "refuses your tree if it runs fewer, or if one of main's is gone by that name",
+            "A test renamed, moved to another module path (its name is its module path), \
+             marked `#[ignore]`, deleted or left in a file no `mod` includes is gone",
+            "a move that keeps the module path (the same `mod tests` in another file) keeps \
+             the name",
+            "A test that must go is the objective's to retire (`rsi/scenarios/retired-tests`, \
+             which you may not edit): if you believe one must go, leave it in and say which \
+             and why in your delivery",
+        ] {
+            assert!(text.contains(wanted), "{wanted:?} in {text}");
+        }
     }
 
     /// A yield ends an objective's count, and its next task starts afresh;
