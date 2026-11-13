@@ -1,12 +1,14 @@
 import { useState } from "react";
 import { ChevronRight, Hand } from "lucide-react";
 
-import { readApi, usePoll } from "../../api";
+import { readApi } from "../../api";
 import type { FigureState, InterventionsAnswer } from "../../interventions.ts";
-import { figureState } from "../../interventions.ts";
-import { Card, CardHeader, FOCUS_RING_INSET, cx } from "../ui";
+import { HomeCard, LoadingLines } from "../aui/HomeCard";
+import { Tooltip } from "../aui/kit";
+import { FOCUS_RING_INSET, cx } from "../ui";
 
-const POLL_MS = 60_000;
+/** How often Home reads each window. */
+export const INTERVENTIONS_POLL_MS = 60_000;
 
 /** The windows Home shows, side by side. */
 const WINDOWS = [
@@ -17,7 +19,7 @@ const WINDOWS = [
 const HINT =
   "Human interventions per agent-hour: each time a person stepped in (a command, a pause, a resume, a task they assigned, a cancel and reassign), divided by the hours agents ran. A command refused and sent again is one intervention; its retries are not counted. Lower is better.";
 
-function fetchInterventions(window: string, signal: AbortSignal): Promise<InterventionsAnswer> {
+export function fetchInterventions(window: string, signal: AbortSignal): Promise<InterventionsAnswer> {
   return readApi(`/api/interventions?window=${window}`, signal, (raw) => raw as InterventionsAnswer);
 }
 
@@ -31,28 +33,32 @@ function Figure({ label, state }: { label: string; state: FigureState }) {
   const [open, setOpen] = useState(false);
   if (state.kind !== "view") {
     return (
-      <div className="min-w-0 px-4 py-3">
+      <div className="min-w-0">
         <div className="text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">{label}</div>
         {state.kind === "failed" ? (
           <p className="mt-1 break-words text-caption text-warning" role="status">
             Could not read the interventions: {state.reason}
           </p>
         ) : (
-          <p className="mt-1 text-caption text-faint-foreground">Loading…</p>
+          <div className="mt-1">
+            <LoadingLines label={`Loading ${label.toLowerCase()}`} lines={2} />
+          </div>
         )}
       </div>
     );
   }
   const { view, stale } = state;
   return (
-    <div className="min-w-0 px-4 py-3">
+    <div className="min-w-0">
       <div className="text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">{label}</div>
-      <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5" title={HINT}>
-        <span className="tnum text-display-sm leading-none font-semibold tracking-tight text-foreground">
-          {view.figure}
-        </span>
-        <span className="text-caption text-muted-foreground">per agent-hour</span>
-      </div>
+      <Tooltip content={HINT}>
+        <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5" tabIndex={0}>
+          <span className="tnum text-display-sm leading-none font-semibold tracking-tight text-foreground">
+            {view.figure}
+          </span>
+          <span className="text-caption text-muted-foreground">per agent-hour</span>
+        </div>
+      </Tooltip>
       <div className="mt-1 text-caption text-muted-foreground">
         <span className="tnum">{view.count}</span>
         {view.retries && <span className="tnum text-faint-foreground"> · {view.retries}</span>}
@@ -115,21 +121,18 @@ function Figure({ label, state }: { label: string; state: FigureState }) {
  * The north star on Home: human interventions per agent-hour over the last
  * 24 hours and 7 days, how many interventions and the retries they leave
  * out, and the list of interventions behind each figure
- * (`/api/interventions`, interventions.ts). Read-only.
+ * (`/api/interventions`, interventions.ts). Read-only, from its props: Home
+ * polls both windows ([`fetchInterventions`]) and passes each figureState.
  */
-export function InterventionsCard() {
-  const day = usePoll("interventions-24h", (signal) => fetchInterventions("24h", signal), POLL_MS);
-  const week = usePoll("interventions-7d", (signal) => fetchInterventions("7d", signal), POLL_MS);
-  const polls = { "24h": day, "7d": week } as const;
+export function InterventionsCard({ day, week }: { day: FigureState; week: FigureState }) {
+  const states = { "24h": day, "7d": week } as const;
   return (
-    <Card>
-      <CardHeader icon={<Hand size={14} />} title="Human interventions" />
-      <div className="grid grid-cols-1 sm:grid-cols-2">
-        {WINDOWS.map((window) => {
-          const poll = polls[window.id];
-          return <Figure key={window.id} label={window.label} state={figureState(poll.data, poll.error)} />;
-        })}
+    <HomeCard icon={<Hand size={14} />} title="Human interventions">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        {WINDOWS.map((window) => (
+          <Figure key={window.id} label={window.label} state={states[window.id]} />
+        ))}
       </div>
-    </Card>
+    </HomeCard>
   );
 }

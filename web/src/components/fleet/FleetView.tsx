@@ -13,13 +13,15 @@ import type { FleetContext } from "../../ordering";
 import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
 import { FOCUS_RING_INSET, LiveStatus, PageHeader, cx } from "../ui";
-import { AgentsNowCard, DigestCard, MissionsTodayCard, NeedsYou, SupervisorNotes, useAway } from "../home/Home";
+import { useAway } from "../home/Home";
+import { HomeView } from "../home/HomeView";
 import { AgentDetail } from "./AgentDetail";
 import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
 import { InputBox } from "./InputBox";
-import { CoreLinesCard } from "../home/CoreLines";
-import { InterventionsCard } from "./Interventions";
+import { CORE_LINES_POLL_MS, fetchCoreLines } from "../home/CoreLines";
+import { figureState } from "../../interventions.ts";
+import { INTERVENTIONS_POLL_MS, fetchInterventions } from "./Interventions";
 import { HealthStrip } from "./HealthStrip";
 import type { Liveness } from "./HealthStrip";
 
@@ -106,6 +108,11 @@ export function FleetView({
   // server's 24 h); slow, since news of days ago does not move by the second.
   const span = alertsSpanMs(now, digestSpan.since);
   const digestAlerts = usePoll(`alerts:since:${span}`, (signal) => fetchAlertsSince(span, signal), 60_000);
+  // Home's north star and core lines (HomeView renders them from these).
+  const day = usePoll("interventions-24h", (signal) => fetchInterventions("24h", signal), INTERVENTIONS_POLL_MS);
+  const week = usePoll("interventions-7d", (signal) => fetchInterventions("7d", signal), INTERVENTIONS_POLL_MS);
+  const coreLines = usePoll("core-lines", fetchCoreLines, CORE_LINES_POLL_MS);
+  const openAgent = (session: string) => onSelect(session);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -142,12 +149,17 @@ export function FleetView({
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1200px] flex-col gap-3 p-3 sm:p-4">
-            <NeedsYou items={needs} onOpenAgent={(session) => onSelect(session)} />
-            <MissionsTodayCard model={missionsToday(missions, now)} onOpen={onShowMissions} />
-            <AgentsNowCard model={agentsNow(agents ?? null, context)} onOpenAgent={(session) => onSelect(session)} />
-            <SupervisorNotes
-              model={latestNotes(attention.data, now)}
-              all={allNotes(attention.data)}
+            <HomeView
+              now={now}
+              needs={needs}
+              missions={missionsToday(missions, now)}
+              agents={agentsNow(agents ?? null, context)}
+              notes={latestNotes(attention.data, now)}
+              allNotes={allNotes(attention.data)}
+              digest={digestSince(missions, digestAlerts.data ?? alerts, now, digestSpan.since, agents ?? null, digestSpan.away)}
+              back={away?.at ?? null}
+              interventions={{ day: figureState(day.data, day.error), week: figureState(week.data, week.error) }}
+              coreLines={{ answer: coreLines.data, error: coreLines.data ? null : coreLines.error }}
               talk={
                 <InputBox
                   key={supervisor.session}
@@ -156,13 +168,9 @@ export function FleetView({
                   stopped={!supervisor.live}
                 />
               }
+              onOpenAgent={openAgent}
+              onShowMissions={onShowMissions}
             />
-            <DigestCard
-              digest={digestSince(missions, digestAlerts.data ?? alerts, now, digestSpan.since, agents ?? null, digestSpan.away)}
-              back={away?.at ?? null}
-            />
-            <InterventionsCard />
-            <CoreLinesCard />
             <button
               type="button"
               onClick={() => setDetailsOpen((value) => !value)}
