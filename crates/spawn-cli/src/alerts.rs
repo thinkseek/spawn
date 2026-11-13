@@ -300,9 +300,14 @@
 //!   older Spawn typed carries
 //!   no marker (no `message.typed`) and is never one, nor is one sent while
 //!   its session's transcript had held no marker yet. Once per message;
-//!   clears when it is taken, or when its session ends with it untaken (the
-//!   execution it was typed into, or its own start's, ended). A message
-//!   whose session ended first fires nothing. Read on start (every message
+//!   clears when it is taken; else, typed, when a later message of its
+//!   session is taken (objective 138: the agent went on past it, its marker
+//!   missed; evidence `later_taken`, that command, and its `taken_at_ms`;
+//!   another session's taking, or one of an untyped message, counts for
+//!   nothing); else when its session ends with it untaken (the execution it
+//!   was typed into, or its own start's, ended). A message whose session
+//!   ended first, or a later one of whose session was taken first, fires
+//!   nothing. Read on start (every message
 //!   that can be one, and the open alerts), then when the log moved (the
 //!   new commands, the pending messages due, the open alerts whose session
 //!   took a message or ended since) and when a pending one falls due.
@@ -2522,8 +2527,10 @@ times in a row)",
     }
 
     /// `message_not_taken`: a tracked message no `message.taken` names past
-    /// its bound, its session not ended with it, fires once; an open one
-    /// clears once it is taken, or once its session ended with it untaken.
+    /// its bound, its session not ended with it and no later message of its
+    /// session taken, fires once; an open one clears once it is taken, else
+    /// once a later message of its session is taken (`later_taken`), else
+    /// once its session ended with it untaken.
     /// One not due yet is pending, read again until it is taken, ends or
     /// fires; the next bound is the earliest pending one's.
     fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
@@ -2534,6 +2541,9 @@ times in a row)",
             let key = format!("message_not_taken:{id}");
             let taken = message["taken"].as_i64().unwrap_or_default();
             let ended = message["ended"].as_bool() != Some(false);
+            // A later message of its session taken (objective 138): the
+            // agent went on past it, its marker missed.
+            let later_taken = message["later_taken"].as_i64();
             if self.known.contains_key(&key) {
                 self.pending.remove(&id);
                 if !self.is_open(&key) {
@@ -2544,6 +2554,14 @@ times in a row)",
                         key,
                         evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
                     });
+                } else if let Some(later) = later_taken {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({
+                            "later_taken": later,
+                            "taken_at_ms": message["later_taken_at_ms"],
+                        }),
+                    });
                 } else if ended {
                     out.push(Event::Clear {
                         key,
@@ -2552,7 +2570,11 @@ times in a row)",
                 }
                 continue;
             }
-            if message["tracked"].as_bool() != Some(true) || taken > 0 || ended {
+            if message["tracked"].as_bool() != Some(true)
+                || taken > 0
+                || later_taken.is_some()
+                || ended
+            {
                 self.pending.remove(&id);
                 continue;
             }
