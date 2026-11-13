@@ -1,0 +1,66 @@
+/* affectUI on Spawn's theme.
+ *
+ * The primitives in components/ui/ are third-party and byte-identical (see
+ * web/THIRD_PARTY_NOTICES.md); each reads its colours, radii, shadows and
+ * fonts as `var(--aui-<name>, <affectUI's default>)`. This file sets every
+ * one of those names from spawn.css's roles, so they wear Spawn's palette in
+ * both themes: the roles change per theme, these aliases do not. No literal
+ * colour here. Motion: none added; each primitive keeps its own
+ * prefers-reduced-motion rules.
+ *
+ * Any hue or status name a primitive may set as text takes a text role (an
+ * -ink, accent-ink, ink, ink-2), which holds 4.5:1 on surface and inset in
+ * both themes; the -mark and trace-* roles are only checked at 3:1. */
+
+:root,
+[data-theme="light"],
+[data-theme="dark"] {
+  /* Grounds and lines. */
+  --aui-surface: var(--surface);
+  --aui-subtle: var(--inset);
+  --aui-overlay: var(--surface);
+  --aui-border: var(--line);
+  --aui-border-strong: var(--line-strong);
+
+  /* Text. */
+  --aui-ink: var(--ink);
+  --aui-muted: var(--ink-2);
+  --aui-placeholder: var(--ink-3);
+
+  /* The accent and focus. */
+  --aui-primary: var(--accent);
+  --aui-on-primary: var(--accent-fg);
+  --aui-focus: var(--ring);
+
+  /* Status: ink for text, tint for the soft ground. */
+  --aui-info: var(--info-ink);
+  --aui-info-soft: var(--info-tint);
+  --aui-success: var(--ok-ink);
+  --aui-success-soft: var(--ok-tint);
+  --aui-warning: var(--wait-ink);
+  --aui-warning-soft: var(--wait-tint);
+  --aui-danger: var(--fail-ink);
+  --aui-danger-soft: var(--fail-tint);
+
+  /* Hues, which the primitives may set as text: the text roles. */
+  --aui-red: var(--fail-ink);
+  --aui-green: var(--ok-ink);
+  --aui-orange: var(--wait-ink);
+  --aui-blue: var(--accent-ink);
+  --aui-teal: var(--info-ink);
+  --aui-purple: var(--judge-ink);
+
+  /* Shape, by what reads each name: chips, controls, cards and overlays. */
+  --aui-radius-sm: var(--radius-chip);
+  --aui-radius: var(--radius-control);
+  --aui-radius-lg: var(--radius-card);
+
+  /* The shadow ladder. */
+  --aui-shadow-card: var(--shadow-card);
+  --aui-shadow-popover: var(--shadow-overlay);
+
+  /* Fonts (index.css's stacks) and Spawn's drawer curve. */
+  --aui-font: var(--font-sans);
+  --aui-font-mono: var(--font-mono);
+  --aui-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
