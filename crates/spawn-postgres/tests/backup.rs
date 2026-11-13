@@ -247,7 +247,7 @@ fn a_store_run_may_name_the_key_that_sealed_it() {
         let refused = store
             .backup_record(&record)
             .expect_err(&format!("{what}: {record}"));
-        let message = format!("{refused:#}");
+        let message = refused.to_string();
         if what.starts_with("another field") {
             assert!(message.contains("nothing else"), "{what}: {message}");
         } else {
