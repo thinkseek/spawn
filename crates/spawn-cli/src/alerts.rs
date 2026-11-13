@@ -9605,10 +9605,7 @@ connections\n";
                 typed(store, "later", exec, missed, true);
                 let mut monitor = prompt_monitor();
                 let fired = read(&mut monitor, store);
-                assert_eq!(
-                    fires(&fired),
-                    [format!("message_not_taken:{}", missed.0)]
-                );
+                assert_eq!(fires(&fired), [format!("message_not_taken:{}", missed.0)]);
                 commit(&mut monitor, &fired);
                 assert!(read(&mut monitor, store).is_empty(), "once");
 
@@ -9676,7 +9673,11 @@ connections\n";
                 // Read within its bound: pending, nothing fired.
                 let mut monitor = Monitor::with(super::settings());
                 assert!(read(&mut monitor, store).is_empty());
-                assert!(monitor.pending.contains_key(&(i64::try_from(missed.0).expect("an id"))));
+                assert!(
+                    monitor
+                        .pending
+                        .contains_key(&(i64::try_from(missed.0).expect("an id")))
+                );
                 let next = input(store, "first", "next", "b");
                 typed(store, "first", exec, next, true);
                 taken(store, "first", exec, "u-next", next.0);
@@ -9728,6 +9729,10 @@ connections\n";
                 let again = input(store, "other", "again", "e");
                 typed(store, "other", "exec_other_1", again, true);
                 taken(store, "other", "exec_other_1", "u-again", again.0);
+                // The untyped one's session takes again: it stays open.
+                let more = input(store, "behind", "more", "f");
+                typed(store, "behind", "exec_behind_1", more, true);
+                taken(store, "behind", "exec_behind_1", "u-more", more.0);
                 let read_again = read(&mut monitor, store);
                 assert!(read_again.is_empty(), "{read_again:?}");
             });
