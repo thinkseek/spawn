@@ -5004,24 +5004,31 @@ fn a_gated_owner_push_without_the_scenarios_directory_is_refused() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// An owner judging's tree gets the installed controller's
-/// web/node_modules, a real directory made before its gate starts (the
-/// gate binds it only when it is there at its setup), so a check that
-/// builds the UI judges the owner's push instead of failing on both
-/// sides as a host fault (lead-mac, 2026-11-10). Only when the candidate
-/// names the dependencies it was installed from (web/pnpm-lock.yaml).
+/// An owner judging's tree gets `web/node_modules` before its gate starts
+/// (git holds none, and the gate binds that directory only when it is
+/// there at its setup), so a check that builds the UI judges the owner's
+/// push instead of failing on both sides as a host fault (lead-mac,
+/// 2026-11-10). The installed controller's set when the candidate names
+/// the dependencies it was installed from (web/pnpm-lock.yaml): copied,
+/// and pnpm not run. Other dependencies (objective 131, K2): the
+/// candidate's own set, installed by pnpm with exactly `INSTALL_ARGS` and
+/// an environment of HOME, LC_ALL and PATH alone, judged and landed. A set
+/// the host's store lacks: no gate, and the `NOT_IN_STORE` no-verdict.
+/// The controller's own set is never written.
 #[test]
 fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
-    let (base, source, scenarios, integrator) = world("owner-modules", "");
+    let (base, source, scenarios, mut integrator) = world("owner-modules", "");
     let seen = base.join("modules-seen");
     let gate = format!(
         "m=\"$4/../web/node_modules\"\n\
              if [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg/index.js\" ]; then echo copied; \
-             else echo none; fi >>'{seen}'\n\
+             elif [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg2/index.js\" ]; then \
+             echo installed; else echo none; fi >>'{seen}'\n\
              printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
         seen = seen.display()
     );
     std::fs::write(base.join("gate.sh"), gate).expect("gate");
+    let pnpm = stub_pnpm(&base, &mut integrator);
     let modules = base.join("web/node_modules");
     std::fs::create_dir_all(modules.join(".pnpm")).expect("modules");
     std::fs::create_dir_all(modules.join("pkg")).expect("modules");
@@ -5055,13 +5062,15 @@ fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
         vec!["copied"],
         "the gate found the copy at its start"
     );
+    assert!(pnpm.runs().is_empty(), "the controller's set: pnpm not run");
     assert_eq!(
         control_records(&db, "source.moved").len(),
         1,
         "judged, and landed"
     );
 
-    // Other dependencies than the installed ones: not given.
+    // Other dependencies than the installed ones: the candidate's own set,
+    // installed.
     let commit = owner_commit_files(
         &base,
         &source,
@@ -5071,12 +5080,198 @@ fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
     gated_request(&db, &source, &commit, "new dependencies");
     integrator.pass_on(&db.store).expect("a pass");
     integrator.settle();
-    assert_eq!(seen_lines(), vec!["copied", "none"]);
+    assert_eq!(
+        pnpm.runs(),
+        vec![super::owner::INSTALL_ARGS.join(" ")],
+        "pnpm ran once, with exactly the install's arguments"
+    );
+    assert_eq!(
+        pnpm.names(),
+        "HOME LC_ALL PATH",
+        "pnpm's environment names HOME, LC_ALL and PATH alone"
+    );
+    assert_eq!(
+        seen_lines(),
+        vec!["copied", "installed"],
+        "the gate found the installed set at its start"
+    );
+    assert_eq!(
+        control_records(&db, "source.moved").len(),
+        2,
+        "judged, and landed"
+    );
+
+    // A set the host's store lacks: no gate, and the no-verdict says so.
+    let commit = owner_commit_files(
+        &base,
+        &source,
+        &[("web/pnpm-lock.yaml", "lock v3, made-up-absent\n")],
+        "owner: absent dependencies",
+    );
+    let request = gated_request(&db, &source, &commit, "absent dependencies");
+    integrator.pass_on(&db.store).expect("a pass");
+    integrator.settle();
+    assert_eq!(pnpm.runs().len(), 2, "pnpm ran for it");
+    assert_eq!(seen_lines(), vec!["copied", "installed"], "no gate ran");
+    let reasons: Vec<String> = no_verdict_records(&db, request)
+        .into_iter()
+        .map(|(reason, _)| reason)
+        .collect();
+    assert_eq!(reasons, vec![super::owner::NOT_IN_STORE.to_string()]);
+    assert_eq!(
+        control_records(&db, "source.moved").len(),
+        2,
+        "nothing moved"
+    );
+
     assert!(
-        std::fs::symlink_metadata(modules.join("pkg/index.js")).is_ok(),
+        std::fs::symlink_metadata(modules.join("pkg/index.js")).is_ok()
+            && std::fs::symlink_metadata(modules.join("pkg2")).is_err(),
         "the controller's own is untouched"
     );
+    assert_eq!(
+        std::fs::read_to_string(modules.join(".pnpm/lock.yaml")).expect("lock"),
+        "lock v1\n"
+    );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An owner judging's candidate whose `web/` holds pnpm configuration that
+/// could run code in pnpm or reach outside the tree (objective 131, rev-g's
+/// F1 and F2): a web/.pnpmfile.cjs, a pnpm-workspace.yaml with modulesDir,
+/// a package.json with a `file:` dependency. Each gets the `WEB_CONFIG`
+/// no-verdict naming it; pnpm never starts and no gate runs.
+#[test]
+fn an_owner_judging_refuses_web_config_that_could_run_code() {
+    let (base, source, scenarios, mut integrator) = world("owner-web-config", "");
+    let ran = base.join("gate-ran");
+    std::fs::write(
+        base.join("gate.sh"),
+        format!(
+            "echo ran >>'{}'\n\
+             printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
+            ran.display()
+        ),
+    )
+    .expect("gate");
+    let pnpm = stub_pnpm(&base, &mut integrator);
+    let modules = base.join("web/node_modules");
+    std::fs::create_dir_all(modules.join(".pnpm")).expect("modules");
+    std::fs::write(modules.join(".pnpm/lock.yaml"), "lock v1\n").expect("lock");
+    let db = Db::new("owner_web_config");
+    db.gated_mission(&source, &scenarios);
+    let cases: [(&str, &[(&str, &str)], &str); 3] = [
+        (
+            "owner: a pnpmfile",
+            &[
+                ("web/.pnpmfile.cjs", "module.exports = {};\n"),
+                ("web/package.json", "{}\n"),
+            ],
+            "web has .pnpmfile.cjs",
+        ),
+        (
+            "owner: a modules directory outside the tree",
+            &[
+                ("web/pnpm-workspace.yaml", "modulesDir: ../../outside\n"),
+                ("web/package.json", "{}\n"),
+            ],
+            "web/pnpm-workspace.yaml sets modulesDir",
+        ),
+        (
+            "owner: a dependency on a host directory, by file:",
+            &[(
+                "web/package.json",
+                "{\"dependencies\": {\"x\": \"file:/etc\"}}\n",
+            )],
+            "web/package.json has a dependency that is not a registry range (x)",
+        ),
+    ];
+    for (subject, files, found) in cases {
+        let mut files = files.to_vec();
+        files.push(("scenarios/protected", ""));
+        files.push(("web/pnpm-lock.yaml", "lock v2\n"));
+        let commit = owner_commit_files(&base, &source, &files, subject);
+        let request = gated_request(&db, &source, &commit, subject);
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let reasons: Vec<String> = no_verdict_records(&db, request)
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![format!("{}: {found}", super::owner::WEB_CONFIG)],
+            "{subject}"
+        );
+        super::owner::withdraw(&db.store, request).expect("withdrawn");
+    }
+    assert!(pnpm.runs().is_empty(), "pnpm never started");
+    assert!(std::fs::symlink_metadata(&ran).is_err(), "no gate ran");
+    assert!(std::fs::symlink_metadata(base.join("outside")).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A stub pnpm, first on the gate environment's PATH (HOME beside it): it
+/// notes each run's arguments and the names (never the values) of the
+/// variables it was given, fails as pnpm 12 does on a set the store lacks
+/// (a lockfile naming made-up-absent: ERR_PNPM_META_FETCH_FAIL, then
+/// ERR_PNPM_NO_OFFLINE_META), and otherwise installs `pkg2`, with the
+/// lockfile as its `.pnpm/lock.yaml`.
+fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
+    let bin = base.join("stub-bin");
+    std::fs::create_dir_all(&bin).expect("stub bin");
+    let runs = base.join("pnpm-runs");
+    let names = base.join("pnpm-names");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$*\" >>'{runs}'\n\
+         awk 'BEGIN {{ for (name in ENVIRON) print name }}' | sort | tr '\\n' ' ' >'{names}'\n\
+         if grep -q made-up-absent pnpm-lock.yaml; then\n\
+         echo ' ERR_PNPM_META_FETCH_FAIL  GET http://127.0.0.1/made-up-absent: offline'\n\
+         echo ' ERR_PNPM_NO_OFFLINE_META  Failed to resolve made-up-absent@1.0.0 in the store' >&2\n\
+         exit 1\n\
+         fi\n\
+         mkdir -p node_modules/.pnpm node_modules/pkg2\n\
+         cp pnpm-lock.yaml node_modules/.pnpm/lock.yaml\n\
+         echo x >node_modules/pkg2/index.js\n",
+        runs = runs.display(),
+        names = names.display()
+    );
+    let pnpm = bin.join("pnpm");
+    std::fs::write(&pnpm, script).expect("stub pnpm");
+    std::fs::set_permissions(&pnpm, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("executable");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let env = &mut integrator.judge.gate_env;
+    env.retain(|(name, _)| name != "PATH" && name != "HOME");
+    env.push(("PATH".to_string(), format!("{}:{path}", bin.display())));
+    env.push(("HOME".to_string(), base.join("home").display().to_string()));
+    StubPnpm { runs, names }
+}
+
+/// What the stub pnpm noted.
+struct StubPnpm {
+    runs: PathBuf,
+    names: PathBuf,
+}
+
+impl StubPnpm {
+    /// Each run's arguments, a line a run.
+    fn runs(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.runs)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The last run's variable names, sorted, joined by spaces.
+    fn names(&self) -> String {
+        std::fs::read_to_string(&self.names)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
 }
 
 /// An owner judging's description names the gate and the scenarios it
