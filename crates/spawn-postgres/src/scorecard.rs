@@ -247,6 +247,15 @@ const FULL_EVERY_MS: i64 = 3_600_000;
 /// database dropped and made again under the name is another store by its
 /// oid ([`PostgresStore::facts_key`]).
 ///
+/// What it rests on, for whoever adds a writer: a new write of anything the
+/// facts read (a control record, a command, its finish, a person's intent)
+/// must append its event in the same transaction under that lock, the
+/// append lock `pg_advisory_xact_lock(1399957335)` that `spawn_append`,
+/// `spawn_append_trusted` and `spawn_submit` take. A writer outside it can
+/// commit an event below one already seen, and a restore that takes that
+/// write away would leave the mark in place: its kept fact would stay until
+/// the hourly whole reading.
+///
 /// The check is in the kept reading's own statement ([`FACTS_SINCE`]'s
 /// `still`), not a statement before it, so no restore can fall between the
 /// check and the window: both see one snapshot. A restore after that
