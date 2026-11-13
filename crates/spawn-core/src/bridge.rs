@@ -4606,6 +4606,7 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Read(//data/tmp/ccd/**)",
     "Read(//data/tmp/ccd-pg/**)",
     "Read(//var/tmp/spawn/**/*.sh)",
+    "Read(~/.pgpass)",
     "Edit(~/.local/share/spawn-rsi/*.env*)",
     "Edit(~/.local/share/spawn-rsi/env.sh)",
     "Edit(~/.local/share/spawn-rsi/backups/**)",
@@ -4620,6 +4621,7 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Edit(//data/tmp/ccd/**)",
     "Edit(//data/tmp/ccd-pg/**)",
     "Edit(//var/tmp/spawn/**/*.sh)",
+    "Edit(~/.pgpass)",
     // The workspaces live under spawn-rsi too, so these name files, not
     // the directory.
     "Bash(*spawn.env*)",
@@ -4627,6 +4629,11 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*spawn-rsi/backups*)",
     "Bash(*fleet-pg*)",
     "Bash(*.config/spawn*)",
+    // A passfile by its variable or by its name (113): engines need not
+    // name it, since libpq and spawn read it themselves. `echo $PGPASSFILE`
+    // is refused too; a search of the code uses Grep, which these miss.
+    "Bash(*PGPASSFILE*)",
+    "Bash(*.pgpass*)",
     "Bash(*test-database.url*)",
     "Bash(*model-relay.env*)",
     "Bash(*typesafe.env*)",
@@ -4791,13 +4798,26 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*pgrep* -lf*)",
     "Bash(*pgrep* --list*)",
     "Bash(*ps ax*)",
-    "Bash(*ps x*)",
+    // `ps x` and `top … -c` at a command position only (113, rev-e's N3
+    // on 108): anywhere, they refused `ls groups x`, `jq '.ps x'` and
+    // `systemctl --user stop x; sh -c true`. Not after `||` or a newline
+    // (Claude Code checks each part of a compound command), `(` or a
+    // backtick (open).
+    "Bash(ps x*)",
+    "Bash(*; ps x*)",
+    "Bash(*&& ps x*)",
+    "Bash(*| ps x*)",
+    "Bash(*$(ps x*)",
     "Bash(*ps -e -f*)",
     "Bash(*ps -A -f*)",
     "Bash(*ps -Af*)",
     "Bash(*ps -wwf*)",
     "Bash(*ps -wf*)",
-    "Bash(*top *-c*)",
+    "Bash(top *-c*)",
+    "Bash(*; top *-c*)",
+    "Bash(*&& top *-c*)",
+    "Bash(*| top *-c*)",
+    "Bash(*$(top *-c*)",
     "Bash(*pstree -a*)",
     "Bash(*pstree -pa*)",
     "Bash(*pstree -ap*)",
@@ -5101,6 +5121,15 @@ mod tests {
             "cd; cd .claude; less settings.json",
             "python3 -c \"open('/home/bb/.claude/settings.local.json')\"",
             "strings ~/.local/share/spawn-rsi/spawn.env.bak-relay",
+            "cat $PGPASSFILE",
+            "cat ~/.pgpass",
+            "ps x",
+            "cd /tmp && ps x",
+            "uptime; ps x",
+            "echo $(ps xww)",
+            "pgrep -f cargo | ps x",
+            "uptime && top -b -n 1 -c",
+            "echo $(top -b -n 1 -c)",
         ] {
             assert!(refused(command), "{command}");
         }
@@ -5125,6 +5154,10 @@ mod tests {
             "top -b -n 1",
             "pstree -p",
             "cd env && ls",
+            "ls groups x",
+            "cargo test -- steps x",
+            "jq '.ps x' report.json",
+            "systemctl --user stop x; sh -c true",
         ] {
             assert!(!refused(command), "{command}");
             for part in parts(command) {
