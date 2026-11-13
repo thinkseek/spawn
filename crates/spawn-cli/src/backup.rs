@@ -1902,6 +1902,20 @@ fn read_bundle_records(prefix: &str, records: &Value) -> Vec<BundleRecord> {
         .collect()
 }
 
+/// The earlier bundles a new bundle sealed with `seal` builds on: those
+/// sealed with it (objective 114; a record without `sealed_with` is k1's, a
+/// record whose name is refused is no one's). With none yet, the bundle is
+/// full and has no base, whatever bundle of another key this week holds.
+/// Here and not in [`bundle_records`], which verify and the drill share.
+fn sealed_alike(earlier: Vec<BundleRecord>, seal: &str) -> Vec<BundleRecord> {
+    earlier
+        .into_iter()
+        .filter(|entry| {
+            record_key("backup.bundled", entry.event_id, &entry.record).is_ok_and(|name| name == seal)
+        })
+        .collect()
+}
+
 /// The earlier bundles as the full/increment decision reads them: when each
 /// ran, whether it was full, and its week's stamp from its own key.
 fn bundle_stamps(earlier: &[BundleRecord]) -> Vec<(Stamp, bool, i64)> {
@@ -2292,12 +2306,12 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         .len();
     let sha256 = sha256_file(&archive)?;
     let encrypted = scratch.join("bundle.gpg");
-    encrypt(&settings, &archive, &encrypted)?;
+    encrypt_with(&seal, &archive, &encrypted)?;
     let stored_bytes = fs::metadata(&encrypted)
         .map_err(|error| format!("{}: {error}", encrypted.display()))?
         .len();
     let back = scratch.join("bundle.back");
-    decrypt(&settings, &encrypted, &back)?;
+    decrypt_with(&seal, &encrypted, &back)?;
     if sha256_file(&back)? != sha256 {
         return Err("the encrypted bundle does not decrypt to the archive".to_string());
     }
@@ -2313,7 +2327,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
     if within_limit(held, written, stored_bytes, settings.limit_bytes) {
-        put_object(&settings, &key, &encrypted, &sha256, 0)?;
+        put_object(&settings, &key, &encrypted, &sha256, 0, &seal.name)?;
         written = written.saturating_add(stored_bytes);
         keys.push(key);
     } else {
@@ -2322,6 +2336,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let over_alert = held.saturating_add(written) > settings.alert_bytes;
     let record = json!({
         "type": "backup.bundled",
+        "sealed_with": seal.name,
         "kind": if full { "full" } else { "incremental" },
         "base_event_id": base.map(|base| base.event_id),
         "keys": keys,
