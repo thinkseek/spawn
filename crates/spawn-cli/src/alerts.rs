@@ -300,9 +300,14 @@
 //!   older Spawn typed carries
 //!   no marker (no `message.typed`) and is never one, nor is one sent while
 //!   its session's transcript had held no marker yet. Once per message;
-//!   clears when it is taken, or when its session ends with it untaken (the
-//!   execution it was typed into, or its own start's, ended). A message
-//!   whose session ended first fires nothing. Read on start (every message
+//!   clears when it is taken; else, typed, when a later message of its
+//!   session is taken (objective 138: the agent went on past it, its marker
+//!   missed; evidence `later_taken`, that command, and its `taken_at_ms`;
+//!   another session's taking counts for nothing, and an untyped message is
+//!   behind nothing the agent took); else when its session ends with it
+//!   untaken (the execution it was typed into, or its own start's, ended).
+//!   A message whose session ended first, or a later message of whose
+//!   session was taken first, fires nothing. Read on start (every message
 //!   that can be one, and the open alerts), then when the log moved (the
 //!   new commands, the pending messages due, the open alerts whose session
 //!   took a message or ended since) and when a pending one falls due.
@@ -2522,8 +2527,10 @@ times in a row)",
     }
 
     /// `message_not_taken`: a tracked message no `message.taken` names past
-    /// its bound, its session not ended with it, fires once; an open one
-    /// clears once it is taken, or once its session ended with it untaken.
+    /// its bound, its session not ended with it and no later message of its
+    /// session taken, fires once; an open one clears once it is taken, else
+    /// once a later message of its session is taken (`later_taken`), else
+    /// once its session ended with it untaken.
     /// One not due yet is pending, read again until it is taken, ends or
     /// fires; the next bound is the earliest pending one's.
     fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
@@ -2534,25 +2541,33 @@ times in a row)",
             let key = format!("message_not_taken:{id}");
             let taken = message["taken"].as_i64().unwrap_or_default();
             let ended = message["ended"].as_bool() != Some(false);
+            // A later message of its session taken (objective 138): the
+            // agent went on past it, its marker missed.
+            let later_taken = message["later_taken"].as_i64();
             if self.known.contains_key(&key) {
                 self.pending.remove(&id);
                 if !self.is_open(&key) {
                     continue;
                 }
-                if taken > 0 {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
-                    });
+                // Taken; else a later message of its session taken; else
+                // its session ended with it.
+                let evidence = if taken > 0 {
+                    json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]})
+                } else if let Some(later) = later_taken {
+                    json!({"later_taken": later, "taken_at_ms": message["later_taken_at_ms"]})
                 } else if ended {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"ended": true, "state": message["state"]}),
-                    });
-                }
+                    json!({"ended": true, "state": message["state"]})
+                } else {
+                    continue;
+                };
+                out.push(Event::Clear { key, evidence });
                 continue;
             }
-            if message["tracked"].as_bool() != Some(true) || taken > 0 || ended {
+            if message["tracked"].as_bool() != Some(true)
+                || taken > 0
+                || later_taken.is_some()
+                || ended
+            {
                 self.pending.remove(&id);
                 continue;
             }
@@ -9174,16 +9189,45 @@ connections\n";
 
         /// The transcript's line `line` took `command`.
         fn taken(store: &PostgresStore, session: &str, execution: &str, line: &str, id: u64) {
-            keyed(
-                store,
-                session,
-                execution,
-                Source::Claude,
-                &format!("{line}:taken:{id}"),
-                EventKind::MessageTaken {
-                    command_id: CommandId(id),
-                },
-            );
+            taken_at(store, session, execution, line, id);
+        }
+
+        /// [`taken`], and the time the records hold for it.
+        fn taken_at(
+            store: &PostgresStore,
+            session: &str,
+            execution: &str,
+            line: &str,
+            id: u64,
+        ) -> i64 {
+            store
+                .append(NewEvent {
+                    agent_id: AgentId::new(format!("agent_{session}")).expect("valid"),
+                    session_id: SessionId::new(format!("session_{session}")).expect("valid"),
+                    execution_id: Some(ExecutionId::new(execution.to_string()).expect("valid")),
+                    source: Source::Claude,
+                    source_event_id: Some(format!("{line}:taken:{id}")),
+                    kind: EventKind::MessageTaken {
+                        command_id: CommandId(id),
+                    },
+                })
+                .expect("append succeeds")
+                .record
+                .recorded_at
+                .0
+        }
+
+        /// The clearings among `events`, by key, in key order.
+        fn clears_of_messages(events: &[Event]) -> Vec<(String, Value)> {
+            let mut clears: Vec<(String, Value)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
+                    Event::Fire { .. } => None,
+                })
+                .collect();
+            clears.sort_by(|a, b| a.0.cmp(&b.0));
+            clears
         }
 
         fn turn_ended(store: &PostgresStore, session: &str, execution: &str, line: &str) -> i64 {
@@ -9436,8 +9480,11 @@ connections\n";
         }
 
         /// The alert fires for the two not taken (whether typed in its
-        /// evidence), once; the one taken later clears, and the session's
-        /// end clears the other; a fresh step then fires nothing.
+        /// evidence), once; the one taken later clears, and so does the deaf
+        /// one before it (objective 138: a later message of its session was
+        /// taken, `later_taken`), so the session's end clears nothing; a
+        /// fresh step then fires nothing. Before 138 the deaf one stayed open
+        /// until the session's end.
         #[test]
         fn a_message_not_taken_is_one_alert_until_taken_or_its_session_ends() {
             in_schema("messages_alert", |store| {
@@ -9482,31 +9529,205 @@ connections\n";
                 commit(&mut monitor, &fired);
                 assert!(read(&mut monitor, store).is_empty(), "once");
 
-                // The untyped one is typed and taken: its alert clears.
+                // The untyped one is typed and taken: its alert clears, and
+                // the deaf one's before it (a later message taken).
                 typed(store, "msg", MSG_EXECUTION, untyped, true);
-                taken(store, "msg", MSG_EXECUTION, "u2", untyped.0);
+                let at = taken_at(store, "msg", MSG_EXECUTION, "u2", untyped.0);
                 let cleared = read(&mut monitor, store);
-                assert!(
-                    matches!(&cleared[..], [Event::Clear { key, evidence }]
-                        if *key == format!("message_not_taken:{}", untyped.0)
-                            && evidence["taken"] == 1),
+                assert_eq!(
+                    clears_of_messages(&cleared),
+                    [
+                        (
+                            format!("message_not_taken:{}", deaf.0),
+                            json!({"later_taken": untyped.0, "taken_at_ms": at})
+                        ),
+                        (
+                            format!("message_not_taken:{}", untyped.0),
+                            json!({"taken": 1, "taken_at_ms": at})
+                        ),
+                    ],
                     "{cleared:?}"
                 );
                 commit(&mut monitor, &cleared);
 
-                // The session ends with the deaf one untaken: it clears.
+                // The session ends: nothing is left open to clear.
                 world.worker.ended(store, EndCause::Stopped);
                 let ended = read(&mut monitor, store);
-                assert!(
-                    matches!(&ended[..], [Event::Clear { key, evidence }]
-                        if *key == format!("message_not_taken:{}", deaf.0)
-                            && evidence["ended"] == true),
-                    "{ended:?}"
-                );
-                commit(&mut monitor, &ended);
+                assert!(ended.is_empty(), "{ended:?}");
                 assert!(read(&mut monitor, store).is_empty());
                 // A fresh step finds nothing to fire for an ended session.
                 assert!(read(&mut prompt_monitor(), store).is_empty());
+            });
+        }
+
+        /// A live session `name` (execution `exec_<name>_1`) whose
+        /// transcript already holds a marker: a first input typed and
+        /// taken, after the first marking loop started. Its messages from
+        /// then on are tracked.
+        fn marked_session(store: &PostgresStore, name: &'static str) -> Session {
+            let mut session = Session::new(name);
+            session.started(store);
+            store
+                .host_record(&json!({"type": "host.messages_marked", "started_at_ms": 1}))
+                .expect("the first marking loop");
+            let execution = format!("exec_{name}_1");
+            let first = input(store, name, &format!("{name}-first"), "hello");
+            typed(store, name, &execution, first, true);
+            taken(store, name, &execution, &format!("{name}-u0"), first.0);
+            session
+        }
+
+        /// The alert (fire or clear) of `id` among `events`.
+        fn message_alert(events: &[Event], id: CommandId) -> Option<&Event> {
+            events
+                .iter()
+                .find(|event| event.key() == format!("message_not_taken:{}", id.0))
+        }
+
+        /// Objective 138: a message whose marker was missed fires; two later
+        /// ones of its session taken clear it, the evidence naming the first
+        /// taking (`later_taken`, its time); a message after those, not
+        /// taken, fires and stays open, nothing later being taken; the
+        /// session's end clears it.
+        #[test]
+        fn a_message_not_taken_clears_when_a_later_one_is_taken() {
+            in_schema("messages_later_taken", |store| {
+                let mut world = marked_session(store, "later");
+                let exec = "exec_later_1";
+                let missed = input(store, "later", "missed", "a");
+                typed(store, "later", exec, missed, true);
+                let mut monitor = prompt_monitor();
+                let fired = read(&mut monitor, store);
+                assert_eq!(fires(&fired), [format!("message_not_taken:{}", missed.0)]);
+                commit(&mut monitor, &fired);
+                assert!(read(&mut monitor, store).is_empty(), "once");
+
+                // The agent goes on: two later messages, both taken before
+                // the step reads again.
+                let next = input(store, "later", "next", "b");
+                let after = input(store, "later", "after", "c");
+                typed(store, "later", exec, next, true);
+                typed(store, "later", exec, after, true);
+                let first = taken_at(store, "later", exec, "u-next", next.0);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                taken(store, "later", exec, "u-after", after.0);
+                let cleared = read(&mut monitor, store);
+                assert_eq!(
+                    clears_of_messages(&cleared),
+                    [(
+                        format!("message_not_taken:{}", missed.0),
+                        json!({"later_taken": next.0, "taken_at_ms": first})
+                    )],
+                    "{cleared:?}"
+                );
+                assert!(fires(&cleared).is_empty(), "{cleared:?}");
+                commit(&mut monitor, &cleared);
+
+                // One after those, never taken, nothing later taken: it
+                // fires and stays open.
+                let last = input(store, "later", "last", "d");
+                typed(store, "later", exec, last, true);
+                let fired = read(&mut monitor, store);
+                assert_eq!(fires(&fired), [format!("message_not_taken:{}", last.0)]);
+                commit(&mut monitor, &fired);
+                assert!(read(&mut monitor, store).is_empty(), "still open");
+                let message = store
+                    .commands_json("session_later", 10, 0)
+                    .expect("the commands");
+                let row = message
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|command| command["command_id"] == json!(last.0))
+                    .expect("the last command");
+                assert_eq!(row["message"]["not_taken"], true, "{row}");
+
+                // Its session's end clears it.
+                world.ended(store, EndCause::Stopped);
+                let ended = read(&mut monitor, store);
+                assert!(
+                    matches!(&ended[..], [Event::Clear { key, evidence }]
+                        if *key == format!("message_not_taken:{}", last.0)
+                            && evidence["ended"] == true),
+                    "{ended:?}"
+                );
+            });
+        }
+
+        /// Objective 138: a message whose later one of its session was taken
+        /// before it fell due never fires, and leaves the pending set.
+        #[test]
+        fn a_message_whose_later_one_was_taken_first_never_fires() {
+            in_schema("messages_later_first", |store| {
+                let _world = marked_session(store, "first");
+                let exec = "exec_first_1";
+                let missed = input(store, "first", "missed", "a");
+                typed(store, "first", exec, missed, true);
+                // Read within its bound: pending, nothing fired.
+                let mut monitor = Monitor::with(super::settings());
+                assert!(read(&mut monitor, store).is_empty());
+                assert!(
+                    monitor
+                        .pending
+                        .contains_key(&(i64::try_from(missed.0).expect("an id")))
+                );
+                let next = input(store, "first", "next", "b");
+                typed(store, "first", exec, next, true);
+                taken(store, "first", exec, "u-next", next.0);
+                // Due at once from here on: still nothing.
+                let mut prompt = prompt_monitor();
+                let fired = read(&mut prompt, store);
+                assert!(message_alert(&fired, missed).is_none(), "{fired:?}");
+                assert!(fired.is_empty(), "{fired:?}");
+                assert!(prompt.pending.is_empty(), "{:?}", prompt.pending);
+                // A restarted step reads it again and fires nothing either.
+                assert!(read(&mut prompt_monitor(), store).is_empty());
+            });
+        }
+
+        /// Objective 138 (rev-f R1 F1, N1): another session's later taking
+        /// neither clears an open alert nor keeps one from firing; an untyped
+        /// message fires though a later message of its session was taken
+        /// (it is behind nothing the agent took).
+        #[test]
+        fn a_later_taking_of_another_session_or_before_the_typing_counts_for_nothing() {
+            in_schema("messages_later_other", |store| {
+                let _own = marked_session(store, "own");
+                let _other = marked_session(store, "other");
+                let _behind = marked_session(store, "behind");
+                let missed = input(store, "own", "missed", "a");
+                typed(store, "own", "exec_own_1", missed, true);
+                // Another session takes a later command before the read.
+                let elsewhere = input(store, "other", "elsewhere", "b");
+                typed(store, "other", "exec_other_1", elsewhere, true);
+                taken(store, "other", "exec_other_1", "u-else", elsewhere.0);
+                // An untyped message, and a later one of its session typed
+                // and taken.
+                let untyped = input(store, "behind", "untyped", "c");
+                let next = input(store, "behind", "next", "d");
+                typed(store, "behind", "exec_behind_1", next, true);
+                taken(store, "behind", "exec_behind_1", "u-next", next.0);
+                let mut monitor = prompt_monitor();
+                let fired = read(&mut monitor, store);
+                assert_eq!(
+                    fires(&fired),
+                    [
+                        format!("message_not_taken:{}", missed.0),
+                        format!("message_not_taken:{}", untyped.0)
+                    ],
+                    "{fired:?}"
+                );
+                commit(&mut monitor, &fired);
+                // Another session takes again: the open one stays open.
+                let again = input(store, "other", "again", "e");
+                typed(store, "other", "exec_other_1", again, true);
+                taken(store, "other", "exec_other_1", "u-again", again.0);
+                // The untyped one's session takes again: it stays open.
+                let more = input(store, "behind", "more", "f");
+                typed(store, "behind", "exec_behind_1", more, true);
+                taken(store, "behind", "exec_behind_1", "u-more", more.0);
+                let read_again = read(&mut monitor, store);
+                assert!(read_again.is_empty(), "{read_again:?}");
             });
         }
 

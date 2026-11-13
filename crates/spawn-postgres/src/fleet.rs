@@ -513,7 +513,8 @@ pub(crate) const SESSION_COMMANDS: &str =
                                 spawn_command_message(k.id, k.session_id, k.action, k.state, k.succeeded,
                                                       k.created_at_ms, k.finished_at_ms, $3,
                                                       m.marked_from, m.now_ms)
-                                  - 'tracked' - 'due_ms' - 'typed' - 'ended' as message
+                                  - 'tracked' - 'due_ms' - 'typed' - 'ended'
+                                  - 'later_taken' - 'later_taken_at_ms' as message
                            from spawn_commands k,
                                 (select spawn_messages_marked_from() as marked_from,
                                         spawn_now_ms() as now_ms offset 0) m
