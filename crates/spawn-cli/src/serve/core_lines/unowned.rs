@@ -511,6 +511,7 @@ mod tests {
                 bytes,
                 reason: Reason::Idle,
             }]),
+            claimed: Vec::new(),
             servers: vec![Server {
                 name: "test".into(),
                 schemas: 3,
@@ -744,7 +745,7 @@ mod tests {
         let counted = read(&alone, None, far, Bound::DEFAULT);
         assert_eq!(counted.unowned_bytes(), json!(1), "the real root counts");
         assert_eq!(
-            super::scratch_json(&alone, Some(&counted))["refused"],
+            super::scratch_json(&alone, Some(&counted), None)["refused"],
             json!([])
         );
         let both = Plan {
@@ -753,7 +754,7 @@ mod tests {
         };
         let got = read(&both, None, far, Bound::DEFAULT);
         assert_eq!(got.unowned_bytes(), Value::Null, "not collected");
-        let answer = super::scratch_json(&both, Some(&got));
+        let answer = super::scratch_json(&both, Some(&got), None);
         assert_eq!(
             answer["refused"].as_array().map(Vec::len),
             Some(1),
@@ -770,5 +771,56 @@ mod tests {
             "{answer}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn claimed(path: &str, agent: &str, objective: &str) -> super::Claimed {
+        super::Claimed {
+            path: PathBuf::from(path),
+            claim: crate::scratch_owner::Claim {
+                agent: agent.to_string(),
+                objective: objective.to_string(),
+                created_ms: 1,
+                lease_until_ms: 2,
+                build: vec!["t/target".to_string()],
+            },
+            bytes: 30,
+            build_bytes: 20,
+        }
+    }
+
+    /// Objective 140: the claimed folders' objectives are asked once each,
+    /// and every folder's `landed` is whether the store's landed pairs hold
+    /// its objective, null when the store was not read.
+    #[test]
+    fn the_claimed_folders_objectives_are_read_once_and_landed_set() {
+        let mut got = reading(0);
+        got.claimed = vec![
+            claimed("/s/a", "rev-b", "4/140"),
+            claimed("/s/b", "rev-e", "4/140"),
+            claimed("/s/c", "rev-e", "4/141"),
+        ];
+        assert_eq!(super::claimed_pairs(Some(&got)), [(4, 140), (4, 141)]);
+        assert_eq!(super::claimed_pairs(Some(&reading(0))), []);
+        assert_eq!(super::claimed_pairs(None), []);
+        let plan = plan("/s");
+        let answer = super::scratch_json(&plan, Some(&got), Some(&[(4, 141), (5, 140)]));
+        assert_eq!(
+            answer["claimed"][0],
+            json!({
+                "path": "/s/a",
+                "agent": "rev-b",
+                "objective": "4/140",
+                "created_ms": 1,
+                "lease_until_ms": 2,
+                "bytes": 30,
+                "build_bytes": 20,
+                "landed": false,
+            })
+        );
+        let landed: Vec<Value> = (0..3).map(|at| answer["claimed"][at]["landed"].clone()).collect();
+        assert_eq!(landed, [json!(false), json!(false), json!(true)]);
+        let unread = super::scratch_json(&plan, Some(&got), None);
+        assert_eq!(unread["claimed"][2]["landed"], Value::Null, "the store was not read");
+        assert_eq!(super::scratch_json(&plan, None, None)["claimed"], json!([]));
     }
 }
