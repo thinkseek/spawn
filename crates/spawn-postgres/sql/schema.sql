@@ -5119,8 +5119,16 @@ begin
         if exists (select 1 from jsonb_object_keys(p_record) k
                     where k not in ('type', 'area', 'host', 'account', 'manifest', 'files',
                                     'unchanged', 'grown', 'whole', 'segments_written',
-                                    'segments_found', 'bytes_written')) then
-            raise exception 'a backup.stored record has type, area, host, account, manifest, files, unchanged, grown, whole, segments_written, segments_found and bytes_written, and nothing else';
+                                    'segments_found', 'bytes_written', 'sealed_with')) then
+            raise exception 'a backup.stored record has type, area, host, account, manifest, files, unchanged, grown, whole, segments_written, segments_found, bytes_written and optionally sealed_with, and nothing else';
+        end if;
+        -- The key that sealed the run's objects (objective 115): optional
+        -- (a record without it is taken as before), and when present only
+        -- a key's name, never anything of the key.
+        if p_record ? 'sealed_with'
+           and (jsonb_typeof(p_record -> 'sealed_with') is distinct from 'string'
+                or p_record ->> 'sealed_with' !~ '^k[1-9][0-9]*$') then
+            raise exception 'a backup.stored record''s sealed_with, when present, is a key''s name: a string k1, k2, ...';
         end if;
         if p_record ->> 'area' is null or p_record ->> 'area' not in ('transcripts', 'sessions')
            or jsonb_typeof(p_record -> 'host') is distinct from 'string'

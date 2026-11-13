@@ -13,11 +13,17 @@
 //! at each of the three alignments in the standard and URL-safe alphabets
 //! (the characters that do not depend on the neighbouring bytes), and as hex
 //! in both cases. A form under 6 bytes is not used; at one place the
-//! longest form wins.
+//! longest form wins, and every form that starts inside a match and runs
+//! past its end joins it, until none does: the union is one
+//! `[SECRET:NAME]`, named by the form that matched first. A value
+//! transformed another way (base64 wrapped across lines as MIME does,
+//! reversed, split, encrypted) is not caught (design section 4).
 //!
 //! - `spawn mask --values <file>`: stdin to stdout through the mask as it
 //!   streams, the last bytes of each read (as many as the longest form,
-//!   less one) held for the next, so a value split across reads is caught.
+//!   less one, or a whole span still being joined) held for the next, so a
+//!   value split across reads is caught and the output does not depend on
+//!   where the input is cut.
 //! - `spawn mask-hook --values <file>`: a Claude Code PostToolUse hook. When
 //!   `tool_response` holds a form of a value, it prints the response with
 //!   every string masked as `updatedToolOutput`; otherwise nothing.
@@ -63,6 +69,9 @@ pub(crate) struct Mask {
 pub(crate) fn read_values(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let shown = path.display();
     let meta = std::fs::metadata(path).map_err(|error| format!("{shown}: cannot read: {error}"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown}: not a file"));
+    }
     {
         use std::os::unix::fs::PermissionsExt as _;
         if meta.permissions().mode() & 0o077 != 0 {
@@ -238,6 +247,25 @@ impl Mask {
             .map(|(form, name)| (form.len(), name.as_str()))
     }
 
+    /// The end of the span that starts with a match at `data[start..first]`:
+    /// every form that starts inside the span and runs past its end extends
+    /// it. `None` when that cannot be decided yet: a place inside the span
+    /// has less than the longest form after it and the input has not ended.
+    fn span_end(&self, data: &[u8], start: usize, first: usize, end: bool) -> Option<usize> {
+        let mut span_end = first;
+        let mut j = start + 1;
+        while j < span_end {
+            if !end && data.len() - j < self.longest {
+                return None;
+            }
+            if let Some((length, _)) = self.at(data, j) {
+                span_end = span_end.max(j + length);
+            }
+            j += 1;
+        }
+        Some(span_end)
+    }
+
     /// Mask `data` into `out`, as far as it can decide: all of it at the
     /// end, else up to where a form could still run past what is there.
     /// Returns how many bytes it took.
@@ -248,8 +276,11 @@ impl Mask {
                 break;
             }
             if let Some((length, name)) = self.at(data, at) {
+                let Some(span_end) = self.span_end(data, at, at + length, end) else {
+                    break;
+                };
                 out.extend_from_slice(format!("[SECRET:{name}]").as_bytes());
-                at += length;
+                at = span_end;
             } else {
                 out.push(data[at]);
                 at += 1;
@@ -302,10 +333,16 @@ fn values_flag(arguments: &[String], usage: &str) -> Result<String, String> {
     }
 }
 
+/// `spawn mask`'s usage, with what it does not catch.
+const MASK_USAGE: &str = "usage: spawn mask --values <file>\n\
+    stdin to stdout with every known form of each value (plain, JSON-escaped, URL-encoded,\n\
+    base64, hex) replaced by [SECRET:NAME]. Not masked: a value transformed another way,\n\
+    such as base64 wrapped across lines (MIME, 76 columns), reversed, split or encrypted.";
+
 /// `spawn mask --values <file>`: exit 2, having printed nothing, when the
 /// values file cannot be used.
 pub(crate) fn mask_command(arguments: &[String]) -> Result<i32, String> {
-    let path = values_flag(arguments, "usage: spawn mask --values <file>")?;
+    let path = values_flag(arguments, MASK_USAGE)?;
     let mask = match read_values(Path::new(&path)) {
         Ok(values) => Mask::new(&values),
         Err(error) => {
@@ -590,5 +627,85 @@ mod tests {
                 "{reply}"
             );
         }
+    }
+
+    const BB_A: &[u8] = b"made-up-AAAA-0123456789abcdefghij";
+    const BB_C: &[u8] = b"PREFIX-made-up-AAAA";
+
+    fn hex(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|byte| format!("{byte:02x}").into_bytes())
+            .collect()
+    }
+
+    /// `text` masked by `mask` in two reads cut at `cut`.
+    fn cut_in_two(mask: &Mask, text: &[u8], cut: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut held = text[..cut].to_vec();
+        let taken = mask.step(&held, false, &mut out);
+        held.drain(..taken);
+        held.extend_from_slice(&text[cut..]);
+        mask.step(&held, true, &mut out);
+        out
+    }
+
+    #[test]
+    fn overlapping_values_are_masked_as_one_span_however_the_input_is_cut() {
+        let a = ("BB_A".to_string(), BB_A.to_vec());
+        let c = ("BB_C".to_string(), BB_C.to_vec());
+        for values in [[a.clone(), c.clone()], [c, a]] {
+            let mask = Mask::new(&values);
+            for overlap in [
+                [b"PREFIX-".as_slice(), BB_A].concat(),
+                hex(&[b"PREFIX-".as_slice(), BB_A].concat()),
+            ] {
+                let text = [b"x ".as_slice(), &overlap, b" y"].concat();
+                assert_eq!(mask.bytes(&text), b"x [SECRET:BB_C] y");
+                for cut in 0..=text.len() {
+                    assert_eq!(
+                        cut_in_two(&mask, &text, cut),
+                        b"x [SECRET:BB_C] y",
+                        "cut at {cut}"
+                    );
+                }
+                let mut streamed = Vec::new();
+                mask.stream(&mut text.as_slice(), &mut streamed)
+                    .expect("stream");
+                assert_eq!(streamed, b"x [SECRET:BB_C] y");
+            }
+            assert_eq!(
+                mask.text("in PREFIX-made-up-AAAA-0123456789abcdefghij-and made-up-AAAA-0123456789abcdefghij."),
+                "in [SECRET:BB_C]-and [SECRET:BB_A]."
+            );
+        }
+    }
+
+    #[test]
+    fn the_hook_masks_an_overlap_whole() {
+        let file = File::new(
+            "BB_A=made-up-AAAA-0123456789abcdefghij\nBB_C=PREFIX-made-up-AAAA\n",
+            0o600,
+        );
+        let event = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                           "tool_response": {"stdout": "PREFIX-made-up-AAAA-0123456789abcdefghij",
+                                             "stderr": "", "interrupted": false}})
+        .to_string();
+        let answer = hook_reply(&file.0, Ok(event.into_bytes())).expect("an answer");
+        assert_eq!(
+            updated(&answer),
+            json!({"stdout": "[SECRET:BB_C]", "stderr": "", "interrupted": false})
+        );
+        assert!(!answer.contains("0123456789"), "{answer}");
+    }
+
+    #[test]
+    fn a_directory_is_not_a_file() {
+        let dir = crate::storage::tests::scratch("mask-dir");
+        let values = dir.join("values");
+        std::fs::create_dir(&values).expect("mkdir");
+        let error = read_values(&values).expect_err("a directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(error, format!("{}: not a file", values.display()));
     }
 }

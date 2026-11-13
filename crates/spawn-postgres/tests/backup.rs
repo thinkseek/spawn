@@ -213,6 +213,68 @@ fn a_store_run_is_a_backup_stored_record_of_fixed_shape() {
     );
 }
 
+/// A `backup.stored` record may name the key that sealed its objects
+/// (`sealed_with`, objective 115) and needs not: a key's name ("k2", "k12")
+/// is accepted, a record without it is accepted as before, and anything
+/// else under that name (another shape, a number, null) refuses the whole
+/// record, as does another field beside a good `sealed_with`.
+#[test]
+fn a_store_run_may_name_the_key_that_sealed_it() {
+    let (store, schema) = store("backup_sealed_with");
+    let mut client = admin(&schema);
+    let sealed = |value: Value| {
+        let mut record = stored();
+        record["sealed_with"] = value;
+        record
+    };
+    store.backup_record(&stored()).expect("a record without sealed_with");
+    for name in ["k2", "k12"] {
+        store
+            .backup_record(&sealed(json!(name)))
+            .unwrap_or_else(|e| panic!("sealed_with {name}: {e}"));
+    }
+    assert_eq!(control_records(&mut client, "backup.stored"), 3);
+    let mut extra = sealed(json!("k2"));
+    extra["sealed_by"] = json!("k2");
+    for (what, record) in [
+        ("another shape", sealed(json!("x7"))),
+        ("key zero", sealed(json!("k0"))),
+        ("a trailing space", sealed(json!("k2 "))),
+        ("a number", sealed(json!(2))),
+        ("null", sealed(Value::Null)),
+        ("another field beside sealed_with", extra),
+    ] {
+        let refused = store
+            .backup_record(&record)
+            .expect_err(&format!("{what}: {record}"));
+        let message = refused.to_string();
+        if what.starts_with("another field") {
+            assert!(message.contains("nothing else"), "{what}: {message}");
+        } else {
+            assert!(message.contains("a key's name"), "{what}: {message}");
+            assert!(!message.contains("x7") && !message.contains("k0"), "{message}");
+        }
+    }
+    assert_eq!(
+        control_records(&mut client, "backup.stored"),
+        3,
+        "nothing refused was recorded"
+    );
+    let names: Vec<Option<String>> = client
+        .query(
+            "select kind -> 'detail' -> 'record' ->> 'sealed_with' from spawn_events
+              where session_id = 'session_control' and event_name = 'control.recorded'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'backup.stored'
+              order by id",
+            &[],
+        )
+        .expect("read the stored records")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(names, [None, Some("k2".into()), Some("k12".into())]);
+}
+
 fn drilled(kind: &str) -> Value {
     json!({
         "type": kind, "ok": true, "reason": "",
