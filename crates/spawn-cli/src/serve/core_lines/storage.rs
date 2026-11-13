@@ -173,24 +173,7 @@ mod tests {
         assert_eq!(guardrails[7]["unit"], "bytes_per_day");
         assert_eq!(guardrails[7].get("store"), None);
         assert_eq!(storage_line["north_star"].get("measuring_since_ms"), None);
-        // Still measuring: days left say from when, and no store is said.
-        let measuring = lines(
-            &json!({"free_bytes": 104, "days_left": null,
-                    "days_left_measuring_since_ms": 86_400_000,
-                    "disk_fall_bytes_per_day": null, "grew_most": null}),
-            &Value::Null,
-            &Observed::default(),
-            Value::Null,
-            Vec::new(),
-        );
-        let days = figure_json(&measuring[1].north_star, None);
-        assert_eq!(days["measuring_since_ms"], 86_400_000);
-        assert_eq!(days["state"], "not_collected");
-        let grew = figure_json(&measuring[1].guardrails[8], None);
-        assert_eq!(
-            (grew["value"].clone(), grew.get("store")),
-            (Value::Null, None)
-        );
+        still_measuring();
         // No log size: no ratio; no readable test database: none.
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
@@ -214,5 +197,27 @@ mod tests {
         assert_eq!(view["lines"][3]["guardrails"], json!([]));
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
+    }
+
+    /// Still measuring (objective 141): days left say from when, and no
+    /// store is said.
+    fn still_measuring() {
+        let measuring = lines(
+            &json!({"free_bytes": 104, "days_left": null,
+                    "days_left_measuring_since_ms": 86_400_000,
+                    "disk_fall_bytes_per_day": null, "grew_most": null}),
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
+        let days = figure_json(&measuring[1].north_star, None);
+        assert_eq!(days["measuring_since_ms"], 86_400_000);
+        assert_eq!(days["state"], "not_collected");
+        let grew = figure_json(&measuring[1].guardrails[8], None);
+        assert_eq!(
+            (grew["value"].clone(), grew.get("store")),
+            (Value::Null, None)
+        );
     }
 }
