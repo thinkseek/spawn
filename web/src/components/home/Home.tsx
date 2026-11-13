@@ -8,11 +8,14 @@ import { newKey } from "../../input";
 import { relativeTime } from "../../format";
 import type { AgentsNow, Digest, MissionsToday, NeedItem, NoteRow, NotesShown } from "../../home";
 import { awayFrom, needsSummary, noWorkText, quietText } from "../../home";
-import { Card, CardHeader, FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
+import { HomeCard } from "../aui/HomeCard";
+import { Badge, Button, Card, EmptyState } from "../aui/kit";
+import { FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
 
 // The home page's sections (design-ui-information.md §3, layout A): what
 // needs you, missions today, agents working now, the supervisor's latest
-// lines, and today as a digest. Each reads a model from home.ts.
+// lines, and today as a digest. Each reads a model from home.ts, and each
+// sits on affectUI's card, its badges and buttons the kit's (objective 120).
 
 /** What a resume from the page came to. */
 type Resumed = { state: "idle" } | { state: "sending" } | { state: "done" } | { state: "refused"; why: string };
@@ -48,19 +51,17 @@ function ResumeButton({ resume }: { resume: { mission: number; halt: number } })
           {resumed.why}
         </span>
       )}
-      <button
-        type="button"
+      <Button
+        variant="secondary"
+        size="sm"
         onClick={send}
         disabled={resumed.state === "sending" || resumed.state === "done"}
+        loading={resumed.state === "sending"}
         title={`Resume mission #${resume.mission} from this halt`}
-        className={cx(
-          "inline-flex h-7 shrink-0 items-center gap-1 rounded-control px-2 text-caption font-medium text-foreground shadow-hairline hover:bg-surface-hover disabled:opacity-60",
-          FOCUS_RING,
-        )}
+        icon={<Play size={12} aria-hidden="true" />}
       >
-        <Play size={12} aria-hidden="true" />
         {resumed.state === "sending" ? "Resuming" : resumed.state === "done" ? "Resumed" : "Resume"}
-      </button>
+      </Button>
     </span>
   );
 }
@@ -73,8 +74,9 @@ function CopyCommand({ command }: { command: string }) {
       <code className="min-w-0 truncate rounded-chip bg-inset px-1.5 py-0.5 font-mono text-micro text-foreground select-all">
         {command}
       </code>
-      <button
-        type="button"
+      <Button
+        variant="ghost"
+        size="sm"
         onClick={() => {
           void navigator.clipboard?.writeText(command).then(
             () => {
@@ -85,14 +87,10 @@ function CopyCommand({ command }: { command: string }) {
           );
         }}
         title="Copy the command"
-        className={cx(
-          "inline-flex h-6 shrink-0 items-center gap-1 rounded-chip px-1.5 text-micro text-muted-foreground hover:bg-surface-hover hover:text-foreground",
-          FOCUS_RING,
-        )}
+        icon={<Copy size={11} aria-hidden="true" />}
       >
-        <Copy size={11} aria-hidden="true" />
         {copied ? "Copied" : "Copy"}
-      </button>
+      </Button>
     </span>
   );
 }
@@ -121,22 +119,20 @@ export function NeedsYou({ items, onOpenAgent }: { items: NeedItem[]; onOpenAgen
   const act = items.filter((item) => item.tone === "act").length;
   if (items.length === 0) {
     return (
-      <Card className="flex items-center gap-2 px-4 py-3">
-        <CircleCheck size={14} className="shrink-0 text-success" aria-hidden="true" />
-        <h2 className="text-label font-medium text-foreground">Nothing needs you.</h2>
+      <Card as="section">
+        <EmptyState bare title="Nothing needs you." icon={<CircleCheck className="text-success" />} />
       </Card>
     );
   }
   return (
-    <Card>
-      <CardHeader
-        icon={<CircleAlert size={14} className={act ? "text-destructive" : undefined} />}
-        title="Needs you"
-        meta={<span className="tnum">{needsSummary(items)}</span>}
-      />
+    <HomeCard
+      icon={<CircleAlert size={14} className={act ? "text-destructive" : undefined} />}
+      title="Needs you"
+      meta={<span className="tnum text-caption text-muted-foreground">{needsSummary(items)}</span>}
+    >
       <ul className="divide-y divide-surface-border">
         {items.map((item) => (
-          <li key={item.key} className="flex min-w-0 items-start gap-3 px-4 py-2.5">
+          <li key={item.key} className="flex min-w-0 flex-wrap items-start gap-x-3 gap-y-2 py-2.5 first:pt-0 last:pb-0">
             {item.tone === "act" ? (
               <Flag size={13} className="mt-0.5 shrink-0 text-destructive" aria-label="to act on" />
             ) : (
@@ -159,38 +155,34 @@ export function NeedsYou({ items, onOpenAgent }: { items: NeedItem[]; onOpenAgen
                 </p>
               )}
             </div>
-            <div className="flex shrink-0 items-center gap-2 self-center">
+            <div className="flex min-w-0 max-w-full shrink-0 flex-wrap items-center gap-2 self-center">
               {item.command && <CopyCommand command={item.command} />}
               {item.resume && (
                 <ResumeButton key={`${item.resume.mission}:${item.resume.halt}`} resume={item.resume} />
               )}
               {item.session && (
-                <button
-                  type="button"
+                <Button
+                  variant="secondary"
+                  size="sm"
                   onClick={() => onOpenAgent(item.session ?? "")}
-                  className={cx(
-                    "inline-flex h-7 items-center gap-1 rounded-control px-2 text-caption font-medium text-foreground shadow-hairline hover:bg-surface-hover",
-                    FOCUS_RING,
-                  )}
+                  iconRight={<ArrowRight size={12} aria-hidden="true" />}
                 >
                   Open
-                  <ArrowRight size={12} aria-hidden="true" />
-                </button>
+                </Button>
               )}
             </div>
           </li>
         ))}
       </ul>
-    </Card>
+    </HomeCard>
   );
 }
 
 export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onOpen: () => void }) {
   return (
-    <Card>
-      <CardHeader icon={<Target size={14} />} title="Missions" meta={<span>today</span>} />
+    <HomeCard icon={<Target size={14} />} title="Missions" meta={<span className="text-caption text-muted-foreground">today</span>}>
       {model.rows.length === 0 ? (
-        <p className="px-4 py-3 text-caption text-muted-foreground">{noWorkText(model)}</p>
+        <p className="text-caption text-muted-foreground">{noWorkText(model)}</p>
       ) : (
         <ul className="divide-y divide-surface-border">
           {model.rows.map((row) => (
@@ -198,13 +190,13 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
               <button
                 type="button"
                 onClick={onOpen}
-                className={cx("block w-full px-4 py-2.5 text-left hover:bg-surface-hover", FOCUS_RING_INSET)}
+                className={cx("-mx-2 block w-[calc(100%+1rem)] rounded-control px-2 py-2.5 text-left hover:bg-surface-hover", FOCUS_RING_INSET)}
               >
                 <div className="flex min-w-0 items-baseline gap-2">
                   <span className="tnum shrink-0 text-caption text-faint-foreground">#{row.id}</span>
                   <span className="shrink-0 text-label font-semibold text-foreground">{row.name}</span>
-                  {row.paused && <span className="shrink-0 text-caption font-medium text-muted-foreground">paused</span>}
-                  {row.halted && <span className="shrink-0 text-caption font-medium text-destructive">halted</span>}
+                  {row.paused && <Badge tone="neutral">paused</Badge>}
+                  {row.halted && <Badge tone="danger">halted</Badge>}
                   <span className="tnum ml-auto shrink-0 text-caption text-muted-foreground">
                     {row.landedToday} landed today
                   </span>
@@ -239,7 +231,7 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
         </ul>
       )}
       {(model.quiet.length > 0 || model.closed > 0) && (
-        <p className="border-t border-surface-border px-4 py-2 text-caption text-faint-foreground">
+        <p className="border-t border-surface-border pt-2 text-caption text-faint-foreground">
           {model.quiet.length > 0 && (
             <>
               Nothing open: {quietText(model.quiet)}
@@ -249,16 +241,15 @@ export function MissionsTodayCard({ model, onOpen }: { model: MissionsToday; onO
           {model.closed > 0 && `${model.closed} closed`}
         </p>
       )}
-    </Card>
+    </HomeCard>
   );
 }
 
 export function AgentsNowCard({ model, onOpenAgent }: { model: AgentsNow; onOpenAgent: (session: string) => void }) {
   return (
-    <Card>
-      <CardHeader icon={<Bot size={14} />} title="Working now" meta={<span className="tnum">{model.working.length}</span>} />
+    <HomeCard icon={<Bot size={14} />} title="Working now" meta={<Badge tone="neutral" count={model.working.length} />}>
       {model.working.length === 0 ? (
-        <p className="px-4 py-3 text-caption text-muted-foreground">No agent is working.</p>
+        <p className="text-caption text-muted-foreground">No agent is working.</p>
       ) : (
         <ul className="divide-y divide-surface-border">
           {model.working.map((agent) => (
@@ -267,7 +258,7 @@ export function AgentsNowCard({ model, onOpenAgent }: { model: AgentsNow; onOpen
                 type="button"
                 onClick={() => onOpenAgent(agent.session_id)}
                 className={cx(
-                  "grid w-full grid-cols-[minmax(0,14rem)_minmax(0,1fr)_minmax(0,16rem)] items-baseline gap-3 px-4 py-2 text-left hover:bg-surface-hover",
+                  "-mx-2 grid w-[calc(100%+1rem)] grid-cols-1 items-baseline gap-x-3 rounded-control px-2 py-2 text-left hover:bg-surface-hover sm:grid-cols-[minmax(0,14rem)_minmax(0,1fr)_minmax(0,16rem)]",
                   FOCUS_RING_INSET,
                 )}
               >
@@ -275,7 +266,7 @@ export function AgentsNowCard({ model, onOpenAgent }: { model: AgentsNow; onOpen
                 <span className="truncate text-caption text-muted-foreground" title={agent.task ?? undefined}>
                   {agent.task ?? "no task"}
                 </span>
-                <span className="tnum truncate text-right text-caption text-foreground">
+                <span className="tnum truncate text-caption text-foreground sm:text-right">
                   {agent.doing}
                   {agent.since_ms !== null && (
                     <span className="text-faint-foreground"> · {sinceText(agent.since_ms)}</span>
@@ -287,7 +278,7 @@ export function AgentsNowCard({ model, onOpenAgent }: { model: AgentsNow; onOpen
         </ul>
       )}
       {model.idle.length > 0 && (
-        <p className="border-t border-surface-border px-4 py-2 text-caption text-faint-foreground">
+        <p className="border-t border-surface-border pt-2 text-caption text-faint-foreground">
           Idle:{" "}
           {model.idle.map((agent, index) => (
             <span key={agent.session_id}>
@@ -304,7 +295,7 @@ export function AgentsNowCard({ model, onOpenAgent }: { model: AgentsNow; onOpen
           ))}
         </p>
       )}
-    </Card>
+    </HomeCard>
   );
 }
 
@@ -329,29 +320,23 @@ export function SupervisorNotes({
     model.earlier > 0 ? `${model.earlier} earlier` : null,
   ].filter((part): part is string => part !== null);
   return (
-    <Card>
-      <CardHeader
-        icon={<MessageSquareText size={14} />}
-        title="From the supervisor"
-        meta={
-          (counts.length > 0 || model.settled > 0) && (
-            <button
-              type="button"
-              onClick={() => setOpen((value) => !value)}
-              aria-expanded={open}
-              className={cx("rounded-chip px-1 text-caption text-muted-foreground hover:text-foreground", FOCUS_RING)}
-            >
-              {open
-                ? "Show the latest"
-                : counts.length > 0
-                  ? counts.join(" · ")
-                  : `${model.settled} settled`}
-            </button>
-          )
-        }
-      />
+    <HomeCard
+      icon={<MessageSquareText size={14} />}
+      title="From the supervisor"
+      meta={
+        (counts.length > 0 || model.settled > 0) && (
+          <Button variant="ghost" size="sm" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
+            {open
+              ? "Show the latest"
+              : counts.length > 0
+                ? counts.join(" · ")
+                : `${model.settled} settled`}
+          </Button>
+        )
+      }
+    >
       {shown.length === 0 ? (
-        <p className="px-4 py-2.5 text-caption text-muted-foreground">Nothing new in the last 6 hours.</p>
+        <p className="text-caption text-muted-foreground">Nothing new in the last 6 hours.</p>
       ) : (
         <ul className="divide-y divide-surface-border">
           {shown.map((note, index) => {
@@ -359,7 +344,7 @@ export function SupervisorNotes({
             const states = row ? row.tasks : (note as NotesShown["shown"][number]).taskStates;
             const earlier = row !== null && !row.current;
             return (
-              <li key={`${note.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 px-4 py-2">
+              <li key={`${note.at_ms}-${index}`} className="flex min-w-0 items-baseline gap-3 py-2 first:pt-0">
                 <div className="min-w-0 flex-1">
                   <p
                     className={cx(
@@ -374,20 +359,18 @@ export function SupervisorNotes({
                   {(row?.settled || earlier || states) && (
                     <p className="mt-0.5 text-micro text-faint-foreground">
                       {earlier && (
-                        <span
-                          className="mr-1.5 rounded-chip bg-surface-hover px-1 font-medium text-muted-foreground"
+                        <Badge
+                          tone="neutral"
+                          className="mr-1.5"
                           title="Said in an earlier turn: the supervisor's newest block does not repeat it"
                         >
                           earlier
-                        </span>
+                        </Badge>
                       )}
                       {row?.settled && (
-                        <span
-                          className="mr-1.5 rounded-chip bg-surface-hover px-1 font-medium text-muted-foreground"
-                          title="Its tasks have all ended: nothing is left to review"
-                        >
+                        <Badge tone="neutral" className="mr-1.5" title="Its tasks have all ended: nothing is left to review">
                           settled
-                        </span>
+                        </Badge>
                       )}
                       {states}
                     </p>
@@ -399,8 +382,8 @@ export function SupervisorNotes({
           })}
         </ul>
       )}
-      <div className="border-t border-surface-border px-4 py-2.5">{talk}</div>
-    </Card>
+      <div className="border-t border-surface-border pt-3">{talk}</div>
+    </HomeCard>
   );
 }
 
@@ -502,13 +485,13 @@ export function DigestCard({ digest, back }: { digest: Digest; back: number | nu
   // while they read.
   const title = digest.away ? `Since you were away · ${awaySpan((back ?? Date.now()) - digest.since_ms)}` : "Today";
   return (
-    <Card>
+    <Card as="section">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         title={digest.away ? `Since ${new Date(digest.since_ms).toLocaleString()}, when this page was last seen` : "The last 24 hours"}
-        className={cx("flex h-10 w-full items-center gap-2 px-4 text-left hover:bg-surface-hover", FOCUS_RING_INSET, open && "border-b border-surface-border")}
+        className={cx("-m-2 flex min-h-10 w-[calc(100%+1rem)] items-center gap-2 rounded-control px-2 text-left hover:bg-surface-hover", FOCUS_RING_INSET)}
       >
         <History size={14} className="shrink-0 text-faint-foreground" aria-hidden="true" />
         <span className="shrink-0 text-label font-medium text-foreground">{title}</span>
@@ -519,9 +502,9 @@ export function DigestCard({ digest, back }: { digest: Digest; back: number | nu
       </button>
       {open &&
         (digest.bands.length === 0 ? (
-          <p className="px-4 py-3 text-caption text-faint-foreground">Nothing happened in this window.</p>
+          <p className="border-t border-surface-border pt-3 text-caption text-faint-foreground">Nothing happened in this window.</p>
         ) : (
-          <div className="max-h-96 overflow-y-auto">
+          <div className="-mx-4 -mb-4 max-h-96 overflow-y-auto border-t border-surface-border pb-2">
             {digest.bands.map((band) => (
               <section key={band.label} aria-label={band.label}>
                 <h3 className="sticky top-0 bg-surface px-4 pt-2.5 pb-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
