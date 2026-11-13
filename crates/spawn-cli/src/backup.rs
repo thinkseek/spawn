@@ -1501,10 +1501,8 @@ fn gpg_with(
     Ok(())
 }
 
-fn encrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
-    gpg(settings, false, input, out)
-}
-
+/// An object opened with the store's key file (`spawn store`, which seals
+/// with the sealing key's file and reads with it until objective 116).
 fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
     gpg(settings, true, input, out)
 }
