@@ -5121,6 +5121,15 @@ mod tests {
             "cd; cd .claude; less settings.json",
             "python3 -c \"open('/home/bb/.claude/settings.local.json')\"",
             "strings ~/.local/share/spawn-rsi/spawn.env.bak-relay",
+            "cat $PGPASSFILE",
+            "cat ~/.pgpass",
+            "ps x",
+            "cd /tmp && ps x",
+            "uptime; ps x",
+            "echo $(ps xww)",
+            "pgrep -f cargo | ps x",
+            "uptime && top -b -n 1 -c",
+            "echo $(top -b -n 1 -c)",
         ] {
             assert!(refused(command), "{command}");
         }
@@ -5145,6 +5154,10 @@ mod tests {
             "top -b -n 1",
             "pstree -p",
             "cd env && ls",
+            "ls groups x",
+            "cargo test -- steps x",
+            "jq '.ps x' report.json",
+            "systemctl --user stop x; sh -c true",
         ] {
             assert!(!refused(command), "{command}");
             for part in parts(command) {
