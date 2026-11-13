@@ -340,6 +340,7 @@ fn marker_runs(entry: &Path, runs: &dyn Fn(u32, u64) -> bool) -> Option<bool> {
 /// saying whether a marker's process still runs. `Err` (why) when the walk
 /// goes past `bound` (no partial count) or the root is refused
 /// ([`refused_root`]).
+#[cfg(test)]
 pub(super) fn unowned_in(
     root: &Path,
     excludes: &[PathBuf],
@@ -455,6 +456,7 @@ pub(super) fn refused_roots(roots: &[PathBuf]) -> Vec<(PathBuf, String)> {
 /// when a root's walk goes past its bound. A root that cannot be read has
 /// none, and so has a refused one ([`refused_root`]): its error is reported
 /// and it counts nothing.
+#[cfg(test)]
 pub(super) fn unowned(
     roots: &[PathBuf],
     excludes: &[PathBuf],
