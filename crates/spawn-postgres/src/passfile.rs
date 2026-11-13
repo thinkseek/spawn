@@ -257,7 +257,11 @@ mod tests {
             password_in("h\\:x:*:*:*:pw", &target("h:x", false)).as_deref(),
             Some("pw")
         );
-        assert_eq!(fields("a:b:c:d:e:f").len(), 5, "the password keeps its colons");
+        assert_eq!(
+            fields("a:b:c:d:e:f").len(),
+            5,
+            "the password keeps its colons"
+        );
         assert_eq!(
             password_in("*:*:*:*:e:f", &target("h", false)).as_deref(),
             Some("e:f")
@@ -316,12 +320,13 @@ mod tests {
             .parse()
             .expect("parses");
         let got = Target::of(&config);
-        assert_eq!((got.host.as_str(), got.default_socket), ("db.example", false));
+        assert_eq!(
+            (got.host.as_str(), got.default_socket),
+            ("db.example", false)
+        );
         assert_eq!(got.port, "6000");
         assert_eq!((got.database.as_str(), got.user.as_str()), ("spawn", "ckl"));
-        let config: postgres::Config = "host=/var/run/postgresql user=ckl"
-            .parse()
-            .expect("parses");
+        let config: postgres::Config = "host=/var/run/postgresql user=ckl".parse().expect("parses");
         let got = Target::of(&config);
         assert!(got.default_socket);
         assert_eq!(got.port, "5432");

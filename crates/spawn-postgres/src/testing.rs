@@ -118,13 +118,12 @@ impl Drop for TestSchema {
             );
             return;
         }
-        let dropped =
-            client(&self.url).and_then(|mut client| {
-                client.batch_execute(&format!(
-                    "set lock_timeout = '5s'; drop schema if exists {} cascade",
-                    self.name
-                ))
-            });
+        let dropped = client(&self.url).and_then(|mut client| {
+            client.batch_execute(&format!(
+                "set lock_timeout = '5s'; drop schema if exists {} cascade",
+                self.name
+            ))
+        });
         if let Err(error) = dropped {
             eprintln!("cannot drop the test schema {}: {error}", self.name);
         }
