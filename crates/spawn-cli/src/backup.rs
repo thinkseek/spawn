@@ -3932,4 +3932,217 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             Ok(k2.file)
         );
     }
+
+    /// Objective 136: a made-up bucket's settings, for a config read and
+    /// never sent.
+    fn made_up_r2_settings(seal: Option<&str>) -> Settings {
+        Settings {
+            root: "/made-up".into(),
+            key_file: "/made-up/backup.key.k1".into(),
+            seal: seal.map_or_else(
+                || Err("no sealing key in this test".to_string()),
+                |name| {
+                    Ok(super::Key {
+                        name: name.to_string(),
+                        file: format!("/made-up/backup.key.{name}").into(),
+                    })
+                },
+            ),
+            r2: R2 {
+                endpoint: "https://made-up.r2.example".to_string(),
+                bucket: "made-up-store".to_string(),
+                access_key: "made-up-access-id-136".to_string(),
+                secret_key: MADE_UP_SECRET.to_string(),
+            },
+            pg_bin: None,
+            compress: "zstd:9".to_string(),
+            transcript_days: 14,
+            limit_bytes: 1,
+            alert_bytes: 1,
+            prefix: String::new(),
+            drill_url: None,
+        }
+    }
+
+    /// A config's `header = "Name: value"` lines, as (lower-cased name,
+    /// value), in order.
+    fn config_headers(config: &str) -> Vec<(String, String)> {
+        config
+            .lines()
+            .filter_map(|line| {
+                let quoted = line.strip_prefix("header = \"")?.strip_suffix('"')?;
+                let (name, value) = quoted.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect()
+    }
+
+    /// SigV4's canonical request for a GET of `url` with the config's
+    /// headers: the query's parameters sorted by name, every header signed,
+    /// and the payload hash `x-amz-content-sha256` names (as an s3 signer
+    /// takes it). Returns it with the query as sent.
+    fn canonical_request(url: &str, config: &str) -> (String, String) {
+        let rest = url.split_once("://").expect("scheme").1;
+        let (host, path_and_query) = rest.split_once('/').expect("path");
+        let (path, sent) = path_and_query
+            .split_once('?')
+            .unwrap_or((path_and_query, ""));
+        let mut params: Vec<(&str, &str)> = sent
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+            .collect();
+        params.sort_unstable();
+        let canonical_query = params
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut headers = config_headers(config);
+        headers.push(("host".to_string(), host.to_string()));
+        headers.sort();
+        let payload = headers
+            .iter()
+            .find(|(name, _)| name == "x-amz-content-sha256")
+            .map_or("(no payload hash)", |(_, value)| value.as_str())
+            .to_string();
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{value}\n"))
+            .collect();
+        let signed = headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        (
+            format!("GET\n/{path}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload}"),
+            sent.to_string(),
+        )
+    }
+
+    /// Objective 136: both listings' queries, first page and later, with
+    /// and without a prefix, are already in SigV4's sorted order (a curl
+    /// that signs the query as written signs what the bucket checks), and
+    /// the payload hash signed is UNSIGNED-PAYLOAD, from the config's header.
+    #[test]
+    fn a_listing_query_is_sent_sorted_and_signs_an_unsigned_payload() {
+        use super::{curl_config, listing_query};
+        let settings = made_up_r2_settings(None);
+        let token = "1/made up+token=";
+        let cases = [
+            (None, None, "?list-type=2&max-keys=1000"),
+            (
+                None,
+                Some(token),
+                "?continuation-token=1%2Fmade%20up%2Btoken%3D&list-type=2&max-keys=1000",
+            ),
+            (
+                Some("store/manifests/"),
+                None,
+                "?list-type=2&max-keys=1000&prefix=store%2Fmanifests%2F",
+            ),
+            (
+                Some("store/manifests/"),
+                Some(token),
+                "?continuation-token=1%2Fmade%20up%2Btoken%3D&list-type=2&max-keys=1000\
+&prefix=store%2Fmanifests%2F",
+            ),
+        ];
+        for (prefix, token, expected) in cases {
+            let query = listing_query(prefix, token);
+            assert_eq!(query, expected, "{prefix:?} {token:?}");
+            let url = settings.r2.url(&query);
+            let config = curl_config(
+                &settings,
+                &url,
+                "",
+                std::path::Path::new("/made-up/body"),
+                std::path::Path::new("/made-up/headers"),
+            );
+            let (canonical, sent) = canonical_request(&url, &config);
+            let canonical_query = canonical.lines().nth(2).unwrap_or_default();
+            assert_eq!(
+                canonical_query, sent,
+                "sorting changed the query of {prefix:?} {token:?}"
+            );
+            if token.is_some() {
+                assert!(sent.starts_with("continuation-token="), "{sent}");
+            }
+            assert!(
+                canonical.contains("\nx-amz-content-sha256:UNSIGNED-PAYLOAD\n"),
+                "the payload hash header is not signed"
+            );
+            assert!(
+                canonical.ends_with("\nUNSIGNED-PAYLOAD"),
+                "the payload hash signed is not UNSIGNED-PAYLOAD"
+            );
+        }
+    }
+
+    /// Objective 136: every bucket request's config (a GET, a HEAD, a
+    /// conditional PUT) names x-amz-content-sha256: UNSIGNED-PAYLOAD next to
+    /// SigV4 and before the call's own headers, and no credential is in a
+    /// header.
+    #[test]
+    fn every_bucket_request_names_its_payload_hash_and_no_credential_in_a_header() {
+        use super::{PAYLOAD_HASH_HEADER, curl_config, put_new_options};
+        assert_eq!(
+            PAYLOAD_HASH_HEADER,
+            "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+        );
+        let settings = made_up_r2_settings(Some("k2"));
+        let put = put_new_options(
+            &settings,
+            std::path::Path::new("/made-up/sealed.gpg"),
+            "ab12",
+        );
+        assert!(
+            put.contains("header = \"If-None-Match: *\"\n"),
+            "not conditional"
+        );
+        for (what, options) in [("GET", ""), ("HEAD", "head\n"), ("PUT", put.as_str())] {
+            let config = curl_config(
+                &settings,
+                &settings.r2.url("store/manifests/x.json.gpg"),
+                options,
+                std::path::Path::new("/made-up/body"),
+                std::path::Path::new("/made-up/headers"),
+            );
+            let headers = config_headers(&config);
+            let hashes: Vec<&str> = headers
+                .iter()
+                .filter(|(name, _)| name == "x-amz-content-sha256")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(hashes, ["UNSIGNED-PAYLOAD"], "{what}");
+            let lines: Vec<&str> = config.lines().collect();
+            let sigv4 = lines
+                .iter()
+                .position(|line| line.starts_with("aws-sigv4 = "))
+                .expect("aws-sigv4");
+            assert_eq!(
+                lines.get(sigv4 + 1).copied(),
+                Some("header = \"x-amz-content-sha256: UNSIGNED-PAYLOAD\""),
+                "{what}: not next to aws-sigv4"
+            );
+            let first_header = lines
+                .iter()
+                .position(|line| line.starts_with("header = "))
+                .expect("a header");
+            assert_eq!(
+                first_header,
+                sigv4 + 1,
+                "{what}: after the call's own headers"
+            );
+            for (name, value) in &headers {
+                for credential in [&settings.r2.access_key, &settings.r2.secret_key] {
+                    assert!(
+                        !value.contains(credential.as_str()) && !name.contains(credential.as_str()),
+                        "{what}: a credential is in the {name} header"
+                    );
+                }
+            }
+        }
+    }
 }
