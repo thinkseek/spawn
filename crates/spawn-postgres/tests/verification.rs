@@ -115,7 +115,10 @@ fn a_verification_record_has_its_fields_and_nothing_else() {
         (with("how", json!("")), "how empty"),
         (with("how", json!(" \n ")), "how blank"),
         (with("how", json!("x".repeat(501))), "how too long"),
-        (with("result", json!("maybe")), "result neither pass nor fail"),
+        (
+            with("result", json!("maybe")),
+            "result neither pass nor fail",
+        ),
         (with("result", json!(true)), "result not a string"),
     ] {
         assert!(store.verification_record(&bad).is_err(), "{why}: {bad}");
@@ -190,7 +193,13 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     landed(&mut client, 1);
     assigned(&mut client, 2, 9, 133, "Objective 133 of another mission.");
     landed(&mut client, 2);
-    assigned(&mut client, 3, 4, 28, "Objective 28.\nVerified by: the first.");
+    assigned(
+        &mut client,
+        3,
+        4,
+        28,
+        "Objective 28.\nVerified by: the first.",
+    );
     landed(&mut client, 3);
     // 4/028 again, its brief with two such lines: the newest landing and
     // the last line.
@@ -211,12 +220,16 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
         .verification_record(&verification(9, 133, "pass"))
         .expect("a pass");
     store
-        .deploy_record(&json!({"type": "deploy.finished", "ok": true, "head": "a".repeat(40),
-                               "by": "owner", "reason": ""}))
+        .deploy_record(
+            &json!({"type": "deploy.finished", "ok": true, "head": "a".repeat(40),
+                               "by": "owner", "reason": ""}),
+        )
         .expect("a deploy");
     store
-        .deploy_record(&json!({"type": "deploy.finished", "ok": false, "head": "b".repeat(40),
-                               "by": "landing", "reason": "the build failed"}))
+        .deploy_record(
+            &json!({"type": "deploy.finished", "ok": false, "head": "b".repeat(40),
+                               "by": "landing", "reason": "the build failed"}),
+        )
         .expect("a deploy");
 
     let facts = store.verification_facts().expect("the facts");
@@ -255,10 +268,7 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     );
     let verifications = facts["verifications"].as_array().expect("verifications");
     assert_eq!(verifications.len(), 2, "{facts}");
-    assert_eq!(
-        verifications[0]["mission"], 4,
-        "oldest first: {facts}"
-    );
+    assert_eq!(verifications[0]["mission"], 4, "oldest first: {facts}");
     assert_eq!(verifications[0]["result"], "fail");
     assert_eq!(verifications[0]["by"], "lead");
     assert_eq!(verifications[0]["how"], "read the running product");
