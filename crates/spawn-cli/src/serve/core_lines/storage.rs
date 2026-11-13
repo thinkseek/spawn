@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 
 use super::{Figure, Line};
 
-/// The storage line, from health.storage.
+/// The storage line, from health.storage, days left from the disk's own
+/// fall as [`super::disk::with_disk`] sets them (objective 141).
 pub(super) fn storage_line(storage: &Value) -> Line {
     let database = &storage["database"];
     let ratio = match (database["bytes"].as_f64(), database["log_bytes"].as_f64()) {
@@ -23,12 +24,15 @@ pub(super) fn storage_line(storage: &Value) -> Line {
     };
     Line {
         name: "storage",
-        north_star: Figure::new(
-            "storage.days_left",
-            "Days until the disk is full",
-            "days",
-            storage["days_left"].clone(),
-        ),
+        north_star: Figure {
+            measuring_since_ms: storage["days_left_measuring_since_ms"].clone(),
+            ..Figure::new(
+                "storage.days_left",
+                "Days until the disk is full",
+                "days",
+                storage["days_left"].clone(),
+            )
+        },
         guardrails: vec![
             Figure::new(
                 "storage.free_bytes",
@@ -74,6 +78,23 @@ pub(super) fn storage_line(storage: &Value) -> Line {
                 "count",
                 storage["leaked_test_schemas"].clone(),
             ),
+            // Objective 141, after the seven: the disk's own fall and the
+            // store that grew most, said with its store.
+            Figure::new(
+                "storage.disk_fall",
+                "Free disk lost a day",
+                "bytes_per_day",
+                storage["disk_fall_bytes_per_day"].clone(),
+            ),
+            Figure {
+                store: storage["grew_most"]["store"].as_str().map(str::to_string),
+                ..Figure::new(
+                    "storage.grew_most",
+                    "Store that grew most",
+                    "bytes_per_day",
+                    storage["grew_most"]["bytes_per_day"].clone(),
+                )
+            },
         ],
     }
 }
@@ -94,6 +115,8 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
             "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
+            "disk_fall_bytes_per_day": 2_000_000,
+            "grew_most": {"store": "unattributed", "bytes_per_day": 1_500_000},
         });
         let view = answer(
             &lines(
@@ -138,8 +161,19 @@ mod tests {
                 ("storage.test_database_schemas", json!(3)),
                 ("storage.unowned_scratch_bytes", json!(401_000)),
                 ("storage.leaked_test_schemas", json!(4)),
+                ("storage.disk_fall", json!(2_000_000)),
+                ("storage.grew_most", json!(1_500_000)),
             ]
         );
+        // The store that grew most is said beside it (objective 141); no
+        // other figure names one.
+        let guardrails = storage_line["guardrails"].as_array().expect("guardrails");
+        assert_eq!(guardrails[8]["store"], "unattributed");
+        assert_eq!(guardrails[8]["unit"], "bytes_per_day");
+        assert_eq!(guardrails[7]["unit"], "bytes_per_day");
+        assert_eq!(guardrails[7].get("store"), None);
+        assert_eq!(storage_line["north_star"].get("measuring_since_ms"), None);
+        still_measuring();
         // No log size: no ratio; no readable test database: none.
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
@@ -163,5 +197,27 @@ mod tests {
         assert_eq!(view["lines"][3]["guardrails"], json!([]));
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
+    }
+
+    /// Still measuring (objective 141): days left say from when, and no
+    /// store is said.
+    fn still_measuring() {
+        let measuring = lines(
+            &json!({"free_bytes": 104, "days_left": null,
+                    "days_left_measuring_since_ms": 86_400_000,
+                    "disk_fall_bytes_per_day": null, "grew_most": null}),
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
+        let days = figure_json(&measuring[1].north_star, None);
+        assert_eq!(days["measuring_since_ms"], 86_400_000);
+        assert_eq!(days["state"], "not_collected");
+        let grew = figure_json(&measuring[1].guardrails[8], None);
+        assert_eq!(
+            (grew["value"].clone(), grew.get("store")),
+            (Value::Null, None)
+        );
     }
 }
