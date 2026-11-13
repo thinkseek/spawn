@@ -47,9 +47,16 @@
 //! fails both, with its reason and no count. A drill that cannot run (exit
 //! 2) records nothing; a record the store refuses is said and exits 2. The
 //! Core lines recovery rows read them (`record`). Otherwise it writes
-//! nothing live: no lock, git and the files read only. The key is read as `spawn backup verify` reads it
-//! (`SPAWN_BACKUP_KEY_FILE`, mode 600, given to gpg by path) and nothing of
-//! it is printed. The scratch directory is made with mode 700 under `--into`
+//! nothing live: no lock, git and the files read only.
+//!
+//! The chain is read with the key its records name (objective 114): every
+//! link must name the newest link's key (a chain that crosses keys cannot
+//! be restored, exit 1), and each object's `x-amz-meta-spawn-seal` must say
+//! it too (absent: k1). A link whose `sealed_with` is not a key name, or a
+//! chain key whose file is not on this host, fails both resources with that
+//! reason, exit 2. The key file is given to gpg by path (mode 600) and
+//! nothing of it is printed; a refused name is never echoed. The scratch
+//! directory is made with mode 700 under `--into`
 //! (default `/data/tmp`), which may not be under `$HOME`, `$SPAWN_LIVE` or
 //! the workspace root; it is removed at the end (kept with `--keep`), and
 //! only once it is checked to be the directory this run made.
@@ -65,8 +72,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BundleRecord, Settings, bundle_records, decompress_bundle, decrypt, get_object_bytes,
-    header_value, heads_of, hex, output, random_hex, sha256_file,
+    BundleRecord, Key, Settings, bundle_records, decompress_bundle, decrypt_with, get_object_bytes,
+    header_value, heads_of, hex, object_key, output, random_hex, reading_key, record_key, same_key,
+    sha256_file,
 };
 use crate::Flags;
 use crate::config::{env_value, open_store};
@@ -131,8 +139,21 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             chain[chain.len() - 1].event_id
         );
     }
+    // One key reads the whole chain, and its file must be here.
+    let seal = match chain_key(&chain) {
+        Ok(name) => match reading_key(&name, "the bundle chain") {
+            Ok(seal) => seal,
+            Err(reason) => return Ok(fail_both(&store, &records, &reason, started, 2)),
+        },
+        Err(ChainKey::Refused(reason)) => {
+            return Ok(fail_both(&store, &records, &reason, started, 2));
+        }
+        Err(ChainKey::Crossed(reason)) => {
+            return Ok(unrestorable(&store, &records, &reason, started));
+        }
+    };
     let drill = DrillDir::create(&parent)?;
-    let result = run(&settings, &chain, drill.path());
+    let result = run(&settings, &chain, &seal, drill.path());
     let newest = chain[chain.len() - 1];
     let (code, outcomes) = match result {
         Ok(report) => (
@@ -207,6 +228,21 @@ fn unrestorable(
     started: Instant,
 ) -> i32 {
     let reason = format!("the backup cannot be restored: {reason}");
+    fail_both(store, records, &reason, started, 1)
+}
+
+/// Both resources recorded failed with `reason`, as it is, against the
+/// newest stored record: exit `code`, or 2 when the store refused a record.
+/// A drill that cannot read its chain (objective 114: a link's key name
+/// refused, the chain key's file not on this host) exits 2 this way.
+fn fail_both(
+    store: &spawn_postgres::PostgresStore,
+    records: &[BundleRecord],
+    reason: &str,
+    started: Instant,
+    code: i32,
+) -> i32 {
+    let reason = reason.to_string();
     println!("restore-drill: FAILED: {reason}");
     let newest = records.iter().rev().find(|record| stored(record));
     let (key, event_id) = newest.map_or((String::new(), 0), |record| {
@@ -221,7 +257,37 @@ fn unrestorable(
         (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
         (MISSIONS, Outcome::Unrestorable(reason)),
     ];
-    record_verdicts(store, &verdict, &both).unwrap_or(1)
+    record_verdicts(store, &verdict, &both).unwrap_or(code)
+}
+
+/// Why a chain has no one key to be read with.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ChainKey {
+    /// A link's `sealed_with` is not a key name: the reason names the
+    /// record, never the value.
+    Refused(String),
+    /// Two links name two keys.
+    Crossed(String),
+}
+
+/// The one key every link of `chain` (oldest first) names, the newest
+/// link's (objective 114).
+pub(super) fn chain_key(chain: &[&BundleRecord]) -> Result<String, ChainKey> {
+    let names = chain
+        .iter()
+        .map(|link| record_key("backup.bundled", link.event_id, &link.record))
+        .collect::<Result<Vec<String>, String>>()
+        .map_err(ChainKey::Refused)?;
+    let (Some(newest), Some(last)) = (names.last(), chain.last()) else {
+        return Err(ChainKey::Crossed("the chain has no link".to_string()));
+    };
+    match chain.iter().zip(&names).find(|(_, name)| *name != newest) {
+        None => Ok(newest.clone()),
+        Some((link, name)) => Err(ChainKey::Crossed(format!(
+            "the chain crosses keys: bundle {} is sealed with {name}, the newest ({}) with {newest}",
+            link.event_id, last.event_id
+        ))),
+    }
 }
 
 /// The report said: its lines, its first mismatches, the verdict; the exit.
@@ -536,13 +602,18 @@ struct Report {
 }
 
 /// Fetch, check and unpack every bundle of the chain, restore, compare.
-fn run(settings: &Settings, chain: &[&BundleRecord], drill: &Path) -> Result<Report, String> {
+fn run(
+    settings: &Settings,
+    chain: &[&BundleRecord],
+    seal: &Key,
+    drill: &Path,
+) -> Result<Report, String> {
     let newest = chain[chain.len() - 1];
     let mut unpacked: Vec<(PathBuf, Value)> = Vec::new();
     for (index, record) in chain.iter().enumerate() {
         let here = drill.join(format!("bundle-{index}"));
         fs::create_dir(&here).map_err(|error| format!("{}: {error}", here.display()))?;
-        let manifest = fetch_bundle(settings, record, &here)?;
+        let manifest = fetch_bundle(settings, record, seal, &here)?;
         unpacked.push((here.join("unpacked"), manifest));
     }
     let key = bundle_key(newest);
@@ -667,8 +738,14 @@ fn restore_repos(
 
 /// One stored bundle: fetched into `here`, its sha256 the record's (the
 /// object's metadata and the decrypted bytes), decompressed by its magic
-/// and unpacked into `here/unpacked`; its manifest's kind the record's.
-fn fetch_bundle(settings: &Settings, record: &BundleRecord, here: &Path) -> Result<Value, String> {
+/// and unpacked into `here/unpacked`; its manifest's kind the record's. It
+/// is opened with `seal`, the chain's key, which its object must say too.
+fn fetch_bundle(
+    settings: &Settings,
+    record: &BundleRecord,
+    seal: &Key,
+    here: &Path,
+) -> Result<Value, String> {
     let key = record.record["keys"][0].as_str().unwrap_or_default();
     let expected = record.record["sha256"].as_str().unwrap_or_default();
     let Some((bytes, headers)) = get_object_bytes(settings, key)? else {
@@ -681,11 +758,12 @@ fn fetch_bundle(settings: &Settings, record: &BundleRecord, here: &Path) -> Resu
             "{key}'s x-amz-meta-sha256 {meta} is not the record's {expected}"
         ));
     }
+    same_key(&seal.name, &object_key(key, &headers)?)?;
     let encrypted = here.join("bundle.gpg");
     fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
     drop(bytes);
     let raw = here.join("bundle.raw");
-    decrypt(settings, &encrypted, &raw)?;
+    decrypt_with(seal, &encrypted, &raw)?;
     let found = sha256_file(&raw)?;
     if found != expected {
         return Err(format!(
@@ -1165,6 +1243,46 @@ mod tests {
                 "skipped": [],
             }),
         }
+    }
+
+    /// Objective 114: a chain is read with one key, its newest link's (no
+    /// `sealed_with`: k1); links of two keys cross and are refused; a link
+    /// whose name is no key name is refused by its record, never echoed.
+    #[test]
+    fn a_chain_is_read_with_one_key_and_never_across_keys() {
+        use super::{ChainKey, chain_key};
+        let sealed = |event_id: i64, base: Option<i64>, name: Option<&str>| {
+            let mut link = record(
+                event_id,
+                if base.is_some() {
+                    "incremental"
+                } else {
+                    "full"
+                },
+                base,
+                true,
+            );
+            if let Some(name) = name {
+                link.record["sealed_with"] = json!(name);
+            }
+            link
+        };
+        let (old, incr) = (sealed(1, None, None), sealed(2, Some(1), Some("k1")));
+        assert_eq!(chain_key(&[&old, &incr]), Ok("k1".to_string()));
+        let (full2, incr2) = (sealed(3, None, Some("k2")), sealed(4, Some(3), Some("k2")));
+        assert_eq!(chain_key(&[&full2, &incr2]), Ok("k2".to_string()));
+        let crossed = sealed(5, Some(2), Some("k2"));
+        assert!(matches!(chain_key(&[&old, &incr, &crossed]),
+                Err(ChainKey::Crossed(reason)) if reason.starts_with("the chain crosses keys")),);
+        let made_up = "bb-made-up-passphrase-0123456789";
+        let planted = sealed(6, None, Some(made_up));
+        assert_eq!(
+            chain_key(&[&planted]),
+            Err(ChainKey::Refused(
+                "the sealed_with of backup.bundled record 6 is not a backup key name (k and a number from 1, as k2)"
+                    .to_string()
+            ))
+        );
     }
 
     /// The parent is refused under a fake home, a fake live directory or the

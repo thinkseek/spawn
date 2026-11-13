@@ -223,7 +223,13 @@ impl PgUrl {
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
     pub(crate) root: PathBuf,
+    /// The file the store seals with ([`seal`]): the sealing key's when it
+    /// is required (the store), else k1's as a stand-in nothing seals with.
     pub(crate) key_file: PathBuf,
+    /// The key new dumps and bundles are sealed with, or why there is none
+    /// ([`sealing_key`]): a run that seals refuses on the reason; a reader
+    /// never needs it.
+    pub(crate) seal: Result<Key, String>,
     pub(crate) r2: R2,
     pub(crate) pg_bin: Option<PathBuf>,
     pub(crate) compress: String,
@@ -291,6 +297,152 @@ fn private_file(path: &Path, what: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// What a value that is not a backup key name is refused with: the rule
+/// alone. The value is never echoed: it may hold anything, a key's content
+/// included (cc-astra A53). Each caller puts the source before it.
+pub(crate) const KEY_NAME_RULE: &str = "is not a backup key name (k and a number from 1, as k2)";
+
+/// The one place that holds the default key (objective 114): `None` gives
+/// `k1`; a name `k` and a number from 1 (`^k[1-9][0-9]*$`) gives itself;
+/// anything else is refused with [`KEY_NAME_RULE`].
+pub(crate) fn key_name(named: Option<&str>) -> Result<String, String> {
+    let Some(name) = named else {
+        return Ok("k1".to_string());
+    };
+    let mut digits = name.strip_prefix('k').unwrap_or("").bytes();
+    let well_formed = digits
+        .next()
+        .is_some_and(|first| (b'1'..=b'9').contains(&first))
+        && digits.all(|digit| digit.is_ascii_digit());
+    if well_formed {
+        Ok(name.to_string())
+    } else {
+        Err(KEY_NAME_RULE.to_string())
+    }
+}
+
+/// A backup key: its name and the file that holds its passphrase (given to
+/// gpg by path; its content is never read here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Key {
+    pub(crate) name: String,
+    pub(crate) file: PathBuf,
+}
+
+/// Where the key files are: `SPAWN_BACKUP_KEY_DIR`, else `~/.config/spawn`.
+fn key_dir() -> PathBuf {
+    env_value("SPAWN_BACKUP_KEY_DIR").map_or_else(|| home().join(".config/spawn"), PathBuf::from)
+}
+
+/// The file of the key `name` (a name [`key_name`] gave) in `dir`, or the
+/// path the lookup would use, in words, when there is none. k1's is
+/// `explicit` (`SPAWN_BACKUP_KEY_FILE`) when set, else `backup.key.k1`, else
+/// the old `backup.key`; every other key's is only `backup.key.<name>`.
+fn find_key(name: &str, explicit: Option<PathBuf>, dir: &Path) -> Result<Key, String> {
+    let found = |file: PathBuf| Key {
+        name: name.to_string(),
+        file,
+    };
+    let named = dir.join(format!("backup.key.{name}"));
+    if name != "k1" {
+        return if named.exists() {
+            Ok(found(named))
+        } else {
+            Err(named.display().to_string())
+        };
+    }
+    if let Some(file) = explicit {
+        return if file.exists() {
+            Ok(found(file))
+        } else {
+            Err(file.display().to_string())
+        };
+    }
+    let old = dir.join("backup.key");
+    if named.exists() {
+        Ok(found(named))
+    } else if old.exists() {
+        Ok(found(old))
+    } else {
+        Err(format!("{} (or backup.key)", named.display()))
+    }
+}
+
+/// [`find_key`] in this host's key directory.
+fn key_on_host(name: &str) -> Result<Key, String> {
+    find_key(
+        name,
+        env_value("SPAWN_BACKUP_KEY_FILE").map(PathBuf::from),
+        &key_dir(),
+    )
+}
+
+/// The key that reads what `what` names ("the dump", "the bundle", "the
+/// bundle chain"), sealed with `name`: its file on this host, mode 600.
+fn reading_key(name: &str, what: &str) -> Result<Key, String> {
+    let key = key_on_host(name).map_err(|path| {
+        format!("{what} is sealed with {name}; its key file {path} is not on this host")
+    })?;
+    private_file(&key.file, "the backup key")?;
+    Ok(key)
+}
+
+/// The key every new dump and bundle is sealed with: `SPAWN_BACKUP_SEAL_KEY`
+/// (unset: k1), its file present and mode 600. Never k1 in its place.
+fn sealing_key() -> Result<Key, String> {
+    let name = key_name(env_value("SPAWN_BACKUP_SEAL_KEY").as_deref())
+        .map_err(|rule| format!("SPAWN_BACKUP_SEAL_KEY {rule}"))?;
+    let key = key_on_host(&name).map_err(|path| {
+        format!("the sealing key {name}: its key file {path} is not on this host")
+    })?;
+    private_file(&key.file, "the backup key")?;
+    Ok(key)
+}
+
+/// The key a `backup.dumped` or `backup.bundled` record says sealed it: its
+/// `sealed_with` (absent: k1, as every record before objective 114).
+fn record_key(record_type: &str, event_id: i64, record: &Value) -> Result<String, String> {
+    let refused =
+        |rule: String| format!("the sealed_with of {record_type} record {event_id} {rule}");
+    match &record["sealed_with"] {
+        Value::Null => key_name(None),
+        Value::String(name) => key_name(Some(name)).map_err(refused),
+        _ => Err(refused(KEY_NAME_RULE.to_string())),
+    }
+}
+
+/// The key an object says sealed it: its `x-amz-meta-spawn-seal` (absent:
+/// k1, as every object before objective 114).
+fn object_key(object: &str, headers: &str) -> Result<String, String> {
+    key_name(header_value(headers, "x-amz-meta-spawn-seal").as_deref())
+        .map_err(|rule| format!("the x-amz-meta-spawn-seal of {object} {rule}"))
+}
+
+/// The record's key and its object's, which must be one.
+fn same_key(record: &str, object: &str) -> Result<(), String> {
+    if record == object {
+        Ok(())
+    } else {
+        Err(format!("record says {record}, object says {object}"))
+    }
+}
+
+/// The store's key file: the sealing key's, which a run that `required` it
+/// cannot do without (a bad name or a missing file refuses it, never k1's
+/// file in its place); not required, the sealing key's when there is one,
+/// else k1's (`stand_in`), which nothing seals with.
+fn store_key_file(
+    seal: &Result<Key, String>,
+    required: bool,
+    stand_in: impl FnOnce() -> PathBuf,
+) -> Result<PathBuf, String> {
+    match seal {
+        Ok(key) => Ok(key.file.clone()),
+        Err(reason) if required => Err(reason.clone()),
+        Err(_) => Ok(stand_in()),
+    }
 }
 
 /// The `NAME=value` lines of an environment file, parsed, never sourced.
@@ -369,8 +521,10 @@ impl Settings {
 
     /// `spawn backup`'s settings: its bucket and credentials from r2.env
     /// ([`Self::backup_r2`]), never the keep bucket.
+    /// It needs no key file: a reader reads each record with the key it
+    /// names, and a run that seals takes [`Self::seal`].
     pub(crate) fn from_env(flags: &Flags) -> Result<Self, String> {
-        Self::with_r2(flags, Self::backup_r2)
+        Self::build(flags, Self::backup_r2, false)
     }
 
     /// The bucket and credentials `spawn backup` works with: r2.env's
@@ -403,17 +557,27 @@ impl Settings {
     }
 
     /// The settings with the bucket and credentials `r2` gives (the store
-    /// passes its own credential's, so it never needs r2.env).
+    /// passes its own credential's, so it never needs r2.env). The store
+    /// seals with the sealing key's file, so it requires it.
     pub(crate) fn with_r2(
         flags: &Flags,
         r2: impl FnOnce() -> Result<R2, String>,
     ) -> Result<Self, String> {
+        Self::build(flags, r2, true)
+    }
+
+    fn build(
+        flags: &Flags,
+        r2: impl FnOnce() -> Result<R2, String>,
+        key_required: bool,
+    ) -> Result<Self, String> {
         let root = workspace_root(flags)
             .map(PathBuf::from)
             .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
-        let key_file = env_value("SPAWN_BACKUP_KEY_FILE")
-            .map_or_else(|| home().join(".config/spawn/backup.key"), PathBuf::from);
-        private_file(&key_file, "the backup key")?;
+        let seal = sealing_key();
+        let key_file = store_key_file(&seal, key_required, || {
+            key_on_host("k1").map_or_else(|_| key_dir().join("backup.key.k1"), |key| key.file)
+        })?;
         let r2 = r2()?;
         let prefix = prefix_value(env_value("SPAWN_BACKUP_PREFIX"))?;
         let limit_bytes = megabytes("SPAWN_BACKUP_R2_LIMIT_MB", DEFAULT_LIMIT_MB)?;
@@ -433,6 +597,7 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
         Ok(Self {
             root,
             key_file,
+            seal,
             r2,
             pg_bin: env_value("SPAWN_BACKUP_PG_BIN").map(PathBuf::from),
             compress: env_or("SPAWN_BACKUP_DUMP_COMPRESS", "zstd:9"),
@@ -974,6 +1139,15 @@ fn dump(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
+    // Sealed with SPAWN_BACKUP_SEAL_KEY's key, never k1 in its place.
+    let seal = match settings.seal.clone() {
+        Ok(seal) => seal,
+        Err(reason) => {
+            eprintln!("spawn backup dump: {reason}");
+            record_refusal("dump", &reason);
+            return Ok(2);
+        }
+    };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
     let url = parse_pg_url(&crate::config::required_env("SPAWN_DATABASE_URL")?)?;
@@ -1020,14 +1194,14 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let mut skipped: Vec<Value> = Vec::new();
     let mut suspect_reason: Option<String> = None;
     let encrypted = scratch.join("dump.gpg");
-    encrypt(&settings, &raw, &encrypted)?;
+    encrypt_with(&seal, &raw, &encrypted)?;
     let stored_bytes = fs::metadata(&encrypted)
         .map_err(|error| format!("{}: {error}", encrypted.display()))?
         .len();
     // The bytes leave the host encrypted, and decrypt back to what was
     // counted: a copy that does not is not a copy.
     let back = scratch.join("dump.back");
-    decrypt(&settings, &encrypted, &back)?;
+    decrypt_with(&seal, &encrypted, &back)?;
     if sha256_file(&back)? != sha256 {
         return Err("the encrypted copy does not decrypt to the dump".to_string());
     }
@@ -1045,7 +1219,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         Some(reason) => {
             let key = settings.stored(&format!("postgres/suspect/spawn-{}.dump.gpg", now.text()));
             if within_limit(held, written, stored_bytes, settings.limit_bytes) {
-                put_object(&settings, &key, &encrypted, &sha256, events)?;
+                put_object(&settings, &key, &encrypted, &sha256, events, &seal.name)?;
                 written = written.saturating_add(stored_bytes);
                 keys.push(key);
             } else {
@@ -1060,7 +1234,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
                     skipped.push(skip(tier.name(), held, written, stored_bytes, &settings));
                     continue;
                 }
-                put_object(&settings, &key, &encrypted, &sha256, events)?;
+                put_object(&settings, &key, &encrypted, &sha256, events, &seal.name)?;
                 written = written.saturating_add(stored_bytes);
                 keys.push(key);
                 tiers.push(tier.name().to_string());
@@ -1071,6 +1245,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let over_alert = held.saturating_add(written) > settings.alert_bytes;
     let mut record = json!({
         "type": "backup.dumped",
+        "sealed_with": seal.name,
         "keys": keys,
         "tiers": tiers,
         "skipped": skipped,
@@ -1281,13 +1456,13 @@ fn count_events(settings: &Settings, scratch: &Scratch, dump: &Path) -> Result<(
 /// gpg: AES256, no compression (the archive is compressed), the passphrase
 /// from its file.
 fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Result<(), String> {
-    gpg_with(settings, decrypting, "none", input, out)
+    gpg_with(&settings.key_file, decrypting, "none", input, out)
 }
 
 /// gpg with the backup key; `compress` is its --compress-algo when it
 /// encrypts (the dumps and bundles are compressed before: `none`).
 fn gpg_with(
-    settings: &Settings,
+    key_file: &Path,
     decrypting: bool,
     compress: &str,
     input: &Path,
@@ -1305,7 +1480,7 @@ fn gpg_with(
             "--no-symkey-cache",
         ])
         .arg("--passphrase-file")
-        .arg(&settings.key_file);
+        .arg(key_file);
     if decrypting {
         command.arg("--output").arg(out).arg("--decrypt").arg(input);
     } else {
@@ -1328,18 +1503,26 @@ fn gpg_with(
     Ok(())
 }
 
-fn encrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
-    gpg(settings, false, input, out)
-}
-
+/// An object opened with the store's key file (`spawn store`, which seals
+/// with the sealing key's file and reads with it until objective 116).
 fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
     gpg(settings, true, input, out)
+}
+
+/// A dump or a bundle sealed with `key` (objective 114).
+fn encrypt_with(key: &Key, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(&key.file, false, "none", input, out)
+}
+
+/// An object opened with `key`, the one its record names.
+fn decrypt_with(key: &Key, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(&key.file, true, "none", input, out)
 }
 
 /// A store object sealed: compressed (zlib) and encrypted with the backup
 /// key, as one gpg step (`spawn backup store`).
 fn seal(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
-    gpg_with(settings, false, "zlib", input, out)
+    gpg_with(&settings.key_file, false, "zlib", input, out)
 }
 
 /// One exchange with the bucket. `options` is curl config (headers, the
@@ -1559,6 +1742,7 @@ fn put_object(
     file: &Path,
     sha256: &str,
     events: i64,
+    sealed_with: &str,
 ) -> Result<(), String> {
     // Again at the PUT itself, before any request (settings are checked
     // when read; this holds whatever built them).
@@ -1566,10 +1750,12 @@ fn put_object(
     let md5 = md5_file(file)?;
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
-header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
+header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n\
+header = \"x-amz-meta-spawn-seal: {}\"\n",
         escape_config(&file.display().to_string()),
         sha256,
-        events
+        events,
+        sealed_with
     );
     let response = bucket_request(settings, &settings.r2.url(key), &options)?;
     if response.status != 200 {
@@ -1601,9 +1787,15 @@ fn put_new_object(
 ) -> Result<store::Put, String> {
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
-header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n",
+header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n{}",
         escape_config(&file.display().to_string()),
-        sha256
+        sha256,
+        // The sealing key's name, the key the store's seal is made with: an
+        // object without it reads as k1's everywhere.
+        settings.seal.as_ref().map_or_else(
+            |_| String::new(),
+            |key| format!("header = \"x-amz-meta-spawn-seal: {}\"\n", key.name)
+        )
     );
     let response = bucket_request(settings, &settings.r2.url(key), &options)?;
     match response.status {
@@ -1706,6 +1898,21 @@ fn read_bundle_records(prefix: &str, records: &Value) -> Vec<BundleRecord> {
             event_id: entry["event_id"].as_i64().unwrap_or_default(),
             at_ms: entry["at_ms"].as_i64().unwrap_or_default(),
             record: entry["record"].clone(),
+        })
+        .collect()
+}
+
+/// The earlier bundles a new bundle sealed with `seal` builds on: those
+/// sealed with it (objective 114; a record without `sealed_with` is k1's, a
+/// record whose name is refused is no one's). With none yet, the bundle is
+/// full and has no base, whatever bundle of another key this week holds.
+/// Here and not in [`bundle_records`], which verify and the drill share.
+fn sealed_alike(earlier: Vec<BundleRecord>, seal: &str) -> Vec<BundleRecord> {
+    earlier
+        .into_iter()
+        .filter(|entry| {
+            record_key("backup.bundled", entry.event_id, &entry.record)
+                .is_ok_and(|name| name == seal)
         })
         .collect()
 }
@@ -1853,11 +2060,22 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
+    let seal = match settings.seal.clone() {
+        Ok(seal) => seal,
+        Err(reason) => {
+            eprintln!("spawn backup bundle: {reason}");
+            record_refusal("bundle", &reason);
+            return Ok(2);
+        }
+    };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
-    let earlier = bundle_records(&store, &settings.prefix, now_ms)?;
+    let earlier = sealed_alike(
+        bundle_records(&store, &settings.prefix, now_ms)?,
+        &seal.name,
+    );
     let base = earlier.last();
     let stamps = bundle_stamps(&earlier);
     let full = full_bundle(now, &stamps, now_ms);
@@ -2092,12 +2310,12 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         .len();
     let sha256 = sha256_file(&archive)?;
     let encrypted = scratch.join("bundle.gpg");
-    encrypt(&settings, &archive, &encrypted)?;
+    encrypt_with(&seal, &archive, &encrypted)?;
     let stored_bytes = fs::metadata(&encrypted)
         .map_err(|error| format!("{}: {error}", encrypted.display()))?
         .len();
     let back = scratch.join("bundle.back");
-    decrypt(&settings, &encrypted, &back)?;
+    decrypt_with(&seal, &encrypted, &back)?;
     if sha256_file(&back)? != sha256 {
         return Err("the encrypted bundle does not decrypt to the archive".to_string());
     }
@@ -2113,7 +2331,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
     if within_limit(held, written, stored_bytes, settings.limit_bytes) {
-        put_object(&settings, &key, &encrypted, &sha256, 0)?;
+        put_object(&settings, &key, &encrypted, &sha256, 0, &seal.name)?;
         written = written.saturating_add(stored_bytes);
         keys.push(key);
     } else {
@@ -2122,6 +2340,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let over_alert = held.saturating_add(written) > settings.alert_bytes;
     let record = json!({
         "type": "backup.bundled",
+        "sealed_with": seal.name,
         "kind": if full { "full" } else { "incremental" },
         "base_event_id": base.map(|base| base.event_id),
         "keys": keys,
@@ -2357,12 +2576,23 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         "dumped_event_id": latest.event_id,
         "expected": expected,
     });
-    let outcome = restore_and_compare(&settings, &drill_url, latest);
+    // Read with the key its record names (objective 114).
+    let sealed_with = record_key("backup.dumped", latest.event_id, &latest.record);
+    let outcome = match &sealed_with {
+        Ok(name) => restore_and_compare(&settings, &drill_url, latest, name),
+        Err(reason) => Err(RestoreError {
+            reason: reason.clone(),
+            drilled: Drilled::default(),
+        }),
+    };
     let (mut ok, mut reason, drilled) = match outcome {
         Ok(drilled) => (true, String::new(), drilled),
         Err(RestoreError { reason, drilled }) => (false, reason, drilled),
     };
     let mut record = naming;
+    if let Ok(name) = &sealed_with {
+        record["sealed_with"] = json!(name);
+    }
     record["events"] = json!(drilled.events);
     record["max_event_id"] = json!(drilled.max_event_id);
     record["server"] = json!(
@@ -2452,11 +2682,15 @@ fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Res
             "the bundle's x-amz-meta-sha256 {meta} is not the record's {expected_sha}"
         ));
     }
+    // Read with the key its record names, which its object must say too.
+    let sealed_with = record_key("backup.bundled", latest.event_id, &latest.record)?;
+    same_key(&sealed_with, &object_key(key, &headers)?)?;
+    let seal = reading_key(&sealed_with, "the bundle")?;
     let scratch = Scratch::new("verify-bundle")?;
     let encrypted = scratch.join("bundle.gpg");
     fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
     let raw = scratch.join("bundle.raw");
-    decrypt(settings, &encrypted, &raw)?;
+    decrypt_with(&seal, &encrypted, &raw)?;
     let found = sha256_file(&raw)?;
     if found != expected_sha {
         return Err(format!(
@@ -2670,6 +2904,7 @@ fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Res
         "checked": true,
         "ok": true,
         "key": key,
+        "sealed_with": sealed_with,
         "bundled_event_id": latest.event_id,
         "kind": kind,
         "sha256": expected_sha,
@@ -2693,6 +2928,7 @@ fn restore_and_compare(
     settings: &Settings,
     drill_url: &str,
     latest: &DumpRecord,
+    sealed_with: &str,
 ) -> Result<Drilled, RestoreError> {
     let mut drilled = Drilled::default();
     let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
@@ -2716,12 +2952,18 @@ fn restore_and_compare(
             drilled,
         });
     }
+    // The object's own word on its key must be its record's, and the key's
+    // file must be on this host.
+    let seal = object_key(key, &headers)
+        .and_then(|said| same_key(sealed_with, &said))
+        .and_then(|()| reading_key(sealed_with, "the dump"))
+        .map_err(|reason| fail(reason, drilled.clone()))?;
     let scratch = Scratch::new("drill").map_err(|error| fail(error, drilled.clone()))?;
     let encrypted = scratch.join("dump.gpg");
     fs::write(&encrypted, &bytes)
         .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled.clone()))?;
     let raw = scratch.join("dump");
-    if let Err(error) = decrypt(settings, &encrypted, &raw) {
+    if let Err(error) = decrypt_with(&seal, &encrypted, &raw) {
         return Err(RestoreError {
             reason: format!("the object does not decrypt: {error}"),
             drilled,
@@ -3010,6 +3252,9 @@ fn record_verified(
         "key": naming.get("key").cloned().unwrap_or(Value::Null),
         "sha256": naming.get("sha256").cloned().unwrap_or(Value::Null),
         "dumped_event_id": naming.get("dumped_event_id").cloned().unwrap_or(Value::Null),
+        // The key the dump's record names (objective 114); the bundle's is
+        // under `bundle`.
+        "sealed_with": naming.get("sealed_with").cloned().unwrap_or(Value::Null),
         "expected": naming.get("expected").cloned().unwrap_or(Value::Null),
         "events": drilled.events,
         "max_event_id": drilled.max_event_id,
@@ -3368,6 +3613,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let settings = |bucket: &str| Settings {
             root: dir.clone(),
             key_file: dir.join("key"),
+            seal: Err("no sealing key in this test".to_string()),
             r2: R2 {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 bucket: bucket.to_string(),
@@ -3382,7 +3628,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             prefix: "locktest/x/".to_string(),
             drill_url: None,
         };
-        let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0).unwrap_err();
+        let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0, "k1").unwrap_err();
         assert!(error.contains("never writes there"), "{error}");
         assert!(!error.contains("made-up-keep"), "{error}");
         // Not an R2 name as given (rev-g F5): refused before the keep test
@@ -3394,7 +3640,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             "made-up-Keep",
             "x",
         ] {
-            let error = put_object(&settings(bucket), "k", &file, "s", 0).unwrap_err();
+            let error = put_object(&settings(bucket), "k", &file, "s", 0, "k1").unwrap_err();
             assert!(
                 error.contains("not an R2 bucket name"),
                 "{bucket:?}: {error}"
@@ -3405,7 +3651,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             );
         }
         // Another bucket gets as far as the request (a closed port).
-        let error = put_object(&settings("made-up-store"), "k", &file, "s", 0).unwrap_err();
+        let error = put_object(&settings("made-up-store"), "k", &file, "s", 0, "k1").unwrap_err();
         assert!(!error.contains("never writes there"), "{error}");
         assert!(not_locked_forever("made-up-keep").is_err());
         assert!(not_locked_forever("made-up-store").is_ok());
@@ -3487,5 +3733,176 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         assert_eq!(manifest["transcripts"][0]["offset"], 100);
         assert_eq!(manifest["repos"][0]["file"], "repos/s.git.bundle");
         assert_eq!(manifest["repos"][0]["heads"]["refs/heads/main"], "abc");
+    }
+
+    /// A made-up key's content: what a misplaced value could hold.
+    const MADE_UP_SECRET: &str = "bb-made-up-passphrase-0123456789";
+
+    /// Objective 114: None is k1; `k` and a number from 1 is itself;
+    /// anything else is the rule alone, never the value.
+    #[test]
+    fn a_key_name_is_k_and_a_number_from_one_and_absent_is_k1() {
+        use super::{KEY_NAME_RULE, key_name};
+        assert_eq!(key_name(None).as_deref(), Ok("k1"));
+        assert_eq!(key_name(Some("k2")).as_deref(), Ok("k2"));
+        assert_eq!(key_name(Some("k12")).as_deref(), Ok("k12"));
+        for bad in [
+            "k0",
+            "K2",
+            "k2/..",
+            "",
+            "k",
+            "k01",
+            " k2",
+            "k2 ",
+            MADE_UP_SECRET,
+        ] {
+            let error = key_name(Some(bad)).expect_err(bad);
+            assert_eq!(error, KEY_NAME_RULE, "{bad:?}");
+        }
+    }
+
+    /// k1's file: SPAWN_BACKUP_KEY_FILE when set (missing: that path), else
+    /// backup.key.k1, else the old backup.key; another key only by its name.
+    #[test]
+    fn k1_is_the_key_file_then_its_new_name_then_the_old_and_others_only_their_own() {
+        use super::find_key;
+        let dir = crate::storage::tests::scratch("backup-keys");
+        let old = dir.join("backup.key");
+        let new = dir.join("backup.key.k1");
+        let given = dir.join("given");
+        let named = |result: Result<super::Key, String>| result.map(|key| key.file);
+        assert_eq!(
+            named(find_key("k1", None, &dir)),
+            Err(format!("{} (or backup.key)", new.display()))
+        );
+        std::fs::write(&old, MADE_UP_SECRET).expect("old");
+        assert_eq!(named(find_key("k1", None, &dir)), Ok(old.clone()));
+        std::fs::write(&new, MADE_UP_SECRET).expect("new");
+        assert_eq!(named(find_key("k1", None, &dir)), Ok(new.clone()));
+        assert_eq!(
+            named(find_key("k1", Some(given.clone()), &dir)),
+            Err(given.display().to_string()),
+            "a set SPAWN_BACKUP_KEY_FILE is the only place looked"
+        );
+        std::fs::write(&given, MADE_UP_SECRET).expect("given");
+        assert_eq!(named(find_key("k1", Some(given.clone()), &dir)), Ok(given));
+        let k2 = dir.join("backup.key.k2");
+        assert_eq!(
+            named(find_key("k2", None, &dir)),
+            Err(k2.display().to_string()),
+            "k2 is never k1's file"
+        );
+        std::fs::write(&k2, MADE_UP_SECRET).expect("k2");
+        assert_eq!(named(find_key("k2", None, &dir)), Ok(k2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record and its object name their key; absent is k1 on both; two
+    /// names are refused, and a value that is no name is refused by where it
+    /// is, never echoed.
+    #[test]
+    fn a_record_and_an_object_that_name_two_keys_are_refused() {
+        use super::{object_key, record_key, same_key};
+        let record = serde_json::json!({"sealed_with": "k2"});
+        assert_eq!(record_key("backup.dumped", 7, &record).as_deref(), Ok("k2"));
+        assert_eq!(
+            record_key("backup.dumped", 7, &serde_json::json!({})).as_deref(),
+            Ok("k1")
+        );
+        assert_eq!(object_key("o", "etag: x\r\n").as_deref(), Ok("k1"));
+        assert_eq!(
+            object_key("o", "x-amz-meta-spawn-seal: k2\r\n").as_deref(),
+            Ok("k2")
+        );
+        assert_eq!(same_key("k2", "k2"), Ok(()));
+        assert_eq!(
+            same_key("k2", "k1"),
+            Err("record says k2, object says k1".to_string())
+        );
+        let planted = serde_json::json!({"sealed_with": MADE_UP_SECRET});
+        assert_eq!(
+            record_key("backup.bundled", 41, &planted),
+            Err("the sealed_with of backup.bundled record 41 is not a backup key name (k and a number from 1, as k2)".to_string())
+        );
+        let header = format!("x-amz-meta-spawn-seal: {MADE_UP_SECRET}\r\n");
+        let error = object_key("postgres/hourly/x.dump.gpg", &header).expect_err("refused");
+        assert_eq!(
+            error,
+            "the x-amz-meta-spawn-seal of postgres/hourly/x.dump.gpg is not a backup key name (k and a number from 1, as k2)"
+        );
+    }
+
+    /// After the switch, a bundle sealed with k2 builds on k2's records
+    /// only: with none yet its earlier records are empty, so it is full,
+    /// whatever k1 full this week holds; then the next builds on it.
+    #[test]
+    fn the_first_bundle_under_a_new_key_builds_on_nothing() {
+        use super::sealed_alike;
+        let entry = |id: i64, record: serde_json::Value| super::BundleRecord {
+            event_id: id,
+            at_ms: id,
+            record,
+        };
+        let k1_full = || {
+            entry(
+                1,
+                serde_json::json!({"kind": "full", "keys": ["bundles/full/a"]}),
+            )
+        };
+        let k1_incr = || {
+            entry(
+                2,
+                serde_json::json!({"kind": "incremental", "sealed_with": "k1", "keys": ["b"]}),
+            )
+        };
+        assert!(sealed_alike(vec![k1_full(), k1_incr()], "k2").is_empty());
+        assert_eq!(sealed_alike(vec![k1_full(), k1_incr()], "k1").len(), 2);
+        let k2_full = entry(
+            3,
+            serde_json::json!({"kind": "full", "sealed_with": "k2", "keys": ["c"]}),
+        );
+        let earlier = sealed_alike(vec![k1_full(), k1_incr(), k2_full], "k2");
+        assert_eq!(earlier.iter().map(|e| e.event_id).collect::<Vec<_>>(), [3]);
+        let planted = entry(
+            4,
+            serde_json::json!({"sealed_with": MADE_UP_SECRET, "keys": ["d"]}),
+        );
+        assert!(
+            sealed_alike(vec![planted], "k1").is_empty(),
+            "a refused name is no one's"
+        );
+    }
+
+    /// The store seals with the sealing key's file: required, a bad name or
+    /// a missing file refuses it, never k1's file in its place; not
+    /// required (a reader), k1's file stands in.
+    #[test]
+    fn the_stores_sealing_key_is_required_and_never_k1_in_its_place() {
+        use super::{Key, store_key_file};
+        let k1 = std::path::PathBuf::from("/made-up/backup.key.k1");
+        let k2 = Key {
+            name: "k2".to_string(),
+            file: "/made-up/backup.key.k2".into(),
+        };
+        let refused: Result<Key, String> =
+            Err(format!("SPAWN_BACKUP_SEAL_KEY {}", super::KEY_NAME_RULE));
+        assert_eq!(
+            store_key_file(&Ok(k2.clone()), true, || k1.clone()),
+            Ok(k2.file.clone())
+        );
+        assert_eq!(
+            store_key_file(&refused, true, || k1.clone()),
+            Err(refused.clone().unwrap_err()),
+            "required: refused, never k1"
+        );
+        assert_eq!(
+            store_key_file(&refused, false, || k1.clone()),
+            Ok(k1.clone())
+        );
+        assert_eq!(
+            store_key_file(&Ok(k2.clone()), false, || k1.clone()),
+            Ok(k2.file)
+        );
     }
 }
