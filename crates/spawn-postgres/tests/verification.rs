@@ -320,7 +320,7 @@ fn the_unverified_landings_read_counts_the_window_and_the_old() {
     // the landing" is never the same millisecond.
     let pause = || std::thread::sleep(std::time::Duration::from_millis(3));
     mission(&mut client, 1);
-    let mut land = |client: &mut Client, task: i64, objective: i64| -> i64 {
+    let land = |client: &mut Client, task: i64, objective: i64| -> i64 {
         assigned(client, task, 1, objective, "Objective.");
         pause();
         let event = landed(client, task);
