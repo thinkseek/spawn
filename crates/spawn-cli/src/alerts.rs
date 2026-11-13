@@ -9207,20 +9207,21 @@ connections\n";
             line: &str,
             id: u64,
         ) -> i64 {
-            let event = keyed(
-                store,
-                session,
-                execution,
-                Source::Claude,
-                &format!("{line}:taken:{id}"),
-                EventKind::MessageTaken {
-                    command_id: CommandId(id),
-                },
-            );
-            let events = store
-                .events_after(EventPosition(u64::try_from(event - 1).expect("an id")), 1)
-                .expect("the taking");
-            i64::try_from(events[0].recorded_at.timestamp_millis()).expect("a time")
+            store
+                .append(NewEvent {
+                    agent_id: AgentId::new(format!("agent_{session}")).expect("valid"),
+                    session_id: SessionId::new(format!("session_{session}")).expect("valid"),
+                    execution_id: Some(ExecutionId::new(execution.to_string()).expect("valid")),
+                    source: Source::Claude,
+                    source_event_id: Some(format!("{line}:taken:{id}")),
+                    kind: EventKind::MessageTaken {
+                        command_id: CommandId(id),
+                    },
+                })
+                .expect("append succeeds")
+                .record
+                .recorded_at
+                .0
         }
 
         /// The clearings among `events`, by key, in key order.
