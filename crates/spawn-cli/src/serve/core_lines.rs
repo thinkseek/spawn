@@ -86,6 +86,18 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 mod drills;
+// The groups are used by objectives 2 and 3 (performance.rs, storage.rs;
+// sync/design-core-lines-kept-figures.md), which land after this one: until
+// then nothing but the tests makes a group. `expect`, so the first of them
+// to use it must take this line out.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept groups land before the groups that use them (objectives 2 and 3)"
+    )
+)]
+pub(crate) mod kept;
 mod observability;
 mod performance;
 mod recoverability;
@@ -118,6 +130,12 @@ pub(super) struct Figure {
     /// The window a figure is read over, when it says one (objective 100:
     /// interventions per agent-hour, "24h"): said as `window`.
     pub(super) window: Option<&'static str>,
+    /// When a figure of a kept group ([`kept`]) was read: said as
+    /// `as_of_ms`; `None` for a figure read by the reading itself.
+    pub(super) as_of_ms: Option<i64>,
+    /// Whether its group is past its stale line: said as `stale`, shown as
+    /// stale, never as current, and left out of the hourly sample.
+    pub(super) stale: bool,
 }
 
 impl Figure {
@@ -129,6 +147,8 @@ impl Figure {
             value,
             measuring_since_ms: Value::Null,
             window: None,
+            as_of_ms: None,
+            stale: false,
         }
     }
 
@@ -256,7 +276,48 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     if let Some(window) = figure.window {
         answer["window"] = json!(window);
     }
+    if let Some(as_of) = figure.as_of_ms {
+        answer["as_of_ms"] = json!(as_of);
+    }
+    if figure.stale {
+        answer["stale"] = json!(true);
+    }
     answer
+}
+
+/// The kept group a figure is read from (sync/design-core-lines-kept-figures.md):
+/// the performance figures and the cost window's unpriced share are the
+/// `performance` group's; the storage figures from the sizes (the free
+/// space aside, read at each reading; the scratch and test schemas aside,
+/// kept by [`unowned`] with their own age) are the `storage` group's.
+pub(super) fn group_of(key: &str) -> Option<&'static str> {
+    match key {
+        "observability.unpriced_share" => Some("performance"),
+        "storage.days_left"
+        | "storage.archive_growth"
+        | "storage.database_ratio"
+        | "storage.test_database_bytes"
+        | "storage.test_database_schemas" => Some("storage"),
+        _ if key.starts_with("performance.") => Some("performance"),
+        _ => None,
+    }
+}
+
+/// Each figure of a kept group in `statuses` said with when its group was
+/// read and whether it is stale at `now_ms`; a group not in use leaves its
+/// figures as the reading read them.
+pub(super) fn aged(lines: &mut [Line], statuses: &[kept::Status], now_ms: i64) {
+    for line in lines {
+        for figure in std::iter::once(&mut line.north_star).chain(&mut line.guardrails) {
+            let Some(status) = group_of(figure.key)
+                .and_then(|group| statuses.iter().find(|status| status.group == group))
+            else {
+                continue;
+            };
+            figure.as_of_ms = status.as_of_ms;
+            figure.stale = status.stale(now_ms);
+        }
+    }
 }
 
 /// The four lines: the performance line's figures from `performance`
@@ -401,6 +462,15 @@ pub(crate) struct Parts {
     /// `kept` from another's within the minute (cc-astra A35): a kept one
     /// times neither archive nor cost.
     pub(crate) performance: Option<&'static str>,
+    /// How old the kept `performance` group served was (none while no
+    /// group of that name is in use): with the refresh's own log line, what
+    /// the acceptance reads beside the reading's time.
+    pub(crate) performance_age_ms: Option<i64>,
+    /// How old the kept `storage` group served was.
+    pub(crate) storage_age_ms: Option<i64>,
+    /// Whether any kept group is in use: only then does the line say the
+    /// two ages (until objectives 2 and 3 register theirs, it is as it was).
+    pub(crate) aged: bool,
 }
 
 impl Parts {
@@ -422,15 +492,40 @@ impl Parts {
         .sum()
     }
 
+    /// Each kept group's age at `now_ms`, from `statuses`.
+    pub(crate) fn ages(&mut self, statuses: &[kept::Status], now_ms: i64) {
+        let age = |group: &str| {
+            statuses
+                .iter()
+                .find(|status| status.group == group)
+                .and_then(|status| status.age_ms(now_ms))
+        };
+        self.performance_age_ms = age("performance");
+        self.storage_age_ms = age("storage");
+        self.aged = !statuses.is_empty();
+    }
+
     /// `open_ms=<n|none> trends_ms=… facts_ms=… archive_ms=… cost_ms=…
-    /// storage_ms=… health_ms=… lock_wait_ms=… performance=<measured|kept|none>`.
+    /// storage_ms=… health_ms=… lock_wait_ms=… performance=<measured|kept|none>`,
+    /// then, while a kept group is in use, ` performance_age_ms=<n|none>
+    /// storage_age_ms=<n|none>`.
     pub(crate) fn text(&self) -> String {
         let ms = |part: Option<Duration>| {
             part.map_or_else(|| "none".to_string(), |took| took.as_millis().to_string())
         };
+        let age = |age: Option<i64>| age.map_or_else(|| "none".to_string(), |age| age.to_string());
+        let ages = if self.aged {
+            format!(
+                " performance_age_ms={} storage_age_ms={}",
+                age(self.performance_age_ms),
+                age(self.storage_age_ms)
+            )
+        } else {
+            String::new()
+        };
         format!(
             "open_ms={} trends_ms={} facts_ms={} archive_ms={} cost_ms={} storage_ms={} \
-health_ms={} lock_wait_ms={} performance={}",
+health_ms={} lock_wait_ms={} performance={}{ages}",
             ms(self.open),
             ms(self.trends),
             ms(self.facts),
@@ -439,7 +534,7 @@ health_ms={} lock_wait_ms={} performance={}",
             ms(self.storage),
             ms(self.health),
             ms(self.lock_wait),
-            self.performance.unwrap_or("none")
+            self.performance.unwrap_or("none"),
         )
     }
 }
@@ -541,6 +636,7 @@ pub(super) fn core_lines_timed(
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
     view["drills"] = extras.drills;
+    with_groups(&mut view, extras.groups);
     view["scratch"] = extras.scratch;
     view["test_schemas"] = extras.test_schemas;
     // A URL file refused (objective 094) is said where a range left out is.
@@ -555,11 +651,21 @@ pub(super) fn core_lines_timed(
     Ok(view)
 }
 
+/// `groups` added to the answer only when a kept group is in use: with none
+/// (until objectives 2 and 3 register theirs) the answer is as it was.
+pub(super) fn with_groups(view: &mut Value, groups: Vec<Value>) {
+    if !groups.is_empty() {
+        view["groups"] = Value::Array(groups);
+    }
+}
+
 /// What the answer gains beside the lines: the drills (objective 093), the
 /// scratch nobody owns, each test server's schemas and the URL files
 /// refused (objective 094).
 struct Extras {
     drills: Value,
+    /// Each kept group in use: its age, stale line and last error.
+    groups: Vec<Value>,
     scratch: Value,
     test_schemas: Value,
     refused: Vec<(String, String)>,
@@ -616,15 +722,20 @@ fn lines_at(
     .map_err(super::err)?;
     let mut guardrails = recoverability(&backups, facts.as_deref(), now_ms);
     guardrails.extend(drills.guardrails);
+    let mut figures = lines(
+        &storage,
+        &performance,
+        &observed,
+        drills.north_star.value,
+        guardrails,
+    );
+    let statuses = kept::statuses();
+    aged(&mut figures, &statuses, now_ms);
+    parts.ages(&statuses, now_ms);
     Ok((
-        lines(
-            &storage,
-            &performance,
-            &observed,
-            drills.north_star.value,
-            guardrails,
-        ),
+        figures,
         Extras {
+            groups: statuses.iter().map(|status| status.json(now_ms)).collect(),
             drills: drills.list,
             scratch: unowned::scratch_json(&unowned.plan, reading),
             test_schemas: unowned::test_schemas_json(reading),
@@ -639,7 +750,7 @@ pub(super) fn values_of(lines: &[Line]) -> Map<String, Value> {
     lines
         .iter()
         .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
-        .filter(|figure| !figure.value.is_null())
+        .filter(|figure| !figure.value.is_null() && !figure.stale)
         .map(|figure| (figure.key.to_string(), figure.value.clone()))
         .collect()
 }
@@ -754,6 +865,107 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spawn-core-lines-{}", std::process::id()));
         assert_eq!(read_ranges(Some(&dir.join("absent.json"))), Ok(None));
         assert_eq!(read_ranges(None), Ok(None));
+    }
+
+    /// A kept group's figures say when the group was read and, past its
+    /// stale line, `stale`; a stale figure is left out of the sample; the
+    /// parts line says each group's age (sync/design-core-lines-kept-figures.md).
+    #[test]
+    fn a_kept_groups_figures_say_their_age_and_a_stale_one_is_not_sampled() {
+        use super::kept::Status;
+        let status = |group, as_of_ms| Status {
+            group,
+            as_of_ms: Some(as_of_ms),
+            first_tried_ms: Some(as_of_ms),
+            every_ms: 60_000,
+            stale_ms: 900_000,
+            last_error: None,
+            refresh_ms: Some(700),
+        };
+        let now = 2_000_000;
+        // Performance read 2 min ago (current); storage 20 min ago, past its
+        // 15 here (stale).
+        let statuses = [
+            status("performance", now - 120_000),
+            status("storage", now - 1_200_000),
+        ];
+        let mut figures = lines(
+            &json!({"free_bytes": 3, "days_left": 9}),
+            &json!({"gate_time": 5}),
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
+        super::aged(&mut figures, &statuses, now);
+        let find = |key: &str| {
+            figures
+                .iter()
+                .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+                .find(|figure| figure.key == key)
+                .expect("the figure")
+                .clone()
+        };
+        let gate = figure_json(&find("performance.gate_time"), None);
+        assert_eq!(gate["as_of_ms"], now - 120_000);
+        assert_eq!(gate.get("stale"), None, "current: no stale field");
+        let days = figure_json(&find("storage.days_left"), None);
+        assert_eq!(days["as_of_ms"], now - 1_200_000);
+        assert_eq!(days["stale"], true);
+        assert_eq!(days["value"], 9, "a stale figure keeps its value");
+        // The free space is read at each reading: no group, no age.
+        let free = figure_json(&find("storage.free_bytes"), None);
+        assert_eq!((free.get("as_of_ms"), free.get("stale")), (None, None));
+        let values = super::values_of(&figures);
+        assert_eq!(values.get("storage.days_left"), None, "stale: not sampled");
+        assert_eq!(values["storage.free_bytes"], 3);
+        assert_eq!(values["performance.gate_time"], 5);
+        let mut parts = super::Parts::default();
+        parts.ages(&statuses, now);
+        assert!(
+            parts
+                .text()
+                .ends_with("performance_age_ms=120000 storage_age_ms=1200000"),
+            "{}",
+            parts.text()
+        );
+    }
+
+    /// Inert until a group is in use (the lead: by test, not by reading):
+    /// with no kept group, the figures, the answer and the parts line are
+    /// exactly what they were before kept groups.
+    #[test]
+    fn with_no_kept_group_the_answer_and_the_parts_line_are_as_before() {
+        let before = lines(
+            &json!({"free_bytes": 3, "days_left": 9}),
+            &json!({"gate_time": 5}),
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
+        let mut figures = before.clone();
+        super::aged(&mut figures, &[], 2_000_000);
+        assert_eq!(figures, before);
+        let trends = std::collections::BTreeMap::new();
+        let view = super::answer(&figures, &Value::Null, Ok(None), &trends);
+        let mut grouped = view.clone();
+        super::with_groups(&mut grouped, Vec::new());
+        assert_eq!(grouped, view, "no `groups` key");
+        let text = serde_json::to_string(&view).expect("text");
+        assert!(
+            !text.contains("as_of_ms") && !text.contains("stale") && !text.contains("groups"),
+            "{text}"
+        );
+        let mut parts = super::Parts {
+            open: Some(std::time::Duration::from_millis(20)),
+            performance: Some("measured"),
+            ..super::Parts::default()
+        };
+        parts.ages(&[], 2_000_000);
+        assert_eq!(
+            parts.text(),
+            "open_ms=20 trends_ms=none facts_ms=none archive_ms=none cost_ms=none \
+storage_ms=none health_ms=none lock_wait_ms=none performance=measured"
+        );
     }
 
     /// Objective 090: a sample holds every figure that has a value, and
