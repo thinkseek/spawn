@@ -85,6 +85,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
+mod disk;
 mod drills;
 // The groups are used by objectives 2 and 3 (performance.rs, storage.rs;
 // sync/design-core-lines-kept-figures.md), which land after this one: until
@@ -136,6 +137,9 @@ pub(super) struct Figure {
     /// Whether its group is past its stale line: said as `stale`, shown as
     /// stale, never as current, and left out of the hourly sample.
     pub(super) stale: bool,
+    /// The store a figure names (objective 141: the store that grew most):
+    /// said as `store`.
+    pub(super) store: Option<String>,
 }
 
 impl Figure {
@@ -149,6 +153,7 @@ impl Figure {
             window: None,
             as_of_ms: None,
             stale: false,
+            store: None,
         }
     }
 
@@ -282,6 +287,9 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     if figure.stale {
         answer["stale"] = json!(true);
     }
+    if let Some(store) = &figure.store {
+        answer["store"] = json!(store);
+    }
     answer
 }
 
@@ -295,6 +303,7 @@ pub(super) fn group_of(key: &str) -> Option<&'static str> {
         "observability.unpriced_share" => Some("performance"),
         "storage.days_left"
         | "storage.archive_growth"
+        | "storage.grew_most"
         | "storage.database_ratio"
         | "storage.test_database_bytes"
         | "storage.test_database_schemas" => Some("storage"),
@@ -632,13 +641,15 @@ pub(super) fn core_lines_timed(
     let now_ms = super::now_ms();
     let contents = timed(&mut parts.open, || read_ranges(path));
     let text = contents.as_ref().ok().and_then(Option::as_deref);
-    let (figures, extras) = lines_at(store, nightly, text, now_ms, parts)?;
+    // The window's samples, read once: the trends and the disk's readings
+    // (objective 141) both come from them.
     let samples = timed(&mut parts.trends, || {
         store
             .host_core_lines(trend_since(now_ms))
             .map(|samples| (samples, store.first_deploy_finished_ms().ok().flatten()))
     })
     .map_err(super::err)?;
+    let (figures, extras) = lines_at(store, nightly, text, &samples.0, now_ms, parts)?;
     let samples = measured_samples(samples.0, samples.1);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
     let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
@@ -682,11 +693,14 @@ struct Extras {
 /// in `nightly` and the Core lines file's contents `file` (its
 /// `recoverability` drills, objective 093; its `storage` scratch roots and
 /// test servers, objective 094), and what the answer gains beside them;
-/// each part's time put in `parts`.
+/// the storage line's days left from the disk's own fall over the window's
+/// `host.core_lines` `samples` ([`disk`], objective 141); each part's time
+/// put in `parts`.
 fn lines_at(
     store: &spawn_postgres::PostgresStore,
     nightly: Option<&Path>,
     file: Option<&str>,
+    samples: &Value,
     now_ms: i64,
     parts: &mut Parts,
 ) -> Result<(Vec<Line>, Extras), String> {
@@ -695,6 +709,7 @@ fn lines_at(
     let reading = unowned.reading.as_deref();
     storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
     storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
+    disk::with_disk(&mut storage, samples, now_ms);
     let (performance, cost_total) = performance_now(store, now_ms, parts);
     // The Home card's figure (objective 100): `/api/interventions?window=24h`
     // over the 24 h ending at this reading's now, through the same answer.
@@ -768,11 +783,18 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
     let store = super::open_store()?;
     let contents = read_ranges(ranges_path().as_deref());
     let text = contents.as_ref().ok().and_then(Option::as_deref);
+    let now_ms = super::now_ms();
+    // The window's samples, for the disk's fall (objective 141): one read
+    // an hour.
+    let samples = store
+        .host_core_lines(trend_since(now_ms))
+        .map_err(super::err)?;
     let (lines, _) = lines_at(
         &store,
         nightly_dir().as_deref(),
         text,
-        super::now_ms(),
+        &samples,
+        now_ms,
         &mut Parts::default(),
     )?;
     Ok(values_of(&lines))
@@ -988,11 +1010,12 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
         );
         let values = super::values_of(&figures);
         // The count not measured always has a value (objective 088): the
-        // other 15 figures that have none (objective 094's two among them).
+        // other 17 figures that have none (objective 094's two and
+        // objective 141's two among them).
         assert_eq!(
             Value::Object(values),
             json!({"storage.free_bytes": 3, "storage.days_left": 9,
-                   "observability.not_measured": 15})
+                   "observability.not_measured": 17})
         );
     }
 }
