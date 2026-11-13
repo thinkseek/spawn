@@ -5222,10 +5222,26 @@ fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
     std::fs::create_dir_all(&bin).expect("stub bin");
     let runs = base.join("pnpm-runs");
     let names = base.join("pnpm-names");
+    let install = bin.join("install.sh");
+    // awk, not a shell, reads what pnpm was given: a shell exports PWD of
+    // its own before its first line runs.
+    let pnpm = format!(
+        "#!/usr/bin/awk -f\n\
+         BEGIN {{\n\
+         line = \"\"\n\
+         for (i = 1; i < ARGC; i++) line = line (i > 1 ? \" \" : \"\") ARGV[i]\n\
+         print line >> \"{runs}\"\n\
+         sorted = \"sort | tr '\\\\n' ' ' >'{names}'\"\n\
+         for (name in ENVIRON) print name | sorted\n\
+         close(sorted)\n\
+         exit system(\"sh '{install}'\")\n\
+         }}\n",
+        runs = runs.display(),
+        names = names.display(),
+        install = install.display()
+    );
     let script = format!(
         "#!/bin/sh\n\
-         echo \"$*\" >>'{runs}'\n\
-         awk 'BEGIN {{ for (name in ENVIRON) print name }}' | sort | tr '\\n' ' ' >'{names}'\n\
          if grep -q made-up-absent pnpm-lock.yaml; then\n\
          echo ' ERR_PNPM_META_FETCH_FAIL  GET http://127.0.0.1/made-up-absent: offline'\n\
          echo ' ERR_PNPM_NO_OFFLINE_META  Failed to resolve made-up-absent@1.0.0 in the store' >&2\n\
@@ -5233,13 +5249,12 @@ fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
          fi\n\
          mkdir -p node_modules/.pnpm node_modules/pkg2\n\
          cp pnpm-lock.yaml node_modules/.pnpm/lock.yaml\n\
-         echo x >node_modules/pkg2/index.js\n",
-        runs = runs.display(),
-        names = names.display()
+         echo x >node_modules/pkg2/index.js\n"
     );
-    let pnpm = bin.join("pnpm");
-    std::fs::write(&pnpm, script).expect("stub pnpm");
-    std::fs::set_permissions(&pnpm, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+    std::fs::write(&install, script).expect("the stub's install");
+    let stub = bin.join("pnpm");
+    std::fs::write(&stub, pnpm).expect("stub pnpm");
+    std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("executable");
     let path = std::env::var("PATH").unwrap_or_default();
     let env = &mut integrator.judge.gate_env;
