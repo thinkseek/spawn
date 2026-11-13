@@ -1319,15 +1319,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
                 scratch: store.scratch,
                 nonce: store.nonce,
             };
-            let other_last = older
-                .as_ref()
-                .map(|older| {
-                    older
-                        .newest()
-                        .map(|newest| newest.map(|(_, manifest)| manifest))
-                })
-                .transpose()?;
-            plan_verb(&planner, other_last, &settings, &flags, &area)
+            plan_verb(&planner, older.as_ref(), &settings, &flags, &area)
         }
         "get" => get_verb(reading, &flags, &area),
         "list" => list_verb(reading, &area),
@@ -1511,7 +1503,7 @@ is not sent again)",
 /// left (empty) if the plan fails.
 fn plan_verb<R: Reader>(
     store: &Store<'_, R>,
-    other_last: Option<Option<Manifest>>,
+    older: Option<&Store<'_, Settings>>,
     settings: &Settings,
     flags: &Flags,
     area: &str,
@@ -1524,8 +1516,11 @@ fn plan_verb<R: Reader>(
     let mut said = Vec::new();
     let sources = sources(area, &from, &mut said)?;
     // After another key's manifest, as put decides: every file whole.
-    let counts = match other_last {
-        Some(last) => store.plan_after(&sources, last.as_ref(), false)?,
+    let counts = match older {
+        Some(older) => {
+            let previous = older.newest()?.map(|(_, manifest)| manifest);
+            store.plan_after(&sources, previous.as_ref(), false)?
+        }
         None => store.plan(&sources)?,
     };
     let bucket = match kind(&settings.r2.bucket) {
