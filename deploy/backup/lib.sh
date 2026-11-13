@@ -8,7 +8,15 @@
 
 SPAWN_ENV_FILE=${SPAWN_ENV_FILE:-$HOME/.local/share/spawn-rsi/spawn.env}
 SPAWN_R2_ENV_FILE=${SPAWN_R2_ENV_FILE:-$HOME/.config/spawn/r2.env}
-SPAWN_BACKUP_KEY_FILE=${SPAWN_BACKUP_KEY_FILE:-$HOME/.config/spawn/backup.key}
+# The encryption keys have names (k1, k2, ...), one file each beside the
+# others: backup.key.<name>. These scripts know k1 only, the key of every
+# object from before the keys had names: its file is backup.key.k1, or
+# backup.key on a host that has not renamed it. SPAWN_BACKUP_KEY_FILE, when
+# set, is k1's file.
+if [ -z "${SPAWN_BACKUP_KEY_FILE-}" ]; then
+  SPAWN_BACKUP_KEY_FILE=$HOME/.config/spawn/backup.key.k1
+  [ -e "$SPAWN_BACKUP_KEY_FILE" ] || SPAWN_BACKUP_KEY_FILE=$HOME/.config/spawn/backup.key
+fi
 SPAWN_BACKUP_DIR=${SPAWN_BACKUP_DIR:-$HOME/.local/share/spawn-rsi/backups}
 # The live server's container: its image supplies a pg_dump/pg_restore of the
 # server's own major version (dumps stay readable by that version's tools).
@@ -32,6 +40,35 @@ need_tools() {
   for t in "$@"; do
     command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
   done
+}
+
+# key_files: every key file beside k1's (backup.key and backup.key.*), one
+# path a line, whatever each holds. Nothing of a file is read. No directory
+# is no key file.
+key_files() {
+  local dir
+  dir=$(dirname "$SPAWN_BACKUP_KEY_FILE")
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -name 'backup.key*' | LC_ALL=C sort
+}
+
+# other_key: the first key file that is not k1's (a k2, a k3, a stray copy),
+# or nothing.
+other_key() {
+  local file held
+  held=$(key_files) || return 1
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    case ${file##*/} in
+      backup.key | backup.key.k1) continue ;;
+    esac
+    [ "$file" -ef "$SPAWN_BACKUP_KEY_FILE" ] && continue
+    printf '%s\n' "$file"
+    return 0
+  done <<LIST
+$held
+LIST
+  return 0
 }
 
 # check_private FILE: the file exists and only its owner can read it.

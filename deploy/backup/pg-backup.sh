@@ -4,7 +4,8 @@
 #   pg-backup.sh               dump, check, encrypt, upload
 #   pg-backup.sh --accept-drop upload as good even if spawn_events fell or the
 #                              dump shrank (only after you know why)
-#   pg-backup.sh --init-key    create the encryption key if it does not exist
+#   pg-backup.sh --init-key    create the first encryption key of a host that
+#                              holds none (refused when any key file exists)
 #
 # Steps; any failure exits non-zero with the reason on stderr:
 #   1. pg_dump -Fc of SPAWN_DATABASE_URL (spawn.env) with the pg_dump of the
@@ -38,17 +39,27 @@ case "${1-}" in
   "") ;;
   --accept-drop) accept_drop=1 ;;
   --init-key)
-    if [ -e "$SPAWN_BACKUP_KEY_FILE" ]; then
-      log "$SPAWN_BACKUP_KEY_FILE already exists; not replacing it"
-    else
-      mkdir -p "$(dirname "$SPAWN_BACKUP_KEY_FILE")"
-      head -c 32 /dev/urandom | base64 > "$SPAWN_BACKUP_KEY_FILE"
-      chmod 600 "$SPAWN_BACKUP_KEY_FILE"
-      log "created $SPAWN_BACKUP_KEY_FILE; copy it somewhere off this host now (without it no backup can be decrypted)"
-    fi
+    # The first key of a host that has none, and nothing else: a second key
+    # made here would seal backups while no copy of it exists off this host.
+    # A new key (k2, ...) is never made here: before anything is sealed with
+    # it, a copy of it elsewhere is proved to open what it seals.
+    held=$(key_files) || die "cannot list the key files beside $SPAWN_BACKUP_KEY_FILE"
+    [ -z "$held" ] && [ ! -e "$SPAWN_BACKUP_KEY_FILE" ] ||
+      die "--init-key makes the first key only, and this host holds a key file already ($(printf '%s' "${held:-$SPAWN_BACKUP_KEY_FILE}" | tr '\n' ' ')); nothing is created or replaced. A new key is never made by this script: a copy of it off this host is first proved to open what it seals"
+    mkdir -p "$(dirname "$SPAWN_BACKUP_KEY_FILE")"
+    head -c 32 /dev/urandom | base64 > "$SPAWN_BACKUP_KEY_FILE"
+    chmod 600 "$SPAWN_BACKUP_KEY_FILE"
+    log "created $SPAWN_BACKUP_KEY_FILE; copy it somewhere off this host now (without it no backup can be decrypted)"
     exit 0 ;;
   *) die "usage: $0 [--accept-drop | --init-key]" ;;
 esac
+
+# A host with a second key seals every new backup with its newest one
+# (`spawn backup dump`); this script seals with k1 only, so it makes no
+# backup there.
+other=$(other_key) || die "cannot list the key files beside $SPAWN_BACKUP_KEY_FILE"
+[ -z "$other" ] ||
+  die "this host holds a key file other than k1's ($other): new backups are sealed with the newest key, by \`spawn backup dump\`; this script seals with k1 only and uploads nothing"
 
 need_tools pg_restore gpg curl flock sha256sum md5sum stat date awk
 # A host without docker names a native pg_dump of the live server's major
