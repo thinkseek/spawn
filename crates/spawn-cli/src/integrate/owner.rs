@@ -706,46 +706,127 @@ fn candidate_scenarios(
     Ok(copy)
 }
 
-/// The installed controller's `web/node_modules`, copied into the
-/// candidate's `tree` before its gate starts: git holds no node_modules, and
-/// the scenarios of an owner judging are the candidate's own, so a check
-/// that builds the UI (Spawn's check-web.sh, `$controller/web/node_modules`)
-/// found none in the tree and failed on the candidate and on the base alike:
-/// a host fault, retried every backoff, never judged (lead-mac, 2026-11-10).
-/// The gate binds that directory into its sandbox only when it is there at
-/// its setup, so the copy is made here, with the tree, on every judging.
+/// What an owner judging's tree got for its `web/node_modules`
+/// ([`controller_modules`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Modules {
+    /// The installed controller's set, copied: the candidate's lockfile is
+    /// the one it was installed from.
+    Copied,
+    /// The candidate's own set, installed offline from the host's store
+    /// ([`install_modules`]).
+    Installed,
+    /// Nothing to give: the controller has no set, the candidate has no
+    /// `web/`, or it tracks its own node_modules.
+    Nothing,
+    /// No verdict, and why: `web/` holds configuration an owner judging
+    /// does not install with ([`web_config_refusal`]), or the install
+    /// failed; `log` is pnpm's output when it ran.
+    NoVerdict { why: String, log: Option<String> },
+}
+
+/// How the integrator installs a candidate's own `web/` dependencies, run
+/// in the tree's `web/` with stdin closed: from the lockfile alone, offline
+/// (no network), no package's lifecycle script and no pnpmfile (a
+/// candidate's would run in pnpm even with --ignore-scripts); pnpm's
+/// directories pinned inside `web/` over anything a configuration says (a
+/// modulesDir or virtualStoreDir cannot write outside the tree, or into the
+/// controller's set); no switching to another pnpm version; every file a
+/// clone or a copy, never a hardlink, so no file of the tree shares an
+/// inode with the store (a candidate's scenario cannot write into the
+/// host's store).
+pub(super) const INSTALL_ARGS: &[&str] = &[
+    "install",
+    "--frozen-lockfile",
+    "--ignore-scripts",
+    "--offline",
+    "--ignore-pnpmfile",
+    "--config.modules-dir=node_modules",
+    "--config.virtual-store-dir=node_modules/.pnpm",
+    "--config.manage-package-manager-versions=false",
+    "--config.package-import-method=clone-or-copy",
+    "--reporter=append-only",
+];
+
+/// The no-verdict of an install that missed a package in the host's store
+/// (pnpm's ERR_PNPM_NO_OFFLINE_META or ERR_PNPM_NO_OFFLINE_TARBALL, under
+/// whatever wrapper code pnpm prints first): the same words every time, so
+/// a second judging of the same set refuses the request (P27).
+pub(super) const NOT_IN_STORE: &str = "dependencies not in the store: the candidate's \
+     web/pnpm-lock.yaml names packages the host's pnpm store does not hold, and an owner \
+     judging installs offline; install the set with network (pnpm install in web/) and \
+     request again";
+
+/// The no-verdict of a candidate whose `web/` holds pnpm configuration
+/// outside the reviewed shape ([`web_config_refusal`]): followed by what
+/// was found.
+pub(super) const WEB_CONFIG: &str =
+    "the candidate's web/ holds pnpm configuration an owner judging does not install with";
+
+/// The start of every other install failure's no-verdict.
+const NOT_INSTALLED: &str = "the candidate's web dependencies could not be installed";
+
+/// The installed controller's `web/node_modules`, or the candidate's own
+/// set, given to the candidate's `tree` before its gate starts: git holds
+/// no node_modules, and the scenarios of an owner judging are the
+/// candidate's own, so a check that builds the UI (Spawn's check-web.sh,
+/// `$controller/web/node_modules`) found none in the tree and failed on the
+/// candidate and on the base alike: a host fault, retried every backoff,
+/// never judged (lead-mac, 2026-11-10). The gate binds that directory into
+/// its sandbox only when it is there at its setup, so it is made here,
+/// with the tree, on every judging, before the room check.
 ///
-/// As deploy/controller.sh copies it into a controller: a real directory,
-/// never a symlink (a gate's tree must not reach the controller's files), a
-/// reflink where the filesystem has them, else hardlinks, else a full copy;
-/// and only when the dependencies it was installed from
-/// (`.pnpm/lock.yaml`) are the candidate's `web/pnpm-lock.yaml`, never
-/// judging the UI with other dependencies than the candidate names.
+/// First the candidate's tree is read ([`web_config_refusal`]): anything
+/// outside the reviewed shape is a no-verdict and nothing is copied or
+/// installed. Then:
+/// - when the controller's set was installed from the candidate's
+///   `web/pnpm-lock.yaml` (its `.pnpm/lock.yaml` is that file): copied, as
+///   deploy/controller.sh copies it into a controller: a real directory,
+///   never a symlink (a gate's tree must not reach the controller's files),
+///   a reflink where the filesystem has them, else hardlinks, else a full
+///   copy;
+/// - otherwise the candidate's own set is installed into the tree's `web/`
+///   from the host's pnpm store, offline ([`install_modules`], with `env`,
+///   the gate's environment, for PATH and HOME): a failure is a
+///   no-verdict (K2, requests 148307 and 148311: a changed lockfile left
+///   the tree without node_modules, and no owner push that changes a
+///   dependency was ever judged).
 ///
-/// `Ok(None)`: copied, or nothing to copy (the controller has none, the
-/// candidate has no `web/` or tracks its own node_modules). `Ok(Some(why))`:
-/// not copied, and why. `Err`: the copy failed (the host's).
+/// The controller's own set is never written. `Err`: the copy failed (the
+/// host's).
 pub(super) fn controller_modules(
     controller: &std::path::Path,
     tree: &std::path::Path,
-) -> Result<Option<String>, String> {
+    env: &[(String, String)],
+) -> Result<Modules, String> {
     let source = controller.join("web/node_modules");
     let Ok(source) = std::fs::canonicalize(&source) else {
-        return Ok(None);
+        return Ok(Modules::Nothing);
     };
     let web = tree.join("web");
+    if std::fs::symlink_metadata(&web).is_err() || !source.is_dir() {
+        return Ok(Modules::Nothing);
+    }
+    if let Some(found) = web_config_refusal(tree) {
+        return Ok(Modules::NoVerdict {
+            why: format!("{WEB_CONFIG}: {found}"),
+            log: None,
+        });
+    }
     let target = web.join("node_modules");
-    if !source.is_dir() || !web.is_dir() || std::fs::symlink_metadata(&target).is_ok() {
-        return Ok(None);
+    if !web.is_dir() || std::fs::symlink_metadata(&target).is_ok() {
+        return Ok(Modules::Nothing);
     }
     if let Ok(installed) = std::fs::read(source.join(".pnpm/lock.yaml"))
         && std::fs::read(web.join("pnpm-lock.yaml")).ok().as_deref() != Some(&installed[..])
     {
-        return Ok(Some(format!(
-            "web/node_modules not given to the candidate's tree: {} was installed from \
-             another lockfile than its web/pnpm-lock.yaml",
-            source.display()
-        )));
+        return Ok(match install_modules(&web, env) {
+            Ok(()) => Modules::Installed,
+            Err((why, log)) => {
+                let _ = std::fs::remove_dir_all(&target);
+                Modules::NoVerdict { why, log }
+            }
+        });
     }
     let temporary = web.join(".node_modules.copy");
     let _ = std::fs::remove_dir_all(&temporary);
@@ -774,7 +855,414 @@ pub(super) fn controller_modules(
         let _ = std::fs::remove_dir_all(&temporary);
         format!("{}: {error}", target.display())
     })?;
-    Ok(None)
+    Ok(Modules::Copied)
+}
+
+/// Install the candidate's own dependency set into `web` (the tree's
+/// `web/`): `pnpm` [`INSTALL_ARGS`], stdin closed, with a cleared
+/// environment: PATH and HOME from `env` (the gate's environment: where
+/// the integrator's unit puts pnpm, and where the store is) and LC_ALL=C,
+/// nothing else (never the integrator's database URL or tokens). Then the
+/// set's `node_modules/.pnpm/lock.yaml` must be the candidate's
+/// `web/pnpm-lock.yaml`, byte for byte. `Err((why, log))`: the no-verdict's
+/// reason, which names no path (P27 compares reasons), and pnpm's output.
+fn install_modules(
+    web: &std::path::Path,
+    env: &[(String, String)],
+) -> Result<(), (String, Option<String>)> {
+    let mut command = std::process::Command::new("pnpm");
+    command
+        .args(INSTALL_ARGS)
+        .current_dir(web)
+        .env_clear()
+        .stdin(std::process::Stdio::null());
+    for (name, value) in env {
+        if name == "PATH" || name == "HOME" {
+            command.env(name, value);
+        }
+    }
+    command.env("LC_ALL", "C");
+    let output = command.output().map_err(|error| {
+        (
+            format!("{NOT_INSTALLED}: pnpm did not start ({:?})", error.kind()),
+            None,
+        )
+    })?;
+    let mut log = String::from_utf8_lossy(&output.stdout).to_string();
+    log.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        if log.contains("ERR_PNPM_NO_OFFLINE") {
+            return Err((NOT_IN_STORE.to_string(), Some(log)));
+        }
+        let code = first_pnpm_code(&log).map_or_else(
+            || {
+                output.status.code().map_or_else(
+                    || "killed by a signal".to_string(),
+                    |code| format!("exit {code}"),
+                )
+            },
+            str::to_string,
+        );
+        return Err((
+            format!("{NOT_INSTALLED}: pnpm install --frozen-lockfile --offline failed ({code})"),
+            Some(log),
+        ));
+    }
+    let installed = std::fs::read(web.join("node_modules/.pnpm/lock.yaml")).ok();
+    if installed.is_none() || installed != std::fs::read(web.join("pnpm-lock.yaml")).ok() {
+        return Err((
+            format!(
+                "{NOT_INSTALLED}: the installed set's node_modules/.pnpm/lock.yaml is not its \
+                 web/pnpm-lock.yaml"
+            ),
+            Some(log),
+        ));
+    }
+    Ok(())
+}
+
+/// pnpm's first error code in `log` (`ERR_PNPM_<CAPITALS>`).
+fn first_pnpm_code(log: &str) -> Option<&str> {
+    let at = log.find("ERR_PNPM_")?;
+    let rest = &log[at..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// What in the candidate's `tree` lies outside the shape an owner judging
+/// installs with, read before anything is copied or installed (rev-g's F1,
+/// F2 and F3 on R1-R3); `None` when nothing does. The rule reads text and
+/// parses no YAML; a key or field is named only when it is a plain word.
+/// Widening a list is the owner's change. Its second copy is
+/// scripts/web-install.sh --strict=web (objective 134), which the owner's
+/// own installs run: a change to one is a change to both.
+/// - `web` a symbolic link (the copy or the install would go where it
+///   points);
+/// - an `.npmrc` or a pnpmfile in `web/`, or an `.npmrc`, a pnpmfile or a
+///   `pnpm-workspace.yaml` at the tree's root;
+/// - `web/package.json`, `pnpm-lock.yaml` or `pnpm-workspace.yaml` that is
+///   not a regular file;
+/// - the workspace file's keys ([`workspace_refusal`]), the package's
+///   fields and dependencies ([`package_refusal`]) and the lockfile's
+///   resolutions and values ([`lock_refusal`]).
+pub(super) fn web_config_refusal(tree: &std::path::Path) -> Option<String> {
+    let web = tree.join("web");
+    if std::fs::symlink_metadata(&web).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Some("web is a symbolic link".to_string());
+    }
+    for name in [".npmrc", ".pnpmfile.cjs", ".pnpmfile.mjs", "pnpmfile.cjs"] {
+        if std::fs::symlink_metadata(web.join(name)).is_ok() {
+            return Some(format!("web has {name}"));
+        }
+    }
+    for name in [
+        ".npmrc",
+        ".pnpmfile.cjs",
+        ".pnpmfile.mjs",
+        "pnpmfile.cjs",
+        "pnpm-workspace.yaml",
+    ] {
+        if std::fs::symlink_metadata(tree.join(name)).is_ok() {
+            return Some(format!("the tree's root has {name}"));
+        }
+    }
+    let checks: [(&str, Refusal); 3] = [
+        ("pnpm-workspace.yaml", workspace_refusal),
+        ("package.json", package_refusal),
+        ("pnpm-lock.yaml", lock_refusal),
+    ];
+    for (name, refusal) in checks {
+        let path = web.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            return Some(format!("web/{name} is not a regular file"));
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Some(format!("web/{name} is not UTF-8 text"));
+        };
+        if let Some(found) = refusal(&text) {
+            return Some(format!("web/{name} {found}"));
+        }
+    }
+    None
+}
+
+/// What a file of `web/` holds outside its shape, from its text.
+type Refusal = fn(&str) -> Option<String>;
+
+/// The one top-level key main's `web/pnpm-workspace.yaml` holds.
+const WORKSPACE_KEY: &str = "minimumReleaseAgeExclude";
+
+/// A plain word: what a refusal may name (letters, digits and `-_.@/`, at
+/// most 80 characters, not starting with `.` or `/`).
+fn plain(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 80
+        && !word.starts_with(['.', '/'])
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '/'))
+}
+
+/// What in `web/pnpm-workspace.yaml` lies outside main's shape: a top-level
+/// key other than [`WORKSPACE_KEY`] (pnpmfile, modulesDir,
+/// virtualStoreDir, storeDir, configDependencies, hooks and every key pnpm
+/// adds later), a top-level line that is no plain key, a first setting
+/// that is indented, or a tab indent.
+pub(super) fn workspace_refusal(text: &str) -> Option<String> {
+    let mut seen_key = false;
+    for line in text.lines() {
+        let body = line.trim_start_matches([' ', '\t']);
+        let indent = &line[..line.len() - body.len()];
+        if indent.contains('\t') {
+            return Some("has a tab indent".to_string());
+        }
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if !indent.is_empty() {
+            if !seen_key {
+                return Some("has an indented first setting".to_string());
+            }
+            continue;
+        }
+        let key = body.split_once(':').map(|(key, _)| key);
+        match key {
+            Some(WORKSPACE_KEY) => seen_key = true,
+            Some(key) if plain(key) && !key.contains(['@', '/', '.']) => {
+                return Some(format!("sets {key}"));
+            }
+            _ => return Some("has a top-level line that is no plain key".to_string()),
+        }
+    }
+    None
+}
+
+/// The fields `web/package.json` may hold.
+const PACKAGE_FIELDS: &[&str] = &[
+    "name",
+    "version",
+    "private",
+    "type",
+    "description",
+    "license",
+    "scripts",
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+/// The fields of `web/package.json` that name dependencies.
+const DEPENDENCY_FIELDS: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+/// What in `web/package.json` lies outside the shape: a field outside
+/// [`PACKAGE_FIELDS`] (so no pnpm, packageManager, devEngines or engines),
+/// a dependency field that is not an object, or a dependency that is not
+/// the registry's: a range, version or dist-tag alone, so any `:` or `/`
+/// is refused (file:, link:, workspace:, portal:, git, github:, http(s):,
+/// an npm: alias, a path), and so are a backslash, a leading `.` (a path:
+/// `.`, `..`) and a tarball's name (rev-g, F2 on R2: `"x": "file:<a host
+/// directory>"` copied that directory into the tree).
+pub(super) fn package_refusal(text: &str) -> Option<String> {
+    let Ok(serde_json::Value::Object(package)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        return Some("is not a JSON object".to_string());
+    };
+    for (field, value) in &package {
+        if !PACKAGE_FIELDS.contains(&field.as_str()) {
+            return Some(if plain(field) {
+                format!("has the field {field}")
+            } else {
+                "has a field outside the reviewed ones".to_string()
+            });
+        }
+        if !DEPENDENCY_FIELDS.contains(&field.as_str()) {
+            continue;
+        }
+        let Some(dependencies) = value.as_object() else {
+            return Some(format!("has {field} that is not an object"));
+        };
+        for (name, spec) in dependencies {
+            if !spec.as_str().is_some_and(registry_range) {
+                return Some(if plain(name) {
+                    format!("has a dependency that is not a registry range ({name})")
+                } else {
+                    "has a dependency that is not a registry range".to_string()
+                });
+            }
+        }
+    }
+    None
+}
+
+/// A registry range, version or dist-tag alone.
+fn registry_range(spec: &str) -> bool {
+    let lower = spec.trim_end().to_ascii_lowercase();
+    !spec.contains([':', '/', '\\'])
+        && !spec.trim_start().starts_with('.')
+        && !TARBALLS.iter().any(|tarball| lower.ends_with(tarball))
+}
+
+/// The endings of a tarball's name, which pnpm reads as a file.
+const TARBALLS: &[&str] = &[".tgz", ".tar", ".tar.gz"];
+
+/// The schemes a lockfile value of a registry's package never starts with.
+const LOCK_SCHEMES: &[&str] = &[
+    "file:",
+    "link:",
+    "portal:",
+    "workspace:",
+    "git:",
+    "git+",
+    "github:",
+    "gitlab:",
+    "bitbucket:",
+    "http:",
+    "https:",
+    "npm:",
+];
+
+/// What in `web/pnpm-lock.yaml` lies outside a registry's lockfile, read as
+/// text (a lockfile can say `version: link:<dir>` under a registry
+/// specifier): a backslash or a double quote anywhere (rev-g, F3 on R3: a
+/// double-quoted scalar spells any key or value with escapes; pnpm writes
+/// neither); a complex key, merge key, anchor, alias or tag
+/// ([`hides_a_key`]); a `resolution` that is not `resolution: {integrity:
+/// …}` alone, however the key is spelled ([`names_resolution`]); a value
+/// that starts with one of [`LOCK_SCHEMES`], or such a scheme after a
+/// package key's `@` ([`scheme_at`]).
+pub(super) fn lock_refusal(text: &str) -> Option<String> {
+    if text.contains(['\\', '"']) {
+        return Some("has a backslash or a double quote".to_string());
+    }
+    for line in text.lines() {
+        let body = line.trim_start();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if let Some(what) = hides_a_key(body) {
+            return Some(format!("has {what}"));
+        }
+        if names_resolution(body) && !integrity_alone(body) {
+            return Some("has a resolution that is not an integrity alone".to_string());
+        }
+        if let Some(found) = scheme_at(body) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Where a scalar of `body` (a line, its indent trimmed) may start: the
+/// line's start, after `- `, after `: `, after `{` or `[`, and after `, `.
+fn scalar_starts(body: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let bytes = body.as_bytes();
+    for at in 0..bytes.len() {
+        let next = match bytes[at] {
+            b'{' | b'[' => at + 1,
+            b':' | b',' | b'-' if bytes.get(at + 1) == Some(&b' ') => {
+                if bytes[at] == b'-' && at != 0 {
+                    continue;
+                }
+                at + 2
+            }
+            _ => continue,
+        };
+        let mut start = next;
+        while bytes.get(start) == Some(&b' ') {
+            start += 1;
+        }
+        if start < bytes.len() {
+            starts.push(start);
+        }
+    }
+    starts
+}
+
+/// A complex key (`?`), a merge key (`<<`), an anchor (`&`), an alias
+/// (`*`) or a tag (`!`) in `body`, each of which can stand for a key or
+/// value no text rule reads.
+fn hides_a_key(body: &str) -> Option<&'static str> {
+    if body.starts_with('?') {
+        return Some("a complex key");
+    }
+    for start in scalar_starts(body) {
+        let rest = &body[start..];
+        if rest.starts_with("<<") {
+            return Some("a merge key");
+        }
+        match rest.chars().next() {
+            Some('&') => return Some("an anchor"),
+            Some('*') => return Some("an alias"),
+            Some('!') => return Some("a tag"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `body` names a `resolution` key, however it is spelled (plain,
+/// single-quoted, or inside a flow mapping).
+fn names_resolution(body: &str) -> bool {
+    let unquoted = body.replace('\'', "");
+    scalar_starts(&unquoted).into_iter().any(|start| {
+        unquoted[start..]
+            .strip_prefix("resolution")
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })
+}
+
+/// `resolution: {integrity: <base64>}` and nothing else.
+fn integrity_alone(body: &str) -> bool {
+    body.trim_end()
+        .strip_prefix("resolution: {integrity: ")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|hash| {
+            !hash.is_empty()
+                && hash
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-'))
+        })
+}
+
+/// A value of `body` that starts with one of [`LOCK_SCHEMES`] (single
+/// quotes aside), or such a scheme after an `@` (a package key's
+/// version): what was found, naming the line's key when it is a plain word.
+fn scheme_at(body: &str) -> Option<String> {
+    let unquoted = body.replace('\'', "");
+    let schemed = |text: &str| {
+        let lower = text.to_ascii_lowercase();
+        LOCK_SCHEMES.iter().any(|scheme| lower.starts_with(scheme))
+    };
+    let found = scalar_starts(&unquoted)
+        .into_iter()
+        .any(|start| schemed(&unquoted[start..]))
+        || unquoted
+            .match_indices('@')
+            .any(|(at, _)| schemed(&unquoted[at + 1..]));
+    if !found {
+        return None;
+    }
+    let key = unquoted
+        .trim_start_matches("- ")
+        .split_once(':')
+        .map(|(key, _)| key.trim())
+        .filter(|key| plain(key) && !key.contains(['@', '/', '.']));
+    Some(match key {
+        Some(key) => format!("has a value that is not the registry's ({key})"),
+        None => "has a value that is not the registry's".to_string(),
+    })
 }
 
 /// The controller whose scenarios directory is `gate`, where `inside` is
@@ -943,10 +1431,8 @@ impl super::Judge {
             Err(error) => return Err(Err(error)),
         };
         let controller = controller_of(std::path::Path::new(&mission.gate), &inside);
-        match controller_modules(&controller, &work.join("tree")) {
-            Ok(None) => {}
-            Ok(Some(why)) => println!("integrate: owner request {}: {why}", request.id),
-            Err(error) => return Err(Err(error)),
+        if let Some(judged) = self.give_modules(store, request, &controller, &work.join("tree")) {
+            return Ok(judged);
         }
         let test_database = super::needs_test_database(&scenarios);
         let room = if test_database {
@@ -1024,6 +1510,37 @@ impl super::Judge {
                 let why = no_verdict(failure);
                 Ok(self.no_verdict_kept(store, request, why, log.as_deref(), again))
             }
+        }
+    }
+
+    /// The candidate's `web/node_modules`, made before the room check and
+    /// the gate ([`controller_modules`], with the gate's environment): `None`
+    /// to go on to the gate; `Some` when there is nothing to judge with, a
+    /// no-verdict kept through [`Self::no_verdict_kept`] (pnpm's output as
+    /// its log, so a second one for the same reason refuses the request,
+    /// P27), or the copy failed (the host's: no verdict, judged again).
+    fn give_modules(
+        &self,
+        store: &PostgresStore,
+        request: &Request,
+        controller: &std::path::Path,
+        tree: &std::path::Path,
+    ) -> Option<Judged> {
+        match controller_modules(controller, tree, &self.gate_env) {
+            Ok(Modules::Copied | Modules::Nothing) => None,
+            Ok(Modules::Installed) => {
+                println!(
+                    "integrate: owner request {}: the candidate's web dependencies installed \
+                     offline from the host's store",
+                    request.id
+                );
+                None
+            }
+            Ok(Modules::NoVerdict { why, log }) => {
+                println!("integrate: owner request {}: {why}", request.id);
+                Some(self.no_verdict_kept(store, request, why, log.as_deref(), true))
+            }
+            Err(error) => Some(Judged::NoVerdict(error)),
         }
     }
 
@@ -1348,6 +1865,205 @@ pub(super) fn judged(
         Judged::Landed { from, to } => {
             backoff.remove(&id);
             println!("{said}: accepted, main {from} -> {to}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lock_refusal, package_refusal, workspace_refusal};
+
+    /// Main's web/ files, as an owner judging reads them.
+    const MAIN_WORKSPACE: &str = include_str!("../../../../web/pnpm-workspace.yaml");
+    const MAIN_PACKAGE: &str = include_str!("../../../../web/package.json");
+    const MAIN_LOCK: &str = include_str!("../../../../web/pnpm-lock.yaml");
+
+    #[test]
+    fn a_workspace_file_holds_mains_one_key_alone() {
+        assert_eq!(workspace_refusal(MAIN_WORKSPACE), None);
+        assert_eq!(workspace_refusal(""), None);
+        assert_eq!(
+            workspace_refusal("# a comment\nminimumReleaseAgeExclude: []\n"),
+            None
+        );
+        for (text, found) in [
+            (
+                "minimumReleaseAgeExclude: []\npnpmfile: hook.cjs\n",
+                "sets pnpmfile",
+            ),
+            ("modulesDir: ../../outside\n", "sets modulesDir"),
+            ("virtualStoreDir: /tmp/v\n", "sets virtualStoreDir"),
+            ("storeDir: /tmp/s\n", "sets storeDir"),
+            ("configDependencies: {}\n", "sets configDependencies"),
+            ("hooks: {}\n", "sets hooks"),
+            (
+                "'pnpmfile': hook.cjs\n",
+                "has a top-level line that is no plain key",
+            ),
+            (
+                "\"pnpmfile\": hook.cjs\n",
+                "has a top-level line that is no plain key",
+            ),
+            (
+                "{pnpmfile: hook.cjs}\n",
+                "has a top-level line that is no plain key",
+            ),
+            ("---\n", "has a top-level line that is no plain key"),
+            ("  pnpmfile: hook.cjs\n", "has an indented first setting"),
+            ("minimumReleaseAgeExclude:\n\t- x\n", "has a tab indent"),
+        ] {
+            assert_eq!(workspace_refusal(text).as_deref(), Some(found), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_package_json_holds_plain_fields_alone() {
+        assert_eq!(package_refusal(MAIN_PACKAGE), None);
+        assert_eq!(
+            package_refusal(
+                r#"{"name": "w", "private": true, "license": "MIT", "description": "d",
+                    "dependencies": {"@hugeicons/react": "^4.4.0", "a": "1.0.0", "b": "latest",
+                                     "c": ">=1 <2 || ^3", "d": "*"},
+                    "peerDependencies": {"e": "~1.2"}, "optionalDependencies": {}}"#
+            ),
+            None,
+            "registry ranges, dist-tags and scoped names"
+        );
+        for (text, found) in [
+            (r#"{"pnpm": {}}"#, "has the field pnpm"),
+            (
+                r#"{"packageManager": "pnpm@9"}"#,
+                "has the field packageManager",
+            ),
+            (r#"{"devEngines": {}}"#, "has the field devEngines"),
+            (r#"{"engines": {}}"#, "has the field engines"),
+            (
+                r#"{"dependencies": []}"#,
+                "has dependencies that is not an object",
+            ),
+            (
+                r#"{"devDependencies": "x"}"#,
+                "has devDependencies that is not an object",
+            ),
+            ("[]", "is not a JSON object"),
+            ("{", "is not a JSON object"),
+        ] {
+            assert_eq!(package_refusal(text).as_deref(), Some(found), "{text}");
+        }
+        for spec in [
+            "\"file:/home/u/.config\"",
+            "\"link:../x\"",
+            "\"github:o/r\"",
+            "\"npm:react@19\"",
+            "\"workspace:*\"",
+            "\"portal:../p\"",
+            "\"git+https://h/r.git\"",
+            "\"https://h/x.tgz\"",
+            "\"o/r\"",
+            "\"../x\"",
+            "\".\"",
+            "\"~/x\"",
+            "\"x.tgz\"",
+            "1",
+            "null",
+        ] {
+            let text = format!(r#"{{"dependencies": {{"x": {spec}}}}}"#);
+            assert_eq!(
+                package_refusal(&text).as_deref(),
+                Some("has a dependency that is not a registry range (x)"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lockfile_resolves_from_the_registry_alone() {
+        assert_eq!(lock_refusal(MAIN_LOCK), None);
+        let good = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+                    excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      \
+                    get-caller-file:\n        specifier: '*'\n        version: 2.0.5\n\n\
+                    packages:\n\n  get-caller-file@2.0.5:\n    resolution: {integrity: \
+                    sha512-abc/+=}\n    engines: {node: 6.* || 8.* || >= 10.*}\n\n  \
+                    terminal-link@2.1.1:\n    resolution: {integrity: sha512-xyz}\n\n  \
+                    '@types/react@19.0.0':\n    resolution: {integrity: sha512-q}\n\n\
+                    snapshots:\n\n  get-caller-file@2.0.5: {}\n";
+        assert_eq!(lock_refusal(good), None, "file- and link-named packages");
+        for (text, found) in [
+            (
+                "      made-up-b:\n        version: link:/home/u/.config\n",
+                "has a value that is not the registry's (version)",
+            ),
+            (
+                "        version: file:../x\n",
+                "has a value that is not the registry's (version)",
+            ),
+            (
+                "        specifier: 'npm:react@19'\n",
+                "has a value that is not the registry's (specifier)",
+            ),
+            (
+                "        version: github:o/r\n",
+                "has a value that is not the registry's (version)",
+            ),
+            (
+                "  secretpkg@file:../x:\n",
+                "has a value that is not the registry's",
+            ),
+            (
+                "  'x@link:/etc': {}\n",
+                "has a value that is not the registry's",
+            ),
+            (
+                "    resolution: {tarball: http://h/x.tgz}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    resolution: {directory: ../x, type: directory}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    resolution: {integrity: sha512-a, tarball: file:x}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    resolution:\n      directory: ../x\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    'resolution': {directory: ../x}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    {resolution: {directory: ../x}}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            ("    ? version\n    : link:/x\n", "has a complex key"),
+            ("    <<: *base\n", "has a merge key"),
+            ("    base: &base {}\n", "has an anchor"),
+            ("    version: *v\n", "has an alias"),
+            ("    version: !!str x\n", "has a tag"),
+            (
+                "        version: \"\\x6cink:/x\"\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "  \"made-up-b@\\x6cink:/x\": {}\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "    \"r\\x65solution\": {directory: ../x}\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "        version: \"1.0.0\"\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "        version: 1.0.0\\\n",
+                "has a backslash or a double quote",
+            ),
+        ] {
+            assert_eq!(lock_refusal(text).as_deref(), Some(found), "{text}");
         }
     }
 }
