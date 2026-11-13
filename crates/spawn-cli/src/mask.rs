@@ -628,4 +628,84 @@ mod tests {
             );
         }
     }
+
+    const BB_A: &[u8] = b"made-up-AAAA-0123456789abcdefghij";
+    const BB_C: &[u8] = b"PREFIX-made-up-AAAA";
+
+    fn hex(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .iter()
+            .flat_map(|byte| format!("{byte:02x}").into_bytes())
+            .collect()
+    }
+
+    /// `text` masked by `mask` in two reads cut at `cut`.
+    fn cut_in_two(mask: &Mask, text: &[u8], cut: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut held = text[..cut].to_vec();
+        let taken = mask.step(&held, false, &mut out);
+        held.drain(..taken);
+        held.extend_from_slice(&text[cut..]);
+        mask.step(&held, true, &mut out);
+        out
+    }
+
+    #[test]
+    fn overlapping_values_are_masked_as_one_span_however_the_input_is_cut() {
+        let a = ("BB_A".to_string(), BB_A.to_vec());
+        let c = ("BB_C".to_string(), BB_C.to_vec());
+        for values in [[a.clone(), c.clone()], [c, a]] {
+            let mask = Mask::new(&values);
+            for overlap in [
+                [b"PREFIX-".as_slice(), BB_A].concat(),
+                hex(&[b"PREFIX-".as_slice(), BB_A].concat()),
+            ] {
+                let text = [b"x ".as_slice(), &overlap, b" y"].concat();
+                assert_eq!(mask.bytes(&text), b"x [SECRET:BB_C] y");
+                for cut in 0..=text.len() {
+                    assert_eq!(
+                        cut_in_two(&mask, &text, cut),
+                        b"x [SECRET:BB_C] y",
+                        "cut at {cut}"
+                    );
+                }
+                let mut streamed = Vec::new();
+                mask.stream(&mut text.as_slice(), &mut streamed)
+                    .expect("stream");
+                assert_eq!(streamed, b"x [SECRET:BB_C] y");
+            }
+            assert_eq!(
+                mask.text("in PREFIX-made-up-AAAA-0123456789abcdefghij-and made-up-AAAA-0123456789abcdefghij."),
+                "in [SECRET:BB_C]-and [SECRET:BB_A]."
+            );
+        }
+    }
+
+    #[test]
+    fn the_hook_masks_an_overlap_whole() {
+        let file = File::new(
+            "BB_A=made-up-AAAA-0123456789abcdefghij\nBB_C=PREFIX-made-up-AAAA\n",
+            0o600,
+        );
+        let event = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                           "tool_response": {"stdout": "PREFIX-made-up-AAAA-0123456789abcdefghij",
+                                             "stderr": "", "interrupted": false}})
+        .to_string();
+        let answer = hook_reply(&file.0, Ok(event.into_bytes())).expect("an answer");
+        assert_eq!(
+            updated(&answer),
+            json!({"stdout": "[SECRET:BB_C]", "stderr": "", "interrupted": false})
+        );
+        assert!(!answer.contains("0123456789"), "{answer}");
+    }
+
+    #[test]
+    fn a_directory_is_not_a_file() {
+        let dir = crate::storage::tests::scratch("mask-dir");
+        let values = dir.join("values");
+        std::fs::create_dir(&values).expect("mkdir");
+        let error = read_values(&values).expect_err("a directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(error, format!("{}: not a file", values.display()));
+    }
 }
