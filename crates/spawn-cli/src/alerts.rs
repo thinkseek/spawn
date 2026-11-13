@@ -92,9 +92,11 @@
 //!   command that releases it (`spawn task release`). One open per task.
 //!   Clears at the task's `task.released`, at a later verdict on it but
 //!   `no_room` and `stale` (which judge nothing, as the store's fold keeps
-//!   it parked then), or at its `task.landed`, `task.cancelled` or
-//!   `task.aborted`; and at start, when the mirror finds the task no longer
-//!   parked by that record (one parked while the step was down fires then).
+//!   it parked then), or at its `task.landed`, `task.cancelled`,
+//!   `task.aborted` or `task.over_budget` (each ends the task, and the
+//!   store's fold takes it out of the bound); and at start, when the mirror
+//!   finds the task no longer parked by that record (one parked while the
+//!   step was down fires then).
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
 //!   longer than `SPAWN_ALERT_UNDELIVERED_SECS` (default 300) while its
@@ -1223,7 +1225,8 @@ impl Monitor {
             && verdict == Some("host_fault")
             && record["evidence"].as_str() == Some("load_sensitive_parked");
         let clears = match kind {
-            "task.released" | "task.landed" | "task.cancelled" | "task.aborted" => true,
+            "task.released" | "task.landed" | "task.cancelled" | "task.aborted"
+            | "task.over_budget" => true,
             "task.gated" => !parks && !matches!(verdict, Some("no_room" | "stale")),
             _ => false,
         };
@@ -5843,6 +5846,33 @@ mod tests {
                     if key == "task_parked:7:18" && evidence["record"] == "task.cancelled")),
             "the task's end clears it"
         );
+        let mut monitor = monitor_parked(parked());
+        let over = feed(
+            &mut monitor,
+            21,
+            0,
+            json!({"type": "task.over_budget", "id": 7, "reason": "r"}),
+        );
+        assert!(
+            decided(&monitor, over)
+                .iter()
+                .any(|event| event.key() == "task_parked:7:20"),
+            "over budget ends it too"
+        );
+    }
+
+    /// A monitor that knows task 7 of mission 4, parked by `record` (event 20).
+    fn monitor_parked(record: Value) -> Monitor {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let parked = feed(&mut monitor, 20, 0, record);
+        commit(&mut monitor, &parked);
+        monitor
     }
 
     /// `validator_defect` (review-fix-gate.md F1 and N1): a task's gate that

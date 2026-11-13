@@ -2341,7 +2341,13 @@ begin
                updated_at_ms = p_at
          where id = v_mission;
     when 'task.landed' then
-        update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
+        -- A task that ends leaves the load-sensitive bound (rev-e F2): no
+        -- board line, no release, for a task no gate judges again.
+        update mission_tasks set state = 'landed',
+                                 gate_load_sensitive_pushed = null,
+                                 gate_load_sensitive_scenarios = null, gate_parked_pushed = null,
+                                 updated_at_ms = p_at
+         where id = v_id;
         -- A landing ends its mission's run of host faults, and its run of
         -- bases that disagreed with themselves.
         update mission_missions set gate_host_faults = 0, gate_host_task = null,
@@ -2363,6 +2369,8 @@ begin
     when 'task.aborted' then
         -- Over budget: the work is dropped, and it counts toward the abort halt.
         update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',
+                                 gate_load_sensitive_pushed = null,
+                                 gate_load_sensitive_scenarios = null, gate_parked_pushed = null,
                                  updated_at_ms = p_at
          where id = v_id;
         update mission_missions set gate_aborts = gate_aborts + 1, updated_at_ms = p_at
@@ -2380,6 +2388,8 @@ begin
         -- gate_aborts and gate_rejections stay as they were
         -- (docs/fleet-architecture.md §10.4).
         update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',
+                                 gate_load_sensitive_pushed = null,
+                                 gate_load_sensitive_scenarios = null, gate_parked_pushed = null,
                                  updated_at_ms = p_at
          where id = v_id;
         -- A task that leaves the gate ends its run of `no_room`.
@@ -2414,7 +2424,11 @@ begin
     when 'task.cancelled' then
         -- `by` names who cancelled (spawn_task_cancel_by), read by the
         -- scorecard, not by the fold.
-        update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
+        update mission_tasks set state = 'cancelled',
+                                 gate_load_sensitive_pushed = null,
+                                 gate_load_sensitive_scenarios = null, gate_parked_pushed = null,
+                                 updated_at_ms = p_at
+         where id = v_id;
         -- A cancel of a task of the objective every rejection of the
         -- mission's run was ends that run, whoever cancels it: a yield
         -- (either rule's: three rejections of one objective, or its failed
