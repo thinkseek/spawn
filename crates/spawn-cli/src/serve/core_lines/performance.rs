@@ -493,6 +493,17 @@ mod tests {
                                    "measured_from_ms": from},
                 "gate_time": {"value": null}, "first_pass": {"value": null}}}]})
         };
+        let star = |scorecard: &Value| {
+            let values = performance(scorecard, &Value::Null);
+            let line = &lines(
+                &json!({}),
+                &values,
+                &Observed::default(),
+                Value::Null,
+                Vec::new(),
+            )[0];
+            figure_json(&line.north_star, None)
+        };
         let from = json!(1_700_000_000_000_i64);
         let waiting = star(&card(false, from.clone(), json!(3_600_000)));
         assert_eq!(waiting["key"], "performance.report_to_live");
