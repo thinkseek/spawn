@@ -4552,6 +4552,18 @@ fn files_digest(files: &[String]) -> u64 {
 ///   long-lived spawn processes are also not dumpable
 ///   (`spawn_host::undumpable`), which is what keeps their environment
 ///   from the same user.
+/// - The accidental prints of a password (url-leak-sources.md): a URL
+///   that holds one anywhere in a command (`*://*:*@*`), the whole
+///   environment printed (`env`, `printenv`, `export -p`, `declare -x`,
+///   `set` and their kin, alone or behind a pipe, `;` or `&&`), process
+///   listings with their arguments (`ps -ef`, `ps aux`, `ps -o args`,
+///   `pgrep -a`/`-l`, `top -c`, `pstree -a`, `/proc/<pid>/cmdline`), and
+///   Claude Code's settings by any path (`cd ~/.claude`). Not `echo $X`,
+///   `env -u X` with no command or an interpreter that prints the
+///   environment: a glob cannot tell them from what must run, and an
+///   engine's environment with no password closes those at the source.
+///   The task's prompt says what to do instead (deliver's credentials
+///   line): a deny rule carries no message of its own.
 ///
 /// Claude Code's own files under `~/.claude` are its internal writes, not
 /// tool calls: a session, its transcript and a resume work with all of it
