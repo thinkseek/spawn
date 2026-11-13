@@ -551,6 +551,7 @@ mod tests {
         readings, record_reading, show, status_at_ms, unit_allowed,
     };
     use serde_json::{Value, json};
+    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     /// A scratch directory removed when the test ends, passed or not:
@@ -920,11 +921,24 @@ mod tests {
         assert_eq!(status_at_ms(None), None);
     }
 
+    /// The fake systemctl, written and made executable by a child `sh`
+    /// (objective 107): no descriptor of this process is ever open for
+    /// writing on it, so another test's child, between its fork and its
+    /// exec, cannot hold it busy (ETXTBSY) when a test runs it.
     fn script(dir: &std::path::Path, body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("systemctl");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the fake");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s\\n' \"$1\" >\"$2\" && chmod 755 \"$2\"",
+                "sh",
+            ])
+            .arg(format!("#!/bin/sh\n{body}"))
+            .arg(&path)
+            .stdin(Stdio::null())
+            .status()
+            .expect("run sh to write the fake");
+        assert!(status.success(), "writing the fake: {status}");
         path.display().to_string()
     }
 
@@ -998,7 +1012,8 @@ mod tests {
         }
         assert!(!ran.exists(), "systemctl was never run");
         // The good name runs it.
-        let _ = show(&program, "a.service", Duration::from_secs(5));
+        let shown = show(&program, "a.service", Duration::from_secs(5));
+        assert!(shown.is_ok(), "a.service: {shown:?}");
         assert!(ran.exists());
     }
 }
