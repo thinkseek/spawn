@@ -21,7 +21,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// The usage, printed for `get` and every verb that is not one.
@@ -288,7 +288,10 @@ fn edit_line(input: &mut impl Read) -> Line {
         match byte[0] {
             b'\n' | b'\r' | 0x04 => return Line::Value(value),
             0x03 => return Line::Cancelled,
-            0x15 => value.0.fill(0),
+            0x15 => {
+                value.0.fill(0);
+                value.0.clear();
+            }
             0x7f | 0x08 => {
                 while let Some(last) = value.0.pop() {
                     if last & 0xC0 != 0x80 {
@@ -302,9 +305,6 @@ fn edit_line(input: &mut impl Read) -> Line {
                 }
                 value.0.push(other);
             }
-        }
-        if byte[0] == 0x15 {
-            value.0.clear();
         }
     }
 }
@@ -572,13 +572,6 @@ impl Store {
             _ => format!("{name}  unreadable metadata"),
         }
     }
-}
-
-/// Whether a path is the store's; used by nothing but kept tested through
-/// [`Store`].
-#[allow(dead_code)]
-fn _is(path: &Path) -> bool {
-    path.is_absolute()
 }
 
 #[cfg(test)]
