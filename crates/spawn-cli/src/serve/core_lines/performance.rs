@@ -406,108 +406,115 @@ mod tests {
         );
     }
 
-    /// Objective 095's (2), by hand: report to live is held back, measuring
-    /// since the first deploy record, until that record covers the 7 days.
+    /// Objective 132, by hand: report to live is the value over what the
+    /// live record covers, measuring since the first deploy record and
+    /// saying so as its window until the record covers the 7 days.
     #[test]
-    fn report_to_live_waits_until_the_live_record_covers_the_window() {
+    fn report_to_live_is_over_what_the_live_record_covers() {
         const DAY: i64 = 86_400_000;
         let now = 100 * DAY;
-        let values = json!({"report_to_live": 383_820_000, "gate_time": 840_000});
-        // The record began 2 days ago: no value, measuring since then.
+        let values = json!({"report_to_live": 2_674_521, "gate_time": 840_000});
+        let star = |values: &Value| {
+            lines(
+                &json!({}),
+                values,
+                &Observed::default(),
+                Value::Null,
+                Vec::new(),
+            )[0]
+            .clone()
+        };
+        // The record began 2 days ago: the value, measuring since then.
         let young = measured(values.clone(), Some(now - 2 * DAY), now);
-        assert_eq!(young["report_to_live"], Value::Null);
-        assert_eq!(young["measuring_since_ms"], json!(now - 2 * DAY));
         assert_eq!(
             young["gate_time"],
             json!(840_000),
             "the guardrails are untouched"
         );
-        let line = &lines(
-            &json!({}),
-            &young,
-            &Observed::default(),
-            Value::Null,
-            Vec::new(),
-        )[0];
+        let line = star(&young);
         assert_eq!(
             figure_json(&line.north_star, None),
             json!({"key": "performance.report_to_live", "name": "Time from report to live",
-                   "unit": "ms", "value": null, "range": null, "state": "not_collected",
-                   "measuring_since_ms": now - 2 * DAY})
+                   "unit": "ms", "value": 2_674_521, "range": null, "state": "no_range",
+                   "measuring_since_ms": now - 2 * DAY,
+                   "window": "since the deploy record began"})
         );
-        assert!(
-            !super::super::values_of(std::slice::from_ref(line))
-                .contains_key("performance.report_to_live"),
-            "no sample of it while measuring"
+        assert_eq!(
+            super::super::values_of(std::slice::from_ref(&line)).get("performance.report_to_live"),
+            Some(&json!(2_674_521)),
+            "sampled hourly"
         );
-        // Just short of 7 days: still measuring.
-        let short = measured(values.clone(), Some(now - 7 * DAY + 1), now);
-        assert_eq!(short["report_to_live"], Value::Null);
-        // No deploy record at all: no value and no start.
+        // Just short of 7 days: the same.
+        let short = star(&measured(values.clone(), Some(now - 7 * DAY + 1), now)).north_star;
+        assert_eq!(short.value, json!(2_674_521));
+        assert_eq!(short.measuring_since_ms, json!(now - 7 * DAY + 1));
+        assert_eq!(short.window, Some("since the deploy record began"));
+        // Not covered and no value: measuring since, no window.
+        let empty = star(&measured(
+            json!({"report_to_live": null}),
+            Some(now - DAY),
+            now,
+        ));
+        assert_eq!(empty.north_star.value, Value::Null);
+        assert_eq!(empty.north_star.measuring_since_ms, json!(now - DAY));
+        assert_eq!(empty.north_star.window, None);
+        // No deploy record at all: no value, no start, no window.
         let none = measured(values.clone(), None, now);
         assert_eq!(none["report_to_live"], Value::Null);
-        assert_eq!(none["measuring_since_ms"], Value::Null);
-        let star = &lines(
-            &json!({}),
-            &none,
-            &Observed::default(),
-            Value::Null,
-            Vec::new(),
-        )[0]
-        .north_star;
-        assert!(figure_json(star, None).get("measuring_since_ms").is_none());
-        // Covered (exactly 7 days, and more): the Scorecard's value, no start.
+        let shown = figure_json(&star(&none).north_star, None);
+        assert_eq!(shown["value"], Value::Null);
+        assert!(shown.get("measuring_since_ms").is_none(), "{shown}");
+        assert!(shown.get("window").is_none(), "{shown}");
+        // Covered (exactly 7 days, and more): the value, window 7d, no start.
         for first in [now - 7 * DAY, now - 30 * DAY] {
-            let covered = measured(values.clone(), Some(first), now);
-            assert_eq!(covered, values, "covered from {first}");
-            let star = &lines(
-                &json!({}),
-                &covered,
-                &Observed::default(),
-                Value::Null,
-                Vec::new(),
-            )[0]
-            .north_star;
-            let shown = figure_json(star, None);
-            assert_eq!(shown["value"], json!(383_820_000));
-            assert!(shown.get("measuring_since_ms").is_none());
+            let not_covered = json!({"report_to_live": 2_674_521,
+                                     "measuring_since_ms": first,
+                                     "report_to_live_window": SINCE_THE_RECORD});
+            for given in [values.clone(), not_covered] {
+                let covered = measured(given, Some(first), now);
+                let shown = figure_json(&star(&covered).north_star, None);
+                assert_eq!(shown["value"], json!(2_674_521), "covered from {first}");
+                assert_eq!(shown["window"], "7d", "{shown}");
+                assert!(shown.get("measuring_since_ms").is_none(), "{shown}");
+            }
         }
     }
 
-    /// Objective 095: the north star while the Scorecard's 7 days are not
-    /// covered by the live record has no value and says where the measuring
-    /// began; once covered it is the Scorecard's value, with no such field.
+    /// Objectives 095 and 132: the north star while the Scorecard's 7 days
+    /// are not covered by the live record is its value, saying where the
+    /// measuring began and its window; under 3 live landings it has no
+    /// value and no window; once covered it is the value, window 7d, with
+    /// no start.
     #[test]
     fn the_performance_north_star_measures_since_the_record_until_covered() {
-        let card = |covered: bool, from: Value| {
+        let card = |covered: bool, from: Value, value: Value| {
             json!({"scopes": [{"scope": "fleet", "dimensions": {
-                "report_to_live": {"value": 3_600_000, "n": 3, "covered": covered,
+                "report_to_live": {"value": value, "n": 3, "covered": covered,
                                    "measured_from_ms": from},
                 "gate_time": {"value": null}, "first_pass": {"value": null}}}]})
         };
-        let star = |scorecard: &Value| {
-            let values = performance(scorecard, &Value::Null);
-            let line = &lines(
-                &json!({}),
-                &values,
-                &Observed::default(),
-                Value::Null,
-                Vec::new(),
-            )[0];
-            figure_json(&line.north_star, None)
-        };
-        let waiting = star(&card(false, json!(1_700_000_000_000_i64)));
+        let from = json!(1_700_000_000_000_i64);
+        let waiting = star(&card(false, from.clone(), json!(3_600_000)));
         assert_eq!(waiting["key"], "performance.report_to_live");
-        assert_eq!(waiting["value"], Value::Null);
-        assert_eq!(waiting["state"], "not_collected");
-        assert_eq!(waiting["measuring_since_ms"], json!(1_700_000_000_000_i64));
-        let covered = star(&card(true, json!(1_700_000_000_000_i64)));
+        assert_eq!(waiting["value"], json!(3_600_000));
+        assert_eq!(waiting["state"], "no_range");
+        assert_eq!(waiting["measuring_since_ms"], from);
+        assert_eq!(waiting["window"], "since the deploy record began");
+        // Under 3 live landings: no value, measuring since, no window.
+        let few = star(&card(false, from.clone(), Value::Null));
+        assert_eq!(few["value"], Value::Null);
+        assert_eq!(few["state"], "not_collected");
+        assert_eq!(few["measuring_since_ms"], from);
+        assert_eq!(few.get("window"), None, "{few}");
+        let covered = star(&card(true, from, json!(3_600_000)));
         assert_eq!(covered["value"], json!(3_600_000));
         assert_eq!(covered["state"], "no_range");
         assert_eq!(covered.get("measuring_since_ms"), None, "{covered}");
+        assert_eq!(covered["window"], "7d");
         // With no deploy record: nothing measured, nothing to say since when.
-        let never = star(&card(false, Value::Null));
+        let never = star(&card(false, Value::Null, Value::Null));
         assert_eq!(never["value"], Value::Null);
         assert_eq!(never.get("measuring_since_ms"), None, "{never}");
+        assert_eq!(never.get("window"), None, "{never}");
     }
 }
