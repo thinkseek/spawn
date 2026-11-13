@@ -72,9 +72,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BundleRecord, Key, Settings, bundle_records, decompress_bundle, decrypt_with,
-    get_object_bytes, header_value, heads_of, hex, object_key, output, random_hex, reading_key,
-    record_key, same_key, sha256_file,
+    BundleRecord, Key, Settings, bundle_records, decompress_bundle, decrypt_with, get_object_bytes,
+    header_value, heads_of, hex, object_key, output, random_hex, reading_key, record_key, same_key,
+    sha256_file,
 };
 use crate::Flags;
 use crate::config::{env_value, open_store};
@@ -1243,6 +1243,46 @@ mod tests {
                 "skipped": [],
             }),
         }
+    }
+
+    /// Objective 114: a chain is read with one key, its newest link's (no
+    /// `sealed_with`: k1); links of two keys cross and are refused; a link
+    /// whose name is no key name is refused by its record, never echoed.
+    #[test]
+    fn a_chain_is_read_with_one_key_and_never_across_keys() {
+        use super::{ChainKey, chain_key};
+        let sealed = |event_id: i64, base: Option<i64>, name: Option<&str>| {
+            let mut link = record(
+                event_id,
+                if base.is_some() {
+                    "incremental"
+                } else {
+                    "full"
+                },
+                base,
+                true,
+            );
+            if let Some(name) = name {
+                link.record["sealed_with"] = json!(name);
+            }
+            link
+        };
+        let (old, incr) = (sealed(1, None, None), sealed(2, Some(1), Some("k1")));
+        assert_eq!(chain_key(&[&old, &incr]), Ok("k1".to_string()));
+        let (full2, incr2) = (sealed(3, None, Some("k2")), sealed(4, Some(3), Some("k2")));
+        assert_eq!(chain_key(&[&full2, &incr2]), Ok("k2".to_string()));
+        let crossed = sealed(5, Some(2), Some("k2"));
+        assert!(matches!(chain_key(&[&old, &incr, &crossed]),
+                Err(ChainKey::Crossed(reason)) if reason.starts_with("the chain crosses keys")),);
+        let made_up = "bb-made-up-passphrase-0123456789";
+        let planted = sealed(6, None, Some(made_up));
+        assert_eq!(
+            chain_key(&[&planted]),
+            Err(ChainKey::Refused(
+                "the sealed_with of backup.bundled record 6 is not a backup key name (k and a number from 1, as k2)"
+                    .to_string()
+            ))
+        );
     }
 
     /// The parent is refused under a fake home, a fake live directory or the

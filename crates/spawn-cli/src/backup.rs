@@ -394,8 +394,9 @@ fn reading_key(name: &str, what: &str) -> Result<Key, String> {
 fn sealing_key() -> Result<Key, String> {
     let name = key_name(env_value("SPAWN_BACKUP_SEAL_KEY").as_deref())
         .map_err(|rule| format!("SPAWN_BACKUP_SEAL_KEY {rule}"))?;
-    let key = key_on_host(&name)
-        .map_err(|path| format!("the sealing key {name}: its key file {path} is not on this host"))?;
+    let key = key_on_host(&name).map_err(|path| {
+        format!("the sealing key {name}: its key file {path} is not on this host")
+    })?;
     private_file(&key.file, "the backup key")?;
     Ok(key)
 }
@@ -403,7 +404,8 @@ fn sealing_key() -> Result<Key, String> {
 /// The key a `backup.dumped` or `backup.bundled` record says sealed it: its
 /// `sealed_with` (absent: k1, as every record before objective 114).
 fn record_key(record_type: &str, event_id: i64, record: &Value) -> Result<String, String> {
-    let refused = |rule: String| format!("the sealed_with of {record_type} record {event_id} {rule}");
+    let refused =
+        |rule: String| format!("the sealed_with of {record_type} record {event_id} {rule}");
     match &record["sealed_with"] {
         Value::Null => key_name(None),
         Value::String(name) => key_name(Some(name)).map_err(refused),
@@ -1909,7 +1911,8 @@ fn sealed_alike(earlier: Vec<BundleRecord>, seal: &str) -> Vec<BundleRecord> {
     earlier
         .into_iter()
         .filter(|entry| {
-            record_key("backup.bundled", entry.event_id, &entry.record).is_ok_and(|name| name == seal)
+            record_key("backup.bundled", entry.event_id, &entry.record)
+                .is_ok_and(|name| name == seal)
         })
         .collect()
 }
@@ -2069,7 +2072,10 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let store = open_store()?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
-    let earlier = sealed_alike(bundle_records(&store, &settings.prefix, now_ms)?, &seal.name);
+    let earlier = sealed_alike(
+        bundle_records(&store, &settings.prefix, now_ms)?,
+        &seal.name,
+    );
     let base = earlier.last();
     let stamps = bundle_stamps(&earlier);
     let full = full_bundle(now, &stamps, now_ms);
@@ -3740,7 +3746,17 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         assert_eq!(key_name(None).as_deref(), Ok("k1"));
         assert_eq!(key_name(Some("k2")).as_deref(), Ok("k2"));
         assert_eq!(key_name(Some("k12")).as_deref(), Ok("k12"));
-        for bad in ["k0", "K2", "k2/..", "", "k", "k01", " k2", "k2 ", MADE_UP_SECRET] {
+        for bad in [
+            "k0",
+            "K2",
+            "k2/..",
+            "",
+            "k",
+            "k01",
+            " k2",
+            "k2 ",
+            MADE_UP_SECRET,
+        ] {
             let error = key_name(Some(bad)).expect_err(bad);
             assert_eq!(error, KEY_NAME_RULE, "{bad:?}");
         }
@@ -3829,7 +3845,10 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             record,
         };
         let k1_full = || {
-            entry(1, serde_json::json!({"kind": "full", "keys": ["bundles/full/a"]}))
+            entry(
+                1,
+                serde_json::json!({"kind": "full", "keys": ["bundles/full/a"]}),
+            )
         };
         let k1_incr = || {
             entry(
@@ -3839,11 +3858,20 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         };
         assert!(sealed_alike(vec![k1_full(), k1_incr()], "k2").is_empty());
         assert_eq!(sealed_alike(vec![k1_full(), k1_incr()], "k1").len(), 2);
-        let k2_full = entry(3, serde_json::json!({"kind": "full", "sealed_with": "k2", "keys": ["c"]}));
+        let k2_full = entry(
+            3,
+            serde_json::json!({"kind": "full", "sealed_with": "k2", "keys": ["c"]}),
+        );
         let earlier = sealed_alike(vec![k1_full(), k1_incr(), k2_full], "k2");
         assert_eq!(earlier.iter().map(|e| e.event_id).collect::<Vec<_>>(), [3]);
-        let planted = entry(4, serde_json::json!({"sealed_with": MADE_UP_SECRET, "keys": ["d"]}));
-        assert!(sealed_alike(vec![planted], "k1").is_empty(), "a refused name is no one's");
+        let planted = entry(
+            4,
+            serde_json::json!({"sealed_with": MADE_UP_SECRET, "keys": ["d"]}),
+        );
+        assert!(
+            sealed_alike(vec![planted], "k1").is_empty(),
+            "a refused name is no one's"
+        );
     }
 
     /// The store seals with the sealing key's file: required, a bad name or
@@ -3857,7 +3885,8 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             name: "k2".to_string(),
             file: "/made-up/backup.key.k2".into(),
         };
-        let refused: Result<Key, String> = Err(format!("SPAWN_BACKUP_SEAL_KEY {}", super::KEY_NAME_RULE));
+        let refused: Result<Key, String> =
+            Err(format!("SPAWN_BACKUP_SEAL_KEY {}", super::KEY_NAME_RULE));
         assert_eq!(
             store_key_file(&Ok(k2.clone()), true, || k1.clone()),
             Ok(k2.file.clone())
@@ -3867,7 +3896,13 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             Err(refused.clone().unwrap_err()),
             "required: refused, never k1"
         );
-        assert_eq!(store_key_file(&refused, false, || k1.clone()), Ok(k1.clone()));
-        assert_eq!(store_key_file(&Ok(k2.clone()), false, || k1.clone()), Ok(k2.file));
+        assert_eq!(
+            store_key_file(&refused, false, || k1.clone()),
+            Ok(k1.clone())
+        );
+        assert_eq!(
+            store_key_file(&Ok(k2.clone()), false, || k1.clone()),
+            Ok(k2.file)
+        );
     }
 }
