@@ -667,9 +667,39 @@ fn unjudged_head(
     Rejection::Record("rejected", record)
 }
 
-/// The record of a gate rejection: the reason, the gate's output and the
-/// note that quotes its tail.
+/// The tests a rejection names at most; the rest are counted.
+const NAMED_FAILURES: usize = 5;
+
+/// The reason a rejection's record gives: the gate's own `reason`, except
+/// for check-tests.sh's regression whose output `log` names failing tests
+/// ([`host::check_tests_failures`]): then "check-tests.sh failed: <test>"
+/// for each of the first [`NAMED_FAILURES`], in the output's order, joined
+/// by "; ", then "; and <n> more" for the rest, then the gate's reason in
+/// brackets.
+fn rejection_reason(reason: &str, log: &str) -> String {
+    if !reason.trim().starts_with(host::CHECK_TESTS_REGRESSION) {
+        return reason.to_string();
+    }
+    let failures = host::check_tests_failures(log);
+    if failures.is_empty() {
+        return reason.to_string();
+    }
+    let mut named: Vec<String> = failures
+        .iter()
+        .take(NAMED_FAILURES)
+        .map(|failure| format!("check-tests.sh failed: {}", failure.test))
+        .collect();
+    if failures.len() > NAMED_FAILURES {
+        named.push(format!("and {} more", failures.len() - NAMED_FAILURES));
+    }
+    format!("{} ({})", named.join("; "), reason.trim())
+}
+
+/// The record of a gate rejection: the reason (naming check-tests.sh's
+/// failing tests, [`rejection_reason`]), the gate's output and the note
+/// that quotes the reason and the output's tail.
 pub(super) fn rejected_fields(reason: &str, log: &str) -> Value {
+    let reason = rejection_reason(reason, log);
     json!({"log": log, "reason": reason, "note": format!(
         "The gate rejected this work: {reason}.\n\nGate output (tail):\n{}",
         tail(log, NOTE_LOG_CHARS))})
