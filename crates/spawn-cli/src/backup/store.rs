@@ -94,7 +94,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Lock, Scratch, Settings, Stamp, hex, random_hex};
+use super::{Key, Lock, Scratch, Settings, Stamp, hex, random_hex};
 use crate::Flags;
 use crate::config::env_value;
 
@@ -178,6 +178,13 @@ pub(crate) trait Reader {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
     /// Every key under `prefix`, with its size and ETag.
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String>;
+    /// The key an object says sealed it (`x-amz-meta-spawn-seal`, read with
+    /// [`super::key_name`]; absent: k1, as every object before objective
+    /// 114). A bucket that keeps no headers (a test's) is k1's.
+    fn sealed_with(&self, key: &str) -> Result<String, String> {
+        let _ = key;
+        super::key_name(None)
+    }
 }
 
 /// The bucket, as this layer writes it: never a delete, never an overwrite.
@@ -204,6 +211,13 @@ impl Reader for Settings {
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
         super::list_prefix(self, prefix)
     }
+    fn sealed_with(&self, key: &str) -> Result<String, String> {
+        let response = super::bucket_request(self, &self.r2.url(key), "head\n")?;
+        if response.status != 200 {
+            return Err(format!("HEAD {key} answered {}", response.status));
+        }
+        super::object_key(key, &response.headers)
+    }
 }
 
 /// The backups' bucket with no way to write: `plan`'s. It is a [`Reader`]
@@ -219,6 +233,9 @@ impl Reader for ReadOnly<'_> {
     }
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
         self.0.list(prefix)
+    }
+    fn sealed_with(&self, key: &str) -> Result<String, String> {
+        self.0.sealed_with(key)
     }
 }
 
@@ -290,8 +307,14 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// The key segment names are made with: from the backup key, never the key
 /// itself.
 fn name_key(settings: &Settings) -> Result<[u8; 32], String> {
-    let secret = fs::read(&settings.key_file)
-        .map_err(|error| format!("the backup key {}: {error}", settings.key_file.display()))?;
+    name_key_of(&settings.key_file)
+}
+
+/// The names' key of the backup key in `file` (another key's, for a
+/// manifest it sealed: objective 116).
+fn name_key_of(file: &Path) -> Result<[u8; 32], String> {
+    let secret =
+        fs::read(file).map_err(|error| format!("the backup key {}: {error}", file.display()))?;
     Ok(Sha256::new()
         // FROZEN from the first live put on: every segment's name is made
         // with it, so a changed label names no object the bucket holds
@@ -718,6 +741,23 @@ fn classify(source: &Source, previous: Option<&Entry>) -> Result<(Plan, File), S
 impl<B: Reader> Store<'_, B> {
     /// The newest manifest of this area, host and account, and its key.
     pub(crate) fn newest(&self) -> Result<Option<(String, Manifest)>, String> {
+        let Some(key) = self.newest_key()? else {
+            return Ok(None);
+        };
+        let bytes = self.open_object(&key)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("the manifest {key}: {error}"))?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(format!(
+                "the manifest {key} is of version {}, not {MANIFEST_VERSION}",
+                manifest.version
+            ));
+        }
+        Ok(Some((key, manifest)))
+    }
+
+    /// The newest manifest's key (one LIST), not opened.
+    fn newest_key(&self) -> Result<Option<String>, String> {
         let listed = self.bucket.list(&self.keys.manifests())?;
         let prefix = self.keys.manifests();
         let Some(key) = listed
@@ -738,16 +778,7 @@ impl<B: Reader> Store<'_, B> {
         else {
             return Ok(None);
         };
-        let bytes = self.open_object(&key)?;
-        let manifest: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("the manifest {key}: {error}"))?;
-        if manifest.version != MANIFEST_VERSION {
-            return Err(format!(
-                "the manifest {key} is of version {}, not {MANIFEST_VERSION}",
-                manifest.version
-            ));
-        }
-        Ok(Some((key, manifest)))
+        Ok(Some(key))
     }
 
     fn open_object(&self, key: &str) -> Result<Vec<u8>, String> {
@@ -770,7 +801,20 @@ impl<B: Reader> Store<'_, B> {
     /// sent, no manifest made.
     fn plan(&self, sources: &[Source]) -> Result<PlanCounts, String> {
         let last = self.newest()?.map(|(_, manifest)| manifest);
+        self.plan_after(sources, last.as_ref(), true)
+    }
+
+    /// [`Self::plan`] against `last`; with `reuse` false (a last manifest
+    /// of another key, objective 116) every file is to be sent whole, as
+    /// [`Self::put_after`] sends it.
+    fn plan_after(
+        &self,
+        sources: &[Source],
+        last: Option<&Manifest>,
+        reuse: bool,
+    ) -> Result<PlanCounts, String> {
         let by_path: BTreeMap<&str, &Entry> = last
+            .filter(|_| reuse)
             .iter()
             .flat_map(|manifest| &manifest.files)
             .map(|entry| (entry.path.as_str(), entry))
@@ -912,8 +956,23 @@ not adopted, nothing written over it",
     /// One `put` run of the area's files `sources`.
     fn put(&self, sources: &[Source], made_ms: i64) -> Result<PutCounts, String> {
         let last = self.newest()?.map(|(_, manifest)| manifest);
-        let generation = last.as_ref().map_or(0, |manifest| manifest.generation) + 1;
+        self.put_after(sources, made_ms, last.as_ref(), true)
+    }
+
+    /// One `put` run after `last`, the newest manifest: its generation is
+    /// the new one's less one. With `reuse` false (`last` is another key's,
+    /// objective 116) none of its segments is named again (their names are
+    /// that key's HMACs): every file is put whole under this run's key.
+    fn put_after(
+        &self,
+        sources: &[Source],
+        made_ms: i64,
+        last: Option<&Manifest>,
+        reuse: bool,
+    ) -> Result<PutCounts, String> {
+        let generation = last.map_or(0, |manifest| manifest.generation) + 1;
         let by_path: BTreeMap<&str, &Entry> = last
+            .filter(|_| reuse)
             .iter()
             .flat_map(|manifest| &manifest.files)
             .map(|entry| (entry.path.as_str(), entry))
@@ -1213,8 +1272,42 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         scratch: &scratch.path,
         nonce: &|| random_hex(4),
     };
+    // The newest manifest's own key (objective 116): when it is another
+    // key's, that key opens it, and its file must be here. Without it the
+    // run refuses before anything is written, never a fresh chain over a
+    // manifest it could not read.
+    let sealing = settings
+        .seal
+        .as_ref()
+        .map(|key| key.name.clone())
+        .map_err(Clone::clone)?;
+    let older_key = match older_key(&store, &sealing) {
+        Ok(older_key) => older_key,
+        Err(reason) => {
+            eprintln!("spawn store {verb}: {reason}");
+            return Ok(2);
+        }
+    };
+    let open_older = |input: &Path, out: &Path| match &older_key {
+        Some(key) => super::decrypt_with(key, input, out),
+        None => Err("no other key".to_string()),
+    };
+    let older = match &older_key {
+        Some(key) => Some(Store {
+            bucket: &settings,
+            keys: store.keys.clone(),
+            name_key: name_key_of(&key.file)?,
+            seal: &seal,
+            open: &open_older,
+            scratch: &scratch.path,
+            nonce: &|| random_hex(4),
+        }),
+        None => None,
+    };
+    // get, list and verify read the newest manifest with its own key.
+    let reading = older.as_ref().unwrap_or(&store);
     match verb.as_str() {
-        "put" => put_verb(&store, &settings, &flags, &area),
+        "put" => put_verb(&store, older.as_ref(), &settings, &flags, &area, &sealing),
         "plan" => {
             let reader = ReadOnly(&settings);
             let planner = Store {
@@ -1226,53 +1319,77 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
                 scratch: store.scratch,
                 nonce: store.nonce,
             };
-            plan_verb(&planner, &settings, &flags, &area)
+            plan_verb(&planner, older.as_ref(), &settings, &flags, &area)
         }
-        "get" => get_verb(&store, &flags, &area),
-        "list" => {
-            let listed = settings.list(&store.keys.manifests())?;
-            println!("store list {area}: {} manifest(s)", listed.len());
-            if let Some((key, manifest)) = store.newest()? {
-                println!("newest {key}");
-                for entry in &manifest.files {
-                    println!(
-                        "{} {} {} {}",
-                        entry.path,
-                        entry.size,
-                        entry.sha256,
-                        entry.segments.len()
-                    );
-                }
-            }
-            Ok(0)
-        }
-        "verify" => {
-            let (key, manifest) = store
-                .newest()?
-                .ok_or("no manifest in the bucket for this area, host and account")?;
-            let found = store.verify(&manifest)?;
-            println!(
-                "store verify {area}: {key}: {} file(s), {} object(s) named: {} present with their size and MD5, {} missing, {} of another size or MD5; {} not named by it; {} file(s) rebuilt and hashed",
-                manifest.files.len(),
-                found.named,
-                found.present,
-                found.missing,
-                found.wrong,
-                found.unnamed,
-                found.hashed
-            );
-            Ok(i32::from(!found.ok()))
-        }
+        "get" => get_verb(reading, &flags, &area),
+        "list" => list_verb(reading, &area),
+        "verify" => verify_verb(reading, &area),
         other => Err(format!("unknown store command {other}\n{USAGE}")),
     }
+}
+
+/// The key of the newest manifest when it is not `sealing` (objective
+/// 116): its object's `x-amz-meta-spawn-seal` (absent: k1), and that key's
+/// file on this host, or why there is none ("the last manifest is sealed
+/// with <name>; its key file <path> is not on this host"). `None` when there
+/// is no manifest, or the newest is the sealing key's.
+fn older_key<B: Reader>(store: &Store<'_, B>, sealing: &str) -> Result<Option<Key>, String> {
+    let Some(newest) = store.newest_key()? else {
+        return Ok(None);
+    };
+    let named = store.bucket.sealed_with(&newest)?;
+    if named == sealing {
+        return Ok(None);
+    }
+    super::reading_key(&named, "the last manifest").map(Some)
+}
+
+/// `list`: the area's manifests counted, and the newest one's files.
+fn list_verb(store: &Store<'_, Settings>, area: &str) -> Result<i32, String> {
+    let listed = store.bucket.list(&store.keys.manifests())?;
+    println!("store list {area}: {} manifest(s)", listed.len());
+    if let Some((key, manifest)) = store.newest()? {
+        println!("newest {key}");
+        for entry in &manifest.files {
+            println!(
+                "{} {} {} {}",
+                entry.path,
+                entry.size,
+                entry.sha256,
+                entry.segments.len()
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `verify`: the newest manifest checked ([`Store::verify`]).
+fn verify_verb(store: &Store<'_, Settings>, area: &str) -> Result<i32, String> {
+    let (key, manifest) = store
+        .newest()?
+        .ok_or("no manifest in the bucket for this area, host and account")?;
+    let found = store.verify(&manifest)?;
+    println!(
+        "store verify {area}: {key}: {} file(s), {} object(s) named: {} present with their size and MD5, {} missing, {} of another size or MD5; {} not named by it; {} file(s) rebuilt and hashed",
+        manifest.files.len(),
+        found.named,
+        found.present,
+        found.missing,
+        found.wrong,
+        found.unnamed,
+        found.hashed
+    );
+    Ok(i32::from(!found.ok()))
 }
 
 /// `put`: one run over the area's files, under the backup lock.
 fn put_verb(
     store: &Store<'_, Settings>,
+    older: Option<&Store<'_, Settings>>,
     settings: &Settings,
     flags: &Flags,
     area: &str,
+    sealing: &str,
 ) -> Result<i32, String> {
     may_write(
         &settings.prefix,
@@ -1287,7 +1404,15 @@ fn put_verb(
     for line in &said {
         println!("store put {area}: {line}");
     }
-    let counts = store.put(&sources, now_ms())?;
+    // After another key's manifest (`older` opens it): its generation, and
+    // every file whole under the sealing key.
+    let counts = match older {
+        Some(older) => {
+            let last = older.newest()?.map(|(_, manifest)| manifest);
+            store.put_after(&sources, now_ms(), last.as_ref(), false)?
+        }
+        None => store.put(&sources, now_ms())?,
+    };
     println!("store put {area}: {}", put_summary(&counts));
     // The run, as a `backup.stored` record (its manifest's key and counts,
     // nothing of a file's content). The copy is in the bucket already; a
@@ -1295,6 +1420,7 @@ fn put_verb(
     // its last manifest from the bucket either way.
     let record = serde_json::json!({
         "type": "backup.stored",
+        "sealed_with": sealing,
         "area": area,
         "host": store.keys.host,
         "account": store.keys.account,
@@ -1377,6 +1503,7 @@ is not sent again)",
 /// left (empty) if the plan fails.
 fn plan_verb<R: Reader>(
     store: &Store<'_, R>,
+    older: Option<&Store<'_, Settings>>,
     settings: &Settings,
     flags: &Flags,
     area: &str,
@@ -1388,7 +1515,14 @@ fn plan_verb<R: Reader>(
     let from = from_dir(settings, flags, area);
     let mut said = Vec::new();
     let sources = sources(area, &from, &mut said)?;
-    let counts = store.plan(&sources)?;
+    // After another key's manifest, as put decides: every file whole.
+    let counts = match older {
+        Some(older) => {
+            let previous = older.newest()?.map(|(_, manifest)| manifest);
+            store.plan_after(&sources, previous.as_ref(), false)?
+        }
+        None => store.plan(&sources)?,
+    };
     let bucket = match kind(&settings.r2.bucket) {
         Kind::Keep => "keep",
         Kind::Work => "work",

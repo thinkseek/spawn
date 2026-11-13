@@ -1413,3 +1413,118 @@ fn the_plans_list_is_a_new_private_file_never_written_over() {
     assert!(!dir.join("target.txt").exists(), "created through the link");
     fs::remove_dir_all(&dir).expect("clean up");
 }
+
+/// Objective 116: after a manifest of another key, `put` names none of its
+/// segments again (another key's HMACs) and puts every file whole under
+/// this run's key, with the next generation; `plan` says the same.
+#[test]
+fn after_another_keys_manifest_every_file_is_put_whole_and_no_old_segment_named() {
+    let bucket = Memory::default();
+    let work = scratch("other-key-work");
+    let dir = scratch("other-key-files");
+    fs::write(dir.join("a.jsonl"), b"line 1\nline 2\n").expect("a");
+    fs::write(dir.join("b.jsonl"), b"memory v1\n").expect("b");
+    let sources = listed(&dir);
+    let old = store(&bucket, &work);
+    old.put(&sources, 1_000).expect("the old key's put");
+    let (_, last) = old.newest().expect("newest").expect("one");
+    let old_names: Vec<String> = last
+        .files
+        .iter()
+        .flat_map(|entry| entry.segments.iter().map(|segment| segment.name.clone()))
+        .collect();
+    let mut new = store(&bucket, &work);
+    new.name_key = [9; 32];
+    let reused = new.plan_after(&sources, Some(&last), true).expect("plan");
+    assert_eq!(
+        (reused.unchanged, reused.whole),
+        (2, 0),
+        "the same key reuses"
+    );
+    let planned = new.plan_after(&sources, Some(&last), false).expect("plan");
+    assert_eq!(
+        (planned.unchanged, planned.appended, planned.whole),
+        (0, 0, 2)
+    );
+    assert_eq!(planned.send, planned.bytes, "every byte is to be sent");
+    let counts = new
+        .put_after(&sources, 2_000, Some(&last), false)
+        .expect("the new key's put");
+    assert_eq!(
+        (
+            counts.files,
+            counts.unchanged,
+            counts.appended,
+            counts.whole
+        ),
+        (2, 0, 0, 2)
+    );
+    assert_eq!(counts.segments_found, 0);
+    let (_, made) = new.newest().expect("newest").expect("one");
+    assert_eq!(made.generation, last.generation + 1);
+    for entry in &made.files {
+        for segment in &entry.segments {
+            assert!(!old_names.contains(&segment.name), "{}", segment.name);
+        }
+    }
+    fs::remove_dir_all(&work).expect("clean up");
+    fs::remove_dir_all(&dir).expect("clean up");
+}
+
+/// A bucket whose objects all say `seal` in their header.
+struct Sealed<'a>(&'a Memory, &'static str);
+
+impl Reader for Sealed<'_> {
+    fn head(&self, key: &str) -> Result<Option<Head>, String> {
+        self.0.head(key)
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        self.0.get(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
+        self.0.list(prefix)
+    }
+    fn sealed_with(&self, _: &str) -> Result<String, String> {
+        crate::backup::key_name(Some(self.1))
+    }
+}
+
+/// The newest manifest's key: none without a manifest or when it is the
+/// sealing key's; a bucket that keeps no header reads as k1; another key
+/// whose file is not on this host refuses the run, naming the key, never a
+/// value.
+#[test]
+fn the_newest_manifests_key_is_its_headers_and_its_file_must_be_here() {
+    use super::older_key;
+    let bucket = Memory::default();
+    let work = scratch("older-key-work");
+    let dir = scratch("older-key-files");
+    let plain = store(&bucket, &work);
+    assert_eq!(older_key(&plain, "k2"), Ok(None), "no manifest yet");
+    fs::write(dir.join("a.jsonl"), b"line\n").expect("a");
+    plain.put(&listed(&dir), 1_000).expect("put");
+    assert_eq!(
+        older_key(&plain, "k1"),
+        Ok(None),
+        "no header: k1's, the sealing key"
+    );
+    let sealed = Sealed(&bucket, "k9");
+    let reading = Store {
+        bucket: &sealed,
+        keys: keys(),
+        name_key: [7; 32],
+        seal: &seal,
+        open: &open,
+        scratch: &work,
+        nonce: &|| random_hex(4),
+    };
+    assert_eq!(older_key(&reading, "k9"), Ok(None));
+    let refused = older_key(&reading, "k2").expect_err("k9's file is not here");
+    assert!(
+        refused.starts_with("the last manifest is sealed with k9; its key file ")
+            && refused.ends_with(" is not on this host"),
+        "{refused}"
+    );
+    fs::remove_dir_all(&work).expect("clean up");
+    fs::remove_dir_all(&dir).expect("clean up");
+}
