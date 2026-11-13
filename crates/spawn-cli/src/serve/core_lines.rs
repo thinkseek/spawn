@@ -23,8 +23,10 @@
 //! null; `state` is `in` when the value lies within it (bounds included),
 //! `out` when it does not, `no_range` without a range and `not_collected`
 //! without a value. A figure still measuring its window carries
-//! `measuring_since_ms`, when its measure starts (only
-//! `performance.report_to_live`, below). `trend` (objective 090) is the
+//! `measuring_since_ms`, when its measure starts
+//! (`performance.report_to_live`, below, and `storage.days_left`, [`disk`]).
+//! A figure that names a store (`storage.grew_most`) says it as `store`.
+//! `trend` (objective 090) is the
 //! figure's last 7 days:
 //! one `{day, value}` for each UTC day (today and the 6 before) that has a
 //! `host.core_lines` sample carrying the figure, that day's last such
@@ -47,7 +49,9 @@
 //! carries `measuring_since_ms`, the record's start (none without a
 //! record) ([`measured`]). The
 //! storage figures are health.storage's on `/api/fleet`, read the same way
-//! ([`super::storage::report`]). The observability line's guardrails
+//! ([`super::storage::report`]), but for days left (objective 141): the
+//! free disk over its own fall, a 7-day fit of its daily readings, beside
+//! which the line gives that fall and the store that grew most ([`disk`]). The observability line's guardrails
 //! (objective 088) are the share of the 7-day cost window's tokens no price
 //! covers (`/api/cost?window=7d`'s total, kept with the performance figures:
 //! unpriced_tokens over its input, output, cache write and cache read
