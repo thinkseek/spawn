@@ -1192,14 +1192,14 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let mut skipped: Vec<Value> = Vec::new();
     let mut suspect_reason: Option<String> = None;
     let encrypted = scratch.join("dump.gpg");
-    encrypt(&settings, &raw, &encrypted)?;
+    encrypt_with(&seal, &raw, &encrypted)?;
     let stored_bytes = fs::metadata(&encrypted)
         .map_err(|error| format!("{}: {error}", encrypted.display()))?
         .len();
     // The bytes leave the host encrypted, and decrypt back to what was
     // counted: a copy that does not is not a copy.
     let back = scratch.join("dump.back");
-    decrypt(&settings, &encrypted, &back)?;
+    decrypt_with(&seal, &encrypted, &back)?;
     if sha256_file(&back)? != sha256 {
         return Err("the encrypted copy does not decrypt to the dump".to_string());
     }
@@ -1217,7 +1217,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         Some(reason) => {
             let key = settings.stored(&format!("postgres/suspect/spawn-{}.dump.gpg", now.text()));
             if within_limit(held, written, stored_bytes, settings.limit_bytes) {
-                put_object(&settings, &key, &encrypted, &sha256, events)?;
+                put_object(&settings, &key, &encrypted, &sha256, events, &seal.name)?;
                 written = written.saturating_add(stored_bytes);
                 keys.push(key);
             } else {
@@ -1232,7 +1232,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
                     skipped.push(skip(tier.name(), held, written, stored_bytes, &settings));
                     continue;
                 }
-                put_object(&settings, &key, &encrypted, &sha256, events)?;
+                put_object(&settings, &key, &encrypted, &sha256, events, &seal.name)?;
                 written = written.saturating_add(stored_bytes);
                 keys.push(key);
                 tiers.push(tier.name().to_string());
@@ -1243,6 +1243,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     let over_alert = held.saturating_add(written) > settings.alert_bytes;
     let mut record = json!({
         "type": "backup.dumped",
+        "sealed_with": seal.name,
         "keys": keys,
         "tiers": tiers,
         "skipped": skipped,
