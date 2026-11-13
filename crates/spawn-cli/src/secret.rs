@@ -212,9 +212,7 @@ fn rotate_flags(words: &[String]) -> Result<(String, Option<usize>), Refusal> {
         (true, None) => Err(say(
             "rotate --generate needs --bytes N (16 to 1024); nothing was stored",
         )),
-        (false, Some(_)) => Err(say(
-            "--bytes goes with --generate; nothing was stored",
-        )),
+        (false, Some(_)) => Err(say("--bytes goes with --generate; nothing was stored")),
         (_, bytes) => Ok((name, bytes)),
     }
 }
@@ -453,9 +451,7 @@ fn retired_numbers(name: &str, entries: &[String]) -> Vec<u64> {
     let mut numbers: Vec<u64> = entries
         .iter()
         .filter_map(|entry| entry.strip_prefix(&prefix))
-        .filter(|k| {
-            !k.is_empty() && !k.starts_with('0') && k.bytes().all(|b| b.is_ascii_digit())
-        })
+        .filter(|k| !k.is_empty() && !k.starts_with('0') && k.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|k| k.parse().ok())
         .collect();
     numbers.sort_unstable();
@@ -476,7 +472,9 @@ fn staged(entry: &str) -> bool {
         return false;
     };
     let name = file.strip_suffix(".json").unwrap_or(file);
-    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && (valid_name(name) || file == KEY_FILE)
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && (valid_name(name) || file == KEY_FILE)
 }
 
 /// The time now, RFC 3339 in UTC to the second.
@@ -747,7 +745,9 @@ impl Store {
             Ok(()) => Ok(stage),
             Err(_) => {
                 let _ = fs::remove_file(&stage);
-                Err(say(format!("{entry} could not be written; it was not stored")))
+                Err(say(format!(
+                    "{entry} could not be written; it was not stored"
+                )))
             }
         }
     }
@@ -811,7 +811,9 @@ impl Store {
                 "{name} holds its new value but its metadata could not be written; the next rotation of {name} repairs it"
             ))
         };
-        let meta_stage = self.stage(&meta, format!("{metadata}\n").as_bytes()).map_err(|_| half())?;
+        let meta_stage = self
+            .stage(&meta, format!("{metadata}\n").as_bytes())
+            .map_err(|_| half())?;
         if fs::rename(&meta_stage, self.file(&meta)).is_err() {
             let _ = fs::remove_file(&meta_stage);
             return Err(half());
@@ -961,7 +963,9 @@ impl Store {
                     .and_then(serde_json::Value::as_str);
                 let fp = match (recorded, key, self.read_regular(name)) {
                     (None, _, _) => "-".to_string(),
-                    (Some(fp), Some(key), Some((_, value))) if fingerprint(&key.0, &value.0) == fp => {
+                    (Some(fp), Some(key), Some((_, value)))
+                        if fingerprint(&key.0, &value.0) == fp =>
+                    {
                         fp.to_string()
                     }
                     _ => "?".to_string(),
