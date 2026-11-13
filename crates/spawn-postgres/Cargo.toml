@@ -15,6 +15,7 @@ postgres.workspace = true
 postgres-protocol.workspace = true
 fallible-iterator.workspace = true
 spawn-kdf.workspace = true
+whoami = "2.1"
 
 [features]
 # The test schema guard (`testing::TestSchema`), for tests only.
