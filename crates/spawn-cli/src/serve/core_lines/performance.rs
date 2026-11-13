@@ -17,11 +17,14 @@ static PERFORMANCE: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
 /// scope's `report_to_live` value, `gate_time` value (the median),
 /// `gate_time`'s `undecided_ms` over its `total_ms` (null when the total is
 /// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
-/// the page does not have is null. While the 7 days are not covered by the
-/// live record (`report_to_live`'s `covered` false, objective 095), report
-/// to live has no value and `measuring_since_ms` is its `measured_from_ms`:
-/// the figure would measure the record's start, not the wait. [`measured`]
-/// holds it back by the same rule from the record's start alone.
+/// the page does not have is null. Report to live is the Scorecard's value
+/// over what the live record covers (objective 132; objective 095 leaves
+/// out the landings from before the record began). While the 7 days are
+/// not covered (`report_to_live`'s `covered` false), `measuring_since_ms` is
+/// its `measured_from_ms` (the record's start) and, with a value, its
+/// window ([`RTL_WINDOW`]) is [`SINCE_THE_RECORD`]; covered, it is
+/// [`COVERED_WINDOW`]. [`measured`] says the same from the record's start
+/// alone.
 pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     let fleet = scorecard["scopes"]
         .as_array()
@@ -42,38 +45,68 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
         "first_pass": fleet["first_pass"]["value"],
         "usd_per_landing": cost["usd_per_landing"],
     });
-    if live["covered"] == false {
-        values["report_to_live"] = Value::Null;
+    if live["covered"] == true {
+        values[RTL_WINDOW] = json!(COVERED_WINDOW);
+    } else if live["covered"] == false {
         values["measuring_since_ms"] = live["measured_from_ms"].clone();
+        if !live["value"].is_null() && !live["measured_from_ms"].is_null() {
+            values[RTL_WINDOW] = json!(SINCE_THE_RECORD);
+        }
     }
     values
 }
 
+/// The performance values' key for the window report to live is read over.
+const RTL_WINDOW: &str = "report_to_live_window";
+
+/// Report to live's window once the live record covers the 7 days.
+const COVERED_WINDOW: &str = "7d";
+
+/// Report to live's window while the live record does not cover the 7 days
+/// (objective 132): it is over what the record covers.
+const SINCE_THE_RECORD: &str = "since the deploy record began";
+
 /// The window report to live is measured over: the Scorecard's default.
 const REPORT_TO_LIVE_WINDOW_MS: i64 = 7 * DAY_MS;
 
-/// `values` with report to live held back while the live record does not
-/// cover its window: with the record starting at `first_deploy_ms` (the
-/// first `deploy.finished`; `None` without one or when it cannot be read)
-/// later than `now_ms` less the window, `report_to_live` is null and
-/// `measuring_since_ms` the record's start (null without a record). Covered,
-/// the values are as they were.
+/// `values` with report to live said over what the live record covers
+/// (objective 132), from the record's start `first_deploy_ms` (the first
+/// `deploy.finished`; `None` without one or when it cannot be read). Later
+/// than `now_ms` less the window: `measuring_since_ms` is the record's start
+/// and, with a value, the window is [`SINCE_THE_RECORD`]. Without a record:
+/// no value, no start and no window. Covered: the value with the window
+/// [`COVERED_WINDOW`] and no start.
 pub(super) fn measured(mut values: Value, first_deploy_ms: Option<i64>, now_ms: i64) -> Value {
-    let covered = first_deploy_ms
-        .is_some_and(|first| first <= now_ms.saturating_sub(REPORT_TO_LIVE_WINDOW_MS));
-    if !covered {
+    let Some(first) = first_deploy_ms else {
         values["report_to_live"] = Value::Null;
-        values["measuring_since_ms"] = first_deploy_ms.map_or(Value::Null, |first| json!(first));
+        values["measuring_since_ms"] = Value::Null;
+        values[RTL_WINDOW] = Value::Null;
+        return values;
+    };
+    if first <= now_ms.saturating_sub(REPORT_TO_LIVE_WINDOW_MS) {
+        if let Some(values) = values.as_object_mut() {
+            values.remove("measuring_since_ms");
+        }
+        values[RTL_WINDOW] = json!(COVERED_WINDOW);
+    } else {
+        values["measuring_since_ms"] = json!(first);
+        values[RTL_WINDOW] = if values["report_to_live"].is_null() {
+            Value::Null
+        } else {
+            json!(SINCE_THE_RECORD)
+        };
     }
     values
 }
 
 /// `samples` (`host.core_lines`, `[{at_ms, values}]`) without a report to
-/// live taken before the live record covered its window (rev-e F1 on
-/// 7b1dd20a): a sample before `first_deploy_ms` plus the window holds the
-/// record's start, not the wait (106 h, sampled live at 19:24), so its trend
-/// never draws it. Without a record (`None`), none is kept. The other
-/// figures stay as they are.
+/// live taken before the live record covered its window, for two reasons:
+/// the samples from before objective 095 hold the record's start, not the
+/// wait (106 h, sampled live at 19:24, rev-e F1 on 7b1dd20a), and all of
+/// them fall before then; the samples since (objective 132) are sound but
+/// over fewer than the trend's 7 days. So a sample before `first_deploy_ms`
+/// plus the window is never drawn. Without a record (`None`), none is kept.
+/// The other figures stay as they are.
 pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>) -> Value {
     let covered_from = first_deploy_ms.map(|first| first.saturating_add(REPORT_TO_LIVE_WINDOW_MS));
     for sample in samples.as_array_mut().into_iter().flatten() {
@@ -88,8 +121,8 @@ pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>)
 
 /// The performance values and the 7-day cost window's `total`, kept for
 /// [`PERFORMANCE_KEPT_MS`]: computed from the 7-day scorecard and cost
-/// window as the pages compute them, report to live held back until the
-/// live record covers the window ([`measured`]). A part that cannot be read
+/// window as the pages compute them, report to live said over what the
+/// live record covers ([`measured`]). A part that cannot be read
 /// counts as not collected. The Scorecard's and the cost window's times go
 /// in `parts` when they are computed, not when they are kept.
 pub(super) fn performance_now(
@@ -167,6 +200,11 @@ pub(super) fn performance_line(performance: &Value) -> Line {
         performance["report_to_live"].clone(),
     );
     report_to_live.measuring_since_ms = performance["measuring_since_ms"].clone();
+    report_to_live.window = match performance[RTL_WINDOW].as_str() {
+        Some(COVERED_WINDOW) => Some(COVERED_WINDOW),
+        Some(SINCE_THE_RECORD) => Some(SINCE_THE_RECORD),
+        _ => None,
+    };
     Line {
         name: "performance",
         north_star: report_to_live,
@@ -368,82 +406,90 @@ mod tests {
         );
     }
 
-    /// Objective 095's (2), by hand: report to live is held back, measuring
-    /// since the first deploy record, until that record covers the 7 days.
+    /// Objective 132, by hand: report to live is the value over what the
+    /// live record covers, measuring since the first deploy record and
+    /// saying so as its window until the record covers the 7 days.
     #[test]
-    fn report_to_live_waits_until_the_live_record_covers_the_window() {
+    fn report_to_live_is_over_what_the_live_record_covers() {
         const DAY: i64 = 86_400_000;
         let now = 100 * DAY;
-        let values = json!({"report_to_live": 383_820_000, "gate_time": 840_000});
-        // The record began 2 days ago: no value, measuring since then.
+        let values = json!({"report_to_live": 2_674_521, "gate_time": 840_000});
+        let star = |values: &Value| {
+            lines(
+                &json!({}),
+                values,
+                &Observed::default(),
+                Value::Null,
+                Vec::new(),
+            )[0]
+            .clone()
+        };
+        // The record began 2 days ago: the value, measuring since then.
         let young = measured(values.clone(), Some(now - 2 * DAY), now);
-        assert_eq!(young["report_to_live"], Value::Null);
-        assert_eq!(young["measuring_since_ms"], json!(now - 2 * DAY));
         assert_eq!(
             young["gate_time"],
             json!(840_000),
             "the guardrails are untouched"
         );
-        let line = &lines(
-            &json!({}),
-            &young,
-            &Observed::default(),
-            Value::Null,
-            Vec::new(),
-        )[0];
+        let line = star(&young);
         assert_eq!(
             figure_json(&line.north_star, None),
             json!({"key": "performance.report_to_live", "name": "Time from report to live",
-                   "unit": "ms", "value": null, "range": null, "state": "not_collected",
-                   "measuring_since_ms": now - 2 * DAY})
+                   "unit": "ms", "value": 2_674_521, "range": null, "state": "no_range",
+                   "measuring_since_ms": now - 2 * DAY,
+                   "window": "since the deploy record began"})
         );
-        assert!(
-            !super::super::values_of(std::slice::from_ref(line))
-                .contains_key("performance.report_to_live"),
-            "no sample of it while measuring"
+        assert_eq!(
+            super::super::values_of(std::slice::from_ref(&line)).get("performance.report_to_live"),
+            Some(&json!(2_674_521)),
+            "sampled hourly"
         );
-        // Just short of 7 days: still measuring.
-        let short = measured(values.clone(), Some(now - 7 * DAY + 1), now);
-        assert_eq!(short["report_to_live"], Value::Null);
-        // No deploy record at all: no value and no start.
+        // Just short of 7 days: the same.
+        let short = star(&measured(values.clone(), Some(now - 7 * DAY + 1), now)).north_star;
+        assert_eq!(short.value, json!(2_674_521));
+        assert_eq!(short.measuring_since_ms, json!(now - 7 * DAY + 1));
+        assert_eq!(short.window, Some("since the deploy record began"));
+        // Not covered and no value: measuring since, no window.
+        let empty = star(&measured(
+            json!({"report_to_live": null}),
+            Some(now - DAY),
+            now,
+        ));
+        assert_eq!(empty.north_star.value, Value::Null);
+        assert_eq!(empty.north_star.measuring_since_ms, json!(now - DAY));
+        assert_eq!(empty.north_star.window, None);
+        // No deploy record at all: no value, no start, no window.
         let none = measured(values.clone(), None, now);
         assert_eq!(none["report_to_live"], Value::Null);
-        assert_eq!(none["measuring_since_ms"], Value::Null);
-        let star = &lines(
-            &json!({}),
-            &none,
-            &Observed::default(),
-            Value::Null,
-            Vec::new(),
-        )[0]
-        .north_star;
-        assert!(figure_json(star, None).get("measuring_since_ms").is_none());
-        // Covered (exactly 7 days, and more): the Scorecard's value, no start.
+        let shown = figure_json(&star(&none).north_star, None);
+        assert_eq!(shown["value"], Value::Null);
+        assert!(shown.get("measuring_since_ms").is_none(), "{shown}");
+        assert!(shown.get("window").is_none(), "{shown}");
+        // Covered (exactly 7 days, and more): the value, window 7d, no start.
         for first in [now - 7 * DAY, now - 30 * DAY] {
-            let covered = measured(values.clone(), Some(first), now);
-            assert_eq!(covered, values, "covered from {first}");
-            let star = &lines(
-                &json!({}),
-                &covered,
-                &Observed::default(),
-                Value::Null,
-                Vec::new(),
-            )[0]
-            .north_star;
-            let shown = figure_json(star, None);
-            assert_eq!(shown["value"], json!(383_820_000));
-            assert!(shown.get("measuring_since_ms").is_none());
+            let not_covered = json!({"report_to_live": 2_674_521,
+                                     "measuring_since_ms": first,
+                                     "report_to_live_window": SINCE_THE_RECORD});
+            for given in [values.clone(), not_covered] {
+                let covered = measured(given, Some(first), now);
+                let shown = figure_json(&star(&covered).north_star, None);
+                assert_eq!(shown["value"], json!(2_674_521), "covered from {first}");
+                assert_eq!(shown["window"], "7d", "{shown}");
+                assert!(shown.get("measuring_since_ms").is_none(), "{shown}");
+            }
         }
     }
 
-    /// Objective 095: the north star while the Scorecard's 7 days are not
-    /// covered by the live record has no value and says where the measuring
-    /// began; once covered it is the Scorecard's value, with no such field.
+    /// Objectives 095 and 132: the north star while the Scorecard's 7 days
+    /// are not covered by the live record is its value, saying where the
+    /// measuring began and its window; under 3 live landings it has no
+    /// value and no window; once covered it is the value, window 7d, with
+    /// no start.
     #[test]
     fn the_performance_north_star_measures_since_the_record_until_covered() {
-        let card = |covered: bool, from: Value| {
+        let card = |covered: bool, from: Value, value: Value| {
             json!({"scopes": [{"scope": "fleet", "dimensions": {
-                "report_to_live": {"value": 3_600_000, "n": 3, "covered": covered,
+                "report_to_live": {"value": value, "n": 3, "covered": covered,
                                    "measured_from_ms": from},
                 "gate_time": {"value": null}, "first_pass": {"value": null}}}]})
         };
@@ -458,18 +504,28 @@ mod tests {
             )[0];
             figure_json(&line.north_star, None)
         };
-        let waiting = star(&card(false, json!(1_700_000_000_000_i64)));
+        let from = json!(1_700_000_000_000_i64);
+        let waiting = star(&card(false, from.clone(), json!(3_600_000)));
         assert_eq!(waiting["key"], "performance.report_to_live");
-        assert_eq!(waiting["value"], Value::Null);
-        assert_eq!(waiting["state"], "not_collected");
-        assert_eq!(waiting["measuring_since_ms"], json!(1_700_000_000_000_i64));
-        let covered = star(&card(true, json!(1_700_000_000_000_i64)));
+        assert_eq!(waiting["value"], json!(3_600_000));
+        assert_eq!(waiting["state"], "no_range");
+        assert_eq!(waiting["measuring_since_ms"], from);
+        assert_eq!(waiting["window"], "since the deploy record began");
+        // Under 3 live landings: no value, measuring since, no window.
+        let few = star(&card(false, from.clone(), Value::Null));
+        assert_eq!(few["value"], Value::Null);
+        assert_eq!(few["state"], "not_collected");
+        assert_eq!(few["measuring_since_ms"], from);
+        assert_eq!(few.get("window"), None, "{few}");
+        let covered = star(&card(true, from, json!(3_600_000)));
         assert_eq!(covered["value"], json!(3_600_000));
         assert_eq!(covered["state"], "no_range");
         assert_eq!(covered.get("measuring_since_ms"), None, "{covered}");
+        assert_eq!(covered["window"], "7d");
         // With no deploy record: nothing measured, nothing to say since when.
-        let never = star(&card(false, Value::Null));
+        let never = star(&card(false, Value::Null, Value::Null));
         assert_eq!(never["value"], Value::Null);
         assert_eq!(never.get("measuring_since_ms"), None, "{never}");
+        assert_eq!(never.get("window"), None, "{never}");
     }
 }
