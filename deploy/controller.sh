@@ -89,6 +89,8 @@ die() {
 }
 
 live=${SPAWN_LIVE:-$HOME/.local/share/spawn-rsi}
+# This tree's scripts/: the deps install runs scripts/web-install.sh from it.
+tree=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 dir=$live/controllers
 deps=$live/deps
 
@@ -221,21 +223,28 @@ deps() {
   # shellcheck disable=SC2064
   trap "remove_tree '$tmp'" EXIT
   git --git-dir="$git_dir" archive "$commit" | tar -x -C "$tmp"
-  # clone-or-copy: pnpm's hardlink import method shares the global store's
-  # inodes, and a read-only tree would make those files read-only for every
-  # tree and the store too. A clone (reflink) or a copy is the tree's own; the
-  # check below refuses anything else.
+  # scripts/web-install.sh --strict=supply: the commit's root holds only the
+  # pnpm configuration Supply's has today (pnpm-workspace.yaml's packages,
+  # nodeLinker, packageImportMethod, engineStrict and allowBuilds; no .npmrc
+  # or pnpmfile; package.json's plain fields), or nothing is installed.
+  # Network, as before (--prefer-offline: the store first).
   #
-  # --ignore-scripts: --frozen-lockfile freezes the lockfile, not the
-  # dependencies' lifecycle scripts, and this runs as the owner with network:
-  # a postinstall or prepare in the commit's root or in a workspace package
-  # (the protected list is a prefix list and could grow to cover one) would
-  # run here. Nothing in the tree needs one: pnpm-workspace.yaml sets
-  # `allowBuilds: esbuild: false`, and esbuild's binary comes from its
-  # platform package, not its postinstall. A new dependency that does need a
-  # build step is an owner decision, and a reason to revisit this line.
-  ( cd "$tmp" && "$pnpm" install --frozen-lockfile --ignore-scripts --config.package-import-method=clone-or-copy ) >&2 ||
-    die "pnpm install failed in $tmp"
+  # clone-or-copy (pinned there on the command line, which wins over the
+  # workspace file's packageImportMethod): pnpm's hardlink import method
+  # shares the global store's inodes, and a read-only tree would make those
+  # files read-only for every tree and the store too. A clone (reflink) or a
+  # copy is the tree's own; the check below refuses anything else.
+  #
+  # --ignore-scripts (and --ignore-pnpmfile, there too): --frozen-lockfile
+  # freezes the lockfile, not the dependencies' lifecycle scripts, and this
+  # runs as the owner with network: a postinstall or prepare in the commit's
+  # root or in a workspace package would run here. Nothing in the tree needs
+  # one: esbuild's binary comes from its platform package, not its
+  # postinstall (pnpm-workspace.yaml's `allowBuilds: esbuild: false` is inert
+  # under --ignore-scripts). A new dependency that does need a build step is
+  # an owner decision, and a reason to revisit this line.
+  SPAWN_PNPM=$pnpm sh "$tree/scripts/web-install.sh" "$tmp" --prefer-offline --strict=supply ||
+    die "pnpm install failed in $tmp (above)"
   # The install is the commit's: the export is the commit's tree, so the
   # lockfile pnpm froze against is the commit's (`--frozen-lockfile` refuses
   # one that disagrees with the manifests). pnpm's own copy of the lockfile

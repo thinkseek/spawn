@@ -272,8 +272,13 @@ tick() {
   if [ -f "$checkout/web/pnpm-lock.yaml" ] &&
     ! cmp -s "$checkout/web/pnpm-lock.yaml" "$checkout/web/node_modules/.pnpm/lock.yaml"; then
     command -v pnpm >/dev/null || failed "$main" "pnpm is not on PATH: the UI's dependencies for $main cannot be installed"
-    (cd "$checkout/web" && pnpm install --frozen-lockfile --prefer-offline --reporter=silent) ||
-      failed "$main" "pnpm install --frozen-lockfile failed in $checkout/web"
+    # The checkout's own scripts/web-install.sh (scripts/ is protected, as
+    # deploy/ is): only web/'s reviewed pnpm configuration, no script, no
+    # pnpmfile, nothing written outside web/ (--strict=web, the owner gate's
+    # rule too).
+    local installed
+    installed=$(sh "$checkout/scripts/web-install.sh" "$checkout/web" --prefer-offline --strict=web 2>&1) ||
+      failed "$main" "scripts/web-install.sh refused or failed in $checkout/web: $(printf '%s\n' "$installed" | tail -n 1)"
   fi
   # The source held at main, so no landing moves it during the deploy; the
   # deploy releases it on every exit.
