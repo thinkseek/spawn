@@ -206,6 +206,7 @@ mod tests {
     #[test]
     fn the_fall_is_the_fits_and_has_no_value_under_a_day() {
         // Exactly on a line falling 10 GiB a day.
+        #[allow(clippy::cast_precision_loss)]
         let free = |at: i64| (100 * GIB) as f64 + (10 * GIB) as f64 * (NOW - at) as f64 / D as f64;
         let on_line: Vec<(i64, f64)> = [MIDNIGHT - 6 * D + 2 * H, MIDNIGHT - 3 * D, NOW]
             .into_iter()
