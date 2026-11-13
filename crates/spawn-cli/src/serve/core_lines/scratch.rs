@@ -520,7 +520,7 @@ pub(super) fn walk(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bound, MARKER, Reason, never_counted, refused_roots, unowned};
+    use super::{Bound, MARKER, Reason, never_counted, refused_roots, unowned, walk};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -823,6 +823,122 @@ mod tests {
                 std::slice::from_ref(&named)
             ),
             Ok(Vec::new())
+        );
+    }
+
+    /// Writes a claim (objective 140) into `folder`, its lease until
+    /// `until`: the owner file's size.
+    fn claim(folder: &Path, agent: &str, created: i64, until: i64, build: &[&str]) -> u64 {
+        let line = crate::scratch_owner::Claim {
+            agent: agent.to_string(),
+            objective: "4/140".to_string(),
+            created_ms: created,
+            lease_until_ms: until,
+            build: build.iter().map(ToString::to_string).collect(),
+        }
+        .line();
+        std::fs::create_dir_all(folder).expect("mkdir");
+        std::fs::write(folder.join(MARKER), format!("{line}\n")).expect("claim");
+        u64::try_from(line.len() + 1).expect("size")
+    }
+
+    /// Objective 140: a claimed folder is owned while its lease runs and
+    /// nobody's ("lease ended") after; claims are listed at the top level and
+    /// one level below an unmarked directory (never deeper, never below a
+    /// marked one, never through a symlink), with their build paths' bytes
+    /// reached through real directories only.
+    #[test]
+    fn a_claim_is_owned_while_its_lease_runs_and_listed_by_owner() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("root");
+        let outside = scratch.0.join("outside");
+        fill(&outside.join("target/big"), 50_000);
+        let now = ms(SystemTime::now());
+        let old = SystemTime::now() - Duration::from_hours(48);
+
+        fill(&root.join("leased/data"), 1000);
+        fill(&root.join("leased/t/target/x"), 300);
+        std::fs::create_dir_all(root.join("leased/via")).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, root.join("leased/link")).expect("link");
+        std::os::unix::fs::symlink(&outside.join("target"), root.join("leased/via/target"))
+            .expect("link");
+        let leased = claim(
+            &root.join("leased"),
+            "rev-e",
+            now - 10,
+            now + 3_600_000,
+            &["t/target", "t/target", "link/target", "via/target", "absent/target"],
+        );
+        fill(&root.join("ended/data"), 2000);
+        let ended = claim(&root.join("ended"), "rev-b", now - 20, now, &[]);
+        fill(&root.join("session/fresh"), 10);
+        let below = claim(&root.join("session/a"), "rev-e", now - 30, now + 1, &[]);
+        fill(&root.join("session/a/data"), 70);
+        claim(&root.join("session/b/deep"), "rev-x", 1, now + 1, &[]);
+        fill(&root.join("old/data"), 40);
+        let old_below = claim(&root.join("old/c"), "rev-a", 5, now + 1, &[]);
+        fill(&root.join("marked/data"), 10);
+        std::fs::write(root.join("marked").join(MARKER), "41 100\n").expect("marker");
+        claim(&root.join("marked/d"), "rev-x", 1, now + 1, &[]);
+        claim(&outside.join("held"), "rev-x", 1, now + 1, &[]);
+        std::os::unix::fs::symlink(outside.join("held"), root.join("link")).expect("link");
+        for name in ["leased", "ended", "old", "marked"] {
+            age(&root.join(name), old);
+        }
+
+        let found = walk(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            now,
+            &|pid, _| pid == 41,
+            Bound::DEFAULT,
+        )
+        .expect("a walk");
+        let unowned: Vec<(String, u64, Reason)> = found
+            .unowned
+            .iter()
+            .map(|entry| {
+                let name = entry.path.strip_prefix(&root).expect("in the root");
+                (name.display().to_string(), entry.bytes, entry.reason)
+            })
+            .collect();
+        assert_eq!(
+            unowned,
+            [
+                ("ended".to_string(), 2000 + ended, Reason::LeaseEnded),
+                ("old".to_string(), 40 + old_below, Reason::Idle),
+            ]
+        );
+        let claimed: Vec<(String, &str, u64, u64)> = found
+            .claimed
+            .iter()
+            .map(|folder| {
+                let name = folder.path.strip_prefix(&root).expect("in the root");
+                (
+                    name.display().to_string(),
+                    folder.claim.agent.as_str(),
+                    folder.bytes,
+                    folder.build_bytes,
+                )
+            })
+            .collect();
+        assert_eq!(
+            claimed,
+            [
+                ("old/c".to_string(), "rev-a", old_below, 0),
+                ("ended".to_string(), "rev-b", 2000 + ended, 0),
+                ("session/a".to_string(), "rev-e", 70 + below, 0),
+                ("leased".to_string(), "rev-e", 1300 + leased, 300),
+            ],
+            "by agent, then oldest first"
+        );
+        assert_eq!(found.claimed[1].claim.lease_until_ms, now, "an ended lease is still listed");
+        assert!(
+            ["leased", "ended", "old", "marked", "session"]
+                .iter()
+                .all(|name| root.join(name).exists()),
+            "nothing removed"
         );
     }
 }
