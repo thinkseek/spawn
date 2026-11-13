@@ -167,7 +167,7 @@ mod tests {
     const MIDNIGHT: i64 = 20_771 * D;
     const NOW: i64 = MIDNIGHT + 2 * H + 39 * 60_000;
 
-    fn sample(at_ms: i64, free: Value) -> Value {
+    fn sample(at_ms: i64, free: &Value) -> Value {
         json!({"at_ms": at_ms, "values": {FREE: free, "storage.days_left": 9}})
     }
 
@@ -175,16 +175,16 @@ mod tests {
     fn the_readings_are_each_earlier_days_last_sample_and_now() {
         let samples = json!([
             // Outside the window: the 7th day before today.
-            sample(MIDNIGHT - 7 * D + 23 * H, json!(1)),
-            sample(MIDNIGHT - 6 * D + H, json!(600)),
-            sample(MIDNIGHT - 6 * D + 5 * H, json!(590)),
+            sample(MIDNIGHT - 7 * D + 23 * H, &json!(1)),
+            sample(MIDNIGHT - 6 * D + H, &json!(600)),
+            sample(MIDNIGHT - 6 * D + 5 * H, &json!(590)),
             // The day's last sample without the figure: the one before it.
-            sample(MIDNIGHT - 3 * D + H, json!(300)),
+            sample(MIDNIGHT - 3 * D + H, &json!(300)),
             json!({"at_ms": MIDNIGHT - 3 * D + 9 * H, "values": {"storage.days_left": 4}}),
-            sample(MIDNIGHT - 2 * D + 9 * H, Value::Null),
-            sample(MIDNIGHT - D + 23 * H, json!(120)),
+            sample(MIDNIGHT - 2 * D + 9 * H, &Value::Null),
+            sample(MIDNIGHT - D + 23 * H, &json!(120)),
             // Today's: the reading now stands for it.
-            sample(MIDNIGHT + H, json!(50)),
+            sample(MIDNIGHT + H, &json!(50)),
         ]);
         assert_eq!(
             readings(&samples, Some(100), NOW),
@@ -271,8 +271,8 @@ mod tests {
             "growth_parts": {"archive": 1000, "projects": 2000, "database": null},
         });
         let samples = json!([
-            sample(MIDNIGHT - 2 * D + 12 * H, json!(99 * GIB)),
-            sample(MIDNIGHT - D + 12 * H, json!(89 * GIB)),
+            sample(MIDNIGHT - 2 * D + 12 * H, &json!(99 * GIB)),
+            sample(MIDNIGHT - D + 12 * H, &json!(89 * GIB)),
         ]);
         let now = MIDNIGHT + 12 * H;
         with_disk(&mut storage, &samples, now);
@@ -296,7 +296,7 @@ mod tests {
         // Measuring from the first reading, a day before the fall.
         let mut storage = json!({"free_bytes": 79 * GIB});
         let first = MIDNIGHT - D + 20 * H;
-        with_disk(&mut storage, &json!([sample(first, json!(80 * GIB))]), now);
+        with_disk(&mut storage, &json!([sample(first, &json!(80 * GIB))]), now);
         assert_eq!(storage["days_left_measuring_since_ms"], first + D);
     }
 }
