@@ -2,7 +2,9 @@
 //! verify` records one `objective.verified` through the owner-only
 //! `spawn_verification_record`, and `spawn verify list` (and
 //! `/api/verifications`) reads what it decides on: each objective's newest
-//! landing, every verification, and Spawn's own newest deploy.
+//! landing, every verification, and Spawn's own newest deploy. The alert
+//! step counts the landed objectives left unverified
+//! (`unverified_landings`, objective 135).
 //!
 //! Each part names one record type, read through
 //! `spawn_events_control_record_type` (type, time, id), never the whole
@@ -55,6 +57,56 @@ select jsonb_build_object(
      order by e.recorded_at_ms desc, e.id desc
      limit 1))";
 
+/// The alert step's polled read (objective 135, `unverified_landings`):
+/// the objectives whose newest landing (the newest `task.landed` of a task
+/// of that mission and objective, by its record's time, then its id) is at
+/// or after `$1` and whose newest `objective.verified` after that landing
+/// is not a pass (none, or a fail: `spawn verify list`'s rule), counted:
+/// `{unverified, old, newest_old_ms}`, `old` those that landed at or before
+/// `$2`, `newest_old_ms` the newest of those landings (null: none).
+///
+/// Each part names one record type with the window, read through
+/// `spawn_events_control_record_type` (type, time, id), never the whole
+/// control stream: the window is applied before the newest landing is
+/// picked (an objective's newest landing is at or after `$1` exactly when
+/// it has a landing at or after it), and a verification after such a
+/// landing is at or after `$1` too. The verifications are read once, not
+/// once per landing. It grows with the window, not the log.
+const UNVERIFIED: &str = r"
+with landed as (
+  select distinct on (t.mission_id, t.objective)
+         t.mission_id, t.objective, e.recorded_at_ms as at_ms
+    from spawn_events e
+    join mission_tasks t on t.id = (e.kind -> 'detail' -> 'record' ->> 'id')::bigint
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'
+     and e.recorded_at_ms >= $1
+     and t.objective is not null
+   order by t.mission_id, t.objective, e.recorded_at_ms desc, e.id desc
+), verified as materialized (
+  select (e.kind -> 'detail' -> 'record' ->> 'mission')::bigint as mission_id,
+         (e.kind -> 'detail' -> 'record' ->> 'objective')::integer as objective,
+         e.kind -> 'detail' -> 'record' ->> 'result' as result,
+         e.recorded_at_ms as at_ms, e.id
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.verified'
+     and e.recorded_at_ms >= $1
+), unverified as (
+  select l.at_ms
+    from landed l
+   where coalesce((select v.result from verified v
+                    where v.mission_id = l.mission_id and v.objective = l.objective
+                      and v.at_ms > l.at_ms
+                    order by v.at_ms desc, v.id desc
+                    limit 1), '') <> 'pass'
+)
+select jsonb_build_object(
+  'unverified', count(*),
+  'old', count(*) filter (where at_ms <= $2),
+  'newest_old_ms', max(at_ms) filter (where at_ms <= $2))
+  from unverified";
+
 /// The phrase an objective's "Verified by:" paragraph starts with.
 const VERIFIED_BY: &str = "Verified by:";
 
@@ -79,6 +131,13 @@ impl PostgresStore {
         Ok(self
             .query_one("select spawn_verification_record($1)", &[record])?
             .get(0))
+    }
+
+    /// The landed objectives not verified since `since_ms`, and how many of
+    /// them landed at or before `old_at_ms` ([`UNVERIFIED`]): `{unverified,
+    /// old, newest_old_ms}`. The alert step reads it at every reading.
+    pub fn unverified_landings(&self, since_ms: i64, old_at_ms: i64) -> Result<Value, StoreError> {
+        self.query_json_prepared(UNVERIFIED, &[&since_ms, &old_at_ms])
     }
 
     /// What `spawn verify list` decides on ([`FACTS`]): each landing with
