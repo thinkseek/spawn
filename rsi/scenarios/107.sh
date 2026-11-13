@@ -56,7 +56,13 @@ harness() {
 }
 
 command -v cargo >/dev/null 2>&1 || harness "cargo is not installed"
-controller=$(cd "$(dirname "$0")/../.." && pwd)
+# The tree under test is the working directory: the gate runs a scenario
+# from the candidate's tree, and the scenario file's own directory is the
+# deployed controller's copy (no Cargo.toml above it in the gate, and
+# main's tests where there is one), as in 051.sh.
+tree=$(pwd)
+[ -f "$tree/Cargo.toml" ] && [ -d "$tree/crates/spawn-cli" ] ||
+    harness "run from the tree under test: no Cargo.toml and crates/spawn-cli under $tree"
 runs=${SPAWN_107_RUNS:-96}
 case $runs in '' | 0 | *[!0-9]*) harness "SPAWN_107_RUNS is not a whole number from 1: $runs" ;; esac
 p=serve::core_lines::drills::tests::
@@ -74,7 +80,7 @@ trap 'status=$?; cleanup; case $status in 0 | 1 | 2) exit "$status" ;; *) echo "
 trap 'exit 130' INT TERM
 
 # The build, outside what is judged.
-if ! (cd "$controller" && cargo test --quiet -p spawn-cli --bin spawn --no-run --message-format=json) \
+if ! (cd "$tree" && cargo test --quiet -p spawn-cli --bin spawn --no-run --message-format=json) \
     >"$WORK/build.json" 2>"$WORK/build.err"; then
     grep -E '^error' -A5 "$WORK/build.err" | head -n 40
     echo "107: (1) the spawn-cli tests do not build" >&2
