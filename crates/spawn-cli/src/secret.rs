@@ -554,12 +554,13 @@ impl Store {
                         "{entry}  incomplete: a value without its metadata (a killed write); a set or generate of {entry} replaces it"
                     ));
                 }
-            } else if let Some(name) = entry.strip_suffix(".json") {
-                if valid_name(name) && !has(name) {
-                    lines.push(format!(
-                        "{name}  incomplete: metadata without its value (a killed write); a set or generate of {name} replaces it"
-                    ));
-                }
+            } else if let Some(name) = entry.strip_suffix(".json")
+                && valid_name(name)
+                && !has(name)
+            {
+                lines.push(format!(
+                    "{name}  incomplete: metadata without its value (a killed write); a set or generate of {name} replaces it"
+                ));
             }
         }
         lines.sort();
