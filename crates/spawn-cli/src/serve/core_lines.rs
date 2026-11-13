@@ -449,9 +449,14 @@ pub(crate) struct Parts {
     pub(crate) archive: Option<Duration>,
     /// The 7-day cost window (`cost::summary`).
     pub(crate) cost: Option<Duration>,
-    /// The storage report, with the scratch nobody owns and each test
-    /// server's schemas.
+    /// The storage report (`serve/storage.rs`: its sizes, kept 10 min,
+    /// and the free space).
     pub(crate) storage: Option<Duration>,
+    /// The scratch nobody owns and each test server's schemas
+    /// ([`unowned`]: kept, refreshed beside the reading; only a process's
+    /// first reading waits). Apart from `storage` (cc-astra), so a slow
+    /// reading says which of the two it was.
+    pub(crate) unowned: Option<Duration>,
     /// Human interventions per agent-hour, the Home card's 24 h answer
     /// (`/api/interventions`, objective 100).
     pub(crate) health: Option<Duration>,
@@ -484,6 +489,7 @@ impl Parts {
             self.archive,
             self.cost,
             self.storage,
+            self.unowned,
             self.health,
             self.lock_wait,
         ]
@@ -506,7 +512,7 @@ impl Parts {
     }
 
     /// `open_ms=<n|none> trends_ms=… facts_ms=… archive_ms=… cost_ms=…
-    /// storage_ms=… health_ms=… lock_wait_ms=… performance=<measured|kept|none>`,
+    /// storage_ms=… unowned_ms=… health_ms=… lock_wait_ms=… performance=<measured|kept|none>`,
     /// then, while a kept group is in use, ` performance_age_ms=<n|none>
     /// storage_age_ms=<n|none>`.
     pub(crate) fn text(&self) -> String {
@@ -525,13 +531,14 @@ impl Parts {
         };
         format!(
             "open_ms={} trends_ms={} facts_ms={} archive_ms={} cost_ms={} storage_ms={} \
-health_ms={} lock_wait_ms={} performance={}{ages}",
+unowned_ms={} health_ms={} lock_wait_ms={} performance={}{ages}",
             ms(self.open),
             ms(self.trends),
             ms(self.facts),
             ms(self.archive),
             ms(self.cost),
             ms(self.storage),
+            ms(self.unowned),
             ms(self.health),
             ms(self.lock_wait),
             self.performance.unwrap_or("none"),
@@ -683,9 +690,8 @@ fn lines_at(
     now_ms: i64,
     parts: &mut Parts,
 ) -> Result<(Vec<Line>, Extras), String> {
-    let (mut storage, unowned) = timed(&mut parts.storage, || {
-        super::storage::report(store, now_ms).map(|storage| (storage, unowned::now(file, now_ms)))
-    })?;
+    let mut storage = timed(&mut parts.storage, || super::storage::report(store, now_ms))?;
+    let unowned = timed(&mut parts.unowned, || unowned::now(file, now_ms));
     let reading = unowned.reading.as_deref();
     storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
     storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
@@ -932,7 +938,8 @@ mod tests {
 
     /// Inert until a group is in use (the lead: by test, not by reading):
     /// with no kept group, the figures, the answer and the parts line are
-    /// exactly what they were before kept groups.
+    /// exactly what they were before kept groups (the line's one change is
+    /// `unowned_ms`, split out of `storage_ms` at the lead's ask).
     #[test]
     fn with_no_kept_group_the_answer_and_the_parts_line_are_as_before() {
         let before = lines(
@@ -964,7 +971,7 @@ mod tests {
         assert_eq!(
             parts.text(),
             "open_ms=20 trends_ms=none facts_ms=none archive_ms=none cost_ms=none \
-storage_ms=none health_ms=none lock_wait_ms=none performance=measured"
+storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=measured"
         );
     }
 

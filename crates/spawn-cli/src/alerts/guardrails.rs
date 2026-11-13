@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(
             read_line(None, std::time::Duration::from_millis(7), &Parts::default()),
             "alerts: core lines read: compute_ms=none observed_ms=7 \
-             open_ms=none trends_ms=none facts_ms=none archive_ms=none cost_ms=none storage_ms=none health_ms=none \
+             open_ms=none trends_ms=none facts_ms=none archive_ms=none cost_ms=none storage_ms=none unowned_ms=none health_ms=none \
              lock_wait_ms=none performance=none"
         );
         let ms = |n| Some(std::time::Duration::from_millis(n));
@@ -1013,6 +1013,7 @@ mod tests {
                     archive: None,
                     cost: None,
                     storage: ms(500),
+                    unowned: ms(7),
                     health: ms(40),
                     lock_wait: None,
                     performance: Some("kept"),
@@ -1022,7 +1023,7 @@ mod tests {
                 }
             ),
             "alerts: core lines read: compute_ms=900 observed_ms=4000 \
-             open_ms=20 trends_ms=300 facts_ms=3 archive_ms=none cost_ms=none storage_ms=500 health_ms=40 \
+             open_ms=20 trends_ms=300 facts_ms=3 archive_ms=none cost_ms=none storage_ms=500 unowned_ms=7 health_ms=40 \
              lock_wait_ms=none performance=kept performance_age_ms=30000 storage_age_ms=none",
             "a part kept by performance_now is none, not 0"
         );
