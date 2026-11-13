@@ -18,6 +18,8 @@
 //!   (docs/fleet-architecture.md, "Alerts").
 //! - `backup` dumps, bundles and drills the fleet's record off this host
 //!   (docs/storage.md, "Where state lives").
+//! - `verify` records an objective's verification after its landing and
+//!   lists what is landed and not verified.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
 //! - `version` prints `spawn <crate version>`.
@@ -58,6 +60,7 @@ mod set_aside;
 mod sources;
 mod storage;
 mod supervise;
+mod verify;
 
 // Re-exported at the crate root, where the command modules import them.
 pub(crate) use config::{Flags, env_or, env_value, open_store};
@@ -70,7 +73,7 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn alert judge <key> false|stale|duplicate\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn store put|get|list|verify --area transcripts|sessions [--from <dir>] [--path <file> --into <dir>] [--root <dir>]\n       spawn ack <command id> done|declined [<why>]\n       spawn mask --values <file>\n       spawn mask-hook --values <file>\n       spawn secret set|generate|list";
+const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn alert judge <key> false|stale|duplicate\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn store put|get|list|verify --area transcripts|sessions [--from <dir>] [--path <file> --into <dir>] [--root <dir>]\n       spawn ack <command id> done|declined [<why>]\n       spawn mask --values <file>\n       spawn mask-hook --values <file>\n       spawn secret set|generate|list\n       spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail\n       spawn verify list";
 
 fn main() {
     let code = match dispatch() {
@@ -135,6 +138,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "mask" => mask::mask_command(&rest),
         "mask-hook" => mask::hook_command(&rest),
         "secret" => Ok(secret::command(&rest)),
+        "verify" => verify::command(&rest),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "run" => engine::run(&rest),
         "version" => {
