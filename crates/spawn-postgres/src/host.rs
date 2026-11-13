@@ -136,9 +136,8 @@ pub fn test_database_size(url: &str) -> Result<Value, StoreError> {
 /// [`TEST_DATABASE_LIMIT`] connecting and as long querying. The error never
 /// names the URL.
 fn test_database_read(url: &str, statement: &str) -> Result<Value, StoreError> {
-    let mut config: postgres::Config = url.parse().map_err(|_: postgres::Error| {
-        StoreError::Backend("the URL is not a postgres URL".to_string())
-    })?;
+    let mut config = crate::passfile::config(url)
+        .map_err(|_| StoreError::Backend("the URL is not a postgres URL".to_string()))?;
     let limit = format!("-c statement_timeout={}", TEST_DATABASE_LIMIT.as_millis());
     let options = match config.get_options() {
         Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),

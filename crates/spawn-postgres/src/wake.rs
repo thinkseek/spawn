@@ -64,10 +64,7 @@ impl PostgresStore {
     /// Listen for this database's event notifications on a connection of
     /// its own ([`Listener`]).
     pub fn listen(&self) -> Result<Listener, StoreError> {
-        let config: postgres::Config = self
-            .url
-            .parse()
-            .map_err(|error: postgres::Error| backend(&error))?;
+        let config = crate::passfile::config(&self.url).map_err(|error| backend(&error))?;
         let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
         client
             .batch_execute(&format!("listen {CHANNEL}"))
