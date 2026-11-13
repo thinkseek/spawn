@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::schemas::{self, UrlFile};
-use super::scratch::{self, Bound, Unowned};
+use super::scratch::{self, Bound, Claimed, Unowned};
 
 /// How long a reading is kept before it is read again.
 pub(super) const READ_EVERY_MS: i64 = 600_000;
@@ -157,6 +157,9 @@ pub(super) struct Server {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Reading {
     pub(super) unowned: Option<Vec<Unowned>>,
+    /// Every claimed folder the walk met (objective 140), by agent then
+    /// oldest first; none with no roots or before a walk within its bound.
+    pub(super) claimed: Vec<Claimed>,
     pub(super) servers: Vec<Server>,
     /// The scratch roots refused (a symlink at or above them), each with
     /// why: named in the answer, and the figure is not collected while any
@@ -196,10 +199,10 @@ static SEEN: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
 /// each test server's schemas (one that does not answer is left out, and
 /// the log says why), the first sights brought up to date.
 pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: Bound) -> Reading {
-    let unowned = if plan.roots.is_empty() {
-        None
+    let (unowned, claimed) = if plan.roots.is_empty() {
+        (None, Vec::new())
     } else {
-        match scratch::unowned(
+        match scratch::walk(
             &plan.roots,
             &plan.excludes,
             &plan.never,
@@ -207,10 +210,12 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
             &crate::integrate::still_runs,
             bound,
         ) {
-            Ok(entries) => Some(entries),
+            Ok(walk) => (Some(walk.unowned), walk.claimed),
             Err(why) => {
                 eprintln!("core-lines: scratch nobody owns: {why}; the previous figure is kept");
-                previous.and_then(|previous| previous.unowned.clone())
+                previous.map_or((None, Vec::new()), |previous| {
+                    (previous.unowned.clone(), previous.claimed.clone())
+                })
             }
         }
     };
@@ -256,14 +261,60 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
     }
     Reading {
         unowned,
+        claimed,
         servers,
         refused: scratch::refused_roots(&plan.roots),
     }
 }
 
+/// The `(mission, objective)` pairs the reading's claimed folders name, each
+/// once, in order: what [`scratch_json`]'s `landed` is read for.
+pub(super) fn claimed_pairs(reading: Option<&Reading>) -> Vec<(i64, i64)> {
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    for claimed in reading
+        .map(|reading| reading.claimed.as_slice())
+        .unwrap_or_default()
+    {
+        if let Some(pair) = claimed.claim.pair()
+            && !pairs.contains(&pair)
+        {
+            pairs.push(pair);
+        }
+    }
+    pairs
+}
+
 /// The answer's `scratch`: the roots, the 20 largest entries nobody owns,
-/// and the roots refused, each with why.
-pub(super) fn scratch_json(plan: &Plan, reading: Option<&Reading>) -> Value {
+/// the roots refused, each with why, and every claimed folder (objective
+/// 140) {path, agent, objective, created_ms, lease_until_ms, bytes,
+/// build_bytes, landed}, `landed` whether `landed` (the store's landed
+/// pairs) holds its objective, null when the store could not be read.
+pub(super) fn scratch_json(
+    plan: &Plan,
+    reading: Option<&Reading>,
+    landed: Option<&[(i64, i64)]>,
+) -> Value {
+    let claimed: Vec<Value> = reading
+        .map(|reading| reading.claimed.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|folder| {
+            let landed = match (landed, folder.claim.pair()) {
+                (Some(landed), Some(pair)) => json!(landed.contains(&pair)),
+                _ => Value::Null,
+            };
+            json!({
+                "path": folder.path.display().to_string(),
+                "agent": folder.claim.agent,
+                "objective": folder.claim.objective,
+                "created_ms": folder.claim.created_ms,
+                "lease_until_ms": folder.claim.lease_until_ms,
+                "bytes": folder.bytes,
+                "build_bytes": folder.build_bytes,
+                "landed": landed,
+            })
+        })
+        .collect();
     let unowned: Vec<Value> = reading
         .and_then(|reading| reading.unowned.as_ref())
         .into_iter()
@@ -287,6 +338,7 @@ pub(super) fn scratch_json(plan: &Plan, reading: Option<&Reading>) -> Value {
         "roots": plan.roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
         "unowned": unowned,
         "refused": refused,
+        "claimed": claimed,
     })
 }
 
@@ -462,6 +514,7 @@ mod tests {
                 bytes,
                 reason: Reason::Idle,
             }]),
+            claimed: Vec::new(),
             servers: vec![Server {
                 name: "test".into(),
                 schemas: 3,
@@ -695,7 +748,7 @@ mod tests {
         let counted = read(&alone, None, far, Bound::DEFAULT);
         assert_eq!(counted.unowned_bytes(), json!(1), "the real root counts");
         assert_eq!(
-            super::scratch_json(&alone, Some(&counted))["refused"],
+            super::scratch_json(&alone, Some(&counted), None)["refused"],
             json!([])
         );
         let both = Plan {
@@ -704,7 +757,7 @@ mod tests {
         };
         let got = read(&both, None, far, Bound::DEFAULT);
         assert_eq!(got.unowned_bytes(), Value::Null, "not collected");
-        let answer = super::scratch_json(&both, Some(&got));
+        let answer = super::scratch_json(&both, Some(&got), None);
         assert_eq!(
             answer["refused"].as_array().map(Vec::len),
             Some(1),
@@ -721,5 +774,62 @@ mod tests {
             "{answer}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn claimed(path: &str, agent: &str, objective: &str) -> super::Claimed {
+        super::Claimed {
+            path: PathBuf::from(path),
+            claim: crate::scratch_owner::Claim {
+                agent: agent.to_string(),
+                objective: objective.to_string(),
+                created_ms: 1,
+                lease_until_ms: 2,
+                build: vec!["t/target".to_string()],
+            },
+            bytes: 30,
+            build_bytes: 20,
+        }
+    }
+
+    /// Objective 140: the claimed folders' objectives are asked once each,
+    /// and every folder's `landed` is whether the store's landed pairs hold
+    /// its objective, null when the store was not read.
+    #[test]
+    fn the_claimed_folders_objectives_are_read_once_and_landed_set() {
+        let mut got = reading(0);
+        got.claimed = vec![
+            claimed("/s/a", "rev-b", "4/140"),
+            claimed("/s/b", "rev-e", "4/140"),
+            claimed("/s/c", "rev-e", "4/141"),
+        ];
+        assert_eq!(super::claimed_pairs(Some(&got)), [(4, 140), (4, 141)]);
+        assert_eq!(super::claimed_pairs(Some(&reading(0))), []);
+        assert_eq!(super::claimed_pairs(None), []);
+        let plan = plan("/s");
+        let answer = super::scratch_json(&plan, Some(&got), Some(&[(4, 141), (5, 140)]));
+        assert_eq!(
+            answer["claimed"][0],
+            json!({
+                "path": "/s/a",
+                "agent": "rev-b",
+                "objective": "4/140",
+                "created_ms": 1,
+                "lease_until_ms": 2,
+                "bytes": 30,
+                "build_bytes": 20,
+                "landed": false,
+            })
+        );
+        let landed: Vec<Value> = (0..3)
+            .map(|at| answer["claimed"][at]["landed"].clone())
+            .collect();
+        assert_eq!(landed, [json!(false), json!(false), json!(true)]);
+        let unread = super::scratch_json(&plan, Some(&got), None);
+        assert_eq!(
+            unread["claimed"][2]["landed"],
+            Value::Null,
+            "the store was not read"
+        );
+        assert_eq!(super::scratch_json(&plan, None, None)["claimed"], json!([]));
     }
 }

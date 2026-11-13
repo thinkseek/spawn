@@ -711,6 +711,18 @@ fn lines_at(
     let mut storage = timed(&mut parts.storage, || super::storage::report(store, now_ms))?;
     let unowned = timed(&mut parts.unowned, || unowned::now(file, now_ms));
     let reading = unowned.reading.as_deref();
+    // Whether each claimed folder's objective landed (objective 140): read
+    // only when a folder is claimed, once for all of them; None when the
+    // store cannot say.
+    let pairs = unowned::claimed_pairs(reading);
+    let landed = if pairs.is_empty() {
+        Some(Vec::new())
+    } else {
+        store
+            .claimed_landed(&pairs)
+            .map_err(|error| eprintln!("core-lines: the claimed folders' landings: {error}"))
+            .ok()
+    };
     storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
     storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
     disk::with_disk(&mut storage, samples, now_ms);
@@ -762,7 +774,7 @@ fn lines_at(
         Extras {
             groups: statuses.iter().map(|status| status.json(now_ms)).collect(),
             drills: drills.list,
-            scratch: unowned::scratch_json(&unowned.plan, reading),
+            scratch: unowned::scratch_json(&unowned.plan, reading, landed.as_deref()),
             test_schemas: unowned::test_schemas_json(reading),
             refused: unowned.refused,
         },

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { CoreFigure, CoreLinesAnswer } from "../src/coreLines.ts";
-import { coreLinesView, drillMark, rangeWords, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
+import { coreLinesView, drillMark, rangeWords, scratchMark, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -161,8 +161,8 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [] });
-  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [] });
+  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [] });
+  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [] });
 });
 
 // Objective 086: the performance line's units.
@@ -429,4 +429,42 @@ test("a figure that names its store says it after its name", () => {
   });
   assert.deepEqual(view.rows[0].guardrails.map((mark) => mark.name), ["Free disk lost a day", "Store that grew most: unattributed"]);
   assert.equal(view.rows[0].north_star.name, "Days until the disk is full");
+});
+
+// Objective 140: each claimed scratch folder is said by its owner and
+// objective, its bytes and its build's, its age, its lease and whether its
+// objective landed; landed with its lease ended is the one to clear.
+test("a claimed scratch folder says its owner, size, age, lease and landing", () => {
+  const now = Date.UTC(2026, 10, 14, 12, 0);
+  const lease = now + 3 * 3_600_000;
+  const folder = {
+    path: "/s/rev-e-140",
+    agent: "rev-e",
+    objective: "4/140",
+    created_ms: now - 2 * 3_600_000,
+    lease_until_ms: lease,
+    bytes: 3 * GIB,
+    build_bytes: 2 * GIB,
+    landed: false,
+  };
+  assert.deepEqual(scratchMark(folder, now), {
+    name: "rev-e · 4/140",
+    text: `3.0 GB (build 2.0 GB) · 2 h old · lease until ${sinceWords(lease)} · not landed`,
+    tone: "plain",
+    detail: "/s/rev-e-140",
+  });
+  const ended = { ...folder, lease_until_ms: now, landed: true };
+  assert.equal(scratchMark(ended, now).text, "3.0 GB (build 2.0 GB) · 2 h old · lease ended · landed");
+  assert.equal(scratchMark(ended, now).tone, "warning", "landed and its lease ended");
+  assert.equal(scratchMark({ ...folder, landed: true }, now).tone, "plain", "its lease still runs");
+  assert.equal(scratchMark({ ...ended, landed: false }, now).tone, "plain", "not landed");
+  assert.match(scratchMark({ ...folder, landed: null }, now).text, / · landing not read$/);
+  const view = coreLinesView({ lines: [], scratch: { claimed: [folder, ended] } }, now);
+  assert.deepEqual(view.scratch.map((mark) => mark.tone), ["plain", "warning"]);
+});
+
+test("no claimed scratch folder, or no walk, is an empty list", () => {
+  assert.deepEqual(coreLinesView({ lines: [], scratch: { claimed: [] } }).scratch, []);
+  assert.deepEqual(coreLinesView({ lines: [] }).scratch, []);
+  assert.deepEqual(coreLinesView(null).scratch, []);
 });

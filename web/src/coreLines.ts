@@ -81,6 +81,39 @@ export interface CoreLinesAnswer {
   ignored_ranges: Array<{ key: string; reason: string }>;
   /** The Core lines file's recoverability rows, in its order. */
   drills?: CoreDrill[];
+  /** The scratch walk (objective 094); `claimed`, every claimed folder by
+   * owner (objective 140). */
+  scratch?: { claimed?: CoreClaimed[] };
+}
+
+/** A claimed scratch folder (objective 140, `spawn scratch claim`). */
+export interface CoreClaimed {
+  path: string;
+  agent: string;
+  /** "<mission>/<NNN>". */
+  objective: string;
+  created_ms: number;
+  lease_until_ms: number;
+  bytes: number;
+  /** Its build paths' bytes, reached through real directories only. */
+  build_bytes: number;
+  /** Whether its objective landed; null when the store was not read. */
+  landed: boolean | null;
+}
+
+/** A claimed folder on the card's Storage row. */
+export interface CoreScratchMark {
+  /** "<agent> · <objective>". */
+  name: string;
+  /** "<size> (build <size>) · <age> old · lease until MM-DD HH:MM" or
+   * "· lease ended", then "· landed", "· not landed" or "· landing not
+   * read". */
+  text: string;
+  /** "warning" when it landed and its lease ended (build output left to
+   * remove), else "plain". */
+  tone: "plain" | "warning";
+  /** The folder's path (the row's title). */
+  detail: string;
 }
 
 /** A drill on the card, under the recoverability row. */
@@ -126,6 +159,9 @@ export interface CoreLinesView {
   pending: string[];
   /** The recovery table's rows, each with its last pass (objective 093). */
   drills: CoreDrillMark[];
+  /** Scratch by owner (objective 140): each claimed folder, as the answer
+   * lists them; empty when none is claimed. */
+  scratch: CoreScratchMark[];
 }
 
 const WEEK_MS = 7 * 86_400_000;
@@ -151,6 +187,28 @@ export function drillMark(raw: Partial<CoreDrill> | null | undefined, now: numbe
   }
   if (passed === null) return { name, text: "never passed", tone: "warning", detail: "" };
   return { name, text: `passed ${ago(passed)}`, tone: now - passed <= WEEK_MS ? "plain" : "warning", detail: "" };
+}
+
+/** A claimed scratch folder in words at `now` (objective 140). */
+export function scratchMark(raw: Partial<CoreClaimed> | null | undefined, now: number): CoreScratchMark {
+  const agent = typeof raw?.agent === "string" ? raw.agent : "";
+  const objective = typeof raw?.objective === "string" ? raw.objective : "";
+  const created = finite(raw?.created_ms);
+  const lease = finite(raw?.lease_until_ms);
+  const leased = lease !== null && lease > now;
+  const landed = raw?.landed === true ? "landed" : raw?.landed === false ? "not landed" : "landing not read";
+  const parts = [
+    `${storageSize(finite(raw?.bytes) ?? 0)} (build ${storageSize(finite(raw?.build_bytes) ?? 0)})`,
+    `${created === null ? "?" : spanWords(Math.max(0, now - created))} old`,
+    leased ? `lease until ${sinceWords(lease)}` : "lease ended",
+    landed,
+  ];
+  return {
+    name: `${agent} · ${objective}`,
+    text: parts.join(" · "),
+    tone: raw?.landed === true && !leased ? "warning" : "plain",
+    detail: typeof raw?.path === "string" ? raw.path : "",
+  };
 }
 
 const LINE_NAMES: Record<string, string> = {
@@ -309,6 +367,9 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
     ignored: ignored.map((entry) => `${entry?.key}: ${entry?.reason}`),
     pending: ignored.map((entry) => pendingWords(entry, names)),
     drills: (Array.isArray(answer?.drills) ? answer.drills : []).map((drill) => drillMark(drill, now)),
+    scratch: (Array.isArray(answer?.scratch?.claimed) ? answer.scratch.claimed : []).map((claimed) =>
+      scratchMark(claimed, now),
+    ),
   };
 }
 

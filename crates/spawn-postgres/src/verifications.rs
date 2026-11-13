@@ -107,6 +107,23 @@ select jsonb_build_object(
   'newest_old_ms', max(at_ms) filter (where at_ms <= $2))
   from unverified";
 
+/// The claimed scratch folders' objectives that landed (objective 140): of
+/// the pairs `unnest($1::bigint[], $2::integer[])` (missions and
+/// objectives), those with a `task.landed` of a task of that mission and
+/// objective (the fleet's code landed), each once, in order. The landings
+/// are read through `spawn_events_control_record_type` (type, time, id),
+/// never the whole control stream, then each task by its primary key. No
+/// time window: it grows with landings only.
+pub const CLAIMED_LANDED: &str = r"
+select distinct t.mission_id, t.objective
+  from spawn_events e
+  join mission_tasks t on t.id = (e.kind -> 'detail' -> 'record' ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'
+   and (t.mission_id, t.objective) in
+       (select c.mission_id, c.objective from unnest($1::bigint[], $2::integer[]) as c(mission_id, objective))
+ order by t.mission_id, t.objective";
+
 /// The phrase an objective's "Verified by:" paragraph starts with.
 const VERIFIED_BY: &str = "Verified by:";
 
@@ -138,6 +155,24 @@ impl PostgresStore {
     /// old, newest_old_ms}`. The alert step reads it at every reading.
     pub fn unverified_landings(&self, since_ms: i64, old_at_ms: i64) -> Result<Value, StoreError> {
         self.query_json_prepared(UNVERIFIED, &[&since_ms, &old_at_ms])
+    }
+
+    /// Which of the claimed folders' `(mission, objective)` pairs landed
+    /// ([`CLAIMED_LANDED`]), each once, in order. An objective out of an
+    /// `integer`'s range never landed.
+    pub fn claimed_landed(&self, pairs: &[(i64, i64)]) -> Result<Vec<(i64, i64)>, StoreError> {
+        let (missions, objectives): (Vec<i64>, Vec<i32>) = pairs
+            .iter()
+            .filter_map(|&(mission, objective)| Some((mission, i32::try_from(objective).ok()?)))
+            .unzip();
+        if missions.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .query_prepared(CLAIMED_LANDED, &[&missions, &objectives])?
+            .iter()
+            .map(|row| (row.get::<_, i64>(0), i64::from(row.get::<_, i32>(1))))
+            .collect())
     }
 
     /// What `spawn verify list` decides on ([`FACTS`]): each landing with
