@@ -163,6 +163,21 @@ export function CoreLinesCard({
                           ))}
                         </ul>
                       )}
+                      {line?.line === "storage" && view.scratch.length > 0 && (
+                        <ul className="space-y-0.5" aria-label="Scratch by owner">
+                          <li className="text-micro font-medium text-faint-foreground">Scratch by owner</li>
+                          {view.scratch.map((folder, at) => (
+                            <li
+                              key={`${at}:${folder.detail}`}
+                              className="flex min-w-0 items-baseline gap-2 text-caption"
+                              title={folder.detail}
+                            >
+                              <span className="min-w-0 truncate text-muted-foreground">{folder.name}</span>
+                              <span className={cx("tnum ml-auto shrink-0", TONE[folder.tone])}>{folder.text}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                       {row.guardrails.length > 0 && (
                         <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
                           {row.guardrails.map((mark, at) => (
