@@ -2549,25 +2549,18 @@ times in a row)",
                 if !self.is_open(&key) {
                     continue;
                 }
-                if taken > 0 {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]}),
-                    });
+                // Taken; else a later message of its session taken; else
+                // its session ended with it.
+                let evidence = if taken > 0 {
+                    json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]})
                 } else if let Some(later) = later_taken {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({
-                            "later_taken": later,
-                            "taken_at_ms": message["later_taken_at_ms"],
-                        }),
-                    });
+                    json!({"later_taken": later, "taken_at_ms": message["later_taken_at_ms"]})
                 } else if ended {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"ended": true, "state": message["state"]}),
-                    });
-                }
+                    json!({"ended": true, "state": message["state"]})
+                } else {
+                    continue;
+                };
+                out.push(Event::Clear { key, evidence });
                 continue;
             }
             if message["tracked"].as_bool() != Some(true)
