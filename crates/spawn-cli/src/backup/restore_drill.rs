@@ -758,11 +758,12 @@ fn fetch_bundle(
             "{key}'s x-amz-meta-sha256 {meta} is not the record's {expected}"
         ));
     }
+    same_key(&seal.name, &object_key(key, &headers)?)?;
     let encrypted = here.join("bundle.gpg");
     fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
     drop(bytes);
     let raw = here.join("bundle.raw");
-    decrypt(settings, &encrypted, &raw)?;
+    decrypt_with(seal, &encrypted, &raw)?;
     let found = sha256_file(&raw)?;
     if found != expected {
         return Err(format!(
