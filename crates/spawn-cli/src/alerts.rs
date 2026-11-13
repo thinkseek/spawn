@@ -272,6 +272,20 @@
 //!   clears when the day ends, or at a reading that finds the budget removed
 //!   or above the day's spend. A mission with no daily budget, or under it,
 //!   raises none. It rests on the readings of the recorded costs.
+//! - `unverified_landings`, `objectives`, key
+//!   `unverified_landings:<the newest old landing's ms>:<the reading's ms>`
+//!   (objective 135, lead-mac's review §2.8): at a reading (every
+//!   `SPAWN_ALERT_CHECK_SECS`), objectives whose newest landing is on or
+//!   after 2026-11-13 00:00 +08:00 (crate::verify's `LISTED_SINCE_MS`,
+//!   when "Verified by:" became required) and whose newest verification
+//!   after it is not a pass (`spawn verify list`'s rule) have landed
+//!   `SPAWN_ALERT_UNVERIFIED_SECS` (default 86400, a day; 0 disables it and
+//!   reads nothing) or more ago. Evidence how many (`old`), how many are
+//!   unverified at all, the bound, the newest of the old landings, the
+//!   listing's start and the reading. One open at a time: more growing old
+//!   while it is open fire nothing. Clears at the first reading with none
+//!   old; a fail recorded after a pass makes an objective unverified
+//!   again, and a later reading fires a new one.
 //! - `message_not_taken`, the session id, key `message_not_taken:<command>`,
 //!   evidence the command, agent, session and whether it was typed
 //!   (objective 045): a message (what the Bridge types for a command, with
@@ -401,6 +415,9 @@ pub(crate) struct Settings {
     /// How long an owner's landing request may have no outcome (0: never
     /// alerted).
     pub(crate) owner_request_ms: i64,
+    /// How long a landed objective may stay unverified (0: never alerted,
+    /// nothing read).
+    pub(crate) unverified_ms: i64,
     /// The window `spawn alerts --once` shows.
     pub(crate) window_ms: i64,
     /// The two database logs, when named.
@@ -506,6 +523,7 @@ impl Settings {
             controller_behind_ms: secs("SPAWN_ALERT_CONTROLLER_BEHIND_SECS", 1800, &mut warnings),
             mission_idle_ms: secs("SPAWN_ALERT_MISSION_IDLE_SECS", 900, &mut warnings),
             owner_request_ms: secs("SPAWN_ALERT_OWNER_REQUEST_SECS", 3600, &mut warnings),
+            unverified_ms: secs("SPAWN_ALERT_UNVERIFIED_SECS", 86_400, &mut warnings),
             window_ms: secs("SPAWN_ALERT_WINDOW_SECS", 86_400, &mut warnings),
             test_log: env_value("SPAWN_TEST_DATABASE_LOG").map(PathBuf::from),
             live_log: env_value("SPAWN_DATABASE_LOG").map(PathBuf::from),
@@ -942,6 +960,7 @@ impl Monitor {
             self.read_sources(store, now, &mut events, &mut lines);
             self.read_defect_gates(store, now, &mut events, &mut lines);
             self.read_budgets(store, now, &mut events, &mut lines);
+            self.read_unverified(store, now, &mut events, &mut lines);
             self.read_idle(now, &mut events);
             if now >= self.database_due_ms {
                 self.database_due_ms = now.saturating_add(self.settings.database_ms);
@@ -3464,6 +3483,82 @@ times in a row)",
         }
     }
 
+    /// The landed objectives' reading (`unverified_landings`): those since
+    /// [`crate::verify::LISTED_SINCE_MS`] not verified, and how many of
+    /// them landed the bound or more before `now`. A read that fails is a
+    /// line; the alert stays as it was.
+    fn read_unverified(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        let Some(old_at) = self.unverified_old_at(now) else {
+            return;
+        };
+        match store.unverified_landings(crate::verify::LISTED_SINCE_MS, old_at) {
+            Ok(reading) => self.unverified(now, &reading, out),
+            Err(error) => lines.push(format!("alerts: the unverified landings: {error}")),
+        }
+    }
+
+    /// The time at or before which a landing is old at `now`: `None` when
+    /// the bound is 0 (never alerted, nothing read).
+    fn unverified_old_at(&self, now: i64) -> Option<i64> {
+        (self.settings.unverified_ms != 0).then(|| now.saturating_sub(self.settings.unverified_ms))
+    }
+
+    /// One reading of the landed objectives (`{unverified, old,
+    /// newest_old_ms}`): fire when any is old and none is open; clear the
+    /// open one when none is old.
+    fn unverified(&mut self, now: i64, reading: &Value, out: &mut Vec<Event>) {
+        const KIND: &str = "unverified_landings";
+        const SUBJECT: &str = "objectives";
+        let old = reading["old"].as_i64().unwrap_or_default();
+        let unverified = reading["unverified"].as_i64().unwrap_or_default();
+        let open = self.open_keys(KIND, SUBJECT);
+        if old == 0 {
+            for key in open {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({"old": 0, "unverified": unverified, "reading_ms": now}),
+                });
+            }
+            return;
+        }
+        if !open.is_empty() {
+            return;
+        }
+        let newest = reading["newest_old_ms"].as_i64().unwrap_or_default();
+        let bound = self.settings.unverified_ms;
+        let span = if bound == DAY_MS {
+            "a day".to_string()
+        } else {
+            idle_words(bound)
+        };
+        let (objectives, them) = if old == 1 {
+            ("objective", "it")
+        } else {
+            ("objectives", "them")
+        };
+        out.push(Event::Fire {
+            key: format!("{KIND}:{newest}:{now}"),
+            kind: KIND,
+            subject: SUBJECT.to_string(),
+            evidence: json!({
+                "old": old, "unverified": unverified, "unverified_ms": bound,
+                "newest_landed_ms": newest, "listed_since_ms": crate::verify::LISTED_SINCE_MS,
+                "reading_ms": now,
+            }),
+            text: format!(
+                "{old} landed {objectives} unverified for over {span}: spawn verify list names \
+                 {them}"
+            ),
+            notice: false,
+        });
+    }
+
     fn read_memory(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
         if self.settings.memory_low_mb == 0 {
             return;
@@ -4844,6 +4939,7 @@ mod tests {
             controller_behind_ms: 1_800_000,
             mission_idle_ms: 900_000,
             owner_request_ms: 3_600_000,
+            unverified_ms: 86_400_000,
             window_ms: 86_400_000,
             test_log: None,
             live_log: None,
@@ -7041,6 +7137,106 @@ connections\n";
         let mut later = Vec::new();
         monitor.bounds(1000 + 2 * 7_200_000, &mut later);
         assert_eq!(fires(&later), ["backup_stale:dump:21"]);
+    }
+
+    #[test]
+    fn landed_objectives_unverified_over_the_bound_alert_once_and_clear_when_verified() {
+        let mut monitor = monitor();
+        let since = crate::verify::LISTED_SINCE_MS;
+        let now = since + 3 * super::DAY_MS;
+        let reading = |unverified: i64, old: i64, newest: Option<i64>| json!({"unverified": unverified, "old": old, "newest_old_ms": newest});
+        let read = |monitor: &mut Monitor, at: i64, value: Value| {
+            let mut out = Vec::new();
+            monitor.unverified(at, &value, &mut out);
+            let out = decided(monitor, out);
+            commit(monitor, &out);
+            out
+        };
+        assert!(
+            read(&mut monitor, now, reading(3, 0, None)).is_empty(),
+            "none old: nothing"
+        );
+        let landed = now - super::DAY_MS - 5000;
+        let fired = read(&mut monitor, now + 2000, reading(3, 2, Some(landed)));
+        let key = format!("unverified_landings:{landed}:{}", now + 2000);
+        assert_eq!(fires(&fired), [key.as_str()]);
+        let Event::Fire {
+            kind,
+            subject,
+            text,
+            evidence,
+            notice,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire");
+        };
+        assert_eq!(*kind, "unverified_landings");
+        assert_eq!(subject, "objectives");
+        assert!(!notice);
+        assert_eq!(
+            text,
+            "2 landed objectives unverified for over a day: spawn verify list names them"
+        );
+        assert_eq!(
+            evidence,
+            &json!({"old": 2, "unverified": 3, "unverified_ms": super::DAY_MS,
+                    "newest_landed_ms": landed, "listed_since_ms": since,
+                    "reading_ms": now + 2000})
+        );
+        // More readings, more grown old: nothing more while one is open.
+        assert!(read(&mut monitor, now + 4000, reading(3, 2, Some(landed))).is_empty());
+        assert!(read(&mut monitor, now + 6000, reading(4, 3, Some(landed + 1))).is_empty());
+        // None old: cleared, with what the reading saw.
+        let cleared = read(&mut monitor, now + 8000, reading(1, 0, None));
+        assert!(
+            matches!(&cleared[..], [Event::Clear { key: cleared, evidence }]
+                if *cleared == key
+                    && *evidence == json!({"old": 0, "unverified": 1, "reading_ms": now + 8000})),
+            "{cleared:?}"
+        );
+        assert!(read(&mut monitor, now + 10_000, reading(1, 0, None)).is_empty());
+        // A later one is a new occurrence, in the singular.
+        let again = read(&mut monitor, now + 12_000, reading(1, 1, Some(landed)));
+        assert_eq!(
+            fires(&again),
+            [format!("unverified_landings:{landed}:{}", now + 12_000).as_str()]
+        );
+        let Event::Fire { text, .. } = &again[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(
+            text,
+            "1 landed objective unverified for over a day: spawn verify list names it"
+        );
+    }
+
+    #[test]
+    fn another_unverified_bound_says_itself_and_zero_reads_nothing() {
+        assert_eq!(monitor().unverified_old_at(100_000_000), Some(13_600_000));
+        let off = Monitor::with(Settings {
+            unverified_ms: 0,
+            ..settings()
+        });
+        assert_eq!(off.unverified_old_at(100_000_000), None, "0: nothing read");
+        let mut monitor = Monitor::with(Settings {
+            unverified_ms: 10_000,
+            ..settings()
+        });
+        let mut out = Vec::new();
+        monitor.unverified(
+            5_000_000,
+            &json!({"unverified": 1, "old": 1, "newest_old_ms": 4_000_000}),
+            &mut out,
+        );
+        let Some(Event::Fire { text, evidence, .. }) = out.first() else {
+            panic!("a fire: {out:?}");
+        };
+        assert_eq!(
+            text,
+            "1 landed objective unverified for over 10 s: spawn verify list names it"
+        );
+        assert_eq!(evidence["unverified_ms"], 10_000);
     }
 
     #[test]

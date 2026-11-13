@@ -285,3 +285,99 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     assert_eq!(deploy["reason"], "the build failed");
     assert!(deploy["at_ms"].as_i64().is_some(), "{facts}");
 }
+
+/// When the event `event` was recorded.
+fn event_ms(client: &mut Client, event: i64) -> i64 {
+    client
+        .query_one(
+            "select recorded_at_ms from spawn_events where id = $1",
+            &[&event],
+        )
+        .expect("an event")
+        .get(0)
+}
+
+/// When the newest control record was recorded.
+fn last_control_ms(client: &mut Client) -> i64 {
+    client
+        .query_one(
+            "select max(recorded_at_ms) from spawn_events where session_id = 'session_control'",
+            &[],
+        )
+        .expect("the last record")
+        .get(0)
+}
+
+/// The alert step's polled read (objective 135): the objectives whose
+/// newest landing is at or after `since_ms` and whose newest verification
+/// after it is not a pass, and how many of them landed at or before
+/// `old_at_ms`, with the newest of those.
+#[test]
+fn the_unverified_landings_read_counts_the_window_and_the_old() {
+    let (store, schema) = store("verification_unverified");
+    let mut client = admin(&schema);
+    // Each record a millisecond or more after the one before it, so "after
+    // the landing" is never the same millisecond.
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(3));
+    mission(&mut client, 1);
+    let land = |client: &mut Client, task: i64, objective: i64| -> i64 {
+        assigned(client, task, 1, objective, "Objective.");
+        pause();
+        let event = landed(client, task);
+        pause();
+        event_ms(client, event)
+    };
+    let verify = |objective: i64, result: &str| {
+        store
+            .verification_record(&verification(1, objective, result))
+            .expect("a verification");
+        pause();
+    };
+
+    // 1: landed before the window.
+    let before = land(&mut client, 1, 1);
+    // 2: pass, then fail (counted, old). 3: fail, then pass (not counted).
+    let two = land(&mut client, 2, 2);
+    verify(2, "pass");
+    verify(2, "fail");
+    land(&mut client, 3, 3);
+    verify(3, "fail");
+    verify(3, "pass");
+    // 5: a fail, then a landing again; 6: a pass, then a landing again.
+    land(&mut client, 5, 5);
+    verify(5, "fail");
+    land(&mut client, 6, 6);
+    verify(6, "pass");
+    // Every landing so far is old; what lands after is under the bound.
+    let bound = last_control_ms(&mut client);
+    pause();
+    // 4: landed under the bound. 5 and 6 land again.
+    land(&mut client, 4, 4);
+    land(&mut client, 7, 5);
+    land(&mut client, 8, 6);
+
+    let since = before + 1;
+    assert_eq!(
+        store.unverified_landings(since, bound).expect("the read"),
+        json!({"unverified": 4, "old": 1, "newest_old_ms": two}),
+        "2 (failed after its pass), 4 (under the bound), 5 and 6 (landed again): only 2 is old"
+    );
+    assert_eq!(
+        store.unverified_landings(before, bound).expect("the read"),
+        json!({"unverified": 5, "old": 2, "newest_old_ms": two}),
+        "the window is at or after since_ms"
+    );
+    let newest = last_control_ms(&mut client);
+    assert_eq!(
+        store.unverified_landings(since, newest).expect("the read")["old"],
+        4,
+        "at or before old_at_ms"
+    );
+    assert_eq!(
+        store
+            .unverified_landings(newest + 1, newest + 1)
+            .expect("the read"),
+        json!({"unverified": 0, "old": 0, "newest_old_ms": null}),
+        "nothing in the window"
+    );
+}
