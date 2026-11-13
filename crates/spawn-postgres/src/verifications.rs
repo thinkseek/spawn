@@ -65,9 +65,9 @@ const VERIFIED_BY: &str = "Verified by:";
 pub fn verified_by_line(brief: &str) -> Option<String> {
     brief
         .lines()
+        .rev()
         .map(str::trim)
-        .filter(|line| line.starts_with(VERIFIED_BY))
-        .last()
+        .find(|line| line.starts_with(VERIFIED_BY))
         .map(str::to_string)
 }
 
