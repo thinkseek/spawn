@@ -519,8 +519,10 @@ impl Settings {
 
     /// `spawn backup`'s settings: its bucket and credentials from r2.env
     /// ([`Self::backup_r2`]), never the keep bucket.
+    /// It needs no key file: a reader reads each record with the key it
+    /// names, and a run that seals takes [`Self::seal`].
     pub(crate) fn from_env(flags: &Flags) -> Result<Self, String> {
-        Self::with_r2(flags, Self::backup_r2)
+        Self::build(flags, Self::backup_r2, false)
     }
 
     /// The bucket and credentials `spawn backup` works with: r2.env's
@@ -553,17 +555,27 @@ impl Settings {
     }
 
     /// The settings with the bucket and credentials `r2` gives (the store
-    /// passes its own credential's, so it never needs r2.env).
+    /// passes its own credential's, so it never needs r2.env). The store
+    /// seals with the sealing key's file, so it requires it.
     pub(crate) fn with_r2(
         flags: &Flags,
         r2: impl FnOnce() -> Result<R2, String>,
     ) -> Result<Self, String> {
+        Self::build(flags, r2, true)
+    }
+
+    fn build(
+        flags: &Flags,
+        r2: impl FnOnce() -> Result<R2, String>,
+        key_required: bool,
+    ) -> Result<Self, String> {
         let root = workspace_root(flags)
             .map(PathBuf::from)
             .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
-        let key_file = env_value("SPAWN_BACKUP_KEY_FILE")
-            .map_or_else(|| home().join(".config/spawn/backup.key"), PathBuf::from);
-        private_file(&key_file, "the backup key")?;
+        let seal = sealing_key();
+        let key_file = store_key_file(&seal, key_required, || {
+            key_on_host("k1").map_or_else(|_| key_dir().join("backup.key.k1"), |key| key.file)
+        })?;
         let r2 = r2()?;
         let prefix = prefix_value(env_value("SPAWN_BACKUP_PREFIX"))?;
         let limit_bytes = megabytes("SPAWN_BACKUP_R2_LIMIT_MB", DEFAULT_LIMIT_MB)?;
@@ -583,6 +595,7 @@ SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
         Ok(Self {
             root,
             key_file,
+            seal,
             r2,
             pg_bin: env_value("SPAWN_BACKUP_PG_BIN").map(PathBuf::from),
             compress: env_or("SPAWN_BACKUP_DUMP_COMPRESS", "zstd:9"),
@@ -1431,13 +1444,13 @@ fn count_events(settings: &Settings, scratch: &Scratch, dump: &Path) -> Result<(
 /// gpg: AES256, no compression (the archive is compressed), the passphrase
 /// from its file.
 fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Result<(), String> {
-    gpg_with(settings, decrypting, "none", input, out)
+    gpg_with(&settings.key_file, decrypting, "none", input, out)
 }
 
 /// gpg with the backup key; `compress` is its --compress-algo when it
 /// encrypts (the dumps and bundles are compressed before: `none`).
 fn gpg_with(
-    settings: &Settings,
+    key_file: &Path,
     decrypting: bool,
     compress: &str,
     input: &Path,
@@ -1455,7 +1468,7 @@ fn gpg_with(
             "--no-symkey-cache",
         ])
         .arg("--passphrase-file")
-        .arg(&settings.key_file);
+        .arg(key_file);
     if decrypting {
         command.arg("--output").arg(out).arg("--decrypt").arg(input);
     } else {
@@ -1486,10 +1499,20 @@ fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> 
     gpg(settings, true, input, out)
 }
 
+/// A dump or a bundle sealed with `key` (objective 114).
+fn encrypt_with(key: &Key, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(&key.file, false, "none", input, out)
+}
+
+/// An object opened with `key`, the one its record names.
+fn decrypt_with(key: &Key, input: &Path, out: &Path) -> Result<(), String> {
+    gpg_with(&key.file, true, "none", input, out)
+}
+
 /// A store object sealed: compressed (zlib) and encrypted with the backup
 /// key, as one gpg step (`spawn backup store`).
 fn seal(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
-    gpg_with(settings, false, "zlib", input, out)
+    gpg_with(&settings.key_file, false, "zlib", input, out)
 }
 
 /// One exchange with the bucket. `options` is curl config (headers, the
