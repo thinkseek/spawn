@@ -741,15 +741,13 @@ impl Store {
             file.write_all(bytes)?;
             file.sync_all()
         })();
-        match result {
-            Ok(()) => Ok(stage),
-            Err(_) => {
-                let _ = fs::remove_file(&stage);
-                Err(say(format!(
-                    "{entry} could not be written; it was not stored"
-                )))
-            }
+        if result.is_err() {
+            let _ = fs::remove_file(&stage);
+            return Err(say(format!(
+                "{entry} could not be written; it was not stored"
+            )));
         }
+        Ok(stage)
     }
 
     /// Rotates `name` to `value` under the exclusive lock: refused (and the
