@@ -303,11 +303,11 @@
 //!   clears when it is taken; else, typed, when a later message of its
 //!   session is taken (objective 138: the agent went on past it, its marker
 //!   missed; evidence `later_taken`, that command, and its `taken_at_ms`;
-//!   another session's taking, or one of an untyped message, counts for
-//!   nothing); else when its session ends with it untaken (the execution it
-//!   was typed into, or its own start's, ended). A message whose session
-//!   ended first, or a later one of whose session was taken first, fires
-//!   nothing. Read on start (every message
+//!   another session's taking counts for nothing, and an untyped message is
+//!   behind nothing the agent took); else when its session ends with it
+//!   untaken (the execution it was typed into, or its own start's, ended).
+//!   A message whose session ended first, or a later message of whose
+//!   session was taken first, fires nothing. Read on start (every message
 //!   that can be one, and the open alerts), then when the log moved (the
 //!   new commands, the pending messages due, the open alerts whose session
 //!   took a message or ended since) and when a pending one falls due.
@@ -9196,7 +9196,18 @@ connections\n";
 
         /// The transcript's line `line` took `command`.
         fn taken(store: &PostgresStore, session: &str, execution: &str, line: &str, id: u64) {
-            keyed(
+            taken_at(store, session, execution, line, id);
+        }
+
+        /// [`taken`], and the time the records hold for it.
+        fn taken_at(
+            store: &PostgresStore,
+            session: &str,
+            execution: &str,
+            line: &str,
+            id: u64,
+        ) -> i64 {
+            let event = keyed(
                 store,
                 session,
                 execution,
@@ -9206,6 +9217,23 @@ connections\n";
                     command_id: CommandId(id),
                 },
             );
+            let events = store
+                .events_after(EventPosition(u64::try_from(event - 1).expect("an id")), 1)
+                .expect("the taking");
+            i64::try_from(events[0].recorded_at.timestamp_millis()).expect("a time")
+        }
+
+        /// The clearings among `events`, by key, in key order.
+        fn clears_of_messages(events: &[Event]) -> Vec<(String, Value)> {
+            let mut clears: Vec<(String, Value)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
+                    Event::Fire { .. } => None,
+                })
+                .collect();
+            clears.sort_by(|a, b| a.0.cmp(&b.0));
+            clears
         }
 
         fn turn_ended(store: &PostgresStore, session: &str, execution: &str, line: &str) -> i64 {
@@ -9458,8 +9486,11 @@ connections\n";
         }
 
         /// The alert fires for the two not taken (whether typed in its
-        /// evidence), once; the one taken later clears, and the session's
-        /// end clears the other; a fresh step then fires nothing.
+        /// evidence), once; the one taken later clears, and so does the deaf
+        /// one before it (objective 138: a later message of its session was
+        /// taken, `later_taken`), so the session's end clears nothing; a
+        /// fresh step then fires nothing. Before 138 the deaf one stayed open
+        /// until the session's end.
         #[test]
         fn a_message_not_taken_is_one_alert_until_taken_or_its_session_ends() {
             in_schema("messages_alert", |store| {
@@ -9504,28 +9535,31 @@ connections\n";
                 commit(&mut monitor, &fired);
                 assert!(read(&mut monitor, store).is_empty(), "once");
 
-                // The untyped one is typed and taken: its alert clears.
+                // The untyped one is typed and taken: its alert clears, and
+                // the deaf one's before it (a later message taken).
                 typed(store, "msg", MSG_EXECUTION, untyped, true);
-                taken(store, "msg", MSG_EXECUTION, "u2", untyped.0);
+                let at = taken_at(store, "msg", MSG_EXECUTION, "u2", untyped.0);
                 let cleared = read(&mut monitor, store);
-                assert!(
-                    matches!(&cleared[..], [Event::Clear { key, evidence }]
-                        if *key == format!("message_not_taken:{}", untyped.0)
-                            && evidence["taken"] == 1),
+                assert_eq!(
+                    clears_of_messages(&cleared),
+                    [
+                        (
+                            format!("message_not_taken:{}", deaf.0),
+                            json!({"later_taken": untyped.0, "taken_at_ms": at})
+                        ),
+                        (
+                            format!("message_not_taken:{}", untyped.0),
+                            json!({"taken": 1, "taken_at_ms": at})
+                        ),
+                    ],
                     "{cleared:?}"
                 );
                 commit(&mut monitor, &cleared);
 
-                // The session ends with the deaf one untaken: it clears.
+                // The session ends: nothing is left open to clear.
                 world.worker.ended(store, EndCause::Stopped);
                 let ended = read(&mut monitor, store);
-                assert!(
-                    matches!(&ended[..], [Event::Clear { key, evidence }]
-                        if *key == format!("message_not_taken:{}", deaf.0)
-                            && evidence["ended"] == true),
-                    "{ended:?}"
-                );
-                commit(&mut monitor, &ended);
+                assert!(ended.is_empty(), "{ended:?}");
                 assert!(read(&mut monitor, store).is_empty());
                 // A fresh step finds nothing to fire for an ended session.
                 assert!(read(&mut prompt_monitor(), store).is_empty());
