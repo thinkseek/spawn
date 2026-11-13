@@ -46,10 +46,15 @@ pub(crate) fn fill(config: &mut postgres::Config) {
     if config.get_password().is_some() {
         return;
     }
-    let Some(path) = passfile_path() else {
-        return;
-    };
-    if let Some(password) = lookup(&path, &Target::of(config)) {
+    if let Some(path) = passfile_path() {
+        fill_from(config, &path);
+    }
+}
+
+/// Give `config`, which has no password, the password of the passfile at
+/// `path` when a line matches.
+fn fill_from(config: &mut postgres::Config, path: &Path) {
+    if let Some(password) = lookup(path, &Target::of(config)) {
         config.password(password);
     }
 }
@@ -213,7 +218,7 @@ fn fields(line: &str) -> Vec<Field> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Target, fields, lookup, password_in};
+    use super::{Target, fields, fill_from, lookup, password_in};
 
     fn target(host: &str, socket: bool) -> Target {
         Target {
@@ -331,5 +336,80 @@ mod tests {
         assert!(got.default_socket);
         assert_eq!(got.port, "5432");
         assert_eq!(got.database, "ckl", "the database defaults to the user");
+    }
+
+    /// A field written as a passfile writes it: `:` and `\` escaped.
+    fn escaped(value: &str) -> String {
+        value.replace('\\', "\\\\").replace(':', "\\:")
+    }
+
+    /// The test database's own login, its password taken out of the URL
+    /// and put in a 0600 passfile line for its host, port, database and
+    /// user: the connection logs in with the passfile's password. Nothing
+    /// is printed but the outcome.
+    #[test]
+    fn a_url_without_its_password_logs_in_with_the_passfiles() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(url) = std::env::var("SPAWN_TEST_DATABASE_URL") else {
+            return;
+        };
+        let full: postgres::Config = url.parse().expect("the test URL parses");
+        let Some(password) = full
+            .get_password()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        else {
+            return;
+        };
+        let target = Target::of(&full);
+        let path = std::env::temp_dir().join(format!(
+            "spawn-passfile-login-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let host = if target.default_socket {
+            "localhost".to_string()
+        } else {
+            escaped(&target.host)
+        };
+        let line = format!(
+            "# spawn's test\n*:*:*:someone_else:nope\n{host}:{}:{}:{}:{}\n",
+            target.port,
+            escaped(&target.database),
+            escaped(&target.user),
+            escaped(&password)
+        );
+        std::fs::write(&path, line).expect("write the passfile");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let mut bare = full.clone();
+        bare.password(Vec::<u8>::new());
+        let mut without = postgres::Config::new();
+        for host in full.get_hosts() {
+            match host {
+                postgres::config::Host::Tcp(name) => without.host(name),
+                postgres::config::Host::Unix(dir) => without.host_path(dir),
+            };
+        }
+        for port in full.get_ports() {
+            without.port(*port);
+        }
+        if let Some(user) = full.get_user() {
+            without.user(user);
+        }
+        if let Some(database) = full.get_dbname() {
+            without.dbname(database);
+        }
+        let before = without.get_password().is_none();
+        fill_from(&mut without, &path);
+        let filled = without.get_password() == full.get_password();
+        let connected = without.connect(postgres::NoTls).is_ok();
+        let _ = std::fs::remove_file(&path);
+        assert!(before, "the copy holds no password");
+        assert!(
+            filled,
+            "the passfile's line matched the URL's own host, port, database and user"
+        );
+        assert!(connected, "the passfile's password logs in");
     }
 }
