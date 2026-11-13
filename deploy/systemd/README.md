@@ -25,6 +25,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-nightly-stale@<source>` (`.timer`) | `scripts/rsi/nightly.sh --stale <source>`: whether the nightly covers anything (two skipped runs in a row, no fact younger than 26 h, or none though its timer fired: one `nightly_stale` alert); no run, no gate | oneshot, hourly |
 | `spawn-deploy-on-landing` (`.timer`) | `deploy/on-landing.sh` from the controller (#54): deploys what the fleet landed on the Spawn source, `deploy.sh --main` from its own checkout of main, once the store holds a gate-accepted landing of it, after a quiet spell (at the latest a max wait), never while the source is held, a deploy is pending or running, or the nightly is red (below) | oneshot, a minute after the last tick |
 | `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the controller: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` whose gate is gone, by the pid, start time and boot the gate recorded in it; never a running gate's, whatever its age), deploy.sh's dumps in the backups directory beyond the newest 5, and a VACUUM (ANALYZE) of the test databases' own catalogs, the fleet's and the gates' shared spawn_test (`scripts/vacuum-catalogs.sh`, P21: refused on the live database's port or name, left alone while another session is connected, drops no schema; `--url-var SPAWN_TEST_DATABASE_URL --full`, a dry run unless `--apply`, is the one-time rewrite that gives a leak's room back, run by hand at a quiet moment, never on the timer); nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly |
+| `spawn-session-backup` (`.timer`), `spawn-session-backup-drill` (`.timer`) | `deploy/session-backup.sh`: every account's Claude Code sessions (`~/.claude/projects`, `history.jsonl`, `file-history`) copied as a version (a reflink copy, its manifest and its file and dir counts), thinned to one version per day after 48 h but never a version that holds a file no later one holds (both units run `thin --dry-run`: print-only); daily, a restore of the newest into scratch, checked file by file. **System** units, run as root, installed by hand (below, "Session backups") | oneshot, every 15 min; the drill daily at 05:30 |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
 server alive. That only works because `ExecStart` is `spawn loop` itself: with
@@ -67,6 +68,58 @@ with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
 lets the owner's intranet read without the token, by the server's address
 (`http://192.168.31.112:8787/`); a client elsewhere (Tailscale, a container)
 still needs it.
+
+## Session backups
+
+`deploy/session-backup.sh` copies the Claude Code sessions as versions into
+`/var/backups/spawn-sessions`. Its header has the rules: what a version is,
+thinning (never a version holding a file that no later version holds; the
+first thinning of a root only prints), restore (into scratch only) and the
+drill. Its test runs under a scratch root and HOME only:
+`bash deploy/test-session-backup.sh`.
+
+The units are **system** units, in `deploy/systemd/system/`. The versions
+are owned by `spawn-backup`, a system user with no login, no home and no
+supplementary group. The root directory is 0711, each account's directory
+0700, and `status.json` 0644. Root only starts each account, which reads its
+own sessions, and `spawn-backup`, which writes its own tree, and joins their
+pipes. Both units run `thin --dry-run` until the owner allows removal.
+
+**Nothing here is live until it is installed by hand, with sudo (the lead's
+only).** The units run `/usr/local/lib/spawn/session-backup.sh`, a root-owned
+copy, and `deploy.sh` installs neither the script nor the units. These files
+are the installed ones, byte for byte (installed 2026-11-12 from 4f247ef1):
+
+```text
+a2437d463f2769bfff4f2da9065dde20ed6570b3218bee40f87e74774555ca85  deploy/session-backup.sh  (= /usr/local/lib/spawn/session-backup.sh)
+50a7f0cce47cbb84b40bbbc68caabd3ea60b2e7f8df38bf14fd4686e7c911773  deploy/test-session-backup.sh
+e653439c64c7bc9cdea7c5e1fe4e2c3f15fa9fd73e97b3ee572c4224c2ef4881  deploy/systemd/system/spawn-session-backup-drill.service
+51be45c296935f0356322d298d65084138f644826fcea78ddaf6d4eadebb310c  deploy/systemd/system/spawn-session-backup-drill.timer
+c7bccae226da53c5a7ec8c3597bdb71a35b7d8eb3f70fb3ebc1bf10ef1b02148  deploy/systemd/system/spawn-session-backup.service
+229ab22eb5e4604125e4a677cf1d5a52f67912de63a8578414e6d0d3d4c0dccb  deploy/systemd/system/spawn-session-backup.timer
+```
+
+A later change installs the same way. Root never runs or installs a file an
+account can change, and runs no git in a checkout. Root copies the files
+into a new root-owned directory, checks each sha256 against the reviewed
+commit's, and only then installs: the script with `install -o root -g root
+-m 755` to `/usr/local/lib/spawn/`, the units with `-m 644` to
+`/etc/systemd/system/`, then `systemctl daemon-reload`.
+
+`spawn serve` reads the status file the units write: `SPAWN_SESSION_BACKUP_STATUS`
+for the storage figure, and `recoverability.session_backup_status` for the
+core lines' backup age.
+
+Restore is never onto the live sessions. It goes into scratch, then is
+copied by hand. `spawn-backup` archives the version, and the account
+extracts it into a directory it made and hashes what it wrote.
+
+```sh
+sudo SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions SPAWN_SESSION_HOMES=/home/ckl \
+  SPAWN_SESSION_BACKUP_USER=spawn-backup bash /usr/local/lib/spawn/session-backup.sh list ckl
+sudo SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions SPAWN_SESSION_HOMES=/home/ckl \
+  SPAWN_SESSION_BACKUP_USER=spawn-backup bash /usr/local/lib/spawn/session-backup.sh restore ckl <version> /data/tmp/restore-<date>
+```
 
 ## Fleet test database and credentials
 
