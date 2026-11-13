@@ -711,3 +711,75 @@ fn no_number_of_host_faults_halts_a_mission() {
         assert_eq!(halt_reason(&mission, 7), None, "{faults}");
     }
 }
+
+/// The reason and the note's first line of the record of a rejection for
+/// `reason`, with gate output `log`.
+fn rejected(reason: &str, log: &str) -> (String, String) {
+    let record = super::rejected_fields(reason, log);
+    let note = record["note"].as_str().unwrap_or_default();
+    (
+        record["reason"].as_str().unwrap_or_default().to_string(),
+        note.lines().next().unwrap_or_default().to_string(),
+    )
+}
+
+#[test]
+fn a_check_tests_rejection_names_each_failed_test() {
+    let log = gate_output(&[
+        "FAILED bb::alpha::adds_up: assertion failed",
+        "FAILED bb::beta::keeps_order: left != right",
+    ]);
+    let (reason, note) = rejected(host::CHECK_TESTS_REGRESSION, &log);
+    let expected = "check-tests.sh failed: bb::alpha::adds_up; check-tests.sh failed: \
+                    bb::beta::keeps_order (regression: check-tests.sh fails on the candidate)";
+    assert_eq!(reason, expected);
+    assert_eq!(note, format!("The gate rejected this work: {expected}."));
+    let record = super::rejected_fields(host::CHECK_TESTS_REGRESSION, &log);
+    assert_eq!(record["log"], json!(log));
+    assert!(record["note"].as_str().unwrap_or_default().contains(
+        "{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the \
+             candidate\"}"
+    ));
+}
+
+#[test]
+fn a_check_tests_rejection_names_five_tests_and_counts_the_rest() {
+    let lines: Vec<String> = (1..=7)
+        .map(|n| format!("FAILED bb::t::case_{n}: boom"))
+        .collect();
+    let (reason, _) = rejected(host::CHECK_TESTS_REGRESSION, &output_of(&lines));
+    let named: Vec<String> = (1..=5)
+        .map(|n| format!("check-tests.sh failed: bb::t::case_{n}"))
+        .collect();
+    assert_eq!(
+        reason,
+        format!(
+            "{}; and 2 more (regression: check-tests.sh fails on the candidate)",
+            named.join("; ")
+        )
+    );
+}
+
+#[test]
+fn a_check_tests_rejection_without_failed_lines_names_the_excerpts_test() {
+    let (reason, _) = rejected(
+        host::CHECK_TESTS_REGRESSION,
+        &output_of(&panic_lines("t", &[ASSERTION])),
+    );
+    assert_eq!(
+        reason,
+        "check-tests.sh failed: t (regression: check-tests.sh fails on the candidate)"
+    );
+}
+
+#[test]
+fn another_reason_or_an_output_naming_no_test_stays_as_it_is() {
+    let failing = gate_output(&["FAILED bb::alpha::adds_up: assertion failed"]);
+    let other = "regression: 046.sh fails on the candidate";
+    assert_eq!(rejected(other, &failing).0, other);
+    let silent = gate_output(&["error: could not compile `spawn-cli`"]);
+    assert_eq!(
+        rejected(host::CHECK_TESTS_REGRESSION, &silent).0,
+        host::CHECK_TESTS_REGRESSION
+    );
+}

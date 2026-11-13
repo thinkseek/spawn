@@ -227,7 +227,9 @@ fn a_store_run_may_name_the_key_that_sealed_it() {
         record["sealed_with"] = value;
         record
     };
-    store.backup_record(&stored()).expect("a record without sealed_with");
+    store
+        .backup_record(&stored())
+        .expect("a record without sealed_with");
     for name in ["k2", "k12"] {
         store
             .backup_record(&sealed(json!(name)))
@@ -252,7 +254,10 @@ fn a_store_run_may_name_the_key_that_sealed_it() {
             assert!(message.contains("nothing else"), "{what}: {message}");
         } else {
             assert!(message.contains("a key's name"), "{what}: {message}");
-            assert!(!message.contains("x7") && !message.contains("k0"), "{message}");
+            assert!(
+                !message.contains("x7") && !message.contains("k0"),
+                "{message}"
+            );
         }
     }
     assert_eq!(
