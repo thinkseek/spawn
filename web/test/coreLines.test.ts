@@ -411,3 +411,22 @@ test("a figure that says its window is named with it", () => {
   ]);
   assert.equal(view.rows[0].north_star.name, "Needs you is right");
 });
+
+// Objective 141: the store that grew most says its store after its name;
+// a figure without one is named as it was.
+test("a figure that names its store says it after its name", () => {
+  const view = coreLinesView({
+    lines: [
+      {
+        line: "storage",
+        north_star: { key: "storage.days_left", name: "Days until the disk is full", unit: "days", value: 7, range: null, state: "no_range" },
+        guardrails: [
+          { key: "storage.disk_fall", name: "Free disk lost a day", unit: "bytes_per_day", value: 10737418240, range: null, state: "no_range" },
+          { key: "storage.grew_most", name: "Store that grew most", unit: "bytes_per_day", value: 10737418240, range: null, state: "no_range", store: "unattributed" },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(view.rows[0].guardrails.map((mark) => mark.name), ["Free disk lost a day", "Store that grew most: unattributed"]);
+  assert.equal(view.rows[0].north_star.name, "Days until the disk is full");
+});
