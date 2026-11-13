@@ -1,0 +1,32 @@
+[Unit]
+Description=Spawn: copy every account's Claude Code sessions, then thin (deploy/session-backup.sh, core (i))
+
+[Service]
+Type=oneshot
+# A system unit: the versions are spawn-backup's (0700), out of reach of
+# anything that runs as the owner without sudo, a test with a wrong HOME
+# among them (2026-11-12). Root only starts the account (to read its own
+# sessions) and spawn-backup (to write its own tree). The script is a copy
+# installed from the repo by hand (deploy/systemd/README.md, "Session
+# backups"): no change to a checkout the owner's sessions can write reaches
+# what runs here.
+ExecStart=/bin/bash /usr/local/lib/spawn/session-backup.sh copy
+# Print-only until the owner allows removal; then `thin` (it removes only a
+# version every file of which a later one holds).
+ExecStart=/bin/bash /usr/local/lib/spawn/session-backup.sh thin --dry-run
+Environment=SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions
+# The versions' owner: root only starts it and each account (setpriv), and
+# writes nothing itself (deploy/session-backup.sh, "Who does what").
+Environment=SPAWN_SESSION_BACKUP_USER=spawn-backup
+# Every account that has a ~/.claude, separated by `:`.
+Environment=SPAWN_SESSION_HOMES=/home/ckl
+# It reads the homes and writes only its root: a mistake in it cannot
+# change a session.
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/backups/spawn-sessions
+PrivateTmp=yes
+NoNewPrivileges=yes
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
