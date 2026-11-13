@@ -257,24 +257,16 @@ pub(crate) mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
 
-    /// A fresh scratch directory of the test's own: each call its own name
-    /// (the pid, the clock and this process's count of calls), made with
-    /// `create_dir`, so a name already taken fails loudly and is never
-    /// shared (objective 107: two drills tests once ran one fake).
+    /// A fresh scratch directory of the test's own.
     pub(crate) fn scratch(case: &str) -> PathBuf {
-        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let parent = std::env::temp_dir();
-        std::fs::create_dir_all(&parent).expect("the temporary directory");
-        let path = parent.join(format!(
-            "spawn-storage-{}-{nanos:x}-{call}-{case}",
+        let path = std::env::temp_dir().join(format!(
+            "spawn-storage-{}-{nanos:x}-{case}",
             std::process::id()
         ));
-        std::fs::create_dir(&path)
-            .unwrap_or_else(|error| panic!("a scratch directory {}: {error}", path.display()));
+        std::fs::create_dir_all(&path).expect("a scratch directory");
         path
     }
 
