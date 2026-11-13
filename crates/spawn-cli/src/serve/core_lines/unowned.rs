@@ -271,7 +271,10 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
 /// once, in order: what [`scratch_json`]'s `landed` is read for.
 pub(super) fn claimed_pairs(reading: Option<&Reading>) -> Vec<(i64, i64)> {
     let mut pairs: Vec<(i64, i64)> = Vec::new();
-    for claimed in reading.map(|reading| reading.claimed.as_slice()).unwrap_or_default() {
+    for claimed in reading
+        .map(|reading| reading.claimed.as_slice())
+        .unwrap_or_default()
+    {
         if let Some(pair) = claimed.claim.pair()
             && !pairs.contains(&pair)
         {
@@ -817,10 +820,16 @@ mod tests {
                 "landed": false,
             })
         );
-        let landed: Vec<Value> = (0..3).map(|at| answer["claimed"][at]["landed"].clone()).collect();
+        let landed: Vec<Value> = (0..3)
+            .map(|at| answer["claimed"][at]["landed"].clone())
+            .collect();
         assert_eq!(landed, [json!(false), json!(false), json!(true)]);
         let unread = super::scratch_json(&plan, Some(&got), None);
-        assert_eq!(unread["claimed"][2]["landed"], Value::Null, "the store was not read");
+        assert_eq!(
+            unread["claimed"][2]["landed"],
+            Value::Null,
+            "the store was not read"
+        );
         assert_eq!(super::scratch_json(&plan, None, None)["claimed"], json!([]));
     }
 }

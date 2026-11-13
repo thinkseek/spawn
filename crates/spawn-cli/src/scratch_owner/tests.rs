@@ -49,7 +49,16 @@ fn an_owner_file_reads_back_its_five_fields_and_nothing_else() {
     let value: serde_json::Value = serde_json::from_str(&line).expect("JSON");
     let mut keys: Vec<&String> = value.as_object().expect("an object").keys().collect();
     keys.sort();
-    assert_eq!(keys, ["agent", "build", "created_ms", "lease_until_ms", "objective"]);
+    assert_eq!(
+        keys,
+        [
+            "agent",
+            "build",
+            "created_ms",
+            "lease_until_ms",
+            "objective"
+        ]
+    );
     let with = |field: &str, to: serde_json::Value| {
         let mut changed = value.clone();
         changed[field] = to;
@@ -59,14 +68,22 @@ fn an_owner_file_reads_back_its_five_fields_and_nothing_else() {
     assert_eq!(with("agent", serde_json::json!("")), None);
     assert_eq!(with("agent", serde_json::json!("a b")), None);
     assert_eq!(with("agent", serde_json::json!("x".repeat(65))), None);
-    assert_eq!(with("objective", serde_json::json!("4/14")), None, "not <mission>/<NNN>");
+    assert_eq!(
+        with("objective", serde_json::json!("4/14")),
+        None,
+        "not <mission>/<NNN>"
+    );
     assert_eq!(with("objective", serde_json::json!("0/140")), None);
     assert_eq!(with("build", serde_json::json!(["src"])), None);
     assert_eq!(with("created_ms", serde_json::json!("1")), None);
     let mut without = value.clone();
     without.as_object_mut().expect("an object").remove("build");
     assert_eq!(Claim::parse(&without.to_string()), None, "a field fewer");
-    assert_eq!(Claim::parse("4242 123456"), None, "094's pid marker is no claim");
+    assert_eq!(
+        Claim::parse("4242 123456"),
+        None,
+        "094's pid marker is no claim"
+    );
     assert_eq!(claim.pair(), Some((4, 140)));
 }
 
@@ -75,7 +92,17 @@ fn a_build_path_is_relative_plain_parts_ending_in_target() {
     for good in ["target", "t/target", "a/b-c/target"] {
         assert!(build_path_ok(good), "{good}");
     }
-    for bad in ["", "t", "target/x", "/abs/target", "../target", "a/../target", "./target", "a//target", "targets"] {
+    for bad in [
+        "",
+        "t",
+        "target/x",
+        "/abs/target",
+        "../target",
+        "a/../target",
+        "./target",
+        "a//target",
+        "targets",
+    ] {
         assert!(!build_path_ok(bad), "{bad}");
     }
 }
@@ -103,7 +130,10 @@ fn a_claim_is_refused_with_nothing_written() {
     refused(&dir, &["--build", "t"], "ending in target");
     refused(&dir, &["--lease-hours", "0"], "--lease-hours");
     refused(&dir, &["--lease-hours", "169"], "--lease-hours");
-    assert!(std::fs::symlink_metadata(dir.join(OWNER_FILE)).is_err(), "nothing written");
+    assert!(
+        std::fs::symlink_metadata(dir.join(OWNER_FILE)).is_err(),
+        "nothing written"
+    );
     // An owner file that holds no claim (094's marker) is not taken over.
     std::fs::write(dir.join(OWNER_FILE), "4242 123456\n").expect("marker");
     refused(&dir, &[], "does not hold a claim");
@@ -121,7 +151,16 @@ fn a_claim_is_written_renewed_released_and_never_taken_over_while_it_runs() {
     let now = 1_000_000;
     let made = claimed(
         &dir,
-        &["--agent", "rev-e", "--objective", "1/7", "--build", "t/target", "--build", "base/target"],
+        &[
+            "--agent",
+            "rev-e",
+            "--objective",
+            "1/7",
+            "--build",
+            "t/target",
+            "--build",
+            "base/target",
+        ],
         now,
     )
     .expect("claimed");
@@ -133,13 +172,18 @@ fn a_claim_is_written_renewed_released_and_never_taken_over_while_it_runs() {
         std::fs::read_to_string(dir.join(OWNER_FILE)).expect("the file"),
         format!("{}\n", made.line())
     );
-    let error = claimed(&dir, &["--agent", "rev-b", "--objective", "1/8"], now + 1).expect_err("runs");
+    let error =
+        claimed(&dir, &["--agent", "rev-b", "--objective", "1/8"], now + 1).expect_err("runs");
     assert!(error.contains("renew or release"), "{error}");
     let renewed = change(&dir, |claim| claim.lease_until_ms = now + 5 * HOUR_MS).expect("renewed");
     assert_eq!(renewed.created_ms, now);
-    assert_eq!(claim_in(&dir).map(|claim| claim.lease_until_ms), Some(now + 5 * HOUR_MS));
+    assert_eq!(
+        claim_in(&dir).map(|claim| claim.lease_until_ms),
+        Some(now + 5 * HOUR_MS)
+    );
     change(&dir, |claim| claim.lease_until_ms = now + 2).expect("released");
-    let taken = claimed(&dir, &["--agent", "rev-b", "--objective", "1/8"], now + 3).expect("its lease ended");
+    let taken = claimed(&dir, &["--agent", "rev-b", "--objective", "1/8"], now + 3)
+        .expect("its lease ended");
     assert_eq!(taken.agent, "rev-b");
     let bare = scratch.0.join("bare");
     std::fs::create_dir_all(&bare).expect("mkdir");

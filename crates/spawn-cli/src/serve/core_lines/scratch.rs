@@ -867,7 +867,13 @@ mod tests {
             "rev-e",
             now - 10,
             now + 3_600_000,
-            &["t/target", "t/target", "link/target", "via/target", "absent/target"],
+            &[
+                "t/target",
+                "t/target",
+                "link/target",
+                "via/target",
+                "absent/target",
+            ],
         );
         fill(&root.join("ended/data"), 2000);
         let ended = claim(&root.join("ended"), "rev-b", now - 20, now, &[]);
@@ -933,7 +939,10 @@ mod tests {
             ],
             "by agent, then oldest first"
         );
-        assert_eq!(found.claimed[1].claim.lease_until_ms, now, "an ended lease is still listed");
+        assert_eq!(
+            found.claimed[1].claim.lease_until_ms, now,
+            "an ended lease is still listed"
+        );
         assert!(
             ["leased", "ended", "old", "marked", "session"]
                 .iter()

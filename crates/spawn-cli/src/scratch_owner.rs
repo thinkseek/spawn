@@ -65,7 +65,15 @@ impl Claim {
         };
         let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        if keys != ["agent", "build", "created_ms", "lease_until_ms", "objective"] {
+        if keys
+            != [
+                "agent",
+                "build",
+                "created_ms",
+                "lease_until_ms",
+                "objective",
+            ]
+        {
             return None;
         }
         let agent = fields["agent"].as_str().filter(|agent| agent_ok(agent))?;
@@ -77,7 +85,11 @@ impl Claim {
         let build = fields["build"]
             .as_array()?
             .iter()
-            .map(|path| path.as_str().filter(|path| build_path_ok(path)).map(str::to_string))
+            .map(|path| {
+                path.as_str()
+                    .filter(|path| build_path_ok(path))
+                    .map(str::to_string)
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(Claim {
             agent: agent.to_string(),
@@ -107,7 +119,9 @@ fn agent_ok(agent: &str) -> bool {
 pub(crate) fn build_path_ok(path: &str) -> bool {
     let path = Path::new(path);
     !path.as_os_str().is_empty()
-        && path.components().all(|part| matches!(part, Component::Normal(_)))
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
         && path.file_name().is_some_and(|name| name == "target")
         && !path.to_string_lossy().contains("//")
 }
@@ -135,7 +149,9 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         "renew" => {
             flags.only(&["lease-hours"])?;
             let hours = flags.lease_hours()?;
-            change(Path::new(dir), |claim| claim.lease_until_ms = now + hours * HOUR_MS)?
+            change(Path::new(dir), |claim| {
+                claim.lease_until_ms = now + hours * HOUR_MS
+            })?
         }
         "release" => {
             flags.only(&[])?;
@@ -205,7 +221,9 @@ impl Parsed {
         text.parse::<i64>()
             .ok()
             .filter(|hours| (1..=MOST_HOURS).contains(hours))
-            .ok_or_else(|| format!("--lease-hours is a whole number from 1 to {MOST_HOURS}, not '{text}'"))
+            .ok_or_else(|| {
+                format!("--lease-hours is a whole number from 1 to {MOST_HOURS}, not '{text}'")
+            })
     }
 }
 
@@ -259,7 +277,10 @@ fn build_refused(dir: &Path, path: &str) -> Option<String> {
                 return Some(format!("--build {path}: {} is a symlink", at.display()));
             }
             Ok(metadata) if !metadata.is_dir() => {
-                return Some(format!("--build {path}: {} is not a directory", at.display()));
+                return Some(format!(
+                    "--build {path}: {} is not a directory",
+                    at.display()
+                ));
             }
             Ok(_) => {}
             Err(_) => return None,
@@ -278,7 +299,8 @@ fn owner_now(dir: &Path) -> Result<Option<Claim>, String> {
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", file.display()));
     }
-    let text = std::fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let text =
+        std::fs::read_to_string(&file).map_err(|error| format!("{}: {error}", file.display()))?;
     Claim::parse(&text)
         .map(Some)
         .ok_or_else(|| format!("{} does not hold a claim", file.display()))
