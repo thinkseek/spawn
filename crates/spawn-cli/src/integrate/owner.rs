@@ -968,7 +968,7 @@ pub(super) fn web_config_refusal(tree: &std::path::Path) -> Option<String> {
             return Some(format!("the tree's root has {name}"));
         }
     }
-    let checks: [(&str, fn(&str) -> Option<String>); 3] = [
+    let checks: [(&str, Refusal); 3] = [
         ("pnpm-workspace.yaml", workspace_refusal),
         ("package.json", package_refusal),
         ("pnpm-lock.yaml", lock_refusal),
@@ -990,6 +990,9 @@ pub(super) fn web_config_refusal(tree: &std::path::Path) -> Option<String> {
     }
     None
 }
+
+/// What a file of `web/` holds outside its shape, from its text.
+type Refusal = fn(&str) -> Option<String>;
 
 /// The one top-level key main's `web/pnpm-workspace.yaml` holds.
 const WORKSPACE_KEY: &str = "minimumReleaseAgeExclude";

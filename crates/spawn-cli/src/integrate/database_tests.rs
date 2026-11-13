@@ -5109,11 +5109,7 @@ fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
         .map(|(reason, _)| reason)
         .collect();
     assert_eq!(reasons, vec![super::owner::NOT_IN_STORE.to_string()]);
-    assert_eq!(
-        control_records(&db, "source.moved").len(),
-        2,
-        "nothing moved"
-    );
+    assert_eq!(control_records(&db, "source.moved").len(), 2);
 
     assert!(
         std::fs::symlink_metadata(modules.join("pkg/index.js")).is_ok()
@@ -5144,6 +5140,14 @@ fn modules_seen_gate(base: &Path) -> PathBuf {
     seen
 }
 
+/// A case of web/ configuration an owner judging refuses: the commit's
+/// subject, its files, and what the no-verdict names.
+type WebCase = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
 /// An owner judging's candidate whose `web/` holds pnpm configuration that
 /// could run code in pnpm or reach outside the tree (objective 131, rev-g's
 /// F1 and F2): a web/.pnpmfile.cjs, a pnpm-workspace.yaml with modulesDir,
@@ -5168,7 +5172,7 @@ fn an_owner_judging_refuses_web_config_that_could_run_code() {
     std::fs::write(modules.join(".pnpm/lock.yaml"), "lock v1\n").expect("lock");
     let db = Db::new("owner_web_config");
     db.gated_mission(&source, &scenarios);
-    let cases: [(&str, &[(&str, &str)], &str); 3] = [
+    let cases: [WebCase; 3] = [
         (
             "owner: a pnpmfile",
             &[
@@ -5248,8 +5252,7 @@ fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
         names = names.display(),
         install = install.display()
     );
-    let script = format!(
-        "#!/bin/sh\n\
+    let script = "#!/bin/sh\n\
          if grep -q made-up-absent pnpm-lock.yaml; then\n\
          echo ' ERR_PNPM_META_FETCH_FAIL  GET http://127.0.0.1/made-up-absent: offline'\n\
          echo ' ERR_PNPM_NO_OFFLINE_META  Failed to resolve made-up-absent@1.0.0 in the store' >&2\n\
@@ -5257,8 +5260,7 @@ fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
          fi\n\
          mkdir -p node_modules/.pnpm node_modules/pkg2\n\
          cp pnpm-lock.yaml node_modules/.pnpm/lock.yaml\n\
-         echo x >node_modules/pkg2/index.js\n"
-    );
+         echo x >node_modules/pkg2/index.js\n";
     std::fs::write(&install, script).expect("the stub's install");
     let stub = bin.join("pnpm");
     std::fs::write(&stub, pnpm).expect("stub pnpm");
