@@ -412,7 +412,6 @@ test("a figure that says its window is named with it", () => {
   assert.equal(view.rows[0].north_star.name, "Needs you is right");
 });
 
-<<<<<<< 7e0cdcb3bd3484902b9b4a5c88a990c13d63e85d
 // Objective 141: the store that grew most says its store after its name;
 // a figure without one is named as it was.
 test("a figure that names its store says it after its name", () => {
@@ -430,7 +429,8 @@ test("a figure that names its store says it after its name", () => {
   });
   assert.deepEqual(view.rows[0].guardrails.map((mark) => mark.name), ["Free disk lost a day", "Store that grew most: unattributed"]);
   assert.equal(view.rows[0].north_star.name, "Days until the disk is full");
-=======
+});
+
 // Objective 140: each claimed scratch folder is said by its owner and
 // objective, its bytes and its build's, its age, its lease and whether its
 // objective landed; landed with its lease ended is the one to clear.
@@ -467,5 +467,4 @@ test("no claimed scratch folder, or no walk, is an empty list", () => {
   assert.deepEqual(coreLinesView({ lines: [], scratch: { claimed: [] } }).scratch, []);
   assert.deepEqual(coreLinesView({ lines: [] }).scratch, []);
   assert.deepEqual(coreLinesView(null).scratch, []);
->>>>>>> 4c190a5ee2908e5b1505ca348cf0f63b84efce1b
 });
