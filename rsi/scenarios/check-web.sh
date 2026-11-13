@@ -9,16 +9,30 @@
 set -eu
 [ -f web/package.json ] || exit 0
 controller=$(cd "$(dirname "$0")/../.." && pwd)
-# A dependency set the owner reviewed is named by the sha256 of package.json
-# and the lockfile together, on the first line of web-dependencies-reviewed
-# beside this script; only that exact set passes.
+# A dependency set the owner reviewed is named by the sha256 of package.json,
+# the lockfile and pnpm's configuration files in web/ (whichever are there,
+# each after a line naming it), on the first line of
+# web-dependencies-reviewed beside this script; only that exact set passes.
+# The configuration is in the set because the owner's installs read it
+# (scripts/web-install.sh --strict=web, and the owner gate's install of a
+# candidate's web/): a change to it is a change to what installs.
 reviewed="$(dirname "$0")/web-dependencies-reviewed"
-set_sha=$(cat web/package.json web/pnpm-lock.yaml | sha256sum | cut -d' ' -f1)
+config="web/pnpm-workspace.yaml web/.npmrc web/.pnpmfile.cjs web/.pnpmfile.mjs web/pnpmfile.cjs"
+set_sha=$({
+    cat web/package.json web/pnpm-lock.yaml
+    for file in $config; do
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            printf '== %s\n' "$file"
+            cat "$file"
+        fi
+    done
+} | sha256sum | cut -d' ' -f1)
 if [ -f "$reviewed" ] && [ "$(grep -v '^#' "$reviewed" | head -n 1)" = "$set_sha" ]; then
     echo "web dependencies: the owner reviewed this set"
 else
-    for file in web/package.json web/pnpm-lock.yaml; do
-        if ! cmp -s "$file" "$SPAWN_BASELINE_TREE/$file"; then
+    for file in web/package.json web/pnpm-lock.yaml $config; do
+        if { [ -e "$file" ] || [ -L "$file" ] || [ -e "$SPAWN_BASELINE_TREE/$file" ] || [ -L "$SPAWN_BASELINE_TREE/$file" ]; } &&
+            ! cmp -s "$file" "$SPAWN_BASELINE_TREE/$file"; then
             echo "web dependencies changed ($file): a human reviews new packages"
             exit 1
         fi

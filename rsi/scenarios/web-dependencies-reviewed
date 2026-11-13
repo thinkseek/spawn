@@ -1,6 +1,8 @@
-e0bd44e1c3c91838a852164f63bff5caf4603407ce9b3fe4333b1747b444dfcf
-# sha256 of web/package.json and web/pnpm-lock.yaml together (check-web.sh). The owner reviewed this set:
+1fe975c99f46566196fec125b1a52c61d8add95553df77919ae78c926efa6c99
+# sha256 of web/package.json, web/pnpm-lock.yaml and web/'s pnpm configuration (check-web.sh). The owner reviewed this set:
 # the existing dependencies plus @hugeicons/core-free-icons exactly 4.4.0 (lead-mac 2026-11-13 15:00, OWNER:
 # "Dependency approved: add @hugeicons/core-free-icons"). Tarball sha256 c69dae55981a6316bcfe90037dc54dab008367d032344930d1f021a3c691c3d1;
 # read by rev-g (sync/review-affectui-kit.md (c)): MIT, sideEffects false, no scripts, bin or dependencies, icons only.
 # The package.json and lockfile of that set land in the next owner push; until then this line matches nothing.
+# 134 counted web/'s pnpm configuration in the set; the same set (K2, 3e08fb12, whose web/pnpm-workspace.yaml is main's c62e620f)
+# was e0bd44e1c3c91838a852164f63bff5caf4603407ce9b3fe4333b1747b444dfcf before.
