@@ -1533,23 +1533,41 @@ struct Response {
     headers: String,
 }
 
-fn bucket_request(settings: &Settings, url: &str, options: &str) -> Result<Response, String> {
-    let scratch = Scratch::new("curl")?;
-    let body_file = scratch.join("body");
-    let headers_file = scratch.join("headers");
-    let config = format!(
-        "url = \"{}\"\noutput = \"{}\"\ndump-header = \"{}\"\nwrite-out = \"%{{http_code}}\"\n{}",
+/// The payload hash every request names: R2 refuses an s3 request without
+/// `x-amz-content-sha256`, and a curl older than 8.x (7.88, Debian 12's)
+/// does not add it itself; a curl that does takes this one. Unsigned: an
+/// upload is streamed, never read twice to hash it, and R2 and S3 accept it
+/// for GET, HEAD, ListObjectsV2 and PUT (a conditional one included).
+const PAYLOAD_HASH_HEADER: &str = "x-amz-content-sha256: UNSIGNED-PAYLOAD";
+
+/// The whole curl config of one request, as curl reads it on stdin: the
+/// credentials and SigV4, the payload hash next to it (before the call's
+/// own headers), then the URL, the files and `options`.
+fn curl_config(
+    settings: &Settings,
+    url: &str,
+    options: &str,
+    body_file: &Path,
+    headers_file: &Path,
+) -> String {
+    format!(
+        "silent\nshow-error\nuser = \"{}:{}\"\naws-sigv4 = \"aws:amz:auto:s3\"\n\
+header = \"{PAYLOAD_HASH_HEADER}\"\nmax-time = \"600\"\nconnect-timeout = \"20\"\n\
+url = \"{}\"\noutput = \"{}\"\ndump-header = \"{}\"\nwrite-out = \"%{{http_code}}\"\n{}",
+        escape_config(&settings.r2.access_key),
+        escape_config(&settings.r2.secret_key),
         escape_config(url),
         body_file.display(),
         headers_file.display(),
         options
-    );
-    let secret = format!(
-        "silent\nshow-error\nuser = \"{}:{}\"\naws-sigv4 = \"aws:amz:auto:s3\"\n\
-max-time = \"600\"\nconnect-timeout = \"20\"\n{config}",
-        escape_config(&settings.r2.access_key),
-        escape_config(&settings.r2.secret_key)
-    );
+    )
+}
+
+fn bucket_request(settings: &Settings, url: &str, options: &str) -> Result<Response, String> {
+    let scratch = Scratch::new("curl")?;
+    let body_file = scratch.join("body");
+    let headers_file = scratch.join("headers");
+    let secret = curl_config(settings, url, options, &body_file, &headers_file);
     let mut command = Command::new("curl");
     command
         .arg("--config")
@@ -1603,13 +1621,7 @@ fn list_bucket(settings: &Settings) -> Result<(u64, Vec<(String, u64)>), String>
     let mut keys = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..10_000 {
-        let url = match &token {
-            None => settings.r2.url("?list-type=2&max-keys=1000"),
-            Some(token) => settings.r2.url(&format!(
-                "?list-type=2&max-keys=1000&continuation-token={}",
-                percent_encode(token)
-            )),
-        };
+        let url = settings.r2.url(&listing_query(None, token.as_deref()));
         let response = bucket_request(settings, &url, "")?;
         if response.status != 200 {
             return Err(format!(
@@ -1630,6 +1642,22 @@ fn list_bucket(settings: &Settings) -> Result<(u64, Vec<(String, u64)>), String>
         }
     }
     Err("ListObjectsV2 did not end".to_string())
+}
+
+/// A ListObjectsV2 query, its parameters sorted by name as SigV4 signs
+/// them (a curl that signs the query as written, 7.88, signs what the
+/// bucket checks only so): the token on a later page only, the prefix when
+/// there is one, each value percent-encoded.
+fn listing_query(prefix: Option<&str>, token: Option<&str>) -> String {
+    let mut query = String::from("?");
+    if let Some(token) = token {
+        let _ = write!(query, "continuation-token={}&", percent_encode(token));
+    }
+    query.push_str("list-type=2&max-keys=1000");
+    if let Some(prefix) = prefix {
+        let _ = write!(query, "&prefix={}", percent_encode(prefix));
+    }
+    query
 }
 
 fn first_line(text: &str) -> String {
@@ -1785,7 +1813,21 @@ fn put_new_object(
     file: &Path,
     sha256: &str,
 ) -> Result<store::Put, String> {
-    let options = format!(
+    let options = put_new_options(settings, file, sha256);
+    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    match response.status {
+        200 => Ok(store::Put::Written),
+        412 => Ok(store::Put::Existed),
+        status => Err(format!(
+            "PUT {key} answered {status}: {}",
+            first_line(&String::from_utf8_lossy(&response.body))
+        )),
+    }
+}
+
+/// A conditional PUT's own curl config: the file and its headers.
+fn put_new_options(settings: &Settings, file: &Path, sha256: &str) -> String {
+    format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
 header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n{}",
         escape_config(&file.display().to_string()),
@@ -1796,16 +1838,7 @@ header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n{}",
             |_| String::new(),
             |key| format!("header = \"x-amz-meta-spawn-seal: {}\"\n", key.name)
         )
-    );
-    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
-    match response.status {
-        200 => Ok(store::Put::Written),
-        412 => Ok(store::Put::Existed),
-        status => Err(format!(
-            "PUT {key} answered {status}: {}",
-            first_line(&String::from_utf8_lossy(&response.body))
-        )),
-    }
+    )
 }
 
 /// An object's length, ETag (lower case, unquoted) and sha256 metadata, as
@@ -1833,13 +1866,7 @@ fn list_prefix(settings: &Settings, prefix: &str) -> Result<Vec<store::Listed>, 
     let mut keys = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..100_000 {
-        let mut query = format!(
-            "?list-type=2&max-keys=1000&prefix={}",
-            percent_encode(prefix)
-        );
-        if let Some(token) = &token {
-            let _ = write!(query, "&continuation-token={}", percent_encode(token));
-        }
+        let query = listing_query(Some(prefix), token.as_deref());
         let response = bucket_request(settings, &settings.r2.url(&query), "")?;
         if response.status != 200 {
             return Err(format!(
