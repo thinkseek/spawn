@@ -2572,12 +2572,23 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         "dumped_event_id": latest.event_id,
         "expected": expected,
     });
-    let outcome = restore_and_compare(&settings, &drill_url, latest);
+    // Read with the key its record names (objective 114).
+    let sealed_with = record_key("backup.dumped", latest.event_id, &latest.record);
+    let outcome = match &sealed_with {
+        Ok(name) => restore_and_compare(&settings, &drill_url, latest, name),
+        Err(reason) => Err(RestoreError {
+            reason: reason.clone(),
+            drilled: Drilled::default(),
+        }),
+    };
     let (mut ok, mut reason, drilled) = match outcome {
         Ok(drilled) => (true, String::new(), drilled),
         Err(RestoreError { reason, drilled }) => (false, reason, drilled),
     };
     let mut record = naming;
+    if let Ok(name) = &sealed_with {
+        record["sealed_with"] = json!(name);
+    }
     record["events"] = json!(drilled.events);
     record["max_event_id"] = json!(drilled.max_event_id);
     record["server"] = json!(
@@ -2908,6 +2919,7 @@ fn restore_and_compare(
     settings: &Settings,
     drill_url: &str,
     latest: &DumpRecord,
+    sealed_with: &str,
 ) -> Result<Drilled, RestoreError> {
     let mut drilled = Drilled::default();
     let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
@@ -2931,12 +2943,18 @@ fn restore_and_compare(
             drilled,
         });
     }
+    // The object's own word on its key must be its record's, and the key's
+    // file must be on this host.
+    let seal = object_key(key, &headers)
+        .and_then(|said| same_key(sealed_with, &said))
+        .and_then(|()| reading_key(sealed_with, "the dump"))
+        .map_err(|reason| fail(reason, drilled.clone()))?;
     let scratch = Scratch::new("drill").map_err(|error| fail(error, drilled.clone()))?;
     let encrypted = scratch.join("dump.gpg");
     fs::write(&encrypted, &bytes)
         .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled.clone()))?;
     let raw = scratch.join("dump");
-    if let Err(error) = decrypt(settings, &encrypted, &raw) {
+    if let Err(error) = decrypt_with(&seal, &encrypted, &raw) {
         return Err(RestoreError {
             reason: format!("the object does not decrypt: {error}"),
             drilled,
