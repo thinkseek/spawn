@@ -4934,6 +4934,13 @@ $$;
 --   with it (what the alert clears on): the execution it was typed into, or
 --   its own start's, ended; or, never typed or started, it finished while no
 --   execution that is still live ran.
+-- - `later_taken` and `later_taken_at_ms` (objective 138): for a tracked
+--   message typed and not taken, the first `message.taken` (by event id) of
+--   its session naming a later command (a greater id), its command and
+--   time: the agent went on past it, its marker missed. Null otherwise or
+--   when there is none: an untyped message is behind nothing the agent
+--   took, and another session's taking never counts. Read through
+--   spawn_events_message_taken.
 create or replace function spawn_command_message(p_id bigint, p_session text, p_action jsonb,
                                                  p_state text, p_succeeded boolean,
                                                  p_created bigint,
@@ -4959,6 +4966,9 @@ declare
     v_live_since bigint;
     v_acted jsonb;
     v_acted_at bigint;
+    v_later_id bigint;
+    v_later bigint;
+    v_later_at bigint;
 begin
     if not (v_type = 'input'
             or (v_type in ('start', 'resume') and coalesce(p_action ->> 'prompt', '') <> '')) then
@@ -5032,6 +5042,17 @@ begin
               order by e.id desc limit 1)) x
          where x.at <= coalesce(v_typing_at, p_now);
     end if;
+    -- A later message of its session taken (objective 138): the first
+    -- taking, by event id, naming a greater command id.
+    if v_tracked and v_typed_at is not null and v_taken = 0 then
+        select min(e.id) into v_later_id from spawn_events e
+         where e.session_id = p_session and e.event_name = 'message.taken'
+           and (e.kind -> 'detail' ->> 'command_id')::bigint > p_id;
+        if v_later_id is not null then
+            select (e.kind -> 'detail' ->> 'command_id')::bigint, e.recorded_at_ms
+              into v_later, v_later_at from spawn_events e where e.id = v_later_id;
+        end if;
+    end if;
     -- The session ended with it: the execution it was typed into, or its
     -- own start's, ended.
     if v_type in ('start', 'resume') then
@@ -5082,7 +5103,9 @@ begin
         'tracked', v_tracked,
         'due_ms', case when v_tracked and v_taken = 0 then v_from + p_bound_ms end,
         'typed', v_typed_at is not null,
-        'ended', v_ended);
+        'ended', v_ended,
+        'later_taken', v_later,
+        'later_taken_at_ms', v_later_at);
 end $$;
 
 -- The owner (the loop) and `spawn serve`'s reader login read messages;
