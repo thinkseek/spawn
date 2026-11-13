@@ -5023,6 +5023,19 @@ fn signal_file(active: &Active) -> String {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use super::{Bridge, BridgeConfig};
+    use crate::command::{CommandAction, Submission};
+    use crate::event::{ENGINE, EventKind, GlobalPosition};
+    use crate::id::{
+        AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+        WorkspaceId,
+    };
+    use crate::memory::{MemoryStore, MemoryWatch};
+    use crate::port::{CommandQueue, EventLog, Launch, TerminalError, TerminalHost};
+    use crate::screen::ScreenState;
+    use crate::time::{ManualClock, Timestamp};
+    use std::time::Duration;
+
     /// Claude Code's documented Bash rule: `*` matches any text.
     fn glob(pattern: &str, text: &str) -> bool {
         let (pattern, text): (Vec<char>, Vec<char>) =
@@ -5120,19 +5133,6 @@ mod tests {
         }
         assert!(super::CREDENTIAL_DENY.contains(&"Read(//proc/**)"));
     }
-
-    use super::{Bridge, BridgeConfig};
-    use crate::command::{CommandAction, Submission};
-    use crate::event::{ENGINE, EventKind, GlobalPosition};
-    use crate::id::{
-        AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
-        WorkspaceId,
-    };
-    use crate::memory::{MemoryStore, MemoryWatch};
-    use crate::port::{CommandQueue, EventLog, Launch, TerminalError, TerminalHost};
-    use crate::screen::ScreenState;
-    use crate::time::{ManualClock, Timestamp};
-    use std::time::Duration;
 
     /// A pane at the input box, as the screen reader draws it.
     const READY: &str = "❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
