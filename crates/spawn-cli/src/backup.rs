@@ -3728,4 +3728,146 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         assert_eq!(manifest["repos"][0]["file"], "repos/s.git.bundle");
         assert_eq!(manifest["repos"][0]["heads"]["refs/heads/main"], "abc");
     }
+
+    /// A made-up key's content: what a misplaced value could hold.
+    const MADE_UP_SECRET: &str = "bb-made-up-passphrase-0123456789";
+
+    /// Objective 114: None is k1; `k` and a number from 1 is itself;
+    /// anything else is the rule alone, never the value.
+    #[test]
+    fn a_key_name_is_k_and_a_number_from_one_and_absent_is_k1() {
+        use super::{KEY_NAME_RULE, key_name};
+        assert_eq!(key_name(None).as_deref(), Ok("k1"));
+        assert_eq!(key_name(Some("k2")).as_deref(), Ok("k2"));
+        assert_eq!(key_name(Some("k12")).as_deref(), Ok("k12"));
+        for bad in ["k0", "K2", "k2/..", "", "k", "k01", " k2", "k2 ", MADE_UP_SECRET] {
+            let error = key_name(Some(bad)).expect_err(bad);
+            assert_eq!(error, KEY_NAME_RULE, "{bad:?}");
+        }
+    }
+
+    /// k1's file: SPAWN_BACKUP_KEY_FILE when set (missing: that path), else
+    /// backup.key.k1, else the old backup.key; another key only by its name.
+    #[test]
+    fn k1_is_the_key_file_then_its_new_name_then_the_old_and_others_only_their_own() {
+        use super::find_key;
+        let dir = crate::storage::tests::scratch("backup-keys");
+        let old = dir.join("backup.key");
+        let new = dir.join("backup.key.k1");
+        let given = dir.join("given");
+        let named = |result: Result<super::Key, String>| result.map(|key| key.file);
+        assert_eq!(
+            named(find_key("k1", None, &dir)),
+            Err(format!("{} (or backup.key)", new.display()))
+        );
+        std::fs::write(&old, MADE_UP_SECRET).expect("old");
+        assert_eq!(named(find_key("k1", None, &dir)), Ok(old.clone()));
+        std::fs::write(&new, MADE_UP_SECRET).expect("new");
+        assert_eq!(named(find_key("k1", None, &dir)), Ok(new.clone()));
+        assert_eq!(
+            named(find_key("k1", Some(given.clone()), &dir)),
+            Err(given.display().to_string()),
+            "a set SPAWN_BACKUP_KEY_FILE is the only place looked"
+        );
+        std::fs::write(&given, MADE_UP_SECRET).expect("given");
+        assert_eq!(named(find_key("k1", Some(given.clone()), &dir)), Ok(given));
+        let k2 = dir.join("backup.key.k2");
+        assert_eq!(
+            named(find_key("k2", None, &dir)),
+            Err(k2.display().to_string()),
+            "k2 is never k1's file"
+        );
+        std::fs::write(&k2, MADE_UP_SECRET).expect("k2");
+        assert_eq!(named(find_key("k2", None, &dir)), Ok(k2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record and its object name their key; absent is k1 on both; two
+    /// names are refused, and a value that is no name is refused by where it
+    /// is, never echoed.
+    #[test]
+    fn a_record_and_an_object_that_name_two_keys_are_refused() {
+        use super::{object_key, record_key, same_key};
+        let record = serde_json::json!({"sealed_with": "k2"});
+        assert_eq!(record_key("backup.dumped", 7, &record).as_deref(), Ok("k2"));
+        assert_eq!(
+            record_key("backup.dumped", 7, &serde_json::json!({})).as_deref(),
+            Ok("k1")
+        );
+        assert_eq!(object_key("o", "etag: x\r\n").as_deref(), Ok("k1"));
+        assert_eq!(
+            object_key("o", "x-amz-meta-spawn-seal: k2\r\n").as_deref(),
+            Ok("k2")
+        );
+        assert_eq!(same_key("k2", "k2"), Ok(()));
+        assert_eq!(
+            same_key("k2", "k1"),
+            Err("record says k2, object says k1".to_string())
+        );
+        let planted = serde_json::json!({"sealed_with": MADE_UP_SECRET});
+        assert_eq!(
+            record_key("backup.bundled", 41, &planted),
+            Err("the sealed_with of backup.bundled record 41 is not a backup key name (k and a number from 1, as k2)".to_string())
+        );
+        let header = format!("x-amz-meta-spawn-seal: {MADE_UP_SECRET}\r\n");
+        let error = object_key("postgres/hourly/x.dump.gpg", &header).expect_err("refused");
+        assert_eq!(
+            error,
+            "the x-amz-meta-spawn-seal of postgres/hourly/x.dump.gpg is not a backup key name (k and a number from 1, as k2)"
+        );
+    }
+
+    /// After the switch, a bundle sealed with k2 builds on k2's records
+    /// only: with none yet its earlier records are empty, so it is full,
+    /// whatever k1 full this week holds; then the next builds on it.
+    #[test]
+    fn the_first_bundle_under_a_new_key_builds_on_nothing() {
+        use super::sealed_alike;
+        let entry = |id: i64, record: serde_json::Value| super::BundleRecord {
+            event_id: id,
+            at_ms: id,
+            record,
+        };
+        let k1_full = || {
+            entry(1, serde_json::json!({"kind": "full", "keys": ["bundles/full/a"]}))
+        };
+        let k1_incr = || {
+            entry(
+                2,
+                serde_json::json!({"kind": "incremental", "sealed_with": "k1", "keys": ["b"]}),
+            )
+        };
+        assert!(sealed_alike(vec![k1_full(), k1_incr()], "k2").is_empty());
+        assert_eq!(sealed_alike(vec![k1_full(), k1_incr()], "k1").len(), 2);
+        let k2_full = entry(3, serde_json::json!({"kind": "full", "sealed_with": "k2", "keys": ["c"]}));
+        let earlier = sealed_alike(vec![k1_full(), k1_incr(), k2_full], "k2");
+        assert_eq!(earlier.iter().map(|e| e.event_id).collect::<Vec<_>>(), [3]);
+        let planted = entry(4, serde_json::json!({"sealed_with": MADE_UP_SECRET, "keys": ["d"]}));
+        assert!(sealed_alike(vec![planted], "k1").is_empty(), "a refused name is no one's");
+    }
+
+    /// The store seals with the sealing key's file: required, a bad name or
+    /// a missing file refuses it, never k1's file in its place; not
+    /// required (a reader), k1's file stands in.
+    #[test]
+    fn the_stores_sealing_key_is_required_and_never_k1_in_its_place() {
+        use super::{Key, store_key_file};
+        let k1 = std::path::PathBuf::from("/made-up/backup.key.k1");
+        let k2 = Key {
+            name: "k2".to_string(),
+            file: "/made-up/backup.key.k2".into(),
+        };
+        let refused: Result<Key, String> = Err(format!("SPAWN_BACKUP_SEAL_KEY {}", super::KEY_NAME_RULE));
+        assert_eq!(
+            store_key_file(&Ok(k2.clone()), true, || k1.clone()),
+            Ok(k2.file.clone())
+        );
+        assert_eq!(
+            store_key_file(&refused, true, || k1.clone()),
+            Err(refused.clone().unwrap_err()),
+            "required: refused, never k1"
+        );
+        assert_eq!(store_key_file(&refused, false, || k1.clone()), Ok(k1.clone()));
+        assert_eq!(store_key_file(&Ok(k2.clone()), false, || k1.clone()), Ok(k2.file));
+    }
 }
