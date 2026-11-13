@@ -8,14 +8,15 @@
 
 SPAWN_ENV_FILE=${SPAWN_ENV_FILE:-$HOME/.local/share/spawn-rsi/spawn.env}
 SPAWN_R2_ENV_FILE=${SPAWN_R2_ENV_FILE:-$HOME/.config/spawn/r2.env}
-# The encryption keys have names (k1, k2, ...), one file each beside the
-# others: backup.key.<name>. These scripts know k1 only, the key of every
-# object from before the keys had names: its file is backup.key.k1, or
-# backup.key on a host that has not renamed it. SPAWN_BACKUP_KEY_FILE, when
-# set, is k1's file.
+# The encryption keys have names (k1, k2, ...), one file each in the key
+# directory: backup.key.<name>. These scripts know k1 only, the key of every
+# object from before the keys had names. Its file, in this order:
+# SPAWN_BACKUP_KEY_FILE when set; else backup.key.k1 in the key directory;
+# else backup.key there, on a host that has not renamed it.
+SPAWN_BACKUP_KEY_DIR=${SPAWN_BACKUP_KEY_DIR:-$HOME/.config/spawn}
 if [ -z "${SPAWN_BACKUP_KEY_FILE-}" ]; then
-  SPAWN_BACKUP_KEY_FILE=$HOME/.config/spawn/backup.key.k1
-  [ -e "$SPAWN_BACKUP_KEY_FILE" ] || SPAWN_BACKUP_KEY_FILE=$HOME/.config/spawn/backup.key
+  SPAWN_BACKUP_KEY_FILE=$SPAWN_BACKUP_KEY_DIR/backup.key.k1
+  [ -e "$SPAWN_BACKUP_KEY_FILE" ] || SPAWN_BACKUP_KEY_FILE=$SPAWN_BACKUP_KEY_DIR/backup.key
 fi
 SPAWN_BACKUP_DIR=${SPAWN_BACKUP_DIR:-$HOME/.local/share/spawn-rsi/backups}
 # The live server's container: its image supplies a pg_dump/pg_restore of the
@@ -42,14 +43,18 @@ need_tools() {
   done
 }
 
-# key_files: every key file beside k1's (backup.key and backup.key.*), one
-# path a line, whatever each holds. Nothing of a file is read. No directory
-# is no key file.
+# key_files: every key file (backup.key and backup.key.*) in the key
+# directory and beside k1's file, where that is somewhere else; one path a
+# line, whatever each holds. Nothing of a file is read. A directory that
+# does not exist holds no key file.
 key_files() {
-  local dir
-  dir=$(dirname "$SPAWN_BACKUP_KEY_FILE")
-  [ -d "$dir" ] || return 0
-  find "$dir" -maxdepth 1 -name 'backup.key*' | LC_ALL=C sort
+  local dir found all=
+  for dir in "$SPAWN_BACKUP_KEY_DIR" "$(dirname "$SPAWN_BACKUP_KEY_FILE")"; do
+    [ -d "$dir" ] || continue
+    found=$(find "$dir" -maxdepth 1 -name 'backup.key*') || return 1
+    [ -z "$found" ] || all+=$found$'\n'
+  done
+  [ -z "$all" ] || printf '%s' "$all" | LC_ALL=C sort -u
 }
 
 # other_key: the first key file that is not k1's (a k2, a k3, a stray copy),

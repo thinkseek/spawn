@@ -43,23 +43,27 @@ case "${1-}" in
     # made here would seal backups while no copy of it exists off this host.
     # A new key (k2, ...) is never made here: before anything is sealed with
     # it, a copy of it elsewhere is proved to open what it seals.
-    held=$(key_files) || die "cannot list the key files beside $SPAWN_BACKUP_KEY_FILE"
+    held=$(key_files) || die "cannot list the key files in $SPAWN_BACKUP_KEY_DIR and beside $SPAWN_BACKUP_KEY_FILE"
     [ -z "$held" ] && [ ! -e "$SPAWN_BACKUP_KEY_FILE" ] ||
       die "--init-key makes the first key only, and this host holds a key file already ($(printf '%s' "${held:-$SPAWN_BACKUP_KEY_FILE}" | tr '\n' ' ')); nothing is created or replaced. A new key is never made by this script: a copy of it off this host is first proved to open what it seals"
     mkdir -p "$(dirname "$SPAWN_BACKUP_KEY_FILE")"
-    head -c 32 /dev/urandom | base64 > "$SPAWN_BACKUP_KEY_FILE"
+    # noclobber: the file is created by this write or the write fails. A
+    # file that appeared since the check is not replaced, and a link is not
+    # written through.
+    (umask 077; set -C; head -c 32 /dev/urandom | base64 > "$SPAWN_BACKUP_KEY_FILE") ||
+      die "could not create $SPAWN_BACKUP_KEY_FILE as a new file (something has that name: a file made just now, or a link); nothing is replaced"
     chmod 600 "$SPAWN_BACKUP_KEY_FILE"
     log "created $SPAWN_BACKUP_KEY_FILE; copy it somewhere off this host now (without it no backup can be decrypted)"
     exit 0 ;;
   *) die "usage: $0 [--accept-drop | --init-key]" ;;
 esac
 
-# A host with a second key seals every new backup with its newest one
-# (`spawn backup dump`); this script seals with k1 only, so it makes no
-# backup there.
-other=$(other_key) || die "cannot list the key files beside $SPAWN_BACKUP_KEY_FILE"
+# This script seals with k1 only. A host that holds another key has its
+# backups made by `spawn backup dump`, which knows the keys by name, so this
+# script makes no backup there.
+other=$(other_key) || die "cannot list the key files in $SPAWN_BACKUP_KEY_DIR and beside $SPAWN_BACKUP_KEY_FILE"
 [ -z "$other" ] ||
-  die "this host holds a key file other than k1's ($other): new backups are sealed with the newest key, by \`spawn backup dump\`; this script seals with k1 only and uploads nothing"
+  die "this host holds a key file other than k1's ($other); this script seals with k1 only and makes no backup here. New backups are made by \`spawn backup dump\`"
 
 need_tools pg_restore gpg curl flock sha256sum md5sum stat date awk
 # A host without docker names a native pg_dump of the live server's major

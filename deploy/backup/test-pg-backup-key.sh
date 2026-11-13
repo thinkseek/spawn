@@ -6,14 +6,17 @@
 #   deploy/backup/test-pg-backup-key.sh
 #
 # Cases:
-# 1. k1's file by default: backup.key.k1 where it exists, else backup.key;
-#    SPAWN_BACKUP_KEY_FILE, when set, is kept.
+# 1. k1's file by default: backup.key.k1 in the key directory
+#    (SPAWN_BACKUP_KEY_DIR, by default ~/.config/spawn) where it exists, else
+#    backup.key there; SPAWN_BACKUP_KEY_FILE, when set, is kept.
 # 2. --init-key makes the first key of a host that holds none (mode 600), and
-#    refuses, changing nothing, when any key file exists: the same file, a
-#    renamed k1, a k2, a stray copy.
+#    refuses, changing nothing, when any key file exists in the key directory
+#    or beside k1's file: the same file, a renamed k1, a k2, a stray copy. It
+#    creates its file or fails: it writes through no link.
 # 3. a run that would make a backup refuses on a host that holds a key file
-#    other than k1's, before it reads a setting; without one it goes on to
-#    its settings (which this test leaves missing).
+#    other than k1's, in the key directory or beside k1's file, before it
+#    reads a setting; without one it goes on to its settings (which this test
+#    leaves missing).
 set -euo pipefail
 umask 077
 here=$(cd "$(dirname "$0")" && pwd)
@@ -62,6 +65,10 @@ made_up a "$h/.config/spawn/backup.key.k1"
 [ "$(default_file "$h")" = "$h/.config/spawn/backup.key.k1" ] && ok "backup.key.k1 is taken before backup.key" || bad "default with backup.key.k1"
 [ "$(default_file "$h" SPAWN_BACKUP_KEY_FILE="$work/elsewhere.key")" = "$work/elsewhere.key" ] && ok "SPAWN_BACKUP_KEY_FILE is kept" || bad "an explicit key file"
 
+[ "$(default_file "$h" SPAWN_BACKUP_KEY_DIR="$work/kd")" = "$work/kd/backup.key" ] && ok "SPAWN_BACKUP_KEY_DIR with no key file: backup.key in it" || bad "default in a named key directory"
+mkdir -p "$work/kd"; made_up a "$work/kd/backup.key"; made_up a "$work/kd/backup.key.k1"
+[ "$(default_file "$h" SPAWN_BACKUP_KEY_DIR="$work/kd")" = "$work/kd/backup.key.k1" ] && ok "SPAWN_BACKUP_KEY_DIR: backup.key.k1 in it is taken before backup.key" || bad "default in a named key directory with backup.key.k1"
+
 # 2. --init-key.
 h=$work/h2; mkdir -p "$h"
 run "$h" -- --init-key
@@ -100,7 +107,57 @@ else
   bad "--init-key with an explicit file beside a k2 (status $status)"
 fi
 
+h=$work/h2-keydir; mkdir -p "$h/.config/spawn" "$h/keys"; made_up b "$h/.config/spawn/backup.key.k2"
+before=$(listing "$h")
+run "$h" SPAWN_BACKUP_KEY_FILE="$h/keys/backup.key" -- --init-key
+if [ "$status" = 1 ] && grep -q 'makes the first key only' "$work/out" && [ "$(listing "$h")" = "$before" ]; then
+  ok "--init-key with SPAWN_BACKUP_KEY_FILE elsewhere and a k2 in the key directory: refused, nothing created"
+else
+  bad "--init-key with an explicit file and a k2 in the key directory (status $status)"
+fi
+
+# A link to nothing under a key file's name is a key file to the check; under
+# any other name only the write itself can refuse it.
+h=$work/h2-link; mkdir -p "$h/.config/spawn" "$h/target"
+ln -s "$h/target/made-through-a-link" "$h/.config/spawn/backup.key"
+run "$h" -- --init-key
+if [ "$status" = 1 ] && grep -q 'makes the first key only' "$work/out" && [ -L "$h/.config/spawn/backup.key" ] && [ -z "$(ls -A "$h/target")" ]; then
+  ok "--init-key where backup.key is a link to nothing: refused, nothing made through the link"
+else
+  bad "--init-key where backup.key is a dangling link (status $status)"
+fi
+h=$work/h2-link-named; mkdir -p "$h/keys" "$h/target"
+ln -s "$h/target/made-through-a-link" "$h/keys/first.key"
+run "$h" SPAWN_BACKUP_KEY_FILE="$h/keys/first.key" -- --init-key
+if [ "$status" = 1 ] && grep -q 'as a new file' "$work/out" && [ -L "$h/keys/first.key" ] && [ -z "$(ls -A "$h/target")" ]; then
+  ok "--init-key where SPAWN_BACKUP_KEY_FILE is a link to nothing: the write refuses, nothing made through the link"
+else
+  bad "--init-key through a dangling link named by SPAWN_BACKUP_KEY_FILE (status $status)"
+fi
+
 # 3. A run that would make a backup.
+h=$work/h3-keydir; mkdir -p "$h/.config/spawn" "$h/keys"
+made_up b "$h/.config/spawn/backup.key.k2"; made_up a "$h/keys/backup.key"
+run "$h" SPAWN_BACKUP_KEY_FILE="$h/keys/backup.key" --
+if [ "$status" = 1 ] && grep -q "other than k1's" "$work/out" && [ ! -e "$h/backups" ]; then
+  ok "a backup run with SPAWN_BACKUP_KEY_FILE elsewhere and a k2 in the key directory: refused"
+else
+  bad "a backup run with an explicit file and a k2 in the key directory (status $status)"
+fi
+h=$work/h3-named; mkdir -p "$h/kd"; made_up a "$h/kd/backup.key.k1"; made_up b "$h/kd/backup.key.k2"
+run "$h" SPAWN_BACKUP_KEY_DIR="$h/kd" --
+if [ "$status" = 1 ] && grep -q "other than k1's" "$work/out" && [ ! -e "$h/backups" ]; then
+  ok "a backup run with SPAWN_BACKUP_KEY_DIR holding k1 and k2: refused"
+else
+  bad "a backup run in a named key directory with a k2 (status $status)"
+fi
+h=$work/h3-named-k1; mkdir -p "$h/kd"; made_up a "$h/kd/backup.key.k1"
+run "$h" SPAWN_BACKUP_KEY_DIR="$h/kd" --
+if [ "$status" != 0 ] && ! grep -q "other than k1's" "$work/out" && [ ! -e "$h/backups" ]; then
+  ok "a backup run with SPAWN_BACKUP_KEY_DIR holding k1 only: not refused for its keys"
+else
+  bad "a backup run in a named key directory with k1 only (status $status)"
+fi
 for held in "backup.key.k1 backup.key.k2" "backup.key backup.key.k3" "backup.key.k1 backup.key.k1.copy"; do
   h=$work/h3-$(printf '%s' "$held" | tr -c 'a-z0-9.' -); mkdir -p "$h/.config/spawn"
   for name in $held; do made_up "$name" "$h/.config/spawn/$name"; done
