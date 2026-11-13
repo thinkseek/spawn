@@ -1,24 +1,39 @@
 //! A test's schema in the test database, dropped when the test ends
-//! (backlog P19).
+//! (backlog P19): as the test passes, and as a failing test unwinds; kept
+//! only under `SPAWN_TEST_KEEP_FAILED=1` (objective 139).
 //!
 //! A test that needs the database makes a [`TestSchema`] and holds it for as
-//! long as it uses the schema. When the test passes, dropping the guard drops
-//! the schema and everything in it; when the test fails (the guard is
-//! dropped while the thread panics), the schema is kept for debugging and its
-//! name is printed. Only the schema the guard named is ever dropped, by that
+//! long as it uses the schema. Dropping the guard drops the schema and
+//! everything in it, whether the test passed or failed (the guard dropped
+//! while the thread panics). With [`KEEP_FAILED`] set to `1` when the guard
+//! was made, a failed test's schema is kept for debugging and its name is
+//! printed. Only the schema the guard named is ever dropped, by that
 //! name: never one found by a pattern, since the tests of other processes
 //! (another suite, another gate) keep theirs in the same database.
 //!
 //! Before it, crate tests left their schemas behind, in the fleet's test
-//! database 2533 of them, 2.7 GB, by 2026-11-11.
+//! database 2533 of them, 2.7 GB, by 2026-11-11; and while failed tests
+//! kept theirs, every mutant a mutation run caught left one (about 100 to
+//! 270 a day on the ccd server, 2026-11-14). A process that is killed or
+//! aborts never unwinds, and its schemas are still left.
 
 use crate::PostgresStore;
 
 /// The variable that names the test database.
 pub const TEST_DATABASE_URL: &str = "SPAWN_TEST_DATABASE_URL";
 
-/// A schema of the test's own, by name (it derefs to `str`), dropped on drop
-/// unless the thread is panicking (a failing test keeps it, and says which).
+/// The variable that keeps a failed test's schema for debugging: only the
+/// value `1` keeps it; unset, or any other value, drops it.
+pub const KEEP_FAILED: &str = "SPAWN_TEST_KEEP_FAILED";
+
+/// How long the drop's connection waits for the server: a failing test's
+/// guard connects as it unwinds, and a server that never answers would
+/// otherwise hold it for the OS's TCP timeout (about 2 min).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A schema of the test's own, by name (it derefs to `str`), dropped on drop,
+/// a failing test's too unless [`KEEP_FAILED`] is `1` (then it is kept, and
+/// its name said).
 ///
 /// Hold it before the connections that use the schema, so that they close
 /// first (a guard declared first is dropped last): the drop waits at most
@@ -27,6 +42,9 @@ pub const TEST_DATABASE_URL: &str = "SPAWN_TEST_DATABASE_URL";
 pub struct TestSchema {
     name: String,
     url: String,
+    /// Whether a failed test keeps the schema: [`KEEP_FAILED`] was `1`
+    /// when the guard was made.
+    keep_failed: bool,
 }
 
 impl TestSchema {
@@ -39,6 +57,9 @@ impl TestSchema {
     /// which dates it with the comment `{"made_at_ms": <ms>}` and names the
     /// connection after it (`application_name`, objective 094), so a reader
     /// tells a live test's schema from a leftover.
+    ///
+    /// It reads [`KEEP_FAILED`] now: a failed test keeps its schema only
+    /// when the variable was `1` here.
     ///
     /// # Panics
     ///
@@ -65,7 +86,12 @@ impl TestSchema {
             "spawn_test_{}_{nanos:x}_{ordinal:x}_{case}",
             std::process::id()
         );
-        Self { name, url }
+        let keep_failed = std::env::var(KEEP_FAILED).is_ok_and(|value| value == "1");
+        Self {
+            name,
+            url,
+            keep_failed,
+        }
     }
 
     /// The schema's name.
@@ -104,16 +130,31 @@ impl std::fmt::Display for TestSchema {
 
 /// A connection to `url`, its password the passfile's when the URL holds
 /// none (objective 109), so a schema made under a password-less URL is
-/// dropped as it was made.
+/// dropped as it was made; it gives up connecting after
+/// [`CONNECT_TIMEOUT`].
 fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
-    crate::passfile::config(url)?.connect(postgres::NoTls)
+    crate::passfile::config(url)?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .connect(postgres::NoTls)
 }
 
+/// Drops the schema: as the test passes, and as a failing test unwinds (the
+/// thread panicking), by the same statement, unless [`KEEP_FAILED`] was `1`
+/// when the guard was made (then it is kept, and its name said). A drop
+/// that fails is said, never a panic: a panic while a failing test unwinds
+/// would abort the whole test process.
+///
+/// Never drop the guard inside a tokio runtime: `postgres::Client` panics
+/// there, and a panic while a failing test unwinds aborts the test binary.
+/// A passing `#[should_panic]` test unwinds too, so its schema now goes as
+/// well (it was kept before, although the test passed).
 impl Drop for TestSchema {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        let failed = std::thread::panicking();
+        if failed && self.keep_failed {
             eprintln!(
-                "the failed test's schema is kept: {} (in the database {TEST_DATABASE_URL} names)",
+                "the failed test's schema is kept: {} (in the database {TEST_DATABASE_URL} names; \
+                 {KEEP_FAILED}=1)",
                 self.name
             );
             return;
@@ -124,8 +165,13 @@ impl Drop for TestSchema {
                 self.name
             ))
         });
-        if let Err(error) = dropped {
-            eprintln!("cannot drop the test schema {}: {error}", self.name);
+        match dropped {
+            Err(error) => eprintln!("cannot drop the test schema {}: {error}", self.name),
+            Ok(()) if failed => eprintln!(
+                "the failed test's schema is dropped: {} ({KEEP_FAILED}=1 keeps it)",
+                self.name
+            ),
+            Ok(()) => {}
         }
     }
 }
@@ -151,8 +197,50 @@ mod tests {
             == 1
     }
 
-    /// A passed test's schema goes with its guard; a failed test's stays,
-    /// and is dropped here by its name.
+    /// A case that makes its schema and fails, its guard's `keep_failed` set
+    /// to `keep` (not the variable, which parallel tests share) and its url
+    /// to `url` when given, run on a thread of its own: the schema's name,
+    /// which the case panics with.
+    fn failed_case(keep: bool, url: Option<&'static str>) -> String {
+        let failed = std::thread::spawn(move || {
+            let mut schema = TestSchema::new("guard_failed");
+            schema.keep_failed = keep;
+            let name = schema.name().to_string();
+            match url {
+                Some(url) => schema.url = url.to_string(),
+                None => drop(schema.store()),
+            }
+            std::panic::panic_any(name);
+        })
+        .join()
+        .expect_err("the case fails");
+        *failed.downcast::<String>().expect("its schema's name")
+    }
+
+    /// A failed test's schema goes with its guard as the test unwinds.
+    #[test]
+    fn a_failed_tests_schema_goes_unless_kept() {
+        let name = failed_case(false, None);
+        assert!(!exists(&name), "a failed test's schema is dropped");
+    }
+
+    /// A failed test's guard whose server never answers (192.0.2.1,
+    /// TEST-NET-1, which drops the SYN) gives up connecting: the test
+    /// finishes unwinding within seconds, not the OS's TCP timeout. Where a
+    /// network refuses the address at once, it passes without showing it.
+    #[test]
+    fn a_failed_tests_drop_gives_up_on_a_silent_server_within_seconds() {
+        let started = std::time::Instant::now();
+        failed_case(false, Some("postgres://spawn@192.0.2.1:5432/spawn_test"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the drop waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A passed test's schema goes with its guard; a failed test's, kept,
+    /// stays, and is dropped here by its name.
     #[test]
     fn a_schema_goes_with_a_passed_test_and_stays_after_a_failed_one() {
         let passed = TestSchema::new("guard_passed");
@@ -162,15 +250,7 @@ mod tests {
         drop(passed);
         assert!(!exists(&name), "a passed test's schema is dropped");
 
-        let failed = std::thread::spawn(|| {
-            let schema = TestSchema::new("guard_failed");
-            drop(schema.store());
-            let name = schema.name().to_string();
-            std::panic::panic_any(name);
-        })
-        .join()
-        .expect_err("the case fails");
-        let name = failed.downcast::<String>().expect("its schema's name");
+        let name = failed_case(true, None);
         assert!(exists(&name), "a failed test's schema is kept");
         let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
         super::client(&url)
