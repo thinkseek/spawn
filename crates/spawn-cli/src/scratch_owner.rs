@@ -150,7 +150,7 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             flags.only(&["lease-hours"])?;
             let hours = flags.lease_hours()?;
             change(Path::new(dir), |claim| {
-                claim.lease_until_ms = now + hours * HOUR_MS
+                claim.lease_until_ms = now + hours * HOUR_MS;
             })?
         }
         "release" => {

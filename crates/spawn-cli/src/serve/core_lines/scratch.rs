@@ -337,25 +337,11 @@ fn marker_runs(entry: &Path, runs: &dyn Fn(u32, u64) -> bool) -> Option<bool> {
 
 /// The entries of `root` nobody owns at `now_ms`, those `excludes` and
 /// `never` name left out (each compared on its resolved path too), `runs`
-/// saying whether a marker's process still runs. `Err` (why) when the walk
-/// goes past `bound` (no partial count) or the root is refused
-/// ([`refused_root`]).
-#[cfg(test)]
-pub(super) fn unowned_in(
-    root: &Path,
-    excludes: &[PathBuf],
-    never: &[PathBuf],
-    now_ms: i64,
-    runs: &dyn Fn(u32, u64) -> bool,
-    bound: Bound,
-) -> Result<Vec<Unowned>, String> {
-    walk_in(root, excludes, never, now_ms, runs, bound).map(|walk| walk.unowned)
-}
-
-/// [`unowned_in`]'s walk, with every claimed folder it met (objective 140):
-/// at the top level, owned while its lease runs and nobody's after; one
-/// level below an unmarked directory, listed while the entry is judged as
-/// 094 judges it.
+/// saying whether a marker's process still runs, with every claimed folder
+/// it met (objective 140): at the top level, owned while its lease runs and
+/// nobody's after; one level below an unmarked directory, listed while the
+/// entry is judged as 094 judges it. `Err` (why) when the walk goes past
+/// `bound` (no partial count) or the root is refused ([`refused_root`]).
 pub(super) fn walk_in(
     root: &Path,
     excludes: &[PathBuf],
@@ -860,7 +846,7 @@ mod tests {
         fill(&root.join("leased/t/target/x"), 300);
         std::fs::create_dir_all(root.join("leased/via")).expect("mkdir");
         std::os::unix::fs::symlink(&outside, root.join("leased/link")).expect("link");
-        std::os::unix::fs::symlink(&outside.join("target"), root.join("leased/via/target"))
+        std::os::unix::fs::symlink(outside.join("target"), root.join("leased/via/target"))
             .expect("link");
         let leased = claim(
             &root.join("leased"),
