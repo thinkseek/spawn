@@ -161,8 +161,8 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [] });
-  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [] });
+  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [] });
+  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [] });
 });
 
 // Objective 086: the performance line's units.
