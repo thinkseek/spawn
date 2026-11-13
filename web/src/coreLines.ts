@@ -59,6 +59,15 @@ export interface CoreDrill {
   name: string;
   source: string | null;
   passed_at_ms: number | null;
+  /** Its newest drill's own result, pass or fail (objective 105), or null. */
+  last?: CoreDrillResult | null;
+}
+
+/** A drill's own result: when it ran, whether it passed, and why not. */
+export interface CoreDrillResult {
+  at_ms: number | null;
+  ok: boolean;
+  reason: string;
 }
 
 /** `GET /api/core-lines`. */
@@ -74,10 +83,15 @@ export interface CoreLinesAnswer {
 /** A drill on the card, under the recoverability row. */
 export interface CoreDrillMark {
   name: string;
-  /** "passed MM-DD HH:MM (<span> ago)", "never passed" or "no drill". */
+  /** "passed MM-DD HH:MM (<span> ago)", "never passed" or "no drill";
+   * "failed MM-DD HH:MM (<span> ago); last passed ..." (or "; never
+   * passed") when its newest drill failed (objective 112). */
   text: string;
-  /** "plain" passed within 7 days, "warning" not, "muted" no drill. */
+  /** "plain" passed within 7 days, "warning" not or newest failed, "muted"
+   * no drill. */
   tone: "plain" | "warning" | "muted";
+  /** A failed newest drill's reason (the row's title), else "". */
+  detail: string;
 }
 
 /** A figure on the card: its words and its tone. */
@@ -119,13 +133,21 @@ export function drillMark(raw: Partial<CoreDrill> | null | undefined, now: numbe
   const name = typeof raw?.name === "string" ? raw.name : "";
   const source = typeof raw?.source === "string" && raw.source !== "" ? raw.source : null;
   const passed = finite(raw?.passed_at_ms);
-  if (source === null) return { name, text: "no drill", tone: "muted" };
-  if (passed === null) return { name, text: "never passed", tone: "warning" };
-  return {
-    name,
-    text: `passed ${sinceWords(passed)} (${spanWords(Math.max(0, now - passed))} ago)`,
-    tone: now - passed <= WEEK_MS ? "plain" : "warning",
-  };
+  if (source === null) return { name, text: "no drill", tone: "muted", detail: "" };
+  const ago = (at: number) => `${sinceWords(at)} (${spanWords(Math.max(0, now - at))} ago)`;
+  const last = raw?.last;
+  if (last && typeof last === "object" && last.ok === false) {
+    const failedAt = finite(last.at_ms);
+    const failed = failedAt === null ? "failed (time unknown)" : `failed ${ago(failedAt)}`;
+    return {
+      name,
+      text: `${failed}; ${passed === null ? "never passed" : `last passed ${ago(passed)}`}`,
+      tone: "warning",
+      detail: typeof last.reason === "string" ? last.reason : "",
+    };
+  }
+  if (passed === null) return { name, text: "never passed", tone: "warning", detail: "" };
+  return { name, text: `passed ${ago(passed)}`, tone: now - passed <= WEEK_MS ? "plain" : "warning", detail: "" };
 }
 
 const LINE_NAMES: Record<string, string> = {
