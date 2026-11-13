@@ -2678,11 +2678,15 @@ fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Res
             "the bundle's x-amz-meta-sha256 {meta} is not the record's {expected_sha}"
         ));
     }
+    // Read with the key its record names, which its object must say too.
+    let sealed_with = record_key("backup.bundled", latest.event_id, &latest.record)?;
+    same_key(&sealed_with, &object_key(key, &headers)?)?;
+    let seal = reading_key(&sealed_with, "the bundle")?;
     let scratch = Scratch::new("verify-bundle")?;
     let encrypted = scratch.join("bundle.gpg");
     fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
     let raw = scratch.join("bundle.raw");
-    decrypt(settings, &encrypted, &raw)?;
+    decrypt_with(&seal, &encrypted, &raw)?;
     let found = sha256_file(&raw)?;
     if found != expected_sha {
         return Err(format!(
@@ -2896,6 +2900,7 @@ fn verify_bundle(settings: &Settings, store: &PostgresStore, now_ms: i64) -> Res
         "checked": true,
         "ok": true,
         "key": key,
+        "sealed_with": sealed_with,
         "bundled_event_id": latest.event_id,
         "kind": kind,
         "sha256": expected_sha,
