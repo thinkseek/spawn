@@ -3246,6 +3246,9 @@ fn record_verified(
         "key": naming.get("key").cloned().unwrap_or(Value::Null),
         "sha256": naming.get("sha256").cloned().unwrap_or(Value::Null),
         "dumped_event_id": naming.get("dumped_event_id").cloned().unwrap_or(Value::Null),
+        // The key the dump's record names (objective 114); the bundle's is
+        // under `bundle`.
+        "sealed_with": naming.get("sealed_with").cloned().unwrap_or(Value::Null),
         "expected": naming.get("expected").cloned().unwrap_or(Value::Null),
         "events": drilled.events,
         "max_event_id": drilled.max_event_id,
