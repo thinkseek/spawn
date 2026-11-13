@@ -12,7 +12,8 @@
 # lapse local.) The TMPDIR must not contain the checkout the gate is run
 # from (so not /data/tmp with the tree at /data/tmp/ccd/...): the gate
 # refuses a tree under the host's TMPDIR, because its sandbox empties that
-# directory whole, and every case would stop at the refusal.
+# directory whole, and every case would stop at the refusal. A TMPDIR unset,
+# missing, or under /tmp, /run or /var/tmp is refused at the start, exit 2.
 #
 # usage: scripts/rsi/test-gate.sh
 set -eu
@@ -21,6 +22,22 @@ set -eu
 if [ -z "${RUSTUP_HOME-}" ] && [ -d "$HOME/.rustup" ]; then
     export RUSTUP_HOME="$HOME/.rustup"
 fi
+
+# The private TMPDIR, refused at the start (not 80 cases in): under /tmp,
+# /run or /var/tmp (and /var/run), the roots the gate's sandbox replaces with
+# its own (gate.sh `sandbox_once`), a case that needs the host's scratch seen
+# through the sandbox (3d', the sandbox it broke started again) cannot
+# happen, and fails with a message about the sandbox. The gate's own check
+# (rsi/scenarios/check-test-gate.sh) runs the suite with TMPDIR at
+# $HOME/test-gate/tmp, the gate runner's home inside its sandbox (a tmpfs
+# with the sandbox's /tmp/test-gate bound on it): `pwd -P` reads that path,
+# under the home, not /tmp, so the check is not refused.
+case "$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" in
+    "" | /tmp | /tmp/* | /run | /run/* | /var/tmp | /var/tmp/* | /var/run | /var/run/*)
+        echo "test-gate: set TMPDIR to an existing private directory outside /tmp, /run and /var/tmp (e.g. TMPDIR=/data/tmp/<you>-suite); it is ${TMPDIR:-unset}" >&2
+        exit 2
+        ;;
+esac
 
 gate=$(cd "$(dirname "$0")" && pwd)/gate.sh
 work=$(mktemp -d)
