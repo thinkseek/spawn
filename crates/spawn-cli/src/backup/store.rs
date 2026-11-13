@@ -1276,7 +1276,11 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
     // key's, that key opens it, and its file must be here. Without it the
     // run refuses before anything is written, never a fresh chain over a
     // manifest it could not read.
-    let sealing = settings.seal.as_ref().map(|key| key.name.clone()).map_err(Clone::clone)?;
+    let sealing = settings
+        .seal
+        .as_ref()
+        .map(|key| key.name.clone())
+        .map_err(Clone::clone)?;
     let older_key = match older_key(&store, &sealing) {
         Ok(older_key) => older_key,
         Err(reason) => {
@@ -1317,7 +1321,11 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
             };
             let other_last = older
                 .as_ref()
-                .map(|older| older.newest().map(|newest| newest.map(|(_, manifest)| manifest)))
+                .map(|older| {
+                    older
+                        .newest()
+                        .map(|newest| newest.map(|(_, manifest)| manifest))
+                })
                 .transpose()?;
             plan_verb(&planner, other_last, &settings, &flags, &area)
         }
