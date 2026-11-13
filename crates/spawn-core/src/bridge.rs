@@ -5023,6 +5023,104 @@ fn signal_file(active: &Active) -> String {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    /// Claude Code's documented Bash rule: `*` matches any text.
+    fn glob(pattern: &str, text: &str) -> bool {
+        let (pattern, text): (Vec<char>, Vec<char>) =
+            (pattern.chars().collect(), text.chars().collect());
+        let mut reach = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+        reach[0][0] = true;
+        for i in 1..=pattern.len() {
+            for j in 0..=text.len() {
+                reach[i][j] = if pattern[i - 1] == '*' {
+                    reach[i - 1][j] || (j > 0 && reach[i][j - 1])
+                } else {
+                    j > 0 && reach[i - 1][j - 1] && pattern[i - 1] == text[j - 1]
+                };
+            }
+        }
+        reach[pattern.len()][text.len()]
+    }
+
+    #[test]
+    fn engines_are_refused_the_accidental_prints_of_a_password() {
+        let refused = |command: &str| {
+            super::CREDENTIAL_DENY.iter().any(|rule| {
+                rule.strip_prefix("Bash(")
+                    .and_then(|body| body.strip_suffix(')'))
+                    .is_some_and(|body| glob(body, command))
+            })
+        };
+        let parts = |command: &str| {
+            command
+                .split(['|', ';', '&', '\n'])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for command in [
+            "env",
+            "env | grep -i spawn",
+            "env|grep PG",
+            "cd /tmp && env",
+            "cd /tmp; env | sort",
+            "printenv | grep DATABASE",
+            "export -p",
+            "declare -x",
+            "set | grep SPAWN",
+            "typeset -p",
+            "env --null | tr '\\0' '\\n'",
+            "/usr/bin/env",
+            "command env",
+            "cat /proc/self/environ",
+            "psql 'postgres://bb:made-up-pw@localhost/bb' -c 'select 1'",
+            "cd /tmp; SPAWN_TEST_DATABASE_URL=postgres://bb:pw@localhost/bb cargo test",
+            "ps -ef | grep cargo",
+            "ps aux",
+            "ps -eo pid,args",
+            "ps -o cmd= -p 1",
+            "pgrep -af cargo",
+            "pgrep -u 501 -a sh",
+            "cat /proc/1/cmdline",
+            "top -b -n 1 -c",
+            "pstree -ap",
+            "cd ~/.claude && grep TOKEN settings.json",
+            "cd; cd .claude; less settings.json",
+            "python3 -c \"open('/home/bb/.claude/settings.local.json')\"",
+            "strings ~/.local/share/spawn-rsi/spawn.env.bak-relay",
+        ] {
+            assert!(refused(command), "{command}");
+        }
+        for command in [
+            "env VAR=x cargo test",
+            "env -u FOO sh -c true",
+            "env -i PATH=/usr/bin sh -c true",
+            "printenv HOME",
+            "set -euo pipefail; make",
+            "export FOO=bar",
+            "declare -a list",
+            "declare -p FOO",
+            "psql 'postgres://bb@localhost/bb' -c 'select 1'",
+            "curl -s http://127.0.0.1:8787/api/rsi",
+            "ps -p 123",
+            "ps -o pid,etime -p 123",
+            "pgrep -f cargo",
+            "pgrep -x tmux",
+            "kill 123",
+            "cat /proc/loadavg",
+            "ls ~/.config",
+            "top -b -n 1",
+            "pstree -p",
+            "cd env && ls",
+        ] {
+            assert!(!refused(command), "{command}");
+            for part in parts(command) {
+                assert!(!refused(&part), "{command}: {part}");
+            }
+        }
+        assert!(super::CREDENTIAL_DENY.contains(&"Read(//proc/**)"));
+    }
+
     use super::{Bridge, BridgeConfig};
     use crate::command::{CommandAction, Submission};
     use crate::event::{ENGINE, EventKind, GlobalPosition};

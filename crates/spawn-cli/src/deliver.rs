@@ -1699,7 +1699,9 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
 /// The line every task's prompt carries about databases and credentials.
 /// The Bridge sets `SPAWN_TEST_DATABASE_URL` to the fleet's own test server
 /// (`SPAWN_FLEET_TEST_DATABASE_URL`); without one a worker went looking for
-/// a database in the loop's environment file (2026-11-08).
+/// a database in the loop's environment file (2026-11-08). Its second
+/// sentence says what to do instead of what the engines' settings refuse
+/// (`CREDENTIAL_DENY`): a deny rule carries no message of its own.
 pub(crate) const CREDENTIALS_LINE: &str = "Your test database is $SPAWN_TEST_DATABASE_URL; never \
 read any credential file, never put a URL on a command line, never print or echo it. A command \
 that prints the whole environment, lists processes with their arguments, reads a credential file \
