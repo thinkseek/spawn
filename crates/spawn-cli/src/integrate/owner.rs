@@ -896,10 +896,10 @@ fn install_modules(
         }
         let code = first_pnpm_code(&log).map_or_else(
             || {
-                output
-                    .status
-                    .code()
-                    .map_or_else(|| "killed by a signal".to_string(), |code| format!("exit {code}"))
+                output.status.code().map_or_else(
+                    || "killed by a signal".to_string(),
+                    |code| format!("exit {code}"),
+                )
             },
             str::to_string,
         );
@@ -1067,8 +1067,8 @@ const DEPENDENCY_FIELDS: &[&str] = &[
 /// a dependency field that is not an object, or a dependency that is not
 /// the registry's: a range, version or dist-tag alone, so any `:` or `/`
 /// is refused (file:, link:, workspace:, portal:, git, github:, http(s):,
-/// an npm: alias, a path), and so are a backslash, a leading `.` or `~` (a
-/// path) and a tarball's name (rev-g, F2 on R2: `"x": "file:<a host
+/// an npm: alias, a path), and so are a backslash, a leading `.` (a path:
+/// `.`, `..`) and a tarball's name (rev-g, F2 on R2: `"x": "file:<a host
 /// directory>"` copied that directory into the tree).
 pub(super) fn package_refusal(text: &str) -> Option<String> {
     let Ok(serde_json::Value::Object(package)) = serde_json::from_str::<serde_json::Value>(text)
@@ -1106,7 +1106,7 @@ pub(super) fn package_refusal(text: &str) -> Option<String> {
 fn registry_range(spec: &str) -> bool {
     let lower = spec.to_ascii_lowercase();
     !spec.contains([':', '/', '\\'])
-        && !spec.trim_start().starts_with(['.', '~'])
+        && !spec.trim_start().starts_with('.')
         && !lower.trim_end().ends_with(".tgz")
         && !lower.trim_end().ends_with(".tar")
         && !lower.trim_end().ends_with(".tar.gz")
@@ -1535,7 +1535,13 @@ impl super::Judge {
             }
             Ok(Modules::NoVerdict { why, log }) => {
                 println!("integrate: owner request {}: {why}", request.id);
-                Some(Ok(self.no_verdict_kept(store, request, why, log.as_deref(), true)))
+                Some(Ok(self.no_verdict_kept(
+                    store,
+                    request,
+                    why,
+                    log.as_deref(),
+                    true,
+                )))
             }
             Err(error) => Some(Err(Err(error))),
         }
@@ -1862,6 +1868,205 @@ pub(super) fn judged(
         Judged::Landed { from, to } => {
             backoff.remove(&id);
             println!("{said}: accepted, main {from} -> {to}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lock_refusal, package_refusal, workspace_refusal};
+
+    /// Main's web/ files, as an owner judging reads them.
+    const MAIN_WORKSPACE: &str = include_str!("../../../../web/pnpm-workspace.yaml");
+    const MAIN_PACKAGE: &str = include_str!("../../../../web/package.json");
+    const MAIN_LOCK: &str = include_str!("../../../../web/pnpm-lock.yaml");
+
+    #[test]
+    fn a_workspace_file_holds_mains_one_key_alone() {
+        assert_eq!(workspace_refusal(MAIN_WORKSPACE), None);
+        assert_eq!(workspace_refusal(""), None);
+        assert_eq!(
+            workspace_refusal("# a comment\nminimumReleaseAgeExclude: []\n"),
+            None
+        );
+        for (text, found) in [
+            (
+                "minimumReleaseAgeExclude: []\npnpmfile: hook.cjs\n",
+                "sets pnpmfile",
+            ),
+            ("modulesDir: ../../outside\n", "sets modulesDir"),
+            ("virtualStoreDir: /tmp/v\n", "sets virtualStoreDir"),
+            ("storeDir: /tmp/s\n", "sets storeDir"),
+            ("configDependencies: {}\n", "sets configDependencies"),
+            ("hooks: {}\n", "sets hooks"),
+            (
+                "'pnpmfile': hook.cjs\n",
+                "has a top-level line that is no plain key",
+            ),
+            (
+                "\"pnpmfile\": hook.cjs\n",
+                "has a top-level line that is no plain key",
+            ),
+            (
+                "{pnpmfile: hook.cjs}\n",
+                "has a top-level line that is no plain key",
+            ),
+            ("---\n", "has a top-level line that is no plain key"),
+            ("  pnpmfile: hook.cjs\n", "has an indented first setting"),
+            ("minimumReleaseAgeExclude:\n\t- x\n", "has a tab indent"),
+        ] {
+            assert_eq!(workspace_refusal(text).as_deref(), Some(found), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_package_json_holds_plain_fields_alone() {
+        assert_eq!(package_refusal(MAIN_PACKAGE), None);
+        assert_eq!(
+            package_refusal(
+                r#"{"name": "w", "private": true, "license": "MIT", "description": "d",
+                    "dependencies": {"@hugeicons/react": "^4.4.0", "a": "1.0.0", "b": "latest",
+                                     "c": ">=1 <2 || ^3", "d": "*"},
+                    "peerDependencies": {"e": "~1.2"}, "optionalDependencies": {}}"#
+            ),
+            None,
+            "registry ranges, dist-tags and scoped names"
+        );
+        for (text, found) in [
+            (r#"{"pnpm": {}}"#, "has the field pnpm"),
+            (
+                r#"{"packageManager": "pnpm@9"}"#,
+                "has the field packageManager",
+            ),
+            (r#"{"devEngines": {}}"#, "has the field devEngines"),
+            (r#"{"engines": {}}"#, "has the field engines"),
+            (
+                r#"{"dependencies": []}"#,
+                "has dependencies that is not an object",
+            ),
+            (
+                r#"{"devDependencies": "x"}"#,
+                "has devDependencies that is not an object",
+            ),
+            ("[]", "is not a JSON object"),
+            ("{", "is not a JSON object"),
+        ] {
+            assert_eq!(package_refusal(text).as_deref(), Some(found), "{text}");
+        }
+        for spec in [
+            "\"file:/home/u/.config\"",
+            "\"link:../x\"",
+            "\"github:o/r\"",
+            "\"npm:react@19\"",
+            "\"workspace:*\"",
+            "\"portal:../p\"",
+            "\"git+https://h/r.git\"",
+            "\"https://h/x.tgz\"",
+            "\"o/r\"",
+            "\"../x\"",
+            "\".\"",
+            "\"~/x\"",
+            "\"x.tgz\"",
+            "1",
+            "null",
+        ] {
+            let text = format!(r#"{{"dependencies": {{"x": {spec}}}}}"#);
+            assert_eq!(
+                package_refusal(&text).as_deref(),
+                Some("has a dependency that is not a registry range (x)"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lockfile_resolves_from_the_registry_alone() {
+        assert_eq!(lock_refusal(MAIN_LOCK), None);
+        let good = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+                    excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      \
+                    get-caller-file:\n        specifier: '*'\n        version: 2.0.5\n\n\
+                    packages:\n\n  get-caller-file@2.0.5:\n    resolution: {integrity: \
+                    sha512-abc/+=}\n    engines: {node: 6.* || 8.* || >= 10.*}\n\n  \
+                    terminal-link@2.1.1:\n    resolution: {integrity: sha512-xyz}\n\n  \
+                    '@types/react@19.0.0':\n    resolution: {integrity: sha512-q}\n\n\
+                    snapshots:\n\n  get-caller-file@2.0.5: {}\n";
+        assert_eq!(lock_refusal(good), None, "file- and link-named packages");
+        for (text, found) in [
+            (
+                "      made-up-b:\n        version: link:/home/u/.config\n",
+                "has a value that is not the registry's (version)",
+            ),
+            (
+                "        version: file:../x\n",
+                "has a value that is not the registry's (version)",
+            ),
+            (
+                "        specifier: 'npm:react@19'\n",
+                "has a value that is not the registry's (specifier)",
+            ),
+            (
+                "        version: github:o/r\n",
+                "has a value that is not the registry's (version)",
+            ),
+            (
+                "  secretpkg@file:../x:\n",
+                "has a value that is not the registry's",
+            ),
+            (
+                "  'x@link:/etc': {}\n",
+                "has a value that is not the registry's",
+            ),
+            (
+                "    resolution: {tarball: http://h/x.tgz}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    resolution: {directory: ../x, type: directory}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    resolution: {integrity: sha512-a, tarball: file:x}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    resolution:\n      directory: ../x\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    'resolution': {directory: ../x}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            (
+                "    {resolution: {directory: ../x}}\n",
+                "has a resolution that is not an integrity alone",
+            ),
+            ("    ? version\n    : link:/x\n", "has a complex key"),
+            ("    <<: *base\n", "has a merge key"),
+            ("    base: &base {}\n", "has an anchor"),
+            ("    version: *v\n", "has an alias"),
+            ("    version: !!str x\n", "has a tag"),
+            (
+                "        version: \"\\x6cink:/x\"\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "  \"made-up-b@\\x6cink:/x\": {}\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "    \"r\\x65solution\": {directory: ../x}\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "        version: \"1.0.0\"\n",
+                "has a backslash or a double quote",
+            ),
+            (
+                "        version: 1.0.0\\\n",
+                "has a backslash or a double quote",
+            ),
+        ] {
+            assert_eq!(lock_refusal(text).as_deref(), Some(found), "{text}");
         }
     }
 }
