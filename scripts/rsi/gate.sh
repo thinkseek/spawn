@@ -163,6 +163,39 @@
 #   scenario (exit 6, its `reason` "unstable on the candidate: ..."),
 #   judged again after the integrator's backoff. Never accepted on it: a
 #   candidate that brought a race in would slip through;
+# - only an exit 1 is a failure's vote: the scenario's own verdict that a
+#   check failed. An exit 2 or more is the harness saying it could not
+#   judge (056 in judging 01a1cc27de: 2, then 0, then 2, was rejected as a
+#   candidate failure). Two exit 1s are a candidate failure as above, and
+#   so is one exit 1 with no pass beside it (1, then 2; 2, then 1: a
+#   candidate that fouls its own test server makes the next run exit 2);
+#   one exit 1 among passes is unstable; any other mix with a failure (2,
+#   then 2; 2, then 0, then 2; 1, then 0, then 2; 2, then 0, then 0) is
+#   `cannot_judge`,
+#   "harness on the candidate: ...", judged again after the backoff and,
+#   like unstable, never accepted on it;
+# - Like for like before a rejection (design-gate-like-for-like.md; 099 on
+#   322: 1, then 1 at 4 at a time, the base 0, then 0 alone, a wrong
+#   rejection a repeat gate accepted). The candidate's runs ran beside the
+#   gate's other jobs on the candidate phase's server; the base's ran alone
+#   on a fresh one. So when two exit 1s would reject (1, then 1; 1, then 0,
+#   then 1) and they ran at load (SPAWN_GATE_JOBS above 1, the scenario not
+#   on the serial list), the candidate runs it once more as the base did:
+#   alone, on a fresh test server of its own (with the gate's own server,
+#   SPAWN_GATE_PG_*; without one, on the shared server, as the base's runs
+#   then are), in a fresh sandbox, its stage
+#   line "... must still pass (alone)". An exit 1 alone: the candidate
+#   failure stands. An exit 0 alone: `cannot_judge`, "load-sensitive on the
+#   candidate: fails at <n> at a time (...), passes alone (0) as the base
+#   does (...): no verdict", the fact's `load_sensitive` naming the
+#   scenario, its runs and times; never accepted on it, since nothing here
+#   shows the base under that load, and a race the candidate brought in
+#   looks the same. Unless it was slower alone than the slower base run by
+#   both twice and 15 s (SPAWN_GATE_SOLO_SLOW_MS, the suite's seam): a
+#   candidate failure, "slower alone than the base (...)". An exit 2 or more
+#   alone: `cannot_judge`, "harness on the candidate (solo): ...". One exit 1
+#   with no pass (1, then 2) gets no run alone: a candidate that fouls its
+#   own server is shown by that server, which a fresh one would hide;
 # - the base failing a run (exit 1): a validator defect. The scenario fails
 #   on the base too, under the same conditions, so it is no evidence
 #   against the candidate, and never a rejection. What it is instead
@@ -709,6 +742,9 @@ flakes=""
 passed=""
 reused=""
 validator_defects=""
+# The regressions that failed under load and passed alone, as the base
+# does (solo_run): the cannot_judge fact names them, each its runs and times.
+load_sensitive=""
 quarantined=""
 
 # JSON string body: backslash, quote and tab escaped, newlines as \n, other
@@ -903,6 +939,9 @@ cannot_judge() {
     # Why, when it is the gate that says so and not the scenario: a
     # regression unstable on the candidate.
     [ -z "${4-}" ] || json="$json,\"reason\":\"$(json_string "$4")\""
+    # A regression load-sensitive on the candidate (solo_run): its runs at
+    # load and alone, the base's, and the times.
+    [ -n "${load_sensitive-}" ] && json="$json,\"load_sensitive\":[$load_sensitive]"
     # The check main was red on (SPAWN_GATE_BASE_CHECK), when it passed on
     # this base before any candidate code ran: main is green on it again,
     # whatever this gate ends with (gate.rs reads it from any fact).
@@ -2317,6 +2356,77 @@ fi
 # runs_alone <scenario>: 0 when the serial list names it.
 runs_alone() {
     [ -n "$serial_list" ] && printf '%s\n' "$serial_list" | grep -qxF -- "$(basename "$1")"
+}
+# solo_run <job> <name>: a regression that failed twice (two exit 1s) on the
+# candidate beside the gate's other jobs, and passed on the base alone on a
+# fresh server, runs once more on the candidate under the base's
+# conditions: alone (the job holds alone.now since the base's runs), on a
+# fresh test server of its own from the gate's template, in a fresh
+# sandbox ("Like for like before a rejection" in the header). It sets
+# run_status: the candidate failure's 1, `load_sensitive`, `harness` (with
+# <job>/solo) or `abort`. Returns 1 when the job was taken from its slot
+# (slot-waited), for the caller to stop as after any run.
+solo_run() {
+    solo_name="$run_name (alone)"
+    job_say "| == $solo_name: it failed at $gate_jobs at a time on the candidate and the base passes it alone: once more on the candidate, alone, on a fresh test server, as the base ran"
+    solo_pg=""
+    if [ -n "$gate_pg" ]; then
+        gate_pg_pid=""
+        if ! gate_pg_start "$1/pg.solo" 1; then
+            gate_pg_stop
+            printf '%s\n' "$on_candidate on the candidate; $base_runs on the base, run now; no run alone" >"$1/runs"
+            echo "the test server of its own for the candidate's run alone did not start" >"$1/infrastructure"
+            run_status=abort
+            return 0
+        fi
+        solo_pg=1
+        sandbox_db_socket=$gate_pg_socket
+        job_say "| test database: a server of its own for the candidate's run alone, up in $gate_pg_ms ms"
+    fi
+    run_at=$(stage_now)
+    solo=0
+    job_run "$1" 6 "$work/candidate" "$job_scenario" || solo=$?
+    solo_ms=$(($(stage_now) - run_at))
+    if [ -n "$solo_pg" ]; then
+        gate_pg_stop
+        sandbox_db_socket=""
+    fi
+    [ ! -e "$1/slot-waited" ] || return 1
+    job_output 6
+    job_stage "$solo_ms" "exit $solo" "$solo_name"
+    loaded=$on_candidate
+    on_candidate="$loaded at $gate_jobs at a time, then $solo alone"
+    printf '%s\n' "$on_candidate on the candidate; $base_runs on the base, run now" >"$1/runs"
+    # Slower alone than the base by both twice and this much is a change of
+    # the candidate's, not load (the suite's seam: SPAWN_GATE_SOLO_SLOW_MS).
+    solo_slack=${SPAWN_GATE_SOLO_SLOW_MS-15000}
+    case "$solo_slack" in '' | *[!0-9]*) solo_slack=15000 ;; esac
+    case "$solo" in
+    0)
+        if [ "$solo_ms" -gt $((2 * base_ms_max)) ] && [ "$solo_ms" -gt $((base_ms_max + solo_slack)) ]; then
+            echo "slower alone than the base (alone $solo_ms ms, the base $base_ms_list ms)" >"$1/slower"
+            job_say "| $2 passes alone on the candidate but slower than the base by more than twice and $solo_slack ms (alone $solo_ms ms, the base $base_ms_list ms; $on_candidate): candidate failure"
+            run_status=1
+        else
+            job_say "| $2: load-sensitive: fails at $gate_jobs at a time ($loaded), passes alone ($solo) as the base does ($base_runs): not this candidate's failure; root fix wanted"
+            echo "load-sensitive on the candidate: fails at $gate_jobs at a time ($loaded), passes alone ($solo) as the base does ($base_runs): no verdict" >"$1/reason"
+            printf '{"scenario":"%s","runs":"%s","base":"%s","solo_ms":%s,"base_ms":[%s]}\n' \
+                "$(json_string "$2")" "$(json_string "$loaded at $gate_jobs at a time; $solo alone")" \
+                "$(json_string "$base_runs alone")" "$solo_ms" "$base_ms_list" >"$1/load-sensitive"
+            run_status=load_sensitive
+        fi
+        ;;
+    1)
+        job_say "| $2 fails on the candidate ($on_candidate) and passes on the base, run now ($base_runs): candidate failure, alone too"
+        run_status=1
+        ;;
+    *)
+        # The harness's own exit alone: no verdict, as the vote rule's.
+        : >"$1/solo"
+        run_status=harness
+        ;;
+    esac
+    return 0
 }
 # The owner's list of validators known to be broken (see the header: "A
 # validator the owner knows is broken"), read as `serial` is.
@@ -4179,6 +4289,14 @@ candidate_job() {
         on_candidate="$run_status, then $again"
         failed=1 third=0
         [ "$again" -eq 0 ] || failed=2
+        # Only an exit 1 is the scenario's verdict that a check failed: a
+        # vote against the candidate. An exit 2 (or more) is the harness
+        # saying it could not judge, no evidence against the candidate
+        # (056 in judging 01a1cc27de: 2, then 0, then 2, rejected as a
+        # candidate failure). `votes` counts the 1s.
+        votes=0
+        [ "$run_status" -ne 1 ] || votes=$((votes + 1))
+        [ "$again" -ne 1 ] || votes=$((votes + 1))
         base_name="base: $job_name (it failed on the candidate: does the base pass it now?)"
         # Alone from here to the job's end (run_jobs): the base's run is
         # beside nothing else of this gate, least of all the candidate's
@@ -4217,16 +4335,21 @@ candidate_job() {
             job_run "$job" 3 "$work/baseline" "$job_scenario" || on_base=$?
             [ ! -e "$job/slot-waited" ] || return 0
             job_output 3
-            job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name"
+            base_ms=$(($(stage_now) - run_at))
+            job_stage "$base_ms" "exit $on_base" "$base_name"
             base_runs=$on_base
+            base_ms_list=$base_ms base_ms_max=$base_ms
             if [ "$on_base" -eq 0 ]; then
                 job_say "| == $base_name (again)"
                 run_at=$(stage_now)
                 job_run "$job" 4 "$work/baseline" "$job_scenario" || on_base=$?
                 [ ! -e "$job/slot-waited" ] || return 0
                 job_output 4
-                job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name (again)"
+                base_ms=$(($(stage_now) - run_at))
+                job_stage "$base_ms" "exit $on_base" "$base_name (again)"
                 base_runs="0, then $on_base"
+                base_ms_list="$base_ms_list,$base_ms"
+                [ "$base_ms" -le "$base_ms_max" ] || base_ms_max=$base_ms
             fi
             if [ -n "$late_pg" ]; then
                 gate_pg_stop
@@ -4244,17 +4367,36 @@ candidate_job() {
                 job_stage "$(($(stage_now) - run_at))" "exit $third" "$run_name (a third run)"
                 on_candidate="$on_candidate, then $third"
                 [ "$third" -eq 0 ] || failed=2
+                [ "$third" -ne 1 ] || votes=$((votes + 1))
             fi
             printf '%s\n' "$on_candidate on the candidate; $base_runs on the base, run now" >"$job/runs"
             case "$on_base" in
             0)
-                if [ "$failed" -ge 2 ]; then
+                # Two exit 1s; or one exit 1 and no pass, the other run the
+                # harness's: a candidate can foul its own test server (the
+                # second run then exits 2), and no run of it ever passed.
+                if [ "$votes" -ge 2 ] && [ "$gate_jobs" -gt 1 ] && ! runs_alone "$job_scenario"; then
+                    # Two exit 1s, but run beside the gate's other jobs on
+                    # the candidate phase's server, while the base passed
+                    # alone on a fresh one: unlike conditions (099 on 322: a
+                    # race that fails under load). The decisive run is the
+                    # candidate's under the base's conditions: alone (the
+                    # job holds alone.now), on a fresh server of its own, in
+                    # a fresh sandbox (design-gate-like-for-like.md, R2).
+                    solo_run "$job" "$job_name" || return 0
+                elif [ "$votes" -ge 2 ] || { [ "$votes" -eq 1 ] && [ "$again" -ne 0 ]; }; then
                     job_say "| $job_name fails on the candidate ($on_candidate) and passes on the base, run now ($base_runs): candidate failure"
                     # The status of its last failing run.
                     [ "$again" -eq 0 ] || run_status=$again
                     [ "${third:-0}" -eq 0 ] || run_status=$third
-                else
+                elif [ "$votes" -eq 1 ] && [ "$failed" -lt 2 ]; then
+                    # One exit 1 among passes.
                     run_status=unstable
+                else
+                    # A failure that is the harness's (an exit 2 or more)
+                    # and fewer than two exit 1s: no verdict on the
+                    # candidate, and never accepted on it either.
+                    run_status=harness
                 fi
                 ;;
             1)
@@ -4394,6 +4536,44 @@ candidate_printed() {
         cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" \
             "unstable on the candidate: it failed one of three runs there and the base passes it ($printed_runs)"
     fi
+    if [ "$printed_status" = load_sensitive ]; then
+        # Two exit 1s at load on the candidate, a pass alone there as on
+        # the base (solo_run): the load's, or a race the candidate brought
+        # in that only load shows; nothing here tells which, so no verdict,
+        # never an acceptance ("Like for like before a rejection").
+        printed_runs=$(cat "$1/runs" 2>/dev/null)
+        load_sensitive="${load_sensitive:+$load_sensitive,}$(cat "$1/load-sensitive")"
+        known_failure_note "$printed_scenario"
+        run_stage "cannot_judge|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        # In the words the integrator quotes as the cause (cannot_judge_cause).
+        echo "| $(basename "$printed_scenario" .sh): cannot judge: $(cat "$1/reason")"
+        cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" "$(cat "$1/reason")"
+    fi
+    if [ "$printed_status" = harness ]; then
+        # Its failures on the candidate are the harness's (an exit 2 or
+        # more) and fewer than two are an exit 1, the scenario's verdict:
+        # no evidence against the candidate, and never accepted on it. Or
+        # its run alone (solo_run) exited 2 or more: likewise.
+        printed_runs=$(cat "$1/runs" 2>/dev/null)
+        if [ -e "$1/solo" ]; then
+            known_failure_note "$printed_scenario"
+            run_stage "cannot_judge|$(cat "$1/last")" "$printed_ms"
+            phase_time candidate
+            echo "| $(basename "$printed_scenario") failed twice on the candidate at load, and its run alone there exited with the harness's own exit (2 or more), and the base passes it ($printed_runs): harness on the candidate (solo), neither a pass nor a candidate failure: infrastructure (cannot judge), no verdict"
+            echo "| $(basename "$printed_scenario" .sh): cannot judge: harness on the candidate (solo) ($printed_runs)"
+            cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" \
+                "harness on the candidate (solo): it failed twice at load, its run alone exited with the harness's own exit, and the base passes it ($printed_runs)"
+        fi
+        known_failure_note "$printed_scenario"
+        run_stage "cannot_judge|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") failed on the candidate with the harness's own exit (2 or more) and fewer than two failed checks (exit 1), and the base passes it ($printed_runs): harness on the candidate, neither a pass nor a candidate failure: infrastructure (cannot judge), no verdict"
+        # In the words the integrator quotes as the cause (cannot_judge_cause).
+        echo "| $(basename "$printed_scenario" .sh): cannot judge: harness on the candidate ($printed_runs)"
+        cannot_judge "$(basename "$printed_scenario")" "$printed_runs" "" \
+            "harness on the candidate: its failures there are the harness's own exits, fewer than two failed checks, and the base passes it ($printed_runs)"
+    fi
     if [ "$printed_status" = abort ] && [ -s "$1/infrastructure" ]; then
         printed_runs=$(cat "$1/runs" 2>/dev/null)
         run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
@@ -4448,7 +4628,10 @@ candidate_printed() {
         run_stage "rejected|$printed_name" "$printed_ms"
         phase_time candidate
         known_failure_note "$printed_scenario"
-        verdict rejected "regression: $(basename "$printed_scenario") fails on the candidate"
+        # Slower alone than the base (solo_run): the reason says so.
+        rejected_why="regression: $(basename "$printed_scenario") fails on the candidate"
+        [ ! -s "$1/slower" ] || rejected_why="$rejected_why: $(cat "$1/slower")"
+        verdict rejected "$rejected_why"
         exit 0
     fi
     # A known failure that passes is known no longer.

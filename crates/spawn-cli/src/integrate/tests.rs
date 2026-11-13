@@ -1880,6 +1880,30 @@ fn the_ready_task_follows_the_acceptance_rule() {
     assert_eq!(gated.ready().map(|task| task.id), Some(2));
 }
 
+/// A task the load-sensitive bound parked is not the ready one: the next
+/// is (its mission goes on), and it is among the parked ones.
+#[test]
+fn a_parked_task_is_not_ready_and_the_next_one_is() {
+    let mut gated = mission(0, 0, 0);
+    gated.accept = "gate".to_string();
+    gated.tasks = serde_json::from_value(json!([
+        {"id": 1, "agent_id": "agent_a", "session_id": "session_a", "state": "reported",
+         "gate_parked_pushed": "a1", "gate_load_sensitive_pushed": "a1",
+         "gate_load_sensitive_scenarios": ["099.sh", "046.sh"]},
+        {"id": 2, "agent_id": "agent_b", "session_id": "session_b", "state": "reported",
+         "gate_load_sensitive_scenarios": null},
+    ]))
+    .expect("tasks");
+    assert_eq!(gated.ready().map(|task| task.id), Some(2));
+    assert_eq!(gated.parked().map(|task| task.id).collect::<Vec<_>>(), [1]);
+    gated.tasks.remove(1);
+    assert_eq!(
+        gated.ready().map(|task| task.id),
+        None,
+        "only the parked one"
+    );
+}
+
 /// A task as `GATED` reads it, with a brief and a report.
 fn task_of(id: i64, objective: Option<u32>, brief: &str, report: Option<&str>) -> super::Task {
     serde_json::from_value(json!({
@@ -2464,4 +2488,32 @@ fn the_nightly_red_is_the_facts_red_since() {
     assert_eq!(super::nightly_red(&root, "/live/missions/.git"), None);
     assert_eq!(super::nightly_red(&root, "/live/missions/a b.git"), None);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `scenario-owners` under the integrator's root: `<scenario> <owner>` a
+/// line, `#` comments and blank lines skipped; a scenario it does not name,
+/// or no file at all, has no owner.
+#[test]
+fn the_scenario_owners_name_each_scenarios_root_fix_owner() {
+    let root = std::env::temp_dir().join(format!("spawn-owners-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root");
+    let named = ["099.sh".to_string(), "046.sh".to_string()];
+    assert_eq!(
+        super::scenario_owners(&root, &named),
+        [("099.sh".to_string(), None), ("046.sh".to_string(), None)],
+        "no file"
+    );
+    std::fs::write(
+        root.join(super::SCENARIO_OWNERS),
+        "# scenario  owner\n\n099.sh   rev-f  # alerts.rs\n046.sh\n",
+    )
+    .expect("owners");
+    assert_eq!(
+        super::scenario_owners(&root, &named),
+        [
+            ("099.sh".to_string(), Some("rev-f".to_string())),
+            ("046.sh".to_string(), None)
+        ]
+    );
+    std::fs::remove_dir_all(&root).expect("clean up");
 }

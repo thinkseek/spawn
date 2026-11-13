@@ -50,6 +50,15 @@ export interface LastGate {
   at_ms: number | null;
 }
 
+/** A task the integrator's load-sensitive bound parked (/api/missions'
+ * task `parked`): its pushed commit was found load-sensitive twice, on
+ * `scenarios`, and it is not judged again until a new commit is pushed or a
+ * person releases it (`spawn task release`). */
+export interface TaskParked {
+  pushed: string;
+  scenarios: string[];
+}
+
 /** One of a task's records in the control stream (`spawn task stages`). */
 export interface TaskStage {
   /** The record type without `task.`: assigned, delivered, reported,
@@ -129,6 +138,9 @@ export interface MissionTask extends Labels {
   model: string | null;
   /** The owner's hold its landing last waited behind, if any. */
   held_by: number | null;
+  /** Parked by the load-sensitive bound; null for any other task, and
+   * absent from an older server. */
+  parked?: TaskParked | null;
   created_by: string | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
@@ -253,6 +265,14 @@ function normalizeLastGate(value: unknown): LastGate | null {
   };
 }
 
+function normalizeParked(value: unknown): TaskParked | null {
+  if (!isObject(value)) return null;
+  const pushed = optionalText(value.pushed);
+  if (pushed === null) return null;
+  const scenarios = list(value.scenarios).filter((name): name is string => typeof name === "string");
+  return { pushed, scenarios };
+}
+
 function normalizeStage(value: unknown): TaskStage | null {
   if (!isObject(value)) return null;
   const stage = optionalText(value.stage);
@@ -291,6 +311,7 @@ function normalizeTask(value: unknown): MissionTask | null {
       .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
     held_by: optionalNumber(value.held_by),
+    parked: normalizeParked(value.parked),
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),

@@ -9131,3 +9131,223 @@ fn a_red_nightly_holds_task_landings_and_not_the_owners() {
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&marks);
 }
+
+/// The load-sensitive bound (sync/design-load-sensitive-bound.md; the
+/// lead, 11-13: any scenario, the same pushed commit). gate.sh found a
+/// regression load-sensitive (failed at load, passed alone as the base
+/// does): `host_fault` with evidence `load_sensitive`, judged again after
+/// the backoff, counted toward no cap. The second time for the same pushed
+/// commit, by another scenario here, parks it (`load_sensitive_parked`):
+/// both scenarios named, each with its root-fix owner from
+/// `scenario-owners`, escalated once; the mission's run of host faults
+/// ends, so its other task is judged, and the parked one is not, pass after
+/// pass, until a person releases it (`task.released`), when the count
+/// starts again; parked again, a new commit pushed on its branch releases
+/// it (by the integrator) and is judged.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_commit_load_sensitive_twice_is_parked_and_its_mission_goes_on() {
+    let dir = std::env::temp_dir().join(format!("spawn-db-parked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let runs = dir.join("runs");
+    let runs_path = runs.display();
+    // Odd runs find 099.sh load-sensitive, even runs 046.sh.
+    let gate = format!(
+        "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
+             if [ $((n % 2)) = 1 ]; then s=099.sh; else s=046.sh; fi\n\
+             echo \"| $s: load-sensitive: fails at 4 at a time (1, then 1), passes alone (0) as the base does (0, then 0): not this candidate's failure; root fix wanted\"\n\
+             printf '{{\"v\":1,\"cannot_judge\":true,\"scenario\":\"%s\",\"runs\":\"1, then 1 at 4 at a time, then 0 alone on the candidate; 0, then 0 on the base, run now\",\"reason\":\"load-sensitive on the candidate\",\"load_sensitive\":[{{\"scenario\":\"%s\",\"runs\":\"r\",\"base\":\"b\",\"solo_ms\":1,\"base_ms\":[1,1]}}]}}\\n' \"$s\" \"$s\" >\"$SPAWN_GATE_VERDICT\"\n\
+             exit 6\n"
+    );
+    let (base, source, scenarios, mut integrator) = world("load-sensitive-parked", &gate);
+    integrator.judge.host = super::HostSettings {
+        server_log: None,
+        backoff: std::time::Duration::from_millis(1),
+        cap: 2,
+    };
+    std::fs::create_dir_all(base.join("host")).expect("root");
+    std::fs::write(
+        base.join("host").join(super::SCENARIO_OWNERS),
+        "# scenario  root-fix owner\n099.sh rev-f\n",
+    )
+    .expect("owners");
+    let db = Db::new("load_sensitive_parked");
+    let mission = db.gated_mission(&source, &scenarios);
+    let first = db.reported_task(mission, "w1");
+    let agent = |index: usize| {
+        db.mission(mission)["tasks"][index]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string()
+    };
+    let pushed = push_work(&base, &source, &agent(0), "work.txt");
+    let count =
+        || std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0));
+    let pass = || {
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+    };
+    let task_of = |id: i64| {
+        gated(&db, mission)
+            .tasks
+            .into_iter()
+            .find(|task| task.id == id)
+            .expect("the task")
+    };
+
+    // The first: load_sensitive, a host fault as any, with its backoff.
+    let source_main_before = source_main(&source);
+    pass();
+    assert_eq!(count(), 1);
+    let (record, _, _) = last_verdict(&db);
+    assert_eq!(record["id"], first);
+    assert_eq!(record["verdict"], "host_fault", "{record}");
+    assert_eq!(record["evidence"], "load_sensitive");
+    assert_eq!(record["pushed"], pushed.as_str());
+    assert_eq!(record["sensitive"], json!(["099.sh"]));
+    assert_eq!(record["host_faults"], 1);
+    assert_eq!(record["escalate"], false);
+    let task = task_of(first);
+    assert_eq!(
+        task.gate_load_sensitive_pushed.as_deref(),
+        Some(pushed.as_str())
+    );
+    assert_eq!(task.gate_parked_pushed, None);
+
+    // An owner's landing between the two moves main (the gate's merge
+    // candidate) but not the task's pushed commit: the key holds (rev-e N1).
+    // Recorded `source.moved`, as `spawn mission moved` does.
+    let moved = main_moves(&base, &source, "owner.txt");
+    db.store
+        .source_moved(&source, &source_main_before, &moved)
+        .expect("moved");
+
+    // The second on the same commit, another scenario: parked.
+    past_due(&db);
+    pass();
+    assert_eq!(count(), 2);
+    let (record, _, _) = last_verdict(&db);
+    assert_eq!(record["id"], first);
+    assert_eq!(record["verdict"], "host_fault", "{record}");
+    assert_eq!(record["evidence"], "load_sensitive_parked");
+    assert_eq!(record["parked"], true);
+    assert_eq!(record["escalate"], true);
+    assert_eq!(record["sensitive"], json!(["099.sh", "046.sh"]));
+    assert_eq!(
+        record["owners"],
+        json!([{"scenario": "099.sh", "owner": "rev-f"}, {"scenario": "046.sh", "owner": null}])
+    );
+    let after = gated(&db, mission);
+    assert_eq!(
+        (after.gate_host_faults, after.gate_host_task),
+        (0, None),
+        "the run ends: nothing waits behind a parked task"
+    );
+    assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
+    let task = task_of(first);
+    assert_eq!(task.gate_parked_pushed.as_deref(), Some(pushed.as_str()));
+    assert_eq!(
+        (task.state, task.revisions),
+        (spawn_core::mission::TaskState::Reported, 0),
+        "neither rejected nor sent back"
+    );
+    assert_eq!(
+        db.store
+            .task_host_faults(first, 0, &source_main(&source))
+            .expect("count"),
+        0,
+        "neither evidence counts toward the cap"
+    );
+    let items = crate::dispatch::digest::host_fault_escalations(
+        db.store
+            .gate_host_fault_escalations()
+            .expect("escalations")
+            .as_array()
+            .expect("records"),
+    );
+    assert_eq!(items.len(), 1, "{items:?}");
+    for wanted in [
+        format!("task #{first} of mission {mission} is parked"),
+        "099.sh (root fix: rev-f)".to_string(),
+        "046.sh (no root-fix owner named in scenario-owners)".to_string(),
+        format!("spawn task release --id {first}"),
+    ] {
+        assert!(
+            items[0].line.contains(&wanted),
+            "{wanted:?} in {}",
+            items[0].line
+        );
+    }
+
+    // The mission's other task is judged; the parked one is not.
+    let second = db.reported_task(mission, "w2");
+    push_work(&base, &source, &agent(1), "other.txt");
+    pass();
+    assert_eq!(count(), 3);
+    assert_eq!(last_verdict(&db).0["id"], second);
+    past_due(&db);
+    pass();
+    assert_eq!(count(), 4);
+    assert_eq!(
+        last_verdict(&db).0["id"],
+        second,
+        "the parked task is not judged"
+    );
+
+    // A person releases it: judged again, its count from the start.
+    db.record(&json!({"type": "task.released", "id": first, "by": "test",
+                      "reason": "the root fix landed"}));
+    let task = task_of(first);
+    assert_eq!(
+        (task.gate_parked_pushed, task.gate_load_sensitive_pushed),
+        (None, None)
+    );
+    past_due(&db);
+    pass();
+    assert_eq!(count(), 5);
+    let record = last_verdict(&db).0;
+    assert_eq!(record["id"], first, "{record}");
+    assert_eq!(
+        record["evidence"], "load_sensitive",
+        "the count starts again"
+    );
+
+    // Parked again; then a new commit on its branch releases it, by the
+    // integrator, and the new commit is judged.
+    past_due(&db);
+    pass();
+    let record = last_verdict(&db).0;
+    assert_eq!(record["id"], first, "{record}");
+    assert_eq!(record["evidence"], "load_sensitive_parked", "{record}");
+    let newer = push_work_on(&base, &source, &agent(0), &pushed, "more.txt");
+    pass();
+    let released: Value = db
+        .admin()
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'task.released'
+              order by session_seq desc limit 1",
+            &[],
+        )
+        .expect("the release")
+        .get(0);
+    assert_eq!(released["id"], first);
+    assert_eq!(released["by"], "spawn-integrate");
+    assert!(
+        released["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(&newer)),
+        "{released}"
+    );
+    pass();
+    let record = last_verdict(&db).0;
+    assert_eq!(record["id"], first, "{record}");
+    assert_eq!(record["pushed"], newer.as_str());
+    assert_eq!(
+        record["evidence"], "load_sensitive",
+        "a new commit counts from the start"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&dir);
+}

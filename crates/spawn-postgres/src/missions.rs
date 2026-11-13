@@ -564,6 +564,12 @@ select jsonb_build_object(
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'model', k.model, 'stages', spawn_task_stages(k.id),
                  'held_by', k.held_by,
+                 -- Parked by the load-sensitive bound: its pushed commit
+                 -- and every scenario found load-sensitive on it (columns
+                 -- of the row already read; null for any other task).
+                 'parked', case when k.gate_parked_pushed is not null then
+                     jsonb_build_object('pushed', k.gate_parked_pushed,
+                                        'scenarios', k.gate_load_sensitive_scenarios) end,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
@@ -879,6 +885,9 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// so they never count toward the cap either. Nor does the gate's own test
 /// server that did not start (`on` `test server`), whichever start it was:
 /// no candidate code makes a server start.
+/// Nor does a regression the gate found load-sensitive (`load_sensitive`,
+/// and the bound's `load_sensitive_parked`): it passed alone, as the base
+/// does, and its own bound ends its re-judging.
 pub(crate) const TASK_HOST_FAULTS: &str = r"
 select count(*)
   from spawn_events e
@@ -892,7 +901,7 @@ select count(*)
    and not (coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'on', '') = 'sandbox'
             and coalesce(e.kind -> 'detail' -> 'record' -> 'fact' ->> 'tree', '') <> 'candidate')
    and coalesce(e.kind -> 'detail' -> 'record' ->> 'evidence', '') not in
-       ('base_disagrees', 'cannot_judge', 'main_red')";
+       ('base_disagrees', 'cannot_judge', 'main_red', 'load_sensitive', 'load_sensitive_parked')";
 
 /// The work an ephemeral objective task starts from: the newest earlier
 /// task of its objective that ended without landing (cancelled, aborted or
@@ -1029,7 +1038,10 @@ from (
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
                'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
-               'continues', k.continues)
+               'continues', k.continues,
+               'gate_load_sensitive_pushed', k.gate_load_sensitive_pushed,
+               'gate_load_sensitive_scenarios', k.gate_load_sensitive_scenarios,
+               'gate_parked_pushed', k.gate_parked_pushed)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -2145,6 +2157,30 @@ impl PostgresStore {
             &[&task, &accept, &note, &revision],
         )?;
         Ok(())
+    }
+
+    /// Release `task`, parked by the integrator's load-sensitive bound
+    /// (`spawn task release`, owner only): records `task.released` with
+    /// `by` and `reason`, and returns what it released, read in the same
+    /// statement: `{task, pushed, scenarios, event}`, the parked pushed
+    /// commit and every scenario found load-sensitive on it. A task that is
+    /// not parked (or none) is refused by the record's check, never a
+    /// silent no-op.
+    pub fn task_release(&self, task: i64, by: &str, reason: &str) -> Result<Value, StoreError> {
+        let record = serde_json::json!({"type": "task.released", "id": task, "by": by,
+                                        "reason": reason});
+        self.query_json(
+            "with parked as (
+                 select gate_parked_pushed, gate_load_sensitive_scenarios
+                   from mission_tasks where id = $1 for update)
+             select jsonb_build_object(
+                      'task', $1::bigint,
+                      'pushed', parked.gate_parked_pushed,
+                      'scenarios', parked.gate_load_sensitive_scenarios,
+                      'event', spawn_integrator_record($2))
+               from (select 1) one left join parked on true",
+            &[&task, &record],
+        )
     }
 
     /// Cancel a task that is not closed yet.

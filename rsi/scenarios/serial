@@ -5,3 +5,8 @@
 # (023, 025, 032 and 036 went to the nightly, rsi/scenarios/nightly/: scripts/rsi/nightly.sh
 # runs each alone on a held host.)
 check-j04-observe.sh
+# 107.sh: 30 s of 16-thread fake-systemctl test runs, a statistical check (96 runs; the
+# base fails 7 to 12 in 100): its threads must not load the scenarios beside it (099), and
+# its own result must not depend on them. Once 107 has landed, the lead moves it to
+# rsi/scenarios/nightly/ in a later contract push.
+107.sh

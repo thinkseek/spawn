@@ -501,10 +501,10 @@ use verdicts::{
     incompatible_note,
 };
 use verdicts::{
-    Rejection, aborted, base_disagrees_fields, base_only_fault, cannot_judge_fields,
-    capped_host_fault, gate_host_fault_fields, host_fault_fields, main_red_fields, markers_note,
-    no_room, on_the_head, over_budget, red_as_host_fault, red_believed, rejected_fields, rejection,
-    short_of_room,
+    LOAD_SENSITIVE, Rejection, aborted, base_disagrees_fields, base_only_fault,
+    cannot_judge_fields, capped_host_fault, gate_host_fault_fields, host_fault_fields,
+    load_sensitive_parked_fields, main_red_fields, markers_note, no_room, on_the_head, over_budget,
+    red_as_host_fault, red_believed, rejected_fields, rejection, short_of_room,
 };
 
 /// Rejections, or aborts, in a row that halt a mission.
@@ -919,6 +919,17 @@ pub(crate) struct Task {
     /// supervisor and holds its objective.
     #[serde(default)]
     pub(crate) continues: Option<i64>,
+    /// The load-sensitive bound (sync/design-load-sensitive-bound.md): the
+    /// pushed commit whose gate last found a regression load-sensitive, and
+    /// every scenario found so across those judgings.
+    #[serde(default)]
+    pub(crate) gate_load_sensitive_pushed: Option<String>,
+    #[serde(default)]
+    pub(crate) gate_load_sensitive_scenarios: Option<Vec<String>>,
+    /// The pushed commit the bound parked: not judged again until a new
+    /// commit is pushed or a person releases it.
+    #[serde(default)]
+    pub(crate) gate_parked_pushed: Option<String>,
 }
 
 impl Mission {
@@ -926,8 +937,21 @@ impl Mission {
     /// the gate alone accepts, also one just reported.
     fn ready(&self) -> Option<&Task> {
         self.tasks.iter().find(|task| {
-            task.state == TaskState::Accepted
-                || (self.accept == "gate" && task.state == TaskState::Reported)
+            // A task the load-sensitive bound parked is not judged; the
+            // mission's next one is ([`Integrator::parked`] says it once).
+            task.gate_parked_pushed.is_none()
+                && (task.state == TaskState::Accepted
+                    || (self.accept == "gate" && task.state == TaskState::Reported))
+        })
+    }
+
+    /// Its tasks the load-sensitive bound parked that would be judged
+    /// otherwise.
+    fn parked(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|task| {
+            task.gate_parked_pushed.is_some()
+                && (task.state == TaskState::Accepted
+                    || (self.accept == "gate" && task.state == TaskState::Reported))
         })
     }
 
@@ -1052,6 +1076,36 @@ pub(crate) fn host_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Dur
     }
     let left = mission.gate_host_due_ms?.saturating_sub(now_ms);
     (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
+}
+
+/// The file of the scenarios' root-fix owners, under the integrator's
+/// root: one `<scenario> <owner>` a line (`#` begins a comment). Outside the
+/// scenarios directory, so it moves no base-cache key.
+pub(crate) const SCENARIO_OWNERS: &str = "scenario-owners";
+
+/// Each of `scenarios` with its root-fix owner from [`SCENARIO_OWNERS`]
+/// under `root`; None when the file names none (or there is no file).
+pub(crate) fn scenario_owners(root: &Path, scenarios: &[String]) -> Vec<(String, Option<String>)> {
+    let text = std::fs::read_to_string(root.join(SCENARIO_OWNERS)).unwrap_or_default();
+    let named: Vec<(&str, &str)> = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .filter_map(|line| {
+            let (scenario, owner) = line.split_once(char::is_whitespace)?;
+            Some((scenario, owner.trim()))
+        })
+        .filter(|(_, owner)| !owner.is_empty())
+        .collect();
+    scenarios
+        .iter()
+        .map(|scenario| {
+            let owner = named
+                .iter()
+                .find(|(name, _)| name == scenario)
+                .map(|(_, owner)| (*owner).to_string());
+            (scenario.clone(), owner)
+        })
+        .collect()
 }
 
 /// A wait as the integrator says it: whole minutes, else seconds.
@@ -2090,6 +2144,82 @@ impl Integrator {
         true
     }
 
+    /// Each task of `mission` the load-sensitive bound parked
+    /// ([`Self::parked_task`]). Its cost: per parked task, every pass, one
+    /// read of the task's pushed head and its fetch into the mirror
+    /// (`sources::fetch_pushed_into`), as a judged task's pass costs; a
+    /// parked task stays so until a person or a new push releases it, so
+    /// the number of them is the owner's to keep small (rev-e N2).
+    fn parked(
+        &self,
+        store: &PostgresStore,
+        mission: &Mission,
+        source: &str,
+        mirror: &Path,
+    ) -> Result<(), String> {
+        for task in mission.parked() {
+            self.parked_task(store, mission, task, source, mirror)?;
+        }
+        Ok(())
+    }
+
+    /// A task the load-sensitive bound parked: a new commit pushed on its
+    /// branch releases it (`task.released`, by the integrator, naming both
+    /// commits), so its next pass judges the new one; else it stays parked,
+    /// said once. Its mission's other tasks are judged meanwhile
+    /// ([`Mission::ready`] skips it).
+    fn parked_task(
+        &self,
+        store: &PostgresStore,
+        mission: &Mission,
+        task: &Task,
+        source: &str,
+        mirror: &Path,
+    ) -> Result<(), String> {
+        let Some(parked) = task.gate_parked_pushed.as_deref() else {
+            return Ok(());
+        };
+        let pushed = sources::fetch_pushed_into(
+            mirror,
+            source,
+            &task.agent_id,
+            &integrator_ref(&task.agent_id),
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(pushed) = pushed.as_deref().filter(|pushed| *pushed != parked) {
+            record(
+                store,
+                &json!({"type": "task.released", "id": task.id, "by": "spawn-integrate",
+                        "reason": format!("a new commit {pushed} was pushed (parked pushed commit: {parked})")}),
+            )?;
+            println!(
+                "integrate: mission {}: task {} released: a new commit {} was pushed (parked pushed commit: {})",
+                mission.id,
+                task.id,
+                short_commit(pushed),
+                short_commit(parked)
+            );
+            self.wait_over(task.id);
+            return Ok(());
+        }
+        if self.waiting.borrow_mut().insert((task.id, Wait::Parked)) {
+            println!(
+                "integrate: mission {}: task {} parked: its pushed commit {} was load-sensitive \
+                 twice ({}); it is judged again on a new commit or a person's release (spawn \
+                 task release --id {}); the mission's other tasks go on",
+                mission.id,
+                task.id,
+                short_commit(parked),
+                task.gate_load_sensitive_scenarios
+                    .as_deref()
+                    .unwrap_or_default()
+                    .join(", "),
+                task.id
+            );
+        }
+        Ok(())
+    }
+
     /// Whether `task`'s gate backs off this pass ([`gate_wait`]), saying
     /// so when it starts to: the line is printed once, not on every pass
     /// it goes on waiting, like every other wait.
@@ -3008,6 +3138,9 @@ impl Integrator {
         }
         if held {
             return Ok(false);
+        }
+        if let Some((mirror, _)) = judgeable.as_ref() {
+            self.parked(store, mission, source, mirror)?;
         }
         if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
             if self.backs_off(mission, task).is_some() {
@@ -3992,9 +4125,21 @@ impl Judge {
                     Rejection::HeadCannotJudge {
                         scenario,
                         log,
+                        load_sensitive,
                         head,
                     } => {
-                        let mut extra = self.cannot_judge(mission, task.id, &scenario, &log);
+                        let mut extra = if load_sensitive.is_empty() {
+                            self.cannot_judge(mission, task.id, &scenario, &log)
+                        } else {
+                            self.load_sensitive(
+                                mission,
+                                task,
+                                &branch,
+                                &scenario,
+                                &log,
+                                &load_sensitive,
+                            )
+                        };
                         extra = on_the_head(extra, &head, main, &verdict.reason);
                         gated("host_fault", extra)
                     }
@@ -4109,8 +4254,19 @@ impl Judge {
             // objective is judged outside the gate, by the owner.
             // `host_fault`: retried after a backoff, never counted toward a
             // halt, never a rejection and never an abort.
-            Err(GateFailure::CannotJudge { scenario, log }) => {
-                let mut extra = self.cannot_judge(mission, task.id, &scenario, &log);
+            // A regression gate.sh found load-sensitive (failed at load,
+            // passed alone as the base does): the same, with its own
+            // evidence and its bound ([`Judge::load_sensitive`]).
+            Err(GateFailure::CannotJudge {
+                scenario,
+                log,
+                load_sensitive,
+            }) => {
+                let mut extra = if load_sensitive.is_empty() {
+                    self.cannot_judge(mission, task.id, &scenario, &log)
+                } else {
+                    self.load_sensitive(mission, task, &branch, &scenario, &log, &load_sensitive)
+                };
                 extra["candidate"] = json!(candidate);
                 gated("host_fault", extra)
             }
@@ -4153,6 +4309,68 @@ impl Judge {
         let extra = cannot_judge_fields(scenario, faults, backoff, log);
         println!(
             "integrate: task {task}: {}",
+            extra["reason"].as_str().unwrap_or_default()
+        );
+        extra
+    }
+
+    /// The record of a gate that found regressions `named` load-sensitive
+    /// on `task`'s pushed commit `pushed` (sync/design-load-sensitive-
+    /// bound.md). The first time for that commit: a host fault with evidence
+    /// [`LOAD_SENSITIVE`], the mission's next in a row with its backoff, as
+    /// [`Self::cannot_judge`]. The second time for the same commit, whatever
+    /// its scenarios: parked ([`LOAD_SENSITIVE_PARKED`]), naming every
+    /// scenario found and each one's root-fix owner, with no backoff: the
+    /// store ends the mission's run of host faults, so its other tasks are
+    /// judged, and this one waits for a new commit or a person's release.
+    fn load_sensitive(
+        &self,
+        mission: &Mission,
+        task: &Task,
+        pushed: &str,
+        scenario: &str,
+        log: &str,
+        named: &[String],
+    ) -> Value {
+        let again = task.gate_load_sensitive_pushed.as_deref() == Some(pushed);
+        let mut scenarios: Vec<String> = if again {
+            task.gate_load_sensitive_scenarios
+                .clone()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for name in named {
+            if !scenarios.contains(name) {
+                scenarios.push(name.clone());
+            }
+        }
+        if again {
+            let owners = scenario_owners(&self.root, &scenarios);
+            let extra = load_sensitive_parked_fields(pushed, &scenarios, &owners, log);
+            println!(
+                "integrate: task {}: {}",
+                task.id,
+                extra["reason"].as_str().unwrap_or_default()
+            );
+            return extra;
+        }
+        let faults = mission.gate_host_faults.saturating_add(1);
+        let backoff = host_fault_backoff(self.host.backoff, faults);
+        let mut extra = cannot_judge_fields(scenario, faults, backoff, log);
+        extra["evidence"] = json!(LOAD_SENSITIVE);
+        extra["pushed"] = json!(pushed);
+        extra["sensitive"] = json!(scenarios);
+        extra["reason"] = json!(format!(
+            "host fault: {} load-sensitive on this task's pushed commit (failed at load, passed \
+             alone as the base does); not a verdict on the work, judged again in {}; a second time \
+             on the same pushed commit parks it",
+            scenarios.join(", "),
+            spoken(backoff)
+        ));
+        println!(
+            "integrate: task {}: {}",
+            task.id,
             extra["reason"].as_str().unwrap_or_default()
         );
         extra
@@ -4446,6 +4664,8 @@ enum Wait {
     Controller,
     /// The nightly found main of its source red (gate v2 step 5b).
     NightlyRed,
+    /// The load-sensitive bound parked its pushed commit.
+    Parked,
 }
 
 /// Whether a wait was said this pass or before, for [`Integrator::backs_off`].

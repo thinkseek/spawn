@@ -212,7 +212,19 @@ select jsonb_build_object(
                               and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text),
         'agent_free', not exists (select 1 from mission_tasks o
                                    where o.agent_id = k.agent_id
-                                     and o.state in ('delivered', 'reported')))
+                                     and o.state in ('delivered', 'reported')),
+        -- A task the load-sensitive bound parked: the `task.gated` record
+        -- that parked it (`task_parked`), read only for such a task.
+        'parked', case when k.gate_parked_pushed is not null then
+            (select jsonb_build_object('event_id', e.id,
+                                       'record', e.kind -> 'detail' -> 'record')
+               from spawn_events e
+              where e.session_id = 'session_control'
+                and e.event_name = 'control.recorded'
+                and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+                and e.kind -> 'detail' -> 'record' ->> 'evidence' = 'load_sensitive_parked'
+              order by e.id desc limit 1) end)
       order by k.id) from mission_tasks k), '[]'::jsonb))";
 
 /// Every alert row, and the newest transition event id: the loop reads its

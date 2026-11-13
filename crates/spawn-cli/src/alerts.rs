@@ -83,6 +83,20 @@
 //!   without it, or at a reading no gate directory of an open mission on its
 //!   source holds it (`reading_ms` and `gates`, no `event_id`); `closed`, every mission it names is closed; `quarantined`,
 //!   a gate names it so.
+//! - `task_parked`, `task #<id>`, key `task_parked:<task>:<event>`
+//!   (sync/design-load-sensitive-bound.md): the integrator's load-sensitive
+//!   bound parked the task, its `task.gated` `host_fault` with evidence
+//!   `load_sensitive_parked`: its pushed commit was load-sensitive twice, so
+//!   it is not judged again until a new commit is pushed or a person
+//!   releases it. Names the scenarios and each one's root-fix owner, and the
+//!   command that releases it (`spawn task release`). One open per task.
+//!   Clears at the task's `task.released`, at a later verdict on it but
+//!   `no_room` and `stale` (which judge nothing, as the store's fold keeps
+//!   it parked then), or at its `task.landed`, `task.cancelled`,
+//!   `task.aborted` or `task.over_budget` (each ends the task, and the
+//!   store's fold takes it out of the bound); and at start, when the mirror
+//!   finds the task no longer parked by that record (one parked while the
+//!   step was down fires then).
 //! - `task_undelivered`, `task #<id>`, key
 //!   `task_undelivered:<task>:<its task.assigned event>`: in `assigned`
 //!   longer than `SPAWN_ALERT_UNDELIVERED_SECS` (default 300) while its
@@ -685,6 +699,8 @@ pub(crate) struct Monitor {
     red: HashMap<(i64, String), String>,
     /// The open (or pending) `validator_defect` alerts.
     defects: Vec<Defect>,
+    /// The open (or pending) `task_parked` key, by task.
+    parked: BTreeMap<i64, String>,
     /// The newest dump and bundle records.
     backups: BTreeMap<&'static str, Backup>,
     commands_after: i64,
@@ -836,6 +852,7 @@ impl Monitor {
             auth: HashMap::new(),
             red: HashMap::new(),
             defects: Vec::new(),
+            parked: BTreeMap::new(),
             backups: BTreeMap::new(),
             commands_after: 0,
             logs,
@@ -980,6 +997,7 @@ impl Monitor {
         }
         self.seed_red();
         self.seed_defects();
+        self.seed_parked();
         let history = store
             .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
             .map_err(|error| error.to_string())?;
@@ -1005,6 +1023,7 @@ impl Monitor {
         // down, or before it fired (an owner alert of before objective 056,
         // one per mission), names no open mission: it clears now.
         self.closed_defects(None, now, &mut events);
+        self.start_parked(&mirror, now, &mut events);
         let observations = store
             .alert_observations()
             .map_err(|error| error.to_string())?;
@@ -1100,6 +1119,11 @@ impl Monitor {
             "task.assigned" | "task.delivered" | "task.reported" | "task.gated"
             | "task.reviewed" | "task.landed" | "task.aborted" | "task.over_budget"
             | "task.cancelled" => self.task_record(event_id, at_ms, record, out),
+            "task.released" => {
+                if let Some(task) = record["id"].as_i64() {
+                    self.parked_record(event_id, task, record, out);
+                }
+            }
             "mission.added" | "mission.closed" | "mission.halted" | "mission.resumed"
             | "mission.configured" => self.mission_record(event_id, record, out),
             "mission.paused" | "mission.unpaused" => {
@@ -1137,6 +1161,130 @@ impl Monitor {
         {
             row.state = "cleared".to_string();
         }
+    }
+
+    /// The open `task_parked` alerts the store holds, by the task each
+    /// names.
+    fn seed_parked(&mut self) {
+        for (key, row) in &self.known {
+            if row.open()
+                && row.kind == "task_parked"
+                && let Some(task) = row.evidence["task"].as_i64()
+            {
+                self.parked.insert(task, key.clone());
+            }
+        }
+    }
+
+    /// At start, the tasks the mirror finds parked (each with the
+    /// `task.gated` record that parked it, `parked`): an open `task_parked`
+    /// whose task is not parked by its record any more (released, judged or
+    /// ended while the step was down) clears, naming the reading; a task
+    /// parked by a record no alert names (parked while the step was down)
+    /// fires.
+    fn start_parked(&mut self, mirror: &Value, now: i64, out: &mut Vec<Event>) {
+        let parked: BTreeMap<i64, (i64, &Value)> = mirror["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|task| {
+                let by = &task["parked"];
+                Some((
+                    task["id"].as_i64()?,
+                    (by["event_id"].as_i64()?, &by["record"]),
+                ))
+            })
+            .collect();
+        for (task, key) in std::mem::take(&mut self.parked) {
+            match parked.get(&task) {
+                Some((event_id, _)) if key == format!("task_parked:{task}:{event_id}") => {
+                    self.parked.insert(task, key);
+                }
+                _ => out.push(Event::Clear {
+                    key,
+                    evidence: json!({"cause": "not_parked", "reading_ms": now}),
+                }),
+            }
+        }
+        for (task, (event_id, record)) in parked {
+            let key = format!("task_parked:{task}:{event_id}");
+            if !self.parked.contains_key(&task) && !self.known.contains_key(&key) {
+                self.fire_parked(event_id, task, record, out);
+            }
+        }
+    }
+
+    /// A record about task `task` for `task_parked`: the bound's parking
+    /// fires one (none while one is open for the task); its release, a
+    /// later verdict but `no_room` and `stale`, or its end clears it,
+    /// naming the record.
+    fn parked_record(&mut self, event_id: i64, task: i64, record: &Value, out: &mut Vec<Event>) {
+        let kind = record["type"].as_str().unwrap_or_default();
+        let verdict = record["verdict"].as_str();
+        let parks = kind == "task.gated"
+            && verdict == Some("host_fault")
+            && record["evidence"].as_str() == Some("load_sensitive_parked");
+        let clears = match kind {
+            "task.released" | "task.landed" | "task.cancelled" | "task.aborted"
+            | "task.over_budget" => true,
+            "task.gated" => !parks && !matches!(verdict, Some("no_room" | "stale")),
+            _ => false,
+        };
+        if clears && let Some(key) = self.parked.remove(&task) {
+            let mut evidence = json!({"event_id": event_id, "record": kind});
+            if kind == "task.released" {
+                evidence["by"] = record["by"].clone();
+                evidence["reason"] = record["reason"].clone();
+            } else if kind == "task.gated" {
+                evidence["verdict"] = json!(verdict);
+            }
+            out.push(Event::Clear { key, evidence });
+        }
+        if parks && !self.parked.contains_key(&task) {
+            self.fire_parked(event_id, task, record, out);
+        }
+    }
+
+    /// Fire `task_parked` for `task` from the record `event_id` that parked
+    /// it: its pushed commit, the scenarios and each one's root-fix owner
+    /// (the record's `owners`), and the command that releases it.
+    fn fire_parked(&mut self, event_id: i64, task: i64, record: &Value, out: &mut Vec<Event>) {
+        let key = format!("task_parked:{task}:{event_id}");
+        let mission = self.tasks.get(&task).map(|known| known.mission);
+        let pushed = record["pushed"].as_str().unwrap_or("?");
+        let owners = record["owners"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let scenario = entry["scenario"].as_str().unwrap_or("a scenario");
+                match entry["owner"].as_str() {
+                    Some(owner) => format!("{scenario} (root fix: {owner})"),
+                    None => format!("{scenario} (no root-fix owner named in scenario-owners)"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let command = format!("spawn task release --id {task} --reason <why>");
+        self.parked.insert(task, key.clone());
+        out.push(Event::Fire {
+            key,
+            kind: "task_parked",
+            subject: format!("task #{task}"),
+            evidence: json!({
+                "task": task, "mission": mission, "pushed": pushed,
+                "scenarios": record["sensitive"], "owners": record["owners"],
+                "event_id": event_id, "command": command,
+            }),
+            text: format!(
+                "task #{task}{}: its pushed commit {} was load-sensitive twice: {owners}. It is \
+                 not judged again until a new commit is pushed or a person releases it \
+                 ({command}); the mission's other tasks go on",
+                mission.map_or_else(String::new, |mission| format!(" (mission #{mission})")),
+                pushed.get(..12).unwrap_or(pushed)
+            ),
+            notice: false,
+        });
     }
 
     /// The open `validator_defect` alerts the store holds: a task's names
@@ -1601,6 +1749,7 @@ the base, unsolved on it (task #{task}'s gate)"
         let Some(id) = record["id"].as_i64() else {
             return;
         };
+        self.parked_record(event_id, id, record, out);
         if kind == "task.assigned" {
             self.tasks.entry(id).or_insert_with(|| Task {
                 mission: record["mission_id"].as_i64().unwrap_or_default(),
@@ -5564,6 +5713,168 @@ mod tests {
         assert!(monitor.is_open("scenario_red:4:047.sh:12"));
     }
 
+    /// `task_parked` (sync/design-load-sensitive-bound.md): the bound's
+    /// parking fires it once per task, naming the pushed commit, each
+    /// scenario's root-fix owner and the release command; `no_room` and
+    /// `stale` leave it open, and the task's release clears it, naming who
+    /// and why. Parked again after: a new alert, which a later verdict
+    /// clears; parked again and cancelled: the cancel clears it.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_parked_task_is_an_alert_until_released_judged_or_ended() {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let parked = || {
+            json!({"type": "task.gated", "id": 7, "revision": 0, "verdict": "host_fault",
+                   "evidence": "load_sensitive_parked", "pushed": "ab".repeat(20),
+                   "sensitive": ["099.sh", "046.sh"], "parked": true, "escalate": true,
+                   "owners": [{"scenario": "099.sh", "owner": "rev-f"},
+                              {"scenario": "046.sh", "owner": null}]})
+        };
+        let first = feed(&mut monitor, 11, 0, parked());
+        assert_eq!(fires(&first), ["task_parked:7:11"]);
+        let Event::Fire {
+            subject,
+            evidence,
+            text,
+            notice,
+            ..
+        } = &first[0]
+        else {
+            panic!("{first:?}");
+        };
+        assert_eq!(subject, "task #7");
+        assert!(!notice, "it needs a person");
+        assert_eq!(
+            evidence["command"],
+            "spawn task release --id 7 --reason <why>"
+        );
+        assert_eq!(evidence["mission"], 4);
+        assert_eq!(evidence["scenarios"], json!(["099.sh", "046.sh"]));
+        for wanted in [
+            "task #7 (mission #4)",
+            "pushed commit abababababab",
+            "099.sh (root fix: rev-f)",
+            "046.sh (no root-fix owner named in scenario-owners)",
+            "spawn task release --id 7",
+        ] {
+            assert!(text.contains(wanted), "{wanted:?} in {text}");
+        }
+        commit(&mut monitor, &first);
+        assert!(
+            fires(&feed(&mut monitor, 12, 0, parked())).is_empty(),
+            "one per task"
+        );
+        for verdict in ["no_room", "stale"] {
+            let kept = feed(
+                &mut monitor,
+                13,
+                0,
+                json!({"type": "task.gated", "id": 7, "revision": 0, "verdict": verdict}),
+            );
+            assert!(
+                !decided(&monitor, kept)
+                    .iter()
+                    .any(|event| event.key().starts_with("task_parked:")),
+                "{verdict} judges nothing"
+            );
+        }
+        let released = feed(
+            &mut monitor,
+            14,
+            0,
+            json!({"type": "task.released", "id": 7, "by": "ckl", "reason": "099 fixed"}),
+        );
+        let released = decided(&monitor, released);
+        let [Event::Clear { key, evidence }] = released.as_slice() else {
+            panic!("{released:?}");
+        };
+        assert_eq!(key, "task_parked:7:11");
+        assert_eq!(
+            *evidence,
+            json!({"event_id": 14, "record": "task.released", "by": "ckl", "reason": "099 fixed"})
+        );
+        commit(&mut monitor, &released);
+        // Another task's release, or a release with none open, clears nothing.
+        let none = feed(
+            &mut monitor,
+            15,
+            0,
+            json!({"type": "task.released", "id": 7, "by": "ckl", "reason": "again"}),
+        );
+        assert!(decided(&monitor, none).is_empty());
+
+        let second = feed(&mut monitor, 16, 0, parked());
+        assert_eq!(
+            fires(&second),
+            ["task_parked:7:16"],
+            "parked again: a new alert"
+        );
+        commit(&mut monitor, &second);
+        let judged = feed(
+            &mut monitor,
+            17,
+            0,
+            json!({"type": "task.gated", "id": 7, "revision": 0, "verdict": "rejected"}),
+        );
+        let judged = decided(&monitor, judged);
+        assert!(
+            judged.iter().any(|event| matches!(event,
+                Event::Clear { key, evidence }
+                    if key == "task_parked:7:16" && evidence["verdict"] == "rejected")),
+            "{judged:?}"
+        );
+        commit(&mut monitor, &judged);
+        let third = feed(&mut monitor, 18, 0, parked());
+        commit(&mut monitor, &third);
+        let cancelled = feed(
+            &mut monitor,
+            19,
+            0,
+            json!({"type": "task.cancelled", "id": 7}),
+        );
+        assert!(
+            decided(&monitor, cancelled)
+                .iter()
+                .any(|event| matches!(event,
+                Event::Clear { key, evidence }
+                    if key == "task_parked:7:18" && evidence["record"] == "task.cancelled")),
+            "the task's end clears it"
+        );
+        let mut monitor = monitor_parked(parked());
+        let over = feed(
+            &mut monitor,
+            21,
+            0,
+            json!({"type": "task.over_budget", "id": 7, "reason": "r"}),
+        );
+        assert!(
+            decided(&monitor, over)
+                .iter()
+                .any(|event| event.key() == "task_parked:7:20"),
+            "over budget ends it too"
+        );
+    }
+
+    /// A monitor that knows task 7 of mission 4, parked by `record` (event 20).
+    fn monitor_parked(record: Value) -> Monitor {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let parked = feed(&mut monitor, 20, 0, record);
+        commit(&mut monitor, &parked);
+        monitor
+    }
+
     /// `validator_defect` (review-fix-gate.md F1 and N1): a task's gate that
     /// ended on one opens it once per mission and scenario, and the
     /// mission's next verdict clears it; an owner's accepted landing that
@@ -7744,6 +8055,102 @@ connections\n";
                     "a record after the start is the checks'"
                 );
                 assert!(monitor.tasks.contains_key(&9));
+            });
+        }
+
+        /// `task_parked` across restarts (sync/design-load-sensitive-
+        /// bound.md): a started step fires one for a task the store holds
+        /// parked, and none for a task released since its parking. Released
+        /// while the step is down, its alert clears at the next start
+        /// (`not_parked`, the start's reading); a task parked while the step
+        /// is down fires then, named by the record that parked it.
+        #[test]
+        fn a_started_step_says_each_parked_task_and_clears_a_released_one() {
+            in_schema("alerts_task_parked", |store, client| {
+                record(
+                    client,
+                    1,
+                    r#"{"type":"mission.added","id":4,"text":"m","origin":"human"}"#,
+                );
+                record(
+                    client,
+                    1,
+                    r#"{"type":"mission.configured","id":4,"accept":"gate","gate":"/g"}"#,
+                );
+                for task in [7, 8] {
+                    record(
+                        client,
+                        1,
+                        &format!(
+                            r#"{{"type":"task.assigned","id":{task},"mission_id":4,
+                                "kind":"ephemeral","agent_id":"agent_worker_{task}",
+                                "session_id":"session_{task}","brief":"b",
+                                "created_by":"agent_supervisor","objective":1}}"#
+                        ),
+                    );
+                }
+                let park = |client: &mut postgres::Client, task: i64| {
+                    record(
+                        client,
+                        1,
+                        &format!(
+                            r#"{{"type":"task.gated","id":{task},"revision":0,
+                                "verdict":"host_fault","evidence":"load_sensitive_parked",
+                                "scenario":"099.sh","sensitive":["099.sh"],
+                                "pushed":"{}","parked":true,"escalate":true,
+                                "owners":[{{"scenario":"099.sh","owner":"rev-f"}}]}}"#,
+                            "c".repeat(40)
+                        ),
+                    )
+                };
+                let release = |client: &mut postgres::Client, task: i64| {
+                    record(
+                        client,
+                        0,
+                        &format!(
+                            r#"{{"type":"task.released","id":{task},"by":"ckl","reason":"r"}}"#
+                        ),
+                    )
+                };
+                let seven = park(client, 7);
+                park(client, 8);
+                release(client, 8);
+                refold(client);
+                let monitor = started(store);
+                let key = format!("task_parked:7:{seven}");
+                assert_eq!(alert(client, &key).0, "open");
+                assert_eq!(monitor.parked.keys().copied().collect::<Vec<_>>(), [7]);
+                let fired: i64 = client
+                    .query_one(
+                        "select count(*) from spawn_alerts where kind = 'task_parked'",
+                        &[],
+                    )
+                    .expect("count")
+                    .get(0);
+                assert_eq!(fired, 1, "none for the released task");
+                drop(monitor);
+
+                // Down: 7 released, 8 parked again.
+                release(client, 7);
+                let eight = park(client, 8);
+                refold(client);
+                let monitor = started(store);
+                assert_eq!(alert(client, &key).0, "cleared");
+                let cause: String = client
+                    .query_one(
+                        "select cleared_evidence ->> 'cause' from spawn_alerts where key = $1",
+                        &[&key],
+                    )
+                    .expect("the clear")
+                    .get(0);
+                assert_eq!(cause, "not_parked");
+                assert_eq!(alert(client, &format!("task_parked:8:{eight}")).0, "open");
+                assert_eq!(monitor.parked.keys().copied().collect::<Vec<_>>(), [8]);
+                drop(monitor);
+                // A start with nothing changed fires and clears nothing.
+                let monitor = started(store);
+                assert_eq!(alert(client, &format!("task_parked:8:{eight}")).0, "open");
+                assert_eq!(monitor.parked.keys().copied().collect::<Vec<_>>(), [8]);
             });
         }
 
