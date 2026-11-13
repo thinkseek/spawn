@@ -3982,6 +3982,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
     /// and the payload hash `x-amz-content-sha256` names (as an s3 signer
     /// takes it). Returns it with the query as sent.
     fn canonical_request(url: &str, config: &str) -> (String, String) {
+        use std::fmt::Write as _;
         let rest = url.split_once("://").expect("scheme").1;
         let (host, path_and_query) = rest.split_once('/').expect("path");
         let (path, sent) = path_and_query
@@ -4006,10 +4007,12 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             .find(|(name, _)| name == "x-amz-content-sha256")
             .map_or("(no payload hash)", |(_, value)| value.as_str())
             .to_string();
-        let canonical_headers: String = headers
+        let canonical_headers = headers
             .iter()
-            .map(|(name, value)| format!("{name}:{value}\n"))
-            .collect();
+            .fold(String::new(), |mut out, (name, value)| {
+                let _ = writeln!(out, "{name}:{value}");
+                out
+            });
         let signed = headers
             .iter()
             .map(|(name, _)| name.as_str())
