@@ -9,7 +9,15 @@
 //!   by another process (other start ticks);
 //! - idle: no marker, and nothing in it changed in 24 h.
 //!
-//! Gone and idle are "nobody owns". Never counted, whatever the
+//! A claimed folder (objective 140, `spawn scratch claim`: its `.spawn-owner`
+//! holds a claim, crate::scratch_owner) is owned while its lease runs, and
+//! nobody's after ("lease ended"). An unmarked top-level directory (a
+//! session's folder) may hold claimed folders one level below: each is
+//! listed, and the entry itself is judged as above. Every claimed folder is
+//! listed ([`Claimed`]) with its bytes and its build paths' bytes, those
+//! reached through real directories only.
+//!
+//! Gone, idle and lease ended are "nobody owns". Never counted, whatever the
 //! configuration says: symlinks (never followed, at any depth); an entry
 //! holding any `*.jsonl` file (a transcript tree); `.transcripts`, names
 //! starting `incident-`, names ending `.pending` or `-pending`;
@@ -40,6 +48,8 @@ pub(super) enum Reason {
     Gone,
     /// No marker, and nothing in it changed in 24 h.
     Idle,
+    /// Its claim's lease ended (objective 140).
+    LeaseEnded,
 }
 
 impl Reason {
@@ -47,6 +57,7 @@ impl Reason {
         match self {
             Reason::Gone => "gone",
             Reason::Idle => "idle",
+            Reason::LeaseEnded => "lease ended",
         }
     }
 }
@@ -57,6 +68,23 @@ pub(super) struct Unowned {
     pub(super) path: PathBuf,
     pub(super) bytes: u64,
     pub(super) reason: Reason,
+}
+
+/// A claimed folder (objective 140): its path, its claim, its regular
+/// files' bytes and its build paths' bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Claimed {
+    pub(super) path: PathBuf,
+    pub(super) claim: crate::scratch_owner::Claim,
+    pub(super) bytes: u64,
+    pub(super) build_bytes: u64,
+}
+
+/// What a walk found: the entries nobody owns and every claimed folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Walk {
+    pub(super) unowned: Vec<Unowned>,
+    pub(super) claimed: Vec<Claimed>,
 }
 
 /// How far one root's walk may go: entries visited and time spent. A walk
@@ -224,6 +252,75 @@ fn found(entry: &Path, metadata: &std::fs::Metadata, budget: &mut Budget) -> Opt
     Some(found)
 }
 
+/// The bytes of `folder`'s build paths (each counted once), only those
+/// reached through real directories: a part that is a symlink, or missing,
+/// gives nothing. `None` when the budget runs out.
+fn build_bytes(folder: &Path, build: &[String], budget: &mut Budget) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut seen: Vec<&str> = Vec::new();
+    for path in build {
+        if seen.contains(&path.as_str()) {
+            continue;
+        }
+        seen.push(path);
+        let mut at = folder.to_path_buf();
+        let mut real = true;
+        for part in Path::new(path).components() {
+            at.push(part);
+            if !std::fs::symlink_metadata(&at)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                real = false;
+                break;
+            }
+        }
+        if real {
+            let metadata = std::fs::symlink_metadata(&at).ok()?;
+            total = total.saturating_add(found(&at, &metadata, budget)?.bytes);
+        }
+    }
+    Some(total)
+}
+
+/// `folder`'s claim as a [`Claimed`], its bytes `bytes` (the walk's count),
+/// or `None` without one. `Err(())` when the budget runs out.
+fn claimed(folder: &Path, bytes: u64, budget: &mut Budget) -> Result<Option<Claimed>, ()> {
+    let Some(claim) = crate::scratch_owner::claim_in(folder) else {
+        return Ok(None);
+    };
+    let build_bytes = build_bytes(folder, &claim.build, budget).ok_or(())?;
+    Ok(Some(Claimed {
+        path: folder.to_path_buf(),
+        claim,
+        bytes,
+        build_bytes,
+    }))
+}
+
+/// The claimed folders one level below the unmarked directory `entry`.
+/// `Err(())` when the budget runs out.
+fn claimed_below(entry: &Path, budget: &mut Budget) -> Result<Vec<Claimed>, ()> {
+    let mut below = Vec::new();
+    let Ok(children) = std::fs::read_dir(entry) else {
+        return Ok(below);
+    };
+    for child in children.flatten() {
+        let path = child.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if crate::scratch_owner::claim_in(&path).is_none() {
+            continue;
+        }
+        let bytes = found(&path, &metadata, budget).ok_or(())?.bytes;
+        below.extend(claimed(&path, bytes, budget)?);
+    }
+    Ok(below)
+}
+
 /// Whose `entry` is by its marker: `Some(true)` a process that still runs
 /// at the marker's start time, `Some(false)` one gone (or a pid used
 /// again), `None` without a marker that reads as `<pid> <start ticks>`.
@@ -251,6 +348,21 @@ pub(super) fn unowned_in(
     runs: &dyn Fn(u32, u64) -> bool,
     bound: Bound,
 ) -> Result<Vec<Unowned>, String> {
+    walk_in(root, excludes, never, now_ms, runs, bound).map(|walk| walk.unowned)
+}
+
+/// [`unowned_in`]'s walk, with every claimed folder it met (objective 140):
+/// at the top level, owned while its lease runs and nobody's after; one
+/// level below an unmarked directory, listed while the entry is judged as
+/// 094 judges it.
+pub(super) fn walk_in(
+    root: &Path,
+    excludes: &[PathBuf],
+    never: &[PathBuf],
+    now_ms: i64,
+    runs: &dyn Fn(u32, u64) -> bool,
+    bound: Bound,
+) -> Result<Walk, String> {
     let mut budget = Budget {
         left: bound.entries,
         until: Instant::now() + bound.time,
@@ -270,7 +382,7 @@ pub(super) fn unowned_in(
     let never = &with_resolved(never);
     let entries =
         std::fs::read_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
-    let mut unowned = Vec::new();
+    let mut walk = Walk::default();
     for entry in entries.flatten() {
         if !budget.take() {
             return Err(over());
@@ -293,19 +405,40 @@ pub(super) fn unowned_in(
         if found.jsonl {
             continue;
         }
+        if metadata.is_dir() {
+            match claimed(&path, found.bytes, &mut budget).map_err(|()| over())? {
+                Some(claim) => {
+                    let ended = claim.claim.lease_until_ms <= now_ms;
+                    walk.claimed.push(claim);
+                    if ended {
+                        walk.unowned.push(Unowned {
+                            path,
+                            bytes: found.bytes,
+                            reason: Reason::LeaseEnded,
+                        });
+                    }
+                    continue;
+                }
+                None if std::fs::symlink_metadata(path.join(MARKER)).is_err() => {
+                    walk.claimed
+                        .extend(claimed_below(&path, &mut budget).map_err(|()| over())?);
+                }
+                None => {}
+            }
+        }
         let reason = match marker_runs(&path, runs) {
             Some(true) => continue,
             Some(false) => Reason::Gone,
             None if now_ms.saturating_sub(found.newest_ms) < IDLE_MS => continue,
             None => Reason::Idle,
         };
-        unowned.push(Unowned {
+        walk.unowned.push(Unowned {
             path,
             bytes: found.bytes,
             reason,
         });
     }
-    Ok(unowned)
+    Ok(walk)
 }
 
 /// The roots of `roots` that are refused ([`refused_root`]), each with why,
@@ -330,7 +463,21 @@ pub(super) fn unowned(
     runs: &dyn Fn(u32, u64) -> bool,
     bound: Bound,
 ) -> Result<Vec<Unowned>, String> {
+    walk(roots, excludes, never, now_ms, runs, bound).map(|walk| walk.unowned)
+}
+
+/// [`unowned`]'s walk of every root, with every claimed folder it met, by
+/// agent then oldest first (then by path).
+pub(super) fn walk(
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    never: &[PathBuf],
+    now_ms: i64,
+    runs: &dyn Fn(u32, u64) -> bool,
+    bound: Bound,
+) -> Result<Walk, String> {
     let mut all = Vec::new();
+    let mut claimed = Vec::new();
     for root in roots {
         if let Some(why) = refused_root(root) {
             eprintln!(
@@ -339,8 +486,11 @@ pub(super) fn unowned(
             );
             continue;
         }
-        match unowned_in(root, excludes, never, now_ms, runs, bound) {
-            Ok(found) => all.extend(found),
+        match walk_in(root, excludes, never, now_ms, runs, bound) {
+            Ok(found) => {
+                all.extend(found.unowned);
+                claimed.extend(found.claimed);
+            }
             Err(why) if std::fs::symlink_metadata(root).is_err() => {
                 eprintln!("core-lines: scratch root {}: {why}", root.display());
             }
@@ -353,7 +503,17 @@ pub(super) fn unowned(
             .cmp(&left.bytes)
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok(all)
+    claimed.sort_by(|left: &Claimed, right: &Claimed| {
+        left.claim
+            .agent
+            .cmp(&right.claim.agent)
+            .then_with(|| left.claim.created_ms.cmp(&right.claim.created_ms))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(Walk {
+        unowned: all,
+        claimed,
+    })
 }
 
 #[cfg(test)]
