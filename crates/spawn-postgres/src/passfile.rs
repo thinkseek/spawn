@@ -409,6 +409,5 @@ mod tests {
             "the passfile's line matched the URL's own host, port, database and user"
         );
         assert!(connected, "the passfile's password logs in");
-        eprintln!("PROBE-109 ran to the end");
     }
 }

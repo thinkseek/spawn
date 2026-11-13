@@ -486,15 +486,16 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 ///
 /// # Errors
 ///
-/// When the owner's URL is not `scheme://...` or carries no password (the
+/// When the owner's URL is not `scheme://...` or has no password, in it or
+/// in the passfile (the
 /// logins' passwords derive from it, and from nothing they would be
 /// public), or the database is unreachable or not migrated.
 pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     let password = url_password(owner);
     let Some((scheme, rest)) = owner.split_once("://").filter(|_| !password.is_empty()) else {
         return Err(format!(
-            "{role}: the database URL must be scheme://user:password@host/... \
-             (the restricted logins' passwords derive from the owner's)"
+            "{role}: the database URL must be scheme://user:password@host/..., or its \
+             password a passfile line's (the restricted logins' passwords derive from the owner's)"
         ));
     };
     let mut config = passfile::config(owner).map_err(|error| format!("{role}: {error}"))?;
