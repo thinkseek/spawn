@@ -267,8 +267,10 @@ mod tests {
             .map(|figure| (figure.key, figure.unit, figure.value.clone()))
             .collect();
         // Not measured: the five performance figures (none read) and the
-        // two other north stars not collected, every storage figure
-        // measured, itself left out though it starts with no value.
+        // two other north stars not collected, the disk's fall and the
+        // store that grew most (objective 141: no readings here), every
+        // other storage figure measured, itself left out though it starts
+        // with no value.
         assert_eq!(
             guardrails,
             [
@@ -278,7 +280,7 @@ mod tests {
                     "ratio",
                     json!(0.125)
                 ),
-                ("observability.not_measured", "count", json!(7)),
+                ("observability.not_measured", "count", json!(9)),
             ]
         );
         // Nothing read: the two guardrails count too.
@@ -291,7 +293,7 @@ mod tests {
         );
         assert_eq!(bare[2].guardrails[0].value, Value::Null);
         assert_eq!(bare[2].guardrails[1].value, Value::Null);
-        assert_eq!(bare[2].guardrails[2].value, json!(9));
+        assert_eq!(bare[2].guardrails[2].value, json!(11));
         // Its range and state as for every figure.
         let view = answer(
             &all,

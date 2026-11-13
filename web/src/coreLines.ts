@@ -29,6 +29,9 @@ export interface CoreFigure {
   /** The window a figure is read over, when it says one (objective 100:
    * interventions per agent-hour, "24h"). */
   window?: string;
+  /** The store a figure names (objective 141: the store that grew most),
+   * said after its name. */
+  store?: string;
 }
 
 /** One day of a figure's trend. */
@@ -248,13 +251,19 @@ function windowWords(window: unknown): string {
   return ` (${window})`;
 }
 
+/** The store a figure names, after its name: ": <store>", nothing without
+ * one. */
+function storeWords(store: unknown): string {
+  return typeof store === "string" && store !== "" ? `: ${store}` : "";
+}
+
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
   const value = finite(figure.value);
   const since = finite(figure.measuring_since_ms);
   return {
-    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}`,
+    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}`,
     value:
       value !== null ? unitWords(unit, value) : since !== null ? `measuring since ${sinceWords(since)}` : "not collected yet",
     range: rangeWords(unit, figure.range),
