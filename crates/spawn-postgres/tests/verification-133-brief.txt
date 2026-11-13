@@ -1,0 +1,59 @@
+Objective 133: [observability] An objective's verification after its landing is recorded, and what is landed and not verified is listed (133a)
+
+Spawn, mission 4, objective 133 [observability] (133a; 133b, the alert, comes after it): an objective's verification after its landing is recorded, and what is landed and not verified is listed.
+
+Where things stand.
+- An objective counts as done when its gate passes and it lands. The look at the running product is a separate step, and the store records none of it: on the live store there is no verification record of any kind but backups' (backup.verified, 11 records). sync/features.md tracks Verified by hand.
+- The live store holds 242 task.landed records, each of a distinct mission and objective (114 objective numbers). 45 of those objectives have their newest landing on or after 2026-11-13 00:00 +08:00; 190 landed over a day ago (read 2026-11-13 21:xx).
+- Since 2026-11-13 every objective carries a "Verified by:" paragraph in its prompt, and a landed task's brief holds the prompt. Of the tasks landed since 11-13 00:00: mission 9, 12 of 26 carry the line; mission 4, 2 of 19.
+- Objectives are numbered per mission: Flake Doctor's 028 (mission 9) is not Spawn's 028 (mission 4).
+- Spawn's own deploys are recorded (deploy.finished, 73 records since 11-12, through spawn_deploy_record), but a deploy record names no mission or source, and owner deploys' heads match no landing (52 of 73). So no landing or mission can be said to be deployed from the record.
+- Lead-mac's review §2.8 (sync/review-spawn-2026-11-13.md): "unverified landings older than a day are listed".
+
+Read:
+- crates/spawn-postgres/sql/schema.sql: `spawn_deploy_record` and `spawn_backup_record` (owner-only writers that check a record's shape), the control fold's `deploy.finished` arm, the function list whose search_path is set, and `spawn_events_landing`.
+- crates/spawn-postgres/tests/deploy.rs: `a_deploy_record_has_its_fields_and_nothing_else`, `only_the_owner_records_deploys`.
+- crates/spawn-cli/src/missions.rs: `deployed` (`spawn mission deployed`).
+- crates/spawn-cli/src/serve.rs: `reader`, `alerts`.
+- rsi/scenarios/095.sh (a seeded history and spawn serve).
+
+Required behaviour.
+(1) The record. `objective.verified` {type, mission, objective, by, how, result}, through a new owner-only `spawn_verification_record(jsonb)` (security definer, in the search_path list), its shape fixed and every field checked, nothing else taken:
+- mission and objective: whole numbers from 1;
+- by: 1 to 80 characters, not blank;
+- how: 1 to 500 characters, not blank;
+- result: pass or fail.
+An objective that never landed in that mission (no task.landed of a task of that mission and objective) is refused with "objective <m>/<o> never landed". The control fold takes it into no table. A login that is not the owner may not record one.
+
+(2) `spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail` records one and prints {event, objective}, the objective named "<mission>/<NNN>" (three digits: "9/028"); "9/28" and "9/028" both name it. A name that is not <mission>/<objective> with whole numbers from 1, a missing flag or a result other than pass or fail is refused before the store. The usage lists it and `spawn verify list`.
+
+(3) The list. `spawn verify list` prints, and `GET /api/verifications` answers (through the reader login, the same JSON):
+- `unverified`: the objectives whose newest landing (the newest task.landed of a task of that mission and objective, by its record's time) is on or after 2026-11-13 00:00 +08:00 (1794499200000, when "Verified by:" became required) and whose newest verification recorded after that landing is not a pass (none, or a fail: the newest decides, so a fail after a pass puts an objective back and a pass after a fail takes it off; a landing again opens an objective again), oldest landing first, each {objective, task, landed_ms, age_ms, over_a_day, verified_by, last}:
+  - verified_by: the landed task's brief's last line that starts with "Verified by:" once leading blanks are trimmed, that whole line trimmed, or null. The phrase quoted inside another line is not it (this prompt quotes it in "Where things stand");
+  - last: the newest verification after the landing ({result, by, how, at_ms}: a fail), or null;
+  - over_a_day: age_ms at least 24 h;
+- `over_a_day`: how many of them;
+- `older_unverified`: how many objectives whose newest landing is before 11-13 00:00 are not verified by the same rule (one count, so the older landings do not bury today's);
+- `listed_since_ms`: 1794499200000;
+- `deploy`: Spawn's own newest deploy.finished (by its record's time), {what: "Spawn's own deploys (deploy/deploy.sh)", at_ms, head, ok, reason}, or null: no claim about any one landing or mission (projects-47).
+
+What stays as it is: every other record, command and API; the control fold of every other record; no page changes (the page part comes with a page objective after 125; the alert "N landed objectives unverified for over a day" is 133b).
+
+Polled read: none. /api/verifications is read on request only (no page polls it yet). Each part of the read names one record type (task.landed, objective.verified, deploy.finished), so it is read through spawn_events_control_record_type (type, recorded_at_ms, id), never the whole control stream (rev-g's N2), and mission_tasks by id. 133b's polled read has the same parts with a time window; the lead's EXPLAIN (ANALYZE, BUFFERS) on live used that index for each part, with no seq scan: 0.52 ms since 11-13 00:00 (48 objectives), 1.36 ms for 24 h, 2.30 ms for 7 d.
+
+Tests:
+- spawn-postgres, a new tests/verification.rs, through the real store: the record's fields and nothing else (each field refused alone, the same number in another mission, an objective never assigned or not landed yet), only the owner, and the read (the newest landing per mission and objective, its "Verified by:" line or null, the verifications oldest first, the newest deploy). The "Verified by:" line is pinned on this prompt as a brief (tests/verification-133-brief.txt): it reads the paragraph's line, not the quote in "Where things stand"; and the last of two such lines is taken.
+- spawn-cli, src/verify.rs: the list's rules (a pass after the newest landing verifies; one before it does not; the newest decides: a fail after a pass is listed with its result, a pass after a fail is not; one number in two missions; landings before 11-13 counted; over a day) and the names.
+Each rule removed alone must fail a test or the scenario.
+
+Files (expected): crates/spawn-postgres/sql/schema.sql, crates/spawn-postgres/src/lib.rs, a new crates/spawn-postgres/src/verifications.rs, a new crates/spawn-postgres/tests/verification.rs with tests/verification-133-brief.txt (this prompt, pinned), a new crates/spawn-cli/src/verify.rs, crates/spawn-cli/src/main.rs (the dispatch line, the usage, the module and its doc line only) and crates/spawn-cli/src/serve.rs (the route). main.rs may meet objective 123 (rev-f's secret verbs) there; the integrator merges. The throwaway is about 310 lines of code and doc comments and 410 of tests (57 of them this prompt, pinned).
+
+Acceptance: rsi/scenarios/133.sh. Black box on its own database, a seeded history (C = 2026-11-13 00:00 +08:00, N = now):
+- mission 1: objective 130 (its brief quoting "Verified by:" inside its first line, then the line "Verified by: the lead reads the card.") landed C+1 h; 131 landed C-48 h; 132 landed C-50 h; 133 landed N-1 h;
+- mission 2: objective 130 (no such line) landed C+2 h; 28 landed C+3 h;
+- deploys: ok at C+1.5 h, failed at N-0.5 h ("the build failed").
+(1) `spawn verify` records 1/132 fail then pass (printing {event, objective "1/132"}), 1/133 pass then fail, and 2/028 pass; refuses 2/131 and 1/134 (never landed), "maybe" and the names 130 and 0/130, recording nothing. Then 2/028 lands again.
+(2) `spawn verify list`: 1/130 (its line, not the quote), 2/130, 1/133 (its newest a fail), 2/028 (open again), oldest first, over_a_day as their ages say; older_unverified 1 (1/131; 1/132's newest is a pass); the deploy at N-0.5 h, failed; and `GET /api/verifications` the same (ages aside).
+On main b5ad3ba1, 133.sh exits 1 with 13 checks failed, the first "(1) spawn verify 1/132 --result fail exited 1: spawn: unknown command verify".
+
+Verified by: the gate runs 133.sh on the candidate. After the landing, the lead runs `spawn verify list` on the live store and posts the unverified objectives since 11-13 beside sync/features.md, records one verification (`spawn verify 4/133 --by lead --how … --result pass`, once 133 itself has been looked at) and posts that 4/133 leaves the list; rev-g reviews.
