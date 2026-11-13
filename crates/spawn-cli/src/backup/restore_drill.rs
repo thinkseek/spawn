@@ -47,9 +47,16 @@
 //! fails both, with its reason and no count. A drill that cannot run (exit
 //! 2) records nothing; a record the store refuses is said and exits 2. The
 //! Core lines recovery rows read them (`record`). Otherwise it writes
-//! nothing live: no lock, git and the files read only. The key is read as `spawn backup verify` reads it
-//! (`SPAWN_BACKUP_KEY_FILE`, mode 600, given to gpg by path) and nothing of
-//! it is printed. The scratch directory is made with mode 700 under `--into`
+//! nothing live: no lock, git and the files read only.
+//!
+//! The chain is read with the key its records name (objective 114): every
+//! link must name the newest link's key (a chain that crosses keys cannot
+//! be restored, exit 1), and each object's `x-amz-meta-spawn-seal` must say
+//! it too (absent: k1). A link whose `sealed_with` is not a key name, or a
+//! chain key whose file is not on this host, fails both resources with that
+//! reason, exit 2. The key file is given to gpg by path (mode 600) and
+//! nothing of it is printed; a refused name is never echoed. The scratch
+//! directory is made with mode 700 under `--into`
 //! (default `/data/tmp`), which may not be under `$HOME`, `$SPAWN_LIVE` or
 //! the workspace root; it is removed at the end (kept with `--keep`), and
 //! only once it is checked to be the directory this run made.
@@ -65,8 +72,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BundleRecord, Settings, bundle_records, decompress_bundle, decrypt, get_object_bytes,
-    header_value, heads_of, hex, output, random_hex, sha256_file,
+    BundleRecord, Key, Settings, bundle_records, decompress_bundle, decrypt_with,
+    get_object_bytes, header_value, heads_of, hex, object_key, output, random_hex, reading_key,
+    record_key, same_key, sha256_file,
 };
 use crate::Flags;
 use crate::config::{env_value, open_store};
@@ -131,8 +139,21 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             chain[chain.len() - 1].event_id
         );
     }
+    // One key reads the whole chain, and its file must be here.
+    let seal = match chain_key(&chain) {
+        Ok(name) => match reading_key(&name, "the bundle chain") {
+            Ok(seal) => seal,
+            Err(reason) => return Ok(fail_both(&store, &records, &reason, started, 2)),
+        },
+        Err(ChainKey::Refused(reason)) => {
+            return Ok(fail_both(&store, &records, &reason, started, 2));
+        }
+        Err(ChainKey::Crossed(reason)) => {
+            return Ok(unrestorable(&store, &records, &reason, started));
+        }
+    };
     let drill = DrillDir::create(&parent)?;
-    let result = run(&settings, &chain, drill.path());
+    let result = run(&settings, &chain, &seal, drill.path());
     let newest = chain[chain.len() - 1];
     let (code, outcomes) = match result {
         Ok(report) => (
