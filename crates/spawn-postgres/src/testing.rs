@@ -102,6 +102,13 @@ impl std::fmt::Display for TestSchema {
     }
 }
 
+/// A connection to `url`, its password the passfile's when the URL holds
+/// none (objective 109), so a schema made under a password-less URL is
+/// dropped as it was made.
+fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
+    crate::passfile::config(url)?.connect(postgres::NoTls)
+}
+
 impl Drop for TestSchema {
     fn drop(&mut self) {
         if std::thread::panicking() {
