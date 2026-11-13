@@ -4552,6 +4552,18 @@ fn files_digest(files: &[String]) -> u64 {
 ///   long-lived spawn processes are also not dumpable
 ///   (`spawn_host::undumpable`), which is what keeps their environment
 ///   from the same user.
+/// - The accidental prints of a password (url-leak-sources.md): a URL
+///   that holds one anywhere in a command (`*://*:*@*`), the whole
+///   environment printed (`env`, `printenv`, `export -p`, `declare -x`,
+///   `set` and their kin, alone or behind a pipe, `;` or `&&`), process
+///   listings with their arguments (`ps -ef`, `ps aux`, `ps -o args`,
+///   `pgrep -a`/`-l`, `top -c`, `pstree -a`, `/proc/<pid>/cmdline`), and
+///   Claude Code's settings by any path (`cd ~/.claude`). Not `echo $X`,
+///   `env -u X` with no command or an interpreter that prints the
+///   environment: a glob cannot tell them from what must run, and an
+///   engine's environment with no password closes those at the source.
+///   The task's prompt says what to do instead (deliver's credentials
+///   line): a deny rule carries no message of its own.
 ///
 /// Claude Code's own files under `~/.claude` are its internal writes, not
 /// tool calls: a session, its transcript and a resume work with all of it
@@ -4643,6 +4655,161 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*ps *eww*)",
     "Bash(*ps *axe*)",
     "Bash(*ps *auxe*)",
+    // A URL that holds a password, anywhere in a command: it shows in
+    // other agents' process listings (url-leak-sources.md, 2026-11-06..08).
+    "Bash(*://*:*@*)",
+    // The whole environment printed: engines' environments hold the test
+    // database's URL, and Claude Code hands every tool shell the env block
+    // of ~/.claude/settings.json (the gateway key). Alone, or behind a
+    // pipe, `;` or `&&`, so the refusal does not depend on Claude Code
+    // splitting the command. `printenv HOME`, `set -e`, `export FOO=bar`
+    // and `env VAR=x cmd` still run.
+    "Bash(env)",
+    "Bash(env |*)",
+    "Bash(env|*)",
+    "Bash(*; env)",
+    "Bash(*&& env)",
+    "Bash(*; env |*)",
+    "Bash(*&& env |*)",
+    "Bash(printenv)",
+    "Bash(printenv |*)",
+    "Bash(printenv|*)",
+    "Bash(*; printenv)",
+    "Bash(*&& printenv)",
+    "Bash(*; printenv |*)",
+    "Bash(*&& printenv |*)",
+    "Bash(export -p)",
+    "Bash(export -p |*)",
+    "Bash(export -p|*)",
+    "Bash(*; export -p)",
+    "Bash(*&& export -p)",
+    "Bash(*; export -p |*)",
+    "Bash(*&& export -p |*)",
+    "Bash(declare -x)",
+    "Bash(declare -x |*)",
+    "Bash(declare -x|*)",
+    "Bash(*; declare -x)",
+    "Bash(*&& declare -x)",
+    "Bash(*; declare -x |*)",
+    "Bash(*&& declare -x |*)",
+    "Bash(set)",
+    "Bash(set |*)",
+    "Bash(set|*)",
+    "Bash(*; set)",
+    "Bash(*&& set)",
+    "Bash(*; set |*)",
+    "Bash(*&& set |*)",
+    "Bash(export)",
+    "Bash(export |*)",
+    "Bash(export|*)",
+    "Bash(*; export)",
+    "Bash(*&& export)",
+    "Bash(*; export |*)",
+    "Bash(*&& export |*)",
+    "Bash(declare)",
+    "Bash(declare |*)",
+    "Bash(declare|*)",
+    "Bash(*; declare)",
+    "Bash(*&& declare)",
+    "Bash(*; declare |*)",
+    "Bash(*&& declare |*)",
+    "Bash(declare -p)",
+    "Bash(declare -p |*)",
+    "Bash(declare -p|*)",
+    "Bash(*; declare -p)",
+    "Bash(*&& declare -p)",
+    "Bash(*; declare -p |*)",
+    "Bash(*&& declare -p |*)",
+    "Bash(typeset)",
+    "Bash(typeset |*)",
+    "Bash(typeset|*)",
+    "Bash(*; typeset)",
+    "Bash(*&& typeset)",
+    "Bash(*; typeset |*)",
+    "Bash(*&& typeset |*)",
+    "Bash(typeset -p)",
+    "Bash(typeset -p |*)",
+    "Bash(typeset -p|*)",
+    "Bash(*; typeset -p)",
+    "Bash(*&& typeset -p)",
+    "Bash(*; typeset -p |*)",
+    "Bash(*&& typeset -p |*)",
+    "Bash(typeset -x)",
+    "Bash(typeset -x |*)",
+    "Bash(typeset -x|*)",
+    "Bash(*; typeset -x)",
+    "Bash(*&& typeset -x)",
+    "Bash(*; typeset -x |*)",
+    "Bash(*&& typeset -x |*)",
+    "Bash(env -0)",
+    "Bash(env -0 |*)",
+    "Bash(env -0|*)",
+    "Bash(*; env -0)",
+    "Bash(*&& env -0)",
+    "Bash(*; env -0 |*)",
+    "Bash(*&& env -0 |*)",
+    "Bash(env --null)",
+    "Bash(env --null |*)",
+    "Bash(env --null|*)",
+    "Bash(*; env --null)",
+    "Bash(*&& env --null)",
+    "Bash(*; env --null |*)",
+    "Bash(*&& env --null |*)",
+    "Bash(/usr/bin/env)",
+    "Bash(/usr/bin/env |*)",
+    "Bash(/usr/bin/env|*)",
+    "Bash(*; /usr/bin/env)",
+    "Bash(*&& /usr/bin/env)",
+    "Bash(*; /usr/bin/env |*)",
+    "Bash(*&& /usr/bin/env |*)",
+    "Bash(command env)",
+    "Bash(command env |*)",
+    "Bash(command env|*)",
+    "Bash(*; command env)",
+    "Bash(*&& command env)",
+    "Bash(*; command env |*)",
+    "Bash(*&& command env |*)",
+    // Process listings with their arguments: a URL on another agent's
+    // command line shows in them. `ps -p <pid>`, `pgrep -f` (pids only),
+    // `top -b -n 1` and `pstree -p` still run.
+    "Bash(*ps -ef*)",
+    "Bash(*ps -fe*)",
+    "Bash(*ps -eF*)",
+    "Bash(*ps -f *)",
+    "Bash(*ps -fp*)",
+    "Bash(*ps aux*)",
+    "Bash(*ps axu*)",
+    "Bash(*ps -aux*)",
+    "Bash(*ps *args*)",
+    "Bash(*ps *cmd*)",
+    "Bash(*ps *command*)",
+    "Bash(*pgrep* -a*)",
+    "Bash(*pgrep* -fa*)",
+    "Bash(*pgrep* -af*)",
+    "Bash(*pgrep* -l*)",
+    "Bash(*pgrep* -fl*)",
+    "Bash(*pgrep* -lf*)",
+    "Bash(*pgrep* --list*)",
+    "Bash(*ps ax*)",
+    "Bash(*ps x*)",
+    "Bash(*ps -e -f*)",
+    "Bash(*ps -A -f*)",
+    "Bash(*ps -Af*)",
+    "Bash(*ps -wwf*)",
+    "Bash(*ps -wf*)",
+    "Bash(*top *-c*)",
+    "Bash(*pstree -a*)",
+    "Bash(*pstree -pa*)",
+    "Bash(*pstree -ap*)",
+    "Bash(*pstree * -a*)",
+    "Bash(*/cmdline*)",
+    "Read(//proc/**)",
+    // Claude Code's settings by any path (they hold the gateway key):
+    // `cd ~/.claude && grep … settings.json` names no file the rules above
+    // know. A workspace's own .claude is refused too.
+    "Bash(*/.claude*)",
+    "Bash(*cd .claude*)",
+    "Bash(*settings.local.json*)",
     // Killing by name or pattern reaches other agents' and gates'
     // processes (2026-11-08 05:19: a resident's `pkill -f 'cargo test'`
     // killed a ccd's run). `kill <pid>` stays: an engine stops its own
@@ -4868,6 +5035,104 @@ mod tests {
     use crate::screen::ScreenState;
     use crate::time::{ManualClock, Timestamp};
     use std::time::Duration;
+
+    /// Claude Code's documented Bash rule: `*` matches any text.
+    fn glob(pattern: &str, text: &str) -> bool {
+        let (pattern, text): (Vec<char>, Vec<char>) =
+            (pattern.chars().collect(), text.chars().collect());
+        let mut reach = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+        reach[0][0] = true;
+        for i in 1..=pattern.len() {
+            for j in 0..=text.len() {
+                reach[i][j] = if pattern[i - 1] == '*' {
+                    reach[i - 1][j] || (j > 0 && reach[i][j - 1])
+                } else {
+                    j > 0 && reach[i - 1][j - 1] && pattern[i - 1] == text[j - 1]
+                };
+            }
+        }
+        reach[pattern.len()][text.len()]
+    }
+
+    #[test]
+    fn engines_are_refused_the_accidental_prints_of_a_password() {
+        let refused = |command: &str| {
+            super::CREDENTIAL_DENY.iter().any(|rule| {
+                rule.strip_prefix("Bash(")
+                    .and_then(|body| body.strip_suffix(')'))
+                    .is_some_and(|body| glob(body, command))
+            })
+        };
+        let parts = |command: &str| {
+            command
+                .split(['|', ';', '&', '\n'])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for command in [
+            "env",
+            "env | grep -i spawn",
+            "env|grep PG",
+            "cd /tmp && env",
+            "cd /tmp; env | sort",
+            "printenv | grep DATABASE",
+            "export -p",
+            "declare -x",
+            "set | grep SPAWN",
+            "typeset -p",
+            "env --null | tr '\\0' '\\n'",
+            "/usr/bin/env",
+            "command env",
+            "cat /proc/self/environ",
+            "psql 'postgres://bb:made-up-pw@localhost/bb' -c 'select 1'",
+            "cd /tmp; SPAWN_TEST_DATABASE_URL=postgres://bb:pw@localhost/bb cargo test",
+            "ps -ef | grep cargo",
+            "ps aux",
+            "ps -eo pid,args",
+            "ps -o cmd= -p 1",
+            "pgrep -af cargo",
+            "pgrep -u 501 -a sh",
+            "cat /proc/1/cmdline",
+            "top -b -n 1 -c",
+            "pstree -ap",
+            "cd ~/.claude && grep TOKEN settings.json",
+            "cd; cd .claude; less settings.json",
+            "python3 -c \"open('/home/bb/.claude/settings.local.json')\"",
+            "strings ~/.local/share/spawn-rsi/spawn.env.bak-relay",
+        ] {
+            assert!(refused(command), "{command}");
+        }
+        for command in [
+            "env VAR=x cargo test",
+            "env -u FOO sh -c true",
+            "env -i PATH=/usr/bin sh -c true",
+            "printenv HOME",
+            "set -euo pipefail; make",
+            "export FOO=bar",
+            "declare -a list",
+            "declare -p FOO",
+            "psql 'postgres://bb@localhost/bb' -c 'select 1'",
+            "curl -s http://127.0.0.1:8787/api/rsi",
+            "ps -p 123",
+            "ps -o pid,etime -p 123",
+            "pgrep -f cargo",
+            "pgrep -x tmux",
+            "kill 123",
+            "cat /proc/loadavg",
+            "ls ~/.config",
+            "top -b -n 1",
+            "pstree -p",
+            "cd env && ls",
+        ] {
+            assert!(!refused(command), "{command}");
+            for part in parts(command) {
+                assert!(!refused(&part), "{command}: {part}");
+            }
+        }
+        assert!(super::CREDENTIAL_DENY.contains(&"Read(//proc/**)"));
+    }
 
     /// A pane at the input box, as the screen reader draws it.
     const READY: &str = "❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";

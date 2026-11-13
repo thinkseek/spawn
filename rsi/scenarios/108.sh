@@ -28,16 +28,17 @@
 # engine, which keeps the --settings it is handed and every line typed into
 # it. One objective is assigned and delivered (to the resident).
 #   (1) The deny list handed to every engine started (the resident's, which
-#       takes the objective's task, and any other) holds each of the 141 entries in $WORK/want below,
+#       takes the objective's task, and any other) holds each of the 139 entries in $WORK/want below,
 #       exactly. They are: `Bash(*://*:*@*)`; for each of `env`, `printenv`,
 #       `export -p`, `declare -x`, `set`, `export`, `declare`, `declare -p`,
 #       `typeset`, `typeset -p`, `typeset -x`, `env -0`, `env --null`,
 #       `/usr/bin/env` and `command env` (P), `Bash(P)`, `Bash(P |*)`,
 #       `Bash(P|*)`, `Bash(*; P)`, `Bash(*&& P)`, `Bash(*; P |*)` and
 #       `Bash(*&& P |*)`; the process listings with arguments (`ps -ef`,
-#       `ps aux`, `ps ax`, `ps x`, `ps -e -f`, `ps -A -f`, `ps -Af`,
-#       `ps -wwf`, `ps … args/cmd/command`, `pgrep -a/-l` and their joined
-#       forms, `top … -c`, `pstree -a`, `*/cmdline*`, `Read(//proc/**)`); and Claude Code's settings
+#       `ps aux`, `ps ax`, `ps -e -f`, `ps -A -f`, `ps -Af`, `ps -wwf`,
+#       `ps … args/cmd/command`, `pgrep -a/-l` and their joined forms,
+#       `pstree -a`, `*/cmdline*`, `Read(//proc/**)`; `ps x` and `top … -c`
+#       are 113's, anchored on a command position); and Claude Code's settings
 #       by any path (`*/.claude*`, `*cd .claude*`, `*settings.local.json*`).
 #       An edit that drops one fails.
 #   (2) Matched as Claude Code documents its Bash rules (`*` matches any
@@ -511,13 +512,11 @@ Bash(*&& command env)
 Bash(*; command env |*)
 Bash(*&& command env |*)
 Bash(*ps ax*)
-Bash(*ps x*)
 Bash(*ps -e -f*)
 Bash(*ps -A -f*)
 Bash(*ps -Af*)
 Bash(*ps -wwf*)
 Bash(*ps -wf*)
-Bash(*top *-c*)
 Bash(*pstree -a*)
 Bash(*pstree -pa*)
 Bash(*pstree -ap*)

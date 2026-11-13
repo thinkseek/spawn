@@ -142,7 +142,11 @@ export function CoreLinesCard() {
                 {line?.line === "recoverability" && view.drills.length > 0 && (
                   <ul className="mt-1.5 space-y-0.5" aria-label="Restore drills">
                     {view.drills.map((drill, at) => (
-                      <li key={`${at}:${drill.name}`} className="flex min-w-0 items-baseline gap-2 text-caption">
+                      <li
+                        key={`${at}:${drill.name}`}
+                        className="flex min-w-0 items-baseline gap-2 text-caption"
+                        title={drill.detail !== "" ? drill.detail : undefined}
+                      >
                         <span className="min-w-0 truncate text-muted-foreground">{drill.name}</span>
                         <span className={cx("tnum ml-auto shrink-0", TONE[drill.tone])}>{drill.text}</span>
                       </li>

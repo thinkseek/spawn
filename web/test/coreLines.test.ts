@@ -337,6 +337,48 @@ test("each drill row says its last pass, never passed, or no drill", () => {
   assert.equal(drillMark(null, now).text, "no drill");
 });
 
+// Objective 112: a row whose newest drill failed says so, with its reason.
+test("a drill row whose newest drill failed says failed, its last pass, and its reason", () => {
+  const now = Date.UTC(2026, 10, 12, 12, 0);
+  const view = coreLinesView(
+    {
+      lines: [],
+      drills: [
+        {
+          name: "Database",
+          source: "record backup.verified",
+          passed_at_ms: now - 3 * 3_600_000,
+          last: { at_ms: now - 3_600_000, ok: false, reason: "pg_restore exited 1" },
+        },
+        {
+          name: "Off-host copy",
+          source: "unit bb-drill-b.service",
+          passed_at_ms: null,
+          last: { at_ms: null, ok: false, reason: "Result=exit-code" },
+        },
+        {
+          name: "Archive",
+          source: "unit bb-drill-a.service",
+          passed_at_ms: now - 3_600_000,
+          last: { at_ms: now - 3_600_000, ok: true, reason: "" },
+        },
+      ],
+    },
+    now,
+  );
+  const [db, off, archive] = view.drills;
+  assert.match(db.text, /^failed \d\d-\d\d \d\d:\d\d \(1 h ago\); last passed \d\d-\d\d \d\d:\d\d \(3 h ago\)$/);
+  assert.equal(db.tone, "warning");
+  assert.equal(db.detail, "pg_restore exited 1");
+  assert.equal(off.text, "failed (time unknown); never passed");
+  assert.equal(off.tone, "warning");
+  assert.equal(off.detail, "Result=exit-code");
+  assert.match(archive.text, /^passed .* \(1 h ago\)$/);
+  assert.equal(archive.tone, "plain");
+  assert.equal(archive.detail, "");
+  assert.equal(drillMark(null, now).detail, "");
+});
+
 // Objective 094: a test database URL file the reader refused is said by its
 // name and why, not as a figure not built.
 test("a refused test database URL file is said by its name and its reason", () => {
