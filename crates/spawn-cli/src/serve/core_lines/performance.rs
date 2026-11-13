@@ -17,11 +17,14 @@ static PERFORMANCE: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
 /// scope's `report_to_live` value, `gate_time` value (the median),
 /// `gate_time`'s `undecided_ms` over its `total_ms` (null when the total is
 /// 0), `first_pass` value, and the cost window's `usd_per_landing`. A value
-/// the page does not have is null. While the 7 days are not covered by the
-/// live record (`report_to_live`'s `covered` false, objective 095), report
-/// to live has no value and `measuring_since_ms` is its `measured_from_ms`:
-/// the figure would measure the record's start, not the wait. [`measured`]
-/// holds it back by the same rule from the record's start alone.
+/// the page does not have is null. Report to live is the Scorecard's value
+/// over what the live record covers (objective 132; objective 095 leaves
+/// out the landings from before the record began). While the 7 days are
+/// not covered (`report_to_live`'s `covered` false), `measuring_since_ms` is
+/// its `measured_from_ms` (the record's start) and, with a value, its
+/// window ([`RTL_WINDOW`]) is [`SINCE_THE_RECORD`]; covered, it is
+/// [`COVERED_WINDOW`]. [`measured`] says the same from the record's start
+/// alone.
 pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     let fleet = scorecard["scopes"]
         .as_array()
@@ -42,38 +45,68 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
         "first_pass": fleet["first_pass"]["value"],
         "usd_per_landing": cost["usd_per_landing"],
     });
-    if live["covered"] == false {
-        values["report_to_live"] = Value::Null;
+    if live["covered"] == true {
+        values[RTL_WINDOW] = json!(COVERED_WINDOW);
+    } else if live["covered"] == false {
         values["measuring_since_ms"] = live["measured_from_ms"].clone();
+        if !live["value"].is_null() && !live["measured_from_ms"].is_null() {
+            values[RTL_WINDOW] = json!(SINCE_THE_RECORD);
+        }
     }
     values
 }
 
+/// The performance values' key for the window report to live is read over.
+const RTL_WINDOW: &str = "report_to_live_window";
+
+/// Report to live's window once the live record covers the 7 days.
+const COVERED_WINDOW: &str = "7d";
+
+/// Report to live's window while the live record does not cover the 7 days
+/// (objective 132): it is over what the record covers.
+const SINCE_THE_RECORD: &str = "since the deploy record began";
+
 /// The window report to live is measured over: the Scorecard's default.
 const REPORT_TO_LIVE_WINDOW_MS: i64 = 7 * DAY_MS;
 
-/// `values` with report to live held back while the live record does not
-/// cover its window: with the record starting at `first_deploy_ms` (the
-/// first `deploy.finished`; `None` without one or when it cannot be read)
-/// later than `now_ms` less the window, `report_to_live` is null and
-/// `measuring_since_ms` the record's start (null without a record). Covered,
-/// the values are as they were.
+/// `values` with report to live said over what the live record covers
+/// (objective 132), from the record's start `first_deploy_ms` (the first
+/// `deploy.finished`; `None` without one or when it cannot be read). Later
+/// than `now_ms` less the window: `measuring_since_ms` is the record's start
+/// and, with a value, the window is [`SINCE_THE_RECORD`]. Without a record:
+/// no value, no start and no window. Covered: the value with the window
+/// [`COVERED_WINDOW`] and no start.
 pub(super) fn measured(mut values: Value, first_deploy_ms: Option<i64>, now_ms: i64) -> Value {
-    let covered = first_deploy_ms
-        .is_some_and(|first| first <= now_ms.saturating_sub(REPORT_TO_LIVE_WINDOW_MS));
-    if !covered {
+    let Some(first) = first_deploy_ms else {
         values["report_to_live"] = Value::Null;
-        values["measuring_since_ms"] = first_deploy_ms.map_or(Value::Null, |first| json!(first));
+        values["measuring_since_ms"] = Value::Null;
+        values[RTL_WINDOW] = Value::Null;
+        return values;
+    };
+    if first <= now_ms.saturating_sub(REPORT_TO_LIVE_WINDOW_MS) {
+        if let Some(values) = values.as_object_mut() {
+            values.remove("measuring_since_ms");
+        }
+        values[RTL_WINDOW] = json!(COVERED_WINDOW);
+    } else {
+        values["measuring_since_ms"] = json!(first);
+        values[RTL_WINDOW] = if values["report_to_live"].is_null() {
+            Value::Null
+        } else {
+            json!(SINCE_THE_RECORD)
+        };
     }
     values
 }
 
 /// `samples` (`host.core_lines`, `[{at_ms, values}]`) without a report to
-/// live taken before the live record covered its window (rev-e F1 on
-/// 7b1dd20a): a sample before `first_deploy_ms` plus the window holds the
-/// record's start, not the wait (106 h, sampled live at 19:24), so its trend
-/// never draws it. Without a record (`None`), none is kept. The other
-/// figures stay as they are.
+/// live taken before the live record covered its window, for two reasons:
+/// the samples from before objective 095 hold the record's start, not the
+/// wait (106 h, sampled live at 19:24, rev-e F1 on 7b1dd20a), and all of
+/// them fall before then; the samples since (objective 132) are sound but
+/// over fewer than the trend's 7 days. So a sample before `first_deploy_ms`
+/// plus the window is never drawn. Without a record (`None`), none is kept.
+/// The other figures stay as they are.
 pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>) -> Value {
     let covered_from = first_deploy_ms.map(|first| first.saturating_add(REPORT_TO_LIVE_WINDOW_MS));
     for sample in samples.as_array_mut().into_iter().flatten() {
@@ -88,8 +121,8 @@ pub(super) fn measured_samples(mut samples: Value, first_deploy_ms: Option<i64>)
 
 /// The performance values and the 7-day cost window's `total`, kept for
 /// [`PERFORMANCE_KEPT_MS`]: computed from the 7-day scorecard and cost
-/// window as the pages compute them, report to live held back until the
-/// live record covers the window ([`measured`]). A part that cannot be read
+/// window as the pages compute them, report to live said over what the
+/// live record covers ([`measured`]). A part that cannot be read
 /// counts as not collected. The Scorecard's and the cost window's times go
 /// in `parts` when they are computed, not when they are kept.
 pub(super) fn performance_now(
@@ -167,6 +200,11 @@ pub(super) fn performance_line(performance: &Value) -> Line {
         performance["report_to_live"].clone(),
     );
     report_to_live.measuring_since_ms = performance["measuring_since_ms"].clone();
+    report_to_live.window = match performance[RTL_WINDOW].as_str() {
+        Some(COVERED_WINDOW) => Some(COVERED_WINDOW),
+        Some(SINCE_THE_RECORD) => Some(SINCE_THE_RECORD),
+        _ => None,
+    };
     Line {
         name: "performance",
         north_star: report_to_live,
