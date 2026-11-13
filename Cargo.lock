@@ -664,6 +664,7 @@ dependencies = [
  "spawn-core",
  "spawn-kdf",
  "spawn-postgres",
+ "whoami",
 ]
 
 [[package]]

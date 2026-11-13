@@ -102,6 +102,13 @@ impl std::fmt::Display for TestSchema {
     }
 }
 
+/// A connection to `url`, its password the passfile's when the URL holds
+/// none (objective 109), so a schema made under a password-less URL is
+/// dropped as it was made.
+fn client(url: &str) -> Result<postgres::Client, postgres::Error> {
+    crate::passfile::config(url)?.connect(postgres::NoTls)
+}
+
 impl Drop for TestSchema {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -111,13 +118,12 @@ impl Drop for TestSchema {
             );
             return;
         }
-        let dropped =
-            postgres::Client::connect(&self.url, postgres::NoTls).and_then(|mut client| {
-                client.batch_execute(&format!(
-                    "set lock_timeout = '5s'; drop schema if exists {} cascade",
-                    self.name
-                ))
-            });
+        let dropped = client(&self.url).and_then(|mut client| {
+            client.batch_execute(&format!(
+                "set lock_timeout = '5s'; drop schema if exists {} cascade",
+                self.name
+            ))
+        });
         if let Err(error) = dropped {
             eprintln!("cannot drop the test schema {}: {error}", self.name);
         }
@@ -134,7 +140,7 @@ mod tests {
 
     fn exists(name: &str) -> bool {
         let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
-        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+        let mut client = super::client(&url).expect("connect");
         client
             .query_one(
                 "select count(*) from pg_namespace where nspname = $1",
@@ -167,7 +173,7 @@ mod tests {
         let name = failed.downcast::<String>().expect("its schema's name");
         assert!(exists(&name), "a failed test's schema is kept");
         let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
-        postgres::Client::connect(&url, postgres::NoTls)
+        super::client(&url)
             .expect("connect")
             .batch_execute(&format!("drop schema {name} cascade"))
             .expect("drop the kept schema");
@@ -186,7 +192,7 @@ mod tests {
     fn a_schema_made_by_the_guard_carries_its_comment_and_its_session_name() {
         let schema = TestSchema::new("guard_comment");
         let url = std::env::var(super::TEST_DATABASE_URL).expect("the test database");
-        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+        let mut client = super::client(&url).expect("connect");
         let before: i64 = client
             .query_one(
                 "select floor(extract(epoch from clock_timestamp()) * 1000)::bigint",

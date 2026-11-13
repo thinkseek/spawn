@@ -89,6 +89,7 @@ mod fleet;
 mod gateway;
 mod host;
 mod missions;
+mod passfile;
 mod recovery;
 mod row;
 mod scorecard;
@@ -169,9 +170,7 @@ const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
 impl PostgresStore {
     /// Connect to the database in the URL.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        let config: postgres::Config = url
-            .parse()
-            .map_err(|error: postgres::Error| backend(&error))?;
+        let config = passfile::config(url).map_err(|error| backend(&error))?;
         Self::connect_config(config, url)
     }
 
@@ -182,9 +181,7 @@ impl PostgresStore {
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<Self, StoreError> {
-        let mut config: postgres::Config = url
-            .parse()
-            .map_err(|error: postgres::Error| backend(&error))?;
+        let mut config = passfile::config(url).map_err(|error| backend(&error))?;
         let limit = format!("-c statement_timeout={}", timeout.as_millis().max(1));
         let options = match config.get_options() {
             Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),
@@ -354,7 +351,7 @@ fn server_migration_lock(url: &str) -> Option<Client> {
 /// every other parameter, as the driver reads them; `None` when the URL
 /// does not parse.
 fn maintenance_config(url: &str) -> Option<postgres::Config> {
-    let mut config: postgres::Config = url.parse().ok()?;
+    let mut config = passfile::config(url).ok()?;
     config.dbname("postgres");
     Some(config)
 }
@@ -418,10 +415,11 @@ fn retry_pause(attempt: u32) -> std::time::Duration {
 }
 
 /// The password `url` connects with, as the driver reads it (the user
-/// info, decoded, or a `password=` parameter), or "": every spelling of one
-/// password derives the same login passwords.
+/// info, decoded, or a `password=` parameter), else the passfile's
+/// ([`passfile`], objective 109), or "": every spelling of one password
+/// derives the same login passwords, wherever it comes from.
 fn url_password(url: &str) -> String {
-    url.parse::<postgres::Config>()
+    passfile::config(url)
         .ok()
         .and_then(|config| config.get_password().map(<[u8]>::to_vec))
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -488,20 +486,18 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 ///
 /// # Errors
 ///
-/// When the owner's URL is not `scheme://...` or carries no password (the
-/// logins' passwords derive from it, and from nothing they would be
-/// public), or the database is unreachable or not migrated.
+/// When the owner's URL is not `scheme://...` or has no password, in it or
+/// in the passfile (the logins' passwords derive from it, and from nothing
+/// they would be public), or the database is unreachable or not migrated.
 pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     let password = url_password(owner);
     let Some((scheme, rest)) = owner.split_once("://").filter(|_| !password.is_empty()) else {
         return Err(format!(
-            "{role}: the database URL must be scheme://user:password@host/... \
-             (the restricted logins' passwords derive from the owner's)"
+            "{role}: the database URL must be scheme://user:password@host/..., or its \
+             password a passfile line's (the restricted logins' passwords derive from the owner's)"
         ));
     };
-    let mut config: postgres::Config = owner
-        .parse()
-        .map_err(|error: postgres::Error| format!("{role}: {error}"))?;
+    let mut config = passfile::config(owner).map_err(|error| format!("{role}: {error}"))?;
     config.connect_timeout(std::time::Duration::from_secs(5));
     let mut client = config
         .connect(NoTls)
@@ -570,9 +566,7 @@ fn login_url(scheme: &str, rest: &str, role: &str, password: &str) -> Result<Str
 /// When the URL does not parse, the server is unreachable, or the login may
 /// not read `pg_control_system()`.
 pub fn cluster_identity(url: &str) -> Result<String, StoreError> {
-    let mut config: postgres::Config = url
-        .parse()
-        .map_err(|error: postgres::Error| backend(&error))?;
+    let mut config = passfile::config(url).map_err(|error| backend(&error))?;
     config.connect_timeout(std::time::Duration::from_secs(5));
     let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
     let row = client
@@ -625,7 +619,7 @@ pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(),
         probe: probe.to_string(),
         error,
     };
-    let mut config: postgres::Config = url.parse().map_err(|error: postgres::Error| {
+    let mut config = passfile::config(url).map_err(|error| {
         failure(
             "read SPAWN_TEST_DATABASE_URL as a postgres URL",
             probe_error(&error),
