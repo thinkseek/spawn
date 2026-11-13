@@ -1137,6 +1137,15 @@ fn dump(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
+    // Sealed with SPAWN_BACKUP_SEAL_KEY's key, never k1 in its place.
+    let seal = match settings.seal.clone() {
+        Ok(seal) => seal,
+        Err(reason) => {
+            eprintln!("spawn backup dump: {reason}");
+            record_refusal("dump", &reason);
+            return Ok(2);
+        }
+    };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
     let url = parse_pg_url(&crate::config::required_env("SPAWN_DATABASE_URL")?)?;
@@ -1732,6 +1741,7 @@ fn put_object(
     file: &Path,
     sha256: &str,
     events: i64,
+    sealed_with: &str,
 ) -> Result<(), String> {
     // Again at the PUT itself, before any request (settings are checked
     // when read; this holds whatever built them).
@@ -1739,10 +1749,12 @@ fn put_object(
     let md5 = md5_file(file)?;
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
-header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
+header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n\
+header = \"x-amz-meta-spawn-seal: {}\"\n",
         escape_config(&file.display().to_string()),
         sha256,
-        events
+        events,
+        sealed_with
     );
     let response = bucket_request(settings, &settings.r2.url(key), &options)?;
     if response.status != 200 {
@@ -1774,9 +1786,15 @@ fn put_new_object(
 ) -> Result<store::Put, String> {
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
-header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n",
+header = \"If-None-Match: *\"\nheader = \"x-amz-meta-sha256: {}\"\n{}",
         escape_config(&file.display().to_string()),
-        sha256
+        sha256,
+        // The sealing key's name, the key the store's seal is made with: an
+        // object without it reads as k1's everywhere.
+        settings.seal.as_ref().map_or_else(
+            |_| String::new(),
+            |key| format!("header = \"x-amz-meta-spawn-seal: {}\"\n", key.name)
+        )
     );
     let response = bucket_request(settings, &settings.r2.url(key), &options)?;
     match response.status {
