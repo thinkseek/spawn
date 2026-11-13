@@ -178,6 +178,13 @@ pub(crate) trait Reader {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
     /// Every key under `prefix`, with its size and ETag.
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String>;
+    /// The key an object says sealed it (`x-amz-meta-spawn-seal`, read with
+    /// [`super::key_name`]; absent: k1, as every object before objective
+    /// 114). A bucket that keeps no headers (a test's) is k1's.
+    fn sealed_with(&self, key: &str) -> Result<String, String> {
+        let _ = key;
+        super::key_name(None)
+    }
 }
 
 /// The bucket, as this layer writes it: never a delete, never an overwrite.
@@ -204,6 +211,13 @@ impl Reader for Settings {
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
         super::list_prefix(self, prefix)
     }
+    fn sealed_with(&self, key: &str) -> Result<String, String> {
+        let response = super::bucket_request(self, &self.r2.url(key), "head\n")?;
+        if response.status != 200 {
+            return Err(format!("HEAD {key} answered {}", response.status));
+        }
+        super::object_key(key, &response.headers)
+    }
 }
 
 /// The backups' bucket with no way to write: `plan`'s. It is a [`Reader`]
@@ -219,6 +233,9 @@ impl Reader for ReadOnly<'_> {
     }
     fn list(&self, prefix: &str) -> Result<Vec<Listed>, String> {
         self.0.list(prefix)
+    }
+    fn sealed_with(&self, key: &str) -> Result<String, String> {
+        self.0.sealed_with(key)
     }
 }
 
@@ -290,8 +307,14 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// The key segment names are made with: from the backup key, never the key
 /// itself.
 fn name_key(settings: &Settings) -> Result<[u8; 32], String> {
-    let secret = fs::read(&settings.key_file)
-        .map_err(|error| format!("the backup key {}: {error}", settings.key_file.display()))?;
+    name_key_of(&settings.key_file)
+}
+
+/// The names' key of the backup key in `file` (another key's, for a
+/// manifest it sealed: objective 116).
+fn name_key_of(file: &Path) -> Result<[u8; 32], String> {
+    let secret =
+        fs::read(file).map_err(|error| format!("the backup key {}: {error}", file.display()))?;
     Ok(Sha256::new()
         // FROZEN from the first live put on: every segment's name is made
         // with it, so a changed label names no object the bucket holds
@@ -718,6 +741,23 @@ fn classify(source: &Source, previous: Option<&Entry>) -> Result<(Plan, File), S
 impl<B: Reader> Store<'_, B> {
     /// The newest manifest of this area, host and account, and its key.
     pub(crate) fn newest(&self) -> Result<Option<(String, Manifest)>, String> {
+        let Some(key) = self.newest_key()? else {
+            return Ok(None);
+        };
+        let bytes = self.open_object(&key)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("the manifest {key}: {error}"))?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(format!(
+                "the manifest {key} is of version {}, not {MANIFEST_VERSION}",
+                manifest.version
+            ));
+        }
+        Ok(Some((key, manifest)))
+    }
+
+    /// The newest manifest's key (one LIST), not opened.
+    fn newest_key(&self) -> Result<Option<String>, String> {
         let listed = self.bucket.list(&self.keys.manifests())?;
         let prefix = self.keys.manifests();
         let Some(key) = listed
@@ -738,16 +778,7 @@ impl<B: Reader> Store<'_, B> {
         else {
             return Ok(None);
         };
-        let bytes = self.open_object(&key)?;
-        let manifest: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("the manifest {key}: {error}"))?;
-        if manifest.version != MANIFEST_VERSION {
-            return Err(format!(
-                "the manifest {key} is of version {}, not {MANIFEST_VERSION}",
-                manifest.version
-            ));
-        }
-        Ok(Some((key, manifest)))
+        Ok(Some(key))
     }
 
     fn open_object(&self, key: &str) -> Result<Vec<u8>, String> {
@@ -770,7 +801,20 @@ impl<B: Reader> Store<'_, B> {
     /// sent, no manifest made.
     fn plan(&self, sources: &[Source]) -> Result<PlanCounts, String> {
         let last = self.newest()?.map(|(_, manifest)| manifest);
+        self.plan_after(sources, last.as_ref(), true)
+    }
+
+    /// [`Self::plan`] against `last`; with `reuse` false (a last manifest
+    /// of another key, objective 116) every file is to be sent whole, as
+    /// [`Self::put_after`] sends it.
+    fn plan_after(
+        &self,
+        sources: &[Source],
+        last: Option<&Manifest>,
+        reuse: bool,
+    ) -> Result<PlanCounts, String> {
         let by_path: BTreeMap<&str, &Entry> = last
+            .filter(|_| reuse)
             .iter()
             .flat_map(|manifest| &manifest.files)
             .map(|entry| (entry.path.as_str(), entry))
@@ -912,8 +956,23 @@ not adopted, nothing written over it",
     /// One `put` run of the area's files `sources`.
     fn put(&self, sources: &[Source], made_ms: i64) -> Result<PutCounts, String> {
         let last = self.newest()?.map(|(_, manifest)| manifest);
-        let generation = last.as_ref().map_or(0, |manifest| manifest.generation) + 1;
+        self.put_after(sources, made_ms, last.as_ref(), true)
+    }
+
+    /// One `put` run after `last`, the newest manifest: its generation is
+    /// the new one's less one. With `reuse` false (`last` is another key's,
+    /// objective 116) none of its segments is named again (their names are
+    /// that key's HMACs): every file is put whole under this run's key.
+    fn put_after(
+        &self,
+        sources: &[Source],
+        made_ms: i64,
+        last: Option<&Manifest>,
+        reuse: bool,
+    ) -> Result<PutCounts, String> {
+        let generation = last.map_or(0, |manifest| manifest.generation) + 1;
         let by_path: BTreeMap<&str, &Entry> = last
+            .filter(|_| reuse)
             .iter()
             .flat_map(|manifest| &manifest.files)
             .map(|entry| (entry.path.as_str(), entry))
