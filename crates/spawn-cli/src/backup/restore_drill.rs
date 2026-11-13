@@ -228,6 +228,21 @@ fn unrestorable(
     started: Instant,
 ) -> i32 {
     let reason = format!("the backup cannot be restored: {reason}");
+    fail_both(store, records, &reason, started, 1)
+}
+
+/// Both resources recorded failed with `reason`, as it is, against the
+/// newest stored record: exit `code`, or 2 when the store refused a record.
+/// A drill that cannot read its chain (objective 114: a link's key name
+/// refused, the chain key's file not on this host) exits 2 this way.
+fn fail_both(
+    store: &spawn_postgres::PostgresStore,
+    records: &[BundleRecord],
+    reason: &str,
+    started: Instant,
+    code: i32,
+) -> i32 {
+    let reason = reason.to_string();
     println!("restore-drill: FAILED: {reason}");
     let newest = records.iter().rev().find(|record| stored(record));
     let (key, event_id) = newest.map_or((String::new(), 0), |record| {
@@ -242,7 +257,37 @@ fn unrestorable(
         (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
         (MISSIONS, Outcome::Unrestorable(reason)),
     ];
-    record_verdicts(store, &verdict, &both).unwrap_or(1)
+    record_verdicts(store, &verdict, &both).unwrap_or(code)
+}
+
+/// Why a chain has no one key to be read with.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ChainKey {
+    /// A link's `sealed_with` is not a key name: the reason names the
+    /// record, never the value.
+    Refused(String),
+    /// Two links name two keys.
+    Crossed(String),
+}
+
+/// The one key every link of `chain` (oldest first) names, the newest
+/// link's (objective 114).
+pub(super) fn chain_key(chain: &[&BundleRecord]) -> Result<String, ChainKey> {
+    let names = chain
+        .iter()
+        .map(|link| record_key("backup.bundled", link.event_id, &link.record))
+        .collect::<Result<Vec<String>, String>>()
+        .map_err(ChainKey::Refused)?;
+    let (Some(newest), Some(last)) = (names.last(), chain.last()) else {
+        return Err(ChainKey::Crossed("the chain has no link".to_string()));
+    };
+    match chain.iter().zip(&names).find(|(_, name)| *name != newest) {
+        None => Ok(newest.clone()),
+        Some((link, name)) => Err(ChainKey::Crossed(format!(
+            "the chain crosses keys: bundle {} is sealed with {name}, the newest ({}) with {newest}",
+            link.event_id, last.event_id
+        ))),
+    }
 }
 
 /// The report said: its lines, its first mismatches, the verdict; the exit.
@@ -557,13 +602,18 @@ struct Report {
 }
 
 /// Fetch, check and unpack every bundle of the chain, restore, compare.
-fn run(settings: &Settings, chain: &[&BundleRecord], drill: &Path) -> Result<Report, String> {
+fn run(
+    settings: &Settings,
+    chain: &[&BundleRecord],
+    seal: &Key,
+    drill: &Path,
+) -> Result<Report, String> {
     let newest = chain[chain.len() - 1];
     let mut unpacked: Vec<(PathBuf, Value)> = Vec::new();
     for (index, record) in chain.iter().enumerate() {
         let here = drill.join(format!("bundle-{index}"));
         fs::create_dir(&here).map_err(|error| format!("{}: {error}", here.display()))?;
-        let manifest = fetch_bundle(settings, record, &here)?;
+        let manifest = fetch_bundle(settings, record, seal, &here)?;
         unpacked.push((here.join("unpacked"), manifest));
     }
     let key = bundle_key(newest);
@@ -688,8 +738,14 @@ fn restore_repos(
 
 /// One stored bundle: fetched into `here`, its sha256 the record's (the
 /// object's metadata and the decrypted bytes), decompressed by its magic
-/// and unpacked into `here/unpacked`; its manifest's kind the record's.
-fn fetch_bundle(settings: &Settings, record: &BundleRecord, here: &Path) -> Result<Value, String> {
+/// and unpacked into `here/unpacked`; its manifest's kind the record's. It
+/// is opened with `seal`, the chain's key, which its object must say too.
+fn fetch_bundle(
+    settings: &Settings,
+    record: &BundleRecord,
+    seal: &Key,
+    here: &Path,
+) -> Result<Value, String> {
     let key = record.record["keys"][0].as_str().unwrap_or_default();
     let expected = record.record["sha256"].as_str().unwrap_or_default();
     let Some((bytes, headers)) = get_object_bytes(settings, key)? else {
