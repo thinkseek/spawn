@@ -1187,7 +1187,15 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   evidence `request`, `commit`, `requested_ms` and `withdraw`, the
   `spawn mission push --withdraw <request>` that ends it; once per
   request; cleared at its outcome, which a restarted step reads from the
-  store), and `message_not_taken`
+  store), `unverified_landings` (objective 135; subject `objectives`, key
+  `unverified_landings:<newest old landing ms>:<reading ms>`: at a reading,
+  objectives whose newest landing is on or after 2026-11-13 00:00 +08:00
+  and whose newest `objective.verified` after it is not a pass, `spawn
+  verify list`'s rule, landed `SPAWN_ALERT_UNVERIFIED_SECS` or more ago,
+  default 86400; evidence `old`, `unverified`, `unverified_ms`,
+  `newest_landed_ms`, `listed_since_ms` and `reading_ms`; one open at a
+  time, cleared at the first reading with none old; a fail after a pass
+  raises a new one at a later reading), and `message_not_taken`
   (below, "Messages"). Each fires once per
   occurrence and clears with the record or reading that cleared it; a
   threshold of `0` disables its check.
