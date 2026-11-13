@@ -5234,10 +5234,11 @@ begin
         raise exception 'a verification record has type, mission, objective, by, how and result, and nothing else';
     end if;
     if exists (select 1 from unnest(array['mission', 'objective']) f
-                where jsonb_typeof(p_record -> f) is distinct from 'number'
-                   or (p_record ->> f)::numeric < 1
-                   or (p_record ->> f)::numeric > 2147483647
-                   or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)) then
+                where case when jsonb_typeof(p_record -> f) = 'number'
+                           then (p_record ->> f)::numeric < 1
+                                or (p_record ->> f)::numeric > 2147483647
+                                or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)
+                           else true end) then
         raise exception 'a verification record''s mission and objective are whole numbers from 1';
     end if;
     if jsonb_typeof(p_record -> 'by') is distinct from 'string'
