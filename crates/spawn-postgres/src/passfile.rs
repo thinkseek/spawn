@@ -382,8 +382,6 @@ mod tests {
         );
         std::fs::write(&path, line).expect("write the passfile");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let mut bare = full.clone();
-        bare.password(Vec::<u8>::new());
         let mut without = postgres::Config::new();
         for host in full.get_hosts() {
             match host {
@@ -411,5 +409,6 @@ mod tests {
             "the passfile's line matched the URL's own host, port, database and user"
         );
         assert!(connected, "the passfile's password logs in");
+        eprintln!("PROBE-109 ran to the end");
     }
 }
