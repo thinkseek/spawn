@@ -42,16 +42,16 @@ fn say(sentence: impl Into<String>) -> Refusal {
 }
 
 /// `spawn secret …`: exit 0 on success, 2 on any refusal.
-pub(crate) fn command(words: &[String]) -> Result<i32, String> {
+pub(crate) fn command(words: &[String]) -> i32 {
     match run(words) {
-        Ok(()) => Ok(0),
+        Ok(()) => 0,
         Err(Refusal::Usage) => {
             eprintln!("{USAGE}");
-            Ok(2)
+            2
         }
         Err(Refusal::Say(sentence)) => {
             eprintln!("spawn secret: {sentence}");
-            Ok(2)
+            2
         }
     }
 }
@@ -235,7 +235,9 @@ fn stty(arguments: &[&str]) -> Option<String> {
 impl Drop for Echo {
     fn drop(&mut self) {
         if stty(&[&self.0]).is_none() {
-            eprintln!("spawn secret: the terminal's settings could not be restored; run `stty sane`");
+            eprintln!(
+                "spawn secret: the terminal's settings could not be restored; run `stty sane`"
+            );
         }
     }
 }
@@ -244,12 +246,16 @@ impl Drop for Echo {
 /// by byte, the settings restored on every path.
 fn from_terminal(name: &str) -> Result<Value, Refusal> {
     let Some(saved) = stty(&["-g"]) else {
-        return Err(say("the terminal's settings could not be read; nothing was stored"));
+        return Err(say(
+            "the terminal's settings could not be read; nothing was stored",
+        ));
     };
     let echo = Echo(saved);
     if stty(&["-echo", "-icanon", "-isig", "min", "1", "time", "0"]).is_none() {
         drop(echo);
-        return Err(say("the terminal's echo could not be turned off; nothing was read or stored"));
+        return Err(say(
+            "the terminal's echo could not be turned off; nothing was read or stored",
+        ));
     }
     eprint!("The value of {name} (not echoed; Enter ends it, Ctrl-C cancels): ");
     let _ = std::io::stderr().flush();
@@ -320,8 +326,7 @@ fn generate(bytes: usize) -> Result<Value, Refusal> {
 
 /// Base64url (RFC 4648 §5) without padding.
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk
@@ -384,7 +389,9 @@ impl Store {
     /// 700, and not a symbolic link (checked without following it).
     fn open() -> Result<Self, Refusal> {
         let Some(path) = std::env::var_os("SPAWN_SECRET_STORE").filter(|p| !p.is_empty()) else {
-            return Err(say("SPAWN_SECRET_STORE is not set; it names the store directory"));
+            return Err(say(
+                "SPAWN_SECRET_STORE is not set; it names the store directory",
+            ));
         };
         let path = PathBuf::from(path);
         let refused = |why: &str| {
@@ -407,7 +414,10 @@ impl Store {
             return Err(refused("another user owns it"));
         }
         if metadata.mode() & 0o7777 != 0o700 {
-            return Err(refused(&format!("its mode is {:o}", metadata.mode() & 0o7777)));
+            return Err(refused(&format!(
+                "its mode is {:o}",
+                metadata.mode() & 0o7777
+            )));
         }
         Ok(Self { path })
     }
@@ -466,8 +476,9 @@ impl Store {
         let directory = self.lock(true)?;
         for entry in self.entries()? {
             if staged(&entry) {
-                fs::remove_file(self.file(&entry))
-                    .map_err(|_| say("a killed write's staged file could not be removed; nothing was stored"))?;
+                fs::remove_file(self.file(&entry)).map_err(|_| {
+                    say("a killed write's staged file could not be removed; nothing was stored")
+                })?;
             }
         }
         let meta = format!("{name}.json");
@@ -481,7 +492,9 @@ impl Store {
         for (present, entry) in [(has_value, name), (has_meta, meta.as_str())] {
             if present {
                 fs::remove_file(self.file(entry)).map_err(|_| {
-                    say(format!("the incomplete {name} could not be removed; nothing was stored"))
+                    say(format!(
+                        "the incomplete {name} could not be removed; nothing was stored"
+                    ))
                 })?;
             }
         }
@@ -600,7 +613,17 @@ mod tests {
             assert!(valid_name(good), "{good}");
         }
         for bad in [
-            "", "a", "Ab", "9A", "_A", "-", "../A", "A/B", "A.json", "A-B", &"A".repeat(65),
+            "",
+            "a",
+            "Ab",
+            "9A",
+            "_A",
+            "-",
+            "../A",
+            "A/B",
+            "A.json",
+            "A-B",
+            &"A".repeat(65),
         ] {
             assert!(!valid_name(bad), "{bad}");
         }
@@ -618,7 +641,10 @@ mod tests {
         assert!(sentence.contains("injectable"), "{sentence}");
         assert!(set_flags(&words(&["NAME", "--tier", "3"])).is_err());
         assert!(set_flags(&words(&["NAME", "--tier"])).is_err());
-        assert_eq!(set_flags(&words(&["NAME", "--tier", "1"])), Ok("NAME".into()));
+        assert_eq!(
+            set_flags(&words(&["NAME", "--tier", "1"])),
+            Ok("NAME".into())
+        );
         assert_eq!(set_flags(&words(&["NAME"])), Ok("NAME".into()));
         assert_eq!(set_flags(&words(&[])), Err(Refusal::Usage));
         assert!(set_flags(&words(&["lower"])).is_err());
@@ -649,7 +675,15 @@ mod tests {
     fn staged_files_are_dotted_new_files_of_a_name() {
         assert!(staged(".DB.123.new"));
         assert!(staged(".DB.json.4194301.new"));
-        for not in [".fingerprint.key", "DB.123.new", ".DB.new", ".DB.x1.new", ".db.1.new", "DB", "DB.json"] {
+        for not in [
+            ".fingerprint.key",
+            "DB.123.new",
+            ".DB.new",
+            ".DB.x1.new",
+            ".db.1.new",
+            "DB",
+            "DB.json",
+        ] {
             assert!(!staged(not), "{not}");
         }
     }

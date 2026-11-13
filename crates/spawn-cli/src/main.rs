@@ -134,7 +134,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "ack" => ack::command(&rest),
         "mask" => mask::mask_command(&rest),
         "mask-hook" => mask::hook_command(&rest),
-        "secret" => secret::command(&rest),
+        "secret" => Ok(secret::command(&rest)),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "run" => engine::run(&rest),
         "version" => {
