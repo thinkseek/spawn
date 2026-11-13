@@ -551,6 +551,7 @@ mod tests {
         readings, record_reading, show, status_at_ms, unit_allowed,
     };
     use serde_json::{Value, json};
+    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     /// A scratch directory removed when the test ends, passed or not:
@@ -927,7 +928,11 @@ mod tests {
     fn script(dir: &std::path::Path, body: &str) -> String {
         let path = dir.join("systemctl");
         let status = Command::new("sh")
-            .args(["-c", "printf '%s\\n' \"$1\" >\"$2\" && chmod 755 \"$2\"", "sh"])
+            .args([
+                "-c",
+                "printf '%s\\n' \"$1\" >\"$2\" && chmod 755 \"$2\"",
+                "sh",
+            ])
             .arg(format!("#!/bin/sh\n{body}"))
             .arg(&path)
             .stdin(Stdio::null())
