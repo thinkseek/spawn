@@ -3494,14 +3494,19 @@ times in a row)",
         out: &mut Vec<Event>,
         lines: &mut Vec<String>,
     ) {
-        if self.settings.unverified_ms == 0 {
+        let Some(old_at) = self.unverified_old_at(now) else {
             return;
-        }
-        let old_at = now.saturating_sub(self.settings.unverified_ms);
+        };
         match store.unverified_landings(crate::verify::LISTED_SINCE_MS, old_at) {
             Ok(reading) => self.unverified(now, &reading, out),
             Err(error) => lines.push(format!("alerts: the unverified landings: {error}")),
         }
+    }
+
+    /// The time at or before which a landing is old at `now`: `None` when
+    /// the bound is 0 (never alerted, nothing read).
+    fn unverified_old_at(&self, now: i64) -> Option<i64> {
+        (self.settings.unverified_ms != 0).then(|| now.saturating_sub(self.settings.unverified_ms))
     }
 
     /// One reading of the landed objectives (`{unverified, old,
@@ -7139,9 +7144,7 @@ connections\n";
         let mut monitor = monitor();
         let since = crate::verify::LISTED_SINCE_MS;
         let now = since + 3 * super::DAY_MS;
-        let reading = |unverified: i64, old: i64, newest: Option<i64>| {
-            json!({"unverified": unverified, "old": old, "newest_old_ms": newest})
-        };
+        let reading = |unverified: i64, old: i64, newest: Option<i64>| json!({"unverified": unverified, "old": old, "newest_old_ms": newest});
         let read = |monitor: &mut Monitor, at: i64, value: Value| {
             let mut out = Vec::new();
             monitor.unverified(at, &value, &mut out);
@@ -7210,6 +7213,12 @@ connections\n";
 
     #[test]
     fn another_unverified_bound_says_itself_and_zero_reads_nothing() {
+        assert_eq!(monitor().unverified_old_at(100_000_000), Some(13_600_000));
+        let off = Monitor::with(Settings {
+            unverified_ms: 0,
+            ..settings()
+        });
+        assert_eq!(off.unverified_old_at(100_000_000), None, "0: nothing read");
         let mut monitor = Monitor::with(Settings {
             unverified_ms: 10_000,
             ..settings()
