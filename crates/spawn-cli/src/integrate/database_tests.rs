@@ -5018,16 +5018,7 @@ fn a_gated_owner_push_without_the_scenarios_directory_is_refused() {
 #[test]
 fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
     let (base, source, scenarios, mut integrator) = world("owner-modules", "");
-    let seen = base.join("modules-seen");
-    let gate = format!(
-        "m=\"$4/../web/node_modules\"\n\
-             if [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg/index.js\" ]; then echo copied; \
-             elif [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg2/index.js\" ]; then \
-             echo installed; else echo none; fi >>'{seen}'\n\
-             printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
-        seen = seen.display()
-    );
-    std::fs::write(base.join("gate.sh"), gate).expect("gate");
+    let seen = modules_seen_gate(&base);
     let pnpm = stub_pnpm(&base, &mut integrator);
     let modules = base.join("web/node_modules");
     std::fs::create_dir_all(modules.join(".pnpm")).expect("modules");
@@ -5134,6 +5125,23 @@ fn an_owner_judgings_tree_gets_the_controllers_web_node_modules() {
         "lock v1\n"
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A gate that notes, in the file it returns, what the tree's
+/// `web/node_modules` held at its start: `copied` (the controller's `pkg`),
+/// `installed` (the stub pnpm's `pkg2`) or `none`; and accepts.
+fn modules_seen_gate(base: &Path) -> PathBuf {
+    let seen = base.join("modules-seen");
+    let gate = format!(
+        "m=\"$4/../web/node_modules\"\n\
+             if [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg/index.js\" ]; then echo copied; \
+             elif [ -d \"$m\" ] && [ ! -L \"$m\" ] && [ -f \"$m/pkg2/index.js\" ]; then \
+             echo installed; else echo none; fi >>'{seen}'\n\
+             printf '%s\\n' '{{\"verdict\":\"accepted\"}}' >\"$SPAWN_GATE_VERDICT\"\n",
+        seen = seen.display()
+    );
+    std::fs::write(base.join("gate.sh"), gate).expect("gate");
+    seen
 }
 
 /// An owner judging's candidate whose `web/` holds pnpm configuration that

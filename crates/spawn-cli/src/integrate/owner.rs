@@ -1104,13 +1104,14 @@ pub(super) fn package_refusal(text: &str) -> Option<String> {
 
 /// A registry range, version or dist-tag alone.
 fn registry_range(spec: &str) -> bool {
-    let lower = spec.to_ascii_lowercase();
+    let lower = spec.trim_end().to_ascii_lowercase();
     !spec.contains([':', '/', '\\'])
         && !spec.trim_start().starts_with('.')
-        && !lower.trim_end().ends_with(".tgz")
-        && !lower.trim_end().ends_with(".tar")
-        && !lower.trim_end().ends_with(".tar.gz")
+        && !TARBALLS.iter().any(|tarball| lower.ends_with(tarball))
 }
+
+/// The endings of a tarball's name, which pnpm reads as a file.
+const TARBALLS: &[&str] = &[".tgz", ".tar", ".tar.gz"];
 
 /// The schemes a lockfile value of a registry's package never starts with.
 const LOCK_SCHEMES: &[&str] = &[
@@ -1152,11 +1153,8 @@ pub(super) fn lock_refusal(text: &str) -> Option<String> {
         if names_resolution(body) && !integrity_alone(body) {
             return Some("has a resolution that is not an integrity alone".to_string());
         }
-        if let Some(key) = scheme_at(body) {
-            return Some(match key {
-                Some(key) => format!("has a value that is not the registry's ({key})"),
-                None => "has a value that is not the registry's".to_string(),
-            });
+        if let Some(found) = scheme_at(body) {
+            return Some(found);
         }
     }
     None
@@ -1237,8 +1235,8 @@ fn integrity_alone(body: &str) -> bool {
 
 /// A value of `body` that starts with one of [`LOCK_SCHEMES`] (single
 /// quotes aside), or such a scheme after an `@` (a package key's
-/// version): `Some(key)`, the line's key when it is a plain word.
-fn scheme_at(body: &str) -> Option<Option<String>> {
+/// version): what was found, naming the line's key when it is a plain word.
+fn scheme_at(body: &str) -> Option<String> {
     let unquoted = body.replace('\'', "");
     let schemed = |text: &str| {
         let lower = text.to_ascii_lowercase();
@@ -1257,9 +1255,11 @@ fn scheme_at(body: &str) -> Option<Option<String>> {
         .trim_start_matches("- ")
         .split_once(':')
         .map(|(key, _)| key.trim())
-        .filter(|key| plain(key) && !key.contains(['@', '/', '.']))
-        .map(str::to_string);
-    Some(key)
+        .filter(|key| plain(key) && !key.contains(['@', '/', '.']));
+    Some(match key {
+        Some(key) => format!("has a value that is not the registry's ({key})"),
+        None => "has a value that is not the registry's".to_string(),
+    })
 }
 
 /// The controller whose scenarios directory is `gate`, where `inside` is
@@ -1429,7 +1429,7 @@ impl super::Judge {
         };
         let controller = controller_of(std::path::Path::new(&mission.gate), &inside);
         if let Some(judged) = self.give_modules(store, request, &controller, &work.join("tree")) {
-            return judged;
+            return Ok(judged);
         }
         let test_database = super::needs_test_database(&scenarios);
         let room = if test_database {
@@ -1515,14 +1515,14 @@ impl super::Judge {
     /// to go on to the gate; `Some` when there is nothing to judge with, a
     /// no-verdict kept through [`Self::no_verdict_kept`] (pnpm's output as
     /// its log, so a second one for the same reason refuses the request,
-    /// P27), or the copy failed (the host's).
+    /// P27), or the copy failed (the host's: no verdict, judged again).
     fn give_modules(
         &self,
         store: &PostgresStore,
         request: &Request,
         controller: &std::path::Path,
         tree: &std::path::Path,
-    ) -> Option<Result<Judged, Result<serde_json::Value, String>>> {
+    ) -> Option<Judged> {
         match controller_modules(controller, tree, &self.gate_env) {
             Ok(Modules::Copied | Modules::Nothing) => None,
             Ok(Modules::Installed) => {
@@ -1535,15 +1535,9 @@ impl super::Judge {
             }
             Ok(Modules::NoVerdict { why, log }) => {
                 println!("integrate: owner request {}: {why}", request.id);
-                Some(Ok(self.no_verdict_kept(
-                    store,
-                    request,
-                    why,
-                    log.as_deref(),
-                    true,
-                )))
+                Some(self.no_verdict_kept(store, request, why, log.as_deref(), true))
             }
-            Err(error) => Some(Err(Err(error))),
+            Err(error) => Some(Judged::NoVerdict(error)),
         }
     }
 
