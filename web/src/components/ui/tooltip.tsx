@@ -17,7 +17,7 @@ import {
 } from "react";
 
 /*
- * Tooltip – a single self-contained file, classic style.
+ * Tooltip – a single self-contained file, clean style.
  * A small dark label for one control: it shows on hover after a short wait and at once under keyboard focus, and goes
  * on Escape, when the pointer leaves, on blur and on a click. Once one is open, its neighbours show at once (the
  * skip-delay window), so you can run along a toolbar and read every name. It lives in the top layer, so no card's
@@ -229,7 +229,7 @@ export function Tooltip({
           ref={tip}
           id={tipId}
           role="tooltip"
-          className={["ui-tip", className].filter(Boolean).join(" ")}
+          className={["ui-tipc", className].filter(Boolean).join(" ")}
           popover="manual"
           data-side={side}
           data-instant={instant || undefined}
@@ -238,14 +238,14 @@ export function Tooltip({
           onPointerLeave={() => hide(true)}
         >
           {/* React 19 hoists this into <head> once, no matter how many tooltips render */}
-          <style href="ui-tooltip" precedence="default">
+          <style href="ui-tooltip-clean" precedence="default">
             {css}
           </style>
-          <span className="ui-tip__text" dir="auto">
+          <span className="ui-tipc__text" dir="auto">
             {content}
           </span>
           {shortcut && (
-            <kbd className="ui-tip__keys" id={keysId}>
+            <kbd className="ui-tipc__keys" id={keysId}>
               {shortcut}
             </kbd>
           )}
@@ -304,88 +304,81 @@ function place(el: HTMLElement, trigger: HTMLElement, side: "top" | "bottom" | "
 /* ---------- Styles ---------- */
 
 const css = /* css */ `
-/* Colors and motion as variables – override them on .ui-tip (see Theming in the docs) */
-.ui-tip {
-  --ui-tip-bg: #171717;
-  --ui-tip-ink: #ffffff;
-  --ui-tip-muted: rgba(255, 255, 255, 0.72);
-  --ui-tip-key: rgba(255, 255, 255, 0.14);
-  --ui-tip-shadow: 0 8px 20px -8px rgba(0, 0, 0, 0.32), 0 2px 6px -2px rgba(0, 0, 0, 0.12);
-  --ui-tip-ease: var(--aui-ease, cubic-bezier(0.22, 1, 0.36, 1));
+/* Colors and motion as variables – override them on .ui-tipc (see Theming in the docs) */
+.ui-tipc {
+  --ui-tipc-bg: rgba(24, 24, 27, 0.92);
+  --ui-tipc-ink: #fcfcfc;
+  --ui-tipc-muted: rgba(255, 255, 255, 0.6);
+  --ui-tipc-shadow: 0 4px 12px -4px rgba(0, 0, 0, 0.24);
+  --ui-tipc-ease: var(--aui-ease, cubic-bezier(0.22, 1, 0.36, 1));
 
   /* A small dark label in the top layer – it fits its text and wraps at 240px */
   position: fixed;
   inset: auto;
   z-index: 1001;
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: baseline;
+  gap: 6px;
   box-sizing: border-box;
   width: max-content;
   max-width: min(240px, calc(100vw - 16px));
   margin: 0;
-  padding: 5px 9px;
+  padding: 4px 8px;
   border: 0;
-  border-radius: var(--aui-radius-sm, 8px);
-  background: var(--ui-tip-bg);
-  box-shadow: var(--ui-tip-shadow);
-  color: var(--ui-tip-ink);
+  border-radius: var(--aui-radius, 6px);
+  background: var(--ui-tipc-bg);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--ui-tipc-shadow);
+  color: var(--ui-tipc-ink);
   font-family: var(--aui-font, "Inter", "InterVariable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: 12px;
+  line-height: 16px;
   font-weight: 500;
-  letter-spacing: -0.005em;
   text-align: start;
   white-space: normal;
   overflow: visible;
   -webkit-font-smoothing: antialiased;
-  animation: ui-tip-in 160ms var(--ui-tip-ease) both;
+  animation: ui-tipc-in 140ms var(--ui-tipc-ease) both;
 }
-.ui-tip::backdrop { display: none; }
-.ui-tip__text { min-width: 0; overflow-wrap: anywhere; }
-/* The shortcut: a small key chip, never broken across lines */
-.ui-tip__keys {
+.ui-tipc::backdrop { display: none; }
+.ui-tipc__text { min-width: 0; overflow-wrap: anywhere; }
+/* The shortcut: quieter, never broken across lines */
+.ui-tipc__keys {
   flex: none;
-  align-self: center;
-  margin: 0 -3px 0 0;
-  padding: 0 5px;
-  border-radius: 4px;
-  background: var(--ui-tip-key);
+  margin: 0;
   font: inherit;
-  font-size: 11px;
-  line-height: 16px;
   font-feature-settings: "tnum";
   letter-spacing: 0.02em;
-  color: var(--ui-tip-muted);
+  color: var(--ui-tipc-muted);
   white-space: nowrap;
 }
 
-/* It drifts in 3px from the trigger's side; a neighbour in the skip-delay window shows at once */
-.ui-tip[data-side="bottom"] { animation-name: ui-tip-in-down; }
-.ui-tip[data-side="left"] { animation-name: ui-tip-in-left; }
-.ui-tip[data-side="right"] { animation-name: ui-tip-in-right; }
-.ui-tip[data-instant] { animation: none; }
-@keyframes ui-tip-in { from { opacity: 0; transform: translateY(3px); } }
-@keyframes ui-tip-in-down { from { opacity: 0; transform: translateY(-3px); } }
-@keyframes ui-tip-in-left { from { opacity: 0; transform: translateX(3px); } }
-@keyframes ui-tip-in-right { from { opacity: 0; transform: translateX(-3px); } }
+/* It drifts in 2px from the trigger's side; a neighbour in the skip-delay window shows at once */
+.ui-tipc[data-side="bottom"] { animation-name: ui-tipc-in-down; }
+.ui-tipc[data-side="left"] { animation-name: ui-tipc-in-left; }
+.ui-tipc[data-side="right"] { animation-name: ui-tipc-in-right; }
+.ui-tipc[data-instant] { animation: none; }
+@keyframes ui-tipc-in { from { opacity: 0; transform: translateY(2px); } }
+@keyframes ui-tipc-in-down { from { opacity: 0; transform: translateY(-2px); } }
+@keyframes ui-tipc-in-left { from { opacity: 0; transform: translateX(2px); } }
+@keyframes ui-tipc-in-right { from { opacity: 0; transform: translateX(-2px); } }
 
 /* Touch screens (a tablet with a mouse or pen): a little larger type */
 @media (pointer: coarse) {
-  .ui-tip { padding: 6px 10px; font-size: 13.5px; line-height: 20px; }
+  .ui-tipc { padding: 5px 9px; font-size: 13px; line-height: 18px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ui-tip { animation: none; }
+  .ui-tipc { animation: none; }
 }
 
 /* Dark mode: a light label – follows a .dark class or data-theme="dark" on any ancestor, e.g. <html> */
-:where(.dark, [data-theme="dark"]) .ui-tip {
-  --ui-tip-bg: #fafafa;
-  --ui-tip-ink: #171717;
-  --ui-tip-muted: rgba(0, 0, 0, 0.6);
-  --ui-tip-key: rgba(0, 0, 0, 0.07);
-  --ui-tip-shadow: 0 8px 20px -8px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.06);
+:where(.dark, [data-theme="dark"]) .ui-tipc {
+  --ui-tipc-bg: rgba(250, 250, 250, 0.94);
+  --ui-tipc-ink: #111113;
+  --ui-tipc-muted: rgba(0, 0, 0, 0.5);
+  --ui-tipc-shadow: 0 4px 12px -4px rgba(0, 0, 0, 0.6);
   color-scheme: dark;
 }
 `;

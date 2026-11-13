@@ -1,12 +1,12 @@
 "use client";
 
-import { Children, isValidElement, type ComponentPropsWithRef, type ElementType, type ReactNode } from "react";
+import type { ComponentPropsWithRef, ElementType, ReactNode } from "react";
 
 /*
- * Card – a single self-contained file.
- * A white card on a gray tray, like the classic items: a header with title, quiet line and an action, the content –
- * and a footer that sits on the tray below the card. It can be a whole click target (a link or button in its title
- * covers the card) and show that it is selected with a darker tray.
+ * Card – a single self-contained file, clean style.
+ * The white card every screen is built from: a 0.5px hairline and a soft drop, a header with title, quiet line and an
+ * action, the content and a footer. It can be a whole click target (a link or button in its title covers the card)
+ * and show that it is selected with a gray fill.
  * The styles are injected below, so no extra files are needed.
  */
 
@@ -20,31 +20,25 @@ export type CardProps = ComponentPropsWithRef<"div"> & {
    * covers the card – other buttons inside stay clickable on their own
    */
   interactive?: boolean;
-  /** Shown as picked: a darker tray and a firmer edge. Put aria-pressed or aria-current on the title's button or link */
+  /** Shown as picked: a gray fill and a firmer edge. Put aria-pressed or aria-current on the title's button or link */
   selected?: boolean;
 };
 
 export function Card({ as = "div", interactive, selected, className, children, ...rest }: CardProps) {
   const Tag = (["div", "section", "article", "li"].includes(as) ? as : "div") as ElementType;
-  // The footer sits on the gray tray under the white card – everything else goes inside the card
-  const items = Children.toArray(children);
-  const isFoot = (c: unknown) => isValidElement(c) && c.type === CardFooter;
-  const main = items.filter((c) => !isFoot(c));
-  const foot = items.filter(isFoot);
   return (
     <>
       {/* React 19 hoists this into <head> once, no matter how many cards render */}
-      <style href="ui-card" precedence="default">
+      <style href="ui-card-clean" precedence="default">
         {css}
       </style>
       <Tag
-        className={["ui-crd", className].filter(Boolean).join(" ")}
+        className={["ui-crdc", className].filter(Boolean).join(" ")}
         data-interactive={interactive ? "" : undefined}
         data-selected={selected ? "" : undefined}
         {...rest}
       >
-        {main.length > 0 && <div className="ui-crd__card">{main}</div>}
-        {foot}
+        {children}
       </Tag>
     </>
   );
@@ -67,14 +61,14 @@ export function CardHeader({ title, description, icon, action, titleAs = "h3", c
   const Title = (["h2", "h3", "h4", "p"].includes(titleAs) ? titleAs : "h3") as ElementType;
   const has = (n: ReactNode) => n != null && n !== false && n !== "";
   return (
-    <div className={["ui-crd__head", className].filter(Boolean).join(" ")} {...rest}>
-      {has(icon) && <span className="ui-crd__icon">{icon}</span>}
-      <div className="ui-crd__titles">
-        {has(title) && <Title className="ui-crd__title">{title}</Title>}
-        {has(description) && <p className="ui-crd__desc">{description}</p>}
+    <div className={["ui-crdc__head", className].filter(Boolean).join(" ")} {...rest}>
+      {has(icon) && <span className="ui-crdc__icon">{icon}</span>}
+      <div className="ui-crdc__titles">
+        {has(title) && <Title className="ui-crdc__title">{title}</Title>}
+        {has(description) && <p className="ui-crdc__desc">{description}</p>}
         {children}
       </div>
-      {has(action) && <div className="ui-crd__action">{action}</div>}
+      {has(action) && <div className="ui-crdc__action">{action}</div>}
     </div>
   );
 }
@@ -82,104 +76,75 @@ export function CardHeader({ title, description, icon, action, titleAs = "h3", c
 export type CardContentProps = ComponentPropsWithRef<"div">;
 
 export function CardContent({ className, ...rest }: CardContentProps) {
-  return <div className={["ui-crd__body", className].filter(Boolean).join(" ")} {...rest} />;
+  return <div className={["ui-crdc__body", className].filter(Boolean).join(" ")} {...rest} />;
 }
 
 export type CardFooterProps = ComponentPropsWithRef<"div">;
 
-/** A row on the tray under the card: a status or meta on the start, buttons on the end (give the first button margin-inline-start: auto). Put it directly inside Card */
+/** A row at the bottom: a status or meta on the start, buttons on the end (give the first button margin-inline-start: auto) */
 export function CardFooter({ className, ...rest }: CardFooterProps) {
-  return <div className={["ui-crd__foot", className].filter(Boolean).join(" ")} {...rest} />;
+  return <div className={["ui-crdc__foot", className].filter(Boolean).join(" ")} {...rest} />;
 }
 
 /* ---------- Styles ---------- */
 
 const css = /* css */ `
-/* Colors as variables – override them on .ui-crd (see Theming in the docs) */
-.ui-crd {
-  --ui-crd-tray: var(--aui-subtle, #f0f0f0);
-  --ui-crd-tray-selected: #e6e6e6;
-  --ui-crd-surface: var(--aui-surface, #ffffff);
-  --ui-crd-strong: var(--aui-ink, #171717);
-  --ui-crd-ink: var(--aui-ink, #404040);
-  --ui-crd-muted: var(--aui-muted, #6b6b6b);
-  --ui-crd-faint: #8f8f8f;
-  --ui-crd-line: var(--aui-border, #ececec);
-  --ui-crd-line-strong: var(--aui-border-strong, #d9d9d9);
-  --ui-crd-shadow: var(--aui-shadow-card, 0 0 0 1px var(--ui-crd-line), 0 1px 2px rgba(0, 0, 0, 0.04));
-  --ui-crd-shadow-hover: 0 0 0 1px var(--ui-crd-line-strong), 0 2px 6px -1px rgba(0, 0, 0, 0.08);
-  --ui-crd-focus: var(--aui-focus, rgba(0, 96, 226, 0.7));
-  --ui-crd-radius: calc(var(--aui-radius-lg, 16px) + 4px);
-  --ui-crd-pad: 16px;
+/* Colors as variables – override them on .ui-crdc (see Theming in the docs) */
+.ui-crdc {
+  --ui-crdc-surface: var(--aui-surface, #ffffff);
+  --ui-crdc-strong: var(--aui-ink, #000000);
+  --ui-crdc-ink: var(--aui-ink, rgba(0, 0, 0, 0.88));
+  --ui-crdc-muted: var(--aui-muted, rgba(0, 0, 0, 0.61));
+  --ui-crdc-shadow: var(--aui-shadow-card, 0 0 0 0.5px var(--aui-border, rgba(0, 0, 0, 0.06)), 0 1px 1px -1px rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.05));
+  --ui-crdc-shadow-hover: 0 0 0 0.5px var(--aui-border-strong, rgba(0, 0, 0, 0.1)), 0 2px 6px -1px rgba(0, 0, 0, 0.08), 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --ui-crdc-selected: color-mix(in srgb, var(--ui-crdc-ink) 3.5%, var(--ui-crdc-surface));
+  --ui-crdc-shadow-selected: 0 0 0 0.5px var(--aui-border-strong, rgba(0, 0, 0, 0.14)), 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --ui-crdc-focus: var(--aui-focus, rgba(0, 96, 226, 0.7));
+  --ui-crdc-radius: var(--aui-radius-lg, 10px);
+  --ui-crdc-pad: 16px;
 
   position: relative;
   display: flex;
   flex-direction: column;
+  gap: 12px;
   box-sizing: border-box;
   min-width: 0;
   margin: 0;
-  padding: 4px;
-  border-radius: var(--ui-crd-radius);
-  background: var(--ui-crd-tray);
-  color: var(--ui-crd-ink);
+  padding: var(--ui-crdc-pad);
+  border-radius: var(--ui-crdc-radius);
+  background: var(--ui-crdc-surface);
+  box-shadow: var(--ui-crdc-shadow);
+  color: var(--ui-crdc-ink);
   font-family: var(--aui-font, "Inter", "InterVariable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
   font-size: 13px;
   line-height: 20px;
   text-align: start;
   list-style: none;
   -webkit-font-smoothing: antialiased;
-  transition: background-color 160ms ease;
+  transition: box-shadow 160ms ease, background-color 160ms ease;
 }
-.ui-crd *, .ui-crd *::before, .ui-crd *::after { box-sizing: border-box; }
-
-/* The white card on the tray */
-.ui-crd__card {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-width: 0;
-  padding: var(--ui-crd-pad);
-  border-radius: var(--aui-radius-lg, 16px);
-  background: var(--ui-crd-surface);
-  box-shadow: var(--ui-crd-shadow);
-  transition: box-shadow 160ms ease;
-}
+.ui-crdc *, .ui-crdc *::before, .ui-crdc *::after { box-sizing: border-box; }
 
 /* ----- Header: icon · title and quiet line · action ----- */
-.ui-crd__head { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
-.ui-crd__icon { display: flex; flex: none; align-items: center; justify-content: center; min-width: 20px; min-height: 20px; color: var(--ui-crd-muted); }
-.ui-crd__icon > svg { display: block; width: 16px; height: 16px; }
-.ui-crd__titles { display: grid; flex: 1; gap: 2px; min-width: 0; }
-.ui-crd__title { margin: 0; font-size: 14px; line-height: 20px; font-weight: 500; letter-spacing: -0.01em; color: var(--ui-crd-strong); overflow-wrap: anywhere; }
-.ui-crd__desc { margin: 0; font-size: 13px; line-height: 20px; color: var(--ui-crd-muted); overflow-wrap: anywhere; }
-/* The action sits on the title's line, centred on it – a 32px button reaches 6px above and below */
-.ui-crd__action { display: flex; flex: none; align-items: center; gap: 4px; height: 20px; }
+.ui-crdc__head { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
+.ui-crdc__icon { display: flex; flex: none; align-items: center; justify-content: center; min-width: 20px; min-height: 20px; color: var(--ui-crdc-muted); }
+/* A larger icon tile sits beside both lines; a 16px icon on the title's line */
+.ui-crdc__icon > svg { display: block; width: 16px; height: 16px; }
+.ui-crdc__titles { display: grid; flex: 1; gap: 2px; min-width: 0; }
+.ui-crdc__title { margin: 0; font-size: 13px; line-height: 20px; font-weight: 500; letter-spacing: 0; color: var(--ui-crdc-strong); overflow-wrap: anywhere; }
+.ui-crdc__desc { margin: 0; font-size: 13px; line-height: 20px; color: var(--ui-crdc-muted); overflow-wrap: anywhere; }
+/* The action sits on the title's line, centred on it – a 28px button reaches 4px above and below */
+.ui-crdc__action { display: flex; flex: none; align-items: center; gap: 4px; height: 20px; }
 
-/* ----- Content ----- */
-.ui-crd__body { min-width: 0; overflow-wrap: anywhere; }
-
-/* ----- Footer on the tray: text lines up with the card's text, a 32px button sits 6px from the tray's edges ----- */
-.ui-crd__foot {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  min-height: 40px;
-  padding-block: 4px 0;
-  padding-inline: var(--ui-crd-pad) 2px;
-  font-size: 12.5px;
-  line-height: 18px;
-  color: var(--ui-crd-faint);
-}
-/* A footer alone, without a card above it */
-.ui-crd__foot:first-child { padding-block: 0; }
+/* ----- Content and footer ----- */
+.ui-crdc__body { min-width: 0; overflow-wrap: anywhere; }
+.ui-crdc__foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; min-height: 28px; font-size: 12px; line-height: 16px; color: var(--ui-crdc-muted); }
 
 /* ----- Interactive: the whole card is a click target ----- */
-.ui-crd[data-interactive] { cursor: pointer; }
-.ui-crd[data-interactive]:hover .ui-crd__card { box-shadow: var(--ui-crd-shadow-hover); }
+.ui-crdc[data-interactive] { cursor: pointer; }
+.ui-crdc[data-interactive]:hover { box-shadow: var(--ui-crdc-shadow-hover); }
 /* The title's link or button reads like the title and stretches over the whole card */
-.ui-crd[data-interactive] .ui-crd__title :is(a, button) {
+.ui-crdc[data-interactive] .ui-crdc__title :is(a, button) {
   margin: 0;
   padding: 0;
   border: 0;
@@ -191,55 +156,52 @@ const css = /* css */ `
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
 }
-.ui-crd[data-interactive] .ui-crd__title :is(a, button)::after {
+.ui-crdc[data-interactive] .ui-crdc__title :is(a, button)::after {
   content: "";
   position: absolute;
   inset: 0;
   z-index: 0;
-  border-radius: var(--ui-crd-radius);
+  border-radius: var(--ui-crdc-radius);
 }
 /* Other controls in the card stay clickable above the stretched title */
-.ui-crd[data-interactive] :is(a, button, input, select, textarea, label, summary, [tabindex]):not(.ui-crd__title *) {
+.ui-crdc[data-interactive] :is(a, button, input, select, textarea, label, summary, [tabindex]):not(.ui-crdc__title *) {
   position: relative;
   z-index: 1;
 }
-/* The ring goes around the whole tray, not the title text */
-.ui-crd[data-interactive] .ui-crd__title :is(a, button):focus-visible { outline: none; }
-.ui-crd[data-interactive] .ui-crd__title :is(a, button):focus-visible::after {
-  outline: 2px solid var(--ui-crd-focus);
+/* The ring goes around the whole card, not the title text */
+.ui-crdc[data-interactive] .ui-crdc__title :is(a, button):focus-visible { outline: none; }
+.ui-crdc[data-interactive] .ui-crdc__title :is(a, button):focus-visible::after {
+  outline: 2px solid var(--ui-crdc-focus);
   outline-offset: 2px;
 }
 
-/* ----- Selected: a darker tray and a firmer edge, no colored ring ----- */
-.ui-crd[data-selected] { background: var(--ui-crd-tray-selected); }
-.ui-crd[data-selected] .ui-crd__card { box-shadow: 0 0 0 1px var(--ui-crd-line-strong), 0 1px 2px rgba(0, 0, 0, 0.04); }
+/* ----- Selected: a gray fill and a firmer edge, no colored ring ----- */
+.ui-crdc[data-selected] { background: var(--ui-crdc-selected); box-shadow: var(--ui-crdc-shadow-selected); }
+.ui-crdc[data-selected][data-interactive]:hover { box-shadow: var(--ui-crdc-shadow-selected); }
 
 /* Touch screens: no hover lift that sticks after a tap */
 @media (hover: none) {
-  .ui-crd[data-interactive]:hover:not([data-selected]) .ui-crd__card { box-shadow: var(--ui-crd-shadow); }
+  .ui-crdc[data-interactive]:hover:not([data-selected]) { box-shadow: var(--ui-crdc-shadow); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .ui-crd, .ui-crd__card { transition: none; }
+  .ui-crdc { transition: none; }
 }
 /* Windows high contrast: shadows are dropped – a border keeps the card's edge */
 @media (forced-colors: active) {
-  .ui-crd__card { border: 1px solid CanvasText; }
-  .ui-crd[data-selected] { outline: 2px solid Highlight; }
+  .ui-crdc { border: 1px solid CanvasText; }
+  .ui-crdc[data-selected] { border: 2px solid Highlight; }
 }
 
 /* Dark mode: follows a .dark class or data-theme="dark" on any ancestor, e.g. <html> */
-:where(.dark, [data-theme="dark"]) .ui-crd {
-  --ui-crd-tray: var(--aui-subtle, #111113);
-  --ui-crd-tray-selected: #26262a;
-  --ui-crd-surface: var(--aui-surface, #19191b);
-  --ui-crd-strong: var(--aui-ink, #ededed);
-  --ui-crd-ink: var(--aui-ink, #c8c8cc);
-  --ui-crd-muted: var(--aui-muted, #a1a1a6);
-  --ui-crd-faint: #8b8b92;
-  --ui-crd-line: var(--aui-border, #2a2a2e);
-  --ui-crd-line-strong: var(--aui-border-strong, #3a3a40);
-  --ui-crd-shadow: var(--aui-shadow-card, 0 0 0 1px var(--ui-crd-line));
-  --ui-crd-shadow-hover: 0 0 0 1px var(--ui-crd-line-strong), 0 2px 6px rgba(0, 0, 0, 0.4);
-  --ui-crd-focus: var(--aui-focus, rgba(77, 141, 255, 0.8));
+:where(.dark, [data-theme="dark"]) .ui-crdc {
+  --ui-crdc-surface: var(--aui-surface, #1b1b1e);
+  --ui-crdc-strong: var(--aui-ink, #ffffff);
+  --ui-crdc-ink: var(--aui-ink, rgba(255, 255, 255, 0.9));
+  --ui-crdc-muted: var(--aui-muted, rgba(255, 255, 255, 0.62));
+  --ui-crdc-shadow: var(--aui-shadow-card, 0 0 0 0.5px var(--aui-border, rgba(255, 255, 255, 0.1)), 0 1px 2px rgba(0, 0, 0, 0.4));
+  --ui-crdc-shadow-hover: 0 0 0 0.5px var(--aui-border-strong, rgba(255, 255, 255, 0.16)), 0 2px 6px rgba(0, 0, 0, 0.4);
+  --ui-crdc-selected: color-mix(in srgb, var(--ui-crdc-ink) 6%, var(--ui-crdc-surface));
+  --ui-crdc-shadow-selected: 0 0 0 0.5px var(--aui-border-strong, rgba(255, 255, 255, 0.2)), 0 1px 2px rgba(0, 0, 0, 0.4);
+  --ui-crdc-focus: var(--aui-focus, rgba(77, 141, 255, 0.8));
 }
 `;

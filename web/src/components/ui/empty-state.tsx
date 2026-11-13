@@ -3,9 +3,9 @@
 import { createElement, type ComponentPropsWithRef, type ReactNode } from "react";
 
 /*
- * Empty State – a single self-contained file.
+ * Empty State – a single self-contained file, clean style.
  * What a list, table or panel shows while there is nothing in it: an icon on a soft tile, a title, one line on what
- * will show up here, and a button for the first step. Framed in a dashed drop area, or bare inside a panel.
+ * will show up here, and a button for the first step. Framed in a quiet drop area, or bare inside a panel.
  * The styles are injected below, so no extra files are needed.
  */
 
@@ -31,19 +31,19 @@ export function EmptyState({ title, text, action, icon = FILE, bare, tall, class
   return (
     <>
       {/* React 19 hoists this into <head> once, no matter how many render */}
-      <style href="ui-empty-state" precedence="default">
+      <style href="ui-empty-state-clean" precedence="default">
         {css}
       </style>
-      <div className={["ui-est", className].filter(Boolean).join(" ")} data-bare={bare || undefined} data-tall={tall || undefined} {...rest}>
+      <div className={["ui-estc", className].filter(Boolean).join(" ")} data-bare={bare || undefined} data-tall={tall || undefined} {...rest}>
         {/* icon={null}: no tile at all, the title moves up */}
         {icon != null && icon !== false && (
-          <span className="ui-est__icon" aria-hidden="true">
+          <span className="ui-estc__icon" aria-hidden="true">
             <Glyph icon={icon} />
           </span>
         )}
-        <p className="ui-est__title">{title}</p>
-        {text != null && text !== false && <p className="ui-est__text">{text}</p>}
-        {action != null && action !== false && <div className="ui-est__action">{action}</div>}
+        <p className="ui-estc__title">{title}</p>
+        {text != null && text !== false && <p className="ui-estc__text">{text}</p>}
+        {action != null && action !== false && <div className="ui-estc__action">{action}</div>}
       </div>
     </>
   );
@@ -63,7 +63,7 @@ function Glyph({ icon }: { icon: ReactNode | HugeIcon }) {
     </svg>
   );
 }
-const STROKE = 1.75;
+const STROKE = 1.9;
 
 /** The default glyph: a file – Hugeicons Free (MIT, © Hugeicons, hugeicons.com) */
 const line = { stroke: "currentColor", strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: "1.5" };
@@ -82,16 +82,14 @@ const FILE: HugeIcon = [
 /* ---------- Styles ---------- */
 
 const css = /* css */ `
-/* Colors as variables – override them on .ui-est (see Theming in the docs) */
-.ui-est {
-  --ui-est-title: var(--aui-ink, #171717);
-  --ui-est-text: var(--aui-muted, #737373);
-  --ui-est-icon: var(--aui-muted, #737373);
-  --ui-est-tile: var(--aui-surface, #ffffff);
-  --ui-est-tile-line: var(--aui-border, #e5e5e5);
-  --ui-est-tile-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
-  --ui-est-frame: #fafafa;
-  --ui-est-line: var(--aui-border, #e5e5e5);
+/* Colors as variables – override them on .ui-estc (see Theming in the docs) */
+.ui-estc {
+  --ui-estc-title: var(--aui-ink, #000000);
+  --ui-estc-text: var(--aui-muted, rgba(0, 0, 0, 0.45));
+  --ui-estc-icon: var(--aui-muted, rgba(0, 0, 0, 0.45));
+  --ui-estc-tile: var(--aui-subtle, rgba(0, 0, 0, 0.04));
+  --ui-estc-frame: rgba(0, 0, 0, 0.02);
+  --ui-estc-line: var(--aui-border, rgba(0, 0, 0, 0.06));
 
   display: flex;
   flex-direction: column;
@@ -99,89 +97,80 @@ const css = /* css */ `
   box-sizing: border-box;
   min-width: 0;
   padding: 48px 24px 52px;
-  border: 1px dashed var(--ui-est-line);
-  border-radius: calc(var(--aui-radius, 12px) + 4px);
-  background: var(--ui-est-frame);
-  font-family: var(--aui-font, "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
-  font-size: 14px;
-  line-height: 21px;
-  letter-spacing: -0.01em;
+  border-radius: calc(var(--aui-radius-lg, 10px) + 2px);
+  background: var(--ui-estc-frame);
+  box-shadow: inset 0 0 0 0.5px var(--ui-estc-line);
+  font-family: var(--aui-font, "Inter", "InterVariable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+  font-size: 13px;
+  line-height: 20px;
   text-align: center;
   -webkit-font-smoothing: antialiased;
 }
 /* bare: no frame – the panel or page around it is the frame */
-.ui-est[data-bare] {
+.ui-estc[data-bare] {
   padding: 0;
-  border: 0;
   background: none;
+  box-shadow: none;
 }
 /* tall: fills its parent's height, the content in the middle */
-.ui-est[data-tall] {
+.ui-estc[data-tall] {
   justify-content: center;
   min-height: 100%;
 }
 
-/* The icon on a small white card */
-.ui-est__icon {
+.ui-estc__icon {
   display: grid;
   place-items: center;
   flex: none;
-  box-sizing: border-box;
-  width: 44px;
-  height: 44px;
-  border: 1px solid var(--ui-est-tile-line);
-  border-radius: 12px;
-  background: var(--ui-est-tile);
-  box-shadow: var(--ui-est-tile-shadow);
-  color: var(--ui-est-icon);
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
+  background: var(--ui-estc-tile);
+  color: var(--ui-estc-icon);
 }
-.ui-est__icon > svg,
-.ui-est__icon > img {
+.ui-estc__icon > svg,
+.ui-estc__icon > img {
   display: block;
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
 }
-.ui-est__title {
+.ui-estc__title {
   max-width: 100%;
   margin: 0;
   font-weight: 500;
-  color: var(--ui-est-title);
+  color: var(--ui-estc-title);
   overflow-wrap: anywhere;
 }
-.ui-est__icon + .ui-est__title { margin-top: 16px; }
-.ui-est__text {
+.ui-estc__icon + .ui-estc__title { margin-top: 16px; }
+.ui-estc__text {
   max-width: 430px;
   margin: 4px 0 0;
-  font-size: 13.5px;
-  line-height: 20px;
-  color: var(--ui-est-text);
+  color: var(--ui-estc-text);
   text-wrap: balance;
   overflow-wrap: anywhere;
 }
-.ui-est__action {
+.ui-estc__action {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   gap: 8px;
-  margin-top: 20px;
+  margin-top: 18px;
 }
 
 /* Small screens: a tighter frame */
 @media (max-width: 560px) {
-  .ui-est:not([data-bare]) {
+  .ui-estc:not([data-bare]) {
     padding: 36px 18px 40px;
   }
 }
 
 /* Dark mode: follows a .dark class or data-theme="dark" on any ancestor, e.g. <html> */
-:where(.dark, [data-theme="dark"]) .ui-est {
-  --ui-est-title: var(--aui-ink, #ededed);
-  --ui-est-text: var(--aui-muted, #8f8f8f);
-  --ui-est-icon: var(--aui-muted, #8f8f8f);
-  --ui-est-tile: var(--aui-surface, #232326);
-  --ui-est-tile-line: var(--aui-border, rgba(255, 255, 255, 0.1));
-  --ui-est-tile-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --ui-est-frame: rgba(255, 255, 255, 0.02);
-  --ui-est-line: var(--aui-border, rgba(255, 255, 255, 0.12));
+:where(.dark, [data-theme="dark"]) .ui-estc {
+  --ui-estc-title: var(--aui-ink, #ffffff);
+  --ui-estc-text: var(--aui-muted, rgba(255, 255, 255, 0.45));
+  --ui-estc-icon: var(--aui-muted, rgba(255, 255, 255, 0.45));
+  --ui-estc-tile: var(--aui-subtle, rgba(255, 255, 255, 0.06));
+  --ui-estc-frame: rgba(255, 255, 255, 0.03);
+  --ui-estc-line: var(--aui-border, rgba(255, 255, 255, 0.08));
 }
 `;

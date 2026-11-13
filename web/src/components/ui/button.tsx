@@ -12,12 +12,13 @@ import {
 } from "react";
 
 /*
- * Button – a single self-contained file.
+ * Button – a single self-contained file, clean style.
+ * Clean style: a dark chip, a white button with hairline shadows, a quiet ghost and a minimal red fill.
  * The styles are injected below, so no extra files are needed.
  */
 
 export type ButtonProps = ComponentPropsWithRef<"button"> & {
-  /** primary: dark and filled · secondary: white with an outline · ghost: text only · destructive: red, for deleting */
+  /** primary: a dark chip · secondary: white with a hairline shadow · ghost: text only · destructive: a light red fill, for deleting */
   variant?: "primary" | "secondary" | "ghost" | "destructive";
   size?: "sm" | "md" | "lg";
   /** Shows a shimmer over the label and blocks clicks */
@@ -85,16 +86,18 @@ export function Button({
   return (
     <>
       {/* React 19 hoists this into <head> once, no matter how many buttons render */}
-      <style href="ui-button" precedence="default">
+      <style href="ui-button-clean" precedence="default">
         {css}
       </style>
       <button
         type={type}
-        className={["ui-button", className].filter(Boolean).join(" ")}
+        className={["ui-buttonc", className].filter(Boolean).join(" ")}
         data-variant={tone}
         data-size={scale}
         data-loading={loading || undefined}
         data-icon-only={iconOnly || undefined}
+        data-icon-left={(!iconOnly && Boolean(icon)) || undefined}
+        data-icon-right={(!iconOnly && Boolean(iconRight)) || undefined}
         data-ready={ready || undefined}
         ref={(el) => {
           inner.current = el;
@@ -113,7 +116,7 @@ export function Button({
         }}
         onPointerEnter={(event) => {
           // A label cut short shows its full text on hover
-          const label = event.currentTarget.querySelector<HTMLElement>(".ui-button__label");
+          const label = event.currentTarget.querySelector<HTMLElement>(".ui-buttonc__label");
           if (label && text && !rest.title) label.title = label.scrollWidth > label.clientWidth + 1 ? text : "";
           onPointerEnter?.(event);
         }}
@@ -121,17 +124,17 @@ export function Button({
       >
         {/* New keys remount the parts that changed, which replays their enter animation */}
         {icon && (
-          <span className="ui-button__icon" aria-hidden="true" key={`icon-${iconKey}`} onErrorCapture={hideBroken}>
+          <span className="ui-buttonc__icon" aria-hidden="true" key={`icon-${iconKey}`} onErrorCapture={hideBroken}>
             {loading ? <Spinner /> : icon}
           </span>
         )}
         {hasLabel && (
-          <span className="ui-button__label" data-text={text} dir="auto" key={`label-${labelKey}`}>
+          <span className="ui-buttonc__label" data-text={text} dir="auto" key={`label-${labelKey}`}>
             {children}
           </span>
         )}
         {iconRight && (
-          <span className="ui-button__icon" aria-hidden="true" key={`icon-right-${iconRightKey}`} onErrorCapture={hideBroken}>
+          <span className="ui-buttonc__icon" aria-hidden="true" key={`icon-right-${iconRightKey}`} onErrorCapture={hideBroken}>
             {iconRight}
           </span>
         )}
@@ -151,7 +154,7 @@ const hideBroken = (event: SyntheticEvent<HTMLElement>) => {
 /** Shown in place of the left icon while loading */
 const Spinner = () => (
   <svg
-    className="ui-button__spinner"
+    className="ui-buttonc__spinner"
     viewBox="0 0 24 24"
     fill="none"
     stroke="currentColor"
@@ -176,56 +179,52 @@ function contentKey(node: ReactNode) {
 /* ---------- Styles ---------- */
 
 const css = /* css */ `
-/* Colors and motion as variables – override them on .ui-button (see Theming in the docs) */
-.ui-button {
-  --ui-btn-ink: var(--aui-ink, #171717);
-  --ui-btn-on-ink: #fafafa;
-  --ui-btn-dark-top: #323137;
-  --ui-btn-dark-bottom: #201e25;
-  --ui-btn-dark-hover-top: #3c3b42;
-  --ui-btn-dark-hover-bottom: #29272f;
-  --ui-btn-edge-top: #4b4951;
-  --ui-btn-edge-mid: #31303a;
-  --ui-btn-edge-bottom: #18171b;
-  --ui-btn-ring: #0d0d0d;
-  --ui-btn-dark-shadow: rgba(0, 0, 0, 0.1);
-  --ui-btn-surface: var(--aui-surface, #ffffff);
-  --ui-btn-surface-hover: #fafafa;
-  --ui-btn-surface-shadow: rgba(0, 0, 0, 0.06);
-  --ui-btn-line: var(--aui-border, #e5e5e5);
-  --ui-btn-muted: var(--aui-muted, #737373);
-  --ui-btn-hover: #404040;
-  --ui-btn-fill: #f0f0f0;
-  --ui-btn-shine: rgba(255, 255, 255, 0.82);
-  --ui-btn-shine-on-ink: rgba(255, 255, 255, 0.95);
-  --ui-btn-danger: var(--aui-danger, #c4320a);
-  --ui-btn-danger-bg: #ffe9e6;
-  --ui-btn-focus: var(--aui-focus, rgba(0, 96, 226, 0.7));
-  --ui-btn-ease: cubic-bezier(0.22, 1, 0.36, 1);
-  --ui-btn-load: 650ms;
+/* Colors and motion as variables – override them on .ui-buttonc (see Theming in the docs) */
+.ui-buttonc {
+  --ui-btnc-title: var(--aui-ink, #000);
+  --ui-btnc-ink: var(--aui-ink, rgba(0, 0, 0, 0.88));
+  --ui-btnc-muted: var(--aui-muted, rgba(0, 0, 0, 0.61));
+  --ui-btnc-icon: var(--aui-muted, rgba(0, 0, 0, 0.447));
+  --ui-btnc-solid: var(--aui-primary, rgba(0, 0, 0, 0.88));
+  --ui-btnc-solid-hover: rgba(0, 0, 0, 0.8);
+  --ui-btnc-on-solid: var(--aui-on-primary, #fcfcfc);
+  --ui-btnc-surface: var(--aui-surface, #ffffff);
+  --ui-btnc-shadow: 0 0 0 0.5px var(--aui-border, rgba(0, 0, 0, 0.06)), 0 1px 1px -1px rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --ui-btnc-shadow-hover: 0 0 0 0.5px var(--aui-border-strong, rgba(0, 0, 0, 0.1)), 0 1px 1px -1px rgba(0, 0, 0, 0.12), 0 1px 3px 0 rgba(0, 0, 0, 0.07);
+  --ui-btnc-wash: rgba(0, 0, 0, 0.03);
+  --ui-btnc-danger: var(--aui-danger, #c4320a);
+  --ui-btnc-danger-bg: color-mix(in srgb, var(--aui-red, #f04438) 8%, transparent);
+  --ui-btnc-danger-bg-hover: color-mix(in srgb, var(--aui-red, #f04438) 12%, transparent);
+  --ui-btnc-shine: rgba(255, 255, 255, 0.82);
+  --ui-btnc-shine-on-solid: #ffffff;
+  --ui-btnc-focus: var(--aui-focus, rgba(0, 96, 226, 0.7));
+  --ui-btnc-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ui-btnc-load: 650ms;
 
-  --h: 40px;
-  --px: 16px;
-  --gap: 8px;
-  --fs: 14px;
-  --icon: 18px;
-  --radius: var(--aui-radius, 12px);
+  --h: 28px;
+  --px: 10px;
+  --gap: 6px;
+  --fs: 13px;
+  --lh: 20px;
+  --icon: 16px;
+  --radius: var(--aui-radius, 6px);
 
   position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--gap);
+  box-sizing: border-box;
   height: var(--h);
   padding: 0 var(--px);
   margin: 0;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: var(--radius);
-  font-family: var(--aui-font, "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+  font-family: var(--aui-font, "Inter", "InterVariable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
   font-size: var(--fs);
   font-weight: 500;
-  line-height: 1;
-  letter-spacing: -0.01em;
+  line-height: var(--lh);
+  letter-spacing: 0;
   max-width: 100%;
   min-width: 0;
   white-space: nowrap;
@@ -235,177 +234,189 @@ const css = /* css */ `
   -webkit-tap-highlight-color: transparent;
   -webkit-font-smoothing: antialiased;
   transition:
-    background-color 160ms ease,
-    border-color 160ms ease,
-    color 160ms ease,
-    box-shadow 160ms ease,
-    transform 160ms var(--ui-btn-ease),
-    opacity 160ms ease;
+    background-color 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease,
+    transform 160ms var(--ui-btnc-ease),
+    opacity 140ms ease;
 }
 
-.ui-button[data-size="sm"] {
+/* Sizes: 24 · 28 · 32 high (taller on touch screens, see below) */
+.ui-buttonc[data-size="sm"] {
+  --h: 24px;
+  --px: 8px;
+  --gap: 4px;
+  --fs: 12px;
+  --lh: 16px;
+  --icon: 14px;
+  --radius: var(--aui-radius, 6px);
+}
+.ui-buttonc[data-size="lg"] {
   --h: 32px;
   --px: 12px;
   --gap: 6px;
   --fs: 13px;
   --icon: 16px;
-  --radius: calc(var(--aui-radius, 12px) - 2px);
+  --radius: var(--aui-radius, 6px);
 }
-.ui-button[data-size="lg"] {
-  --h: 48px;
-  --px: 20px;
-  --gap: 10px;
-  --fs: 15px;
-  --icon: 20px;
-  --radius: calc(var(--aui-radius, 12px) + 2px);
+/* Touch screens: every size grows to a comfortable tap height – 32 · 34 · 36 – the look stays the same */
+@media (pointer: coarse) {
+  .ui-buttonc[data-size="sm"] { --h: 32px; }
+  .ui-buttonc[data-size="md"] { --h: 34px; }
+  .ui-buttonc[data-size="lg"] { --h: 36px; }
 }
-.ui-button[data-icon-only] {
+/* An icon sits closer to the edge than the text, so both look evenly spaced */
+.ui-buttonc[data-icon-left] {
+  padding-left: calc(var(--px) - 2px);
+}
+.ui-buttonc[data-icon-right] {
+  padding-right: calc(var(--px) - 2px);
+}
+.ui-buttonc[data-icon-only] {
   width: var(--h);
   padding: 0;
 }
 
-/* primary: like the send button */
-/* primary: a dark gradient with a light edge running down the border and a 1px ring */
-.ui-button[data-variant="primary"] {
-  background:
-    linear-gradient(var(--ui-btn-dark-top), var(--ui-btn-dark-bottom)) padding-box,
-    linear-gradient(var(--ui-btn-edge-top), var(--ui-btn-edge-mid), var(--ui-btn-edge-bottom)) border-box;
-  color: var(--ui-btn-on-ink);
-  box-shadow:
-    0 0 0 1px var(--ui-btn-ring),
-    0 2px 4px var(--ui-btn-dark-shadow);
+/* primary: a dark chip */
+.ui-buttonc[data-variant="primary"] {
+  background: var(--ui-btnc-solid);
+  color: var(--ui-btnc-on-solid);
 }
-.ui-button[data-variant="primary"]:hover:not(:disabled) {
-  background:
-    linear-gradient(var(--ui-btn-dark-hover-top), var(--ui-btn-dark-hover-bottom)) padding-box,
-    linear-gradient(var(--ui-btn-edge-top), var(--ui-btn-edge-mid), var(--ui-btn-edge-bottom)) border-box;
+.ui-buttonc[data-variant="primary"]:hover:not(:disabled) {
+  background: var(--ui-btnc-solid-hover);
 }
 
-/* secondary: white with the card outline */
-.ui-button[data-variant="secondary"] {
-  background: var(--ui-btn-surface);
-  border-color: var(--ui-btn-line);
-  color: var(--ui-btn-ink);
-  box-shadow: 0 1px 2px var(--ui-btn-surface-shadow);
+/* secondary: white with the card's hairline shadow */
+.ui-buttonc[data-variant="secondary"] {
+  background: var(--ui-btnc-surface);
+  color: var(--ui-btnc-title);
+  box-shadow: var(--ui-btnc-shadow);
 }
-.ui-button[data-variant="secondary"]:hover:not(:disabled) {
-  background: var(--ui-btn-surface-hover);
+.ui-buttonc[data-variant="secondary"] .ui-buttonc__icon {
+  color: var(--ui-btnc-icon);
+}
+.ui-buttonc[data-variant="secondary"]:hover:not(:disabled) {
+  box-shadow: var(--ui-btnc-shadow-hover);
 }
 
-/* ghost: a muted label, the gray layer appears on hover */
-.ui-button[data-variant="ghost"] {
+/* ghost: a muted label, a soft wash appears on hover */
+.ui-buttonc[data-variant="ghost"] {
   background: transparent;
-  color: var(--ui-btn-muted);
+  color: var(--ui-btnc-muted);
 }
-.ui-button[data-variant="ghost"]:hover:not(:disabled) {
-  background: var(--ui-btn-fill);
-  color: var(--ui-btn-hover);
+.ui-buttonc[data-variant="ghost"] .ui-buttonc__icon {
+  color: var(--ui-btnc-icon);
 }
-
-/* destructive: red label on a light red fill */
-.ui-button[data-variant="destructive"] {
-  background: var(--ui-btn-danger-bg);
-  color: var(--ui-btn-danger);
+.ui-buttonc[data-variant="ghost"]:hover:not(:disabled) {
+  background: var(--ui-btnc-wash);
+  color: var(--ui-btnc-ink);
 }
-.ui-button[data-variant="destructive"]:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--ui-btn-danger-bg) 88%, var(--ui-btn-danger));
-}
-.ui-button[data-variant="destructive"] .ui-button__label::after {
-  --ui-btn-shine: rgba(255, 255, 255, 0.82);
+.ui-buttonc[data-variant="ghost"]:hover:not(:disabled) .ui-buttonc__icon {
+  color: var(--ui-btnc-ink);
 }
 
-.ui-button:active:not(:disabled):not([data-loading]) {
+/* destructive: red label on a minimal red fill, no stroke */
+.ui-buttonc[data-variant="destructive"] {
+  background: var(--ui-btnc-danger-bg);
+  color: var(--ui-btnc-danger);
+}
+.ui-buttonc[data-variant="destructive"]:hover:not(:disabled) {
+  background: var(--ui-btnc-danger-bg-hover);
+}
+
+.ui-buttonc .ui-buttonc__icon {
+  transition: color 140ms ease;
+}
+.ui-buttonc:active:not(:disabled):not([data-loading]) {
   transform: scale(0.97);
 }
-.ui-button:focus-visible {
-  outline: 2px solid var(--ui-btn-focus);
+.ui-buttonc:focus-visible {
+  outline: 2px solid var(--ui-btnc-focus);
   outline-offset: 2px;
 }
-.ui-button:disabled {
+.ui-buttonc:disabled {
   opacity: 0.4;
   cursor: default;
 }
-.ui-button[data-loading] {
+.ui-buttonc[data-loading] {
   cursor: default;
 }
 
-.ui-button__icon {
+.ui-buttonc__icon {
   display: grid;
   place-items: center;
   flex: none;
   width: var(--icon);
   height: var(--icon);
 }
-.ui-button__icon {
+.ui-buttonc__icon {
   overflow: hidden;
 }
-.ui-button__icon > svg,
-.ui-button__icon > img {
+.ui-buttonc__icon > svg,
+.ui-buttonc__icon > img {
   display: block;
   width: 100%;
   height: 100%;
 }
-.ui-button__icon > img {
+.ui-buttonc__icon > img {
   object-fit: contain;
 }
 
 /* Morph: the button clips while its width glides; changed parts blur in */
-.ui-button {
+.ui-buttonc {
   overflow: clip;
 }
-.ui-button[data-ready] .ui-button__label {
-  animation: ui-button-label-in 480ms cubic-bezier(0.25, 1, 0.5, 1) both;
+.ui-buttonc[data-ready] .ui-buttonc__label {
+  animation: ui-buttonc-label-in 480ms cubic-bezier(0.25, 1, 0.5, 1) both;
 }
-.ui-button[data-ready] .ui-button__icon {
-  animation: ui-button-icon-in 520ms cubic-bezier(0.25, 1, 0.5, 1) both;
+.ui-buttonc[data-ready] .ui-buttonc__icon {
+  animation: ui-buttonc-icon-in 520ms cubic-bezier(0.25, 1, 0.5, 1) both;
 }
 
-/* Loading: a band sweeps across a copy of the label, like "Request approval" in the Chat Composer */
+/* Loading: a light band sweeps across a copy of the dimmed label */
 /* A label too long for its parent ends in "…" – the full text shows on hover */
-.ui-button__label {
+.ui-buttonc__label {
   position: relative;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  /* Room for descenders now that the label clips */
-  line-height: normal;
 }
-.ui-button__label::after {
+.ui-buttonc__label::after {
   content: attr(data-text);
   content: attr(data-text) / "";
   position: absolute;
   inset: 0;
   white-space: nowrap;
   color: transparent;
-  background: linear-gradient(90deg, transparent 38%, var(--ui-btn-shine) 50%, transparent 62%) 100% 0 / 300% 100%
+  background: linear-gradient(90deg, transparent 38%, var(--ui-btnc-shine) 50%, transparent 62%) 100% 0 / 300% 100%
     no-repeat;
   -webkit-background-clip: text;
   background-clip: text;
   opacity: 0;
   pointer-events: none;
 }
-.ui-button[data-variant="primary"] .ui-button__label::after {
-  --ui-btn-shine: var(--ui-btn-shine-on-ink);
+.ui-buttonc[data-variant="primary"] .ui-buttonc__label::after {
+  --ui-btnc-shine: var(--ui-btnc-shine-on-solid);
 }
-.ui-button[data-loading] .ui-button__label {
-  color: color-mix(in srgb, currentColor 55%, transparent);
+.ui-buttonc[data-loading] .ui-buttonc__label {
+  color: color-mix(in srgb, currentColor 50%, transparent);
 }
-.ui-button[data-loading] .ui-button__label::after {
+.ui-buttonc[data-loading] .ui-buttonc__label::after {
   opacity: 1;
-  animation: ui-button-sweep calc(var(--ui-btn-load) * 1.6) linear infinite;
+  animation: ui-buttonc-sweep calc(var(--ui-btnc-load) * 1.6) linear infinite;
 }
-.ui-button__spinner {
-  animation: ui-button-spin 900ms linear infinite;
+.ui-buttonc__spinner {
+  animation: ui-buttonc-spin 900ms linear infinite;
 }
 
-@keyframes ui-button-label-in {
+@keyframes ui-buttonc-label-in {
   from {
     opacity: 0;
     filter: blur(3px);
     transform: translateY(25%);
   }
 }
-@keyframes ui-button-icon-in {
+@keyframes ui-buttonc-icon-in {
   from {
     opacity: 0;
     filter: blur(2px);
@@ -413,13 +424,13 @@ const css = /* css */ `
   }
 }
 
-@keyframes ui-button-spin {
+@keyframes ui-buttonc-spin {
   to {
     transform: rotate(1turn);
   }
 }
 
-@keyframes ui-button-sweep {
+@keyframes ui-buttonc-sweep {
   from {
     background-position: 100% 0;
   }
@@ -429,45 +440,47 @@ const css = /* css */ `
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ui-button[data-ready] .ui-button__label,
-  .ui-button[data-ready] .ui-button__icon {
+  .ui-buttonc[data-ready] .ui-buttonc__label,
+  .ui-buttonc[data-ready] .ui-buttonc__icon {
     animation: none;
   }
-  .ui-button {
+  .ui-buttonc {
     transition-duration: 1ms;
   }
-  .ui-button[data-loading] .ui-button__label::after {
+  .ui-buttonc[data-loading] .ui-buttonc__label::after {
     animation: none;
     opacity: 0;
   }
 }
 
 /* Dark mode: follows a .dark class or data-theme="dark" on any ancestor, e.g. <html> */
-:where(.dark, [data-theme="dark"]) .ui-button {
-  /* primary inverts: a light gradient with dark text */
-  --ui-btn-on-ink: #121213;
-  --ui-btn-dark-top: #f4f4f5;
-  --ui-btn-dark-bottom: #e4e4e7;
-  --ui-btn-dark-hover-top: #ffffff;
-  --ui-btn-dark-hover-bottom: #ececef;
-  --ui-btn-edge-top: #ffffff;
-  --ui-btn-edge-mid: #ececef;
-  --ui-btn-edge-bottom: #d4d4d8;
-  --ui-btn-ring: rgba(0, 0, 0, 0.6);
-  --ui-btn-dark-shadow: rgba(0, 0, 0, 0.4);
-  --ui-btn-shine-on-ink: rgba(255, 255, 255, 0.9);
+:where(.dark, [data-theme="dark"]) .ui-buttonc {
+  /* primary inverts: a light chip with dark text */
+  --ui-btnc-solid: var(--aui-primary, rgba(255, 255, 255, 0.9));
+  --ui-btnc-solid-hover: rgba(255, 255, 255, 0.82);
+  --ui-btnc-on-solid: var(--aui-on-primary, #161618);
+  --ui-btnc-shine-on-solid: #ffffff;
 
-  --ui-btn-ink: var(--aui-ink, #ededed);
-  --ui-btn-surface: var(--aui-surface, #232326);
-  --ui-btn-surface-hover: #2a2a2d;
-  --ui-btn-surface-shadow: rgba(0, 0, 0, 0.4);
-  --ui-btn-line: var(--aui-border, rgba(255, 255, 255, 0.1));
-  --ui-btn-muted: var(--aui-muted, #8f8f8f);
-  --ui-btn-hover: #ededed;
-  --ui-btn-fill: rgba(255, 255, 255, 0.06);
-  --ui-btn-shine: rgba(237, 237, 237, 0.95);
-  --ui-btn-danger: var(--aui-danger, #ff8a7a);
-  --ui-btn-danger-bg: color-mix(in srgb, var(--aui-red, #ff6b5f) 16%, transparent);
-  --ui-btn-focus: var(--aui-focus, rgba(77, 141, 255, 0.8));
+  --ui-btnc-title: var(--aui-ink, rgba(255, 255, 255, 0.9));
+  --ui-btnc-ink: var(--aui-ink, rgba(255, 255, 255, 0.9));
+  --ui-btnc-muted: var(--aui-muted, rgba(255, 255, 255, 0.62));
+  --ui-btnc-icon: var(--aui-muted, rgba(255, 255, 255, 0.5));
+  --ui-btnc-surface: var(--aui-surface, #1c1c1e);
+  --ui-btnc-shadow: 0 0 0 0.5px var(--aui-border, rgba(255, 255, 255, 0.1)), 0 1px 2px 0 rgba(0, 0, 0, 0.4);
+  --ui-btnc-shadow-hover: 0 0 0 0.5px var(--aui-border-strong, rgba(255, 255, 255, 0.16)), 0 1px 2px 0 rgba(0, 0, 0, 0.4);
+  --ui-btnc-wash: rgba(255, 255, 255, 0.06);
+  --ui-btnc-danger: var(--aui-danger, #ff8a7a);
+  --ui-btnc-danger-bg: color-mix(in srgb, var(--aui-red, #ff6b5f) 14%, transparent);
+  --ui-btnc-danger-bg-hover: color-mix(in srgb, var(--aui-red, #ff6b5f) 20%, transparent);
+  --ui-btnc-shine: #ffffff;
+  --ui-btnc-focus: var(--aui-focus, rgba(77, 141, 255, 0.8));
+}
+
+/* Hover of the primary button follows its fill – also a brand color from --aui-primary. Browsers without
+   color-mix() (Safari before 16.2) keep the fixed hover above */
+@supports (color: color-mix(in srgb, red 50%, transparent)) {
+  .ui-buttonc {
+    --ui-btnc-solid-hover: color-mix(in srgb, var(--ui-btnc-solid) 91%, transparent);
+  }
 }
 `;
