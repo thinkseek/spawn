@@ -487,9 +487,8 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 /// # Errors
 ///
 /// When the owner's URL is not `scheme://...` or has no password, in it or
-/// in the passfile (the
-/// logins' passwords derive from it, and from nothing they would be
-/// public), or the database is unreachable or not migrated.
+/// in the passfile (the logins' passwords derive from it, and from nothing
+/// they would be public), or the database is unreachable or not migrated.
 pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     let password = url_password(owner);
     let Some((scheme, rest)) = owner.split_once("://").filter(|_| !password.is_empty()) else {
