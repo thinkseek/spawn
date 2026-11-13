@@ -13,11 +13,17 @@
 //! at each of the three alignments in the standard and URL-safe alphabets
 //! (the characters that do not depend on the neighbouring bytes), and as hex
 //! in both cases. A form under 6 bytes is not used; at one place the
-//! longest form wins.
+//! longest form wins, and every form that starts inside a match and runs
+//! past its end joins it, until none does: the union is one
+//! `[SECRET:NAME]`, named by the form that matched first. A value
+//! transformed another way (base64 wrapped across lines as MIME does,
+//! reversed, split, encrypted) is not caught (design section 4).
 //!
 //! - `spawn mask --values <file>`: stdin to stdout through the mask as it
 //!   streams, the last bytes of each read (as many as the longest form,
-//!   less one) held for the next, so a value split across reads is caught.
+//!   less one, or a whole span still being joined) held for the next, so a
+//!   value split across reads is caught and the output does not depend on
+//!   where the input is cut.
 //! - `spawn mask-hook --values <file>`: a Claude Code PostToolUse hook. When
 //!   `tool_response` holds a form of a value, it prints the response with
 //!   every string masked as `updatedToolOutput`; otherwise nothing.
@@ -63,6 +69,9 @@ pub(crate) struct Mask {
 pub(crate) fn read_values(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let shown = path.display();
     let meta = std::fs::metadata(path).map_err(|error| format!("{shown}: cannot read: {error}"))?;
+    if !meta.is_file() {
+        return Err(format!("{shown}: not a file"));
+    }
     {
         use std::os::unix::fs::PermissionsExt as _;
         if meta.permissions().mode() & 0o077 != 0 {
@@ -238,6 +247,25 @@ impl Mask {
             .map(|(form, name)| (form.len(), name.as_str()))
     }
 
+    /// The end of the span that starts with a match at `data[start..first]`:
+    /// every form that starts inside the span and runs past its end extends
+    /// it. `None` when that cannot be decided yet: a place inside the span
+    /// has less than the longest form after it and the input has not ended.
+    fn span_end(&self, data: &[u8], start: usize, first: usize, end: bool) -> Option<usize> {
+        let mut span_end = first;
+        let mut j = start + 1;
+        while j < span_end {
+            if !end && data.len() - j < self.longest {
+                return None;
+            }
+            if let Some((length, _)) = self.at(data, j) {
+                span_end = span_end.max(j + length);
+            }
+            j += 1;
+        }
+        Some(span_end)
+    }
+
     /// Mask `data` into `out`, as far as it can decide: all of it at the
     /// end, else up to where a form could still run past what is there.
     /// Returns how many bytes it took.
@@ -248,8 +276,11 @@ impl Mask {
                 break;
             }
             if let Some((length, name)) = self.at(data, at) {
+                let Some(span_end) = self.span_end(data, at, at + length, end) else {
+                    break;
+                };
                 out.extend_from_slice(format!("[SECRET:{name}]").as_bytes());
-                at += length;
+                at = span_end;
             } else {
                 out.push(data[at]);
                 at += 1;
@@ -302,10 +333,16 @@ fn values_flag(arguments: &[String], usage: &str) -> Result<String, String> {
     }
 }
 
+/// `spawn mask`'s usage, with what it does not catch.
+const MASK_USAGE: &str = "usage: spawn mask --values <file>\n\
+    stdin to stdout with every known form of each value (plain, JSON-escaped, URL-encoded,\n\
+    base64, hex) replaced by [SECRET:NAME]. Not masked: a value transformed another way,\n\
+    such as base64 wrapped across lines (MIME, 76 columns), reversed, split or encrypted.";
+
 /// `spawn mask --values <file>`: exit 2, having printed nothing, when the
 /// values file cannot be used.
 pub(crate) fn mask_command(arguments: &[String]) -> Result<i32, String> {
-    let path = values_flag(arguments, "usage: spawn mask --values <file>")?;
+    let path = values_flag(arguments, MASK_USAGE)?;
     let mask = match read_values(Path::new(&path)) {
         Ok(values) => Mask::new(&values),
         Err(error) => {
