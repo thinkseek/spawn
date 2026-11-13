@@ -3607,6 +3607,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let settings = |bucket: &str| Settings {
             root: dir.clone(),
             key_file: dir.join("key"),
+            seal: Err("no sealing key in this test".to_string()),
             r2: R2 {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 bucket: bucket.to_string(),
@@ -3621,7 +3622,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             prefix: "locktest/x/".to_string(),
             drill_url: None,
         };
-        let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0).unwrap_err();
+        let error = put_object(&settings("made-up-keep"), "k", &file, "s", 0, "k1").unwrap_err();
         assert!(error.contains("never writes there"), "{error}");
         assert!(!error.contains("made-up-keep"), "{error}");
         // Not an R2 name as given (rev-g F5): refused before the keep test
@@ -3633,7 +3634,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             "made-up-Keep",
             "x",
         ] {
-            let error = put_object(&settings(bucket), "k", &file, "s", 0).unwrap_err();
+            let error = put_object(&settings(bucket), "k", &file, "s", 0, "k1").unwrap_err();
             assert!(
                 error.contains("not an R2 bucket name"),
                 "{bucket:?}: {error}"
@@ -3644,7 +3645,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             );
         }
         // Another bucket gets as far as the request (a closed port).
-        let error = put_object(&settings("made-up-store"), "k", &file, "s", 0).unwrap_err();
+        let error = put_object(&settings("made-up-store"), "k", &file, "s", 0, "k1").unwrap_err();
         assert!(!error.contains("never writes there"), "{error}");
         assert!(not_locked_forever("made-up-keep").is_err());
         assert!(not_locked_forever("made-up-store").is_ok());
