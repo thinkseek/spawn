@@ -233,7 +233,7 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
         .expect("a deploy");
 
     let facts = store.verification_facts().expect("the facts");
-    let at = |event: &str| -> i64 {
+    let mut at = |event: &str| -> i64 {
         client
             .query_one(
                 "select recorded_at_ms from spawn_events
