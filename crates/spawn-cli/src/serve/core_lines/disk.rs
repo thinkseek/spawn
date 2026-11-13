@@ -122,10 +122,10 @@ pub(super) fn grew_most(parts: &Value, fall: Option<i64>) -> Option<(&'static st
         .iter()
         .fold(0_i64, |sum, (_, grew)| sum.saturating_add(*grew));
     let mut most: Option<(&'static str, i64)> = None;
-    for (store, grew) in named
-        .into_iter()
-        .chain(std::iter::once((UNATTRIBUTED, fall.saturating_sub(accounted))))
-    {
+    for (store, grew) in named.into_iter().chain(std::iter::once((
+        UNATTRIBUTED,
+        fall.saturating_sub(accounted),
+    ))) {
         if most.is_none_or(|(_, kept)| grew > kept) {
             most = Some((store, grew));
         }
@@ -150,9 +150,10 @@ pub(super) fn with_disk(storage: &mut Value, samples: &Value, now_ms: i64) {
     storage["days_left"] = json!(days_left(free, fall));
     storage["days_left_measuring_since_ms"] = json!(measuring_since);
     storage["disk_fall_bytes_per_day"] = json!(fall);
-    storage["grew_most"] = most.map_or(Value::Null, |(store, grew)| {
-        json!({"store": store, "bytes_per_day": grew})
-    });
+    storage["grew_most"] = most.map_or(
+        Value::Null,
+        |(store, grew)| json!({"store": store, "bytes_per_day": grew}),
+    );
 }
 
 #[cfg(test)]
@@ -194,7 +195,11 @@ mod tests {
                 (NOW, 100.0),
             ]
         );
-        assert_eq!(readings(&samples, None, NOW).len(), 3, "no free disk now: no reading now");
+        assert_eq!(
+            readings(&samples, None, NOW).len(),
+            3,
+            "no free disk now: no reading now"
+        );
         assert_eq!(readings(&json!([]), Some(7), NOW), [(NOW, 7.0)]);
     }
 
@@ -207,7 +212,10 @@ mod tests {
             .map(|at| (at, free(at)))
             .collect();
         let fall_on_line = fall(&on_line).expect("a fall");
-        assert!((fall_on_line - i64::try_from(10 * GIB).expect("fits")).abs() <= 1, "{fall_on_line}");
+        assert!(
+            (fall_on_line - i64::try_from(10 * GIB).expect("fits")).abs() <= 1,
+            "{fall_on_line}"
+        );
         // The least-squares line, not the first and last: 0, 2 and 0 a day
         // apart gives a slope of 0; 10, 4, 4 over days 0, 1, 2: -3.
         assert_eq!(fall(&[(0, 0.0), (D, 2.0), (2 * D, 0.0)]), Some(0));
@@ -218,7 +226,11 @@ mod tests {
         assert_eq!(fall(&[(0, 100.0), (D - 1, 10.0)]), None);
         assert_eq!(fall(&[(0, 100.0)]), None);
         assert_eq!(fall(&[]), None);
-        assert_eq!(fall(&[(0, 100.0), (D, 90.0)]), Some(10), "a day exactly is enough");
+        assert_eq!(
+            fall(&[(0, 100.0), (D, 90.0)]),
+            Some(10),
+            "a day exactly is enough"
+        );
     }
 
     #[test]
@@ -241,7 +253,11 @@ mod tests {
         // A tie goes to the store named first.
         let tied = json!({"archive": 5, "projects": 20, "database": 20});
         assert_eq!(grew_most(&tied, Some(45)), Some(("projects", 20)));
-        assert_eq!(grew_most(&tied, Some(65)), Some(("projects", 20)), "a tie with unattributed");
+        assert_eq!(
+            grew_most(&tied, Some(65)),
+            Some(("projects", 20)),
+            "a tie with unattributed"
+        );
         // No store measured: all of the fall.
         assert_eq!(grew_most(&Value::Null, Some(7)), Some(("unattributed", 7)));
         assert_eq!(grew_most(&parts, None), None, "no fall: none");

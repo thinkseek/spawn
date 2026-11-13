@@ -187,7 +187,10 @@ mod tests {
         assert_eq!(days["measuring_since_ms"], 86_400_000);
         assert_eq!(days["state"], "not_collected");
         let grew = figure_json(&measuring[1].guardrails[8], None);
-        assert_eq!((grew["value"].clone(), grew.get("store")), (Value::Null, None));
+        assert_eq!(
+            (grew["value"].clone(), grew.get("store")),
+            (Value::Null, None)
+        );
         // No log size: no ratio; no readable test database: none.
         let bare = lines(
             &json!({"database": {"bytes": 300, "log_bytes": 0}, "test_databases": []}),
