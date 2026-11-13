@@ -23,7 +23,6 @@ export function NorthStarChart({ mark, figure }: { mark: CoreMark; figure: CoreF
       format={(value) => unitWords(unit, value)}
       footer={mark.range}
       emptyText="no trend yet: fewer than two days sampled"
-      className={mark.tone === "warning" ? "text-warning" : undefined}
     />
   );
 }
