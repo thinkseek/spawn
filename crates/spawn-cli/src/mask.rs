@@ -16,8 +16,8 @@
 //! longest form wins.
 //!
 //! - `spawn mask --values <file>`: stdin to stdout through the mask as it
-//!   streams, the last [`Mask::window`] bytes of each read held for the
-//!   next, so a value split across reads is caught.
+//!   streams, the last bytes of each read (as many as the longest form,
+//!   less one) held for the next, so a value split across reads is caught.
 //! - `spawn mask-hook --values <file>`: a Claude Code PostToolUse hook. When
 //!   `tool_response` holds a form of a value, it prints the response with
 //!   every string masked as `updatedToolOutput`; otherwise nothing.
@@ -30,6 +30,7 @@
 //! Nothing here installs the hook anywhere.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -116,7 +117,7 @@ fn json_escaped(value: &str, ascii: bool) -> String {
             c if (c as u32) < 0x20 || (ascii && !c.is_ascii()) => {
                 let mut units = [0_u16; 2];
                 for unit in c.encode_utf16(&mut units) {
-                    out.push_str(&format!("\\u{unit:04x}"));
+                    let _ = write!(out, "\\u{unit:04x}");
                 }
             }
             c => out.push(c),
@@ -132,9 +133,9 @@ fn url_encoded(value: &[u8], upper: bool) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(*byte));
         } else if upper {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         } else {
-            out.push_str(&format!("%{byte:02x}"));
+            let _ = write!(out, "%{byte:02x}");
         }
     }
     out
@@ -167,7 +168,7 @@ fn base64_interior(value: &[u8], shift: usize, alphabet: &[u8; 64]) -> Vec<u8> {
     padded.extend_from_slice(value);
     let encoded = base64(&padded, alphabet);
     let skip = [0, 2, 3][shift];
-    let keep = if padded.len() % 3 == 0 {
+    let keep = if padded.len().is_multiple_of(3) {
         encoded.len()
     } else {
         encoded.len() - 1
@@ -193,7 +194,10 @@ pub(crate) fn forms(value: &[u8]) -> Vec<Vec<u8>> {
             all.push(base64_interior(value, shift, alphabet));
         }
     }
-    let hex: String = value.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex = value.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
     all.push(hex.to_uppercase().into_bytes());
     all.push(hex.into_bytes());
     let mut seen = std::collections::BTreeSet::new();
@@ -222,12 +226,6 @@ impl Mask {
             by_first,
             longest,
         }
-    }
-
-    /// How many bytes a stream holds back for its next read: the longest
-    /// form, less one.
-    pub(crate) fn window(&self) -> usize {
-        self.longest.saturating_sub(1)
     }
 
     /// The longest form at `data[at..]`: its length and name.
