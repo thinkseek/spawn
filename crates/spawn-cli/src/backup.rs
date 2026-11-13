@@ -2045,11 +2045,19 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
+    let seal = match settings.seal.clone() {
+        Ok(seal) => seal,
+        Err(reason) => {
+            eprintln!("spawn backup bundle: {reason}");
+            record_refusal("bundle", &reason);
+            return Ok(2);
+        }
+    };
     let _lock = Lock::acquire(&settings.root)?;
     let store = open_store()?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
     let now = Stamp::at(now_ms);
-    let earlier = bundle_records(&store, &settings.prefix, now_ms)?;
+    let earlier = sealed_alike(bundle_records(&store, &settings.prefix, now_ms)?, &seal.name);
     let base = earlier.last();
     let stamps = bundle_stamps(&earlier);
     let full = full_bundle(now, &stamps, now_ms);
