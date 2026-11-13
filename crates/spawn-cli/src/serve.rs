@@ -878,6 +878,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/alerts" => Box::new(move || alerts(query)),
         "/api/cost" => Box::new(move || cost(query)),
         "/api/core-lines" => Box::new(core_lines::core_lines),
+        "/api/verifications" => Box::new(verifications),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1476,6 +1477,14 @@ fn missions() -> Result<Value, String> {
     labels::label_board(&mut board);
     answers::slim_board(&mut board);
     Ok(board)
+}
+
+/// `/api/verifications`: what `spawn verify list` prints (crate::verify),
+/// read through the reader login on request.
+fn verifications() -> Result<Value, String> {
+    let store = open_store()?;
+    let facts = store.verification_facts().map_err(err)?;
+    Ok(crate::verify::list(&facts, now_ms()))
 }
 
 /// `/api/missions/task/<id>`: one task's brief, report and review note in

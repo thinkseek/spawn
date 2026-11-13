@@ -2504,6 +2504,11 @@ begin
         -- spawn_deploy_record): read by the alert step (`deploy_failed`),
         -- folded into no table.
         null;
+    when 'objective.verified' then
+        -- A look at the running product after an objective landed (`spawn
+        -- verify`, through spawn_verification_record, objective 133): read
+        -- by `spawn verify list` and /api/verifications, folded into no table.
+        null;
     when 'backup.dumped', 'backup.bundled', 'backup.verified', 'backup.stored',
          'backup.drilled.transcripts', 'backup.drilled.missions' then
         -- What `spawn backup` did (crate backup.rs; `backup.stored`: a
@@ -5201,6 +5206,70 @@ begin
     return spawn_control_record(p_record);
 end $$;
 
+-- An objective's verification after its landing (objective 133): `spawn
+-- verify <mission>/<objective>` writes one `objective.verified` through
+-- `spawn_verification_record` (owner only): who looked (`by`), how (`how`)
+-- and what they saw (`result`, pass or fail). Its shape is fixed, every
+-- field checked, and nothing else is taken. Objectives are numbered per
+-- mission, so the record names both; an objective that never landed in
+-- that mission (no `task.landed` of a task of that mission and objective)
+-- is refused. Folded into no table: `spawn verify list` reads the records.
+create or replace function spawn_verification_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_mission bigint;
+    v_objective integer;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record verifications', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' is distinct from 'objective.verified' then
+        raise exception 'not a verification record: %', p_record ->> 'type';
+    end if;
+    if exists (select 1 from jsonb_object_keys(p_record) k
+                where k not in ('type', 'mission', 'objective', 'by', 'how', 'result'))
+       or exists (select 1 from unnest(array['mission', 'objective', 'by', 'how', 'result']) f
+                   where not p_record ? f) then
+        raise exception 'a verification record has type, mission, objective, by, how and result, and nothing else';
+    end if;
+    if exists (select 1 from unnest(array['mission', 'objective']) f
+                where case when jsonb_typeof(p_record -> f) = 'number'
+                           then (p_record ->> f)::numeric < 1
+                                or (p_record ->> f)::numeric > 2147483647
+                                or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)
+                           else true end) then
+        raise exception 'a verification record''s mission and objective are whole numbers from 1';
+    end if;
+    if jsonb_typeof(p_record -> 'by') is distinct from 'string'
+       or char_length(p_record ->> 'by') not between 1 and 80
+       or p_record ->> 'by' ~ '^[[:space:]]*$' then
+        raise exception 'a verification record''s by is 1 to 80 characters, not blank';
+    end if;
+    if jsonb_typeof(p_record -> 'how') is distinct from 'string'
+       or char_length(p_record ->> 'how') not between 1 and 500
+       or p_record ->> 'how' ~ '^[[:space:]]*$' then
+        raise exception 'a verification record''s how is 1 to 500 characters, not blank';
+    end if;
+    if jsonb_typeof(p_record -> 'result') is distinct from 'string'
+       or p_record ->> 'result' not in ('pass', 'fail') then
+        raise exception 'a verification record''s result is pass or fail';
+    end if;
+    v_mission := (p_record ->> 'mission')::numeric::bigint;
+    v_objective := (p_record ->> 'objective')::numeric::integer;
+    if not exists (
+        select 1
+          from mission_tasks t
+          join spawn_events e
+            on e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'
+           and e.kind -> 'detail' -> 'record' -> 'id' = to_jsonb(t.id)
+         where t.mission_id = v_mission and t.objective = v_objective) then
+        raise exception 'objective %/% never landed', v_mission, v_objective;
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
 -- The landings and the deploy records, found without reading the rest of
 -- the stream: deploy/on-landing.sh reads main's landing and the last deploy
 -- every minute (`MAIN_LANDING`).
@@ -5885,7 +5954,8 @@ begin
         'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
-        'spawn_deploy_record(jsonb)', 'spawn_cost_record(jsonb)',
+        'spawn_deploy_record(jsonb)', 'spawn_verification_record(jsonb)',
+        'spawn_cost_record(jsonb)',
         'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
         'spawn_cost_archive_record(jsonb, jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',

@@ -15,6 +15,7 @@
 //! - `fleet`: the dashboard and dispatcher read model.
 //! - `missions`: missions, tasks and residents, and the integrator's lock.
 //! - `scorecard`: the facts `spawn scorecard` measures, read in one snapshot.
+//! - `verifications`: objectives' verifications after their landings.
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -96,6 +97,7 @@ mod scorecard;
 mod sessions;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+mod verifications;
 mod wake;
 
 pub use acks::{AckRecord, ReportAnswer};
@@ -106,6 +108,7 @@ pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
+pub use verifications::verified_by_line;
 pub use wake::Listener;
 
 /// Schema installed by [`PostgresStore::migrate`].
