@@ -40,7 +40,12 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             return Err(format!("unexpected argument {word}\n{USAGE}"));
         }
         let store = crate::open_store()?;
-        list(&store.verification_facts().map_err(|error| error.to_string())?, now_ms())
+        list(
+            &store
+                .verification_facts()
+                .map_err(|error| error.to_string())?,
+            now_ms(),
+        )
     } else {
         let record = record(first, &Flags::parse(&rest[1..])?)?;
         let store = crate::open_store()?;
@@ -79,14 +84,18 @@ fn record(objective: &str, flags: &Flags) -> Result<Value, String> {
     if result != "pass" && result != "fail" {
         return Err(format!("--result is pass or fail, not '{result}'"));
     }
-    Ok(json!({"type": "objective.verified", "mission": mission, "objective": objective,
-              "by": by, "how": how, "result": result}))
+    Ok(
+        json!({"type": "objective.verified", "mission": mission, "objective": objective,
+              "by": by, "how": how, "result": result}),
+    )
 }
 
 /// `<mission>/<objective>`, each a whole number from 1 (`9/28` and
 /// `9/028` name the same objective; an objective fits an `integer`).
 pub(crate) fn parse_name(text: &str) -> Result<(i64, i64), String> {
-    let refused = || format!("an objective is named <mission>/<objective>, whole numbers from 1, not '{text}'");
+    let refused = || {
+        format!("an objective is named <mission>/<objective>, whole numbers from 1, not '{text}'")
+    };
     let (mission, objective) = text.split_once('/').ok_or_else(refused)?;
     let number = |part: &str, most: i64| {
         if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -96,7 +105,10 @@ pub(crate) fn parse_name(text: &str) -> Result<(i64, i64), String> {
             .ok()
             .filter(|number| (1..=most).contains(number))
     };
-    match (number(mission, i64::MAX), number(objective, i64::from(i32::MAX))) {
+    match (
+        number(mission, i64::MAX),
+        number(objective, i64::from(i32::MAX)),
+    ) {
         (Some(mission), Some(objective)) => Ok((mission, objective)),
         _ => Err(refused()),
     }
@@ -185,8 +197,207 @@ pub(crate) fn list(facts: &Value, now_ms: i64) -> Value {
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| i64::try_from(time.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |time| {
+            i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{A_DAY_MS, LISTED_SINCE_MS, list, name, parse_name};
+
+    const C: i64 = LISTED_SINCE_MS;
+    const H: i64 = 3_600_000;
+
+    fn landing(mission: i64, objective: i64, task: i64, landed_ms: i64) -> Value {
+        json!({"mission": mission, "objective": objective, "task": task,
+               "landed_ms": landed_ms, "verified_by": null})
+    }
+
+    fn seen(mission: i64, objective: i64, result: &str, at_ms: i64) -> Value {
+        json!({"mission": mission, "objective": objective, "result": result, "by": "lead",
+               "how": "read it", "at_ms": at_ms})
+    }
+
+    /// The listed objectives' names, in order.
+    fn listed(answer: &Value) -> Vec<String> {
+        answer["unverified"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|entry| entry["objective"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn facts(landings: &[Value], verifications: &[Value]) -> Value {
+        json!({"landings": landings, "verifications": verifications, "deploy": null})
+    }
+
+    #[test]
+    fn a_pass_after_the_newest_landing_verifies_and_one_before_it_does_not() {
+        let now = C + 10 * H;
+        let answer = list(
+            &facts(
+                &[landing(4, 1, 10, C + H), landing(4, 2, 11, C + 2 * H)],
+                &[seen(4, 1, "pass", C + 3 * H), seen(4, 2, "pass", C + H)],
+            ),
+            now,
+        );
+        assert_eq!(listed(&answer), ["4/002"], "{answer}");
+        assert_eq!(answer["unverified"][0]["last"], Value::Null);
+        assert_eq!(answer["unverified"][0]["task"], 11);
+        assert_eq!(answer["unverified"][0]["landed_ms"], C + 2 * H);
+        assert_eq!(answer["unverified"][0]["age_ms"], 8 * H);
+    }
+
+    #[test]
+    fn the_newest_verification_decides() {
+        let answer = list(
+            &facts(
+                &[landing(4, 1, 10, C + H), landing(4, 2, 11, C + H + 1)],
+                &[
+                    seen(4, 1, "pass", C + 2 * H),
+                    seen(4, 2, "fail", C + 2 * H),
+                    seen(4, 1, "fail", C + 3 * H),
+                    seen(4, 2, "pass", C + 3 * H),
+                ],
+            ),
+            C + 4 * H,
+        );
+        assert_eq!(listed(&answer), ["4/001"], "a fail after a pass: {answer}");
+        assert_eq!(
+            answer["unverified"][0]["last"],
+            json!({"result": "fail", "by": "lead", "how": "read it", "at_ms": C + 3 * H})
+        );
+    }
+
+    #[test]
+    fn one_number_in_two_missions_is_two_objectives() {
+        let answer = list(
+            &facts(
+                &[landing(9, 28, 1, C + 2 * H), landing(4, 28, 2, C + H)],
+                &[seen(9, 28, "pass", C + 3 * H)],
+            ),
+            C + 4 * H,
+        );
+        assert_eq!(listed(&answer), ["4/028"], "{answer}");
+        let answer = list(
+            &facts(
+                &[landing(9, 28, 1, C + 2 * H), landing(4, 28, 2, C + H)],
+                &[],
+            ),
+            C + 4 * H,
+        );
+        assert_eq!(listed(&answer), ["4/028", "9/028"], "oldest landing first");
+    }
+
+    #[test]
+    fn landings_before_the_listed_since_are_counted_not_listed() {
+        let answer = list(
+            &facts(
+                &[
+                    landing(4, 1, 1, C - 1),
+                    landing(4, 2, 2, C - 2 * H),
+                    landing(4, 3, 3, C - 3 * H),
+                    landing(4, 4, 4, C),
+                ],
+                &[seen(4, 2, "pass", C - H), seen(4, 3, "fail", C - H)],
+            ),
+            C + H,
+        );
+        assert_eq!(listed(&answer), ["4/004"], "{answer}");
+        assert_eq!(answer["older_unverified"], 2);
+        assert_eq!(answer["listed_since_ms"], C);
+    }
+
+    #[test]
+    fn over_a_day_is_an_age_of_24_hours_or_more() {
+        let now = C + 30 * H;
+        let answer = list(
+            &facts(
+                &[
+                    landing(4, 1, 1, now - A_DAY_MS),
+                    landing(4, 2, 2, now - A_DAY_MS + 1),
+                ],
+                &[],
+            ),
+            now,
+        );
+        assert_eq!(answer["unverified"][0]["over_a_day"], true, "{answer}");
+        assert_eq!(answer["unverified"][1]["over_a_day"], false);
+        assert_eq!(answer["over_a_day"], 1);
+    }
+
+    #[test]
+    fn the_deploy_is_spawns_own_newest_or_null() {
+        assert_eq!(list(&facts(&[], &[]), C)["deploy"], Value::Null);
+        let mut with = facts(&[], &[]);
+        with["deploy"] = json!({"at_ms": C, "head": "a".repeat(40), "ok": false,
+                                "reason": "the build failed"});
+        assert_eq!(
+            list(&with, C)["deploy"],
+            json!({"what": "Spawn's own deploys (deploy/deploy.sh)", "at_ms": C,
+                   "head": "a".repeat(40), "ok": false, "reason": "the build failed"})
+        );
+    }
+
+    #[test]
+    fn a_name_is_mission_slash_objective_whole_numbers_from_1() {
+        assert_eq!(parse_name("9/28"), Ok((9, 28)));
+        assert_eq!(parse_name("9/028"), Ok((9, 28)));
+        for bad in [
+            "130",
+            "0/130",
+            "1/0",
+            "1/",
+            "/1",
+            "a/1",
+            "1/-2",
+            "1/+2",
+            "1/2/3",
+            " 1/2",
+            "1/2147483648",
+        ] {
+            assert!(parse_name(bad).is_err(), "{bad}");
+        }
+        assert_eq!(name(9, 28), "9/028");
+        assert_eq!(name(4, 1133), "4/1133");
+    }
+
+    #[test]
+    fn a_result_other_than_pass_or_fail_or_a_missing_flag_is_refused() {
+        let flags = |words: &[&str]| {
+            crate::Flags::parse(&words.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .expect("flags")
+        };
+        let good = super::record(
+            "2/028",
+            &flags(&["--by", "lead", "--how", "x", "--result", "pass"]),
+        )
+        .expect("a record");
+        assert_eq!(
+            good,
+            json!({"type": "objective.verified", "mission": 2, "objective": 28, "by": "lead",
+                   "how": "x", "result": "pass"})
+        );
+        assert!(
+            super::record(
+                "2/028",
+                &flags(&["--by", "lead", "--how", "x", "--result", "maybe"])
+            )
+            .is_err()
+        );
+        assert!(super::record("2/028", &flags(&["--by", "lead", "--result", "pass"])).is_err());
+        assert!(
+            super::record(
+                "2/028",
+                &flags(&[
+                    "--by", "lead", "--how", "x", "--result", "pass", "--at", "1"
+                ])
+            )
+            .is_err()
+        );
+    }
+}
