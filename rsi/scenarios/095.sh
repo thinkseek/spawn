@@ -18,11 +18,13 @@
 #       window's start and the record's start (null with no deploy record),
 #       and `covered`, whether the record starts at or before the window.
 #   (2) the Core lines performance north star `performance.report_to_live`
-#       has no value (not collected) while the 7-day window is not covered,
-#       and carries `measuring_since_ms` (the window's measured_from_ms);
-#       web/src/coreLines.ts says "measuring since <MM-DD HH:MM>" (local
-#       time) for such a figure in place of "not collected yet". Covered,
-#       the figure is the Scorecard's value, as 086 says.
+#       carries `measuring_since_ms` (the window's measured_from_ms) while
+#       the 7-day window is not covered. Since objective 132 it is the
+#       Scorecard's value over what the record covers (window "since the
+#       deploy record began"); web/src/coreLines.ts says "measuring since
+#       <MM-DD HH:MM>" (local time) for such a figure without a value (under
+#       3 live landings) in place of "not collected yet". Covered, the figure
+#       is the Scorecard's value, as 086 says.
 #
 # The history: 081's (five landings, deploys at -9 h, a failed one at -7 h,
 # -6 h and -4 h), with the first deploy record at -9 h, and task 1 landing
@@ -288,8 +290,8 @@ if [ "$code" != 200 ]; then
     check_failed "(2) GET /api/core-lines answered $code: $(head -c 200 "$WORK/lines.json")"
 else
     expect_eq "$(jq -c '.lines[] | select(.line == "performance") | .north_star | {key, value, state, measuring_since_ms}' "$WORK/lines.json")" \
-        "{\"key\":\"performance.report_to_live\",\"value\":null,\"state\":\"not_collected\",\"measuring_since_ms\":$record_from}" \
-        "(2) the north star while the 7 days are not covered: no value, measuring since the record's start"
+        "{\"key\":\"performance.report_to_live\",\"value\":$H,\"state\":\"no_range\",\"measuring_since_ms\":$record_from}" \
+        "(2) the north star while the 7 days are not covered: the Scorecard's value (objective 132), measuring since the record's start"
     since_words=$(TZ=Asia/Shanghai date -d "@$((record_from / 1000))" '+%m-%d %H:%M')
     cat >"$WORK/lines.test.mjs" <<'TEST'
 import assert from "node:assert/strict";
@@ -301,11 +303,12 @@ const env = process.env;
 const { coreLinesView } = await import(pathToFileURL(`${env.BB_TREE}/web/src/coreLines.ts`).href);
 const answer = JSON.parse(readFileSync(`${env.BB_WORK}/lines.json`, "utf8"));
 
-test("(2) the card says measuring since, and the figure once covered", () => {
-  const view = coreLinesView(answer);
-  const row = view.rows.find((r) => r.line === "Performance");
-  assert.equal(row.north_star.value, `measuring since ${env.BB_SINCE}`);
+test("(2) the card says measuring since without a value, and the figure once covered", () => {
   const star = answer.lines.find((l) => l.line === "performance").north_star;
+  const few = { ...answer, lines: answer.lines.map((l) => l.line === "performance"
+    ? { ...l, north_star: { ...star, value: null, state: "not_collected" } } : l) };
+  const row = coreLinesView(few).rows.find((r) => r.line === "Performance");
+  assert.equal(row.north_star.value, `measuring since ${env.BB_SINCE}`);
   const covered = { ...answer, lines: answer.lines.map((l) => l.line === "performance"
     ? { ...l, north_star: { ...star, value: 5_400_000, state: "no_range", measuring_since_ms: undefined } } : l) };
   assert.equal(coreLinesView(covered).rows.find((r) => r.line === "Performance").north_star.value, "1 h 30 min");
