@@ -167,6 +167,11 @@ run (no drill server named, no credentials, no key).
 
 ## Install
 
+The oldest curl it works with is 7.88 (Debian 12's): every request names
+its payload hash (`x-amz-content-sha256: UNSIGNED-PAYLOAD`), which 7.88 does
+not send itself and R2 requires, and every listing sends its query sorted
+by name, as SigV4 signs it (7.88 signs the query as written).
+
 The binary is installed as `bin/spawn` by `deploy/deploy.sh`, like every
 other command; the timers are new here. After `spawn backup` is in the
 deployed `bin/spawn`:
@@ -281,8 +286,10 @@ the live one, then point `SPAWN_DATABASE_URL` at it.
 # 1. fetch: list, take the newest key under postgres/daily/
 set -a; . ~/.config/spawn/r2.env; set +a
 curl --aws-sigv4 aws:amz:auto:s3 --user "$SPAWN_R2_ACCESS_KEY_ID:$SPAWN_R2_SECRET_ACCESS_KEY" \
+  -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
   "$SPAWN_R2_ENDPOINT/$SPAWN_R2_BUCKET?list-type=2&prefix=postgres%2Fdaily%2F"
 curl --aws-sigv4 aws:amz:auto:s3 --user "$SPAWN_R2_ACCESS_KEY_ID:$SPAWN_R2_SECRET_ACCESS_KEY" \
+  -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
   -o spawn.dump.gpg "$SPAWN_R2_ENDPOINT/$SPAWN_R2_BUCKET/postgres/daily/spawn-YYYYMMDD-HHMMSS.dump.gpg"
 # 2. decrypt and restore into a new, empty database
 gpg --batch --pinentry-mode loopback --passphrase-file ~/.config/spawn/backup.key -o spawn.dump -d spawn.dump.gpg

@@ -175,6 +175,7 @@ pg_image() {
 s3() {
   curl --silent --show-error --fail-with-body --retry 3 --connect-timeout 20 --max-time 900 \
     --aws-sigv4 "aws:amz:auto:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
     -K <(printf 'user = "%s:%s"\n' "$R2_ACCESS_KEY_ID" "$R2_SECRET_ACCESS_KEY") \
     "$@"
 }
