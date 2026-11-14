@@ -4182,7 +4182,11 @@ begin
         end if;
         if not exists (
             select 1 from mission_source_reds r
-             where r.source = p_record ->> 'source' and r.main = p_record ->> 'main'
+             where r.source = p_record ->> 'source'
+               -- Both through the commit map (objective 177): a red main
+               -- recorded before a history rewrite is its new commit.
+               and coalesce(spawn_commit_now(r.main), r.main)
+                   = coalesce(spawn_commit_now(p_record ->> 'main'), p_record ->> 'main')
                and spawn_now_ms() - greatest(r.red_ms, coalesce(r.probed_ms, r.red_ms))
                    >= (p_record ->> 'probe_ms')::numeric) then
             raise exception 'no probe of % is due', p_record ->> 'source';
