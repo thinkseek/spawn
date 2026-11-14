@@ -1993,6 +1993,13 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
+    let until = health["generated_at_ms"].as_i64().unwrap_or_else(now_ms);
+    if let Some(posts) = crate::scorecard::interventions::queue_posts_between(
+        until.saturating_sub(crate::scorecard::time::DAY_MS),
+        until,
+    ) {
+        add_queue_posts(&mut health, posts.len());
+    }
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     health["memory"] = crate::memory::report();
     health["storage"] = storage::report(&store, now_ms())?;
@@ -2003,6 +2010,25 @@ fn fleet() -> Result<Value, String> {
         "agents": agents,
         "health": health,
     }))
+}
+
+/// The owner's `posts` posts in the queue over the strip's day (objective
+/// 158), added as the Home card adds them: `interventions_24h` gains them,
+/// `queue_posts_24h` says how many, and `human_per_agent_hour` is worked out
+/// again from `interventions_24h` and `agent_ms_24h` (the card's one ratio).
+/// Only called when the ranges file names the queue: without it the strip
+/// is the store's, with no `queue_posts_24h`.
+fn add_queue_posts(health: &mut Value, posts: usize) {
+    let posts = i64::try_from(posts).unwrap_or(i64::MAX);
+    let total = health["interventions_24h"]
+        .as_i64()
+        .unwrap_or(0)
+        .saturating_add(posts);
+    let agent_ms = health["agent_ms_24h"].as_i64().unwrap_or(0);
+    health["interventions_24h"] = json!(total);
+    health["queue_posts_24h"] = json!(posts);
+    health["human_per_agent_hour"] =
+        crate::scorecard::interventions::per_agent_hour(total, agent_ms);
 }
 
 /// The health's `backups`: `{dump, bundle}`, each the newest `backup.dumped`

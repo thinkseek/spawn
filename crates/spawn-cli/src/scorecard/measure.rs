@@ -86,6 +86,9 @@ pub(crate) struct Counts {
     /// The runs whose verdict decided nothing, and their wall clocks summed.
     pub(crate) undecided_gate_runs: usize,
     pub(crate) undecided_gate_ms: i64,
+    /// Whether the queue is named (objective 158): autonomy counts and says
+    /// the owner's two kinds too.
+    pub(crate) queue: bool,
 }
 
 impl Counts {
@@ -140,6 +143,7 @@ pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts 
         open_ms: union_ms(&history.open_intervals(scope.mission()), window),
         live_measured_from: history.live_from.map(|from| from.max(window.since)),
         live_covered: history.live_from.is_some_and(|from| from <= window.since),
+        queue: history.queue,
         ..Counts::default()
     };
     // A landing before the live record began is neither live nor not live.
@@ -346,6 +350,17 @@ const INTERVENTIONS: [(Kind, &str); 4] = [
     (Kind::CancelReassign, "cancel_reassign"),
 ];
 
+/// The interventions when the queue is named (objective 158): the four,
+/// then the owner's posts in the queue.
+const WITH_QUEUE: [(Kind, &str); 6] = [
+    (Kind::Command, "command"),
+    (Kind::Resume, "resume"),
+    (Kind::OwnerTask, "owner_task"),
+    (Kind::CancelReassign, "cancel_reassign"),
+    (Kind::OwnerDecision, "owner_decision"),
+    (Kind::Steering, "steering"),
+];
+
 const FAILURES: [(Kind, &str); 4] = [
     (Kind::FailedCommand, "failed_command"),
     (Kind::SpentDelivery, "spent_delivery"),
@@ -353,7 +368,7 @@ const FAILURES: [(Kind, &str); 4] = [
     (Kind::GateInfrastructure, "gate_infrastructure"),
 ];
 
-fn by_kind(counts: &Counts, kinds: &[(Kind, &str); 4]) -> Value {
+fn by_kind(counts: &Counts, kinds: &[(Kind, &str)]) -> Value {
     Value::Object(
         kinds
             .iter()
@@ -362,7 +377,7 @@ fn by_kind(counts: &Counts, kinds: &[(Kind, &str); 4]) -> Value {
     )
 }
 
-fn kinds(table: &[(Kind, &str); 4]) -> Vec<Kind> {
+fn kinds(table: &[(Kind, &str)]) -> Vec<Kind> {
     table.iter().map(|(kind, _)| *kind).collect()
 }
 
@@ -456,7 +471,7 @@ fn first_pass(counts: &Counts, enough: bool) -> Dimension {
 fn marks_per_landing(
     counts: &Counts,
     enough: bool,
-    table: &[(Kind, &str); 4],
+    table: &[(Kind, &str)],
     total: &str,
     breakdown: &str,
 ) -> Dimension {
@@ -473,10 +488,16 @@ fn marks_per_landing(
 }
 
 /// Autonomy: the interventions per landing, and `retries`, a person's
-/// commands sent again after a refusal (each intent counts once).
+/// commands sent again after a refusal (each intent counts once). When the
+/// queue is named, the owner's posts in it are interventions too (objective
+/// 158): the fleet's only, so a mission says them at 0.
 fn autonomy(counts: &Counts, enough: bool) -> Dimension {
-    let mut dimension =
-        marks_per_landing(counts, enough, &INTERVENTIONS, "interventions", "by_kind");
+    let table: &[(Kind, &str)] = if counts.queue {
+        &WITH_QUEUE
+    } else {
+        &INTERVENTIONS
+    };
+    let mut dimension = marks_per_landing(counts, enough, table, "interventions", "by_kind");
     dimension
         .parts
         .insert("retries".into(), usize_json(counts.count(Kind::Retry)));

@@ -42,6 +42,12 @@ pub(crate) enum Kind {
     /// Autonomy: a person's cancellation followed by the same work assigned
     /// again.
     CancelReassign,
+    /// Autonomy, when the queue is named (objective 158): an owner's
+    /// decision lead-mac posted in it; the fleet's only.
+    OwnerDecision,
+    /// Autonomy, when the queue is named: lead-mac's steering post in it;
+    /// the fleet's only.
+    Steering,
     /// Reliability: a command finished with `succeeded` false.
     FailedCommand,
     /// Reliability: a delivery whose retries are spent.
@@ -157,6 +163,9 @@ pub(crate) struct History {
     /// `None` with no deploy record. A landing before it is in no part of
     /// report to live: nothing recorded when it went live.
     pub(crate) live_from: Option<i64>,
+    /// Whether the ranges file names the queue (objective 158): autonomy
+    /// then says its two kinds, at 0 where none was posted.
+    pub(crate) queue: bool,
 }
 
 /// One control record, as the store projects it (spawn-postgres,
@@ -840,6 +849,28 @@ impl History {
     /// Only what counts in `[since, until)`: the landings, marks, gate runs
     /// and tokens in it, and the tasks open in it. Every count of a window
     /// inside it is the same after; there is less to read for each.
+    /// The owner's posts in the queue (objective 158; the items
+    /// `/api/interventions` lists, `{kind, at_ms, …}`): each a mark of the
+    /// fleet's only, of its kind; an item of any other kind is none. The
+    /// queue is then named.
+    pub(crate) fn queue_posts(&mut self, items: &[Value]) {
+        self.queue = true;
+        for item in items {
+            let kind = match item["kind"].as_str() {
+                Some("owner_decision") => Kind::OwnerDecision,
+                Some("steering") => Kind::Steering,
+                _ => continue,
+            };
+            if let Some(at) = item["at_ms"].as_i64() {
+                self.marks.push(Mark {
+                    at,
+                    mission: None,
+                    kind,
+                });
+            }
+        }
+    }
+
     pub(crate) fn clip(&mut self, since: i64, until: i64) {
         let inside = |at: i64| since <= at && at < until;
         self.landings.retain(|landing| inside(landing.at));

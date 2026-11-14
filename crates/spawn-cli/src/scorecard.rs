@@ -186,6 +186,12 @@ pub(crate) fn measure(
     let (messages, reach) =
         transcripts::read_archive(&archive, previous_since).map_err(Failure::Record)?;
     let mut history = History::from_record(&facts, &messages);
+    // The owner's posts in the queue, when the ranges file names it
+    // (objective 158), over the previous window and this one, so the
+    // window, the previous one and each day count them as the card does.
+    if let Some(posts) = interventions::queue_posts_between(previous_since, window.until) {
+        history.queue_posts(&posts);
+    }
     history.clip(previous_since, window.until);
     let mut card = card(&history, window, mission)?;
     settle(
@@ -420,14 +426,21 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
                 &["rejected", "conflict", "incompatible", "reviewed"],
             )
         ),
-        "autonomy" => format!(
-            "interventions {}: {}",
-            show(&field("interventions")),
-            counts_of(
-                &field("by_kind"),
-                &["command", "resume", "owner_task", "cancel_reassign"],
+        "autonomy" => {
+            let by_kind = field("by_kind");
+            let mut kinds = vec!["command", "resume", "owner_task", "cancel_reassign"];
+            // The owner's posts in the queue, when it is named (objective 158).
+            for kind in ["owner_decision", "steering"] {
+                if by_kind.get(kind).is_some() {
+                    kinds.push(kind);
+                }
+            }
+            format!(
+                "interventions {}: {}",
+                show(&field("interventions")),
+                counts_of(&by_kind, &kinds)
             )
-        ),
+        }
         "reliability" => format!(
             "events {}: {}",
             show(&field("events")),

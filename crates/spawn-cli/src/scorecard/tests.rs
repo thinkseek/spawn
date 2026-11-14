@@ -2350,3 +2350,52 @@ fn a_file_not_the_one_read_is_read_from_its_start() {
     assert_eq!((none.len(), parsed), (0, Parsed::default()));
     std::fs::remove_dir_all(&root).expect("clean up");
 }
+
+/// Objective 158: when the queue is named, the owner's posts in it are
+/// interventions of the fleet's only, of their kinds; a mission says them at
+/// 0, and an item of another kind is no mark.
+#[test]
+fn autonomy_counts_the_owners_queue_posts_for_the_fleet_only() {
+    let mut story = Story::default();
+    story.mission(1, true);
+    three_landings(&mut story, 0);
+    story.rec(at(9), json!({"type": "mission.resumed", "id": 1}));
+    let mut history = story.history();
+    let fleet = |history: &History| {
+        dimension(
+            &counts(history, Scope::Fleet, window_hours(0, 24)),
+            None,
+            "autonomy",
+        )
+    };
+    let before = fleet(&history);
+    assert_eq!(
+        before["by_kind"],
+        json!({"command": 0, "resume": 1, "owner_task": 0, "cancel_reassign": 0}),
+        "no queue named: the four kinds"
+    );
+    assert_eq!(before["interventions"], json!(1));
+    assert_eq!(before["value"], json!(0.333));
+    history.queue_posts(&[
+        json!({"kind": "owner_decision", "at_ms": at(10), "line": "OWNER DECISIONS"}),
+        json!({"kind": "steering", "at_ms": at(11), "line": "F4 PASSES"}),
+        json!({"kind": "steering", "at_ms": at(30), "line": "outside the window"}),
+        json!({"kind": "command", "at_ms": at(12), "line": "no mark"}),
+    ]);
+    let after = fleet(&history);
+    assert_eq!(
+        after["by_kind"],
+        json!({"command": 0, "resume": 1, "owner_task": 0, "cancel_reassign": 0,
+               "owner_decision": 1, "steering": 1})
+    );
+    assert_eq!(after["interventions"], json!(3));
+    assert_eq!(after["value"], json!(1.0));
+    let mission_1 = dimension(
+        &counts(&history, Scope::Mission(1), window_hours(0, 24)),
+        None,
+        "autonomy",
+    );
+    assert_eq!(mission_1["interventions"], json!(1));
+    assert_eq!(mission_1["by_kind"]["owner_decision"], json!(0));
+    assert_eq!(mission_1["by_kind"]["steering"], json!(0));
+}
