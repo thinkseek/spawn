@@ -1029,8 +1029,15 @@ fn objectives_at_their_limit_yield_and_the_next_get_the_slots() {
     assert_eq!(prior[0]["commit"], work);
     // Objective 177: after a history rewrite, the prior work by its new commit.
     let rewritten = "3".repeat(40);
-    db.store.commit_map_load(&[(work.to_string(), Some(rewritten.clone()))]).expect("the map");
-    assert_eq!(db.store.objective_prior_work(mission, 19, 3).expect("prior work")[0]["commit"], rewritten.as_str());
+    db.store
+        .commit_map_load(&[(work.to_string(), Some(rewritten.clone()))])
+        .expect("the map");
+    assert_eq!(
+        db.store
+            .objective_prior_work(mission, 19, 3)
+            .expect("prior work")[0]["commit"],
+        rewritten.as_str()
+    );
     let fresh = objective_task(&db, mission, 25).brief;
     assert!(!fresh.contains("Earlier tasks"), "a first task has none");
 
@@ -9664,12 +9671,17 @@ fn a_parked_task_and_a_red_main_are_read_by_their_new_commits_after_a_rewrite() 
         parked[field] = value;
     }
     db.record(&parked);
-    db.record(&json!({"type": "source.main_red", "source": source, "main": main,
+    db.record(
+        &json!({"type": "source.main_red", "source": source, "main": main,
                       "scenario": "check-tests.sh", "runs": 2,
                       "failures": [{"test": "t", "message": "m", "class": "regression"}],
-                      "task": task, "mission": mission}));
+                      "task": task, "mission": mission}),
+    );
     let before = gated(&db, mission);
-    assert_eq!(before.tasks[0].gate_parked_pushed.as_deref(), Some(pushed.as_str()));
+    assert_eq!(
+        before.tasks[0].gate_parked_pushed.as_deref(),
+        Some(pushed.as_str())
+    );
 
     db.store
         .commit_map_load(&[
@@ -9678,12 +9690,18 @@ fn a_parked_task_and_a_red_main_are_read_by_their_new_commits_after_a_rewrite() 
         ])
         .expect("the map");
     let after = gated(&db, mission);
-    assert_eq!(after.tasks[0].gate_parked_pushed.as_deref(), Some(pushed_new.as_str()));
+    assert_eq!(
+        after.tasks[0].gate_parked_pushed.as_deref(),
+        Some(pushed_new.as_str())
+    );
     assert_eq!(
         after.tasks[0].gate_load_sensitive_pushed.as_deref(),
         Some(pushed_new.as_str())
     );
-    assert_eq!(after.red.as_ref().map(|red| red.main.as_str()), Some(main_new.as_str()));
+    assert_eq!(
+        after.red.as_ref().map(|red| red.main.as_str()),
+        Some(main_new.as_str())
+    );
 
     std::thread::sleep(std::time::Duration::from_millis(5));
     assert!(

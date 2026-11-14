@@ -121,8 +121,14 @@ fn an_agents_checkpoints_are_read_by_their_new_commits_after_a_rewrite() {
     // Before the map: the recorded ids.
     assert_eq!(rows(&store)[0]["start"], commit(2));
     assert_eq!(rows(&store)[0]["set_aside"], commit(5));
-    assert_eq!(store.latest_checkpoint(AGENT).expect("latest"), Some(commit(5)));
-    assert_eq!(store.reported_commit(reporter).expect("reported"), Some(commit(6)));
+    assert_eq!(
+        store.latest_checkpoint(AGENT).expect("latest"),
+        Some(commit(5))
+    );
+    assert_eq!(
+        store.reported_commit(reporter).expect("reported"),
+        Some(commit(6))
+    );
 
     let mut pairs: Vec<(String, Option<String>)> = [1, 2, 3, 5, 6]
         .into_iter()
@@ -149,7 +155,10 @@ fn an_agents_checkpoints_are_read_by_their_new_commits_after_a_rewrite() {
 
     // A checkpoint the rewrite dropped reads as itself: the writers refuse it.
     checkpoint(&store, 7, CheckpointReason::TurnStopped, None);
-    assert_eq!(store.latest_checkpoint(AGENT).expect("latest"), Some(commit(7)));
+    assert_eq!(
+        store.latest_checkpoint(AGENT).expect("latest"),
+        Some(commit(7))
+    );
     assert_eq!(
         store.checkpoint_at(AGENT).expect("at").expect("one")["commit"],
         commit(7).as_str()

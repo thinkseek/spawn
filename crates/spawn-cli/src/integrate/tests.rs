@@ -2526,7 +2526,8 @@ fn the_scenario_owners_name_each_scenarios_root_fix_owner() {
 #[test]
 fn a_checkpoint_the_mirror_lacks_is_named_an_unknown_commit() {
     let git = crate::sources::test_git;
-    let base = std::env::temp_dir().join(format!("spawn-unknown-checkpoint-{}", std::process::id()));
+    let base =
+        std::env::temp_dir().join(format!("spawn-unknown-checkpoint-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let seed = base.join("seed");
     std::fs::create_dir_all(&seed).expect("seed");
@@ -2538,7 +2539,14 @@ fn a_checkpoint_the_mirror_lacks_is_named_an_unknown_commit() {
     let mirror = base.join("mirror.git").to_string_lossy().to_string();
     git(&["clone", "-q", "--bare", &seed_path, &mirror]).expect("mirror");
     let in_mirror = |commit: &str| {
-        git(&["--git-dir", &mirror, "cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok()
+        git(&[
+            "--git-dir",
+            &mirror,
+            "cat-file",
+            "-e",
+            &format!("{commit}^{{commit}}"),
+        ])
+        .is_ok()
     };
     let unknown = "1".repeat(40);
     let stale = || Freshness::Stale("the pushed branch (p) does not contain it".to_string());
@@ -2571,7 +2579,12 @@ fn a_checkpoint_the_mirror_lacks_is_named_an_unknown_commit() {
         "both known"
     );
     assert_eq!(
-        super::name_unknown(Freshness::Fresh(known.clone()), Some(&unknown), None, in_mirror),
+        super::name_unknown(
+            Freshness::Fresh(known.clone()),
+            Some(&unknown),
+            None,
+            in_mirror
+        ),
         Freshness::Fresh(known.clone()),
         "only a stale verdict is named"
     );

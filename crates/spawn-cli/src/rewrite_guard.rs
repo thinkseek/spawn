@@ -135,8 +135,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo.git").to_string_lossy().to_string();
         git(&["init", "-q", "--bare", &repo]).expect("init");
-        let empty = git(&["--git-dir", &repo, "hash-object", "-t", "tree", "-w", "/dev/null"])
-            .expect("the empty tree");
+        let empty = git(&[
+            "--git-dir",
+            &repo,
+            "hash-object",
+            "-t",
+            "tree",
+            "-w",
+            "/dev/null",
+        ])
+        .expect("the empty tree");
         let m0 = commit_tree(&repo, &empty, None, "m0");
         let m1 = commit_tree(&repo, &empty, Some(&m0), "m1");
         let e = commit_tree(&repo, &empty, Some(&m1), "e");
@@ -145,7 +153,11 @@ mod tests {
         let new = commit_tree(&repo, &empty, Some(&m1n), "made on the new history");
         git(&["--git-dir", &repo, "update-ref", "refs/heads/main", &m1n]).expect("main");
 
-        assert_eq!(why_old(&store, &repo, &m1), Ok(None), "no map: nothing refused");
+        assert_eq!(
+            why_old(&store, &repo, &m1),
+            Ok(None),
+            "no map: nothing refused"
+        );
 
         store
             .commit_map_load(&[
@@ -162,7 +174,9 @@ mod tests {
         );
         assert_eq!(
             why_old(&store, &repo, &e),
-            Ok(Some(format!("the commit {e} was dropped by the history rewrite")))
+            Ok(Some(format!(
+                "the commit {e} was dropped by the history rewrite"
+            )))
         );
         assert_eq!(
             why_old(&store, &repo, &on_old),
