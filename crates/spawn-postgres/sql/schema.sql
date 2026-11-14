@@ -1969,6 +1969,7 @@ drop trigger if exists spawn_commit_map_unchanged on spawn_commit_map;
 create trigger spawn_commit_map_unchanged
     before update or delete or truncate on spawn_commit_map
     for each statement execute function spawn_commit_map_unchanged();
+revoke execute on function spawn_commit_map_unchanged() from public;
 
 -- A recorded commit id as the commit it is now: the map's `new` for an id
 -- the map names (any case; null for a dropped commit), otherwise the id
@@ -1986,6 +1987,11 @@ do $$
 begin
     execute format('alter function spawn_commit_now(text) set search_path = %I, pg_temp',
                    current_schema());
+    -- Not public's (the gateway's ACL holds no store reader): the restricted
+    -- logins read recorded commits through it as the owner does.
+    execute 'revoke execute on function spawn_commit_now(text) from public';
+    execute format('grant execute on function spawn_commit_now(text) to %I, %I',
+                   spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader'));
 end
 $$;
 
