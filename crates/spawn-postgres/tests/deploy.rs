@@ -373,12 +373,59 @@ fn judging_counts_the_sources_tasks_between_report_and_landing() {
     assert_eq!(
         judging(),
         json!(2),
-        "an accepted task waits for its landing"
+        "a gate-accepted task (landing) waits for its landing"
+    );
+
+    // A mission without a gate on the source: its reported task waits for a
+    // person, and its accepted task is final (kept for good): neither lands
+    // through the integrator, so neither holds the quiet spell.
+    let reviewed = store
+        .mission_add("reviewed work", &json!([SOURCE]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(reviewed, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    assert_eq!(
+        judging(),
+        json!(2),
+        "a reported task of a mission without a gate waits for a person"
+    );
+    store.task_review(task, true, "", None).expect("review");
+    assert_eq!(
+        judging(),
+        json!(2),
+        "an accepted task of a mission without a gate never lands"
+    );
+
+    // A gated mission that accepts by review: a person first, then its gate.
+    let both = store
+        .mission_add("reviewed, then gated", &json!([SOURCE]), "human")
+        .expect("add");
+    store
+        .mission_configure(both, Some("/scenarios"), "review", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(both, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    assert_eq!(
+        judging(),
+        json!(2),
+        "a gated mission's reported task waits for a person when it accepts by review"
+    );
+    store.task_review(task, true, "", None).expect("review");
+    assert_eq!(
+        judging(),
+        json!(3),
+        "a task a person accepted is its gate's input"
     );
 
     store
         .integrator_record(&json!({"type": "task.landed", "id": accepted,
                                     "from": commit('0'), "to": commit('a')}))
         .expect("landed");
-    assert_eq!(judging(), json!(1), "a landed task is no longer counted");
+    assert_eq!(judging(), json!(2), "a landed task is no longer counted");
 }
