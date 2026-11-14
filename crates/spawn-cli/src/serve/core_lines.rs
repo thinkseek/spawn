@@ -534,7 +534,7 @@ pub(super) fn adopted(readings: &[Line]) -> Set {
                 card("observability.unpriced_share", "Use with no price", "share"),
                 card(
                     "recoverability.cloud_dump_age",
-                    "Age of the newest cloud database copy",
+                    "Age of the newest database copy",
                     "ms",
                 ),
             ],
