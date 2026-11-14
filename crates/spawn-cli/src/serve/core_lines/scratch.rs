@@ -1201,7 +1201,7 @@ mod tests {
                 (name.display().to_string(), entry.bytes, entry.reason)
             })
             .collect();
-        unowned.sort();
+        unowned.sort_by(|left, right| left.0.cmp(&right.0));
         unowned
     }
 
