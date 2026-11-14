@@ -4773,9 +4773,7 @@ fn lines(alerts: &[Value]) -> Vec<String> {
             if alert["state"].as_str() != Some("notice") {
                 return Some(line(alert));
             }
-            let (_, earlier) = current
-                .iter()
-                .find(|(row, _)| std::ptr::eq(*row, alert))?;
+            let (_, earlier) = current.iter().find(|(row, _)| std::ptr::eq(*row, alert))?;
             Some(if *earlier > 0 {
                 format!("{} · {earlier} earlier", line(alert))
             } else {
