@@ -93,6 +93,7 @@ use super::{
     sha256_file,
 };
 use crate::Flags;
+use crate::commit_now::CommitNow;
 use crate::config::{env_value, open_store};
 
 /// Where the scratch directory goes when `--into` is not given.
@@ -169,7 +170,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         }
     };
     let drill = DrillDir::create(&parent)?;
-    let result = run(&settings, &chain, &seal, drill.path());
+    let result = run(&store, &settings, &chain, &seal, drill.path());
     let newest = chain[chain.len() - 1];
     let (code, outcomes) = match result {
         Ok(report) => (
@@ -177,9 +178,12 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             [
                 (
                     TRANSCRIPTS,
-                    outcome(TRANSCRIPTS, &report.transcripts, &report.key),
+                    outcome(TRANSCRIPTS, &report.transcripts, &[], &report.key),
                 ),
-                (MISSIONS, outcome(MISSIONS, &report.missions, &report.key)),
+                (
+                    MISSIONS,
+                    outcome(MISSIONS, &report.missions, &report.unknown, &report.key),
+                ),
             ],
         ),
         Err(error) => {
@@ -321,7 +325,16 @@ fn said(report: &Report) -> i32 {
             mismatches.len() - NAMED
         );
     }
-    if mismatches.is_empty() {
+    for line in report.unknown.iter().take(NAMED) {
+        eprintln!("restore-drill: unknown commit: {line}");
+    }
+    if report.unknown.len() > NAMED {
+        eprintln!(
+            "restore-drill: and {} more unknown commits",
+            report.unknown.len() - NAMED
+        );
+    }
+    if mismatches.is_empty() && report.unknown.is_empty() {
         println!(
             "restore-drill: passed: bundle {} (event {}) restored and matches live",
             report.key, report.event_id
@@ -329,8 +342,8 @@ fn said(report: &Report) -> i32 {
         0
     } else {
         println!(
-            "restore-drill: FAILED: {} mismatch(es) older than bundle {} (event {})",
-            mismatches.len(),
+            "restore-drill: FAILED: {} older than bundle {} (event {})",
+            counted(mismatches.len(), report.unknown.len()),
             report.key,
             report.event_id
         );
@@ -338,16 +351,27 @@ fn said(report: &Report) -> i32 {
     }
 }
 
-/// A resource's outcome from its mismatches: none passes; any fails, its
-/// reason the count and the first.
-fn outcome(resource: &str, mismatches: &[String], key: &str) -> Outcome {
-    match mismatches.first() {
+/// "N mismatch(es)", and " and M unknown commit(s)" when there is one.
+fn counted(mismatches: usize, unknown: usize) -> String {
+    if unknown == 0 {
+        format!("{mismatches} mismatch(es)")
+    } else {
+        format!("{mismatches} mismatch(es) and {unknown} unknown commit(s)")
+    }
+}
+
+/// A resource's outcome from its mismatches and its unknown commits
+/// (objective 178: a restored head in neither the commit map nor live):
+/// none passes; any fails, its count both, its reason each count (an
+/// unknown commit never called a mismatch) and the first.
+fn outcome(resource: &str, mismatches: &[String], unknown: &[String], key: &str) -> Outcome {
+    match mismatches.first().or_else(|| unknown.first()) {
         None => Outcome::Passed,
         Some(first) => Outcome::Mismatched(
-            mismatches.len(),
+            mismatches.len() + unknown.len(),
             format!(
-                "{resource}: {} mismatch(es) older than bundle {key}; the first: {first}",
-                mismatches.len()
+                "{resource}: {} older than bundle {key}; the first: {first}",
+                counted(mismatches.len(), unknown.len())
             ),
         ),
     }
@@ -615,10 +639,14 @@ struct Report {
     transcripts: Vec<String>,
     /// The mission repositories' mismatches.
     missions: Vec<String>,
+    /// The mission repositories' restored heads in neither the commit map
+    /// nor live (objective 178): they fail the drill, never as mismatches.
+    unknown: Vec<String>,
 }
 
 /// Fetch, check and unpack every bundle of the chain, restore, compare.
 fn run(
+    store: &spawn_postgres::PostgresStore,
     settings: &Settings,
     chain: &[&BundleRecord],
     seal: &Key,
@@ -682,27 +710,41 @@ fn run(
     lines.push(transcripts.line(&live));
     mismatches.extend(transcripts.mismatches);
 
-    restore_repos(newest, &unpacked, drill, &mut lines, &mut missions)?;
+    let mut unknown = Vec::new();
+    let found = Found {
+        lines: &mut lines,
+        mismatches: &mut missions,
+        unknown: &mut unknown,
+    };
+    restore_repos(store, newest, &unpacked, drill, found)?;
     Ok(Report {
         key,
         event_id: newest.event_id,
         lines,
         transcripts: mismatches,
         missions,
+        unknown,
     })
 }
 
 /// Every mission source of the newest record restored under `drill/repos`
 /// and compared with live: a line each, and the mismatches. A source the
 /// newest bundle could not read (`missing`) is one: the backup holds none
-/// of it.
+/// of it. Each restored head is read through the commit map (objective
+/// 178): one the rewrite dropped is said on its own line, one in neither
+/// the map nor live is an unknown commit.
 fn restore_repos(
+    store: &spawn_postgres::PostgresStore,
     newest: &BundleRecord,
     unpacked: &[(PathBuf, Value)],
     drill: &Path,
-    lines: &mut Vec<String>,
-    mismatches: &mut Vec<String>,
+    found: Found<'_>,
 ) -> Result<(), String> {
+    let Found {
+        lines,
+        mismatches,
+        unknown,
+    } = found;
     let repos = drill.join("repos");
     fs::create_dir(&repos).map_err(|error| format!("{}: {error}", repos.display()))?;
     let newest_repos = newest.record["repos"]
@@ -738,13 +780,39 @@ fn restore_repos(
                 continue;
             }
         };
-        let refs = compare_refs(&heads, &live_heads, |old, new| descends(source, old, new));
+        let refs = compare_refs(
+            &heads,
+            &live_heads,
+            |commit| {
+                crate::commit_now::commit_now(store, Path::new(source), commit)
+                    .map_err(|error| error.to_string())
+            },
+            |old, new| descends(source, old, new),
+        );
+        let refs = match refs {
+            Ok(refs) => refs,
+            Err(error) => {
+                lines.push(format!(
+                    "restore-drill: missions {source}: {} refs restored; the commit map cannot \
+                     be read: {error}",
+                    heads.len()
+                ));
+                mismatches.push(format!("{source}: the commit map cannot be read: {error}"));
+                continue;
+            }
+        };
         lines.push(refs.line(source));
+        lines.extend(
+            refs.dropped
+                .iter()
+                .map(|dropped| format!("restore-drill: missions {source}: {dropped}")),
+        );
         mismatches.extend(
             refs.mismatches
                 .iter()
                 .map(|mismatch| format!("{source}: {mismatch}")),
         );
+        unknown.extend(refs.unknown.iter().map(|head| format!("{source}: {head}")));
     }
     for source in newest.record["missing"].as_array().into_iter().flatten() {
         mismatches.push(format!(
@@ -1209,6 +1277,14 @@ fn descends(source: &str, old: &str, new: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Where [`restore_repos`] puts what it finds: the report's lines, the
+/// mismatches and the unknown commits.
+struct Found<'a> {
+    lines: &'a mut Vec<String>,
+    mismatches: &'a mut Vec<String>,
+    unknown: &'a mut Vec<String>,
+}
+
 /// One source's refs restored and live, compared.
 #[derive(Debug, Default)]
 pub(super) struct Refs {
@@ -1218,11 +1294,18 @@ pub(super) struct Refs {
     pub(super) added: usize,
     pub(super) removed: usize,
     pub(super) mismatches: Vec<String>,
+    /// Heads whose commit the history rewrite dropped (the commit map names
+    /// no new commit): said, never a failure; nothing of an empty commit is
+    /// lost.
+    pub(super) dropped: Vec<String>,
+    /// Heads in neither the commit map nor live: a failure, as "unknown
+    /// commit", never a mismatch.
+    pub(super) unknown: Vec<String>,
 }
 
 impl Refs {
     fn line(&self, source: &str) -> String {
-        format!(
+        let mut line = format!(
             "restore-drill: missions {source}: {} refs restored (clone --mirror, fsck connected); \
              against live: {} the same, {} moved on since (descendants), {} added since, {} \
              removed since, {} mismatch(es)",
@@ -1232,36 +1315,78 @@ impl Refs {
             self.added,
             self.removed,
             self.mismatches.len()
-        )
+        );
+        if !self.dropped.is_empty() || !self.unknown.is_empty() {
+            line.push_str(&format!(
+                ", {} dropped by the history rewrite, {} unknown commit(s)",
+                self.dropped.len(),
+                self.unknown.len()
+            ));
+        }
+        line
     }
 }
 
-/// The restored refs against live's (`refs/heads` and `refs/tags`), with
-/// `descends(old, new)` asked of live.
+/// The restored refs against live's (`refs/heads` and `refs/tags`): each
+/// restored head read through `now` (the commit map, then live:
+/// [`crate::commit_now::commit_now`]; objective 178), then compared with
+/// live, `descends(old, new)` asked of live. Mapped to live's commit is the
+/// same, one live moved past is newer; only a commit live holds can be a
+/// mismatch. A dropped head is listed in `dropped`, one in neither the map
+/// nor live in `unknown`. An error of `now` (the store's) is the error.
 pub(super) fn compare_refs(
     restored: &BTreeMap<String, String>,
     live: &BTreeMap<String, String>,
+    now: impl Fn(&str) -> Result<CommitNow, String>,
     descends: impl Fn(&str, &str) -> bool,
-) -> Refs {
+) -> Result<Refs, String> {
     let mut out = Refs {
         restored: restored.len(),
         ..Refs::default()
     };
     for (name, commit) in restored {
-        match live.get(name) {
-            None => out.removed += 1,
-            Some(now) if now == commit => out.same += 1,
-            Some(now) if descends(commit, now) => out.newer += 1,
-            Some(now) => out.mismatches.push(format!(
-                "{name}: restored at {commit}; live is at {now}, which does not descend from it"
-            )),
+        let Some(live_at) = live.get(name) else {
+            out.removed += 1;
+            continue;
+        };
+        let current = match now(commit)? {
+            CommitNow::Commit(current) => current,
+            CommitNow::Dropped => {
+                out.dropped
+                    .push(format!("{name}: {}", why(CommitNow::Dropped, commit)));
+                continue;
+            }
+            CommitNow::Unknown => {
+                out.unknown
+                    .push(format!("{name}: {}", why(CommitNow::Unknown, commit)));
+                continue;
+            }
+        };
+        if *live_at == current {
+            out.same += 1;
+        } else if descends(&current, live_at) {
+            out.newer += 1;
+        } else if current == *commit {
+            out.mismatches.push(format!(
+                "{name}: restored at {commit}; live is at {live_at}, which does not descend from it"
+            ));
+        } else {
+            out.mismatches.push(format!(
+                "{name}: restored at {commit} (now {current}); live is at {live_at}, which does \
+                 not descend from it"
+            ));
         }
     }
     out.added = live
         .keys()
         .filter(|name| !restored.contains_key(*name))
         .count();
-    out
+    Ok(out)
+}
+
+/// The sentence of a restored head with no commit now.
+fn why(now: CommitNow, commit: &str) -> String {
+    now.id_or_why("restored at", commit).unwrap_or_else(|why| why)
 }
 
 #[cfg(test)]
