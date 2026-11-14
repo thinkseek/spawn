@@ -49,11 +49,15 @@
 #   SPAWN_DEPLOY_RETRY_SECS (default 1800): a failed main is tried again
 #   after that, or as soon as another landing moves main. Its alert stays
 #   open meanwhile (one per occurrence: alerts.rs `deploy_failed`);
-# - the debounce: no landing for SPAWN_DEPLOY_QUIET_SECS (default 300)
-#   since main's, so a burst of landings makes one deploy, or else
+# - the debounce, only while another task of the source is between its
+#   report and its landing (`spawn mission landing`'s judging: reported,
+#   accepted or landing): no landing for SPAWN_DEPLOY_QUIET_SECS (default
+#   300) since main's, so a burst of landings makes one deploy, or else
 #   SPAWN_DEPLOY_MAX_WAIT_SECS (default 1800) have passed since the first
 #   landing after the live commit's, so landings that keep coming still
-#   reach the live system within that bound;
+#   reach the live system within that bound. With none judging, no landing
+#   can follow sooner than a report and its gate (minutes), so there is no
+#   burst to wait for: main deploys at once (objective 160);
 # - no deploy holds <live>/deploy.lock.
 #
 # Then it brings its checkout (<live>/deploy-checkout, a clone of the
@@ -240,10 +244,15 @@ tick() {
     say_once "main $main waits: its deploy failed $(((now - last_at) / 1000)) s ago; tried again $retry s after it (SPAWN_DEPLOY_RETRY_SECS), or at the next landing"
     return 0
   fi
+  # The debounce, only while a burst can still come (header): a store that
+  # does not say how many are judging is read as some, so the quiet holds.
+  local judging
   at=$(printf '%s' "$read" | jq -r '.landing.at_ms')
   first=$(printf '%s' "$read" | jq -r '.first_undeployed_ms // .landing.at_ms')
-  if [ $((now - at)) -lt $((quiet * 1000)) ] && [ $((now - first)) -lt $((max_wait * 1000)) ]; then
-    say_once "main $main waits: landed $(((now - at) / 1000)) s ago; deployed after $quiet s without a landing (SPAWN_DEPLOY_QUIET_SECS), at the latest $max_wait s after the first landing not live (SPAWN_DEPLOY_MAX_WAIT_SECS)"
+  judging=$(printf '%s' "$read" | jq -r '.judging // empty')
+  [[ $judging =~ ^[0-9]+$ ]] || judging=1
+  if [ "$judging" -gt 0 ] && [ $((now - at)) -lt $((quiet * 1000)) ] && [ $((now - first)) -lt $((max_wait * 1000)) ]; then
+    say_once "main $main waits: landed $(((now - at) / 1000)) s ago and $judging task(s) of the source are judged or landing; deployed after $quiet s without a landing (SPAWN_DEPLOY_QUIET_SECS), at the latest $max_wait s after the first landing not live (SPAWN_DEPLOY_MAX_WAIT_SECS), or as soon as none is"
     return 0
   fi
   if ! flock -n "$live/deploy.lock" true; then
@@ -251,7 +260,7 @@ tick() {
     return 0
   fi
 
-  say "deploying main $main (landed by $(printf '%s' "$read" | jq -r '.landing.record'), event $(printf '%s' "$read" | jq -r '.landing.event'); live is ${deployed:-unknown}$nightly_note)"
+  say "deploying main $main (landed by $(printf '%s' "$read" | jq -r '.landing.record'), event $(printf '%s' "$read" | jq -r '.landing.event'); live is ${deployed:-unknown}; $judging judged or landing$nightly_note)"
   : >"$said_file"
   # The checkout: a clone of the missions repo, at main, nothing in it but
   # the commit (deploy.sh refuses a tree with changes and exports HEAD).

@@ -341,3 +341,44 @@ fn an_owners_landing_request_without_an_outcome_is_named_until_it_has_one() {
     // The other source's request is still its own.
     assert_eq!(pending(ELSEWHERE, &commit('a')), [json!(elsewhere)]);
 }
+
+/// `judging` counts the source's tasks between their report and their
+/// landing (reported, accepted, landing): a task still at work, another
+/// source's task and a landed one are none. deploy/on-landing.sh keeps its
+/// quiet spell only while it is above 0.
+#[test]
+fn judging_counts_the_sources_tasks_between_report_and_landing() {
+    let (store, _schema) = store("deploy_judging");
+    let judging = || landing(&store, &commit('a'), None)["judging"].clone();
+    assert_eq!(judging(), json!(0), "nothing on the source");
+
+    let mission = store
+        .mission_add("deployed work", &json!([SOURCE]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert_eq!(judging(), json!(0), "a task at work is not judged yet");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    assert_eq!(judging(), json!(1), "a reported task waits for its gate");
+
+    accepted_task(&store, ELSEWHERE);
+    assert_eq!(judging(), json!(1), "another source's task is not counted");
+
+    let accepted = accepted_task(&store, SOURCE);
+    assert_eq!(
+        judging(),
+        json!(2),
+        "an accepted task waits for its landing"
+    );
+
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": accepted,
+                                    "from": commit('0'), "to": commit('a')}))
+        .expect("landed");
+    assert_eq!(judging(), json!(1), "a landed task is no longer counted");
+}

@@ -129,6 +129,29 @@ fn related(entry: &Path, paths: &[PathBuf]) -> bool {
         .any(|path| entry.starts_with(path) || path.starts_with(entry))
 }
 
+/// Whether the claimed folder `folder`, met by the walk of one of `roots`,
+/// may be swept (objective 145): none of its names below its root is one
+/// the walk never counts ([`fixed_name`]; the walk checks only the top
+/// level), and it is not, does not lie under and does not hold an exclude
+/// or a never-counted place, each compared by its resolved path too.
+pub(super) fn sweepable(
+    folder: &Path,
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    never: &[PathBuf],
+) -> bool {
+    let Some(below) = roots.iter().find_map(|root| folder.strip_prefix(root).ok()) else {
+        return false;
+    };
+    let mut places = with_resolved(excludes);
+    places.extend(with_resolved(never));
+    below
+        .components()
+        .all(|part| !fixed_name(&part.as_os_str().to_string_lossy()))
+        && !related(folder, &places)
+        && std::fs::canonicalize(folder).is_ok_and(|resolved| !related(&resolved, &places))
+}
+
 /// Why `root` is never read, when it is not: a symlink at the root or at
 /// any parent component (cc-astra A27), so an alias can never take a walk
 /// into a protected place under a name the protections do not know. A root
@@ -506,7 +529,7 @@ pub(super) fn walk(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bound, MARKER, Reason, never_counted, refused_roots, unowned, walk};
+    use super::{Bound, MARKER, Reason, never_counted, refused_roots, sweepable, unowned, walk};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -934,6 +957,49 @@ mod tests {
                 .iter()
                 .all(|name| root.join(name).exists()),
             "nothing removed"
+        );
+    }
+
+    /// A claimed folder under a name or in a place the walk never counts is
+    /// never swept (objective 145), whatever the walk's top level allowed.
+    #[test]
+    fn a_folder_the_walk_never_counts_is_never_swept() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("root");
+        let projects = scratch.0.join("projects");
+        let kept_path = root.join("sess/kept");
+        for folder in [
+            "sess/deep",
+            "sess/incident-9",
+            "sess/x.pending",
+            "sess/x-pending",
+            "sess/.transcripts",
+            "sess/kept",
+            "projects-link/a",
+        ] {
+            std::fs::create_dir_all(root.join(folder)).expect("mkdir");
+        }
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        std::os::unix::fs::symlink(root.join("projects-link"), projects.join("alias"))
+            .expect("symlink");
+        let roots = [root.clone()];
+        let excludes = [kept_path];
+        let never = never_counted(&projects.join("alias"));
+        let swept = |folder: &str| sweepable(&root.join(folder), &roots, &excludes, &never);
+        assert!(swept("sess/deep"));
+        for kept in [
+            "sess/incident-9",
+            "sess/x.pending",
+            "sess/x-pending",
+            "sess/.transcripts",
+            "sess/kept",
+            "projects-link/a",
+        ] {
+            assert!(!swept(kept), "{kept}");
+        }
+        assert!(
+            !sweepable(&scratch.0.join("elsewhere"), &roots, &excludes, &never),
+            "under no root"
         );
     }
 }

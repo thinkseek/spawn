@@ -18,7 +18,8 @@
 #   (2) GET /api/core-lines: `scratch.claimed` lists every claimed folder,
 #       at a root's top level or one below it, by owner then oldest first,
 #       each {path, agent, objective, created_ms, lease_until_ms, bytes,
-#       build_bytes, landed}: bytes the folder's regular files, build_bytes
+#       build_bytes, landed}: bytes the folder's regular files (null while
+#       its lease runs: objective 155 never walks it whole), build_bytes
 #       its build paths' (never through a symlink), landed whether the
 #       store has a task.landed of that mission and objective.
 #   (3) a claimed folder whose lease ended is nobody's, reason "lease
@@ -307,8 +308,8 @@ code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "http://127.0
 
 # --- (2) every claimed folder, by owner ------------------------------------------------------
 expect_eq "$(jq -c '[.scratch.claimed[] | {path, agent, objective, bytes, build_bytes, landed}]' "$WORK/api.json")" \
-    "[{\"path\":\"$S/b\",\"agent\":\"rev-b\",\"objective\":\"1/008\",\"bytes\":$(size_of "$S/b"),\"build_bytes\":0,\"landed\":false},{\"path\":\"$S/a\",\"agent\":\"rev-e\",\"objective\":\"1/007\",\"bytes\":$(size_of "$S/a"),\"build_bytes\":3000,\"landed\":true},{\"path\":\"$S/sess/o\",\"agent\":\"rev-e\",\"objective\":\"1/009\",\"bytes\":$(size_of "$S/sess/o"),\"build_bytes\":0,\"landed\":true}]" \
-    "(2) the claimed folders by owner, oldest first: b (not landed), a (its t/target counted, base/target through a symlink not), sess/o one level down (landed); not c (refused), sess/p or the pid-marked ones"
+    "[{\"path\":\"$S/b\",\"agent\":\"rev-b\",\"objective\":\"1/008\",\"bytes\":$(size_of "$S/b"),\"build_bytes\":0,\"landed\":false},{\"path\":\"$S/a\",\"agent\":\"rev-e\",\"objective\":\"1/007\",\"bytes\":null,\"build_bytes\":3000,\"landed\":true},{\"path\":\"$S/sess/o\",\"agent\":\"rev-e\",\"objective\":\"1/009\",\"bytes\":null,\"build_bytes\":0,\"landed\":true}]" \
+    "(2) the claimed folders by owner, oldest first: b (not landed), a (its t/target counted, base/target through a symlink not), sess/o one level down (landed); not c (refused), sess/p or the pid-marked ones; a and sess/o leased, so never walked whole (bytes null, objective 155)"
 expect_eq "$(jq -c --argjson c "$(owner "$S/a")" '[.scratch.claimed[] | select(.agent == "rev-e" and .objective == "1/007") | {created_ms, lease_until_ms}] == [{created_ms: $c.created_ms, lease_until_ms: $c.lease_until_ms}]' "$WORK/api.json")" \
     true "(2) a's created and lease as its owner file says"
 
@@ -331,7 +332,7 @@ test("the claimed folders in the card's words", () => {
   const view = coreLinesView(answer, Number(process.env.BB_ASKED));
   assert.deepEqual(view.scratch.map((row) => row.name), ["rev-b · 1/008", "rev-e · 1/007", "rev-e · 1/009"]);
   assert.match(view.scratch[0].text, /^\d+\.\d MB \(build 0\.0 MB\) · .+ old · lease ended · not landed$/);
-  assert.match(view.scratch[1].text, /^\d+\.\d MB \(build \d+\.\d MB\) · .+ old · lease until \d\d-\d\d \d\d:\d\d · landed$/);
+  assert.match(view.scratch[1].text, /^build \d+\.\d MB \(not walked whole while leased\) · .+ old · lease until \d\d-\d\d \d\d:\d\d · landed$/);
   assert.match(view.scratch[2].text, / · lease until \d\d-\d\d \d\d:\d\d · landed$/);
   assert.equal(view.scratch[1].detail, `${process.env.BB_SCRATCH}/a`);
 });

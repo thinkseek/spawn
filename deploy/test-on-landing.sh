@@ -20,8 +20,9 @@
 # the tick and itself outright (SIGKILL: no trap runs).
 #
 # Covered: a live main deploys nothing; a main nothing gate-accepted landed
-# deploys nothing; the debounce waits for a quiet spell and the max wait
-# bounds it; a held source, an owner's landing request with no outcome
+# deploys nothing; while another task of the source is judged the debounce
+# waits for a quiet spell and the max wait bounds it, and with none judged
+# main deploys at once (160); a held source, an owner's landing request with no outcome
 # (S23), a pending deploy, a red nightly (until it is
 # green), a busy deploy lock and the off switch each make the tick wait,
 # and say so once; the deploy runs main's own deploy.sh --main from the
@@ -165,6 +166,17 @@ land() {
 }
 sql "select spawn_control_record(jsonb_build_object('type', 'source.moved', 'source', '$missions',
        'from', '$c0', 'to', '$c0'))" >/dev/null
+# judged <state>: a task of the mission between its report and its landing
+# (reported, accepted, landing), as `spawn mission landing`'s judging counts
+# them; prints it. unjudge <task>: it landed.
+judged() {
+  local task
+  task=$(spawn_live task assign --mission "$mission" --kind ephemeral --worker w --brief "judged" | jq -r '.task')
+  sql "update mission_tasks set state = '$1' where id = $task" >/dev/null
+  printf '%s\n' "$task"
+}
+unjudge() { sql "update mission_tasks set state = 'landed' where id = $1" >/dev/null; }
+judging() { spawn_live mission landing --source "$missions" | jq -r '.judging'; }
 
 export FAKE_LOG=$scratch/deploys.log
 : >"$FAKE_LOG"
@@ -212,11 +224,14 @@ tick
 check "not deployed" [ "$(deploys)" -eq 0 ]
 check "says so" grep -qF "main $c1 has no gate-accepted landing in the store" "$out"
 
-echo "== the debounce: a landing a moment ago waits for a quiet spell"
+echo "== the debounce: while another task is judged, a landing a moment ago waits for a quiet spell"
 land "$c1"
+pending=$(judged reported)
+check "the store counts the task judged" [ "$(judging)" = 1 ]
 tick SPAWN_DEPLOY_QUIET_SECS=600
 check "not deployed yet" [ "$(deploys)" -eq 0 ]
-check "says it waits for the quiet spell" grep -qF "main $c1 waits: landed" "$out"
+check "says it waits for the quiet spell, and why" grep -qF "main $c1 waits: landed" "$out"
+check "naming the task judged" grep -qF "and 1 task(s) of the source are judged or landing" "$out"
 check "and names the bounds" grep -qF "deployed after 600 s without a landing (SPAWN_DEPLOY_QUIET_SECS), at the latest 1800 s" "$out"
 tick SPAWN_DEPLOY_QUIET_SECS=600
 check "said once" [ ! -s "$out" ]
@@ -367,6 +382,27 @@ spawn_live mission hold --source "$missions" --reason "owner gate $c5" >/dev/nul
 tick
 check "an owner's hold is never taken for a stale one" [ "$(holds | jq -r .reason)" = "owner gate $c5" ]
 spawn_live mission release --source "$missions" >/dev/null
+
+echo "== nothing judged: no burst can come, so a landing deploys at once (160)"
+unjudge "$pending"
+check "the store counts none judged" [ "$(judging)" = 0 ]
+c8=$(commit_work "a landing with nothing else of the source judged")
+land "$c8"
+before=$(deploys)
+tick SPAWN_DEPLOY_QUIET_SECS=600
+check "deployed inside the quiet spell (status $status)" bash -c '[ "$1" -eq 0 ] && [ "$(wc -l <"$2")" -eq "$3" ]' _ "$status" "$FAKE_LOG" "$((before + 1))"
+check "live at main now" [ "$(live_commit)" = "spawn-$c8" ]
+check "and that 0 were judged" grep -qF "; 0 judged or landing" "$out"
+for state in accepted landing; do
+  pending=$(judged "$state")
+  c9=$(commit_work "a landing beside a task $state")
+  land "$c9"
+  tick SPAWN_DEPLOY_QUIET_SECS=600
+  check "a task $state keeps the quiet spell" grep -qF "main $c9 waits: landed" "$out"
+  unjudge "$pending"
+  tick SPAWN_DEPLOY_QUIET_SECS=600
+  check "and once it landed, main deploys at once" [ "$(live_commit)" = "spawn-$c9" ]
+done
 
 echo "== a failure before deploy.sh is recorded as deploy.sh records its own"
 c6=$(commit_work "a main whose UI dependencies cannot be installed")
