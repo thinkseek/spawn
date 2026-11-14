@@ -404,7 +404,12 @@
 #   The base's listing is cached, keyed by the base commit, the toolchain,
 #   the sandbox's environment, the listing's arguments and the gate, so only
 #   the first gate on a main builds the base's test binaries for it ("tests:
-#   what cargo runs" below). The candidate is always listed.
+#   what cargo runs" below). The candidate is always listed. When the base's
+#   listing is not in the cache, it runs as a job in a host scenario slot
+#   beside the candidate's runs, and the tests are judged after them: the
+#   verdict waits for it, and only a whole listing accepts (objective 161,
+#   "The base's listing as a job beside the runs"). A warm lists the base
+#   beside its own runs, so the next gate on that main finds the entry.
 # - Lint configuration (text, before anything runs): a change to a
 #   `[lints]` / `[workspace.lints]` table (or `lints.` keys) in any
 #   Cargo.toml, any change to clippy.toml or .clippy.toml, a new crate-level
@@ -3785,19 +3790,6 @@ if [ "$base_misses" -gt 0 ]; then
     : >"$work/base-built"
     stage_close ok
 fi
-phase_start base
-run_jobs base "$base_count" base_job base_finished base_printed
-phase_time base
-if [ -n "$from_cache$run_on_base" ]; then
-    echo "| base results from the cache:${from_cache:- none}; run on the base:${run_on_base:- none}"
-fi
-# base_result <scenario>: solved, unsolved, or none (not judged on the base).
-base_result() {
-    awk -F'|' -v want="$1" '
-        $2 == want { print $1; found = 1; exit }
-        END { if (!found) print "none" }' "$work/base-results"
-}
-
 # What the listing runs: cargo's arguments and libtest's (and `--ignored`
 # for the second pass). Both are in the base listing's cache key below.
 listing_cargo='test --quiet --workspace'
@@ -3807,7 +3799,10 @@ listing_libtest='--list --format terse'
 # `<name>: test` lines of `--list`, minus those of `--list --ignored`. Their
 # names go to <names file>, sorted, one line per test (a name two test
 # binaries share is there twice), a doctest's ` (line N)` dropped so that
-# an edit above it does not rename it.
+# an edit above it does not rename it. Its scratch is beside <names file>
+# and its cargo lines go to $tests_log, so the base's listing (a job beside
+# the candidate's runs, below) and the candidate's never share a file.
+tests_log=$work/tests.log
 runnable_tests() {
     list_dir=$1
     list_tree=$2
@@ -3821,11 +3816,11 @@ runnable_tests() {
         sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" ${gate_build_jobs:+"CARGO_BUILD_JOBS=$gate_build_jobs"} \
             cargo $listing_cargo \
             --manifest-path "$list_tree/Cargo.toml" -- "$@" \
-            >"$work/tests.$list_mode" 2>>"$work/tests.log" || return 1
-        sed -n 's/: test$//p' "$work/tests.$list_mode" | sed -E 's/ \(line [0-9]+\)$//' |
-            LC_ALL=C sort >"$work/names.$list_mode"
+            >"$list_names.listed.$list_mode" 2>>"$tests_log" || return 1
+        sed -n 's/: test$//p' "$list_names.listed.$list_mode" | sed -E 's/ \(line [0-9]+\)$//' |
+            LC_ALL=C sort >"$list_names.$list_mode"
     done
-    LC_ALL=C comm -23 "$work/names.all" "$work/names.ignored" >"$list_names"
+    LC_ALL=C comm -23 "$list_names.all" "$list_names.ignored" >"$list_names"
     grep -c . "$list_names" || true
 }
 
@@ -3902,12 +3897,10 @@ listing_read() {
     [ "$(grep -c . "$2" || true)" = "$listing_count" ] || return 1
     [ "$(wc -l <"$2")" = "$listing_count" ] || return 1
 }
-# base_listing: the base's runnable tests, $base_tests, and their names in
-# $work/tests.base-names, from the cache or listed now and cached; fails
-# when the base's tests do not build (cargo's lines in $work/tests.log).
-# The gate's listing and the warm's (--base-only) both come here: one key,
-# one entry, one way to write it.
-base_listing() {
+# base_listing_lookup: this base's entry ($listing_entry) read from the
+# cache: 0 with $base_tests and $work/tests.base-names when it is whole,
+# otherwise 1 with the miss said ($listing_miss).
+base_listing_lookup() {
     mkdir -p "$work/base-target"
     listing_entry=$base_cache/$(listing_key)
     if listing_read "$listing_entry" "$work/tests.base-names"; then
@@ -3917,9 +3910,18 @@ base_listing() {
         return 0
     fi
     echo "| tests: the base's listing is not in the cache ($listing_miss): listed now"
-    : >"$work/tests.log"
-    base_tests=$(runnable_tests "$work/base-target" "$work/baseline" "$work/base-target" \
-        "$work/tests.base-names") || return 1
+    return 1
+}
+# base_listing_make: the base listed now, $base_tests and
+# $work/tests.base-names, and cached; fails when the base's tests do not
+# build (cargo's lines in $tests_log). Its count goes through a file, not
+# a command substitution, so that the listing's sandbox is a child of the
+# shell that runs this (the listing job's, below, whose stop ends it).
+base_listing_make() {
+    : >"$tests_log"
+    runnable_tests "$work/base-target" "$work/baseline" "$work/base-target" \
+        "$work/tests.base-names" >"$work/tests.base-count" || return 1
+    base_tests=$(cat "$work/tests.base-count")
     # A whole listing only: a count, and its names beside it.
     case $base_tests in '' | *[!0-9]*) return 1 ;; esac
     [ -f "$work/tests.base-names" ] || return 1
@@ -3936,6 +3938,69 @@ base_listing() {
     fi
 }
 
+# The base's listing as a job beside the runs (objective 161). On a miss it
+# builds the base's test binaries, 12-259 s (median 135 s over 40 gates of
+# 2026-11-13/14, against 8 s on a hit), which every scenario run used to
+# wait for. Now:
+# - a gate whose base listing misses lists the candidate as before and
+#   makes the base's listing the first job of the candidate phase
+#   (add_listing_job, listing_run, listing_printed): it claims a host
+#   scenario slot like a run, starts with the task's scenario and
+#   check-tests (after the serial list, which still runs alone), and is
+#   judged first in the scenario order, as the listing was before any run:
+#   a base whose tests do not build, or a candidate that runs fewer tests
+#   or drops one by name, is the gate's verdict whatever a run says. The
+#   other runs go on beside it; only their verdicts wait for it. Being
+#   first, no failure stops it, so its entry is always written;
+# - a warm (--base-only) starts it as its base runs start, not after them
+#   (base_listing_start), so the first gate on a new main finds the entry
+#   sooner. No slot: it is the warm's one compiler job (the base's build,
+#   when there is one, has ended), beside its one run.
+listing_job=""
+base_listing_start() {
+    listing_job=$jobs_dir/tests-listing
+    mkdir -p "$listing_job"
+    echo "| tests: the base's listing started, beside the base runs"
+    (
+        trap - EXIT HUP INT TERM
+        tests_log=$listing_job/tests.log
+        if base_listing_make; then
+            printf 'ok %s\n' "$base_tests" >"$listing_job/result.tmp"
+        else
+            echo failed >"$listing_job/result.tmp"
+        fi
+        mv -f "$listing_job/result.tmp" "$listing_job/result"
+    ) >"$listing_job/out" 2>&1 &
+    printf '%s\n' "$!" >"$listing_job/job.pid"
+}
+# base_listing_wait: the warm's listing job ended, its lines said; 0 with
+# $base_tests when it listed the base, 1 when the base's tests do not build.
+base_listing_wait() {
+    wait "$(cat "$listing_job/job.pid")" 2>/dev/null || :
+    [ ! -s "$listing_job/out" ] || cat "$listing_job/out"
+    lw_result=$(cat "$listing_job/result" 2>/dev/null || echo failed)
+    case $lw_result in "ok "*) base_tests=${lw_result#ok }; return 0 ;; esac
+    return 1
+}
+
+phase_start base
+# A warm lists the base beside its runs (base_listing_start); a gate lists
+# it later, beside the candidate's runs, and only on a miss.
+if [ -n "$base_only" ] && [ -f "$work/baseline/Cargo.toml" ] && ! base_listing_lookup; then
+    base_listing_start
+fi
+run_jobs base "$base_count" base_job base_finished base_printed
+phase_time base
+if [ -n "$from_cache$run_on_base" ]; then
+    echo "| base results from the cache:${from_cache:- none}; run on the base:${run_on_base:- none}"
+fi
+# base_result <scenario>: solved, unsolved, or none (not judged on the base).
+base_result() {
+    awk -F'|' -v want="$1" '
+        $2 == want { print $1; found = 1; exit }
+        END { if (!found) print "none" }' "$work/base-results"
+}
+
 # Base only: the base's results are in the cache, for the gates that judge
 # a candidate on this base next (the deploy starts one after it moves main:
 # deploy/deploy.sh). No candidate, no verdict.
@@ -3943,11 +4008,14 @@ if [ -n "$base_only" ]; then
     # And the base's test listing, so the first gate on this main takes it
     # from the cache. The base is main's commit, listed in the sandbox like
     # a gate's base; a listing that fails or does not complete writes no
-    # entry (base_listing), and the warm still exits 0: its results stand.
+    # entry (base_listing_make), and the warm still exits 0: its results
+    # stand. It started beside the base runs (base_listing_start); here the
+    # warm waits for it.
     if [ -f "$work/baseline/Cargo.toml" ]; then
         section "base only: the base's test listing"
-        base_listing ||
-            echo "| base only: the base's tests do not build: no listing cached ($(tail -n 1 "$work/tests.log"))"
+        if [ -n "$listing_job" ] && ! base_listing_wait; then
+            echo "| base only: the base's tests do not build: no listing cached ($(tail -n 1 "$listing_job/tests.log" 2>/dev/null))"
+        fi
         stage_close ok
     fi
     echo "| base only: $(grep -c . "$work/base-results" || true) results for the base $base_commit" \
@@ -4067,39 +4135,11 @@ fi
 # never on what the file holds later.
 candidate_binary=$(binary_hash "$work/candidate")
 
-# The candidate may not run fewer tests than the base, nor stop running one
-# of the base's by name. Read from what cargo runs, so a test deleted,
-# ignored, commented out, left in a file no `mod` includes, or behind
-# `#[cfg(any())]` is gone; one renamed or moved to another module path is
-# gone too (its name is its module path; a move that keeps the path, the
-# same `mod tests` in another file, keeps the name). The base tree stays
-# read-only: its cargo writes to a target directory of its own. The
-# candidate's target directory is the one check-tests reuses. What names
-# cannot see: a test kept by name whose body no longer tests anything (the
-# empty-body check above catches only an empty one), and one of two
-# same-named tests in different crates traded for a third. A gate of a
-# commit against itself (scripts/rsi/nightly.sh: main judged as its own
-# candidate, one scenario at a time) has no diff to drop a test, and skips
-# the listing: it compiles both trees' test binaries.
-if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ] &&
-    [ "$base_commit" != "$candidate_commit" ]; then
-    section "tests: what cargo runs, base and candidate"
-    listing_started=$(date +%s)
-    mkdir -p "$work/base-target"
-    if ! base_listing; then
-        sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
-        verdict rejected "base tests do not build"
-        exit 0
-    fi
-    : >"$work/tests.log"
-    if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target" \
-        "$work/tests.candidate-names"); then
-        sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
-        verdict rejected "candidate tests do not build"
-        exit 0
-    fi
-    echo "| tests cargo runs: $base_tests on the base, $candidate_tests on the candidate" \
-        "(listed in $(($(date +%s) - listing_started)) s)"
+# tests_judge: the base's runnable tests against the candidate's, by count
+# and by name ($base_tests, $candidate_tests and their names files); a
+# rejection ends the gate. Right after the candidate's listing on a cache
+# hit; after the candidate's runs when the base's listing ran beside them.
+tests_judge() {
     if [ "$candidate_tests" -lt "$base_tests" ]; then
         verdict rejected "candidate runs fewer tests ($base_tests -> $candidate_tests)"
         exit 0
@@ -4129,8 +4169,48 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ] &&
         verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))${near_miss:+; retired-tests names it by its last component only: write the whole name, as cargo lists it}"
         exit 0
     fi
-fi
+}
 
+# The candidate may not run fewer tests than the base, nor stop running one
+# of the base's by name. Read from what cargo runs, so a test deleted,
+# ignored, commented out, left in a file no `mod` includes, or behind
+# `#[cfg(any())]` is gone; one renamed or moved to another module path is
+# gone too (its name is its module path; a move that keeps the path, the
+# same `mod tests` in another file, keeps the name). The base tree stays
+# read-only: its cargo writes to a target directory of its own. The
+# candidate's target directory is the one check-tests reuses. What names
+# cannot see: a test kept by name whose body no longer tests anything (the
+# empty-body check above catches only an empty one), and one of two
+# same-named tests in different crates traded for a third. A gate of a
+# commit against itself (scripts/rsi/nightly.sh: main judged as its own
+# candidate, one scenario at a time) has no diff to drop a test, and skips
+# the listing: it compiles both trees' test binaries.
+if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ] &&
+    [ "$base_commit" != "$candidate_commit" ]; then
+    section "tests: what cargo runs, base and candidate"
+    listing_started=$(date +%s)
+    tests_pending=""
+    if ! base_listing_lookup; then
+        # A miss: the base is listed as the candidate phase's first job,
+        # beside its runs ("The base's listing as a job beside the runs").
+        tests_pending=1
+        echo "| tests: the base's listing runs beside the candidate's runs, in a host scenario slot; the verdict waits for it"
+    fi
+    : >"$tests_log"
+    if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target" \
+        "$work/tests.candidate-names"); then
+        sed 's/^/| tests: /' "$tests_log" | tail -n 30
+        verdict rejected "candidate tests do not build"
+        exit 0
+    fi
+    if [ -n "$tests_pending" ]; then
+        echo "| tests: $candidate_tests on the candidate (listed in $(($(date +%s) - listing_started)) s); the base's count follows its listing"
+    else
+        echo "| tests cargo runs: $base_tests on the base, $candidate_tests on the candidate" \
+            "(listed in $(($(date +%s) - listing_started)) s)"
+        tests_judge
+    fi
+fi
 # The candidate's scenarios, N at a time: the task scenario first, then
 # check-tests.sh (the regression most often decisive, so a failure there
 # stops the rest early), then every other but the ratchets, in order. The
@@ -4158,6 +4238,10 @@ fi
 # candidate_job <job>: one scenario on the candidate (its runs), in the
 # background.
 candidate_job() {
+    if [ -e "$1/listing" ]; then
+        listing_run "$1"
+        return 0
+    fi
     job=$1 job_part=0
     run_name=$(cat "$job/section")
     job_scenario=$(cat "$job/scenario")
@@ -4452,6 +4536,10 @@ candidate_finished() {
 # candidate_printed <job> <n>: its block, then what it means.
 candidate_printed() {
     job_print "$1"
+    if [ -e "$1/listing" ]; then
+        listing_printed "$1"
+        return 0
+    fi
     # A check that failed once and passed again: named in the verdict.
     if [ -s "$1/flake" ]; then
         flakes="${flakes:+$flakes,}\"$(json_string "$(cat "$1/flake")")\""
@@ -4711,6 +4799,51 @@ add_candidate_job() { # <scenario> <section> [regression]
     fi
     seed_plan "$1"
 }
+# add_listing_job: the base's listing as the candidate phase's job (first
+# in the scenario order; "The base's listing as a job beside the runs").
+add_listing_job() {
+    candidate_count=$((candidate_count + 1))
+    job=$jobs_dir/candidate.$candidate_count
+    mkdir "$job"
+    echo base-test-listing >"$job/scenario"
+    echo "tests: the base's listing, beside the candidate's runs" >"$job/section"
+    : >"$job/listing"
+    : >"$job/head"
+}
+# listing_run <job>: in the job's subshell: a host scenario slot, then the
+# base listed and cached (base_listing_make, its lines in the block, its
+# sandbox a child of this subshell: job_stop ends it). Result 0 listed, 1
+# the base's tests do not build; `abort` with slot-waited when it gave up
+# waiting for a slot (slot_claim).
+listing_run() {
+    job=$1 job_part=0
+    job_say "| == $(cat "$job/section")"
+    run_at=$(stage_now)
+    tests_log=$job/tests.log
+    slot_claim "$job" || return 0
+    listing_status=0
+    base_listing_make >>"$job/text.$job_part" 2>&1 || listing_status=1
+    slot_release
+    echo "$(($(stage_now) - run_at))" >"$job/ms"
+    job_done "$listing_status"
+}
+# listing_printed <job>: what the listing means, in the scenario order: no
+# room, a sandbox that never started, the base's tests that do not build,
+# or the counts and names judged (tests_judge).
+listing_printed() {
+    [ ! -e "$1/slot-waited" ] || slot_no_room "$1"
+    if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started"; fi
+    if [ "$(cat "$1/result")" != 0 ]; then
+        sed 's/^/| tests: /' "$1/tests.log" 2>/dev/null | tail -n 30
+        phase_time candidate
+        verdict rejected "base tests do not build"
+        exit 0
+    fi
+    base_tests=$(cat "$work/tests.base-count")
+    run_stage "ok|$(cat "$1/section")" "$(cat "$1/ms" 2>/dev/null || echo 0)"
+    echo "| tests cargo runs: $base_tests on the base, $candidate_tests on the candidate"
+    tests_judge
+}
 # same_in_commits <path>: 0 when the base and the candidate commits hold the
 # same object at <path> of the tree, or neither holds one.
 same_in_commits() {
@@ -4874,6 +5007,10 @@ seed() {
     rm -f "$seed_entry.seed.$$" 2>/dev/null || :
     exec 8>&-
 }
+# The base's listing when it missed the cache: the first job in the
+# scenario order, judged before every run as it was listed before them
+# ("The base's listing as a job beside the runs").
+[ -z "${tests_pending-}" ] || add_listing_job
 # A known failure first (see the header): the first job, before the task's
 # own. Not when it is the task's scenario (judged by its own rules, and at
 # the head already), nor when no gate runs it as a regression any more.

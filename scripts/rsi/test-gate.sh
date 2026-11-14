@@ -1373,6 +1373,12 @@ rm -rf "$integrator"
 mkdir -m 700 "$integrator"
 expect "a warm on a new main exits 0" "$(warm_listing "$warm_base" "$work/caches/warm-list")" 'exit=0'
 expect "it lists the base's tests" "$(cat "$work/gate.out")" "== base only: the base's test listing"
+# 161 (a): beside its base runs, not after them: the listing is started
+# before the first base run's block.
+warm_miss_line=$(grep -n "| tests: the base's listing started, beside the base runs" "$work/gate.out" | head -n 1 | cut -d: -f1)
+warm_run_line=$(grep -n "^| == base: " "$work/gate.out" | grep -v "| == base: build$" | head -n 1 | cut -d: -f1)
+expect "it starts the listing before its base runs (161)" \
+    "$([ -n "$warm_miss_line" ] && [ -n "$warm_run_line" ] && [ "$warm_miss_line" -lt "$warm_run_line" ] && echo before)" before
 expect "and caches them" "$(cat "$work/gate.out")" "| tests: the base's listing, now in the cache (4)"
 refuse "it judges no candidate" "$(cat "$work/gate.out")" '== candidate: build'
 expect "its listing stage closes ok" "$(cat "$work/gate.out")" "stage gate ok"
@@ -1458,6 +1464,53 @@ sed -i 's/^    fn b() { .*/    fn b() {}/' "$seed/src/lib.rs"
 emptied=$(commit rust-emptied)
 expect "a test whose body is emptied is refused" "$(judge_rust "$emptied")" \
     'adds or edits a test with an empty body (src/lib.rs:19 b)'
+# 161: a gate whose base listing misses the cache lists the candidate
+# first and makes the base's listing the candidate phase's first job, in a
+# host scenario slot beside the runs; it is judged first in the scenario
+# order, so its verdicts are the ones the serial listing gave.
+saved_base=$base
+base=$rust_base
+expect "a gate on a base not in the cache lands" \
+    "$(XDG_CACHE_HOME=$work/caches/beside judge "$same")" 'exit=0 {"verdict":"accepted"}'
+expect "it says the base's listing runs beside the runs" "$(cat "$work/gate.out")" \
+    "| tests: the base's listing runs beside the candidate's runs, in a host scenario slot; the verdict waits for it"
+expect "the candidate is listed before the runs" "$(cat "$work/gate.out")" "| tests: 4 on the candidate (listed in"
+expect "the base's listing is a job of the candidate phase" "$(cat "$work/gate.out")" \
+    "== tests: the base's listing, beside the candidate's runs"
+expect "which lists and caches it" "$(cat "$work/gate.out")" "| tests: the base's listing, now in the cache (4)"
+expect "the counts are judged" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+listing_line=$(grep -n "== tests: the base's listing, beside the candidate's runs" "$work/gate.out" | head -n 1 | cut -d: -f1)
+first_run_line=$(grep -n "^| == regression: " "$work/gate.out" | head -n 1 | cut -d: -f1)
+expect "and its block is the first of the phase, before every run's" \
+    "$([ -n "$listing_line" ] && [ -n "$first_run_line" ] && [ "$listing_line" -lt "$first_run_line" ] && echo first)" first
+expect "its stage line names it" "$(cat "$work/gate.out")" \
+    "ms tests: the base's listing, beside the candidate's runs"
+expect "the next gate on that base finds it" \
+    "$(XDG_CACHE_HOME=$work/caches/beside judge "$same")" 'exit=0 {"verdict":"accepted"}'
+expect "from the cache, judged at once" "$(cat "$work/gate.out")" "| tests: the base's listing from the cache (4)"
+refuse "with no listing job" "$(cat "$work/gate.out")" "== tests: the base's listing, beside"
+expect "a renamed test is refused by the listing job too" \
+    "$(XDG_CACHE_HOME=$work/caches/beside-renamed judge "$renamed")" 'drops or renames base tests (1: tests::b)'
+expect "after the base was listed beside the runs" "$(cat "$work/gate.out")" \
+    "== tests: the base's listing, beside the candidate's runs"
+expect "a dropped test likewise" \
+    "$(XDG_CACHE_HOME=$work/caches/beside-dropped judge "$ignored")" 'runs fewer tests (4 -> 3)'
+base=$saved_base
+# A base whose tests do not build (its library does): the candidate fixes
+# them and lists; the base's listing job fails, and that is the verdict.
+rust_branch rust-broken-tests-base
+printf '#[test]\nfn broken( {\n' >"$seed/tests/broken.rs"
+broken_tests_base=$(commit rust-broken-tests-base)
+git -C "$seed" rm -q tests/broken.rs
+printf 'three\n' >"$seed/value"
+fixing=$(commit rust-broken-tests-fixed)
+saved_base=$base
+base=$broken_tests_base
+expect "a base whose tests do not build is the verdict of the listing job" \
+    "$(XDG_CACHE_HOME=$work/caches/beside-broken judge "$fixing")" 'base tests do not build'
+expect "with cargo's lines" "$(cat "$work/gate.out")" "| tests: "
+refuse "and no listing is cached" "$(listing_entries "$work/caches/beside-broken" | grep -c . || true)" 1
+base=$saved_base
 rust_branch rust-emptied-comment
 sed -i 's|^    fn b() { .*|    fn b() {\n        // kept for later\n        ;\n    }|' "$seed/src/lib.rs"
 emptied_comment=$(commit rust-emptied-comment)
