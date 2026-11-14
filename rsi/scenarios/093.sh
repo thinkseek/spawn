@@ -38,6 +38,9 @@
 #       status file's `at`; null without one); `recoverability.oldest_drill_age`
 #       (ms: the answer's moment less the oldest of the rows' last passes,
 #       rows that never passed left out; null with none).
+#       Since objective 176 (the owner's core metric set) the north star is
+#       guardrail U1 of the sustainability line, and the two ages are alert
+#       figures (`alert_figures`, line sustainability).
 #
 # The history: a passing database drill 3 h ago and a failed one 1 h ago;
 # a fake systemctl with three units: one passed 10 h ago, one failed, one
@@ -286,7 +289,8 @@ else
         grep -qF -- "$refused" "$WORK/serve.log" ||
             check_failed "(1) serve's log does not name the refused unit [$refused]"
     done
-    rec() { jq -c ".lines[] | select(.line == \"recoverability\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\")" "$WORK/api.json"; }
+    # Objective 176: restores passed is sustainability's U1; the two ages are alert figures.
+    rec() { jq -c "((.lines[] | select(.line == \"sustainability\") | ([.north_star] + .guardrails)[]), (.alert_figures // [])[]) | select(.key == \"$1\")" "$WORK/api.json"; }
     expect_eq "$(rec recoverability.restores_passed | jq -c '{unit, value}')" '{"unit":"count","value":1}' \
         "(2) restores passed in 7 days: the session files (the old drill is 8 days old; since 105 the database's newest drill, failed 1 h ago, is not counted)"
     between() { # <key> <at_ms> <what>

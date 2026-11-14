@@ -325,7 +325,7 @@ code=$(get /api/core-lines "$WORK/api.json")
 if [ "$code" != 200 ]; then
     check_failed "(3) GET /api/core-lines answered $code: $(head -c 200 "$WORK/api.json")"
 else
-    got=$(jq -c '.lines[] | select(.line == "observability") | .guardrails[] | select(.key == "observability.interventions_per_agent_hour") | {value, state}' "$WORK/api.json")
+    got=$(jq -c '.lines[] | select(.line == "sustainability") | .north_star | select(.key == "observability.interventions_per_agent_hour") | {value, state}' "$WORK/api.json")
     expect_eq "$got" '{"value":0.625,"state":"out"}' \
         "(3) Core lines' interventions per agent-hour counts the queue's posts"
     note "(3) done"

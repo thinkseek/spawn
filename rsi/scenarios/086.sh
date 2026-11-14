@@ -22,6 +22,9 @@
 #       value, gate_time's value, gate_time's undecided_ms over its total_ms
 #       (null when the total is 0), first_pass's value; and the Cost page's
 #       7-day usd_per_landing. State and range as for every figure (084).
+#       Since objective 176 (the owner's core metric set) dollars per
+#       landing is a diagnostic, read from the answer's `diagnostics`, and
+#       the line is the other four.
 #   (2) coreLinesView says the new units: ms as a span ("45 s", "14 min",
 #       "1 h 32 min", "2 h"), share as a percent to one decimal ("74.9%"),
 #       usd as dollars and cents ("$8.08"), ranges in the same words.
@@ -278,9 +281,10 @@ if [ "$code" != 200 ]; then
     printf '{}' >"$WORK/lines.json"
 else
     perf() { jq -c ".lines[] | select(.line == \"performance\") | $1" "$WORK/lines.json"; }
-    figure() { perf "([.north_star] + .guardrails)[] | select(.key == \"$1\") | {unit, value, range, state}"; }
+    # Objective 176: dollars per landing is read from the diagnostics.
+    figure() { jq -c "([.lines[] | select(.line == \"performance\") | .north_star, .guardrails[]] + (.diagnostics // []))[] | select(.key == \"$1\") | {unit, value, range, state}" "$WORK/lines.json"; }
     expect_eq "$(perf '[.north_star.key] + [.guardrails[].key]')" \
-        '["performance.report_to_live","performance.gate_time","performance.decided_nothing","performance.first_pass","performance.usd_per_landing"]' \
+        '["performance.report_to_live","performance.gate_time","performance.decided_nothing","performance.first_pass"]' \
         "(1) the performance line's north star and guardrails, in order"
     state() { # <value> <in?>: the state a value with this range has
         if [ "$1" = null ]; then echo not_collected; elif [ "$2" = in ]; then echo in; else echo out; fi

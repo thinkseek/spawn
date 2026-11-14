@@ -240,7 +240,8 @@ code=$(get /api/core-lines "$WORK/api.json")
 if [ "$code" != 200 ]; then
     check_failed "(2) GET /api/core-lines answered $code: $(head -c 200 "$WORK/api.json")"
 else
-    got=$(jq -c '.lines[] | select(.line == "observability") | .guardrails[] | select(.key == "observability.interventions_per_agent_hour") | {unit, value, range, state, window}' "$WORK/api.json")
+    # Objective 176: the sustainability line's north star.
+    got=$(jq -c '.lines[] | select(.line == "sustainability") | .north_star | select(.key == "observability.interventions_per_agent_hour") | {unit, value, range, state, window}' "$WORK/api.json")
     expect_eq "$got" '{"unit":"ratio","value":0.25,"range":{"max":0.05},"state":"out","window":"24h"}' \
         "(2) Core lines' interventions per agent-hour is the Home card's (/api/interventions?window=24h per_agent_hour 0.25), over its 24 h window"
     note "(2) checked: Core lines reads the Home card's figure, window 24h"

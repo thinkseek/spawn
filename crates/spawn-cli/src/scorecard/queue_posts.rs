@@ -9,8 +9,12 @@
 //! end of the file: the newest is on the local date of now (the day before
 //! when its time is more than 5 minutes later than now's), and each earlier
 //! heading more than 12 h later than the heading after it is a day before
-//! it; otherwise the same day (headings minutes out of order are no
-//! midnight). Only lead-mac's headings count: the lead relays what lead-mac
+//! it; each earlier heading more than 23 h 30 min earlier than the heading
+//! after it is the day after it (a stamp up to half an hour out of order
+//! across midnight: lead-mac's 00:10 above the lead's 23:50); otherwise the
+//! same day (headings minutes out of order are no midnight). The price: a
+//! gap of more than 23 h 30 min within one local day (a silence of nearly a
+//! day starting right after midnight) is read as the next day. Only lead-mac's headings count: the lead relays what lead-mac
 //! posted, and a reviewer's post is no intervention.
 
 use std::io::{Read, Seek, SeekFrom};
@@ -34,6 +38,9 @@ const NEWEST_SLACK_MINUTES: i64 = 5;
 /// An earlier heading later than the one after it by more than this is a
 /// day before it.
 const WRAP_MINUTES: i64 = 12 * 60;
+/// An earlier heading earlier than the one after it by more than this is
+/// the day after it: a stamp up to half an hour out of order across midnight.
+const BACK_ACROSS_MIDNIGHT_MINUTES: i64 = 23 * 60 + 30;
 /// A line's length, in characters, before "…".
 const LINE_CHARS: usize = 120;
 const MINUTE_MS: i64 = 60_000;
@@ -134,6 +141,7 @@ pub(crate) fn posts(text: &str, offset_minutes: i64, window: Window, now_ms: i64
         match after {
             None if heading.minute - now_minute > NEWEST_SLACK_MINUTES => day -= 1,
             Some(later) if heading.minute - later > WRAP_MINUTES => day -= 1,
+            Some(later) if later - heading.minute > BACK_ACROSS_MIDNIGHT_MINUTES => day += 1,
             _ => {}
         }
         after = Some(heading.minute);
@@ -383,6 +391,46 @@ mod tests {
         assert_eq!(item["commands"], serde_json::json!([]));
         for key in ["agent", "session", "attempts", "outcome"] {
             assert_eq!(item[key], Value::Null, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_stamp_out_of_order_across_midnight_is_the_day_after() {
+        // Now: 03:10 local, 8 h east of UTC.
+        let offset = 480;
+        let today = 20_407_i64;
+        let now = today * DAY_MS + (3 * 60 + 10) * MIN - offset * MIN;
+        let queue = "\
+## lead-mac 22:00 — above it
+## lead-mac 00:10 — stamped 15 minutes after the lead's, above it
+## lead 23:55 — the lead's
+## lead-mac 03:00 — newest
+";
+        let got = summary(&posts(queue, offset, all(), now), offset, now);
+        let want: Vec<(String, i64, i64, String)> = [
+            ("steering", 3 * 60, 0, "newest"),
+            (
+                "steering",
+                10,
+                0,
+                "stamped 15 minutes after the lead's, above it",
+            ),
+            ("steering", 22 * 60, 1, "above it"),
+        ]
+        .into_iter()
+        .map(|(kind, minute, back, line)| (kind.to_string(), minute, back, line.to_string()))
+        .collect();
+        assert_eq!(got, want);
+
+        // The line: 29 minutes out of order across midnight is the day
+        // after; 31 minutes is the 12 h rule's day, yesterday.
+        for (above, back) in [("00:14", 0), ("00:16", 1)] {
+            let queue = format!(
+                "## lead-mac {above} — above\n## lead 23:45 — the lead's\n## lead-mac 03:00 — newest\n"
+            );
+            let got = summary(&posts(&queue, offset, all(), now), offset, now);
+            assert_eq!(got.len(), 2, "{above}");
+            assert_eq!(got[1].2, back, "{above}");
         }
     }
 

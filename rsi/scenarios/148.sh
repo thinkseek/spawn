@@ -95,7 +95,7 @@ finish() {
         fi
         if [ -s "$WORK/api.json" ]; then
             echo "148: the answer's observability line:" >&2
-            jq -c '.lines[] | select(.line == "observability")' "$WORK/api.json" >&2 2>/dev/null || true
+            jq -c '.lines[] | select(.line == "sustainability")' "$WORK/api.json" >&2 2>/dev/null || true
         fi
     fi
     cleanup
@@ -275,8 +275,8 @@ get_answer() { # <file>
     code=$(curl -s --noproxy '*' -o "$1" -w '%{http_code}' "$base/api/core-lines" 2>/dev/null) || code=000
     [ "$code" = 200 ] || harness "GET /api/core-lines answered $code: $(head -c 200 "$1")"
 }
-star() { # <file>: the observability north star
-    jq -c '[.lines[] | select(.line == "observability") | .north_star][0] | {key, value, judged}' "$1"
+star() { # <file>: "Needs you is right" (since objective 176, sustainability's guardrail U2)
+    jq -c '[.lines[] | select(.line == "sustainability") | .guardrails[] | select(.key == "observability.needs_you_right")][0] | {key, value, judged}' "$1"
 }
 row() { # <key>: its state and outcome on GET /api/alerts
     curl -s --noproxy '*' "$base/api/alerts" | jq -c --arg k "$1" '[.[] | select(.key == $k) | {state, outcome}][0]'
@@ -329,7 +329,8 @@ const answer = JSON.parse(readFileSync(`${env.BB_WORK}/api.json`, "utf8"));
 
 test("(4) the card says what the share is read from", () => {
   const rows = coreLinesView(answer).rows;
-  const names = rows.map((row) => row.north_star.name);
+  // Objective 176: a guardrail of the sustainability row.
+  const names = rows.flatMap((row) => [row.north_star, ...row.guardrails]).map((mark) => mark.name);
   assert.ok(names.includes("Needs you is right (5 judged, 1 unjudged of 6)"), JSON.stringify(names));
 });
 TEST

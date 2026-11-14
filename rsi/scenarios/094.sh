@@ -43,6 +43,8 @@
 #       or one that does not read, first seen by the reader at least 24 h
 #       ago, kept in <root>/test-schemas-seen.json as {"<server>/<schema>":
 #       <ms>}). The answer lists `test_schemas` [{server, schemas, leaked}].
+#       Since objective 176 (the owner's core metric set) both figures are
+#       diagnostics of the storage page (`diagnostics`), on no card line.
 #   (3) read only: every file, directory, symlink and schema is still there,
 #       unchanged, after the answer.
 #
@@ -363,7 +365,8 @@ else
     expect_eq "$(jq -c '[.scratch.unowned[] | {path, bytes, reason}]' "$WORK/api.json")" \
         "[{\"path\":\"$S/idle\",\"bytes\":$(size_of idle),\"reason\":\"idle\"},{\"path\":\"$S/gone\",\"bytes\":$(size_of gone),\"reason\":\"gone\"},{\"path\":\"$S/reused\",\"bytes\":$(size_of reused),\"reason\":\"gone\"}]" \
         "(1) nobody's entries, largest first: idle (its symlink not followed), an exited owner, a pid used again; not the owned, the fresh, the link or any excluded entry"
-    fig() { jq -c ".lines[] | select(.line == \"storage\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\") | {name, unit, value}" "$WORK/api.json"; }
+    # Objective 176: both figures are storage diagnostics.
+    fig() { jq -c "(.diagnostics // [])[] | select(.key == \"$1\") | {name, unit, value}" "$WORK/api.json"; }
     expect_eq "$(fig storage.unowned_scratch_bytes)" "{\"name\":\"Scratch nobody owns\",\"unit\":\"bytes\",\"value\":$want_bytes}" \
         "(2) scratch nobody owns: the gone and idle entries' bytes"
     asked=$(scalar "select (floor(extract(epoch from clock_timestamp()) * 1000))::bigint")

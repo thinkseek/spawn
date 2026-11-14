@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: daily restore drill of the mission repositories (objective 186)
+
+[Timer]
+# 05:45 local: after the 04:00 bundle (and its retries) and the 05:00 dump
+# drill; apart from the combined drill's 05:30, which stays uninstalled until
+# 152 and 154.
+OnCalendar=*-*-* 05:45:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
