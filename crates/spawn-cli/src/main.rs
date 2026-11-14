@@ -36,6 +36,7 @@ mod alerts;
 mod backup;
 mod commands;
 mod commit_map;
+mod commit_now;
 mod config;
 mod context;
 mod core_lines_sample;
