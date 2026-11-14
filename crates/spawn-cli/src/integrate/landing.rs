@@ -694,3 +694,71 @@ pub(super) fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Opti
         .filter(|other| other.id != mission.id && other.source == mission.source)
         .find_map(|other| other.in_flight().map(|task| (other.id, task.id)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::foreign;
+    use crate::sources::test_git as git;
+
+    /// Objective 173: a landing's candidate descends from its base (a merge
+    /// whose first parent is the base); one off the base's line, as a
+    /// candidate merged on the history before a rewrite is off its base's
+    /// new commit, is named why, and so is a base neither the mirror nor the
+    /// source holds.
+    #[test]
+    fn a_landing_candidate_that_does_not_descend_from_its_base_is_named_why() {
+        let base = std::env::temp_dir().join(format!("spawn-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("file"), "m0\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "m0");
+        let m0 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m0");
+        std::fs::write(seed.join("file"), "m1\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "m1");
+        let m1 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m1");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("source");
+        let mirror = base.join("mirror.git");
+        let mirror_path = mirror.to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &source, &mirror_path]).expect("mirror");
+        // The candidate: a merge on m0 in the mirror, off m1's line.
+        let tree = git(&["--git-dir", &mirror_path, "rev-parse", &format!("{m0}^{{tree}}")])
+            .expect("tree");
+        let off = git(&[
+            "--git-dir",
+            &mirror_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            &tree,
+            "-p",
+            &m0,
+            "-m",
+            "merged on m0",
+        ])
+        .expect("candidate");
+
+        assert_eq!(foreign(&mirror, &source, &m0, &m1), Ok(None), "m1 descends from m0");
+        assert_eq!(foreign(&mirror, &source, &m0, &off), Ok(None));
+        assert_eq!(
+            foreign(&mirror, &source, &m1, &off),
+            Ok(Some(format!(
+                "the candidate {off} does not descend from its base {m1}"
+            )))
+        );
+        let unknown = "f".repeat(40);
+        assert_eq!(
+            foreign(&mirror, &source, &unknown, &off),
+            Ok(Some(format!(
+                "the base {unknown} is an unknown commit (in neither the commit map nor the \
+                 source)"
+            )))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

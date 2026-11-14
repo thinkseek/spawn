@@ -9571,3 +9571,61 @@ fn a_commit_load_sensitive_twice_is_parked_and_its_mission_goes_on() {
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Objective 173: a gate-accepted candidate that does not descend from its
+/// base (after a history rewrite its base reads as the new commit, and the
+/// candidate was merged on the old history) is never pushed, although main
+/// is at its base: its verdict is `stale`, naming why, and the task is
+/// judged again.
+#[test]
+fn a_landing_candidate_that_does_not_descend_from_its_base_is_never_pushed() {
+    let (base, source, scenarios, integrator) = world("foreign-candidate", "exit 1\n");
+    let db = Db::new("foreign_candidate");
+    let b0 = source_main(&source);
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = db.reported_task(mission, "f");
+    let c1 = main_moves(&base, &source, "moved.txt");
+    let mirror = mirror_of(&integrator, &source);
+    // The candidate: a merge on b0, in the mirror (where landings are made).
+    let tree = git(&["--git-dir", &mirror, "rev-parse", &format!("{b0}^{{tree}}")]).expect("tree");
+    let candidate = git(&[
+        "--git-dir",
+        &mirror,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit-tree",
+        &tree,
+        "-p",
+        &b0,
+        "-m",
+        "merged on b0",
+    ])
+    .expect("candidate");
+    db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                      "verdict": "accepted", "base": c1, "candidate": candidate}));
+
+    integrator.pass_on(&db.store).expect("a pass");
+    assert_eq!(source_main(&source), c1, "main is left at the base");
+    let after = db.mission(mission);
+    assert_ne!(after["tasks"][0]["state"], "landed", "{after}");
+    let gated: Value = db
+        .admin()
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                and kind -> 'detail' -> 'record' ->> 'id' = $1
+              order by id desc limit 1",
+            &[&task.to_string()],
+        )
+        .expect("the latest verdict")
+        .get(0);
+    assert_eq!(gated["verdict"], "stale", "{gated}");
+    assert_eq!(
+        gated["reason"],
+        format!("the candidate {candidate} does not descend from its base {c1}").as_str(),
+        "{gated}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
