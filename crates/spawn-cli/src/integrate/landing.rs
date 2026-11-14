@@ -431,8 +431,10 @@ pub(super) const DROPPED_CANDIDATE: &str =
 /// (objective 173): a landing's candidate is a merge whose first parent is
 /// its base, so it descends from it, unless the base is read through the
 /// commit map of a history rewrite and the candidate was merged on the old
-/// history. A base the mirror does not hold is fetched once; one still
-/// unknown is named so. A fetch that fails decides nothing (an error).
+/// history. A base or candidate the mirror does not hold is fetched once; a
+/// base still unknown is named so, and a candidate still unknown says
+/// nothing here (its push fails as before). A fetch that fails decides
+/// nothing (an error).
 pub(super) fn foreign(
     mirror: &Path,
     source: &str,
@@ -450,12 +452,15 @@ pub(super) fn foreign(
         ])
         .is_ok()
     };
-    if !known(base) {
+    if !known(base) || !known(candidate) {
         sources::refresh(mirror, source)?;
         if !known(base) {
             return Ok(Some(format!(
                 "the base {base} is an unknown commit (in neither the commit map nor the source)"
             )));
+        }
+        if !known(candidate) {
+            return Ok(None);
         }
     }
     let descends = git(&[
