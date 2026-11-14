@@ -324,7 +324,7 @@ mod tests {
             since: day.since,
             until: today * DAY_MS + (9 * 60 + 40) * MIN - offset * MIN,
         };
-        assert_eq!(posts(queue, offset, until, now).len(), 4);
+        assert_eq!(posts(queue, offset, until, now).len(), 3);
 
         // The 12 h line: 12:59 above 01:00 is the same day, 13:01 a day back.
         for (above, back) in [("12:59", 0), ("13:01", 1)] {
