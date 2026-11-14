@@ -2394,9 +2394,11 @@ fn landing_commits_ignore_the_hosts_git_configuration() {
 /// scenarios' physical path (through the `controllers/<name>` symlink);
 /// main is behind-checked against it: a descendant is ahead, the commit
 /// itself, an ancestor or an unrelated commit is not, and scenarios in
-/// no controller say nothing.
+/// no controller say nothing. With no commit map, a commit the repository
+/// lacks is an unknown commit (objective 178), never behind.
 #[test]
 fn a_main_ahead_of_its_controller_is_a_descendant_of_its_commit() {
+    use super::ControllerLag;
     let git = crate::sources::test_git;
     let base = std::env::temp_dir().join(format!("spawn-controller-commit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -2410,6 +2412,12 @@ fn a_main_ahead_of_its_controller_is_a_descendant_of_its_commit() {
     std::fs::write(repo.join("a"), "2\n").expect("write");
     commit_in(&repo_path, "two");
     let c2 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("c2");
+    // No commit map: each id as the repository holds it.
+    let unmapped = |commit: &str| {
+        Ok::<_, String>(crate::commit_now::CommitNow::of(commit, None, || {
+            crate::commit_now::held(&repo, commit)
+        }))
+    };
     let controllers = base.join("controllers");
     std::fs::create_dir_all(controllers.join(format!("spawn-{c1}/rsi/scenarios")))
         .expect("controller");
@@ -2417,23 +2425,34 @@ fn a_main_ahead_of_its_controller_is_a_descendant_of_its_commit() {
     let scenarios = controllers.join("spawn/rsi/scenarios");
     assert_eq!(super::controller_commit(&scenarios), Some(c1.clone()));
     assert_eq!(
-        super::controller_behind(&repo, &scenarios, &c2),
-        Some(c1.clone())
+        super::controller_behind(&repo, &scenarios, &c2, unmapped),
+        Ok(ControllerLag::Behind(c1.clone()))
     );
     assert_eq!(
-        super::controller_behind(&repo, &scenarios, &c1),
-        None,
+        super::controller_behind(&repo, &scenarios, &c1, unmapped),
+        Ok(ControllerLag::No),
         "one commit"
     );
     // The controller ahead of main (an ancestor main): not behind.
     std::fs::create_dir_all(controllers.join(format!("spawn-{c2}/rsi/scenarios")))
         .expect("controller two");
     let ahead = controllers.join(format!("spawn-{c2}/rsi/scenarios"));
-    assert_eq!(super::controller_behind(&repo, &ahead, &c1), None);
-    // A commit this repository does not have: nothing to say.
-    let other = controllers.join(format!("spawn-{}/rsi/scenarios", "e".repeat(40)));
+    assert_eq!(
+        super::controller_behind(&repo, &ahead, &c1, unmapped),
+        Ok(ControllerLag::No)
+    );
+    // A commit this repository does not have (and no map names): an
+    // unknown commit, never behind.
+    let missing = "e".repeat(40);
+    let other = controllers.join(format!("spawn-{missing}/rsi/scenarios"));
     std::fs::create_dir_all(&other).expect("other");
-    assert_eq!(super::controller_behind(&repo, &other, &c2), None);
+    assert_eq!(
+        super::controller_behind(&repo, &other, &c2, unmapped),
+        Ok(ControllerLag::Unknown(format!(
+            "the controller's commit {missing} is an unknown commit (in neither the commit map \
+             nor the source)"
+        )))
+    );
     // Not a controller: no commit on the path, or not 40 hex digits.
     let plain = base.join("scenarios");
     std::fs::create_dir_all(&plain).expect("plain");
@@ -2441,7 +2460,69 @@ fn a_main_ahead_of_its_controller_is_a_descendant_of_its_commit() {
     let short = controllers.join("spawn-abc1234/rsi/scenarios");
     std::fs::create_dir_all(&short).expect("short");
     assert_eq!(super::controller_commit(&short), None);
-    assert_eq!(super::controller_behind(&repo, &plain, &c2), None);
+    assert_eq!(
+        super::controller_behind(&repo, &plain, &c2, unmapped),
+        Ok(ControllerLag::No)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Objective 178: a controller built before a history rewrite
+/// (`controllers/spawn-<old>`) is compared by the commit map's new id for
+/// its commit: behind a descendant of the new id, not behind the new id
+/// itself; a dropped commit is unknown with its sentence, and an error of
+/// the map's reading is an error, not a verdict.
+#[test]
+fn a_controller_built_before_the_rewrite_is_compared_by_its_new_commit() {
+    use super::ControllerLag;
+    use crate::commit_now::CommitNow;
+    let git = crate::sources::test_git;
+    let base = std::env::temp_dir().join(format!("spawn-controller-rewrite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    let repo_path = repo.to_string_lossy().to_string();
+    std::fs::create_dir_all(&repo).expect("repo");
+    git(&["init", "-q", "--initial-branch=main", &repo_path]).expect("init");
+    std::fs::write(repo.join("a"), "1\n").expect("write");
+    commit_in(&repo_path, "new one");
+    let new1 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("new1");
+    std::fs::write(repo.join("a"), "2\n").expect("write");
+    commit_in(&repo_path, "new two");
+    let new2 = git(&["-C", &repo_path, "rev-parse", "HEAD"]).expect("new2");
+    // The old id is no commit of this repository: the map alone knows it.
+    let old = "a".repeat(40);
+    let controllers = base.join("controllers");
+    let scenarios = controllers.join(format!("spawn-{old}/rsi/scenarios"));
+    std::fs::create_dir_all(&scenarios).expect("controller");
+    let mapped = |commit: &str| {
+        Ok::<_, String>(CommitNow::of(
+            commit,
+            (commit == old).then(|| Some(new1.clone())),
+            || false,
+        ))
+    };
+    assert_eq!(
+        super::controller_behind(&repo, &scenarios, &new2, mapped),
+        Ok(ControllerLag::Behind(new1.clone()))
+    );
+    assert_eq!(
+        super::controller_behind(&repo, &scenarios, &new1, mapped),
+        Ok(ControllerLag::No)
+    );
+    let dropped = |commit: &str| Ok::<_, String>(CommitNow::of(commit, Some(None), || true));
+    assert_eq!(
+        super::controller_behind(&repo, &scenarios, &new2, dropped),
+        Ok(ControllerLag::Unknown(format!(
+            "the controller's commit {old} was dropped by the history rewrite (the commit map \
+             names no new commit for it)"
+        )))
+    );
+    assert_eq!(
+        super::controller_behind(&repo, &scenarios, &new2, |_: &str| Err(
+            "the store is gone".to_string()
+        )),
+        Err("the store is gone".to_string())
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
