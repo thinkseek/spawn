@@ -75,9 +75,10 @@ select coalesce((select jsonb_build_object('id', e.id, 'at_ms', e.recorded_at_ms
 
 /// Where the latest `source.moved` record of source `$1` moved its main
 /// (`to`): the owner's latest landing on it, which its deploy follows; null
-/// when the owner never moved it.
+/// when the owner never moved it. Read through the commit map (objective
+/// 173): a move recorded before a history rewrite names its commit now.
 pub(crate) const SOURCE_OWNER_LANDED: &str = r"
-select e.kind #>> '{detail,record,to}'
+select spawn_commit_now(e.kind #>> '{detail,record,to}')
   from spawn_events e
  where e.session_id = 'session_control' and e.event_name = 'control.recorded'
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
@@ -146,11 +147,16 @@ macro_rules! owner_requests_pending {
 ///   its `reported` task waits for a person, not a gate. Counting either
 ///   would hold the quiet spell for ever;
 /// - `now_ms`: the database's clock, which every `at_ms` is on.
+///
+/// Every recorded commit (a move's `to`, the anchor `$3`, a request's
+/// commit) is read through the commit map (objective 173); a request for a
+/// commit the rewrite dropped keeps its recorded one.
 pub(crate) const MAIN_LANDING: &str = concat!(
     r#"
 with on_source as (
   select e.session_seq as seq, e.id as event, e.recorded_at_ms as at_ms,
-         e.kind #>> '{detail,record,type}' as type, e.kind #>> '{detail,record,to}' as moved_to,
+         e.kind #>> '{detail,record,type}' as type,
+         spawn_commit_now(e.kind #>> '{detail,record,to}') as moved_to,
          e.kind #>> '{detail,record,type}' = 'task.landed'
            or e.kind #>> '{detail,record,verdict}' = 'accepted' as accepted,
          case when e.kind #>> '{detail,record,type}' = 'task.landed'
@@ -171,7 +177,7 @@ with on_source as (
                                   and m.sources ->> 0 = $1)
          end
 ), anchor as (
-  select max(seq) as seq from on_source where moved_to = $3
+  select max(seq) as seq from on_source where moved_to = spawn_commit_now($3::text)
 ), "#,
     owner_requests_pending!(),
     r#"
@@ -201,7 +207,9 @@ select jsonb_build_object(
              from mission_source_holds h
             where h.source = $1),
   'owner_requests', (select coalesce(jsonb_agg(jsonb_build_object('request', q.id,
-                                                                  'commit', q.r ->> 'commit',
+                                                                  'commit',
+                                                                  coalesce(spawn_commit_now(q.r ->> 'commit'),
+                                                                           q.r ->> 'commit'),
                                                                   'at_ms', q.recorded_at_ms)
                                                order by q.session_seq), '[]'::jsonb)
                        from pending q
@@ -1026,11 +1034,14 @@ select jsonb_build_object(
 /// the report a landing's message is written from. Each names `hold`, the
 /// active owner's hold on its source (or null), `red` its source's red main
 /// (`mission_source_reds`: main, scenario, since_ms, latest_ms, probed_ms; or
-/// null), and each task `held_by`.
+/// null), and each task `held_by`. The mission's baseline and each task's
+/// base and candidate are read through the commit map (objective 173): the
+/// commits they are now, after a history rewrite (null for a dropped one).
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
-  select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
+  select m.id, m.state, m.gate, m.accept, m.budget, spawn_commit_now(m.baseline) as baseline,
+         m.halted, m.scenario_floor,
          m.scenario_names, spawn_now_ms() as now_ms, m.pause_event is not null as paused,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
@@ -1051,8 +1062,9 @@ from (
     left join lateral (
       select jsonb_agg(jsonb_build_object(
                'id', k.id, 'agent_id', k.agent_id,
-               'session_id', k.session_id, 'state', k.state, 'base', k.base,
-               'candidate', k.candidate, 'scenario', k.scenario,
+               'session_id', k.session_id, 'state', k.state,
+               'base', spawn_commit_now(k.base),
+               'candidate', spawn_commit_now(k.candidate), 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
                'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
@@ -1542,13 +1554,18 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
 /// `source.push_refused` naming them), oldest first: `[{request, source,
 /// commit, ref, at_ms, gated, urgent, reason}]`, `request` the request's
 /// event id (`gated` and `urgent` false and `reason` null when not given). Read through the
-/// `spawn_events_source_push` index.
+/// `spawn_events_source_push` index. The `commit` is read through the commit
+/// map (objective 173): a request recorded before a history rewrite is
+/// applied as its new commit; one for a commit the rewrite dropped keeps its
+/// recorded id, which the integrator refuses (`owner.rs` `pre_rewrite`).
 pub(crate) const SOURCE_PUSHES_PENDING: &str = concat!(
     "with ",
     owner_requests_pending!(),
     r"
 select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 'source',
-                                             'commit', q.r ->> 'commit', 'ref', q.r ->> 'ref',
+                                             'commit', coalesce(spawn_commit_now(q.r ->> 'commit'),
+                                                                q.r ->> 'commit'),
+                                             'ref', q.r ->> 'ref',
                                              'at_ms', q.recorded_at_ms,
                                              'gated', coalesce((q.r ->> 'gated')::boolean, false),
                                              'urgent', coalesce((q.r ->> 'urgent')::boolean, false),
