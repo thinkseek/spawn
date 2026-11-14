@@ -4859,7 +4859,26 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
 /// need, objective 148).
 pub(crate) const VERDICTS: [&str; 4] = ["right", "false", "stale", "duplicate"];
 
-const JUDGE_USAGE: &str = "usage: spawn alert judge <key> right|false|stale|duplicate";
+const JUDGE_USAGE: &str = "usage: spawn alert judge <key> right|false|stale|duplicate\n       \
+                           spawn alert record < <one alert.fired or alert.cleared JSON object>";
+
+/// What `spawn alert record` takes, as its refusals name it.
+const RECORD_TAKES: &str =
+    "spawn alert record takes one alert.fired or alert.cleared JSON object on stdin";
+
+/// The record `spawn alert record` was given on stdin (`text`): one JSON
+/// object whose `type` is `alert.fired` or `alert.cleared`, or why it is
+/// not. Anything else is refused here, before the store (objective 172);
+/// the store checks the record's shape and its rules.
+pub(crate) fn record_argument(text: &str) -> Result<Value, String> {
+    let record: Value = serde_json::from_str(text.trim())
+        .map_err(|error| format!("not JSON ({error}): {RECORD_TAKES}"))?;
+    match record.get("type").and_then(Value::as_str) {
+        Some("alert.fired" | "alert.cleared") if record.is_object() => Ok(record),
+        Some(other) if record.is_object() => Err(format!("{other:?} is not one: {RECORD_TAKES}")),
+        _ => Err(format!("not an alert record object: {RECORD_TAKES}")),
+    }
+}
 
 /// The arguments of `spawn alert`: `judge <key> <verdict>`, the key and
 /// the verdict, or why they are not.
@@ -4887,12 +4906,33 @@ pub(crate) fn judge_arguments(arguments: &[String]) -> Result<(String, String), 
 /// `right`. The store refuses a key no alert has, a notice and an alert
 /// judged already.
 pub(crate) fn alert(arguments: &[String]) -> Result<i32, String> {
+    if matches!(arguments, [verb] if verb == "record") {
+        return record_from_stdin();
+    }
     let (key, verdict) = judge_arguments(arguments)?;
     let store = open_store()?;
     let id = store
         .alert_judge(&key, &verdict)
         .map_err(|error| format!("{key} was not judged: {error}"))?;
     println!("judged {key} {verdict} (event {id})");
+    Ok(0)
+}
+
+/// `spawn alert record`: one alert.fired or alert.cleared on stdin
+/// ([`record_argument`]), recorded through the store's `alert_record`, which
+/// masks its free text (objective 170) and checks its shape and rules (a
+/// second fired, an unknown cleared, the owner). scripts/rsi/nightly.sh
+/// records its alerts so, never by psql (objective 172). Prints `{event}`.
+fn record_from_stdin() -> Result<i32, String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .map_err(|error| format!("read the alert record on stdin: {error}"))?;
+    let record = record_argument(&text)?;
+    let store = open_store()?;
+    let event = store
+        .alert_record(&record)
+        .map_err(|error| format!("the alert was not recorded: {error}"))?;
+    println!("{}", serde_json::json!({"event": event}));
     Ok(0)
 }
 
@@ -5102,7 +5142,8 @@ mod tests {
                 Ok(("bb:a1".to_string(), verdict.to_string()))
             );
         }
-        let usage = "usage: spawn alert judge <key> right|false|stale|duplicate";
+        let usage = "usage: spawn alert judge <key> right|false|stale|duplicate\n       \
+                     spawn alert record < <one alert.fired or alert.cleared JSON object>";
         for wrong in [
             &[][..],
             &["judge"][..],
@@ -5123,6 +5164,38 @@ mod tests {
             "{refused}"
         );
         assert!(super::judge_arguments(&words(&["judge", " ", "false"])).is_err());
+    }
+
+    /// Objective 172: `spawn alert record` takes one alert.fired or
+    /// alert.cleared object; anything else is refused before the store,
+    /// naming what it takes.
+    #[test]
+    fn the_record_verb_takes_one_alert_record() {
+        for taken in [
+            r#"{"type": "alert.fired", "key": "k", "kind": "nightly_red", "subject": "s"}"#,
+            "{\"type\": \"alert.cleared\", \"key\": \"k\"}\n",
+        ] {
+            let record = super::record_argument(taken).expect("taken");
+            assert!(
+                record["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("alert."))
+            );
+        }
+        for refused in [
+            "",
+            "not json",
+            r#"[{"type": "alert.fired"}]"#,
+            r#"{"type": "alert.judged", "key": "k"}"#,
+            r#"{"type": "task.gated", "id": 1}"#,
+            r#""alert.fired""#,
+        ] {
+            let error = super::record_argument(refused).expect_err(refused);
+            assert!(
+                error.contains("alert.fired or alert.cleared"),
+                "{refused}: {error}"
+            );
+        }
     }
 
     /// Objective 148: a need judged right stays open in the step's memory,
