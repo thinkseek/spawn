@@ -1034,7 +1034,10 @@ mod tests {
     /// nobody's ("lease ended") after; claims are listed at the top level and
     /// one level below an unmarked directory (never deeper, never below a
     /// marked one, never through a symlink), with their build paths' bytes
-    /// reached through real directories only.
+    /// reached through real directories only. Objective 155: a leased
+    /// folder is never walked whole (its bytes `None`), and an unmarked
+    /// directory holding a running claim (old, session) is no entry, each of
+    /// its other children its own (old/data idle).
     #[test]
     fn a_claim_is_owned_while_its_lease_runs_and_listed_by_owner() {
         let scratch = Scratch::new();
@@ -1050,7 +1053,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("leased/link")).expect("link");
         std::os::unix::fs::symlink(outside.join("target"), root.join("leased/via/target"))
             .expect("link");
-        let leased = claim(
+        claim(
             &root.join("leased"),
             "rev-e",
             now - 10,
@@ -1066,11 +1069,11 @@ mod tests {
         fill(&root.join("ended/data"), 2000);
         let ended = claim(&root.join("ended"), "rev-b", now - 20, now, &[]);
         fill(&root.join("session/fresh"), 10);
-        let below = claim(&root.join("session/a"), "rev-e", now - 30, now + 1, &[]);
+        claim(&root.join("session/a"), "rev-e", now - 30, now + 1, &[]);
         fill(&root.join("session/a/data"), 70);
         claim(&root.join("session/b/deep"), "rev-x", 1, now + 1, &[]);
         fill(&root.join("old/data"), 40);
-        let old_below = claim(&root.join("old/c"), "rev-a", 5, now + 1, &[]);
+        claim(&root.join("old/c"), "rev-a", 5, now + 1, &[]);
         fill(&root.join("marked/data"), 10);
         std::fs::write(root.join("marked").join(MARKER), "41 100\n").expect("marker");
         claim(&root.join("marked/d"), "rev-x", 1, now + 1, &[]);
@@ -1101,10 +1104,10 @@ mod tests {
             unowned,
             [
                 ("ended".to_string(), 2000 + ended, Reason::LeaseEnded),
-                ("old".to_string(), 40 + old_below, Reason::Idle),
+                ("old/data".to_string(), 40, Reason::Idle),
             ]
         );
-        let claimed: Vec<(String, &str, u64, u64)> = found
+        let claimed: Vec<(String, &str, Option<u64>, u64)> = found
             .claimed
             .iter()
             .map(|folder| {
@@ -1120,10 +1123,10 @@ mod tests {
         assert_eq!(
             claimed,
             [
-                ("old/c".to_string(), "rev-a", old_below, 0),
-                ("ended".to_string(), "rev-b", 2000 + ended, 0),
-                ("session/a".to_string(), "rev-e", 70 + below, 0),
-                ("leased".to_string(), "rev-e", 1300 + leased, 300),
+                ("old/c".to_string(), "rev-a", None, 0),
+                ("ended".to_string(), "rev-b", Some(2000 + ended), 0),
+                ("session/a".to_string(), "rev-e", None, 0),
+                ("leased".to_string(), "rev-e", None, 300),
             ],
             "by agent, then oldest first"
         );
