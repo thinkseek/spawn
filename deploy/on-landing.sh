@@ -49,9 +49,10 @@
 #   SPAWN_DEPLOY_RETRY_SECS (default 1800): a failed main is tried again
 #   after that, or as soon as another landing moves main. Its alert stays
 #   open meanwhile (one per occurrence: alerts.rs `deploy_failed`);
-# - the debounce, only while another task of the source is between its
-#   report and its landing (`spawn mission landing`'s judging: reported,
-#   accepted or landing): no landing for SPAWN_DEPLOY_QUIET_SECS (default
+# - the debounce, only while another task of the source's gated missions
+#   is between its report and its landing (`spawn mission landing`'s
+#   judging: reported, accepted or landing; a review mission's task never
+#   lands, 168): no landing for SPAWN_DEPLOY_QUIET_SECS (default
 #   300) since main's, so a burst of landings makes one deploy, or else
 #   SPAWN_DEPLOY_MAX_WAIT_SECS (default 1800) have passed since the first
 #   landing after the live commit's, so landings that keep coming still

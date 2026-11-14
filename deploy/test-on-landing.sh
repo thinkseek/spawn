@@ -157,6 +157,11 @@ git init -q --bare -b main "$missions"
 c0=$(commit_work "the live commit")
 ln -s "spawn-$c0" "$live/controllers/spawn"
 mission=$(spawn_live mission add --text "test-on-landing: the Spawn mission" --source "$missions" | jq -r '.mission')
+# Gated, as the live Spawn mission is: only a gated mission's tasks are
+# judged (168: a review mission's never land). It accepts by its gate, so
+# its reported task is the gate's input and is counted too.
+mkdir -p "$scratch/scenarios"
+spawn_live mission configure --id "$mission" --accept gate --gate "$scratch/scenarios" >/dev/null
 # land <commit>: a task of the mission, landed at <commit> by the integrator.
 land() {
   local task
@@ -166,9 +171,9 @@ land() {
 }
 sql "select spawn_control_record(jsonb_build_object('type', 'source.moved', 'source', '$missions',
        'from', '$c0', 'to', '$c0'))" >/dev/null
-# judged <state>: a task of the mission between its report and its landing
-# (reported, accepted, landing), as `spawn mission landing`'s judging counts
-# them; prints it. unjudge <task>: it landed.
+# judged <state>: a task of the (gated) mission between its report and its
+# landing (reported, accepted, landing), as `spawn mission landing`'s
+# judging counts them; prints it. unjudge <task>: it landed.
 judged() {
   local task
   task=$(spawn_live task assign --mission "$mission" --kind ephemeral --worker w --brief "judged" | jq -r '.task')
@@ -403,6 +408,27 @@ for state in accepted landing; do
   tick SPAWN_DEPLOY_QUIET_SECS=600
   check "and once it landed, main deploys at once" [ "$(live_commit)" = "spawn-$c9" ]
 done
+
+echo "== an answer without judging (an older binary): the quiet holds (160's fallback; 168)"
+nojudging=$scratch/spawn-nojudging
+cat >"$nojudging" <<EOF
+#!/usr/bin/env bash
+if [ "\${1-}" = mission ] && [ "\${2-}" = landing ]; then
+  "$spawn_bin" "\$@" | jq -c 'del(.judging)'
+  exit "\${PIPESTATUS[0]}"
+fi
+exec "$spawn_bin" "\$@"
+EOF
+chmod +x "$nojudging"
+ln -sfn "$nojudging" "$live/bin/spawn"
+c10=$(commit_work "a landing read by a binary that does not say judging")
+land "$c10"
+tick SPAWN_DEPLOY_QUIET_SECS=600
+check "with nothing judged, an answer without judging keeps the quiet spell" grep -qF "main $c10 waits: landed" "$out"
+check "read as one judged" grep -qF "and 1 task(s) of the source are judged or landing" "$out"
+ln -sfn "$spawn_bin" "$live/bin/spawn"
+tick SPAWN_DEPLOY_QUIET_SECS=600
+check "and with judging said again (0), main deploys at once" [ "$(live_commit)" = "spawn-$c10" ]
 
 echo "== a failure before deploy.sh is recorded as deploy.sh records its own"
 c6=$(commit_work "a main whose UI dependencies cannot be installed")
