@@ -312,13 +312,20 @@ pub(super) fn land(
     task: &Task,
 ) -> Result<Landing, String> {
     let (Some(base), Some(candidate)) = (task.base.as_deref(), task.candidate.as_deref()) else {
-        return record(
-            store,
-            &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
-                    "revision": task.revisions,
-                    "inputs": inputs::known(task.base.as_deref(), task.candidate.as_deref())}),
-        )
-        .map(|()| Landing::Stale);
+        let mut stale = json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                               "revision": task.revisions,
+                               "inputs": inputs::known(task.base.as_deref(), task.candidate.as_deref())});
+        // A candidate the commit map names dropped is read as none
+        // (objective 173): said so, never pushed.
+        if task.base.is_some()
+            && store
+                .commit_map_size()
+                .map_err(|error| error.to_string())?
+                > 0
+        {
+            stale["reason"] = json!(DROPPED_CANDIDATE);
+        }
+        return record(store, &stale).map(|()| Landing::Stale);
     };
     // Held until the landing is recorded: dropping the mission waits for it,
     // and so does an owner's hold (an owner's landing takes the lock on a
@@ -339,6 +346,19 @@ pub(super) fn land(
         .map_err(|error| error.to_string())?
     {
         return land_held(store, mirror, source, task, (base, candidate), hold);
+    }
+    // A candidate off its base's line is never pushed (objective 173): after
+    // a history rewrite the base reads as its new commit, and a candidate
+    // merged on the old history would bring it back onto main.
+    if let Some(reason) = foreign(mirror, source, base, candidate)? {
+        println!("integrate: task {}: {reason}; judging again", task.id);
+        return record(
+            store,
+            &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                    "revision": task.revisions, "reason": reason,
+                    "inputs": inputs::known(Some(base), Some(candidate))}),
+        )
+        .map(|()| Landing::Stale);
     }
     let mirror_path = mirror.to_string_lossy().to_string();
     let (branch, _) = source_head(source)?;
@@ -400,6 +420,54 @@ pub(super) fn land(
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
     Ok(Landing::Landed)
+}
+
+/// Why a stale landing's candidate is none: the history rewrite dropped it
+/// (objective 173).
+pub(super) const DROPPED_CANDIDATE: &str =
+    "the candidate was dropped by the history rewrite (the commit map names it dropped)";
+
+/// Why `candidate` must not be pushed onto main at `base`, if it must not
+/// (objective 173): a landing's candidate is a merge whose first parent is
+/// its base, so it descends from it, unless the base is read through the
+/// commit map of a history rewrite and the candidate was merged on the old
+/// history. A base the mirror does not hold is fetched once; one still
+/// unknown is named so. A fetch that fails decides nothing (an error).
+pub(super) fn foreign(
+    mirror: &Path,
+    source: &str,
+    base: &str,
+    candidate: &str,
+) -> Result<Option<String>, String> {
+    let mirror_path = mirror.to_string_lossy();
+    let known = |commit: &str| {
+        git(&[
+            "--git-dir",
+            &mirror_path,
+            "cat-file",
+            "-e",
+            &format!("{commit}^{{commit}}"),
+        ])
+        .is_ok()
+    };
+    if !known(base) {
+        sources::refresh(mirror, source)?;
+        if !known(base) {
+            return Ok(Some(format!(
+                "the base {base} is an unknown commit (in neither the commit map nor the source)"
+            )));
+        }
+    }
+    let descends = git(&[
+        "--git-dir",
+        &mirror_path,
+        "merge-base",
+        "--is-ancestor",
+        base,
+        candidate,
+    ])
+    .is_ok();
+    Ok((!descends).then(|| format!("the candidate {candidate} does not descend from its base {base}")))
 }
 
 /// [`land`] on a source the owner holds (`hold`, read under the landing

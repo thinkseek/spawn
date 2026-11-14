@@ -307,6 +307,9 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
             owner_ref(commit)
         ));
     }
+    if let Some(why) = pre_rewrite(store, source, commit)? {
+        return refuse(why);
+    }
     let missions: Vec<Mission> =
         serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
             .map_err(|error| format!("gated missions: {error}"))?;
@@ -369,6 +372,46 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
     refuse(format!(
         "main moved under the owner's landing twice; the compare-and-swap failed: {failed}"
     ))
+}
+
+/// Why a request for `commit` on `source` must not land after a history
+/// rewrite (objective 173), if it must not: with a commit map loaded, a
+/// commit the rewrite dropped (the request kept its recorded id, which the
+/// map names dropped), or a commit whose history not yet in main
+/// (`rev-list <commit> --not main`) holds an old commit the rewrite changed
+/// or dropped: landing it would merge the history from before the rewrite
+/// back into the rewritten main. A commit the rewrite kept is no such old
+/// one. With no map loaded nothing is refused here.
+pub(super) fn pre_rewrite(
+    store: &PostgresStore,
+    source: &str,
+    commit: &str,
+) -> Result<Option<String>, String> {
+    let error = |error: spawn_core::port::StoreError| error.to_string();
+    if store.commit_map_size().map_err(error)? == 0 {
+        return Ok(None);
+    }
+    if store.commit_map_entry(commit).map_err(error)? == Some(None) {
+        return Ok(Some(format!(
+            "the commit {commit} was dropped by the history rewrite: push it again from the \
+             rewritten history"
+        )));
+    }
+    let (_, main) = source_head(source)?;
+    let olds = store.commit_map_olds().map_err(error)?;
+    let listed = git(&["--git-dir", source, "rev-list", commit, "--not", &main])?;
+    let old: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| olds.contains(&line.to_ascii_lowercase()))
+        .collect();
+    Ok(old.first().map(|first| {
+        format!(
+            "the commit {commit} would bring {} commit(s) from before the history rewrite onto \
+             main (the first: {first}): rebase it onto the rewritten main and push it again",
+            old.len()
+        )
+    }))
 }
 
 /// A task landing on the source whose push went out without its record (its
