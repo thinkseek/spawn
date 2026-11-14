@@ -4173,4 +4173,63 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             }
         }
     }
+
+    /// Objective 167: two bundles in one second (or one millisecond) name
+    /// two objects, and the names sort, by byte, as the bundles ran.
+    #[test]
+    fn bundles_in_one_second_get_names_that_sort_as_they_ran() {
+        use super::bundle_name;
+        // 2026-11-14T03:05:09.042Z
+        let at = 1_763_089_509_042_i64;
+        assert_eq!(
+            bundle_name("full", at, "tar.zst", "0a1b2c3d"),
+            "bundles/full/spawn-bundle-20251114-030509-042-0a1b2c3d.tar.zst.gpg"
+        );
+        let first = bundle_name("incr", at, "tar.zst", "ffffffff");
+        let later_ms = bundle_name("incr", at + 1, "tar.zst", "00000000");
+        let same_ms = bundle_name("incr", at, "tar.zst", "00000001");
+        assert_ne!(first, later_ms, "one second, two names");
+        assert_ne!(first, same_ms, "one millisecond, named apart by the random part");
+        // Times that cross millisecond widths, a second, an hour and a day,
+        // their random parts descending: the names sort as the times.
+        let times = [
+            at - 42,
+            at - 41,
+            at - 33,
+            at,
+            at + 57,
+            at + 958,
+            at + 1_000,
+            at + 3_600_000,
+            at + 86_400_000,
+        ];
+        let randoms = [
+            "ffffffff", "eeeeeeee", "dddddddd", "cccccccc", "bbbbbbbb", "aaaaaaaa", "99999999",
+            "88888888", "77777777",
+        ];
+        let names: Vec<String> = times
+            .iter()
+            .zip(randoms)
+            .map(|(time, random)| bundle_name("incr", *time, "tar.zst", random))
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, names, "by byte, as they ran");
+        // An earlier second's one-second name (before objective 167) sorts
+        // first.
+        let old = format!(
+            "bundles/incr/spawn-bundle-{}.tar.zst.gpg",
+            Stamp::at(at - 1_000).text()
+        );
+        assert!(old < first, "{old} {first}");
+        // The second is read from the name, under a prefix too.
+        assert_eq!(
+            Stamp::parse(&first).map(|stamp| stamp.text()),
+            Some(Stamp::at(at).text())
+        );
+        assert_eq!(
+            Stamp::parse(&format!("locktest/{first}")).map(|stamp| stamp.text()),
+            Some("20251114-030509".to_string())
+        );
+    }
 }
