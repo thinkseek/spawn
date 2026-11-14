@@ -5106,16 +5106,14 @@ mod tests {
         );
         assert!(judged.is_empty(), "{judged:?}");
         assert!(monitor.is_open(key), "a need judged right stays open");
-        let cleared = decided(
-            &monitor,
-            feed(
-                &mut monitor,
-                13,
-                0,
-                json!({"type": "task.gated", "id": 7, "verdict": "accepted", "revision": 0,
-                       "base": "c"}),
-            ),
+        let accepted = feed(
+            &mut monitor,
+            13,
+            0,
+            json!({"type": "task.gated", "id": 7, "verdict": "accepted", "revision": 0,
+                   "base": "c"}),
         );
+        let cleared = decided(&monitor, accepted);
         assert!(
             cleared
                 .iter()
