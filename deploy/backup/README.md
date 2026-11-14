@@ -24,8 +24,10 @@ the drill's test.
 ## Layout, locks and expiry
 
 Object keys are `postgres/<tier>/spawn-YYYYMMDD-HHMMSS.dump.gpg` and
-`bundles/<full|incr>/spawn-bundle-YYYYMMDD-HHMMSS.tar.gpg`, timestamps in
-UTC. Retention is entirely R2's: nothing here ever deletes or overwrites.
+`bundles/<full|incr>/spawn-bundle-YYYYMMDD-HHMMSS-mmm-<8 hex>.tar.gpg`, timestamps in
+UTC. A bundle's name adds its millisecond and a random part (objective 167),
+so two bundles in one second never share a name, which the lock would refuse;
+names still sort as the bundles ran. Retention is entirely R2's: nothing here ever deletes or overwrites.
 
 | Prefix | Gets | Bucket lock | Lifecycle expiry | Held at most |
 | --- | --- | --- | --- | --- |
@@ -337,7 +339,7 @@ the same:
 
 ```sh
 gpg --batch --pinentry-mode loopback --passphrase-file ~/.config/spawn/backup.key \
-  -o bundle.raw -d spawn-bundle-YYYYMMDD-HHMMSS.tar.zst.gpg
+  -o bundle.raw -d spawn-bundle-YYYYMMDD-HHMMSS-mmm-<8 hex>.tar.zst.gpg
 case "$(head -c 4 bundle.raw | od -An -tx1 | tr -d ' \n')" in
 1f8b*)     gzip -dc <bundle.raw >bundle.tar ;;
 28b52ffd*) zstd -q -dc <bundle.raw >bundle.tar ;;
