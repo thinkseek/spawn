@@ -119,7 +119,8 @@ fn not_commits(source: &str, pairs: &[Pair]) -> Result<Vec<String>, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("run git cat-file: {error}"))?;
-    let input: String = news.iter().map(|new| format!("{new}\n")).collect();
+    let mut input = news.join("\n");
+    input.push('\n');
     let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
     let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
     let output = child

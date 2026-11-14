@@ -104,7 +104,7 @@ fn request(store: &PostgresStore, commit: &str) -> i64 {
 /// the rewrite changed or dropped, never the kept m0.
 #[test]
 fn an_owner_request_of_a_pre_rewrite_commit_is_read_as_its_new_commit() {
-    let (store, _schema) = store("commit_map_request");
+    let (store, schema) = store("commit_map_request");
     let h = history();
     mission_at(&store, &h.m1);
     let x = request(&store, &h.x);
@@ -154,7 +154,7 @@ fn an_owner_request_of_a_pre_rewrite_commit_is_read_as_its_new_commit() {
     assert_eq!(store.commit_now(&h.m0).expect("now"), Some(h.m0.clone()));
     let other = "9".repeat(40);
     assert_eq!(store.commit_now(&other).expect("now"), Some(other.clone()));
-    let mut client = admin(&_schema);
+    let mut client = admin(&schema);
     let null: Option<String> = client
         .query_one("select spawn_commit_now(null)", &[])
         .expect("null")
