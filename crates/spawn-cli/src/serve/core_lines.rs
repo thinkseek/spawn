@@ -59,7 +59,11 @@
 //! agent-hour (`/api/interventions?window=24h`'s `per_agent_hour`, its last
 //! 24 h, objective 100; the figure says `"window": "24h"`) on
 //! `/api/fleet`, and how many figures of this same answer have no value,
-//! itself left out. The recoverability guardrails (objective 087,
+//! itself left out. Its north star, "Needs you is right" (objective 148),
+//! is the owner's judgements (`spawn alert judge`) of the needs (alerts,
+//! never notices) fired in the last 7 days: right ÷ judged, no value under
+//! 5 judged, said with `judged: {fired, judged, unjudged}` (none when not
+//! read); a clearing is never evidence. The recoverability guardrails (objective 087,
 //! [`recoverability`]) are the ages of the newest database copy and bundle
 //! (health.backups on `/api/fleet`), the age of the oldest nightly judging
 //! and how many sources the nightly holds red (its fact files,
