@@ -19,7 +19,10 @@ impl PostgresStore {
     /// Returns how many pairs the map holds, and whether this load put them
     /// there (`false`: they were loaded already). A different map, a
     /// malformed or repeated old and an empty list are refused.
-    pub fn commit_map_load(&self, pairs: &[(String, Option<String>)]) -> Result<(i64, bool), StoreError> {
+    pub fn commit_map_load(
+        &self,
+        pairs: &[(String, Option<String>)],
+    ) -> Result<(i64, bool), StoreError> {
         let before = self.commit_map_size()?;
         let pairs = Value::Array(
             pairs

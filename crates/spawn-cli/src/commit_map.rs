@@ -35,8 +35,8 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
     }
     let flags = Flags::parse(&rest[2..])?;
     let source = flags.required("source")?;
-    let text =
-        std::fs::read_to_string(file).map_err(|error| format!("read the commit map {file}: {error}"))?;
+    let text = std::fs::read_to_string(file)
+        .map_err(|error| format!("read the commit map {file}: {error}"))?;
     let pairs = read(&text).map_err(|error| format!("the commit map {file}: {error}"))?;
     let missing = not_commits(&source, &pairs)?;
     if let Some(first) = missing.first() {
@@ -92,10 +92,7 @@ pub(crate) fn read(text: &str) -> Result<Vec<Pair>, String> {
             ));
         }
         let new = new.to_ascii_lowercase();
-        pairs.push((
-            old.to_ascii_lowercase(),
-            (new != DROPPED).then_some(new),
-        ));
+        pairs.push((old.to_ascii_lowercase(), (new != DROPPED).then_some(new)));
     }
     if pairs.is_empty() {
         return Err("it holds no pair".to_string());
@@ -106,15 +103,17 @@ pub(crate) fn read(text: &str) -> Result<Vec<Pair>, String> {
 /// The new commits of `pairs` that are not commits of `source`, in the
 /// map's order, read with one `git cat-file --batch-check`.
 fn not_commits(source: &str, pairs: &[Pair]) -> Result<Vec<String>, String> {
-    let news: Vec<&str> = pairs
-        .iter()
-        .filter_map(|(_, new)| new.as_deref())
-        .collect();
+    let news: Vec<&str> = pairs.iter().filter_map(|(_, new)| new.as_deref()).collect();
     if news.is_empty() {
         return Ok(Vec::new());
     }
     let mut child = crate::sources::controller_git()
-        .args(["--git-dir", source, "cat-file", "--batch-check=%(objecttype)"])
+        .args([
+            "--git-dir",
+            source,
+            "cat-file",
+            "--batch-check=%(objecttype)",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -160,16 +159,17 @@ mod tests {
         let b = "B".repeat(40);
         let c = "c".repeat(40);
         let zeros = "0".repeat(40);
-        let text = format!("old                                      new\n{a} {b}\n\n{c} {zeros}\n");
+        let text =
+            format!("old                                      new\n{a} {b}\n\n{c} {zeros}\n");
         assert_eq!(
             read(&text),
-            Ok(vec![
-                (a.clone(), Some("b".repeat(40))),
-                (c.clone(), None),
-            ])
+            Ok(vec![(a.clone(), Some("b".repeat(40))), (c.clone(), None),])
         );
         // The header is optional.
-        assert_eq!(read(&format!("{a} {a}\n")), Ok(vec![(a.clone(), Some(a.clone()))]));
+        assert_eq!(
+            read(&format!("{a} {a}\n")),
+            Ok(vec![(a.clone(), Some(a.clone()))])
+        );
         // An error names the line.
         let error = read(&format!("old new\n{a} {b}\n{a}\n")).unwrap_err();
         assert!(error.contains("line 3"), "{error}");

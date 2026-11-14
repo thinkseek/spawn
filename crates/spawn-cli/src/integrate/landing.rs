@@ -317,12 +317,7 @@ pub(super) fn land(
                                "inputs": inputs::known(task.base.as_deref(), task.candidate.as_deref())});
         // A candidate the commit map names dropped is read as none
         // (objective 173): said so, never pushed.
-        if task.base.is_some()
-            && store
-                .commit_map_size()
-                .map_err(|error| error.to_string())?
-                > 0
-        {
+        if task.base.is_some() && store.commit_map_size().map_err(|error| error.to_string())? > 0 {
             stale["reason"] = json!(DROPPED_CANDIDATE);
         }
         return record(store, &stale).map(|()| Landing::Stale);
@@ -472,7 +467,8 @@ pub(super) fn foreign(
         candidate,
     ])
     .is_ok();
-    Ok((!descends).then(|| format!("the candidate {candidate} does not descend from its base {base}")))
+    Ok((!descends)
+        .then(|| format!("the candidate {candidate} does not descend from its base {base}")))
 }
 
 /// [`land`] on a source the owner holds (`hold`, read under the landing
@@ -725,8 +721,13 @@ mod tests {
         let mirror_path = mirror.to_string_lossy().to_string();
         git(&["clone", "-q", "--bare", &source, &mirror_path]).expect("mirror");
         // The candidate: a merge on m0 in the mirror, off m1's line.
-        let tree = git(&["--git-dir", &mirror_path, "rev-parse", &format!("{m0}^{{tree}}")])
-            .expect("tree");
+        let tree = git(&[
+            "--git-dir",
+            &mirror_path,
+            "rev-parse",
+            &format!("{m0}^{{tree}}"),
+        ])
+        .expect("tree");
         let off = git(&[
             "--git-dir",
             &mirror_path,
@@ -743,7 +744,11 @@ mod tests {
         ])
         .expect("candidate");
 
-        assert_eq!(foreign(&mirror, &source, &m0, &m1), Ok(None), "m1 descends from m0");
+        assert_eq!(
+            foreign(&mirror, &source, &m0, &m1),
+            Ok(None),
+            "m1 descends from m0"
+        );
         assert_eq!(foreign(&mirror, &source, &m0, &off), Ok(None));
         assert_eq!(
             foreign(&mirror, &source, &m1, &off),

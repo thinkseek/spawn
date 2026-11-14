@@ -109,7 +109,11 @@ fn an_owner_request_of_a_pre_rewrite_commit_is_read_as_its_new_commit() {
     mission_at(&store, &h.m1);
     let x = request(&store, &h.x);
     let pending = store.source_pushes_pending().expect("pending");
-    assert_eq!(pending[0]["commit"], h.x.as_str(), "no map: the recorded id");
+    assert_eq!(
+        pending[0]["commit"],
+        h.x.as_str(),
+        "no map: the recorded id"
+    );
 
     assert_eq!(store.commit_map_size().expect("size"), 0);
     assert_eq!(
@@ -136,7 +140,11 @@ fn an_owner_request_of_a_pre_rewrite_commit_is_read_as_its_new_commit() {
         .iter()
         .find(|row| row["request"] == json!(e))
         .expect("the request for E");
-    assert_eq!(dropped["commit"], h.e.as_str(), "a dropped commit keeps its id");
+    assert_eq!(
+        dropped["commit"],
+        h.e.as_str(),
+        "a dropped commit keeps its id"
+    );
 
     assert_eq!(
         store.commit_now(&h.x.to_uppercase()).expect("now"),
@@ -210,7 +218,10 @@ fn the_map_is_loaded_once_by_the_owner_and_never_changed() {
     );
     assert_eq!(store.commit_map_size().expect("size"), 0, "nothing loaded");
 
-    assert_eq!(store.commit_map_load(&h.pairs()).expect("loaded"), (4, true));
+    assert_eq!(
+        store.commit_map_load(&h.pairs()).expect("loaded"),
+        (4, true)
+    );
     let mut reversed = h.pairs();
     reversed.reverse();
     assert_eq!(
@@ -240,14 +251,10 @@ fn the_map_is_loaded_once_by_the_owner_and_never_changed() {
     ] {
         let refused = client
             .batch_execute(statement)
-            .expect_err("the map is never changed")
-            .to_string();
-        let error = client
-            .batch_execute(statement)
-            .expect_err("refused")
+            .expect_err("the map is never changed");
+        let error = refused
             .as_db_error()
-            .map(|error| error.message().to_string())
-            .unwrap_or(refused);
+            .map_or_else(|| refused.to_string(), |error| error.message().to_string());
         assert!(
             error.contains("the commit map is never changed (objective 173)"),
             "{statement}: {error}"
