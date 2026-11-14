@@ -189,6 +189,10 @@ select jsonb_build_object(
                                    'liveness', 0, 'human', 0)
                 || (select coalesce(jsonb_object_agg(tier, n), '{}'::jsonb) from decided),
   'agent_hours_24h', (select ms / 3600000.0 from live_ms),
+  -- The ratio's two parts (objective 158): serve adds the owner's posts in
+  -- the queue to the count and works the ratio out again from them.
+  'interventions_24h', (select n from intervened),
+  'agent_ms_24h', (select round(ms)::bigint from live_ms),
   -- The Home card's figure: interventions over agent hours, to 3
   -- decimals rounded half up (`ratio_milli`); null with no agent time.
   'human_per_agent_hour', (select case when l.ms > 0

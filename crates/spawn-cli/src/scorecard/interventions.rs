@@ -66,6 +66,30 @@ fn milli(numerator: i64, denominator: i64) -> Value {
         .map_or(Value::Null, |value| Number::Milli(value).json())
 }
 
+/// Interventions per agent-hour: `total` over `agent_ms`, to 3 decimals
+/// rounded half up; null with no agent time. The one ratio the Home card,
+/// the Fleet strip and the guardrail say (objective 158).
+pub(crate) fn per_agent_hour(total: i64, agent_ms: i64) -> Value {
+    if agent_ms > 0 {
+        milli(total.saturating_mul(HOUR_MS), agent_ms)
+    } else {
+        Value::Null
+    }
+}
+
+/// The owner's posts in the queue the ranges file names (objective 156)
+/// within `[since, until)`, placed by the wall clock as the Home card places
+/// them; `None` when the file names no queue (objective 158: the Fleet
+/// strip and the scorecard count them as the card does).
+pub(crate) fn queue_posts_between(since: i64, until: i64) -> Option<Vec<Value>> {
+    let settings = crate::serve::core_lines::queue_settings()?;
+    Some(queue_posts::read(
+        &settings,
+        Window { since, until },
+        crate::verify::now_ms(),
+    ))
+}
+
 /// The answer for `window` (named `name`) from the store.
 pub(crate) fn measure(store: &PostgresStore, name: &str, window: Window) -> Result<Value, Failure> {
     let mut read = store
@@ -120,11 +144,7 @@ pub(crate) fn answer(read: &Value, name: &str, window: Window) -> Value {
         "total": total,
         "by_kind": by_kind,
         "retries": retries,
-        "per_agent_hour": if agent_ms > 0 {
-            milli(total.saturating_mul(HOUR_MS), agent_ms)
-        } else {
-            Value::Null
-        },
+        "per_agent_hour": per_agent_hour(total, agent_ms),
         "items": items,
     })
 }
