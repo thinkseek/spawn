@@ -109,7 +109,6 @@ mod answers;
 pub(crate) mod attention;
 pub(crate) mod core_lines;
 mod labels;
-mod notices;
 mod storage;
 
 use std::collections::BTreeSet;

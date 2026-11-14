@@ -4747,13 +4747,42 @@ pub(crate) fn window_ms(since: Option<&str>) -> Result<i64, String> {
 }
 
 /// The alert window as `spawn alerts --once --json` and `/api/alerts`
-/// answer it: the one array both show.
+/// answer it: the one array both show, with the notice fold (objectives 151
+/// and 166, [`notices::fold`]): each task's or mission's notice that its
+/// subject's next one follows says `superseded_by`, that one's key. Every
+/// row stays; nothing is recorded.
 pub(crate) fn window(store: &PostgresStore, since: Option<&str>) -> Result<Value, String> {
     let span = window_ms(since)?;
     let now = store.now_ms().map_err(|error| error.to_string())?;
-    store
+    let mut rows = store
         .alerts(now.saturating_sub(span))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    notices::fold(&mut rows);
+    Ok(rows)
+}
+
+/// `spawn alerts --once` in text (objective 166), in the window's order:
+/// each open and cleared alert's [`line`], and of the notices each
+/// subject's newest only ([`notices::current`]), with " · N earlier" after
+/// its line when notices came before it, as the Alerts view shows them.
+fn lines(alerts: &[Value]) -> Vec<String> {
+    let current = notices::current(alerts);
+    alerts
+        .iter()
+        .filter_map(|alert| {
+            if alert["state"].as_str() != Some("notice") {
+                return Some(line(alert));
+            }
+            let (_, earlier) = current
+                .iter()
+                .find(|(row, _)| std::ptr::eq(*row, alert))?;
+            Some(if *earlier > 0 {
+                format!("{} · {earlier} earlier", line(alert))
+            } else {
+                line(alert)
+            })
+        })
+        .collect()
 }
 
 const USAGE: &str = "usage: spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]";
@@ -4791,8 +4820,8 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         if json {
             println!("{}", Value::Array(alerts.clone()));
         } else {
-            for alert in &alerts {
-                println!("{}", line(alert));
+            for line in lines(&alerts) {
+                println!("{line}");
             }
         }
         return Ok(0);
@@ -4931,6 +4960,7 @@ fn host_sources(listed: &Value) -> BTreeSet<(i64, String)> {
 }
 
 mod guardrails;
+mod notices;
 
 #[cfg(test)]
 mod tests {
