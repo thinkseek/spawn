@@ -311,7 +311,10 @@ with latest as materialized (
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.agent_id, k.session_id, k.name as resident,
-         start.commit as start, aside.commit as set_aside,
+         -- Through the commit map (objective 177): an id the map cannot
+         -- translate (dropped) reads as itself, which the set-aside refuses.
+         coalesce(spawn_commit_now(start.commit), start.commit) as start,
+         coalesce(spawn_commit_now(aside.commit), aside.commit) as set_aside,
          exists (select 1 from spawn_commands c
                   where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
                     and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
@@ -871,7 +874,8 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
 /// mission, `$2` objective, `$3` limit.
 pub(crate) const OBJECTIVE_PRIOR_WORK: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
-         'task', k.id, 'branch', c.branch, 'commit', c.commit, 'outcome', o.outcome,
+         'task', k.id, 'branch', c.branch, 'commit', coalesce(spawn_commit_now(c.commit), c.commit),
+         'outcome', o.outcome,
          'reason', o.reason, 'report', k.report) order by k.id desc), '[]'::jsonb)
   from (select id, session_id, report, created_at_ms from mission_tasks
          where mission_id = $1 and objective = $2 and state = 'cancelled'
@@ -946,7 +950,7 @@ select count(*)
 /// task.
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
-  select jsonb_build_object('task', p.id, 'commit', c.commit)
+  select jsonb_build_object('task', p.id, 'commit', coalesce(spawn_commit_now(c.commit), c.commit))
          || case when p.id = k.reassign_of then jsonb_build_object('reassign', true)
                  else '{}'::jsonb end
     from mission_tasks k
@@ -1049,7 +1053,7 @@ from (
          m.gate_host_due_ms, m.gate_base_disagrees, m.gate_rejection_objective,
          m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
-         (select jsonb_build_object('main', r.main, 'scenario', r.scenario,
+         (select jsonb_build_object('main', coalesce(spawn_commit_now(r.main), r.main), 'scenario', r.scenario,
                                     'since_ms', r.since_ms, 'latest_ms', r.red_ms,
                                     'probed_ms', r.probed_ms)
             from mission_source_reds r where r.source = m.sources ->> 0) as red,
@@ -1069,9 +1073,10 @@ from (
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
                'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
                'continues', k.continues,
-               'gate_load_sensitive_pushed', k.gate_load_sensitive_pushed,
+               'gate_load_sensitive_pushed',
+               coalesce(spawn_commit_now(k.gate_load_sensitive_pushed), k.gate_load_sensitive_pushed),
                'gate_load_sensitive_scenarios', k.gate_load_sensitive_scenarios,
-               'gate_parked_pushed', k.gate_parked_pushed)
+               'gate_parked_pushed', coalesce(spawn_commit_now(k.gate_parked_pushed), k.gate_parked_pushed))
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -1476,23 +1481,28 @@ pub(crate) const OVERRUN_AT: &str = "select recorded_at_ms from spawn_events
                      and kind -> 'detail' -> 'record' ->> 'id' = $1
                    order by id desc limit 1";
 
-/// An agent's latest checkpoint (`LATEST_CHECKPOINT`)
-pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact' ->> 'commit'
+/// An agent's latest checkpoint (`LATEST_CHECKPOINT`), read through the
+/// commit map (objective 177): its new commit after a history rewrite, or
+/// the recorded id when the map cannot translate it.
+pub(crate) const LATEST_CHECKPOINT: &str = "select coalesce(spawn_commit_now(kind -> 'detail' -> 'artifact' ->> 'commit'), kind -> 'detail' -> 'artifact' ->> 'commit')
                    from spawn_events
                   where agent_id = $1 and event_name = 'artifact.committed'
                   order by id desc limit 1";
 
 /// An agent's latest checkpoint and when it was recorded, for the work an
-/// overrun task keeps: `{commit, at_ms}`, or no row.
+/// overrun task keeps: `{commit, at_ms}`, or no row. The commit through
+/// the commit map (objective 177).
 pub(crate) const CHECKPOINT_AT: &str = "select jsonb_build_object(
-                   'commit', kind -> 'detail' -> 'artifact' ->> 'commit', 'at_ms', recorded_at_ms)
+                   'commit', coalesce(spawn_commit_now(kind -> 'detail' -> 'artifact' ->> 'commit'), kind -> 'detail' -> 'artifact' ->> 'commit'),
+                   'at_ms', recorded_at_ms)
                    from spawn_events
                   where agent_id = $1 and event_name = 'artifact.committed'
                   order by id desc limit 1";
 
 /// The `commit` of a task's latest `task.reported` control record. `$1`
-/// the task id, as text (the record's `id`).
-pub(crate) const REPORTED_COMMIT: &str = "select kind -> 'detail' -> 'record' ->> 'commit'
+/// the task id, as text (the record's `id`). Through the commit map
+/// (objective 177): an id the map cannot translate reads as itself.
+pub(crate) const REPORTED_COMMIT: &str = "select coalesce(spawn_commit_now(kind -> 'detail' -> 'record' ->> 'commit'), kind -> 'detail' -> 'record' ->> 'commit')
                    from spawn_events
                   where session_id = 'session_control'
                     and kind -> 'detail' -> 'record' ->> 'type' = 'task.reported'
