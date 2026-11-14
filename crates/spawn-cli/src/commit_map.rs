@@ -82,13 +82,13 @@ pub(crate) fn read(text: &str) -> Result<Vec<Pair>, String> {
         let [old, new] = fields[..] else {
             return Err(format!(
                 "line {number} is not an `old new` pair: {:?}",
-                crate::integrate::landing_cut(line, 120)
+                line.chars().take(120).collect::<String>()
             ));
         };
         if !full(old) || !full(new) {
             return Err(format!(
                 "line {number}: each commit is 40 hex characters: {:?}",
-                crate::integrate::landing_cut(line, 120)
+                line.chars().take(120).collect::<String>()
             ));
         }
         let new = new.to_ascii_lowercase();

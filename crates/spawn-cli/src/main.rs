@@ -35,6 +35,7 @@ mod ack;
 mod alerts;
 mod backup;
 mod commands;
+mod commit_map;
 mod config;
 mod context;
 mod core_lines_sample;
@@ -75,7 +76,7 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn alert judge <key> right|false|stale|duplicate\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn store put|get|list|verify --area transcripts|sessions [--from <dir>] [--path <file> --into <dir>] [--root <dir>]\n       spawn ack <command id> done|declined [<why>]\n       spawn mask --values <file>\n       spawn mask-hook --values <file>\n       spawn secret set|generate|rotate|list\n       spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail\n       spawn verify list\n       spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> [--build <path>]... [--lease-hours <h>]\n       spawn scratch renew <dir> [--lease-hours <h>]\n       spawn scratch release <dir>\n       spawn scratch sweep [--excuse <pid>:<start ticks>]... [--apply --expect-digest <digest>]";
+const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn alert judge <key> right|false|stale|duplicate\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]\n       spawn store put|get|list|verify --area transcripts|sessions [--from <dir>] [--path <file> --into <dir>] [--root <dir>]\n       spawn ack <command id> done|declined [<why>]\n       spawn mask --values <file>\n       spawn mask-hook --values <file>\n       spawn secret set|generate|rotate|list\n       spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail\n       spawn verify list\n       spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> [--build <path>]... [--lease-hours <h>]\n       spawn scratch renew <dir> [--lease-hours <h>]\n       spawn scratch release <dir>\n       spawn scratch sweep [--excuse <pid>:<start ticks>]... [--apply --expect-digest <digest>]\n       spawn commit-map load <file> --source <git dir>";
 
 fn main() {
     let code = match dispatch() {
@@ -141,6 +142,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "mask-hook" => mask::hook_command(&rest),
         "secret" => Ok(secret::command(&rest)),
         "verify" => verify::command(&rest),
+        "commit-map" => commit_map::command(&rest),
         "scratch" => scratch_owner::command(&rest),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "run" => engine::run(&rest),
