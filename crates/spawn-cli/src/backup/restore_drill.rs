@@ -1603,7 +1603,7 @@ fn run_git(mut command: Command, what: &str) -> Result<String, String> {
 /// One source restored into `mirror`: a `git clone --mirror` of its bundle
 /// in the chain's full bundle, each increment's bundle fetched on top, its
 /// refs then exactly `heads` (the newest record's), and its objects
-/// connected.
+/// whole and connected (`git fsck --full`: every object read).
 fn restore_repo(
     source: &str,
     unpacked: &[(PathBuf, Value)],
@@ -1815,7 +1815,7 @@ fn why(now: CommitNow, commit: &str) -> String {
 mod tests {
     use super::{
         Chain, DrillDir, Outcome, chain_of, compare_refs, compare_transcripts, drill_parent,
-        judge_by_record, outcome, sha256_prefix,
+        judge_by_record, missions_members, only_missions, outcome, sha256_prefix,
     };
     use crate::backup::BundleRecord;
     use crate::commit_now::CommitNow;
@@ -2339,5 +2339,37 @@ mod tests {
             descends,
         );
         assert_eq!(failed.err(), Some("the store is gone".to_string()));
+    }
+
+    #[test]
+    fn a_missions_only_drill_extracts_the_manifest_and_the_repository_bundles_alone() {
+        let listing = "./\n./manifest.json\n./repos/\n./repos/repo-0.bundle\n\
+                       ./repos/repo-1.bundle\n./repos/deeper/x.bundle\n./repos/..\n./repos/.\n\
+                       ./repos/../transcripts/a.jsonl\n./repos/odd\\nname\n./transcripts/\n\
+                       ./transcripts/agent_supervisor/0001.jsonl\n../repos/escape.bundle\n\
+                       ./repos/repo-0.bundle\n";
+        assert_eq!(
+            missions_members(listing),
+            Ok(vec![
+                "./manifest.json".to_string(),
+                "./repos/repo-0.bundle".to_string(),
+                "./repos/repo-1.bundle".to_string(),
+            ])
+        );
+        // Names without the leading ./ are taken as listed.
+        assert_eq!(
+            missions_members("manifest.json\nrepos/a.bundle\ntranscripts/b.jsonl\n"),
+            Ok(vec!["manifest.json".to_string(), "repos/a.bundle".to_string()])
+        );
+        // No manifest: refused, never an empty list of names (tar -x would
+        // extract every member).
+        assert!(missions_members("./transcripts/a.jsonl\n./repos/a.bundle\n").is_err());
+        assert!(missions_members("").is_err());
+
+        assert_eq!(only_missions(None), Ok(false));
+        assert_eq!(only_missions(Some("missions")), Ok(true));
+        for refused in ["transcripts", "", "Missions", "missions,transcripts"] {
+            assert!(only_missions(Some(refused)).is_err(), "{refused:?}");
+        }
     }
 }
