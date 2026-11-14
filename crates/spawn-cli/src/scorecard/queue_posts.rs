@@ -78,8 +78,7 @@ struct Heading<'a> {
 fn minute_of(token: &str) -> Option<i64> {
     let (hours, minutes) = token.split_once(':')?;
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
-    if !(1..=2).contains(&hours.len()) || minutes.len() != 2 || !digits(hours) || !digits(minutes)
-    {
+    if !(1..=2).contains(&hours.len()) || minutes.len() != 2 || !digits(hours) || !digits(minutes) {
         return None;
     }
     let (hours, minutes): (i64, i64) = (hours.parse().ok()?, minutes.parse().ok()?);
@@ -230,7 +229,10 @@ pub(crate) fn read(settings: &Settings, window: Window, now_ms: i64) -> Vec<Valu
     match text(&settings.path) {
         Ok(text) => posts(&text, settings.offset_minutes, window, now_ms),
         Err(error) => {
-            eprintln!("interventions: the queue {}: {error}", settings.path.display());
+            eprintln!(
+                "interventions: the queue {}: {error}",
+                settings.path.display()
+            );
             Vec::new()
         }
     }
@@ -306,7 +308,12 @@ mod tests {
             ("steering", 18, 0, "two minutes under the lead's"),
             ("steering", 60, 1, "a backstep follows"),
             ("steering", 34, 1, "after it, ownership moved"),
-            ("owner_decision", 23 * 60 + 56, 2, "Owner: before the first midnight"),
+            (
+                "owner_decision",
+                23 * 60 + 56,
+                2,
+                "Owner: before the first midnight",
+            ),
             ("steering", 22 * 60, 2, "two days back"),
         ]
         .into_iter()
@@ -330,15 +337,24 @@ mod tests {
         for (above, back) in [("12:59", 0), ("13:01", 1)] {
             let queue = format!("## lead-mac {above} — above\n## lead-mac 01:00 — below\n");
             let got = summary(&posts(&queue, offset, all(), now), offset, now);
-            assert_eq!((got[1].1, got[1].2), (if back == 0 { 779 } else { 781 }, back), "{above}");
+            assert_eq!(
+                (got[1].1, got[1].2),
+                (if back == 0 { 779 } else { 781 }, back),
+                "{above}"
+            );
         }
 
         // A hostile heading keeps its text, the escape character dropped,
         // cut at 120 characters then "…".
         let long = "y".repeat(200);
         let queue = format!("## lead-mac 09:00 — x\u{1b}[31m <b>hi</b> & {long}\n");
-        let line = summary(&posts(&queue, offset, all(), now), offset, now)[0].3.clone();
-        let want: String = format!("x[31m <b>hi</b> & {long}").chars().take(120).collect();
+        let line = summary(&posts(&queue, offset, all(), now), offset, now)[0]
+            .3
+            .clone();
+        let want: String = format!("x[31m <b>hi</b> & {long}")
+            .chars()
+            .take(120)
+            .collect();
         assert_eq!(line, format!("{want}…"));
         assert_eq!(line.chars().count(), 121);
 
@@ -354,7 +370,9 @@ mod tests {
         let queue = "## lead-mac 01:30 — utc\n";
         let at = posts(queue, 0, all(), now)[0]["at_ms"].as_i64().unwrap();
         assert_eq!(at, today * DAY_MS + 90 * MIN);
-        let at = posts(queue, offset, all(), now)[0]["at_ms"].as_i64().unwrap();
+        let at = posts(queue, offset, all(), now)[0]["at_ms"]
+            .as_i64()
+            .unwrap();
         assert_eq!(at, today * DAY_MS + 90 * MIN - offset * MIN);
 
         // Each item in the store's shape.
@@ -378,11 +396,21 @@ mod tests {
                 offset_minutes: 480
             })
         );
-        for (offset, want) in [("-300", -300), ("840", 840), ("841", 0), ("-900", 0), ("\"8\"", 0)] {
+        for (offset, want) in [
+            ("-300", -300),
+            ("840", 840),
+            ("841", 0),
+            ("-900", 0),
+            ("\"8\"", 0),
+        ] {
             let text = format!(
                 r#"{{"observability": {{"queue_file": "/q.md", "queue_utc_offset_minutes": {offset}}}}}"#
             );
-            assert_eq!(settings(Some(&text)).map(|s| s.offset_minutes), Some(want), "{offset}");
+            assert_eq!(
+                settings(Some(&text)).map(|s| s.offset_minutes),
+                Some(want),
+                "{offset}"
+            );
         }
         let no_offset = r#"{"ranges": {}, "observability": {"queue_file": "/q.md"}}"#;
         assert_eq!(settings(Some(no_offset)).map(|s| s.offset_minutes), Some(0));
@@ -420,7 +448,10 @@ mod tests {
 
         // A changed file is read again; an unchanged one is the kept text.
         std::fs::write(&path, "## lead-mac 01:00 — one\n").unwrap();
-        assert_eq!(&*text_capped(&path, 1024).unwrap(), "## lead-mac 01:00 — one\n");
+        assert_eq!(
+            &*text_capped(&path, 1024).unwrap(),
+            "## lead-mac 01:00 — one\n"
+        );
         std::fs::write(&path, "## lead-mac 01:00 — one\n## lead-mac 02:00 — two\n").unwrap();
         let again = text_capped(&path, 1024).unwrap();
         assert!(again.contains("two"));
