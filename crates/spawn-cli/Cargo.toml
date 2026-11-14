@@ -22,6 +22,9 @@ serde_json.workspace = true
 sha2.workspace = true
 # The secrets' keyed fingerprint (objective 123).
 hmac.workspace = true
+# The scratch sweep removes the very directories it judged, from file
+# descriptors (objective 145).
+rustix.workspace = true
 tiny_http = "0.12.0"
 # SIGTERM ends `spawn loop` between passes, so its pending pushes are made.
 signal-hook = { version = "0.3", default-features = false }

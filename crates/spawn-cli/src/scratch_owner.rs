@@ -33,7 +33,9 @@ const MOST_HOURS: i64 = 168;
 const USAGE: &str = "usage: spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> \
                      [--build <path>]... [--lease-hours <h>]\n       \
                      spawn scratch renew <dir> [--lease-hours <h>]\n       \
-                     spawn scratch release <dir>";
+                     spawn scratch release <dir>\n       \
+                     spawn scratch sweep [--excuse <pid>:<start ticks>]... \
+                     [--apply --expect-digest <digest>]";
 
 /// A folder's claim, as its owner file holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +141,10 @@ pub(crate) fn claim_in(dir: &Path) -> Option<Claim> {
 
 /// `spawn scratch claim|renew|release`: prints the owner file's line.
 pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
+    // The sweep (objective 145) takes no folder: it reads the claimed ones.
+    if rest.first().is_some_and(|verb| verb == "sweep") {
+        return crate::scratch_sweep::command(&rest[1..]);
+    }
     let (Some(verb), Some(dir)) = (rest.first(), rest.get(1)) else {
         return Err(USAGE.to_string());
     };
@@ -365,11 +371,20 @@ fn change(dir: &Path, apply: impl FnOnce(&mut Claim)) -> Result<Claim, String> {
     Ok(claim)
 }
 
-/// The owner file, written through a temporary file renamed over it.
+/// The owner file, written through a temporary file renamed over it. The
+/// temporary file is made new (objective 145's (7)): a symlink or a file
+/// already at its name is never followed or overwritten.
 fn write(dir: &Path, claim: &Claim) -> Result<(), String> {
+    use std::io::Write;
     let file = dir.join(OWNER_FILE);
     let temporary: PathBuf = dir.join(format!("{OWNER_FILE}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, format!("{}\n", claim.line()))
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("{}: {error}", temporary.display()))?;
+    let mut made = made;
+    made.write_all(format!("{}\n", claim.line()).as_bytes())
         .and_then(|()| std::fs::rename(&temporary, &file))
         .map_err(|error| {
             let _ = std::fs::remove_file(&temporary);
