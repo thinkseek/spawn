@@ -5176,7 +5176,11 @@ mod tests {
             "{\"type\": \"alert.cleared\", \"key\": \"k\"}\n",
         ] {
             let record = super::record_argument(taken).expect("taken");
-            assert!(record["type"].as_str().is_some_and(|kind| kind.starts_with("alert.")));
+            assert!(
+                record["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("alert."))
+            );
         }
         for refused in [
             "",
@@ -5187,7 +5191,10 @@ mod tests {
             r#""alert.fired""#,
         ] {
             let error = super::record_argument(refused).expect_err(refused);
-            assert!(error.contains("alert.fired or alert.cleared"), "{refused}: {error}");
+            assert!(
+                error.contains("alert.fired or alert.cleared"),
+                "{refused}: {error}"
+            );
         }
     }
 
