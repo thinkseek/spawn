@@ -9699,3 +9699,88 @@ fn a_parked_task_and_a_red_main_are_read_by_their_new_commits_after_a_rewrite() 
         .expect("a probe of the rewritten red main is due");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Objective 177: the re-push of a lost checkpoint refuses one from before
+/// a history rewrite. The agent's recorded checkpoint, the head of its
+/// branch in this host's mirror, which the source lacks, is one the commit
+/// map names dropped: it is never pushed (the source has no spawn/<agent>),
+/// the task is stale, and the refusal is recorded once however many passes
+/// try.
+#[test]
+fn a_checkpoint_from_before_the_rewrite_is_never_pushed_again() {
+    use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
+    use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
+    use spawn_core::port::{Commit, EventLog, WorkspaceStore};
+    let db = Db::new("dropped_push");
+    let (base, source, scenarios, _integrator) = world("dropped-push", "#!/bin/sh\nexit 0\n");
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = ready_task(&db, db.reported_task(mission, "dropped"));
+    let root = base.join("host");
+    let mirror = crate::sources::ensure_mirror(&root, Some(&source)).expect("mirror");
+    let host = spawn_host::GitWorkspace::new(&mirror, &root);
+    let branch = BranchName::new(task.agent_id.as_str()).expect("branch");
+    host.ensure_branch(&branch, None).expect("branch");
+    let workspace = host.mount(&branch).expect("mount");
+    std::fs::write(Path::new(workspace.path()).join("work.txt"), "work\n").expect("write");
+    let Commit::Created(commit) = host.commit(&workspace, "work").expect("commit") else {
+        panic!("a checkpoint");
+    };
+    host.unmount(&workspace).expect("unmount");
+    db.store
+        .append(NewEvent {
+            agent_id: AgentId::new(task.agent_id.as_str()).expect("agent"),
+            session_id: SessionId::new(task.session_id.as_str()).expect("session"),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some(format!("commit:{commit}")),
+            kind: EventKind::ArtifactCommitted {
+                reason: CheckpointReason::TurnStopped,
+                artifact: ArtifactRef {
+                    project: "missions".to_string(),
+                    branch: branch.clone(),
+                    commit: CommitId::new(commit.as_str()).expect("commit"),
+                },
+                files: vec!["work.txt".to_string()],
+            },
+        })
+        .expect("recorded, never pushed");
+    db.store
+        .commit_map_load(&[(commit.as_str().to_string(), None)])
+        .expect("the map drops it");
+
+    for _ in 0..2 {
+        let verdict =
+            super::Judge::pushed_candidate(&db.store, &mirror, &source, &task).expect("judged");
+        assert!(matches!(verdict, super::Freshness::Stale(_)), "{verdict:?}");
+    }
+    assert!(
+        git(&[
+            "--git-dir",
+            &source,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/spawn/{}", task.agent_id),
+        ])
+        .is_err(),
+        "nothing pushed"
+    );
+    let alerts: Vec<(String, Value)> = db
+        .admin()
+        .query(
+            "select key, evidence from spawn_alerts where kind = 'rewrite_refused'",
+            &[],
+        )
+        .expect("alerts")
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(
+        alerts[0].0,
+        format!("rewrite_refused:push-again:{}:{commit}", task.id)
+    );
+    assert_eq!(alerts[0].1["writer"], "push-again");
+    assert_eq!(alerts[0].1["commit"], commit.as_str());
+    let _ = std::fs::remove_dir_all(&base);
+}
