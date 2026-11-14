@@ -53,9 +53,8 @@ pub(super) fn fold(rows: &mut Value) {
         .iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            folded(row).map(|(kind, subject, event)| {
-                (kind.to_string(), subject.to_string(), event, index)
-            })
+            folded(row)
+                .map(|(kind, subject, event)| (kind.to_string(), subject.to_string(), event, index))
         })
         .collect();
     notices.sort();
