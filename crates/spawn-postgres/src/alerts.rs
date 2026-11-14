@@ -456,7 +456,10 @@ impl PostgresStore {
     /// without its `fired` and a second `cleared` are refused.
     pub fn alert_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one("select spawn_alert_record($1)", &[record])?
+            .query_one(
+                "select spawn_alert_record($1)",
+                &[&crate::control_mask::masked(record)],
+            )?
             .get(0))
     }
 

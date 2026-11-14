@@ -9958,3 +9958,92 @@ fn a_checkpoint_from_before_the_rewrite_is_never_pushed_again() {
     assert_eq!(alerts[0].1["commit"], commit.as_str());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A gate that gives no verdict: a host fault on check-tests.sh whose reason
+/// is `reason` (no quote or backslash in it).
+fn gate_with_host_fault_reason(reason: &str) -> String {
+    let verdict = format!(
+        "{{\"host_fault\":true,\"scenario\":\"check-tests.sh\",\"on\":\"base\",\
+         \"runs\":\"1, then 1 on the base\",\"reason\":\"{reason}\"}}"
+    );
+    format!(
+        "echo \"$3\" >>\"$(dirname \"$0\")/runs\"\n\
+             printf '%s\\n' '{verdict}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+    )
+}
+
+/// An owner request judged with no verdict until it is refused: two
+/// judgings, the refusal at the second, never a third. Its no-verdict
+/// reasons and its refusal, as stored.
+fn judged_twice_then_refused(tag: &str, reason: &str) -> (Vec<(String, String)>, Value) {
+    let (base, source, scenarios, mut integrator) =
+        world(tag, &gate_with_host_fault_reason(reason));
+    integrator.judge.host = super::HostSettings {
+        server_log: None,
+        backoff: std::time::Duration::from_mins(10),
+        cap: 3,
+    };
+    let db = Db::new(&tag.replace('-', "_"));
+    let m0 = source_main(&source);
+    db.gated_mission(&source, &scenarios);
+    let commit = owner_commit_files(
+        &base,
+        &source,
+        &[("scenarios/protected", ""), ("A.md", "a\n")],
+        "owner: a",
+    );
+    let request = gated_request(&db, &source, &commit, "a");
+    for _ in 0..3 {
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        end_backoff(&integrator, request);
+    }
+    assert_eq!(gate_runs(&base), 2, "judged twice, never a third time");
+    let refused = control_records(&db, "source.push_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["request"], json!(request));
+    assert_eq!(source_main(&source), m0, "nothing moves");
+    let found = no_verdict_records(&db, request);
+    assert_eq!(found.len(), 2, "{found:?}");
+    let _ = std::fs::remove_dir_all(&base);
+    (found, refused[0].clone())
+}
+
+/// Objective 170: the rule "no verdict twice for the same reason" compares
+/// the stored reason, masked, with what the store keeps of the new one: a
+/// fault reason holding a PGPASSWORD= value is refused at the second
+/// judging, and the stored reasons and the refusal are masked.
+#[test]
+fn no_verdict_twice_for_one_masked_reason_is_refused() {
+    let (found, refused) = judged_twice_then_refused(
+        "owner-no-verdict-masked",
+        "connect: PGPASSWORD=s3cretvalue refused",
+    );
+    for (reason, _) in &found {
+        assert!(reason.contains("[redacted]"), "{reason}");
+        assert!(!reason.contains("s3cretvalue"), "{reason}");
+    }
+    assert_eq!(found[0].0, found[1].0, "the same reason, as stored");
+    let said = refused["reason"].as_str().expect("the refusal's reason");
+    assert!(!said.contains("s3cretvalue"), "{said}");
+    assert!(said.contains("[redacted]"), "{said}");
+}
+
+/// Objective 170 R3 (cc-astra's A73): the formatted reason is exactly 500
+/// characters and ends in " PWD=x", whose mask is longer. Only the fields a
+/// store check limits are cut, so the stored reason is kept whole (past 500,
+/// masked) and is the same reason at the second judging: refused then, never
+/// judged a third time.
+#[test]
+fn no_verdict_twice_at_the_500_char_boundary_is_refused() {
+    let prefix = "the host's fault on check-tests.sh: ";
+    let tail = " PWD=x";
+    let reason = format!("{}{tail}", "r".repeat(500 - prefix.len() - tail.len()));
+    assert_eq!(prefix.len() + reason.len(), 500);
+    let (found, _) = judged_twice_then_refused("owner-no-verdict-boundary", &reason);
+    for (stored, _) in &found {
+        assert!(stored.chars().count() > 500, "never cut: {stored}");
+        assert!(!stored.contains("PWD=x"), "{stored}");
+        assert!(stored.starts_with(prefix), "{stored}");
+    }
+}
