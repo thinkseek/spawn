@@ -1598,3 +1598,48 @@ fn a_kept_reading_costs_what_is_new_not_the_log() {
         buffers[0]
     );
 }
+
+/// Objective 159: the missions no deploy ships, those with a source and none
+/// ending in `/missions/spawn.git` (the one deploy/on-landing.sh deploys),
+/// whatever their state; a mission with no source is not one, and a source
+/// that only contains the name is another source.
+#[test]
+fn the_store_names_the_missions_no_deploy_ships() {
+    let (store, schema) = store("scorecard_undeployed");
+    let mut client = admin(&schema);
+    assert_eq!(
+        store.scorecard_undeployed_missions().expect("read"),
+        json!([]),
+        "no mission, none undeployed"
+    );
+    for (id, state, sources) in [
+        (4_i64, "active", json!(["/srv/live/missions/spawn.git"])),
+        (
+            7,
+            "done",
+            json!(["/srv/live/missions/flake-doctor.git", "/srv/live/missions/spawn.git"]),
+        ),
+        (9, "active", json!(["/srv/live/missions/flake-doctor.git"])),
+        (8, "done", json!(["/srv/live/missions/flake-doctor.git"])),
+        (5, "active", json!([])),
+        (
+            6,
+            "open",
+            json!(["/srv/live/missions/spawn.git.bak", "/spawn.git"]),
+        ),
+    ] {
+        client
+            .execute(
+                "insert into mission_missions (id, text, origin, sources, state,
+                                               created_at_ms, updated_at_ms)
+                 values ($1, 'mission', 'human', $2, $3, 1, 1)",
+                &[&id, &sources, &state],
+            )
+            .expect("write a mission");
+    }
+    assert_eq!(
+        store.scorecard_undeployed_missions().expect("read"),
+        json!([6, 8, 9]),
+        "spawn.git's missions (4, 7) wait for a deploy; one with no source (5) too"
+    );
+}
