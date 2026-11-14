@@ -1027,6 +1027,10 @@ fn objectives_at_their_limit_yield_and_the_next_get_the_slots() {
         .objective_prior_work(mission, 19, 3)
         .expect("prior work");
     assert_eq!(prior[0]["commit"], work);
+    // Objective 177: after a history rewrite, the prior work by its new commit.
+    let rewritten = "3".repeat(40);
+    db.store.commit_map_load(&[(work.to_string(), Some(rewritten.clone()))]).expect("the map");
+    assert_eq!(db.store.objective_prior_work(mission, 19, 3).expect("prior work")[0]["commit"], rewritten.as_str());
     let fresh = objective_task(&db, mission, 25).brief;
     assert!(!fresh.contains("Earlier tasks"), "a first task has none");
 
@@ -9627,5 +9631,71 @@ fn a_landing_candidate_that_does_not_descend_from_its_base_is_never_pushed() {
         format!("the candidate {candidate} does not descend from its base {c1}").as_str(),
         "{gated}"
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Objective 177: a parked task's pushed commit and a red main, recorded
+/// before a history rewrite (shaped as the integrator records them:
+/// `load_sensitive_parked_fields`, `source.main_red`), are read by their new
+/// commits once the commit map is loaded, so the parked task is not released
+/// as if on a new commit, and a probe of the rewritten red main is due as
+/// before.
+#[test]
+fn a_parked_task_and_a_red_main_are_read_by_their_new_commits_after_a_rewrite() {
+    let (base, source, scenarios, _integrator) = world("parked-rewrite", "exit 1\n");
+    let db = Db::new("parked_rewrite");
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = db.reported_task(mission, "p");
+    let (pushed, pushed_new) = ("a1".repeat(20), "b1".repeat(20));
+    let (main, main_new) = ("c2".repeat(20), "d2".repeat(20));
+    let mut parked = super::load_sensitive_parked_fields(
+        &pushed,
+        &["003.sh".to_string()],
+        &[("003.sh".to_string(), None)],
+        "log",
+    );
+    for (field, value) in [
+        ("type", json!("task.gated")),
+        ("id", json!(task)),
+        ("revision", json!(0)),
+        ("verdict", json!("host_fault")),
+        ("base", json!(main)),
+    ] {
+        parked[field] = value;
+    }
+    db.record(&parked);
+    db.record(&json!({"type": "source.main_red", "source": source, "main": main,
+                      "scenario": "check-tests.sh", "runs": 2,
+                      "failures": [{"test": "t", "message": "m", "class": "regression"}],
+                      "task": task, "mission": mission}));
+    let before = gated(&db, mission);
+    assert_eq!(before.tasks[0].gate_parked_pushed.as_deref(), Some(pushed.as_str()));
+
+    db.store
+        .commit_map_load(&[
+            (pushed.clone(), Some(pushed_new.clone())),
+            (main.clone(), Some(main_new.clone())),
+        ])
+        .expect("the map");
+    let after = gated(&db, mission);
+    assert_eq!(after.tasks[0].gate_parked_pushed.as_deref(), Some(pushed_new.as_str()));
+    assert_eq!(
+        after.tasks[0].gate_load_sensitive_pushed.as_deref(),
+        Some(pushed_new.as_str())
+    );
+    assert_eq!(after.red.as_ref().map(|red| red.main.as_str()), Some(main_new.as_str()));
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(
+        db.store
+            .integrator_record(&json!({"type": "source.main_probe", "source": source,
+                                       "main": "e3".repeat(20), "task": task, "probe_ms": 1}))
+            .is_err(),
+        "another main's probe is not due"
+    );
+    db.store
+        .integrator_record(&json!({"type": "source.main_probe", "source": source,
+                                   "main": main_new, "task": task, "probe_ms": 1}))
+        .expect("a probe of the rewritten red main is due");
     let _ = std::fs::remove_dir_all(&base);
 }
