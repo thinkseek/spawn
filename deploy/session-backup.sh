@@ -5,7 +5,7 @@
 #
 #   deploy/session-backup.sh copy               # one version per account, now
 #   deploy/session-backup.sh thin [--dry-run]   # drop versions no file needs
-#   deploy/session-backup.sh restore <account> <version> <empty scratch dir>
+#   deploy/session-backup.sh restore [--from-blocks] <account> <version> <empty scratch dir>
 #   deploy/session-backup.sh drill              # restore the newest into scratch, compare
 #   deploy/session-backup.sh list [<account>]   # the versions, with their counts
 #
@@ -78,7 +78,10 @@
 # every account's directory 0700) tells the owner's alert step each
 # account's newest version and counts, the bytes the kept versions are
 # estimated to use (what each added to the one before it), and the free
-# bytes where the root is.
+# bytes where the root is. Every write of it (a copy's, a thinning's, a
+# skip's) holds the status lock, an flock on <root>/status.lock (0600) held
+# only while status.json is read and published under a temporary name of
+# its own, so no update is lost or mixed (cc-astra's A65).
 #
 # Thinning keeps every version of the last 48 hours, and of each UTC day
 # before that its last version. Any other version goes only when the
@@ -99,13 +102,53 @@
 # into a scratch directory the account makes, checks it, has the account
 # remove it, and prints one line for sync/recovery.md.
 #
+# Blocks (objective 147, stage 1 of sync/design-143-session-block-store.md).
+# Every new version is also written as blocks beside its directory, by
+# deploy/session-blocks.py (beside this script, as the backup user):
+# <account>/blocks/<h1h2>/<sha256>.zst, each distinct 64 KiB of a file once,
+# zstd -3, 0400, and <stamp>.blocks, the version's index of them. The copy
+# tells it how each file was made (taken whole from the version before, or
+# grown from it), so an unchanged file reuses the version before's block
+# list and a grown one writes only its new tail. The directory stays the
+# version: restore, thinning and every check above read it as before. A
+# block write that fails says BLOCKS FAILED and leaves the version without
+# blocks; the version itself is kept. Thinning removes a version's .blocks
+# with it; a block no index names is left (stage 5's sweep, not this one).
+# A version's index is published (<stamp>.blocks.partial renamed) only once
+# the version is committed, so an index never names a version that is not
+# one (a kill before it leaves a .partial that check reports).
+# Redaction: the redaction tools change a version's directory and manifest,
+# not its blocks, so the values they remove would stay in the blocks. No
+# redaction may run on a version written with blocks until a block
+# redaction exists (design 143 section 5); check reports such a version
+# (its index then disagrees with its manifest).
+# `restore --from-blocks` rebuilds a version from its blocks instead (each
+# block checked against its name, each file against its index), and the
+# drill does both for the newest version and compares the two copies byte
+# for byte, then checks the account's blocks whole (session-blocks.py
+# check: every index parses and agrees with its manifest, every block named
+# hashes to its name, every distinct file rebuilds to its sha256).
+#
+# The backup lock (objective 147). copy and thin take an exclusive flock on
+# the root directory itself; restore and the drill take it shared. It is
+# taken through a descriptor of the directory guard() checked, so no lock
+# file is made and root writes nothing. A copy or thin that cannot have it
+# within SPAWN_SESSION_BACKUP_LOCK_WAIT seconds (600) does nothing, says
+# SKIPPED, and records the skip in status.json (`last_skip`); status.json's
+# `at` stays the last real copy's, so a long hold reads as a stale backup. A
+# restore or drill that cannot have it fails. A process started as an
+# account never holds the descriptor. The redaction tools
+# (/usr/local/lib/spawn/redact) do not take the lock: the redaction runbook
+# keeps them from running beside a copy, and their lock is a later change.
+#
 # Variables. Every function's names carry its prefix (as_, gd_, ls_, pl_,
-# rc_, ab_, cp_, st_, ok_, th_, nw_, li_, rs_, dr_, mn_): sh scopes no variable
+# rc_, ab_, cp_, st_, ok_, th_, nw_, li_, rs_, dr_, mn_, lk_, sk_): sh scopes no variable
 # to a function, and a helper's variable once turned a caller's `rm -rf` on
 # the real transcripts (2026-11-12).
 set -euo pipefail
 export LC_ALL=C
 self=$(readlink -f -- "${BASH_SOURCE[0]}")
+blocks_tool=$(dirname -- "$self")/session-blocks.py
 
 say() { printf 'session-backup: %s\n' "$*"; }
 die() {
@@ -127,7 +170,13 @@ as() {
       echo "session-backup: refused: uid $as_uid has no passwd entry" >&2
       return 1
     }
-    setpriv --reuid="$as_uid" --regid="$as_gid" --clear-groups --no-new-privs -- "$@"
+    if [ -n "${lock_fd-}" ] && [ "$as_uid" != "${bkp-}" ]; then
+      # An account never holds the root's descriptor (it would list the
+      # root through it).
+      setpriv --reuid="$as_uid" --regid="$as_gid" --clear-groups --no-new-privs -- "$@" {lock_fd}<&-
+    else
+      setpriv --reuid="$as_uid" --regid="$as_gid" --clear-groups --no-new-privs -- "$@"
+    fi
   else
     echo "session-backup: refused: this run (uid $(id -u)) cannot act as uid $as_uid" >&2
     return 1
@@ -174,6 +223,17 @@ backup() { as "$bkp" bash "$self" "$@"; }
 
 valid_account() { [[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; }
 valid_version() { [[ $1 =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; }
+
+# lock_root <-x|-s>: the backup lock, taken on the root directory through a
+# descriptor (lock_fd) held until this run exits; status 1 when it is not
+# had within SPAWN_SESSION_BACKUP_LOCK_WAIT seconds (600).
+lock_root() {
+  local lk_wait=${SPAWN_SESSION_BACKUP_LOCK_WAIT:-600}
+  [[ $lk_wait =~ ^[0-9]+$ ]] || die "SPAWN_SESSION_BACKUP_LOCK_WAIT must be a number of seconds"
+  [ -d "$root" ] || backup _mkroot
+  exec {lock_fd}<"$root" || die "cannot open $root for the backup lock"
+  flock "$1" -w "$lk_wait" "$lock_fd"
+}
 
 versions() { # <account dir>: its versions, oldest first
   find "$1" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
@@ -259,7 +319,7 @@ _plan() {
 _receive() {
   local rc_account=$1 rc_stamp=$2 rc_uid=$3 rc_dir rc_work rc_part rc_prev rc_pdir rc_size rc_mtime rc_path
   local rc_psize rc_pmtime rc_psha rc_line rc_sha rc_vanished=0 rc_files rc_dirs rc_bytes rc_new rc_pfiles=0
-  local rc_shrank rc_bad
+  local rc_shrank rc_bad rc_blocks rc_blocks_ok
   local -A rc_known=()
   valid_account "$rc_account" && valid_version "$rc_stamp" && [[ $rc_uid =~ ^[0-9]+$ ]] || die "_receive: bad arguments"
   rc_dir=$root/$rc_account
@@ -285,6 +345,7 @@ _receive() {
   fi
   mkdir -m 700 "$rc_part"
   : >"$rc_part.manifest.partial"
+  : >"$rc_work/hints"
   while read -r rc_size rc_mtime rc_path; do
     rc_line=${rc_known[$rc_path]-}
     mkdir -p -- "$(dirname -- "$rc_part/$rc_path")"
@@ -292,6 +353,7 @@ _receive() {
       # Unchanged: the version before's, shared.
       cp --reflink=auto -p -- "$rc_pdir/$rc_path" "$rc_part/$rc_path"
       rc_sha=${rc_line##* }
+      printf 'U\t%s\n' "$rc_path" >>"$rc_work/hints"
     elif [ -f "$rc_work/files/$rc_path" ]; then
       rc_size=$(stat -c %s -- "$rc_work/files/$rc_path")
       rc_psize=${rc_line%% *}
@@ -300,6 +362,7 @@ _receive() {
         # Grown: the version before's bytes, shared, then the new ones.
         cp --reflink=auto -p -- "$rc_pdir/$rc_path" "$rc_part/$rc_path"
         tail -c +"$((rc_psize + 1))" -- "$rc_work/files/$rc_path" >>"$rc_part/$rc_path"
+        printf 'G\t%s\t%s\t%s\n' "$rc_psize" "${rc_line##* }" "$rc_path" >>"$rc_work/hints"
       else
         mv -- "$rc_work/files/$rc_path" "$rc_part/$rc_path"
       fi
@@ -312,6 +375,19 @@ _receive() {
     printf '%s %s %s %s\n' "$rc_sha" "$rc_size" "$rc_mtime" "$rc_path" >>"$rc_part.manifest.partial"
   done <"$rc_work/list"
   sort -k4 -o "$rc_part.manifest.partial" "$rc_part.manifest.partial"
+  # Its blocks, and its index as <stamp>.blocks.partial, before its
+  # manifest; the index is published (renamed) only once the version is
+  # committed, below (cc-astra's A63). The directory stays the version, so a
+  # block write that fails is said and the copy goes on.
+  rc_blocks_ok=0
+  if python3 -I -B "$blocks_tool" write "$rc_dir" "$rc_stamp" "$rc_part" "$rc_part.manifest.partial" \
+    "$rc_prev" "$rc_work/hints" >"$rc_work/blocks.out" 2>&1; then
+    rc_blocks=$(tail -n 1 "$rc_work/blocks.out")
+    rc_blocks_ok=1
+  else
+    rm -f -- "$rc_dir/$rc_stamp.blocks.partial" "$rc_dir/$rc_stamp.blocks"
+    rc_blocks="BLOCKS FAILED $rc_account $rc_stamp: $(tail -n 2 "$rc_work/blocks.out" | tr '\n' ' ')"
+  fi
   rc_files=$(find "$rc_part" -type f | wc -l)
   rc_dirs=$(find "$rc_part" -mindepth 1 -type d | wc -l)
   rc_bytes=$(awk '{ n += $2 } END { print n + 0 }' "$rc_part.manifest.partial")
@@ -328,10 +404,20 @@ _receive() {
       previous: (if $p == "" then null else {version: $p, files: $pf} end)}' >"$rc_part.counts"
   mv -- "$rc_part.counts" "$rc_dir/$rc_stamp.counts"
   mv -- "$rc_part.manifest.partial" "$rc_dir/$rc_stamp.manifest"
+  # A barrier for the test only (test-session-backup.sh; no unit sets it):
+  # the copy fails here, its index written and its version not committed.
+  [ "${SPAWN_SESSION_BACKUP_TEST_FAIL_AT-}" != before-commit ] || die "failed before its commit (SPAWN_SESSION_BACKUP_TEST_FAIL_AT)"
   mv -T -- "$rc_part" "$rc_dir/$rc_stamp"
+  # The version is committed: its index now names it.
+  if [ "$rc_blocks_ok" = 1 ] &&
+    ! python3 -I -B "$blocks_tool" publish "$rc_dir" "$rc_stamp" >>"$rc_work/blocks.out" 2>&1; then
+    rm -f -- "$rc_dir/$rc_stamp.blocks.partial"
+    rc_blocks="BLOCKS FAILED $rc_account $rc_stamp: $(tail -n 1 "$rc_work/blocks.out")"
+  fi
   # The work directory _plan made for this stamp, and only it.
   case $rc_work in "$root"/*/.incoming-[0-9]*T[0-9]*Z) rm -rf -- "${rc_work:?}" ;; esac
   say "$rc_account: version $rc_stamp: $rc_files files, $rc_dirs dirs, $rc_bytes bytes, $rc_new new"
+  say "$rc_account: $rc_blocks"
   if [ "$rc_shrank" = true ]; then
     say "SHRANK $rc_account: $rc_files files now, $rc_pfiles in $rc_prev (every earlier version is kept)"
   fi
@@ -345,7 +431,9 @@ _abandon() {
   ab_dir=$root/$1
   [ -d "$ab_dir" ] || return 0
   rm -rf -- "${ab_dir:?}/.incoming-$2" "${ab_dir:?}/$2.partial"
-  rm -f -- "${ab_dir:?}/$2.manifest.partial" "${ab_dir:?}/$2.partial.counts"
+  rm -f -- "${ab_dir:?}/$2.manifest.partial" "${ab_dir:?}/$2.partial.counts" "${ab_dir:?}/$2.blocks.partial"
+  # Its index, unless the version was completed (its manifest written).
+  [ -e "$ab_dir/$2.manifest" ] || rm -f -- "${ab_dir:?}/$2.blocks"
   rmdir --ignore-fail-on-non-empty -- "$ab_dir"
 }
 
@@ -367,7 +455,7 @@ new_bytes() {
 # estimated bytes of every kept version (new_bytes summed), and the free
 # bytes where the root is.
 status() {
-  local st_account_dir st_v st_counts=() st_estimate=0 st_n st_free
+  local st_account_dir st_v st_counts=() st_estimate=0 st_n st_free st_blocks st_new
   for st_account_dir in "$root"/*/; do
     [ -d "$st_account_dir" ] || continue
     st_account_dir=${st_account_dir%/}
@@ -380,12 +468,83 @@ status() {
       st_counts+=("$(jq -c --arg a "$(basename "$st_account_dir")" '{account: $a} + .' "$st_account_dir/$st_v.counts")")
   done
   st_free=$(df -B1 --output=avail -- "$root" | tail -n 1 | tr -d ' ')
-  printf '%s\n' "${st_counts[@]}" | jq -cs --argjson at "${SPAWN_SESSION_BACKUP_NOW:-$(date -u +%s)}" \
-    --argjson e "$st_estimate" --argjson free "$st_free" \
-    '{at: $at, accounts: ., estimated_bytes: $e, free_bytes: $free}' >"$root/status.json.partial"
-  chmod 644 "$root/status.json.partial"
-  mv -- "$root/status.json.partial" "$root/status.json"
+  # The blocks' stored bytes (stage 1 adds them beside the directories).
+  st_blocks=$(find "$root" -mindepth 4 -maxdepth 4 -path "$root/*/blocks/*/*.zst" -type f -printf '%s\n' |
+    awk '{ n += $1 } END { print n + 0 }')
+  st_new=$(printf '%s\n' "${st_counts[@]}" | jq -cs --argjson at "${SPAWN_SESSION_BACKUP_NOW:-$(date -u +%s)}" \
+    --argjson e "$st_estimate" --argjson free "$st_free" --argjson blocks "$st_blocks" \
+    '{at: $at, accounts: ., estimated_bytes: $e, free_bytes: $free, blocks_bytes: $blocks}') ||
+    die "status: the new status could not be made"
+  # The last skip is kept from the status before, read under the lock.
+  status_locked status_merge "$st_new"
   chmod 711 "$root"
+}
+
+# status_merge <new status JSON> (under the status lock): the new status,
+# with the last skip kept from the status before, published.
+status_merge() {
+  local sm_skip
+  sm_skip=$(jq -c '.last_skip // null' "$root/status.json" 2>/dev/null || echo null)
+  status_test_hold
+  jq -cn --argjson new "$1" --argjson skip "${sm_skip:-null}" \
+    '$new + (if $skip == null then {} else {last_skip: $skip} end)' | status_publish
+}
+
+# status_locked <command...>: the command under the status lock, an
+# exclusive flock on <root>/status.lock held only while status.json is read
+# and written. Every status write takes it (the copy's and the thinning's
+# status, and a skip's, which does not have the backup lock: cc-astra's
+# A65), so no update is lost or mixed.
+status_locked() {
+  local sl_fd sl_status=0
+  [ -e "$root/status.lock" ] || (umask 077 && : >>"$root/status.lock") || die "cannot make $root/status.lock"
+  exec {sl_fd}>>"$root/status.lock" || die "cannot open $root/status.lock"
+  flock -x -w 60 "$sl_fd" || die "the status lock on $root is held (waited 60 s): status.json not written"
+  "$@" || sl_status=$?
+  exec {sl_fd}>&-
+  return "$sl_status"
+}
+
+# status_publish (under the status lock): stdin, valid JSON, as
+# status.json, through a temporary name of this run's own.
+status_publish() {
+  local sp_tmp
+  sp_tmp=$(mktemp "$root/status.json.XXXXXXXX") || die "cannot make a temporary status in $root"
+  if jq -e . >"$sp_tmp" && chmod 644 "$sp_tmp" && mv -- "$sp_tmp" "$root/status.json"; then
+    return 0
+  fi
+  rm -f -- "$sp_tmp"
+  die "status.json not written"
+}
+
+# status_test_hold: the test's barrier (SPAWN_SESSION_BACKUP_TEST_STATUS_HOLD,
+# a directory): under the status lock, says "in" and waits up to 30 s for "go".
+status_test_hold() {
+  local th_dir=${SPAWN_SESSION_BACKUP_TEST_STATUS_HOLD-} th_n
+  [ -n "$th_dir" ] || return 0
+  : >"$th_dir/in"
+  for th_n in $(seq 300); do
+    [ -e "$th_dir/go" ] && return 0
+    sleep 0.1
+  done
+}
+
+# skipped <what> (as the backup user): the skip of a copy or thin that could
+# not have the lock, in status.json's last_skip; its `at` is left as it was.
+skipped() {
+  local sk_at=${SPAWN_SESSION_BACKUP_NOW:-$(date -u +%s)}
+  case $1 in copy | thin) ;; *) die "_skipped: copy or thin" ;; esac
+  status_locked skip_merge "$sk_at" "$1"
+}
+
+# skip_merge <at> <what> (under the status lock): the status before, with
+# this skip as its last_skip, published.
+skip_merge() {
+  if [ -f "$root/status.json" ]; then
+    jq -c --argjson at "$1" --arg w "$2" '. + {last_skip: {at: $at, what: $w, because: "locked"}}' "$root/status.json"
+  else
+    jq -cn --argjson at "$1" --arg w "$2" '{last_skip: {at: $at, what: $w, because: "locked"}}'
+  fi | status_publish
 }
 
 # holds <older version dir> <older manifest> <newer version dir>: every
@@ -451,7 +610,7 @@ thin() {
       # under the guarded root.
       case $th_account_dir/$th_v in "$root"/*/[0-9]*T[0-9]*Z) ;; *) die "not a version: $th_account_dir/$th_v" ;; esac
       rm -rf -- "${th_account_dir:?}/${th_v:?}"
-      rm -f -- "$th_account_dir/$th_v.manifest" "$th_account_dir/$th_v.counts"
+      rm -f -- "$th_account_dir/$th_v.manifest" "$th_account_dir/$th_v.counts" "$th_account_dir/$th_v.blocks"
       say "$th_account: removed $th_v (every file of it is in $th_next)"
     done
   done
@@ -468,6 +627,14 @@ thin() {
 _emit() {
   valid_account "$1" && valid_version "$2" && [ -d "$root/$1/$2" ] || die "no version $2 of $1"
   tar -C "$root/$1/$2" -c -f - .
+}
+_emit_blocks() {
+  valid_account "$1" && valid_version "$2" && [ -f "$root/$1/$2.blocks" ] || die "no blocks of version $2 of $1"
+  python3 -I -B "$blocks_tool" emit "$root/$1" "$2"
+}
+_check() {
+  valid_account "$1" && [ -d "$root/$1" ] || die "no account $1"
+  python3 -I -B "$blocks_tool" check "$root/$1"
 }
 _want() {
   valid_account "$1" && valid_version "$2" && [ -f "$root/$1/$2.manifest" ] || die "no version $2 of $1"
@@ -540,9 +707,14 @@ copy() {
 }
 
 restore() {
+  local rs_emit=_emit rs_from=""
+  if [ "${1-}" = --from-blocks ]; then
+    rs_emit=_emit_blocks rs_from=" from its blocks"
+    shift
+  fi
   local rs_account=${1-} rs_version=${2-} rs_target=${3-} rs_home rs_real rs_uid rs_want rs_have rs_n rs_owner
   [ -n "$rs_account" ] && [ -n "$rs_version" ] && [ -n "$rs_target" ] ||
-    die "usage: restore <account> <version> <empty scratch dir>"
+    die "usage: restore [--from-blocks] <account> <version> <empty scratch dir>"
   valid_version "$rs_version" || die "not a version: $rs_version"
   valid_account "$rs_account" || die "not an account: $rs_account"
   rs_uid=$(backup _uid "$rs_account" "$rs_version") || die "no version $rs_version of $rs_account that names its uid"
@@ -568,19 +740,19 @@ restore() {
   # what it wrote. The backup user only reads the version.
   as "$rs_uid" sh -c 'mkdir -p -m 700 -- "$1" && [ -d "$1" ] && [ -z "$(ls -A -- "$1")" ]' _ "$rs_real" ||
     die "$rs_real is not an empty directory uid $rs_uid can write"
-  backup _emit "$rs_account" "$rs_version" | as "$rs_uid" tar -x --no-same-owner -C "$rs_real" -f - ||
-    die "the copy of $rs_account $rs_version into $rs_real failed"
+  backup "$rs_emit" "$rs_account" "$rs_version" | as "$rs_uid" tar -x --no-same-owner -C "$rs_real" -f - ||
+    die "the copy of $rs_account $rs_version$rs_from into $rs_real failed"
   rs_want=$(backup _want "$rs_account" "$rs_version")
   rs_have=$(as "$rs_uid" sh -c 'cd "$1" && find . -type f -printf "%P\0" | sort -z | xargs -0 -r sha256sum --' _ "$rs_real" | sort)
   if [ "$rs_want" != "$rs_have" ]; then
     die "restored $rs_account $rs_version into $rs_real, but it does not match its manifest: $(diff <(printf '%s\n' "$rs_want") <(printf '%s\n' "$rs_have") | grep '^[<>]' | head -n 3 | tr '\n' ' ')"
   fi
   rs_n=$(printf '%s\n' "$rs_want" | grep -c . || true)
-  say "restored $rs_account $rs_version into $rs_real: $rs_n files, each as its manifest says"
+  say "restored $rs_account $rs_version$rs_from into $rs_real: $rs_n files, each as its manifest says"
 }
 
 drill() {
-  local dr_account dr_version dr_uid dr_scratch dr_out dr_failed=0
+  local dr_account dr_version dr_uid dr_scratch dr_out dr_blocks dr_cmp dr_check dr_failed=0
   while read -r dr_account dr_version; do
     if ! dr_uid=$(backup _uid "$dr_account" "$dr_version"); then
       say "DRILL FAILED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: its counts name no uid"
@@ -590,7 +762,20 @@ drill() {
     # A scratch directory the account makes, and removes.
     dr_scratch=$(as "$dr_uid" mktemp -d "${TMPDIR:-/tmp}/spawn-session-drill.XXXXXX")
     if dr_out=$(restore "$dr_account" "$dr_version" "$dr_scratch/restored" 2>&1); then
-      say "DRILL PASSED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: ${dr_out#session-backup: }"
+      # Its blocks: the same version rebuilt from them, byte for byte the
+      # directory's, and the account's blocks checked whole.
+      if ! dr_blocks=$(restore --from-blocks "$dr_account" "$dr_version" "$dr_scratch/from-blocks" 2>&1); then
+        say "DRILL FAILED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: from its blocks: ${dr_blocks#session-backup: error: }"
+        dr_failed=1
+      elif ! dr_cmp=$(as "$dr_uid" diff -r -q -- "$dr_scratch/restored" "$dr_scratch/from-blocks" 2>&1); then
+        say "DRILL FAILED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: its blocks rebuild other bytes than its directory: $(printf '%s' "$dr_cmp" | head -n 3 | tr '\n' ' ')"
+        dr_failed=1
+      elif ! dr_check=$(backup _check "$dr_account" 2>&1); then
+        say "DRILL FAILED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: $(printf '%s' "$dr_check" | head -n 3 | tr '\n' ' ')"
+        dr_failed=1
+      else
+        say "DRILL PASSED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: ${dr_out#session-backup: }; rebuilt from its blocks byte for byte; ${dr_check##*$'\n'}"
+      fi
     else
       say "DRILL FAILED $(date -u +%Y-%m-%dT%H:%MZ) $dr_account $dr_version: ${dr_out#session-backup: error: }"
       dr_failed=1
@@ -613,17 +798,32 @@ main() {
   guard
   case $mn_command in
   # The backup user's side: refused unless this run is the backup user.
-  _plan | _receive | _abandon | _emit | _want | _uid | _newest | _status)
+  _plan | _receive | _abandon | _emit | _emit_blocks | _check | _want | _uid | _newest | _status | _skipped | _mkroot)
     [ "$(id -u)" = "$bkp" ] || die "$mn_command runs as the backup user only"
     [ -d "$root" ] || { mkdir -p -- "$(dirname -- "$root")" && mkdir -m 711 -- "$root"; }
-    if [ "$mn_command" = _status ]; then status; else "$mn_command" "$@"; fi
+    case $mn_command in
+    _status) status ;;
+    _skipped) skipped "$@" ;;
+    _mkroot) ;;
+    *) "$mn_command" "$@" ;;
+    esac
     ;;
   copy)
+    if ! lock_root -x; then
+      say "SKIPPED copy: the backup lock on $root is held (waited ${SPAWN_SESSION_BACKUP_LOCK_WAIT:-600} s); nothing copied"
+      backup _skipped copy
+      return 0
+    fi
     copy || mn_status=$?
     backup _status
     return "$mn_status"
     ;;
   thin)
+    if ! lock_root -x; then
+      say "SKIPPED thin: the backup lock on $root is held (waited ${SPAWN_SESSION_BACKUP_LOCK_WAIT:-600} s); nothing thinned"
+      backup _skipped thin
+      return 0
+    fi
     backup _thin "$@"
     ;;
   _thin)
@@ -636,9 +836,18 @@ main() {
     [ "$(id -u)" = "$bkp" ] || die "list runs as the backup user only"
     list "$@"
     ;;
-  restore) restore "$@" ;;
-  drill) drill ;;
-  *) die "usage: session-backup.sh copy | thin [--dry-run] | restore <account> <version> <dir> | drill | list [<account>]" ;;
+  restore)
+    lock_root -s || die "the backup lock on $root is held (waited ${SPAWN_SESSION_BACKUP_LOCK_WAIT:-600} s): nothing restored"
+    restore "$@"
+    ;;
+  drill)
+    if ! lock_root -s; then
+      say "DRILL FAILED $(date -u +%Y-%m-%dT%H:%MZ): the backup lock on $root is held (waited ${SPAWN_SESSION_BACKUP_LOCK_WAIT:-600} s)"
+      return 1
+    fi
+    drill
+    ;;
+  *) die "usage: session-backup.sh copy | thin [--dry-run] | restore [--from-blocks] <account> <version> <dir> | drill | list [<account>]" ;;
   esac
 }
 

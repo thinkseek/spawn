@@ -62,8 +62,8 @@ root=$scratch/backups/spawn-sessions
 mkdir -p "$HOME" "$alice/.claude/projects/p1" "$bob/.claude/projects/p9" "$scratch/tmp"
 chmod 1777 "$scratch/tmp"
 if [ "$(id -u)" = 0 ]; then
-  mkdir -p "$root" "$scratch/backups2/spawn-sessions"
-  chown "$bkp_uid" "$root" "$scratch/backups2/spawn-sessions"
+  mkdir -p "$root" "$scratch/backups2/spawn-sessions" "$scratch/backups3/spawn-sessions"
+  chown "$bkp_uid" "$root" "$scratch/backups2/spawn-sessions" "$scratch/backups3/spawn-sessions"
 fi
 # owned: every scratch home is the account's (as root; files the test writes
 # are root's until then).
@@ -252,10 +252,12 @@ for t in $((24 * 3600)) $((30 * 3600)) $((36 * 3600)) $((47 * 3600)) $((48 * 360
   sb SPAWN_SESSION_BACKUP_NOW="$(at "$t")" -- copy
 done
 now=$((5 * 86400))
-all=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+all=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" -printf '%f\n' | sort)
 count_all=$(wc -l <<<"$all")
 check "$count_all versions of alice" [ "$count_all" -eq 106 ]
 # Every (path, content) ever copied: the manifests before any thinning.
+had_blocks=no
+[ ! -e "$root/alice/20261101T060000Z.blocks" ] || had_blocks=yes
 mkdir "$scratch/manifests"
 cp -- "$root"/alice/*.manifest "$scratch/manifests/"
 
@@ -282,17 +284,17 @@ echo "== thinning: the first run on a root only prints"
 sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin
 check "says it is print-only (status $status)" grep -q "is print-only (rule (c))" "$out"
 check "would remove versions" grep -q "would remove 20261101T" "$out"
-check "removed none" [ "$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq "$count_all" ]
+check "removed none" [ "$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)" -eq "$count_all" ]
 check "left the marker" [ -e "$root/.thin-dry-run-done" ]
 sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin --dry-run
 check "--dry-run after it removes none either" \
-  bash -c '[ "$(find "$1" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq "$2" ] && ! grep -q "removed " "$3"' _ "$root/alice" "$count_all" "$out"
+  bash -c '[ "$(find "$1" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)" -eq "$2" ] && ! grep -q "removed " "$3"' _ "$root/alice" "$count_all" "$out"
 check "and says it removes nothing, not that a next one removes" \
   bash -c 'grep -q "thin --dry-run: prints what it would remove, removes nothing" "$1" && ! grep -q "the next one" "$1"' _ "$out"
 
 echo "== thinning"
 sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin
-kept=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+kept=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" -printf '%f\n' | sort)
 check "removed versions (status $status; $(wc -l <<<"$kept") kept of $count_all)" \
   bash -c '[ "$1" -eq 0 ] && [ "$(wc -l <<<"$2")" -lt "$3" ] && grep -q "removed 20261101T" "$4"' _ "$status" "$kept" "$count_all" "$out"
 check "nothing ever copied is lost" bash -c '[ -z "$1" ]' _ "$(lost)"
@@ -304,6 +306,8 @@ check "and those after the rewrite and in the 48 hours' days, every file of whic
 check "a version every file of which is in the next is gone" bash -c '! grep -qx 20261101T060000Z <<<"$1"' _ "$kept"
 check "its manifest and counts are gone with it" \
   bash -c '[ ! -e "$1.manifest" ] && [ ! -e "$1.counts" ]' _ "$root/alice/20261101T060000Z"
+check "and its .blocks (it had one: $had_blocks)" \
+  bash -c '[ "$2" = yes ] && [ ! -e "$1.blocks" ]' _ "$root/alice/20261101T060000Z" "$had_blocks"
 check "each day's last version is kept" \
   bash -c 'grep -qx 20261101T234500Z <<<"$1" && grep -qx 20261102T230000Z <<<"$1" && grep -qx 20261103T230000Z <<<"$1"' _ "$kept"
 check "every version of the last 48 hours is kept" \
@@ -321,14 +325,14 @@ check "and still nothing ever copied is lost" bash -c '[ -z "$1" ]' _ "$(lost)"
 echo "== a shrink"
 rm -rf -- "${alice:?}/.claude/projects"
 mkdir -p "$alice/.claude/projects"
-before=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d | wc -l)
+before=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)
 sb SPAWN_SESSION_BACKUP_NOW="$(at $((5 * 86400 + 900)))" -- copy
 check "copied, saying SHRANK (status $status)" \
   bash -c '[ "$1" -eq 0 ] && grep -q "SHRANK alice: 2 files now, 5 in 20261105T231500Z" "$2"' _ "$status" "$out"
 check "recorded in its counts and status.json" \
   bash -c 'jq -e ".shrank" "$1/alice/20261106T001500Z.counts" >/dev/null &&
     jq -e "[.accounts[] | select(.account == \"alice\")][0].shrank" "$1/status.json" >/dev/null' _ "$root"
-check "every earlier version is kept" [ "$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq $((before + 1)) ]
+check "every earlier version is kept" [ "$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)" -eq $((before + 1)) ]
 
 echo "== refused homes (rev-g's F1)"
 carol=$scratch/home/carol
@@ -385,6 +389,308 @@ sb -- drill
 check "fails on a damaged version (status $status)" \
   bash -c '[ "$1" -ne 0 ] && grep -q "DRILL FAILED .* bob 20261106T003000Z.*does not match its manifest.*projects/p9/z.jsonl" "$2"' _ "$status" "$out"
 printf 'z\n' >"$root/bob/20261106T003000Z/projects/p9/z.jsonl"
+
+echo "== blocks beside each version (objective 147)"
+# A root of its own: frank's big file spans blocks, and grows.
+frank=$scratch/home/frank
+root3=$scratch/backups3/spawn-sessions
+mkdir -p "$frank/.claude/projects/p"
+head -c 200000 /dev/urandom >"$frank/.claude/projects/p/big.bin"
+printf 'small\n' >"$frank/.claude/projects/p/a.jsonl"
+s3() { sb SPAWN_SESSION_BACKUP_ROOT="$root3" SPAWN_SESSION_HOMES="$frank" "$@"; }
+s3 SPAWN_SESSION_BACKUP_NOW="$(at 0)" -- copy
+f0=20261101T000000Z
+check "a version has its .blocks, 0400, its files read whole (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && [ "$(stat -c %a "$2.blocks")" = 400 ] && grep -q "frank: blocks $3: 2 files, 5 blocks, 5 new (.*), 200006 bytes read" "$4"' \
+  _ "$status" "$root3/frank/$f0" "$f0" "$out"
+check "every block is 0400, named by its plaintext's sha256" \
+  bash -c 'cd "$1" && n=0 && for b in */*.zst; do [ "$(stat -c %a "$b")" = 400 ] || exit 1
+      [ "$(zstd -d -q -c -- "$b" | sha256sum | cut -d" " -f1).zst" = "$(basename "$b")" ] || exit 1; n=$((n + 1)); done; [ "$n" -eq 5 ]' \
+  _ "$root3/frank/blocks"
+check "its index agrees with its manifest" \
+  bash -c 'diff <(head -n -1 "$1.blocks" | jq -r "[.sha256, (.size | tostring), .path] | join(\" \")") <(awk "{print \$1, \$2, \$4}" "$1.manifest")' _ "$root3/frank/$f0"
+head -c 70000 /dev/urandom >>"$frank/.claude/projects/p/big.bin"
+s3 SPAWN_SESSION_BACKUP_NOW="$(at 900)" -- copy
+f1=20261101T001500Z
+big() { head -n -1 "$1.blocks" | jq -c 'select(.path == "projects/p/big.bin") | .blocks'; }
+check "a grown file reads and writes only its tail, an unchanged one nothing: 2 new blocks, 73392 bytes read, its first 3 kept (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "frank: blocks $2: 2 files, 6 blocks, 2 new (.*), 73392 bytes read" "$3" &&
+    [ "$(jq -c ".[:3]" <<<"$4")" = "$(jq -c ".[:3]" <<<"$5")" ] && [ "$(jq length <<<"$5")" -eq 5 ]' \
+  _ "$status" "$f1" "$out" "$(big "$root3/frank/$f0")" "$(big "$root3/frank/$f1")"
+s3 -- _check frank
+check "check passes on a whole store (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "check frank: 2 indexes, 3 distinct files, 7 blocks named" "$2"' _ "$status" "$out"
+s3 -- restore --from-blocks frank "$f1" "$rt/from-blocks"
+fb_status=$status
+s3 -- restore frank "$f1" "$rt/from-dir"
+check "restore --from-blocks: checked against its manifest, byte for byte the directory's (status $fb_status)" \
+  bash -c '[ "$1" -eq 0 ] && [ "$2" -eq 0 ] && diff -r -q -- "$3" "$4" && [ -s "$3/projects/p/big.bin" ]' \
+  _ "$fb_status" "$status" "$rt/from-blocks" "$rt/from-dir"
+s3 -- drill
+check "the drill rebuilds the newest from its blocks and checks them (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "DRILL PASSED .* frank $2: .*rebuilt from its blocks byte for byte; check frank: " "$3"' _ "$status" "$f1" "$out"
+
+# damage <what>: one kind of damage to frank's store, then check; the store
+# is put back after.
+idx=$root3/frank/$f1.blocks
+b0=$(jq -r '.[0]' <<<"$(big "$root3/frank/$f1")")
+b4=$(jq -r '.[4]' <<<"$(big "$root3/frank/$f1")")
+blk() { printf '%s/frank/blocks/%s/%s.zst' "$root3" "${1:0:2}" "$1"; }
+cp -p -- "$idx" "$scratch/idx.kept"
+cp -p -- "$(blk "$b0")" "$scratch/b0.kept"
+cp -p -- "$(blk "$b4")" "$scratch/b4.kept"
+put_back() {
+  chmod 600 "$idx" "$(blk "$b0")" "$(blk "$b4")" 2>/dev/null || true
+  cp -- "$scratch/idx.kept" "$idx" && cp -- "$scratch/b0.kept" "$(blk "$b0")" && cp -- "$scratch/b4.kept" "$(blk "$b4")"
+  chmod 400 "$idx" "$(blk "$b0")" "$(blk "$b4")"
+}
+edit_index() { # <jq filter on big.bin's line>
+  chmod 600 "$idx"
+  { head -n -1 "$scratch/idx.kept" | jq -c "if .path == \"projects/p/big.bin\" then $1 else . end"; tail -n 1 "$scratch/idx.kept"; } >"$idx"
+}
+chmod 600 "$(blk "$b0")"
+head -c 65536 /dev/urandom | zstd -3 -q -c >"$(blk "$b0")"
+s3 -- _check frank
+check "check fails on a block that does not hash to its name (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: .*block $2 does not hash to its name" "$3"' _ "$status" "$b0" "$out"
+s3 -- restore --from-blocks frank "$f1" "$rt/from-bad-block"
+check "and restore --from-blocks refuses it (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "does not hash to its name" "$2"' _ "$status" "$out"
+s3 -- drill
+check "and the drill fails (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "DRILL FAILED .* frank $2: from its blocks" "$3"' _ "$status" "$f1" "$out"
+put_back
+edit_index '.blocks = [.blocks[1], .blocks[0]] + .blocks[2:]'
+s3 -- _check frank
+check "check fails on a block list in the wrong order, every block whole (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2 projects/p/big.bin: its blocks do not rebuild its sha256" "$3"' _ "$status" "$f1" "$out"
+s3 -- restore --from-blocks frank "$f1" "$rt/from-bad-list"
+check "and restore --from-blocks refuses it (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "projects/p/big.bin: its blocks do not rebuild its sha256" "$2"' _ "$status" "$out"
+put_back
+edit_index '.sha256 = ("0" * 64)'
+s3 -- _check frank
+check "check fails on an index that disagrees with its manifest (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2.blocks disagrees with its manifest: projects/p/big.bin" "$3"' _ "$status" "$f1" "$out"
+put_back
+# A whole file's line gone, the summary made to count what is left (A61).
+chmod 600 "$idx"
+{ head -n -1 "$scratch/idx.kept" | jq -c 'select(.path != "projects/p/big.bin")'
+  tail -n 1 "$scratch/idx.kept" | jq -c --argjson n "$(head -n -1 "$scratch/idx.kept" | jq -s '[.[] | select(.path != "projects/p/big.bin")] | {files: length, bytes: (map(.size) | add), blocks: (map(.blocks | length) | add)}')" '. + $n'; } >"$idx"
+s3 -- _check frank
+check "check fails on an index missing a whole file, its summary made to agree (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2.blocks disagrees with its manifest: projects/p/big.bin" "$3"' _ "$status" "$f1" "$out"
+put_back
+# A file's line twice.
+chmod 600 "$idx"
+{ head -n -1 "$scratch/idx.kept"; head -n 1 "$scratch/idx.kept"; tail -n 1 "$scratch/idx.kept"; } >"$idx"
+s3 -- _check frank
+check "check fails on an index with a file's line twice (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2.blocks its file lines are not sorted and unique" "$3"' _ "$status" "$f1" "$out"
+put_back
+# A summary whose bytes are not its files' (A61: totals reconciled).
+chmod 600 "$idx"
+{ head -n -1 "$scratch/idx.kept"; tail -n 1 "$scratch/idx.kept" | jq -c '.bytes += 1'; } >"$idx"
+s3 -- _check frank
+check "check fails on a summary whose bytes are not its files' (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2.blocks its summary says" "$3"' _ "$status" "$f1" "$out"
+put_back
+# A copy killed before it published its index (A63): the version is its
+# directory, its index a .partial that check reports and nothing reads.
+mv -- "$idx" "$idx.partial"
+s3 -- _check frank
+check "an index left unpublished is reported (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2.blocks.partial is left" "$3"' _ "$status" "$f1" "$out"
+s3 -- restore frank "$f1" "$rt/unpublished"
+check "and its version still restores from its directory (status $status)" [ "$status" -eq 0 ]
+mv -- "$idx.partial" "$idx"
+# A copy that fails after its index is written and before its version is
+# committed (the test's barrier): no index names the uncommitted version.
+printf 'barrier\n' >>"$frank/.claude/projects/p/a.jsonl"
+s3 SPAWN_SESSION_BACKUP_TEST_FAIL_AT=before-commit SPAWN_SESSION_BACKUP_NOW="$(at 1500)" -- copy
+check "a copy failing before its commit leaves no index of the version (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "failed before its commit" "$2" && [ ! -e "$3.blocks" ] && [ ! -e "$3.blocks.partial" ] && [ ! -d "$3" ]' \
+  _ "$status" "$out" "$root3/frank/20261101T002500Z"
+# Its manifest and counts are left, as before 147 (a copy that fails after
+# writing them; check reports them): the test removes them.
+s3 -- _check frank
+check "check reports the failed copy's manifest, whose content is nowhere (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: 20261101T002500Z.manifest has neither a .blocks nor a directory" "$2"' _ "$status" "$out"
+rm -f -- "$root3/frank/20261101T002500Z.manifest" "$root3/frank/20261101T002500Z.counts"
+# An index for a version that was never committed.
+{ head -n -1 "$idx"; tail -n 1 "$idx" | jq -c '.version = "20261101T235900Z"'; } >"$root3/frank/20261101T235900Z.blocks"
+s3 -- _check frank
+check "an index naming no committed version is reported (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: 20261101T235900Z.blocks names no committed version" "$2"' _ "$status" "$out"
+chmod 600 "$root3/frank/20261101T235900Z.blocks"
+rm -f -- "$root3/frank/20261101T235900Z.blocks"
+chmod 600 "$idx"
+head -n -1 "$scratch/idx.kept" >"$idx"
+s3 -- _check frank
+check "check fails on an index cut short (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: $2.blocks its last line is not the summary" "$3"' _ "$status" "$f1" "$out"
+put_back
+# The last block, short, then 70000 bytes more in its frame.
+chmod 600 "$(blk "$b4")"
+{ zstd -d -q -c -- "$scratch/b4.kept"; head -c 70000 /dev/urandom; } | zstd -3 -q -c >"$(blk "$b4")"
+s3 -- _check frank
+check "check fails on a block that decompresses beyond its size (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: .*decompress beyond" "$2"' _ "$status" "$out"
+# The file's own bytes come first, so a reader that stops at its size reads
+# them whole (rev-e's F1, cc-astra's A66): restore refuses it all the same.
+s3 -- restore --from-blocks frank "$f1" "$rt/from-overlong"
+check "and restore --from-blocks refuses it, though the file's bytes come first (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "decompress beyond" "$2"' _ "$status" "$out"
+put_back
+# The first block's frame, whole, then bytes that are no frame: zstd gives
+# the right bytes, goes on to the next block, and fails at its exit.
+chmod 600 "$(blk "$b0")"
+{ cat -- "$scratch/b0.kept"; printf 'not a frame'; } >"$(blk "$b0")"
+s3 -- _check frank
+check "check fails on a block zstd fails on after its bytes (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: .*zstd failed on the blocks" "$2"' _ "$status" "$out"
+s3 -- restore --from-blocks frank "$f1" "$rt/from-zstd-failed"
+check "and restore --from-blocks refuses it (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "zstd failed on the blocks" "$2"' _ "$status" "$out"
+put_back
+# A manifest naming a path twice, the later line the right one.
+mf=$root3/frank/$f1.manifest
+cp -p -- "$mf" "$scratch/mf.kept"
+chmod 600 "$mf"
+{ sed -n 1p "$scratch/mf.kept" | awk '{ $1 = "0000000000000000000000000000000000000000000000000000000000000000"; print }'; cat -- "$scratch/mf.kept"; } >"$mf"
+s3 -- _check frank
+check "check fails on a manifest naming a path twice (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: .*the manifest names .* twice" "$2"' _ "$status" "$out"
+cp -- "$scratch/mf.kept" "$mf"
+chmod "$(stat -c %a "$scratch/mf.kept")" "$mf"
+mv -- "$(blk "$b4")" "$scratch/b4.moved"
+s3 -- _check frank
+check "check fails on a missing block (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "CHECK FAILED frank: .*block $2 is missing" "$3"' _ "$status" "$b4" "$out"
+mv -- "$scratch/b4.moved" "$(blk "$b4")"
+s3 -- _check frank
+check "and passes once each is put back (status $status)" [ "$status" -eq 0 ]
+
+# A block write that fails: the version is kept, without blocks; the next
+# one writes its files whole.
+# Every directory of the blocks read-only, so no new block can be written
+# (whatever its first two hex digits).
+find "$root3/frank/blocks" -type d -exec chmod 500 {} +
+printf 'more\n' >>"$frank/.claude/projects/p/a.jsonl"
+s3 SPAWN_SESSION_BACKUP_NOW="$(at 1800)" -- copy
+find "$root3/frank/blocks" -type d -exec chmod 700 {} +
+f2=20261101T003000Z
+check "a block write that fails says so and keeps the version, without blocks (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "BLOCKS FAILED frank $2" "$3" && [ -d "$4/$2" ] && [ ! -e "$4/$2.blocks" ] && [ ! -e "$4/$2.blocks.partial" ]' \
+  _ "$status" "$f2" "$out" "$root3/frank"
+printf 'more again\n' >>"$frank/.claude/projects/p/a.jsonl"
+s3 SPAWN_SESSION_BACKUP_NOW="$(at 2700)" -- copy
+s3 -- _check frank
+check "the next version has its blocks again, and check passes (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && [ -e "$2.blocks" ]' _ "$status" "$root3/frank/20261101T004500Z"
+
+echo "== the backup lock (objective 147)"
+# hold_lock <-x|-s>: another holder of the root's lock, until release_lock.
+hold_lock() {
+  bash -c 'exec 9<"$2" && flock "$1" 9 && exec sleep 120' _ "$1" "$root3" &
+  holder=$!
+  for _ in $(seq 100); do
+    flock -n -x "$root3" true 2>/dev/null || return 0
+    sleep 0.1
+  done
+  echo "test-session-backup: the lock was not taken" >&2
+  exit 2
+}
+release_lock() {
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+}
+versions3() { find "$root3/frank" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | wc -l; }
+status_at=$(jq .at "$root3/status.json")
+n3=$(versions3)
+hold_lock -x
+printf 'locked out\n' >>"$frank/.claude/projects/p/a.jsonl"
+s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 SPAWN_SESSION_BACKUP_NOW="$(at 3600)" -- copy
+check "a copy that cannot have the lock skips, says so, copies nothing (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "SKIPPED copy: the backup lock on .* is held (waited 1 s)" "$2" && [ "$3" -eq "$4" ]' \
+  _ "$status" "$out" "$n3" "$(versions3)"
+check "and records the skip in status.json, its at left as the last copy's" \
+  bash -c 'jq -e ".last_skip.what == \"copy\" and .last_skip.because == \"locked\" and .at == $2" "$1/status.json" >/dev/null' \
+  _ "$root3" "$status_at"
+s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 SPAWN_SESSION_BACKUP_NOW="$(at 3700)" -- thin --dry-run
+check "a thin skips the same way (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "SKIPPED thin" "$2" && jq -e ".last_skip.what == \"thin\"" "$3/status.json" >/dev/null' \
+  _ "$status" "$out" "$root3"
+s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 -- restore frank "$f1" "$rt/locked-out"
+check "a restore that cannot have the lock fails, restoring nothing (status $status)" \
+  bash -c '[ "$1" -eq 2 ] && grep -q "nothing restored" "$2" && [ ! -e "$3" ]' _ "$status" "$out" "$rt/locked-out"
+s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 -- drill
+check "a drill that cannot have the lock fails (status $status)" \
+  bash -c '[ "$1" -eq 1 ] && grep -q "DRILL FAILED .*: the backup lock on .* is held" "$2"' _ "$status" "$out"
+release_lock
+hold_lock -s
+s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 -- restore frank "$f1" "$rt/shared"
+check "a restore runs beside another reader (status $status)" [ "$status" -eq 0 ]
+s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 SPAWN_SESSION_BACKUP_NOW="$(at 3800)" -- copy
+check "and a copy waits for every reader (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "SKIPPED copy" "$2"' _ "$status" "$out"
+release_lock
+s3 SPAWN_SESSION_BACKUP_NOW="$(at 3900)" -- copy
+check "once the lock is free, the copy runs, and the last skip is still said (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && [ "$(find "$2/frank" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)" -eq $(($3 + 1)) ] &&
+    jq -e ".last_skip.what == \"copy\" and .at == $4" "$2/status.json" >/dev/null' _ "$status" "$root3" "$n3" "$(at 3900)"
+
+echo "== status writes under the status lock (cc-astra's A65)"
+# A copy holds the status lock (the test's barrier, after it has read the
+# status before); a copy that cannot have the backup lock skips meanwhile.
+# The skip waits for the status lock, so the status keeps both: the copy's
+# at and the skip.
+hold=$scratch/status-hold
+mkdir -p "$hold" && chmod 777 "$hold"
+printf 'status race\n' >>"$frank/.claude/projects/p/a.jsonl"
+(
+  out=$scratch/a65-copy.out
+  s3 SPAWN_SESSION_BACKUP_TEST_STATUS_HOLD="$hold" SPAWN_SESSION_BACKUP_NOW="$(at 4100)" -- copy
+  echo "$status" >"$scratch/a65-copy.status"
+) &
+a65_copy=$!
+for _ in $(seq 300); do [ -e "$hold/in" ] && break; sleep 0.1; done
+(
+  out=$scratch/a65-skip.out
+  s3 SPAWN_SESSION_BACKUP_LOCK_WAIT=1 SPAWN_SESSION_BACKUP_NOW="$(at 4150)" -- copy
+  echo "$status" >"$scratch/a65-skip.status"
+) &
+a65_skip=$!
+for _ in $(seq 300); do grep -qs SKIPPED "$scratch/a65-skip.out" && break; sleep 0.1; done
+sleep 1
+check "a skip beside a status publication waits for it" \
+  bash -c '[ -e "$1/in" ] && grep -q SKIPPED "$2" && [ ! -e "$3" ]' _ "$hold" "$scratch/a65-skip.out" "$scratch/a65-skip.status"
+: >"$hold/go"
+wait "$a65_copy" "$a65_skip" || true
+check "and the status keeps both, the copy's at and the skip (copy $(cat "$scratch/a65-copy.status"), skip $(cat "$scratch/a65-skip.status"))" \
+  bash -c '[ "$(cat "$1")" -eq 0 ] && [ "$(cat "$2")" -eq 0 ] &&
+    jq -e ".at == $4 and .last_skip.at == $5 and .last_skip.what == \"copy\"" "$3/status.json" >/dev/null &&
+    [ -z "$(find "$3" -maxdepth 1 -name "status.json.*")" ]' \
+  _ "$scratch/a65-copy.status" "$scratch/a65-skip.status" "$root3" "$(at 4100)" "$(at 4150)"
+
+echo "== a grown file's hint holds against the index's sha256 too (rev-e's N1)"
+# The newest index says big.bin's size right and its sha256 wrong: the next
+# copy reads big.bin whole rather than keep that index's blocks.
+newest=$(find "$root3/frank" -mindepth 1 -maxdepth 1 -type d -name '2*Z' -printf '%f\n' | sort | tail -n 1)
+nidx=$root3/frank/$newest.blocks
+cp -p -- "$nidx" "$scratch/nidx.kept"
+chmod 600 "$nidx"
+{ head -n -1 "$scratch/nidx.kept" | jq -c 'if .path == "projects/p/big.bin" then .sha256 = ("0" * 64) else . end'
+  tail -n 1 "$scratch/nidx.kept"; } >"$nidx"
+head -c 1000 /dev/urandom >>"$frank/.claude/projects/p/big.bin"
+s3 SPAWN_SESSION_BACKUP_NOW="$(at 4200)" -- copy
+check "a grown file whose index line has another sha256 is read whole (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "frank: blocks .*, $2 bytes read" "$3"' \
+  _ "$status" "$(stat -c %s "$frank/.claude/projects/p/big.bin")" "$out"
+cp -- "$scratch/nidx.kept" "$nidx"
+chmod 400 "$nidx"
+s3 -- _check frank
+check "and check passes on the store (status $status)" [ "$status" -eq 0 ]
 
 echo "== a rewrite of the same size and mtime, and appends (rev-g's F2)"
 # A: f is X. B: f is Y, the same size, given A's mtime, so B's manifest
