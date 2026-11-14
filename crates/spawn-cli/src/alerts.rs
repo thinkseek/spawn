@@ -9145,6 +9145,81 @@ connections\n";
             });
         }
 
+        /// Objective 166: the window both `--once --json` and /api/alerts
+        /// answer folds the notices (every row kept, each but a subject's
+        /// newest superseded by its next one), and `--once` in text shows
+        /// each subject's newest with how many came before.
+        #[test]
+        fn the_window_folds_notices_and_the_text_shows_each_subjects_newest() {
+            in_schema("window_fold", |store| {
+                let fire = |key: &str, kind: &str, subject: &str, text: &str, notice: bool| {
+                    store
+                        .alert_record(&json!({
+                            "type": "alert.fired", "key": key, "kind": kind,
+                            "subject": subject, "evidence": {}, "text": text,
+                            "notice": notice,
+                        }))
+                        .expect("fire");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
+                fire(
+                    "memory_low:1",
+                    "memory_low",
+                    "host",
+                    "MemAvailable is low",
+                    false,
+                );
+                for (event, state) in [(10, "assigned"), (12, "reported"), (11, "delivered")] {
+                    fire(
+                        &format!("task_state:7:{event}"),
+                        "task_state",
+                        "task #7",
+                        &format!("task #7 {state}"),
+                        true,
+                    );
+                }
+                fire(
+                    "task_state:8:15",
+                    "task_state",
+                    "task #8",
+                    "task #8 assigned",
+                    true,
+                );
+                let window = super::super::window(store, Some("1d")).expect("the window");
+                let rows = window.as_array().expect("an array");
+                assert_eq!(rows.len(), 5, "every row kept: {window}");
+                let mut folded: Vec<(String, Value)> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["key"].as_str().expect("a key").to_string(),
+                            row.get("superseded_by").cloned().unwrap_or(Value::Null),
+                        )
+                    })
+                    .collect();
+                folded.sort_by(|left, right| left.0.cmp(&right.0));
+                assert_eq!(
+                    folded,
+                    [
+                        ("memory_low:1".to_string(), Value::Null),
+                        ("task_state:7:10".to_string(), json!("task_state:7:11")),
+                        ("task_state:7:11".to_string(), json!("task_state:7:12")),
+                        ("task_state:7:12".to_string(), Value::Null),
+                        ("task_state:8:15".to_string(), Value::Null),
+                    ]
+                );
+                let lines = super::super::lines(rows);
+                assert_eq!(lines.len(), 3, "{lines:?}");
+                assert!(lines[0].starts_with("open memory_low host "), "{lines:?}");
+                assert!(
+                    lines[1].starts_with("notice task_state task #7 ")
+                        && lines[1].ends_with("task #7 reported · 2 earlier"),
+                    "{lines:?}"
+                );
+                assert!(lines[2].ends_with("task #8 assigned"), "{lines:?}");
+            });
+        }
+
         /// An open agent_stuck says when its session was last scored, read
         /// with the window: an unscored judgement after it (a judge that is
         /// down) leaves that time where it was.
