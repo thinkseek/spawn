@@ -431,6 +431,30 @@ test("a figure that names its store says it after its name", () => {
   assert.equal(view.rows[0].north_star.name, "Days until the disk is full");
 });
 
+// Objective 148: "Needs you is right" says what it is read from after its
+// name, the needs judged and not; a figure without it is named as it was.
+test("a judged share says what it is read from after its name", () => {
+  const line = (judged?: unknown) =>
+    coreLinesView({
+      lines: [
+        {
+          line: "observability",
+          north_star: { key: "observability.needs_you_right", name: "Needs you is right", unit: "share", value: 0.6, range: null, state: "no_range", ...(judged === undefined ? {} : { judged }) } as CoreFigure,
+          guardrails: [{ key: "observability.unpriced_share", name: "Use with no price", unit: "share", value: 0, range: null, state: "no_range" }],
+        },
+      ],
+    }).rows[0];
+  const row = line({ fired: 6, judged: 5, unjudged: 1 });
+  assert.equal(row.north_star.name, "Needs you is right (5 judged, 1 unjudged of 6)");
+  assert.equal(row.north_star.value, "60.0%");
+  assert.deepEqual(row.guardrails.map((mark) => mark.name), ["Use with no price"]);
+  // Not collected under 5 judged: still says what it is read from.
+  assert.equal(line({ fired: 6, judged: 4, unjudged: 2 }).north_star.name, "Needs you is right (4 judged, 2 unjudged of 6)");
+  // Not read: the name alone.
+  assert.equal(line().north_star.name, "Needs you is right");
+  assert.equal(line(null).north_star.name, "Needs you is right");
+});
+
 // Objective 140: each claimed scratch folder is said by its owner and
 // objective, its bytes and its build's, its age, its lease and whether its
 // objective landed; landed with its lease ended is the one to clear.

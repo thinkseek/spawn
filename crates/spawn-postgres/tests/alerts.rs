@@ -262,6 +262,126 @@ fn the_owner_judges_an_alert_and_every_alert_ends_with_an_outcome() {
     assert_eq!(alert_rows(&mut client), folded);
 }
 
+/// Objective 148: the owner judges a need right (a real need). It changes
+/// nothing else: an open need judged right stays open, then clears by its
+/// condition keeping the verdict; a cleared one keeps its clearing. Once,
+/// never on a notice. The judged read counts the needs fired since its
+/// bound, how many were judged and how many right: notices never, and
+/// nothing fired before the bound. A refold gives the same rows.
+#[test]
+fn a_need_judged_right_stays_as_it_was_and_is_counted() {
+    let (store, schema) = store("alerts_right");
+    let mut client = admin(&schema);
+    for key in ["memory_low:1", "memory_low:2", "memory_low:3"] {
+        store.alert_record(&fired(key, false)).expect("fire");
+    }
+    store
+        .alert_record(&fired("task_state:7:10", true))
+        .expect("a notice");
+    store
+        .alert_record(&cleared("memory_low:2"))
+        .expect("clear one");
+
+    // An open need judged right stays open, no clearing.
+    store
+        .alert_judge("memory_low:1", "right")
+        .expect("judge an open need right");
+    let row = alert(&mut client, "memory_low:1");
+    assert_eq!(row["state"], "open");
+    assert_eq!(row["verdict"], "right");
+    assert!(row["judged_at_ms"].is_i64(), "{row}");
+    assert_eq!(row["cleared_event_id"], Value::Null);
+    assert_eq!(row["cleared_evidence"], Value::Null);
+    assert!(
+        outcomes(&store).contains(&("memory_low:1".to_string(), json!("right"))),
+        "its outcome is its verdict while open"
+    );
+    // Its condition clears it later, and it keeps its verdict.
+    let cleared_id = store
+        .alert_record(&cleared("memory_low:1"))
+        .expect("its condition clears it");
+    let row = alert(&mut client, "memory_low:1");
+    assert_eq!(row["state"], "cleared");
+    assert_eq!(row["verdict"], "right");
+    assert_eq!(row["cleared_event_id"], cleared_id);
+    assert_eq!(row["cleared_evidence"], json!({"measured_mb": 9000}));
+
+    // A cleared need judged right keeps its clearing.
+    let before = alert(&mut client, "memory_low:2");
+    store
+        .alert_judge("memory_low:2", "right")
+        .expect("judge a cleared need right");
+    let row = alert(&mut client, "memory_low:2");
+    assert_eq!(row["verdict"], "right");
+    assert_eq!(row["state"], "cleared");
+    assert_eq!(row["cleared_event_id"], before["cleared_event_id"]);
+    assert_eq!(row["cleared_at_ms"], before["cleared_at_ms"]);
+    assert_eq!(row["cleared_evidence"], before["cleared_evidence"]);
+
+    // Once, never on a notice, never for a key no alert has.
+    assert_eq!(judgements(&mut client), 2);
+    for (key, verdict, why) in [
+        ("memory_low:1", "right", "judged right already"),
+        (
+            "memory_low:1",
+            "false",
+            "judged right already, another verdict",
+        ),
+        ("task_state:7:10", "right", "a notice"),
+        ("memory_low:9", "right", "a key no alert has"),
+    ] {
+        assert!(store.alert_judge(key, verdict).is_err(), "{why} is refused");
+    }
+    assert_eq!(judgements(&mut client), 2, "the refused wrote nothing");
+    assert_eq!(
+        alert(&mut client, "task_state:7:10")["verdict"],
+        Value::Null
+    );
+
+    // The judged read: three needs fired, two judged, both right; the
+    // notice never counted.
+    assert_eq!(
+        store.needs_judged(0).expect("the judged read"),
+        json!({"fired": 3, "judged": 2, "right": 2})
+    );
+    store
+        .alert_judge("memory_low:3", "false")
+        .expect("judge one false");
+    assert_eq!(alert(&mut client, "memory_low:3")["state"], "cleared");
+    assert_eq!(
+        store.needs_judged(0).expect("the judged read"),
+        json!({"fired": 3, "judged": 3, "right": 2})
+    );
+    // Nothing fired after the bound: none.
+    assert_eq!(
+        store.needs_judged(i64::MAX).expect("the judged read"),
+        json!({"fired": 0, "judged": 0, "right": 0})
+    );
+
+    // A refold gives the same rows.
+    let folded = alert_rows(&mut client);
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold the control stream");
+    assert_eq!(alert_rows(&mut client), folded);
+
+    // A need fired before the bound is not counted.
+    let now = store.now_ms().expect("the clock");
+    client
+        .execute(
+            "update spawn_alerts set fired_at_ms = fired_at_ms - 8 * 86400000
+              where key = 'memory_low:1'",
+            &[],
+        )
+        .expect("age one need");
+    assert_eq!(
+        store
+            .needs_judged(now - 7 * 86_400_000)
+            .expect("the judged read"),
+        json!({"fired": 2, "judged": 2, "right": 1})
+    );
+}
+
 /// The records are the owner's: a restricted login may read the table (the
 /// supervisor's `spawn alerts`) and may not record an alert. Its read
 /// carries an open agent_stuck alert's `scored_at_ms`, through a view: the
