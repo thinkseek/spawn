@@ -696,13 +696,48 @@ fn rejection_reason(reason: &str, log: &str) -> String {
 }
 
 /// The record of a gate rejection: the reason (naming check-tests.sh's
-/// failing tests, [`rejection_reason`]), the gate's output and the note
-/// that quotes the reason and the output's tail.
+/// failing tests, [`rejection_reason`], or another scenario's first failed
+/// check, [`checks_reason`]), the gate's output, the note that quotes the
+/// reason and the output's tail, and `failed` {scenario, first, count} when
+/// the deciding run names a check ([`host::rejected_checks`]).
 pub(super) fn rejected_fields(reason: &str, log: &str) -> Value {
-    let reason = rejection_reason(reason, log);
-    json!({"log": log, "reason": reason, "note": format!(
+    let checks = host::rejected_checks(log);
+    let reason = match &checks {
+        Some(checks)
+            if checks.scenario != host::CHECK_TESTS
+                && !reason.trim().starts_with(host::CHECK_TESTS_REGRESSION) =>
+        {
+            checks_reason(reason, checks)
+        }
+        _ => rejection_reason(reason, log),
+    };
+    let mut record = json!({"log": log, "reason": reason, "note": format!(
         "The gate rejected this work: {reason}.\n\nGate output (tail):\n{}",
-        tail(log, NOTE_LOG_CHARS))})
+        tail(log, NOTE_LOG_CHARS))});
+    if let Some(checks) = checks {
+        record["failed"] = json!({
+            "scenario": checks.scenario,
+            "first": checks.first,
+            "count": checks.count,
+        });
+    }
+    record
+}
+
+/// The reason of a rejection whose deciding run (of a scenario other than
+/// check-tests.sh) names checks: "<scenario> failed: <first>", then "; and
+/// <n> more" for the rest, then the gate's reason in brackets.
+fn checks_reason(reason: &str, checks: &host::Checks) -> String {
+    let more = match checks.count {
+        0 | 1 => String::new(),
+        count => format!("; and {} more", count - 1),
+    };
+    format!(
+        "{} failed: {}{more} ({})",
+        checks.scenario,
+        checks.first,
+        reason.trim()
+    )
 }
 
 /// The main the pushed `head` last took in, `git merge-base <head> <main>`,
