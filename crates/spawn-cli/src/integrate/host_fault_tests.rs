@@ -783,3 +783,147 @@ fn another_reason_or_an_output_naming_no_test_stays_as_it_is() {
         host::CHECK_TESTS_REGRESSION
     );
 }
+
+/// What gate.sh prints when a scenario's run decides a rejection: a build,
+/// the sections before (each with its stage line), the deciding section's
+/// opening line, its lines, its stage line and the closing total.
+fn scenario_output(before: &[&str], phase: &str, scenario: &str, lines: &[&str]) -> String {
+    let mut all: Vec<String> = [
+        "== candidate: build",
+        "| build: ok",
+        "| stage gate ok 900ms candidate: build",
+    ]
+    .iter()
+    .chain(before)
+    .map(ToString::to_string)
+    .collect();
+    all.push(format!("| == {phase}: {scenario} must pass"));
+    all.extend(lines.iter().map(|line| format!("| {line}")));
+    all.push(format!(
+        "| stage gate rejected 2323ms {phase}: {scenario} must pass"
+    ));
+    all.push("| stage gate rejected 5000ms total".to_string());
+    all.push(
+        "{\"verdict\":\"rejected\",\"reason\":\"scenario fails on the candidate\"}".to_string(),
+    );
+    all.push(String::new());
+    all.join("\n")
+}
+
+#[test]
+fn a_scenario_rejection_names_its_first_failed_check() {
+    let reason = "scenario fails on the candidate";
+    let log = scenario_output(
+        &[
+            "| == regression: 012.sh must still pass",
+            "| blackbox: (9) not the deciding run's line",
+            "| stage gate ok 700ms regression: 012.sh must still pass",
+        ],
+        "candidate",
+        "149.sh",
+        &[
+            "149: (1) checked: made-up",
+            "blackbox: ",
+            "blackbox: (2) the checkout has no made-up.service",
+            "149: the stand-in's last requests:",
+        ],
+    );
+    let expected =
+        "149.sh failed: (2) the checkout has no made-up.service (scenario fails on the candidate)";
+    let (got, note) = rejected(reason, &log);
+    assert_eq!(got, expected);
+    assert_eq!(note, format!("The gate rejected this work: {expected}."));
+    let record = super::rejected_fields(reason, &log);
+    assert_eq!(
+        record["failed"],
+        json!({"scenario": "149.sh", "first": "(2) the checkout has no made-up.service", "count": 1})
+    );
+    assert_eq!(record["log"], json!(log));
+}
+
+#[test]
+fn a_scenario_rejection_counts_the_checks_after_the_first() {
+    let reason = "regression: 092.sh fails on the candidate";
+    let log = scenario_output(
+        &[],
+        "regression",
+        "092.sh",
+        &[
+            "blackbox: (1) one",
+            "blackbox: (2) two",
+            "blackbox: (3) three",
+        ],
+    );
+    assert_eq!(
+        rejected(reason, &log).0,
+        "092.sh failed: (1) one; and 2 more (regression: 092.sh fails on the candidate)"
+    );
+    let record = super::rejected_fields(reason, &log);
+    assert_eq!(record["failed"]["count"], json!(3));
+    assert_eq!(record["failed"]["first"], json!("(1) one"));
+}
+
+#[test]
+fn a_quoted_check_is_masked_and_cut() {
+    let token = "ghp_169madeup0123456789abcdefghijklmnopqrs";
+    let password = "hunter169hunter169";
+    let line = format!(
+        "blackbox: (3) curl -H 'Authorization: Bearer {token}' failed with PGPASSWORD={password} set"
+    );
+    let reason = "regression: 092.sh fails on the candidate";
+    let log = scenario_output(&[], "regression", "092.sh", &[&line]);
+    let record = super::rejected_fields(reason, &log);
+    for text in [&record["reason"], &record["failed"]["first"]] {
+        let text = text.as_str().unwrap_or_default();
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(!text.contains(token) && !text.contains(password), "{text}");
+    }
+    let accents = "é".repeat(500);
+    let cut = scenario_output(
+        &[],
+        "regression",
+        "093.sh",
+        &[&format!("blackbox: {accents}")],
+    );
+    let checks = host::rejected_checks(&cut).unwrap_or_else(|| panic!("no check"));
+    assert_eq!(checks.first, "é".repeat(host::CHECK_CHARS));
+    assert_eq!(checks.first.chars().count(), 200);
+    assert_eq!(checks.count, 1);
+}
+
+#[test]
+fn a_run_that_names_no_check_is_as_before() {
+    let reason = "regression: 046.sh fails on the candidate";
+    let silent = scenario_output(&[], "regression", "046.sh", &["046: made-up failure"]);
+    let record = super::rejected_fields(reason, &silent);
+    assert_eq!(record["reason"], json!(reason));
+    assert!(record.get("failed").is_none());
+    let unnamed = "| == regression: 046.sh must still pass\n| blackbox: (1) a check\n\
+                   | stage gate rejected 5000ms total\n";
+    let record = super::rejected_fields(reason, unnamed);
+    assert_eq!(record["reason"], json!(reason));
+    assert!(record.get("failed").is_none());
+    assert_eq!(host::rejected_checks(unnamed), None);
+}
+
+#[test]
+fn a_check_tests_rejection_records_its_first_test_and_the_count() {
+    let lines: Vec<String> = (1..=7)
+        .map(|n| format!("FAILED bb::t::case_{n}: boom"))
+        .collect();
+    let record = super::rejected_fields(host::CHECK_TESTS_REGRESSION, &output_of(&lines));
+    assert_eq!(
+        record["failed"],
+        json!({"scenario": "check-tests.sh", "first": "bb::t::case_1", "count": 7})
+    );
+    let named: Vec<String> = (1..=5)
+        .map(|n| format!("check-tests.sh failed: bb::t::case_{n}"))
+        .collect();
+    assert_eq!(
+        record["reason"],
+        json!(format!(
+            "{}; and 2 more (regression: check-tests.sh fails on the candidate)",
+            named.join("; ")
+        ))
+    );
+}
