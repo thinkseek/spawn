@@ -5123,7 +5123,7 @@ mod tests {
             "its condition clears it: {cleared:?}"
         );
         // Judged false, an open need is cleared in the step's memory.
-        let mut other = monitor();
+        let mut other = Monitor::with(settings());
         feed(
             &mut other,
             10,
@@ -7017,7 +7017,7 @@ mod tests {
         let fired = flapping.source_events(&watched, |_| false, 7000);
         assert_eq!(fires(&fired), ["source_away:4:7000"]);
         // Unwatched in between: the count starts again.
-        let mut other = monitor();
+        let mut other = Monitor::with(settings());
         assert!(other.source_events(&watched, |_| false, 0).is_empty());
         assert!(
             other
