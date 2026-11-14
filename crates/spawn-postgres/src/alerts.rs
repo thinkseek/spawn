@@ -342,8 +342,8 @@ where c.succeeded = false and c.finished_at_ms > $1";
 /// The alerts the windows show: every open one, and every one fired or
 /// cleared since `$1` (a notice is news within the window only). Each row's
 /// `outcome` (objective 092): null while open (and for a notice), the
-/// owner's verdict (`false`, `stale`, `duplicate`) when judged, else
-/// `cleared` when its condition cleared it.
+/// owner's verdict (`right`, `false`, `stale`, `duplicate`) when judged,
+/// else `cleared` when its condition cleared it.
 pub(crate) const ALERTS: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
       'key', a.key, 'kind', a.kind, 'subject', a.subject, 'state', a.state,
@@ -359,6 +359,18 @@ select coalesce(jsonb_agg(jsonb_build_object(
 from spawn_alerts a
 where a.state = 'open' or a.fired_at_ms >= $1
    or coalesce(a.cleared_at_ms, 0) >= $1";
+
+/// The needs (alerts, never notices) fired at or after `$1`, through
+/// `spawn_alerts_time` (objective 148): how many fired, how many the owner
+/// judged and how many of those right. What "Needs you is right" is read
+/// from; a clearing is never counted.
+pub(crate) const NEEDS_JUDGED: &str = r"
+select jsonb_build_object(
+      'fired', count(*),
+      'judged', count(a.verdict),
+      'right', count(*) filter (where a.verdict = 'right'))
+from spawn_alerts a
+where not a.notice and a.fired_at_ms >= $1";
 
 /// The transitions recorded after event `$1`, oldest first, at most `$2`:
 /// what `spawn alerts --follow` prints as they are recorded.
@@ -449,10 +461,12 @@ impl PostgresStore {
 
     /// The owner's judgement of the alert `key` (`spawn alert judge`,
     /// objective 092): an `alert.judged` record `{key, verdict}` through
-    /// `spawn_alert_record` (owner only). `verdict` is `false`, `stale` or
-    /// `duplicate`; another verdict, a key no alert has, a notice and an
-    /// alert judged already are refused and write nothing. An open alert is
-    /// cleared by it. Returns the event's id.
+    /// `spawn_alert_record` (owner only). `verdict` is `right` (a real need,
+    /// objective 148), `false`, `stale` or `duplicate`; another verdict, a
+    /// key no alert has, a notice and an alert judged already are refused
+    /// and write nothing. `right` changes nothing else (an open alert stays
+    /// open); every other verdict clears an open alert. Returns the event's
+    /// id.
     pub fn alert_judge(&self, key: &str, verdict: &str) -> Result<i64, StoreError> {
         self.alert_record(&serde_json::json!({
             "type": "alert.judged", "key": key, "verdict": verdict,
@@ -548,6 +562,12 @@ impl PostgresStore {
     /// The alerts the window shows ([`ALERTS`]).
     pub fn alerts(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(ALERTS, &[&since_ms])
+    }
+
+    /// The needs fired since `since_ms`: `{fired, judged, right}`
+    /// ([`NEEDS_JUDGED`], objective 148).
+    pub fn needs_judged(&self, since_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(NEEDS_JUDGED, &[&since_ms])
     }
 
     /// The transitions recorded after event `since` ([`TRANSITIONS`]).

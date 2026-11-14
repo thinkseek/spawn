@@ -834,13 +834,17 @@ is a control record in the stream, in the same shape as everything else:
 - `alert.cleared {key, kind, subject, evidence}` — what cleared it, with the
   clearing record's `event_id` (or the log line, or the reading).
 - `alert.judged {key, verdict}` (objective 092) — the owner's judgement of an
-  alert that should not have been raised, `spawn alert judge <key>
-  false|stale|duplicate`. An open alert is cleared by it (its
+  alert, `spawn alert judge <key> right|false|stale|duplicate`: `right`
+  (objective 148) a real need, the others one that should not have been
+  raised. `right` changes nothing else: an open alert stays open (its
+  condition clears it later, and it keeps its verdict) and a cleared one
+  keeps its clearing. Any other verdict clears an open alert (its
   `cleared_evidence` `{judged: <verdict>}`); a cleared one keeps its
   clearing and gains the verdict. The writer refuses another verdict, a key
   no alert has, a notice and an alert judged already. The loop reads it at
-  its next pass and treats the alert as cleared: it retries no clear, and a
-  later occurrence of the same kind and subject fires anew.
+  its next pass and, but for `right`, treats the alert as cleared: it
+  retries no clear, and a later occurrence of the same kind and subject
+  fires anew.
 
 The records are written by the loop through `spawn_alert_record` (owner
 only) and folded into `spawn_alerts`, one row per key: `key` (primary key),
@@ -963,11 +967,16 @@ does not have is not collected. These are kept for a minute, so Home's
 minute poll does not compute the 7-day windows again; the ranges file is
 still read at every request.
 
-The observability line (objective 092) has the north star
-`observability.needs_you_right`, "Needs you is right": of the alerts (not
-notices) that ended in the last 7 days (`cleared_at_ms` in the window), the
-share whose `outcome` is `cleared` (their condition cleared them, rather
-than the owner judging them false, stale or a duplicate); null with none.
+The observability line has the north star `observability.needs_you_right`,
+"Needs you is right" (objective 148): of the needs (alerts, never notices)
+fired in the last 7 days (`fired_at_ms`, through `spawn_alerts_time`), the
+share the owner judged `right` of those judged (`spawn alert judge`); no
+value while fewer than 5 are judged. Beside its value the figure says
+`judged: {fired, judged, unjudged}` (unjudged = fired − judged; none when
+not read), and the card says it after the name ("Needs you is right (5
+judged, 1 unjudged of 6)"). A need nobody judged counts neither way, and a
+clearing is never evidence (A23: the former cleared ÷ ended counted a false
+alert whose condition went away as right).
 
 The storage line's last two guardrails (objective 094) are read only.
 They come after the frame's five.

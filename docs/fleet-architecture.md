@@ -1033,9 +1033,11 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   ([storage.md](storage.md#alerts)). `key` names the occurrence; the store
   refuses a second `alert.fired` for it, an `alert.cleared` without its
   `alert.fired`, and a second `alert.cleared`. The owner's `spawn alert
-  judge <key> false|stale|duplicate` records a third, `alert.judged {key,
-  verdict}` (objective 092): it clears an open alert, and the step, reading
-  it at its next pass, treats the alert as cleared. The step reads the keys back
+  judge <key> right|false|stale|duplicate` records a third, `alert.judged
+  {key, verdict}` (objective 092): every verdict but `right` clears an open
+  alert, and the step, reading it at its next pass, treats the alert as
+  cleared; `right` (objective 148, a real need) leaves it open for its
+  condition to clear, and is what "Needs you is right" counts. The step reads the keys back
   on start, so a restart fires nothing twice, and two loops at once still
   record each transition once.
 - **What fires.** Notices, for every mission: `task_state` (a control record
