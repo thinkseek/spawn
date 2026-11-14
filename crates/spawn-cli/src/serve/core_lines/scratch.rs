@@ -980,7 +980,7 @@ mod tests {
             std::fs::create_dir_all(root.join(folder)).expect("mkdir");
         }
         std::fs::create_dir_all(&projects).expect("mkdir");
-        std::os::unix::fs::symlink(&root.join("projects-link"), projects.join("alias"))
+        std::os::unix::fs::symlink(root.join("projects-link"), projects.join("alias"))
             .expect("symlink");
         let roots = [root.clone()];
         let excludes = [kept_path];

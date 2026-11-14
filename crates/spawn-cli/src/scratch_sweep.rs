@@ -301,9 +301,9 @@ fn sweep(
             ) {
                 Proof::Used(why) => Err(why),
                 Proof::Free(by_name) => Ok(Judged {
-            excused: by_name,
-            ..judged
-        }),
+                    excused: by_name,
+                    ..judged
+                }),
             }
         })
         .collect();

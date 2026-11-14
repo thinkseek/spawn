@@ -638,7 +638,27 @@ fn excused_processes_are_printed() {
     assert!(!s.join("go/target").exists());
 }
 
-/// The in-use proof on a /proc of the test's own.
+/// The in-use proof of `target` (claimed when a process of 100 ticks
+/// started) on a /proc of the test's own holding `fakes`.
+fn proof(scratch: &Scratch, target: &Path, fakes: &[Fake], excuses: &[(u32, u64)]) -> Proof {
+    let proc = scratch.0.join(format!("proc-{}", fakes.len()));
+    let _ = std::fs::remove_dir_all(&proc);
+    std::fs::create_dir_all(&proc).expect("mkdir");
+    std::fs::write(proc.join("stat"), format!("btime {BTIME}\n")).expect("stat");
+    for fake in fakes {
+        fake.make(&proc);
+    }
+    in_use(
+        target,
+        uid(),
+        started(100),
+        &snapshot(&proc).expect("snapshot"),
+        excuses,
+    )
+}
+
+/// The in-use proof on a /proc of the test's own: what a readable process
+/// has at the path, compared by component.
 #[test]
 fn the_in_use_proof_reads_a_proc_of_its_own() {
     let scratch = Scratch::new("sweep-proof");
@@ -646,23 +666,7 @@ fn the_in_use_proof_reads_a_proc_of_its_own() {
     let near = scratch.0.join("s/go/target2");
     std::fs::create_dir_all(&target).expect("mkdir");
     std::fs::create_dir_all(&near).expect("mkdir");
-    let created = started(100);
-    let proof = |fakes: &[Fake], excuses: &[(u32, u64)]| {
-        let proc = scratch.0.join(format!("proc-{}", fakes.len()));
-        let _ = std::fs::remove_dir_all(&proc);
-        std::fs::create_dir_all(&proc).expect("mkdir");
-        std::fs::write(proc.join("stat"), format!("btime {BTIME}\n")).expect("stat");
-        for fake in fakes {
-            fake.make(&proc);
-        }
-        in_use(
-            &target,
-            uid(),
-            created,
-            &snapshot(&proc).expect("snapshot"),
-            excuses,
-        )
-    };
+    let proof = |fakes: &[Fake], excuses: &[(u32, u64)]| proof(&scratch, &target, fakes, excuses);
     // A cwd, and a mapping of a deleted file.
     assert_eq!(
         proof(&[Fake::readable(10, &target.join("debug"))], &[]),
@@ -697,6 +701,15 @@ fn the_in_use_proof_reads_a_proc_of_its_own() {
         ..Fake::readable(13, &near)
     };
     assert_eq!(proof(&[near_use], &[]), Proof::Free(Vec::new()));
+}
+
+/// The in-use proof on a /proc of the test's own: its unreadable processes.
+#[test]
+fn the_in_use_proof_names_unreadable_processes() {
+    let scratch = Scratch::new("sweep-proof-unreadable");
+    let target = scratch.0.join("s/go/target");
+    std::fs::create_dir_all(&target).expect("mkdir");
+    let proof = |fakes: &[Fake], excuses: &[(u32, u64)]| proof(&scratch, &target, fakes, excuses);
     // An unreadable process of the owner.
     assert_eq!(
         proof(&[Fake::unreadable(20, "(sd-pam)", Some(50))], &[]),
