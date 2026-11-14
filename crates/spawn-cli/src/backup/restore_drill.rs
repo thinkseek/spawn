@@ -15,6 +15,14 @@
 //!   increment's bundle fetched on top, its refs set to the newest record's
 //!   heads and `git fsck --connectivity-only` run on it.
 //!
+//! Each restored transcript is first judged against the newest record
+//! itself (objective 149): `transcripts.sha256` names the sha256 of every
+//! window file as bundled, so a restored file whose sha256 is not the
+//! record's, or a file the record sizes without one, is a mismatch, and the
+//! drill says "<n> of <m> files as the newest record's sha256". A record
+//! bundled before 149 names no map: that is said, and its files are judged
+//! against live only, with no mismatch of the record's own.
+//!
 //! Then each is compared with live, read-only:
 //!
 //! - a transcript file is the same size and sha256 as the live one, or the
@@ -60,6 +68,14 @@
 //! (default `/data/tmp`), which may not be under `$HOME`, `$SPAWN_LIVE` or
 //! the workspace root; it is removed at the end (kept with `--keep`), and
 //! only once it is checked to be the directory this run made.
+//!
+//! deploy/systemd/spawn-backup-restore-drill.{service,timer} run it daily
+//! (05:30) with the bundle unit's environment, so it reads the bundle
+//! records from, and records into, the store the bundle writes to. The
+//! removal above is by name after a check: until objective 149b empties
+//! the directory through the fd held from its creation, the drill runs
+//! only by hand, attended, and the timer is not installed
+//! (deploy/backup/README.md).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -657,6 +673,9 @@ fn run(
             )),
         }
     }
+    let (record_line, against_record) = judge_by_record(&restored, &newest.record["transcripts"])?;
+    lines.push(record_line);
+    mismatches.extend(against_record);
     let window_ms = settings.transcript_days.saturating_mul(86_400_000);
     let live = settings.root.join(".transcripts");
     let transcripts = compare_transcripts(&restored, &live, bundle_ms, window_ms)?;
@@ -920,8 +939,63 @@ fn files_under(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// The sha256 of a file's first `bytes` bytes.
-fn sha256_prefix(path: &Path, bytes: u64) -> Result<String, String> {
+/// The restored transcripts judged against the newest record's own
+/// `transcripts.sha256` (objective 149), before live is looked at: its
+/// line, and a mismatch for each restored file whose sha256 is not the one
+/// the record names, and for each file the record sizes without a sha256.
+/// A file the chain did not restore is the size check's mismatch, not this
+/// one's. A record bundled before 149 names no map: said, no mismatch, and
+/// the files are judged against live only.
+pub(super) fn judge_by_record(
+    restored: &Path,
+    transcripts: &Value,
+) -> Result<(String, Vec<String>), String> {
+    let Some(hashes) = transcripts["sha256"].as_object() else {
+        return Ok((
+            "restore-drill: transcripts: the newest record names no per-file sha256 \
+             (bundled before objective 149): judged against live only"
+                .to_string(),
+            Vec::new(),
+        ));
+    };
+    let sizes = transcripts["sizes"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let mut same = 0usize;
+    let mut mismatches = Vec::new();
+    for (path, size) in &sizes {
+        let Some(want) = hashes.get(path).and_then(Value::as_str) else {
+            mismatches.push(format!(
+                "transcripts/{path}: the newest record sizes it ({} bytes) and names no sha256",
+                size.as_u64().unwrap_or(0)
+            ));
+            continue;
+        };
+        let file = restored.join(path);
+        if !file.is_file() {
+            continue;
+        }
+        if sha256_file(&file)? == want {
+            same += 1;
+        } else {
+            mismatches.push(format!(
+                "transcripts/{path}: the restored bytes are not the sha256 the newest record names"
+            ));
+        }
+    }
+    Ok((
+        format!(
+            "restore-drill: transcripts: {same} of {} files as the newest record's sha256",
+            sizes.len()
+        ),
+        mismatches,
+    ))
+}
+
+/// The sha256 of a file's first `bytes` bytes: the drill's look at live, and
+/// the bundle's record of each transcript as bundled (objective 149).
+pub(super) fn sha256_prefix(path: &Path, bytes: u64) -> Result<String, String> {
     let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut reader = file.take(bytes);
     let mut hasher = Sha256::new();
@@ -1192,7 +1266,10 @@ pub(super) fn compare_refs(
 
 #[cfg(test)]
 mod tests {
-    use super::{Chain, DrillDir, chain_of, compare_refs, compare_transcripts, drill_parent};
+    use super::{
+        Chain, DrillDir, chain_of, compare_refs, compare_transcripts, drill_parent,
+        judge_by_record, sha256_prefix,
+    };
     use crate::backup::BundleRecord;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1382,6 +1459,87 @@ mod tests {
             chain_of(&[record(1, "full", None, false)]),
             Err(Chain::None)
         ));
+    }
+
+    /// The sha256 of these bytes, hex.
+    fn digest(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        crate::backup::hex(&Sha256::digest(bytes))
+    }
+
+    /// Restored transcripts against the newest record's own sha256
+    /// (objective 149): the bytes as bundled pass; the same size with other
+    /// bytes fails, named; a file sized without a sha256 fails; a record
+    /// bundled before 149 (no map) is said, with no mismatch.
+    #[test]
+    fn restored_transcripts_are_judged_against_the_records_sha256() {
+        let own = Own::new("record");
+        let restored = own.0.join("restored");
+        write(&restored.join("a/one.jsonl"), b"one\n");
+        write(&restored.join("b/two.jsonl"), b"two\ntwo\n");
+        let sizes = json!({"a/one.jsonl": 4, "b/two.jsonl": 8});
+
+        let good = json!({"sizes": sizes, "sha256": {
+            "a/one.jsonl": digest(b"one\n"), "b/two.jsonl": digest(b"two\ntwo\n"),
+        }});
+        let (line, mismatches) = judge_by_record(&restored, &good).expect("judged");
+        assert_eq!(
+            line,
+            "restore-drill: transcripts: 2 of 2 files as the newest record's sha256"
+        );
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+
+        let other = json!({"sizes": sizes, "sha256": {
+            "a/one.jsonl": digest(b"ONE\n"), "b/two.jsonl": digest(b"two\ntwo\n"),
+        }});
+        let (line, mismatches) = judge_by_record(&restored, &other).expect("judged");
+        assert!(line.contains(" 1 of 2 files "), "{line}");
+        assert_eq!(
+            mismatches,
+            [
+                "transcripts/a/one.jsonl: the restored bytes are not the sha256 the newest record names"
+            ]
+        );
+
+        let unhashed = json!({"sizes": sizes, "sha256": {"a/one.jsonl": digest(b"one\n")}});
+        let (line, mismatches) = judge_by_record(&restored, &unhashed).expect("judged");
+        assert!(line.contains(" 1 of 2 files "), "{line}");
+        assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+        assert!(
+            mismatches[0].starts_with("transcripts/b/two.jsonl:")
+                && mismatches[0].contains("names no sha256"),
+            "{mismatches:?}"
+        );
+
+        let before = json!({"files": 2, "bytes": 12, "sizes": sizes});
+        let (line, mismatches) = judge_by_record(&restored, &before).expect("judged");
+        assert!(
+            line.contains("names no per-file sha256 (bundled before objective 149)"),
+            "{line}"
+        );
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+    }
+
+    /// The hash the bundle records is of a file's first `size` bytes: a file
+    /// grown since its size was read is recorded as its bundled bytes.
+    #[test]
+    fn a_prefix_hash_is_of_the_first_bytes_only() {
+        let own = Own::new("prefix");
+        let file = own.0.join("grown.jsonl");
+        write(&file, b"bundled\nappended since\n");
+        assert_eq!(
+            sha256_prefix(&file, 8).expect("hashed"),
+            digest(b"bundled\n")
+        );
+        assert_ne!(
+            sha256_prefix(&file, 8).expect("hashed"),
+            crate::backup::sha256_file(&file).expect("hashed")
+        );
+        assert_eq!(
+            sha256_prefix(&file, 1 << 20).expect("hashed"),
+            digest(b"bundled\nappended since\n"),
+            "a size past the end is the whole file"
+        );
     }
 
     /// Restored transcripts against live: the same file, one grown since,
