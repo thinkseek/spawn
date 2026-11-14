@@ -7,9 +7,13 @@
 //! ```text
 //! "storage": {
 //!   "scratch_roots": [<dir>], "scratch_exclude": [<path>],
+//!   "scratch_bound": {"entries": <n>, "ms": <n>},
 //!   "test_database_url_files": [{"name", "url_file"}]
 //! }
 //! ```
+//!
+//! `scratch_bound` sets each root's walk's bound (objective 155): both whole
+//! numbers from 1, otherwise the default ([`Bound::DEFAULT`]).
 //!
 //! The scratch walk ([`super::scratch`]) and the test servers' schemas
 //! ([`super::schemas`]) are read at most every [`READ_EVERY_MS`], on a
@@ -42,12 +46,27 @@ pub(super) const FIRST_WAIT: Duration = Duration::from_secs(10);
 /// How many entries nobody owns the answer lists, largest first.
 const LISTED: usize = 20;
 
-/// The file's `storage`: the scratch roots, the excludes and the URL files.
+/// The file's `storage`: the scratch roots, the excludes, each root's
+/// walk's bound and the URL files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Settings {
     pub(super) roots: Vec<PathBuf>,
     pub(super) excludes: Vec<PathBuf>,
+    pub(super) bound: Bound,
     pub(super) url_files: Vec<UrlFile>,
+}
+
+/// `scratch_bound` `{"entries": <n>, "ms": <n>}`: both whole numbers from 1,
+/// otherwise [`Bound::DEFAULT`].
+fn bound(section: &Value) -> Bound {
+    let whole = |field: &str| section[field].as_u64().filter(|value| *value >= 1);
+    match (whole("entries"), whole("ms")) {
+        (Some(entries), Some(ms)) => Bound {
+            entries,
+            time: Duration::from_millis(ms),
+        },
+        _ => Bound::DEFAULT,
+    }
 }
 
 /// The `storage` of the Core lines file's `text` (`None`: no file): no
@@ -81,17 +100,20 @@ pub(super) fn settings(text: Option<&str>) -> Settings {
     Settings {
         roots: paths("scratch_roots"),
         excludes: paths("scratch_exclude"),
+        bound: bound(&section["scratch_bound"]),
         url_files,
     }
 }
 
-/// What one reading reads: the roots and excludes, the paths never counted,
+/// What one reading reads: the roots and excludes, each root's walk's bound
+/// (a change in the file starts a new reading), the paths never counted,
 /// the test servers by name (the env's first, then the URL files taken), and
 /// where the first sights are kept. Its URLs are never printed.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct Plan {
     pub(super) roots: Vec<PathBuf>,
     pub(super) excludes: Vec<PathBuf>,
+    pub(super) bound: Bound,
     pub(super) never: Vec<PathBuf>,
     pub(super) servers: Vec<(String, String)>,
     pub(super) seen: Option<PathBuf>,
@@ -103,6 +125,7 @@ impl std::fmt::Debug for Plan {
             .debug_struct("Plan")
             .field("roots", &self.roots)
             .field("excludes", &self.excludes)
+            .field("bound", &self.bound)
             .field(
                 "servers",
                 &self
@@ -136,6 +159,7 @@ pub(super) fn plan(settings: &Settings) -> (Plan, Vec<(String, String)>) {
     let plan = Plan {
         roots: settings.roots.clone(),
         excludes: settings.excludes.clone(),
+        bound: settings.bound,
         never: scratch::never_counted(&crate::storage::projects_path()),
         servers,
         seen: crate::env_value("SPAWN_WORKSPACE_ROOT")
@@ -161,9 +185,9 @@ pub(super) struct Reading {
     /// oldest first; none with no roots or before a walk within its bound.
     pub(super) claimed: Vec<Claimed>,
     pub(super) servers: Vec<Server>,
-    /// The scratch roots refused (a symlink at or above them), each with
-    /// why: named in the answer, and the figure is not collected while any
-    /// is.
+    /// The scratch roots refused (a symlink at or above them, or an exclude
+    /// that holds them), each with why: named in the answer, and the figure
+    /// is not collected while any is.
     pub(super) refused: Vec<(PathBuf, String)>,
 }
 
@@ -263,7 +287,7 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
         unowned,
         claimed,
         servers,
-        refused: scratch::refused_roots(&plan.roots),
+        refused: scratch::refused_roots(&plan.roots, &plan.excludes),
     }
 }
 
@@ -480,7 +504,7 @@ pub(super) fn now(text: Option<&str>, now_ms: i64) -> Now {
         Some(Arc::new(Reading::default()))
     } else {
         CACHE.get(&plan, now_ms, FIRST_WAIT, |plan, previous, now_ms| {
-            read(plan, previous, now_ms, Bound::DEFAULT)
+            read(plan, previous, now_ms, plan.bound)
         })
     };
     Now {
@@ -536,6 +560,28 @@ mod tests {
         assert_eq!(read.excludes, [PathBuf::from("/var/tmp/spawn/sync")]);
         assert_eq!(read.url_files.len(), 1);
         assert_eq!(read.url_files[0].name, "ccd");
+        assert_eq!(read.bound, Bound::DEFAULT, "no scratch_bound");
+        // Objective 155: the file's bound, both whole numbers from 1.
+        let bound = |text: &str| {
+            settings(Some(&format!(r#"{{"storage": {{"scratch_bound": {text}}}}}"#))).bound
+        };
+        assert_eq!(
+            bound(r#"{"entries": 900, "ms": 30000}"#),
+            Bound {
+                entries: 900,
+                time: Duration::from_secs(30),
+            }
+        );
+        for bad in [
+            r#"{"entries": 0, "ms": 30000}"#,
+            r#"{"entries": 900}"#,
+            r#"{"entries": 9.5, "ms": 30000}"#,
+            r#"{"entries": "900", "ms": 30000}"#,
+            r#"{"entries": 900, "ms": -1}"#,
+            "null",
+        ] {
+            assert_eq!(bound(bad), Bound::DEFAULT, "{bad}");
+        }
         assert_eq!(settings(None), super::Settings::default());
         assert_eq!(settings(Some("{")), super::Settings::default());
     }
@@ -786,7 +832,7 @@ mod tests {
                 lease_until_ms: 2,
                 build: vec!["t/target".to_string()],
             },
-            bytes: 30,
+            bytes: Some(30),
             build_bytes: 20,
         }
     }
