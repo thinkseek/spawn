@@ -2517,3 +2517,63 @@ fn the_scenario_owners_name_each_scenarios_root_fix_owner() {
     );
     std::fs::remove_dir_all(&root).expect("clean up");
 }
+
+/// Objective 177: a stale verdict whose report's checkpoint, or else whose
+/// latest checkpoint, the mirror lacks (after a history rewrite, neither the
+/// commit map nor the source holds it) names it an unknown commit, read with
+/// `git cat-file -e` in a mirror as `pushed_candidate` reads it. A fresh
+/// verdict, and a stale one whose checkpoints are known, are as they were.
+#[test]
+fn a_checkpoint_the_mirror_lacks_is_named_an_unknown_commit() {
+    let git = crate::sources::test_git;
+    let base = std::env::temp_dir().join(format!("spawn-unknown-checkpoint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let seed = base.join("seed");
+    std::fs::create_dir_all(&seed).expect("seed");
+    let seed_path = seed.to_string_lossy().to_string();
+    git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+    std::fs::write(seed.join("file"), "w\n").expect("write");
+    commit_in(&seed_path, "w");
+    let known = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("w");
+    let mirror = base.join("mirror.git").to_string_lossy().to_string();
+    git(&["clone", "-q", "--bare", &seed_path, &mirror]).expect("mirror");
+    let in_mirror = |commit: &str| {
+        git(&["--git-dir", &mirror, "cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok()
+    };
+    let unknown = "1".repeat(40);
+    let stale = || Freshness::Stale("the pushed branch (p) does not contain it".to_string());
+
+    assert_eq!(
+        super::name_unknown(stale(), Some(&unknown), Some(&known), in_mirror),
+        Freshness::Stale(format!(
+            "the report's checkpoint {unknown} is an unknown commit (in neither the commit map \
+             nor the source)"
+        ))
+    );
+    assert_eq!(
+        super::name_unknown(stale(), Some(&known), Some(&unknown), in_mirror),
+        Freshness::Stale(format!(
+            "the latest checkpoint {unknown} is an unknown commit (in neither the commit map nor \
+             the source)"
+        )),
+        "the report's is known: the latest one is named"
+    );
+    assert_eq!(
+        super::name_unknown(stale(), None, Some(&unknown), in_mirror),
+        Freshness::Stale(format!(
+            "the latest checkpoint {unknown} is an unknown commit (in neither the commit map nor \
+             the source)"
+        ))
+    );
+    assert_eq!(
+        super::name_unknown(stale(), Some(&known), Some(&known), in_mirror),
+        stale(),
+        "both known"
+    );
+    assert_eq!(
+        super::name_unknown(Freshness::Fresh(known.clone()), Some(&unknown), None, in_mirror),
+        Freshness::Fresh(known.clone()),
+        "only a stale verdict is named"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
