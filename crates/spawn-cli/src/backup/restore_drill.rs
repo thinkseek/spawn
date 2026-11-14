@@ -13,7 +13,18 @@
 //!   size the newest record names for it;
 //! - every mission source as a `git clone --mirror` of its full bundle, each
 //!   increment's bundle fetched on top, its refs set to the newest record's
-//!   heads and `git fsck --connectivity-only` run on it.
+//!   heads and `git fsck --full` run on it (every object read whole).
+//!
+//! `--only missions` (objective 186) drills the mission repositories alone:
+//! from each bundle it unpacks by name only `manifest.json` and the files
+//! directly under `repos/`, never a transcript, and records
+//! `backup.drilled.missions` alone. The bundle is never written in the
+//! clear: gpg decrypts the stored ciphertext into a pipe, and the stream is
+//! hashed on its way through the decompressor its magic names into tar,
+//! twice: `tar -t` first, whose sha256 must be the record's before anything
+//! is extracted, then `tar -x` of the names chosen from that listing, whose
+//! sha256 must be the same. A run killed part way leaves the ciphertext,
+//! the list of names and what it has extracted: no transcript.
 //!
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
@@ -112,8 +123,25 @@ const DRILL_PREFIX: &str = "spawn-restore-drill-";
 /// How many mismatches are named one by one.
 const NAMED: usize = 20;
 
-/// `spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]`.
+/// `spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]
+/// [--only missions]`.
 pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
+    let only = match only_missions(flags.get("only").as_deref()) {
+        Ok(only) => only,
+        Err(error) => {
+            eprintln!("spawn backup restore-drill: {error}");
+            return Ok(2);
+        }
+    };
+    let resources: &[&str] = if only {
+        println!(
+            "restore-drill: --only missions: the mission repositories alone; no transcript \
+             unpacked or restored"
+        );
+        &[MISSIONS]
+    } else {
+        &[TRANSCRIPTS, MISSIONS]
+    };
     let settings = match Settings::from_env(flags) {
         Ok(settings) => settings,
         Err(error) => {
@@ -150,7 +178,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
         Err(Chain::Broken(reason)) => {
-            return Ok(unrestorable(&store, &records, &reason, started));
+            return Ok(unrestorable(&store, &records, &reason, started, resources));
         }
     };
     if let Some(newest) = records.last()
