@@ -38,7 +38,13 @@
 //!   (newer: expected); a live ref the backup lacks was made since, and a
 //!   restored ref live no longer has was removed since (both said, both
 //!   expected). A live ref at a commit that does not descend from the
-//!   restored one is a mismatch.
+//!   restored one is a mismatch. Each restored head is first read through
+//!   the history rewrite's commit map (objective 178), so a head bundled
+//!   before the rewrite is compared by its new id; a head the rewrite
+//!   dropped is said on its own line and counted on the source's, never a
+//!   failure; a head in neither the map nor live is an "unknown commit": it
+//!   fails the drill (counted in the record's `mismatches`), never as a
+//!   mismatch.
 //!
 //! One summary line per resource, then the verdict: exit 0 when nothing
 //! older than the bundle differs, 1 on any such mismatch (or a backup that
