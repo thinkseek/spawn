@@ -84,6 +84,7 @@ mod acks;
 mod alerts;
 mod command_queue;
 mod commit_map;
+pub mod control_mask;
 mod cost;
 mod event_log;
 mod experience;
@@ -102,6 +103,7 @@ mod verifications;
 mod wake;
 
 pub use acks::{AckRecord, ReportAnswer};
+pub use control_mask::stored_text as control_stored_text;
 pub use cost::{ArchiveCounted, ArchiveFile, ArchivedMessage};
 pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
