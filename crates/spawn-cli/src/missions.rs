@@ -631,8 +631,18 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         "moved" => {
             let source = text(&flags, "source")?;
             crate::sources::MissionSource::parse(&source)?;
-            let from = text(&flags, "from")?;
-            let to = text(&flags, "to")?;
+            // Each read through the commit map (objective 178): a deploy
+            // recorded before a history rewrite names the old id. The new
+            // ids are compared and recorded; a dropped or unknown one is
+            // refused with its sentence.
+            let read = |name: &str| -> Result<String, String> {
+                let recorded = text(&flags, name)?;
+                crate::commit_now::commit_now(&store, std::path::Path::new(&source), &recorded)
+                    .map_err(err)?
+                    .id_or_why(&format!("--{name}"), &recorded)
+            };
+            let from = read("from")?;
+            let to = read("to")?;
             // Forward only: a main that dropped landed work is a halt, not a deploy.
             let forward = crate::sources::controller_git()
                 .args([
