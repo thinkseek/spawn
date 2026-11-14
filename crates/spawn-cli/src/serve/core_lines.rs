@@ -152,6 +152,10 @@ pub(super) struct Figure {
     /// right"), `{fired, judged, unjudged}`: said as `judged`; `None` when
     /// not read.
     pub(super) judged: Option<Value>,
+    /// Each mission's figure beside the fleet's (objective 159: the
+    /// performance north star's report to live by mission): said as
+    /// `by_mission`; `None` on every other figure.
+    pub(super) by_mission: Option<Value>,
 }
 
 impl Figure {
@@ -167,6 +171,7 @@ impl Figure {
             stale: false,
             store: None,
             judged: None,
+            by_mission: None,
         }
     }
 
@@ -305,6 +310,9 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     }
     if let Some(judged) = &figure.judged {
         answer["judged"] = judged.clone();
+    }
+    if let Some(by_mission) = &figure.by_mission {
+        answer["by_mission"] = by_mission.clone();
     }
     answer
 }

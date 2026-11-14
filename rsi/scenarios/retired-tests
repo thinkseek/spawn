@@ -40,3 +40,6 @@ serve::core_lines::tests::needs_you_is_right_is_the_share_of_the_ended_alerts_th
 serve::core_lines::tests::the_observability_line_gives_unpriced_use_interventions_and_the_count_not_measured
 serve::core_lines::tests::a_trend_is_each_days_last_sample_of_the_last_seven
 serve::core_lines::performance::tests::report_to_live_waits_until_the_live_record_covers_the_window
+# 166 (rev-b, 11-14): the notice fold moved from serve to alerts (alerts::window folds);
+# the same test, now alerts::notices::tests::a_notice_is_superseded_by_its_subjects_next_one.
+serve::notices::tests::a_notice_is_superseded_by_its_subjects_next_one

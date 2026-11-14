@@ -24,7 +24,8 @@ static PERFORMANCE: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
 /// its `measured_from_ms` (the record's start) and, with a value, its
 /// window ([`RTL_WINDOW`]) is [`SINCE_THE_RECORD`]; covered, it is
 /// [`COVERED_WINDOW`]. [`measured`] says the same from the record's start
-/// alone.
+/// alone. With a mission's live landing, [`BY_MISSION`] says each mission's
+/// report to live ([`by_mission`]).
 pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
     let fleet = scorecard["scopes"]
         .as_array()
@@ -45,6 +46,10 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
         "first_pass": fleet["first_pass"]["value"],
         "usd_per_landing": cost["usd_per_landing"],
     });
+    let by_mission = by_mission(scorecard);
+    if !by_mission.is_empty() {
+        values[BY_MISSION] = Value::Array(by_mission);
+    }
     if live["covered"] == true {
         values[RTL_WINDOW] = json!(COVERED_WINDOW);
     } else if live["covered"] == false {
@@ -54,6 +59,40 @@ pub(super) fn performance(scorecard: &Value, cost: &Value) -> Value {
         }
     }
     values
+}
+
+/// The performance values' key for each mission's report to live
+/// (objective 159).
+const BY_MISSION: &str = "report_to_live_by_mission";
+
+/// Each mission's report to live beside the fleet's (objective 159): every
+/// mission scope with a live landing (`report_to_live.n` above 0) as
+/// `{mission, value, n, live_at_landing}`, by mission; `value` is null below
+/// the Scorecard's minimum. The fleet's figure mixes the missions a deploy
+/// ships with those live when they land, so each is said on its own.
+fn by_mission(scorecard: &Value) -> Vec<Value> {
+    let mut missions: Vec<(i64, Value)> = scorecard["scopes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|scope| scope["scope"] == "mission")
+        .filter_map(|scope| {
+            let mission = scope["mission"].as_i64()?;
+            let live = &scope["dimensions"]["report_to_live"];
+            let n = live["n"].as_u64().filter(|n| *n > 0)?;
+            Some((
+                mission,
+                json!({
+                    "mission": mission,
+                    "value": live["value"],
+                    "n": n,
+                    "live_at_landing": live["live_at_landing"].as_u64().unwrap_or(0),
+                }),
+            ))
+        })
+        .collect();
+    missions.sort_by_key(|(mission, _)| *mission);
+    missions.into_iter().map(|(_, figure)| figure).collect()
 }
 
 /// The performance values' key for the window report to live is read over.
@@ -205,6 +244,7 @@ pub(super) fn performance_line(performance: &Value) -> Line {
         Some(SINCE_THE_RECORD) => Some(SINCE_THE_RECORD),
         _ => None,
     };
+    report_to_live.by_mission = performance.get(BY_MISSION).cloned();
     Line {
         name: "performance",
         north_star: report_to_live,
@@ -367,6 +407,51 @@ mod tests {
             "Dollars per landing (priced use only)",
             "the Cost page's priced dollars only (cc-astra A11)"
         );
+    }
+
+    /// Objective 159: each mission's report to live is said beside the
+    /// fleet's, in the values and as the north star's `by_mission`, by
+    /// mission; a mission with no live landing is left out, and with none
+    /// at all there is no key.
+    #[test]
+    fn report_to_live_per_mission_is_said_beside_the_fleets() {
+        let rtl = |value: Value, n: u64, at_landing: u64| {
+            json!({"report_to_live": {"value": value, "n": n, "not_live": 0,
+                                      "live_at_landing": at_landing}})
+        };
+        let scorecard = json!({"scopes": [
+            {"scope": "fleet", "mission": null, "dimensions": rtl(json!(360_000), 7, 3)},
+            {"scope": "mission", "mission": 9, "dimensions": rtl(json!(360_000), 3, 3)},
+            {"scope": "mission", "mission": 6, "dimensions": rtl(Value::Null, 0, 0)},
+            {"scope": "mission", "mission": 4, "dimensions": rtl(json!(3_600_000), 3, 0)},
+            {"scope": "mission", "mission": 8, "dimensions": rtl(Value::Null, 1, 1)},
+        ]});
+        let values = performance(&scorecard, &Value::Null);
+        let want = json!([
+            {"mission": 4, "value": 3_600_000, "n": 3, "live_at_landing": 0},
+            {"mission": 8, "value": null, "n": 1, "live_at_landing": 1},
+            {"mission": 9, "value": 360_000, "n": 3, "live_at_landing": 3},
+        ]);
+        assert_eq!(values["report_to_live_by_mission"], want);
+        let line = performance_line(&values);
+        let star = figure_json(&line.north_star, None);
+        assert_eq!(star["value"], json!(360_000));
+        assert_eq!(star["by_mission"], want);
+        assert!(
+            line.guardrails
+                .iter()
+                .all(|figure| figure_json(figure, None).get("by_mission").is_none()),
+            "no other figure carries it"
+        );
+        // No mission with a live landing: no key at all.
+        let quiet = json!({"scopes": [
+            {"scope": "fleet", "mission": null, "dimensions": rtl(Value::Null, 0, 0)},
+            {"scope": "mission", "mission": 4, "dimensions": rtl(Value::Null, 0, 0)},
+        ]});
+        let values = performance(&quiet, &Value::Null);
+        assert_eq!(values.get("report_to_live_by_mission"), None, "{values}");
+        let star = figure_json(&performance_line(&values).north_star, None);
+        assert_eq!(star.get("by_mission"), None, "{star}");
     }
 
     /// rev-e F1 on 7b1dd20a: a report to live sampled before the record

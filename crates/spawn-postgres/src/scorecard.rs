@@ -14,6 +14,28 @@ use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
 
+/// The missions no deploy ships (objective 159): the ids of every mission,
+/// whatever its state, with at least one source and none whose path ends in
+/// `/missions/spawn.git`, sorted, as a JSON array. deploy/on-landing.sh
+/// deploys `<live>/missions/spawn.git` and nothing else ("a landing on any
+/// other source ... deploys nothing here"), so a landing on another source is
+/// live on its main when it lands. A source that only contains the name
+/// (`.../spawn.git.bak`, a bare `/spawn.git`) is another source. A mission
+/// with no source is not here: what it ships is not known, so its landings
+/// wait for a deploy. If on-landing ever deploys another source, this path
+/// rule moves with it. One statement over `mission_missions` (a row per
+/// mission), read beside the facts and never kept with them.
+const UNDEPLOYED_MISSIONS: &str = r"
+    select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
+      from mission_missions m
+     where jsonb_typeof(m.sources) = 'array'
+       and jsonb_array_length(m.sources) > 0
+       and not exists (
+             select 1 from jsonb_array_elements(m.sources) s(source)
+              where jsonb_typeof(s.source) = 'string'
+                and right(s.source #>> '{}', 19) = '/missions/spawn.git')
+";
+
 /// The control records recorded before `$1`, in stream order, each projected
 /// to `{seq, at, type, ...}`: the fields a measure reads, big text (a brief,
 /// a gate's log, a report) reduced to what is compared or read from it. A
@@ -510,6 +532,12 @@ impl PostgresStore {
             )?
             .get(0);
         Ok((hasher.finish(), place))
+    }
+
+    /// The ids of the missions no deploy ships ([`UNDEPLOYED_MISSIONS`]),
+    /// sorted, as a JSON array: their landings are live when they land.
+    pub fn scorecard_undeployed_missions(&self) -> Result<Value, StoreError> {
+        self.query_json(UNDEPLOYED_MISSIONS, &[])
     }
 
     /// When the live record starts: the first `deploy.finished` of any
