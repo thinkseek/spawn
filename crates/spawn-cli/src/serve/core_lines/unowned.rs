@@ -563,7 +563,10 @@ mod tests {
         assert_eq!(read.bound, Bound::DEFAULT, "no scratch_bound");
         // Objective 155: the file's bound, both whole numbers from 1.
         let bound = |text: &str| {
-            settings(Some(&format!(r#"{{"storage": {{"scratch_bound": {text}}}}}"#))).bound
+            settings(Some(&format!(
+                r#"{{"storage": {{"scratch_bound": {text}}}}}"#
+            )))
+            .bound
         };
         assert_eq!(
             bound(r#"{"entries": 900, "ms": 30000}"#),

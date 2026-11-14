@@ -450,7 +450,12 @@ impl Judging<'_> {
     /// first recent change; idle). A top-level unmarked directory holding a
     /// running claim one level below is a session folder: its children are
     /// judged instead, and it is none.
-    fn judge(&mut self, path: PathBuf, metadata: &std::fs::Metadata, top: bool) -> Result<(), String> {
+    fn judge(
+        &mut self,
+        path: PathBuf,
+        metadata: &std::fs::Metadata,
+        top: bool,
+    ) -> Result<(), String> {
         if metadata.is_dir()
             && let Some(claim) = crate::scratch_owner::claim_in(&path)
         {
@@ -1217,7 +1222,13 @@ mod tests {
         let old = SystemTime::now() - Duration::from_hours(48);
         many(&root.join("held/data"), 200);
         fill(&root.join("held/t/target/x"), 3000);
-        claim(&root.join("held"), "rev-e", now - 10, now + 3_600_000, &["t/target"]);
+        claim(
+            &root.join("held"),
+            "rev-e",
+            now - 10,
+            now + 3_600_000,
+            &["t/target"],
+        );
         many(&root.join("fresh/data"), 200);
         fill(&root.join("idle/a"), 600);
         age(&root.join("held"), old);
@@ -1230,7 +1241,10 @@ mod tests {
         };
         let found = walk(std::slice::from_ref(&root), &[], &[], now, &runs, bound)
             .expect("within 60 entries");
-        assert_eq!(names(&found, &root), [("idle".to_string(), 600, Reason::Idle)]);
+        assert_eq!(
+            names(&found, &root),
+            [("idle".to_string(), 600, Reason::Idle)]
+        );
         assert_eq!(found.claimed.len(), 1);
         assert_eq!(found.claimed[0].bytes, None, "never walked whole");
         assert_eq!(found.claimed[0].build_bytes, 3000);
