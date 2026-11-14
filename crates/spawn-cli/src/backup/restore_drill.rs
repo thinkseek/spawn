@@ -99,14 +99,14 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Instant, SystemTime};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BundleRecord, Key, Settings, bundle_records, decompress_bundle, decrypt_with, get_object_bytes,
+    BundleRecord, Key, Settings, bundle_compression, bundle_records, decompress_bundle, decrypt_with, get_object_bytes,
     header_value, heads_of, hex, object_key, output, random_hex, reading_key, record_key, same_key,
     sha256_file,
 };
@@ -955,6 +955,38 @@ fn fetch_bundle(
         ));
     }
     fs::remove_file(&tar).map_err(|error| format!("{}: {error}", tar.display()))?;
+    read_manifest(key, record, &unpacked)
+}
+
+/// One stored bundle's ciphertext fetched into `here/bundle.gpg`: the
+/// object's `x-amz-meta-sha256` the record's, its seal `seal`'s. Only the
+/// ciphertext is written; the caller decrypts it.
+fn fetch_ciphertext(
+    settings: &Settings,
+    record: &BundleRecord,
+    seal: &Key,
+    here: &Path,
+) -> Result<PathBuf, String> {
+    let key = record.record["keys"][0].as_str().unwrap_or_default();
+    let expected = record.record["sha256"].as_str().unwrap_or_default();
+    let Some((bytes, headers)) = get_object_bytes(settings, key)? else {
+        return Err(format!("the bucket does not hold {key}"));
+    };
+    if let Some(meta) = header_value(&headers, "x-amz-meta-sha256")
+        && meta != expected
+    {
+        return Err(format!(
+            "{key}'s x-amz-meta-sha256 {meta} is not the record's {expected}"
+        ));
+    }
+    same_key(&seal.name, &object_key(key, &headers)?)?;
+    let encrypted = here.join("bundle.gpg");
+    fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
+    Ok(encrypted)
+}
+
+/// The manifest unpacked into `unpacked`, its kind the record's.
+fn read_manifest(key: &str, record: &BundleRecord, unpacked: &Path) -> Result<Value, String> {
     let manifest: Value = serde_json::from_slice(
         &fs::read(unpacked.join("manifest.json"))
             .map_err(|error| format!("{key} holds no manifest.json: {error}"))?,
@@ -968,6 +1000,318 @@ fn fetch_bundle(
         ));
     }
     Ok(manifest)
+}
+
+/// One stored bundle for `--only missions` (objective 186): its ciphertext
+/// fetched into `here` as `fetch_bundle` does, then never decrypted to a
+/// file. The decrypted stream goes through a pipe into `tar -t`, and its
+/// sha256 must be the record's before anything is extracted; the names
+/// chosen from that listing (`missions_members`: the manifest and the files
+/// directly under `repos/`) are written to `here/names`, and a second
+/// stream goes into `tar -x` of those names alone into `here/unpacked`, its
+/// sha256 the same. The manifest's kind is then the record's.
+fn fetch_missions(
+    settings: &Settings,
+    record: &BundleRecord,
+    seal: &Key,
+    here: &Path,
+) -> Result<Value, String> {
+    let key = record.record["keys"][0].as_str().unwrap_or_default();
+    let expected = record.record["sha256"].as_str().unwrap_or_default();
+    let encrypted = fetch_ciphertext(settings, record, seal, here)?;
+    let mut list = Command::new("tar");
+    list.args(["-tf", "-"]);
+    let listed = stream_into_tar(seal, &encrypted, list)?;
+    listed.judge(key, expected, "tar -t")?;
+    let members = missions_members(&listed.stdout).map_err(|error| format!("{key}: {error}"))?;
+    let names = here.join("names");
+    let mut text = String::new();
+    for member in &members {
+        text.push_str(member);
+        text.push('\n');
+    }
+    fs::write(&names, text).map_err(|error| format!("{}: {error}", names.display()))?;
+    let unpacked = here.join("unpacked");
+    fs::create_dir(&unpacked).map_err(|error| format!("{}: {error}", unpacked.display()))?;
+    let mut extract = Command::new("tar");
+    extract
+        .args(["-xf", "-", "-C"])
+        .arg(&unpacked)
+        .args(["--no-wildcards", "--verbatim-files-from", "-T"])
+        .arg(&names);
+    let extracted = stream_into_tar(seal, &encrypted, extract)?;
+    extracted.judge(key, expected, "tar -x")?;
+    fs::remove_file(&encrypted).map_err(|error| format!("{}: {error}", encrypted.display()))?;
+    fs::remove_file(&names).map_err(|error| format!("{}: {error}", names.display()))?;
+    read_manifest(key, record, &unpacked)
+}
+
+/// What a bundle's listing names that `--only missions` extracts: the
+/// manifest and each file directly under `repos/`, as listed (`./` and
+/// all), once each; never a transcript slice, a deeper path, a directory,
+/// `.` or `..`, nor a name tar had to quote. A listing without the manifest
+/// is refused: an empty list of names would make `tar -x` extract every
+/// member.
+pub(super) fn missions_members(listing: &str) -> Result<Vec<String>, String> {
+    let mut members: Vec<String> = Vec::new();
+    let mut manifest = false;
+    for line in listing.lines() {
+        let name = line.strip_prefix("./").unwrap_or(line);
+        let wanted = if name == "manifest.json" {
+            manifest = true;
+            true
+        } else {
+            name.strip_prefix("repos/").is_some_and(|file| {
+                !file.is_empty()
+                    && file != "."
+                    && file != ".."
+                    && !file.contains('/')
+                    && !file.contains('\\')
+                    && !file.chars().any(char::is_control)
+            })
+        };
+        if wanted && !members.iter().any(|member| member == line) {
+            members.push(line.to_string());
+        }
+    }
+    if !manifest {
+        return Err("the bundle lists no manifest.json".to_string());
+    }
+    Ok(members)
+}
+
+/// One step of a stream: whether it exited 0, and its stderr.
+struct Ran {
+    ok: bool,
+    stderr: String,
+}
+
+/// A decrypted stream run through tar: its sha256, what its magic said it
+/// is, what each step said, and tar's stdout.
+struct Streamed {
+    sha256: String,
+    compression: &'static str,
+    gpg: Ran,
+    decompressor: Option<(&'static str, Ran)>,
+    tar: Ran,
+    stdout: String,
+}
+
+impl Streamed {
+    /// The stream judged: gpg opened it, its sha256 is `expected`, then the
+    /// decompressor and tar (`what`) read it.
+    fn judge(&self, key: &str, expected: &str, what: &str) -> Result<(), String> {
+        if !self.gpg.ok {
+            return Err(format!("gpg: {}", self.gpg.stderr.trim()));
+        }
+        if self.sha256 != expected {
+            return Err(format!(
+                "{key} decrypts to sha256 {}, not the record's {expected}",
+                self.sha256
+            ));
+        }
+        if let Some((program, ran)) = &self.decompressor
+            && !ran.ok
+        {
+            return Err(format!("{program}: {}", ran.stderr.trim()));
+        }
+        if !self.tar.ok {
+            return Err(format!(
+                "{key}: {what} ({}): {}",
+                self.compression,
+                self.tar.stderr.trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A reader drained on a thread of its own.
+fn drain<R: Read + Send + 'static>(reader: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut reader) = reader {
+            let _ = reader.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+/// A drained reader's bytes, as text.
+fn drained(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&handle.join().unwrap_or_default()).into_owned()
+}
+
+/// The children of one stream, killed and reaped if it stops part way.
+struct Running(Vec<Child>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// gpg decrypting `encrypted` to its stdout, a pipe: never to a file.
+fn start_gpg(seal: &Key, encrypted: &Path) -> Result<Child, String> {
+    Command::new("gpg")
+        .args([
+            "--batch",
+            "--quiet",
+            "--no-tty",
+            "--pinentry-mode",
+            "loopback",
+            "--no-symkey-cache",
+        ])
+        .arg("--passphrase-file")
+        .arg(&seal.file)
+        .arg("--decrypt")
+        .arg(encrypted)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("gpg: {error}"))
+}
+
+/// The decompressor `compression` names (none for a plain tar) and `tar`
+/// after it, started into `running`: the pipe the stream is written to,
+/// and the drained stderr of each and tar's stdout.
+struct TarPipes {
+    sink: Option<ChildStdin>,
+    decompressor: Option<(&'static str, std::thread::JoinHandle<Vec<u8>>)>,
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn start_tar(
+    compression: &str,
+    mut tar: Command,
+    running: &mut Running,
+) -> Result<TarPipes, String> {
+    let program = match compression {
+        "gzip" => Some(("gzip", &["-dc"][..])),
+        "zstd" => Some(("zstd", &["-q", "-dc"][..])),
+        _ => None,
+    };
+    let mut sink = None;
+    let mut decompressor = None;
+    if let Some((name, arguments)) = program {
+        let mut child = Command::new(name)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("{name}: {error}"))?;
+        sink = child.stdin.take();
+        let out = child.stdout.take();
+        decompressor = Some((name, drain(child.stderr.take())));
+        running.0.push(child);
+        tar.stdin(out.map_or_else(Stdio::null, Stdio::from));
+    } else {
+        tar.stdin(Stdio::piped());
+    }
+    let mut child = tar
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("tar: {error}"))?;
+    if sink.is_none() {
+        sink = child.stdin.take();
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    running.0.push(child);
+    Ok(TarPipes {
+        sink,
+        decompressor,
+        stdout,
+        stderr,
+    })
+}
+
+/// Bytes written on to the next step while it reads; once it stops (a
+/// broken pipe) nothing more is written to it, and the stream is still
+/// read through and hashed.
+fn feed(sink: &mut Option<ChildStdin>, bytes: &[u8]) {
+    if let Some(pipe) = sink
+        && pipe.write_all(bytes).is_err()
+    {
+        *sink = None;
+    }
+}
+
+/// `encrypted` decrypted by gpg into a pipe, never a file: the stream
+/// hashed as it passes, decompressed by the program its magic names (zstd,
+/// gzip, or none) and fed into `tar`, whose stdout is kept. Nothing is
+/// judged here (`Streamed::judge`).
+fn stream_into_tar(seal: &Key, encrypted: &Path, tar: Command) -> Result<Streamed, String> {
+    let mut running = Running(Vec::new());
+    let mut gpg = start_gpg(seal, encrypted)?;
+    let plain = gpg.stdout.take();
+    let gpg_err = drain(gpg.stderr.take());
+    running.0.push(gpg);
+    let mut plain = plain.ok_or("gpg: no stdout")?;
+    let mut head = Vec::with_capacity(4);
+    (&mut plain)
+        .take(4)
+        .read_to_end(&mut head)
+        .map_err(|error| format!("gpg: {error}"))?;
+    let compression = bundle_compression(&head);
+    let pipes = start_tar(compression, tar, &mut running)?;
+    let mut sink = pipes.sink;
+    let mut hasher = Sha256::new();
+    hasher.update(&head);
+    feed(&mut sink, &head);
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match plain.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("gpg: {error}")),
+        };
+        hasher.update(&buffer[..read]);
+        feed(&mut sink, &buffer[..read]);
+    }
+    drop(sink);
+    drop(plain);
+    let mut statuses = Vec::new();
+    for mut child in std::mem::take(&mut running.0) {
+        statuses.push(
+            child
+                .wait()
+                .map_err(|error| format!("wait: {error}"))?
+                .success(),
+        );
+    }
+    let ok = |index: usize| statuses.get(index).copied().unwrap_or(false);
+    let decompressor = pipes.decompressor.map(|(name, stderr)| {
+        (
+            name,
+            Ran {
+                ok: ok(1),
+                stderr: drained(stderr),
+            },
+        )
+    });
+    Ok(Streamed {
+        sha256: hex(&hasher.finalize()),
+        compression,
+        gpg: Ran {
+            ok: ok(0),
+            stderr: drained(gpg_err),
+        },
+        decompressor,
+        tar: Ran {
+            ok: ok(statuses.len().saturating_sub(1)),
+            stderr: drained(pipes.stderr),
+        },
+        stdout: drained(pipes.stdout),
+    })
 }
 
 /// A path the manifest names, as a relative path with no `..`: what a
@@ -1384,7 +1728,7 @@ pub(super) struct Refs {
 impl Refs {
     fn line(&self, source: &str) -> String {
         let mut line = format!(
-            "restore-drill: missions {source}: {} refs restored (clone --mirror, fsck connected); \
+            "restore-drill: missions {source}: {} refs restored (clone --mirror, fsck --full clean); \
              against live: {} the same, {} moved on since (descendants), {} added since, {} \
              removed since, {} mismatch(es)",
             self.restored,
