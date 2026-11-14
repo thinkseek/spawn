@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { CoreFigure, CoreLinesAnswer } from "../src/coreLines.ts";
-import { coreLinesView, drillMark, rangeWords, scratchMark, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
+import { coreLinesView, drillMark, missionMark, rangeWords, scratchMark, sinceWords, spanWords, trendView, unitWords } from "../src/coreLines.ts";
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
@@ -161,8 +161,8 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [] });
-  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [] });
+  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], byMission: [] });
+  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], byMission: [] });
 });
 
 // Objective 086: the performance line's units.
@@ -513,4 +513,50 @@ test("a leased scratch folder says its build size, not walked whole", () => {
     `build 2.0 GB (not walked whole while leased) · 2 h old · lease until ${sinceWords(lease)} · not landed`,
   );
   assert.equal(scratchMark({ ...folder, bytes: 0 }, now).text.startsWith("0.0 MB (build 2.0 GB)"), true, "walked: its bytes");
+});
+
+// Objective 159: each mission's report to live beside the fleet's, from the
+// performance north star's `by_mission`; a mission no deploy ships says its
+// landings were live when they landed.
+test("the card says each mission's report to live beside the fleet's", () => {
+  const figure = (key: string, extra: Partial<CoreFigure>): CoreFigure => ({
+    key,
+    name: key,
+    unit: "ms",
+    value: 360_000,
+    range: null,
+    state: "no_range",
+    ...extra,
+  });
+  const answer: Partial<CoreLinesAnswer> = {
+    lines: [
+      {
+        line: "storage",
+        north_star: figure("storage.days_left", { by_mission: [{ mission: 1, value: 1, n: 3, live_at_landing: 0 }] }),
+        guardrails: [],
+      },
+      {
+        line: "performance",
+        north_star: figure("performance.report_to_live", {
+          by_mission: [
+            { mission: 4, value: 3_600_000, n: 3, live_at_landing: 0 },
+            { mission: 6, value: null, n: 2, live_at_landing: 1 },
+            { mission: 9, value: 360_000, n: 3, live_at_landing: 3 },
+          ],
+        }),
+        guardrails: [],
+      },
+    ],
+  };
+  assert.deepEqual(coreLinesView(answer).byMission, [
+    { name: "mission 4", text: "1 h (3 live)", tone: "plain" },
+    { name: "mission 6", text: "2 live, too few for a median", tone: "plain" },
+    { name: "mission 9", text: "6 min (3 live) · live when landed (no deploy ships it)", tone: "muted" },
+  ]);
+  assert.deepEqual(
+    coreLinesView({ lines: [answer.lines![0]] }).byMission,
+    [],
+    "another line's by_mission is not the performance line's",
+  );
+  assert.deepEqual(missionMark(null), { name: "mission ?", text: "0 live, too few for a median", tone: "plain" });
 });
