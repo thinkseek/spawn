@@ -1399,8 +1399,9 @@ fn why(now: CommitNow, commit: &str) -> String {
 mod tests {
     use super::{
         Chain, DrillDir, chain_of, compare_refs, compare_transcripts, drill_parent,
-        judge_by_record, sha256_prefix,
+        judge_by_record, outcome, sha256_prefix, Outcome,
     };
+    use crate::commit_now::CommitNow;
     use crate::backup::BundleRecord;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1765,7 +1766,9 @@ mod tests {
         .into_iter()
         .map(|(name, commit)| (name.to_string(), commit.to_string()))
         .collect();
-        let report = compare_refs(&restored, &live, |old, new| old == "c1" && new == "c2");
+        let held = |commit: &str| Ok(CommitNow::Commit(commit.to_string()));
+        let report = compare_refs(&restored, &live, held, |old, new| old == "c1" && new == "c2")
+            .expect("compared");
         assert_eq!(
             (
                 report.restored,
@@ -1782,5 +1785,115 @@ mod tests {
             "{:?}",
             report.mismatches
         );
+    }
+
+    /// Objective 178: each restored head is read through the commit map,
+    /// then live. A head bundled before the rewrite mapped to live's commit
+    /// is the same, one live moved past is newer; a dropped head is listed
+    /// apart and fails nothing; a head in neither the map nor live is an
+    /// unknown commit, never a mismatch; a mapped head live does not descend
+    /// from is a mismatch naming both ids. The source's line gains the
+    /// counts; the outcome counts the unknown without calling it a
+    /// mismatch; a store error is the error.
+    #[test]
+    fn restored_heads_are_compared_with_live_through_the_commit_map() {
+        let restored: BTreeMap<String, String> = [
+            ("refs/heads/same", "o1"),
+            ("refs/heads/newer", "o1"),
+            ("refs/heads/e", "oe"),
+            ("refs/heads/lost", "ol"),
+            ("refs/heads/rewritten", "o2"),
+        ]
+        .into_iter()
+        .map(|(name, commit)| (name.to_string(), commit.to_string()))
+        .collect();
+        let live: BTreeMap<String, String> = [
+            ("refs/heads/same", "n1"),
+            ("refs/heads/newer", "n2"),
+            ("refs/heads/e", "n1"),
+            ("refs/heads/lost", "n1"),
+            ("refs/heads/rewritten", "n9"),
+        ]
+        .into_iter()
+        .map(|(name, commit)| (name.to_string(), commit.to_string()))
+        .collect();
+        let map = |commit: &str| {
+            let entry = match commit {
+                "o1" => Some(Some("n1".to_string())),
+                "o2" => Some(Some("n3".to_string())),
+                "oe" => Some(None),
+                _ => None,
+            };
+            Ok(CommitNow::of(commit, entry, || commit.starts_with('n')))
+        };
+        let descends = |old: &str, new: &str| old == "n1" && new == "n2";
+        let report = compare_refs(&restored, &live, map, descends).expect("compared");
+        assert_eq!(
+            (report.restored, report.same, report.newer, report.added, report.removed),
+            (5, 1, 1, 0, 0)
+        );
+        assert_eq!(
+            report.dropped,
+            ["refs/heads/e: restored at oe was dropped by the history rewrite (the commit map \
+              names no new commit for it)"]
+        );
+        assert_eq!(
+            report.unknown,
+            ["refs/heads/lost: restored at ol is an unknown commit (in neither the commit map \
+              nor the source)"]
+        );
+        assert_eq!(
+            report.mismatches,
+            ["refs/heads/rewritten: restored at o2 (now n3); live is at n9, which does not \
+              descend from it"]
+        );
+        assert!(
+            report.line("/src").ends_with(
+                "against live: 1 the same, 1 moved on since (descendants), 0 added since, 0 \
+                 removed since, 1 mismatch(es), 1 dropped by the history rewrite, 1 unknown \
+                 commit(s)"
+            ),
+            "{}",
+            report.line("/src")
+        );
+        // Neither dropped nor unknown: the line as it was.
+        let plain = compare_refs(
+            &restored,
+            &BTreeMap::new(),
+            |_: &str| Err("never asked".to_string()),
+            descends,
+        )
+        .expect("all removed");
+        assert!(plain.line("/src").ends_with("5 removed since, 0 mismatch(es)"));
+        // The outcome: both counted, the unknown never called a mismatch.
+        match outcome("missions", &[], &report.unknown, "k") {
+            Outcome::Mismatched(count, reason) => {
+                assert_eq!(count, 1);
+                assert!(
+                    reason.starts_with(
+                        "missions: 0 mismatch(es) and 1 unknown commit(s) older than bundle k; \
+                         the first: refs/heads/lost: restored at ol is an unknown commit"
+                    ),
+                    "{reason}"
+                );
+            }
+            other => panic!("not failed: {other:?}"),
+        }
+        match outcome("missions", &report.mismatches, &[], "k") {
+            Outcome::Mismatched(1, reason) => assert!(
+                reason.starts_with("missions: 1 mismatch(es) older than bundle k; the first:"),
+                "{reason}"
+            ),
+            other => panic!("not one mismatch: {other:?}"),
+        }
+        assert!(matches!(outcome("missions", &[], &[], "k"), Outcome::Passed));
+        // A store error is the error, not a verdict.
+        let failed = compare_refs(
+            &restored,
+            &live,
+            |_: &str| Err("the store is gone".to_string()),
+            descends,
+        );
+        assert_eq!(failed.err(), Some("the store is gone".to_string()));
     }
 }
