@@ -133,7 +133,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
-    let resources: &[&str] = if only {
+    let resources: &[&'static str] = if only {
         println!(
             "restore-drill: --only missions: the mission repositories alone; no transcript \
              unpacked or restored"
@@ -209,26 +209,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let drill = DrillDir::create(&parent)?;
     let result = run(&store, &settings, &chain, &seal, drill.path(), only);
     let newest = chain[chain.len() - 1];
-    let (code, outcomes): (i32, Vec<(&str, Outcome)>) = match result {
-        Ok(report) => (
-            said(&report),
-            outcomes(&report)
-                .into_iter()
-                .filter(|(resource, _)| resources.contains(resource))
-                .collect(),
-        ),
-        Err(error) => {
-            let reason = format!("the backup cannot be restored: {error}");
-            println!("restore-drill: FAILED: {reason}");
-            (
-                1,
-                resources
-                    .iter()
-                    .map(|resource| (*resource, Outcome::Unrestorable(reason.clone())))
-                    .collect(),
-            )
-        }
-    };
+    let (code, outcomes) = verdicts(result, resources);
     if flags.switch("keep") {
         println!("restore-drill: kept {}", drill.path().display());
         drill.keep();
@@ -242,6 +223,36 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         duration_ms: elapsed_ms(started),
     };
     Ok(record_verdicts(&store, &verdict, &outcomes).unwrap_or(code))
+}
+
+/// A drill's result said, and its exit and the outcome of each resource
+/// it proves (`resources`): a report's own, or each unrestorable.
+fn verdicts(
+    result: Result<Report, String>,
+    resources: &[&'static str],
+) -> (i32, Vec<(&'static str, Outcome)>) {
+    match result {
+        Ok(report) => (
+            said(&report),
+            outcomes(&report)
+                .into_iter()
+                .filter(|(resource, _)| resources.contains(resource))
+                .collect(),
+        ),
+        Err(error) => {
+            let reason = format!("the backup cannot be restored: {error}");
+            println!("restore-drill: FAILED: {reason}");
+            (1, unrestorable_all(resources, &reason))
+        }
+    }
+}
+
+/// Each of `resources` unrestorable, for `reason`.
+fn unrestorable_all(resources: &[&'static str], reason: &str) -> Vec<(&'static str, Outcome)> {
+    resources
+        .iter()
+        .map(|resource| (*resource, Outcome::Unrestorable(reason.to_string())))
+        .collect()
 }
 
 /// The two resources a drill proves, each recorded as `backup.drilled.<name>`.
@@ -288,7 +299,7 @@ fn unrestorable(
     records: &[BundleRecord],
     reason: &str,
     started: Instant,
-    resources: &[&str],
+    resources: &[&'static str],
 ) -> i32 {
     let reason = format!("the backup cannot be restored: {reason}");
     fail_both(store, records, &reason, started, 1, resources)
@@ -307,7 +318,7 @@ fn fail_both(
     reason: &str,
     started: Instant,
     code: i32,
-    resources: &[&str],
+    resources: &[&'static str],
 ) -> i32 {
     let reason = reason.to_string();
     println!("restore-drill: FAILED: {reason}");
@@ -320,11 +331,7 @@ fn fail_both(
         event_id,
         duration_ms: elapsed_ms(started),
     };
-    let failed: Vec<(&str, Outcome)> = resources
-        .iter()
-        .map(|resource| (*resource, Outcome::Unrestorable(reason.clone())))
-        .collect();
-    record_verdicts(store, &verdict, &failed).unwrap_or(code)
+    record_verdicts(store, &verdict, &unrestorable_all(resources, &reason)).unwrap_or(code)
 }
 
 /// Why a chain has no one key to be read with.
