@@ -1176,8 +1176,12 @@ impl Monitor {
 
     /// The owner judged an alert (`spawn alert judge`, objective 092): an
     /// open one is cleared by it, so the step clears it no more, and a later
-    /// occurrence of its kind and subject fires anew.
+    /// occurrence of its kind and subject fires anew. Judged `right`
+    /// (objective 148) it stays open: its condition still clears it.
     fn judged_record(&mut self, record: &Value) {
+        if record["verdict"] == "right" {
+            return;
+        }
         if let Some(row) = record["key"]
             .as_str()
             .and_then(|key| self.known.get_mut(key))
@@ -4804,10 +4808,11 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
     follow_stream(&store, after, json)
 }
 
-/// The verdicts an owner may give an alert (objective 092).
-pub(crate) const VERDICTS: [&str; 3] = ["false", "stale", "duplicate"];
+/// The verdicts an owner may give an alert (objective 092; `right`, a real
+/// need, objective 148).
+pub(crate) const VERDICTS: [&str; 4] = ["right", "false", "stale", "duplicate"];
 
-const JUDGE_USAGE: &str = "usage: spawn alert judge <key> false|stale|duplicate";
+const JUDGE_USAGE: &str = "usage: spawn alert judge <key> right|false|stale|duplicate";
 
 /// The arguments of `spawn alert`: `judge <key> <verdict>`, the key and
 /// the verdict, or why they are not.
@@ -4819,7 +4824,7 @@ pub(crate) fn judge_arguments(arguments: &[String]) -> Result<(String, String), 
             }
             if !VERDICTS.contains(&verdict.as_str()) {
                 return Err(format!(
-                    "{verdict:?} is not a verdict (false, stale or duplicate)\n{JUDGE_USAGE}"
+                    "{verdict:?} is not a verdict (right, false, stale or duplicate)\n{JUDGE_USAGE}"
                 ));
             }
             Ok((key.clone(), verdict.clone()))
@@ -4828,10 +4833,12 @@ pub(crate) fn judge_arguments(arguments: &[String]) -> Result<(String, String), 
     }
 }
 
-/// `spawn alert judge <key> false|stale|duplicate`: the owner's judgement
-/// of an alert that should not have been raised. It records `alert.judged`
-/// through `spawn_alert_record`; an open alert is cleared by it. The store
-/// refuses a key no alert has, a notice and an alert judged already.
+/// `spawn alert judge <key> right|false|stale|duplicate`: the owner's
+/// judgement of an alert, a real need (`right`, objective 148) or one that
+/// should not have been raised. It records `alert.judged` through
+/// `spawn_alert_record`; an open alert is cleared by any verdict but
+/// `right`. The store refuses a key no alert has, a notice and an alert
+/// judged already.
 pub(crate) fn alert(arguments: &[String]) -> Result<i32, String> {
     let (key, verdict) = judge_arguments(arguments)?;
     let store = open_store()?;
@@ -5033,19 +5040,21 @@ mod tests {
             .collect()
     }
 
-    /// Objective 092: `spawn alert judge <key> false|stale|duplicate`, its
-    /// usage and what it refuses before reaching the store.
+    /// Objective 092: `spawn alert judge <key> right|false|stale|duplicate`
+    /// (`right`, objective 148), its usage and what it refuses before
+    /// reaching the store.
     #[test]
     fn the_judge_verb_takes_a_key_and_one_of_three_verdicts() {
         let words =
             |list: &[&str]| -> Vec<String> { list.iter().map(ToString::to_string).collect() };
+        assert_eq!(super::VERDICTS, ["right", "false", "stale", "duplicate"]);
         for verdict in super::VERDICTS {
             assert_eq!(
                 super::judge_arguments(&words(&["judge", "bb:a1", verdict])),
                 Ok(("bb:a1".to_string(), verdict.to_string()))
             );
         }
-        let usage = "usage: spawn alert judge <key> false|stale|duplicate";
+        let usage = "usage: spawn alert judge <key> right|false|stale|duplicate";
         for wrong in [
             &[][..],
             &["judge"][..],
@@ -5066,6 +5075,78 @@ mod tests {
             "{refused}"
         );
         assert!(super::judge_arguments(&words(&["judge", " ", "false"])).is_err());
+    }
+
+    /// Objective 148: a need judged right stays open in the step's memory,
+    /// so the step still clears it when its condition does; any other
+    /// verdict clears it there.
+    #[test]
+    fn a_need_judged_right_stays_open_for_the_step() {
+        let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let defect = json!({"type": "task.gated", "id": 7, "verdict": "host_fault",
+                            "revision": 0, "base": "b", "evidence": "validator_defect",
+                            "validator_defects": ["028.sh"],
+                            "fact": {"scenario": "028.sh", "on": "candidate and base"}});
+        let first = feed(&mut monitor, 11, 0, defect);
+        commit(&mut monitor, &first);
+        let key = "validator_defect:4:028.sh:11";
+        assert!(monitor.is_open(key), "{first:?}");
+        // Judged right: still open, so its condition clears it.
+        let judged = feed(
+            &mut monitor,
+            12,
+            0,
+            json!({"type": "alert.judged", "key": key, "verdict": "right"}),
+        );
+        assert!(judged.is_empty(), "{judged:?}");
+        assert!(monitor.is_open(key), "a need judged right stays open");
+        let cleared = decided(
+            &monitor,
+            feed(
+                &mut monitor,
+                13,
+                0,
+                json!({"type": "task.gated", "id": 7, "verdict": "accepted", "revision": 0,
+                       "base": "c"}),
+            ),
+        );
+        assert!(
+            cleared
+                .iter()
+                .any(|event| matches!(event, Event::Clear { key: k, .. } if k == key)),
+            "its condition clears it: {cleared:?}"
+        );
+        // Judged false, an open need is cleared in the step's memory.
+        let mut other = monitor();
+        feed(
+            &mut other,
+            10,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        let first = feed(
+            &mut other,
+            11,
+            0,
+            json!({"type": "task.gated", "id": 7, "verdict": "host_fault",
+                   "revision": 0, "base": "b", "evidence": "validator_defect",
+                   "validator_defects": ["028.sh"],
+                   "fact": {"scenario": "028.sh", "on": "candidate and base"}}),
+        );
+        commit(&mut other, &first);
+        feed(
+            &mut other,
+            12,
+            0,
+            json!({"type": "alert.judged", "key": key, "verdict": "false"}),
+        );
+        assert!(!other.is_open(key), "judged false, it is cleared");
     }
 
     #[test]

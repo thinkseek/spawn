@@ -144,6 +144,10 @@ pub(super) struct Figure {
     /// The store a figure names (objective 141: the store that grew most):
     /// said as `store`.
     pub(super) store: Option<String>,
+    /// What a judged share is read from (objective 148: "Needs you is
+    /// right"), `{fired, judged, unjudged}`: said as `judged`; `None` when
+    /// not read.
+    pub(super) judged: Option<Value>,
 }
 
 impl Figure {
@@ -158,6 +162,7 @@ impl Figure {
             as_of_ms: None,
             stale: false,
             store: None,
+            judged: None,
         }
     }
 
@@ -293,6 +298,9 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     }
     if let Some(store) = &figure.store {
         answer["store"] = json!(store);
+    }
+    if let Some(judged) = &figure.judged {
+        answer["judged"] = judged.clone();
     }
     answer
 }
@@ -739,13 +747,21 @@ fn lines_at(
             error
         }
     })?;
+    // "Needs you is right" (objective 148): of the needs fired in the last
+    // 7 days, the owner's judgements; a clearing is never evidence (A23).
+    // A failed read is no figure, not a failed answer.
+    let counts = timed(&mut parts.health, || {
+        store
+            .needs_judged(now_ms - observability::WEEK_MS)
+            .map_err(|error| eprintln!("core-lines: the needs judged: {error}"))
+            .ok()
+    });
+    let (needs_you_right, needs_judged) = observability::judged_share(counts.as_ref());
     let observed = Observed {
         cost_total,
         human_per_agent_hour: interventions["per_agent_hour"].clone(),
-        // Not collected until A22/A23 land (owner, 2026-11-12): the share of
-        // alerts whose condition cleared them is not whether they were right
-        // (sync/astra/findings.md A23), so it is not shown as the north star.
-        needs_you_right: Value::Null,
+        needs_you_right,
+        needs_judged,
     };
     let (backups, facts, drills) = timed(&mut parts.facts, || {
         store.newest_backups().map(|backups| {
