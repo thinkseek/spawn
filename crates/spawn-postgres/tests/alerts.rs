@@ -322,14 +322,21 @@ fn a_need_judged_right_stays_as_it_was_and_is_counted() {
     assert_eq!(judgements(&mut client), 2);
     for (key, verdict, why) in [
         ("memory_low:1", "right", "judged right already"),
-        ("memory_low:1", "false", "judged right already, another verdict"),
+        (
+            "memory_low:1",
+            "false",
+            "judged right already, another verdict",
+        ),
         ("task_state:7:10", "right", "a notice"),
         ("memory_low:9", "right", "a key no alert has"),
     ] {
         assert!(store.alert_judge(key, verdict).is_err(), "{why} is refused");
     }
     assert_eq!(judgements(&mut client), 2, "the refused wrote nothing");
-    assert_eq!(alert(&mut client, "task_state:7:10")["verdict"], Value::Null);
+    assert_eq!(
+        alert(&mut client, "task_state:7:10")["verdict"],
+        Value::Null
+    );
 
     // The judged read: three needs fired, two judged, both right; the
     // notice never counted.

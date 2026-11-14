@@ -271,9 +271,7 @@ mod tests {
     /// from; nothing said when not read.
     #[test]
     fn needs_you_is_right_is_the_share_judged_right_of_the_judged() {
-        let counts = |fired: u64, judged: u64, right: u64| {
-            json!({"fired": fired, "judged": judged, "right": right})
-        };
+        let counts = |fired: u64, judged: u64, right: u64| json!({"fired": fired, "judged": judged, "right": right});
         let said = |fired: u64, judged: u64, unjudged: u64| {
             Some(json!({"fired": fired, "judged": judged, "unjudged": unjudged}))
         };
