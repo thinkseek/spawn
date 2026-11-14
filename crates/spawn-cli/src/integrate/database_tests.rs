@@ -9319,8 +9319,14 @@ fn a_controller_from_before_the_rewrite_holds_the_task_through_the_map() {
     owner_request(&db, &source, &commit);
 
     integrator.pass_on(&db.store).expect("the landing's pass");
-    assert_eq!(source_main(&source), commit, "the owner's landing moved main");
-    integrator.pass_on(&db.store).expect("a pass before the deploy");
+    assert_eq!(
+        source_main(&source),
+        commit,
+        "the owner's landing moved main"
+    );
+    integrator
+        .pass_on(&db.store)
+        .expect("a pass before the deploy");
     assert!(
         integrator.running.borrow().is_empty() && started(&marks).is_empty(),
         "no gate judges past the controller built before the rewrite: {:?}",
@@ -9414,14 +9420,21 @@ fn the_controller_behind_alert_reads_the_controller_through_the_map() {
     let fired = alerts();
     assert_eq!(fired.len(), 1, "once: {fired:?}");
     assert_eq!(fired[0]["state"], "open");
-    assert_eq!(fired[0]["evidence"]["controller"], m0.as_str(), "the new id");
+    assert_eq!(
+        fired[0]["evidence"]["controller"],
+        m0.as_str(),
+        "the new id"
+    );
     assert_eq!(fired[0]["evidence"]["landed"], m1.as_str());
 
     deploy(&dropped);
     check();
     let cleared = alerts();
     assert_eq!(cleared.len(), 1, "{cleared:?}");
-    assert_eq!(cleared[0]["state"], "cleared", "a dropped controller is never behind");
+    assert_eq!(
+        cleared[0]["state"], "cleared",
+        "a dropped controller is never behind"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 

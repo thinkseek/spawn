@@ -1396,17 +1396,18 @@ pub(super) fn compare_refs(
 
 /// The sentence of a restored head with no commit now.
 fn why(now: CommitNow, commit: &str) -> String {
-    now.id_or_why("restored at", commit).unwrap_or_else(|why| why)
+    now.id_or_why("restored at", commit)
+        .unwrap_or_else(|why| why)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Chain, DrillDir, chain_of, compare_refs, compare_transcripts, drill_parent,
-        judge_by_record, outcome, sha256_prefix, Outcome,
+        Chain, DrillDir, Outcome, chain_of, compare_refs, compare_transcripts, drill_parent,
+        judge_by_record, outcome, sha256_prefix,
     };
-    use crate::commit_now::CommitNow;
     use crate::backup::BundleRecord;
+    use crate::commit_now::CommitNow;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1771,8 +1772,10 @@ mod tests {
         .map(|(name, commit)| (name.to_string(), commit.to_string()))
         .collect();
         let held = |commit: &str| Ok(CommitNow::Commit(commit.to_string()));
-        let report = compare_refs(&restored, &live, held, |old, new| old == "c1" && new == "c2")
-            .expect("compared");
+        let report = compare_refs(&restored, &live, held, |old, new| {
+            old == "c1" && new == "c2"
+        })
+        .expect("compared");
         assert_eq!(
             (
                 report.restored,
@@ -1789,6 +1792,35 @@ mod tests {
             "{:?}",
             report.mismatches
         );
+    }
+
+    /// The outcome of `report`'s heads: both counted, the unknown never
+    /// called a mismatch.
+    fn outcomes_count_the_unknown_apart(report: &super::Refs) {
+        match outcome("missions", &[], &report.unknown, "k") {
+            Outcome::Mismatched(count, reason) => {
+                assert_eq!(count, 1);
+                assert!(
+                    reason.starts_with(
+                        "missions: 0 mismatch(es) and 1 unknown commit(s) older than bundle k; \
+                         the first: refs/heads/lost: restored at ol is an unknown commit"
+                    ),
+                    "{reason}"
+                );
+            }
+            other => panic!("not failed: {other:?}"),
+        }
+        match outcome("missions", &report.mismatches, &[], "k") {
+            Outcome::Mismatched(1, reason) => assert!(
+                reason.starts_with("missions: 1 mismatch(es) older than bundle k; the first:"),
+                "{reason}"
+            ),
+            other => panic!("not one mismatch: {other:?}"),
+        }
+        assert!(matches!(
+            outcome("missions", &[], &[], "k"),
+            Outcome::Passed
+        ));
     }
 
     /// Objective 178: each restored head is read through the commit map,
@@ -1835,23 +1867,35 @@ mod tests {
         let descends = |old: &str, new: &str| old == "n1" && new == "n2";
         let report = compare_refs(&restored, &live, map, descends).expect("compared");
         assert_eq!(
-            (report.restored, report.same, report.newer, report.added, report.removed),
+            (
+                report.restored,
+                report.same,
+                report.newer,
+                report.added,
+                report.removed
+            ),
             (5, 1, 1, 0, 0)
         );
         assert_eq!(
             report.dropped,
-            ["refs/heads/e: restored at oe was dropped by the history rewrite (the commit map \
-              names no new commit for it)"]
+            [
+                "refs/heads/e: restored at oe was dropped by the history rewrite (the commit map \
+              names no new commit for it)"
+            ]
         );
         assert_eq!(
             report.unknown,
-            ["refs/heads/lost: restored at ol is an unknown commit (in neither the commit map \
-              nor the source)"]
+            [
+                "refs/heads/lost: restored at ol is an unknown commit (in neither the commit map \
+              nor the source)"
+            ]
         );
         assert_eq!(
             report.mismatches,
-            ["refs/heads/rewritten: restored at o2 (now n3); live is at n9, which does not \
-              descend from it"]
+            [
+                "refs/heads/rewritten: restored at o2 (now n3); live is at n9, which does not \
+              descend from it"
+            ]
         );
         assert!(
             report.line("/src").ends_with(
@@ -1870,29 +1914,12 @@ mod tests {
             descends,
         )
         .expect("all removed");
-        assert!(plain.line("/src").ends_with("5 removed since, 0 mismatch(es)"));
-        // The outcome: both counted, the unknown never called a mismatch.
-        match outcome("missions", &[], &report.unknown, "k") {
-            Outcome::Mismatched(count, reason) => {
-                assert_eq!(count, 1);
-                assert!(
-                    reason.starts_with(
-                        "missions: 0 mismatch(es) and 1 unknown commit(s) older than bundle k; \
-                         the first: refs/heads/lost: restored at ol is an unknown commit"
-                    ),
-                    "{reason}"
-                );
-            }
-            other => panic!("not failed: {other:?}"),
-        }
-        match outcome("missions", &report.mismatches, &[], "k") {
-            Outcome::Mismatched(1, reason) => assert!(
-                reason.starts_with("missions: 1 mismatch(es) older than bundle k; the first:"),
-                "{reason}"
-            ),
-            other => panic!("not one mismatch: {other:?}"),
-        }
-        assert!(matches!(outcome("missions", &[], &[], "k"), Outcome::Passed));
+        assert!(
+            plain
+                .line("/src")
+                .ends_with("5 removed since, 0 mismatch(es)")
+        );
+        outcomes_count_the_unknown_apart(&report);
         // A store error is the error, not a verdict.
         let failed = compare_refs(
             &restored,

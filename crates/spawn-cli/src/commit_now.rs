@@ -67,7 +67,9 @@ pub(crate) fn commit_now(
     commit: &str,
 ) -> Result<CommitNow, StoreError> {
     let entry = store.commit_map_entry(commit)?;
-    Ok(CommitNow::of(commit, entry.as_ref(), || held(repository, commit)))
+    Ok(CommitNow::of(commit, entry.as_ref(), || {
+        held(repository, commit)
+    }))
 }
 
 /// Whether the repository at `repository` holds `commit` as a commit.
@@ -103,7 +105,10 @@ mod tests {
 
     #[test]
     fn a_dropped_id_is_dropped_even_when_the_repository_still_holds_it() {
-        assert_eq!(CommitNow::of("old", Some(&None), || true), CommitNow::Dropped);
+        assert_eq!(
+            CommitNow::of("old", Some(&None), || true),
+            CommitNow::Dropped
+        );
     }
 
     #[test]
@@ -123,15 +128,19 @@ mod tests {
         );
         assert_eq!(
             CommitNow::Dropped.id_or_why("--from", "e1"),
-            Err("--from e1 was dropped by the history rewrite (the commit map names no new \
+            Err(
+                "--from e1 was dropped by the history rewrite (the commit map names no new \
                  commit for it)"
-                .to_string())
+                    .to_string()
+            )
         );
         assert_eq!(
             CommitNow::Unknown.id_or_why("the controller's commit", "u1"),
-            Err("the controller's commit u1 is an unknown commit (in neither the commit map \
+            Err(
+                "the controller's commit u1 is an unknown commit (in neither the commit map \
                  nor the source)"
-                .to_string())
+                    .to_string()
+            )
         );
     }
 

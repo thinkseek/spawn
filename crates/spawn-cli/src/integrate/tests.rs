@@ -2477,7 +2477,8 @@ fn a_controller_built_before_the_rewrite_is_compared_by_its_new_commit() {
     use super::ControllerLag;
     use crate::commit_now::CommitNow;
     let git = crate::sources::test_git;
-    let base = std::env::temp_dir().join(format!("spawn-controller-rewrite-{}", std::process::id()));
+    let base =
+        std::env::temp_dir().join(format!("spawn-controller-rewrite-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let repo = base.join("repo");
     let repo_path = repo.to_string_lossy().to_string();
