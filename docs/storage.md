@@ -1145,6 +1145,30 @@ is no ranges, and a broken one gives a `ranges_error`. Home's "Core lines"
 card shows each line, colours a guardrail out of range, and says a broken
 file and the ignored entries. Nothing but `spawn serve` reads the file.
 
+The owner's interventions through the queue (objective 156): the ranges
+file may name the queue, `{"observability": {"queue_file": <absolute
+path>, "queue_utc_offset_minutes": <minutes east of UTC>}}` (the offset 0
+when absent or beyond 14 h). Then `/api/interventions`, and so Home's
+figure and Core lines' `observability.interventions_per_agent_hour`, count
+each `## lead-mac <H:MM or HH:MM> <text>` heading of that file in the
+window as one intervention, `source: "queue"`: kind `owner_decision` when
+the text holds the word "owner" in any case, else `steering`; `by_kind`
+then always says both. Nobody else's heading counts (the lead relays what
+lead-mac posted; a reviewer's post is no intervention), nor a heading with
+no time. qpost's headings carry no date, so a heading's day is read back
+from the end of the file, in the queue's local time: the newest is on the
+local date of now, or the day before when its time is more than 5 minutes
+later than now's; each earlier heading more than 12 h later than the one
+after it is a day before it, otherwise the same day (headings minutes out
+of order are no midnight); more than 24 h with no post breaks the reading.
+An item's line is the text with control characters dropped, cut at 120
+characters then "…". The file is read whole up to 4 MiB, beyond that its
+last 4 MiB from the first whole line, and read again only when its length
+or modification time changes. A relative path, no `queue_file` or no
+ranges file: nothing is read and the answer is as before. The Fleet
+strip's `health.human_per_agent_hour` and the scorecard's autonomy do not
+count the posts yet (follow-up 158).
+
 ### Trends (objective 090)
 
 The loop records a `host.core_lines` sample, `{"type": "host.core_lines",

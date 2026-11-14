@@ -85,14 +85,24 @@ supplementary group. The root directory is 0711, each account's directory
 own sessions, and `spawn-backup`, which writes its own tree, and joins their
 pipes. Both units run `thin --dry-run` until the owner allows removal.
 
+Since objective 147, every new version is also written as blocks beside its
+directory (`deploy/session-blocks.py`, stage 1 of
+sync/design-143-session-block-store.md), and copy, thin, restore and the drill
+take a lock on the root (the script's header says how). The directory stays
+the version; nothing is converted or removed.
+
 **Nothing here is live until it is installed by hand, with sudo (the lead's
 only).** The units run `/usr/local/lib/spawn/session-backup.sh`, a root-owned
-copy, and `deploy.sh` installs neither the script nor the units. These files
-are the installed ones, byte for byte (installed 2026-11-12 from 4f247ef1):
+copy, which runs `session-blocks.py` from beside itself, and `deploy.sh`
+installs neither the scripts nor the units. These are the reviewed files of
+this tree. Until the lead installs 147, the host runs 146's
+`session-backup.sh` (a2437d463f2769bfff4f2da9065dde20ed6570b3218bee40f87e74774555ca85,
+installed 2026-11-12 from 4f247ef1) and has no `session-blocks.py`:
 
 ```text
-a2437d463f2769bfff4f2da9065dde20ed6570b3218bee40f87e74774555ca85  deploy/session-backup.sh  (= /usr/local/lib/spawn/session-backup.sh)
-50a7f0cce47cbb84b40bbbc68caabd3ea60b2e7f8df38bf14fd4686e7c911773  deploy/test-session-backup.sh
+e9e5f2431e1e8289972fe969eee7a386d8e5fb5fd4c82827a7eebdca0c898589  deploy/session-backup.sh
+c534ff6dbecfdb32afce70a337b39266f6b92b534db070a19c6bcae37364f57b  deploy/session-blocks.py
+d9befa41fdb9743f6eebfc257bf3b26ea54a24dc95b0af90fe40d319f8695a14  deploy/test-session-backup.sh
 e653439c64c7bc9cdea7c5e1fe4e2c3f15fa9fd73e97b3ee572c4224c2ef4881  deploy/systemd/system/spawn-session-backup-drill.service
 51be45c296935f0356322d298d65084138f644826fcea78ddaf6d4eadebb310c  deploy/systemd/system/spawn-session-backup-drill.timer
 c7bccae226da53c5a7ec8c3597bdb71a35b7d8eb3f70fb3ebc1bf10ef1b02148  deploy/systemd/system/spawn-session-backup.service
@@ -102,9 +112,12 @@ c7bccae226da53c5a7ec8c3597bdb71a35b7d8eb3f70fb3ebc1bf10ef1b02148  deploy/systemd
 A later change installs the same way. Root never runs or installs a file an
 account can change, and runs no git in a checkout. Root copies the files
 into a new root-owned directory, checks each sha256 against the reviewed
-commit's, and only then installs: the script with `install -o root -g root
--m 755` to `/usr/local/lib/spawn/`, the units with `-m 644` to
-`/etc/systemd/system/`, then `systemctl daemon-reload`.
+commit's, and only then installs: `session-backup.sh` with `install -o root
+-g root -m 755` and `session-blocks.py` with `-m 644`, both to
+`/usr/local/lib/spawn/`; the units (when they change) with `-m 644` to
+`/etc/systemd/system/`, then `systemctl daemon-reload`. Before the install,
+the test runs as root from that copy, in the pilot's form
+(`SPAWN_TEST_ACCOUNT`, `SPAWN_TEST_BACKUP_USER`).
 
 `spawn serve` reads the status file the units write: `SPAWN_SESSION_BACKUP_STATUS`
 for the storage figure, and `recoverability.session_backup_status` for the
