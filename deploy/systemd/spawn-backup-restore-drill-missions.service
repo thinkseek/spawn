@@ -1,0 +1,28 @@
+[Unit]
+Description=Spawn: daily restore drill of the mission repositories alone (objective 186): every mission source restored from the newest bundle chain into scratch, fsck'd and its refs checked against live, and recorded as backup.drilled.missions (deploy/backup)
+After=spawn-backup-bundle.service
+
+[Service]
+Type=oneshot
+# --only missions: from each bundle only manifest.json and repos/* are
+# unpacked, never a transcript, so the scratch directory holds no transcript
+# and the drill removes all of it (the owner's 10:16 rule: a drill writes and
+# removes only its own copies).
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn backup restore-drill --only missions
+# The bundle's environment, so the record goes to the store the bundle
+# records go to; R2 is only read (GET), never written.
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=SPAWN_WORKSPACE_ROOT=%h/.local/share/spawn-rsi/ws
+Environment=PATH=%h/.local/share/spawn-rsi/bin:/usr/local/bin:/usr/bin:/bin
+Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+# The scratch directory is made under /data/tmp (never under $HOME,
+# $SPAWN_LIVE or the workspace root); a run killed part way leaves it, named
+# spawn-restore-drill-*. Exit 1 is a failed drill (the record's and a
+# person's), 2 a drill that cannot run: neither is a retry's.
+Restart=on-failure
+RestartSec=1h
+RestartPreventExitStatus=1 2
+TimeoutStartSec=1h
+MemoryMax=1G
+Nice=15
+IOSchedulingClass=idle
