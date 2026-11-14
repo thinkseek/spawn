@@ -9,6 +9,11 @@
 //! follows (later by its event, compared as a number) gets `superseded_by`,
 //! the key of the next one. Every row stays, in its order; nothing is
 //! recorded, and the store's rows are unchanged.
+//!
+//! The window both `spawn alerts --once --json` and `GET /api/alerts`
+//! answer is folded (objective 166, [`super::window`]), and [`current`]
+//! gives what the Alerts view and `spawn alerts --once` in text show: each
+//! subject's newest notice, with how many came before it.
 
 use serde_json::Value;
 
@@ -69,9 +74,50 @@ pub(super) fn fold(rows: &mut Value) {
     }
 }
 
+/// The notices of `rows` no later notice in them supersedes, in their
+/// order, each with how many notices' `superseded_by` chains end at it
+/// (web/src/notices.ts's rule). A notice whose next one is not in `rows`
+/// stands, so nothing is hidden; a cycle (never folded so) ends where it
+/// meets itself. Open and cleared rows are no notices.
+pub(super) fn current(rows: &[Value]) -> Vec<(&Value, usize)> {
+    let notices: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row.get("state").and_then(Value::as_str) == Some("notice"))
+        .collect();
+    let key = |row: &Value| row.get("key").and_then(Value::as_str).map(str::to_string);
+    let next = |row: &Value| -> Option<usize> {
+        let wanted = row.get("superseded_by").and_then(Value::as_str)?;
+        notices
+            .iter()
+            .position(|other| other.get("key").and_then(Value::as_str) == Some(wanted))
+    };
+    let mut earlier = vec![0_usize; notices.len()];
+    for (start, row) in notices.iter().enumerate() {
+        let mut at = start;
+        let mut seen = vec![key(row)];
+        while let Some(step) = next(notices[at]) {
+            let step_key = key(notices[step]);
+            if seen.contains(&step_key) {
+                break;
+            }
+            seen.push(step_key);
+            at = step;
+        }
+        if at != start {
+            earlier[at] += 1;
+        }
+    }
+    notices
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| next(row).is_none())
+        .map(|(index, row)| (*row, earlier[index]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fold;
+    use super::{current, fold};
     use serde_json::{Value, json};
 
     fn row(key: &str, kind: &str, state: &str) -> Value {
@@ -139,5 +185,44 @@ mod tests {
         let mut empty = json!([]);
         fold(&mut empty);
         assert_eq!(empty, json!([]));
+    }
+
+    fn notice(key: &str, state: &str, superseded_by: Option<&str>) -> Value {
+        let mut row = json!({"key": key, "kind": key.split(':').next(), "state": state});
+        if let Some(next) = superseded_by {
+            row["superseded_by"] = json!(next);
+        }
+        row
+    }
+
+    #[test]
+    fn each_subjects_newest_notice_is_current_with_how_many_came_before() {
+        let rows = [
+            notice("task_state:7:10", "notice", Some("task_state:7:11")),
+            notice("memory_low:1", "open", None),
+            notice("task_state:7:12", "notice", None),
+            notice("task_state:8:15", "notice", None),
+            notice("task_state:7:11", "notice", Some("task_state:7:12")),
+            // Its next one is not in the rows: it stands, nothing is hidden.
+            notice("mission_state:4:20", "notice", Some("mission_state:4:99")),
+            notice("task_state:9:1", "cleared", None),
+            // A cycle (never folded so) ends.
+            notice("task_state:5:1", "notice", Some("task_state:5:2")),
+            notice("task_state:5:2", "notice", Some("task_state:5:1")),
+        ];
+        let got: Vec<(&str, usize)> = current(&rows)
+            .into_iter()
+            .map(|(row, earlier)| (row["key"].as_str().expect("a key"), earlier))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("task_state:7:12", 2),
+                ("task_state:8:15", 0),
+                ("mission_state:4:20", 0),
+            ]
+        );
+        assert!(current(&[]).is_empty());
+        assert!(current(&[notice("memory_low:1", "open", None)]).is_empty());
     }
 }

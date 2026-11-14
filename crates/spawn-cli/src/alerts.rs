@@ -4747,13 +4747,40 @@ pub(crate) fn window_ms(since: Option<&str>) -> Result<i64, String> {
 }
 
 /// The alert window as `spawn alerts --once --json` and `/api/alerts`
-/// answer it: the one array both show.
+/// answer it: the one array both show, with the notice fold (objectives 151
+/// and 166, [`notices::fold`]): each task's or mission's notice that its
+/// subject's next one follows says `superseded_by`, that one's key. Every
+/// row stays; nothing is recorded.
 pub(crate) fn window(store: &PostgresStore, since: Option<&str>) -> Result<Value, String> {
     let span = window_ms(since)?;
     let now = store.now_ms().map_err(|error| error.to_string())?;
-    store
+    let mut rows = store
         .alerts(now.saturating_sub(span))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    notices::fold(&mut rows);
+    Ok(rows)
+}
+
+/// `spawn alerts --once` in text (objective 166), in the window's order:
+/// each open and cleared alert's [`line`], and of the notices each
+/// subject's newest only ([`notices::current`]), with " · N earlier" after
+/// its line when notices came before it, as the Alerts view shows them.
+fn lines(alerts: &[Value]) -> Vec<String> {
+    let current = notices::current(alerts);
+    alerts
+        .iter()
+        .filter_map(|alert| {
+            if alert["state"].as_str() != Some("notice") {
+                return Some(line(alert));
+            }
+            let (_, earlier) = current.iter().find(|(row, _)| std::ptr::eq(*row, alert))?;
+            Some(if *earlier > 0 {
+                format!("{} · {earlier} earlier", line(alert))
+            } else {
+                line(alert)
+            })
+        })
+        .collect()
 }
 
 const USAGE: &str = "usage: spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]";
@@ -4791,8 +4818,8 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         if json {
             println!("{}", Value::Array(alerts.clone()));
         } else {
-            for alert in &alerts {
-                println!("{}", line(alert));
+            for line in lines(&alerts) {
+                println!("{line}");
             }
         }
         return Ok(0);
@@ -4931,6 +4958,7 @@ fn host_sources(listed: &Value) -> BTreeSet<(i64, String)> {
 }
 
 mod guardrails;
+mod notices;
 
 #[cfg(test)]
 mod tests {
@@ -9112,6 +9140,81 @@ connections\n";
                 assert_eq!(orphan.len(), 1, "the up with no down known: {orphan:?}");
                 assert_eq!(orphan[0].0, key);
                 assert_eq!(orphan[0].1["event_id"], up);
+            });
+        }
+
+        /// Objective 166: the window both `--once --json` and /api/alerts
+        /// answer folds the notices (every row kept, each but a subject's
+        /// newest superseded by its next one), and `--once` in text shows
+        /// each subject's newest with how many came before.
+        #[test]
+        fn the_window_folds_notices_and_the_text_shows_each_subjects_newest() {
+            in_schema("window_fold", |store| {
+                let fire = |key: &str, kind: &str, subject: &str, text: &str, notice: bool| {
+                    store
+                        .alert_record(&json!({
+                            "type": "alert.fired", "key": key, "kind": kind,
+                            "subject": subject, "evidence": {}, "text": text,
+                            "notice": notice,
+                        }))
+                        .expect("fire");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
+                fire(
+                    "memory_low:1",
+                    "memory_low",
+                    "host",
+                    "MemAvailable is low",
+                    false,
+                );
+                for (event, state) in [(10, "assigned"), (12, "reported"), (11, "delivered")] {
+                    fire(
+                        &format!("task_state:7:{event}"),
+                        "task_state",
+                        "task #7",
+                        &format!("task #7 {state}"),
+                        true,
+                    );
+                }
+                fire(
+                    "task_state:8:15",
+                    "task_state",
+                    "task #8",
+                    "task #8 assigned",
+                    true,
+                );
+                let window = super::super::window(store, Some("1d")).expect("the window");
+                let rows = window.as_array().expect("an array");
+                assert_eq!(rows.len(), 5, "every row kept: {window}");
+                let mut folded: Vec<(String, Value)> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["key"].as_str().expect("a key").to_string(),
+                            row.get("superseded_by").cloned().unwrap_or(Value::Null),
+                        )
+                    })
+                    .collect();
+                folded.sort_by(|left, right| left.0.cmp(&right.0));
+                assert_eq!(
+                    folded,
+                    [
+                        ("memory_low:1".to_string(), Value::Null),
+                        ("task_state:7:10".to_string(), json!("task_state:7:11")),
+                        ("task_state:7:11".to_string(), json!("task_state:7:12")),
+                        ("task_state:7:12".to_string(), Value::Null),
+                        ("task_state:8:15".to_string(), Value::Null),
+                    ]
+                );
+                let lines = super::super::lines(rows);
+                assert_eq!(lines.len(), 3, "{lines:?}");
+                assert!(lines[0].starts_with("open memory_low host "), "{lines:?}");
+                assert!(
+                    lines[1].starts_with("notice task_state task #7 ")
+                        && lines[1].ends_with("task #7 reported · 2 earlier"),
+                    "{lines:?}"
+                );
+                assert!(lines[2].ends_with("task #8 assigned"), "{lines:?}");
             });
         }
 

@@ -1232,11 +1232,11 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   <span>]` prints every open alert and the window's transitions
   (`SPAWN_ALERT_WINDOW_SECS`, default a day); `spawn alerts --follow
   [--json]` prints each transition as it is recorded; `GET /api/alerts`
-  answers the same array as `--once --json`, from the same store method,
-  with the notice fold: each task's or mission's notice that its subject's
-  next one follows says `superseded_by`, that one's key (every row stays;
-  objective 151); the Alerts view's notices list shows each subject's newest
-  with how many came before. The
+  answers the same array as `--once --json`, from the same store method;
+  both carry the notice fold: each task's or mission's notice that its
+  subject's next one follows says `superseded_by`, that one's key (every row
+  stays; objectives 151 and 166). The Alerts view's notices list and
+  `--once` in text show each subject's newest with "· N earlier". The
   dashboard shows the open alerts on every page and an Alerts view with
   their evidence and their clearing. The supervisor's charter names the
   command: its hand-run monitor retires, and the fleet's alerting is the

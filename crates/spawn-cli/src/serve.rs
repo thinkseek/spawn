@@ -109,7 +109,6 @@ mod answers;
 pub(crate) mod attention;
 pub(crate) mod core_lines;
 mod labels;
-mod notices;
 mod storage;
 
 use std::collections::BTreeSet;
@@ -2369,20 +2368,16 @@ fn interventions(query: &str) -> Result<Value, String> {
     crate::scorecard::interventions::measure(&store, name, span).map_err(failure)
 }
 
-/// `/api/alerts?since=`: the JSON array of `spawn alerts --once --json`
-/// with the same flag (crate::alerts), from the same store method, read
-/// through the reader login, with the notice fold (objective 151,
-/// [`notices::fold`]): each task's or mission's notice that its subject's
-/// next one follows says `superseded_by`, that one's key. Every row stays;
-/// nothing is recorded. An empty parameter is the configured window.
+/// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once
+/// --json` with the same flag (`crate::alerts::window`, notices folded:
+/// objectives 151 and 166), from the same store method, read through the
+/// reader login. An empty parameter is the configured window.
 fn alerts(query: &str) -> Result<Value, String> {
     let store = open_store()?;
     let since = parameter(query, "since")
         .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad since {text}")))
         .transpose()?;
-    let mut rows = crate::alerts::window(&store, since.as_deref())?;
-    notices::fold(&mut rows);
-    Ok(rows)
+    crate::alerts::window(&store, since.as_deref())
 }
 
 /// `/api/cost?window=24h|7d` (24h when absent; any other window is the
