@@ -195,7 +195,10 @@ test("the health's storage is read as the server reports it, null from an older 
 
 test("the host section's Resources are followed by a Storage card drawn from storageView", () => {
   const strip = readFileSync(new URL("../src/components/fleet/HealthStrip.tsx", import.meta.url), "utf8");
-  assert.match(strip, /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} \/>/);
+  assert.match(
+    strip,
+    /<Cell label="Storage"[^>]*>\s*<StorageCard storage=\{health\.storage\} backups=\{health\.backups\} diagnostics=\{diagnostics\} \/>/,
+  );
   assert.match(strip, /backupView\(backups, now\)/, "the card's backup rows are drawn from backupView");
   assert.match(strip, /const \{ rows, lasts, lasts_note, measured_from, lasts_from \} = storageView\(storage\)/);
   // Objective 098: each line's own date beside it while it is set (not twice
