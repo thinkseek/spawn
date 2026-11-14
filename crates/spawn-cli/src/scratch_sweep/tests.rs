@@ -208,7 +208,7 @@ fn line_for<'a>(lines: &'a [String], path: &Path) -> &'a str {
     let field = format!("\t{}\t", path.display());
     lines
         .iter()
-        .find(|line| line.contains(&field))
+        .find(|line| line.contains(&field) && !line.starts_with("excused\t"))
         .unwrap_or_else(|| panic!("no line for {}: {lines:?}", path.display()))
 }
 
