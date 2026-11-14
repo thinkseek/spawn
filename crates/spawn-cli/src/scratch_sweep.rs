@@ -117,9 +117,11 @@ fn args(words: &[String]) -> Result<Args, String> {
                 let value = words
                     .next()
                     .ok_or_else(|| format!("--excuse needs a value\n{USAGE}"))?;
-                parsed.excuses.push(pair(value).ok_or_else(|| {
-                    format!("--excuse is <pid>:<start ticks>, not '{value}'")
-                })?);
+                parsed
+                    .excuses
+                    .push(pair(value).ok_or_else(|| {
+                        format!("--excuse is <pid>:<start ticks>, not '{value}'")
+                    })?);
             }
             "--apply" | "--expect-digest" => return Err(format!("{word} is given twice")),
             other => return Err(format!("unexpected argument {other}\n{USAGE}")),
@@ -272,7 +274,9 @@ fn sweep(
     let mut first: Vec<String> = unreadable
         .iter()
         .map(|process| {
-            let start = process.start.map_or("?".to_string(), |start| start.to_string());
+            let start = process
+                .start
+                .map_or("?".to_string(), |start| start.to_string());
             let excused = process
                 .start
                 .is_some_and(|start| args.excuses.contains(&(process.pid, start)));
@@ -288,7 +292,13 @@ fn sweep(
         .iter()
         .map(|row| {
             let (judged, owner) = examine(row, inputs.landed, now)?;
-            match in_use(&row.path, owner, row.claim.created_ms, &procs, &args.excuses) {
+            match in_use(
+                &row.path,
+                owner,
+                row.claim.created_ms,
+                &procs,
+                &args.excuses,
+            ) {
                 Proof::Used(why) => Err(why),
                 Proof::Free(excused) => Ok(Judged { excused, ..judged }),
             }
@@ -485,10 +495,7 @@ fn tagged(dir: &Path) -> bool {
     }
     let mut head = Vec::new();
     std::fs::File::open(&tag)
-        .and_then(|file| {
-            file.take(TAG_SIGNATURE.len() as u64)
-                .read_to_end(&mut head)
-        })
+        .and_then(|file| file.take(TAG_SIGNATURE.len() as u64).read_to_end(&mut head))
         .is_ok_and(|_| head == TAG_SIGNATURE)
 }
 
@@ -603,8 +610,10 @@ fn process(dir: &Path, pid: u32) -> Option<Process> {
     let start = std::fs::read_to_string(dir.join("stat"))
         .ok()
         .and_then(|stat| spawn_host::process::start_time_of(&stat));
-    let comm = std::fs::read_to_string(dir.join("comm"))
-        .map_or_else(|_| "?".to_string(), |comm| comm.trim_end_matches('\n').to_string());
+    let comm = std::fs::read_to_string(dir.join("comm")).map_or_else(
+        |_| "?".to_string(),
+        |comm| comm.trim_end_matches('\n').to_string(),
+    );
     let uses = uses(dir);
     if uses.is_none() && std::fs::symlink_metadata(dir).is_err() {
         return None;
@@ -773,7 +782,8 @@ fn fstat_is(fd: impl AsFd, id: (u64, u64)) -> bool {
 /// symlink, each as judged; its contents removed from its own fd; last,
 /// its name, while that name still holds it.
 fn remove(row: &Row, ids: &[(u64, u64)], hook: &dyn Fn(Stage, &Path)) -> Result<(), Removal> {
-    let (Some(&folder_id), Some(&build_id), Some(last)) = (ids.first(), ids.last(), row.parts.last())
+    let (Some(&folder_id), Some(&build_id), Some(last)) =
+        (ids.first(), ids.last(), row.parts.last())
     else {
         return Err(Removal::PathChanged);
     };

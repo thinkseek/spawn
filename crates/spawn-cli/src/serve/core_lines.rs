@@ -809,26 +809,50 @@ pub(crate) fn claimed_scratch(now_ms: i64) -> Result<ClaimedScratch, String> {
         return Err("the Core lines file names no storage.scratch_roots".to_string());
     }
     let never = scratch::never_counted(&crate::storage::projects_path());
-    let walk = scratch::walk(&settings.roots, &settings.excludes, &never, now_ms, &crate::integrate::still_runs, SWEEP_BOUND)?;
+    let walk = scratch::walk(
+        &settings.roots,
+        &settings.excludes,
+        &never,
+        now_ms,
+        &crate::integrate::still_runs,
+        SWEEP_BOUND,
+    )?;
     let mut places = never;
     places.extend(crate::env_value("HOME").map(PathBuf::from));
     let folders: Vec<_> = walk
         .claimed
         .into_iter()
-        .filter(|claimed| scratch::sweepable(&claimed.path, &settings.roots, &settings.excludes, &places))
+        .filter(|claimed| {
+            scratch::sweepable(&claimed.path, &settings.roots, &settings.excludes, &places)
+        })
         .map(|claimed| (claimed.path, claimed.claim))
         .collect();
-    let pairs: Vec<(i64, i64)> = folders.iter().filter_map(|(_, claim)| claim.pair()).collect();
+    let pairs: Vec<(i64, i64)> = folders
+        .iter()
+        .filter_map(|(_, claim)| claim.pair())
+        .collect();
     if pairs.is_empty() {
-        return Ok(ClaimedScratch { folders, landed: Vec::new() });
+        return Ok(ClaimedScratch {
+            folders,
+            landed: Vec::new(),
+        });
     }
     let no_url = |why: String| {
-        if why.contains("://") { "(its error names a URL, not shown)".to_string() } else { why }
+        if why.contains("://") {
+            "(its error names a URL, not shown)".to_string()
+        } else {
+            why
+        }
     };
     let landed = super::open_store()
         .map_err(|why| format!("the store cannot be opened: {}", no_url(why)))?
         .claimed_landed(&pairs)
-        .map_err(|error| format!("the store's landings cannot be read: {}", no_url(error.to_string())))?;
+        .map_err(|error| {
+            format!(
+                "the store's landings cannot be read: {}",
+                no_url(error.to_string())
+            )
+        })?;
     Ok(ClaimedScratch { folders, landed })
 }
 

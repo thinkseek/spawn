@@ -134,7 +134,12 @@ fn related(entry: &Path, paths: &[PathBuf]) -> bool {
 /// the walk never counts ([`fixed_name`]; the walk checks only the top
 /// level), and it is not, does not lie under and does not hold an exclude
 /// or a never-counted place, each compared by its resolved path too.
-pub(super) fn sweepable(folder: &Path, roots: &[PathBuf], excludes: &[PathBuf], never: &[PathBuf]) -> bool {
+pub(super) fn sweepable(
+    folder: &Path,
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    never: &[PathBuf],
+) -> bool {
     let Some(below) = roots.iter().find_map(|root| folder.strip_prefix(root).ok()) else {
         return false;
     };
@@ -963,19 +968,38 @@ mod tests {
         let root = scratch.0.join("root");
         let projects = scratch.0.join("projects");
         let excluded = root.join("sess/kept");
-        for folder in ["sess/deep", "sess/incident-9", "sess/x.pending", "sess/x-pending", "sess/.transcripts", "sess/kept", "projects-link/a"] {
+        for folder in [
+            "sess/deep",
+            "sess/incident-9",
+            "sess/x.pending",
+            "sess/x-pending",
+            "sess/.transcripts",
+            "sess/kept",
+            "projects-link/a",
+        ] {
             std::fs::create_dir_all(root.join(folder)).expect("mkdir");
         }
         std::fs::create_dir_all(&projects).expect("mkdir");
-        std::os::unix::fs::symlink(&root.join("projects-link"), projects.join("alias")).expect("symlink");
+        std::os::unix::fs::symlink(&root.join("projects-link"), projects.join("alias"))
+            .expect("symlink");
         let roots = [root.clone()];
         let excludes = [excluded];
         let never = never_counted(&projects.join("alias"));
         let swept = |folder: &str| sweepable(&root.join(folder), &roots, &excludes, &never);
         assert!(swept("sess/deep"));
-        for kept in ["sess/incident-9", "sess/x.pending", "sess/x-pending", "sess/.transcripts", "sess/kept", "projects-link/a"] {
+        for kept in [
+            "sess/incident-9",
+            "sess/x.pending",
+            "sess/x-pending",
+            "sess/.transcripts",
+            "sess/kept",
+            "projects-link/a",
+        ] {
             assert!(!swept(kept), "{kept}");
         }
-        assert!(!sweepable(&scratch.0.join("elsewhere"), &roots, &excludes, &never), "under no root");
+        assert!(
+            !sweepable(&scratch.0.join("elsewhere"), &roots, &excludes, &never),
+            "under no root"
+        );
     }
 }

@@ -125,7 +125,12 @@ impl Fake<'_> {
         )
         .expect("status");
         let stat = self.start.map_or("garbage".to_string(), |start| {
-            format!("{} ({}) S{} {start} 0 0\n", self.pid, self.comm, " 0".repeat(18))
+            format!(
+                "{} ({}) S{} {start} 0 0\n",
+                self.pid,
+                self.comm,
+                " 0".repeat(18)
+            )
         });
         std::fs::write(dir.join("stat"), stat).expect("stat");
         std::fs::write(dir.join("comm"), format!("{}\n", self.comm)).expect("comm");
@@ -223,21 +228,36 @@ fn each_rule_alone_keeps_its_path() {
     // No tag.
     fill(&s.join("notag/target/debug/x"), 3000);
     std::fs::create_dir_all(s.join("notag")).expect("mkdir");
-    folders.push((s.join("notag"), claim(&s.join("notag"), "1/007", &["target"], None)));
+    folders.push((
+        s.join("notag"),
+        claim(&s.join("notag"), "1/007", &["target"], None),
+    ));
     // A transcript under it.
     folder_with(&s.join("jsonl"), "target");
     fill(&s.join("jsonl/target/debug/session.jsonl"), 10);
-    folders.push((s.join("jsonl"), claim(&s.join("jsonl"), "1/007", &["target"], None)));
+    folders.push((
+        s.join("jsonl"),
+        claim(&s.join("jsonl"), "1/007", &["target"], None),
+    ));
     // Through a symlink.
     std::fs::create_dir_all(s.join("link")).expect("mkdir");
     std::os::unix::fs::symlink(&outside, s.join("link/x")).expect("symlink");
-    folders.push((s.join("link"), claim(&s.join("link"), "1/007", &["x/target"], None)));
+    folders.push((
+        s.join("link"),
+        claim(&s.join("link"), "1/007", &["x/target"], None),
+    ));
     // A file named target.
     fill(&s.join("file/target"), 10);
-    folders.push((s.join("file"), claim(&s.join("file"), "1/007", &["target"], None)));
+    folders.push((
+        s.join("file"),
+        claim(&s.join("file"), "1/007", &["target"], None),
+    ));
     // Not there.
     std::fs::create_dir_all(s.join("gone")).expect("mkdir");
-    folders.push((s.join("gone"), claim(&s.join("gone"), "1/007", &["target"], None)));
+    folders.push((
+        s.join("gone"),
+        claim(&s.join("gone"), "1/007", &["target"], None),
+    ));
     // Not a build path (a claim no owner file could hold).
     folder_with(&s.join("odd"), "target");
     let mut odd = claim(&s.join("odd"), "1/007", &["target"], None);
@@ -245,7 +265,10 @@ fn each_rule_alone_keeps_its_path() {
     folders.push((s.join("odd"), odd));
     // In use.
     folder_with(&s.join("used"), "target");
-    folders.push((s.join("used"), claim(&s.join("used"), "1/007", &["target"], None)));
+    folders.push((
+        s.join("used"),
+        claim(&s.join("used"), "1/007", &["target"], None),
+    ));
     Fake::readable(4242, &s.join("used/target/debug")).make(&scratch.proc());
 
     let (listed, result, applied) = listed_then_applied(&scratch, &folders, &none);
@@ -254,21 +277,42 @@ fn each_rule_alone_keeps_its_path() {
         let why = |path: &Path| line_for(lines, path).to_string();
         assert!(why(&s.join("notag/target")).ends_with(": no CACHEDIR.TAG"));
         assert!(
-            why(&s.join("jsonl/target"))
-                .ends_with(&format!(": {} is a transcript", s.join("jsonl/target/debug/session.jsonl").display())),
+            why(&s.join("jsonl/target")).ends_with(&format!(
+                ": {} is a transcript",
+                s.join("jsonl/target/debug/session.jsonl").display()
+            )),
             "{}",
             why(&s.join("jsonl/target"))
         );
-        assert!(why(&s.join("link/x/target")).ends_with(&format!(": {} is a symlink", s.join("link/x").display())));
-        assert!(why(&s.join("file/target")).ends_with(&format!(": {} is not a directory", s.join("file/target").display())));
+        assert!(
+            why(&s.join("link/x/target"))
+                .ends_with(&format!(": {} is a symlink", s.join("link/x").display()))
+        );
+        assert!(why(&s.join("file/target")).ends_with(&format!(
+            ": {} is not a directory",
+            s.join("file/target").display()
+        )));
         assert!(why(&s.join("gone/target")).ends_with(": not there"));
         assert!(why(&s.join("odd/../odd/target")).ends_with(": not a build path"));
         assert!(why(&s.join("used/target")).ends_with(": in use: process 4242's cwd"));
-        assert!(lines.iter().all(|line| line.starts_with("stays\t") || !line.contains('\t') || line.starts_with("digest\t")), "{lines:?}");
+        assert!(
+            lines.iter().all(|line| line.starts_with("stays\t")
+                || !line.contains('\t')
+                || line.starts_with("digest\t")),
+            "{lines:?}"
+        );
     }
-    assert_eq!(applied.last().map(String::as_str), Some("removed 0 build path(s), 0 bytes"));
+    assert_eq!(
+        applied.last().map(String::as_str),
+        Some("removed 0 build path(s), 0 bytes")
+    );
     assert!(outside.join("target/secret").exists());
-    for kept in ["notag/target/debug/x", "jsonl/target/debug/session.jsonl", "used/target/debug/x", "odd/target/debug/x"] {
+    for kept in [
+        "notag/target/debug/x",
+        "jsonl/target/debug/session.jsonl",
+        "used/target/debug/x",
+        "odd/target/debug/x",
+    ] {
         assert!(s.join(kept).exists(), "{kept}");
     }
 }
@@ -281,9 +325,23 @@ fn only_a_landed_claim_with_an_ended_lease_goes_and_print_only_removes_nothing()
     folder_with(&s.join("lease"), "target");
     folder_with(&s.join("notl"), "target");
     let folders = vec![
-        (s.join("go"), claim(&s.join("go"), "1/007", &["a/target"], None)),
-        (s.join("lease"), claim(&s.join("lease"), "1/009", &["target"], Some(now() + HOUR_MS))),
-        (s.join("notl"), claim(&s.join("notl"), "1/008", &["target"], None)),
+        (
+            s.join("go"),
+            claim(&s.join("go"), "1/007", &["a/target"], None),
+        ),
+        (
+            s.join("lease"),
+            claim(
+                &s.join("lease"),
+                "1/009",
+                &["target"],
+                Some(now() + HOUR_MS),
+            ),
+        ),
+        (
+            s.join("notl"),
+            claim(&s.join("notl"), "1/008", &["target"], None),
+        ),
     ];
     let (listed, result, applied) = listed_then_applied(&scratch, &folders, &none);
     assert!(line_for(&listed, &s.join("go/a/target")).starts_with("would-remove\t"));
@@ -296,9 +354,15 @@ fn only_a_landed_claim_with_an_ended_lease_goes_and_print_only_removes_nothing()
     assert_eq!(result, Ok(0), "{applied:?}");
     assert_eq!(
         line_for(&applied, &s.join("go/a/target")),
-        format!("removed\t{}\t{bytes}\trev-g 1/007", s.join("go/a/target").display())
+        format!(
+            "removed\t{}\t{bytes}\trev-g 1/007",
+            s.join("go/a/target").display()
+        )
     );
-    assert_eq!(applied.last().cloned(), Some(format!("removed 1 build path(s), {bytes} bytes")));
+    assert_eq!(
+        applied.last().cloned(),
+        Some(format!("removed 1 build path(s), {bytes} bytes"))
+    );
     assert!(!s.join("go/a/target").exists());
     // The removal keeps the sources, the folder, the build path's parent
     // and the owner file.
@@ -314,12 +378,19 @@ fn print_only_removes_nothing() {
     let scratch = Scratch::new("sweep-print");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let (result, listed) = run(&scratch, &folders, &[], &none);
     assert_eq!(result, Ok(0));
     assert!(line_for(&listed, &s.join("go/target")).starts_with("would-remove\t"));
     assert!(s.join("go/target/debug/x").exists());
-    assert!(listed.last().is_some_and(|line| line.starts_with("digest\t")));
+    assert!(
+        listed
+            .last()
+            .is_some_and(|line| line.starts_with("digest\t"))
+    );
 }
 
 #[test]
@@ -336,7 +407,11 @@ fn a_claim_changed_between_list_and_removal_stays() {
         again.created_ms += 1;
         std::fs::write(folder.join(OWNER_FILE), again.line()).expect("again");
     };
-    for (name, change) in [("renewed", renewed), ("gone", gone), ("made again", made_again)] {
+    for (name, change) in [
+        ("renewed", renewed),
+        ("gone", gone),
+        ("made again", made_again),
+    ] {
         let scratch = Scratch::new("sweep-claim");
         let s = scratch.0.join("s");
         folder_with(&s.join("go"), "target");
@@ -368,7 +443,10 @@ fn a_component_swapped_for_a_symlink_during_the_in_use_proof_removes_nothing_out
     fill(&outside.join("target/secret"), 3000);
     tag(&outside.join("target"));
     folder_with(&s.join("go"), "x/target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["x/target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["x/target"], None),
+    )];
     let go = s.join("go");
     let hook = |stage: Stage, _: &Path| {
         if stage == Stage::InUse {
@@ -378,7 +456,10 @@ fn a_component_swapped_for_a_symlink_during_the_in_use_proof_removes_nothing_out
     };
     let (_, result, applied) = listed_then_applied(&scratch, &folders, &hook);
     assert_eq!(result, Ok(0), "{applied:?}");
-    assert!(line_for(&applied, &s.join("go/x/target")).ends_with(": its path changed"), "{applied:?}");
+    assert!(
+        line_for(&applied, &s.join("go/x/target")).ends_with(": its path changed"),
+        "{applied:?}"
+    );
     assert!(outside.join("target/secret").exists());
     assert!(outside.join("target/CACHEDIR.TAG").exists());
     assert!(go.join("x.judged/target/debug/x").exists());
@@ -392,7 +473,10 @@ fn a_replacement_after_the_judged_directory_is_opened_is_never_removed() {
     let scratch = Scratch::new("sweep-a58");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let go = s.join("go");
     let replace = || {
         std::fs::rename(go.join("target"), go.join("judged")).expect("move");
@@ -415,13 +499,19 @@ fn a_replacement_after_the_judged_directory_is_opened_is_never_removed() {
     assert!(go.join("target/sentinel").exists());
     assert!(go.join("target/session.jsonl").exists());
     // The judged directory, emptied, under the name it was moved to.
-    assert_eq!(std::fs::read_dir(go.join("judged")).expect("read").count(), 0);
+    assert_eq!(
+        std::fs::read_dir(go.join("judged")).expect("read").count(),
+        0
+    );
 
     // The same replacement after the re-judgement's checks: its path changed.
     let scratch = Scratch::new("sweep-a58b");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let go = s.join("go");
     let hook = |stage: Stage, _: &Path| {
         if stage == Stage::InUse {
@@ -443,7 +533,10 @@ fn a_path_grown_after_the_digest_check_stays_changed_since_the_list() {
     let scratch = Scratch::new("sweep-a59");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let new = s.join("go/target/debug/new");
     let hook = |stage: Stage, _: &Path| {
         if stage == Stage::Digested {
@@ -461,7 +554,10 @@ fn rg_bytes_added_after_the_digest_keep_the_path() {
     let scratch = Scratch::new("sweep-rg-bytes");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let x = s.join("go/target/debug/x");
     let hook = |stage: Stage, _: &Path| {
         if stage == Stage::Digested {
@@ -486,7 +582,10 @@ fn a_transcript_put_in_the_judged_directory_during_removal_is_never_removed() {
     let scratch = Scratch::new("sweep-late-jsonl");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let late = s.join("go/target/debug/late.jsonl");
     let hook = |stage: Stage, _: &Path| {
         if stage == Stage::Opened {
@@ -498,11 +597,17 @@ fn a_transcript_put_in_the_judged_directory_during_removal_is_never_removed() {
     let line = line_for(&applied, &s.join("go/target"));
     assert!(line.starts_with("failed\t"), "{line}");
     assert!(
-        line.ends_with(&format!(": {} is a transcript: it is never removed", late.display())),
+        line.ends_with(&format!(
+            ": {} is a transcript: it is never removed",
+            late.display()
+        )),
         "{line}"
     );
     assert!(late.exists());
-    assert_eq!(applied.last().map(String::as_str), Some("removed 0 build path(s), 0 bytes"));
+    assert_eq!(
+        applied.last().map(String::as_str),
+        Some("removed 0 build path(s), 0 bytes")
+    );
 }
 
 #[test]
@@ -510,7 +615,10 @@ fn excused_processes_are_printed() {
     let scratch = Scratch::new("sweep-excused");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     assert_eq!(EXCUSED, ["(sd-pam)"]);
     Fake::unreadable(7, "(sd-pam)", Some(3)).make(&scratch.proc());
     let (listed, result, applied) = listed_then_applied(&scratch, &folders, &none);
@@ -518,7 +626,10 @@ fn excused_processes_are_printed() {
         "excused\t{}\tprocess 7 (sd-pam): cannot be read, started before the claim",
         s.join("go/target").display()
     );
-    assert_eq!(listed.first().map(String::as_str), Some("unreadable\t7:3\t(sd-pam)"));
+    assert_eq!(
+        listed.first().map(String::as_str),
+        Some("unreadable\t7:3\t(sd-pam)")
+    );
     assert!(listed.contains(&excused), "{listed:?}");
     assert!(line_for(&listed, &s.join("go/target")).starts_with("would-remove\t"));
     assert_eq!(result, Ok(0));
@@ -543,25 +654,40 @@ fn the_in_use_proof_reads_a_proc_of_its_own() {
         for fake in fakes {
             fake.make(&proc);
         }
-        in_use(&target, uid(), created, &snapshot(&proc).expect("snapshot"), excuses)
+        in_use(
+            &target,
+            uid(),
+            created,
+            &snapshot(&proc).expect("snapshot"),
+            excuses,
+        )
     };
     // A cwd, and a mapping of a deleted file.
     assert_eq!(
         proof(&[Fake::readable(10, &target.join("debug"))], &[]),
         Proof::Used("in use: process 10's cwd".to_string())
     );
-    let deleted = format!("{}/debug/deps/libserde_derive.so (deleted)", target.display());
+    let deleted = format!(
+        "{}/debug/deps/libserde_derive.so (deleted)",
+        target.display()
+    );
     let mapping = Fake {
         maps: &[deleted.as_str()],
         ..Fake::readable(11, Path::new("/"))
     };
-    assert_eq!(proof(&[mapping], &[]), Proof::Used("in use: process 11's mapping".to_string()));
+    assert_eq!(
+        proof(&[mapping], &[]),
+        Proof::Used("in use: process 11's mapping".to_string())
+    );
     let fd_path = target.join("debug/x");
     let fd = Fake {
         fds: &[&fd_path],
         ..Fake::readable(12, Path::new("/"))
     };
-    assert_eq!(proof(&[fd], &[]), Proof::Used("in use: process 12's open file".to_string()));
+    assert_eq!(
+        proof(&[fd], &[]),
+        Proof::Used("in use: process 12's open file".to_string())
+    );
     // A near name is not under the path.
     let near_file = near.join("x");
     let near_use = Fake {
@@ -578,28 +704,43 @@ fn the_in_use_proof_reads_a_proc_of_its_own() {
     );
     assert_eq!(
         proof(&[Fake::unreadable(20, "(sd-pam)", Some(150))], &[]),
-        Proof::Used("in use unknown: process 20 ((sd-pam)) of its owner cannot be read".to_string()),
+        Proof::Used(
+            "in use unknown: process 20 ((sd-pam)) of its owner cannot be read".to_string()
+        ),
         "started since the claim"
     );
     assert_eq!(
         proof(&[Fake::unreadable(21, "gpg-agent", Some(50))], &[]),
-        Proof::Used("in use unknown: process 21 (gpg-agent) of its owner cannot be read".to_string()),
+        Proof::Used(
+            "in use unknown: process 21 (gpg-agent) of its owner cannot be read".to_string()
+        ),
         "not listed, started before"
     );
     assert_eq!(
         proof(&[Fake::unreadable(22, "(sd-pam)", None)], &[]),
-        Proof::Used("in use unknown: process 22 ((sd-pam)) of its owner cannot be read".to_string()),
+        Proof::Used(
+            "in use unknown: process 22 ((sd-pam)) of its owner cannot be read".to_string()
+        ),
         "an unknown start"
     );
     // An exact --excuse pair passes; another start does not.
-    assert_eq!(proof(&[Fake::unreadable(21, "gpg-agent", Some(50))], &[(21, 50)]), Proof::Free(Vec::new()));
+    assert_eq!(
+        proof(&[Fake::unreadable(21, "gpg-agent", Some(50))], &[(21, 50)]),
+        Proof::Free(Vec::new())
+    );
     assert!(matches!(
         proof(&[Fake::unreadable(21, "gpg-agent", Some(50))], &[(21, 51)]),
         Proof::Used(_)
     ));
     // A definite use ahead of an unknown one, whatever the order.
     assert_eq!(
-        proof(&[Fake::unreadable(5, "python3", Some(50)), Fake::readable(90, &target)], &[]),
+        proof(
+            &[
+                Fake::unreadable(5, "python3", Some(50)),
+                Fake::readable(90, &target)
+            ],
+            &[]
+        ),
         Proof::Used("in use: process 90's cwd".to_string())
     );
     // Another user's unreadable process is not counted.
@@ -613,9 +754,15 @@ fn the_in_use_proof_reads_a_proc_of_its_own() {
 #[test]
 fn proc_paths_compare_by_component() {
     assert!(under(Path::new("/a/target"), Path::new("/a/target")));
-    assert!(under(Path::new("/a/target/x (deleted)"), Path::new("/a/target")));
+    assert!(under(
+        Path::new("/a/target/x (deleted)"),
+        Path::new("/a/target")
+    ));
     assert!(!under(Path::new("/a/target2"), Path::new("/a/target")));
-    assert!(!under(Path::new("/a/target2 (deleted)"), Path::new("/a/target")));
+    assert!(!under(
+        Path::new("/a/target2 (deleted)"),
+        Path::new("/a/target")
+    ));
     assert_eq!(
         mapped(b"7f00-7f10 r-xp 00000000 fd:01 1234      /a/b c.so (deleted)"),
         Some(PathBuf::from("/a/b c.so (deleted)"))
@@ -631,7 +778,10 @@ fn the_unreadable_listing_is_of_this_uid_only() {
     let scratch = Scratch::new("sweep-listing");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     Fake::unreadable(40, "gpg-agent", Some(9)).make(&scratch.proc());
     Fake::unreadable(41, "python3", Some(10)).make(&scratch.proc());
     Fake {
@@ -643,9 +793,19 @@ fn the_unreadable_listing_is_of_this_uid_only() {
     assert_eq!(result, Ok(0));
     assert_eq!(listed[0], "excuse\t41:10\tpython3");
     assert_eq!(listed[1], "unreadable\t40:9\tgpg-agent");
-    assert!(listed.iter().all(|line| !line.contains("other")), "{listed:?}");
-    assert!(line_for(&listed, &s.join("go/target")).contains("in use unknown: process 40 (gpg-agent)"));
-    let (result, listed) = run(&scratch, &folders, &["--excuse", "41:10", "--excuse", "40:9"], &none);
+    assert!(
+        listed.iter().all(|line| !line.contains("other")),
+        "{listed:?}"
+    );
+    assert!(
+        line_for(&listed, &s.join("go/target")).contains("in use unknown: process 40 (gpg-agent)")
+    );
+    let (result, listed) = run(
+        &scratch,
+        &folders,
+        &["--excuse", "41:10", "--excuse", "40:9"],
+        &none,
+    );
     assert_eq!(result, Ok(0));
     assert!(line_for(&listed, &s.join("go/target")).starts_with("would-remove\t"));
     for stale in ["41:11", "42:11", "43:1"] {
@@ -674,18 +834,23 @@ fn the_real_proc_sees_this_process_open_file() {
         .filter(|process| process.uses.is_none() && process.uid == Some(uid()))
         .filter_map(|process| Some((process.pid, process.start?)))
         .collect();
-    let unknown_start = procs
-        .list
-        .iter()
-        .any(|process| process.uses.is_none() && process.uid == Some(uid()) && process.start.is_none());
+    let unknown_start = procs.list.iter().any(|process| {
+        process.uses.is_none() && process.uid == Some(uid()) && process.start.is_none()
+    });
     if !unknown_start {
-        assert_eq!(in_use(&fresh, uid(), now(), &procs, &excuses), Proof::Free(Vec::new()));
+        assert_eq!(
+            in_use(&fresh, uid(), now(), &procs, &excuses),
+            Proof::Free(Vec::new())
+        );
     }
     let _held = std::fs::File::create(fresh.join("held")).expect("open");
     let procs = snapshot(Path::new("/proc")).expect("/proc");
     assert_eq!(
         in_use(&fresh, uid(), now(), &procs, &excuses),
-        Proof::Used(format!("in use: process {}'s open file", std::process::id()))
+        Proof::Used(format!(
+            "in use: process {}'s open file",
+            std::process::id()
+        ))
     );
 }
 
@@ -697,11 +862,21 @@ fn the_digest_is_of_what_would_go_and_the_excuses() {
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
     folder_with(&s.join("notl"), "target");
-    let go = (s.join("go"), claim(&s.join("go"), "1/007", &["target"], None));
-    let notl = (s.join("notl"), claim(&s.join("notl"), "1/008", &["target"], None));
+    let go = (
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    );
+    let notl = (
+        s.join("notl"),
+        claim(&s.join("notl"), "1/008", &["target"], None),
+    );
     let (_, alone) = run(&scratch, std::slice::from_ref(&go), &[], &none);
     let (_, both) = run(&scratch, &[go.clone(), notl], &[], &none);
-    assert_eq!(digest_of(&alone), digest_of(&both), "what stays is not in it");
+    assert_eq!(
+        digest_of(&alone),
+        digest_of(&both),
+        "what stays is not in it"
+    );
     let rows: Vec<String> = alone
         .iter()
         .filter(|line| line.starts_with("would-remove\t"))
@@ -728,14 +903,23 @@ fn the_digest_is_of_what_would_go_and_the_excuses() {
         )
     );
     assert_eq!(digest_of(&alone), digest(&rows, &[]));
-    assert_ne!(digest(&rows, &[]), digest(&rows, &[(1, 2)]), "the excuses are in it");
+    assert_ne!(
+        digest(&rows, &[]),
+        digest(&rows, &[(1, 2)]),
+        "the excuses are in it"
+    );
     assert_ne!(digest(&rows, &[]), digest(&[], &[]));
     assert_eq!(
         digest(&[], &[]),
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
     Fake::unreadable(41, "python3", Some(10)).make(&scratch.proc());
-    let (_, excused) = run(&scratch, std::slice::from_ref(&go), &["--excuse", "41:10"], &none);
+    let (_, excused) = run(
+        &scratch,
+        std::slice::from_ref(&go),
+        &["--excuse", "41:10"],
+        &none,
+    );
     assert_eq!(digest_of(&excused), digest(&rows, &[(41, 10)]));
 }
 
@@ -758,7 +942,10 @@ fn a_same_size_replacement_or_a_new_claim_between_runs_is_another_digest() {
     let apply = ["--apply", "--expect-digest", first.as_str()];
     let (result, lines) = run(&scratch, &folders, &apply, &none);
     let error = result.expect_err("another directory");
-    assert!(error.starts_with("the list is not the one read (its digest is now "), "{error}");
+    assert!(
+        error.starts_with("the list is not the one read (its digest is now "),
+        "{error}"
+    );
     assert!(error.ends_with("); nothing removed"));
     assert!(lines.is_empty());
     assert!(go.join("target/debug/x").exists());
@@ -769,7 +956,11 @@ fn a_same_size_replacement_or_a_new_claim_between_runs_is_another_digest() {
     std::fs::write(go.join(OWNER_FILE), again.line()).expect("claimed again");
     let folders = vec![(s.join("go"), again)];
     let (result, _) = run(&scratch, &folders, &apply, &none);
-    assert!(result.expect_err("a new claim").contains("is not the one read"));
+    assert!(
+        result
+            .expect_err("a new claim")
+            .contains("is not the one read")
+    );
     assert!(go.join("target/debug/x").exists());
 }
 
@@ -778,10 +969,18 @@ fn apply_with_a_digest_not_of_the_list_removes_nothing() {
     let scratch = Scratch::new("sweep-wrong-digest");
     let s = scratch.0.join("s");
     folder_with(&s.join("go"), "target");
-    let folders = vec![(s.join("go"), claim(&s.join("go"), "1/007", &["target"], None))];
+    let folders = vec![(
+        s.join("go"),
+        claim(&s.join("go"), "1/007", &["target"], None),
+    )];
     let empty = digest(&[], &[]);
     for wrong in ["0000", empty.as_str()] {
-        let (result, lines) = run(&scratch, &folders, &["--apply", "--expect-digest", wrong], &none);
+        let (result, lines) = run(
+            &scratch,
+            &folders,
+            &["--apply", "--expect-digest", wrong],
+            &none,
+        );
         assert!(result.expect_err(wrong).contains("is not the one read"));
         assert!(lines.is_empty());
         assert!(s.join("go/target/debug/x").exists());
@@ -792,8 +991,16 @@ fn apply_with_a_digest_not_of_the_list_removes_nothing() {
 fn the_arguments() {
     let parse = |words: &[&str]| args(&words.iter().map(ToString::to_string).collect::<Vec<_>>());
     assert_eq!(parse(&[]), Ok(Args::default()));
-    assert!(parse(&["--apply"]).expect_err("alone").contains("go together"));
-    assert!(parse(&["--expect-digest", "ab"]).expect_err("alone").contains("go together"));
+    assert!(
+        parse(&["--apply"])
+            .expect_err("alone")
+            .contains("go together")
+    );
+    assert!(
+        parse(&["--expect-digest", "ab"])
+            .expect_err("alone")
+            .contains("go together")
+    );
     assert_eq!(
         parse(&["--apply", "--expect-digest", "ab", "--excuse", "7:3"]),
         Ok(Args {
@@ -810,7 +1017,10 @@ fn the_arguments() {
     );
     for bad in ["7", "7:", ":3", "a:3", "7:3:1", "-7:3", "7: 3"] {
         assert!(parse(&["--excuse", bad]).is_err(), "{bad}");
-        assert!(parse(&["--apply", "--expect-digest", "ab", "--excuse", bad]).is_err(), "{bad}");
+        assert!(
+            parse(&["--apply", "--expect-digest", "ab", "--excuse", bad]).is_err(),
+            "{bad}"
+        );
     }
     assert!(parse(&["--excuse"]).is_err());
     assert!(parse(&["--apply", "--apply", "--expect-digest", "ab"]).is_err());
