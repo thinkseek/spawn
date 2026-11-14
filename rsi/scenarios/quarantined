@@ -1,0 +1,7 @@
+# Scenarios the owner knows are broken: the gate does not run them as regressions and names them in
+# every gate's log and verdict (scripts/rsi/gate.sh, "quarantined"). Each entry says why and until when.
+# 156: depends on the time of day. Its queue headings carry only HH:MM (date -u) and the reader dates
+# them by the 12 h wrap rule, so the same main passed at 17:49Z (gate of 007563ed) and failed on both
+# base and candidate at 19:3xZ on 2026-11-14 (task 403, validator defect). Until objective 195 makes
+# 156.sh independent of the hour it runs at (the lead, 2026-11-15).
+156.sh
