@@ -1943,6 +1943,110 @@ language sql stable as $$
       from (select spawn_principal() as p) x
 $$;
 
+-- The commit map of a history rewrite (objective 173). The owner rewrites
+-- the history of a source (git filter-repo: every changed commit gets a new
+-- id) while the event log keeps the old ids, so every reader that compares
+-- a recorded id with git reads it through the map: `spawn commit-map load`
+-- loads filter-repo's commit-map once (`spawn_commit_map_load`, owner only),
+-- and `spawn_commit_now` reads a recorded id as the commit it is now. `old`
+-- is the commit before the rewrite, `new` the one after it (null: the
+-- rewrite dropped it). The map is never changed: a statement trigger
+-- refuses every update, delete and truncate, and a load is either the
+-- first or exactly the pairs loaded already.
+create table if not exists spawn_commit_map (
+    old text primary key check (old ~ '^[0-9a-f]{40}$'),
+    new text check (new ~ '^[0-9a-f]{40}$')
+);
+revoke all on spawn_commit_map from public;
+
+create or replace function spawn_commit_map_unchanged() returns trigger
+language plpgsql as $$
+begin
+    raise exception 'the commit map is never changed (objective 173): % refused', lower(tg_op)
+        using errcode = '42501';
+end $$;
+drop trigger if exists spawn_commit_map_unchanged on spawn_commit_map;
+create trigger spawn_commit_map_unchanged
+    before update or delete or truncate on spawn_commit_map
+    for each statement execute function spawn_commit_map_unchanged();
+
+-- A recorded commit id as the commit it is now: the map's `new` for an id
+-- the map names (any case; null for a dropped commit), otherwise the id
+-- itself. Null stays null. Every reader and fold that compares a recorded
+-- id (a baseline, a base, a request's commit, a move's from and to) reads
+-- it through this, both sides alike.
+create or replace function spawn_commit_now(p_commit text) returns text
+language sql stable security definer as $$
+    select case when p_commit is null then null
+                else coalesce((select array[m.new] from spawn_commit_map m
+                                where m.old = lower(p_commit)),
+                              array[p_commit])[1] end
+$$;
+do $$
+begin
+    execute format('alter function spawn_commit_now(text) set search_path = %I, pg_temp',
+                   current_schema());
+end
+$$;
+
+-- Load filter-repo's commit map (owner only): `p_pairs` a non-empty array
+-- of `[old, new]` pairs, each old 40 hex characters, each new 40 hex or null
+-- (a dropped commit), no old twice. On an empty map it inserts them and
+-- returns how many; given exactly the pairs loaded already it returns that
+-- count and changes nothing; any other map is refused: a map is loaded once
+-- and never changed. The table is locked, so two loads never both insert.
+create or replace function spawn_commit_map_load(p_pairs jsonb) returns integer
+language plpgsql security definer as $$
+declare
+    v_loaded integer;
+    v_given integer;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner loads the commit map' using errcode = '42501';
+    end if;
+    if jsonb_typeof(p_pairs) is distinct from 'array' or jsonb_array_length(p_pairs) = 0 then
+        raise exception 'a commit map is a non-empty array of [old, new] pairs';
+    end if;
+    if exists (select 1 from jsonb_array_elements(p_pairs) p
+                where jsonb_typeof(p) is distinct from 'array'
+                   or jsonb_array_length(p) <> 2
+                   or jsonb_typeof(p -> 0) is distinct from 'string'
+                   or lower(p ->> 0) !~ '^[0-9a-f]{40}$'
+                   or (jsonb_typeof(p -> 1) is distinct from 'null'
+                       and (jsonb_typeof(p -> 1) is distinct from 'string'
+                            or lower(p ->> 1) !~ '^[0-9a-f]{40}$'))) then
+        raise exception 'a commit map pair is [old, new]: old 40 hex characters, new 40 hex characters or null (a dropped commit)';
+    end if;
+    if (select count(distinct lower(p ->> 0)) from jsonb_array_elements(p_pairs) p)
+       <> jsonb_array_length(p_pairs) then
+        raise exception 'a commit map names each old commit once';
+    end if;
+    lock table spawn_commit_map in exclusive mode;
+    v_given := jsonb_array_length(p_pairs);
+    select count(*) into v_loaded from spawn_commit_map;
+    if v_loaded = 0 then
+        insert into spawn_commit_map (old, new)
+        select lower(p ->> 0), lower(p ->> 1) from jsonb_array_elements(p_pairs) p;
+        return v_given;
+    end if;
+    if v_loaded = v_given
+       and not exists (select 1 from jsonb_array_elements(p_pairs) p
+                        where not exists (select 1 from spawn_commit_map m
+                                           where m.old = lower(p ->> 0)
+                                             and m.new is not distinct from lower(p ->> 1))) then
+        return v_loaded;
+    end if;
+    raise exception 'a different commit map is loaded (% pairs): a map is loaded once and never changed',
+                    v_loaded;
+end $$;
+do $$
+begin
+    execute format('alter function spawn_commit_map_load(jsonb) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_commit_map_load(jsonb) from public';
+end
+$$;
+
 -- Closure: whether a task may be in `p_state`, given its mission's state,
 -- whether the mission has a gate, and its resident's state (null for an
 -- ephemeral worker). The one rule that closing a mission, retiring a
@@ -2100,7 +2204,10 @@ begin
                                                           else scenario_floor end,
                                     scenario_names = case when p_record ? 'request' then null
                                                           else scenario_names end
-         where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
+         where sources ->> 0 = p_record ->> 'source'
+           -- Both read through the commit map (objective 173): a baseline
+           -- recorded before a history rewrite is the commit it is now.
+           and spawn_commit_now(baseline) = spawn_commit_now(p_record ->> 'from')
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
@@ -2326,14 +2433,16 @@ begin
                -- controller's count, and must not raise the floor the landing
                -- started again. A `stale` one on the baseline counts as before.
                scenario_floor = case
-                   when baseline is null or baseline = p_record ->> 'base'
+                   when baseline is null
+                        or spawn_commit_now(baseline) = spawn_commit_now(p_record ->> 'base')
                        then greatest(scenario_floor,
                                      coalesce((p_record ->> 'scenarios')::integer, 0))
                    else scenario_floor end,
                -- The names of the gating that set the floor: the latest at
                -- it (one at the floor with other names replaces them).
                scenario_names = case
-                   when (baseline is null or baseline = p_record ->> 'base')
+                   when (baseline is null
+                         or spawn_commit_now(baseline) = spawn_commit_now(p_record ->> 'base'))
                         and p_record ? 'scenarios'
                         and (p_record ->> 'scenarios')::integer >= scenario_floor
                         and (p_record ->> 'scenarios')::integer > 0
@@ -3805,10 +3914,14 @@ begin
            and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.halted'
            and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text
          order by e.id desc limit 1) halt on true
-     where m.sources ->> 0 = p_source and m.baseline = p_from
+     where m.sources ->> 0 = p_source
+       -- Through the commit map (objective 173): a baseline or a halt
+       -- recorded before a history rewrite names the commit it is now.
+       and spawn_commit_now(m.baseline) = spawn_commit_now(p_from)
        and (m.halted is null
             or (halt.r ->> 'cause' = 'main_moved' and halt.r ->> 'source' = p_source
-                and halt.r ->> 'from' = p_from and halt.r ->> 'to' = p_to));
+                and spawn_commit_now(halt.r ->> 'from') = spawn_commit_now(p_from)
+                and spawn_commit_now(halt.r ->> 'to') = spawn_commit_now(p_to)));
     v_count := jsonb_array_length(v_missions) + jsonb_array_length(v_cleared);
     perform spawn_control_record(jsonb_build_object(
         'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
@@ -4184,7 +4297,8 @@ begin
                 select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
                   from mission_missions m
                  where m.sources ->> 0 = p_record ->> 'source'
-                   and m.baseline = p_record ->> 'from' and m.halted is null),
+                   and spawn_commit_now(m.baseline) = spawn_commit_now(p_record ->> 'from')
+                   and m.halted is null),
                 -- No baseline yet: a gate of theirs judging against the old
                 -- main would make it their first one, and halt them at the
                 -- next pass. They take the new main instead.
@@ -4419,7 +4533,8 @@ begin
               join mission_missions own on m.sources ->> 0 = own.sources ->> 0 and m.id <> own.id
               join mission_tasks k on k.mission_id = own.id
              where k.id = (p_record ->> 'id')::bigint
-               and m.baseline = p_record ->> 'from' and m.halted is null));
+               and spawn_commit_now(m.baseline) = spawn_commit_now(p_record ->> 'from')
+               and m.halted is null));
     end if;
     -- A done mission's work still lands, but nothing new comes for it: a
     -- landing that keeps going stale (its worker never pushes again, main
