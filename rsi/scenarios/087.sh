@@ -29,6 +29,12 @@
 #       (count: the fact files whose `red_since` is set). Each is null
 #       without its record or files. State and range as for every figure.
 #   (2) coreLinesView over the answer gives the row its tones.
+#   Since objective 176 (the owner's core metric set): the newest database
+#   copy's age is a guardrail of the sustainability line, after
+#   restores_passed, needs_you_right and unpriced_share; the bundle's age,
+#   the nightly's age and its reds are alert figures (`alert_figures`, line
+#   sustainability), on no card row. Their values, ranges and states are
+#   as above.
 #
 # The history: database copies 1.5 h and 0.5 h before "now", one bundle 30 h
 # before; two fact files, spawn (green, judged 3 h ago) and supply (red,
@@ -247,11 +253,14 @@ if [ "$code" != 200 ]; then
     check_failed "(1) GET /api/core-lines answered $code: $(head -c 200 "$WORK/api.json")"
     printf '{}' >"$WORK/api.json"
 else
-    rec() { jq -c ".lines[] | select(.line == \"recoverability\") | $1" "$WORK/api.json"; }
-    figure() { rec "([.north_star] + .guardrails)[] | select(.key == \"$1\")"; }
-    expect_eq "$(rec '[.north_star.key] + [.guardrails[].key]')" \
-        '["recoverability.restores_passed","recoverability.cloud_dump_age","recoverability.cloud_bundle_age","recoverability.nightly_age","recoverability.nightly_red"]' \
-        "(1) the recoverability line's north star and guardrails, in order"
+    # Objective 176: the sustainability line's guardrails and the alert figures.
+    figure() { jq -c "([.lines[] | select(.line == \"sustainability\") | .north_star, .guardrails[]] + (.alert_figures // []))[] | select(.key == \"$1\")" "$WORK/api.json"; }
+    expect_eq "$(jq -c '[.lines[] | select(.line == "sustainability") | .guardrails[].key | select(startswith("recoverability."))]' "$WORK/api.json")" \
+        '["recoverability.restores_passed","recoverability.cloud_dump_age"]' \
+        "(1) the sustainability line's recoverability guardrails, in order"
+    expect_eq "$(jq -c '[(.alert_figures // [])[] | select(.key | startswith("recoverability.")) | [.line, .key]]' "$WORK/api.json")" \
+        '[["sustainability","recoverability.cloud_bundle_age"],["sustainability","recoverability.nightly_age"],["sustainability","recoverability.nightly_red"]]' \
+        "(1) the recoverability alert figures, under sustainability"
     # The north star's value is the drills' objective's (B3): only its key is
     # this line's, and 084 holds "not collected exactly when no value".
     # An age is read at the answer: at least seed_now less the record's
@@ -268,7 +277,7 @@ else
     age recoverability.nightly_age "$supply_judged" '{"max":93600000}' out "(1) the oldest nightly judging (supply, 30 h), out of its range of 26 h or less; the log beside it is no fact"
     expect_eq "$(figure recoverability.nightly_red | jq -c '{unit, value, range, state}')" \
         '{"unit":"count","value":1,"range":{"max":0},"state":"out"}' "(1) one source held red (supply), out of its range of none"
-    note "(1) checked: the recoverability line"
+    note "(1) checked: the recoverability figures"
 fi
 
 # --- (2) the card ---------------------------------------------------------------------------
@@ -283,12 +292,16 @@ const env = process.env;
 const { coreLinesView } = await import(pathToFileURL(`${env.BB_TREE}/web/src/coreLines.ts`).href);
 const answer = JSON.parse(readFileSync(`${env.BB_WORK}/api.json`, "utf8"));
 
-test("(2) the recoverability row over the answer", () => {
+test("(2) the sustainability row over the answer (objective 176)", () => {
   assert.ok(Array.isArray(answer.lines), "GET /api/core-lines answered");
-  const row = coreLinesView(answer).rows.find((r) => r.line === "Recoverability");
-  assert.deepEqual(row.guardrails.map((mark) => [mark.range, mark.tone]), [
-    ["2 h or less", "plain"], ["26 h or less", "warning"], ["26 h or less", "warning"], ["0 or less", "warning"],
-  ]);
+  const rows = coreLinesView(answer).rows;
+  const row = rows.find((r) => r.line === "Sustainability");
+  const dump = row.guardrails.find((mark) => mark.name === "Age of the newest database copy");
+  assert.deepEqual([dump.range, dump.tone], ["2 h or less", "plain"]);
+  const names = rows.flatMap((r) => [r.north_star, ...r.guardrails]).map((mark) => mark.name);
+  for (const alertOnly of ["Age of the newest bundle", "Age of the oldest nightly judging", "Nightly sources held red"]) {
+    assert.ok(!names.includes(alertOnly), `${alertOnly} is an alert figure, on no row`);
+  }
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/lines.test.mjs" >"$WORK/lines.out" 2>&1; then
@@ -301,5 +314,5 @@ if [ -s "$WORK/failures" ]; then
     echo "087: $(wc -l <"$WORK/failures") check(s) failed" >&2
     exit 1
 fi
-echo "087: the Core lines recoverability line gives the cloud backup ages and the nightly's age and reds"
+echo "087: Core lines gives the cloud backup ages and the nightly's age and reds"
 exit 0

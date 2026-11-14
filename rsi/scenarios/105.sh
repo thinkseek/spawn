@@ -282,7 +282,8 @@ expect_eq "$calls" 3 "(1) systemctl calls for one reading (one per unit row: the
 note "(1) checked: each row's newest drill"
 
 # --- (2) the north star --------------------------------------------------------------------------
-got=$(jq -c '.lines[] | select(.line == "recoverability") | .north_star | {key, value}' "$WORK/api.json")
+# Objective 176: restores passed is guardrail U1 of the sustainability line.
+got=$(jq -c '.lines[] | select(.line == "sustainability") | .guardrails[] | select(.key == "recoverability.restores_passed") | {key, value}' "$WORK/api.json")
 expect_eq "$got" '{"key":"recoverability.restores_passed","value":2}' \
     "(2) the north star counts only the rows passed in 7 days whose newest drill did not fail (Transcript archive, Session files)"
 note "(2) checked: the north star"

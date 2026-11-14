@@ -230,7 +230,8 @@ code=$(get /api/core-lines "$WORK/api.json")
 if [ "$code" != 200 ]; then
     check_failed "(3) GET /api/core-lines answered $code: $(head -c 200 "$WORK/api.json")"
 else
-    got=$(jq -c '.lines[] | select(.line == "observability") | .guardrails[] | select(.key == "observability.interventions_per_agent_hour") | {value, window}' "$WORK/api.json")
+    # Objective 176: the sustainability line's north star.
+    got=$(jq -c '.lines[] | select(.line == "sustainability") | .north_star | select(.key == "observability.interventions_per_agent_hour") | {value, window}' "$WORK/api.json")
     expect_eq "$got" '{"value":0.286,"window":"24h"}' \
         "(3) Core lines' human interventions per agent-hour, the pause and its release included"
     note "(3) checked: Core lines"

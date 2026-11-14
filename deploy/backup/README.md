@@ -17,7 +17,7 @@ the drill's test.
 | --- | --- |
 | Bucket | `spawn-store`, account q1293822641@gmail.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
 | Format | dumps: `pg_dump -Fc` (compression `SPAWN_BACKUP_DUMP_COMPRESS`, default `zstd:9`) and `gpg --symmetric` AES-256; bundles: a tar (zstd) of `manifest.json`, `repos/*.bundle` and `transcripts/`, the same `gpg` passphrase |
-| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
+| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below), `spawn-backup-restore-drill-missions.timer` (daily 05:45, `spawn backup restore-drill --only missions`, objective 186: the mission repositories alone, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
 | Records | every run writes a `backup.dumped`, `backup.bundled` or `backup.verified` control record (owner-only `spawn_backup_record`); the tiers, the bundle's base and the plausibility check are read from them, never from a state file |
 | Settings | `SPAWN_BACKUP_KEY_FILE`, `SPAWN_R2_ENV_FILE`, `SPAWN_BACKUP_R2_LIMIT_MB` (10000), `SPAWN_BACKUP_R2_ALERT_MB` (8000), `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14), `SPAWN_BACKUP_DRILL_DATABASE_URL` (the drill's disposable server), `SPAWN_BACKUP_PREFIX` (empty in the fleet; a test run's `locktest/`) |
 
@@ -211,6 +211,22 @@ systemctl --user daemon-reload
 systemctl --user enable --now spawn-backup-restore-drill.timer
 ```
 
+The mission repositories' drill (objective 186) runs on its own, daily at
+05:45: `spawn backup restore-drill --only missions` unpacks from each bundle
+only `manifest.json` and `repos/*`, never a transcript, so its scratch
+directory holds no transcript and is removed whole; it records
+`backup.drilled.missions` alone. It reads R2 with the bundle's own
+credentials (`SPAWN_R2_ENV_FILE`), GET only: no read-only token is on this
+host (that one is the Mac's, for a restore on a new machine). Once 186 has
+landed and is deployed:
+
+```sh
+install -m 644 deploy/systemd/spawn-backup-restore-drill-missions.service \
+  deploy/systemd/spawn-backup-restore-drill-missions.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-backup-restore-drill-missions.timer
+```
+
 `SPAWN_BACKUP_DRILL_DATABASE_URL` must be in `spawn.env` before the drill
 timer is enabled: a disposable server (the fleet's test database), never the
 live one. The drill refuses without it, by name, and touches nothing.
@@ -255,7 +271,7 @@ pass `git bundle verify` in an empty repository (an increment's
 prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
 
-`spawn backup restore-drill [--into <dir>] [--keep]` (core (ii); by hand,
+`spawn backup restore-drill [--into <dir>] [--keep] [--only missions]` (core (ii); by hand,
 attended, by the lead; daily from `spawn-backup-restore-drill.timer` at 05:30
 once 149b has passed and landed, see above)
 restores the sources and the transcript archive themselves, not only opens

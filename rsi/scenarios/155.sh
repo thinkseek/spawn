@@ -248,7 +248,8 @@ ask() { # the answer into $WORK/api.json
     code=$(curl -s --noproxy '*' -o "$WORK/api.json" -w '%{http_code}' "http://127.0.0.1:$port/api/core-lines" 2>/dev/null) || code=000
     [ "$code" = 200 ] || harness "GET /api/core-lines answered $code: $(head -c 300 "$WORK/api.json")"
 }
-fig() { jq -c ".lines[] | select(.line == \"storage\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\") | .value" "$WORK/api.json"; }
+# Objective 176: scratch nobody owns is a storage diagnostic.
+fig() { jq -c "(.diagnostics // [])[] | select(.key == \"$1\") | .value" "$WORK/api.json"; }
 
 # --- (1) a large root within a tight bound ---------------------------------------------------------
 lines "{\"scratch_roots\": [\"$S\"], \"scratch_bound\": {\"entries\": 900, \"ms\": 30000}}"

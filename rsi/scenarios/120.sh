@@ -160,7 +160,8 @@ const core: CoreLinesAnswer = {
       guardrails: [{ key: "perf.guard", name: "Made-up guard", unit: "count", value: 3, range: { max: 5 }, state: "in", trend: [] }],
     },
     {
-      line: "recoverability",
+      // Objective 176: the drills show under the sustainability row.
+      line: "sustainability",
       north_star: {
         key: "rec.age", name: "Made-up restore age", unit: "days", value: null, range: { max: 2 }, state: "not_collected",
         measuring_since_ms: now - 3 * 24 * H,

@@ -28,6 +28,9 @@
 #       0. The card draws the points as a small line beside each figure
 #       (read off a screenshot: no check here reads the page's source).
 #       coreLinesView's marks stay as 084 says them.
+#   Since objective 176 (the owner's core metric set) free disk is an alert
+#   figure (`alert_figures`), and every figure means those of the lines,
+#   the alert figures and the diagnostics alike.
 #
 # The history: host.core_lines samples of free disk at fixed UTC days: 8
 # days ago (outside the window), 6 days ago (100 GiB), 3 days ago (110
@@ -343,14 +346,14 @@ if [ "$code" != 200 ]; then
     printf '{}' >"$WORK/api.json"
 else
     # Today's point is the loop's sample, or a later one of this loop.
-    trend=$(jq -c '[.lines[] | ([.north_star] + .guardrails)[] | select(.key == "storage.free_bytes") | .trend][0]' "$WORK/api.json")
+    trend=$(jq -c '[(.lines[] | ([.north_star] + .guardrails)[]), (.alert_figures // [])[] | select(.key == "storage.free_bytes") | .trend][0]' "$WORK/api.json")
     expect_eq "$(printf '%s' "$trend" | jq -c '.[:3]')" \
         "[{\"day\":\"$(day $((midnight - 6 * D)))\",\"value\":$((100 * GIB))},{\"day\":\"$(day $((midnight - 3 * D)))\",\"value\":$((110 * GIB))},{\"day\":\"$(day $((midnight - D)))\",\"value\":$((120 * GIB))}]" \
         "(2) free disk's trend: one point a day of the last 7, that day's last sample (yesterday's 120 GiB, not its 999), nothing from 8 days ago"
     expect_eq "$(printf '%s' "$trend" | jq -c --arg d "$(day "$now_ms")" '.[3:] | map(.day) | unique')" "[\"$(day "$now_ms")\"]" \
         "(2) free disk's trend: today's point from this loop's sample"
     expect_eq "$(printf '%s' "$trend" | jq -c '.[3].value | type')" '"number"' "(2) today's point has a value"
-    expect_eq "$(jq -c '[.lines[] | ([.north_star] + .guardrails)[] | select((.trend | type) != "array") | .key]' "$WORK/api.json")" '[]' \
+    expect_eq "$(jq -c '[(.lines[] | ([.north_star] + .guardrails)[]), (.alert_figures // [])[], (.diagnostics // [])[] | select((.trend | type) != "array") | .key]' "$WORK/api.json")" '[]' \
         "(2) every figure carries a trend (a list, empty without samples)"
     note "(2) checked: the answer"
 fi
@@ -385,7 +388,8 @@ test("(3) the change, in words", () => {
 
 test("(3) over the answer: free disk's points", () => {
   assert.ok(Array.isArray(answer.lines), "GET /api/core-lines answered");
-  const free = answer.lines.find((line) => line.line === "storage").guardrails.find((f) => f.key === "storage.free_bytes");
+  // Objective 176: free disk is an alert figure.
+  const free = (answer.alert_figures ?? []).find((f) => f.key === "storage.free_bytes");
   assert.deepEqual(view(free.trend).points.slice(0, 3), [100 * GIB, 110 * GIB, 120 * GIB]);
 });
 TEST
