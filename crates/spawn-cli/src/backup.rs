@@ -108,7 +108,7 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
 
-const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]";
+const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions]";
 
 /// One `postgres://` URL, read the way libpq reads it (scripts/pg-url.sh):
 /// user and password percent-decoded, an IPv6 host in brackets, a socket
