@@ -7,12 +7,18 @@
 //! experience views' (`spawn_interventions`), which the scorecard's autonomy
 //! counts the same; each command's outcome is as it stood before `until`.
 //! Hours and the ratio to 3 decimals, rounded as the scorecard rounds.
+//!
+//! When the ranges file names the queue (objective 156), lead-mac's posts
+//! in it within the window are the owner's interventions too, kinds
+//! `owner_decision` and `steering` (`queue_posts`), placed by the wall clock
+//! among the store's items, newest first.
 
 use serde_json::{Map, Value, json};
 use spawn_postgres::PostgresStore;
 
 use super::Failure;
 use super::measure::{Number, Window, ratio_milli};
+use super::queue_posts;
 use super::time::{DAY_MS, HOUR_MS, parse_rfc3339};
 
 /// The windows this answer knows, by name.
@@ -20,6 +26,9 @@ pub(crate) const WINDOWS: [(&str, i64); 2] = [("24h", DAY_MS), ("7d", 7 * DAY_MS
 
 /// The kinds of intervention, as the scorecard names them.
 const KINDS: [&str; 4] = ["command", "resume", "owner_task", "cancel_reassign"];
+
+/// The kinds of the owner's posts in the queue, said when it is named.
+const QUEUE_KINDS: [&str; 2] = ["owner_decision", "steering"];
 
 /// The window `window` (24h when absent) ending at `until` (an RFC 3339
 /// instant; `now` when absent). Any other window, or an `until` that is no
@@ -59,10 +68,30 @@ fn milli(numerator: i64, denominator: i64) -> Value {
 
 /// The answer for `window` (named `name`) from the store.
 pub(crate) fn measure(store: &PostgresStore, name: &str, window: Window) -> Result<Value, Failure> {
-    let read = store
+    let mut read = store
         .interventions_window(window.since, window.until)
         .map_err(|error| Failure::Record(error.to_string()))?;
-    Ok(answer(&read, name, window))
+    let Some(settings) = crate::serve::core_lines::queue_settings() else {
+        return Ok(answer(&read, name, window));
+    };
+    let posts = queue_posts::read(&settings, window, crate::verify::now_ms());
+    with_posts(&mut read, posts);
+    let mut answer = answer(&read, name, window);
+    if let Some(by_kind) = answer["by_kind"].as_object_mut() {
+        for kind in QUEUE_KINDS {
+            by_kind.entry(kind).or_insert(json!(0));
+        }
+    }
+    Ok(answer)
+}
+
+/// The queue's posts added to the store's items, all newest first (the
+/// store's order kept on ties, its items before the posts).
+fn with_posts(read: &mut Value, posts: Vec<Value>) {
+    let mut items: Vec<Value> = read["items"].as_array().cloned().unwrap_or_default();
+    items.extend(posts);
+    items.sort_by_key(|item| std::cmp::Reverse(item["at_ms"].as_i64().unwrap_or(i64::MIN)));
+    read["items"] = Value::Array(items);
 }
 
 /// The answer from the store's read of `window`: `{agent_ms, items}`.
@@ -146,6 +175,7 @@ mod tests {
                 {"kind": "command", "attempts": 2, "commands": [3, 4]},
                 {"kind": "resume", "attempts": null, "commands": []},
                 {"kind": "command", "attempts": 5, "commands": [1, 2, 5, 6, 7]},
+                {"kind": "owner_decision", "attempts": null, "commands": [], "source": "queue"},
             ]
         });
         let window = Window {
@@ -153,15 +183,15 @@ mod tests {
             until: DAY_MS,
         };
         let answer = answer(&read, "24h", window);
-        assert_eq!(answer["total"], 3);
+        assert_eq!(answer["total"], 4);
         assert_eq!(
             answer["by_kind"],
-            json!({"command": 2, "resume": 1, "owner_task": 0, "cancel_reassign": 0})
+            json!({"command": 2, "resume": 1, "owner_task": 0, "cancel_reassign": 0, "owner_decision": 1})
         );
         assert_eq!(answer["retries"], 5);
         assert_eq!(answer["agent_hours"], json!(20.0));
-        assert_eq!(answer["per_agent_hour"], json!(0.15));
-        assert_eq!(answer["items"].as_array().map(Vec::len), Some(3));
+        assert_eq!(answer["per_agent_hour"], json!(0.2));
+        assert_eq!(answer["items"].as_array().map(Vec::len), Some(4));
         let idle = super::answer(&json!({"agent_ms": 0, "items": []}), "24h", window);
         assert_eq!(idle["per_agent_hour"], json!(null));
         assert_eq!(idle["total"], 0);

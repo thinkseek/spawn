@@ -23,6 +23,7 @@ pub(crate) mod fleet;
 mod history;
 pub(crate) mod interventions;
 mod measure;
+pub(crate) mod queue_posts;
 pub(crate) mod time;
 mod transcripts;
 
