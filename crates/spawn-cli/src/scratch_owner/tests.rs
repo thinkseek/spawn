@@ -196,3 +196,21 @@ fn a_claim_is_written_renewed_released_and_never_taken_over_while_it_runs() {
         .collect();
     assert_eq!(leftovers, [OWNER_FILE], "no temporary file is left");
 }
+
+/// The owner file's temporary file is made new (objective 145's (7)): a
+/// symlink at its name is never followed, nor what it names overwritten.
+#[test]
+fn the_temporary_owner_file_is_never_followed() {
+    let scratch = Scratch::new("owner-create-new");
+    let dir = scratch.0.join("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let elsewhere = scratch.0.join("elsewhere");
+    std::fs::write(&elsewhere, "kept").expect("write");
+    let temporary = dir.join(format!("{OWNER_FILE}.{}.tmp", std::process::id()));
+    std::os::unix::fs::symlink(&elsewhere, &temporary).expect("symlink");
+    assert!(claimed(&dir, &["--agent", "a", "--objective", "4/145"], 1_000).is_err());
+    assert_eq!(std::fs::read_to_string(&elsewhere).expect("read"), "kept");
+    assert!(!dir.join(OWNER_FILE).exists());
+    std::fs::remove_file(&temporary).expect("rm");
+    assert!(claimed(&dir, &["--agent", "a", "--objective", "4/145"], 1_000).is_ok());
+}

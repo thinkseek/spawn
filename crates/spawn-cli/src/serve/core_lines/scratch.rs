@@ -524,7 +524,7 @@ pub(super) fn walk(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bound, MARKER, Reason, never_counted, refused_roots, unowned, walk};
+    use super::{Bound, MARKER, Reason, never_counted, refused_roots, sweepable, unowned, walk};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
@@ -953,5 +953,29 @@ mod tests {
                 .all(|name| root.join(name).exists()),
             "nothing removed"
         );
+    }
+
+    /// A claimed folder under a name or in a place the walk never counts is
+    /// never swept (objective 145), whatever the walk's top level allowed.
+    #[test]
+    fn a_folder_the_walk_never_counts_is_never_swept() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("root");
+        let projects = scratch.0.join("projects");
+        let excluded = root.join("sess/kept");
+        for folder in ["sess/deep", "sess/incident-9", "sess/x.pending", "sess/x-pending", "sess/.transcripts", "sess/kept", "projects-link/a"] {
+            std::fs::create_dir_all(root.join(folder)).expect("mkdir");
+        }
+        std::fs::create_dir_all(&projects).expect("mkdir");
+        std::os::unix::fs::symlink(&root.join("projects-link"), projects.join("alias")).expect("symlink");
+        let roots = [root.clone()];
+        let excludes = [excluded];
+        let never = never_counted(&projects.join("alias"));
+        let swept = |folder: &str| sweepable(&root.join(folder), &roots, &excludes, &never);
+        assert!(swept("sess/deep"));
+        for kept in ["sess/incident-9", "sess/x.pending", "sess/x-pending", "sess/.transcripts", "sess/kept", "projects-link/a"] {
+            assert!(!swept(kept), "{kept}");
+        }
+        assert!(!sweepable(&scratch.0.join("elsewhere"), &roots, &excludes, &never), "under no root");
     }
 }
