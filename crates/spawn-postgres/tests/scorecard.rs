@@ -1617,7 +1617,10 @@ fn the_store_names_the_missions_no_deploy_ships() {
         (
             7,
             "done",
-            json!(["/srv/live/missions/flake-doctor.git", "/srv/live/missions/spawn.git"]),
+            json!([
+                "/srv/live/missions/flake-doctor.git",
+                "/srv/live/missions/spawn.git"
+            ]),
         ),
         (9, "active", json!(["/srv/live/missions/flake-doctor.git"])),
         (8, "done", json!(["/srv/live/missions/flake-doctor.git"])),
