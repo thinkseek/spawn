@@ -310,6 +310,12 @@ pub(crate) fn fork_from_prior(
     // (a checkpoint main already holds) is no work to continue.
     sources::refresh(&mirror, &source).map_err(|e| error("refresh main", &e))?;
     let path = mirror.to_string_lossy();
+    // No history from before a rewrite becomes the branch (objective 177).
+    if let Some(reason) = crate::rewrite_guard::why_old(store, &path, &prior.commit)
+        .map_err(|e| error("the commit map", &e))?
+    {
+        return Ok(Fork::Refused(reason));
+    }
     let base = sources::git(&[
         "--git-dir",
         &path,
@@ -432,6 +438,9 @@ pub(crate) enum Fork {
     NoWork,
     /// The agent has no mission source on this host: nothing forked.
     NoSource,
+    /// The commit is from before a history rewrite (objective 177; why):
+    /// nothing forked, the task starts from main.
+    Refused(String),
 }
 
 /// The head of `agent`'s branch on this host, if it has one: what a
@@ -1614,6 +1623,128 @@ mod tests {
             .is_err(),
             "its branch forks from main at the Start"
         );
+        // Objective 177: after a history rewrite, the work by its new commit.
+        fork_reads_the_rewritten_work(&db, second.0, first.0, &work);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `task`'s fork reads `prior`'s `work` by its new commit once the commit
+    /// map names it rewritten (objective 177).
+    fn fork_reads_the_rewritten_work(db: &Db, task: i64, prior: i64, work: &str) {
+        let rewritten = "7".repeat(40);
+        db.store
+            .commit_map_load(&[(work.to_string(), Some(rewritten.clone()))])
+            .expect("the map");
+        assert_eq!(
+            db.store.objective_fork(task).expect("fork"),
+            serde_json::json!({"task": prior, "commit": rewritten})
+        );
+    }
+
+    /// Objective 177: a commit from before a history rewrite is never
+    /// written into a ref. The fork of a predecessor's work the commit map
+    /// names dropped is refused (twice, no branch made, the task starting
+    /// from main, its prompt saying why), and a cancelled task's set-aside
+    /// to a dropped start sets the work aside to the branch's base with main
+    /// (main's tree) instead. Each writer's refusal is one alert.
+    #[test]
+    fn a_commit_from_before_the_rewrite_is_never_written_into_a_ref() {
+        use crate::set_aside::{Done, set_aside};
+        let db = Db::new("rewrite_writers");
+        let (base, source, root, mirror, store) = world("rewrite-writers");
+        let (first, second, _) = reassigned(&db, &store, &mirror, &source, |directory| {
+            std::fs::write(directory.join("work.txt"), "before the rewrite\n").expect("write");
+        });
+        let work = head(&mirror, &first.1);
+        db.store
+            .commit_map_load(&[(work.clone(), None)])
+            .expect("the map drops it");
+        for _ in 0..2 {
+            let mut order = start(&second);
+            let line = crate::dispatch::fork_before_within(&db.store, &root, &mut order, 3_600_000)
+                .expect("not held")
+                .expect("said");
+            assert!(line.contains("refused"), "{line}");
+            assert!(
+                prompt(&order).contains(&format!(
+                    "Task #{}'s last checkpoint (commit {work}) is not continued: the commit \
+                     {work} was dropped by the history rewrite. Your workspace starts from main.",
+                    first.0
+                )),
+                "{}",
+                prompt(&order)
+            );
+        }
+        assert!(
+            git(&[
+                "--git-dir",
+                &mirror.to_string_lossy(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", second.1),
+            ])
+            .is_err(),
+            "no branch made: it forks from main at the Start"
+        );
+
+        let (agent, session) = db.task_on(&source, "rewrite-aside");
+        let workspace = agent_with_work(&store, &agent, |directory| {
+            std::fs::write(directory.join("aside.txt"), "cancelled\n").expect("write");
+        });
+        store.unmount(&workspace).expect("its execution ended");
+        let cancelled = crate::deliver::Cancelled {
+            id: 7,
+            mission_id: 1,
+            agent_id: agent.clone(),
+            session_id: session.clone(),
+            start: Some(work.clone()),
+            set_aside: None,
+            told: false,
+            closed_by: Some("task.cancelled".to_string()),
+            reason: None,
+            yielded: false,
+            yield_reason: None,
+            reassigned_as: None,
+            reassigned_to_session: None,
+        };
+        let done = set_aside(&db.store, &root, &cancelled).expect("set aside");
+        assert!(matches!(done, Done::SetAside { .. }), "{done:?}");
+        let tree = |commit: &str| {
+            git(&[
+                "--git-dir",
+                &mirror.to_string_lossy(),
+                "rev-parse",
+                &format!("{commit}^{{tree}}"),
+            ])
+            .expect("tree")
+        };
+        assert_eq!(
+            tree(&head(&mirror, &agent)),
+            tree(&head(&mirror, "main")),
+            "set aside to main's tree, never the dropped start's"
+        );
+
+        let mut client = postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
+        client
+            .batch_execute(&format!("set search_path to {}", db.schema))
+            .expect("schema");
+        let mut keys: Vec<String> = client
+            .query(
+                "select key from spawn_alerts where kind = 'rewrite_refused'",
+                &[],
+            )
+            .expect("alerts")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        keys.sort();
+        let mut want = vec![
+            format!("rewrite_refused:fork:{}:{work}", second.0),
+            format!("rewrite_refused:set-aside:7:{work}"),
+        ];
+        want.sort();
+        assert_eq!(keys, want);
         let _ = std::fs::remove_dir_all(&base);
     }
 

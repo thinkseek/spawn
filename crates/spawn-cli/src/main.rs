@@ -54,6 +54,7 @@ mod missions;
 mod objectives;
 mod push;
 mod recover;
+mod rewrite_guard;
 mod runtime;
 mod scorecard;
 mod scratch_owner;
