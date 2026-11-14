@@ -446,11 +446,13 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
   const names = new Map<string, string>();
   const diagnostics = Array.isArray(answer?.diagnostics) ? answer.diagnostics : [];
   const alertFigures = Array.isArray(answer?.alert_figures) ? answer.alert_figures : [];
-  for (const line of lines) {
-    const figures = [line?.north_star, ...(Array.isArray(line?.guardrails) ? line.guardrails : [])];
-    for (const figure of [...figures, ...alertFigures, ...diagnostics]) {
-      if (typeof figure?.key === "string" && typeof figure?.name === "string") names.set(figure.key, figure.name);
-    }
+  const figures = [
+    ...lines.flatMap((line) => [line?.north_star, ...(Array.isArray(line?.guardrails) ? line.guardrails : [])]),
+    ...alertFigures,
+    ...diagnostics,
+  ];
+  for (const figure of figures) {
+    if (typeof figure?.key === "string" && typeof figure?.name === "string") names.set(figure.key, figure.name);
   }
   return {
     rows: lines.map((line) => ({
