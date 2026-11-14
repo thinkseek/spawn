@@ -195,29 +195,37 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let seal = match chain_key(&chain) {
         Ok(name) => match reading_key(&name, "the bundle chain") {
             Ok(seal) => seal,
-            Err(reason) => return Ok(fail_both(&store, &records, &reason, started, 2)),
+            Err(reason) => {
+                return Ok(fail_both(&store, &records, &reason, started, 2, resources));
+            }
         },
         Err(ChainKey::Refused(reason)) => {
-            return Ok(fail_both(&store, &records, &reason, started, 2));
+            return Ok(fail_both(&store, &records, &reason, started, 2, resources));
         }
         Err(ChainKey::Crossed(reason)) => {
-            return Ok(unrestorable(&store, &records, &reason, started));
+            return Ok(unrestorable(&store, &records, &reason, started, resources));
         }
     };
     let drill = DrillDir::create(&parent)?;
-    let result = run(&store, &settings, &chain, &seal, drill.path());
+    let result = run(&store, &settings, &chain, &seal, drill.path(), only);
     let newest = chain[chain.len() - 1];
-    let (code, outcomes) = match result {
-        Ok(report) => (said(&report), outcomes(&report)),
+    let (code, outcomes): (i32, Vec<(&str, Outcome)>) = match result {
+        Ok(report) => (
+            said(&report),
+            outcomes(&report)
+                .into_iter()
+                .filter(|(resource, _)| resources.contains(resource))
+                .collect(),
+        ),
         Err(error) => {
             let reason = format!("the backup cannot be restored: {error}");
             println!("restore-drill: FAILED: {reason}");
             (
                 1,
-                [
-                    (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
-                    (MISSIONS, Outcome::Unrestorable(reason)),
-                ],
+                resources
+                    .iter()
+                    .map(|resource| (*resource, Outcome::Unrestorable(reason.clone())))
+                    .collect(),
             )
         }
     };
@@ -240,6 +248,17 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
 const TRANSCRIPTS: &str = "transcripts";
 const MISSIONS: &str = "missions";
 
+/// `--only`'s value: absent, the drill proves both resources (`false`);
+/// `missions`, the mission repositories alone (`true`, objective 186).
+/// Anything else (`transcripts`, an empty value) is refused.
+pub(super) fn only_missions(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(MISSIONS) => Ok(true),
+        Some(_) => Err("--only takes missions alone (the mission repositories)".to_string()),
+    }
+}
+
 /// The longest reason a drill record takes (`spawn_backup_record`).
 const REASON_CHARS: usize = 500;
 
@@ -261,29 +280,34 @@ struct Verdict<'a> {
     duration_ms: i64,
 }
 
-/// A chain that lacks a link: said, and both resources recorded failed
-/// against the newest stored record (`chain_of` found one); exit 1, or 2
-/// when the store refused a record.
+/// A chain that lacks a link: said, and the drilled resources recorded
+/// failed against the newest stored record (`chain_of` found one); exit 1,
+/// or 2 when the store refused a record.
 fn unrestorable(
     store: &spawn_postgres::PostgresStore,
     records: &[BundleRecord],
     reason: &str,
     started: Instant,
+    resources: &[&str],
 ) -> i32 {
     let reason = format!("the backup cannot be restored: {reason}");
-    fail_both(store, records, &reason, started, 1)
+    fail_both(store, records, &reason, started, 1, resources)
 }
 
-/// Both resources recorded failed with `reason`, as it is, against the
-/// newest stored record: exit `code`, or 2 when the store refused a record.
-/// A drill that cannot read its chain (objective 114: a link's key name
-/// refused, the chain key's file not on this host) exits 2 this way.
+/// Each resource the drill proves (both, or the missions alone with
+/// `--only missions`) recorded failed with `reason`, as it is, against the
+/// newest stored record; said once. Exit `code`, or 2 when the store
+/// refused a record. Called for a chain that cannot be restored (exit 1,
+/// through `unrestorable`) and for one that cannot be read (exit 2;
+/// objective 114: a link's key name refused, the chain key's file not on
+/// this host).
 fn fail_both(
     store: &spawn_postgres::PostgresStore,
     records: &[BundleRecord],
     reason: &str,
     started: Instant,
     code: i32,
+    resources: &[&str],
 ) -> i32 {
     let reason = reason.to_string();
     println!("restore-drill: FAILED: {reason}");
@@ -296,11 +320,11 @@ fn fail_both(
         event_id,
         duration_ms: elapsed_ms(started),
     };
-    let both = [
-        (TRANSCRIPTS, Outcome::Unrestorable(reason.clone())),
-        (MISSIONS, Outcome::Unrestorable(reason)),
-    ];
-    record_verdicts(store, &verdict, &both).unwrap_or(code)
+    let failed: Vec<(&str, Outcome)> = resources
+        .iter()
+        .map(|resource| (*resource, Outcome::Unrestorable(reason.clone())))
+        .collect();
+    record_verdicts(store, &verdict, &failed).unwrap_or(code)
 }
 
 /// Why a chain has no one key to be read with.
@@ -682,19 +706,27 @@ struct Report {
 }
 
 /// Fetch, check and unpack every bundle of the chain, restore, compare.
+/// With `only` (`--only missions`), each bundle's manifest and repository
+/// bundles alone are unpacked, through a pipe, and the transcripts are
+/// neither unpacked nor restored nor compared.
 fn run(
     store: &spawn_postgres::PostgresStore,
     settings: &Settings,
     chain: &[&BundleRecord],
     seal: &Key,
     drill: &Path,
+    only: bool,
 ) -> Result<Report, String> {
     let newest = chain[chain.len() - 1];
     let mut unpacked: Vec<(PathBuf, Value)> = Vec::new();
     for (index, record) in chain.iter().enumerate() {
         let here = drill.join(format!("bundle-{index}"));
         fs::create_dir(&here).map_err(|error| format!("{}: {error}", here.display()))?;
-        let manifest = fetch_bundle(settings, record, seal, &here)?;
+        let manifest = if only {
+            fetch_missions(settings, record, seal, &here)?
+        } else {
+            fetch_bundle(settings, record, seal, &here)?
+        };
         unpacked.push((here.join("unpacked"), manifest));
     }
     let key = bundle_key(newest);
@@ -713,6 +745,28 @@ fn run(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    if only {
+        lines.push(format!(
+            "restore-drill: chain {chain_text}: {} bundle(s) fetched, decrypted in a pipe, \
+             sha256 as recorded; manifest.json and repos/* alone unpacked",
+            chain.len()
+        ));
+        let mut unknown = Vec::new();
+        let found = Found {
+            lines: &mut lines,
+            mismatches: &mut missions,
+            unknown: &mut unknown,
+        };
+        restore_repos(store, newest, &unpacked, drill, found)?;
+        return Ok(Report {
+            key,
+            event_id: newest.event_id,
+            lines,
+            transcripts: mismatches,
+            missions,
+            unknown,
+        });
+    }
     lines.push(format!(
         "restore-drill: chain {chain_text}: {} bundle(s) fetched, sha256 as recorded, decrypted",
         chain.len()
@@ -872,20 +926,7 @@ fn fetch_bundle(
 ) -> Result<Value, String> {
     let key = record.record["keys"][0].as_str().unwrap_or_default();
     let expected = record.record["sha256"].as_str().unwrap_or_default();
-    let Some((bytes, headers)) = get_object_bytes(settings, key)? else {
-        return Err(format!("the bucket does not hold {key}"));
-    };
-    if let Some(meta) = header_value(&headers, "x-amz-meta-sha256")
-        && meta != expected
-    {
-        return Err(format!(
-            "{key}'s x-amz-meta-sha256 {meta} is not the record's {expected}"
-        ));
-    }
-    same_key(&seal.name, &object_key(key, &headers)?)?;
-    let encrypted = here.join("bundle.gpg");
-    fs::write(&encrypted, &bytes).map_err(|error| format!("{}: {error}", encrypted.display()))?;
-    drop(bytes);
+    let encrypted = fetch_ciphertext(settings, record, seal, here)?;
     let raw = here.join("bundle.raw");
     decrypt_with(seal, &encrypted, &raw)?;
     let found = sha256_file(&raw)?;
