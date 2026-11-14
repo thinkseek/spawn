@@ -79,6 +79,9 @@ export interface Alert {
    * "cleared" when its condition cleared it, else the owner's verdict
    * ("false", "stale" or "duplicate", `spawn alert judge`). */
   outcome?: string | null;
+  /** A task's or mission's notice that its subject's next one follows:
+   * that one's key (objective 151, the notice fold); null otherwise. */
+  superseded_by?: string | null;
 }
 
 export interface Execution {
@@ -281,6 +284,7 @@ export function normalizeAlerts(value: unknown): Alert[] {
       cleared_evidence: alert.cleared_evidence ?? null,
       text: text(alert.text),
       outcome: optionalText(alert.outcome),
+      superseded_by: optionalText(alert.superseded_by),
     };
   });
 }
