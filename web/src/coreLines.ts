@@ -104,7 +104,9 @@ export interface CoreClaimed {
   objective: string;
   created_ms: number;
   lease_until_ms: number;
-  bytes: number;
+  /** Its bytes; null while its lease runs (never walked whole, objective
+   * 155). */
+  bytes: number | null;
   /** Its build paths' bytes, reached through real directories only. */
   build_bytes: number;
   /** Whether its objective landed; null when the store was not read. */
