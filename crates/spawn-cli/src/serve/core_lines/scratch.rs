@@ -1184,4 +1184,227 @@ mod tests {
             "under no root"
         );
     }
+
+    fn many(dir: &Path, count: usize) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        for n in 0..count {
+            std::fs::write(dir.join(format!("f{n}")), b"x").expect("write");
+        }
+    }
+
+    fn names(found: &super::Walk, root: &Path) -> Vec<(String, u64, Reason)> {
+        let mut unowned: Vec<(String, u64, Reason)> = found
+            .unowned
+            .iter()
+            .map(|entry| {
+                let name = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+                (name.display().to_string(), entry.bytes, entry.reason)
+            })
+            .collect();
+        unowned.sort();
+        unowned
+    }
+
+    /// Objective 155 (a), (b): a root that fits 60 entries only because a
+    /// folder whose lease runs is walked by its build path and a fresh one
+    /// stops at its own change; with the lease ended, the same root runs
+    /// over the bound.
+    #[test]
+    fn a_running_lease_and_a_fresh_folder_are_never_walked_whole() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("root");
+        let now = ms(SystemTime::now());
+        let old = SystemTime::now() - Duration::from_hours(48);
+        many(&root.join("held/data"), 200);
+        fill(&root.join("held/t/target/x"), 3000);
+        claim(&root.join("held"), "rev-e", now - 10, now + 3_600_000, &["t/target"]);
+        many(&root.join("fresh/data"), 200);
+        fill(&root.join("idle/a"), 600);
+        age(&root.join("held"), old);
+        age(&root.join("fresh/data"), old);
+        age(&root.join("idle"), old);
+        let runs = |_: u32, _: u64| false;
+        let bound = Bound {
+            entries: 60,
+            time: Duration::from_secs(30),
+        };
+        let found = walk(std::slice::from_ref(&root), &[], &[], now, &runs, bound)
+            .expect("within 60 entries");
+        assert_eq!(names(&found, &root), [("idle".to_string(), 600, Reason::Idle)]);
+        assert_eq!(found.claimed.len(), 1);
+        assert_eq!(found.claimed[0].bytes, None, "never walked whole");
+        assert_eq!(found.claimed[0].build_bytes, 3000);
+        // The lease ended: walked whole, nobody's, and over the same bound.
+        let over = walk(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            now + 7_200_000,
+            &runs,
+            bound,
+        );
+        assert!(
+            over.as_ref().is_err_and(|why| why.contains("ran over")),
+            "{over:?}"
+        );
+        let whole = walk(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            now + 7_200_000,
+            &runs,
+            Bound::DEFAULT,
+        )
+        .expect("a walk");
+        assert!(
+            whole
+                .unowned
+                .iter()
+                .any(|entry| entry.path.ends_with("held") && entry.reason == Reason::LeaseEnded),
+            "{whole:?}"
+        );
+    }
+
+    /// Objective 155 (d): roots /x and /x/ccd, with the inner root excluded
+    /// and without: /x/b, /x/ccd/a and /x/ccd/c are each counted once, and
+    /// an exclude inside the inner root still holds.
+    #[test]
+    fn a_root_inside_a_root_is_its_own_and_counted_once() {
+        let scratch = Scratch::new();
+        let x = scratch.0.join("x");
+        let ccd = x.join("ccd");
+        fill(&x.join("b/f"), 50);
+        fill(&ccd.join("a/f"), 7);
+        fill(&ccd.join("c/f"), 11);
+        fill(&ccd.join("kept/f"), 13);
+        let runs = |_: u32, _: u64| false;
+        let far = i64::MAX / 2;
+        let roots = [x.clone(), ccd.clone()];
+        let want = [
+            ("b".to_string(), 50, Reason::Idle),
+            ("ccd/a".to_string(), 7, Reason::Idle),
+            ("ccd/c".to_string(), 11, Reason::Idle),
+        ];
+        for excludes in [vec![ccd.clone(), ccd.join("kept")], vec![ccd.join("kept")]] {
+            let found = walk(&roots, &excludes, &[], far, &runs, Bound::DEFAULT).expect("a walk");
+            assert_eq!(names(&found, &x), want, "excludes {excludes:?}");
+            assert!(refused_roots(&roots, &excludes).is_empty());
+        }
+        // The inner root alone, its exclude held.
+        let found = walk(
+            std::slice::from_ref(&ccd),
+            &[ccd.join("kept")],
+            &[],
+            far,
+            &runs,
+            Bound::DEFAULT,
+        )
+        .expect("a walk");
+        assert_eq!(names(&found, &x), want[1..]);
+    }
+
+    /// Objective 155 (b), R2: a session folder (unmarked, unclaimed, holding
+    /// a running claim one level below) is no entry; each of its other
+    /// children is its own: old-tree and loose (a file) idle, gone (a dead
+    /// marker) gone, ended (a lease ended) lease ended; fresh is its
+    /// maker's; the leased one is listed, never walked whole.
+    #[test]
+    fn a_session_folder_hides_none_of_its_unclaimed_children() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("root");
+        let sess = root.join("sess");
+        let now = ms(SystemTime::now());
+        let old = SystemTime::now() - Duration::from_hours(48);
+        fill(&sess.join("o/z"), 500);
+        claim(&sess.join("o"), "rev-e", now - 10, now + 3_600_000, &[]);
+        fill(&sess.join("old-tree/f"), 1000);
+        fill(&sess.join("loose"), 20);
+        fill(&sess.join("gone/f"), 30);
+        std::fs::write(sess.join("gone").join(MARKER), "42 100\n").expect("marker");
+        fill(&sess.join("ended/f"), 40);
+        let ended = claim(&sess.join("ended"), "rev-b", now - 20, now - 1, &[]);
+        age(&sess, old);
+        fill(&sess.join("fresh/f"), 50);
+        let runs = |pid: u32, _: u64| pid == 41;
+        let found = walk(
+            std::slice::from_ref(&root),
+            &[],
+            &[],
+            now,
+            &runs,
+            Bound::DEFAULT,
+        )
+        .expect("a walk");
+        assert_eq!(
+            names(&found, &root),
+            [
+                ("sess/ended".to_string(), 40 + ended, Reason::LeaseEnded),
+                ("sess/gone".to_string(), 30 + 7, Reason::Gone),
+                ("sess/loose".to_string(), 20, Reason::Idle),
+                ("sess/old-tree".to_string(), 1000, Reason::Idle),
+            ]
+        );
+        let mut claimed: Vec<(String, Option<u64>)> = found
+            .claimed
+            .iter()
+            .map(|folder| {
+                let name = folder.path.strip_prefix(&root).expect("in the root");
+                (name.display().to_string(), folder.bytes)
+            })
+            .collect();
+        claimed.sort();
+        assert_eq!(
+            claimed,
+            [
+                ("sess/ended".to_string(), Some(40 + ended)),
+                ("sess/o".to_string(), None),
+            ]
+        );
+    }
+
+    /// Objective 155 (d), R2: an exclude that holds a root refuses that
+    /// root, said, and it counts nothing; an exclude equal to the root
+    /// refuses nothing.
+    #[test]
+    fn an_exclude_above_a_root_refuses_it_and_says_so() {
+        let scratch = Scratch::new();
+        let n = scratch.0.join("n");
+        let ccd = n.join("ccd");
+        fill(&ccd.join("x/f"), 7);
+        let runs = |_: u32, _: u64| false;
+        let far = i64::MAX / 2;
+        let refused = refused_roots(std::slice::from_ref(&ccd), std::slice::from_ref(&n));
+        assert_eq!(
+            refused,
+            [(
+                ccd.clone(),
+                format!(
+                    "exclude {} hides root {}: a root under an exclude is never read",
+                    n.display(),
+                    ccd.display()
+                )
+            )]
+        );
+        let found = walk(
+            std::slice::from_ref(&ccd),
+            std::slice::from_ref(&n),
+            &[],
+            far,
+            &runs,
+            Bound::DEFAULT,
+        )
+        .expect("a walk");
+        assert!(found.unowned.is_empty(), "{found:?}");
+        assert!(refused_roots(std::slice::from_ref(&ccd), std::slice::from_ref(&ccd)).is_empty());
+        let found = walk(
+            std::slice::from_ref(&ccd),
+            std::slice::from_ref(&ccd),
+            &[],
+            far,
+            &runs,
+            Bound::DEFAULT,
+        )
+        .expect("a walk");
+        assert_eq!(names(&found, &n), [("ccd/x".to_string(), 7, Reason::Idle)]);
+    }
 }
