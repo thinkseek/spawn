@@ -4189,7 +4189,10 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let later_ms = bundle_name("incr", at + 1, "tar.zst", "00000000");
         let same_ms = bundle_name("incr", at, "tar.zst", "00000001");
         assert_ne!(first, later_ms, "one second, two names");
-        assert_ne!(first, same_ms, "one millisecond, named apart by the random part");
+        assert_ne!(
+            first, same_ms,
+            "one millisecond, named apart by the random part"
+        );
         // Times that cross millisecond widths, a second, an hour and a day,
         // their random parts descending: the names sort as the times.
         let times = [
