@@ -83,6 +83,7 @@ macro_rules! lost_before_ready {
 mod acks;
 mod alerts;
 mod command_queue;
+mod commit_map;
 mod cost;
 mod event_log;
 mod experience;

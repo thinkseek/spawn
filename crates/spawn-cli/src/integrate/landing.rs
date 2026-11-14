@@ -312,13 +312,15 @@ pub(super) fn land(
     task: &Task,
 ) -> Result<Landing, String> {
     let (Some(base), Some(candidate)) = (task.base.as_deref(), task.candidate.as_deref()) else {
-        return record(
-            store,
-            &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
-                    "revision": task.revisions,
-                    "inputs": inputs::known(task.base.as_deref(), task.candidate.as_deref())}),
-        )
-        .map(|()| Landing::Stale);
+        let mut stale = json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                               "revision": task.revisions,
+                               "inputs": inputs::known(task.base.as_deref(), task.candidate.as_deref())});
+        // A candidate the commit map names dropped is read as none
+        // (objective 173): said so, never pushed.
+        if task.base.is_some() && store.commit_map_size().map_err(|error| error.to_string())? > 0 {
+            stale["reason"] = json!(DROPPED_CANDIDATE);
+        }
+        return record(store, &stale).map(|()| Landing::Stale);
     };
     // Held until the landing is recorded: dropping the mission waits for it,
     // and so does an owner's hold (an owner's landing takes the lock on a
@@ -339,6 +341,19 @@ pub(super) fn land(
         .map_err(|error| error.to_string())?
     {
         return land_held(store, mirror, source, task, (base, candidate), hold);
+    }
+    // A candidate off its base's line is never pushed (objective 173): after
+    // a history rewrite the base reads as its new commit, and a candidate
+    // merged on the old history would bring it back onto main.
+    if let Some(reason) = foreign(mirror, source, base, candidate)? {
+        println!("integrate: task {}: {reason}; judging again", task.id);
+        return record(
+            store,
+            &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                    "revision": task.revisions, "reason": reason,
+                    "inputs": inputs::known(Some(base), Some(candidate))}),
+        )
+        .map(|()| Landing::Stale);
     }
     let mirror_path = mirror.to_string_lossy().to_string();
     let (branch, _) = source_head(source)?;
@@ -400,6 +415,60 @@ pub(super) fn land(
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
     Ok(Landing::Landed)
+}
+
+/// Why a stale landing's candidate is none: the history rewrite dropped it
+/// (objective 173).
+pub(super) const DROPPED_CANDIDATE: &str =
+    "the candidate was dropped by the history rewrite (the commit map names it dropped)";
+
+/// Why `candidate` must not be pushed onto main at `base`, if it must not
+/// (objective 173): a landing's candidate is a merge whose first parent is
+/// its base, so it descends from it, unless the base is read through the
+/// commit map of a history rewrite and the candidate was merged on the old
+/// history. A base or candidate the mirror does not hold is fetched once; a
+/// base still unknown is named so, and a candidate still unknown says
+/// nothing here (its push fails as before). A fetch that fails decides
+/// nothing (an error).
+pub(super) fn foreign(
+    mirror: &Path,
+    source: &str,
+    base: &str,
+    candidate: &str,
+) -> Result<Option<String>, String> {
+    let mirror_path = mirror.to_string_lossy();
+    let known = |commit: &str| {
+        git(&[
+            "--git-dir",
+            &mirror_path,
+            "cat-file",
+            "-e",
+            &format!("{commit}^{{commit}}"),
+        ])
+        .is_ok()
+    };
+    if !known(base) || !known(candidate) {
+        sources::refresh(mirror, source)?;
+        if !known(base) {
+            return Ok(Some(format!(
+                "the base {base} is an unknown commit (in neither the commit map nor the source)"
+            )));
+        }
+        if !known(candidate) {
+            return Ok(None);
+        }
+    }
+    let descends = git(&[
+        "--git-dir",
+        &mirror_path,
+        "merge-base",
+        "--is-ancestor",
+        base,
+        candidate,
+    ])
+    .is_ok();
+    Ok((!descends)
+        .then(|| format!("the candidate {candidate} does not descend from its base {base}")))
 }
 
 /// [`land`] on a source the owner holds (`hold`, read under the landing
@@ -620,4 +689,81 @@ pub(super) fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Opti
         .iter()
         .filter(|other| other.id != mission.id && other.source == mission.source)
         .find_map(|other| other.in_flight().map(|task| (other.id, task.id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::foreign;
+    use crate::sources::test_git as git;
+
+    /// Objective 173: a landing's candidate descends from its base (a merge
+    /// whose first parent is the base); one off the base's line, as a
+    /// candidate merged on the history before a rewrite is off its base's
+    /// new commit, is named why, and so is a base neither the mirror nor the
+    /// source holds.
+    #[test]
+    fn a_landing_candidate_that_does_not_descend_from_its_base_is_named_why() {
+        let base = std::env::temp_dir().join(format!("spawn-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("file"), "m0\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "m0");
+        let m0 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m0");
+        std::fs::write(seed.join("file"), "m1\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "m1");
+        let m1 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m1");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("source");
+        let mirror = base.join("mirror.git");
+        let mirror_path = mirror.to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &source, &mirror_path]).expect("mirror");
+        // The candidate: a merge on m0 in the mirror, off m1's line.
+        let tree = git(&[
+            "--git-dir",
+            &mirror_path,
+            "rev-parse",
+            &format!("{m0}^{{tree}}"),
+        ])
+        .expect("tree");
+        let off = git(&[
+            "--git-dir",
+            &mirror_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            &tree,
+            "-p",
+            &m0,
+            "-m",
+            "merged on m0",
+        ])
+        .expect("candidate");
+
+        assert_eq!(
+            foreign(&mirror, &source, &m0, &m1),
+            Ok(None),
+            "m1 descends from m0"
+        );
+        assert_eq!(foreign(&mirror, &source, &m0, &off), Ok(None));
+        assert_eq!(
+            foreign(&mirror, &source, &m1, &off),
+            Ok(Some(format!(
+                "the candidate {off} does not descend from its base {m1}"
+            )))
+        );
+        let unknown = "f".repeat(40);
+        assert_eq!(
+            foreign(&mirror, &source, &unknown, &off),
+            Ok(Some(format!(
+                "the base {unknown} is an unknown commit (in neither the commit map nor the \
+                 source)"
+            )))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

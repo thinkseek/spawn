@@ -425,14 +425,15 @@ select jsonb_build_object(
 /// first source (the one it lands on: `sources ->> 0`, as the integrator's
 /// `gated_missions` reads it, so the alert and the wait judge one source)
 /// and the owner's latest landing on
-/// that source (`landed`: the latest `source.moved` record's `to`, or
-/// null).
+/// that source (`landed`: the latest `source.moved` record's `to`, read
+/// through the commit map (objective 173), or null).
 pub(crate) const CONTROLLERS: &str = r"
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
                                  'mission', m.id, 'gate', m.gate, 'source', m.sources ->> 0,
-                                 'landed', (select e.kind #>> '{detail,record,to}'
+                                 'landed', (select spawn_commit_now(
+                                                       e.kind #>> '{detail,record,to}')
                                               from spawn_events e
                                              where e.session_id = 'session_control'
                                                and e.event_name = 'control.recorded'
