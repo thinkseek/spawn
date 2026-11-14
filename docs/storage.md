@@ -959,7 +959,10 @@ bytes over its `log_bytes`), `storage.test_database_bytes` (the largest
 readable test database) and `storage.test_database_schemas` (the most test
 schemas). The performance line (objective 086) gives the pages' figures:
 its north star `performance.report_to_live` (the Scorecard's fleet value
-over its default 7 days), then `performance.gate_time` (the gate time's
+over its default 7 days; with a mission's live landing it carries
+`by_mission`, each mission with one as `{mission, value, n,
+live_at_landing}` by mission, `value` null below the Scorecard's minimum,
+objective 159), then `performance.gate_time` (the gate time's
 median), `performance.decided_nothing` (the gate time's `undecided_ms` over
 its `total_ms`, a share; null when the total is 0), `performance.first_pass`
 and `performance.usd_per_landing` (`/api/cost?window=7d`). A value the page

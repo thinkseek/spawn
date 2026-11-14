@@ -67,6 +67,9 @@ pub(crate) struct Counts {
     /// (objective 081). A landing with no report counts in neither.
     pub(crate) report_to_live_ms: Vec<i64>,
     pub(crate) not_live: usize,
+    /// How many of the live landings were live when they landed (objective
+    /// 159: no deploy ships their mission's source).
+    pub(crate) live_at_landing: usize,
     /// Where report to live is measured from (objective 095): the later of
     /// the window's start and the live record's; `None` with no deploy
     /// record. `live_covered`: the record starts at or before the window.
@@ -148,7 +151,10 @@ pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts 
             counts.first_pass += usize::from(landing.first_pass);
             match (landing.report_to_live_ms, landing.reported_at) {
                 _ if !seen(landing.at) => {}
-                (Some(ms), _) => counts.report_to_live_ms.push(ms),
+                (Some(ms), _) => {
+                    counts.report_to_live_ms.push(ms);
+                    counts.live_at_landing += usize::from(landing.live_when_landed);
+                }
                 (None, Some(_)) => counts.not_live += 1,
                 (None, None) => {}
             }
@@ -402,7 +408,9 @@ fn lead_time(counts: &Counts, enough: bool) -> Dimension {
 /// figures). Enough at [`MIN_N`] live landings. Only landings at or after
 /// the live record's start count (objective 095): `measured_from_ms` is
 /// where the window's measuring starts (null with no deploy record), and
-/// `covered` whether the record covers the whole window.
+/// `covered` whether the record covers the whole window. `live_at_landing`
+/// is how many of the live landings were live when they landed (objective
+/// 159: a landing on a source no deploy ships).
 fn report_to_live(counts: &Counts) -> Dimension {
     let live = counts.report_to_live_ms.len();
     let rank = |percent| {
@@ -415,6 +423,7 @@ fn report_to_live(counts: &Counts) -> Dimension {
     let mut parts = Map::new();
     parts.insert("p90".into(), number(rank(90)));
     parts.insert("not_live".into(), usize_json(counts.not_live));
+    parts.insert("live_at_landing".into(), usize_json(counts.live_at_landing));
     parts.insert(
         "measured_from_ms".into(),
         counts.live_measured_from.map_or(Value::Null, Value::from),

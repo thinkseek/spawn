@@ -35,6 +35,33 @@ export interface CoreFigure {
   /** What a judged share is read from (objective 148: "Needs you is
    * right", the needs fired in 7 days), said after its name. */
   judged?: CoreJudged;
+  /** Each mission's figure beside the fleet's (objective 159: the
+   * performance north star's report to live by mission), by mission;
+   * absent when no mission has a live landing. */
+  by_mission?: CoreMissionFigure[];
+}
+
+/** One mission's report to live (objective 159): its median (null below
+ * the Scorecard's minimum), how many of its landings are live, and how many
+ * of those were live when they landed (no deploy ships its source). */
+export interface CoreMissionFigure {
+  mission: number;
+  value: number | null;
+  n: number;
+  live_at_landing: number;
+}
+
+/** A mission's report to live on the card. */
+export interface CoreMissionMark {
+  /** "mission <id>". */
+  name: string;
+  /** "<span> (<n> live)", or "<n> live, too few for a median" without a
+   * value; then " · live when landed (no deploy ships it)" when every live
+   * landing was. */
+  text: string;
+  /** "muted" when every live landing was live when it landed (its figure
+   * is no deploy's wait), else "plain". */
+  tone: "plain" | "muted";
 }
 
 /** The needs a judged share is read from: fired, judged and not. */
@@ -174,6 +201,9 @@ export interface CoreLinesView {
   /** Scratch by owner (objective 140): each claimed folder, as the answer
    * lists them; empty when none is claimed. */
   scratch: CoreScratchMark[];
+  /** Report to live by mission (objective 159): the performance line's
+   * north star `by_mission`, in words; empty without it. */
+  byMission: CoreMissionMark[];
 }
 
 const WEEK_MS = 7 * 86_400_000;
@@ -224,6 +254,21 @@ export function scratchMark(raw: Partial<CoreClaimed> | null | undefined, now: n
     text: parts.join(" · "),
     tone: raw?.landed === true && !leased ? "warning" : "plain",
     detail: typeof raw?.path === "string" ? raw.path : "",
+  };
+}
+
+/** A mission's report to live in words (objective 159). */
+export function missionMark(raw: Partial<CoreMissionFigure> | null | undefined): CoreMissionMark {
+  const mission = finite(raw?.mission);
+  const value = finite(raw?.value);
+  const n = finite(raw?.n) ?? 0;
+  const atLanding = finite(raw?.live_at_landing) ?? 0;
+  const live = value === null ? `${n} live, too few for a median` : `${spanWords(value)} (${n} live)`;
+  const landed = n > 0 && atLanding === n;
+  return {
+    name: `mission ${mission === null ? "?" : mission}`,
+    text: landed ? `${live} · live when landed (no deploy ships it)` : live,
+    tone: landed ? "muted" : "plain",
   };
 }
 
@@ -396,6 +441,11 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
     scratch: (Array.isArray(answer?.scratch?.claimed) ? answer.scratch.claimed : []).map((claimed) =>
       scratchMark(claimed, now),
     ),
+    byMission: (() => {
+      const performance = lines.find((line) => line?.line === "performance");
+      const byMission = performance?.north_star?.by_mission;
+      return Array.isArray(byMission) ? byMission.map(missionMark) : [];
+    })(),
   };
 }
 

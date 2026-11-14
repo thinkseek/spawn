@@ -161,12 +161,21 @@ pub(crate) fn measure(
             .map_err(|error| Failure::Record(error.to_string()))?,
     };
     let window = window(since, until, now)?;
-    let facts: Facts = serde_json::from_value(
+    let mut facts: Facts = serde_json::from_value(
         store
             .scorecard_facts(window.until)
             .map_err(|error| Failure::Record(error.to_string()))?,
     )
     .map_err(|error| Failure::Record(format!("the record's facts: {error}")))?;
+    // The missions no deploy ships (objective 159): read beside the facts,
+    // never kept with them; their landings are live when they land.
+    let undeployed = store
+        .scorecard_undeployed_missions()
+        .map_err(|error| Failure::Record(error.to_string()))?;
+    facts.undeployed_missions = Some(
+        serde_json::from_value(undeployed)
+            .map_err(|error| Failure::Record(format!("the missions no deploy ships: {error}")))?,
+    );
     let previous_since = window.since - (window.until - window.since);
     let archive = root.join(spawn_host::TRANSCRIPT_DIRECTORY);
     // Where the archive stands is read before the archive: a copy recorded

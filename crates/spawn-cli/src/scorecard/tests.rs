@@ -186,6 +186,7 @@ impl Story {
             commands: self.commands.clone(),
             owner_runs_from_ms: None,
             live_from_ms: None,
+            undeployed_missions: None,
         };
         History::from_record(&facts, &self.messages)
     }
@@ -1236,6 +1237,119 @@ fn report_to_live_runs_from_the_last_report_to_the_deploy_that_ships_it() {
     );
 }
 
+/// Objective 159: a landing of a mission no deploy ships is live when it
+/// lands, its wait running to its landing, and counts in `live_at_landing`;
+/// the deploys before and after it change nothing. A deployed mission's
+/// landings still wait for the first ok deploy at or after them, and one
+/// with no deploy since is not live. Facts read without the set, or with
+/// none in it, keep the old reading.
+#[test]
+fn a_landing_no_deploy_ships_is_live_when_it_lands() {
+    let minutes = |m: i64| at(0) + m * 60_000;
+    let deployed = |story: &mut Story, m: i64| {
+        story.rec(
+            minutes(m),
+            json!({"type": "deploy.finished", "ok": true, "head": "h"}),
+        );
+    };
+    let mut story = Story::default();
+    story.mission(4, true).mission(9, true);
+    // The live record began long before, with a deploy.
+    story.rec(
+        minutes(-6000),
+        json!({"type": "deploy.finished", "ok": false, "head": "h"}),
+    );
+    for (task, mission) in [(41, 4), (42, 4), (43, 4), (91, 9), (92, 9)] {
+        story.assign(minutes(1), task, mission, None, "spawn-integrate");
+    }
+    // A deploy before mission 9's landings.
+    deployed(&mut story, 10);
+    // T41 (mission 4): reported 20, landed 40, deploy at 50: 30 min.
+    // T91 (mission 9): reported 25, landed 27: 2 min (the old reading: to
+    // the deploy at 50, 25 min).
+    story
+        .task(41, "task.reported", minutes(20))
+        .task(91, "task.reported", minutes(25))
+        .task(91, "task.landed", minutes(27))
+        .task(41, "task.landed", minutes(40));
+    deployed(&mut story, 50);
+    // T92 (mission 9): reported 60, landed 65: 5 min (old: to 130, 70 min).
+    // T42 (mission 4): reported 80, landed 100, deploy at 130: 50 min.
+    story
+        .task(92, "task.reported", minutes(60))
+        .task(92, "task.landed", minutes(65))
+        .task(42, "task.reported", minutes(80))
+        .task(42, "task.landed", minutes(100));
+    deployed(&mut story, 130);
+    // T43 (mission 4): landed after the last deploy: not live.
+    story
+        .task(43, "task.reported", minutes(140))
+        .task(43, "task.landed", minutes(150));
+    let read = |undeployed: Option<&[i64]>| {
+        let facts = Facts {
+            control: story.control.clone(),
+            commands: Vec::new(),
+            owner_runs_from_ms: None,
+            live_from_ms: None,
+            undeployed_missions: undeployed.map(|ids| ids.iter().copied().collect()),
+        };
+        History::from_record(&facts, &[])
+    };
+    let rtl = |history: &History, scope: Scope| {
+        let d = dimension(
+            &counts(history, scope, window_hours(0, 24)),
+            None,
+            "report_to_live",
+        );
+        json!({"value": d["value"], "n": d["n"], "not_live": d["not_live"],
+               "live_at_landing": d["live_at_landing"]})
+    };
+    let history = read(Some(&[9]));
+    let at_landing: Vec<(i64, Option<i64>, bool)> = history
+        .landings
+        .iter()
+        .map(|landing| {
+            (
+                landing.task,
+                landing.report_to_live_ms,
+                landing.live_when_landed,
+            )
+        })
+        .collect();
+    assert_eq!(
+        at_landing,
+        vec![
+            (91, Some(2 * 60_000), true),
+            (41, Some(30 * 60_000), false),
+            (92, Some(5 * 60_000), true),
+            (42, Some(50 * 60_000), false),
+            (43, None, false),
+        ]
+    );
+    // The fleet: 2, 5, 30, 50; median 5 min.
+    assert_eq!(
+        rtl(&history, Scope::Fleet),
+        json!({"value": 300_000, "n": 4, "not_live": 1, "live_at_landing": 2})
+    );
+    assert_eq!(
+        rtl(&history, Scope::Mission(4)),
+        json!({"value": null, "n": 2, "not_live": 1, "live_at_landing": 0})
+    );
+    assert_eq!(
+        rtl(&history, Scope::Mission(9)),
+        json!({"value": null, "n": 2, "not_live": 0, "live_at_landing": 2})
+    );
+    // The old reading: mission 9's landings wait for Spawn's deploys (25
+    // and 70 min); 25, 30, 50, 70: median 30 min.
+    for undeployed in [None, Some(&[][..])] {
+        assert_eq!(
+            rtl(&read(undeployed), Scope::Fleet),
+            json!({"value": 1_800_000, "n": 4, "not_live": 1, "live_at_landing": 0}),
+            "undeployed: {undeployed:?}"
+        );
+    }
+}
+
 /// Objective 095: report to live counts only the landings the live record
 /// can see. The record begins at the first `deploy.finished` of any outcome
 /// (a failed one too); a landing before it is neither live nor not live,
@@ -1330,6 +1444,7 @@ fn report_to_live_counts_only_landings_from_the_live_records_start() {
         commands: Vec::new(),
         owner_runs_from_ms: None,
         live_from_ms: Some(minutes(-60)),
+        undeployed_missions: None,
     };
     let read = History::from_record(&facts, &[]);
     assert_eq!(read.live_from, Some(minutes(-60)));
