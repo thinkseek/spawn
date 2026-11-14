@@ -784,8 +784,7 @@ enum Removal {
 }
 
 fn id_of(stat: &rustix::fs::Stat) -> (u64, u64) {
-    #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
-    (stat.st_dev as u64, stat.st_ino as u64)
+    (stat.st_dev, stat.st_ino)
 }
 
 fn open_dir(at: impl AsFd, name: &OsStr) -> rustix::io::Result<OwnedFd> {
