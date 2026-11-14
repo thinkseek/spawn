@@ -9282,6 +9282,156 @@ fn the_controller_behind_alert_fires_once_and_clears_after_the_deploy() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Objective 178, through the real store and `spawn_commit_map`: the
+/// controller deployed before a history rewrite is `controllers/spawn-<old>`,
+/// an id the rewritten source does not hold; the commit map reads it as m0.
+/// The owner lands past m0: the task waits for the deploy (read through
+/// the map, the controller is behind), starting no gate. Switched to a
+/// controller whose commit the rewrite dropped, the task is judged (an
+/// unknown controller is never a wait) and accepted.
+#[test]
+fn a_controller_from_before_the_rewrite_holds_the_task_through_the_map() {
+    let marks = fresh_marks("spawn-controller-rewrite");
+    let release = Release(marks.clone());
+    let (base, source, _, integrator) = world("controller-rewrite", &holding_gate(&marks));
+    let db = Db::new("controller_rewrite");
+    let m0 = source_main(&source);
+    let old = "a1".repeat(20);
+    let dropped = "d2".repeat(20);
+    db.store
+        .commit_map_load(&[(old.clone(), Some(m0.clone())), (dropped.clone(), None)])
+        .expect("the map");
+    let controllers = base.join("controllers");
+    let deploy = |commit: &str| {
+        std::fs::create_dir_all(controllers.join(format!("spawn-{commit}/rsi/scenarios")))
+            .expect("a controller");
+        let next = controllers.join("spawn.next");
+        let _ = std::fs::remove_file(&next);
+        std::os::unix::fs::symlink(format!("spawn-{commit}"), &next).expect("link");
+        std::fs::rename(&next, controllers.join("spawn")).expect("switch");
+    };
+    deploy(&old);
+    let mission = db.gated_mission(&source, &controllers.join("spawn/rsi/scenarios"));
+    let task = db.reported_task(mission, "w");
+    let agent = agent_of(&db, mission, task);
+    push_work(&base, &source, &agent, "work.txt");
+    let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+    owner_request(&db, &source, &commit);
+
+    integrator.pass_on(&db.store).expect("the landing's pass");
+    assert_eq!(source_main(&source), commit, "the owner's landing moved main");
+    integrator.pass_on(&db.store).expect("a pass before the deploy");
+    assert!(
+        integrator.running.borrow().is_empty() && started(&marks).is_empty(),
+        "no gate judges past the controller built before the rewrite: {:?}",
+        started(&marks)
+    );
+    assert!(verdicts(&db, task).is_empty());
+    assert!(
+        integrator
+            .waiting
+            .borrow()
+            .contains(&(task, super::Wait::Controller)),
+        "the controller, read as m0, is behind the owner's landing"
+    );
+
+    deploy(&dropped);
+    integrator
+        .pass_on(&db.store)
+        .expect("the pass with a dropped controller");
+    assert!(
+        integrator
+            .waiting
+            .borrow()
+            .contains(&(task, super::Wait::ControllerUnknown)),
+        "the dropped controller is said"
+    );
+    let judged = wait_started(&marks, 1);
+    assert_eq!(judged.len(), 1, "judged, never a wait: {judged:?}");
+    std::fs::write(marks.join("release"), "").expect("release");
+    integrator.settle();
+    assert_eq!(verdicts(&db, task), vec!["accepted"]);
+    drop(release);
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&marks);
+}
+
+/// Objective 178, the alert: the loop's Monitor reads the controller
+/// through the commit map. A controller built before the rewrite
+/// (`spawn-<old>`, mapped to m0) behind the owner's landing fires
+/// `controller_behind` after the bound, its evidence the new id; switched
+/// to a controller whose commit the rewrite dropped, it clears (never
+/// behind).
+#[test]
+fn the_controller_behind_alert_reads_the_controller_through_the_map() {
+    let (base, source, _, integrator) = world("controller-alert-map", "exit 0\n");
+    let db = Db::new("controller_alert_map");
+    let m0 = source_main(&source);
+    let old = "a1".repeat(20);
+    let dropped = "d2".repeat(20);
+    db.store
+        .commit_map_load(&[(old.clone(), Some(m0.clone())), (dropped.clone(), None)])
+        .expect("the map");
+    let controllers = base.join("controllers");
+    let deploy = |commit: &str| {
+        std::fs::create_dir_all(controllers.join(format!("spawn-{commit}/rsi/scenarios")))
+            .expect("a controller");
+        let next = controllers.join("spawn.next");
+        let _ = std::fs::remove_file(&next);
+        std::os::unix::fs::symlink(format!("spawn-{commit}"), &next).expect("link");
+        std::fs::rename(&next, controllers.join("spawn")).expect("switch");
+    };
+    deploy(&old);
+    let mission = db.gated_mission(&source, &controllers.join("spawn/rsi/scenarios"));
+    db.reported_task(mission, "w");
+    let (mut settings, _) = crate::alerts::Settings::from_env();
+    settings.check_ms = 1;
+    settings.integrator_down_ms = 0;
+    settings.controller_behind_ms = 300;
+    settings.memory_low_mb = 0;
+    settings.tmpfs_high_mb = 0;
+    settings.test_log = None;
+    settings.live_log = None;
+    let mut monitor = crate::alerts::Monitor::with(settings);
+    let mut check = || {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        monitor.check(&db.store).expect("a check");
+    };
+    let past_the_bound = || std::thread::sleep(std::time::Duration::from_millis(400));
+    let alerts = || -> Vec<Value> {
+        db.store
+            .alerts(0)
+            .expect("the alerts")
+            .as_array()
+            .expect("alerts")
+            .iter()
+            .filter(|row| row["kind"] == "controller_behind")
+            .cloned()
+            .collect()
+    };
+
+    let m1 = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+    owner_request(&db, &source, &m1);
+    integrator.pass_on(&db.store).expect("the landing's pass");
+    assert_eq!(source_main(&source), m1, "the owner's landing moved main");
+    check();
+    assert!(alerts().is_empty(), "not yet: the bound starts");
+    past_the_bound();
+    check();
+    let fired = alerts();
+    assert_eq!(fired.len(), 1, "once: {fired:?}");
+    assert_eq!(fired[0]["state"], "open");
+    assert_eq!(fired[0]["evidence"]["controller"], m0.as_str(), "the new id");
+    assert_eq!(fired[0]["evidence"]["landed"], m1.as_str());
+
+    deploy(&dropped);
+    check();
+    let cleared = alerts();
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!(cleared[0]["state"], "cleared", "a dropped controller is never behind");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Gate v2 step 5b, on the store: while the nightly's fact for the
 /// source has a red (`red_since`), the mission's reported task is not
 /// judged (held, said once), so nothing of it lands; the owner's push
