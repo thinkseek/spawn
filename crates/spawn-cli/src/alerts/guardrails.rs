@@ -575,6 +575,49 @@ mod tests {
 
     const GIB: i64 = 1_073_741_824;
 
+    /// Objective 176: an answer of the owner's set with free disk an alert
+    /// figure under storage, leaked test schemas a diagnostic with its line
+    /// and scratch nobody owns one without, all three out of range.
+    fn adopted_answer() -> Value {
+        json!({
+            "lines": [{"line": "storage",
+                "north_star": {"key": "storage.bytes_per_landing", "name": "Bytes a landing leaves behind",
+                    "unit": "bytes", "value": null, "range": null, "state": "not_measured_yet"},
+                "guardrails": []}],
+            "alert_figures": [{"key": "storage.free_bytes", "name": "Free disk", "unit": "bytes",
+                "value": 2 * GIB, "range": {"min": 42_949_672_960_i64}, "state": "out", "line": "storage"}],
+            "diagnostics": [
+                {"key": "storage.unowned_scratch_bytes", "name": "Scratch nobody owns", "unit": "bytes",
+                 "value": 9 * GIB, "range": {"max": GIB}, "state": "out"},
+                {"key": "storage.leaked_test_schemas", "name": "Leaked test schemas", "unit": "count",
+                 "value": 4, "range": {"max": 0}, "state": "out", "line": "storage"},
+            ],
+        })
+    }
+
+    #[test]
+    fn an_alert_figure_or_a_lined_diagnostic_raises_and_any_other_diagnostic_never() {
+        let mut monitor = monitor();
+        assert!(read(&mut monitor, 0, Ok(adopted_answer())).0.is_empty());
+        let (fired, _) = read(&mut monitor, RAISE, Ok(adopted_answer()));
+        let mut fired = keys(&fired);
+        fired.sort();
+        assert_eq!(
+            fired,
+            [
+                format!("fire {KIND}:storage.free_bytes:0"),
+                format!("fire {KIND}:storage.leaked_test_schemas:0"),
+            ]
+        );
+        let (later, _) = read(&mut monitor, 10 * RAISE, Ok(adopted_answer()));
+        assert!(
+            !keys(&later)
+                .iter()
+                .any(|key| key.contains("unowned_scratch_bytes")),
+            "a diagnostic without a line never raises"
+        );
+    }
+
     #[test]
     fn a_figure_held_out_raises_once_after_the_hold_and_a_reading_in_restarts_it() {
         let mut monitor = monitor();
