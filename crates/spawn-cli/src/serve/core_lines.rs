@@ -447,6 +447,14 @@ pub(super) fn read_ranges(path: Option<&std::path::Path>) -> Result<Option<Strin
     }
 }
 
+/// The queue the ranges file names for the owner's interventions
+/// (objective 156): none without a ranges file, one that cannot be read,
+/// or no absolute `observability.queue_file`.
+pub(crate) fn queue_settings() -> Option<crate::scorecard::queue_posts::Settings> {
+    let text = read_ranges(ranges_path().as_deref()).ok().flatten();
+    crate::scorecard::queue_posts::settings(text.as_deref())
+}
+
 /// Where the nightly's fact files are: `<SPAWN_WORKSPACE_ROOT>/nightly`.
 fn nightly_dir() -> Option<PathBuf> {
     crate::env_value("SPAWN_WORKSPACE_ROOT").map(|root| PathBuf::from(root).join("nightly"))
