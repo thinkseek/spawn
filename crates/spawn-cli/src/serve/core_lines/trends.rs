@@ -108,21 +108,27 @@ mod tests {
             vec![json!({"day": "2026-11-12", "value": 3})],
         );
         let view = answer(
-            &lines(
+            &adopted(&lines(
                 &json!({"free_bytes": 3}),
                 &Value::Null,
                 &Observed::default(),
                 Value::Null,
                 Vec::new(),
-            ),
+            )),
             &Value::Null,
             Ok(None),
             &trends,
         );
+        // Every list carries trends (objective 176): free disk is an alert
+        // figure now.
+        let mut seen = 0;
         for line in view["lines"].as_array().expect("lines") {
             for figure in std::iter::once(&line["north_star"])
                 .chain(line["guardrails"].as_array().expect("guardrails"))
+                .chain(view["alert_figures"].as_array().expect("alert figures"))
+                .chain(view["diagnostics"].as_array().expect("diagnostics"))
             {
+                seen += usize::from(figure["key"] == "storage.free_bytes");
                 let want = if figure["key"] == "storage.free_bytes" {
                     json!([{"day": "2026-11-12", "value": 3}])
                 } else {
@@ -131,5 +137,6 @@ mod tests {
                 assert_eq!(figure["trend"], want, "{figure}");
             }
         }
+        assert!(seen > 0, "free disk's trend is read");
     }
 }
