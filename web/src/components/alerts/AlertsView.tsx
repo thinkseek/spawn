@@ -5,6 +5,7 @@ import { fetchAlerts, usePoll } from "../../api";
 import type { FleetAgent } from "../../fleet";
 import { alertMoot, alertRowWords, alertStale, alertTitle, openAlertsLine } from "../../home";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
+import { currentNotices, earlierWords } from "../../notices";
 import { LiveStatus, PageHeader, cx } from "../ui";
 import { useNowEvery } from "../timeaxis/useTimeWindow";
 
@@ -90,7 +91,8 @@ function AlertRow({
 /** The Alerts view (design §2.9): what is open and still applies, each in
  * the words home's "Needs you" uses; what an ended session made moot,
  * folded; what cleared. The task and mission notices are news: home's
- * digest tells them by task, and the raw list stays here, folded. */
+ * digest tells them by task, and the list stays here, folded, each task's
+ * and mission's newest with how many came before it (objective 151). */
 export function AlertsView({
   agents = null,
   nameOf = () => null,
@@ -106,7 +108,8 @@ export function AlertsView({
   const open = data.filter((alert) => alert.state === "open");
   const applies = open.filter((alert) => !alertMoot(alert, agents));
   const moot = open.filter((alert) => alertMoot(alert, agents));
-  const notices = data.filter((alert) => alert.state === "notice");
+  const notices = currentNotices(data);
+  const folded = notices.reduce((sum, notice) => sum + notice.earlier, 0);
   const cleared = data.filter((alert) => alert.state === "cleared");
 
   return (
@@ -197,13 +200,16 @@ export function AlertsView({
           <details className="border-t border-surface-border">
             <summary className="cursor-pointer select-none px-4 py-2 text-caption text-muted-foreground hover:text-foreground">
               All notices <span className="tnum text-faint-foreground">{notices.length}</span>
+              {folded > 0 && (
+                <span className="tnum text-faint-foreground"> · {folded} earlier folded</span>
+              )}
             </summary>
             {notices.length === 0 ? (
               <p className="px-4 py-3 text-caption text-faint-foreground">No notices in the window.</p>
             ) : (
               <ul>
-                {notices.map((alert) => (
-                  <AlertRow key={alert.key} alert={alert} now={now} />
+                {notices.map(({ alert, earlier }) => (
+                  <AlertRow key={alert.key} alert={alert} now={now} note={earlierWords(earlier)} />
                 ))}
               </ul>
             )}
