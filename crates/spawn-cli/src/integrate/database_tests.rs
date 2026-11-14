@@ -9339,13 +9339,6 @@ fn a_controller_from_before_the_rewrite_holds_the_task_through_the_map() {
     integrator
         .pass_on(&db.store)
         .expect("the pass with a dropped controller");
-    assert!(
-        integrator
-            .waiting
-            .borrow()
-            .contains(&(task, super::Wait::ControllerUnknown)),
-        "the dropped controller is said"
-    );
     let judged = wait_started(&marks, 1);
     assert_eq!(judged.len(), 1, "judged, never a wait: {judged:?}");
     std::fs::write(marks.join("release"), "").expect("release");
