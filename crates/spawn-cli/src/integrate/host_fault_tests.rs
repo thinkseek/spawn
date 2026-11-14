@@ -788,24 +788,26 @@ fn another_reason_or_an_output_naming_no_test_stays_as_it_is() {
 /// the sections before (each with its stage line), the deciding section's
 /// opening line, its lines, its stage line and the closing total.
 fn scenario_output(before: &[&str], phase: &str, scenario: &str, lines: &[&str]) -> String {
-    let mut log =
-        String::from("== candidate: build\n| build: ok\n| stage gate ok 900ms candidate: build\n");
-    for line in before {
-        log.push_str(line);
-        log.push('\n');
-    }
-    log.push_str(&format!("| == {phase}: {scenario} must pass\n"));
-    for line in lines {
-        log.push_str("| ");
-        log.push_str(line);
-        log.push('\n');
-    }
-    log.push_str(&format!(
-        "| stage gate rejected 2323ms {phase}: {scenario} must pass\n\
-         | stage gate rejected 5000ms total\n\
-         {{\"verdict\":\"rejected\",\"reason\":\"scenario fails on the candidate\"}}\n"
+    let mut all: Vec<String> = [
+        "== candidate: build",
+        "| build: ok",
+        "| stage gate ok 900ms candidate: build",
+    ]
+    .iter()
+    .chain(before)
+    .map(ToString::to_string)
+    .collect();
+    all.push(format!("| == {phase}: {scenario} must pass"));
+    all.extend(lines.iter().map(|line| format!("| {line}")));
+    all.push(format!(
+        "| stage gate rejected 2323ms {phase}: {scenario} must pass"
     ));
-    log
+    all.push("| stage gate rejected 5000ms total".to_string());
+    all.push(
+        "{\"verdict\":\"rejected\",\"reason\":\"scenario fails on the candidate\"}".to_string(),
+    );
+    all.push(String::new());
+    all.join("\n")
 }
 
 #[test]
@@ -876,9 +878,14 @@ fn a_quoted_check_is_masked_and_cut() {
         assert!(text.contains("[redacted]"), "{text}");
         assert!(!text.contains(token) && !text.contains(password), "{text}");
     }
-    let long = "é".repeat(500);
-    let log = scenario_output(&[], "regression", "093.sh", &[&format!("blackbox: {long}")]);
-    let checks = host::rejected_checks(&log).unwrap_or_else(|| panic!("no check"));
+    let accents = "é".repeat(500);
+    let cut = scenario_output(
+        &[],
+        "regression",
+        "093.sh",
+        &[&format!("blackbox: {accents}")],
+    );
+    let checks = host::rejected_checks(&cut).unwrap_or_else(|| panic!("no check"));
     assert_eq!(checks.first, "é".repeat(host::CHECK_CHARS));
     assert_eq!(checks.first.chars().count(), 200);
     assert_eq!(checks.count, 1);
