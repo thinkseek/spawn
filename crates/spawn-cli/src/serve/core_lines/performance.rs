@@ -409,6 +409,51 @@ mod tests {
         );
     }
 
+    /// Objective 159: each mission's report to live is said beside the
+    /// fleet's, in the values and as the north star's `by_mission`, by
+    /// mission; a mission with no live landing is left out, and with none
+    /// at all there is no key.
+    #[test]
+    fn report_to_live_per_mission_is_said_beside_the_fleets() {
+        let rtl = |value: Value, n: u64, at_landing: u64| {
+            json!({"report_to_live": {"value": value, "n": n, "not_live": 0,
+                                      "live_at_landing": at_landing}})
+        };
+        let scorecard = json!({"scopes": [
+            {"scope": "fleet", "mission": null, "dimensions": rtl(json!(360_000), 7, 3)},
+            {"scope": "mission", "mission": 9, "dimensions": rtl(json!(360_000), 3, 3)},
+            {"scope": "mission", "mission": 6, "dimensions": rtl(Value::Null, 0, 0)},
+            {"scope": "mission", "mission": 4, "dimensions": rtl(json!(3_600_000), 3, 0)},
+            {"scope": "mission", "mission": 8, "dimensions": rtl(Value::Null, 1, 1)},
+        ]});
+        let values = performance(&scorecard, &Value::Null);
+        let want = json!([
+            {"mission": 4, "value": 3_600_000, "n": 3, "live_at_landing": 0},
+            {"mission": 8, "value": null, "n": 1, "live_at_landing": 1},
+            {"mission": 9, "value": 360_000, "n": 3, "live_at_landing": 3},
+        ]);
+        assert_eq!(values["report_to_live_by_mission"], want);
+        let line = performance_line(&values);
+        let star = figure_json(&line.north_star, None);
+        assert_eq!(star["value"], json!(360_000));
+        assert_eq!(star["by_mission"], want);
+        assert!(
+            line.guardrails
+                .iter()
+                .all(|figure| figure_json(figure, None).get("by_mission").is_none()),
+            "no other figure carries it"
+        );
+        // No mission with a live landing: no key at all.
+        let quiet = json!({"scopes": [
+            {"scope": "fleet", "mission": null, "dimensions": rtl(Value::Null, 0, 0)},
+            {"scope": "mission", "mission": 4, "dimensions": rtl(Value::Null, 0, 0)},
+        ]});
+        let values = performance(&quiet, &Value::Null);
+        assert_eq!(values.get("report_to_live_by_mission"), None, "{values}");
+        let star = figure_json(&performance_line(&values).north_star, None);
+        assert_eq!(star.get("by_mission"), None, "{star}");
+    }
+
     /// rev-e F1 on 7b1dd20a: a report to live sampled before the record
     /// covered the window (106 h, the record's start) never reaches its
     /// trend; one sampled after does, and the other figures are untouched.
