@@ -17,7 +17,7 @@ the drill's test.
 | --- | --- |
 | Bucket | `spawn-store`, account q1293822641@gmail.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
 | Format | dumps: `pg_dump -Fc` (compression `SPAWN_BACKUP_DUMP_COMPRESS`, default `zstd:9`) and `gpg --symmetric` AES-256; bundles: a tar (zstd) of `manifest.json`, `repos/*.bundle` and `transcripts/`, the same `gpg` passphrase |
-| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`); all `Persistent=true`, so a run missed while the host was off happens at next boot |
+| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
 | Records | every run writes a `backup.dumped`, `backup.bundled` or `backup.verified` control record (owner-only `spawn_backup_record`); the tiers, the bundle's base and the plausibility check are read from them, never from a state file |
 | Settings | `SPAWN_BACKUP_KEY_FILE`, `SPAWN_R2_ENV_FILE`, `SPAWN_BACKUP_R2_LIMIT_MB` (10000), `SPAWN_BACKUP_R2_ALERT_MB` (8000), `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14), `SPAWN_BACKUP_DRILL_DATABASE_URL` (the drill's disposable server), `SPAWN_BACKUP_PREFIX` (empty in the fleet; a test run's `locktest/`) |
 
@@ -187,6 +187,28 @@ systemctl --user enable --now spawn-backup.timer spawn-backup-bundle.timer spawn
 systemctl --user start spawn-backup.service && journalctl --user -u spawn-backup -n 20
 ```
 
+The restore drill's timer (objective 149) is installed and enabled only
+after objective 149b passes and lands; until then the drill runs only by
+hand, attended, by the lead. Until 149b the drill removes its scratch
+directory by name after a check (`remove_dir_all`), which is no removal to
+run unattended every day; 149b removes it through the fd it was made with.
+By hand, with the bundle's environment (so its records reach the bundle's
+store):
+
+```sh
+(set -a; . ~/.local/share/spawn-rsi/spawn.env; set +a
+ SPAWN_WORKSPACE_ROOT=~/.local/share/spawn-rsi/ws ~/.local/share/spawn-rsi/bin/spawn backup restore-drill)
+```
+
+Once 149b has passed and landed, and is deployed:
+
+```sh
+install -m 644 deploy/systemd/spawn-backup-restore-drill.service \
+  deploy/systemd/spawn-backup-restore-drill.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-backup-restore-drill.timer
+```
+
 `SPAWN_BACKUP_DRILL_DATABASE_URL` must be in `spawn.env` before the drill
 timer is enabled: a disposable server (the fleet's test database), never the
 live one. The drill refuses without it, by name, and touches nothing.
@@ -231,7 +253,9 @@ pass `git bundle verify` in an empty repository (an increment's
 prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
 
-`spawn backup restore-drill [--into <dir>] [--keep]` (by hand; core (ii))
+`spawn backup restore-drill [--into <dir>] [--keep]` (core (ii); by hand,
+attended, by the lead; daily from `spawn-backup-restore-drill.timer` at 05:30
+once 149b has passed and landed, see above)
 restores the sources and the transcript archive themselves, not only opens
 them. It takes the newest stored bundle and the chain of increments back to
 its full bundle (each record's `base_event_id`; a base that stored nothing
@@ -243,7 +267,11 @@ workspace root, symlinks resolved):
 
 - the transcript archive: each slice at its offset (whole at 0, an append at
   exactly the size restored so far), each file then the size the newest
-  record names; compared with `<root>/.transcripts` by size and SHA-256. A
+  record names, then each file's SHA-256 against the one the newest record
+  names (`transcripts.sha256`, recorded by `spawn backup bundle` since
+  objective 149: the bytes as bundled), so the backup is judged without
+  live; a record bundled before 149 names none, and the drill says so; then
+  compared with `<root>/.transcripts` by size and SHA-256. A
   live file that grew since the bundle (its first bytes the restored file)
   and one made since are expected; one last written before the bundle's
   window (`SPAWN_BACKUP_TRANSCRIPT_DAYS`) is in no bundle (so it has no
@@ -261,7 +289,9 @@ workspace root, symlinks resolved):
 One line per resource, then `passed` (exit 0) or `FAILED` (exit 1: a
 mismatch older than the bundle, or a backup that cannot be restored); 2 when
 it cannot run (no settings, a refused `--into`, no stored bundle). It reads
-live and writes none of it, records nothing, reads the key as `verify` does
+live and writes none of it, records its verdict per resource
+(`backup.drilled.transcripts`, `backup.drilled.missions`, objective 104;
+the Core lines recovery rows read them), reads the key as `verify` does
 and prints none of it, and removes its directory at the end (`--keep` leaves
 it) only after checking it is still the one it made. It reads the bundle
 records from the live database, as `verify` does: it drills the backup, not
