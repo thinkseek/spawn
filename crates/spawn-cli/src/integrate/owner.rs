@@ -1657,10 +1657,7 @@ impl super::Judge {
                 request.id
             );
         }
-        // The stored reason is masked (objective 170): compare it with
-        // exactly what the store keeps of this one, never the raw text.
-        let stored = spawn_postgres::control_stored_text("source.push_no_verdict", "reason", &why);
-        if before.as_deref() == Some(stored.as_str()) {
+        if before.as_deref() == Some(why.as_str()) {
             return refuse_owner(
                 store,
                 request,

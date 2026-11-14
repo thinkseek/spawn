@@ -286,10 +286,7 @@ impl PostgresStore {
     /// event's id.
     pub fn host_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one(
-                "select spawn_host_record($1)",
-                &[&crate::control_mask::masked(record)],
-            )?
+            .query_one("select spawn_host_record($1)", &[record])?
             .get(0))
     }
 
@@ -395,10 +392,7 @@ impl PostgresStore {
     /// `backup.stored` record (owner only). Returns the event's id.
     pub fn backup_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one(
-                "select spawn_backup_record($1)",
-                &[&crate::control_mask::masked(record)],
-            )?
+            .query_one("select spawn_backup_record($1)", &[record])?
             .get(0))
     }
 
