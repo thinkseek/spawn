@@ -129,6 +129,24 @@ fn related(entry: &Path, paths: &[PathBuf]) -> bool {
         .any(|path| entry.starts_with(path) || path.starts_with(entry))
 }
 
+/// Whether the claimed folder `folder`, met by the walk of one of `roots`,
+/// may be swept (objective 145): none of its names below its root is one
+/// the walk never counts ([`fixed_name`]; the walk checks only the top
+/// level), and it is not, does not lie under and does not hold an exclude
+/// or a never-counted place, each compared by its resolved path too.
+pub(super) fn sweepable(folder: &Path, roots: &[PathBuf], excludes: &[PathBuf], never: &[PathBuf]) -> bool {
+    let Some(below) = roots.iter().find_map(|root| folder.strip_prefix(root).ok()) else {
+        return false;
+    };
+    let mut places = with_resolved(excludes);
+    places.extend(with_resolved(never));
+    below
+        .components()
+        .all(|part| !fixed_name(&part.as_os_str().to_string_lossy()))
+        && !related(folder, &places)
+        && std::fs::canonicalize(folder).is_ok_and(|resolved| !related(&resolved, &places))
+}
+
 /// Why `root` is never read, when it is not: a symlink at the root or at
 /// any parent component (cc-astra A27), so an alias can never take a walk
 /// into a protected place under a name the protections do not know. A root

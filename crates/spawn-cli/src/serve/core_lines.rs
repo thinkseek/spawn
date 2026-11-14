@@ -781,6 +781,57 @@ fn lines_at(
     ))
 }
 
+/// How far a sweep's walk of one root may go (objective 145): it reads the
+/// whole of the scratch once, not every ten minutes.
+const SWEEP_BOUND: scratch::Bound = scratch::Bound {
+    entries: 50_000_000,
+    time: Duration::from_secs(600),
+};
+
+/// What `spawn scratch sweep` decides from (objective 145): the claimed
+/// folders the page's walk finds (the Core lines file's scratch roots, its
+/// exclusions and refused roots), each rechecked against every name and
+/// place the walk never counts, $HOME too ([`scratch::sweepable`]), and
+/// which of their objectives landed, read once through the dashboard's
+/// read-only login, only when a folder is claimed.
+pub(crate) struct ClaimedScratch {
+    pub(crate) folders: Vec<(PathBuf, crate::scratch_owner::Claim)>,
+    pub(crate) landed: Vec<(i64, i64)>,
+}
+
+/// [`ClaimedScratch`] at `now_ms`; why not (never with a URL) when the file
+/// names no root, a walk goes past its bound, or the store cannot be opened
+/// or its landings read.
+pub(crate) fn claimed_scratch(now_ms: i64) -> Result<ClaimedScratch, String> {
+    let text = read_ranges(ranges_path().as_deref())?;
+    let settings = unowned::settings(text.as_deref());
+    if settings.roots.is_empty() {
+        return Err("the Core lines file names no storage.scratch_roots".to_string());
+    }
+    let never = scratch::never_counted(&crate::storage::projects_path());
+    let walk = scratch::walk(&settings.roots, &settings.excludes, &never, now_ms, &crate::integrate::still_runs, SWEEP_BOUND)?;
+    let mut places = never;
+    places.extend(crate::env_value("HOME").map(PathBuf::from));
+    let folders: Vec<_> = walk
+        .claimed
+        .into_iter()
+        .filter(|claimed| scratch::sweepable(&claimed.path, &settings.roots, &settings.excludes, &places))
+        .map(|claimed| (claimed.path, claimed.claim))
+        .collect();
+    let pairs: Vec<(i64, i64)> = folders.iter().filter_map(|(_, claim)| claim.pair()).collect();
+    if pairs.is_empty() {
+        return Ok(ClaimedScratch { folders, landed: Vec::new() });
+    }
+    let no_url = |why: String| {
+        if why.contains("://") { "(its error names a URL, not shown)".to_string() } else { why }
+    };
+    let landed = super::open_store()
+        .map_err(|why| format!("the store cannot be opened: {}", no_url(why)))?
+        .claimed_landed(&pairs)
+        .map_err(|error| format!("the store's landings cannot be read: {}", no_url(error.to_string())))?;
+    Ok(ClaimedScratch { folders, landed })
+}
+
 /// The figures that have a value, by key: what a `host.core_lines` sample
 /// holds.
 pub(super) fn values_of(lines: &[Line]) -> Map<String, Value> {

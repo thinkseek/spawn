@@ -15,7 +15,8 @@
 //! ended") after. Nothing here removes, moves or renames anything but the
 //! owner file it writes (through a temporary file renamed over it), and no
 //! symlink is followed: a folder named through one, or a build path
-//! through one, is refused.
+//! through one, is refused. `spawn scratch sweep` (crate::scratch_sweep,
+//! objective 145) is the one that removes build paths.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -378,12 +379,11 @@ fn write(dir: &Path, claim: &Claim) -> Result<(), String> {
     use std::io::Write;
     let file = dir.join(OWNER_FILE);
     let temporary: PathBuf = dir.join(format!("{OWNER_FILE}.{}.tmp", std::process::id()));
-    let made = std::fs::OpenOptions::new()
+    let mut made = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
-    let mut made = made;
     made.write_all(format!("{}\n", claim.line()).as_bytes())
         .and_then(|()| std::fs::rename(&temporary, &file))
         .map_err(|error| {
