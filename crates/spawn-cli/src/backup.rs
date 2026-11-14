@@ -918,6 +918,22 @@ impl Stamp {
     }
 }
 
+/// A bundle's object name (objective 167):
+/// `bundles/<tier>/spawn-bundle-YYYYMMDD-HHMMSS-mmm-<random>.<extension>.gpg`,
+/// the UTC second, the millisecond in three digits and `random` (4 bytes of
+/// /dev/urandom as hex). Two bundles in one second (a by-hand one beside the
+/// timer's) no longer name one object, which the bucket's lock refuses
+/// (409); the names still sort, by byte, as the bundles ran (the second,
+/// then the fixed-width millisecond; the random part only parts two of one
+/// millisecond), and [`Stamp::parse`] still reads the second from them.
+pub(crate) fn bundle_name(tier: &str, now_ms: i64, extension: &str, random: &str) -> String {
+    format!(
+        "bundles/{tier}/spawn-bundle-{}-{:03}-{random}.{extension}.gpg",
+        Stamp::at(now_ms).text(),
+        now_ms.rem_euclid(1000)
+    )
+}
+
 /// Whether a dump's copy may be written: the bucket's bytes, the copies this
 /// run already wrote and this one together stay within the limit.
 pub(crate) fn within_limit(held: u64, written: u64, copy: u64, limit: u64) -> bool {
@@ -2361,11 +2377,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
 
     let held = list_bucket(&settings)?.0;
     let tier = if full { "full" } else { "incr" };
-    let key = settings.stored(&format!(
-        "bundles/{}/spawn-bundle-{}.{extension}.gpg",
-        tier,
-        now.text()
-    ));
+    let key = settings.stored(&bundle_name(tier, now_ms, extension, &random_hex(4)?));
     let mut keys: Vec<String> = Vec::new();
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
