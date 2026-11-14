@@ -1678,13 +1678,11 @@ fn restore_repo(
         })?;
     }
     let mut fsck = git();
-    fsck.arg("--git-dir").arg(mirror).args([
-        "fsck",
-        "--connectivity-only",
-        "--no-dangling",
-        "--no-progress",
-    ]);
-    run_git(fsck, "git fsck --connectivity-only")?;
+    // --full: every object read whole, not only the links between them.
+    fsck.arg("--git-dir")
+        .arg(mirror)
+        .args(["fsck", "--full", "--no-dangling", "--no-progress"]);
+    run_git(fsck, "git fsck --full")?;
     Ok(())
 }
 
