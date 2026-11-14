@@ -106,9 +106,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BundleRecord, Key, Settings, bundle_compression, bundle_records, decompress_bundle, decrypt_with, get_object_bytes,
-    header_value, heads_of, hex, object_key, output, random_hex, reading_key, record_key, same_key,
-    sha256_file,
+    BundleRecord, Key, Settings, bundle_compression, bundle_records, decompress_bundle,
+    decrypt_with, get_object_bytes, header_value, heads_of, hex, object_key, output, random_hex,
+    reading_key, record_key, same_key, sha256_file,
 };
 use crate::Flags;
 use crate::commit_now::CommitNow;
@@ -2359,7 +2359,10 @@ mod tests {
         // Names without the leading ./ are taken as listed.
         assert_eq!(
             missions_members("manifest.json\nrepos/a.bundle\ntranscripts/b.jsonl\n"),
-            Ok(vec!["manifest.json".to_string(), "repos/a.bundle".to_string()])
+            Ok(vec![
+                "manifest.json".to_string(),
+                "repos/a.bundle".to_string()
+            ])
         );
         // No manifest: refused, never an empty list of names (tar -x would
         // extract every member).

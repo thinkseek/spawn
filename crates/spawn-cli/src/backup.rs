@@ -55,7 +55,11 @@
 //!   directory of its own (mode 700, never under `$HOME`, `$SPAWN_LIVE` or
 //!   the root), the transcript archive and every mission source, judged
 //!   against the newest record's sha256 and compared with live, read only
-//!   ([`restore_drill`]).
+//!   ([`restore_drill`]). `--only missions` (objective 186, daily from
+//!   its own timer) drills the mission repositories alone: the bundles
+//!   decrypted in a pipe, only their manifests and repository bundles
+//!   unpacked, never a transcript, and `backup.drilled.missions` recorded
+//!   alone.
 //!
 //! The bucket stays inside R2's free tier: `SPAWN_BACKUP_R2_LIMIT_MB`
 //! (default 10000) is 10,000,000,000 bytes, and nothing is ever written
