@@ -1638,9 +1638,11 @@ create table if not exists spawn_alerts (
 create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
 
 -- The owner's judgement of an alert (objective 092, `spawn alert judge`):
--- `false`, `stale` or `duplicate`, and when. An alert's outcome is its
--- verdict when judged, `cleared` when its condition cleared it, none while
--- open (and for a notice): what "Needs you is right" counts.
+-- `right` (a real need, objective 148), `false`, `stale` or `duplicate`,
+-- and when. An alert's outcome is its verdict when judged, `cleared` when
+-- its condition cleared it, none while open (and for a notice). "Needs you
+-- is right" (objective 148) is right over judged, of the needs fired in 7
+-- days: a clearing is never evidence.
 alter table spawn_alerts add column if not exists verdict text;
 alter table spawn_alerts add column if not exists judged_at_ms bigint;
 
@@ -2520,17 +2522,26 @@ begin
         null;
     when 'alert.judged' then
         -- The owner's verdict on an alert (`spawn alert judge`, objective
-        -- 092): `false`, `stale` or `duplicate`, once, never on a notice. An
-        -- open alert it judges is cleared by it (cleared evidence {judged});
-        -- a cleared one keeps its cleared evidence and gains the verdict.
+        -- 092): `right` (objective 148), `false`, `stale` or `duplicate`,
+        -- once, never on a notice. `right` changes nothing else: an open
+        -- alert stays open (its condition clears it later, and it keeps its
+        -- verdict), a cleared one keeps its clearing. Every other verdict
+        -- clears an open alert (cleared evidence {judged}); a cleared one
+        -- keeps its cleared evidence and gains the verdict.
         if p_record ->> 'verdict' is null
-           or p_record ->> 'verdict' not in ('false', 'stale', 'duplicate') then
-            raise exception 'an alert verdict is false, stale or duplicate: %', p_record;
+           or p_record ->> 'verdict' not in ('right', 'false', 'stale', 'duplicate') then
+            raise exception 'an alert verdict is right, false, stale or duplicate: %', p_record;
         end if;
         if not exists (select 1 from spawn_alerts
                         where key = p_record ->> 'key' and not notice and verdict is null) then
             raise exception 'alert % cannot be judged: no such alert, a notice, or judged already',
                             p_record ->> 'key';
+        end if;
+        if p_record ->> 'verdict' = 'right' then
+            update spawn_alerts
+               set verdict = 'right', judged_at_ms = p_at
+             where key = p_record ->> 'key';
+            return;
         end if;
         update spawn_alerts
            set verdict = p_record ->> 'verdict', judged_at_ms = p_at,
@@ -4837,8 +4848,8 @@ begin
                     where k not in ('type', 'key', 'verdict')) then
             raise exception 'an alert judgement is {type, key, verdict}, nothing else';
         end if;
-        if coalesce(p_record ->> 'verdict', '') not in ('false', 'stale', 'duplicate') then
-            raise exception 'an alert verdict is false, stale or duplicate, not %',
+        if coalesce(p_record ->> 'verdict', '') not in ('right', 'false', 'stale', 'duplicate') then
+            raise exception 'an alert verdict is right, false, stale or duplicate, not %',
                             coalesce(p_record ->> 'verdict', 'none');
         end if;
         if not exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
