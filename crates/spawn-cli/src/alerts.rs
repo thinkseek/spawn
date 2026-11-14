@@ -3196,7 +3196,8 @@ times in a row)",
     /// The controller-behind reading (`controller_behind`): read only while
     /// the fold has a reported task of a mission open and not halted, or the
     /// alert is open. Each listed mission's owner's latest landing is
-    /// compared with its controller in its source.
+    /// compared with its controller in its source, the controller's commit
+    /// read through the commit map (objective 178).
     fn read_controllers(
         &mut self,
         store: &PostgresStore,
@@ -3243,10 +3244,29 @@ times in a row)",
             if !Path::new(source).is_absolute() {
                 continue;
             }
-            if let Some(controller) =
-                crate::integrate::controller_behind(Path::new(source), Path::new(gate), landed)
-            {
-                behind.insert(mission, (controller, landed.to_string()));
+            // The controller's commit read through the commit map
+            // (objective 178): one dropped by a history rewrite, or unknown,
+            // is never behind.
+            let lag = crate::integrate::controller_behind(
+                Path::new(source),
+                Path::new(gate),
+                landed,
+                |commit| {
+                    crate::commit_now::commit_now(store, Path::new(source), commit)
+                        .map_err(|error| error.to_string())
+                },
+            );
+            match lag {
+                Ok(crate::integrate::ControllerLag::Behind(controller)) => {
+                    behind.insert(mission, (controller, landed.to_string()));
+                }
+                Ok(_) => {}
+                // Said like the reading's other errors: nothing is decided
+                // from a reading the store could not finish.
+                Err(error) => {
+                    lines.push(format!("alerts: the missions' controllers: {error}"));
+                    return;
+                }
             }
         }
         out.extend(self.controller_events(&behind, at));
