@@ -1954,10 +1954,24 @@ $$;
 -- refuses every update, delete and truncate, and a load is either the
 -- first or exactly the pairs loaded already.
 create table if not exists spawn_commit_map (
-    old text primary key check (old ~ '^[0-9a-f]{40}$'),
-    new text check (new ~ '^[0-9a-f]{40}$')
+    old text collate "C" primary key check (old ~ '^[0-9a-f]{40}$'),
+    new text collate "C" check (new ~ '^[0-9a-f]{40}$')
 );
 revoke all on spawn_commit_map from public;
+-- Byte order, not the database's locale (objective 190): the ids are hex,
+-- and comparing them through the locale (strcoll) was most of a lookup's
+-- cost. A map made before is altered once; its rows stay as they are.
+do $$
+begin
+    if exists (select 1 from pg_attribute a
+                where a.attrelid = 'spawn_commit_map'::regclass and a.attname in ('old', 'new')
+                  and a.attcollation <> (select oid from pg_collation where collname = 'C'
+                                                                        and collnamespace = 'pg_catalog'::regnamespace)) then
+        alter table spawn_commit_map alter column old type text collate "C",
+                                     alter column new type text collate "C";
+    end if;
+end
+$$;
 
 create or replace function spawn_commit_map_unchanged() returns trigger
 language plpgsql as $$
@@ -1976,21 +1990,47 @@ revoke execute on function spawn_commit_map_unchanged() from public;
 -- itself. Null stays null. Every reader and fold that compares a recorded
 -- id (a baseline, a base, a request's commit, a move's from and to) reads
 -- it through this, both sides alike.
-create or replace function spawn_commit_now(p_commit text) returns text
-language sql stable security definer as $$
-    select case when p_commit is null then null
-                when exists (select 1 from spawn_commit_map m where m.old = lower(p_commit))
-                    then (select m.new from spawn_commit_map m where m.old = lower(p_commit))
-                else p_commit end
-$$;
+--
+-- Fast (objective 190): SECURITY DEFINER with a SET clause cost about
+-- 5.5 us a call on live. It is plpgsql run with the caller's rights and
+-- no SET clause, its plan kept per session; the map is named with this
+-- schema when it is made, so no caller's search_path reads another table.
+-- `spawn_commit_now_rows` is the same translation as an SQL set-returning
+-- function, which PostgreSQL inlines into a caller that joins it LATERAL
+-- (an index scan on the map per row, no call): the polled readers use it.
+-- (A scalar SQL function with a subquery is never inlined.) The callers
+-- read the map with their own rights: the owner, and the restricted logins
+-- granted SELECT on it. The map stays insert-once and owner-only: only
+-- `spawn_commit_map_load` writes it.
 do $$
 begin
-    execute format('alter function spawn_commit_now(text) set search_path = %I, pg_temp',
-                   current_schema());
+    execute format($f$
+create or replace function spawn_commit_now(p_commit text) returns text
+language plpgsql stable as $b$
+declare
+    v_known boolean;
+    v_new text;
+begin
+    select true, m.new into v_known, v_new from %1$I.spawn_commit_map m where m.old = lower(p_commit);
+    return case when v_known then v_new else p_commit end;
+end
+$b$
+$f$, current_schema());
+    execute format($f$
+create or replace function spawn_commit_now_rows(p_commit text) returns table (now text)
+language sql stable as $b$
+    select case when count(*) = 0 then p_commit else max(m.new) end
+      from %1$I.spawn_commit_map m
+     where m.old = lower(p_commit)
+$b$
+$f$, current_schema());
     -- Not public's (the gateway's ACL holds no store reader): the restricted
-    -- logins read recorded commits through it as the owner does.
+    -- logins read recorded commits through them as the owner does.
     execute 'revoke execute on function spawn_commit_now(text) from public';
-    execute format('grant execute on function spawn_commit_now(text) to %I, %I',
+    execute 'revoke execute on function spawn_commit_now_rows(text) from public';
+    execute format('grant execute on function spawn_commit_now(text), spawn_commit_now_rows(text) to %I, %I',
+                   spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader'));
+    execute format('grant select on spawn_commit_map to %I, %I',
                    spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader'));
 end
 $$;

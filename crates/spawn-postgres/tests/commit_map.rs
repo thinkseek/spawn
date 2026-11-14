@@ -12,7 +12,7 @@ use postgres::Client;
 use serde_json::{Value, json};
 
 mod common;
-use common::{admin, schema_url, store};
+use common::{admin, as_login, schema_url, store};
 use spawn_postgres::{PostgresStore, PushRequest, role_url};
 
 const SOURCE: &str = "/tmp/commit-map.git";
@@ -269,6 +269,175 @@ fn the_map_is_loaded_once_by_the_owner_and_never_changed() {
         .expect("privilege")
         .get(0);
     assert!(!public, "the table is revoked from public");
+}
+
+/// Objective 190: the translation is fast. `spawn_commit_now` runs with
+/// the caller's rights and no SET clause (SECURITY DEFINER with one cost
+/// about 5.5 us a call), and `spawn_commit_now_rows`, joined LATERAL, is
+/// inlined: no function is called per row, the owner's plan or a
+/// restricted login's. The access rule is kept: the supervisor and the
+/// reader read recorded commits through both and read the map, and neither
+/// writes it.
+#[test]
+fn the_translation_is_fast_and_the_restricted_logins_read_through_it() {
+    let (store, schema) = store("commit_map_fast");
+    let h = history();
+    store.commit_map_load(&h.pairs()).expect("loaded");
+    let plan = |client: &mut Client| -> String {
+        client
+            .query(
+                "explain (verbose, costs off) select b.now, c.now from mission_tasks k \
+                 cross join lateral spawn_commit_now_rows(k.base) b \
+                 cross join lateral spawn_commit_now_rows(k.candidate) c",
+                &[],
+            )
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut owner = admin(&schema);
+    let owners = plan(&mut owner);
+    assert!(!owners.contains("spawn_commit_now"), "{owners}");
+    assert!(owners.contains("spawn_commit_map"), "{owners}");
+    let row = owner
+        .query_one(
+            "select prosecdef, proconfig is null from pg_proc \
+             where oid = 'spawn_commit_now(text)'::regprocedure",
+            &[],
+        )
+        .expect("the function");
+    assert_eq!(
+        (row.get::<_, bool>(0), row.get::<_, bool>(1)),
+        (false, true),
+        "run with the caller's rights, no SET clause"
+    );
+    for login in ["spawn_supervisor", "spawn_reader"] {
+        let mut client = as_login(&schema, login);
+        let theirs = plan(&mut client);
+        assert!(!theirs.contains("spawn_commit_now"), "{login}: {theirs}");
+        let mut read = |commit: &str| -> Option<String> {
+            let row = client
+                .query_one(
+                    "select spawn_commit_now($1::text), \
+                     (select now from spawn_commit_now_rows($1::text))",
+                    &[&commit],
+                )
+                .expect("read through the map");
+            let (now, rows): (Option<String>, Option<String>) = (row.get(0), row.get(1));
+            assert_eq!(now, rows, "both forms read alike");
+            now
+        };
+        assert_eq!(read(&h.m1.to_uppercase()), Some(h.m1n.clone()), "{login}");
+        assert_eq!(read(&h.e), None, "{login}: a dropped commit");
+        assert_eq!(
+            read(&h.xn),
+            Some(h.xn.clone()),
+            "{login}: an id the map does not name"
+        );
+        let size: i64 = client
+            .query_one("select count(*) from spawn_commit_map", &[])
+            .expect("the map is readable")
+            .get(0);
+        assert_eq!(size, 4, "{login}");
+        let refused = client
+            .batch_execute(&format!(
+                "insert into spawn_commit_map (old, new) values ('{}', null)",
+                "ab".repeat(20)
+            ))
+            .expect_err("a restricted login writes no map");
+        let error = refused
+            .as_db_error()
+            .map_or_else(|| refused.to_string(), |error| error.message().to_string());
+        assert!(error.contains("permission denied"), "{login}: {error}");
+    }
+    let null: Option<String> = owner
+        .query_one("select spawn_commit_now(null)", &[])
+        .expect("null")
+        .get(0);
+    assert_eq!(null, None, "null stays null");
+    assert_eq!(store.commit_map_size().expect("size"), 4);
+}
+
+/// Objective 190: the map compares its ids in byte order (collation "C"),
+/// not through the database's locale, which was most of a lookup's cost:
+/// a new map is made so, and a map made before (the default collation) is
+/// altered by the next migration, its pairs unchanged.
+#[test]
+fn the_map_compares_in_byte_order_and_a_map_made_before_is_altered() {
+    let (store, schema) = store("commit_map_collation");
+    let h = history();
+    store.commit_map_load(&h.pairs()).expect("loaded");
+    let mut client = admin(&schema);
+    let collations = |client: &mut Client| -> Vec<String> {
+        client
+            .query(
+                "select a.attname || '=' || c.collname from pg_attribute a \
+                 join pg_collation c on c.oid = a.attcollation \
+                 where a.attrelid = 'spawn_commit_map'::regclass \
+                   and a.attname in ('old', 'new') order by a.attname",
+                &[],
+            )
+            .expect("collations")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    assert_eq!(collations(&mut client), ["new=C", "old=C"], "a new map");
+    client
+        .batch_execute(
+            "alter table spawn_commit_map alter column old type text collate \"default\", \
+             alter column new type text collate \"default\"",
+        )
+        .expect("the map as it was made before");
+    assert_eq!(
+        collations(&mut client),
+        ["new=default", "old=default"],
+        "made before"
+    );
+    // The rows, byte for byte: their count and a checksum of old || new in
+    // byte order, the same before the migration and after it.
+    let rows = |client: &mut Client| -> (i64, String) {
+        let row = client
+            .query_one(
+                "select count(*), md5(coalesce(string_agg(old || ':' || coalesce(new, '-'), ',' \
+                 order by old collate \"C\"), '')) from spawn_commit_map",
+                &[],
+            )
+            .expect("the rows");
+        (row.get(0), row.get(1))
+    };
+    let before = rows(&mut client);
+    store.migrate().expect("migrate");
+    assert_eq!(collations(&mut client), ["new=C", "old=C"], "altered");
+    assert_eq!(rows(&mut client), before, "the rows unchanged");
+    assert_eq!(before.0, 4);
+    // Still loaded once: the same pairs change nothing, another map is
+    // refused.
+    assert_eq!(
+        store.commit_map_load(&h.pairs()).expect("the same pairs"),
+        (4, false)
+    );
+    let mut different = h.pairs();
+    different[1].1 = None;
+    assert!(
+        store
+            .commit_map_load(&different)
+            .expect_err("a different map")
+            .to_string()
+            .contains("a different commit map is loaded (4 pairs)"),
+        "refused after the migration"
+    );
+    assert_eq!(rows(&mut client), before, "nothing loaded");
+    for (old, new) in h.pairs() {
+        assert_eq!(
+            store.commit_map_entry(&old).expect("entry"),
+            Some(new),
+            "{old}"
+        );
+    }
+    assert_eq!(store.commit_map_size().expect("size"), 4);
 }
 
 /// Recorded before the rewrite, read after it: the mission's baseline (m1)
