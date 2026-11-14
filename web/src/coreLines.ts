@@ -32,6 +32,16 @@ export interface CoreFigure {
   /** The store a figure names (objective 141: the store that grew most),
    * said after its name. */
   store?: string;
+  /** What a judged share is read from (objective 148: "Needs you is
+   * right", the needs fired in 7 days), said after its name. */
+  judged?: CoreJudged;
+}
+
+/** The needs a judged share is read from: fired, judged and not. */
+export interface CoreJudged {
+  fired: number;
+  judged: number;
+  unjudged: number;
 }
 
 /** One day of a figure's trend. */
@@ -315,13 +325,23 @@ function storeWords(store: unknown): string {
   return typeof store === "string" && store !== "" ? `: ${store}` : "";
 }
 
+/** What a judged share is read from, after its name: " (5 judged, 1
+ * unjudged of 6)", nothing without it. */
+function judgedWords(judged: unknown): string {
+  if (typeof judged !== "object" || judged === null) return "";
+  const counts = judged as Partial<CoreJudged>;
+  const [fired, done, unjudged] = [finite(counts.fired), finite(counts.judged), finite(counts.unjudged)];
+  if (fired === null || done === null || unjudged === null) return "";
+  return ` (${done} judged, ${unjudged} unjudged of ${fired})`;
+}
+
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
   const value = finite(figure.value);
   const since = finite(figure.measuring_since_ms);
   return {
-    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}`,
+    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}${judgedWords(figure.judged)}`,
     value:
       value !== null ? unitWords(unit, value) : since !== null ? `measuring since ${sinceWords(since)}` : "not collected yet",
     range: rangeWords(unit, figure.range),

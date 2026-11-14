@@ -8,12 +8,46 @@ use super::{Figure, Line};
 /// cost window's `total`, the Home card's human interventions per
 /// agent-hour (`human_per_agent_hour`: `/api/interventions?window=24h`'s
 /// `per_agent_hour`, objective 100), and the north star "Needs you is right"
-/// ([`needs_you_right`], objective 092).
+/// and what it is read from (`needs_judged`, `{fired, judged, unjudged}`;
+/// `None` when not read), both from [`judged_share`] (objective 148).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(in crate::serve) struct Observed {
     pub(in crate::serve) cost_total: Value,
     pub(in crate::serve) human_per_agent_hour: Value,
     pub(in crate::serve) needs_you_right: Value,
+    pub(in crate::serve) needs_judged: Option<Value>,
+}
+
+/// The fewest needs judged for "Needs you is right" to have a value.
+const FEWEST_JUDGED: u32 = 5;
+
+/// "Needs you is right" (objective 148) from the store's count of the needs
+/// fired in the last 7 days, `{fired, judged, right}` (`None` when not
+/// read): right ÷ judged, null while fewer than [`FEWEST_JUDGED`] are
+/// judged; and what it is read from, `{fired, judged, unjudged}` (unjudged
+/// = fired − judged), `None` when not read. A need nobody judged counts
+/// neither way, and a clearing is never evidence.
+pub(in crate::serve) fn judged_share(counts: Option<&Value>) -> (Value, Option<Value>) {
+    let Some(counts) = counts else {
+        return (Value::Null, None);
+    };
+    let count = |name: &str| {
+        counts[name]
+            .as_u64()
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
+    let (fired, judged, right) = (count("fired"), count("judged"), count("right"));
+    let said = json!({
+        "fired": fired,
+        "judged": judged,
+        "unjudged": fired.saturating_sub(judged),
+    });
+    let value = if judged >= FEWEST_JUDGED {
+        json!(f64::from(right) / f64::from(judged))
+    } else {
+        Value::Null
+    };
+    (value, Some(said))
 }
 
 /// The share of `total`'s tokens (input, output, cache write and cache
@@ -38,12 +72,16 @@ const NOT_MEASURED: &str = "observability.not_measured";
 pub(super) fn observability_line(observed: &Observed) -> Line {
     Line {
         name: "observability",
-        north_star: Figure::new(
-            "observability.needs_you_right",
-            "Needs you is right",
-            "share",
-            observed.needs_you_right.clone(),
-        ),
+        north_star: Figure {
+            // What the share is read from, said beside it (objective 148).
+            judged: observed.needs_judged.clone(),
+            ..Figure::new(
+                "observability.needs_you_right",
+                "Needs you is right",
+                "share",
+                observed.needs_you_right.clone(),
+            )
+        },
         guardrails: vec![
             Figure::new(
                 "observability.unpriced_share",
@@ -87,9 +125,9 @@ pub(super) fn count_not_measured(lines: &mut [Line]) {
     }
 }
 
-/// The window of the observability north star: 7 days.
-#[cfg(test)]
-const WEEK_MS: i64 = 7 * 24 * 3_600_000;
+/// The window of the observability north star: the needs fired in the last
+/// 7 days.
+pub(super) const WEEK_MS: i64 = 7 * 24 * 3_600_000;
 
 /// "Needs you is right" (objective 092): of the alerts (not notices) that
 /// ended in the 7 days up to `now_ms` (`cleared_at_ms` in the window), the
@@ -226,6 +264,76 @@ mod tests {
         assert_eq!(line.north_star.key, "observability.needs_you_right");
         assert_eq!(line.north_star.unit, "share");
         assert_eq!(line.north_star.value, json!(0.5));
+    }
+
+    /// Objective 148: "Needs you is right" is right ÷ judged of the needs
+    /// fired in the 7 days, null under 5 judged, said with what it is read
+    /// from; nothing said when not read.
+    #[test]
+    fn needs_you_is_right_is_the_share_judged_right_of_the_judged() {
+        let counts = |fired: u64, judged: u64, right: u64| json!({"fired": fired, "judged": judged, "right": right});
+        let said = |fired: u64, judged: u64, unjudged: u64| {
+            Some(json!({"fired": fired, "judged": judged, "unjudged": unjudged}))
+        };
+        // Under 5 judged: no value, the counts said.
+        assert_eq!(
+            judged_share(Some(&counts(6, 4, 4))),
+            (Value::Null, said(6, 4, 2))
+        );
+        assert_eq!(
+            judged_share(Some(&counts(0, 0, 0))),
+            (Value::Null, said(0, 0, 0))
+        );
+        // 5 judged: right over judged, never over fired.
+        assert_eq!(
+            judged_share(Some(&counts(9, 5, 3))),
+            (json!(0.6), said(9, 5, 4))
+        );
+        assert_eq!(
+            judged_share(Some(&counts(5, 5, 0))),
+            (json!(0.0), said(5, 5, 0))
+        );
+        assert_eq!(
+            judged_share(Some(&counts(7, 5, 5))),
+            (json!(1.0), said(7, 5, 2))
+        );
+        // Not read: nothing said.
+        assert_eq!(judged_share(None), (Value::Null, None));
+
+        // The line carries it, and the answer says `judged` beside it.
+        let (needs_you_right, needs_judged) = judged_share(Some(&counts(6, 5, 3)));
+        let observed = Observed {
+            needs_you_right,
+            needs_judged,
+            ..Observed::default()
+        };
+        let line = &lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new())[2];
+        let view = figure_json(&line.north_star, None);
+        assert_eq!(view["key"], "observability.needs_you_right");
+        assert_eq!(view["name"], "Needs you is right");
+        assert_eq!(view["value"], json!(0.6));
+        assert_eq!(
+            view["judged"],
+            json!({"fired": 6, "judged": 5, "unjudged": 1})
+        );
+        // Not read: no `judged`, and no other figure says one.
+        let bare = lines(
+            &json!({}),
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
+        for figure in bare
+            .iter()
+            .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+        {
+            assert!(
+                figure_json(figure, None).get("judged").is_none(),
+                "{}",
+                figure.key
+            );
+        }
     }
 
     /// Objective 088: the observability line's guardrails.
