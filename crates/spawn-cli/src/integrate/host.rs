@@ -25,6 +25,9 @@ use std::path::Path;
 /// candidate: the only rejection whose failures are read.
 pub(crate) const CHECK_TESTS_REGRESSION: &str = "regression: check-tests.sh fails on the candidate";
 
+/// The scenario whose failures are its failing tests.
+pub(crate) const CHECK_TESTS: &str = "check-tests.sh";
+
 /// The line that opens the check-tests section of the gate's output.
 const SECTION: &str = "| == regression: check-tests.sh must still pass";
 
@@ -246,6 +249,74 @@ pub(crate) fn check_tests_failures(log: &str) -> Vec<Failure> {
     } else {
         owner
     }
+}
+
+/// Characters of a check a rejection quotes.
+pub(crate) const CHECK_CHARS: usize = 200;
+
+/// The checks the deciding run of a rejection failed (objective 169).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Checks {
+    /// The scenario of the gate's deciding stage line.
+    pub(crate) scenario: String,
+    /// Its first failed check, masked and cut to [`CHECK_CHARS`].
+    pub(crate) first: String,
+    /// How many checks it failed.
+    pub(crate) count: usize,
+}
+
+/// The phase and scenario a `| stage gate rejected <ms>ms <phase>:
+/// <scenario> must …` line names; None for any other line (the closing
+/// `… total` line names none).
+fn rejected_stage(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("| stage gate rejected ")?;
+    let (ms, rest) = rest.split_once(' ')?;
+    ms.strip_suffix("ms")?;
+    let (phase, rest) = rest.split_once(": ")?;
+    let (scenario, _) = rest.split_once(" must")?;
+    let named = |word: &str| !word.is_empty() && !word.contains(char::is_whitespace);
+    (named(phase) && named(scenario)).then_some((phase, scenario))
+}
+
+/// The checks the gate's deciding run failed: the scenario its last
+/// rejected stage line names (that line naming none: None) and, for
+/// check-tests.sh, its failing tests ([`check_tests_failures`]); for any
+/// other scenario, the non-empty `| blackbox: ` lines of its section (from
+/// its last `| == <phase>: <scenario> must …` line before the stage line),
+/// in order. Each is masked ([`spawn_core::redact::redact`]) and cut to
+/// [`CHECK_CHARS`]. None when the run names no check.
+pub(crate) fn rejected_checks(log: &str) -> Option<Checks> {
+    let lines: Vec<&str> = log.lines().collect();
+    let stage = lines.iter().rposition(|line| {
+        line.starts_with("| stage gate rejected ") && !line.trim_end().ends_with(" total")
+    })?;
+    let (phase, scenario) = rejected_stage(lines[stage].trim_end())?;
+    let checks: Vec<String> = if scenario == CHECK_TESTS {
+        check_tests_failures(log)
+            .into_iter()
+            .map(|failure| failure.test)
+            .collect()
+    } else {
+        let header = format!("| == {phase}: {scenario} must");
+        let start = lines[..stage]
+            .iter()
+            .rposition(|line| line.starts_with(&header))?;
+        lines[start + 1..stage]
+            .iter()
+            .take_while(|line| !line.starts_with("| == ") && !line.starts_with("| stage gate "))
+            .filter_map(|line| line.strip_prefix("| blackbox: "))
+            .map(str::trim)
+            .filter(|check| !check.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    };
+    let first = checks.first()?;
+    let masked = spawn_core::redact::redact(first);
+    Some(Checks {
+        scenario: scenario.to_string(),
+        first: super::cut(&masked, CHECK_CHARS).to_string(),
+        count: checks.len(),
+    })
 }
 
 /// The time of a line of the test database's log, as PostgreSQL writes it
