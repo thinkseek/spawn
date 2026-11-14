@@ -299,7 +299,7 @@ workspace root, symlinks resolved):
   window and not restored is a mismatch;
 - every mission source: `git clone --mirror` of its full bundle, each
   increment's bundle fetched on top, the refs set to the newest record's
-  heads, `git fsck --connectivity-only`; compared with the live repository's
+  heads, `git fsck --full` (every object read whole); compared with the live repository's
   `refs/heads` and `refs/tags`. A ref live moved on to a descendant, added or
   removed since is expected; one live moved to a commit that does not descend
   from the restored one is a mismatch.
