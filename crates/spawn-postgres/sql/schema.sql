@@ -2541,16 +2541,16 @@ begin
             update spawn_alerts
                set verdict = 'right', judged_at_ms = p_at
              where key = p_record ->> 'key';
-            return;
+        else
+            update spawn_alerts
+               set verdict = p_record ->> 'verdict', judged_at_ms = p_at,
+                   state = 'cleared',
+                   cleared_event_id = coalesce(cleared_event_id, p_event),
+                   cleared_at_ms = coalesce(cleared_at_ms, p_at),
+                   cleared_evidence = coalesce(cleared_evidence,
+                                               jsonb_build_object('judged', p_record ->> 'verdict'))
+             where key = p_record ->> 'key';
         end if;
-        update spawn_alerts
-           set verdict = p_record ->> 'verdict', judged_at_ms = p_at,
-               state = 'cleared',
-               cleared_event_id = coalesce(cleared_event_id, p_event),
-               cleared_at_ms = coalesce(cleared_at_ms, p_at),
-               cleared_evidence = coalesce(cleared_evidence,
-                                           jsonb_build_object('judged', p_record ->> 'verdict'))
-         where key = p_record ->> 'key';
     when 'alert.cleared' then
         -- What cleared an alert, once: the row must be open (a notice never
         -- clears, and a cleared alert is cleared at most once).
