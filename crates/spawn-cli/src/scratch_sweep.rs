@@ -300,7 +300,10 @@ fn sweep(
                 &args.excuses,
             ) {
                 Proof::Used(why) => Err(why),
-                Proof::Free(excused) => Ok(Judged { excused, ..judged }),
+                Proof::Free(by_name) => Ok(Judged {
+            excused: by_name,
+            ..judged
+        }),
             }
         })
         .collect();
@@ -337,8 +340,21 @@ fn sweep(
     }
     first.into_iter().for_each(&mut *out);
     hook(Stage::Digested, Path::new(""));
+    Ok(apply(&rows, &listed, inputs, &args.excuses, hook, out))
+}
+
+/// `--apply` on the list read: each path judged again just before it
+/// goes, and removed only as it was listed. 1 when a removal failed.
+fn apply(
+    rows: &[Row],
+    listed: &[Result<Judged, String>],
+    inputs: &Inputs,
+    excuses: &[(u32, u64)],
+    hook: &dyn Fn(Stage, &Path),
+    out: &mut dyn FnMut(String),
+) -> i32 {
     let (mut count, mut bytes, mut failed) = (0_u64, 0_u64, false);
-    for (row, judged) in rows.iter().zip(&listed) {
+    for (row, judged) in rows.iter().zip(listed) {
         let judged = match judged {
             Ok(judged) => judged,
             Err(why) => {
@@ -346,7 +362,7 @@ fn sweep(
                 continue;
             }
         };
-        let again = match rejudge(row, inputs, &args.excuses, hook) {
+        let again = match rejudge(row, inputs, excuses, hook) {
             Ok(again) => again,
             Err(why) => {
                 out(row.stays(&why));
@@ -381,7 +397,7 @@ fn sweep(
         }
     }
     out(format!("removed {count} build path(s), {bytes} bytes"));
-    Ok(i32::from(failed))
+    i32::from(failed)
 }
 
 /// Each build path of each folder, once per folder, in order.
@@ -426,7 +442,10 @@ fn rejudge(
     let procs = snapshot(inputs.proc_root).map_err(|why| format!("in use unknown: {why}"))?;
     match in_use(&row.path, owner, row.claim.created_ms, &procs, excuses) {
         Proof::Used(why) => Err(why),
-        Proof::Free(excused) => Ok(Judged { excused, ..judged }),
+        Proof::Free(by_name) => Ok(Judged {
+            excused: by_name,
+            ..judged
+        }),
     }
 }
 
@@ -710,7 +729,7 @@ fn in_use(
     excuses: &[(u32, u64)],
 ) -> Proof {
     let mut unknown = None;
-    let mut excused = Vec::new();
+    let mut by_name = Vec::new();
     for process in &procs.list {
         let Some(uses) = &process.uses else {
             if process.uid.is_some_and(|uid| uid != owner) {
@@ -727,7 +746,7 @@ fn in_use(
                 .zip(procs.btime)
                 .is_some_and(|(start, btime)| started_ms(btime, start) < created_ms);
             if before && EXCUSED.contains(&process.comm.as_str()) {
-                excused.push((process.pid, process.comm.clone()));
+                by_name.push((process.pid, process.comm.clone()));
                 continue;
             }
             unknown.get_or_insert_with(|| {
@@ -742,7 +761,7 @@ fn in_use(
             return Proof::Used(format!("in use: process {}'s {}", process.pid, kind.word()));
         }
     }
-    unknown.map_or(Proof::Free(excused), Proof::Used)
+    unknown.map_or(Proof::Free(by_name), Proof::Used)
 }
 
 /// When a process started, in ms since the epoch: the boot time plus its

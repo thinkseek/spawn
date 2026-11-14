@@ -785,7 +785,7 @@ fn lines_at(
 /// whole of the scratch once, not every ten minutes.
 const SWEEP_BOUND: scratch::Bound = scratch::Bound {
     entries: 50_000_000,
-    time: Duration::from_secs(600),
+    time: Duration::from_mins(10),
 };
 
 /// What `spawn scratch sweep` decides from (objective 145): the claimed

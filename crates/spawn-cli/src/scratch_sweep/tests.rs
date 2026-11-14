@@ -5,6 +5,7 @@ use super::{
     Args, EXCUSED, Inputs, Proof, Stage, args, digest, in_use, mapped, snapshot, sweep, under,
 };
 use crate::scratch_owner::{Claim, OWNER_FILE};
+use sha2::Digest as _;
 
 const HOUR_MS: i64 = 3_600_000;
 const SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# a test's\n";
@@ -891,7 +892,6 @@ fn the_digest_is_of_what_would_go_and_the_excuses() {
         metadata(&s.join("go/target")).dev(),
         metadata(&s.join("go/target")).ino()
     );
-    use sha2::Digest as _;
     let line = std::fs::read_to_string(s.join("go").join(OWNER_FILE)).expect("owner");
     let claim_sha = super::hex(&sha2::Sha256::digest(line.trim_end().as_bytes()));
     assert_eq!(

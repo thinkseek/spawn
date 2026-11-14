@@ -967,7 +967,7 @@ mod tests {
         let scratch = Scratch::new();
         let root = scratch.0.join("root");
         let projects = scratch.0.join("projects");
-        let excluded = root.join("sess/kept");
+        let kept_path = root.join("sess/kept");
         for folder in [
             "sess/deep",
             "sess/incident-9",
@@ -983,7 +983,7 @@ mod tests {
         std::os::unix::fs::symlink(&root.join("projects-link"), projects.join("alias"))
             .expect("symlink");
         let roots = [root.clone()];
-        let excludes = [excluded];
+        let excludes = [kept_path];
         let never = never_counted(&projects.join("alias"));
         let swept = |folder: &str| sweepable(&root.join(folder), &roots, &excludes, &never);
         assert!(swept("sess/deep"));
