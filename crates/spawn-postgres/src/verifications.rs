@@ -146,7 +146,10 @@ impl PostgresStore {
     /// checked by `spawn_verification_record`). Returns the event's id.
     pub fn verification_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one("select spawn_verification_record($1)", &[record])?
+            .query_one(
+                "select spawn_verification_record($1)",
+                &[&crate::control_mask::masked(record)],
+            )?
             .get(0))
     }
 

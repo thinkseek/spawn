@@ -1975,7 +1975,8 @@ impl PostgresStore {
     /// already made (a second `task.held` for one task and hold:
     /// [`Self::task_held`]) is an error here.
     pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
-        self.query_one("select spawn_integrator_record($1)", &[record])?
+        let record = crate::control_mask::masked(record);
+        self.query_one("select spawn_integrator_record($1)", &[&record])?
             .get::<_, Option<i64>>(0)
             .ok_or_else(|| StoreError::Rejected(format!("already recorded: {record}")))
     }
@@ -2033,8 +2034,8 @@ impl PostgresStore {
     /// pushed nothing (owner only): the event id, or `None` when one was
     /// recorded for this task and hold already (nothing is recorded).
     pub fn task_held(&self, task: i64, hold: i64, source: &str) -> Result<Option<i64>, StoreError> {
-        let record = serde_json::json!({"type": "task.held", "id": task, "hold": hold,
-                                        "source": source});
+        let record = crate::control_mask::masked(&serde_json::json!({"type": "task.held",
+            "id": task, "hold": hold, "source": source}));
         Ok(self
             .query_one("select spawn_integrator_record($1)", &[&record])?
             .get(0))
@@ -2212,8 +2213,8 @@ impl PostgresStore {
     /// not parked (or none) is refused by the record's check, never a
     /// silent no-op.
     pub fn task_release(&self, task: i64, by: &str, reason: &str) -> Result<Value, StoreError> {
-        let record = serde_json::json!({"type": "task.released", "id": task, "by": by,
-                                        "reason": reason});
+        let record = crate::control_mask::masked(&serde_json::json!({"type": "task.released",
+            "id": task, "by": by, "reason": reason}));
         self.query_json(
             "with parked as (
                  select gate_parked_pushed, gate_load_sensitive_scenarios
@@ -2393,7 +2394,10 @@ impl PostgresStore {
     /// is checked by `spawn_deploy_record`). Returns the event's id.
     pub fn deploy_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one("select spawn_deploy_record($1)", &[record])?
+            .query_one(
+                "select spawn_deploy_record($1)",
+                &[&crate::control_mask::masked(record)],
+            )?
             .get(0))
     }
 
