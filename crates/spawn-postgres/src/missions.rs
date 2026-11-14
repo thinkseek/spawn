@@ -134,11 +134,17 @@ macro_rules! owner_requests_pending {
 ///   it, holds nothing on the source until it is accepted, and a deploy
 ///   would restart its judging (S23). deploy/on-landing.sh waits for the
 ///   ones whose commit main does not hold already;
-/// - `judging`: how many tasks of the source's missions are reported,
+/// - `judging`: how many tasks of the source's gated missions are reported,
 ///   accepted or landing, i.e. between their report and their landing: each
 ///   may land within a gate's time. deploy/on-landing.sh keeps its quiet
 ///   spell only while one is (a burst can still come); at 0 no landing can
-///   follow sooner than a report and a gate, so it deploys at once;
+///   follow sooner than a report and a gate, so it deploys at once. Only
+///   the gate's inputs and what is past them count (objective 168): a
+///   mission without a gate never lands a task through the integrator (its
+///   `accepted` is final, kept for good), and a gated mission that accepts
+///   by review sends a task to its gate only once a person accepted it, so
+///   its `reported` task waits for a person, not a gate. Counting either
+///   would hold the quiet spell for ever;
 /// - `now_ms`: the database's clock, which every `at_ms` is on.
 pub(crate) const MAIN_LANDING: &str = concat!(
     r#"
@@ -204,6 +210,8 @@ select jsonb_build_object(
                 from mission_tasks t
                 join mission_missions m on m.id = t.mission_id
                where t.state in ('reported', 'accepted', 'landing')
+                 and m.gate is not null
+                 and (t.state <> 'reported' or m.accept = 'gate')
                  and m.sources ->> 0 = $1))"#
 );
 
@@ -2340,7 +2348,9 @@ impl PostgresStore {
     /// What deploy/on-landing.sh decides on ([`MAIN_LANDING`]): main's
     /// gate-accepted landing on `source`, when the first landing after the
     /// live commit `deployed` was, the source's hold, and how many of its
-    /// tasks are between their report and their landing (`judging`).
+    /// tasks the gate can still land (`judging`): a gated mission's tasks
+    /// between their report and their landing, a reported one only where
+    /// the gate accepts (elsewhere a person comes first).
     pub fn main_landing(
         &self,
         source: &str,
