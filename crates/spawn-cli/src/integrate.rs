@@ -1202,6 +1202,66 @@ pub(crate) fn report_freshness(
     freshness(checkpoint, pushed, contains)
 }
 
+/// A stale verdict whose report's checkpoint, or else whose latest
+/// checkpoint, is no commit of the mirror (`known`), says so (objective
+/// 177): after a history rewrite it is neither in the commit map nor in the
+/// source. The verdict is still stale; any other verdict is as it was.
+pub(crate) fn name_unknown(
+    verdict: Freshness,
+    reported: Option<&str>,
+    checkpoint: Option<&str>,
+    known: impl Fn(&str) -> bool,
+) -> Freshness {
+    if !matches!(verdict, Freshness::Stale(_)) {
+        return verdict;
+    }
+    let unknown = [("report's", reported), ("latest", checkpoint)]
+        .into_iter()
+        .find_map(|(which, commit)| commit.filter(|commit| !known(commit)).map(|c| (which, c)));
+    match unknown {
+        Some((which, commit)) => Freshness::Stale(format!(
+            "the {which} checkpoint {commit} is an unknown commit (in neither the commit map nor \
+             the source)"
+        )),
+        None => verdict,
+    }
+}
+
+/// The re-push of `task`'s agent's lost checkpoint `checkpoint` from this
+/// host's mirror ([`sources::push_recorded`]), unless it is from before a
+/// history rewrite ([`crate::rewrite_guard::why_old`], objective 177): then
+/// nothing is pushed, and the refusal is recorded once (`push-again`).
+fn push_again(store: &PostgresStore, mirror: &Path, source: &str, task: &Task, checkpoint: &str) {
+    match crate::rewrite_guard::why_old(store, &mirror.to_string_lossy(), checkpoint) {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            println!(
+                "integrate: task {}: {checkpoint} is not pushed again: {reason}",
+                task.id
+            );
+            if let Err(error) =
+                crate::rewrite_guard::refused(store, "push-again", task.id, checkpoint, &reason)
+            {
+                eprintln!("integrate: task {}: {error}", task.id);
+            }
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "integrate: task {}: {checkpoint} is not pushed again: {error}",
+                task.id
+            );
+            return;
+        }
+    }
+    if let Some(again) = sources::push_recorded(mirror, source, &task.agent_id, checkpoint) {
+        println!(
+            "integrate: task {}: {checkpoint} pushed again: {again:?}",
+            task.id
+        );
+    }
+}
+
 /// The mirror's own copy of an agent's pushed branch: never
 /// `refs/heads/<agent>`, which on the Bridge's host is the Bridge's.
 fn integrator_ref(agent: &str) -> String {
@@ -3546,18 +3606,28 @@ impl Judge {
                 contains,
             );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
-                return Ok(verdict);
+                // A checkpoint the mirror lacks is named so (objective 177).
+                return Ok(name_unknown(
+                    verdict,
+                    reported.as_deref(),
+                    checkpoint.as_deref(),
+                    |commit| {
+                        git(&[
+                            "--git-dir",
+                            &mirror_path,
+                            "cat-file",
+                            "-e",
+                            &format!("{commit}^{{commit}}"),
+                        ])
+                        .is_ok()
+                    },
+                ));
             }
             // A recorded checkpoint whose push was lost (issue #8) is pushed
             // again from this host's mirror, once a pass.
             if !pushed_again && let Some(checkpoint) = checkpoint.as_deref() {
                 pushed_again = true;
-                if let Some(again) = sources::push_recorded(mirror, source, agent, checkpoint) {
-                    println!(
-                        "integrate: task {}: {checkpoint} pushed again: {again:?}",
-                        task.id
-                    );
-                }
+                push_again(store, mirror, source, task, checkpoint);
             }
             std::thread::sleep(PUSH_POLL);
         }
