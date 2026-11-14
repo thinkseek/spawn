@@ -471,6 +471,7 @@ use spawn_core::port::CommandQueue;
 use spawn_host::GitWorkspace;
 use spawn_postgres::{ActivityEvent, PostgresStore};
 
+use crate::commit_now::{CommitNow, commit_now};
 use crate::config::{loop_interval, workspace_root};
 use crate::gate::{self, GateFailure, RoomFailure};
 use crate::{Flags, env_or, open_store};
@@ -2089,8 +2090,28 @@ impl Integrator {
         else {
             return Ok(false);
         };
-        let Some(controller) = controller_behind(mirror, scenarios, &landed) else {
-            return Ok(false);
+        let lag = controller_behind(mirror, scenarios, &landed, |commit| {
+            commit_now(store, mirror, commit).map_err(|error| error.to_string())
+        })?;
+        let controller = match lag {
+            ControllerLag::No => return Ok(false),
+            ControllerLag::Behind(controller) => controller,
+            ControllerLag::Unknown(why) => {
+                if self
+                    .waiting
+                    .borrow_mut()
+                    .insert((task.id, Wait::ControllerUnknown))
+                {
+                    println!(
+                        "integrate: mission {}: task {}: {why}: it is not compared with the \
+                         owner's landing {} on {source}, and is judged",
+                        mission.id,
+                        task.id,
+                        short_commit(&landed)
+                    );
+                }
+                return Ok(false);
+            }
         };
         if self
             .waiting
@@ -4616,24 +4637,47 @@ pub(crate) fn controller_commit(scenarios: &Path) -> Option<String> {
     })
 }
 
-/// The controller commit `scenarios` come from when the commit `landed`
-/// (the owner's latest landing, in the repository at `repository`: the
-/// mirror or the source itself) is newer than it: a descendant, not the
-/// commit itself. None when they are one commit, when the scenarios are in
-/// no controller, or when the controller's commit is not `landed`'s
-/// ancestor there (the controller has the landing, or is of another
-/// repository's commits: nothing to say).
+/// Whether the controller holding `scenarios` lags the commit `landed`
+/// (the owner's latest landing, already read through the commit map, in the
+/// repository at `repository`: the mirror or the source itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControllerLag {
+    /// Not behind: one commit, the scenarios in no controller, or the
+    /// controller's commit not `landed`'s ancestor there.
+    No,
+    /// `landed` is newer than the controller's commit (as it is now, the
+    /// commit map's new id for one built before a history rewrite).
+    Behind(String),
+    /// The controller's commit was dropped by the rewrite, or is in neither
+    /// the commit map nor the repository: why (objective 178). Never behind.
+    Unknown(String),
+}
+
+/// Whether the controller `scenarios` come from is behind the commit
+/// `landed`: its commit (`controller_commit`) is read through `now` (the
+/// commit map, then the repository: [`crate::commit_now::commit_now`])
+/// before the ancestry check, so a controller built before a history
+/// rewrite is compared by its new id. A dropped or unknown commit is
+/// [`ControllerLag::Unknown`] with its sentence; an error of `now` (the
+/// store's) is an error, not a verdict.
 pub(crate) fn controller_behind(
     repository: &Path,
     scenarios: &Path,
     landed: &str,
-) -> Option<String> {
-    let controller = controller_commit(scenarios)?;
+    now: impl FnOnce(&str) -> Result<CommitNow, String>,
+) -> Result<ControllerLag, String> {
+    let Some(recorded) = controller_commit(scenarios) else {
+        return Ok(ControllerLag::No);
+    };
+    let controller = match now(&recorded)?.id_or_why("the controller's commit", &recorded) {
+        Ok(controller) => controller,
+        Err(why) => return Ok(ControllerLag::Unknown(why)),
+    };
     if landed.eq_ignore_ascii_case(&controller) {
-        return None;
+        return Ok(ControllerLag::No);
     }
     let repository = repository.to_string_lossy();
-    git(&[
+    let behind = git(&[
         "-C",
         &repository,
         "merge-base",
@@ -4641,8 +4685,12 @@ pub(crate) fn controller_behind(
         &controller,
         landed,
     ])
-    .is_ok()
-    .then_some(controller)
+    .is_ok();
+    Ok(if behind {
+        ControllerLag::Behind(controller)
+    } else {
+        ControllerLag::No
+    })
 }
 
 /// Why a task waits, for saying each wait once ([`Integrator::waiting`]).
@@ -4662,6 +4710,9 @@ enum Wait {
     /// controller its scenarios come from: its deploy has not switched the
     /// controller yet (P22).
     Controller,
+    /// The controller's commit was dropped by a history rewrite or is an
+    /// unknown commit (objective 178): said once, never a wait.
+    ControllerUnknown,
     /// The nightly found main of its source red (gate v2 step 5b).
     NightlyRed,
     /// The load-sensitive bound parked its pushed commit.
