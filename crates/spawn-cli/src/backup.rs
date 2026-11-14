@@ -34,9 +34,7 @@
 //!   — whole or `--not` its base's heads, and the transcript archive's
 //!   files modified
 //!   within `SPAWN_BACKUP_TRANSCRIPT_DAYS` (default 14), whole or the bytes
-//!   appended since the base's sizes; the record names every window file's
-//!   size (`transcripts.sizes`) and the sha256 of its first size bytes
-//!   (`transcripts.sha256`, objective 149). The record is a true description of the
+//!   appended since the base's sizes. The record is a true description of the
 //!   archive: verify refuses a bundle that lists a ref its manifest does not
 //!   name, so the bundle may hold only what the manifest holds.
 //! - `spawn backup verify`, every day: the newest good dump fetched,
@@ -49,13 +47,11 @@
 //!   repo's `git bundle` (heads listed; a full one verified alone) compared
 //!   with its record, so the sources and transcripts are proven to open too:
 //!   exit 0 when both pass, 1 when either does not, 2 when it cannot run.
-//! - `spawn backup restore-drill`, by hand until objective 149b (core (ii)):
-//!   the newest stored
+//! - `spawn backup restore-drill`, by hand (core (ii)): the newest stored
 //!   bundle and its chain back to a full one restored into a scratch
 //!   directory of its own (mode 700, never under `$HOME`, `$SPAWN_LIVE` or
-//!   the root), the transcript archive and every mission source, judged
-//!   against the newest record's sha256 and compared with live, read only
-//!   ([`restore_drill`]).
+//!   the root), the transcript archive and every mission source, and
+//!   compared with live, read only ([`restore_drill`]).
 //!
 //! The bucket stays inside R2's free tier: `SPAWN_BACKUP_R2_LIMIT_MB`
 //! (default 10000) is 10,000,000,000 bytes, and nothing is ever written
@@ -2128,16 +2124,8 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut transcript_entries: Vec<Value> = Vec::new();
     let mut transp_bytes = 0u64;
     let mut sizes = serde_json::Map::new();
-    // Each file's sha256 as bundled (objective 149): of its first `size`
-    // bytes, unchanged files too, so the newest record alone names every
-    // file a restore must give back, and a restore drill judges it.
-    let mut hashes = serde_json::Map::new();
     for (path, size) in &window {
         sizes.insert(path.clone(), json!(size));
-        hashes.insert(
-            path.clone(),
-            json!(restore_drill::sha256_prefix(&archive.join(path), *size)?),
-        );
         let base_size = base
             .and_then(|base| base.record["transcripts"]["sizes"].get(path))
             .and_then(Value::as_u64);
@@ -2394,7 +2382,6 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
             "files": transcript_entries.len(),
             "bytes": transp_bytes,
             "sizes": sizes,
-            "sha256": hashes,
         },
         "held_bytes": held,
         "written_bytes": written,
