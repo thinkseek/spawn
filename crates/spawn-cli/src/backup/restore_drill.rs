@@ -84,6 +84,7 @@
 //! (deploy/backup/README.md).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -179,19 +180,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let result = run(&store, &settings, &chain, &seal, drill.path());
     let newest = chain[chain.len() - 1];
     let (code, outcomes) = match result {
-        Ok(report) => (
-            said(&report),
-            [
-                (
-                    TRANSCRIPTS,
-                    outcome(TRANSCRIPTS, &report.transcripts, &[], &report.key),
-                ),
-                (
-                    MISSIONS,
-                    outcome(MISSIONS, &report.missions, &report.unknown, &report.key),
-                ),
-            ],
-        ),
+        Ok(report) => (said(&report), outcomes(&report)),
         Err(error) => {
             let reason = format!("the backup cannot be restored: {error}");
             println!("restore-drill: FAILED: {reason}");
@@ -364,6 +353,20 @@ fn counted(mismatches: usize, unknown: usize) -> String {
     } else {
         format!("{mismatches} mismatch(es) and {unknown} unknown commit(s)")
     }
+}
+
+/// Each resource's outcome from a drill that ran.
+fn outcomes(report: &Report) -> [(&'static str, Outcome); 2] {
+    [
+        (
+            TRANSCRIPTS,
+            outcome(TRANSCRIPTS, &report.transcripts, &[], &report.key),
+        ),
+        (
+            MISSIONS,
+            outcome(MISSIONS, &report.missions, &report.unknown, &report.key),
+        ),
+    ]
 }
 
 /// A resource's outcome from its mismatches and its unknown commits
@@ -1323,11 +1326,12 @@ impl Refs {
             self.mismatches.len()
         );
         if !self.dropped.is_empty() || !self.unknown.is_empty() {
-            line.push_str(&format!(
+            let _ = write!(
+                line,
                 ", {} dropped by the history rewrite, {} unknown commit(s)",
                 self.dropped.len(),
                 self.unknown.len()
-            ));
+            );
         }
         line
     }
@@ -1824,7 +1828,9 @@ mod tests {
                 "oe" => Some(None),
                 _ => None,
             };
-            Ok(CommitNow::of(commit, entry, || commit.starts_with('n')))
+            Ok(CommitNow::of(commit, entry.as_ref(), || {
+                commit.starts_with('n')
+            }))
         };
         let descends = |old: &str, new: &str| old == "n1" && new == "n2";
         let report = compare_refs(&restored, &live, map, descends).expect("compared");

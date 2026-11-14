@@ -30,11 +30,11 @@ impl CommitNow {
     /// it.
     pub(crate) fn of(
         commit: &str,
-        entry: Option<Option<String>>,
+        entry: Option<&Option<String>>,
         held: impl FnOnce() -> bool,
     ) -> Self {
         match entry {
-            Some(Some(new)) => Self::Commit(new),
+            Some(Some(new)) => Self::Commit(new.clone()),
             Some(None) => Self::Dropped,
             None if held() => Self::Commit(commit.to_string()),
             None => Self::Unknown,
@@ -67,7 +67,7 @@ pub(crate) fn commit_now(
     commit: &str,
 ) -> Result<CommitNow, StoreError> {
     let entry = store.commit_map_entry(commit)?;
-    Ok(CommitNow::of(commit, entry, || held(repository, commit)))
+    Ok(CommitNow::of(commit, entry.as_ref(), || held(repository, commit)))
 }
 
 /// Whether the repository at `repository` holds `commit` as a commit.
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn a_mapped_id_is_its_new_one_without_asking_the_repository() {
         let asked = Cell::new(false);
-        let now = CommitNow::of("old", Some(Some("new".to_string())), || {
+        let now = CommitNow::of("old", Some(&Some("new".to_string())), || {
             asked.set(true);
             true
         });
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn a_dropped_id_is_dropped_even_when_the_repository_still_holds_it() {
-        assert_eq!(CommitNow::of("old", Some(None), || true), CommitNow::Dropped);
+        assert_eq!(CommitNow::of("old", Some(&None), || true), CommitNow::Dropped);
     }
 
     #[test]

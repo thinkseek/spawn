@@ -2497,7 +2497,7 @@ fn a_controller_built_before_the_rewrite_is_compared_by_its_new_commit() {
     let mapped = |commit: &str| {
         Ok::<_, String>(CommitNow::of(
             commit,
-            (commit == old).then(|| Some(new1.clone())),
+            (commit == old).then_some(&Some(new1.clone())),
             || false,
         ))
     };
@@ -2509,7 +2509,7 @@ fn a_controller_built_before_the_rewrite_is_compared_by_its_new_commit() {
         super::controller_behind(&repo, &scenarios, &new1, mapped),
         Ok(ControllerLag::No)
     );
-    let dropped = |commit: &str| Ok::<_, String>(CommitNow::of(commit, Some(None), || true));
+    let dropped = |commit: &str| Ok::<_, String>(CommitNow::of(commit, Some(&None), || true));
     assert_eq!(
         super::controller_behind(&repo, &scenarios, &new2, dropped),
         Ok(ControllerLag::Unknown(format!(

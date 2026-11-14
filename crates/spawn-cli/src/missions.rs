@@ -628,39 +628,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         }
         "push" => return push(&store, &flags),
         "pushes" => print(&pushes(&store, &flags)?),
-        "moved" => {
-            let source = text(&flags, "source")?;
-            crate::sources::MissionSource::parse(&source)?;
-            // Each read through the commit map (objective 178): a deploy
-            // recorded before a history rewrite names the old id. The new
-            // ids are compared and recorded; a dropped or unknown one is
-            // refused with its sentence.
-            let read = |name: &str| -> Result<String, String> {
-                let recorded = text(&flags, name)?;
-                crate::commit_now::commit_now(&store, std::path::Path::new(&source), &recorded)
-                    .map_err(err)?
-                    .id_or_why(&format!("--{name}"), &recorded)
-            };
-            let from = read("from")?;
-            let to = read("to")?;
-            // Forward only: a main that dropped landed work is a halt, not a deploy.
-            let forward = crate::sources::controller_git()
-                .args([
-                    "--git-dir",
-                    &source,
-                    "merge-base",
-                    "--is-ancestor",
-                    &from,
-                    &to,
-                ])
-                .status()
-                .map_err(|error| format!("git: {error}"))?;
-            if !forward.success() {
-                return Err(format!("{to} does not descend from {from} in {source}"));
-            }
-            let missions = store.source_moved(&source, &from, &to).map_err(err)?;
-            print(&json!({ "source": source, "to": to, "missions": missions }));
-        }
+        "moved" => print(&moved(&store, &flags)?),
         "landing" => print(&landing(&store, &flags)?),
         "deployed" => print(&deployed(&store, &flags)?),
         "hold" => print(&hold(&store, &flags)?),
@@ -690,6 +658,43 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// `spawn mission moved --source <dir> --from <commit> --to <commit>`: a
+/// deploy's record of main moved forward (`source.moved`). `--from` and
+/// `--to` are each read through the commit map (objective 178): a deploy
+/// recorded before a history rewrite names the old id. The new ids are
+/// compared and recorded; a dropped or unknown one is refused with its
+/// sentence, never as "does not descend".
+fn moved(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let err = |error: spawn_core::port::StoreError| error.to_string();
+    let source = text(flags, "source")?;
+    crate::sources::MissionSource::parse(&source)?;
+    let read = |name: &str| -> Result<String, String> {
+        let recorded = text(flags, name)?;
+        crate::commit_now::commit_now(store, std::path::Path::new(&source), &recorded)
+            .map_err(err)?
+            .id_or_why(&format!("--{name}"), &recorded)
+    };
+    let from = read("from")?;
+    let to = read("to")?;
+    // Forward only: a main that dropped landed work is a halt, not a deploy.
+    let forward = crate::sources::controller_git()
+        .args([
+            "--git-dir",
+            &source,
+            "merge-base",
+            "--is-ancestor",
+            &from,
+            &to,
+        ])
+        .status()
+        .map_err(|error| format!("git: {error}"))?;
+    if !forward.success() {
+        return Err(format!("{to} does not descend from {from} in {source}"));
+    }
+    let missions = store.source_moved(&source, &from, &to).map_err(err)?;
+    Ok(json!({ "source": source, "to": to, "missions": missions }))
 }
 
 /// `spawn mission pause --id N [--reason <text>]` (objective 099): the
