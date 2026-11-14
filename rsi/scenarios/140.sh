@@ -317,7 +317,8 @@ expect_eq "$(jq -c --argjson c "$(owner "$S/a")" '[.scratch.claimed[] | select(.
 expect_eq "$(jq -c '[.scratch.unowned[] | {path, bytes, reason}]' "$WORK/api.json")" \
     "[{\"path\":\"$S/gone\",\"bytes\":$(size_of "$S/gone"),\"reason\":\"gone\"},{\"path\":\"$S/b\",\"bytes\":$(size_of "$S/b"),\"reason\":\"lease ended\"}]" \
     "(3) nobody's: the exited owner's (094) and b, released (lease ended); not a or sess/o (leased), old (its pid runs), sess (changed now)"
-fig() { jq -c ".lines[] | select(.line == \"storage\") | ([.north_star] + .guardrails)[] | select(.key == \"$1\") | .value" "$WORK/api.json"; }
+# Objective 176: scratch nobody owns is a storage diagnostic.
+fig() { jq -c "(.diagnostics // [])[] | select(.key == \"$1\") | .value" "$WORK/api.json"; }
 expect_eq "$(fig storage.unowned_scratch_bytes)" "$(($(size_of "$S/gone") + $(size_of "$S/b")))" \
     "(3) scratch nobody owns counts the ended lease"
 

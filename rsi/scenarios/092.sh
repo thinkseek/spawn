@@ -336,9 +336,10 @@ code=$(get /api/core-lines "$WORK/lines.json")
 if [ "$code" != 200 ]; then
     check_failed "(3) GET /api/core-lines answered $code"
 else
-    got=$(jq -c '.lines[] | select(.line == "observability") | .north_star | {key, unit, value, state}' "$WORK/lines.json")
-    expect_eq "$got" '{"key":"observability.needs_you_right","unit":"share","value":null,"state":"not_collected"}' \
-        "(3) the observability north star is not collected until A22/A23 land (a condition clearing is not an alert being right)"
+    # Objective 176: "Needs you is right" is guardrail U2 of the sustainability line.
+    got=$(jq -c '[.lines[] | select(.line == "sustainability") | .guardrails[] | select(.key == "observability.needs_you_right") | {key, unit, value, state}]' "$WORK/lines.json")
+    expect_eq "$got" '[{"key":"observability.needs_you_right","unit":"share","value":null,"state":"not_collected"}]' \
+        "(3) needs you is right (sustainability U2) is not collected until A22/A23 land (a condition clearing is not an alert being right)"
     note "(3) checked: the north star"
 fi
 
