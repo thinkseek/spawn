@@ -1978,9 +1978,9 @@ create trigger spawn_commit_map_unchanged
 create or replace function spawn_commit_now(p_commit text) returns text
 language sql stable security definer as $$
     select case when p_commit is null then null
-                else coalesce((select array[m.new] from spawn_commit_map m
-                                where m.old = lower(p_commit)),
-                              array[p_commit])[1] end
+                when exists (select 1 from spawn_commit_map m where m.old = lower(p_commit))
+                    then (select m.new from spawn_commit_map m where m.old = lower(p_commit))
+                else p_commit end
 $$;
 do $$
 begin
