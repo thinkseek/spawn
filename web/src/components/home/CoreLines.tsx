@@ -163,6 +163,17 @@ export function CoreLinesCard({
                           ))}
                         </ul>
                       )}
+                      {line?.line === "performance" && view.byMission.length > 0 && (
+                        <ul className="space-y-0.5" aria-label="Report to live by mission">
+                          <li className="text-micro font-medium text-faint-foreground">Report to live by mission</li>
+                          {view.byMission.map((mission, at) => (
+                            <li key={`${at}:${mission.name}`} className="flex min-w-0 items-baseline gap-2 text-caption">
+                              <span className="min-w-0 truncate text-muted-foreground">{mission.name}</span>
+                              <span className={cx("tnum ml-auto shrink-0", TONE[mission.tone])}>{mission.text}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                       {line?.line === "storage" && view.scratch.length > 0 && (
                         <ul className="space-y-0.5" aria-label="Scratch by owner">
                           <li className="text-micro font-medium text-faint-foreground">Scratch by owner</li>
