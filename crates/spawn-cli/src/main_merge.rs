@@ -1624,15 +1624,21 @@ mod tests {
             "its branch forks from main at the Start"
         );
         // Objective 177: after a history rewrite, the work by its new commit.
+        fork_reads_the_rewritten_work(&db, second.0, first.0, &work);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `task`'s fork reads `prior`'s `work` by its new commit once the commit
+    /// map names it rewritten (objective 177).
+    fn fork_reads_the_rewritten_work(db: &Db, task: i64, prior: i64, work: &str) {
         let rewritten = "7".repeat(40);
         db.store
-            .commit_map_load(&[(work.clone(), Some(rewritten.clone()))])
+            .commit_map_load(&[(work.to_string(), Some(rewritten.clone()))])
             .expect("the map");
         assert_eq!(
-            db.store.objective_fork(second.0).expect("fork"),
-            serde_json::json!({"task": first.0, "commit": rewritten})
+            db.store.objective_fork(task).expect("fork"),
+            serde_json::json!({"task": prior, "commit": rewritten})
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Objective 177: a commit from before a history rewrite is never
