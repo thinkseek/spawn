@@ -161,59 +161,8 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  const empty = { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], byMission: [], diagnostics: [] };
-  assert.deepEqual(coreLinesView(null), empty);
-  assert.deepEqual(coreLinesView({}), empty);
-});
-
-// Objective 176: the owner's core metric set (2026-11-14).
-test("the adopted set (objective 176): three rows, not measured yet, the diagnostics apart, a retired range named", () => {
-  const figure = (key: string, name: string, unit: string, value: number | null, state: string, range: object | null = null) => ({
-    key, name, unit, value, range, state, trend: [],
-  });
-  const view = coreLinesView({
-    lines: [
-      {
-        line: "storage",
-        north_star: figure("storage.bytes_per_landing", "Bytes a landing leaves behind", "bytes", null, "not_measured_yet", { max: 52_428_800 }),
-        guardrails: [
-          figure("storage.rebuildable_bytes", "Rebuildable bytes", "bytes", null, "not_measured_yet"),
-          figure("storage.kept_share", "Share kept on purpose", "share", null, "not_measured_yet"),
-        ],
-      },
-      { line: "performance", north_star: figure("performance.report_to_live", "Time from report to live", "ms", null, "not_collected"), guardrails: [] },
-      {
-        line: "sustainability",
-        north_star: { ...figure("observability.interventions_per_agent_hour", "Human interventions per agent-hour", "ratio", 0.125, "out", { max: 0.1 }), window: "24h" },
-        guardrails: [],
-      },
-    ],
-    alert_figures: [{ ...figure("storage.free_bytes", "Free disk", "bytes", 1024, "out", { min: 1e18 }), line: "storage" }],
-    diagnostics: [
-      figure("storage.unowned_scratch_bytes", "Scratch nobody owns", "bytes", 400_000, "out", { max: 0 }),
-      { ...figure("storage.leaked_test_schemas", "Leaked test schemas", "count", 0, "in", { max: 0 }), line: "storage" },
-    ],
-    ranges_file: null,
-    ranges_error: null,
-    ignored_ranges: [{ key: "storage.days_left", reason: "retired by the owner's core metric set (2026-11-14)" }],
-  });
-  assert.deepEqual(view.rows.map((row) => row.line), ["Storage", "Performance", "Sustainability"]);
-  assert.deepEqual(view.rows[0].north_star, {
-    name: "Bytes a landing leaves behind",
-    value: "not measured yet",
-    range: "50.0 MB or less",
-    tone: "muted",
-  });
-  assert.deepEqual(view.rows[0].guardrails.map((mark) => mark.value), ["not measured yet", "not measured yet"]);
-  assert.equal(view.rows[1].north_star.value, "not collected yet", "not collected is not not measured yet");
-  assert.equal(view.rows[2].north_star.tone, "warning");
-  const onRows = view.rows.flatMap((row) => [row.north_star, ...row.guardrails]).map((mark) => mark.name);
-  assert.ok(!onRows.includes("Free disk") && !onRows.some((name) => name.startsWith("Scratch nobody owns")), `${onRows}`);
-  assert.deepEqual(view.diagnostics.map((mark) => [mark.name, mark.tone]), [
-    ["Scratch nobody owns", "warning"],
-    ["Leaked test schemas", "plain"],
-  ]);
-  assert.deepEqual(view.pending, ["days left: retired from the core metric set"]);
+  assert.deepEqual(coreLinesView(null), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], byMission: [] });
+  assert.deepEqual(coreLinesView({}), { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], byMission: [] });
 });
 
 // Objective 086: the performance line's units.

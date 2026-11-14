@@ -525,8 +525,7 @@ mod tests {
                    "window": "since the deploy record began"})
         );
         assert_eq!(
-            super::super::values_of(&super::super::adopted(std::slice::from_ref(&line)))
-                .get("performance.report_to_live"),
+            super::super::values_of(std::slice::from_ref(&line)).get("performance.report_to_live"),
             Some(&json!(2_674_521)),
             "sampled hourly"
         );

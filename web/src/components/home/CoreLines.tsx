@@ -149,7 +149,7 @@ export function CoreLinesCard({
                   <div className="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,460px)_minmax(0,1fr)]">
                     <NorthStarChart mark={row.north_star} figure={line?.north_star} />
                     <div className="min-w-0 space-y-2">
-                      {(line?.line === "sustainability" || line?.line === "recoverability") && view.drills.length > 0 && (
+                      {line?.line === "recoverability" && view.drills.length > 0 && (
                         <ul className="space-y-0.5" aria-label="Restore drills">
                           {view.drills.map((drill, at) => (
                             <li

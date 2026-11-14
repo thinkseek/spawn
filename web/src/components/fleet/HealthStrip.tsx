@@ -2,7 +2,6 @@ import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
 import { absoluteTitle, clockTime, formatDuration } from "../../format";
-import type { CoreMark } from "../../coreLines";
 import type { Backups, GateRoom, Memory, Storage } from "../../resources";
 import { backupAge, backupView, memoryBar, storageView, waitingGates } from "../../resources";
 import { cx } from "../ui";
@@ -219,22 +218,12 @@ function BackupRows({ backups }: { backups: Backups | null }) {
  * and note, then how long the free space lasts at the growth of what
  * persists (the archive, Claude Code's transcripts and the database);
  * then how old the newest off-host backups are (`health.backups`). */
-export function StorageCard({
-  storage,
-  backups = null,
-  diagnostics = [],
-}: {
-  storage: Storage | null;
-  backups?: Backups | null;
-  /** The Core lines answer's diagnostics in words (objective 176). */
-  diagnostics?: CoreMark[];
-}) {
+export function StorageCard({ storage, backups = null }: { storage: Storage | null; backups?: Backups | null }) {
   if (!storage) {
     return (
       <div className="min-w-0 text-caption">
         <p className="text-faint-foreground">This server reports no storage.</p>
         <BackupRows backups={backups} />
-        <DiagnosticRows diagnostics={diagnostics} />
       </div>
     );
   }
@@ -270,32 +259,7 @@ export function StorageCard({
       </p>
       {lasts_note !== null && <p className="text-micro text-faint-foreground">{lasts_note}</p>}
       <BackupRows backups={backups} />
-      <DiagnosticRows diagnostics={diagnostics} />
     </div>
-  );
-}
-
-/** The storage diagnostics (objective 176): each figure's name, value and
- * range, the out-of-range ones in the warning tone. Nothing without any. */
-function DiagnosticRows({ diagnostics }: { diagnostics: CoreMark[] }) {
-  if (diagnostics.length === 0) return null;
-  return (
-    <ul className="mt-1.5 space-y-0.5" aria-label="Storage diagnostics">
-      <li className="text-micro font-medium text-faint-foreground">Diagnostics</li>
-      {diagnostics.map((mark) => (
-        <li key={mark.name} className="flex min-w-0 items-baseline gap-2" title={mark.range !== "" ? mark.range : undefined}>
-          <span className="min-w-0 truncate text-muted-foreground">{mark.name}</span>
-          <span
-            className={cx(
-              "tnum ml-auto shrink-0",
-              mark.tone === "warning" ? "text-warning" : mark.tone === "muted" ? "text-faint-foreground" : "text-foreground",
-            )}
-          >
-            {mark.value}
-          </span>
-        </li>
-      ))}
-    </ul>
   );
 }
 
@@ -384,12 +348,9 @@ export const HUMAN_RATE_HINT =
 export function HealthStrip({
   health,
   liveness,
-  diagnostics = [],
 }: {
   health: FleetHealth;
   liveness: Liveness;
-  /** The Core lines answer's diagnostics in words (objective 176). */
-  diagnostics?: CoreMark[];
 }) {
   const restarts = health.ladder_24h.liveness;
   const down = liveness.total - liveness.up;
@@ -468,7 +429,7 @@ export function HealthStrip({
       </Cell>
 
       <Cell label="Storage" className="sm:col-span-2">
-        <StorageCard storage={health.storage} backups={health.backups} diagnostics={diagnostics} />
+        <StorageCard storage={health.storage} backups={health.backups} />
       </Cell>
 
     </section>

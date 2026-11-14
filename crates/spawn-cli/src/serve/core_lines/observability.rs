@@ -403,12 +403,8 @@ mod tests {
         assert_eq!(bare[2].guardrails[1].value, Value::Null);
         assert_eq!(bare[2].guardrails[2].value, json!(11));
         // Its range and state as for every figure.
-        // Its range and state as for every figure, where the owner's set
-        // (objective 176) puts it: the interventions are the sustainability
-        // north star, unpriced use its third guardrail; the count not
-        // measured is retired.
         let view = answer(
-            &adopted(&all),
+            &all,
             &Value::Null,
             Ok(Some(
                 r#"{"ranges": {"observability.unpriced_share": {"max": 0.05},
@@ -418,21 +414,12 @@ mod tests {
             )),
             &std::collections::BTreeMap::new(),
         );
-        let sustainability = &view["lines"][2];
-        assert_eq!(
-            sustainability["north_star"]["key"],
-            "observability.interventions_per_agent_hour"
-        );
-        assert_eq!(sustainability["north_star"]["state"], "out");
-        assert_eq!(sustainability["north_star"]["window"], "24h");
-        assert_eq!(
-            sustainability["guardrails"][2]["key"],
-            "observability.unpriced_share"
-        );
-        assert_eq!(sustainability["guardrails"][2]["state"], "out");
-        assert_eq!(
-            view["ignored_ranges"],
-            json!([{"key": "observability.not_measured", "reason": RETIRED_REASON}])
-        );
+        let states: Vec<&str> = view["lines"][2]["guardrails"]
+            .as_array()
+            .expect("guardrails")
+            .iter()
+            .map(|figure| figure["state"].as_str().expect("a state"))
+            .collect();
+        assert_eq!(states, ["out", "out", "out"]);
     }
 }
