@@ -287,9 +287,9 @@ fn rejected_stage(line: &str) -> Option<(&str, &str)> {
 /// [`CHECK_CHARS`]. None when the run names no check.
 pub(crate) fn rejected_checks(log: &str) -> Option<Checks> {
     let lines: Vec<&str> = log.lines().collect();
-    let stage = lines
-        .iter()
-        .rposition(|line| line.starts_with("| stage gate rejected ") && !line.trim_end().ends_with(" total"))?;
+    let stage = lines.iter().rposition(|line| {
+        line.starts_with("| stage gate rejected ") && !line.trim_end().ends_with(" total")
+    })?;
     let (phase, scenario) = rejected_stage(lines[stage].trim_end())?;
     let checks: Vec<String> = if scenario == CHECK_TESTS {
         check_tests_failures(log)
