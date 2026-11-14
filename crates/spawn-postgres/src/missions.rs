@@ -134,6 +134,11 @@ macro_rules! owner_requests_pending {
 ///   it, holds nothing on the source until it is accepted, and a deploy
 ///   would restart its judging (S23). deploy/on-landing.sh waits for the
 ///   ones whose commit main does not hold already;
+/// - `judging`: how many tasks of the source's missions are reported,
+///   accepted or landing, i.e. between their report and their landing: each
+///   may land within a gate's time. deploy/on-landing.sh keeps its quiet
+///   spell only while one is (a burst can still come); at 0 no landing can
+///   follow sooner than a report and a gate, so it deploys at once;
 /// - `now_ms`: the database's clock, which every `at_ms` is on.
 pub(crate) const MAIN_LANDING: &str = concat!(
     r#"
@@ -194,7 +199,12 @@ select jsonb_build_object(
                                                                   'at_ms', q.recorded_at_ms)
                                                order by q.session_seq), '[]'::jsonb)
                        from pending q
-                      where q.r ->> 'source' = $1))"#
+                      where q.r ->> 'source' = $1),
+  'judging', (select count(*)
+                from mission_tasks t
+                join mission_missions m on m.id = t.mission_id
+               where t.state in ('reported', 'accepted', 'landing')
+                 and m.sources ->> 0 = $1))"#
 );
 
 /// The owner's pauses as the dispatcher acts on them (objective 099): every
@@ -2329,7 +2339,8 @@ impl PostgresStore {
 
     /// What deploy/on-landing.sh decides on ([`MAIN_LANDING`]): main's
     /// gate-accepted landing on `source`, when the first landing after the
-    /// live commit `deployed` was, and the source's hold.
+    /// live commit `deployed` was, the source's hold, and how many of its
+    /// tasks are between their report and their landing (`judging`).
     pub fn main_landing(
         &self,
         source: &str,
