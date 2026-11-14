@@ -78,6 +78,9 @@ pub(crate) struct Landing {
     pub(crate) report_to_live_ms: Option<i64>,
     /// Its task's last report before it landed, if any.
     pub(crate) reported_at: Option<i64>,
+    /// Live when it landed (objective 159): its mission is one no deploy
+    /// ships, so its wait runs to its landing.
+    pub(crate) live_when_landed: bool,
 }
 
 /// A gate run that names its wall clock.
@@ -253,6 +256,12 @@ pub(crate) struct Facts {
     /// over the whole log before the facts' end; null when there is none.
     #[serde(default)]
     pub(crate) live_from_ms: Option<i64>,
+    /// The missions no deploy ships (objective 159; spawn-postgres
+    /// `scorecard_undeployed_missions`), read beside the facts: a landing of
+    /// one is live when it lands. `None` (facts read without it) keeps every
+    /// landing waiting for a deploy.
+    #[serde(default)]
+    pub(crate) undeployed_missions: Option<BTreeSet<i64>>,
 }
 
 fn int(value: &Value) -> Option<i64> {
@@ -595,6 +604,7 @@ impl Fold {
             first_pass: !task.sent_back,
             report_to_live_ms: None,
             reported_at: task.reported_at,
+            live_when_landed: false,
         };
         if let Some(objective) = task.objective {
             self.objective_landings
@@ -659,7 +669,7 @@ impl History {
             (Some(folded), Some(read)) => Some(folded.min(read)),
             (folded, read) => folded.or(read),
         };
-        history.live();
+        history.live(facts.undeployed_missions.as_ref());
         history.commands(&facts.commands);
         history.messages(messages);
         history
@@ -807,14 +817,21 @@ impl History {
     /// Each landing's wait from its report to live: to the first deploy that
     /// succeeded at or after it. A deploy is known only by when it finished,
     /// so a landing made while one ran counts as shipped by it (optimistic
-    /// by at most one deploy's run).
-    fn live(&mut self) {
+    /// by at most one deploy's run). A landing of a mission in `undeployed`
+    /// (objective 159: no deploy ships its source) is live when it lands:
+    /// its wait runs to its landing. This corrects the figure, not the work.
+    fn live(&mut self, undeployed: Option<&BTreeSet<i64>>) {
         let mut deploys = self.deploys.clone();
         deploys.sort_unstable();
         for landing in &mut self.landings {
             let Some(reported) = landing.reported_at else {
                 continue;
             };
+            if undeployed.is_some_and(|missions| missions.contains(&landing.mission)) {
+                landing.report_to_live_ms = Some(landing.at - reported);
+                landing.live_when_landed = true;
+                continue;
+            }
             let first = deploys.partition_point(|at| *at < landing.at);
             landing.report_to_live_ms = deploys.get(first).map(|deployed| deployed - reported);
         }
