@@ -310,6 +310,12 @@ pub(crate) fn fork_from_prior(
     // (a checkpoint main already holds) is no work to continue.
     sources::refresh(&mirror, &source).map_err(|e| error("refresh main", &e))?;
     let path = mirror.to_string_lossy();
+    // No history from before a rewrite becomes the branch (objective 177).
+    if let Some(reason) = crate::rewrite_guard::why_old(store, &path, &prior.commit)
+        .map_err(|e| error("the commit map", &e))?
+    {
+        return Ok(Fork::Refused(reason));
+    }
     let base = sources::git(&[
         "--git-dir",
         &path,
@@ -432,6 +438,9 @@ pub(crate) enum Fork {
     NoWork,
     /// The agent has no mission source on this host: nothing forked.
     NoSource,
+    /// The commit is from before a history rewrite (objective 177; why):
+    /// nothing forked, the task starts from main.
+    Refused(String),
 }
 
 /// The head of `agent`'s branch on this host, if it has one: what a

@@ -110,13 +110,14 @@ pub(crate) fn set_aside(
         factory,
     );
     let branch = BranchName::new(agent).map_err(|error| error.to_string())?;
+    let start = start_after_rewrite(store, &mirror, cancelled)?;
     let message = format!(
         "spawn: set aside the work of cancelled task #{} (this tree is the checkpoint it \
          started from; the work stays in the parent)",
         cancelled.id
     );
     let done = match workspaces
-        .set_aside(&branch, cancelled.start.as_deref(), &message)
+        .set_aside(&branch, start.as_deref(), &message)
         .map_err(|error| format!("set aside the work of task #{}: {error}", cancelled.id))?
     {
         SetAside::Unchanged => Done::Nothing,
@@ -151,6 +152,40 @@ pub(crate) fn set_aside(
         eprintln!("set aside the work of task #{}: push: {why}", cancelled.id);
     }
     Ok(done)
+}
+
+/// The start `cancelled`'s work is set aside to: its recorded start, unless
+/// that is from before a history rewrite ([`crate::rewrite_guard::why_old`],
+/// objective 177): then the refusal is recorded once (`set-aside`) and the
+/// work is set aside to the branch's base with main instead, so no old
+/// content is written into the branch.
+fn start_after_rewrite(
+    store: &PostgresStore,
+    mirror: &Path,
+    cancelled: &Cancelled,
+) -> Result<Option<String>, String> {
+    let Some(start) = cancelled.start.as_deref() else {
+        return Ok(None);
+    };
+    let path = mirror.to_string_lossy();
+    let Some(reason) = crate::rewrite_guard::why_old(store, &path, start)? else {
+        return Ok(Some(start.to_string()));
+    };
+    crate::rewrite_guard::refused(store, "set-aside", cancelled.id, start, &reason)?;
+    let base = sources::git(&[
+        "--git-dir",
+        &path,
+        "merge-base",
+        "refs/heads/main",
+        &format!("refs/heads/{}", cancelled.agent_id),
+    ])
+    .map_err(|error| format!("the base with main of {}: {error}", cancelled.agent_id))?;
+    eprintln!(
+        "set aside the work of task #{}: {reason}; set aside to the branch's base with main \
+         {base}",
+        cancelled.id
+    );
+    Ok(Some(base))
 }
 
 /// The set-aside as the agent's checkpoint, once per task.

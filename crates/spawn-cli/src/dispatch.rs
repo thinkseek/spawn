@@ -1177,6 +1177,23 @@ pub(crate) fn fork_before_within(
             )))
         }
         Ok(Fork::NoSource) => Ok(None),
+        // From before a history rewrite (objective 177): refused once on
+        // the record, and the task starts from main.
+        Ok(Fork::Refused(reason)) => {
+            crate::rewrite_guard::refused(store, "fork", task, &prior.commit, &reason)?;
+            prompt.push_str("\n\n");
+            let _ = write!(
+                prompt,
+                "Task #{}'s last checkpoint (commit {}) is not continued: {reason}. Your \
+                 workspace starts from main.",
+                prior.task, prior.commit
+            );
+            Ok(Some(format!(
+                "deliver: task #{task}: task #{}'s checkpoint {} is refused ({reason}); it \
+                 starts from main",
+                prior.task, prior.commit
+            )))
+        }
         Err(error) => {
             let age = store
                 .task_fork_failed(task, prior.task, &prior.commit, &error)
