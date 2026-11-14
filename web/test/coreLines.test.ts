@@ -492,3 +492,25 @@ test("no claimed scratch folder, or no walk, is an empty list", () => {
   assert.deepEqual(coreLinesView({ lines: [] }).scratch, []);
   assert.deepEqual(coreLinesView(null).scratch, []);
 });
+
+// Objective 155: a folder whose lease runs is never walked whole: its bytes
+// are null, and the card says its build paths' size only.
+test("a leased scratch folder says its build size, not walked whole", () => {
+  const now = Date.UTC(2026, 10, 14, 12, 0);
+  const lease = now + 3 * 3_600_000;
+  const folder = {
+    path: "/s/held",
+    agent: "rev-e",
+    objective: "1/155",
+    created_ms: now - 2 * 3_600_000,
+    lease_until_ms: lease,
+    bytes: null,
+    build_bytes: 2 * GIB,
+    landed: false,
+  };
+  assert.equal(
+    scratchMark(folder, now).text,
+    `build 2.0 GB (not walked whole while leased) · 2 h old · lease until ${sinceWords(lease)} · not landed`,
+  );
+  assert.equal(scratchMark({ ...folder, bytes: 0 }, now).text.startsWith("0.0 MB (build 2.0 GB)"), true, "walked: its bytes");
+});

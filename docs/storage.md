@@ -1002,8 +1002,32 @@ counted:
   projects directory, and anything under them or holding them;
 - the configured excludes.
 
+So that a large root is collected within its bound (objective 155):
+- a folder whose claim's lease runs (objective 140) is someone's and never
+  walked whole: its build paths only, its `bytes` null in the answer. A
+  claimed folder whose lease has ended is walked whole, "lease ended";
+- an entry whose marker's process runs is never walked. An unmarked,
+  unclaimed entry's walk stops at its first change in the last 24 h: it is
+  its maker's. Gone and idle entries are walked whole;
+- an unmarked, unclaimed directory holding a claim whose lease runs one
+  level below is a session folder: it is no entry itself, and each of its
+  children is judged as an entry of its own by the same rules, so one claim
+  hides none of its unclaimed siblings. Finding one reads the claim files
+  one level down only;
+- a root inside another root (`/data/tmp/ccd` beside `/data/tmp`) is walked
+  as its own: the outer root's walk skips an entry that is, or holds,
+  another root, so nothing is counted twice. An exclude that is a root is
+  for the roots around it, not its own walk; an exclude that holds a root
+  refuses that root ("exclude <X> hides root <Y>: a root under an exclude
+  is never read"), named in the answer and serve's log, and the figure is
+  not collected while it stands.
+
+`"scratch_bound": {"entries": <n>, "ms": <n>}` in `storage` sets each
+root's bound (both whole numbers from 1; otherwise the default, a million
+entries and 5 s).
+
 The answer lists `scratch` `{roots, unowned: [{path, bytes, reason:
-"gone"|"idle"}]}`, the 20 largest first.
+"gone"|"idle"|"lease ended"}]}`, the 20 largest first.
 
 `storage.leaked_test_schemas`, "Leaked test schemas" (count; null when no
 test server answered), is the sum over the test servers of the schemas
@@ -1047,15 +1071,17 @@ Both are read on a thread of their own, at most every 10 minutes and kept
 between. A request, and the loop's sample, gets the kept reading and never
 waits; only the first read after start is waited for, at most 10 s, and
 until it ends the figures are not collected. A scratch walk is bounded to
-5 s and a million entries per root. One past its bound keeps the previous
+5 s and a million entries per root, or `scratch_bound`. One past its bound keeps the previous
 figure and says so in serve's log; it never gives a partial count.
 
 Nothing here removes, moves, renames or touches a file or a schema. A
 sweep is the owner's decision.
 
 The live file (a lead step):
-- `scratch_roots` `["/var/tmp/spawn"]` and `scratch_exclude`
-  `["/var/tmp/spawn/sync"]`;
+- `scratch_roots` `["/var/tmp/spawn", "/data/tmp", "/data/tmp/ccd"]` and
+  `scratch_exclude` `["/var/tmp/spawn/sync", "/data/tmp/ccd"]` (objective
+  155: each `/data/tmp/ccd` session folder an entry with its owner and
+  age);
 - ranges: scratch nobody owns max 2147483648 (2 GB), leaked test schemas
   max 200;
 - on live the schema figure reads 0 for the first day, since no schema has

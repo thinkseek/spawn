@@ -104,7 +104,9 @@ export interface CoreClaimed {
   objective: string;
   created_ms: number;
   lease_until_ms: number;
-  bytes: number;
+  /** Its bytes; null while its lease runs (never walked whole, objective
+   * 155). */
+  bytes: number | null;
   /** Its build paths' bytes, reached through real directories only. */
   build_bytes: number;
   /** Whether its objective landed; null when the store was not read. */
@@ -199,7 +201,9 @@ export function drillMark(raw: Partial<CoreDrill> | null | undefined, now: numbe
   return { name, text: `passed ${ago(passed)}`, tone: now - passed <= WEEK_MS ? "plain" : "warning", detail: "" };
 }
 
-/** A claimed scratch folder in words at `now` (objective 140). */
+/** A claimed scratch folder in words at `now` (objective 140). A folder
+ * whose lease runs is never walked whole (objective 155): its bytes are
+ * null, and it says its build paths' size only. */
 export function scratchMark(raw: Partial<CoreClaimed> | null | undefined, now: number): CoreScratchMark {
   const agent = typeof raw?.agent === "string" ? raw.agent : "";
   const objective = typeof raw?.objective === "string" ? raw.objective : "";
@@ -207,8 +211,10 @@ export function scratchMark(raw: Partial<CoreClaimed> | null | undefined, now: n
   const lease = finite(raw?.lease_until_ms);
   const leased = lease !== null && lease > now;
   const landed = raw?.landed === true ? "landed" : raw?.landed === false ? "not landed" : "landing not read";
+  const bytes = finite(raw?.bytes);
+  const build = storageSize(finite(raw?.build_bytes) ?? 0);
   const parts = [
-    `${storageSize(finite(raw?.bytes) ?? 0)} (build ${storageSize(finite(raw?.build_bytes) ?? 0)})`,
+    bytes === null ? `build ${build} (not walked whole while leased)` : `${storageSize(bytes)} (build ${build})`,
     `${created === null ? "?" : spanWords(Math.max(0, now - created))} old`,
     leased ? `lease until ${sinceWords(lease)}` : "lease ended",
     landed,
