@@ -30,8 +30,9 @@
 #       force push of an unrelated commit): the drill fails (exit 1), its
 #       missions record is ok false with at least one mismatch, and still no
 #       backup.drilled.transcripts is recorded.
-#   (5) --only with anything but missions (transcripts, an empty value):
-#       exit 2, nothing recorded.
+#   (5) --only with anything but missions or transcripts (objective 200
+#       takes transcripts; here repos and an empty value): exit 2, nothing
+#       recorded.
 #   (6) A missions-only drill killed part way (R2, rev-f's R1 F1), once when
 #       it lists the bundle and once when it extracts from it, leaves no
 #       transcript in the clear in its directory: no *.jsonl, no bundle.raw
@@ -785,14 +786,14 @@ rec=$(newest backup.drilled.missions)
 [ "$(count_records backup.drilled.transcripts)" = 0 ] || fail "(4) a missions-only drill recorded the transcripts"
 note "(4) checked: a source rewritten off the backed-up history fails the missions record alone"
 
-# --- (5) --only takes missions alone ------------------------------------------------------
+# --- (5) --only takes missions or transcripts ------------------------------------------------------
 before=$(backup_records)
-for value in transcripts ""; do
+for value in repos ""; do
     drill_only "$WORK/drill4.log" --only "$value"
     [ "$status" -eq 2 ] || fail "(5) --only '$value' exited $status, not 2: $(tail -n 2 "$WORK/drill4.log" | tr '\n' ' ')"
 done
 [ "$(backup_records)" = "$before" ] || fail "(5) a refused --only recorded a drill ($before before, $(backup_records) after)"
-note "(5) checked: --only takes missions alone; anything else is refused with nothing recorded"
+note "(5) checked: --only refuses repos and an empty value with nothing recorded"
 
 # --- (6) a drill killed part way leaves no transcript in the clear --------------------
 # A tar first on PATH kills the drill (its parent) when its first argument

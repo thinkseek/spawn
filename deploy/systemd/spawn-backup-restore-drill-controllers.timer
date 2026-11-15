@@ -1,0 +1,12 @@
+[Unit]
+Description=Spawn: daily restore drill of the controllers (objective 198)
+
+[Timer]
+# 06:00 local: after the 04:00 bundle and the 05:45 missions drill. Installed
+# disabled; enabled after a supervised first run (the owner or the lead).
+OnCalendar=*-*-* 06:00:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
