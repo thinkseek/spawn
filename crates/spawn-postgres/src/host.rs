@@ -80,6 +80,21 @@ select coalesce(jsonb_agg(jsonb_build_object('at_ms', s.recorded_at_ms, 'values'
            and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
            and e.recorded_at_ms >= $1) s";
 
+/// The newest `host.storage_bytes` reading (objective 180) as `{at_ms,
+/// sources}`, or null before the first, and the database's clock `now_ms`:
+/// through its own partial index (`spawn_events_host_storage_bytes`), never
+/// the rest of the control stream.
+pub(crate) const HOST_STORAGE_BYTES: &str = r"
+select jsonb_build_object(
+  'now_ms', (floor(extract(epoch from clock_timestamp()) * 1000))::bigint,
+  'newest', (select jsonb_build_object('at_ms', e.recorded_at_ms,
+                                       'sources', e.kind -> 'detail' -> 'record' -> 'sources')
+               from spawn_events e
+              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes'
+              order by e.session_seq desc
+              limit 1))";
+
 /// The schemas a database holds other than PostgreSQL's own (`pg_*`,
 /// `information_schema`) and `public`: what tests leave behind (objective
 /// 074).
@@ -274,6 +289,12 @@ impl PostgresStore {
         self.query_json(HOST_CORE_LINES, &[&since_ms])
     }
 
+    /// The newest `host.storage_bytes` reading and the database's clock
+    /// ([`HOST_STORAGE_BYTES`]): `{now_ms, newest: {at_ms, sources} | null}`.
+    pub fn host_storage_bytes(&self) -> Result<Value, StoreError> {
+        self.query_json(HOST_STORAGE_BYTES, &[])
+    }
+
     /// The database's name, size, schemas, event log bytes and five
     /// largest tables ([`DATABASE_SIZE`]).
     pub fn database_size(&self) -> Result<Value, StoreError> {
@@ -281,7 +302,8 @@ impl PostgresStore {
     }
 
     /// Record a host fact through `spawn_host_record` (owner only):
-    /// `host.disk`, `host.storage`, `host.core_lines`, `host.judge`, and the
+    /// `host.disk`, `host.storage`, `host.core_lines`, `host.storage_bytes`,
+    /// `host.judge`, and the
     /// recovery's records. Returns the
     /// event's id.
     pub fn host_record(&self, record: &Value) -> Result<i64, StoreError> {

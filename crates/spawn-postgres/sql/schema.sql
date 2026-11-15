@@ -2636,6 +2636,11 @@ begin
         -- (spawn loop, crate core_lines_sample.rs, objective 090): read from
         -- the log by `/api/core-lines`' 7-day trends, folded into no table.
         null;
+    when 'host.storage_bytes' then
+        -- A daily reading of the real bytes on disk of each storage source,
+        -- each extent counted once (spawn loop, crate storage_bytes.rs,
+        -- objective 180): read from the log, folded into no table.
+        null;
     when 'host.judge' then
         -- The model judge's calls began failing (`down`) or answered again
         -- (`up`): one record per crossing (spawn loop, crate judge_watch.rs),
@@ -4885,6 +4890,24 @@ begin
         if jsonb_typeof(p_record -> 'values') is distinct from 'object' then
             raise exception 'a host.core_lines record has values, an object: %', p_record;
         end if;
+    elsif v_type = 'host.storage_bytes' then
+        -- The real bytes on disk of each storage source, read daily by the
+        -- loop outside every owner hold (objective 180): {"sources": {<name>:
+        -- {"bytes": <n>, ...} | {"not_measured": <why>}}}, at least one.
+        if jsonb_typeof(p_record -> 'sources') is distinct from 'object'
+           or not exists (select 1 from jsonb_each(p_record -> 'sources'))
+           or exists (
+               select 1 from jsonb_each(p_record -> 'sources') s(name, source)
+                where s.name = ''
+                   or jsonb_typeof(s.source) is distinct from 'object'
+                   or not coalesce(
+                          jsonb_typeof(s.source -> 'bytes') is not distinct from 'number'
+                              and (s.source ->> 'bytes')::numeric >= 0
+                              and s.source -> 'not_measured' is null
+                          or jsonb_typeof(s.source -> 'not_measured') is not distinct from 'string'
+                              and s.source -> 'bytes' is null, false)) then
+            raise exception 'a host.storage_bytes record has sources, each with bytes (a number from 0) or not_measured (why): %', p_record;
+        end if;
     elsif v_type = 'host.judge' then
         if p_record ->> 'judge' is null or p_record ->> 'state' is null
            or p_record ->> 'state' not in ('down', 'up') then
@@ -4989,6 +5012,13 @@ create index if not exists spawn_events_host_core_lines
     on spawn_events (recorded_at_ms)
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines';
+
+-- The daily `host.storage_bytes` readings (objective 180), found without
+-- reading the rest of the stream: the loop reads the newest when one is due.
+create index if not exists spawn_events_host_storage_bytes
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes';
 
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
