@@ -26,6 +26,11 @@
 //! sha256 must be the same. A run killed part way leaves the ciphertext,
 //! the list of names and what it has extracted: no transcript.
 //!
+//! `--only controllers` (objective 198, [`controllers`]) reads no bundle: it
+//! checks that each live controller an open or active mission's gate names,
+//! current and previous, is `git archive` of its commit from the live
+//! source, and records one `backup.drilled.controllers` per controller.
+//!
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
 //! window file as bundled, so a restored file whose sha256 is not the

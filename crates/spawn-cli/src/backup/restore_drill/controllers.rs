@@ -47,6 +47,9 @@ use crate::backup::sha256_file;
 /// never compared (a directory's whole subtree).
 pub(super) const LEFT_OUT: [&str; 3] = [".controller", ".deps", "web/node_modules"];
 
+/// `--only`'s value for this drill.
+pub(super) const CONTROLLERS: &str = "controllers";
+
 /// The record's type.
 const TYPE: &str = "backup.drilled.controllers";
 
