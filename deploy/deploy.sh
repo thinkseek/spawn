@@ -794,10 +794,4 @@ for relay in jev-relay model-relay; do
     ;;
   esac
 done
-# The storage extents script (objective 180): the loop runs it once a day
-# beside its binary, under python3 -I -B. Nothing is restarted.
-if ! cmp -s "$export_dir/scripts/storage-extents.py" "$live/bin/storage-extents.py"; then
-  install -m 644 "$export_dir/scripts/storage-extents.py" "$live/bin/storage-extents.py"
-  say "installed storage-extents.py"
-fi
 [ "$relays_failed" = 0 ] || die "the deploy is live at $head, but a relay did not restart (above)"
