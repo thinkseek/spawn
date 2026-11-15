@@ -5363,7 +5363,22 @@ begin
     -- the drill record's fields, and the run's start, the controller, its
     -- missions and source, its current tree and its previous one (null when
     -- there is none), what was left out; each of its kind, nothing else.
-    if p_record ->> 'type' = 'backup.drilled.controllers' then
+    -- Each tree may say what the backup holds of it (objective 199): held,
+    -- null (no commit of its history) or {commit, lag_commits, lag_hours,
+    -- ok, files, differing}. A run that cannot restore the backup records
+    -- one failed record of the drill record's fields alone.
+    if p_record ->> 'type' = 'backup.drilled.controllers'
+       and (p_record ->> 'ok')::boolean is distinct from false
+          or exists (select 1 from jsonb_object_keys(p_record) k
+                      where k in ('run', 'controller', 'missions', 'source', 'current',
+                                  'prev', 'left_out')) then
+        null;
+    end if;
+    if p_record ->> 'type' = 'backup.drilled.controllers'
+       and ((p_record ->> 'ok')::boolean is distinct from false
+            or exists (select 1 from jsonb_object_keys(p_record) k
+                        where k in ('run', 'controller', 'missions', 'source', 'current',
+                                    'prev', 'left_out'))) then
         if exists (select 1 from jsonb_object_keys(p_record) k
                     where k not in ('type', 'ok', 'reason', 'bundle', 'bundle_event_id',
                                     'mismatches', 'duration_ms', 'run', 'controller',
@@ -5388,7 +5403,23 @@ begin
            or exists (select 1 from (values (p_record -> 'current'), (p_record -> 'prev')) t(tree)
                        where jsonb_typeof(tree) = 'object'
                          and (exists (select 1 from jsonb_object_keys(tree) k
-                                       where k not in ('commit', 'live'))
+                                       where k not in ('commit', 'live', 'held'))
+                              or coalesce(jsonb_typeof(tree -> 'held'), 'null') not in ('object', 'null')
+                              or (jsonb_typeof(tree -> 'held') = 'object'
+                                  and (exists (select 1 from jsonb_object_keys(tree -> 'held') k
+                                                where k not in ('commit', 'lag_commits', 'lag_hours',
+                                                                'ok', 'files', 'differing'))
+                                       or jsonb_typeof(tree -> 'held' -> 'commit') is distinct from 'string'
+                                       or jsonb_typeof(tree -> 'held' -> 'ok') is distinct from 'boolean'
+                                       or exists (select 1 from unnest(array['lag_commits', 'lag_hours', 'files']) f
+                                                   where jsonb_typeof(tree -> 'held' -> f) is distinct from 'number'
+                                                      or (tree -> 'held' ->> f)::numeric < 0
+                                                      or (tree -> 'held' ->> f)::numeric
+                                                         <> trunc((tree -> 'held' ->> f)::numeric))
+                                       or jsonb_typeof(tree -> 'held' -> 'differing') is distinct from 'array'
+                                       or jsonb_array_length(tree -> 'held' -> 'differing') > 20
+                                       or exists (select 1 from jsonb_array_elements(tree -> 'held' -> 'differing') d
+                                                   where jsonb_typeof(d) is distinct from 'string')))
                               or jsonb_typeof(tree -> 'commit') is distinct from 'string'
                               or jsonb_typeof(tree -> 'live') is distinct from 'object'
                               or exists (select 1 from jsonb_object_keys(tree -> 'live') k
@@ -5402,7 +5433,7 @@ begin
                               or jsonb_array_length(tree -> 'live' -> 'differing') > 20
                               or exists (select 1 from jsonb_array_elements(tree -> 'live' -> 'differing') d
                                           where jsonb_typeof(d) is distinct from 'string'))) then
-            raise exception 'a controllers drill record is {run: a whole number, controller: a name, source: a string, missions: mission ids, left_out: strings, current: {commit: a string, live: {ok: boolean, files: a whole number, differing: at most 20 strings}}, prev: the same or null}';
+            raise exception 'a controllers drill record is {run: a whole number, controller: a name, source: a string, missions: mission ids, left_out: strings, current: {commit: a string, live: {ok: boolean, files: a whole number, differing: at most 20 strings}, held (optional): null or {commit: a string, ok: boolean, lag_commits, lag_hours and files whole numbers, differing: at most 20 strings}}, prev: the same or null}';
         end if;
     end if;
     if p_record ->> 'type' in ('backup.drilled.transcripts', 'backup.drilled.missions',
