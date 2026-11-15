@@ -676,9 +676,25 @@ fn the_first_sample_carrying_a_figure_is_found() {
         None
     );
 
+    // A control stream of some size, mostly other records, as the live
+    // one is: the read must not walk it.
     client
-        .batch_execute("analyze spawn_events")
-        .expect("analyze");
+        .batch_execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                       source_event_id, kind, session_seq, recorded_at_ms)
+             select 'agent_control', 'session_control', null, 'control', null,
+                    jsonb_build_object('name', 'control.recorded', 'detail',
+                        jsonb_build_object('record', jsonb_build_object('type', 'host.storage',
+                            'archive_bytes', n, 'archive_files', 1,
+                            'projects_bytes', 1, 'projects_files', 1))),
+                    m.seq + n, 3000 + n
+               from generate_series(1, 5000) n,
+                    (select max(session_seq) as seq from spawn_events
+                      where session_id = 'session_control') m;
+             analyze spawn_events;",
+        )
+        .expect("a stream of other records");
+    assert_eq!(store.first_core_lines_value(KEY).expect("read"), Some(6 * DAY));
     let plan: Value = client
         .query_one(
             "explain (format json)
