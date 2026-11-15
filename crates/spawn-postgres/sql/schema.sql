@@ -5384,7 +5384,7 @@ begin
            or exists (select 1 from jsonb_array_elements(p_record -> 'left_out') l
                        where jsonb_typeof(l) is distinct from 'string')
            or jsonb_typeof(p_record -> 'current') is distinct from 'object'
-           or jsonb_typeof(p_record -> 'prev') not in ('object', 'null')
+           or coalesce(jsonb_typeof(p_record -> 'prev'), 'absent') not in ('object', 'null')
            or exists (select 1 from (values (p_record -> 'current'), (p_record -> 'prev')) t(tree)
                        where jsonb_typeof(tree) = 'object'
                          and (exists (select 1 from jsonb_object_keys(tree) k

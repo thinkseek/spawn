@@ -212,12 +212,9 @@ fn named_controllers(listed: &Value, controllers: &Path) -> BTreeMap<String, Nam
             Gate::Controller(name) => {
                 let entry = named.entry(name).or_default();
                 entry.missions.push(id);
-                entry.sources.insert(
-                    mission["source"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                );
+                entry
+                    .sources
+                    .insert(mission["source"].as_str().unwrap_or_default().to_string());
             }
             Gate::Skipped(why) => println!("controllers: skipped mission {id}: {why}"),
         }
@@ -310,10 +307,13 @@ fn drill_one(
         let prev = fs::symlink_metadata(&prev_link)
             .is_ok()
             .then(|| drill_tree(&prev_link, &source, &scratch.join(format!("{name}.prev"))));
-        let reasons: Vec<String> = [current.why("current"), prev.as_ref().and_then(|p| p.why("prev"))]
-            .into_iter()
-            .flatten()
-            .collect();
+        let reasons: Vec<String> = [
+            current.why("current"),
+            prev.as_ref().and_then(|p| p.why("prev")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         (current, prev, reason)
     };
@@ -484,8 +484,8 @@ fn entries(root: &Path) -> Result<BTreeMap<String, Entry>, String> {
                 continue;
             }
             let path = item.path();
-            let meta =
-                fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
             let kind = meta.file_type();
             let entry = if kind.is_dir() {
                 pending.push((path, relative));
@@ -548,7 +548,9 @@ fn differences(live: &BTreeMap<String, Entry>, archived: &BTreeMap<String, Entry
                 }
                 how.join(", ")
             }
-            (Some(Entry::Link(_)), Some(Entry::Link(_))) => "the symlink's target differs".to_string(),
+            (Some(Entry::Link(_)), Some(Entry::Link(_))) => {
+                "the symlink's target differs".to_string()
+            }
             (Some(Entry::File { .. }), Some(Entry::Link(_))) => {
                 "a file live, a symlink in the commit".to_string()
             }
