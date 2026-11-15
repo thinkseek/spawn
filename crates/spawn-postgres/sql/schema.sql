@@ -2672,7 +2672,8 @@ begin
         -- by `spawn verify list` and /api/verifications, folded into no table.
         null;
     when 'backup.dumped', 'backup.bundled', 'backup.verified', 'backup.stored',
-         'backup.drilled.transcripts', 'backup.drilled.missions' then
+         'backup.drilled.transcripts', 'backup.drilled.missions',
+         'backup.drilled.controllers' then
         -- What `spawn backup` did (crate backup.rs; `backup.stored`: a
         -- `spawn store put` run, its manifest's key): read from the log by the
         -- next run, folded into no table. What a copy holds is in its record
@@ -5343,7 +5344,8 @@ begin
     end if;
     if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified',
                                    'backup.stored', 'backup.drilled.transcripts',
-                                   'backup.drilled.missions') then
+                                   'backup.drilled.missions',
+                                   'backup.drilled.controllers') then
         raise exception 'not a backup record: %', p_record ->> 'type';
     end if;
     -- A `spawn store put` run (crate backup/store.rs): its shape is fixed,
@@ -5386,6 +5388,55 @@ begin
                                     'mismatches', 'duration_ms')) then
             raise exception 'a drill record has type, ok, reason, bundle, bundle_event_id, mismatches and duration_ms, and nothing else';
         end if;
+    end if;
+    -- The controllers' drill (objective 198), one record per controller:
+    -- the drill record's fields, and the run's start, the controller, its
+    -- missions and source, its current tree and its previous one (null when
+    -- there is none), what was left out; each of its kind, nothing else.
+    if p_record ->> 'type' = 'backup.drilled.controllers' then
+        if exists (select 1 from jsonb_object_keys(p_record) k
+                    where k not in ('type', 'ok', 'reason', 'bundle', 'bundle_event_id',
+                                    'mismatches', 'duration_ms', 'run', 'controller',
+                                    'missions', 'source', 'current', 'prev', 'left_out')) then
+            raise exception 'a controllers drill record has type, ok, reason, bundle, bundle_event_id, mismatches, duration_ms, run, controller, missions, source, current, prev and left_out, and nothing else';
+        end if;
+        if jsonb_typeof(p_record -> 'run') is distinct from 'number'
+           or (p_record ->> 'run')::numeric < 0
+           or (p_record ->> 'run')::numeric <> trunc((p_record ->> 'run')::numeric)
+           or jsonb_typeof(p_record -> 'controller') is distinct from 'string'
+           or p_record ->> 'controller' = ''
+           or jsonb_typeof(p_record -> 'source') is distinct from 'string'
+           or jsonb_typeof(p_record -> 'missions') is distinct from 'array'
+           or exists (select 1 from jsonb_array_elements(p_record -> 'missions') m
+                       where jsonb_typeof(m) is distinct from 'number'
+                          or (m #>> '{}')::numeric <> trunc((m #>> '{}')::numeric))
+           or jsonb_typeof(p_record -> 'left_out') is distinct from 'array'
+           or exists (select 1 from jsonb_array_elements(p_record -> 'left_out') l
+                       where jsonb_typeof(l) is distinct from 'string')
+           or jsonb_typeof(p_record -> 'current') is distinct from 'object'
+           or coalesce(jsonb_typeof(p_record -> 'prev'), 'absent') not in ('object', 'null')
+           or exists (select 1 from (values (p_record -> 'current'), (p_record -> 'prev')) t(tree)
+                       where jsonb_typeof(tree) = 'object'
+                         and (exists (select 1 from jsonb_object_keys(tree) k
+                                       where k not in ('commit', 'live'))
+                              or jsonb_typeof(tree -> 'commit') is distinct from 'string'
+                              or jsonb_typeof(tree -> 'live') is distinct from 'object'
+                              or exists (select 1 from jsonb_object_keys(tree -> 'live') k
+                                          where k not in ('ok', 'files', 'differing'))
+                              or jsonb_typeof(tree -> 'live' -> 'ok') is distinct from 'boolean'
+                              or jsonb_typeof(tree -> 'live' -> 'files') is distinct from 'number'
+                              or (tree -> 'live' ->> 'files')::numeric < 0
+                              or (tree -> 'live' ->> 'files')::numeric
+                                 <> trunc((tree -> 'live' ->> 'files')::numeric)
+                              or jsonb_typeof(tree -> 'live' -> 'differing') is distinct from 'array'
+                              or jsonb_array_length(tree -> 'live' -> 'differing') > 20
+                              or exists (select 1 from jsonb_array_elements(tree -> 'live' -> 'differing') d
+                                          where jsonb_typeof(d) is distinct from 'string'))) then
+            raise exception 'a controllers drill record is {run: a whole number, controller: a name, source: a string, missions: mission ids, left_out: strings, current: {commit: a string, live: {ok: boolean, files: a whole number, differing: at most 20 strings}}, prev: the same or null}';
+        end if;
+    end if;
+    if p_record ->> 'type' in ('backup.drilled.transcripts', 'backup.drilled.missions',
+                               'backup.drilled.controllers') then
         if jsonb_typeof(p_record -> 'ok') is distinct from 'boolean'
            or jsonb_typeof(p_record -> 'reason') is distinct from 'string'
            or length(p_record ->> 'reason') > 500
