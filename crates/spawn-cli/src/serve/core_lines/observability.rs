@@ -344,6 +344,12 @@ mod tests {
             "database": {"bytes": 300, "log_bytes": 100},
             "test_databases": [{"bytes": 7, "schemas": 3}],
             "unowned_scratch_bytes": 0, "leaked_test_schemas": 0,
+            // Two storage readings a day apart with a landing between them
+            // (objective 185): the storage north star and S1 are measured.
+            "readings": {"newest": {"at_ms": 2 * 86_400_000, "sources": {"scratch": {"bytes": 9},
+                                    "build_cache": {"bytes": 1}, "test_databases": {"bytes": 0}}},
+                         "older": {"at_ms": 0, "sources": {"scratch": {"bytes": 3}}},
+                         "landings": 2},
         });
         let tokens = |input: u64, cache_read: u64, unpriced: u64| {
             json!({"usd": 0.9, "tokens": {"input": input, "output": 0, "cache_write": 0,

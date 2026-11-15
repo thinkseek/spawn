@@ -551,3 +551,89 @@ fn the_readings_index_is_used(
         "the readings' index unused: {indexes:?}"
     );
 }
+
+/// One control record after every other, at `at_ms`, as the loop and the
+/// integrator append them.
+fn seed(client: &mut Client, record: &Value, at_ms: i64) {
+    client
+        .execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                       source_event_id, kind, session_seq, recorded_at_ms)
+             select 'agent_control', 'session_control', null, 'control', null,
+                    jsonb_build_object('name', 'control.recorded', 'detail',
+                        jsonb_build_object('record', $1::jsonb)),
+                    coalesce(max(session_seq), 0) + 1, $2
+               from spawn_events where session_id = 'session_control'",
+            &[record, &at_ms],
+        )
+        .expect("a control record");
+}
+
+/// Objective 185: the readings read back are the newest and the newest at
+/// least a day older, with the landings between them: every task.landed and
+/// every owner's landing (a source.moved naming its request), never a
+/// deploy's source.moved or a deploy.finished, nor one outside the two.
+#[test]
+fn storage_readings_are_read_back_with_the_landings_between_them() {
+    const H: i64 = 3_600_000;
+    let (store, schema) = store("storage_bytes_landings");
+    let mut client = admin(&schema);
+    let reading = |scratch: i64| json!({"type": "host.storage_bytes", "sources": {"scratch": {"bytes": scratch}}});
+    seed(&mut client, &json!({"type": "task.landed", "id": 1}), 0);
+    seed(&mut client, &reading(MIB), 10 * H);
+    let one = store.host_storage_bytes().expect("read");
+    assert_eq!(one["newest"]["at_ms"], 10 * H);
+    assert_eq!(one["older"], Value::Null, "one reading: no older one");
+    assert_eq!(one["landings"], 0);
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 2}),
+        11 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "source.moved", "source": "/s", "from": "a", "to": "b",
+                              "request": 7}),
+        12 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "source.moved", "source": "/s", "from": "b", "to": "c"}),
+        13 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "deploy.finished", "ok": true}),
+        14 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 3}),
+        20 * H,
+    );
+    // A reading less than a day after the first: not a day older than the
+    // next one, which is.
+    seed(&mut client, &reading(2 * MIB), 30 * H);
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 4}),
+        31 * H,
+    );
+    seed(&mut client, &reading(5 * MIB), 40 * H);
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 5}),
+        41 * H,
+    );
+    let read = store.host_storage_bytes().expect("read");
+    assert_eq!(read["newest"]["at_ms"], 40 * H);
+    assert_eq!(read["newest"]["sources"]["scratch"]["bytes"], 5 * MIB);
+    assert_eq!(
+        read["older"]["at_ms"],
+        10 * H,
+        "the newest a day older, not the one 10 h before: {read}"
+    );
+    // Between them: task.landed 2, 3 and 4 and the owner's landing; not the
+    // deploy's move, deploy.finished, task 1 (before) or task 5 (after).
+    assert_eq!(read["landings"], 4, "{read}");
+}

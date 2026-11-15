@@ -80,20 +80,45 @@ select coalesce(jsonb_agg(jsonb_build_object('at_ms', s.recorded_at_ms, 'values'
            and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
            and e.recorded_at_ms >= $1) s";
 
-/// The newest `host.storage_bytes` reading (objective 180) as `{at_ms,
-/// sources}`, or null before the first, and the database's clock `now_ms`:
-/// through its own partial index (`spawn_events_host_storage_bytes`), never
-/// the rest of the control stream.
+/// The `host.storage_bytes` readings (objective 180) the storage figures are
+/// measured from (objective 185), and the database's clock `now_ms`:
+/// `newest`, the newest reading as `{at_ms, sources}`, or null before the
+/// first; `older`, the newest recorded at least a day before it, or null;
+/// `landings`, the landings recorded after `older` and up to `newest` (0
+/// without both): every `task.landed`, and every owner's landing, a
+/// `source.moved` naming its request (a deploy's names none), on any mission
+/// and source, through `spawn_events_landing` between the two readings'
+/// places in the stream. The readings are not materialized, so `newest` and
+/// `older` each walk `spawn_events_host_storage_bytes` back and stop at their
+/// row, never reading every reading.
 pub(crate) const HOST_STORAGE_BYTES: &str = r"
+with readings as not materialized (
+  select e.session_seq as seq, e.recorded_at_ms as at_ms,
+         e.kind -> 'detail' -> 'record' -> 'sources' as sources
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes'
+), newest as (
+  select * from readings order by seq desc limit 1
+), older as (
+  select r.* from readings r, newest n
+   where r.at_ms <= n.at_ms - 86400000
+   order by r.seq desc limit 1
+)
 select jsonb_build_object(
   'now_ms', (floor(extract(epoch from clock_timestamp()) * 1000))::bigint,
-  'newest', (select jsonb_build_object('at_ms', e.recorded_at_ms,
-                                       'sources', e.kind -> 'detail' -> 'record' -> 'sources')
-               from spawn_events e
-              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-                and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes'
-              order by e.session_seq desc
-              limit 1))";
+  'newest', (select jsonb_build_object('at_ms', n.at_ms, 'sources', n.sources) from newest n),
+  'older', (select jsonb_build_object('at_ms', o.at_ms, 'sources', o.sources) from older o),
+  'landings', (select count(*) from spawn_events e, newest n, older o
+                where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                  and e.kind -> 'detail' -> 'record' ->> 'type'
+                      in ('task.landed', 'source.moved', 'deploy.finished')
+                  and e.session_seq > o.seq and e.session_seq <= n.seq
+                  and (e.kind -> 'detail' -> 'record' ->> 'type' = 'task.landed'
+                       or e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
+                          and jsonb_typeof(e.kind -> 'detail' -> 'record' -> 'request')
+                              is distinct from 'null'
+                          and e.kind -> 'detail' -> 'record' ? 'request')))";
 
 /// The schemas a database holds other than PostgreSQL's own (`pg_*`,
 /// `information_schema`) and `public`: what tests leave behind (objective
@@ -289,8 +314,8 @@ impl PostgresStore {
         self.query_json(HOST_CORE_LINES, &[&since_ms])
     }
 
-    /// The newest `host.storage_bytes` reading and the database's clock
-    /// ([`HOST_STORAGE_BYTES`]): `{now_ms, newest: {at_ms, sources} | null}`.
+    /// The storage readings and the database's clock ([`HOST_STORAGE_BYTES`]):
+    /// `{now_ms, newest, older: {at_ms, sources} | null, landings}`.
     pub fn host_storage_bytes(&self) -> Result<Value, StoreError> {
         self.query_json(HOST_STORAGE_BYTES, &[])
     }

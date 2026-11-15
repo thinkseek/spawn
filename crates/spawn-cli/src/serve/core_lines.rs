@@ -160,6 +160,11 @@ pub(super) struct Figure {
     /// storage north star, S1 and S2): its value is null and its state
     /// `not_measured_yet`, never a made-up value.
     pub(super) not_measured_yet: bool,
+    /// Why a figure is not measured, or what it was read from (objective
+    /// 185: the storage north star and S1): said as `note`.
+    pub(super) note: Option<String>,
+    /// The figure split by source (objective 185): said as `by_source`.
+    pub(super) by_source: Option<Value>,
 }
 
 impl Figure {
@@ -177,6 +182,8 @@ impl Figure {
             judged: None,
             by_mission: None,
             not_measured_yet: false,
+            note: None,
+            by_source: None,
         }
     }
 
@@ -327,6 +334,12 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     }
     if let Some(by_mission) = &figure.by_mission {
         answer["by_mission"] = by_mission.clone();
+    }
+    if let Some(note) = &figure.note {
+        answer["note"] = json!(note);
+    }
+    if let Some(by_source) = &figure.by_source {
+        answer["by_source"] = by_source.clone();
     }
     answer
 }
@@ -487,16 +500,21 @@ pub(super) fn adopted(readings: &[Line]) -> Set {
     let card = |key: &'static str, name: &'static str, unit: &'static str| {
         find(key).unwrap_or_else(|| Figure::not_collected(key, name, unit))
     };
+    // The storage north star and S1 are measured from the storage readings
+    // (objective 185); S2 is not measured yet (objective 184).
+    let measured = |key: &'static str, name: &'static str, unit: &'static str| {
+        find(key).unwrap_or_else(|| Figure::not_measured_yet(key, name, unit))
+    };
     let lines = vec![
         Line {
             name: "storage",
-            north_star: Figure::not_measured_yet(
+            north_star: measured(
                 "storage.bytes_per_landing",
                 "Bytes a landing leaves behind",
                 "bytes",
             ),
             guardrails: vec![
-                Figure::not_measured_yet("storage.rebuildable_bytes", "Rebuildable bytes", "bytes"),
+                measured("storage.rebuildable_bytes", "Rebuildable bytes", "bytes"),
                 Figure::not_measured_yet("storage.kept_share", "Share kept on purpose", "share"),
             ],
         },
@@ -991,6 +1009,16 @@ fn lines_at(
     parts: &mut Parts,
 ) -> Result<(Vec<Line>, Extras), String> {
     let mut storage = timed(&mut parts.storage, || super::storage::report(store, now_ms))?;
+    // The storage readings (objective 180), the newest and the newest a day
+    // older with the landings between them, which the storage north star
+    // and S1 are measured from (objective 185). A failed read is no figure,
+    // not a failed answer.
+    storage["readings"] = timed(&mut parts.storage, || {
+        store
+            .host_storage_bytes()
+            .map_err(|error| eprintln!("core-lines: the storage readings: {error}"))
+            .unwrap_or(Value::Null)
+    });
     let unowned = timed(&mut parts.unowned, || unowned::now(file, now_ms));
     let reading = unowned.reading.as_deref();
     // Whether each claimed folder's objective landed (objective 140): read
