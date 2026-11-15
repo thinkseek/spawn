@@ -209,7 +209,7 @@ pub(crate) fn refused(
 
 #[cfg(test)]
 mod tests {
-    use super::why_old;
+    use super::{why_old, why_old_walked};
     use crate::sources::test_git as git;
 
     fn commit_tree(repo: &str, tree: &str, parent: Option<&str>, message: &str) -> String {
@@ -304,6 +304,98 @@ mod tests {
         );
         assert_eq!(why_old(&store, &repo, &new), Ok(None), "new history");
         assert_eq!(why_old(&store, &repo, &m0), Ok(None), "kept by the rewrite");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The mirror's refs reach the old history and the resident's
+    /// checkpoint built on it: the checkpoint is refused all the same, and a
+    /// commit on the new history is not. The walk is incremental: a first
+    /// walk reads the whole history, a child of a clean commit itself alone,
+    /// a commit proven once nothing, and an old-history commit only what the
+    /// clean proofs do not reach, then nothing.
+    #[test]
+    fn a_commit_built_on_the_old_history_is_refused_whatever_ref_holds_it_walked_once() {
+        let schema = spawn_postgres::testing::TestSchema::new("rewrite_guard_walk");
+        let store = spawn_postgres::PostgresStore::connect_in_schema(schema.url(), &schema)
+            .expect("connect");
+        let base =
+            std::env::temp_dir().join(format!("spawn-rewrite-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mirror = base.join("mirror.git").to_string_lossy().to_string();
+        let own = base.join("own.git").to_string_lossy().to_string();
+        let empty_tree = |repo: &str| {
+            git(&["init", "-q", "--bare", repo]).expect("init");
+            git(&[
+                "--git-dir",
+                repo,
+                "hash-object",
+                "-t",
+                "tree",
+                "-w",
+                "/dev/null",
+            ])
+            .expect("the empty tree")
+        };
+        let empty = empty_tree(&mirror);
+        let m0 = commit_tree(&mirror, &empty, None, "m0");
+        let m1 = commit_tree(&mirror, &empty, Some(&m0), "m1");
+        let w = commit_tree(&mirror, &empty, Some(&m1), "w");
+        let m1n = commit_tree(&mirror, &empty, Some(&m0), "m1 (rewritten)");
+        let wn = commit_tree(&mirror, &empty, Some(&m1n), "w (rewritten)");
+        let c = commit_tree(&mirror, &empty, Some(&w), "the resident's checkpoint");
+        let n = commit_tree(&mirror, &empty, Some(&wn), "on the new history");
+        for (name, at) in [
+            ("refs/heads/main", &m1n),
+            ("refs/heads/old-main", &m1),
+            ("refs/spawn-integrate/resident", &w),
+            ("refs/heads/resident", &c),
+        ] {
+            git(&["--git-dir", &mirror, "update-ref", name, at]).expect("a ref");
+        }
+
+        let empty = empty_tree(&own);
+        let r0 = commit_tree(&own, &empty, None, "r0");
+        let r1 = commit_tree(&own, &empty, Some(&r0), "r1");
+        let r2 = commit_tree(&own, &empty, Some(&r1), "r2");
+        let r3 = commit_tree(&own, &empty, Some(&r2), "r3");
+        let r4 = commit_tree(&own, &empty, Some(&r3), "r4");
+        let o1 = commit_tree(&own, &empty, Some(&r0), "o1 (old)");
+        let o2 = commit_tree(&own, &empty, Some(&o1), "o2");
+        let x = commit_tree(&own, &empty, Some(&o2), "x, on the old history");
+
+        store
+            .commit_map_load(&[
+                (m0.clone(), Some(m0.clone())),
+                (m1.clone(), Some(m1n.clone())),
+                (w.clone(), Some(wn.clone())),
+                (o1.clone(), None),
+            ])
+            .expect("the map");
+        assert_eq!(
+            why_old(&store, &mirror, &c),
+            Ok(Some(format!(
+                "the commit {c} is built on the history before the rewrite: 2 commit(s) of its \
+                 history were changed or dropped by it (the first: {w})"
+            ))),
+            "the checkpoint on the old history, whatever ref holds it"
+        );
+        assert_eq!(why_old(&store, &mirror, &n), Ok(None), "the new history");
+
+        let walked = |commit: &str| why_old_walked(&store, &own, commit).expect("why_old");
+        assert_eq!(walked(&r3), (None, 4), "a first walk: the whole history");
+        assert_eq!(walked(&r4), (None, 1), "a child of a clean commit: itself");
+        assert_eq!(walked(&r4), (None, 0), "proven once: no walk");
+        assert_eq!(walked(&r2), (None, 0), "in a clean commit's history");
+        let reason = format!(
+            "the commit {x} is built on the history before the rewrite: 1 commit(s) of its \
+             history were changed or dropped by it (the first: {o1})"
+        );
+        assert_eq!(
+            walked(&x),
+            (Some(reason.clone()), 3),
+            "only what the clean proofs do not reach"
+        );
+        assert_eq!(walked(&x), (Some(reason), 0), "proven old: no walk");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
