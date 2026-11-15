@@ -232,7 +232,11 @@ restore-drill --only controllers`. For each controller an active mission's
 gate names (`$SPAWN_LIVE/controllers/<name>/...`), current and previous, it
 checks, read only, that the live directory equals `git archive` of its
 `.controller` commit from the live source (left out: `.controller`, `.deps`,
-`web/node_modules`, which deploy/controller.sh adds). One
+`web/node_modules`, which deploy/controller.sh adds), and (objective 199)
+that X, the newest commit of that history the newest bundle chain holds,
+restored and extracted from it equals X from the live source; the lag from
+X to the live commit (commits, hours) is recorded, never a failure (deploys
+are many a day, bundles one). One
 `backup.drilled.controllers` per controller; the run exits 0 only when every
 one passed, so the recovery table's row for the controllers names the unit:
 `{"name": "controllers", "unit": "spawn-backup-restore-drill-controllers.service"}`
