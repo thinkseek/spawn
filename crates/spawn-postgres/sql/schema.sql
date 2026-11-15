@@ -5367,24 +5367,20 @@ begin
     -- null (no commit of its history) or {commit, lag_commits, lag_hours,
     -- ok, files, differing}. A run that cannot restore the backup records
     -- one failed record of the drill record's fields alone.
-    if p_record ->> 'type' = 'backup.drilled.controllers'
-       and (p_record ->> 'ok')::boolean is distinct from false
-          or exists (select 1 from jsonb_object_keys(p_record) k
-                      where k in ('run', 'controller', 'missions', 'source', 'current',
-                                  'prev', 'left_out')) then
-        null;
-    end if;
-    if p_record ->> 'type' = 'backup.drilled.controllers'
-       and ((p_record ->> 'ok')::boolean is distinct from false
-            or exists (select 1 from jsonb_object_keys(p_record) k
-                        where k in ('run', 'controller', 'missions', 'source', 'current',
-                                    'prev', 'left_out'))) then
+    if p_record ->> 'type' = 'backup.drilled.controllers' then
         if exists (select 1 from jsonb_object_keys(p_record) k
                     where k not in ('type', 'ok', 'reason', 'bundle', 'bundle_event_id',
                                     'mismatches', 'duration_ms', 'run', 'controller',
                                     'missions', 'source', 'current', 'prev', 'left_out')) then
             raise exception 'a controllers drill record has type, ok, reason, bundle, bundle_event_id, mismatches, duration_ms, run, controller, missions, source, current, prev and left_out, and nothing else';
         end if;
+    end if;
+    if p_record ->> 'type' = 'backup.drilled.controllers'
+       and (jsonb_typeof(p_record -> 'ok') is distinct from 'boolean'
+            or (p_record ->> 'ok')::boolean
+            or exists (select 1 from jsonb_object_keys(p_record) k
+                        where k in ('run', 'controller', 'missions', 'source', 'current',
+                                    'prev', 'left_out'))) then
         if jsonb_typeof(p_record -> 'run') is distinct from 'number'
            or (p_record ->> 'run')::numeric < 0
            or (p_record ->> 'run')::numeric <> trunc((p_record ->> 'run')::numeric)
