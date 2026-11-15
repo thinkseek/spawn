@@ -27,9 +27,28 @@
 //! the other, differs. Directories are not entries. Nothing live is
 //! written.
 //!
-//! One `backup.drilled.controllers` per controller (see [`record`]); exit 0
-//! only when every controller passed, 1 when one failed or no mission names
-//! a controller, 2 when the drill cannot run or a record is refused.
+//! HELD (objective 199), per controller, its current tree and its previous
+//! one: the sources are first restored from the newest bundle chain, as
+//! `--only missions` restores them (decrypted in a pipe, the manifest and
+//! `repos/*` alone, never a transcript: [`super::restore_sources`]). X is
+//! the first commit of `git rev-list --topo-order <commit>` in the live
+//! source that the restored mirror holds (reachable from its refs); `git
+//! archive X` from the mirror equals `git archive X` from the live source,
+//! both extracted into scratch and compared as LIVE compares. The lag from
+//! X to the tree's commit (`lag_commits`: `X..commit`; `lag_hours`: whole
+//! hours by committer time) is recorded, never a failure: deploys are
+//! several a day and bundles one. What HELD proves: the same commit id pins
+//! the same tree, and objects that pass `fsck --full` give the same
+//! archive, so it adds that X extracts whole from the off-site copy into a
+//! usable tree. A tree fails also when its HELD trees differ, or when the
+//! mirror holds no commit of its history (its `held` null).
+//!
+//! One `backup.drilled.controllers` per controller (see [`record`]), naming
+//! the bundle; exit 0 only when every controller passed, 1 when one failed
+//! or no mission names a controller, 2 when the drill cannot run or a
+//! record is refused. A run that cannot restore the backup records one
+//! failed record of the drill record's fields alone (its reason "the backup
+//! cannot be restored: ...") and exits 1.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -40,8 +59,10 @@ use std::time::Instant;
 use serde_json::{Value, json};
 use spawn_postgres::PostgresStore;
 
-use super::{DrillDir, NAMED, REASON_CHARS, elapsed_ms, git};
-use crate::backup::sha256_file;
+use super::{
+    Bundle, DrillDir, Mirrors, NAMED, REASON_CHARS, elapsed_ms, git, restore_sources, run_git,
+};
+use crate::backup::{Settings, sha256_file};
 
 /// What deploy/controller.sh adds to a controller and git does not hold:
 /// never compared (a directory's whole subtree).
@@ -85,10 +106,25 @@ struct Tree {
     differing: Vec<String>,
     /// Why it could not be compared, when it could not.
     error: Option<String>,
+    /// HELD: the newest commit of its history the backup holds, compared.
+    held: Option<Held>,
+    /// Why HELD failed (no commit held, a mirror that cannot be read), when
+    /// it did.
+    held_error: Option<String>,
+}
+
+/// HELD for one tree (objective 199).
+struct Held {
+    commit: String,
+    lag_commits: u64,
+    lag_hours: i64,
+    files: usize,
+    differing: Vec<String>,
 }
 
 impl Tree {
-    fn ok(&self) -> bool {
+    /// LIVE alone.
+    fn live_ok(&self) -> bool {
         self.error.is_none() && self.differing.is_empty()
     }
 
@@ -98,17 +134,34 @@ impl Tree {
             files: 0,
             differing: Vec::new(),
             error: Some(error),
+            held: None,
+            held_error: None,
         }
     }
 
+    fn mismatches(&self) -> usize {
+        self.differing.len() + self.held.as_ref().map_or(0, |held| held.differing.len())
+    }
+
     fn json(&self) -> Value {
+        let held = self.held.as_ref().map_or(Value::Null, |held| {
+            json!({
+                "commit": held.commit,
+                "lag_commits": held.lag_commits,
+                "lag_hours": held.lag_hours,
+                "ok": self.held_error.is_none() && held.differing.is_empty(),
+                "files": held.files,
+                "differing": held.differing.iter().take(NAMED).collect::<Vec<_>>(),
+            })
+        });
         json!({
             "commit": self.commit,
             "live": {
-                "ok": self.ok(),
+                "ok": self.live_ok(),
                 "files": self.files,
                 "differing": self.differing.iter().take(NAMED).collect::<Vec<_>>(),
             },
+            "held": held,
         })
     }
 
@@ -117,13 +170,43 @@ impl Tree {
         if let Some(error) = &self.error {
             return Some(format!("{which}: {error}"));
         }
-        let first = self.differing.first()?;
-        Some(format!(
-            "{which} {}: {} of {} live paths differ from the commit's tree; the first: {first}",
-            short(&self.commit),
-            self.differing.len(),
-            self.files
-        ))
+        let mut why = Vec::new();
+        if let Some(first) = self.differing.first() {
+            why.push(format!(
+                "{which} {}: {} of {} live paths differ from the commit's tree; the first: {first}",
+                short(&self.commit),
+                self.differing.len(),
+                self.files
+            ));
+        }
+        if let Some(error) = &self.held_error {
+            why.push(format!("{which} {}: {error}", short(&self.commit)));
+        } else if let Some(held) = &self.held
+            && let Some(first) = held.differing.first()
+        {
+            why.push(format!(
+                "{which} {}: held {}: {} of {} paths differ between git archive from the \
+                 backup's mirror and from the live source; the first: {first}",
+                short(&self.commit),
+                short(&held.commit),
+                held.differing.len(),
+                held.files
+            ));
+        }
+        (!why.is_empty()).then(|| why.join("; "))
+    }
+
+    /// HELD said for the console.
+    fn held_said(&self) -> String {
+        match &self.held {
+            Some(held) => format!(
+                " (held {}, lag {} commit(s), {} h)",
+                short(&held.commit),
+                held.lag_commits,
+                held.lag_hours
+            ),
+            None => " (held: none)".to_string(),
+        }
     }
 }
 
@@ -133,11 +216,18 @@ fn short(commit: &str) -> &str {
 
 /// The drill: `parent` is the scratch directory's resolved parent, `live`
 /// is `$SPAWN_LIVE`.
-pub(super) fn drill(store: &PostgresStore, parent: &Path, live: &Path) -> Result<i32, String> {
+pub(super) fn drill(
+    store: &PostgresStore,
+    settings: &Settings,
+    parent: &Path,
+    live: &Path,
+) -> Result<i32, String> {
     println!(
         "restore-drill: --only controllers: each controller an open or active mission's gate \
          names, current and previous, compared with git archive of its commit from the live \
-         source; read only ({} left out)",
+         source; read only ({} left out); and the newest commit of its history the newest \
+         bundle chain holds, restored (manifest.json and repos/* alone, decrypted in a pipe), \
+         compared with the live source's",
         LEFT_OUT.join(", ")
     );
     let started = Instant::now();
@@ -155,18 +245,54 @@ pub(super) fn drill(store: &PostgresStore, parent: &Path, live: &Path) -> Result
         return Ok(1);
     }
     let scratch = DrillDir::create(parent)?;
+    let sources: BTreeSet<String> = named
+        .values()
+        .filter(|named| named.sources.len() == 1)
+        .flat_map(|named| named.sources.iter().cloned())
+        .filter(|source| !source.is_empty())
+        .collect();
+    let (bundle, mirrors) = match restore_sources(store, settings, &sources, scratch.path()) {
+        Ok(restored) => restored,
+        Err((bundle, reason)) => {
+            let reason = format!("the backup cannot be restored: {reason}");
+            println!("restore-drill: FAILED: {reason}");
+            scratch.remove()?;
+            let record = json!({
+                "type": TYPE,
+                "ok": false,
+                "reason": reason.chars().take(REASON_CHARS).collect::<String>(),
+                "bundle": bundle.key,
+                "bundle_event_id": bundle.event_id,
+                "mismatches": 0,
+                "duration_ms": elapsed_ms(started),
+            });
+            if let Err(error) = store.backup_record(&record) {
+                eprintln!("spawn backup restore-drill: {TYPE} was not recorded: {error}");
+                return Ok(2);
+            }
+            return Ok(1);
+        }
+    };
+    println!(
+        "restore-drill: --only controllers: restored {} source(s) from the bundle {} (record {})",
+        sources.len(),
+        bundle.key,
+        bundle.event_id
+    );
     let mut records = Vec::new();
     for (name, named) in &named {
-        let record = drill_one(&controllers, name, named, scratch.path(), run, started);
+        let drilled = Drilled {
+            controllers: &controllers,
+            scratch: scratch.path(),
+            mirrors: &mirrors,
+            bundle: &bundle,
+            run,
+            started,
+        };
+        let (record, said) = drill_one(&drilled, name, named);
         let ok = record["ok"].as_bool() == Some(true);
         if ok {
-            println!(
-                "controllers: {name}: passed: current {}{}",
-                record["current"]["commit"].as_str().unwrap_or_default(),
-                record["prev"]["commit"]
-                    .as_str()
-                    .map_or_else(String::new, |prev| format!(", prev {prev}"))
-            );
+            println!("controllers: {name}: passed: {said}");
         } else {
             println!(
                 "controllers: {name}: FAILED: {}",
@@ -268,15 +394,26 @@ fn is_built_name(name: &str) -> bool {
     })
 }
 
-/// One controller drilled, as its record.
-fn drill_one(
-    controllers: &Path,
-    name: &str,
-    named: &Named,
-    scratch: &Path,
+/// What every controller of one run is drilled with.
+struct Drilled<'a> {
+    controllers: &'a Path,
+    scratch: &'a Path,
+    mirrors: &'a Mirrors,
+    bundle: &'a Bundle,
     run: i64,
     started: Instant,
-) -> Value {
+}
+
+/// One controller drilled, as its record, and its trees said.
+fn drill_one(drilled: &Drilled<'_>, name: &str, named: &Named) -> (Value, String) {
+    let Drilled {
+        controllers,
+        scratch,
+        mirrors,
+        bundle,
+        run,
+        started,
+    } = *drilled;
     let link = controllers.join(name);
     let source = if named.sources.len() == 1 {
         named.sources.iter().next().cloned().unwrap_or_default()
@@ -302,11 +439,26 @@ fn drill_one(
         let reason = format!("{} is not there", link.display());
         (Tree::unread("", reason.clone()), None, Some(reason))
     } else {
-        let current = drill_tree(&link, &source, &scratch.join(format!("{name}.current")));
+        let mirror = match mirrors.get(&source) {
+            Some(Ok(mirror)) => Ok(mirror.as_path()),
+            Some(Err(error)) => Err(error.as_str()),
+            None => Err("it was not restored"),
+        };
+        let current = drill_tree(
+            &link,
+            &source,
+            mirror,
+            &scratch.join(format!("{name}.current")),
+        );
         let prev_link = controllers.join(format!("{name}.prev"));
-        let prev = fs::symlink_metadata(&prev_link)
-            .is_ok()
-            .then(|| drill_tree(&prev_link, &source, &scratch.join(format!("{name}.prev"))));
+        let prev = fs::symlink_metadata(&prev_link).is_ok().then(|| {
+            drill_tree(
+                &prev_link,
+                &source,
+                mirror,
+                &scratch.join(format!("{name}.prev")),
+            )
+        });
         let reasons: Vec<String> = [
             current.why("current"),
             prev.as_ref().and_then(|p| p.why("prev")),
@@ -317,24 +469,36 @@ fn drill_one(
         let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         (current, prev, reason)
     };
-    let mismatches = current.differing.len() + prev.as_ref().map_or(0, |prev| prev.differing.len());
+    let mismatches = current.mismatches() + prev.as_ref().map_or(0, Tree::mismatches);
+    let said = format!(
+        "current {}{}{}",
+        current.commit,
+        current.held_said(),
+        prev.as_ref().map_or_else(String::new, |prev| format!(
+            ", prev {}{}",
+            prev.commit,
+            prev.held_said()
+        ))
+    );
     let reason = reason.map_or_else(String::new, |reason| {
         format!("{name}: {reason}")
             .chars()
             .take(REASON_CHARS)
             .collect()
     });
-    record(&Record {
+    let record = record(&Record {
         controller: name,
         missions: &named.missions,
         source: &source,
         reason: &reason,
+        bundle,
         mismatches,
         current: &current,
         prev: prev.as_ref(),
         run,
         duration_ms: elapsed_ms(started),
-    })
+    });
+    (record, said)
 }
 
 /// What one record is made of.
@@ -343,6 +507,7 @@ struct Record<'a> {
     missions: &'a [i64],
     source: &'a str,
     reason: &'a str,
+    bundle: &'a Bundle,
     mismatches: usize,
     current: &'a Tree,
     prev: Option<&'a Tree>,
@@ -350,17 +515,18 @@ struct Record<'a> {
     duration_ms: i64,
 }
 
-/// A `backup.drilled.controllers` record: the drill record's fields
-/// (`bundle` "" and `bundle_event_id` 0: objective 199 fills them), the
-/// run's start, the controller, its missions and source, its current tree
-/// and its previous one (null when there is none), what was left out.
+/// A `backup.drilled.controllers` record: the drill record's fields (the
+/// bundle its sources were restored from), the run's start, the
+/// controller, its missions and source, its current tree and its previous
+/// one (null when there is none; each with `live` and `held`), what was
+/// left out.
 fn record(record: &Record<'_>) -> Value {
     json!({
         "type": TYPE,
         "ok": record.reason.is_empty(),
         "reason": record.reason,
-        "bundle": "",
-        "bundle_event_id": 0,
+        "bundle": record.bundle.key,
+        "bundle_event_id": record.bundle.event_id,
         "mismatches": record.mismatches,
         "duration_ms": record.duration_ms,
         "run": record.run,
@@ -374,8 +540,10 @@ fn record(record: &Record<'_>) -> Value {
 }
 
 /// The tree a link points at, compared with `git archive` of the commit
-/// its `.controller` names, extracted into `into`.
-fn drill_tree(link: &Path, source: &str, into: &Path) -> Tree {
+/// its `.controller` names, extracted into `into` (LIVE); then HELD
+/// against `mirror`, the source restored from the backup (or why it could
+/// not be).
+fn drill_tree(link: &Path, source: &str, mirror: Result<&Path, &str>, into: &Path) -> Tree {
     let dir = match link.canonicalize() {
         Ok(dir) => dir,
         Err(error) => return Tree::unread("", format!("{}: {error}", link.display())),
@@ -401,14 +569,137 @@ fn drill_tree(link: &Path, source: &str, into: &Path) -> Tree {
     if let Err(error) = archive(source, &commit, into) {
         return Tree::unread(&commit, error);
     }
-    match (entries(&dir), entries(into)) {
+    let mut tree = match (entries(&dir), entries(into)) {
         (Ok(live), Ok(archived)) => Tree {
             commit,
             files: live.len(),
             differing: differences(&live, &archived),
             error: None,
+            held: None,
+            held_error: None,
         },
-        (Err(error), _) | (_, Err(error)) => Tree::unread(&commit, error),
+        (Err(error), _) | (_, Err(error)) => return Tree::unread(&commit, error),
+    };
+    match mirror {
+        Ok(mirror) => match held(source, mirror, &tree.commit, into) {
+            Ok(held) => tree.held = Some(held),
+            Err(Unheld::None(why)) => tree.held_error = Some(why),
+            Err(Unheld::Failed(held, why)) => {
+                tree.held = Some(held);
+                tree.held_error = Some(why);
+            }
+        },
+        Err(error) => {
+            tree.held_error = Some(format!(
+                "the backup holds no commit of its history: {error}"
+            ));
+        }
+    }
+    tree
+}
+
+/// Why HELD failed.
+enum Unheld {
+    /// No commit compared (none held, or the histories cannot be read).
+    None(String),
+    /// X found, but its trees could not be compared.
+    Failed(Held, String),
+}
+
+/// HELD for `commit`: X, the first commit of its history in the live
+/// source (topological order) the restored `mirror` holds; `git archive X`
+/// from each extracted beside `into` and compared.
+fn held(source: &str, mirror: &Path, commit: &str, into: &Path) -> Result<Held, Unheld> {
+    let mirror_text = mirror.display().to_string();
+    let listed = run_git(
+        {
+            let mut command = git();
+            command
+                .arg("--git-dir")
+                .arg(mirror)
+                .args(["rev-list", "--all"]);
+            command
+        },
+        "git rev-list --all (the restored mirror)",
+    )
+    .map_err(Unheld::None)?;
+    let holds: BTreeSet<&str> = listed.lines().collect();
+    let history = run_git(
+        {
+            let mut command = git();
+            command
+                .args(["-C", source, "rev-list", "--topo-order"])
+                .arg(commit);
+            command
+        },
+        "git rev-list --topo-order (the live source)",
+    )
+    .map_err(Unheld::None)?;
+    let Some(x) = history.lines().find(|line| holds.contains(line)) else {
+        return Err(Unheld::None(
+            "the backup holds no commit of its history".to_string(),
+        ));
+    };
+    let lag_commits = run_git(
+        {
+            let mut command = git();
+            command
+                .args(["-C", source, "rev-list", "--count"])
+                .arg(format!("{x}..{commit}"));
+            command
+        },
+        "git rev-list --count",
+    )
+    .map_err(Unheld::None)?
+    .trim()
+    .parse::<u64>()
+    .map_err(|error| Unheld::None(format!("git rev-list --count: {error}")))?;
+    let times = run_git(
+        {
+            let mut command = git();
+            command
+                .args(["-C", source, "show", "-s", "--format=%ct"])
+                .args([commit, x]);
+            command
+        },
+        "git show --format=%ct",
+    )
+    .map_err(Unheld::None)?;
+    let times: Vec<i64> = times
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    let lag_hours = match times.as_slice() {
+        [at, held_at] => ((at - held_at) / 3600).max(0),
+        _ => 0,
+    };
+    let mut held = Held {
+        commit: x.to_string(),
+        lag_commits,
+        lag_hours,
+        files: 0,
+        differing: Vec::new(),
+    };
+    let base = into.as_os_str().to_string_lossy();
+    let (from_mirror, from_source) = (
+        PathBuf::from(format!("{base}.held-backup")),
+        PathBuf::from(format!("{base}.held-live")),
+    );
+    if let Err(error) = archive(&mirror_text, x, &from_mirror) {
+        return Err(Unheld::Failed(held, format!("held {}: {error}", short(x))));
+    }
+    if let Err(error) = archive(source, x, &from_source) {
+        return Err(Unheld::Failed(held, format!("held {}: {error}", short(x))));
+    }
+    match (entries(&from_source), entries(&from_mirror)) {
+        (Ok(live), Ok(backup)) => {
+            held.files = backup.len();
+            held.differing = differences(&live, &backup);
+            Ok(held)
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            Err(Unheld::Failed(held, format!("held {}: {error}", short(x))))
+        }
     }
 }
 
