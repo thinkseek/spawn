@@ -413,3 +413,141 @@ fn core_lines_samples_are_recorded_and_read_back_through_their_index() {
         "the samples' index unused: {indexes:?}"
     );
 }
+
+/// Objective 180: the loop's daily `host.storage_bytes` readings go through
+/// `spawn_host_record` (each source with bytes or why it is not measured;
+/// any other shape refused), fold into no table, and the newest is read
+/// back with the database's clock through its own partial index.
+#[test]
+fn storage_readings_are_recorded_and_the_newest_read_back() {
+    let (store, schema) = store("storage_bytes");
+    let mut client = admin(&schema);
+    let empty = store.host_storage_bytes().expect("read");
+    assert_eq!(empty["newest"], Value::Null, "{empty}");
+    assert!(
+        empty["now_ms"].as_i64().is_some_and(|now| now > 0),
+        "{empty}"
+    );
+    let tables_before: i64 = client
+        .query_one("select count(*) from mission_missions", &[])
+        .expect("count")
+        .get(0);
+    let reading = |scratch: i64| {
+        json!({"type": "host.storage_bytes", "sources": {
+            "scratch": {"bytes": scratch, "files": 3, "unreadable": 0, "seconds": 0.5},
+            "session_backups": {"not_measured": "no status file is configured"},
+            "live_database": {"bytes": 300}}})
+    };
+    for (at, scratch) in [(1000, 8 * MIB), (9000, 9 * MIB), (5000, 7 * MIB)] {
+        let id = store.host_record(&reading(scratch)).expect("recorded");
+        place(&mut client, id, at);
+    }
+    for bad in [
+        json!({"type": "host.storage_bytes"}),
+        json!({"type": "host.storage_bytes", "sources": []}),
+        json!({"type": "host.storage_bytes", "sources": {}}),
+        json!({"type": "host.storage_bytes", "sources": {"scratch": 5}}),
+        json!({"type": "host.storage_bytes", "sources": {"scratch": {"bytes": "lots"}}}),
+        json!({"type": "host.storage_bytes", "sources": {"scratch": {"bytes": -1}}}),
+        json!({"type": "host.storage_bytes", "sources": {"scratch": {"files": 3}}}),
+        json!({"type": "host.storage_bytes", "sources": {"scratch": {"not_measured": 3}}}),
+        json!({"type": "host.storage_bytes",
+               "sources": {"scratch": {"bytes": 1, "not_measured": "both"}}}),
+        json!({"type": "host.storage_bytes", "sources": {"": {"bytes": 1}}}),
+    ] {
+        assert!(store.host_record(&bad).is_err(), "refused: {bad}");
+    }
+    let count: i64 = client
+        .query_one(
+            "select count(*) from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes'",
+            &[],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(count, 3);
+    let tables_after: i64 = client
+        .query_one("select count(*) from mission_missions", &[])
+        .expect("count")
+        .get(0);
+    assert_eq!(tables_before, tables_after, "folded into no table");
+    // The newest is the last recorded (its place in the stream), with its
+    // time.
+    let read = store.host_storage_bytes().expect("read");
+    assert_eq!(read["newest"]["at_ms"], 5000, "{read}");
+    assert_eq!(read["newest"]["sources"]["scratch"]["bytes"], 7 * MIB);
+    assert_eq!(
+        read["newest"]["sources"]["session_backups"],
+        json!({"not_measured": "no status file is configured"})
+    );
+    let clock: i64 = client
+        .query_one(
+            "select (floor(extract(epoch from clock_timestamp()) * 1000))::bigint",
+            &[],
+        )
+        .expect("clock")
+        .get(0);
+    let now = read["now_ms"].as_i64().expect("the database's clock");
+    assert!((clock - now).abs() < 60_000, "{now} against {clock}");
+
+    the_readings_index_is_used(&store, &mut client, &schema);
+}
+
+/// The readings' partial index exists, and the newest is read through it in
+/// a stream of 5,000 other records.
+fn the_readings_index_is_used(
+    store: &spawn_postgres::PostgresStore,
+    client: &mut Client,
+    schema: &str,
+) {
+    // The partial index exists, and the read goes through it in a stream of
+    // other records.
+    let definition: String = client
+        .query_one(
+            "select indexdef from pg_indexes
+              where schemaname = $1 and indexname = 'spawn_events_host_storage_bytes'",
+            &[&schema],
+        )
+        .expect("the index exists")
+        .get(0);
+    assert!(definition.contains("session_seq"), "{definition}");
+    assert!(definition.contains("host.storage_bytes"), "{definition}");
+    client
+        .batch_execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                       source_event_id, kind, session_seq, recorded_at_ms)
+             select 'agent_control', 'session_control', null, 'control', null,
+                    jsonb_build_object('name', 'control.recorded', 'detail',
+                        jsonb_build_object('record', jsonb_build_object('type', 'host.storage',
+                            'archive_bytes', n, 'archive_files', 1,
+                            'projects_bytes', 1, 'projects_files', 1))),
+                    m.seq + n, 10000 + n
+               from generate_series(1, 5000) n,
+                    (select max(session_seq) as seq from spawn_events
+                      where session_id = 'session_control') m;
+             analyze spawn_events;",
+        )
+        .expect("a stream of other records");
+    assert_eq!(
+        store.host_storage_bytes().expect("read")["newest"]["at_ms"],
+        5000,
+        "other records are not readings"
+    );
+    let plan: Value = client
+        .query_one(
+            "explain (format json)
+             select e.session_seq from spawn_events e
+              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes'
+              order by e.session_seq desc limit 1",
+            &[],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut indexes = Vec::new();
+    plan_indexes(&plan, &mut indexes);
+    assert!(
+        indexes.contains(&"spawn_events_host_storage_bytes".to_string()),
+        "the readings' index unused: {indexes:?}"
+    );
+}
