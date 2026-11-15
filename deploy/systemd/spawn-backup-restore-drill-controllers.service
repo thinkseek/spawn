@@ -1,11 +1,12 @@
 [Unit]
-Description=Spawn: daily drill of the controllers (objective 198): each controller's current and previous tree compared with git archive of its commit from the live source, read only; recorded as backup.drilled.controllers, one record per controller (deploy/backup)
+Description=Spawn: daily drill of the controllers (objectives 198, 199): each controller's current and previous tree compared with git archive of its commit from the live source, and the newest commit of its history the backup holds rebuilt from the newest bundle chain and compared with the same commit from the live source; recorded as backup.drilled.controllers, one record per controller (deploy/backup)
 After=spawn-backup-bundle.service spawn-backup-restore-drill-missions.service
 
 [Service]
 Type=oneshot
-# --only controllers: the controllers and the live sources are only read,
-# never written. Exit 0 every controller passed (what U1 reads),
+# --only controllers: from each bundle only manifest.json and repos/* are
+# unpacked, as --only missions does; the controllers and the live sources are
+# only read, never written. Exit 0 every controller passed (what U1 reads),
 # 1 one failed, 2 the drill could not run or record.
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn backup restore-drill --only controllers
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
