@@ -26,6 +26,12 @@
 //! sha256 must be the same. A run killed part way leaves the ciphertext,
 //! the list of names and what it has extracted: no transcript.
 //!
+<<<<<<< 40293466db32cb4376fe20ba8af611199fea6eaf
+//! `--only controllers` (objective 198, [`controllers`]) reads no bundle: it
+//! checks that each live controller an open or active mission's gate names,
+//! current and previous, is `git archive` of its commit from the live
+//! source, and records one `backup.drilled.controllers` per controller.
+=======
 //! `--only transcripts` (objective 200) drills the transcript archive
 //! alone, through the same pipe: from each bundle it unpacks by name only
 //! `manifest.json` and the files under `transcripts/` (no directory, no
@@ -44,6 +50,7 @@
 //! removed, after the identity check below, only when everything in it is
 //! a directory or a regular file, else the drill fails and the folder is
 //! left, said.
+>>>>>>> b822c635abac0fae9289692121a5f4d6d49cbb6e
 //!
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
@@ -133,6 +140,8 @@ use crate::Flags;
 use crate::commit_now::CommitNow;
 use crate::config::{env_value, open_store};
 
+mod controllers;
+
 /// Where the scratch directory goes when `--into` is not given.
 const DEFAULT_PARENT: &str = "/data/tmp";
 
@@ -143,10 +152,26 @@ const DRILL_PREFIX: &str = "spawn-restore-drill-";
 const NAMED: usize = 20;
 
 /// `spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]
+<<<<<<< 40293466db32cb4376fe20ba8af611199fea6eaf
+/// [--only missions|controllers]`.
+pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
+    let only_controllers = flags.get("only").as_deref() == Some(controllers::CONTROLLERS);
+    let only = if only_controllers {
+        false
+    } else {
+        match only_missions(flags.get("only").as_deref()) {
+            Ok(only) => only,
+            Err(error) => {
+                eprintln!("spawn backup restore-drill: {error}");
+                return Ok(2);
+            }
+        }
+=======
 /// [--only missions|transcripts]`.
 pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let Some((only, resources)) = resources_of(flags) else {
         return Ok(2);
+>>>>>>> b822c635abac0fae9289692121a5f4d6d49cbb6e
     };
     let settings = match Settings::from_env(flags) {
         Ok(settings) => settings,
@@ -155,8 +180,34 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
+<<<<<<< 40293466db32cb4376fe20ba8af611199fea6eaf
+    let parent = match parent_of(flags, &settings) {
+        Ok(parent) => parent,
+        Err(error) => {
+            eprintln!("spawn backup restore-drill: {error}");
+            return Ok(2);
+        }
+=======
     let Some(parent) = parent_of(flags, &settings) else {
         return Ok(2);
+>>>>>>> b822c635abac0fae9289692121a5f4d6d49cbb6e
+    };
+    if only_controllers {
+        let live = env_value("SPAWN_LIVE").map_or_else(
+            || super::home().join(".local/share/spawn-rsi"),
+            PathBuf::from,
+        );
+        let store = open_store()?;
+        return controllers::drill(&store, &parent, &live);
+    }
+    let resources: &[&'static str] = if only {
+        println!(
+            "restore-drill: --only missions: the mission repositories alone; no transcript \
+             unpacked or restored"
+        );
+        &[MISSIONS]
+    } else {
+        &[TRANSCRIPTS, MISSIONS]
     };
     let started = Instant::now();
     let store = open_store()?;
@@ -390,6 +441,19 @@ fn unrestorable_all(resources: &[&'static str], reason: &str) -> Vec<(&'static s
 const TRANSCRIPTS: &str = "transcripts";
 const MISSIONS: &str = "missions";
 
+<<<<<<< 40293466db32cb4376fe20ba8af611199fea6eaf
+/// `--only`'s value: absent, the drill proves both resources (`false`);
+/// `missions`, the mission repositories alone (`true`, objective 186).
+/// `controllers` (objective 198) is taken before this; anything else
+/// (`transcripts`, an empty value) is refused.
+pub(super) fn only_missions(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(MISSIONS) => Ok(true),
+        Some(_) => Err(
+            "--only takes missions (the mission repositories) or controllers (the live \
+             controllers)"
+=======
 /// What a drill proves: both resources, or one alone (`--only`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Only {
@@ -412,6 +476,7 @@ pub(super) fn only_of(value: Option<&str>) -> Result<Only, String> {
         Some(_) => Err(
             "--only takes missions or transcripts (the mission repositories, the transcript \
              archive)"
+>>>>>>> b822c635abac0fae9289692121a5f4d6d49cbb6e
                 .to_string(),
         ),
     }
@@ -630,6 +695,24 @@ fn drill_record(resource: &str, outcome: &Outcome, verdict: &Verdict<'_>) -> Val
         "mismatches": mismatches,
         "duration_ms": verdict.duration_ms,
     })
+}
+
+/// The scratch directory's parent (`--into`, else [`DEFAULT_PARENT`]),
+/// resolved and checked to be under none of `$HOME`, `$SPAWN_LIVE` and the
+/// workspace root ([`drill_parent`]).
+fn parent_of(flags: &Flags, settings: &Settings) -> Result<PathBuf, String> {
+    let parent = flags
+        .get("into")
+        .map_or_else(|| PathBuf::from(DEFAULT_PARENT), PathBuf::from);
+    let guards: Vec<(&str, PathBuf)> = [
+        ("$HOME", env_value("HOME").map(PathBuf::from)),
+        ("$SPAWN_LIVE", env_value("SPAWN_LIVE").map(PathBuf::from)),
+        ("the workspace root", Some(settings.root.clone())),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| Some((name, path?)))
+    .collect();
+    drill_parent(&parent, &guards)
 }
 
 /// The parent of the scratch directory, resolved: an existing directory
