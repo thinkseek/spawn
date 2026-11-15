@@ -14,7 +14,8 @@ extents (FIEMAP, through fcntl.ioctl; the file is opened read-only and never
 read), and prints one JSON object on stdout:
 
     {"sources": [{"name", "bytes", "files", "unreadable", "seconds"}
-                 | {"name", "over_bound": true, "files", "seconds"}]}
+                 | {"name", "over_bound": true, "files", "seconds"}
+                 | {"name", "not_measured": <why>}]}
 
 An extent is counted once across the whole reading, in the first source
 that holds it: a reflinked copy (cp --reflink) adds nothing, a plain copy
@@ -23,6 +24,10 @@ that cannot be opened or mapped counts in `unreadable`, and so does a
 directory that cannot be listed (one gone mid-walk, or a root that does not
 exist, counts nowhere). A source not done
 within `bound_secs` of its start reads `over_bound`, never a partial count.
+A source after one that is over its bound is not walked and reads
+`not_measured` (cc-astra A82): the earlier source's walk stopped part way,
+so which extents it held first is unknown, and a later count would depend
+on how far it got while reading as complete.
 No file name, path or content is ever printed.
 """
 
@@ -121,7 +126,18 @@ def main():
     config = json.load(sys.stdin)
     bound = float(config["bound_secs"])
     seen = set()
-    readings = [measure(source, seen, bound) for source in config["sources"]]
+    readings = []
+    stopped = None
+    for source in config["sources"]:
+        if stopped is not None:
+            readings.append({"name": source["name"], "not_measured": (
+                "not walked: %s, before it, was over its bound, so which extents it "
+                "held first is unknown" % stopped)})
+            continue
+        reading = measure(source, seen, bound)
+        readings.append(reading)
+        if reading.get("over_bound"):
+            stopped = source["name"]
     json.dump({"sources": readings}, sys.stdout)
     sys.stdout.write("\n")
 
