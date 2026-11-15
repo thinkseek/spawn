@@ -1,0 +1,24 @@
+[Unit]
+Description=Spawn: one passive read-only shadow observation (scripts/shadow/shadow_observe.py)
+# Phase 1 of the heartbeat design (owner order 2026-11-15). It observes and
+# records. It restarts, stops, launches and repairs nothing. No other unit
+# depends on it, and it changes no other unit's settings.
+
+[Service]
+Type=oneshot
+# From the controller (the deployed commit's tree), through python3 -I, so
+# the script's folder and the environment's PYTHON* never add code.
+ExecStart=/usr/bin/python3 -I %h/.local/share/spawn-rsi/controllers/spawn/scripts/shadow/shadow_observe.py
+# No EnvironmentFile: this unit gets no credential and no Spawn setting.
+Environment=PATH=/usr/bin:/bin
+# Bounds (candidates, to be compared with the first real samples). The
+# script's own deadline is 20 s; this is the outer stop for the script only.
+TimeoutStartSec=30
+CPUQuota=20%
+MemoryMax=96M
+TasksMax=16
+Nice=10
+IOSchedulingClass=idle
+# A run that fails is simply the next sample missing: no Restart=.
+# Turn off: touch ~/.config/spawn-shadow/disabled (the script then exits
+# before any probe), or: systemctl --user disable --now spawn-shadow-observe.timer
