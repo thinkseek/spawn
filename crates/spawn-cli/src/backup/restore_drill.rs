@@ -518,8 +518,8 @@ fn said(report: &Report) -> i32 {
     }
     if mismatches.is_empty() && report.unknown.is_empty() {
         println!(
-            "restore-drill: passed: bundle {} (event {}) restored and matches live",
-            report.key, report.event_id
+            "restore-drill: passed: bundle {} (event {}) restored and matches {}",
+            report.key, report.event_id, report.against
         );
         0
     } else {
@@ -651,6 +651,9 @@ pub(super) struct DrillDir {
     parent: PathBuf,
     #[cfg(unix)]
     identity: (u64, u64),
+    /// Removed only when every entry under it is a directory or a regular
+    /// file (the transcripts drill's, objective 200).
+    plain: bool,
     done: bool,
 }
 
@@ -686,6 +689,7 @@ impl DrillDir {
                         parent: parent.to_path_buf(),
                         #[cfg(unix)]
                         identity,
+                        plain: false,
                         done: false,
                     });
                 }
@@ -701,6 +705,12 @@ impl DrillDir {
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Removed only when it holds nothing but directories and regular
+    /// files ([`plain_tree`]): anything else is left, and said.
+    pub(super) fn plain_only(&mut self) {
+        self.plain = true;
     }
 
     /// Left as it is, for a person to look at.
@@ -734,6 +744,9 @@ impl DrillDir {
                 self.path.display()
             ));
         }
+        if self.plain {
+            plain_tree(&self.path).map_err(|error| format!("{error}: the drill folder is left as it is"))?;
+        }
         fs::remove_dir_all(&self.path).map_err(|error| format!("{}: {error}", self.path.display()))
     }
 }
@@ -747,6 +760,7 @@ impl Drop for DrillDir {
                 parent: self.parent.clone(),
                 #[cfg(unix)]
                 identity: self.identity,
+                plain: self.plain,
                 done: false,
             };
             self.done = true;
@@ -755,6 +769,35 @@ impl Drop for DrillDir {
             }
         }
     }
+}
+
+/// `root` holds only directories and regular files, read without
+/// following anything: else the first other entry, named (a symlink in a
+/// bundle is never followed).
+pub(super) fn plain_tree(root: &Path) -> Result<(), String> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries =
+            fs::read_dir(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            if kind.is_dir() {
+                stack.push(path);
+            } else if !kind.is_file() {
+                let what = if kind.is_symlink() {
+                    "a symlink"
+                } else {
+                    "neither a directory nor a regular file"
+                };
+                return Err(format!("{} is {what}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether a bundle record stored something (a key in the bucket).
@@ -838,29 +881,41 @@ struct Report {
     /// The mission repositories' restored heads in neither the commit map
     /// nor live (objective 178): they fail the drill, never as mismatches.
     unknown: Vec<String>,
+    /// What a passed drill matches: live, or the newest record alone (the
+    /// transcripts drill).
+    against: &'static str,
 }
 
 /// Fetch, check and unpack every bundle of the chain, restore, compare.
-/// With `only` (`--only missions`), each bundle's manifest and repository
-/// bundles alone are unpacked, through a pipe, and the transcripts are
-/// neither unpacked nor restored nor compared.
+/// With `--only missions`, each bundle's manifest and repository bundles
+/// alone are unpacked, through a pipe, and the transcripts are neither
+/// unpacked nor restored nor compared. With `--only transcripts`, each
+/// bundle's manifest and transcript slices alone are unpacked the same way
+/// (each unpacked tree plain: [`plain_tree`]), restored into the drill's
+/// folder and judged by the newest record alone ([`judge_alone`]); nothing
+/// live is read.
 fn run(
     store: &spawn_postgres::PostgresStore,
     settings: &Settings,
     chain: &[&BundleRecord],
     seal: &Key,
     drill: &Path,
-    only: bool,
+    only: Only,
 ) -> Result<Report, String> {
     let newest = chain[chain.len() - 1];
     let mut unpacked: Vec<(PathBuf, Value)> = Vec::new();
     for (index, record) in chain.iter().enumerate() {
         let here = drill.join(format!("bundle-{index}"));
         fs::create_dir(&here).map_err(|error| format!("{}: {error}", here.display()))?;
-        let manifest = if only {
-            fetch_missions(settings, record, seal, &here)?
-        } else {
-            fetch_bundle(settings, record, seal, &here)?
+        let manifest = match only {
+            Only::Both => fetch_bundle(settings, record, seal, &here)?,
+            Only::Missions => fetch_members(settings, record, seal, &here, missions_members)?,
+            Only::Transcripts => {
+                let manifest =
+                    fetch_members(settings, record, seal, &here, transcripts_members)?;
+                plain_tree(&here.join("unpacked"))?;
+                manifest
+            }
         };
         unpacked.push((here.join("unpacked"), manifest));
     }
@@ -880,7 +935,31 @@ fn run(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    if only {
+    if only == Only::Transcripts {
+        lines.push(format!(
+            "restore-drill: chain {chain_text}: {} bundle(s) fetched, decrypted in a pipe, \
+             sha256 as recorded; manifest.json and transcripts/* alone unpacked",
+            chain.len()
+        ));
+        let restored = drill.join("transcripts");
+        fs::create_dir(&restored).map_err(|error| format!("{}: {error}", restored.display()))?;
+        restore_transcripts(&unpacked, &restored)?;
+        let (judged, found) = judge_alone(&restored, &newest.record["transcripts"])?;
+        lines.extend(judged);
+        // Everything the drill wrote is plain, or it fails (and its folder
+        // is left).
+        plain_tree(drill)?;
+        return Ok(Report {
+            key,
+            event_id: newest.event_id,
+            lines,
+            transcripts: found,
+            missions,
+            unknown: Vec::new(),
+            against: "the newest record",
+        });
+    }
+    if only == Only::Missions {
         lines.push(format!(
             "restore-drill: chain {chain_text}: {} bundle(s) fetched, decrypted in a pipe, \
              sha256 as recorded; manifest.json and repos/* alone unpacked",
@@ -900,6 +979,7 @@ fn run(
             transcripts: mismatches,
             missions,
             unknown,
+            against: "live",
         });
     }
     lines.push(format!(
@@ -950,6 +1030,7 @@ fn run(
         transcripts: mismatches,
         missions,
         unknown,
+        against: "live",
     })
 }
 
@@ -1137,19 +1218,22 @@ fn read_manifest(key: &str, record: &BundleRecord, unpacked: &Path) -> Result<Va
     Ok(manifest)
 }
 
-/// One stored bundle for `--only missions` (objective 186): its ciphertext
-/// fetched into `here` as `fetch_bundle` does, then never decrypted to a
-/// file. The decrypted stream goes through a pipe into `tar -t`, and its
-/// sha256 must be the record's before anything is extracted; the names
-/// chosen from that listing (`missions_members`: the manifest and the files
-/// directly under `repos/`) are written to `here/names`, and a second
+/// One stored bundle for `--only missions` (objective 186) or `--only
+/// transcripts` (objective 200): its ciphertext fetched into `here` as
+/// `fetch_bundle` does, then never decrypted to a file. The decrypted
+/// stream goes through a pipe into `tar -t`, and its sha256 must be the
+/// record's before anything is extracted; the names `choose` takes from
+/// that listing (`missions_members`: the manifest and the files directly
+/// under `repos/`; `transcripts_members`: the manifest and the files under
+/// `transcripts/`) are written to `here/names`, and a second
 /// stream goes into `tar -x` of those names alone into `here/unpacked`, its
 /// sha256 the same. The manifest's kind is then the record's.
-fn fetch_missions(
+fn fetch_members(
     settings: &Settings,
     record: &BundleRecord,
     seal: &Key,
     here: &Path,
+    choose: fn(&str) -> Result<Vec<String>, String>,
 ) -> Result<Value, String> {
     let key = record.record["keys"][0].as_str().unwrap_or_default();
     let expected = record.record["sha256"].as_str().unwrap_or_default();
@@ -1158,7 +1242,7 @@ fn fetch_missions(
     list.args(["-tf", "-"]);
     let listed = stream_into_tar(seal, &encrypted, list)?;
     listed.judge(key, expected, "tar -t")?;
-    let members = missions_members(&listed.stdout).map_err(|error| format!("{key}: {error}"))?;
+    let members = choose(&listed.stdout).map_err(|error| format!("{key}: {error}"))?;
     let names = here.join("names");
     let mut text = String::new();
     for member in &members {
@@ -1188,6 +1272,37 @@ fn fetch_missions(
 /// is refused: an empty list of names would make `tar -x` extract every
 /// member.
 pub(super) fn missions_members(listing: &str) -> Result<Vec<String>, String> {
+    members_of(listing, |name| {
+        name.strip_prefix("repos/")
+            .is_some_and(|file| plain_part(file) && !file.contains('/'))
+    })
+}
+
+/// What a bundle's listing names that `--only transcripts` extracts: the
+/// manifest and each file under `transcripts/`, at any depth, as listed,
+/// once each; never a repository bundle, a directory (a name ending in
+/// `/`), a name with an empty, `.` or `..` part, nor a name tar had to
+/// quote. A listing without the manifest is refused.
+pub(super) fn transcripts_members(listing: &str) -> Result<Vec<String>, String> {
+    members_of(listing, |name| {
+        name.strip_prefix("transcripts/")
+            .is_some_and(|file| file.split('/').all(plain_part))
+    })
+}
+
+/// A part of a member's name as taken: not empty, `.` or `..`, and nothing
+/// tar quotes (a backslash, a control character).
+fn plain_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains('\\')
+        && !part.chars().any(char::is_control)
+}
+
+/// The manifest and the names `wanted` takes (each without its leading
+/// `./`), as listed, once each; refused without the manifest.
+fn members_of(listing: &str, wanted: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
     let mut members: Vec<String> = Vec::new();
     let mut manifest = false;
     for line in listing.lines() {
@@ -1196,14 +1311,7 @@ pub(super) fn missions_members(listing: &str) -> Result<Vec<String>, String> {
             manifest = true;
             true
         } else {
-            name.strip_prefix("repos/").is_some_and(|file| {
-                !file.is_empty()
-                    && file != "."
-                    && file != ".."
-                    && !file.contains('/')
-                    && !file.contains('\\')
-                    && !file.chars().any(char::is_control)
-            })
+            wanted(name)
         };
         if wanted && !members.iter().any(|member| member == line) {
             members.push(line.to_string());
