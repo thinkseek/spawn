@@ -1,6 +1,8 @@
 //! The storage line.
 
-use serde_json::{Value, json};
+use std::collections::BTreeSet;
+
+use serde_json::{Map, Value, json};
 
 use super::{Figure, Line};
 
@@ -95,7 +97,153 @@ pub(super) fn storage_line(storage: &Value) -> Line {
                     storage["grew_most"]["bytes_per_day"].clone(),
                 )
             },
+            // Objective 185, after the nine: the storage north star and S1,
+            // from the storage readings (objective 180) `lines_at` sets.
+            bytes_per_landing(&storage["readings"]),
+            rebuildable_bytes(&storage["readings"]),
         ],
+    }
+}
+
+/// One hour, in milliseconds.
+const HOUR_MS: i64 = 3_600_000;
+
+/// The sources S1 adds up: what can be rebuilt.
+const REBUILDABLE: [&str; 3] = ["scratch", "build_cache", "test_databases"];
+
+/// A storage figure not measured, and why.
+fn not_measured(key: &'static str, name: &'static str, note: String) -> Figure {
+    Figure {
+        note: Some(note),
+        ..Figure::not_measured_yet(key, name, "bytes")
+    }
+}
+
+/// A source's bytes in a reading's `sources`, when it was measured.
+fn bytes_of(sources: &Value, name: &str) -> Option<i64> {
+    sources[name]["bytes"].as_i64()
+}
+
+/// The storage north star, "Bytes a landing leaves behind" (objective 185):
+/// over the sources measured in both readings (`readings`: the newest and the
+/// newest a day older, `HOST_STORAGE_BYTES`), the newest's bytes less the
+/// older's, each source's gain in `by_source`, divided by the landings
+/// between them. Not measured without two readings, without a source
+/// measured in both, or without a landing between them.
+pub(super) fn bytes_per_landing(readings: &Value) -> Figure {
+    const KEY: &str = "storage.bytes_per_landing";
+    const NAME: &str = "Bytes a landing leaves behind";
+    let newest = &readings["newest"];
+    let Some(newest_at) = newest["at_ms"].as_i64() else {
+        return not_measured(KEY, NAME, "not measured yet: no storage reading yet".to_string());
+    };
+    let older = &readings["older"];
+    let Some(older_at) = older["at_ms"].as_i64() else {
+        return Figure {
+            as_of_ms: Some(newest_at),
+            ..not_measured(
+                KEY,
+                NAME,
+                "not measured yet: the figure needs two storage readings a day apart".to_string(),
+            )
+        };
+    };
+    let names: BTreeSet<&String> = [&newest["sources"], &older["sources"]]
+        .into_iter()
+        .filter_map(Value::as_object)
+        .flat_map(Map::keys)
+        .collect();
+    let mut gains = Map::new();
+    let mut one_only: Vec<&str> = Vec::new();
+    let mut total: i64 = 0;
+    for name in names {
+        match (bytes_of(&newest["sources"], name), bytes_of(&older["sources"], name)) {
+            (Some(now), Some(then)) => {
+                let gain = now.saturating_sub(then);
+                total = total.saturating_add(gain);
+                gains.insert(name.clone(), json!(gain));
+            }
+            _ => one_only.push(name),
+        }
+    }
+    let hours = newest_at.saturating_sub(older_at) / HOUR_MS;
+    let landings = readings["landings"].as_i64().unwrap_or(0);
+    let left_out = if one_only.is_empty() {
+        String::new()
+    } else {
+        format!("; not measured in both readings: {}", one_only.join(", "))
+    };
+    if gains.is_empty() {
+        return Figure {
+            as_of_ms: Some(newest_at),
+            ..not_measured(
+                KEY,
+                NAME,
+                format!("not measured: no source is measured in both readings{left_out}"),
+            )
+        };
+    }
+    let by_source = Some(Value::Object(gains));
+    if landings <= 0 {
+        return Figure {
+            as_of_ms: Some(newest_at),
+            by_source,
+            ..not_measured(
+                KEY,
+                NAME,
+                format!("not measured: no landing in the {hours} h between the two readings{left_out}"),
+            )
+        };
+    }
+    Figure {
+        as_of_ms: Some(newest_at),
+        by_source,
+        note: Some(format!(
+            "{landings} landing(s) in the {hours} h between the two readings (the integrator's \
+             and the owner's, on every mission and source){left_out}"
+        )),
+        ..Figure::new(KEY, NAME, "bytes", json!(total / landings))
+    }
+}
+
+/// S1, "Rebuildable bytes on disk" (objective 185): the newest reading's
+/// scratch, build cache and test databases, each in `by_source`; not
+/// measured when one of them is not, its note giving each one's why.
+pub(super) fn rebuildable_bytes(readings: &Value) -> Figure {
+    const KEY: &str = "storage.rebuildable_bytes";
+    const NAME: &str = "Rebuildable bytes";
+    let newest = &readings["newest"];
+    let Some(newest_at) = newest["at_ms"].as_i64() else {
+        return not_measured(KEY, NAME, "not measured yet: no storage reading yet".to_string());
+    };
+    let sources = &newest["sources"];
+    let mut by_source = Map::new();
+    let mut whys: Vec<String> = Vec::new();
+    let mut total: i64 = 0;
+    for name in REBUILDABLE {
+        match bytes_of(sources, name) {
+            Some(bytes) => {
+                total = total.saturating_add(bytes);
+                by_source.insert(name.to_string(), json!(bytes));
+            }
+            None => whys.push(format!(
+                "{name}: {}",
+                sources[name]["not_measured"]
+                    .as_str()
+                    .unwrap_or("not in the reading")
+            )),
+        }
+    }
+    if !whys.is_empty() {
+        return Figure {
+            as_of_ms: Some(newest_at),
+            ..not_measured(KEY, NAME, format!("not measured: {}", whys.join("; ")))
+        };
+    }
+    Figure {
+        as_of_ms: Some(newest_at),
+        by_source: Some(Value::Object(by_source)),
+        ..Figure::new(KEY, NAME, "bytes", json!(total))
     }
 }
 
