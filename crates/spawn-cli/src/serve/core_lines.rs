@@ -1092,11 +1092,22 @@ fn lines_at(
             .ok()
     });
     let (needs_you_right, needs_judged) = observability::judged_share(counts.as_ref());
+    // Its week of judged data starts at the first hourly sample carrying it
+    // (objective 181); a failed read is read as no sample yet.
+    let first = timed(&mut parts.health, || {
+        store
+            .first_core_lines_value(observability::NEEDS_YOU_RIGHT)
+            .map_err(|error| eprintln!("core-lines: the first judged value: {error}"))
+            .ok()
+            .flatten()
+    });
+    let needs_range_note = observability::range_note(first, &needs_you_right, now_ms);
     let observed = Observed {
         cost_total,
         human_per_agent_hour: interventions["per_agent_hour"].clone(),
         needs_you_right,
         needs_judged,
+        needs_range_note,
     };
     let (backups, facts, drills) = timed(&mut parts.facts, || {
         store.newest_backups().map(|backups| {
@@ -1117,6 +1128,13 @@ fn lines_at(
         drills.north_star.value,
         guardrails,
     );
+    // U1 out of the recovery table's rows (objective 181).
+    for star in figures.iter_mut().map(|line| &mut line.north_star) {
+        if star.key == "recoverability.restores_passed" {
+            star.of = drills.north_star.of;
+            star.note.clone_from(&drills.north_star.note);
+        }
+    }
     let statuses = kept::statuses();
     aged(&mut figures, &statuses, now_ms);
     parts.ages(&statuses, now_ms);
