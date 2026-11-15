@@ -659,6 +659,55 @@ pub(crate) fn queue_settings() -> Option<crate::scorecard::queue_posts::Settings
     crate::scorecard::queue_posts::settings(text.as_deref())
 }
 
+/// What the daily storage reading (objective 180, crate storage_bytes.rs)
+/// reads from the Core lines file, re-read at each reading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StorageBytesSettings {
+    /// `storage.scratch_roots`, less what `storage.scratch_exclude` names.
+    pub(crate) scratch_roots: Vec<PathBuf>,
+    pub(crate) scratch_exclude: Vec<PathBuf>,
+    /// `storage.quiet_hold_file`, else `SPAWN_QUIET_HOLD_FILE`; `None`: no
+    /// such check.
+    pub(crate) quiet_hold_file: Option<PathBuf>,
+    /// The configured test databases by role or name, with their URLs (the
+    /// env's, then the file's `storage.test_database_url_files` taken).
+    /// Never printed.
+    pub(crate) test_databases: Vec<(String, String)>,
+}
+
+/// The Core lines file's settings for the daily storage reading: an error
+/// when the file is there but cannot be read (the quiet-hold file it may
+/// name is then unknown).
+pub(crate) fn storage_bytes_settings() -> Result<StorageBytesSettings, String> {
+    let text = read_ranges(ranges_path().as_deref())?;
+    Ok(storage_bytes_settings_of(
+        text.as_deref(),
+        crate::env_value("SPAWN_QUIET_HOLD_FILE"),
+    ))
+}
+
+/// [`storage_bytes_settings`] of the file's `text` (`None`: no file), with
+/// `SPAWN_QUIET_HOLD_FILE`'s value `quiet_env`.
+pub(crate) fn storage_bytes_settings_of(
+    text: Option<&str>,
+    quiet_env: Option<String>,
+) -> StorageBytesSettings {
+    let settings = unowned::settings(text);
+    let quiet_hold_file = text
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| value["storage"]["quiet_hold_file"].as_str().map(str::to_string))
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| quiet_env.filter(|path| !path.trim().is_empty()))
+        .map(PathBuf::from);
+    let (plan, _) = unowned::plan(&settings);
+    StorageBytesSettings {
+        scratch_roots: settings.roots,
+        scratch_exclude: settings.excludes,
+        quiet_hold_file,
+        test_databases: plan.servers,
+    }
+}
+
 /// Where the nightly's fact files are: `<SPAWN_WORKSPACE_ROOT>/nightly`.
 fn nightly_dir() -> Option<PathBuf> {
     crate::env_value("SPAWN_WORKSPACE_ROOT").map(|root| PathBuf::from(root).join("nightly"))
