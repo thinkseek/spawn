@@ -64,7 +64,6 @@ mod serve;
 mod set_aside;
 mod sources;
 mod storage;
-mod storage_bytes;
 mod supervise;
 mod verify;
 

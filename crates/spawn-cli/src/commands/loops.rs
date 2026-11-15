@@ -444,7 +444,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         workspace_root: root,
         disk: monitor,
         storage: sampler,
-        storage_bytes: crate::storage_bytes::Sampler::default(),
         core_lines,
         terminals: crate::config::terminal_host(),
         config,
@@ -489,10 +488,6 @@ struct Fleet<'a> {
     /// The `host.storage` samples: at the loop's start, then hourly
     /// ([`crate::storage::Sampler`]).
     storage: crate::storage::Sampler,
-    /// The daily `host.storage_bytes` readings (objective 180): the real
-    /// bytes on disk of each storage source, read beside the passes and
-    /// outside every owner hold ([`crate::storage_bytes::Sampler`]).
-    storage_bytes: crate::storage_bytes::Sampler,
     /// The `host.core_lines` samples (objective 090): at the loop's start,
     /// then every `SPAWN_CORE_LINES_SAMPLE_SECS`, read beside the passes
     /// ([`crate::core_lines_sample::Sampler`]).
@@ -704,16 +699,6 @@ impl Fleet<'_> {
         // Nor the Core lines sample: its reading runs beside the passes and
         // one that could not be read or written is tried a minute later.
         match self.core_lines.check(open, now) {
-            Ok(line) => lines.extend(line),
-            Err(error) => lines.push(error),
-        }
-        // Nor the daily storage reading (objective 180): its script runs
-        // beside the passes, and a reading held off, or one that could not
-        // be taken or written, is looked at again ten minutes later.
-        match self
-            .storage_bytes
-            .check(open, self.workspace_root.as_deref(), now)
-        {
             Ok(line) => lines.extend(line),
             Err(error) => lines.push(error),
         }
