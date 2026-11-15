@@ -1228,6 +1228,50 @@ pub(crate) fn name_unknown(
     }
 }
 
+/// A stale verdict whose report's checkpoint, or else whose latest
+/// checkpoint, the rewrite guard refuses (`why_old`, objective 194) says
+/// so: it is built on the history before the rewrite, and never lands. An
+/// unknown commit is [`name_unknown`]'s to say; any other verdict is as it
+/// was.
+pub(crate) fn name_old(
+    verdict: Freshness,
+    reported: Option<&str>,
+    checkpoint: Option<&str>,
+    why_old: impl Fn(&str) -> Option<String>,
+) -> Freshness {
+    if !matches!(verdict, Freshness::Stale(_)) {
+        return verdict;
+    }
+    let old = [("report's", reported), ("latest", checkpoint)]
+        .into_iter()
+        .find_map(|(which, commit)| {
+            commit
+                .and_then(&why_old)
+                .filter(|reason| !reason.contains("is an unknown commit"))
+                .map(|reason| (which, reason))
+        });
+    match old {
+        Some((which, reason)) => Freshness::Stale(format!(
+            "the {which} checkpoint is from before the rewrite: {reason}"
+        )),
+        None => verdict,
+    }
+}
+
+/// Whether this integrator has not yet recorded the stale verdict (task,
+/// revision, reason) of a checkpoint from before a rewrite ([`name_old`]):
+/// each is recorded once in its life (objective 194); a restart records it
+/// once more.
+fn first_stale(task: i64, revision: i32, reason: &str) -> bool {
+    static SAID: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(i64, i32, String)>>,
+    > = std::sync::OnceLock::new();
+    SAID.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((task, revision, reason.to_string()))
+}
+
 /// The re-push of `task`'s agent's lost checkpoint `checkpoint` from this
 /// host's mirror ([`sources::push_recorded`]), unless it is from before a
 /// history rewrite ([`crate::rewrite_guard::why_old`], objective 177): then
@@ -3628,8 +3672,8 @@ impl Judge {
             );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 // A checkpoint the mirror lacks is named so (objective 177).
-                return Ok(name_unknown(
-                    verdict,
+                let named = name_unknown(
+                    verdict.clone(),
                     reported.as_deref(),
                     checkpoint.as_deref(),
                     |commit| {
@@ -3641,6 +3685,24 @@ impl Judge {
                             &format!("{commit}^{{commit}}"),
                         ])
                         .is_ok()
+                    },
+                );
+                if named != verdict {
+                    return Ok(named);
+                }
+                // One built on the history before a rewrite too (objective
+                // 194).
+                return Ok(name_old(
+                    verdict,
+                    reported.as_deref(),
+                    checkpoint.as_deref(),
+                    |commit| {
+                        crate::rewrite_guard::why_old(store, &mirror_path, commit).unwrap_or_else(
+                            |error| {
+                                eprintln!("integrate: task {}: {error}", task.id);
+                                None
+                            },
+                        )
                     },
                 ));
             }
@@ -3688,6 +3750,12 @@ impl Judge {
             Freshness::Fresh(branch) => Some(branch),
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
+                // Said once in this integrator's life (objective 194).
+                if reason.contains("checkpoint is from before the rewrite: ")
+                    && !first_stale(task.id, task.revisions, &reason)
+                {
+                    return Ok(false);
+                }
                 // Not a verdict on the work: the pusher has not caught up.
                 record(
                     store,

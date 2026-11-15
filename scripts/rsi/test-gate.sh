@@ -2894,15 +2894,18 @@ EOF
     cat >"$own/check-escape.sh" <<EOF
 #!/bin/sh
 $q_function
-q "copy (select 1) to program 'cat $HOME/.config/spawn/secret >/var/lib/postgresql/data/leak 2>/dev/null; touch $HOME/pwned 2>/dev/null; true'"
+q "copy (select 1) to program 'cat >/dev/null; cat $HOME/.config/spawn/secret >/var/lib/postgresql/data/leak 2>/dev/null; touch $HOME/pwned 2>/dev/null; true'"
 [ "\$(q "select pg_read_file('leak')")" = "" ] || { echo "the server read the owner's secret"; exit 1; }
 EOF
     # It can replace the path of its own socket with a symlink to another
     # socket of the host; the sandbox's link still names the server's.
+    # Each program reads its input first: one that exits before Postgres
+    # closes the pipe fails the copy ("could not close pipe to external
+    # command: Broken pipe").
     cat >"$own/check-swap.sh" <<EOF
 #!/bin/sh
 $q_function
-q "copy (select 1) to program 'rm -f /run/postgresql/.s.PGSQL.5432; ln -s $work/decoy.sock /run/postgresql/.s.PGSQL.5432'"
+q "copy (select 1) to program 'cat >/dev/null; rm -f /run/postgresql/.s.PGSQL.5432; ln -s $work/decoy.sock /run/postgresql/.s.PGSQL.5432'"
 EOF
     cat >"$own/check-zswap.sh" <<EOF
 #!/bin/sh
