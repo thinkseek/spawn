@@ -57,6 +57,10 @@ pub(crate) const SCRIPT_LIMIT: Duration = Duration::from_hours(1);
 /// How long the script may take over one source.
 pub(crate) const BOUND_SECS: u64 = 1200;
 
+/// How many characters of the extents script's own reason a source not
+/// measured keeps (objective 202).
+pub(crate) const WHY_MAX_CHARS: usize = 300;
+
 /// How often the holds are looked at while a reading is in flight.
 const HOLD_LOOK_MS: i64 = 5_000;
 
@@ -219,8 +223,20 @@ pub(crate) fn script_sources(
 }
 
 /// One source's entry of the script's answer: its bytes, files, unreadable
-/// count and seconds, or not measured when over its bound or malformed.
+/// count and seconds, or not measured when the script says so (with its
+/// reason, control characters dropped and cut at [`WHY_MAX_CHARS`]), when
+/// over its bound, or when malformed.
 fn script_entry(entry: &Value) -> Value {
+    if let Some(why) = entry["not_measured"].as_str() {
+        let why: String = why
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(WHY_MAX_CHARS)
+            .collect();
+        if !why.trim().is_empty() {
+            return not_measured(why);
+        }
+    }
     if entry["over_bound"] == true {
         return not_measured(format!(
             "over its bound of {BOUND_SECS} s ({} files read)",
