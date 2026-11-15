@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: passive shadow observation every 30 s (read-only; see the .service)
+
+[Timer]
+# A oneshot still running is never started a second time by its timer, and
+# the script holds its own lock: samples never overlap.
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=5s
+# Not Persistent: a missed sample is a gap in the record, never caught up.
+
+[Install]
+WantedBy=timers.target
