@@ -59,7 +59,12 @@
 //!   its own timer) drills the mission repositories alone: the bundles
 //!   decrypted in a pipe, only their manifests and repository bundles
 //!   unpacked, never a transcript, and `backup.drilled.missions` recorded
-//!   alone.
+//!   alone. `--only transcripts` (objective 200, daily from its own timer)
+//!   drills the transcript archive alone the same way: only the manifests
+//!   and the transcript slices unpacked, restored into the drill's own
+//!   folder and judged by the newest record's sizes and sha256, nothing
+//!   live read, refused under `SPAWN_BACKUP_DRILL_FLOOR_MB` (default 40960)
+//!   of free space left, and `backup.drilled.transcripts` recorded alone.
 //!
 //! The bucket stays inside R2's free tier: `SPAWN_BACKUP_R2_LIMIT_MB`
 //! (default 10000) is 10,000,000,000 bytes, and nothing is ever written
@@ -112,7 +117,7 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
 
-const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions]";
+const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions|transcripts]";
 
 /// One `postgres://` URL, read the way libpq reads it (scripts/pg-url.sh):
 /// user and password percent-decoded, an IPv6 host in brackets, a socket

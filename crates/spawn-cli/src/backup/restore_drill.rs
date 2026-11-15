@@ -26,6 +26,25 @@
 //! sha256 must be the same. A run killed part way leaves the ciphertext,
 //! the list of names and what it has extracted: no transcript.
 //!
+//! `--only transcripts` (objective 200) drills the transcript archive
+//! alone, through the same pipe: from each bundle it unpacks by name only
+//! `manifest.json` and the files under `transcripts/` (no directory, no
+//! empty, `.` or `..` part, no name tar had to quote), never a repository
+//! bundle, and each unpacked tree must hold only directories and regular
+//! files (a symlink in a bundle is never followed). The chain's slices are
+//! restored into the drill's folder and each file is judged by the newest
+//! record alone: the size it names and its sha256 in `transcripts.sha256`
+//! (a record bundled before objective 149 names none, and fails). Nothing
+//! live is read: the archive, `~/.claude` and every path outside the folder
+//! stay unopened. Before anything is fetched it refuses (exit 2, nothing
+//! recorded, nothing made) when the chain's ciphertext and slices and the
+//! newest record's files, counted from the records, would leave the
+//! folder's file system under `SPAWN_BACKUP_DRILL_FLOOR_MB` (default 40960,
+//! 40 GB). It records `backup.drilled.transcripts` alone; its folder is
+//! removed, after the identity check below, only when everything in it is
+//! a directory or a regular file, else the drill fails and the folder is
+//! left, said.
+//!
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
 //! window file as bundled, so a restored file whose sha256 is not the
@@ -1724,6 +1743,94 @@ pub(super) fn judge_by_record(
         ),
         mismatches,
     ))
+}
+
+/// The restored transcripts judged by the newest record alone (`--only
+/// transcripts`, objective 200), nothing live read: its lines (the files
+/// and bytes restored, and "<k> of <n> files as the newest record's
+/// sha256") and a mismatch for each file the record names that is not
+/// restored at its size and its sha256 in `transcripts.sha256`. A record
+/// bundled before objective 149 names no sha256: that fails each file. A
+/// path the record names that is not a plain relative one is a mismatch,
+/// never opened.
+pub(super) fn judge_alone(
+    restored: &Path,
+    transcripts: &Value,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let files = files_under(restored)?;
+    let mut bytes = 0u64;
+    for file in &files {
+        let path = restored.join(file);
+        let meta = fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        bytes = bytes.saturating_add(meta.len());
+    }
+    let mut lines = vec![format!(
+        "restore-drill: transcripts: {} files ({bytes} bytes) restored into the drill's own \
+         folder; judged by the newest record alone, nothing live read",
+        files.len()
+    )];
+    let sizes = transcripts["sizes"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let hashes = transcripts["sha256"].as_object();
+    if hashes.is_none() {
+        lines.push(
+            "restore-drill: transcripts: the newest record names no per-file sha256 (bundled \
+             before objective 149): no file can be judged by it"
+                .to_string(),
+        );
+    }
+    let mut same = 0usize;
+    let mut mismatches = Vec::new();
+    for (named, size) in &sizes {
+        let want_size = size.as_u64().unwrap_or(0);
+        let Some(path) = relative(named) else {
+            mismatches.push(format!(
+                "the newest record names the transcript path {named:?}"
+            ));
+            continue;
+        };
+        let Some(want) = hashes.and_then(|hashes| hashes.get(named)).and_then(Value::as_str)
+        else {
+            mismatches.push(format!(
+                "transcripts/{named}: the newest record sizes it ({want_size} bytes) and names \
+                 no sha256"
+            ));
+            continue;
+        };
+        let file = restored.join(path);
+        match fs::symlink_metadata(&file) {
+            Ok(meta) if meta.is_file() && meta.len() == want_size => {}
+            Ok(meta) if meta.is_file() => {
+                mismatches.push(format!(
+                    "transcripts/{named}: the chain restores {} bytes; the newest record says \
+                     {want_size}",
+                    meta.len()
+                ));
+                continue;
+            }
+            _ => {
+                mismatches.push(format!(
+                    "transcripts/{named}: the newest record names it ({want_size} bytes); the \
+                     chain restores none"
+                ));
+                continue;
+            }
+        }
+        if sha256_file(&file)? == want {
+            same += 1;
+        } else {
+            mismatches.push(format!(
+                "transcripts/{named}: the restored bytes are not the sha256 the newest record names"
+            ));
+        }
+    }
+    lines.push(format!(
+        "restore-drill: transcripts: {same} of {} files as the newest record's sha256",
+        sizes.len()
+    ));
+    Ok((lines, mismatches))
 }
 
 /// The sha256 of a file's first `bytes` bytes: the drill's look at live, and
