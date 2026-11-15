@@ -138,6 +138,8 @@ use crate::Flags;
 use crate::commit_now::CommitNow;
 use crate::config::{env_value, open_store};
 
+mod controllers;
+
 /// Where the scratch directory goes when `--into` is not given.
 const DEFAULT_PARENT: &str = "/data/tmp";
 
@@ -635,6 +637,24 @@ fn drill_record(resource: &str, outcome: &Outcome, verdict: &Verdict<'_>) -> Val
         "mismatches": mismatches,
         "duration_ms": verdict.duration_ms,
     })
+}
+
+/// The scratch directory's parent (`--into`, else [`DEFAULT_PARENT`]),
+/// resolved and checked to be under none of `$HOME`, `$SPAWN_LIVE` and the
+/// workspace root ([`drill_parent`]).
+fn parent_of(flags: &Flags, settings: &Settings) -> Result<PathBuf, String> {
+    let parent = flags
+        .get("into")
+        .map_or_else(|| PathBuf::from(DEFAULT_PARENT), PathBuf::from);
+    let guards: Vec<(&str, PathBuf)> = [
+        ("$HOME", env_value("HOME").map(PathBuf::from)),
+        ("$SPAWN_LIVE", env_value("SPAWN_LIVE").map(PathBuf::from)),
+        ("the workspace root", Some(settings.root.clone())),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| Some((name, path?)))
+    .collect();
+    drill_parent(&parent, &guards)
 }
 
 /// The parent of the scratch directory, resolved: an existing directory

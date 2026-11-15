@@ -1,0 +1,25 @@
+[Unit]
+Description=Spawn: daily drill of the controllers (objective 198): each controller's current and previous tree compared with git archive of its commit from the live source, read only; recorded as backup.drilled.controllers, one record per controller (deploy/backup)
+After=spawn-backup-bundle.service spawn-backup-restore-drill-missions.service
+
+[Service]
+Type=oneshot
+# --only controllers: the controllers and the live sources are only read,
+# never written. Exit 0 every controller passed (what U1 reads),
+# 1 one failed, 2 the drill could not run or record.
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn backup restore-drill --only controllers
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=SPAWN_WORKSPACE_ROOT=%h/.local/share/spawn-rsi/ws
+Environment=SPAWN_LIVE=%h/.local/share/spawn-rsi
+Environment=PATH=%h/.local/share/spawn-rsi/bin:/usr/local/bin:/usr/bin:/bin
+Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+# The scratch directory is made under /data/tmp (never under $HOME,
+# $SPAWN_LIVE or the workspace root); a run killed part way leaves it, named
+# spawn-restore-drill-*.
+Restart=on-failure
+RestartSec=1h
+RestartPreventExitStatus=1 2
+TimeoutStartSec=1h
+MemoryMax=1G
+Nice=15
+IOSchedulingClass=idle
