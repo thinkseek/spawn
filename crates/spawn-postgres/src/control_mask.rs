@@ -164,7 +164,6 @@ pub const VERBATIM: &[&str] = &[
 pub const LIMITED: &[(&str, &str)] = &[
     ("backup.drilled.transcripts", "reason"),
     ("backup.drilled.missions", "reason"),
-    ("backup.drilled.controllers", "reason"),
     ("deploy.finished", "reason"),
     ("objective.verified", "how"),
 ];
