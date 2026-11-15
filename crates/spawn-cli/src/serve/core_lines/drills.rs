@@ -30,7 +30,8 @@
 //! the log names it as refused: systemctl reads a leading `-` as an option
 //! (`-H<host>` is an SSH connection to that host), and a `.timer` has no
 //! `ExecMain*` result, so it could never pass. A row with neither has no
-//! drill. The session backups' status file (`at`, epoch seconds) gives the
+//! drill. The north star is out of the rows (objective 181,
+//! [`out_of_rows`]). The session backups' status file (`at`, epoch seconds) gives the
 //! newest backup's age.
 //!
 //! Monitoring only: no gate, integrator or deploy step reads any of it.
@@ -492,6 +493,26 @@ pub(super) fn figures(
     )
 }
 
+/// The north star out of the recovery table's rows (objective 181): `of`
+/// the row count and the note "rows: <name>, ..." in the file's order, rows
+/// without a drill among them; neither with no rows. What counts is
+/// [`figures`]'s, unchanged.
+pub(super) fn out_of_rows(star: &mut Figure, config: &Config) {
+    if config.drills.is_empty() {
+        return;
+    }
+    star.of = Some(config.drills.len());
+    star.note = Some(format!(
+        "rows: {}",
+        config
+            .drills
+            .iter()
+            .map(|drill| drill.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+}
+
 /// The drills read now: the north star, the two ages and the answer's
 /// `drills`, from the Core lines file's `text` and the store.
 pub(super) struct Drills {
@@ -532,8 +553,9 @@ pub(super) fn read(
             unit_reading(unit, now_ms);
         }
     }
-    let (north_star, mut guardrails) =
+    let (mut north_star, mut guardrails) =
         figures(&readings, status_at_ms(config.status.as_deref()), now_ms);
+    out_of_rows(&mut north_star, &config);
     if !config.present {
         guardrails.clear();
     }
@@ -547,8 +569,8 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, Drill, Last, Reading, Source, config, drills_json, figures, parse_last, parse_show,
-        readings, record_reading, show, status_at_ms, unit_allowed,
+        Config, Drill, Last, Reading, Source, config, drills_json, figures, out_of_rows,
+        parse_last, parse_show, readings, record_reading, show, status_at_ms, unit_allowed,
     };
     use serde_json::{Value, json};
     use std::process::{Command, Stdio};
@@ -777,9 +799,26 @@ mod tests {
         assert_eq!(ages[0].value, json!(10 * 60_000));
         assert_eq!(ages[1].key, "recoverability.oldest_drill_age");
         assert_eq!(ages[1].value, json!(8 * DAY), "never passed is left out");
+        // Objective 181: out of the rows, each named, those without a drill
+        // (and the refused one) among them; what counts is unchanged.
+        let mut star = star;
+        out_of_rows(&mut star, &config);
+        assert_eq!((star.value.clone(), star.of), (json!(2), Some(7)));
+        assert_eq!(
+            star.note.as_deref(),
+            Some("rows: Database, Failing record, Passed, Failed, Old, Refused, Configuration")
+        );
+        let shown = super::super::figure_json(&star, None);
+        assert_eq!(shown["of"], json!(7));
+        assert_eq!(list[6]["last"], Value::Null, "no drill, never counted");
 
-        // No rows: no north star; none passed: 0 and no oldest age.
-        let (star, ages) = figures(&[], None, now);
+        // No rows: no north star, neither `of` nor a note; none passed: 0
+        // and no oldest age.
+        let (mut star, ages) = figures(&[], None, now);
+        out_of_rows(&mut star, &Config::default());
+        assert_eq!((star.of, star.note.clone()), (None, None));
+        let shown = super::super::figure_json(&star, None);
+        assert!(shown.get("of").is_none() && shown.get("note").is_none());
         assert_eq!(star.value, Value::Null);
         assert_eq!(ages[0].value, Value::Null);
         assert_eq!(ages[1].value, Value::Null);
