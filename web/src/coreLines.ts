@@ -20,7 +20,12 @@ export interface CoreFigure {
   unit: CoreUnit | string;
   value: number | null;
   range: CoreRange | null;
-  state: "in" | "out" | "no_range" | "not_collected" | string;
+  /** `not_measured_yet` (objective 176): a figure of the owner's set no
+   * code computes yet, its value null. */
+  state: "in" | "out" | "no_range" | "not_collected" | "not_measured_yet" | string;
+  /** The line an alert figure, or a diagnostic that still raises, is
+   * under (objective 176). */
+  line?: string;
   /** The last 7 UTC days (objective 090): each day's last sample carrying
    * the figure, oldest first; empty without one. */
   trend?: CoreTrendPoint[];
@@ -116,6 +121,11 @@ export interface CoreLinesAnswer {
   ranges_file: string | null;
   ranges_error: string | null;
   ignored_ranges: Array<{ key: string; reason: string }>;
+  /** The figures demoted to an alert only, each with its line (objective
+   * 176). */
+  alert_figures?: CoreFigure[];
+  /** The storage page's diagnostics, in order (objective 176). */
+  diagnostics?: CoreFigure[];
   /** The Core lines file's recoverability rows, in its order. */
   drills?: CoreDrill[];
   /** The scratch walk (objective 094); `claimed`, every claimed folder by
@@ -179,7 +189,7 @@ export interface CoreMark {
 }
 
 export interface CoreRow {
-  /** "Performance", "Storage", "Observability" or "Recoverability". */
+  /** "Storage", "Performance" or "Sustainability" (objective 176). */
   line: string;
   north_star: CoreMark;
   guardrails: CoreMark[];
@@ -204,6 +214,9 @@ export interface CoreLinesView {
   /** Report to live by mission (objective 159): the performance line's
    * north star `by_mission`, in words; empty without it. */
   byMission: CoreMissionMark[];
+  /** The storage page's diagnostics in words (objective 176), as the
+   * answer lists them; on no row. */
+  diagnostics: CoreMark[];
 }
 
 const WEEK_MS = 7 * 86_400_000;
@@ -273,8 +286,9 @@ export function missionMark(raw: Partial<CoreMissionFigure> | null | undefined):
 }
 
 const LINE_NAMES: Record<string, string> = {
-  performance: "Performance",
   storage: "Storage",
+  performance: "Performance",
+  sustainability: "Sustainability",
   observability: "Observability",
   recoverability: "Recoverability",
 };
@@ -394,7 +408,13 @@ function mark(raw: unknown): CoreMark {
   return {
     name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}${judgedWords(figure.judged)}`,
     value:
-      value !== null ? unitWords(unit, value) : since !== null ? `measuring since ${sinceWords(since)}` : "not collected yet",
+      value !== null
+        ? unitWords(unit, value)
+        : figure.state === "not_measured_yet"
+          ? "not measured yet"
+          : since !== null
+            ? `measuring since ${sinceWords(since)}`
+            : "not collected yet",
     range: rangeWords(unit, figure.range),
     tone: figure.state === "in" ? "plain" : figure.state === "out" ? "warning" : "muted",
   };
@@ -413,6 +433,8 @@ function pendingWords(entry: { key?: unknown; reason?: unknown } | null | undefi
   const known = names.get(key);
   if (known !== undefined) return `${known}: range not read (it needs a number min or max)`;
   const words = key.slice(key.lastIndexOf(".") + 1).replace(/_/g, " ");
+  // A figure the owner's core metric set dropped (objective 176).
+  if (String(entry?.reason ?? "").startsWith("retired")) return `${words}: retired from the core metric set`;
   return `${words}: figure not built yet`;
 }
 
@@ -422,11 +444,15 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
   const error = typeof answer?.ranges_error === "string" && answer.ranges_error !== "" ? answer.ranges_error : null;
   const ignored = Array.isArray(answer?.ignored_ranges) ? answer.ignored_ranges : [];
   const names = new Map<string, string>();
-  for (const line of lines) {
-    const figures = [line?.north_star, ...(Array.isArray(line?.guardrails) ? line.guardrails : [])];
-    for (const figure of figures) {
-      if (typeof figure?.key === "string" && typeof figure?.name === "string") names.set(figure.key, figure.name);
-    }
+  const diagnostics = Array.isArray(answer?.diagnostics) ? answer.diagnostics : [];
+  const alertFigures = Array.isArray(answer?.alert_figures) ? answer.alert_figures : [];
+  const figures = [
+    ...lines.flatMap((line) => [line?.north_star, ...(Array.isArray(line?.guardrails) ? line.guardrails : [])]),
+    ...alertFigures,
+    ...diagnostics,
+  ];
+  for (const figure of figures) {
+    if (typeof figure?.key === "string" && typeof figure?.name === "string") names.set(figure.key, figure.name);
   }
   return {
     rows: lines.map((line) => ({
@@ -446,6 +472,7 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
       const byMission = performance?.north_star?.by_mission;
       return Array.isArray(byMission) ? byMission.map(missionMark) : [];
     })(),
+    diagnostics: diagnostics.map(mark),
   };
 }
 

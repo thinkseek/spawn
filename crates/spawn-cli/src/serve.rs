@@ -3587,6 +3587,10 @@ mod tests {
                         std::iter::once(line["north_star"].clone())
                             .chain(line["guardrails"].as_array().cloned().unwrap_or_default())
                     })
+                    // The owner's set (objective 176): the alert figures and
+                    // the diagnostics are figures too.
+                    .chain(view["alert_figures"].as_array().cloned().unwrap_or_default())
+                    .chain(view["diagnostics"].as_array().cloned().unwrap_or_default())
                     .find(|figure| figure["key"] == key)
                     .unwrap_or_else(|| panic!("no {key}: {view}"))
             };
@@ -3613,25 +3617,28 @@ mod tests {
             // A file: its ranges, and the entries it cannot use listed.
             std::fs::write(
                 &file,
-                r#"{"ranges": {"storage.database_ratio": {"min": 0, "max": 1000000000000},
+                r#"{"ranges": {"storage.leaked_test_schemas": {"min": 0, "max": 1000000000000},
                     "storage.free_bites": {"min": 1},
                     "recoverability.restores_passed": {"min": 6},
-                    "storage.days_left": {"max": "many"}}}"#,
+                    "storage.free_bytes": {"max": "many"},
+                    "storage.database_ratio": {"max": 10}}}"#,
             )
             .expect("the file");
             let ranged = read();
             assert_eq!(ranged["ranges_error"], Value::Null);
             assert_eq!(
                 ranged["ignored_ranges"],
-                json!([{"key": "storage.days_left", "reason": "needs a number min or max"},
-                       {"key": "storage.free_bites", "reason": "unknown figure"}])
+                json!([{"key": "storage.database_ratio",
+                        "reason": super::core_lines::RETIRED_REASON},
+                       {"key": "storage.free_bites", "reason": "unknown figure"},
+                       {"key": "storage.free_bytes", "reason": "needs a number min or max"}])
             );
-            let ratio = figure(&ranged, "storage.database_ratio");
+            let ratio = figure(&ranged, "storage.leaked_test_schemas");
             assert_eq!(
                 ratio["range"],
                 json!({"min": 0, "max": 1_000_000_000_000_i64})
             );
-            // The test schema's database has a size; its log may have none.
+            // The test servers' schemas are counted; with none read, none.
             let expected = if ratio["value"].is_null() {
                 "not_collected"
             } else {
@@ -3651,7 +3658,7 @@ mod tests {
             );
             assert_eq!(broken["ignored_ranges"], json!([]));
             assert_eq!(
-                figure(&broken, "storage.database_ratio")["range"],
+                figure(&broken, "storage.leaked_test_schemas")["range"],
                 Value::Null
             );
             let _ = std::fs::remove_dir_all(&dir);
