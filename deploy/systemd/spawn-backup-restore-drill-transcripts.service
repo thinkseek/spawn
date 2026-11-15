@@ -1,0 +1,31 @@
+[Unit]
+Description=Spawn: daily restore drill of the transcript archive alone (objective 200, restore drill 3): every transcript restored from the newest bundle chain into the drill's own folder, judged by the newest record's sizes and sha256 (live is not read), the folder removed, and recorded as backup.drilled.transcripts (deploy/backup)
+After=spawn-backup-bundle.service
+
+[Service]
+Type=oneshot
+# --only transcripts: from each bundle only manifest.json and transcripts/*
+# are unpacked, into the drill's own folder; the restored files are copies,
+# judged by the record alone, and the folder is removed only when it holds
+# nothing but directories and regular files (the owner's 10:16 rule: a drill
+# writes and removes only its own copies; the originals are never opened).
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn backup restore-drill --only transcripts
+# The bundle's environment, so the record goes to the store the bundle
+# records go to; R2 is only read (GET), never written.
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=SPAWN_WORKSPACE_ROOT=%h/.local/share/spawn-rsi/ws
+Environment=PATH=%h/.local/share/spawn-rsi/bin:/usr/local/bin:/usr/bin:/bin
+Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+# The drill folder is made under /data/tmp (never under $HOME, $SPAWN_LIVE
+# or the workspace root); the drill refuses (exit 2) when unpacking would
+# leave /data/tmp's file system under 40 GB free. A run killed part way
+# leaves its folder, named spawn-restore-drill-*. Exit 1 is a failed drill
+# (the record's and a person's), 2 a drill that cannot run: neither is a
+# retry's.
+Restart=on-failure
+RestartSec=1h
+RestartPreventExitStatus=1 2
+TimeoutStartSec=1h
+MemoryMax=1G
+Nice=15
+IOSchedulingClass=idle

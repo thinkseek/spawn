@@ -17,7 +17,7 @@ the drill's test.
 | --- | --- |
 | Bucket | `spawn-store`, account q1293822641@gmail.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
 | Format | dumps: `pg_dump -Fc` (compression `SPAWN_BACKUP_DUMP_COMPRESS`, default `zstd:9`) and `gpg --symmetric` AES-256; bundles: a tar (zstd) of `manifest.json`, `repos/*.bundle` and `transcripts/`, the same `gpg` passphrase |
-| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below), `spawn-backup-restore-drill-missions.timer` (daily 05:45, `spawn backup restore-drill --only missions`, objective 186: the mission repositories alone, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
+| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below), `spawn-backup-restore-drill-missions.timer` (daily 05:45, `spawn backup restore-drill --only missions`, objective 186: the mission repositories alone, below); `spawn-backup-restore-drill-transcripts.timer` (daily 06:15, `spawn backup restore-drill --only transcripts`, objective 200: the transcript archive alone, judged by its record, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
 | Records | every run writes a `backup.dumped`, `backup.bundled` or `backup.verified` control record (owner-only `spawn_backup_record`); the tiers, the bundle's base and the plausibility check are read from them, never from a state file |
 | Settings | `SPAWN_BACKUP_KEY_FILE`, `SPAWN_R2_ENV_FILE`, `SPAWN_BACKUP_R2_LIMIT_MB` (10000), `SPAWN_BACKUP_R2_ALERT_MB` (8000), `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14), `SPAWN_BACKUP_DRILL_DATABASE_URL` (the drill's disposable server), `SPAWN_BACKUP_PREFIX` (empty in the fleet; a test run's `locktest/`) |
 
@@ -247,6 +247,42 @@ systemctl --user start spawn-backup-restore-drill-controllers.service   # superv
 systemctl --user enable --now spawn-backup-restore-drill-controllers.timer
 ```
 
+The transcript archive's drill (objective 200, restore drill 3) runs on its
+own, daily at 06:15: `spawn backup restore-drill --only transcripts` unpacks
+from each bundle of the newest chain only `manifest.json` and
+`transcripts/*` (decrypted in a pipe, as the missions drill does), restores
+the chain's slices into its own folder, and judges each file by the newest
+record alone: the size the record names and the record's
+`transcripts.sha256` (a record bundled before objective 149 names none and
+fails it). It never reads live: the archive, `~/.claude`, the session
+backups and every path outside its folder stay unopened. The restored files
+are copies; the folder (under `/data/tmp`, never under `$HOME`,
+`$SPAWN_LIVE` or the workspace root) is removed by its literal path once it
+is checked to be the one the drill made and to hold nothing but directories
+and regular files; anything else (a symlink, a device) fails the drill and
+leaves the folder for a person. Before it fetches anything it refuses, with
+one line and exit 2, when the chain's ciphertext, slices and restored files
+would leave less than 40 GB free on the folder's file system
+(`SPAWN_BACKUP_DRILL_FLOOR_MB`, default 40960). It records
+`backup.drilled.transcripts` alone and prints counts, never a transcript's
+content. Exit 0 passed, 1 failed, 2 cannot run. Installed disabled; enabled
+after a supervised first run (the owner or the lead), once 200 has landed
+and is deployed:
+
+```sh
+install -m 644 deploy/systemd/spawn-backup-restore-drill-transcripts.service \
+  deploy/systemd/spawn-backup-restore-drill-transcripts.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start spawn-backup-restore-drill-transcripts.service   # supervised; then:
+systemctl --user enable --now spawn-backup-restore-drill-transcripts.timer
+```
+
+The unit's result is the run's, so guardrail U1's recovery table (the Core
+lines file's `recoverability.drills`, an owner config change made after
+landing) names the unit: `{"name": "transcripts", "unit":
+"spawn-backup-restore-drill-transcripts.service"}`: passed when its last
+run exited 0.
+
 `SPAWN_BACKUP_DRILL_DATABASE_URL` must be in `spawn.env` before the drill
 timer is enabled: a disposable server (the fleet's test database), never the
 live one. The drill refuses without it, by name, and touches nothing.
@@ -291,7 +327,7 @@ pass `git bundle verify` in an empty repository (an increment's
 prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
 
-`spawn backup restore-drill [--into <dir>] [--keep] [--only missions|controllers]` (core (ii); by hand,
+`spawn backup restore-drill [--into <dir>] [--keep] [--only missions|controllers|transcripts]` (core (ii); by hand,
 attended, by the lead; daily from `spawn-backup-restore-drill.timer` at 05:30
 once 149b has passed and landed, see above)
 restores the sources and the transcript archive themselves, not only opens

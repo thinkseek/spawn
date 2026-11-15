@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: daily restore drill of the transcript archive (objective 200)
+
+[Timer]
+# 06:15 local: after the 04:00 bundle (and its retries), the 05:00 dump
+# drill and the missions drill's 05:45; apart from the combined drill's
+# 05:30, which stays uninstalled until 152 and 154.
+OnCalendar=*-*-* 06:15:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
