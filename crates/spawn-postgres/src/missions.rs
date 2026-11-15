@@ -1040,11 +1040,13 @@ select jsonb_build_object(
 /// (`mission_source_reds`: main, scenario, since_ms, latest_ms, probed_ms; or
 /// null), and each task `held_by`. The mission's baseline and each task's
 /// base and candidate are read through the commit map (objective 173): the
-/// commits they are now, after a history rewrite (null for a dropped one).
+/// commits they are now, after a history rewrite (null for a dropped one),
+/// through `spawn_commit_now_rows` joined LATERAL, which PostgreSQL inlines
+/// (objective 190: no function call per row on this polled read).
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
-  select m.id, m.state, m.gate, m.accept, m.budget, spawn_commit_now(m.baseline) as baseline,
+  select m.id, m.state, m.gate, m.accept, m.budget, mb.now as baseline,
          m.halted, m.scenario_floor,
          m.scenario_names, spawn_now_ms() as now_ms, m.pause_event is not null as paused,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
@@ -1053,33 +1055,40 @@ from (
          m.gate_host_due_ms, m.gate_base_disagrees, m.gate_rejection_objective,
          m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
-         (select jsonb_build_object('main', coalesce(spawn_commit_now(r.main), r.main), 'scenario', r.scenario,
+         (select jsonb_build_object('main', coalesce(rm.now, r.main), 'scenario', r.scenario,
                                     'since_ms', r.since_ms, 'latest_ms', r.red_ms,
                                     'probed_ms', r.probed_ms)
-            from mission_source_reds r where r.source = m.sources ->> 0) as red,
+            from mission_source_reds r
+           cross join lateral spawn_commit_now_rows(r.main) rm
+           where r.source = m.sources ->> 0) as red,
          (select max(e.recorded_at_ms) from spawn_events e
            where e.session_id = 'session_control' and e.event_name = 'control.recorded'
              and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
              and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text) as configured_ms,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
+    cross join lateral spawn_commit_now_rows(m.baseline) mb
     left join lateral (
       select jsonb_agg(jsonb_build_object(
                'id', k.id, 'agent_id', k.agent_id,
                'session_id', k.session_id, 'state', k.state,
-               'base', spawn_commit_now(k.base),
-               'candidate', spawn_commit_now(k.candidate), 'scenario', k.scenario,
+               'base', kb.now,
+               'candidate', kc.now, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
                'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
                'continues', k.continues,
                'gate_load_sensitive_pushed',
-               coalesce(spawn_commit_now(k.gate_load_sensitive_pushed), k.gate_load_sensitive_pushed),
+               coalesce(kl.now, k.gate_load_sensitive_pushed),
                'gate_load_sensitive_scenarios', k.gate_load_sensitive_scenarios,
-               'gate_parked_pushed', coalesce(spawn_commit_now(k.gate_parked_pushed), k.gate_parked_pushed))
+               'gate_parked_pushed', coalesce(kp.now, k.gate_parked_pushed))
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
+        cross join lateral spawn_commit_now_rows(k.base) kb
+        cross join lateral spawn_commit_now_rows(k.candidate) kc
+        cross join lateral spawn_commit_now_rows(k.gate_load_sensitive_pushed) kl
+        cross join lateral spawn_commit_now_rows(k.gate_parked_pushed) kp
        where k.mission_id = m.id
          and k.state not in ('cancelled', 'landed')
          and spawn_task_may_continue(k.state, m.state, true, r.state)) t on true
@@ -2576,6 +2585,318 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use spawn_core::mission::TaskState;
+
+    /// Objective 190: the integrator's polled read of the gated missions
+    /// reads each baseline, base and candidate, the red's main and the
+    /// gate's two pushed commits (objective 177's) through the commit map
+    /// inlined: its plan reads the map's primary key and calls no
+    /// `spawn_commit_now`, so no function runs per row.
+    #[test]
+    fn the_gated_read_reads_the_commit_map_inlined() {
+        let schema = crate::testing::TestSchema::new("gated_inlined");
+        let store = schema.store();
+        let plan = store
+            .query_json(
+                &format!("explain (verbose, costs off, format json) {}", super::GATED),
+                &[],
+            )
+            .expect("explain")
+            .to_string();
+        assert!(!plan.contains("spawn_commit_now"), "{plan}");
+        assert_eq!(
+            plan.matches(r#""Relation Name":"spawn_commit_map""#)
+                .count(),
+            6,
+            "the baseline, the base, the candidate, the red's main and the two pushed: {plan}"
+        );
+    }
+
+    /// The lead's live size of 22:51: a map of 4,840 pairs (a tenth of
+    /// them dropped), 9 gated missions, 398 tasks of which 61 open, half
+    /// their commits named by the map; a third of the tasks with a parked push, a quarter with a
+    /// load-sensitive one (objective 177's two).
+    fn seed_live_size(schema: &crate::testing::TestSchema, store: &crate::PostgresStore) {
+        // Every tenth commit dropped by the rewrite (no new id).
+        let pairs: Vec<(String, Option<String>)> = (0..4840)
+            .map(|i| {
+                let new = (i % 10 != 0).then(|| format!("{:040x}", i + 1_000_000));
+                (format!("{i:040x}"), new)
+            })
+            .collect();
+        store.commit_map_load(&pairs).expect("the map");
+        let mut client = postgres::Client::connect(schema.url(), postgres::NoTls).expect("connect");
+        client
+            .batch_execute(&format!(
+                "set search_path to {name};
+                 insert into mission_missions (text, origin, created_at_ms, updated_at_ms, gate, accept, baseline)
+                   select 'm' || i, 'human', 0, 0, '/gate', 'gate', lpad(to_hex(i * 2), 40, '0')
+                     from generate_series(1, 9) i;
+                 insert into mission_tasks (mission_id, kind, agent_id, session_id, brief, state,
+                                            created_by, created_at_ms, updated_at_ms, base, candidate)
+                   select 1 + i % 9, 'ephemeral', 'agent_worker_t' || i, 'session_worker_t' || i, 'b',
+                          case when i <= 61 then 'delivered' else 'landed' end, 'human', 0, 0,
+                          lpad(to_hex(i * 4), 40, '0'), lpad(to_hex(i * 4 + 9000), 40, '0')
+                     from generate_series(1, 398) i;
+                 update mission_tasks set gate_parked_pushed = base where id % 3 = 0;
+                 update mission_tasks set gate_load_sensitive_pushed = base where id % 4 = 0;
+                 analyze mission_missions; analyze mission_tasks;",
+                name = schema.name()
+            ))
+            .expect("seed");
+        client
+            .batch_execute("vacuum analyze spawn_commit_map")
+            .expect("vacuum");
+    }
+
+    /// The gated read's answer with the translations as main reads them
+    /// (objective 177's scalar `spawn_commit_now` calls), for comparing.
+    fn gated_scalar_form() -> String {
+        let mut text = super::GATED.to_string();
+        for (lateral, scalar) in [
+            (
+                "mb.now as baseline",
+                "spawn_commit_now(m.baseline) as baseline",
+            ),
+            ("'base', kb.now", "'base', spawn_commit_now(k.base)"),
+            (
+                "'candidate', kc.now",
+                "'candidate', spawn_commit_now(k.candidate)",
+            ),
+            (
+                "coalesce(rm.now, r.main)",
+                "coalesce(spawn_commit_now(r.main), r.main)",
+            ),
+            (
+                "coalesce(kl.now, k.gate_load_sensitive_pushed)",
+                "coalesce(spawn_commit_now(k.gate_load_sensitive_pushed), k.gate_load_sensitive_pushed)",
+            ),
+            (
+                "coalesce(kp.now, k.gate_parked_pushed)",
+                "coalesce(spawn_commit_now(k.gate_parked_pushed), k.gate_parked_pushed)",
+            ),
+            (
+                "    cross join lateral spawn_commit_now_rows(m.baseline) mb\n",
+                "",
+            ),
+            (
+                "           cross join lateral spawn_commit_now_rows(r.main) rm\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.base) kb\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.candidate) kc\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.gate_load_sensitive_pushed) kl\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.gate_parked_pushed) kp\n",
+                "",
+            ),
+        ] {
+            text = text.replace(lateral, scalar);
+        }
+        text
+    }
+
+    /// A read's answer, the time of the read (`now_ms`) left out, as text,
+    /// and its md5: the same bytes from another form or build.
+    fn gated_answer(store: &crate::PostgresStore, sql: &str) -> (String, String) {
+        let answer = store
+            .query_json(
+                &format!(
+                    "select coalesce(jsonb_agg(e - 'now_ms' order by (e ->> 'id')::bigint), '[]')
+                       from jsonb_array_elements(({sql})) e"
+                ),
+                &[],
+            )
+            .expect("the gated read")
+            .to_string();
+        let md5 = store
+            .query_one("select md5($1::text)", &[&answer])
+            .expect("md5")
+            .get(0);
+        (answer, md5)
+    }
+
+    /// Objective 190: at live size, with dropped commits in the map, the
+    /// lateral form answers byte for byte as the scalar calls main makes
+    /// (each translation, a dropped id coalesced to itself where 177 reads
+    /// it so, a missing one kept, null kept null).
+    #[test]
+    fn the_gated_read_answers_as_the_scalar_translation_does() {
+        let schema = crate::testing::TestSchema::new("gated_same");
+        let store = schema.store();
+        seed_live_size(&schema, &store);
+        let scalar = gated_scalar_form();
+        assert!(!scalar.contains("spawn_commit_now_rows"), "{scalar}");
+        let (lateral, lateral_md5) = gated_answer(&store, super::GATED);
+        let (scalar, scalar_md5) = gated_answer(&store, &scalar);
+        assert_eq!(lateral, scalar);
+        assert_eq!(lateral_md5, scalar_md5);
+        assert!(
+            lateral.contains(&format!("{:040x}", 1_000_004)),
+            "a translated base read"
+        );
+    }
+
+    /// Each of `reads` timed (EXPLAIN ANALYZE's execution time), interleaved
+    /// so a loaded host weighs on every read alike: 9 rounds, each read once
+    /// a round; each read's times printed with their minimum (its own cost)
+    /// and median (as the host gave it); the minima returned, NaN for a read
+    /// this build does not have.
+    fn timed(store: &crate::PostgresStore, reads: &[(&str, String)]) -> Vec<f64> {
+        let mut runs: Vec<Vec<f64>> = vec![Vec::new(); reads.len()];
+        for _ in 0..9 {
+            for (at, (_, sql)) in reads.iter().enumerate() {
+                // A form this build does not have (spawn_commit_now_rows
+                // before objective 190) is left out.
+                if let Ok(explained) = store.query_json(
+                    &format!("explain (analyze, timing off, summary on, format json) {sql}"),
+                    &[],
+                ) {
+                    runs[at].push(explained[0]["Execution Time"].as_f64().expect("a time"));
+                }
+            }
+        }
+        let mut least = Vec::new();
+        for ((name, _), times) in reads.iter().zip(&mut runs) {
+            if times.is_empty() {
+                println!("{name}: not on this build");
+                least.push(f64::NAN);
+                continue;
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "{name}: min {:.3} ms, median {:.3} ms, of {times:?}",
+                times[0], times[4]
+            );
+            least.push(times[0]);
+        }
+        least
+    }
+
+    /// Objective 190's timing, at live size (the lead's 22:51 reading: 9
+    /// missions, 398 tasks of which 61 open, a map of about 4,840 pairs):
+    /// EXPLAIN ANALYZE of the real gated read and the same read with the
+    /// commits as recorded, 9 interleaved rounds ([`timed`]), each printed;
+    /// the translation's part (the least gated minus the least as
+    /// recorded) under 1 ms. Ignored: a timing is the proof's
+    /// measurement (`cargo test -- --ignored --nocapture`), not a gate check
+    /// on a loaded host.
+    #[test]
+    #[ignore = "a timing: run by hand for the proof"]
+    fn the_gated_read_at_live_size_takes_under_a_millisecond() {
+        let schema = crate::testing::TestSchema::new("gated_timing");
+        let store = schema.store();
+        seed_live_size(&schema, &store);
+        let tasks = store.gated_missions().expect("the gated read");
+        let read_open: usize = tasks
+            .as_array()
+            .expect("missions")
+            .iter()
+            .map(|mission| mission["tasks"].as_array().map_or(0, Vec::len))
+            .sum();
+        assert_eq!(read_open, 61, "the open tasks read");
+        // The answer's bytes, to compare with the same test on another
+        // build (main's GATED before objective 190).
+        println!("gated answer md5 {}", gated_answer(&store, super::GATED).1);
+        // The gated read; the same with the commits as recorded (no
+        // translation); the open tasks' two commits through each form.
+        // The same text with no translation: this build's lateral form
+        // (objective 190) or main's scalar calls (before it), so the test
+        // copied onto main times main's read alike.
+        let mut plain = super::GATED.to_string();
+        for (form, recorded) in [
+            ("mb.now as baseline", "m.baseline"),
+            ("'base', kb.now", "'base', k.base"),
+            ("'candidate', kc.now", "'candidate', k.candidate"),
+            ("coalesce(rm.now, r.main)", "r.main"),
+            (
+                "coalesce(kl.now, k.gate_load_sensitive_pushed)",
+                "k.gate_load_sensitive_pushed",
+            ),
+            (
+                "coalesce(kp.now, k.gate_parked_pushed)",
+                "k.gate_parked_pushed",
+            ),
+            (
+                "    cross join lateral spawn_commit_now_rows(m.baseline) mb\n",
+                "",
+            ),
+            (
+                "           cross join lateral spawn_commit_now_rows(r.main) rm\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.base) kb\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.candidate) kc\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.gate_load_sensitive_pushed) kl\n",
+                "",
+            ),
+            (
+                "        cross join lateral spawn_commit_now_rows(k.gate_parked_pushed) kp\n",
+                "",
+            ),
+            ("spawn_commit_now(m.baseline) as baseline", "m.baseline"),
+            ("coalesce(spawn_commit_now(r.main), r.main)", "r.main"),
+            ("spawn_commit_now(k.base)", "k.base"),
+            ("spawn_commit_now(k.candidate)", "k.candidate"),
+            (
+                "coalesce(spawn_commit_now(k.gate_load_sensitive_pushed), k.gate_load_sensitive_pushed)",
+                "k.gate_load_sensitive_pushed",
+            ),
+            (
+                "coalesce(spawn_commit_now(k.gate_parked_pushed), k.gate_parked_pushed)",
+                "k.gate_parked_pushed",
+            ),
+        ] {
+            plain = plain.replace(form, recorded);
+        }
+        assert!(
+            !plain.contains("spawn_commit_now"),
+            "no translation left: {plain}"
+        );
+        let open = "from mission_tasks k where k.state not in ('cancelled', 'landed')";
+        let reads = [
+            ("gated", super::GATED.to_string()),
+            ("gated, commits as recorded", plain),
+            (
+                "open tasks, spawn_commit_now",
+                format!("select spawn_commit_now(k.base), spawn_commit_now(k.candidate) {open}"),
+            ),
+            (
+                "open tasks, spawn_commit_now_rows",
+                format!(
+                    "select b.now, c.now {open_from} \
+                     cross join lateral spawn_commit_now_rows(k.base) b \
+                     cross join lateral spawn_commit_now_rows(k.candidate) c {open_where}",
+                    open_from = "from mission_tasks k",
+                    open_where = "where k.state not in ('cancelled', 'landed')"
+                ),
+            ),
+            (
+                "open tasks, as recorded",
+                format!("select k.base, k.candidate {open}"),
+            ),
+        ];
+        let least = timed(&store, &reads);
+        assert!(
+            least[0] - least[1] < 1.0,
+            "the translation's part of the gated read: {least:?}"
+        );
+    }
 
     /// The values allowed by the check constraint on `mission_tasks.state`,
     /// read from the schema text.

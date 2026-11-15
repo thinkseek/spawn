@@ -2072,6 +2072,7 @@ unset SPAWN_TEST_DATABASE_URL
 . "$(dirname "$gate")/../pg-url.sh"
 parsed() {
     if pg_url_parse "$1"; then
+        # credential-print: ok the test's made-up URLs, parsed and compared (174)
         printf '%s|%s|%s|%s|%s|%s' "$pg_url_user" "$pg_url_password" "$pg_url_host" "$pg_url_port" \
             "$pg_url_database" "$pg_url_options"
     else
