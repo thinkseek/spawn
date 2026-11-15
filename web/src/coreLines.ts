@@ -44,6 +44,15 @@ export interface CoreFigure {
    * performance north star's report to live by mission), by mission;
    * absent when no mission has a live landing. */
   by_mission?: CoreMissionFigure[];
+  /** The ranges file's target (objective 181): said beside the figure,
+   * never judged against. */
+  target?: number;
+  /** What a count is out of (objective 181: U1 out of the recovery
+   * table's rows): "<n> of <of>". */
+  of?: number;
+  /** Why the file's range is held (objective 181: U2 in its first week of
+   * judged data): said where the range would be. */
+  range_note?: string;
 }
 
 /** One mission's report to live (objective 159): its median (null below
@@ -183,7 +192,11 @@ export interface CoreDrillMark {
 export interface CoreMark {
   name: string;
   value: string;
+  /** The range in words, or the note that holds it (objective 181). */
   range: string;
+  /** "target <value in the unit's words>" (objective 181); absent without
+   * one. */
+  target?: string;
   /** "plain" in its range, "warning" out of it, "muted" otherwise. */
   tone: "plain" | "warning" | "muted";
 }
@@ -405,19 +418,24 @@ function mark(raw: unknown): CoreMark {
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
   const value = finite(figure.value);
   const since = finite(figure.measuring_since_ms);
-  return {
+  const of = finite(figure.of);
+  const target = finite(figure.target);
+  const held = typeof figure.range_note === "string" && figure.range_note !== "" ? figure.range_note : null;
+  const said: CoreMark = {
     name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}${judgedWords(figure.judged)}`,
     value:
       value !== null
-        ? unitWords(unit, value)
+        ? `${unitWords(unit, value)}${of !== null ? ` of ${GROUPED.format(of)}` : ""}`
         : figure.state === "not_measured_yet"
           ? "not measured yet"
           : since !== null
             ? `measuring since ${sinceWords(since)}`
             : "not collected yet",
-    range: rangeWords(unit, figure.range),
+    range: held ?? rangeWords(unit, figure.range),
     tone: figure.state === "in" ? "plain" : figure.state === "out" ? "warning" : "muted",
   };
+  if (target !== null) said.target = `target ${boundWords(unit, target)}`;
+  return said;
 }
 
 /** An ignored range as the owner reads it: the figure's name (its own, or

@@ -611,3 +611,49 @@ test("the card says each mission's report to live beside the fleet's", () => {
   );
   assert.deepEqual(missionMark(null), { name: "mission ?", text: "0 live, too few for a median", tone: "plain" });
 });
+
+test("a target is said apart from the range, a count out of its rows, a held range by its note (objective 181)", () => {
+  const view = coreLinesView(
+    answer({
+      lines: [
+        {
+          line: "sustainability",
+          north_star: { ...fig("observability.interventions_per_agent_hour", "Human interventions per agent-hour", "ratio", 0.05, { max: 0.1 }, "in"), target: 0.1 },
+          guardrails: [
+            { ...fig("recoverability.restores_passed", "Critical resources with a restore passed in 7 days", "count", 1, null, "no_range"), of: 3 },
+            {
+              ...fig("observability.needs_you_right", "Needs you is right", "share", 0.5, null, "no_range"),
+              range_note: "range proposed after 2026-11-20",
+            },
+          ],
+        },
+        {
+          line: "storage",
+          north_star: { ...fig("storage.bytes_per_landing", "Storage per landing", "bytes", 40 * MIB, null, "no_range"), target: 52428800 },
+          guardrails: [],
+        },
+      ],
+    }),
+  );
+  const [sustainability, storage] = view.rows;
+  assert.deepEqual(sustainability.north_star, {
+    name: "Human interventions per agent-hour",
+    value: "0.05",
+    range: "0.1 or less",
+    target: "target 0.1",
+    tone: "plain",
+  });
+  // A target alone: no range, its target apart, never judged.
+  assert.equal(storage.north_star.range, "no range set");
+  assert.equal(storage.north_star.target, "target 50.0 MB");
+  assert.equal(storage.north_star.tone, "muted");
+  const [u1, u2] = sustainability.guardrails;
+  assert.equal(u1.value, "1 of 3");
+  assert.equal(u1.target, undefined, "no target, none said");
+  assert.equal(u2.value, "50.0%");
+  assert.equal(u2.range, "range proposed after 2026-11-20", "the note where the range would be");
+  assert.equal(u2.tone, "muted");
+  // Without `of` or a note, as before.
+  const bare = coreLinesView(answer()).rows[1].north_star;
+  assert.deepEqual(bare, { name: "Days until the disk is full", value: "1,234 days", range: "180 days or more", tone: "plain" });
+});

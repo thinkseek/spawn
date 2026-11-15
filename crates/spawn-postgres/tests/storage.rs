@@ -637,3 +637,93 @@ fn storage_readings_are_read_back_with_the_landings_between_them() {
     // deploy's move, deploy.finished, task 1 (before) or task 5 (after).
     assert_eq!(read["landings"], 4, "{read}");
 }
+
+/// Objective 181: the first `host.core_lines` sample carrying a figure as a
+/// number is found by when it was recorded, not by its place in the
+/// stream; a sample without the figure, or with it as no number, is passed
+/// over; a figure no sample carries reads none. The read goes through the
+/// samples' index.
+#[test]
+fn the_first_sample_carrying_a_figure_is_found() {
+    const DAY: i64 = 86_400_000;
+    const KEY: &str = "observability.needs_you_right";
+    let (store, schema) = store("storage_first_value");
+    let mut client = admin(&schema);
+    assert_eq!(store.first_core_lines_value(KEY).expect("read"), None);
+    let sample = |values: Value| json!({"type": "host.core_lines", "values": values});
+    seed(&mut client, &sample(json!({"storage.free_bytes": 5})), DAY);
+    seed(&mut client, &sample(json!({KEY: null})), 2 * DAY);
+    seed(&mut client, &sample(json!({KEY: "0.5"})), 3 * DAY);
+    seed(
+        &mut client,
+        &json!({"type": "host.storage", "values": {KEY: 0.9}}),
+        4 * DAY,
+    );
+    seed(&mut client, &sample(json!({KEY: 0.5})), 8 * DAY);
+    assert_eq!(
+        store.first_core_lines_value(KEY).expect("read"),
+        Some(8 * DAY)
+    );
+    // Appended after, recorded before: the older one is the first.
+    seed(&mut client, &sample(json!({KEY: 0.4})), 6 * DAY);
+    seed(&mut client, &sample(json!({KEY: 0.3})), 9 * DAY);
+    assert_eq!(
+        store.first_core_lines_value(KEY).expect("read"),
+        Some(6 * DAY)
+    );
+    assert_eq!(
+        store
+            .first_core_lines_value("storage.free_bytes")
+            .expect("read"),
+        Some(DAY)
+    );
+    assert_eq!(
+        store
+            .first_core_lines_value("no.such_figure")
+            .expect("read"),
+        None
+    );
+
+    // A control stream of some size, mostly other records, as the live
+    // one is: the read must not walk it.
+    client
+        .batch_execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                       source_event_id, kind, session_seq, recorded_at_ms)
+             select 'agent_control', 'session_control', null, 'control', null,
+                    jsonb_build_object('name', 'control.recorded', 'detail',
+                        jsonb_build_object('record', jsonb_build_object('type', 'host.storage',
+                            'archive_bytes', n, 'archive_files', 1,
+                            'projects_bytes', 1, 'projects_files', 1))),
+                    m.seq + n, 3000 + n
+               from generate_series(1, 5000) n,
+                    (select max(session_seq) as seq from spawn_events
+                      where session_id = 'session_control') m;
+             analyze spawn_events;",
+        )
+        .expect("a stream of other records");
+    assert_eq!(
+        store.first_core_lines_value(KEY).expect("read"),
+        Some(6 * DAY)
+    );
+    let plan: Value = client
+        .query_one(
+            "explain (format json)
+             select e.recorded_at_ms
+               from spawn_events e
+              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
+                and jsonb_typeof(e.kind -> 'detail' -> 'record' -> 'values' -> $1::text) = 'number'
+              order by e.recorded_at_ms
+              limit 1",
+            &[&KEY],
+        )
+        .expect("the plan")
+        .get(0);
+    let mut indexes = Vec::new();
+    plan_indexes(&plan, &mut indexes);
+    assert!(
+        indexes.contains(&"spawn_events_host_core_lines".to_string()),
+        "the samples' index unused: {indexes:?}"
+    );
+}

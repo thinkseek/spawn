@@ -80,6 +80,21 @@ select coalesce(jsonb_agg(jsonb_build_object('at_ms', s.recorded_at_ms, 'values'
            and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
            and e.recorded_at_ms >= $1) s";
 
+/// When the first `host.core_lines` sample carrying the figure `$1` as a
+/// number was recorded (objective 181: the week of judged data U2's range
+/// waits for), or null before one: the samples read oldest first through
+/// their partial index (`spawn_events_host_core_lines`, on
+/// `recorded_at_ms`), stopping at the first that carries it.
+pub(crate) const FIRST_CORE_LINES_VALUE: &str = r"
+select coalesce(to_jsonb((
+  select e.recorded_at_ms
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
+     and jsonb_typeof(e.kind -> 'detail' -> 'record' -> 'values' -> $1::text) = 'number'
+   order by e.recorded_at_ms
+   limit 1)), 'null'::jsonb)";
+
 /// The `host.storage_bytes` readings (objective 180) the storage figures are
 /// measured from (objective 185), and the database's clock `now_ms`:
 /// `newest`, the newest reading as `{at_ms, sources}`, or null before the
@@ -312,6 +327,14 @@ impl PostgresStore {
     /// first, as `[{at_ms, values}]` ([`HOST_CORE_LINES`]).
     pub fn host_core_lines(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(HOST_CORE_LINES, &[&since_ms])
+    }
+
+    /// When the first `host.core_lines` sample carrying `key` as a number
+    /// was recorded, in ms; `None` before one ([`FIRST_CORE_LINES_VALUE`]).
+    pub fn first_core_lines_value(&self, key: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_json_prepared(FIRST_CORE_LINES_VALUE, &[&key])?
+            .as_i64())
     }
 
     /// The storage readings and the database's clock ([`HOST_STORAGE_BYTES`]):

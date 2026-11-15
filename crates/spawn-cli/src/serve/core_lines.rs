@@ -78,10 +78,13 @@
 //!
 //! No range lives in code: they come only from the ranges file,
 //! `SPAWN_CORE_LINES_FILE`, by default `<workspace root>/core-lines.json`,
-//! shaped `{"ranges": {<figure key>: {"min"?: number, "max"?: number}}}`,
-//! read at every request, so an edit shows without a restart. An entry whose
-//! key names no figure, or with no number min or max, is left out and listed
-//! in `ignored_ranges`. A missing file is no ranges and no error; a file that
+//! shaped `{"ranges": {<figure key>: {"min"?: number, "max"?: number,
+//! "target"?: number}}}`, read at every request, so an edit shows without a
+//! restart. A `target` (objective 181) is said as the figure's `target`,
+//! apart from its range, and never judged against: an entry with a target
+//! alone gives no range. An entry whose key names no figure, or with
+//! neither a number min or max nor a target, is left out and listed in
+//! `ignored_ranges`. A missing file is no ranges and no error; a file that
 //! is not such JSON is no ranges and a `ranges_error`. Nothing but `spawn
 //! serve` and the loop's alert step ([`reading`], `guardrail_out_of_range`,
 //! on a thread of its own) read the file, and no gate, integrator or deploy step reads the answer:
@@ -165,6 +168,13 @@ pub(super) struct Figure {
     pub(super) note: Option<String>,
     /// The figure split by source (objective 185): said as `by_source`.
     pub(super) by_source: Option<Value>,
+    /// What a count is out of (objective 181: U1 out of the recovery
+    /// table's rows): said as `of`.
+    pub(super) of: Option<usize>,
+    /// Why the ranges file's range is not applied yet (objective 181: U2
+    /// in its first week of judged data): said as `range_note`; while it is
+    /// set the figure has no range, so it is never out.
+    pub(super) range_note: Option<String>,
 }
 
 impl Figure {
@@ -184,6 +194,8 @@ impl Figure {
             not_measured_yet: false,
             note: None,
             by_source: None,
+            of: None,
+            range_note: None,
         }
     }
 
@@ -245,11 +257,14 @@ fn number(value: f64) -> Value {
     }
 }
 
-/// What the ranges file gave: the ranges by key, the entries left out with
-/// why, and why the file could not be read, if it could not.
+/// What the ranges file gave: the ranges by key, the targets by key
+/// (objective 181: said beside the figure, never judged against), the
+/// entries left out with why, and why the file could not be read, if it
+/// could not.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Ranges {
     pub(super) bounds: BTreeMap<String, Range>,
+    pub(super) targets: BTreeMap<String, f64>,
     pub(super) ignored: Vec<(String, &'static str)>,
     pub(super) error: Option<String>,
 }
@@ -282,10 +297,17 @@ pub(super) fn parse_ranges(text: Option<&str>, known: &[&str]) -> Ranges {
             min: bound("min"),
             max: bound("max"),
         };
+        let target = bound("target");
+        if let Some(target) = target {
+            ranges.targets.insert(key.clone(), target);
+        }
         if range.min.is_none() && range.max.is_none() {
-            ranges
-                .ignored
-                .push((key.clone(), "needs a number min or max"));
+            // A target alone gives no range, and is not left out.
+            if target.is_none() {
+                ranges
+                    .ignored
+                    .push((key.clone(), "needs a number min or max"));
+            }
             continue;
         }
         ranges.bounds.insert(key.clone(), range);
@@ -297,8 +319,10 @@ pub(super) fn parse_ranges(text: Option<&str>, known: &[&str]) -> Ranges {
 /// One UTC day, in milliseconds.
 const DAY_MS: i64 = 86_400_000;
 
-/// A figure as the answer gives it: with its range and its state.
+/// A figure as the answer gives it: with its range and its state. A
+/// figure with a `range_note` takes no range (objective 181).
 pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
+    let range = range.filter(|_| figure.range_note.is_none());
     let state = match (figure.value.as_f64(), range) {
         (None, _) if figure.not_measured_yet => "not_measured_yet",
         (None, _) => "not_collected",
@@ -340,6 +364,12 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     }
     if let Some(by_source) = &figure.by_source {
         answer["by_source"] = by_source.clone();
+    }
+    if let Some(of) = figure.of {
+        answer["of"] = json!(of);
+    }
+    if let Some(range_note) = &figure.range_note {
+        answer["range_note"] = json!(range_note);
     }
     answer
 }
@@ -604,6 +634,9 @@ pub(super) fn answer(
     let lines = &set.lines;
     let with_range = |figure: &Figure| {
         let mut view = figure_json(figure, ranges.bounds.get(figure.key).copied());
+        if let Some(target) = ranges.targets.get(figure.key) {
+            view["target"] = number(*target);
+        }
         view["trend"] = json!(trends.get(figure.key).cloned().unwrap_or_default());
         view
     };
@@ -1059,11 +1092,22 @@ fn lines_at(
             .ok()
     });
     let (needs_you_right, needs_judged) = observability::judged_share(counts.as_ref());
+    // Its week of judged data starts at the first hourly sample carrying it
+    // (objective 181); a failed read is read as no sample yet.
+    let first = timed(&mut parts.health, || {
+        store
+            .first_core_lines_value(observability::NEEDS_YOU_RIGHT)
+            .map_err(|error| eprintln!("core-lines: the first judged value: {error}"))
+            .ok()
+            .flatten()
+    });
+    let needs_range_note = observability::range_note(first, &needs_you_right, now_ms);
     let observed = Observed {
         cost_total,
         human_per_agent_hour: interventions["per_agent_hour"].clone(),
         needs_you_right,
         needs_judged,
+        needs_range_note,
     };
     let (backups, facts, drills) = timed(&mut parts.facts, || {
         store.newest_backups().map(|backups| {
@@ -1084,6 +1128,13 @@ fn lines_at(
         drills.north_star.value,
         guardrails,
     );
+    // U1 out of the recovery table's rows (objective 181).
+    for star in figures.iter_mut().map(|line| &mut line.north_star) {
+        if star.key == "recoverability.restores_passed" {
+            star.of = drills.north_star.of;
+            star.note.clone_from(&drills.north_star.note);
+        }
+    }
     let statuses = kept::statuses();
     aged(&mut figures, &statuses, now_ms);
     parts.ages(&statuses, now_ms);
@@ -1211,6 +1262,7 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
 mod tests {
     use super::{Figure, Observed, figure_json, lines, parse_ranges, read_ranges};
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     const KNOWN: [&str; 3] = ["a.one", "a.two", "a.three"];
 
@@ -1279,6 +1331,97 @@ mod tests {
         // A number bound beside one that is not: the number counts.
         assert_eq!(ranges.bounds.len(), 1);
         assert!(ranges.bounds.contains_key("a.one"));
+    }
+
+    /// Objective 181: a ranges file entry's `target` is kept apart from its
+    /// range and said as the figure's `target`, never judged against; an
+    /// entry with a target alone gives no range and is not left out; one
+    /// with neither is left out as before.
+    #[test]
+    fn a_target_is_said_beside_the_figure_apart_from_its_range() {
+        let ranges = parse_ranges(
+            Some(
+                r#"{"ranges": {
+                    "a.one": {"max": 0.1, "target": 0.1},
+                    "a.two": {"target": 52428800},
+                    "a.three": {"target": "many"}
+                }}"#,
+            ),
+            &KNOWN,
+        );
+        assert_eq!(ranges.bounds.len(), 1);
+        assert_eq!(
+            ranges.bounds.get("a.one").copied().map(super::Range::json),
+            Some(json!({"max": 0.1}))
+        );
+        assert_eq!(
+            ranges
+                .targets
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect::<Vec<_>>(),
+            [("a.one", 0.1), ("a.two", 52_428_800.0)]
+        );
+        assert_eq!(
+            ranges.ignored,
+            [("a.three".to_string(), "needs a number min or max")]
+        );
+
+        let star = |file: &str| {
+            let observed = Observed {
+                human_per_agent_hour: json!(0.5),
+                ..Observed::default()
+            };
+            let figures = lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new());
+            let view = super::answer(
+                &super::adopted(&figures),
+                &Value::Null,
+                Ok(Some(file.to_string())),
+                &BTreeMap::new(),
+            );
+            let all: Vec<Value> = view["lines"]
+                .as_array()
+                .expect("lines")
+                .iter()
+                .flat_map(|line| {
+                    std::iter::once(line["north_star"].clone())
+                        .chain(line["guardrails"].as_array().expect("guardrails").clone())
+                })
+                .collect();
+            let find = |key: &str| {
+                all.iter()
+                    .find(|figure| figure["key"] == key)
+                    .cloned()
+                    .expect(key)
+            };
+            (
+                find("observability.interventions_per_agent_hour"),
+                find("storage.bytes_per_landing"),
+                view["ignored_ranges"].clone(),
+            )
+        };
+        let (sustainability, storage, ignored) = star(
+            r#"{"ranges": {
+                "observability.interventions_per_agent_hour": {"max": 0.1, "target": 0.1},
+                "storage.bytes_per_landing": {"target": 52428800}}}"#,
+        );
+        assert_eq!(sustainability["target"], json!(0.1));
+        assert_eq!(sustainability["range"], json!({"max": 0.1}));
+        assert_eq!(sustainability["state"], "out", "from the range alone");
+        assert_eq!(storage["target"], json!(52_428_800), "whole, as written");
+        assert_eq!(storage["range"], Value::Null);
+        assert_eq!(ignored, json!([]));
+        // A target alone, the value past it: no range, never judged.
+        let (sustainability, _, _) =
+            star(r#"{"ranges": {"observability.interventions_per_agent_hour": {"target": 0.1}}}"#);
+        assert_eq!(sustainability["target"], json!(0.1));
+        assert_eq!(
+            (&sustainability["range"], &sustainability["state"]),
+            (&Value::Null, &json!("no_range"))
+        );
+        // No target: none said.
+        let (sustainability, storage, _) = star(r#"{"ranges": {}}"#);
+        assert!(sustainability.get("target").is_none() && storage.get("target").is_none());
     }
 
     #[test]

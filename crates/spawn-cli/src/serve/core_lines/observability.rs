@@ -9,13 +9,42 @@ use super::{Figure, Line};
 /// agent-hour (`human_per_agent_hour`: `/api/interventions?window=24h`'s
 /// `per_agent_hour`, objective 100), and the north star "Needs you is right"
 /// and what it is read from (`needs_judged`, `{fired, judged, unjudged}`;
-/// `None` when not read), both from [`judged_share`] (objective 148).
+/// `None` when not read), both from [`judged_share`] (objective 148), and
+/// why its range is held, from [`range_note`] (objective 181).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(in crate::serve) struct Observed {
     pub(in crate::serve) cost_total: Value,
     pub(in crate::serve) human_per_agent_hour: Value,
     pub(in crate::serve) needs_you_right: Value,
     pub(in crate::serve) needs_judged: Option<Value>,
+    pub(in crate::serve) needs_range_note: Option<String>,
+}
+
+/// The key of "Needs you is right" (U2).
+pub(in crate::serve) const NEEDS_YOU_RIGHT: &str = "observability.needs_you_right";
+
+/// Why "Needs you is right" takes no range yet (objective 181): its range is
+/// proposed after a week of judged data, which starts at `first_ms`, the
+/// first hourly `host.core_lines` sample carrying it as a number, or at
+/// `now_ms` when it has a `value` no sample carries yet. Before any value,
+/// "range proposed 7 days after the first judged value"; during the week,
+/// "range proposed after <YYYY-MM-DD>", the week's end in UTC; after it,
+/// none, and the ranges file's range applies.
+pub(in crate::serve) fn range_note(
+    first_ms: Option<i64>,
+    value: &Value,
+    now_ms: i64,
+) -> Option<String> {
+    let Some(first) = first_ms.or_else(|| value.is_number().then_some(now_ms)) else {
+        return Some("range proposed 7 days after the first judged value".to_string());
+    };
+    let end = first.saturating_add(WEEK_MS);
+    (now_ms < end).then(|| {
+        format!(
+            "range proposed after {}",
+            crate::scorecard::time::day_of(end)
+        )
+    })
 }
 
 /// The fewest needs judged for "Needs you is right" to have a value.
@@ -75,8 +104,10 @@ pub(super) fn observability_line(observed: &Observed) -> Line {
         north_star: Figure {
             // What the share is read from, said beside it (objective 148).
             judged: observed.needs_judged.clone(),
+            // No range in its first week of judged data (objective 181).
+            range_note: observed.needs_range_note.clone(),
             ..Figure::new(
-                "observability.needs_you_right",
+                NEEDS_YOU_RIGHT,
                 "Needs you is right",
                 "share",
                 observed.needs_you_right.clone(),
@@ -440,5 +471,72 @@ mod tests {
             view["ignored_ranges"],
             json!([{"key": "observability.not_measured", "reason": RETIRED_REASON}])
         );
+    }
+
+    /// Objective 181: "Needs you is right" takes no range in its first week
+    /// of judged data, whatever the ranges file gives it: before any value,
+    /// a value no sample carries yet (the week starts now), during the
+    /// week, at its end and after it.
+    #[test]
+    fn needs_you_is_right_takes_no_range_in_its_first_week_of_data() {
+        const DAY: i64 = 86_400_000;
+        // 2025-11-15T12:00:00Z.
+        let now = 1_763_208_000_000;
+        assert_eq!(crate::scorecard::time::day_of(now), "2025-11-15");
+        let before = range_note(None, &Value::Null, now);
+        assert_eq!(
+            before.as_deref(),
+            Some("range proposed 7 days after the first judged value")
+        );
+        assert_eq!(
+            range_note(None, &json!(0.5), now).as_deref(),
+            Some("range proposed after 2025-11-22"),
+            "a value no sample carries yet: the week starts now"
+        );
+        assert_eq!(
+            range_note(Some(now - 2 * DAY), &json!(0.5), now).as_deref(),
+            Some("range proposed after 2025-11-20")
+        );
+        assert_eq!(
+            range_note(Some(now - 2 * DAY), &Value::Null, now).as_deref(),
+            Some("range proposed after 2025-11-20"),
+            "a first value read, none now: still its week"
+        );
+        assert_eq!(
+            range_note(Some(now - 7 * DAY + 1), &json!(0.5), now).as_deref(),
+            Some("range proposed after 2025-11-15"),
+            "its last moment"
+        );
+        assert_eq!(
+            range_note(Some(now - 7 * DAY), &json!(0.5), now),
+            None,
+            "at its end"
+        );
+        assert_eq!(range_note(Some(now - 8 * DAY), &json!(0.5), now), None);
+
+        // The held range is never applied, so the value is never out.
+        let ranges = parse_ranges(
+            Some(r#"{"ranges": {"observability.needs_you_right": {"min": 0.8}}}"#),
+            &[NEEDS_YOU_RIGHT],
+        );
+        let range = ranges.bounds.get(NEEDS_YOU_RIGHT).copied();
+        let star = |note: Option<String>| {
+            let observed = Observed {
+                needs_you_right: json!(0.5),
+                needs_range_note: note,
+                ..Observed::default()
+            };
+            let line = &lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new())[2];
+            figure_json(&line.north_star, range)
+        };
+        let held = star(range_note(Some(now - 2 * DAY), &json!(0.5), now));
+        assert_eq!(held["key"], NEEDS_YOU_RIGHT);
+        assert_eq!(held["range"], Value::Null);
+        assert_eq!(held["state"], "no_range", "never out");
+        assert_eq!(held["range_note"], "range proposed after 2025-11-20");
+        let applied = star(range_note(Some(now - 8 * DAY), &json!(0.5), now));
+        assert_eq!(applied["range"], json!({"min": 0.8}));
+        assert_eq!(applied["state"], "out");
+        assert!(applied.get("range_note").is_none());
     }
 }
