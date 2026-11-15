@@ -242,15 +242,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         if only != Only::Transcripts {
             return Err(error);
         }
-        // The folder left (not plain, or no longer the one made): said, and
-        // the drill fails.
-        println!("restore-drill: FAILED: {error}");
-        code = code.max(1);
-        for (_, outcome) in &mut outcomes {
-            if matches!(outcome, Outcome::Passed) {
-                *outcome = Outcome::Unrestorable(error.clone());
-            }
-        }
+        code = folder_left(&error, code, &mut outcomes);
     }
     let key = bundle_key(newest);
     let verdict = Verdict {
@@ -259,6 +251,19 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         duration_ms: elapsed_ms(started),
     };
     Ok(record_verdicts(&store, &verdict, &outcomes).unwrap_or(code))
+}
+
+/// The transcripts drill's folder left (not plain, or no longer the one
+/// made): said, and the drill fails; each passed outcome is failed with
+/// `error`. The exit, at least 1.
+fn folder_left(error: &str, code: i32, outcomes: &mut [(&'static str, Outcome)]) -> i32 {
+    println!("restore-drill: FAILED: {error}");
+    for (_, outcome) in outcomes.iter_mut() {
+        if matches!(outcome, Outcome::Passed) {
+            *outcome = Outcome::Unrestorable(error.to_string());
+        }
+    }
+    code.max(1)
 }
 
 /// `--only`'s drill and the resources it proves, its line said; `None`
