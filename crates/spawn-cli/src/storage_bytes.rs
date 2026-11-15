@@ -52,7 +52,7 @@ pub(crate) const DAY_MS: i64 = 86_400_000;
 pub(crate) const RETRY_MS: i64 = 600_000;
 
 /// How long the extents script may run before it is stopped.
-pub(crate) const SCRIPT_LIMIT: Duration = Duration::from_secs(3600);
+pub(crate) const SCRIPT_LIMIT: Duration = Duration::from_hours(1);
 
 /// How long the script may take over one source.
 pub(crate) const BOUND_SECS: u64 = 1200;
@@ -209,7 +209,7 @@ pub(crate) fn script_sources(
                     .find(|entry| entry["name"] == source.name)
                     .map_or_else(
                         || not_measured("the extents script gave no answer for it"),
-                        |entry| script_entry(entry),
+                        script_entry,
                     ),
             }
         };

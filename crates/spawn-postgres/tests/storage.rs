@@ -490,13 +490,23 @@ fn storage_readings_are_recorded_and_the_newest_read_back() {
     let now = read["now_ms"].as_i64().expect("the database's clock");
     assert!((clock - now).abs() < 60_000, "{now} against {clock}");
 
+    the_readings_index_is_used(&store, &mut client, &schema);
+}
+
+/// The readings' partial index exists, and the newest is read through it in
+/// a stream of 5,000 other records.
+fn the_readings_index_is_used(
+    store: &spawn_postgres::PostgresStore,
+    client: &mut Client,
+    schema: &str,
+) {
     // The partial index exists, and the read goes through it in a stream of
     // other records.
     let definition: String = client
         .query_one(
             "select indexdef from pg_indexes
               where schemaname = $1 and indexname = 'spawn_events_host_storage_bytes'",
-            &[&&*schema],
+            &[&schema],
         )
         .expect("the index exists")
         .get(0);

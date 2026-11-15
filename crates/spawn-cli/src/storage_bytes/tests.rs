@@ -382,7 +382,7 @@ fn fake(dir: &Path, name: &str, body: &str) -> PathBuf {
 fn the_script_is_run_bounded_and_stoppable() {
     let dir = scratch("fake-extents");
     let go = AtomicBool::new(false);
-    let limit = Duration::from_secs(60);
+    let limit = Duration::from_mins(1);
     let answering = fake(
         &dir,
         "answer.py",
@@ -446,7 +446,7 @@ fn the_extents_script_gives_no_partial_count_past_its_bound() {
     file(&dir.join("full/b/c.bin"), 64 * 1024);
     std::fs::create_dir_all(dir.join("empty")).expect("an empty root");
     let go = AtomicBool::new(false);
-    let limit = Duration::from_secs(60);
+    let limit = Duration::from_mins(1);
     let source = |root: &Path| Source {
         name: "scratch",
         roots: vec![root.to_path_buf()],
@@ -516,7 +516,7 @@ fn the_extents_script_counts_a_directory_it_cannot_list() {
     let read = run_script(
         &real_script(),
         &script_input(&sources, BOUND_SECS),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         &go,
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
