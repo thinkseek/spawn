@@ -15,6 +15,25 @@ use std::time::Duration;
 
 const MIB: u64 = 1_048_576;
 
+/// A test's scratch directory, removed with everything in it when the test
+/// ends, passing or not (check-tests: a passing run leaves nothing in its
+/// TMPDIR).
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The sources a reading's thread would give, the live database aside.
 fn answer() -> Map<String, Value> {
     let mut sources = Map::new();
@@ -135,7 +154,7 @@ fn until_written(
 
 #[test]
 fn a_reading_waits_for_every_owner_hold() {
-    let dir = scratch("quiet");
+    let dir = Scratch(scratch("quiet"));
     let quiet = dir.join("owner-gate.state");
     let held = |settings: StorageBytesSettings, holds: Value| {
         let mut world = Fake::new(None, 10 * DAY_MS);
@@ -316,7 +335,7 @@ fn a_source_over_its_bound_or_unread_is_not_measured() {
     }
     // The session backups: their status file's estimated bytes, or why not.
     assert!(session_backups(None)["not_measured"].is_string());
-    let dir = scratch("backups-status");
+    let dir = Scratch(scratch("backups-status"));
     let status = dir.join("status.json");
     std::fs::write(&status, r#"{"estimated_bytes": 4096}"#).expect("status");
     assert_eq!(session_backups(Some(&status)), json!({"bytes": 4096}));
@@ -380,7 +399,7 @@ fn fake(dir: &Path, name: &str, body: &str) -> PathBuf {
 
 #[test]
 fn the_script_is_run_bounded_and_stoppable() {
-    let dir = scratch("fake-extents");
+    let dir = Scratch(scratch("fake-extents"));
     let go = AtomicBool::new(false);
     let limit = Duration::from_mins(1);
     let answering = fake(
@@ -455,7 +474,7 @@ fn the_extents_script_gives_no_partial_count_past_its_bound() {
     let Some(script) = real_script() else {
         return;
     };
-    let dir = scratch("extents-bound");
+    let dir = Scratch(scratch("extents-bound"));
     file(&dir.join("full/a.bin"), 64 * 1024);
     file(&dir.join("full/b/c.bin"), 64 * 1024);
     std::fs::create_dir_all(dir.join("empty")).expect("an empty root");
@@ -506,7 +525,7 @@ fn the_extents_script_counts_a_directory_it_cannot_list() {
     let Some(script) = real_script() else {
         return;
     };
-    let dir = scratch("extents-unlisted");
+    let dir = Scratch(scratch("extents-unlisted"));
     file(&dir.join("root/a.bin"), 4096);
     file(&dir.join("root/locked/b.bin"), 4096);
     let locked = dir.join("root/locked");
