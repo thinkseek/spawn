@@ -143,8 +143,7 @@ fn why_old_walked(
         Ok(history) => history,
         Err(_) if !clean.is_empty() => {
             with_proofs(git_dir, |proofs| proofs.clean.clear());
-            walk(&VecDeque::new())
-                .map_err(|error| format!("the history of {commit}: {error}"))?
+            walk(&VecDeque::new()).map_err(|error| format!("the history of {commit}: {error}"))?
         }
         Err(error) => return Err(format!("the history of {commit}: {error}")),
     };
@@ -318,8 +317,7 @@ mod tests {
         let schema = spawn_postgres::testing::TestSchema::new("rewrite_guard_walk");
         let store = spawn_postgres::PostgresStore::connect_in_schema(schema.url(), &schema)
             .expect("connect");
-        let base =
-            std::env::temp_dir().join(format!("spawn-rewrite-walk-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("spawn-rewrite-walk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let mirror = base.join("mirror.git").to_string_lossy().to_string();
         let own = base.join("own.git").to_string_lossy().to_string();

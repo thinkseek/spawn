@@ -3697,11 +3697,12 @@ impl Judge {
                     reported.as_deref(),
                     checkpoint.as_deref(),
                     |commit| {
-                        crate::rewrite_guard::why_old(store, &mirror_path, commit)
-                            .unwrap_or_else(|error| {
+                        crate::rewrite_guard::why_old(store, &mirror_path, commit).unwrap_or_else(
+                            |error| {
                                 eprintln!("integrate: task {}: {error}", task.id);
                                 None
-                            })
+                            },
+                        )
                     },
                 ));
             }
