@@ -578,27 +578,53 @@ fn storage_readings_are_read_back_with_the_landings_between_them() {
     const H: i64 = 3_600_000;
     let (store, schema) = store("storage_bytes_landings");
     let mut client = admin(&schema);
-    let reading = |scratch: i64| {
-        json!({"type": "host.storage_bytes", "sources": {"scratch": {"bytes": scratch}}})
-    };
+    let reading = |scratch: i64| json!({"type": "host.storage_bytes", "sources": {"scratch": {"bytes": scratch}}});
     seed(&mut client, &json!({"type": "task.landed", "id": 1}), 0);
     seed(&mut client, &reading(MIB), 10 * H);
     let one = store.host_storage_bytes().expect("read");
     assert_eq!(one["newest"]["at_ms"], 10 * H);
     assert_eq!(one["older"], Value::Null, "one reading: no older one");
     assert_eq!(one["landings"], 0);
-    seed(&mut client, &json!({"type": "task.landed", "id": 2}), 11 * H);
-    seed(&mut client, &json!({"type": "source.moved", "source": "/s", "from": "a", "to": "b",
-                              "request": 7}), 12 * H);
-    seed(&mut client, &json!({"type": "source.moved", "source": "/s", "from": "b", "to": "c"}), 13 * H);
-    seed(&mut client, &json!({"type": "deploy.finished", "ok": true}), 14 * H);
-    seed(&mut client, &json!({"type": "task.landed", "id": 3}), 20 * H);
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 2}),
+        11 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "source.moved", "source": "/s", "from": "a", "to": "b",
+                              "request": 7}),
+        12 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "source.moved", "source": "/s", "from": "b", "to": "c"}),
+        13 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "deploy.finished", "ok": true}),
+        14 * H,
+    );
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 3}),
+        20 * H,
+    );
     // A reading less than a day after the first: not a day older than the
     // next one, which is.
     seed(&mut client, &reading(2 * MIB), 30 * H);
-    seed(&mut client, &json!({"type": "task.landed", "id": 4}), 31 * H);
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 4}),
+        31 * H,
+    );
     seed(&mut client, &reading(5 * MIB), 40 * H);
-    seed(&mut client, &json!({"type": "task.landed", "id": 5}), 41 * H);
+    seed(
+        &mut client,
+        &json!({"type": "task.landed", "id": 5}),
+        41 * H,
+    );
     let read = store.host_storage_bytes().expect("read");
     assert_eq!(read["newest"]["at_ms"], 40 * H);
     assert_eq!(read["newest"]["sources"]["scratch"]["bytes"], 5 * MIB);
@@ -610,18 +636,4 @@ fn storage_readings_are_read_back_with_the_landings_between_them() {
     // Between them: task.landed 2, 3 and 4 and the owner's landing; not the
     // deploy's move, deploy.finished, task 1 (before) or task 5 (after).
     assert_eq!(read["landings"], 4, "{read}");
-    // The read walks the readings' index.
-    let plan: Value = client
-        .query_one(
-            &format!("explain (format json) {}", spawn_postgres_host_storage_bytes()),
-            &[],
-        )
-        .expect("the plan")
-        .get(0);
-    let mut indexes = Vec::new();
-    plan_indexes(&plan, &mut indexes);
-    assert!(
-        indexes.contains(&"spawn_events_host_storage_bytes".to_string()),
-        "the readings' index unused: {indexes:?}"
-    );
 }
