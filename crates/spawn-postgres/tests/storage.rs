@@ -660,11 +660,17 @@ fn the_first_sample_carrying_a_figure_is_found() {
         4 * DAY,
     );
     seed(&mut client, &sample(json!({KEY: 0.5})), 8 * DAY);
-    assert_eq!(store.first_core_lines_value(KEY).expect("read"), Some(8 * DAY));
+    assert_eq!(
+        store.first_core_lines_value(KEY).expect("read"),
+        Some(8 * DAY)
+    );
     // Appended after, recorded before: the older one is the first.
     seed(&mut client, &sample(json!({KEY: 0.4})), 6 * DAY);
     seed(&mut client, &sample(json!({KEY: 0.3})), 9 * DAY);
-    assert_eq!(store.first_core_lines_value(KEY).expect("read"), Some(6 * DAY));
+    assert_eq!(
+        store.first_core_lines_value(KEY).expect("read"),
+        Some(6 * DAY)
+    );
     assert_eq!(
         store
             .first_core_lines_value("storage.free_bytes")
@@ -672,7 +678,9 @@ fn the_first_sample_carrying_a_figure_is_found() {
         Some(DAY)
     );
     assert_eq!(
-        store.first_core_lines_value("no.such_figure").expect("read"),
+        store
+            .first_core_lines_value("no.such_figure")
+            .expect("read"),
         None
     );
 
@@ -694,7 +702,10 @@ fn the_first_sample_carrying_a_figure_is_found() {
              analyze spawn_events;",
         )
         .expect("a stream of other records");
-    assert_eq!(store.first_core_lines_value(KEY).expect("read"), Some(6 * DAY));
+    assert_eq!(
+        store.first_core_lines_value(KEY).expect("read"),
+        Some(6 * DAY)
+    );
     let plan: Value = client
         .query_one(
             "explain (format json)

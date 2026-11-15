@@ -30,7 +30,11 @@ pub(in crate::serve) const NEEDS_YOU_RIGHT: &str = "observability.needs_you_righ
 /// "range proposed 7 days after the first judged value"; during the week,
 /// "range proposed after <YYYY-MM-DD>", the week's end in UTC; after it,
 /// none, and the ranges file's range applies.
-pub(in crate::serve) fn range_note(first_ms: Option<i64>, value: &Value, now_ms: i64) -> Option<String> {
+pub(in crate::serve) fn range_note(
+    first_ms: Option<i64>,
+    value: &Value,
+    now_ms: i64,
+) -> Option<String> {
     let Some(first) = first_ms.or_else(|| value.is_number().then_some(now_ms)) else {
         return Some("range proposed 7 days after the first judged value".to_string());
     };
@@ -498,8 +502,15 @@ mod tests {
             Some("range proposed after 2025-11-20"),
             "a first value read, none now: still its week"
         );
-        assert_eq!(range_note(Some(now - 7 * DAY + 1), &json!(0.5), now).is_some(), true);
-        assert_eq!(range_note(Some(now - 7 * DAY), &json!(0.5), now), None, "at its end");
+        assert_eq!(
+            range_note(Some(now - 7 * DAY + 1), &json!(0.5), now).is_some(),
+            true
+        );
+        assert_eq!(
+            range_note(Some(now - 7 * DAY), &json!(0.5), now),
+            None,
+            "at its end"
+        );
         assert_eq!(range_note(Some(now - 8 * DAY), &json!(0.5), now), None);
 
         // The held range is never applied, so the value is never out.

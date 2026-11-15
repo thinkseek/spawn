@@ -1262,6 +1262,7 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
 mod tests {
     use super::{Figure, Observed, figure_json, lines, parse_ranges, read_ranges};
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
 
     const KNOWN: [&str; 3] = ["a.one", "a.two", "a.three"];
 
@@ -1330,6 +1331,97 @@ mod tests {
         // A number bound beside one that is not: the number counts.
         assert_eq!(ranges.bounds.len(), 1);
         assert!(ranges.bounds.contains_key("a.one"));
+    }
+
+    /// Objective 181: a ranges file entry's `target` is kept apart from its
+    /// range and said as the figure's `target`, never judged against; an
+    /// entry with a target alone gives no range and is not left out; one
+    /// with neither is left out as before.
+    #[test]
+    fn a_target_is_said_beside_the_figure_apart_from_its_range() {
+        let ranges = parse_ranges(
+            Some(
+                r#"{"ranges": {
+                    "a.one": {"max": 0.1, "target": 0.1},
+                    "a.two": {"target": 52428800},
+                    "a.three": {"target": "many"}
+                }}"#,
+            ),
+            &KNOWN,
+        );
+        assert_eq!(ranges.bounds.len(), 1);
+        assert_eq!(
+            ranges.bounds.get("a.one").copied().map(super::Range::json),
+            Some(json!({"max": 0.1}))
+        );
+        assert_eq!(
+            ranges
+                .targets
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect::<Vec<_>>(),
+            [("a.one", 0.1), ("a.two", 52_428_800.0)]
+        );
+        assert_eq!(
+            ranges.ignored,
+            [("a.three".to_string(), "needs a number min or max")]
+        );
+
+        let star = |file: &str| {
+            let observed = Observed {
+                human_per_agent_hour: json!(0.5),
+                ..Observed::default()
+            };
+            let figures = lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new());
+            let view = super::answer(
+                &super::adopted(&figures),
+                &Value::Null,
+                Ok(Some(file.to_string())),
+                &BTreeMap::new(),
+            );
+            let all: Vec<Value> = view["lines"]
+                .as_array()
+                .expect("lines")
+                .iter()
+                .flat_map(|line| {
+                    std::iter::once(line["north_star"].clone())
+                        .chain(line["guardrails"].as_array().expect("guardrails").clone())
+                })
+                .collect();
+            let find = |key: &str| {
+                all.iter()
+                    .find(|figure| figure["key"] == key)
+                    .cloned()
+                    .expect(key)
+            };
+            (
+                find("observability.interventions_per_agent_hour"),
+                find("storage.bytes_per_landing"),
+                view["ignored_ranges"].clone(),
+            )
+        };
+        let (sustainability, storage, ignored) = star(
+            r#"{"ranges": {
+                "observability.interventions_per_agent_hour": {"max": 0.1, "target": 0.1},
+                "storage.bytes_per_landing": {"target": 52428800}}}"#,
+        );
+        assert_eq!(sustainability["target"], json!(0.1));
+        assert_eq!(sustainability["range"], json!({"max": 0.1}));
+        assert_eq!(sustainability["state"], "out", "from the range alone");
+        assert_eq!(storage["target"], json!(52_428_800), "whole, as written");
+        assert_eq!(storage["range"], Value::Null);
+        assert_eq!(ignored, json!([]));
+        // A target alone, the value past it: no range, never judged.
+        let (sustainability, _, _) =
+            star(r#"{"ranges": {"observability.interventions_per_agent_hour": {"target": 0.1}}}"#);
+        assert_eq!(sustainability["target"], json!(0.1));
+        assert_eq!(
+            (&sustainability["range"], &sustainability["state"]),
+            (&Value::Null, &json!("no_range"))
+        );
+        // No target: none said.
+        let (sustainability, storage, _) = star(r#"{"ranges": {}}"#);
+        assert!(sustainability.get("target").is_none() && storage.get("target").is_none());
     }
 
     #[test]
