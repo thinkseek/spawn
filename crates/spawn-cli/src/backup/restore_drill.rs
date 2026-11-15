@@ -26,10 +26,15 @@
 //! sha256 must be the same. A run killed part way leaves the ciphertext,
 //! the list of names and what it has extracted: no transcript.
 //!
-//! `--only controllers` (objective 198, [`controllers`]) reads no bundle: it
-//! checks that each live controller an open or active mission's gate names,
-//! current and previous, is `git archive` of its commit from the live
-//! source, and records one `backup.drilled.controllers` per controller.
+//! `--only controllers` (objective 198, [`controllers`]) checks that each
+//! live controller an open or active mission's gate names, current and
+//! previous, is `git archive` of its commit from the live source, and
+//! records one `backup.drilled.controllers` per controller. It also
+//! (objective 199) restores those sources from the newest bundle chain
+//! through the same pipe as `--only missions` (the manifest and `repos/*`
+//! alone, never a transcript: [`restore_sources`]) and checks that the
+//! newest commit of each controller's history the backup holds extracts
+//! from the restored mirror as from the live source.
 //!
 //! `--only transcripts` (objective 200) drills the transcript archive
 //! alone, through the same pipe: from each bundle it unpacks by name only
@@ -175,7 +180,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             PathBuf::from,
         );
         let store = open_store()?;
-        return controllers::drill(&store, &parent, &live);
+        return controllers::drill(&store, &settings, &parent, &live);
     }
     let started = Instant::now();
     let store = open_store()?;
@@ -402,7 +407,8 @@ pub(super) enum Only {
     /// `--only transcripts` (objective 200): the transcript archive alone,
     /// judged by the newest record, nothing live read.
     Transcripts,
-    /// `--only controllers` (objective 198, [`controllers`]): no bundle read;
+    /// `--only controllers` (objectives 198 and 199, [`controllers`]): the
+    /// live controllers, and their sources restored from the bundle chain;
     /// it records `backup.drilled.controllers` per controller.
     Controllers,
 }
@@ -1173,6 +1179,101 @@ fn restore_repos(
         ));
     }
     Ok(())
+}
+
+/// The bundle a controllers drill restored from (objective 199): the newest
+/// stored one's key and record, or "" and 0 when there is none.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Bundle {
+    pub(super) key: String,
+    pub(super) event_id: i64,
+}
+
+/// Each source's restored mirror, or why it could not be restored.
+pub(super) type Mirrors = BTreeMap<String, Result<PathBuf, String>>;
+
+/// The controllers' sources (objective 199) restored from the newest stored
+/// bundle chain into `drill`, as `--only missions` restores the mission
+/// repositories: each bundle fetched and unpacked through the pipe
+/// ([`fetch_members`] with [`missions_members`]: the manifest and
+/// `repos/*` alone, never a transcript), then each of `sources` the newest
+/// record names restored as [`restore_repo`] does, into
+/// `drill/repos/repo-<n>.git`. A source the newest record does not name is
+/// one the backup holds no commit of. The bundle and each source's mirror;
+/// or the bundle and why the chain cannot be restored (no stored bundle, a
+/// broken chain, its key, a bundle that cannot be fetched or opened).
+pub(super) fn restore_sources(
+    store: &spawn_postgres::PostgresStore,
+    settings: &Settings,
+    sources: &BTreeSet<String>,
+    drill: &Path,
+) -> Result<(Bundle, Mirrors), (Bundle, String)> {
+    let now_ms = store
+        .now_ms()
+        .map_err(|error| (Bundle::default(), error.to_string()))?;
+    let records = bundle_records(store, &settings.prefix, now_ms)
+        .map_err(|error| (Bundle::default(), error))?;
+    let bundle = records
+        .iter()
+        .rev()
+        .find(|record| stored(record))
+        .map_or_else(Bundle::default, |record| Bundle {
+            key: bundle_key(record),
+            event_id: record.event_id,
+        });
+    let fail = |reason: String| (bundle.clone(), reason);
+    let chain = match chain_of(&records) {
+        Ok(chain) => chain,
+        Err(Chain::None) => {
+            return Err(fail(
+                "no backup.bundled record with a stored key".to_string(),
+            ));
+        }
+        Err(Chain::Broken(reason)) => return Err(fail(reason)),
+    };
+    let seal = match chain_key(&chain) {
+        Ok(name) => reading_key(&name, "the bundle chain").map_err(fail)?,
+        Err(ChainKey::Refused(reason) | ChainKey::Crossed(reason)) => return Err(fail(reason)),
+    };
+    let mut unpacked: Vec<(PathBuf, Value)> = Vec::new();
+    for (index, record) in chain.iter().enumerate() {
+        let here = drill.join(format!("bundle-{index}"));
+        fs::create_dir(&here).map_err(|error| fail(format!("{}: {error}", here.display())))?;
+        let manifest =
+            fetch_members(settings, record, &seal, &here, missions_members).map_err(fail)?;
+        unpacked.push((here.join("unpacked"), manifest));
+    }
+    let newest = chain[chain.len() - 1];
+    let repos = drill.join("repos");
+    fs::create_dir(&repos).map_err(|error| fail(format!("{}: {error}", repos.display())))?;
+    let mut mirrors = Mirrors::new();
+    for (index, source) in sources.iter().enumerate() {
+        let named = newest.record["repos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|repo| repo["source"].as_str() == Some(source.as_str()));
+        let restored = match named {
+            None => Err(format!(
+                "the newest bundle ({}) holds no repository of {source}",
+                bundle.key
+            )),
+            Some(repo) => {
+                let heads: BTreeMap<String, String> = repo["heads"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(name, commit)| {
+                        Some((name.clone(), commit.as_str()?.to_string()))
+                    })
+                    .collect();
+                let mirror = repos.join(format!("repo-{index}.git"));
+                restore_repo(source, &unpacked, &heads, &mirror).map(|()| mirror)
+            }
+        };
+        mirrors.insert(source.clone(), restored);
+    }
+    Ok((bundle, mirrors))
 }
 
 /// One stored bundle: fetched into `here`, its sha256 the record's (the
