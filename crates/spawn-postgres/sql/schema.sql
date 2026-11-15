@@ -4899,11 +4899,12 @@ begin
                select 1 from jsonb_each(p_record -> 'sources') s(name, source)
                 where s.name = ''
                    or jsonb_typeof(s.source) is distinct from 'object'
-                   or not (jsonb_typeof(s.source -> 'bytes') = 'number'
-                           and (s.source ->> 'bytes')::numeric >= 0
-                           and s.source -> 'not_measured' is null
-                        or jsonb_typeof(s.source -> 'not_measured') = 'string'
-                           and s.source -> 'bytes' is null)) then
+                   or not coalesce(
+                          jsonb_typeof(s.source -> 'bytes') is not distinct from 'number'
+                              and (s.source ->> 'bytes')::numeric >= 0
+                              and s.source -> 'not_measured' is null
+                          or jsonb_typeof(s.source -> 'not_measured') is not distinct from 'string'
+                              and s.source -> 'bytes' is null, false)) then
             raise exception 'a host.storage_bytes record has sources, each with bytes (a number from 0) or not_measured (why): %', p_record;
         end if;
     elsif v_type = 'host.judge' then
