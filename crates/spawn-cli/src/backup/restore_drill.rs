@@ -2166,7 +2166,7 @@ fn why(now: CommitNow, commit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Chain, DrillDir, Outcome, chain_of, compare_refs, compare_transcripts, drill_parent,
+        Chain, DrillDir, Only, Outcome, chain_of, compare_refs, compare_transcripts, drill_parent,
         judge_by_record, missions_members, only_of, outcome, sha256_prefix,
     };
     use crate::backup::BundleRecord;
@@ -2721,7 +2721,6 @@ mod tests {
         assert!(missions_members("./transcripts/a.jsonl\n./repos/a.bundle\n").is_err());
         assert!(missions_members("").is_err());
 
-        use super::Only;
         assert_eq!(only_of(None), Ok(Only::Both));
         assert_eq!(only_of(Some("missions")), Ok(Only::Missions));
         assert_eq!(only_of(Some("transcripts")), Ok(Only::Transcripts));
