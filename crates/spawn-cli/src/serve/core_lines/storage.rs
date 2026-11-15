@@ -118,14 +118,15 @@ mod tests {
             "disk_fall_bytes_per_day": 2_000_000,
             "grew_most": {"store": "unattributed", "bytes_per_day": 1_500_000},
         });
+        let readings = lines(
+            &storage,
+            &Value::Null,
+            &Observed::default(),
+            Value::Null,
+            Vec::new(),
+        );
         let view = answer(
-            &lines(
-                &storage,
-                &Value::Null,
-                &Observed::default(),
-                Value::Null,
-                Vec::new(),
-            ),
+            &adopted(&readings),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -136,19 +137,13 @@ mod tests {
             .iter()
             .map(|line| line["line"].as_str().expect("a name"))
             .collect();
-        assert_eq!(
-            names,
-            ["performance", "storage", "observability", "recoverability"]
-        );
-        let storage_line = &view["lines"][1];
-        let values: Vec<(&str, Value)> = std::iter::once(&storage_line["north_star"])
-            .chain(storage_line["guardrails"].as_array().expect("guardrails"))
-            .map(|figure| {
-                (
-                    figure["key"].as_str().expect("a key"),
-                    figure["value"].clone(),
-                )
-            })
+        assert_eq!(names, ["storage", "performance", "sustainability"]);
+        // The readings keep every storage figure (other pages read them);
+        // the owner's set (objective 176) picks from them by key.
+        let storage_line = &readings[1];
+        let values: Vec<(&str, Value)> = std::iter::once(&storage_line.north_star)
+            .chain(&storage_line.guardrails)
+            .map(|figure| (figure.key, figure.value.clone()))
             .collect();
         assert_eq!(
             values,
@@ -165,14 +160,25 @@ mod tests {
                 ("storage.grew_most", json!(1_500_000)),
             ]
         );
-        // The store that grew most is said beside it (objective 141); no
-        // other figure names one.
-        let guardrails = storage_line["guardrails"].as_array().expect("guardrails");
-        assert_eq!(guardrails[8]["store"], "unattributed");
-        assert_eq!(guardrails[8]["unit"], "bytes_per_day");
-        assert_eq!(guardrails[7]["unit"], "bytes_per_day");
-        assert_eq!(guardrails[7].get("store"), None);
-        assert_eq!(storage_line["north_star"].get("measuring_since_ms"), None);
+        // The store that grew most is said beside it (objective 141), now a
+        // diagnostic; no other figure names one.
+        let diagnostic = |key: &str| {
+            view["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .find(|figure| figure["key"] == key)
+                .cloned()
+                .expect(key)
+        };
+        assert_eq!(diagnostic("storage.grew_most")["store"], "unattributed");
+        assert_eq!(diagnostic("storage.grew_most")["unit"], "bytes_per_day");
+        assert_eq!(diagnostic("storage.disk_fall")["unit"], "bytes_per_day");
+        assert_eq!(diagnostic("storage.disk_fall").get("store"), None);
+        assert_eq!(view["alert_figures"][0]["key"], "storage.free_bytes");
+        assert_eq!(view["alert_figures"][0]["value"], 104);
+        assert_eq!(view["alert_figures"][0]["line"], "storage");
+        assert_eq!(view["lines"][0]["north_star"]["state"], "not_measured_yet");
         still_measuring();
         // No log size: no ratio; no readable test database: none.
         let bare = lines(
@@ -185,16 +191,14 @@ mod tests {
         assert_eq!(bare[1].guardrails[2].value, Value::Null);
         assert_eq!(bare[1].guardrails[3].value, Value::Null);
         // The performance line without its figures: nothing collected.
-        assert_eq!(view["lines"][0]["north_star"]["state"], "not_collected");
+        assert_eq!(view["lines"][1]["north_star"]["state"], "not_collected");
         assert_eq!(
-            view["lines"][0]["guardrails"].as_array().map(Vec::len),
-            Some(4)
+            view["lines"][1]["guardrails"].as_array().map(Vec::len),
+            Some(3)
         );
-        // The other north stars are not collected.
-        for index in [2, 3] {
-            assert_eq!(view["lines"][index]["north_star"]["state"], "not_collected");
-        }
-        assert_eq!(view["lines"][3]["guardrails"], json!([]));
+        // The sustainability north star and restores are not collected.
+        assert_eq!(view["lines"][2]["north_star"]["state"], "not_collected");
+        assert_eq!(view["lines"][2]["guardrails"][0]["state"], "not_collected");
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
     }

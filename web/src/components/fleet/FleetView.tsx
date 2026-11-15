@@ -20,6 +20,7 @@ import { AlwaysOnAgents, uptimeMs } from "./AlwaysOnAgents";
 import { FleetBoard } from "./FleetBoard";
 import { InputBox } from "./InputBox";
 import { CORE_LINES_POLL_MS, fetchCoreLines } from "../home/CoreLines";
+import { coreLinesView } from "../../coreLines";
 import { figureState } from "../../interventions.ts";
 import { INTERVENTIONS_POLL_MS, fetchInterventions } from "./Interventions";
 import { HealthStrip } from "./HealthStrip";
@@ -200,7 +201,11 @@ export function FleetView({
               selectedId={selectedId}
               onSelect={onSelect}
             />
-            <HealthStrip health={data.health} liveness={liveness} />
+            <HealthStrip
+              health={data.health}
+              liveness={liveness}
+              diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
+            />
             <FleetBoard
               groups={groups}
               total={data.agents}

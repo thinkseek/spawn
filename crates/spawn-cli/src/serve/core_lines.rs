@@ -156,6 +156,10 @@ pub(super) struct Figure {
     /// performance north star's report to live by mission): said as
     /// `by_mission`; `None` on every other figure.
     pub(super) by_mission: Option<Value>,
+    /// A figure of the adopted set no code computes yet (objective 176: the
+    /// storage north star, S1 and S2): its value is null and its state
+    /// `not_measured_yet`, never a made-up value.
+    pub(super) not_measured_yet: bool,
 }
 
 impl Figure {
@@ -172,6 +176,15 @@ impl Figure {
             store: None,
             judged: None,
             by_mission: None,
+            not_measured_yet: false,
+        }
+    }
+
+    /// A figure of the adopted set no code computes yet (objective 176).
+    fn not_measured_yet(key: &'static str, name: &'static str, unit: &'static str) -> Self {
+        Figure {
+            not_measured_yet: true,
+            ..Figure::new(key, name, unit, Value::Null)
         }
     }
 
@@ -280,6 +293,7 @@ const DAY_MS: i64 = 86_400_000;
 /// A figure as the answer gives it: with its range and its state.
 pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     let state = match (figure.value.as_f64(), range) {
+        (None, _) if figure.not_measured_yet => "not_measured_yet",
         (None, _) => "not_collected",
         (Some(_), None) => "no_range",
         (Some(value), Some(range)) if range.holds(value) => "in",
@@ -385,29 +399,191 @@ pub(super) fn lines(
     lines
 }
 
+/// The figures the owner's core metric set dropped (objective 176): still
+/// read (other pages read them), in none of the answer's lists, and a range
+/// the file gives one is listed in `ignored_ranges` with [`RETIRED_REASON`].
+pub(super) const RETIRED: [&str; 5] = [
+    "storage.days_left",
+    "storage.database_ratio",
+    "storage.test_database_bytes",
+    "storage.test_database_schemas",
+    "observability.not_measured",
+];
+
+/// Why a dropped figure's range is ignored.
+pub(super) const RETIRED_REASON: &str = "retired by the owner's core metric set (2026-11-14)";
+
+/// The figures demoted to an alert only, each with its line, in order;
+/// one the reading did not make (the drills' ages without a recovery table)
+/// is left out.
+const ALERT_FIGURES: [(&str, &str); 6] = [
+    ("storage", "storage.free_bytes"),
+    ("sustainability", "recoverability.cloud_bundle_age"),
+    ("sustainability", "recoverability.nightly_age"),
+    ("sustainability", "recoverability.nightly_red"),
+    ("sustainability", "recoverability.session_backup_age"),
+    ("sustainability", "recoverability.oldest_drill_age"),
+];
+
+/// The diagnostics on the storage page, in order; none raises an alert but
+/// those in [`ALERTING_DIAGNOSTICS`].
+const DIAGNOSTICS: [&str; 6] = [
+    "storage.unowned_scratch_bytes",
+    "storage.disk_fall",
+    "storage.grew_most",
+    "storage.archive_growth",
+    "storage.leaked_test_schemas",
+    "performance.usd_per_landing",
+];
+
+/// The diagnostics that still raise their out-of-range alert, each with its
+/// line (rev-e's 176 R1 F1): leaked test schemas "stays visible until it has
+/// read 0 for 7 days, then an alert only" (objective 182); until 182 it
+/// raises while it is shown.
+const ALERTING_DIAGNOSTICS: [(&str, &str); 1] = [("storage.leaked_test_schemas", "storage")];
+
+/// The line a diagnostic raises its alert under, if it raises one.
+pub(super) fn alerting_line(key: &str) -> Option<&'static str> {
+    ALERTING_DIAGNOSTICS
+        .iter()
+        .find(|(diagnostic, _)| *diagnostic == key)
+        .map(|(_, line)| *line)
+}
+
+/// The core metric set the owner adopted on 2026-11-14 (objective 176):
+/// three lines (storage, performance, sustainability), the figures demoted
+/// to an alert with their lines, and the diagnostics.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Set {
+    pub(super) lines: Vec<Line>,
+    pub(super) alert_figures: Vec<(&'static str, Figure)>,
+    pub(super) diagnostics: Vec<Figure>,
+}
+
+impl Set {
+    /// Every figure of the set: the lines', the alert figures and the
+    /// diagnostics.
+    pub(super) fn figures(&self) -> impl Iterator<Item = &Figure> {
+        self.lines
+            .iter()
+            .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+            .chain(self.alert_figures.iter().map(|(_, figure)| figure))
+            .chain(&self.diagnostics)
+    }
+}
+
+/// The adopted set from `readings`, the figures [`lines`] reads, picked by
+/// key: keys stay as they were (trends and ranges files keep working). A
+/// line's figure the readings lack is not collected; an alert figure or a
+/// diagnostic they lack is left out.
+pub(super) fn adopted(readings: &[Line]) -> Set {
+    let find = |key: &str| {
+        readings
+            .iter()
+            .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+            .find(|figure| figure.key == key)
+            .cloned()
+    };
+    let card = |key: &'static str, name: &'static str, unit: &'static str| {
+        find(key).unwrap_or_else(|| Figure::not_collected(key, name, unit))
+    };
+    let lines = vec![
+        Line {
+            name: "storage",
+            north_star: Figure::not_measured_yet(
+                "storage.bytes_per_landing",
+                "Bytes a landing leaves behind",
+                "bytes",
+            ),
+            guardrails: vec![
+                Figure::not_measured_yet("storage.rebuildable_bytes", "Rebuildable bytes", "bytes"),
+                Figure::not_measured_yet("storage.kept_share", "Share kept on purpose", "share"),
+            ],
+        },
+        Line {
+            name: "performance",
+            north_star: card(
+                "performance.report_to_live",
+                "Time from report to live",
+                "ms",
+            ),
+            guardrails: vec![
+                card("performance.gate_time", "Gate time per run", "ms"),
+                card(
+                    "performance.decided_nothing",
+                    "Gate time that decided nothing",
+                    "share",
+                ),
+                card(
+                    "performance.first_pass",
+                    "Landings that pass first time",
+                    "share",
+                ),
+            ],
+        },
+        Line {
+            name: "sustainability",
+            north_star: card(
+                "observability.interventions_per_agent_hour",
+                "Human interventions per agent-hour",
+                "ratio",
+            ),
+            guardrails: vec![
+                card(
+                    "recoverability.restores_passed",
+                    "Critical resources with a restore passed in 7 days",
+                    "count",
+                ),
+                card(
+                    "observability.needs_you_right",
+                    "Needs you is right",
+                    "share",
+                ),
+                card("observability.unpriced_share", "Use with no price", "share"),
+                card(
+                    "recoverability.cloud_dump_age",
+                    "Age of the newest database copy",
+                    "ms",
+                ),
+            ],
+        },
+    ];
+    Set {
+        lines,
+        alert_figures: ALERT_FIGURES
+            .iter()
+            .filter_map(|(line, key)| find(key).map(|figure| (*line, figure)))
+            .collect(),
+        diagnostics: DIAGNOSTICS.iter().filter_map(|key| find(key)).collect(),
+    }
+}
+
 /// The answer from the lines, the ranges file's path (null when there is
 /// no workspace root to find it under) and its contents
 /// (`Err` when it could not be read for another reason than not being
 /// there; `Ok(None)` when it is not there), every figure with its trend
 /// from `trends` ([`trends`]; empty without one).
 pub(super) fn answer(
-    lines: &[Line],
+    set: &Set,
     ranges_file: &Value,
     contents: Result<Option<String>, String>,
     trends: &BTreeMap<String, Vec<Value>>,
 ) -> Value {
-    let known: Vec<&str> = lines
-        .iter()
-        .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
-        .map(|figure| figure.key)
-        .collect();
-    let ranges = match contents {
+    let known: Vec<&str> = set.figures().map(|figure| figure.key).collect();
+    let mut ranges = match contents {
         Ok(text) => parse_ranges(text.as_deref(), &known),
         Err(error) => Ranges {
             error: Some(error),
             ..Ranges::default()
         },
     };
+    // A range of a figure the owner's set dropped is said so, not unknown.
+    for (key, reason) in &mut ranges.ignored {
+        if RETIRED.contains(&key.as_str()) && *reason == "unknown figure" {
+            *reason = RETIRED_REASON;
+        }
+    }
+    let lines = &set.lines;
     let with_range = |figure: &Figure| {
         let mut view = figure_json(figure, ranges.bounds.get(figure.key).copied());
         view["trend"] = json!(trends.get(figure.key).cloned().unwrap_or_default());
@@ -421,6 +597,26 @@ pub(super) fn answer(
                 "north_star": with_range(&line.north_star),
                 "guardrails": line.guardrails.iter().map(with_range).collect::<Vec<_>>(),
             }))
+            .collect::<Vec<_>>(),
+        "alert_figures": set
+            .alert_figures
+            .iter()
+            .map(|(line, figure)| {
+                let mut view = with_range(figure);
+                view["line"] = json!(line);
+                view
+            })
+            .collect::<Vec<_>>(),
+        "diagnostics": set
+            .diagnostics
+            .iter()
+            .map(|figure| {
+                let mut view = with_range(figure);
+                if let Some(line) = alerting_line(figure.key) {
+                    view["line"] = json!(line);
+                }
+                view
+            })
             .collect::<Vec<_>>(),
         "ranges_file": ranges_file,
         "ranges_error": ranges.error,
@@ -684,7 +880,12 @@ pub(super) fn core_lines_timed(
     let (figures, extras) = lines_at(store, nightly, text, &samples.0, now_ms, parts)?;
     let samples = measured_samples(samples.0, samples.1);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    let mut view = answer(&figures, &file, contents, &trends(&samples, now_ms));
+    let mut view = answer(
+        &adopted(&figures),
+        &file,
+        contents,
+        &trends(&samples, now_ms),
+    );
     view["drills"] = extras.drills;
     with_groups(&mut view, extras.groups);
     view["scratch"] = extras.scratch;
@@ -894,10 +1095,8 @@ pub(crate) fn claimed_scratch(now_ms: i64) -> Result<ClaimedScratch, String> {
 
 /// The figures that have a value, by key: what a `host.core_lines` sample
 /// holds.
-pub(super) fn values_of(lines: &[Line]) -> Map<String, Value> {
-    lines
-        .iter()
-        .flat_map(|line| std::iter::once(&line.north_star).chain(&line.guardrails))
+pub(super) fn values_of(set: &Set) -> Map<String, Value> {
+    set.figures()
         .filter(|figure| !figure.value.is_null() && !figure.stale)
         .map(|figure| (figure.key.to_string(), figure.value.clone()))
         .collect()
@@ -924,7 +1123,7 @@ pub(crate) fn sample_values() -> Result<Map<String, Value>, String> {
         now_ms,
         &mut Parts::default(),
     )?;
-    Ok(values_of(&lines))
+    Ok(values_of(&adopted(&lines)))
 }
 
 #[cfg(test)]
@@ -1045,7 +1244,7 @@ mod tests {
             status("storage", now - 1_200_000),
         ];
         let mut figures = lines(
-            &json!({"free_bytes": 3, "days_left": 9}),
+            &json!({"free_bytes": 3, "days_left": 9, "growth_bytes_per_day": 7}),
             &json!({"gate_time": 5}),
             &Observed::default(),
             Value::Null,
@@ -1070,8 +1269,12 @@ mod tests {
         // The free space is read at each reading: no group, no age.
         let free = figure_json(&find("storage.free_bytes"), None);
         assert_eq!((free.get("as_of_ms"), free.get("stale")), (None, None));
-        let values = super::values_of(&figures);
-        assert_eq!(values.get("storage.days_left"), None, "stale: not sampled");
+        let values = super::values_of(&super::adopted(&figures));
+        assert_eq!(
+            values.get("storage.archive_growth"),
+            None,
+            "stale: not sampled"
+        );
         assert_eq!(values["storage.free_bytes"], 3);
         assert_eq!(values["performance.gate_time"], 5);
         let mut parts = super::Parts::default();
@@ -1102,7 +1305,7 @@ mod tests {
         super::aged(&mut figures, &[], 2_000_000);
         assert_eq!(figures, before);
         let trends = std::collections::BTreeMap::new();
-        let view = super::answer(&figures, &Value::Null, Ok(None), &trends);
+        let view = super::answer(&super::adopted(&figures), &Value::Null, Ok(None), &trends);
         let mut grouped = view.clone();
         super::with_groups(&mut grouped, Vec::new());
         assert_eq!(grouped, view, "no `groups` key");
@@ -1135,14 +1338,257 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
             Value::Null,
             Vec::new(),
         );
-        let values = super::values_of(&figures);
-        // The count not measured always has a value (objective 088): the
-        // other 17 figures that have none (objective 094's two and
-        // objective 141's two among them).
+        let values = super::values_of(&super::adopted(&figures));
+        // The owner's set (objective 176): the figures dropped from it (days
+        // left, the count not measured) are no longer sampled.
+        assert_eq!(Value::Object(values), json!({"storage.free_bytes": 3}));
+    }
+
+    /// The answer of the owner's set (objective 176) over readings with
+    /// every storage figure, the performance figures, the interventions and
+    /// the recoverability figures (the drills' ages when `drills`), and the
+    /// ranges file `ranges`.
+    fn adopted_view(drills: bool, ranges: &str) -> Value {
+        let storage = json!({
+            "days_left": 1234, "free_bytes": 104, "growth_bytes_per_day": 10,
+            "database": {"bytes": 300, "log_bytes": 100},
+            "test_databases": [{"bytes": 7, "schemas": 3}],
+            "unowned_scratch_bytes": 400_000, "leaked_test_schemas": 1,
+            "disk_fall_bytes_per_day": 5, "grew_most": {"store": "archive", "bytes_per_day": 6},
+        });
+        let performance = json!({"report_to_live": 60_000, "gate_time": 5, "decided_nothing": 0.1,
+                                 "first_pass": 0.9, "usd_per_landing": 2.5});
+        let observed = Observed {
+            human_per_agent_hour: json!(0.125),
+            ..Observed::default()
+        };
+        let mut guardrails = vec![
+            Figure::new(
+                "recoverability.cloud_dump_age",
+                "Age of the newest database copy",
+                "ms",
+                json!(1),
+            ),
+            Figure::new("recoverability.cloud_bundle_age", "Bundle", "ms", json!(2)),
+            Figure::new("recoverability.nightly_age", "Nightly", "ms", json!(3)),
+            Figure::new("recoverability.nightly_red", "Reds", "count", json!(1)),
+        ];
+        if drills {
+            guardrails.push(Figure::new(
+                "recoverability.session_backup_age",
+                "Sessions",
+                "ms",
+                json!(4),
+            ));
+            guardrails.push(Figure::new(
+                "recoverability.oldest_drill_age",
+                "Drill",
+                "ms",
+                json!(5),
+            ));
+        }
+        let readings = lines(&storage, &performance, &observed, json!(2), guardrails);
+        super::answer(
+            &super::adopted(&readings),
+            &Value::Null,
+            Ok(Some(ranges.to_string())),
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    fn keys(figures: &Value) -> Vec<String> {
+        figures
+            .as_array()
+            .expect("figures")
+            .iter()
+            .map(|figure| figure["key"].as_str().expect("a key").to_string())
+            .collect()
+    }
+
+    /// Objective 176: the three lines in the owner's order, each figure by
+    /// key; the storage figures no code computes yet are not measured yet
+    /// (with their range), and a figure with a value is never that.
+    #[test]
+    fn the_answer_is_the_adopted_core_metric_set() {
+        let view = adopted_view(
+            false,
+            r#"{"ranges": {"storage.bytes_per_landing": {"max": 52428800},
+                "observability.interventions_per_agent_hour": {"max": 0.1}}}"#,
+        );
+        let shape: Vec<(String, String, Vec<String>)> = view["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|line| {
+                (
+                    line["line"].as_str().expect("a name").to_string(),
+                    line["north_star"]["key"]
+                        .as_str()
+                        .expect("a key")
+                        .to_string(),
+                    keys(&line["guardrails"]),
+                )
+            })
+            .collect();
+        let owned = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(
-            Value::Object(values),
-            json!({"storage.free_bytes": 3, "storage.days_left": 9,
-                   "observability.not_measured": 17})
+            shape,
+            [
+                (
+                    "storage".to_string(),
+                    "storage.bytes_per_landing".to_string(),
+                    owned(&["storage.rebuildable_bytes", "storage.kept_share"])
+                ),
+                (
+                    "performance".to_string(),
+                    "performance.report_to_live".to_string(),
+                    owned(&[
+                        "performance.gate_time",
+                        "performance.decided_nothing",
+                        "performance.first_pass"
+                    ])
+                ),
+                (
+                    "sustainability".to_string(),
+                    "observability.interventions_per_agent_hour".to_string(),
+                    owned(&[
+                        "recoverability.restores_passed",
+                        "observability.needs_you_right",
+                        "observability.unpriced_share",
+                        "recoverability.cloud_dump_age"
+                    ])
+                ),
+            ]
+        );
+        let storage = &view["lines"][0];
+        assert_eq!(
+            [
+                &storage["north_star"]["value"],
+                &storage["north_star"]["state"],
+                &storage["north_star"]["range"]
+            ],
+            [
+                &Value::Null,
+                &json!("not_measured_yet"),
+                &json!({"max": 52_428_800})
+            ]
+        );
+        for guardrail in storage["guardrails"].as_array().expect("guardrails") {
+            assert_eq!(guardrail["state"], "not_measured_yet");
+            assert_eq!(guardrail["value"], Value::Null);
+        }
+        let star = &view["lines"][2]["north_star"];
+        assert_eq!(
+            [&star["value"], &star["window"], &star["state"]],
+            [&json!(0.125), &json!("24h"), &json!("out")]
+        );
+        assert_eq!(
+            view["lines"][2]["guardrails"][0]["value"], 2,
+            "restores passed"
+        );
+        for line in view["lines"].as_array().expect("lines").iter().skip(1) {
+            for figure in std::iter::once(&line["north_star"])
+                .chain(line["guardrails"].as_array().expect("guardrails"))
+            {
+                assert_ne!(figure["state"], "not_measured_yet", "{figure}");
+            }
+        }
+    }
+
+    /// Objective 176: the demoted figures are the alert figures, each with
+    /// its line (the drills' ages only with a recovery table), or the
+    /// diagnostics, in order; leaked test schemas alone carries its line.
+    #[test]
+    fn the_demoted_figures_are_alert_figures_with_their_lines_or_diagnostics() {
+        let view = adopted_view(
+            false,
+            r#"{"ranges": {"recoverability.nightly_red": {"max": 0}}}"#,
+        );
+        let lined = |figures: &Value| -> Vec<(String, String)> {
+            figures
+                .as_array()
+                .expect("figures")
+                .iter()
+                .filter(|figure| figure["line"].is_string())
+                .map(|figure| {
+                    (
+                        figure["line"].as_str().unwrap_or_default().to_string(),
+                        figure["key"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let pair = |line: &str, key: &str| (line.to_string(), key.to_string());
+        assert_eq!(
+            lined(&view["alert_figures"]),
+            [
+                pair("storage", "storage.free_bytes"),
+                pair("sustainability", "recoverability.cloud_bundle_age"),
+                pair("sustainability", "recoverability.nightly_age"),
+                pair("sustainability", "recoverability.nightly_red"),
+            ]
+        );
+        assert_eq!(view["alert_figures"][3]["state"], "out");
+        assert_eq!(
+            keys(&view["diagnostics"]),
+            [
+                "storage.unowned_scratch_bytes",
+                "storage.disk_fall",
+                "storage.grew_most",
+                "storage.archive_growth",
+                "storage.leaked_test_schemas",
+                "performance.usd_per_landing",
+            ]
+        );
+        assert_eq!(
+            lined(&view["diagnostics"]),
+            [pair("storage", "storage.leaked_test_schemas")]
+        );
+        assert_eq!(view["diagnostics"][2]["store"], "archive");
+        let with_drills = adopted_view(true, r#"{"ranges": {}}"#);
+        assert_eq!(
+            keys(&with_drills["alert_figures"])[4..],
+            [
+                "recoverability.session_backup_age",
+                "recoverability.oldest_drill_age"
+            ]
+        );
+        assert_eq!(with_drills["alert_figures"][5]["line"], "sustainability");
+    }
+
+    /// Objective 176: a dropped figure is in none of the lists, and a range
+    /// the file still gives one is retired by name; an unknown key stays
+    /// unknown.
+    #[test]
+    fn a_dropped_figure_is_nowhere_and_its_range_is_retired() {
+        let view = adopted_view(
+            true,
+            r#"{"ranges": {"storage.days_left": {"min": 180}, "storage.database_ratio": {"max": 10},
+                "observability.not_measured": {"max": 0}, "storage.free_bites": {"min": 1}}}"#,
+        );
+        let mut every: Vec<String> = Vec::new();
+        for line in view["lines"].as_array().expect("lines") {
+            every.push(
+                line["north_star"]["key"]
+                    .as_str()
+                    .expect("a key")
+                    .to_string(),
+            );
+            every.extend(keys(&line["guardrails"]));
+        }
+        every.extend(keys(&view["alert_figures"]));
+        every.extend(keys(&view["diagnostics"]));
+        for dropped in super::RETIRED {
+            assert!(!every.iter().any(|key| key == dropped), "{dropped}");
+        }
+        assert_eq!(
+            view["ignored_ranges"],
+            json!([
+                {"key": "observability.not_measured", "reason": super::RETIRED_REASON},
+                {"key": "storage.database_ratio", "reason": super::RETIRED_REASON},
+                {"key": "storage.days_left", "reason": super::RETIRED_REASON},
+                {"key": "storage.free_bites", "reason": "unknown figure"},
+            ])
         );
     }
 }

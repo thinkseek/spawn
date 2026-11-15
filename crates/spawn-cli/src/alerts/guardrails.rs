@@ -111,32 +111,44 @@ struct Reading {
     stale: bool,
 }
 
-/// Every figure of an answer of `GET /api/core-lines`, north stars and
-/// guardrails alike.
+/// Every figure of an answer of `GET /api/core-lines` the step watches
+/// (objective 176): the lines' north stars and guardrails, the figures
+/// demoted to an alert (`alert_figures`), and the diagnostics that carry a
+/// line (leaked test schemas, until objective 182), each under its line.
+/// Any other diagnostic raises nothing.
 fn figures(answer: &Value) -> Vec<Reading> {
-    answer["lines"]
+    let reading = |line: &str, figure: &Value| {
+        Some(Reading {
+            line: line.to_string(),
+            key: figure["key"].as_str()?.to_string(),
+            name: figure["name"].as_str().unwrap_or_default().to_string(),
+            unit: figure["unit"].as_str().unwrap_or_default().to_string(),
+            value: figure["value"].clone(),
+            range: figure["range"].clone(),
+            state: figure["state"].as_str().unwrap_or_default().to_string(),
+            stale: figure["stale"] == true,
+        })
+    };
+    let mut figures: Vec<Reading> = answer["lines"]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|line| {
-            let name = line["line"].as_str().unwrap_or_default().to_string();
+            let name = line["line"].as_str().unwrap_or_default();
             std::iter::once(&line["north_star"])
                 .chain(line["guardrails"].as_array().into_iter().flatten())
-                .filter_map(move |figure| {
-                    Some(Reading {
-                        line: name.clone(),
-                        key: figure["key"].as_str()?.to_string(),
-                        name: figure["name"].as_str().unwrap_or_default().to_string(),
-                        unit: figure["unit"].as_str().unwrap_or_default().to_string(),
-                        value: figure["value"].clone(),
-                        range: figure["range"].clone(),
-                        state: figure["state"].as_str().unwrap_or_default().to_string(),
-                        stale: figure["stale"] == true,
-                    })
-                })
+                .filter_map(|figure| reading(name, figure))
                 .collect::<Vec<_>>()
         })
-        .collect()
+        .collect();
+    for list in ["alert_figures", "diagnostics"] {
+        for figure in answer[list].as_array().into_iter().flatten() {
+            if let Some(line) = figure["line"].as_str() {
+                figures.extend(reading(line, figure));
+            }
+        }
+    }
+    figures
 }
 
 /// A value in its unit's words, as the card says it (web/src/coreLines.ts),
@@ -562,6 +574,49 @@ mod tests {
     }
 
     const GIB: i64 = 1_073_741_824;
+
+    /// Objective 176: an answer of the owner's set with free disk an alert
+    /// figure under storage, leaked test schemas a diagnostic with its line
+    /// and scratch nobody owns one without, all three out of range.
+    fn adopted_answer() -> Value {
+        json!({
+            "lines": [{"line": "storage",
+                "north_star": {"key": "storage.bytes_per_landing", "name": "Bytes a landing leaves behind",
+                    "unit": "bytes", "value": null, "range": null, "state": "not_measured_yet"},
+                "guardrails": []}],
+            "alert_figures": [{"key": "storage.free_bytes", "name": "Free disk", "unit": "bytes",
+                "value": 2 * GIB, "range": {"min": 42_949_672_960_i64}, "state": "out", "line": "storage"}],
+            "diagnostics": [
+                {"key": "storage.unowned_scratch_bytes", "name": "Scratch nobody owns", "unit": "bytes",
+                 "value": 9 * GIB, "range": {"max": GIB}, "state": "out"},
+                {"key": "storage.leaked_test_schemas", "name": "Leaked test schemas", "unit": "count",
+                 "value": 4, "range": {"max": 0}, "state": "out", "line": "storage"},
+            ],
+        })
+    }
+
+    #[test]
+    fn an_alert_figure_or_a_lined_diagnostic_raises_and_any_other_diagnostic_never() {
+        let mut monitor = monitor();
+        assert!(read(&mut monitor, 0, Ok(adopted_answer())).0.is_empty());
+        let (fired, _) = read(&mut monitor, RAISE, Ok(adopted_answer()));
+        let mut fired = keys(&fired);
+        fired.sort();
+        assert_eq!(
+            fired,
+            [
+                format!("fire {KIND}:storage.free_bytes:0"),
+                format!("fire {KIND}:storage.leaked_test_schemas:0"),
+            ]
+        );
+        let (later, _) = read(&mut monitor, 10 * RAISE, Ok(adopted_answer()));
+        assert!(
+            !keys(&later)
+                .iter()
+                .any(|key| key.contains("unowned_scratch_bytes")),
+            "a diagnostic without a line never raises"
+        );
+    }
 
     #[test]
     fn a_figure_held_out_raises_once_after_the_hold_and_a_reading_in_restarts_it() {
