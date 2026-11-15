@@ -86,14 +86,14 @@ select coalesce(jsonb_agg(jsonb_build_object('at_ms', s.recorded_at_ms, 'values'
 /// their partial index (`spawn_events_host_core_lines`, on
 /// `recorded_at_ms`), stopping at the first that carries it.
 pub(crate) const FIRST_CORE_LINES_VALUE: &str = r"
-select to_jsonb((
+select coalesce(to_jsonb((
   select e.recorded_at_ms
     from spawn_events e
    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
      and e.kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'
      and jsonb_typeof(e.kind -> 'detail' -> 'record' -> 'values' -> $1::text) = 'number'
    order by e.recorded_at_ms
-   limit 1))";
+   limit 1)), 'null'::jsonb)";
 
 /// The `host.storage_bytes` readings (objective 180) the storage figures are
 /// measured from (objective 185), and the database's clock `now_ms`:
