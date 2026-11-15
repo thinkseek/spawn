@@ -105,6 +105,16 @@ fn why_old_walked(
             0,
         ));
     }
+    walk_history(store, git_dir, commit)
+}
+
+/// The third check of [`why_old`] on a commit of the repository: its whole
+/// history, walked against the commits proven clean, or its proof.
+fn walk_history(
+    store: &PostgresStore,
+    git_dir: &str,
+    commit: &str,
+) -> Result<(Option<String>, usize), String> {
     let id = commit.to_ascii_lowercase();
     let (olds, clean, proven) = with_proofs(git_dir, |proofs| {
         let proven = if proofs.clean.contains(&id) {
@@ -121,13 +131,12 @@ fn why_old_walked(
     if let Some(proven) = proven {
         return Ok((proven, 0));
     }
-    let olds = match olds {
-        Some(olds) => olds,
-        None => {
-            let olds = Arc::new(store.commit_map_olds().map_err(error)?);
-            with_proofs(git_dir, |proofs| proofs.olds = Some(olds.clone()));
-            olds
-        }
+    let olds = if let Some(olds) = olds {
+        olds
+    } else {
+        let olds = Arc::new(store.commit_map_olds().map_err(|error| error.to_string())?);
+        with_proofs(git_dir, |proofs| proofs.olds = Some(olds.clone()));
+        olds
     };
     let walk = |clean: &VecDeque<String>| {
         let mut arguments = vec!["--git-dir", git_dir, "rev-list", commit];
