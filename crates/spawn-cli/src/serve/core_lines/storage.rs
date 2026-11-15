@@ -135,7 +135,11 @@ pub(super) fn bytes_per_landing(readings: &Value) -> Figure {
     const NAME: &str = "Bytes a landing leaves behind";
     let newest = &readings["newest"];
     let Some(newest_at) = newest["at_ms"].as_i64() else {
-        return not_measured(KEY, NAME, "not measured yet: no storage reading yet".to_string());
+        return not_measured(
+            KEY,
+            NAME,
+            "not measured yet: no storage reading yet".to_string(),
+        );
     };
     let older = &readings["older"];
     let Some(older_at) = older["at_ms"].as_i64() else {
@@ -157,7 +161,10 @@ pub(super) fn bytes_per_landing(readings: &Value) -> Figure {
     let mut one_only: Vec<&str> = Vec::new();
     let mut total: i64 = 0;
     for name in names {
-        match (bytes_of(&newest["sources"], name), bytes_of(&older["sources"], name)) {
+        match (
+            bytes_of(&newest["sources"], name),
+            bytes_of(&older["sources"], name),
+        ) {
             (Some(now), Some(then)) => {
                 let gain = now.saturating_sub(then);
                 total = total.saturating_add(gain);
@@ -191,7 +198,9 @@ pub(super) fn bytes_per_landing(readings: &Value) -> Figure {
             ..not_measured(
                 KEY,
                 NAME,
-                format!("not measured: no landing in the {hours} h between the two readings{left_out}"),
+                format!(
+                    "not measured: no landing in the {hours} h between the two readings{left_out}"
+                ),
             )
         };
     }
@@ -214,7 +223,11 @@ pub(super) fn rebuildable_bytes(readings: &Value) -> Figure {
     const NAME: &str = "Rebuildable bytes";
     let newest = &readings["newest"];
     let Some(newest_at) = newest["at_ms"].as_i64() else {
-        return not_measured(KEY, NAME, "not measured yet: no storage reading yet".to_string());
+        return not_measured(
+            KEY,
+            NAME,
+            "not measured yet: no storage reading yet".to_string(),
+        );
     };
     let sources = &newest["sources"];
     let mut by_source = Map::new();
@@ -306,6 +319,9 @@ mod tests {
                 ("storage.leaked_test_schemas", json!(4)),
                 ("storage.disk_fall", json!(2_000_000)),
                 ("storage.grew_most", json!(1_500_000)),
+                // Objective 185: no storage readings here, no value.
+                ("storage.bytes_per_landing", Value::Null),
+                ("storage.rebuildable_bytes", Value::Null),
             ]
         );
         // The store that grew most is said beside it (objective 141), now a
@@ -371,5 +387,128 @@ mod tests {
             (grew["value"].clone(), grew.get("store")),
             (Value::Null, None)
         );
+    }
+
+    /// A `host.storage_bytes` reading's sources as the loop records them.
+    fn sources(scratch: &Value, transcripts: u64, live: &Value) -> Value {
+        json!({"transcripts": {"bytes": transcripts}, "build_cache": {"bytes": 1_048_576},
+               "scratch": scratch, "test_databases": {"bytes": 0, "databases": 0},
+               "session_backups": {"not_measured": "no status file"}, "live_database": live})
+    }
+
+    const MIB: i64 = 1_048_576;
+    const H: i64 = 3_600_000;
+
+    /// Objective 185: the gain of the sources measured in both readings over
+    /// the landings between them, each source's gain by source, the sources
+    /// measured in one reading only named; not measured, with why, without
+    /// two readings, a source in both or a landing.
+    #[test]
+    fn the_storage_north_star_is_the_days_gain_over_its_landings() {
+        let star = |readings: &Value| figure_json(&super::bytes_per_landing(readings), None);
+        // No reading.
+        let none = star(&Value::Null);
+        assert_eq!(
+            [&none["value"], &none["state"]],
+            [&Value::Null, &json!("not_measured_yet")]
+        );
+        assert_eq!(none["note"], "not measured yet: no storage reading yet");
+        // One reading.
+        let newest = json!({"at_ms": 48 * H, "sources": sources(&json!({"bytes": 8 * MIB}), 512, &json!({"bytes": 999}))});
+        let one = star(&json!({"newest": newest, "older": null, "landings": 0}));
+        assert_eq!(one["state"], "not_measured_yet");
+        assert_eq!(
+            one["note"],
+            "not measured yet: the figure needs two storage readings a day apart"
+        );
+        assert_eq!(one["as_of_ms"], 48 * H);
+        // Two, 47 h apart, 3 landings: 6 MiB of scratch over 3.
+        let older = json!({"at_ms": H, "sources": sources(&json!({"bytes": 2 * MIB}), 512, &json!({"not_measured": "seeded"}))});
+        let two = star(&json!({"newest": newest, "older": older, "landings": 3}));
+        assert_eq!(two["value"], 2 * MIB);
+        assert_eq!(two["state"], "no_range");
+        assert_eq!(
+            two["by_source"],
+            json!({"build_cache": 0, "scratch": 6 * MIB, "test_databases": 0, "transcripts": 0})
+        );
+        assert_eq!(
+            two["note"],
+            "3 landing(s) in the 47 h between the two readings (the integrator's and the owner's, \
+             on every mission and source); not measured in both readings: live_database, session_backups"
+        );
+        assert_eq!(two["as_of_ms"], 48 * H);
+        // Against a range, as any figure.
+        let ranged = figure_json(
+            &super::bytes_per_landing(&json!({"newest": newest, "older": older, "landings": 3})),
+            Some(Range {
+                min: None,
+                max: Some(1_048_576.0),
+            }),
+        );
+        assert_eq!(ranged["state"], "out");
+        // No landing between them: not measured, its gains still by source.
+        let idle = star(&json!({"newest": newest, "older": older, "landings": 0}));
+        assert_eq!(
+            [&idle["value"], &idle["state"]],
+            [&Value::Null, &json!("not_measured_yet")]
+        );
+        assert!(
+            idle["note"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("not measured: no landing in the 47 h")),
+            "{idle}"
+        );
+        assert_eq!(idle["by_source"]["scratch"], 6 * MIB);
+        // No source measured in both.
+        let apart = star(
+            &json!({"newest": {"at_ms": 48 * H, "sources": {"scratch": {"bytes": 1}}},
+                                 "older": {"at_ms": 0, "sources": {"scratch": {"not_measured": "over"}}},
+                                 "landings": 4}),
+        );
+        assert_eq!(apart["value"], Value::Null);
+        assert_eq!(
+            apart["note"],
+            "not measured: no source is measured in both readings; not measured in both readings: scratch"
+        );
+        assert!(apart.get("by_source").is_none());
+    }
+
+    /// Objective 185: S1 is the newest reading's scratch, build cache and
+    /// test databases, each by source; one of them not measured leaves S1
+    /// not measured, its note giving each one's why.
+    #[test]
+    fn rebuildable_bytes_are_scratch_build_cache_and_test_databases() {
+        let s1 = |readings: &Value| figure_json(&super::rebuildable_bytes(readings), None);
+        let none = s1(&Value::Null);
+        assert_eq!(
+            [&none["value"], &none["state"]],
+            [&Value::Null, &json!("not_measured_yet")]
+        );
+        let read = s1(
+            &json!({"newest": {"at_ms": 7, "sources": sources(&json!({"bytes": 2 * MIB}), 512, &json!({"bytes": 999}))}}),
+        );
+        assert_eq!(
+            read["value"],
+            3 * MIB,
+            "transcripts and the live database are not rebuildable"
+        );
+        assert_eq!(
+            read["by_source"],
+            json!({"build_cache": MIB, "scratch": 2 * MIB, "test_databases": 0})
+        );
+        assert_eq!(read["as_of_ms"], 7);
+        assert!(read.get("note").is_none());
+        let over = s1(&json!({"newest": {"at_ms": 7, "sources": {
+            "scratch": {"not_measured": "over the bound of 1200 s (9 files read)"},
+            "build_cache": {"bytes": 1}}}}));
+        assert_eq!(
+            [&over["value"], &over["state"]],
+            [&Value::Null, &json!("not_measured_yet")]
+        );
+        assert_eq!(
+            over["note"],
+            "not measured: scratch: over the bound of 1200 s (9 files read); test_databases: not in the reading"
+        );
+        assert!(over.get("by_source").is_none());
     }
 }
