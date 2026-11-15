@@ -124,23 +124,10 @@ const DRILL_PREFIX: &str = "spawn-restore-drill-";
 const NAMED: usize = 20;
 
 /// `spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]
-/// [--only missions]`.
+/// [--only missions|transcripts]`.
 pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
-    let only = match only_missions(flags.get("only").as_deref()) {
-        Ok(only) => only,
-        Err(error) => {
-            eprintln!("spawn backup restore-drill: {error}");
-            return Ok(2);
-        }
-    };
-    let resources: &[&'static str] = if only {
-        println!(
-            "restore-drill: --only missions: the mission repositories alone; no transcript \
-             unpacked or restored"
-        );
-        &[MISSIONS]
-    } else {
-        &[TRANSCRIPTS, MISSIONS]
+    let Some((only, resources)) = resources_of(flags) else {
+        return Ok(2);
     };
     let settings = match Settings::from_env(flags) {
         Ok(settings) => settings,
@@ -149,23 +136,8 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(2);
         }
     };
-    let parent = flags
-        .get("into")
-        .map_or_else(|| PathBuf::from(DEFAULT_PARENT), PathBuf::from);
-    let guards: Vec<(&str, PathBuf)> = [
-        ("$HOME", env_value("HOME").map(PathBuf::from)),
-        ("$SPAWN_LIVE", env_value("SPAWN_LIVE").map(PathBuf::from)),
-        ("the workspace root", Some(settings.root.clone())),
-    ]
-    .into_iter()
-    .filter_map(|(name, path)| Some((name, path?)))
-    .collect();
-    let parent = match drill_parent(&parent, &guards) {
-        Ok(parent) => parent,
-        Err(error) => {
-            eprintln!("spawn backup restore-drill: {error}");
-            return Ok(2);
-        }
+    let Some(parent) = parent_of(flags, &settings) else {
+        return Ok(2);
     };
     let started = Instant::now();
     let store = open_store()?;
@@ -206,15 +178,41 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(unrestorable(&store, &records, &reason, started, resources));
         }
     };
-    let drill = DrillDir::create(&parent)?;
+    // Before anything is fetched: the transcripts drill's bytes above the
+    // floor, or no drill (exit 2, nothing recorded, nothing made).
+    if only == Only::Transcripts
+        && let Err(refusal) = above_floor(&chain, &parent)
+    {
+        eprintln!("spawn backup restore-drill: {refusal}");
+        return Ok(2);
+    }
+    let mut drill = DrillDir::create(&parent)?;
+    if only == Only::Transcripts {
+        drill.plain_only();
+    }
     let result = run(&store, &settings, &chain, &seal, drill.path(), only);
     let newest = chain[chain.len() - 1];
-    let (code, outcomes) = verdicts(result, resources);
-    if flags.switch("keep") {
+    let (mut code, mut outcomes) = verdicts(result, resources);
+    let removed = if flags.switch("keep") {
         println!("restore-drill: kept {}", drill.path().display());
         drill.keep();
+        Ok(())
     } else {
-        drill.remove()?;
+        drill.remove()
+    };
+    if let Err(error) = removed {
+        if only != Only::Transcripts {
+            return Err(error);
+        }
+        // The folder left (not plain, or no longer the one made): said, and
+        // the drill fails.
+        println!("restore-drill: FAILED: {error}");
+        code = code.max(1);
+        for (_, outcome) in &mut outcomes {
+            if matches!(outcome, Outcome::Passed) {
+                *outcome = Outcome::Unrestorable(error.clone());
+            }
+        }
     }
     let key = bundle_key(newest);
     let verdict = Verdict {
@@ -223,6 +221,120 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         duration_ms: elapsed_ms(started),
     };
     Ok(record_verdicts(&store, &verdict, &outcomes).unwrap_or(code))
+}
+
+/// `--only`'s drill and the resources it proves, its line said; `None`
+/// (said) when `--only`'s value is refused: exit 2, nothing recorded.
+fn resources_of(flags: &Flags) -> Option<(Only, &'static [&'static str])> {
+    let only = match only_of(flags.get("only").as_deref()) {
+        Ok(only) => only,
+        Err(error) => {
+            eprintln!("spawn backup restore-drill: {error}");
+            return None;
+        }
+    };
+    let resources: &'static [&'static str] = match only {
+        Only::Both => &[TRANSCRIPTS, MISSIONS],
+        Only::Missions => {
+            println!(
+                "restore-drill: --only missions: the mission repositories alone; no transcript \
+                 unpacked or restored"
+            );
+            &[MISSIONS]
+        }
+        Only::Transcripts => {
+            println!(
+                "restore-drill: --only transcripts: the transcript archive alone, judged by the \
+                 newest record; no repository bundle unpacked, nothing live read"
+            );
+            &[TRANSCRIPTS]
+        }
+    };
+    Some((only, resources))
+}
+
+/// The drill folder's parent (`--into`, default [`DEFAULT_PARENT`]),
+/// resolved and under none of `$HOME`, `$SPAWN_LIVE` and the workspace
+/// root; `None` (said) when refused.
+fn parent_of(flags: &Flags, settings: &Settings) -> Option<PathBuf> {
+    let parent = flags
+        .get("into")
+        .map_or_else(|| PathBuf::from(DEFAULT_PARENT), PathBuf::from);
+    let guards: Vec<(&str, PathBuf)> = [
+        ("$HOME", env_value("HOME").map(PathBuf::from)),
+        ("$SPAWN_LIVE", env_value("SPAWN_LIVE").map(PathBuf::from)),
+        ("the workspace root", Some(settings.root.clone())),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| Some((name, path?)))
+    .collect();
+    match drill_parent(&parent, &guards) {
+        Ok(parent) => Some(parent),
+        Err(error) => {
+            eprintln!("spawn backup restore-drill: {error}");
+            None
+        }
+    }
+}
+
+/// The free space a transcripts drill must leave on its folder's file
+/// system: `SPAWN_BACKUP_DRILL_FLOOR_MB`, in MiB.
+const FLOOR_MB: u64 = 40_960;
+
+/// The bytes a transcripts drill writes, from the chain's records alone:
+/// each link's ciphertext (`stored_bytes`) and transcript slices
+/// (`transcripts.bytes`), and the newest record's files
+/// (`transcripts.sizes`), which the chain's slices are restored into.
+pub(super) fn transcripts_bytes(chain: &[&BundleRecord]) -> u64 {
+    let fetched = chain.iter().fold(0u64, |sum, link| {
+        sum.saturating_add(link.record["stored_bytes"].as_u64().unwrap_or(0))
+            .saturating_add(link.record["transcripts"]["bytes"].as_u64().unwrap_or(0))
+    });
+    let restored = chain.last().map_or(0, |newest| {
+        newest.record["transcripts"]["sizes"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .fold(0u64, |sum, (_, size)| {
+                sum.saturating_add(size.as_u64().unwrap_or(0))
+            })
+    });
+    fetched.saturating_add(restored)
+}
+
+/// The refusal, one line naming the floor, when writing `needed` bytes
+/// into `parent` with `free` bytes free would leave under `floor_mb` MiB.
+pub(super) fn floor_refusal(
+    needed: u64,
+    free: u64,
+    floor_mb: u64,
+    parent: &Path,
+) -> Result<(), String> {
+    let floor = floor_mb.saturating_mul(1024 * 1024);
+    if free.saturating_sub(needed) >= floor && free >= needed {
+        return Ok(());
+    }
+    Err(format!(
+        "refused: the chain's ciphertext and slices and the newest record's files are {needed} \
+         bytes, and {} has {free} bytes free: that would leave it under the floor of {floor_mb} \
+         MB (SPAWN_BACKUP_DRILL_FLOOR_MB); nothing fetched",
+        parent.display()
+    ))
+}
+
+/// The transcripts drill's bytes (`transcripts_bytes`) against the free
+/// space of `parent`'s file system and the floor.
+fn above_floor(chain: &[&BundleRecord], parent: &Path) -> Result<(), String> {
+    let floor_mb = match env_value("SPAWN_BACKUP_DRILL_FLOOR_MB") {
+        None => FLOOR_MB,
+        Some(value) => value.trim().parse::<u64>().map_err(|_| {
+            "refused: SPAWN_BACKUP_DRILL_FLOOR_MB, the floor, is not a whole number of MB"
+                .to_string()
+        })?,
+    };
+    let free = crate::disk::free_bytes(parent)
+        .map_err(|error| format!("refused: the floor cannot be checked: {error}"))?;
+    floor_refusal(transcripts_bytes(chain), free, floor_mb, parent)
 }
 
 /// A drill's result said, and its exit and the outcome of each resource
@@ -259,14 +371,30 @@ fn unrestorable_all(resources: &[&'static str], reason: &str) -> Vec<(&'static s
 const TRANSCRIPTS: &str = "transcripts";
 const MISSIONS: &str = "missions";
 
-/// `--only`'s value: absent, the drill proves both resources (`false`);
-/// `missions`, the mission repositories alone (`true`, objective 186).
-/// Anything else (`transcripts`, an empty value) is refused.
-pub(super) fn only_missions(value: Option<&str>) -> Result<bool, String> {
+/// What a drill proves: both resources, or one alone (`--only`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Only {
+    /// No `--only`: the transcripts and the missions, against live.
+    Both,
+    /// `--only missions` (objective 186): the mission repositories alone.
+    Missions,
+    /// `--only transcripts` (objective 200): the transcript archive alone,
+    /// judged by the newest record, nothing live read.
+    Transcripts,
+}
+
+/// `--only`'s value: absent, both resources; `missions` or `transcripts`,
+/// that one alone. Anything else (`repos`, an empty value) is refused.
+pub(super) fn only_of(value: Option<&str>) -> Result<Only, String> {
     match value {
-        None => Ok(false),
-        Some(MISSIONS) => Ok(true),
-        Some(_) => Err("--only takes missions alone (the mission repositories)".to_string()),
+        None => Ok(Only::Both),
+        Some(MISSIONS) => Ok(Only::Missions),
+        Some(TRANSCRIPTS) => Ok(Only::Transcripts),
+        Some(_) => Err(
+            "--only takes missions or transcripts (the mission repositories, the transcript \
+             archive)"
+                .to_string(),
+        ),
     }
 }
 
