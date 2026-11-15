@@ -503,8 +503,9 @@ mod tests {
             "a first value read, none now: still its week"
         );
         assert_eq!(
-            range_note(Some(now - 7 * DAY + 1), &json!(0.5), now).is_some(),
-            true
+            range_note(Some(now - 7 * DAY + 1), &json!(0.5), now).as_deref(),
+            Some("range proposed after 2025-11-15"),
+            "its last moment"
         );
         assert_eq!(
             range_note(Some(now - 7 * DAY), &json!(0.5), now),
