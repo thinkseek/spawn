@@ -505,14 +505,6 @@ pub(crate) struct Sampler {
 }
 
 impl Sampler {
-    pub(crate) fn new() -> Self {
-        Self {
-            next_ms: i64::MIN,
-            reading: None,
-            abandoned: None,
-        }
-    }
-
     /// Looked at again [`RETRY_MS`] after `now_ms`.
     fn retry(&mut self, now_ms: i64) {
         self.next_ms = now_ms.saturating_add(RETRY_MS);
