@@ -241,7 +241,7 @@ fn gate_of(gate: &Path, controllers: &Path, resolved: Option<&Path>) -> Gate {
             controllers.display()
         ));
     };
-    if name.ends_with(".prev") {
+    if name.strip_suffix(".prev").is_some() {
         return Gate::Skipped(format!(
             "its gate {} is under {name}, the previous controller, not a current one",
             gate.display()
