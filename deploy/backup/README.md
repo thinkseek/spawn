@@ -227,6 +227,26 @@ systemctl --user daemon-reload
 systemctl --user enable --now spawn-backup-restore-drill-missions.timer
 ```
 
+The controllers' drill (objective 198) runs daily at 06:00: `spawn backup
+restore-drill --only controllers`. For each controller an active mission's
+gate names (`$SPAWN_LIVE/controllers/<name>/...`), current and previous, it
+checks, read only, that the live directory equals `git archive` of its
+`.controller` commit from the live source (left out: `.controller`, `.deps`,
+`web/node_modules`, which deploy/controller.sh adds). One
+`backup.drilled.controllers` per controller; the run exits 0 only when every
+one passed, so the recovery table's row for the controllers names the unit:
+`{"name": "controllers", "unit": "spawn-backup-restore-drill-controllers.service"}`
+(an owner config change, after landing). Installed disabled; enabled after a
+supervised first run:
+
+```sh
+install -m 644 deploy/systemd/spawn-backup-restore-drill-controllers.service \
+  deploy/systemd/spawn-backup-restore-drill-controllers.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start spawn-backup-restore-drill-controllers.service   # supervised; then:
+systemctl --user enable --now spawn-backup-restore-drill-controllers.timer
+```
+
 `SPAWN_BACKUP_DRILL_DATABASE_URL` must be in `spawn.env` before the drill
 timer is enabled: a disposable server (the fleet's test database), never the
 live one. The drill refuses without it, by name, and touches nothing.
@@ -271,7 +291,7 @@ pass `git bundle verify` in an empty repository (an increment's
 prerequisites are its base's commits, which the drill does not fetch). A store with no bundle yet says so in the record and passes. The result is the record's `bundle`
 object; a bundle that fails makes the day's verdict a failure.
 
-`spawn backup restore-drill [--into <dir>] [--keep] [--only missions]` (core (ii); by hand,
+`spawn backup restore-drill [--into <dir>] [--keep] [--only missions|controllers]` (core (ii); by hand,
 attended, by the lead; daily from `spawn-backup-restore-drill.timer` at 05:30
 once 149b has passed and landed, see above)
 restores the sources and the transcript archive themselves, not only opens
