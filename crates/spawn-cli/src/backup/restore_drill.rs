@@ -452,8 +452,8 @@ fn unrestorable(
     fail_both(store, records, &reason, started, 1, resources)
 }
 
-/// Each resource the drill proves (both, or the missions alone with
-/// `--only missions`) recorded failed with `reason`, as it is, against the
+/// Each resource the drill proves (both, or the one `--only` names)
+/// recorded failed with `reason`, as it is, against the
 /// newest stored record; said once. Exit `code`, or 2 when the store
 /// refused a record. Called for a chain that cannot be restored (exit 1,
 /// through `unrestorable`) and for one that cannot be read (exit 2;
@@ -764,7 +764,8 @@ impl DrillDir {
             ));
         }
         if self.plain {
-            plain_tree(&self.path).map_err(|error| format!("{error}: the drill folder is left as it is"))?;
+            plain_tree(&self.path)
+                .map_err(|error| format!("{error}: the drill folder is left as it is"))?;
         }
         fs::remove_dir_all(&self.path).map_err(|error| format!("{}: {error}", self.path.display()))
     }
@@ -796,8 +797,8 @@ impl Drop for DrillDir {
 pub(super) fn plain_tree(root: &Path) -> Result<(), String> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
-        let entries =
-            fs::read_dir(&directory).map_err(|error| format!("{}: {error}", directory.display()))?;
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
         for entry in entries {
             let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
             let path = entry.path();
@@ -930,8 +931,7 @@ fn run(
             Only::Both => fetch_bundle(settings, record, seal, &here)?,
             Only::Missions => fetch_members(settings, record, seal, &here, missions_members)?,
             Only::Transcripts => {
-                let manifest =
-                    fetch_members(settings, record, seal, &here, transcripts_members)?;
+                let manifest = fetch_members(settings, record, seal, &here, transcripts_members)?;
                 plain_tree(&here.join("unpacked"))?;
                 manifest
             }
@@ -1791,7 +1791,9 @@ pub(super) fn judge_alone(
             ));
             continue;
         };
-        let Some(want) = hashes.and_then(|hashes| hashes.get(named)).and_then(Value::as_str)
+        let Some(want) = hashes
+            .and_then(|hashes| hashes.get(named))
+            .and_then(Value::as_str)
         else {
             mismatches.push(format!(
                 "transcripts/{named}: the newest record sizes it ({want_size} bytes) and names \
@@ -2165,7 +2167,7 @@ fn why(now: CommitNow, commit: &str) -> String {
 mod tests {
     use super::{
         Chain, DrillDir, Outcome, chain_of, compare_refs, compare_transcripts, drill_parent,
-        judge_by_record, missions_members, only_missions, outcome, sha256_prefix,
+        judge_by_record, missions_members, only_of, outcome, sha256_prefix,
     };
     use crate::backup::BundleRecord;
     use crate::commit_now::CommitNow;
@@ -2719,10 +2721,136 @@ mod tests {
         assert!(missions_members("./transcripts/a.jsonl\n./repos/a.bundle\n").is_err());
         assert!(missions_members("").is_err());
 
-        assert_eq!(only_missions(None), Ok(false));
-        assert_eq!(only_missions(Some("missions")), Ok(true));
-        for refused in ["transcripts", "", "Missions", "missions,transcripts"] {
-            assert!(only_missions(Some(refused)).is_err(), "{refused:?}");
+        use super::Only;
+        assert_eq!(only_of(None), Ok(Only::Both));
+        assert_eq!(only_of(Some("missions")), Ok(Only::Missions));
+        assert_eq!(only_of(Some("transcripts")), Ok(Only::Transcripts));
+        for refused in [
+            "repos",
+            "",
+            "Missions",
+            "missions,transcripts",
+            "Transcripts",
+        ] {
+            assert!(only_of(Some(refused)).is_err(), "{refused:?}");
         }
+    }
+
+    /// Objective 200: `--only transcripts` takes from a bundle's listing the
+    /// manifest and the files under `transcripts/` alone, as listed; never a
+    /// repository bundle, a directory, a `.` or `..` part, nor a quoted name.
+    /// A listing without the manifest is refused.
+    #[test]
+    fn a_transcripts_only_drill_extracts_the_manifest_and_the_transcript_slices_alone() {
+        use super::transcripts_members;
+        let listing = "./\n./manifest.json\n./repos/\n./repos/repo-0.bundle\n./transcripts/\n\
+                       ./transcripts/agent/\n./transcripts/agent/a.jsonl\n\
+                       ./transcripts/agent/sub/b.jsonl\n./transcripts/../escape\n\
+                       ./transcripts/agent/./c.jsonl\n./transcripts//d.jsonl\n\
+                       ./transcripts/agent/odd\\nname.jsonl\n./transcripts/agent/a.jsonl\n\
+                       ./transcripts\n./other/transcripts/e.jsonl\n";
+        assert_eq!(
+            transcripts_members(listing),
+            Ok(vec![
+                "./manifest.json".to_string(),
+                "./transcripts/agent/a.jsonl".to_string(),
+                "./transcripts/agent/sub/b.jsonl".to_string(),
+            ])
+        );
+        assert_eq!(
+            transcripts_members("manifest.json\nrepos/a.bundle\ntranscripts/x/b.jsonl\n"),
+            Ok(vec![
+                "manifest.json".to_string(),
+                "transcripts/x/b.jsonl".to_string()
+            ])
+        );
+        // An increment with no transcript: the manifest alone.
+        assert_eq!(
+            transcripts_members("./manifest.json\n./repos/a.bundle\n"),
+            Ok(vec!["./manifest.json".to_string()])
+        );
+        assert!(transcripts_members("./transcripts/a/b.jsonl\n./repos/a.bundle\n").is_err());
+        assert!(transcripts_members("").is_err());
+    }
+
+    /// Objective 200: a drill folder is plain when it holds only directories
+    /// and regular files; a symlink, even under a transcript's name, is
+    /// refused and named, never followed, and a plain-only DrillDir with one
+    /// is left, not removed.
+    #[cfg(unix)]
+    #[test]
+    fn the_drill_folder_is_plain_only_with_directories_and_regular_files() {
+        use super::plain_tree;
+        let own = Own::new("plain");
+        let tree = own.0.join("tree");
+        write(&tree.join("transcripts/agent/a.jsonl"), b"{}\n");
+        fs::create_dir_all(tree.join("transcripts/empty")).expect("dir");
+        assert_eq!(plain_tree(&tree), Ok(()));
+
+        let outside = own.0.join("outside.jsonl");
+        write(&outside, b"never to be opened\n");
+        let link = tree.join("transcripts/agent/b.jsonl");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+        let refused = plain_tree(&tree).expect_err("a symlink is refused");
+        assert!(refused.contains("transcripts/agent/b.jsonl"), "{refused}");
+        assert!(refused.contains("a symlink"), "{refused}");
+
+        // A plain-only drill folder holding a symlink is left, said.
+        let mut drill = DrillDir::create(&own.0).expect("drill");
+        drill.plain_only();
+        let path = drill.path().to_path_buf();
+        std::os::unix::fs::symlink(&outside, path.join("c.jsonl")).expect("symlink");
+        let left = drill.remove().expect_err("not removed");
+        assert!(left.contains("c.jsonl") && left.contains("left"), "{left}");
+        assert!(path.is_dir());
+        assert_eq!(
+            fs::read(&outside).expect("outside"),
+            b"never to be opened\n"
+        );
+        fs::remove_file(path.join("c.jsonl")).expect("unlink");
+
+        // Plain again: removed.
+        let mut drill = DrillDir::create(&own.0).expect("drill");
+        drill.plain_only();
+        let path = drill.path().to_path_buf();
+        write(&path.join("transcripts/a.jsonl"), b"{}\n");
+        drill.remove().expect("removed");
+        assert!(!path.exists());
+    }
+
+    /// Objective 200: the bytes a transcripts drill writes are counted from
+    /// the chain's records (each link's ciphertext and slices, the newest
+    /// record's files), and the drill refuses, naming the floor, when they
+    /// would leave the file system under it.
+    #[test]
+    fn a_transcripts_only_drill_needs_its_bytes_above_the_floor() {
+        use super::{floor_refusal, transcripts_bytes};
+        let mut full = record(1, "full", None, true);
+        full.record["stored_bytes"] = json!(1000);
+        full.record["transcripts"] = json!({"bytes": 300, "sizes": {"a": 100, "b": 200}});
+        let mut incr = record(2, "incremental", Some(1), true);
+        incr.record["stored_bytes"] = json!(50);
+        incr.record["transcripts"] = json!({"bytes": 20, "sizes": {"a": 120, "b": 200}});
+        assert_eq!(
+            transcripts_bytes(&[&full, &incr]),
+            1000 + 300 + 50 + 20 + 120 + 200
+        );
+        assert_eq!(transcripts_bytes(&[&full]), 1000 + 300 + 300);
+
+        let mib = 1024 * 1024;
+        let parent = Path::new("/data/tmp");
+        assert_eq!(floor_refusal(1_000, 40 * mib + 1_000, 40, parent), Ok(()));
+        let refused = floor_refusal(1_001, 40 * mib + 1_000, 40, parent).expect_err("under");
+        assert!(refused.contains("floor of 40 MB"), "{refused}");
+        assert!(refused.contains("SPAWN_BACKUP_DRILL_FLOOR_MB"), "{refused}");
+        assert!(!refused.contains('\n'), "one line: {refused}");
+        // More than is free: refused, even with no floor.
+        assert!(floor_refusal(2_000, 1_000, 0, parent).is_err());
+        // The default floor, 40 GB.
+        assert!(floor_refusal(0, 40_960 * mib - 1, super::FLOOR_MB, parent).is_err());
+        assert_eq!(
+            floor_refusal(0, 40_960 * mib, super::FLOOR_MB, parent),
+            Ok(())
+        );
     }
 }
