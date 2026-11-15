@@ -1263,9 +1263,7 @@ pub(super) fn restore_sources(
                     .as_object()
                     .into_iter()
                     .flatten()
-                    .filter_map(|(name, commit)| {
-                        Some((name.clone(), commit.as_str()?.to_string()))
-                    })
+                    .filter_map(|(name, commit)| Some((name.clone(), commit.as_str()?.to_string())))
                     .collect();
                 let mirror = repos.join(format!("repo-{index}.git"));
                 restore_repo(source, &unpacked, &heads, &mirror).map(|()| mirror)
