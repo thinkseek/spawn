@@ -695,7 +695,11 @@ pub(crate) fn storage_bytes_settings_of(
     let settings = unowned::settings(text);
     let quiet_hold_file = text
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .and_then(|value| value["storage"]["quiet_hold_file"].as_str().map(str::to_string))
+        .and_then(|value| {
+            value["storage"]["quiet_hold_file"]
+                .as_str()
+                .map(str::to_string)
+        })
         .filter(|path| !path.trim().is_empty())
         .or_else(|| quiet_env.filter(|path| !path.trim().is_empty()))
         .map(PathBuf::from);

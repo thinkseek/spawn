@@ -124,7 +124,8 @@ pub(crate) fn sources(
     cache: Option<PathBuf>,
     settings: &StorageBytesSettings,
 ) -> Vec<Source> {
-    let mut transcripts: Vec<PathBuf> = root.map(crate::storage::archive_path).into_iter().collect();
+    let mut transcripts: Vec<PathBuf> =
+        root.map(crate::storage::archive_path).into_iter().collect();
     transcripts.push(projects);
     vec![
         Source {
@@ -148,7 +149,12 @@ pub(crate) fn sources(
 /// The plan of a reading now, for the workspace root `root`.
 pub(crate) fn plan(root: Option<&Path>, settings: &StorageBytesSettings) -> Plan {
     Plan {
-        sources: sources(root, crate::storage::projects_path(), build_cache(), settings),
+        sources: sources(
+            root,
+            crate::storage::projects_path(),
+            build_cache(),
+            settings,
+        ),
         session_status: crate::storage::session_backup_status(),
         test_databases: settings.test_databases.clone(),
         script: script_path(),
@@ -158,7 +164,10 @@ pub(crate) fn plan(root: Option<&Path>, settings: &StorageBytesSettings) -> Plan
 /// The script's input: each source with a root, in the counting order.
 pub(crate) fn script_input(sources: &[Source], bound_secs: u64) -> Value {
     let paths = |paths: &[PathBuf]| -> Vec<String> {
-        paths.iter().map(|path| path.display().to_string()).collect()
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect()
     };
     json!({
         "bound_secs": bound_secs,
@@ -182,7 +191,10 @@ fn not_measured(why: impl Into<String>) -> Value {
 /// The script's sources' entries from its answer (or why it gave none): a
 /// source with no root, one over its bound, and one the answer leaves out
 /// are not measured, each with why.
-pub(crate) fn script_sources(sources: &[Source], answer: &Result<Value, String>) -> Map<String, Value> {
+pub(crate) fn script_sources(
+    sources: &[Source],
+    answer: &Result<Value, String>,
+) -> Map<String, Value> {
     let mut out = Map::new();
     for source in sources {
         let entry = if source.roots.is_empty() {
@@ -247,7 +259,11 @@ pub(crate) fn test_databases(
     for (role, url) in databases {
         let size = match read(url) {
             Ok(size) => size,
-            Err(error) => return not_measured(format!("the test database {role} could not be read: {error}")),
+            Err(error) => {
+                return not_measured(format!(
+                    "the test database {role} could not be read: {error}"
+                ));
+            }
         };
         let name = size["name"].as_str().unwrap_or_default().to_string();
         if counted.contains(&name) {
@@ -342,7 +358,9 @@ pub(crate) fn run_script(
         std::thread::sleep(Duration::from_millis(50));
     };
     let joined = |handle: Option<std::thread::JoinHandle<String>>| {
-        handle.and_then(|handle| handle.join().ok()).unwrap_or_default()
+        handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
     };
     let (stdout, stderr) = (joined(stdout), joined(stderr));
     if !status.success() {
@@ -408,7 +426,10 @@ pub(crate) fn quiet_hold(file: Option<&Path>) -> Option<String> {
                 Some("the quiet-hold file does not say ENDED".to_string())
             }
         }
-        Err(error) => Some(format!("the quiet-hold file cannot be read ({})", error.kind())),
+        Err(error) => Some(format!(
+            "the quiet-hold file cannot be read ({})",
+            error.kind()
+        )),
     }
 }
 
@@ -449,7 +470,9 @@ pub(crate) struct StoreWorld<'a> {
 
 impl World for StoreWorld<'_> {
     fn readings(&mut self) -> Result<Value, String> {
-        self.store.host_storage_bytes().map_err(|error| error.to_string())
+        self.store
+            .host_storage_bytes()
+            .map_err(|error| error.to_string())
     }
 
     fn holds(&mut self) -> Result<Value, String> {
@@ -465,11 +488,17 @@ impl World for StoreWorld<'_> {
     }
 
     fn live_database(&mut self) -> Value {
-        live_database(self.store.database_size().map_err(|error| error.to_string()))
+        live_database(
+            self.store
+                .database_size()
+                .map_err(|error| error.to_string()),
+        )
     }
 
     fn write(&mut self, record: &Value) -> Result<i64, String> {
-        self.store.host_record(record).map_err(|error| error.to_string())
+        self.store
+            .host_record(record)
+            .map_err(|error| error.to_string())
     }
 }
 

@@ -424,7 +424,10 @@ fn storage_readings_are_recorded_and_the_newest_read_back() {
     let mut client = admin(&schema);
     let empty = store.host_storage_bytes().expect("read");
     assert_eq!(empty["newest"], Value::Null, "{empty}");
-    assert!(empty["now_ms"].as_i64().is_some_and(|now| now > 0), "{empty}");
+    assert!(
+        empty["now_ms"].as_i64().is_some_and(|now| now > 0),
+        "{empty}"
+    );
     let tables_before: i64 = client
         .query_one("select count(*) from mission_missions", &[])
         .expect("count")
