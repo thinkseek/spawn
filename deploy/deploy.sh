@@ -774,6 +774,12 @@ warm_base_cache() {
   say "base cache: warming it for $head in the background (pid $!), with ${own:-the shared test server}: log $log, results in $cached"
 }
 warm_base_cache || say "base cache: not warmed (above)"
+# The storage reading's script (objective 180): the loop runs it from beside
+# its binary, once a day; nothing to restart.
+if ! cmp -s "$export_dir/scripts/storage-extents.py" "$live/bin/storage-extents.py"; then
+  install -m 644 "$export_dir/scripts/storage-extents.py" "$live/bin/storage-extents.py"
+  say "installed storage-extents.py"
+fi
 # The relays run from the live bin directory too; restart one only when its
 # script changed, so a deploy does not drop engines' model calls needlessly.
 # Last, so a relay cannot stop the deploy halfway. A relay whose unit is not
