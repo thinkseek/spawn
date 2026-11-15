@@ -26,7 +26,6 @@
 //! sha256 must be the same. A run killed part way leaves the ciphertext,
 //! the list of names and what it has extracted: no transcript.
 //!
-<<<<<<< d73e9ef06daec75d60838fefdd0762928d5d75bd
 //! `--only controllers` (objective 198, [`controllers`]) reads no bundle: it
 //! checks that each live controller an open or active mission's gate names,
 //! current and previous, is `git archive` of its commit from the live
@@ -51,8 +50,6 @@
 //! a directory or a regular file, else the drill fails and the folder is
 //! left, said.
 //!
-=======
->>>>>>> 61887faae61711d5cb5331cb37f66e4044ec73ac
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
 //! window file as bundled, so a restored file whose sha256 is not the
@@ -151,7 +148,6 @@ const DRILL_PREFIX: &str = "spawn-restore-drill-";
 const NAMED: usize = 20;
 
 /// `spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]
-<<<<<<< d73e9ef06daec75d60838fefdd0762928d5d75bd
 /// [--only missions|controllers|transcripts]`.
 pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let Some((only, resources)) = resources_of(flags) else {
@@ -159,56 +155,18 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     };
     let settings = match Settings::from_env(flags) {
         Ok(settings) => settings,
-=======
-/// [--only missions]`.
-pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
-    let only = match only_missions(flags.get("only").as_deref()) {
-        Ok(only) => only,
->>>>>>> 61887faae61711d5cb5331cb37f66e4044ec73ac
         Err(error) => {
             eprintln!("spawn backup restore-drill: {error}");
             return Ok(2);
         }
     };
-<<<<<<< d73e9ef06daec75d60838fefdd0762928d5d75bd
     let parent = match parent_of(flags, &settings) {
-=======
-    let resources: &[&'static str] = if only {
-        println!(
-            "restore-drill: --only missions: the mission repositories alone; no transcript \
-             unpacked or restored"
-        );
-        &[MISSIONS]
-    } else {
-        &[TRANSCRIPTS, MISSIONS]
-    };
-    let settings = match Settings::from_env(flags) {
-        Ok(settings) => settings,
-        Err(error) => {
-            eprintln!("spawn backup restore-drill: {error}");
-            return Ok(2);
-        }
-    };
-    let parent = flags
-        .get("into")
-        .map_or_else(|| PathBuf::from(DEFAULT_PARENT), PathBuf::from);
-    let guards: Vec<(&str, PathBuf)> = [
-        ("$HOME", env_value("HOME").map(PathBuf::from)),
-        ("$SPAWN_LIVE", env_value("SPAWN_LIVE").map(PathBuf::from)),
-        ("the workspace root", Some(settings.root.clone())),
-    ]
-    .into_iter()
-    .filter_map(|(name, path)| Some((name, path?)))
-    .collect();
-    let parent = match drill_parent(&parent, &guards) {
->>>>>>> 61887faae61711d5cb5331cb37f66e4044ec73ac
         Ok(parent) => parent,
         Err(error) => {
             eprintln!("spawn backup restore-drill: {error}");
             return Ok(2);
         }
     };
-<<<<<<< d73e9ef06daec75d60838fefdd0762928d5d75bd
     if only == Only::Controllers {
         let live = env_value("SPAWN_LIVE").map_or_else(
             || super::home().join(".local/share/spawn-rsi"),
@@ -217,8 +175,6 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         let store = open_store()?;
         return controllers::drill(&store, &parent, &live);
     }
-=======
->>>>>>> 61887faae61711d5cb5331cb37f66e4044ec73ac
     let started = Instant::now();
     let store = open_store()?;
     let now_ms = store.now_ms().map_err(|error| error.to_string())?;
@@ -434,7 +390,6 @@ fn unrestorable_all(resources: &[&'static str], reason: &str) -> Vec<(&'static s
 const TRANSCRIPTS: &str = "transcripts";
 const MISSIONS: &str = "missions";
 
-<<<<<<< d73e9ef06daec75d60838fefdd0762928d5d75bd
 /// What a drill proves: both resources, or one alone (`--only`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Only {
@@ -464,16 +419,6 @@ pub(super) fn only_of(value: Option<&str>) -> Result<Only, String> {
              live controllers, the transcript archive)"
                 .to_string(),
         ),
-=======
-/// `--only`'s value: absent, the drill proves both resources (`false`);
-/// `missions`, the mission repositories alone (`true`, objective 186).
-/// Anything else (`transcripts`, an empty value) is refused.
-pub(super) fn only_missions(value: Option<&str>) -> Result<bool, String> {
-    match value {
-        None => Ok(false),
-        Some(MISSIONS) => Ok(true),
-        Some(_) => Err("--only takes missions alone (the mission repositories)".to_string()),
->>>>>>> 61887faae61711d5cb5331cb37f66e4044ec73ac
     }
 }
 
