@@ -159,7 +159,7 @@ impl MissionSource {
         };
         let lead =
             |rest: &str, banned: &[char]| rest.chars().next().is_some_and(|c| !banned.contains(&c));
-        if text.is_empty() || text.len() > Self::MAX_LEN {
+        if text.is_empty() {
             return Err(refused());
         }
         let allowed = if text.starts_with('/') {
@@ -269,7 +269,9 @@ pub(crate) fn described(text: &str) -> String {
         .then(|| scheme.to_ascii_lowercase())
     });
     let what = match scheme {
-        Some(scheme) if NAMED_SCHEMES.contains(&scheme.as_str()) => format!("a {scheme}:// URL"),
+        Some(scheme) if NAMED_SCHEMES.contains(&scheme.as_str()) => {
+            format!("a URL of scheme {scheme}://")
+        }
         Some(_) => "a URL of another scheme".to_string(),
         None => "a text with no scheme".to_string(),
     };
