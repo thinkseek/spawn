@@ -678,7 +678,7 @@ test("a line's plain reading says its note, never a range; free disk is a diagno
       ],
       diagnostics: [
         fig("storage.free_bytes", "Free disk", "bytes", 40 * GIB, null, "no_range"),
-        fig("storage.disk_fall", "Disk fall", "bytes_per_day", 5 * MIB, { max: 1 }, "out"),
+        fig("storage.disk_fall", "Disk fall", "bytes_per_day", 5 * MIB, { max: 500_000_000 }, "in"),
       ],
       ignored_ranges: [
         { key: "performance.usd_per_landing", reason: "shown with no range until use with no price is under 10% (the owner's core metric set)" },
@@ -699,7 +699,7 @@ test("a line's plain reading says its note, never a range; free disk is a diagno
     view.diagnostics.map((mark) => [mark.name, mark.range]),
     [
       ["Free disk", "no range set"],
-      ["Disk fall", "1 B a day or less"],
+      ["Disk fall", "500 MB a day or less"],
     ],
   );
   // A range ignored on purpose is said by its figure's name and why.
