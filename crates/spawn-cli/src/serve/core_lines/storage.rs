@@ -287,7 +287,7 @@ mod tests {
             Vec::new(),
         );
         let view = answer(
-            &adopted(&readings),
+            &adopted(&readings, false),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),

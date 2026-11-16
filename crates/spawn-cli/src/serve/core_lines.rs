@@ -1474,7 +1474,7 @@ mod tests {
             };
             let figures = lines(&json!({}), &Value::Null, &observed, Value::Null, Vec::new());
             let view = super::answer(
-                &super::adopted(&figures),
+                &super::adopted(&figures, false),
                 &Value::Null,
                 Ok(Some(file.to_string())),
                 &BTreeMap::new(),
@@ -1593,7 +1593,7 @@ mod tests {
         // The free space is read at each reading: no group, no age.
         let free = figure_json(&find("storage.free_bytes"), None);
         assert_eq!((free.get("as_of_ms"), free.get("stale")), (None, None));
-        let values = super::values_of(&super::adopted(&figures));
+        let values = super::values_of(&super::adopted(&figures, false));
         assert_eq!(
             values.get("storage.archive_growth"),
             None,
@@ -1629,7 +1629,7 @@ mod tests {
         super::aged(&mut figures, &[], 2_000_000);
         assert_eq!(figures, before);
         let trends = std::collections::BTreeMap::new();
-        let view = super::answer(&super::adopted(&figures), &Value::Null, Ok(None), &trends);
+        let view = super::answer(&super::adopted(&figures, false), &Value::Null, Ok(None), &trends);
         let mut grouped = view.clone();
         super::with_groups(&mut grouped, Vec::new());
         assert_eq!(grouped, view, "no `groups` key");
@@ -1662,7 +1662,7 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
             Value::Null,
             Vec::new(),
         );
-        let values = super::values_of(&super::adopted(&figures));
+        let values = super::values_of(&super::adopted(&figures, false));
         // The owner's set (objective 176): the figures dropped from it (days
         // left, the count not measured) are no longer sampled.
         assert_eq!(Value::Object(values), json!({"storage.free_bytes": 3}));
@@ -1713,7 +1713,7 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
         }
         let readings = lines(&storage, &performance, &observed, json!(2), guardrails);
         super::answer(
-            &super::adopted(&readings),
+            &super::adopted(&readings, false),
             &Value::Null,
             Ok(Some(ranges.to_string())),
             &std::collections::BTreeMap::new(),

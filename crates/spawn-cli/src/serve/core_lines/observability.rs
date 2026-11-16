@@ -445,7 +445,7 @@ mod tests {
         // north star, unpriced use its third guardrail; the count not
         // measured is retired.
         let view = answer(
-            &adopted(&all),
+            &adopted(&all, false),
             &Value::Null,
             Ok(Some(
                 r#"{"ranges": {"observability.unpriced_share": {"max": 0.05},
