@@ -11,6 +11,7 @@ repository.workspace = true
 spawn-core.workspace = true
 libc.workspace = true
 rustix.workspace = true
+serde_json.workspace = true
 
 [features]
 # The git a test runs for itself (`test_git_command`), for tests only.
