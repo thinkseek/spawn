@@ -105,6 +105,9 @@ export interface CoreLine {
   line: string;
   north_star: CoreFigure;
   guardrails: CoreFigure[];
+  /** The line's plain readings (objective 182): no range, never judged,
+   * each with its `range_note`; empty for most lines. */
+  readings?: CoreFigure[];
 }
 
 /** One row of the recovery table (objective 093): its drill's source
@@ -206,6 +209,9 @@ export interface CoreRow {
   line: string;
   north_star: CoreMark;
   guardrails: CoreMark[];
+  /** The line's plain readings (objective 182), shown under its
+   * guardrails: the note where the range would be. */
+  readings: CoreMark[];
 }
 
 export interface CoreLinesView {
@@ -217,7 +223,8 @@ export interface CoreLinesView {
   /** The same, as the Home card says them (never the internal key and
    * reason): "<name>: figure not built yet" for a range of a figure this
    * build does not have, "<name>: range not read (it needs a number min or
-   * max)" for one without a bound. */
+   * max)" for one without a bound, "<name>: <reason>" for one the set
+   * ignores on purpose (objective 182). */
   pending: string[];
   /** The recovery table's rows, each with its last pass (objective 093). */
   drills: CoreDrillMark[];
@@ -449,6 +456,10 @@ function pendingWords(entry: { key?: unknown; reason?: unknown } | null | undefi
     return `test database URL file ${key.slice(urlFile.length)} not used: ${String(entry?.reason ?? "refused")}`;
   }
   const known = names.get(key);
+  const reason = typeof entry?.reason === "string" ? entry.reason : "";
+  // A range the set ignores on purpose (objective 182: free disk, dollars
+  // per landing): the figure's name and why.
+  if (known !== undefined && reason !== "" && reason !== "needs a number min or max") return `${known}: ${reason}`;
   if (known !== undefined) return `${known}: range not read (it needs a number min or max)`;
   const words = key.slice(key.lastIndexOf(".") + 1).replace(/_/g, " ");
   // A figure the owner's core metric set dropped (objective 176).
@@ -464,8 +475,13 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
   const names = new Map<string, string>();
   const diagnostics = Array.isArray(answer?.diagnostics) ? answer.diagnostics : [];
   const alertFigures = Array.isArray(answer?.alert_figures) ? answer.alert_figures : [];
+  const readingsOf = (line: Partial<CoreLine> | null | undefined) => (Array.isArray(line?.readings) ? line.readings : []);
   const figures = [
-    ...lines.flatMap((line) => [line?.north_star, ...(Array.isArray(line?.guardrails) ? line.guardrails : [])]),
+    ...lines.flatMap((line) => [
+      line?.north_star,
+      ...(Array.isArray(line?.guardrails) ? line.guardrails : []),
+      ...readingsOf(line),
+    ]),
     ...alertFigures,
     ...diagnostics,
   ];
@@ -477,6 +493,7 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
       line: LINE_NAMES[line?.line] ?? String(line?.line ?? ""),
       north_star: mark(line?.north_star),
       guardrails: Array.isArray(line?.guardrails) ? line.guardrails.map(mark) : [],
+      readings: readingsOf(line).map(mark),
     })),
     notice: error === null ? null : `ranges file unreadable: ${error}`,
     ignored: ignored.map((entry) => `${entry?.key}: ${entry?.reason}`),
