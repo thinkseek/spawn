@@ -999,6 +999,12 @@ impl Bridge {
         self
     }
 
+    /// [`Self::with_archive_mask`] on a Bridge already built (tests).
+    #[cfg(test)]
+    fn set_archive_mask(&mut self, mask: Arc<dyn crate::port::ArchiveMask>) {
+        self.archive_mask = Some(mask);
+    }
+
     /// Use `clock` for screen refreshes instead of the system clock.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -5822,6 +5828,79 @@ mod tests {
         world.tick();
         assert!(world.archived().ends_with(&second));
         assert_eq!(world.archived().matches("msg_c1").count(), 1, "copied once");
+    }
+
+    /// A made-up credential mask that can be had or not, as a credential
+    /// file readable or not makes the collector's.
+    struct Flip {
+        mask: Arc<crate::mask::Mask>,
+        had: Mutex<bool>,
+    }
+
+    impl crate::port::ArchiveMask for Flip {
+        fn mask(&self) -> Result<Arc<crate::mask::Mask>, String> {
+            if *self.had.lock().expect("lock") {
+                Ok(self.mask.clone())
+            } else {
+                Err("/made-up/cred/spawn.env is unreadable".to_string())
+            }
+        }
+
+        fn current(&self, mask: &Arc<crate::mask::Mask>) -> bool {
+            *self.had.lock().expect("lock") && Arc::ptr_eq(mask, &self.mask)
+        }
+    }
+
+    /// Objective 175: with a credential mask, what the archive copies is
+    /// masked; without it a pass copies nothing, says why, and the record
+    /// says from when the archive lacks lines; once it is had, the waiting
+    /// lines are copied masked.
+    #[test]
+    fn the_archive_masks_values_and_copies_nothing_without_the_mask() {
+        const VALUE: &str = "made-up-token-0123456789";
+        let mut world = World::with_archive();
+        let flip = Arc::new(Flip {
+            mask: Arc::new(crate::mask::Mask::new(
+                &[("spawn.env:API_TOKEN".to_string(), VALUE.as_bytes().to_vec())],
+                crate::transcripts::ARCHIVE_MARKER,
+            )),
+            had: Mutex::new(false),
+        });
+        world.bridge.set_archive_mask(flip.clone());
+        world.advance(20_000);
+        let said = call_line("c1", 18).replace("\"model\":\"m\"", &format!("\"model\":\"{VALUE}\""));
+        assert!(said.contains(VALUE));
+        world.engine_writes(&said);
+        let warnings = world.tick();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("the credential mask: /made-up/cred/spawn.env")),
+            "{warnings:?}"
+        );
+        assert_eq!(world.archived(), "", "nothing copied without the mask");
+        assert!(world.progress().behind_ms.is_some());
+        *flip.had.lock().expect("lock") = true;
+        world.watch.changed(&world.path.clone());
+        world.tick();
+        let archived = world.archived();
+        assert!(
+            archived.contains("[REDACTED:spawn.env:API_TOKEN]") && !archived.contains(VALUE),
+            "{archived}"
+        );
+        assert_eq!(world.progress().behind_ms, None);
+        assert!(
+            String::from_utf8(
+                world
+                    .store
+                    .read_from(&world.progress().workspace, &world.path, 0)
+                    .expect("read")
+                    .expect("present")
+            )
+            .expect("utf-8")
+            .contains(VALUE),
+            "the transcript is never written"
+        );
     }
 
     /// S33: a failing copy whose first read of what the archive lacks meets
