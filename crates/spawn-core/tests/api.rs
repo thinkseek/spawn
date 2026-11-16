@@ -1675,17 +1675,28 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
     resume(&store, "key_resume");
     let report = bridge.tick().expect("resume");
     assert!(
-        report.warnings.iter().any(|warning| warning.contains("was not restored")),
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("the credential mask")),
         "{:?}",
         report.warnings
     );
-    assert_eq!(archived(&store, &native), first, "nothing copied without the mask");
+    // The resumed engine says the value again, still without the mask.
+    let (_, resumed) = transcript_of_latest(&store);
+    store.append_file(&resumed, &said_line("u3", ROTATED_ONE));
+    bridge.tick().expect("no mask");
+    assert_eq!(
+        archived(&store, &native),
+        first,
+        "nothing copied without the mask, across the stop and the resume"
+    );
     source.had(true);
     for _ in 0..3 {
         bridge.tick().expect("copy");
     }
     let after = archived(&store, &native);
-    assert!(after.contains("u2") && !after.contains(ROTATED_ONE), "{after}");
+    assert!(after.contains("u3") && !after.contains(ROTATED_ONE), "{after}");
 }
 
 #[test]
@@ -1695,14 +1706,16 @@ fn a_rotation_between_a_pass_and_a_resume_is_masked_with_the_new_value() {
     bridge.tick().expect("copy");
     submit(&store, "key_stop", CommandAction::Stop);
     bridge.tick().expect("stop");
-    // Rotated while stopped, and the transcript holds the new value.
+    // Rotated while stopped; the resumed engine says the new value.
     source.rotate(ROTATED_TWO);
-    store.append_file(&path, &said_line("u2", ROTATED_TWO));
     resume(&store, "key_resume");
     bridge.tick().expect("resume");
+    let (_, resumed) = transcript_of_latest(&store);
+    store.append_file(&resumed, &said_line("u2", ROTATED_TWO));
+    bridge.tick().expect("copy");
     bridge.tick().expect("copy");
     let after = archived(&store, &native);
-    assert!(after.contains("u2"), "the resume archived the file first: {after}");
+    assert!(after.contains("u2"), "{after}");
     assert!(!after.contains(ROTATED_TWO) && !after.contains(ROTATED_ONE), "{after}");
 }
 
