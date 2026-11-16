@@ -35,9 +35,9 @@
 # The history: alerts as the loop records them (spawn_alert_record): a1 and
 # a2 fired and cleared, a3 and a4 fired and open, a5 a notice. Then the
 # owner judges a2 false and a3 a duplicate. Then a real `spawn loop` runs
-# with a ranges file that puts free disk out of range (089, raised and
-# cleared after 2 s); the owner judges its alert false; free disk goes back
-# in range for a while, and out again.
+# with a ranges file that puts leaked test schemas out of range (089,
+# raised and cleared after 2 s; objective 182); the owner judges its alert
+# false; leaked test schemas goes back in range for a while, and out again.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -85,6 +85,7 @@ pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
 server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
+test_made=""
 loop_pid=""
 serve_pid=""
 cleanup() {
@@ -96,6 +97,9 @@ cleanup() {
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$test_made" ]; then
+        sh "$controller/scripts/blackbox/scenario-db.sh" drop "${SPAWN_DB_NAME}_t" >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
@@ -127,6 +131,9 @@ sh "$controller/scripts/blackbox/scenario-db.sh" sweep "${SPAWN_DB_NAME%"$run"}"
 psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
     harness "cannot create the scenario database"
 database_made=1
+psql -d postgres -tA -c "create database ${SPAWN_DB_NAME}_t" >/dev/null 2>&1 ||
+    harness "cannot create the scenario's test database"
+test_made=1
 
 . "$controller/scripts/blackbox/assertions.sh"
 
@@ -346,14 +353,20 @@ fi
 # --- (4) a running loop learns of a judgement ---------------------------------------------
 
 ranges=$SPAWN_WORKSPACE_ROOT/core-lines.json
-out_range() { printf '{"ranges": {"storage.free_bytes": {"min": 1000000000000000000}}}\n' >"$ranges"; }
-in_range() { printf '{"ranges": {"storage.free_bytes": {"min": 1}}}\n' >"$ranges"; }
+# Leaked test schemas over the scenario's own test database, named by a
+# URL file (mode 0600, never printed): out at most -1, in at most 10^18
+# (objective 182: free disk, the figure used before, has no range now).
+test_url=$WORK/test.url
+(umask 077 && printf '%s\n' "$server_url/${SPAWN_DB_NAME}_t" >"$test_url") || harness "cannot write the URL file"
+leaked_range() { printf '{"ranges": {"storage.leaked_test_schemas": {"max": %s}}, "storage": {"test_database_url_files": [{"name": "bb", "url_file": "%s"}]}}\n' "$1" "$test_url" >"$ranges"; }
+out_range() { leaked_range -1; }
+in_range() { leaked_range 1000000000000000000; }
 out_range
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
-guardrail() { # free disk's guardrail alerts in /api/alerts, oldest first
+guardrail() { # leaked test schemas' guardrail alerts in /api/alerts, oldest first
     alerts_json
-    jq -c '[.[] | select(.kind == "guardrail_out_of_range" and .subject == "guardrail storage.free_bytes")] | sort_by(.fired_at_ms)' "$WORK/alerts.json"
+    jq -c '[.[] | select(.kind == "guardrail_out_of_range" and .subject == "guardrail storage.leaked_test_schemas")] | sort_by(.fired_at_ms)' "$WORK/alerts.json"
 }
 one_open() { [ "$(guardrail | jq '[.[] | select(.state == "open")] | length')" = 1 ]; }
 if wait_until 60 one_open; then
@@ -368,12 +381,12 @@ if wait_until 60 one_open; then
         expect_eq "$(guardrail | jq -c --arg k "$first" '[.[] | select(.key == $k) | {state, outcome}]')" '[{"state":"cleared","outcome":"false"}]' \
             "(4) the judged alert stays cleared, judged false"
     else
-        check_failed "(4) free disk went back in range and out again after its alert was judged, and no new alert opened within 60 s: $(guardrail | head -c 500)"
+        check_failed "(4) leaked test schemas went back in range and out again after its alert was judged, and no new alert opened within 60 s: $(guardrail | head -c 500)"
     fi
     refused=$(grep -c "alerts: $first: " "$WORK/loop.log" || true)
     [ "${refused:-0}" -le 1 ] || check_failed "(4) the loop retried a clear of the judged alert the store refused, $refused times: $(grep "alerts: $first: " "$WORK/loop.log" | head -n 2 | tr '\n' ' ' | head -c 300)"
 else
-    check_failed "(4) free disk (out of its range) has no open guardrail_out_of_range alert 60 s after the loop started: $(guardrail | head -c 300)"
+    check_failed "(4) leaked test schemas (out of its range) has no open guardrail_out_of_range alert 60 s after the loop started: $(guardrail | head -c 300)"
 fi
 note "(4) checked: the running loop"
 

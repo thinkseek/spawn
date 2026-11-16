@@ -28,13 +28,15 @@
 #       sustainability north star reads its value (0.125 here) and its
 #       state against its range.
 #   (3) `alert_figures` lists the figures demoted to an alert, each with its
-#       line and its state against its range: storage.free_bytes (storage);
+#       line and its state against its range (objective 182: free disk is a
+#       diagnostic now, with no range and no line):
 #       recoverability.cloud_bundle_age, recoverability.nightly_age,
 #       recoverability.nightly_red (sustainability: here 1, out); the drills' two ages
 #       only with a recovery table (none here). `diagnostics` lists, in
-#       order, storage.unowned_scratch_bytes, storage.disk_fall,
-#       storage.grew_most, storage.archive_growth,
-#       storage.leaked_test_schemas, performance.usd_per_landing. Leaked
+#       order, storage.free_bytes, storage.unowned_scratch_bytes,
+#       storage.disk_fall, storage.grew_most, storage.archive_growth,
+#       storage.leaked_test_schemas (dollars per landing is a reading of the
+#       sustainability line since objective 182). Leaked
 #       test schemas, shown here, still raises (rev-e's 176 R1 F1: "stays
 #       visible until it has read 0 for 7 days, then an alert only", 182):
 #       it carries its line, storage; no other diagnostic does.
@@ -51,7 +53,7 @@
 #   (6) The loop's alert step reads the lines and the alert figures: a line
 #       figure or an alert figure held out of its range raises one
 #       `guardrail_out_of_range` alert whose evidence names its line (here
-#       free disk under storage; the interventions, a line's figure, and the
+#       the interventions, a line's figure, and the
 #       nightly's reds, an alert figure, under sustainability; leaked test
 #       schemas, a lined diagnostic, under storage); any other
 #       diagnostic held out of its range raises nothing.
@@ -430,16 +432,16 @@ expect_eq "$(answer '.lines[2].north_star | {value, window, range, state}')" \
 note "(2) checked: not measured yet, and a real value"
 
 expect_eq "$(answer '[(.alert_figures // [])[] | {line, key}]')" \
-    '[{"line":"storage","key":"storage.free_bytes"},{"line":"sustainability","key":"recoverability.cloud_bundle_age"},{"line":"sustainability","key":"recoverability.nightly_age"},{"line":"sustainability","key":"recoverability.nightly_red"}]' \
+    '[{"line":"sustainability","key":"recoverability.cloud_bundle_age"},{"line":"sustainability","key":"recoverability.nightly_age"},{"line":"sustainability","key":"recoverability.nightly_red"}]' \
     "(3) the alert figures, each with its line (no recovery table: no drill ages)"
-expect_eq "$(answer '[(.alert_figures // [])[] | select(.key == "storage.free_bytes") | {valued: (.value | type == "number"), range: (.range == {"min": 1e18}), state}]')" \
-    '[{"valued":true,"range":true,"state":"out"}]' \
-    "(3) free disk: read, out of its range of 10^18 bytes or more"
+expect_eq "$(answer '[(.diagnostics // [])[] | select(.key == "storage.free_bytes") | {valued: (.value | type == "number"), range, state}]')" \
+    '[{"valued":true,"range":null,"state":"no_range"}]' \
+    "(3) free disk: read, a diagnostic with no range (objective 182), whatever the file gives"
 expect_eq "$(answer '[(.alert_figures // [])[] | select(.key == "recoverability.nightly_red") | {line, value, range, state}]')" \
     '[{"line":"sustainability","value":1,"range":{"max":0},"state":"out"}]' \
     "(3) nightly sources held red: one (supply), out of its range of none, under sustainability"
 expect_eq "$(answer '[(.diagnostics // [])[].key]')" \
-    '["storage.unowned_scratch_bytes","storage.disk_fall","storage.grew_most","storage.archive_growth","storage.leaked_test_schemas","performance.usd_per_landing"]' \
+    '["storage.free_bytes","storage.unowned_scratch_bytes","storage.disk_fall","storage.grew_most","storage.archive_growth","storage.leaked_test_schemas"]' \
     "(3) the diagnostics, in order"
 expect_eq "$(answer '[(.diagnostics // [])[] | select(.key == "storage.unowned_scratch_bytes") | {name, value, range, state}]')" \
     "[{\"name\":\"Scratch nobody owns\",\"value\":$idle_bytes,\"range\":{\"max\":0},\"state\":\"out\"}]" \
@@ -455,7 +457,7 @@ dropped='["storage.days_left","storage.database_ratio","storage.test_database_by
 expect_eq "$(jq -c --argjson d "$dropped" '[(.lines[] | ([.north_star] + .guardrails)[]), (.alert_figures // [])[], (.diagnostics // [])[] | .key | select(IN($d[]))]' "$WORK/lines.json")" '[]' \
     "(4) no dropped figure in the lines, the alert figures or the diagnostics"
 expect_eq "$(answer '.ignored_ranges | sort_by(.key)')" \
-    "[{\"key\":\"storage.database_ratio\",\"reason\":\"retired by the owner's core metric set (2026-11-14)\"},{\"key\":\"storage.days_left\",\"reason\":\"retired by the owner's core metric set (2026-11-14)\"},{\"key\":\"storage.free_bites\",\"reason\":\"unknown figure\"}]" \
+    "[{\"key\":\"storage.database_ratio\",\"reason\":\"retired by the owner's core metric set (2026-11-14)\"},{\"key\":\"storage.days_left\",\"reason\":\"retired by the owner's core metric set (2026-11-14)\"},{\"key\":\"storage.free_bites\",\"reason\":\"unknown figure\"},{\"key\":\"storage.free_bytes\",\"reason\":\"an alert of its own (disk_low, objective 204)\"}]" \
     "(4) a dropped figure's range is retired by name; an unknown key stays unknown"
 note "(4) checked: the dropped figures"
 
@@ -481,8 +483,10 @@ test("(5) the three rows, not measured yet, the diagnostics apart", () => {
   const names = view.rows.flatMap((row) => [row.north_star, ...row.guardrails]).map((mark) => mark.name);
   assert.ok(!names.includes("Free disk") && !names.some((name) => name.startsWith("Scratch nobody owns")), `no alert figure or diagnostic on a row: ${names}`);
   assert.equal(view.diagnostics.length, 6);
-  assert.deepEqual(view.diagnostics[0].tone, "warning", "scratch nobody owns is out of its range");
-  assert.match(view.diagnostics[0].name, /^Scratch nobody owns/);
+  assert.match(view.diagnostics[0].name, /^Free disk/);
+  assert.notEqual(view.diagnostics[0].tone, "warning", "free disk has no range (objective 182)");
+  assert.deepEqual(view.diagnostics[1].tone, "warning", "scratch nobody owns is out of its range");
+  assert.match(view.diagnostics[1].name, /^Scratch nobody owns/);
 });
 TEST
 if ! BB_TREE=$tree BB_WORK=$WORK node --test "$WORK/set.test.mjs" >"$WORK/set.out" 2>&1; then
@@ -499,12 +503,10 @@ alert_of() { # <key>: its guardrail_out_of_range alerts, any state
     jq -c --arg s "guardrail $1" '[.[] | select(.kind == "guardrail_out_of_range" and .subject == $s)]' "$WORK/alerts.json"
 }
 open_for() { [ "$(alert_of "$1" | jq '[.[] | select(.state == "open")] | length')" = 1 ]; }
-for key in storage.free_bytes observability.interventions_per_agent_hour recoverability.nightly_red storage.leaked_test_schemas; do
+for key in observability.interventions_per_agent_hour recoverability.nightly_red storage.leaked_test_schemas; do
     wait_until 60 open_for "$key" ||
         check_failed "(6) $key (out of its range from the first reading) has no open guardrail_out_of_range alert 60 s after the loop started: $(alert_of "$key" | head -c 400)"
 done
-expect_eq "$(alert_of storage.free_bytes | jq -c '[.[] | .evidence | {line, key}]')" \
-    '[{"line":"storage","key":"storage.free_bytes"}]' "(6) free disk's alert names the storage line"
 expect_eq "$(alert_of observability.interventions_per_agent_hour | jq -c '[.[] | .evidence | {line, key}]')" \
     '[{"line":"sustainability","key":"observability.interventions_per_agent_hour"}]' "(6) the interventions' alert names the sustainability line"
 expect_eq "$(alert_of recoverability.nightly_red | jq -c '[.[] | .evidence | {line, key}]')" \
@@ -516,8 +518,8 @@ expect_eq "$(alert_of storage.leaked_test_schemas | jq -c '[.[] | .evidence | {l
 sleep 12
 alerts_json
 expect_eq "$(jq -c '[.[] | select(.kind == "guardrail_out_of_range") | .subject] | unique' "$WORK/alerts.json")" \
-    '["guardrail observability.interventions_per_agent_hour","guardrail recoverability.nightly_red","guardrail storage.free_bytes","guardrail storage.leaked_test_schemas"]' \
-    "(6) no alert for a plain diagnostic (scratch nobody owns, out of its range), nor any other"
+    '["guardrail observability.interventions_per_agent_hour","guardrail recoverability.nightly_red","guardrail storage.leaked_test_schemas"]' \
+    "(6) no alert for a plain diagnostic (scratch nobody owns, out of its range; free disk, whose file range is not applied, objective 182), nor any other"
 note "(6) checked: the alerts"
 
 if [ -s "$WORK/failures" ]; then

@@ -30,9 +30,12 @@
 #       that reading ({key, state, value, range, reading_ms}).
 #
 # A real `spawn loop` and `spawn serve` run on a scratch database with a
-# ranges file at <workspace root>/core-lines.json: free disk at least 10^18
-# bytes (out from the first reading), the database against its log at most
-# 10^12 (in). Then free disk's range is moved to 1 byte or more.
+# ranges file at <workspace root>/core-lines.json: leaked test schemas at
+# most -1 (out from the first reading, whatever it counts), the database
+# against its log at most 10^12 (in). Then leaked test schemas' range is
+# moved to 10^18 or less. Its one test server is a second scratch database,
+# named by a URL file (objective 182: free disk, the figure this used
+# before, has no range now; its alert is disk_low's).
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -80,6 +83,7 @@ pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
 server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
+test_made=""
 loop_pid=""
 serve_pid=""
 cleanup() {
@@ -91,6 +95,9 @@ cleanup() {
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$test_made" ]; then
+        sh "$controller/scripts/blackbox/scenario-db.sh" drop "${SPAWN_DB_NAME}_t" >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
@@ -122,6 +129,9 @@ sh "$controller/scripts/blackbox/scenario-db.sh" sweep "${SPAWN_DB_NAME%"$run"}"
 psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
     harness "cannot create the scenario database"
 database_made=1
+psql -d postgres -tA -c "create database ${SPAWN_DB_NAME}_t" >/dev/null 2>&1 ||
+    harness "cannot create the scenario's test database"
+test_made=1
 
 . "$controller/scripts/blackbox/assertions.sh"
 
@@ -273,13 +283,18 @@ alerts_json() {
 
 # --- the ranges, the loop -------------------------------------------------------------------
 
-# No test database is handed to the loop: the figures under test are the
-# live database's and the disk's.
+# No test database is handed to the loop in its environment: leaked test
+# schemas reads the scenario's own test database, named by a URL file
+# (mode 0600, never printed).
+test_url=$WORK/test.url
+(umask 077 && printf '%s\n' "$server_url/${SPAWN_DB_NAME}_t" >"$test_url") || harness "cannot write the URL file"
 unset SPAWN_TEST_DATABASE_URL SPAWN_FLEET_TEST_DATABASE_URL 2>/dev/null || true
 ranges=$SPAWN_WORKSPACE_ROOT/core-lines.json
-cat >"$ranges" <<'JSON'
-{"ranges": {"storage.free_bytes": {"min": 1000000000000000000}, "storage.database_ratio": {"max": 1000000000000}}}
-JSON
+write_ranges() { # <leaked test schemas' max>
+    printf '{"ranges": {"storage.leaked_test_schemas": {"max": %s}, "storage.database_ratio": {"max": 1000000000000}},\n "storage": {"test_database_url_files": [{"name": "bb", "url_file": "%s"}]}}\n' \
+        "$1" "$test_url" >"$ranges"
+}
+write_ranges -1
 started=$(q "select (floor(extract(epoch from clock_timestamp()) * 1000))::bigint")
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
@@ -291,42 +306,40 @@ alert_of() { # <key>: its guardrail_out_of_range alerts in /api/alerts, any stat
 }
 open_for() { [ "$(alert_of "$1" | jq '[.[] | select(.state == "open")] | length')" = 1 ]; }
 
-# --- (1) free disk stays out: one alert, not before 6 s ---------------------------------------
+# --- (1) leaked test schemas stays out: one alert, not before 6 s -------------------------------
 
-if wait_until 60 open_for storage.free_bytes; then
-    expect_eq "$(alert_of storage.free_bytes | jq -c '[.[] | .evidence | {line, key, name, range, valued: (.value | type == "number")}]')" \
-        '[{"line":"storage","key":"storage.free_bytes","name":"Free disk","range":{"min":1000000000000000000},"valued":true}]' \
-        "(1) free disk's guardrail_out_of_range alert: its evidence"
-    expect_eq "$(alert_of storage.free_bytes | jq -c --argjson t "$started" '[.[] | {
+if wait_until 60 open_for storage.leaked_test_schemas; then
+    expect_eq "$(alert_of storage.leaked_test_schemas | jq -c '[.[] | .evidence | {line, key, name, range, valued: (.value | type == "number")}]')" \
+        '[{"line":"storage","key":"storage.leaked_test_schemas","name":"Leaked test schemas","range":{"max":-1},"valued":true}]' \
+        "(1) leaked test schemas' guardrail_out_of_range alert: its evidence"
+    expect_eq "$(alert_of storage.leaked_test_schemas | jq -c --argjson t "$started" '[.[] | {
         held: (.fired_at_ms - .evidence.out_since_ms >= 6000),
         since: (.evidence.out_since_ms >= $t),
-        text: ((.text | test("[Ss]torage")) and (.text | contains("Free disk")))}]')" \
+        text: ((.text | test("[Ss]torage")) and (.text | contains("Leaked test schemas")))}]')" \
         '[{"held":true,"since":true,"text":true}]' \
         "(1) raised only after 6 s out of range, counted from a reading of this loop; its text names the line and the figure"
 else
-    check_failed "(1) free disk (out of a range of 10^18 bytes or more from the first reading) has no open guardrail_out_of_range alert 60 s after the loop started: $(alert_of storage.free_bytes | head -c 400)"
+    check_failed "(1) leaked test schemas (out of a range of -1 or less from the first reading) has no open guardrail_out_of_range alert 60 s after the loop started: $(alert_of storage.leaked_test_schemas | head -c 400)"
 fi
 expect_eq "$(alert_of storage.database_ratio | jq -c 'length')" 0 "(1) no alert for the database against its log (in its range)"
 alerts_json
-expect_eq "$(jq -c '[.[] | select(.kind == "guardrail_out_of_range") | .subject] | unique' "$WORK/alerts.json")" '["guardrail storage.free_bytes"]' \
+expect_eq "$(jq -c '[.[] | select(.kind == "guardrail_out_of_range") | .subject] | unique' "$WORK/alerts.json")" '["guardrail storage.leaked_test_schemas"]' \
     "(1) no other guardrail alert (the other figures have no range)"
 note "(1) checked: the alert"
 
 # --- (2) back in range: it clears, not before 6 s ------------------------------------------------
 
 moved=$(q "select (floor(extract(epoch from clock_timestamp()) * 1000))::bigint")
-cat >"$ranges" <<'JSON'
-{"ranges": {"storage.free_bytes": {"min": 1}, "storage.database_ratio": {"max": 1000000000000}}}
-JSON
-cleared() { [ "$(alert_of storage.free_bytes | jq -c '[.[] | .state]')" = '["cleared"]' ]; }
+write_ranges 1000000000000000000
+cleared() { [ "$(alert_of storage.leaked_test_schemas | jq -c '[.[] | .state]')" = '["cleared"]' ]; }
 if wait_until 60 cleared; then
-    expect_eq "$(alert_of storage.free_bytes | jq -c --argjson t "$moved" '[.[] | {
+    expect_eq "$(alert_of storage.leaked_test_schemas | jq -c --argjson t "$moved" '[.[] | {
         held: (.cleared_at_ms - $t >= 6000),
         evidence: (.cleared_evidence | {key, state, range})}]')" \
-        '[{"held":true,"evidence":{"key":"storage.free_bytes","state":"in","range":{"min":1}}}]' \
+        '[{"held":true,"evidence":{"key":"storage.leaked_test_schemas","state":"in","range":{"max":1000000000000000000}}}]' \
         "(2) cleared only after 6 s back in range; its cleared evidence the reading"
 else
-    check_failed "(2) free disk's alert did not clear within 60 s of its range moving to 1 byte or more: $(alert_of storage.free_bytes | head -c 400)"
+    check_failed "(2) leaked test schemas' alert did not clear within 60 s of its range moving to 10^18 or less: $(alert_of storage.leaked_test_schemas | head -c 400)"
 fi
 note "(2) checked: the clearing"
 

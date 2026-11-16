@@ -1,0 +1,25 @@
+[Unit]
+Description=Spawn: send the sanitized agent presence to observe3 (scripts/observe3/presence_upload.py)
+# OFF BY DEFAULT: it sends nothing unless ~/.config/spawn-agent-presence/upload.json
+# says {"enabled": true} AND the dedicated token file exists (0600). One outbound
+# HTTPS POST of presence.json to a fixed URL; it serves nothing and opens no port.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/.local/share/spawn-rsi/controllers/spawn/scripts/observe3/presence_upload.py
+# No EnvironmentFile: the only credential it reads is its own token file.
+Environment=PATH=/usr/bin:/bin
+# TLS uses the system trust store only (rev-e): OpenSSL would honour these.
+UnsetEnvironment=SSL_CERT_FILE SSL_CERT_DIR
+TimeoutStartSec=30
+CPUQuota=10%
+MemoryMax=64M
+TasksMax=8
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+# No Restart=: a failed send is one document not delivered; the receiver marks
+# the source stale after 60 s by itself.
+# Turn off: rm ~/.config/spawn-agent-presence/upload.json, or
+# touch ~/.config/spawn-agent-presence/disabled (stops the exporter too), or
+# systemctl --user disable --now spawn-agent-presence-upload.timer

@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: agent presence upload every 15 s (see the .service; off unless enabled)
+
+[Timer]
+OnBootSec=2min30s
+# Every 15 s, offset from the exporter's timer. The uploader itself sends at most
+# one request per 10 s and each document once; the receiver's producer budget is
+# 4, +1 per 5 s.
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

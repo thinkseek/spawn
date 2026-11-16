@@ -346,7 +346,7 @@ if [ "$code" != 200 ]; then
     printf '{}' >"$WORK/api.json"
 else
     # Today's point is the loop's sample, or a later one of this loop.
-    trend=$(jq -c '[(.lines[] | ([.north_star] + .guardrails)[]), (.alert_figures // [])[] | select(.key == "storage.free_bytes") | .trend][0]' "$WORK/api.json")
+    trend=$(jq -c '[(.lines[] | ([.north_star] + .guardrails)[]), (.alert_figures // [])[], (.diagnostics // [])[] | select(.key == "storage.free_bytes") | .trend][0]' "$WORK/api.json")
     expect_eq "$(printf '%s' "$trend" | jq -c '.[:3]')" \
         "[{\"day\":\"$(day $((midnight - 6 * D)))\",\"value\":$((100 * GIB))},{\"day\":\"$(day $((midnight - 3 * D)))\",\"value\":$((110 * GIB))},{\"day\":\"$(day $((midnight - D)))\",\"value\":$((120 * GIB))}]" \
         "(2) free disk's trend: one point a day of the last 7, that day's last sample (yesterday's 120 GiB, not its 999), nothing from 8 days ago"
@@ -388,8 +388,8 @@ test("(3) the change, in words", () => {
 
 test("(3) over the answer: free disk's points", () => {
   assert.ok(Array.isArray(answer.lines), "GET /api/core-lines answered");
-  // Objective 176: free disk is an alert figure.
-  const free = (answer.alert_figures ?? []).find((f) => f.key === "storage.free_bytes");
+  // Objective 176 made free disk an alert figure; objective 182 a diagnostic.
+  const free = [...(answer.alert_figures ?? []), ...(answer.diagnostics ?? [])].find((f) => f.key === "storage.free_bytes");
   assert.deepEqual(view(free.trend).points.slice(0, 3), [100 * GIB, 110 * GIB, 120 * GIB]);
 });
 TEST

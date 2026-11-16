@@ -15,7 +15,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-loop` | `spawn loop`: Bridge, Observer, dispatcher, supervisor and resident liveness | never (`Restart=always`) |
 | `spawn-integrate` | `spawn integrate`: lands gated missions' work through the controller's `scripts/rsi/gate.sh` (below), assigns objective tasks (RSI is an objective mission) | never; a halt is per mission, cleared by `spawn mission resume` |
 | `spawn-serve` | `spawn serve`: UI and API, read as `spawn_reader`, and a person's input to a session typed as `spawn_human` (the one write, `POST /api/session/<id>/input`); the UI is the build `deploy.sh` installs in `~/.local/share/spawn-rsi/web` (`SPAWN_WEB_DIR`), on `SPAWN_SERVE_ADDRESS` (default `127.0.0.1:8787`). Off loopback (e.g. `0.0.0.0:8787` for the LAN) it refuses to start without `SPAWN_SERVE_TOKEN`; open the UI once as `http://<host>:8787/?token=<token>` | never; without the token it exits and restarts every 3 s |
-| `spawn-jev-relay` | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key | never |
+| `spawn-jev-relay` (and `.path`) | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key (Keep's `/run/keep/typesafe.api-key`, by `LoadCredential`; objective 201). Without the file (after a reboot, until Keep delivers again) it fails with 243 and stays stopped; `spawn-jev-relay.path` starts it when Keep writes the file | never; stopped while the key file is absent or empty, until Keep writes it |
 | `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.hermes/.env`, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
 | `spawn-fleet-test-db` | PostgreSQL 16 on a Unix socket only (`~/.local/share/spawn-rsi/fleet-pg`): the fleet's test server, which engines get as `SPAWN_TEST_DATABASE_URL` once it checks out (below) | never (`Restart=on-failure`) |
 | `spawn-backup` (`.timer`) | `spawn backup dump`: the hourly encrypted `pg_dump` of the event log to R2, bucket-locked, expired by R2's lifecycle; install, keys, windows and cost in [deploy/backup](../backup/README.md) | oneshot, hourly at :00 + up to 5 min |
@@ -37,7 +37,7 @@ A loop killed outright loses none either: the next one publishes again the
 branch of every agent with an open task.
 
 Install: copy to `~/.config/systemd/user/`, then
-`systemctl --user daemon-reload && systemctl --user enable --now spawn-loop spawn-integrate spawn-serve spawn-jev-relay spawn-model-relay`.
+`systemctl --user daemon-reload && systemctl --user enable --now spawn-loop spawn-integrate spawn-serve spawn-jev-relay spawn-jev-relay.path spawn-model-relay`.
 
 The relays' scripts run from `~/.local/share/spawn-rsi/bin/`, installed by
 hand the first time; after that `deploy.sh` installs a changed relay script and try-restarts its unit (a unit that is not installed is skipped). The model relay:
