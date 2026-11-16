@@ -1092,7 +1092,11 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
   the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
   `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
-  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `database_size` (`database
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `disk_low` (objective 204: the
+  free space of the filesystem holding `SPAWN_WORKSPACE_ROOT` under
+  `SPAWN_ALERT_DISK_LOW_GB` GiB, default 0, off; clears at
+  `SPAWN_ALERT_DISK_OK_GB`, default 45; the live loop's unit sets 40 and 45),
+  `database_size` (`database
   <name>`, objective 074: every `SPAWN_ALERT_DATABASE_SECS`, default 600, the
   live database, the gates' test database and the engines'
   (`SPAWN_TEST_DATABASE_URL`, `SPAWN_FLEET_TEST_DATABASE_URL`, each when set)

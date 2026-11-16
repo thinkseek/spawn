@@ -3125,6 +3125,7 @@ fn the_integrator_down_alert_fires_once_and_clears_when_it_runs_again() {
     settings.integrator_down_ms = 300;
     settings.memory_low_mb = 0;
     settings.tmpfs_high_mb = 0;
+    settings.disk_low_gb = 0;
     settings.test_log = None;
     settings.live_log = None;
     let mut monitor = crate::alerts::Monitor::with(settings);
@@ -9241,6 +9242,7 @@ fn the_controller_behind_alert_fires_once_and_clears_after_the_deploy() {
     settings.controller_behind_ms = 300;
     settings.memory_low_mb = 0;
     settings.tmpfs_high_mb = 0;
+    settings.disk_low_gb = 0;
     settings.test_log = None;
     settings.live_log = None;
     let mut monitor = crate::alerts::Monitor::with(settings);
@@ -9400,6 +9402,7 @@ fn the_controller_behind_alert_reads_the_controller_through_the_map() {
     settings.controller_behind_ms = 300;
     settings.memory_low_mb = 0;
     settings.tmpfs_high_mb = 0;
+    settings.disk_low_gb = 0;
     settings.test_log = None;
     settings.live_log = None;
     let mut monitor = crate::alerts::Monitor::with(settings);
