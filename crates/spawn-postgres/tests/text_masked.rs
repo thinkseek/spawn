@@ -164,6 +164,9 @@ fn a_holds_and_a_pauses_reason_at_its_limit_is_taken_masked_within_it() {
     assert!(paused.starts_with("éé"), "{paused}");
 
     let source = "/tmp/text-masked.git";
+    store
+        .mission_add("Held", &json!([source]), "human")
+        .expect("a mission on the source");
     let lock = store.source_hold_lock(source).expect("the landing lock");
     store
         .source_hold(source, &"a".repeat(40), 600, Some(&reason))
