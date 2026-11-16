@@ -962,9 +962,7 @@ fn run(
             // `--only controllers` never comes here (its own drill, above).
             Only::Both | Only::Controllers => fetch_bundle(settings, record, seal, &here)?,
             Only::Missions => fetch_members(settings, record, seal, &here, missions_members)?,
-            Only::Transcripts => {
-                fetch_members(settings, record, seal, &here, transcripts_members)?
-            }
+            Only::Transcripts => fetch_members(settings, record, seal, &here, transcripts_members)?,
         };
         unpacked.push((here.join("unpacked"), manifest));
     }
@@ -2972,6 +2970,102 @@ mod tests {
         write(&path.join("transcripts/a.jsonl"), b"{}\n");
         drill.remove().expect("removed");
         assert!(!path.exists());
+    }
+
+    /// Objective 203: every drill reaches a bundle's unpacked tree through
+    /// `unpacked_manifest` (the tree judged first), and the manifest is read
+    /// only through a no-follow, non-blocking, regular-only open. The
+    /// symlink's target is a FIFO a witness waits to open for writing: an
+    /// open for reading would let it through, so "never opened" is seen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_manifest_is_refused_before_its_target_is_opened() {
+        use super::{read_manifest, unpacked_manifest};
+        use rustix::fs::{CWD, FileType, Mode, OFlags};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fifo = |path: &Path| {
+            rustix::fs::mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o600), 0)
+                .expect("mkfifo");
+        };
+        let own = Own::new("manifest");
+        let outside = own.0.join("outside");
+        fs::create_dir(&outside).expect("outside");
+        let target = outside.join("fifo");
+        fifo(&target);
+        let opened = Arc::new(AtomicBool::new(false));
+        let witness = {
+            let (target, opened) = (target.clone(), Arc::clone(&opened));
+            std::thread::spawn(move || {
+                let file = fs::OpenOptions::new().write(true).open(&target);
+                opened.store(true, Ordering::SeqCst);
+                drop(file);
+            })
+        };
+        let unpacked = own.0.join("bundle-0").join("unpacked");
+        fs::create_dir_all(&unpacked).expect("unpacked");
+        let manifest = unpacked.join("manifest.json");
+        std::os::unix::fs::symlink(&target, &manifest).expect("symlink");
+        let full = record(1, "full", None, true);
+
+        let judged = unpacked_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert!(
+            judged.contains("manifest.json") && judged.contains("a symlink"),
+            "{judged}"
+        );
+        let read = read_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert_eq!(
+            read,
+            "bundles/k1's manifest.json: a symlink, never followed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!opened.load(Ordering::SeqCst), "the FIFO was opened");
+        assert!(!witness.is_finished(), "the witness still waits");
+
+        // The manifest a FIFO itself: refused, never waited on.
+        fs::remove_file(&manifest).expect("unlink");
+        fifo(&manifest);
+        let judged = unpacked_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert!(
+            judged.contains("manifest.json")
+                && judged.contains("neither a directory nor a regular file"),
+            "{judged}"
+        );
+        let read = read_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert_eq!(
+            read,
+            "bundles/k1's manifest.json: not a regular file, never read"
+        );
+
+        // A regular manifest of the record's kind: read both ways.
+        fs::remove_file(&manifest).expect("unlink");
+        write(&manifest, br#"{"kind":"full"}"#);
+        let value = unpacked_manifest("bundles/k1", &full, &unpacked).expect("read");
+        assert_eq!(value["kind"], "full");
+        let value = read_manifest("bundles/k1", &full, &unpacked).expect("read");
+        assert_eq!(value["kind"], "full");
+
+        // A repository bundle beside it that is a symlink: the tree refuses it.
+        fs::create_dir(unpacked.join("repos")).expect("repos");
+        std::os::unix::fs::symlink(&target, unpacked.join("repos/x.bundle")).expect("symlink");
+        let judged = unpacked_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert!(
+            judged.contains("repos/x.bundle") && judged.contains("a symlink"),
+            "{judged}"
+        );
+        assert!(!opened.load(Ordering::SeqCst), "the FIFO was opened");
+        assert!(!witness.is_finished(), "the witness still waits");
+
+        // Let the witness go: a reader of the test's own, then joined.
+        let reader = rustix::fs::open(
+            &target,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("reader");
+        witness.join().expect("witness");
+        drop(reader);
+        assert!(target.exists(), "the FIFO is still there");
     }
 
     /// Objective 200: the bytes a transcripts drill writes are counted from
