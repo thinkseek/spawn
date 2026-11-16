@@ -105,8 +105,17 @@ pub(crate) fn controller_git() -> Command {
 /// `https://` or `ssh://` URL, or ssh's `user@host:path`. Nothing that names
 /// another transport (`ext::`, `fd::`, `file://`), nothing relative, nothing
 /// that begins like an option; no whitespace or control character in a URL.
-/// `spawn_source_allowed` in the schema is the same rule, where a mission is
-/// added.
+/// `spawn_source_allowed` in the schema is the same rule of shape, where a
+/// mission is added.
+///
+/// Objective 171 adds two rules of Spawn's own, before the shape: an
+/// `https://` or `ssh://` URL whose port is not digits from 1 to 65535 is
+/// refused ([`port_is_digits`]; no git can fetch it, and a password written
+/// where the port goes would otherwise be stored), and so is one carrying
+/// credentials (any userinfo in an `https://` URL, a password in an
+/// `ssh://` one: [`carries_credentials`]). No refusal repeats a URL-shaped
+/// text: each says a fixed explanation and what the text is
+/// ([`described`]); only an absolute path with no `:` and no `@` is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissionSource(String);
 
@@ -116,8 +125,35 @@ impl MissionSource {
 
     /// `text` as a source, or why it is not one.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
-        let refused =
-            || format!("a source is an absolute path or an https:// or ssh:// URL, not {text:?}");
+        let refused = || {
+            format!(
+                "a source is an absolute path or an https:// or ssh:// URL, not {}",
+                described(text)
+            )
+        };
+        if text.len() > Self::MAX_LEN {
+            return Err(format!(
+                "a source is at most {} bytes, not {}",
+                Self::MAX_LEN,
+                text.len()
+            ));
+        }
+        if let Some(authority) = authority(text) {
+            if !port_is_digits(authority) {
+                return Err(format!(
+                    "a source URL's port is digits from 1 to 65535, after the host: not {}",
+                    described(text)
+                ));
+            }
+            if carries_credentials(text, authority) {
+                return Err(format!(
+                    "a source URL carries credentials (its userinfo, before the host's @): give \
+                     git its credentials through a credential helper or an ssh key, not in the \
+                     URL ({})",
+                    described(text)
+                ));
+            }
+        }
         let plain = |rest: &str| {
             !rest.is_empty() && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
         };
@@ -159,6 +195,85 @@ impl MissionSource {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The authority of an `https://` or `ssh://` URL (exactly those letters):
+/// what follows the scheme up to the first `/`, or the end. `None` for any
+/// other text.
+fn authority(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix("https://")
+        .or_else(|| text.strip_prefix("ssh://"))?;
+    Some(rest.split_once('/').map_or(rest, |(authority, _)| authority))
+}
+
+/// Whether an authority's port, if it names one, is digits from 1 to 65535.
+/// The host follows the userinfo (up to the last `@`); a bracketed host
+/// (`[2001:db8::1]`) ends at its `]`, any other at its first `:`, and the
+/// port is everything after that colon: `user:<secret>:443` names the port
+/// "<secret>:443", refused, and so does `user:<secret>` (a password where
+/// the port goes, the host forgotten). An empty port is refused too.
+pub(crate) fn port_is_digits(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let port = if let Some(bracketed) = host.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((_, "")) => return true,
+            Some((_, after)) => match after.strip_prefix(':') {
+                Some(port) => port,
+                None => return false,
+            },
+            None => return false,
+        }
+    } else {
+        match host.split_once(':') {
+            Some((_, port)) => port,
+            None => return true,
+        }
+    };
+    !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|port| (1..=65535).contains(&port))
+}
+
+/// Whether an `https://` or `ssh://` URL carries credentials in its
+/// `authority`: any userinfo in an https URL (`user:password@`, or a token
+/// as the user), a password in an ssh one (`user:password@`). An ssh user
+/// alone (`ssh://git@host/…`) is no credential.
+fn carries_credentials(text: &str, authority: &str) -> bool {
+    let Some((userinfo, _)) = authority.rsplit_once('@') else {
+        return false;
+    };
+    text.starts_with("https://") || userinfo.contains(':')
+}
+
+/// The schemes a refusal names; any other reads as "another scheme".
+const NAMED_SCHEMES: &[&str] = &["https", "ssh", "http", "git", "ftp", "file"];
+
+/// What a refused source is, never what it says (cc-astra A83): an
+/// absolute path with no `:` and no `@` is shown (escaped); any other text
+/// is described by its scheme from [`NAMED_SCHEMES`] (in lower case),
+/// "another scheme" or "no scheme", and its length, so no shape of
+/// credential (a token as the user, a password where the port goes, under
+/// any scheme) is ever repeated.
+pub(crate) fn described(text: &str) -> String {
+    if text.starts_with('/') && !text.contains(':') && !text.contains('@') {
+        return format!("{text:?}");
+    }
+    let scheme = text.split_once("://").and_then(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        (chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .then(|| scheme.to_ascii_lowercase())
+    });
+    let what = match scheme {
+        Some(scheme) if NAMED_SCHEMES.contains(&scheme.as_str()) => format!("a {scheme}:// URL"),
+        Some(_) => "a URL of another scheme".to_string(),
+        None => "a text with no scheme".to_string(),
+    };
+    format!("{what} of {} bytes (not shown)", text.len())
 }
 
 /// Run git and return its trimmed stdout, or the failure as an error.
