@@ -54,7 +54,9 @@ pub(crate) fn masked_within(text: &str, limit: usize, chars: bool) -> String {
         return out;
     }
     let end = if chars {
-        out.char_indices().nth(limit).map_or(out.len(), |(at, _)| at)
+        out.char_indices()
+            .nth(limit)
+            .map_or(out.len(), |(at, _)| at)
     } else {
         let mut end = limit;
         while !out.is_char_boundary(end) {
@@ -1997,8 +1999,7 @@ impl PostgresStore {
                     &reference,
                     &how.gated,
                     &how.urgent,
-                    &how
-                        .reason
+                    &how.reason
                         .as_deref()
                         .map(|reason| masked_within(reason, PUSH_REASON_CHARS, true)),
                 ],
@@ -2700,7 +2701,10 @@ mod tests {
         use serde_json::json;
         let token = "ghp_171madeup0123456789abcdefghijklmnopq";
         let said = masked(&format!("curl -H 'Authorization: Bearer {token}'"));
-        assert!(!said.contains(token) && said.contains("[redacted]"), "{said}");
+        assert!(
+            !said.contains(token) && said.contains("[redacted]"),
+            "{said}"
+        );
         assert_eq!(masked("no secret here"), "no secret here");
 
         // 494 é and " PWD=x": 500 chars, masked longer, cut back to 500.
@@ -2726,7 +2730,10 @@ mod tests {
             {"command": 3, "error": format!("token {token}")}, "PGPASSWORD=hunter171"],
             "n": 2}));
         let text = nested.to_string();
-        assert!(!text.contains(token) && !text.contains("hunter171"), "{text}");
+        assert!(
+            !text.contains(token) && !text.contains("hunter171"),
+            "{text}"
+        );
         assert_eq!(nested["n"], 2);
         assert_eq!(nested["attempts"][0]["command"], 3);
     }

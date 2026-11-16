@@ -204,7 +204,10 @@ fn authority(text: &str) -> Option<&str> {
     let rest = text
         .strip_prefix("https://")
         .or_else(|| text.strip_prefix("ssh://"))?;
-    Some(rest.split_once('/').map_or(rest, |(authority, _)| authority))
+    Some(
+        rest.split_once('/')
+            .map_or(rest, |(authority, _)| authority),
+    )
 }
 
 /// Whether an authority's port, if it names one, is digits from 1 to 65535.
@@ -235,7 +238,9 @@ pub(crate) fn port_is_digits(authority: &str) -> bool {
     !port.is_empty()
         && port.len() <= 5
         && port.bytes().all(|b| b.is_ascii_digit())
-        && port.parse::<u32>().is_ok_and(|port| (1..=65535).contains(&port))
+        && port
+            .parse::<u32>()
+            .is_ok_and(|port| (1..=65535).contains(&port))
 }
 
 /// Whether an `https://` or `ssh://` URL carries credentials in its
@@ -796,8 +801,8 @@ impl Drop for MissionWorkspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        MissionSource, ensure_mirror, fetch_pushed_into, mirror_name, receives_branches,
-        test_git as git,
+        MissionSource, ensure_mirror, fetch_pushed_into, mirror_name, port_is_digits,
+        receives_branches, test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
@@ -1223,10 +1228,19 @@ mod tests {
     fn a_source_url_carrying_credentials_is_refused_by_name() {
         let token = "ghp_171madeup0123456789abcdefghijklmnopq";
         for (bad, secret) in [
-            (format!("https://user:{token}@git.example.org/acme/r.git"), token),
+            (
+                format!("https://user:{token}@git.example.org/acme/r.git"),
+                token,
+            ),
             (format!("https://{token}@git.example.org/acme/r.git"), token),
-            ("https://deploy:hunter171@github.com:443/acme/r.git".to_string(), "hunter171"),
-            ("ssh://git:hunter171@git.example.org/acme/r.git".to_string(), "hunter171"),
+            (
+                "https://deploy:hunter171@github.com:443/acme/r.git".to_string(),
+                "hunter171",
+            ),
+            (
+                "ssh://git:hunter171@git.example.org/acme/r.git".to_string(),
+                "hunter171",
+            ),
         ] {
             let error = MissionSource::parse(&bad).expect_err(&bad);
             assert!(error.contains("carries credentials"), "{error}");
@@ -1295,11 +1309,18 @@ mod tests {
             );
         }
         let overlength = MissionSource::parse(&cases[2]).expect_err("overlength");
-        assert_eq!(overlength, format!("a source is at most 4096 bytes, not {}", cases[2].len()));
+        assert_eq!(
+            overlength,
+            format!("a source is at most 4096 bytes, not {}", cases[2].len())
+        );
         let port = MissionSource::parse(&cases[9]).expect_err("port");
         assert!(port.contains("port"), "{port}");
         assert!(port.contains("scheme https://"), "{port}");
-        assert!(MissionSource::parse(&cases[13]).expect_err("pasted").contains("no scheme"));
+        assert!(
+            MissionSource::parse(&cases[13])
+                .expect_err("pasted")
+                .contains("no scheme")
+        );
         // A plain absolute path is shown; ports 1 to 65535 in digits are
         // taken, any other refused.
         let plain = MissionSource::parse("/srv/a\u{7}b").expect_err("control");
@@ -1311,7 +1332,10 @@ mod tests {
         for port in ["0", "65536", "abc", "", "00000022", "+22"] {
             let bad = format!("https://git.example.org:{port}/r.git");
             assert!(MissionSource::parse(&bad).is_err(), "{bad}");
-            assert!(!port_is_digits(&format!("git.example.org:{port}")), "{port}");
+            assert!(
+                !port_is_digits(&format!("git.example.org:{port}")),
+                "{port}"
+            );
         }
         assert!(!port_is_digits("[2001:db8::1]:x"));
         assert!(!port_is_digits("[2001:db8::1"));

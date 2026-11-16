@@ -151,7 +151,9 @@ fn a_holds_and_a_pauses_reason_at_its_limit_is_taken_masked_within_it() {
     // 494 é and " PWD=x": 500 chars, which masking lengthens.
     let reason = format!("{} PWD=x", "é".repeat(494));
     assert_eq!(reason.chars().count(), 500);
-    let mission = store.mission_add("Paused", &json!([]), "human").expect("add");
+    let mission = store
+        .mission_add("Paused", &json!([]), "human")
+        .expect("add");
     store
         .mission_pause(mission, Some(&reason))
         .expect("a 500-char reason is taken");
@@ -180,7 +182,9 @@ fn a_holds_and_a_pauses_reason_at_its_limit_is_taken_masked_within_it() {
     assert!(!held.contains("PWD=x"), "{held}");
 
     // A credential in a short reason is masked whole.
-    let other = store.mission_add("Paused 2", &json!([]), "human").expect("add");
+    let other = store
+        .mission_add("Paused 2", &json!([]), "human")
+        .expect("add");
     store
         .mission_pause(other, Some(&format!("hold: {}", secret())))
         .expect("pause");
@@ -214,7 +218,9 @@ fn a_charter_and_a_closing_summary_are_stored_masked() {
         .get(0);
     clean("the resident's charter", &charter);
 
-    let mission = store.mission_add("Closed", &json!([]), "human").expect("add");
+    let mission = store
+        .mission_add("Closed", &json!([]), "human")
+        .expect("add");
     store
         .mission_close(mission, "done", &format!("over: {}", secret()))
         .expect("close");
