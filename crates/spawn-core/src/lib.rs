@@ -8,6 +8,7 @@ pub mod contract;
 pub mod event;
 pub mod id;
 pub mod ingest;
+pub mod mask;
 #[cfg(feature = "testing")]
 pub mod memory;
 pub mod message;
