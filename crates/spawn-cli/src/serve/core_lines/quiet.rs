@@ -84,10 +84,6 @@ mod tests {
         Value::Array(samples)
     }
 
-    fn zeros(_: i64) -> Option<Value> {
-        Some(json!({KEY: 0}))
-    }
-
     /// Objective 182: leaked test schemas has read 0 for a week only when it
     /// reads 0 now and hourly samples cover the whole week, each carrying it
     /// as 0; a missing sample, a sample without it, a gap at the week's
