@@ -784,8 +784,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ArchiveProgress, Restored, archive, archive_to, first_line_ms, parse_rfc3339_ms, restore,
-        settling, whole,
+        ArchiveProgress, Keeper, Restored, archive, archive_to, first_line_ms, parse_rfc3339_ms,
+        restore, settling, whole,
     };
     use crate::id::{AgentId, WorkspaceId};
     use crate::id::{ExecutionId, SessionId};
@@ -838,7 +838,7 @@ mod tests {
     fn a_copy_says_how_long_the_archive_is_after_it() {
         let (store, agent, workspace) = setup();
         let copy = |store: &MemoryStore| {
-            archive_to(store, store, &workspace, PATH, &agent, "n1").expect("archive")
+            archive_to(store, store, None, &workspace, PATH, &agent, "n1").expect("archive")
         };
         assert_eq!(copy(&store).length, None, "nothing archived, no file");
         store.append_file(PATH, "{\"a\":1}\n");
@@ -975,6 +975,14 @@ mod tests {
         assert_eq!(copies(&store, &agent)[0].len(), big.len());
     }
 
+    /// The archive a restore puts back from, copying unmasked.
+    fn keep(store: &MemoryStore) -> Option<Keeper<'_>> {
+        Some(Keeper {
+            archive: store,
+            mask: Ok(None),
+        })
+    }
+
     fn file(store: &MemoryStore, workspace: &WorkspaceId) -> Vec<u8> {
         store
             .read_from(workspace, PATH, 0)
@@ -990,12 +998,12 @@ mod tests {
         store.replace_file(PATH, b"new\n");
         step(&store, &agent, &workspace);
         store.remove_file(PATH);
-        let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
+        let restored = restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true);
         assert_eq!(restored, Ok(Some(Restored::Written { bytes: 8 })));
         assert_eq!(file(&store, &workspace), b"old\nnew\n");
         // Present now: nothing to do, and the archive goes on.
         assert_eq!(
-            restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+            restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true),
             Ok(None)
         );
         store.append_file(PATH, "more\n");
@@ -1018,7 +1026,7 @@ mod tests {
             if archived {
                 step(&store, &agent, &workspace);
             }
-            let restored = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true);
+            let restored = restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true);
             assert_eq!(
                 restored,
                 Ok(Some(Restored::Replaced { bytes: 6, had: 2 })),
@@ -1031,7 +1039,7 @@ mod tests {
             );
             // Restored once: the next resume finds it whole.
             assert_eq!(
-                restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+                restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true),
                 Ok(None),
                 "archived {archived}"
             );
@@ -1061,7 +1069,7 @@ mod tests {
         // resume, though the mismatch stays.
         for resume in 0..2 {
             assert_eq!(
-                restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+                restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true),
                 Ok(Some(Restored::Left { had })),
                 "resume {resume}"
             );
@@ -1080,14 +1088,14 @@ mod tests {
         step(&store, &agent, &workspace);
         store.replace_file(PATH, b"a\n");
         assert_eq!(
-            restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+            restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true),
             Ok(Some(Restored::Replaced { bytes: 4, had: 2 }))
         );
         assert_eq!(file(&store, &workspace), b"a\nb\n");
         // A file that only went on is the transcript itself: left as it is.
         store.append_file(PATH, "c\n");
         assert_eq!(
-            restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true),
+            restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true),
             Ok(None)
         );
         assert_eq!(file(&store, &workspace), b"a\nb\nc\n");
@@ -1148,13 +1156,13 @@ mod tests {
     #[test]
     fn a_transcript_gone_without_a_copy_fails_the_resume() {
         let (store, agent, workspace) = setup();
-        let gone = restore(&store, Some(&store), &workspace, PATH, &agent, "n1", true)
+        let gone = restore(&store, keep(&store), &workspace, PATH, &agent, "n1", true)
             .expect_err("events were read from it");
         assert!(gone.contains("start the agent blank"), "{gone}");
         assert!(restore(&store, None, &workspace, PATH, &agent, "n1", true).is_err());
         // A session that never wrote a transcript has nothing to lose.
         assert_eq!(
-            restore(&store, Some(&store), &workspace, PATH, &agent, "n1", false),
+            restore(&store, keep(&store), &workspace, PATH, &agent, "n1", false),
             Ok(None)
         );
     }

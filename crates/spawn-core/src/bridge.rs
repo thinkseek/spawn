@@ -478,7 +478,8 @@ struct Archiving {
     /// The transcript may hold bytes the archive lacks (it was read
     /// growing, or a copy failed): a copy is made on this pass.
     due: bool,
-    /// The length of the latest copy after the last copy that succeeded.
+    /// How far into the transcript the archive reaches after the last copy
+    /// that succeeded ([`transcripts::Archived::offset`]).
     archived: Option<u64>,
     /// The time of the first line the archive lacks, after a copy failed.
     behind_ms: Option<i64>,
