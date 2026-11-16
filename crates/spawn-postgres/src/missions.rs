@@ -10,6 +10,71 @@ use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
 
+/// Free text a SQL function writes into a control record from its
+/// parameters (objective 171: a mission's text, a brief, a report, a note,
+/// a reason, a charter, a summary), masked before SQL sees it: 170's mask
+/// ([`crate::control_mask`]) covers only the records the Rust side builds
+/// whole. The SQL compares what it is given, so its own comparisons (the
+/// brief's md5 index, the interventions join) see the masked text on both
+/// sides.
+pub(crate) fn masked(text: &str) -> String {
+    spawn_core::redact::redact(text)
+}
+
+/// `value` with every string in it masked ([`masked`]): a re-issue's
+/// attempts and an unfinished report's markers.
+pub(crate) fn masked_strings(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(masked(text)),
+        Value::Array(items) => Value::Array(items.iter().map(masked_strings).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), masked_strings(item)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// `text` masked, kept within the store's `limit` (in characters when
+/// `chars`, else in bytes) when it was within it: masking can lengthen a
+/// short secret ("PWD=x" becomes "PWD=[redacted]"), and the store must not
+/// refuse what it took before. The cut falls on a char boundary. Text
+/// already over its limit is not cut, so the store refuses it as before.
+pub(crate) fn masked_within(text: &str, limit: usize, chars: bool) -> String {
+    let size = |text: &str| {
+        if chars {
+            text.chars().count()
+        } else {
+            text.len()
+        }
+    };
+    let mut out = masked(text);
+    if size(text) > limit || size(&out) <= limit {
+        return out;
+    }
+    let end = if chars {
+        out.char_indices()
+            .nth(limit)
+            .map_or(out.len(), |(at, _)| at)
+    } else {
+        let mut end = limit;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
+    };
+    out.truncate(end);
+    out
+}
+
+/// The store's limit on a hold's and a pause's reason, in characters.
+const REASON_CHARS: usize = 500;
+/// The store's limit on a push request's reason, in characters.
+const PUSH_REASON_CHARS: usize = 2000;
+/// The store's limit on a restart's and a reassign's reason, in bytes.
+const RESTART_REASON_BYTES: usize = 2000;
+
 /// One task the dispatcher has to look at, with what it needs to deliver it.
 /// A closed ephemeral task stays for a day, and for as long as its worker
 /// still runs: its worker is stopped, and it is managed until then. A
@@ -1724,7 +1789,7 @@ impl PostgresStore {
     ) -> Result<i64, StoreError> {
         let row = self.query_one(
             "select spawn_mission_add($1, $2, $3)",
-            &[&text, sources, &origin],
+            &[&masked(text), sources, &origin],
         )?;
         Ok(row.get(0))
     }
@@ -1738,7 +1803,7 @@ impl PostgresStore {
     ) -> Result<(), StoreError> {
         self.execute(
             "select spawn_mission_close($1, $2, $3)",
-            &[&mission, &state, &summary],
+            &[&mission, &state, &masked(summary)],
         )?;
         Ok(())
     }
@@ -1798,7 +1863,7 @@ impl PostgresStore {
         Ok(self
             .query_one(
                 "select spawn_objective_assign($1, $2, $3, $4, $5)",
-                &[&mission, &objective, &scenario, &brief, &continues],
+                &[&mission, &objective, &scenario, &masked(brief), &continues],
             )?
             .get(0))
     }
@@ -1890,7 +1955,13 @@ impl PostgresStore {
     /// a closed or an already paused mission. Returns the record's event id.
     pub fn mission_pause(&self, mission: i64, reason: Option<&str>) -> Result<i64, StoreError> {
         Ok(self
-            .query_one("select spawn_mission_pause($1, $2)", &[&mission, &reason])?
+            .query_one(
+                "select spawn_mission_pause($1, $2)",
+                &[
+                    &mission,
+                    &reason.map(|reason| masked_within(reason, REASON_CHARS, true)),
+                ],
+            )?
             .get(0))
     }
 
@@ -1928,7 +1999,9 @@ impl PostgresStore {
                     &reference,
                     &how.gated,
                     &how.urgent,
-                    &how.reason.as_deref(),
+                    &how.reason
+                        .as_deref()
+                        .map(|reason| masked_within(reason, PUSH_REASON_CHARS, true)),
                 ],
             )?
             .get(0))
@@ -2013,7 +2086,12 @@ impl PostgresStore {
         Ok(self
             .query_one(
                 "select spawn_source_hold($1, $2, $3, $4)",
-                &[&source, &main, &bound_s, &reason],
+                &[
+                    &source,
+                    &main,
+                    &bound_s,
+                    &reason.map(|reason| masked_within(reason, REASON_CHARS, true)),
+                ],
             )?
             .get(0))
     }
@@ -2193,7 +2271,7 @@ impl PostgresStore {
     ) -> Result<i64, StoreError> {
         let row = self.query_one(
             "select spawn_task_assign($1, $2, $3, $4, $5)",
-            &[&mission, &kind, &worker, &brief, &model],
+            &[&mission, &kind, &worker, &masked(brief), &model],
         )?;
         Ok(row.get(0))
     }
@@ -2209,7 +2287,7 @@ impl PostgresStore {
     ) -> Result<(), StoreError> {
         self.execute(
             "select spawn_task_review($1, $2, $3, $4)",
-            &[&task, &accept, &note, &revision],
+            &[&task, &accept, &masked(note), &revision],
         )?;
         Ok(())
     }
@@ -2250,7 +2328,10 @@ impl PostgresStore {
     /// in one transaction. Returns the new task's id.
     pub fn task_reissue(&self, task: i64, attempts: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one("select spawn_task_reissue($1, $2)", &[&task, attempts])?
+            .query_one(
+                "select spawn_task_reissue($1, $2)",
+                &[&task, &masked_strings(attempts)],
+            )?
             .get(0))
     }
 
@@ -2267,7 +2348,13 @@ impl PostgresStore {
     /// session_id, agent_id}`.
     pub fn task_restart(&self, task: i64, reason: Option<&str>) -> Result<Value, StoreError> {
         Ok(self
-            .query_one("select spawn_task_restart($1, $2)", &[&task, &reason])?
+            .query_one(
+                "select spawn_task_restart($1, $2)",
+                &[
+                    &task,
+                    &reason.map(|reason| masked_within(reason, RESTART_REASON_BYTES, false)),
+                ],
+            )?
             .get(0))
     }
 
@@ -2278,13 +2365,22 @@ impl PostgresStore {
     /// agent_id}` of the new task.
     pub fn task_reassign(&self, task: i64, reason: Option<&str>) -> Result<Value, StoreError> {
         Ok(self
-            .query_one("select spawn_task_reassign($1, $2)", &[&task, &reason])?
+            .query_one(
+                "select spawn_task_reassign($1, $2)",
+                &[
+                    &task,
+                    &reason.map(|reason| masked_within(reason, RESTART_REASON_BYTES, false)),
+                ],
+            )?
             .get(0))
     }
 
     /// Propose a resident (or revise a pending proposal).
     pub fn resident_propose(&self, name: &str, charter: &str) -> Result<(), StoreError> {
-        self.execute("select spawn_resident_propose($1, $2)", &[&name, &charter])?;
+        self.execute(
+            "select spawn_resident_propose($1, $2)",
+            &[&name, &masked(charter)],
+        )?;
         Ok(())
     }
 
@@ -2480,7 +2576,10 @@ impl PostgresStore {
 
     /// Store a delivered task's report, naming no checkpoint.
     pub fn task_reported(&self, task: i64, report: &str) -> Result<bool, StoreError> {
-        let row = self.query_one("select spawn_task_reported($1, $2)", &[&task, &report])?;
+        let row = self.query_one(
+            "select spawn_task_reported($1, $2)",
+            &[&task, &masked(report)],
+        )?;
         Ok(row.get(0))
     }
 
@@ -2495,7 +2594,7 @@ impl PostgresStore {
     ) -> Result<bool, StoreError> {
         let row = self.query_one(
             "select spawn_task_reported($1, $2, $3)",
-            &[&task, &report, &commit],
+            &[&task, &masked(report), &commit],
         )?;
         Ok(row.get(0))
     }
@@ -2528,7 +2627,13 @@ impl PostgresStore {
         Ok(self
             .query_one(
                 "select spawn_task_report_unfinished($1, $2, $3, $4, $5)",
-                &[&task, &digest, markers, &note, &command],
+                &[
+                    &task,
+                    &digest,
+                    &masked_strings(markers),
+                    &masked(note),
+                    &command,
+                ],
             )?
             .get(0))
     }
@@ -2547,7 +2652,7 @@ impl PostgresStore {
         Ok(self
             .query_one(
                 "select spawn_task_fork_failed($1, $2, $3, $4)",
-                &[&task, &from, &commit, &error],
+                &[&task, &from, &commit, &masked(error)],
             )?
             .get(0))
     }
@@ -2585,6 +2690,53 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use spawn_core::mission::TaskState;
+
+    /// Objective 171: free text for a control record is masked; a reason
+    /// within its limit stays within it once masked (in chars or in bytes,
+    /// as the store counts it), cut at a char boundary; text already over
+    /// its limit is not cut; every string of a JSON value is masked.
+    #[test]
+    fn text_for_a_control_record_is_masked_within_its_limit() {
+        use super::{masked, masked_strings, masked_within};
+        use serde_json::json;
+        let token = "ghp_171madeup0123456789abcdefghijklmnopq";
+        let said = masked(&format!("curl -H 'Authorization: Bearer {token}'"));
+        assert!(
+            !said.contains(token) && said.contains("[redacted]"),
+            "{said}"
+        );
+        assert_eq!(masked("no secret here"), "no secret here");
+
+        // 494 é and " PWD=x": 500 chars, masked longer, cut back to 500.
+        let reason = format!("{} PWD=x", "é".repeat(494));
+        assert_eq!(reason.chars().count(), 500);
+        let kept = masked_within(&reason, 500, true);
+        assert_eq!(kept.chars().count(), 500, "{kept}");
+        assert!(!kept.contains("PWD=x"), "{kept}");
+        // 997 é and " PWD=x": 2000 bytes, kept within 2000 bytes.
+        let reason = format!("{} PWD=x", "é".repeat(997));
+        assert_eq!(reason.len(), 2000);
+        let kept = masked_within(&reason, 2000, false);
+        assert!(kept.len() <= 2000 && kept.len() >= 1998, "{}", kept.len());
+        assert!(!kept.contains("PWD=x"));
+        // Short text is masked whole, not cut.
+        assert_eq!(masked_within("PWD=x", 500, true), masked("PWD=x"));
+        // Already over: not cut, so the store refuses it as before.
+        let over = format!("{} PWD=x", "r".repeat(600));
+        assert_eq!(masked_within(&over, 500, true), masked(&over));
+        assert!(masked_within(&over, 500, true).chars().count() > 500);
+
+        let nested = masked_strings(&json!({"attempts": [
+            {"command": 3, "error": format!("token {token}")}, "PGPASSWORD=hunter171"],
+            "n": 2}));
+        let text = nested.to_string();
+        assert!(
+            !text.contains(token) && !text.contains("hunter171"),
+            "{text}"
+        );
+        assert_eq!(nested["n"], 2);
+        assert_eq!(nested["attempts"][0]["command"], 3);
+    }
 
     /// Objective 190: the integrator's polled read of the gated missions
     /// reads each baseline, base and candidate, the red's main and the
