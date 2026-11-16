@@ -1576,7 +1576,10 @@ impl spawn_core::port::ArchiveMask for Rotating {
             Some((value, mask)) if *value == state.value => mask.clone(),
             _ => {
                 let mask = Arc::new(spawn_core::mask::Mask::new(
-                    &[("spawn.env:API_TOKEN".to_string(), state.value.as_bytes().to_vec())],
+                    &[(
+                        "spawn.env:API_TOKEN".to_string(),
+                        state.value.as_bytes().to_vec(),
+                    )],
                     spawn_core::transcripts::ARCHIVE_MARKER,
                 ));
                 state.built = Some((state.value.clone(), mask.clone()));
@@ -1660,12 +1663,18 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
     bridge.tick().expect("copy");
     bridge.tick().expect("copy");
     let first = archived(&store, &native);
-    assert!(first.contains("[REDACTED:spawn.env:API_TOKEN]") && !first.contains(ROTATED_ONE), "{first}");
+    assert!(
+        first.contains("[REDACTED:spawn.env:API_TOKEN]") && !first.contains(ROTATED_ONE),
+        "{first}"
+    );
     source.had(false);
     store.append_file(&path, &said_line("u2", ROTATED_ONE));
     let report = bridge.tick().expect("no mask");
     assert!(
-        report.warnings.iter().any(|warning| warning.contains("the credential mask")),
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("the credential mask")),
         "{:?}",
         report.warnings
     );
@@ -1696,7 +1705,10 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
         bridge.tick().expect("copy");
     }
     let after = archived(&store, &native);
-    assert!(after.contains("u3") && !after.contains(ROTATED_ONE), "{after}");
+    assert!(
+        after.contains("u3") && !after.contains(ROTATED_ONE),
+        "{after}"
+    );
 }
 
 #[test]
@@ -1716,7 +1728,10 @@ fn a_rotation_between_a_pass_and_a_resume_is_masked_with_the_new_value() {
     bridge.tick().expect("copy");
     let after = archived(&store, &native);
     assert!(after.contains("u2"), "{after}");
-    assert!(!after.contains(ROTATED_TWO) && !after.contains(ROTATED_ONE), "{after}");
+    assert!(
+        !after.contains(ROTATED_TWO) && !after.contains(ROTATED_ONE),
+        "{after}"
+    );
 }
 
 #[test]
@@ -1736,8 +1751,15 @@ fn a_rotation_between_the_mask_and_the_read_copies_nothing_that_pass() {
         "{:?}",
         report.warnings
     );
-    assert_eq!(archived(&store, &native), before, "nothing copied that pass");
+    assert_eq!(
+        archived(&store, &native),
+        before,
+        "nothing copied that pass"
+    );
     bridge.tick().expect("copy");
     let after = archived(&store, &native);
-    assert!(after.contains("u2") && !after.contains(ROTATED_TWO), "{after}");
+    assert!(
+        after.contains("u2") && !after.contains(ROTATED_TWO),
+        "{after}"
+    );
 }
