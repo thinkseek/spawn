@@ -3992,6 +3992,39 @@ PENDING_ISSUES\n";
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Objective 171: a worker's report holding a token and a PGPASSWORD=
+    /// value, taken by the deliver loop's route (no command writes a
+    /// report), is stored masked in `task.reported` and the task's row.
+    #[test]
+    fn a_reports_credentials_are_stored_masked() {
+        let token = "ghp_171madeup0123456789abcdefghijklmnopq";
+        let password = "hunter171hunter171";
+        let db = Db::new("report_masked");
+        let (task, facts, root) = delivered_task(&db, "masked");
+        std::fs::write(
+            root.join(&task.agent_id).join(REPORT),
+            format!(
+                "## Outcome\ndone; the deploy log said: curl -H 'Authorization: Bearer {token}' \
+                 and PGPASSWORD={password} psql\n## What changed\nnothing\n## Open issues\nnone\n"
+            ),
+        )
+        .expect("report");
+        let lines = collect(&db, &task, &facts, &root);
+        let _ = std::fs::remove_dir_all(&root);
+        let (state, report) = db.task(task.id);
+        assert_eq!(state, "reported", "{lines:?}");
+        let records = db.records(task.id, "task.reported");
+        let [record] = records.as_slice() else {
+            panic!("one task.reported: {records:?}");
+        };
+        let recorded = record["report"].as_str().expect("the record's report");
+        for text in [recorded, report.as_deref().expect("the task's report")] {
+            assert!(text.contains("[redacted]"), "{text}");
+            assert!(!text.contains(token) && !text.contains(password), "{text}");
+            assert!(text.contains("## What changed"), "{text}");
+        }
+    }
+
     #[test]
     fn the_same_file_unchanged_is_not_told_again_and_a_new_draft_is() {
         let db = Db::new("unfinished_same");
