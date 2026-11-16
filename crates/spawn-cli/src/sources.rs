@@ -1216,6 +1216,108 @@ mod tests {
         assert!(MissionSource::parse(&format!("/{}", "a".repeat(5000))).is_err());
     }
 
+    /// Objective 171: a URL carrying credentials is refused by name,
+    /// without repeating them; an ssh user alone, an @ in a path and an
+    /// scp-style source are no credential.
+    #[test]
+    fn a_source_url_carrying_credentials_is_refused_by_name() {
+        let token = "ghp_171madeup0123456789abcdefghijklmnopq";
+        for (bad, secret) in [
+            (format!("https://user:{token}@git.example.org/acme/r.git"), token),
+            (format!("https://{token}@git.example.org/acme/r.git"), token),
+            ("https://deploy:hunter171@github.com:443/acme/r.git".to_string(), "hunter171"),
+            ("ssh://git:hunter171@git.example.org/acme/r.git".to_string(), "hunter171"),
+        ] {
+            let error = MissionSource::parse(&bad).expect_err(&bad);
+            assert!(error.contains("carries credentials"), "{error}");
+            assert!(error.contains("credential helper"), "{error}");
+            assert!(!error.contains(secret), "{error}");
+        }
+        for good in [
+            "ssh://git@github.com/acme/widget.git",
+            "ssh://git@github.com:2222/acme/widget.git",
+            "https://git.example.org/acme/r@2.git",
+            "https://git.example.org:8443/acme/r.git",
+            "https://[2001:db8::1]:443/acme/r.git",
+            "https://[2001:db8::1]/acme/r.git",
+            "git@github.com:acme/widget.git",
+        ] {
+            assert_eq!(
+                MissionSource::parse(good).map(|source| source.as_str().to_string()),
+                Ok(good.to_string()),
+                "{good}"
+            );
+        }
+    }
+
+    /// cc-astra A76, A83 and rev-g's F1 to F3: no refusal repeats a
+    /// credential, whatever its form and whichever rule refuses it; a port
+    /// that is not digits from 1 to 65535 is refused; only a plain absolute
+    /// path is shown.
+    #[test]
+    fn no_refusal_repeats_a_credential_in_any_form() {
+        let opaque = "Zq81mPW04xLrT7vKjHc2NdYb";
+        let digits = "8675309123456";
+        let long = "a".repeat(4200);
+        let cases = [
+            format!("https://{opaque}@git.example.org/acme/r.git"),
+            format!("https://deploy:{digits}@git.example.org/acme/r.git"),
+            format!("https://u:{opaque}@git.example.org/{long}"),
+            format!("ftp://u:{opaque}@git.example.org/acme/r.git"),
+            format!("u:{digits}@git.example.org"),
+            format!("u:{opaque}@git.example.org/x://y"),
+            format!("https://u:abc/{opaque}@git.example.org/r b.git"),
+            format!("ftp://u:abc/{opaque}@git.example.org/r.git"),
+            format!("https://u:abc/{opaque}@git.example.org/r.git"),
+            format!("https://user:{opaque}/r.git"),
+            format!("ssh://git@git.example.org:{opaque}/r"),
+            format!("https://user:{digits}/r.git"),
+            format!("oauth2:{opaque}"),
+            opaque.to_string(),
+            format!("http://oauth2:{opaque}/r.git"),
+            format!("HTTPS://user:{opaque}/r.git"),
+            format!("SSH://git@git.example.org:{opaque}/r"),
+            format!("git://git.example.org:{opaque}/r"),
+            format!("https://u/{opaque}@git.example.org/r b.git"),
+            format!("https://user:{opaque}:443/r b.git"),
+            format!("https://user:{opaque}:443/r.git"),
+            format!("ssh://git@git.example.org:{digits}:22/r"),
+            format!("/srv/u:{opaque}@git.example.org\u{1}"),
+            format!("/srv/{opaque}@git.example.org\u{1}"),
+            format!("ssh://deploy:{digits}@git.example.org/acme/r.git"),
+            format!("https://[2001:db8::1]:{opaque}/acme/r.git"),
+        ];
+        for bad in &cases {
+            let error = MissionSource::parse(bad).expect_err(bad);
+            assert!(
+                !error.contains(opaque) && !error.contains(digits),
+                "{bad:?}: {error}"
+            );
+        }
+        let overlength = MissionSource::parse(&cases[2]).expect_err("overlength");
+        assert_eq!(overlength, format!("a source is at most 4096 bytes, not {}", cases[2].len()));
+        let port = MissionSource::parse(&cases[9]).expect_err("port");
+        assert!(port.contains("port"), "{port}");
+        assert!(port.contains("scheme https://"), "{port}");
+        assert!(MissionSource::parse(&cases[13]).expect_err("pasted").contains("no scheme"));
+        // A plain absolute path is shown; ports 1 to 65535 in digits are
+        // taken, any other refused.
+        let plain = MissionSource::parse("/srv/a\u{7}b").expect_err("control");
+        assert!(plain.contains(r#""/srv/a\u{7}b""#), "{plain}");
+        for port in ["1", "22", "65535"] {
+            let good = format!("https://git.example.org:{port}/r.git");
+            assert!(MissionSource::parse(&good).is_ok(), "{good}");
+        }
+        for port in ["0", "65536", "abc", "", "00000022", "+22"] {
+            let bad = format!("https://git.example.org:{port}/r.git");
+            assert!(MissionSource::parse(&bad).is_err(), "{bad}");
+            assert!(!port_is_digits(&format!("git.example.org:{port}")), "{port}");
+        }
+        assert!(!port_is_digits("[2001:db8::1]:x"));
+        assert!(!port_is_digits("[2001:db8::1"));
+        assert!(port_is_digits("git@[2001:db8::1]:22"));
+    }
+
     /// The controller's git runs only file, https and ssh, even on a host
     /// whose git configuration allows `ext::`: GIT_ALLOW_PROTOCOL wins.
     #[test]
