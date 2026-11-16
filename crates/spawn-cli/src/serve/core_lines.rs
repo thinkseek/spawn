@@ -652,17 +652,7 @@ pub(super) fn adopted(readings: &[Line], leaked_quiet: bool) -> Set {
         lines,
         readings: READINGS
             .iter()
-            .filter_map(|(line, key)| {
-                find(key).map(|figure| {
-                    (
-                        *line,
-                        Figure {
-                            range_note: Some(READING_NOTE.to_string()),
-                            ..figure
-                        },
-                    )
-                })
-            })
+            .filter_map(|(line, key)| find(key).map(|figure| (*line, plain_reading(figure))))
             .collect(),
         alert_figures: ALERT_FIGURES
             .iter()
@@ -674,6 +664,15 @@ pub(super) fn adopted(readings: &[Line], leaked_quiet: bool) -> Set {
             .filter(|key| !(leaked_quiet && **key == LEAKED_SCHEMAS))
             .filter_map(|key| find(key))
             .collect(),
+    }
+}
+
+/// `figure` as a line's plain reading: no range, its note where the range
+/// would be.
+fn plain_reading(figure: Figure) -> Figure {
+    Figure {
+        range_note: Some(READING_NOTE.to_string()),
+        ..figure
     }
 }
 
