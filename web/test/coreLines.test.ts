@@ -657,3 +657,56 @@ test("a target is said apart from the range, a count out of its rows, a held ran
   const bare = coreLinesView(answer()).rows[1].north_star;
   assert.deepEqual(bare, { name: "Days until the disk is full", value: "1,234 days", range: "180 days or more", tone: "plain" });
 });
+
+test("a line's plain reading says its note, never a range; free disk is a diagnostic (objective 182)", () => {
+  const note = "no range until use with no price is under 10%";
+  const view = coreLinesView(
+    answer({
+      lines: [
+        {
+          line: "storage",
+          north_star: fig("storage.bytes_per_landing", "Bytes a landing leaves behind", "bytes", null, null, "not_measured_yet"),
+          guardrails: [],
+          readings: [],
+        },
+        {
+          line: "sustainability",
+          north_star: fig("observability.interventions_per_agent_hour", "Human interventions per agent-hour", "ratio", 0.05, null, "no_range"),
+          guardrails: [],
+          readings: [{ ...fig("performance.usd_per_landing", "Dollars per landing", "usd", 2.5, null, "no_range"), range_note: note }],
+        },
+      ],
+      diagnostics: [
+        fig("storage.free_bytes", "Free disk", "bytes", 40 * GIB, null, "no_range"),
+        fig("storage.disk_fall", "Disk fall", "bytes_per_day", 5 * MIB, { max: 500_000_000 }, "in"),
+      ],
+      ignored_ranges: [
+        { key: "performance.usd_per_landing", reason: "shown with no range until use with no price is under 10% (the owner's core metric set)" },
+        { key: "storage.free_bytes", reason: "an alert of its own (disk_low, objective 204)" },
+      ],
+    }),
+  );
+  const [storage, sustainability] = view.rows;
+  assert.deepEqual(storage.readings, []);
+  assert.equal(sustainability.readings.length, 1);
+  const [usd] = sustainability.readings;
+  assert.equal(usd.name, "Dollars per landing");
+  assert.equal(usd.range, note, "the note where the range would be");
+  assert.equal(usd.target, undefined);
+  assert.equal(usd.tone, "muted");
+  // Free disk is the first diagnostic, with no range.
+  assert.deepEqual(
+    view.diagnostics.map((mark) => [mark.name, mark.range]),
+    [
+      ["Free disk", "no range set"],
+      ["Disk fall", "500 MB a day or less"],
+    ],
+  );
+  // A range ignored on purpose is said by its figure's name and why.
+  assert.deepEqual(view.pending, [
+    "Dollars per landing: shown with no range until use with no price is under 10% (the owner's core metric set)",
+    "Free disk: an alert of its own (disk_low, objective 204)",
+  ]);
+  // A line without readings in the answer has none on the card.
+  assert.deepEqual(coreLinesView(answer()).rows[0].readings, []);
+});

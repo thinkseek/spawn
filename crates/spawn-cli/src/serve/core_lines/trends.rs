@@ -108,19 +108,22 @@ mod tests {
             vec![json!({"day": "2026-11-12", "value": 3})],
         );
         let view = answer(
-            &adopted(&lines(
-                &json!({"free_bytes": 3}),
-                &Value::Null,
-                &Observed::default(),
-                Value::Null,
-                Vec::new(),
-            )),
+            &adopted(
+                &lines(
+                    &json!({"free_bytes": 3}),
+                    &Value::Null,
+                    &Observed::default(),
+                    Value::Null,
+                    Vec::new(),
+                ),
+                false,
+            ),
             &Value::Null,
             Ok(None),
             &trends,
         );
-        // Every list carries trends (objective 176): free disk is an alert
-        // figure now.
+        // Every list carries trends (objective 176): free disk is a
+        // diagnostic now (objective 182).
         let mut seen = 0;
         for line in view["lines"].as_array().expect("lines") {
             for figure in std::iter::once(&line["north_star"])

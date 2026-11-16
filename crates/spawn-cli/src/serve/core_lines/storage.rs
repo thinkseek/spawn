@@ -287,7 +287,7 @@ mod tests {
             Vec::new(),
         );
         let view = answer(
-            &adopted(&readings),
+            &adopted(&readings, false),
             &json!("/ws/core-lines.json"),
             Ok(None),
             &std::collections::BTreeMap::new(),
@@ -339,9 +339,10 @@ mod tests {
         assert_eq!(diagnostic("storage.grew_most")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall").get("store"), None);
-        assert_eq!(view["alert_figures"][0]["key"], "storage.free_bytes");
-        assert_eq!(view["alert_figures"][0]["value"], 104);
-        assert_eq!(view["alert_figures"][0]["line"], "storage");
+        // Free disk is the first diagnostic, with no line (objective 182).
+        assert_eq!(view["diagnostics"][0]["key"], "storage.free_bytes");
+        assert_eq!(view["diagnostics"][0]["value"], 104);
+        assert_eq!(view["diagnostics"][0].get("line"), None);
         assert_eq!(view["lines"][0]["north_star"]["state"], "not_measured_yet");
         still_measuring();
         // No log size: no ratio; no readable test database: none.

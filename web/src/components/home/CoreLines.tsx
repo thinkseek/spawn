@@ -91,7 +91,9 @@ function Guardrail({ mark, figure }: { mark: CoreMark; figure: CoreFigure | unde
  * reason (lead-mac 2026-11-12 18:15). Each figure
  * carries its last 7 days (objective 090): a north star on the kit's KPI
  * chart (objective 120), a guardrail as a small line with the change as its
- * title. Under the recoverability row, the recovery table's rows
+ * title. A line's plain readings (objective 182: dollars per landing under
+ * sustainability) follow its guardrails, each with its note where the range
+ * would be. Under the recoverability row, the recovery table's rows
  * each with its drill's last pass, "never passed" or "no drill" (objective
  * 093). Read-only, from its props: Home polls the answer
  * ([`fetchCoreLines`]); both null while the first read is out.
@@ -193,6 +195,13 @@ export function CoreLinesCard({
                         <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
                           {row.guardrails.map((mark, at) => (
                             <Guardrail key={mark.name} mark={mark} figure={line?.guardrails?.[at]} />
+                          ))}
+                        </ul>
+                      )}
+                      {row.readings.length > 0 && (
+                        <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2" aria-label="Readings">
+                          {row.readings.map((mark, at) => (
+                            <Guardrail key={mark.name} mark={mark} figure={line?.readings?.[at]} />
                           ))}
                         </ul>
                       )}
