@@ -52,6 +52,10 @@ pub struct TmuxHost {
     /// What this host keeps in `$XDG_RUNTIME_DIR` goes here instead
     /// ([`TmuxHost::with_runtime_under`]): a test's own.
     runtime_base: Option<std::path::PathBuf>,
+    /// The engines' projects root, pinned (objective 175 R7): every
+    /// transcript below it is read, restored and replaced through it
+    /// ([`TmuxHost::with_files_beneath`]).
+    beneath: Option<crate::beneath::Beneath>,
 }
 
 /// One finished tmux call.
@@ -75,7 +79,20 @@ impl TmuxHost {
             socket,
             waits: (HANGUP_WAIT, KILL_WAIT),
             runtime_base: None,
+            beneath: None,
         }
+    }
+
+    /// The same host, reading, restoring and replacing every file below
+    /// `projects` (the engines' projects root, pinned when the loop's mask
+    /// is a stand-in's) through it ([`crate::beneath`]): a link below it is
+    /// never followed, and a transcript with a second hard link is never
+    /// read. Asked first, whatever other root also holds a path (R8: a
+    /// projects root inside a workspace).
+    #[must_use]
+    pub fn with_files_beneath(mut self, projects: crate::beneath::Beneath) -> Self {
+        self.beneath = Some(projects);
+        self
     }
 
     /// The same host, waiting `hangup` for a killed terminal's processes to
@@ -969,6 +986,13 @@ impl TerminalHost for TmuxHost {
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError> {
+        // Below the pinned projects root first, whatever other root also
+        // holds the path: never through a link, never a second hard link.
+        if let Some(beneath) = &self.beneath
+            && let Some(relative) = beneath.relative(std::path::Path::new(path))
+        {
+            return read_beneath(beneath, relative, offset);
+        }
         // A file in the workspace (the engine's exit status) is the agent's:
         // opened the safe way, from the workspace through held directories.
         let top = workspace.path().trim_end_matches('/');
@@ -989,6 +1013,11 @@ impl TerminalHost for TmuxHost {
         path: &str,
         bytes: &[u8],
     ) -> Result<bool, TerminalError> {
+        if let Some(beneath) = &self.beneath
+            && let Some(relative) = beneath.relative(std::path::Path::new(path))
+        {
+            return beneath.write_new(relative, bytes).map_err(TerminalError);
+        }
         write_local(path, bytes)
     }
 
@@ -999,6 +1028,13 @@ impl TerminalHost for TmuxHost {
         bytes: &[u8],
         current: &[u8],
     ) -> Result<bool, TerminalError> {
+        if let Some(beneath) = &self.beneath
+            && let Some(relative) = beneath.relative(std::path::Path::new(path))
+        {
+            return beneath
+                .replace_grown(relative, bytes, current)
+                .map_err(TerminalError);
+        }
         replace_local(path, bytes, current)
     }
 }
@@ -1155,6 +1191,29 @@ fn read_in_workspace(
     file.seek(SeekFrom::Start(offset))
         .and_then(|_| (&mut file).take(READ_LIMIT as u64).read_to_end(&mut bytes))
         .map_err(|error| TerminalError(format!("read {}: {error}", shown())))?;
+    Ok(Some(bytes))
+}
+
+/// At most [`READ_LIMIT`] bytes from `offset` of the file `relative` below
+/// `beneath`; `None` when it does not exist.
+fn read_beneath(
+    beneath: &crate::beneath::Beneath,
+    relative: &std::path::Path,
+    offset: u64,
+) -> Result<Option<Vec<u8>>, TerminalError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(mut file) = beneath.open_read(relative).map_err(TerminalError)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| (&mut file).take(READ_LIMIT as u64).read_to_end(&mut bytes))
+        .map_err(|error| {
+            TerminalError(format!(
+                "read {}: {error}",
+                beneath.root().join(relative).display()
+            ))
+        })?;
     Ok(Some(bytes))
 }
 
