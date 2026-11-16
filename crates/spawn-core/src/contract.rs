@@ -467,4 +467,39 @@ pub fn transcript_archive(tag: &str, archive: &dyn crate::port::TranscriptArchiv
             .is_empty(),
         "copies are per agent"
     );
+    // Each copy's record (objective 175): none until one is put, read back
+    // as put, replaced whole, and none for a copy not made.
+    assert_eq!(archive.source(&agent, native, 0).expect("source"), None);
+    let record = |length: u64, offset: u64, masked: bool| crate::transcripts::CopySource {
+        archive_length: length,
+        source_offset: offset,
+        tail_sha256: crate::transcripts::tail_sha256(b"one\ntwo\n"),
+        masked,
+    };
+    archive
+        .put_source(&agent, native, 0, &record(8, 8, false))
+        .expect("a record");
+    assert_eq!(
+        archive.source(&agent, native, 0).expect("source"),
+        Some(record(8, 8, false))
+    );
+    archive
+        .put_source(&agent, native, 0, &record(8, 12, true))
+        .expect("replaced");
+    assert_eq!(
+        archive.source(&agent, native, 0).expect("source"),
+        Some(record(8, 12, true))
+    );
+    assert_eq!(
+        archive.source(&agent, native, 1).expect("source"),
+        None,
+        "records are per copy"
+    );
+    assert!(
+        archive
+            .put_source(&agent, native, 2, &record(1, 1, false))
+            .is_err(),
+        "no record for a copy not made"
+    );
+    assert_eq!(archive.source(&agent, native, 2).expect("source"), None);
 }
