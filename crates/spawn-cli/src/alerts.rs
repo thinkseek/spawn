@@ -7272,6 +7272,87 @@ mod tests {
         );
     }
 
+    /// Objective 204: free disk under its threshold fires one `disk_low`
+    /// with its evidence and text; a lower reading fires no second; one
+    /// between the threshold and the margin holds it; one at the margin
+    /// clears it, the margin in its evidence; a threshold of 0 reads
+    /// nothing; and a threshold over any disk fires on the real root's
+    /// reading.
+    #[test]
+    fn free_disk_under_its_threshold_alerts_once_and_clears_at_its_margin() {
+        const GIB: u64 = 1 << 30;
+        let root = Path::new("/srv/ws");
+        let mut monitor = Monitor::with(Settings {
+            disk_root: Some(root.to_path_buf()),
+            disk_low_gb: 40,
+            disk_ok_gb: 45,
+            ..settings()
+        });
+        let mut step = |monitor: &mut Monitor, now: i64, free: u64| {
+            let mut out = Vec::new();
+            monitor.disk_reading(now, root, free, &mut out);
+            let events = decided(monitor, out);
+            commit(monitor, &events);
+            events
+        };
+        assert_eq!(step(&mut monitor, 1, 50 * GIB), [], "50 GiB: nothing");
+        let fired = step(&mut monitor, 2, 39 * GIB + GIB / 2);
+        assert_eq!(
+            fired,
+            [Event::Fire {
+                key: "disk_low:2".to_string(),
+                kind: "disk_low",
+                subject: "host".to_string(),
+                evidence: json!({
+                    "path": "/srv/ws", "free_bytes": 39 * GIB + GIB / 2,
+                    "threshold_bytes": 40 * GIB, "reading_ms": 2,
+                }),
+                text: "/srv/ws has 39.5 GiB free, under 40 GiB".to_string(),
+                notice: false,
+            }]
+        );
+        assert_eq!(step(&mut monitor, 3, 30 * GIB), [], "no second while open");
+        assert_eq!(step(&mut monitor, 4, 42 * GIB), [], "held between the two");
+        assert_eq!(
+            step(&mut monitor, 5, 45 * GIB),
+            [Event::Clear {
+                key: "disk_low:2".to_string(),
+                evidence: json!({
+                    "path": "/srv/ws", "free_bytes": 45 * GIB,
+                    "threshold_bytes": 45 * GIB, "reading_ms": 5,
+                }),
+            }]
+        );
+        assert_eq!(step(&mut monitor, 6, 50 * GIB), [], "cleared stays cleared");
+
+        // A threshold of 0 reads nothing, whatever the root holds.
+        let mut off = Monitor::with(Settings {
+            disk_root: Some(std::env::temp_dir()),
+            ..settings()
+        });
+        let (mut out, mut lines) = (Vec::new(), Vec::new());
+        off.read_disk(7, &mut out, &mut lines);
+        assert_eq!((out.len(), lines.len()), (0, 0));
+
+        // A threshold over any disk fires on the real root's reading.
+        let real = std::env::temp_dir();
+        let mut over = Monitor::with(Settings {
+            disk_root: Some(real.clone()),
+            disk_low_gb: 1_000_000,
+            disk_ok_gb: 2_000_000,
+            ..settings()
+        });
+        over.read_disk(8, &mut out, &mut lines);
+        assert_eq!(lines, Vec::<String>::new());
+        let [Event::Fire { kind, evidence, .. }] = out.as_slice() else {
+            panic!("one fire: {out:?}");
+        };
+        assert_eq!(*kind, "disk_low");
+        assert_eq!(evidence["path"], real.display().to_string());
+        assert!(evidence["free_bytes"].is_u64(), "{evidence}");
+        assert_eq!(evidence["threshold_bytes"], 1_000_000 * GIB);
+    }
+
     #[test]
     fn a_command_failure_is_a_notice_and_an_owner_note_is_not() {
         let mut monitor = monitor();
