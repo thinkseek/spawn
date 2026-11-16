@@ -1018,6 +1018,27 @@ systemd restarts it (`Restart=always`). Engines use the relay only where
 unset or `off`, every engine runs on Claude Code's own settings, nothing
 probes a relay, and a cheap start fails.
 
+**Peer messages are refused (objective 206, issue #42).** Every engine the
+Bridge starts (the supervisor, the residents, the workers; both profiles;
+through the relay, without one, and on the fallback) gets
+`"crossSessionInbound": "refuse"` in the same inline `--settings`
+(`CROSS_SESSION_INBOUND` in `crates/spawn-core/src/bridge.rs`). All the
+engines and every other Claude Code session of this user share one HOME and
+one runtime directory, so each lists the others from `~/.claude/sessions`
+and can `SendMessage` into one; the engines skip permission prompts, and
+under Claude Code's default (mode parity) a message from another bypassing
+session would be delivered with no one approving it. With `refuse` the
+engine takes none, and the sender gets a "refused" receipt. The inline value
+wins over the user's settings file; only managed settings override it.
+Claude Code enforces it, not Spawn, and a Claude Code without the setting
+ignores the key (read in 2.1.325's loader). Spawn's own input, typed into
+the engine's pane, is no peer message and is unchanged. It reaches an engine
+at its next start or resume. What it does not cover: an engine can still
+send into sessions outside Spawn (the lead's, the reviewers', cc-astra's),
+which deliver it under mode parity until each sets its own
+`crossSessionInbound`; and the shared `~/.claude/sessions` records, through
+which every session lists the others, stay as they are.
+
 ### 3.4 Alerts: what Spawn tells about itself
 
 The fleet used to be watched by a monitor the supervisor ran by hand: a loop
