@@ -205,7 +205,9 @@ fn the_mask_is_built_again_when_what_it_was_built_from_changes() {
     assert!(Arc::ptr_eq(&first, &source.mask().expect("kept")), "kept");
     assert_eq!(world.runs(), 1, "no run while nothing changed");
     assert!(source.current(&first));
-    let again = |what: &str, change: &dyn Fn()| {
+    // `settles`: the answer built again no longer names what changed (an
+    // accepted path the stand-in still lists as missing never settles).
+    let again = |what: &str, settles: bool, change: &dyn Fn()| {
         let before = source.mask().expect("built");
         let runs = world.runs();
         change();
@@ -213,10 +215,10 @@ fn the_mask_is_built_again_when_what_it_was_built_from_changes() {
         let after = source.mask().expect("built again");
         assert!(!Arc::ptr_eq(&before, &after), "{what}: a new mask");
         assert_eq!(world.runs(), runs + 1, "{what}: the tool ran again");
-        assert!(source.current(&after), "{what}");
+        assert_eq!(source.current(&after), settles, "{what}");
     };
     // A same-size rewrite, its mtime set back: only the ctime moves.
-    again("a same-size rewrite with its old mtime", &|| {
+    again("a same-size rewrite with its old mtime", true, &|| {
         let old = std::fs::metadata(&cred).expect("stat").modified().expect("mtime");
         let rotated = TOKEN.replace('0', "9");
         std::fs::write(&cred, format!("API_TOKEN={rotated}\n")).expect("rewrite");
@@ -226,15 +228,15 @@ fn the_mask_is_built_again_when_what_it_was_built_from_changes() {
             .and_then(|file| file.set_modified(old))
             .expect("mtime set back");
     });
-    again("an accepted path appearing", &|| {
+    again("an accepted path appearing", false, &|| {
         std::fs::write(&accepted, "X=1\n").expect("accepted");
     });
     std::fs::remove_file(&accepted).expect("gone again");
     let _ = source.mask().expect("built");
-    again("a watched directory changing", &|| {
+    again("a watched directory changing", true, &|| {
         std::fs::write(cred_dir.join("spawn.env.bak"), "old\n").expect("bak");
     });
-    again("a probed path appearing", &|| {
+    again("a probed path appearing", true, &|| {
         std::fs::create_dir(base.join("a/.claude")).expect(".claude");
     });
     // The rewritten value is masked by the mask built again.
