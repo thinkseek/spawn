@@ -741,6 +741,18 @@ cat >"$work/gitconfig" <<'EOF'
 [tag]
 	gpgsign = false
 EOF
+# The transcript archive's and the store's location tool (objective 175):
+# in the sandbox an empty stand-in that places no credential value, so no
+# scenario depends on what the host's installed collector finds under the
+# sandbox's empty HOME. A scenario that names its own (175.sh, 196.sh)
+# overrides it. SPAWN_GATE_SANDBOX=1 is what lets the binary honour a
+# stand-in at all; deploy, the loop units and live never set it.
+cat >"$work/empty-locations.py" <<'EOF'
+import json
+print(json.dumps({"sources": [], "entries": [], "missing": [], "unreadable": [], "accepted": [],
+                  "accepted_paths": [], "watch": [], "probe": []}))
+EOF
+echo "| archive locations: an empty stand-in tool (no credential places) unless a scenario sets its own"
 
 metric=""
 flakes=""
@@ -1678,6 +1690,7 @@ sandbox_once() {
     # Git: the gate's config, not the owner's (signing keys, credential
     # helpers).
     set -- "$@" --ro-bind "$work/gitconfig" /tmp/gitconfig
+    set -- "$@" --ro-bind "$work/empty-locations.py" /tmp/empty-locations.py
     # Cargo: a private home over the real caches, read-only, offline. Not
     # the owner's cargo config (`config`, `config.toml`): it may name a
     # compiler cache as rustc-wrapper (kache), which inside would only start
@@ -1717,7 +1730,8 @@ sandbox_once() {
     set -- "$@" --clearenv --setenv HOME "$HOME" --setenv PATH "$PATH" --setenv TMPDIR /tmp \
         --setenv CARGO_HOME /tmp/cargo-home --setenv CARGO_NET_OFFLINE true \
         --setenv npm_config_cache /tmp/npm-cache \
-        --setenv GIT_CONFIG_GLOBAL /tmp/gitconfig
+        --setenv GIT_CONFIG_GLOBAL /tmp/gitconfig \
+        --setenv SPAWN_GATE_SANDBOX 1 --setenv SPAWN_ARCHIVE_LOCATIONS_TOOL /tmp/empty-locations.py
     # LANG and RUSTUP_HOME as they are; a tree's deps store (SUPPLY_PA_DEPS)
     # as the integrator names it, so `build` and the scenarios read the tree
     # the owner installed rather than the default under $HOME.
