@@ -325,7 +325,11 @@ mod tests {
     #[test]
     fn the_local_archive_passes_the_shared_contract() {
         let root = std::env::temp_dir().join(format!("spawn-transcripts-{}", std::process::id()));
+        // The copies' records are kept beside the archive, in `<root>-sources`.
+        let sources =
+            root.with_file_name(format!("spawn-transcripts-{}-sources", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&sources);
         let archive = LocalTranscriptArchive::new(&root);
         spawn_core::contract::transcript_archive("local", &archive);
         assert!(
@@ -338,6 +342,7 @@ mod tests {
         let agent = AgentId::new("agent_local").expect("valid agent");
         assert!(archive.append(&agent, "../escape", 0, 0, b"x").is_err());
         std::fs::remove_dir_all(&root).expect("clean up");
+        std::fs::remove_dir_all(&sources).expect("clean up the records");
     }
 
     /// The progress records live beside the archive, not in it, and are
