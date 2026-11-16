@@ -22,12 +22,81 @@
 //! still gain a model call ([`ArchiveProgress::holds_open`]: the window is
 //! *settling*), and what a restarted Bridge reads to go on copying the
 //! transcript of an execution that ended behind.
+//!
+//! Masked (objective 175): an engine that prints a credential it read
+//! writes the value into its transcript, and the archive keeps what it
+//! copies for good. So the Bridge copies through a [`Masking`]: every value
+//! the value collector places is replaced by `[REDACTED:<name>]`
+//! ([`ARCHIVE_MARKER`]) in each of its forms before a line is copied; only
+//! whole lines are copied (a line the engine is still writing waits for the
+//! next pass, so a value is never cut across two appends); and a pass that
+//! cannot have the mask copies nothing. A masked copy is not the
+//! transcript's bytes, so its length no longer says where it stands in the
+//! transcript: each copy's record ([`CopySource`]) does.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::event::{EventKind, NewEvent, Source};
 use crate::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
+use crate::mask::Mask;
 use crate::port::{READ_LIMIT, TerminalHost, TranscriptArchive};
+
+/// What a value is replaced by in the archive: `[REDACTED:<name>]`.
+pub const ARCHIVE_MARKER: &str = "REDACTED";
+
+/// Why a copy stopped when the mask went stale between its build and an
+/// append: nothing written after a rotation is masked by the mask from
+/// before it.
+pub const MASK_CHANGED: &str =
+    "the credential files changed after the mask was built; copied on the next pass";
+
+/// Where a copy stands in the transcript (objective 175), replaced whole
+/// after each append: the copy's length when it was written
+/// (`archive_length`), the transcript's offset its bytes reach
+/// (`source_offset`), the sha256 of the transcript's [`OVERLAP`] bytes
+/// before that offset (fewer at the start), and whether any of its bytes
+/// went through a mask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopySource {
+    pub archive_length: u64,
+    pub source_offset: u64,
+    pub tail_sha256: String,
+    pub masked: bool,
+}
+
+impl CopySource {
+    /// The record as one JSON line.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// A record written by [`Self::to_json`]; `None` when it is not one.
+    pub fn from_json(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+}
+
+/// The mask a copy goes through, and whether it is still the one its
+/// sources give ([`crate::port::ArchiveMask::current`]), asked before each
+/// append.
+pub struct Masking<'a> {
+    pub mask: Arc<Mask>,
+    pub current: &'a dyn Fn() -> bool,
+}
+
+/// The sha256, in hex, of the last [`OVERLAP`] bytes of `bytes`.
+pub fn tail_sha256(bytes: &[u8]) -> String {
+    let width = usize::try_from(OVERLAP).unwrap_or(usize::MAX).min(bytes.len());
+    let digest = Sha256::digest(&bytes[bytes.len() - width..]);
+    digest.iter().fold(String::new(), |mut hex, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
 
 /// Where the archive stands with one native session's transcript, as the
 /// Bridge last knew it.
@@ -53,8 +122,9 @@ pub struct ArchiveProgress {
     /// Until when (epoch ms, the Bridge's clock, less a margin for a line
     /// written as it was read) the transcript is known.
     pub known_ms: i64,
-    /// The length of the latest copy after the last copy that succeeded,
-    /// if one did.
+    /// How far into the transcript the archive reaches after the last copy
+    /// that succeeded, if one did (objective 175: the transcript's offset,
+    /// no longer the copy's length, which masking changes).
     pub archived: Option<u64>,
     /// The time of the first line the archive lacks (its `timestamp`;
     /// `i64::MIN` when it has none that reads), `None` when the archive
@@ -85,12 +155,13 @@ pub fn settling(progress: &[ArchiveProgress], until_ms: i64) -> bool {
     progress.iter().any(|record| record.holds_open(until_ms))
 }
 
-/// What one [`archive_to`] did: the bytes copied, and the length of the
-/// latest copy after it.
+/// What one [`archive_to`] did: the bytes copied, the length of the
+/// latest copy after it, and how far into the transcript it reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Archived {
     pub copied: u64,
     pub length: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 /// Bytes before the end of the latest copy that are compared with the file
@@ -98,8 +169,8 @@ pub struct Archived {
 const OVERLAP: u64 = 4096;
 
 /// Copy what the transcript at `path` gained since the latest copy of
-/// `native` into the archive: the bytes copied (0 when the file is missing
-/// or has nothing new).
+/// `native` into the archive, unmasked: the bytes copied (0 when the file is
+/// missing or has nothing new).
 pub fn archive(
     host: &dyn TerminalHost,
     archive: &dyn TranscriptArchive,
@@ -108,13 +179,96 @@ pub fn archive(
     agent: &AgentId,
     native: &str,
 ) -> Result<u64, String> {
-    archive_to(host, archive, workspace, path, agent, native).map(|done| done.copied)
+    archive_to(host, archive, None, workspace, path, agent, native).map(|done| done.copied)
 }
 
-/// [`archive`], with the length of the latest copy after it.
+/// Where the latest copy stands, read from its record: the copy appended
+/// to, its length, the transcript's offset it reaches, the sha256 of the
+/// transcript's bytes before that offset, and whether it is masked.
+struct Standing {
+    copy: usize,
+    length: u64,
+    offset: u64,
+    sha: String,
+    masked: bool,
+}
+
+impl Standing {
+    fn fresh(copy: usize) -> Self {
+        Self {
+            copy,
+            length: 0,
+            offset: 0,
+            sha: tail_sha256(b""),
+            masked: false,
+        }
+    }
+}
+
+/// The latest copy's [`Standing`], and its length (`None`: no copy). A copy
+/// whose length is not its record's was cut by a crash between an append
+/// and its record: never appended to again, the next copy starts with the
+/// whole file. A copy with no record (made before 175) is the transcript's
+/// own bytes.
+fn standing(
+    archive: &dyn TranscriptArchive,
+    agent: &AgentId,
+    native: &str,
+) -> Result<(Standing, Option<u64>), String> {
+    let copies = archive
+        .copies(agent, native)
+        .map_err(|error| error.to_string())?;
+    let Some(&length) = copies.last() else {
+        return Ok((Standing::fresh(0), None));
+    };
+    let copy = copies.len() - 1;
+    let record = archive
+        .source(agent, native, copy)
+        .map_err(|error| error.to_string())?;
+    let standing = match record {
+        Some(record) if record.archive_length == length => Standing {
+            copy,
+            length,
+            offset: record.source_offset,
+            sha: record.tail_sha256,
+            masked: record.masked,
+        },
+        Some(_) => Standing::fresh(copy + 1),
+        None => {
+            let width = length.min(OVERLAP);
+            let tail = archive
+                .read(
+                    agent,
+                    native,
+                    copy,
+                    length - width,
+                    usize::try_from(width).unwrap_or(usize::MAX),
+                )
+                .map_err(|error| error.to_string())?;
+            Standing {
+                copy,
+                length,
+                offset: length,
+                sha: tail_sha256(&tail),
+                masked: false,
+            }
+        }
+    };
+    Ok((standing, Some(length)))
+}
+
+/// [`archive`], through `masking` when given (objective 175): only whole
+/// lines, each chunk masked, the mask asked before each append whether it
+/// is still current (if not, nothing more is copied this pass and the copy
+/// fails with [`MASK_CHANGED`]), and each append followed by its record.
+/// Without a mask, the bytes are copied as they are. The file is
+/// append-only: one that shrank, or whose [`OVERLAP`] bytes before the
+/// latest copy's offset are not its record's, is copied whole as the next
+/// copy, so archived bytes are never overwritten.
 pub fn archive_to(
     host: &dyn TerminalHost,
     archive: &dyn TranscriptArchive,
+    masking: Option<&Masking<'_>>,
     workspace: &WorkspaceId,
     path: &str,
     agent: &AgentId,
@@ -124,53 +278,83 @@ pub fn archive_to(
         host.read_from(workspace, path, offset)
             .map_err(|error| format!("read {path}: {error}"))
     };
-    let copies = archive
-        .copies(agent, native)
-        .map_err(|error| error.to_string())?;
-    let (mut copy, mut length) = copies
-        .last()
-        .map_or((0, 0), |length| (copies.len() - 1, *length));
-    let overlap = length.min(OVERLAP);
-    let Some(mut bytes) = read(length - overlap)? else {
+    let (mut at, latest) = standing(archive, agent, native)?;
+    let start = at.offset - at.offset.min(OVERLAP);
+    let width = usize::try_from(at.offset - start).unwrap_or(usize::MAX);
+    let Some(mut bytes) = read(start)? else {
         return Ok(Archived {
             copied: 0,
-            length: copies.last().copied(),
+            length: latest,
+            offset: latest.map(|_| at.offset),
         });
     };
     let mut full = bytes.len() >= READ_LIMIT;
-    if overlap > 0 {
-        let width = usize::try_from(overlap).unwrap_or(usize::MAX);
-        let archived = archive
-            .read(agent, native, copy, length - overlap, width)
-            .map_err(|error| error.to_string())?;
-        if bytes.get(..width) == Some(archived.as_slice()) {
-            bytes.drain(..width);
-        } else {
-            // Shrunk or replaced: the whole file, as the next copy.
-            copy += 1;
-            length = 0;
-            bytes = read(0)?.unwrap_or_default();
-            full = bytes.len() >= READ_LIMIT;
-        }
+    let mut tail: Vec<u8>;
+    if bytes.len() >= width && tail_sha256(&bytes[..width]) == at.sha {
+        tail = bytes.drain(..width).collect();
+    } else {
+        // Shrunk or replaced: the whole file, as the next copy.
+        at = Standing::fresh(at.copy + 1);
+        tail = Vec::new();
+        bytes = read(0)?.unwrap_or_default();
+        full = bytes.len() >= READ_LIMIT;
     }
     let mut total = 0;
     loop {
-        if !bytes.is_empty() {
+        // With a mask, whole lines only: a line still being written waits.
+        let take = match masking {
+            Some(_) => bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |newline| newline + 1),
+            None => bytes.len(),
+        };
+        if take > 0 {
+            let chunk = &bytes[..take];
+            let out = match masking {
+                Some(masking) => {
+                    if !(masking.current)() {
+                        return Err(MASK_CHANGED.to_string());
+                    }
+                    masking.mask.bytes(chunk)
+                }
+                None => chunk.to_vec(),
+            };
             archive
-                .append(agent, native, copy, length, &bytes)
+                .append(agent, native, at.copy, at.length, &out)
                 .map_err(|error| error.to_string())?;
-            let grown = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            length += grown;
+            let grown = u64::try_from(out.len()).unwrap_or(u64::MAX);
+            at.length += grown;
             total += grown;
+            at.offset += u64::try_from(take).unwrap_or(u64::MAX);
+            at.masked |= masking.is_some();
+            tail.extend_from_slice(chunk);
+            let keep = usize::try_from(OVERLAP).unwrap_or(usize::MAX);
+            if tail.len() > keep {
+                tail.drain(..tail.len() - keep);
+            }
+            let record = CopySource {
+                archive_length: at.length,
+                source_offset: at.offset,
+                tail_sha256: tail_sha256(&tail),
+                masked: at.masked,
+            };
+            archive
+                .put_source(agent, native, at.copy, &record)
+                .map_err(|error| error.to_string())?;
+            bytes.drain(..take);
         }
         if !full {
             return Ok(Archived {
                 copied: total,
-                length: Some(length),
+                length: Some(at.length),
+                offset: Some(at.offset),
             });
         }
-        bytes = read(length)?.unwrap_or_default();
-        full = bytes.len() >= READ_LIMIT;
+        let next = at.offset + u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let more = read(next)?.unwrap_or_default();
+        full = more.len() >= READ_LIMIT;
+        bytes.extend_from_slice(&more);
     }
 }
 
