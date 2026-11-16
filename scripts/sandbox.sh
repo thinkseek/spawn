@@ -103,8 +103,18 @@ sandbox_run() {
         --unshare-pid --unshare-net --die-with-parent --new-session
     sandbox_runtime=/run/user/$(id -u)
     [ -d "$sandbox_runtime" ] && set -- "$@" --tmpfs "$sandbox_runtime"
+    # Bind each socket once by its real path: /var/run is a symlink to /run
+    # on some hosts, and bwrap cannot create a mount point through that
+    # symlink inside the read-only bound root.
+    sandbox_socket_seen=
     for sandbox_socket in /run/docker.sock /var/run/docker.sock; do
-        [ -S "$sandbox_socket" ] && set -- "$@" --ro-bind /dev/null "$sandbox_socket"
+        [ -S "$sandbox_socket" ] || continue
+        sandbox_real=$(readlink -f "$sandbox_socket")
+        case " $sandbox_socket_seen " in
+            *" $sandbox_real "*) continue ;;
+        esac
+        sandbox_socket_seen="$sandbox_socket_seen $sandbox_real"
+        set -- "$@" --ro-bind /dev/null "$sandbox_real"
     done
     case "${TMPDIR:-/tmp}" in
     / | /tmp | /tmp/) ;;

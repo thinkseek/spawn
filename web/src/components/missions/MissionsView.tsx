@@ -983,20 +983,27 @@ function StageSteps({
           />
         );
       })}
-      {ahead.map((step, index) => (
+      {waiting !== null && (
+        <StepItem
+          key="waiting"
+          first={false}
+          pending
+          title={`waiting for ${ahead[0]} since ${absolute(last.at_ms) ?? "an unknown time"}`}
+          chip="text-faint-foreground ring-surface-border"
+          label="waiting"
+          took={waiting}
+          slow={slow[slow.length - 1]}
+        />
+      )}
+      {ahead.map((step) => (
         <StepItem
           key={`ahead-${step}`}
           first={false}
           pending
-          title={
-            index === 0 && waiting !== null
-              ? `waiting since ${absolute(last.at_ms) ?? "an unknown time"}`
-              : undefined
-          }
           chip="text-faint-foreground ring-surface-border"
           label={step}
-          took={index === 0 ? waiting : null}
-          slow={index === 0 && waiting !== null && slow[slow.length - 1]}
+          took={null}
+          slow={false}
         />
       ))}
     </ol>

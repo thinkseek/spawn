@@ -1,5 +1,5 @@
 import { CalendarDays, Gauge, OctagonAlert, Target } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { usePoll } from "../../api";
 import { absoluteTitle, localDateTime, relativeTime } from "../../format";
@@ -78,7 +78,13 @@ export function ScorecardView({ missions }: { missions: Missions | null }) {
     }),
     POLL_MS,
   );
-  const data = scorecard.data?.card ?? null;
+  // Keep the last card on screen while a new window or scope loads: a click
+  // on the window toggle must not blank the table and re-render it.
+  const lastLoaded = useRef<Loaded | null>(null);
+  if (scorecard.data) lastLoaded.current = scorecard.data;
+  const loaded = scorecard.data ?? lastLoaded.current;
+  const refreshing = scorecard.data === null && lastLoaded.current !== null;
+  const data = loaded?.card ?? null;
 
   const titles = useMemo(() => {
     const out = new Map<number, string>();
@@ -137,9 +143,11 @@ export function ScorecardView({ missions }: { missions: Missions | null }) {
         <LiveStatus
           error={scorecard.error}
           label={
-            scorecard.data
-              ? `Updated ${relativeTime(scorecard.data.at_ms)}`
-              : "Connecting"
+            refreshing
+              ? "Updating…"
+              : loaded
+                ? `Updated ${relativeTime(loaded.at_ms)}`
+                : "Connecting"
           }
         />
       </PageHeader>
