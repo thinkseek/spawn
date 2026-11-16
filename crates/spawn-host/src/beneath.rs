@@ -608,3 +608,6 @@ fn split(relative: &Path) -> Result<(&Path, String), String> {
         _ => Err(format!("{} names no file", relative.display())),
     }
 }
+
+#[cfg(test)]
+mod tests;

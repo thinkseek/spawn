@@ -281,6 +281,41 @@ impl ArchiveMask for CollectorMask {
     }
 }
 
+/// The loop's roots as its files are reached ([`crate::beneath`]): the
+/// workspace root, which the archive is reached from, and with a stand-in
+/// the engines' projects root too, both pinned; with the installed tool
+/// the workspace root is walked unpinned and the projects root is read as
+/// before (the user's own links are theirs).
+pub struct LoopRoots {
+    pub workspace: crate::beneath::Beneath,
+    pub projects: Option<crate::beneath::Beneath>,
+}
+
+/// [`LoopRoots`] for `stand_in` (the one [`CollectorMask::configured`]
+/// accepted, if any).
+///
+/// # Errors
+///
+/// Why a stand-in's root may not be pinned: paths only.
+pub fn loop_roots(
+    stand_in: Option<&StandIn>,
+    workspace_root: &Path,
+    projects: &Path,
+    home: &Home,
+) -> Result<LoopRoots, String> {
+    use crate::beneath::Beneath;
+    match stand_in {
+        None => Ok(LoopRoots {
+            workspace: Beneath::new(workspace_root),
+            projects: None,
+        }),
+        Some(_) => Ok(LoopRoots {
+            workspace: Beneath::pinned(workspace_root, home)?,
+            projects: Some(Beneath::pinned(projects, home)?),
+        }),
+    }
+}
+
 /// `root` where its links lead: its deepest existing directory resolved,
 /// the rest of it as written.
 fn judged(root: &Path) -> PathBuf {
