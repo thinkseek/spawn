@@ -38,56 +38,6 @@ pub struct Mask {
     marker: String,
 }
 
-/// The values of the file at `path`, `(name, value)` in its order.
-///
-/// # Errors
-///
-/// The file and the reason, with the line when it is one line's: never a
-/// value.
-pub(crate) fn read_values(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let shown = path.display();
-    let meta = std::fs::metadata(path).map_err(|error| format!("{shown}: cannot read: {error}"))?;
-    if !meta.is_file() {
-        return Err(format!("{shown}: not a file"));
-    }
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(format!("{shown}: has group or world access (chmod 600)"));
-        }
-    }
-    let bytes = std::fs::read(path).map_err(|error| format!("{shown}: cannot read: {error}"))?;
-    let mut values = Vec::new();
-    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
-        let number = index + 1;
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() || line.starts_with(b"#") {
-            continue;
-        }
-        let Some(equals) = line.iter().position(|byte| *byte == b'=') else {
-            return Err(format!("{shown}: line {number}: not NAME=value"));
-        };
-        let (name, value) = (&line[..equals], &line[equals + 1..]);
-        if name.is_empty()
-            || !name
-                .iter()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
-        {
-            return Err(format!("{shown}: line {number}: not NAME=value"));
-        }
-        if value.len() < SHORTEST_VALUE {
-            return Err(format!(
-                "{shown}: line {number}: a value shorter than {SHORTEST_VALUE} bytes"
-            ));
-        }
-        values.push((String::from_utf8_lossy(name).into_owned(), value.to_vec()));
-    }
-    if values.is_empty() {
-        return Err(format!("{shown}: names no value"));
-    }
-    Ok(values)
-}
-
 /// `value` JSON-escaped: `"`, `\` and control characters, and either every
 /// non-ASCII character as `\uXXXX` or none.
 fn json_escaped(value: &str, ascii: bool) -> String {
