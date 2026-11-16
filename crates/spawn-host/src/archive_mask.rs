@@ -59,7 +59,7 @@ pub const INSTALLED_TOOL: &str = "/usr/local/lib/spawn/redact/emit-locations.py"
 pub const TOOL_LIMIT: Duration = Duration::from_secs(30);
 
 /// How old a kept mask may be before an archive attempt builds it again.
-pub const REBUILD_AFTER: Duration = Duration::from_secs(600);
+pub const REBUILD_AFTER: Duration = Duration::from_mins(10);
 
 /// Why a named stand-in is refused outside a gate's sandbox.
 pub const SANDBOX_ONLY: &str = "SPAWN_ARCHIVE_LOCATIONS_TOOL is honoured only in a gate's \
@@ -403,8 +403,11 @@ fn paths(answer: &Value, name: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Named values, `(name, value)`.
+type Values = Vec<(String, Vec<u8>)>;
+
 /// The values the answer places and the stamps the mask is kept with.
-fn build(answer: &Value) -> Result<(Vec<(String, Vec<u8>)>, Stamps), String> {
+fn build(answer: &Value) -> Result<(Values, Stamps), String> {
     if !answer.is_object() || !answer["sources"].is_array() || !answer["entries"].is_array() {
         return Err("the location tool's answer is not {sources, entries, ...}".to_string());
     }
@@ -454,24 +457,23 @@ fn build(answer: &Value) -> Result<(Vec<(String, Vec<u8>)>, Stamps), String> {
     let mut values = Vec::new();
     for entry in answer["entries"].as_array().into_iter().flatten() {
         let path = PathBuf::from(entry["path"].as_str().unwrap_or_default());
-        let bytes = match read.iter().find(|(at, _)| *at == path) {
-            Some((_, bytes)) => bytes.clone(),
-            None => {
-                let stamp = stamps
-                    .sources
-                    .iter()
-                    .find(|(at, _)| *at == path)
-                    .map(|(_, stamp)| *stamp)
-                    .ok_or_else(|| {
-                        format!(
-                            "the location tool places a value in {} but gives no stamp of it",
-                            path.display()
-                        )
-                    })?;
-                let bytes = read_stamped(&path, stamp)?;
-                read.push((path.clone(), bytes.clone()));
-                bytes
-            }
+        let bytes = if let Some((_, bytes)) = read.iter().find(|(at, _)| *at == path) {
+            bytes.clone()
+        } else {
+            let stamp = stamps
+                .sources
+                .iter()
+                .find(|(at, _)| *at == path)
+                .map(|(_, stamp)| *stamp)
+                .ok_or_else(|| {
+                    format!(
+                        "the location tool places a value in {} but gives no stamp of it",
+                        path.display()
+                    )
+                })?;
+            let bytes = read_stamped(&path, stamp)?;
+            read.push((path.clone(), bytes.clone()));
+            bytes
         };
         let name = entry["name"]
             .as_str()

@@ -329,15 +329,14 @@ impl Beneath {
     pub fn make_dir(&self, relative: &Path) -> Result<Directory, String> {
         plain(relative)?;
         let shown = self.shown(relative);
-        let base = match self.base()? {
-            Some((base, rest)) => (base, rest.to_path_buf()),
-            None => {
-                std::fs::create_dir_all(&self.root)
-                    .map_err(|error| format!("create {}: {error}", self.root.display()))?;
-                self.base()?
-                    .map(|(base, rest)| (base, rest.to_path_buf()))
-                    .ok_or_else(|| format!("{} is gone", self.root.display()))?
-            }
+        let base = if let Some((base, rest)) = self.base()? {
+            (base, rest.to_path_buf())
+        } else {
+            std::fs::create_dir_all(&self.root)
+                .map_err(|error| format!("create {}: {error}", self.root.display()))?;
+            self.base()?
+                .map(|(base, rest)| (base, rest.to_path_buf()))
+                .ok_or_else(|| format!("{} is gone", self.root.display()))?
         };
         let (mut dir, rest) = base;
         let mut walked = PathBuf::new();

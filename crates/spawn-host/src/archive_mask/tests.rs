@@ -66,9 +66,7 @@ impl World {
     }
 
     fn runs(&self) -> usize {
-        std::fs::read_to_string(self.path("runs"))
-            .map(|text| text.lines().count())
-            .unwrap_or(0)
+        std::fs::read_to_string(self.path("runs")).map_or(0, |text| text.lines().count())
     }
 
     fn mask(&self) -> CollectorMask {
@@ -403,7 +401,7 @@ fn a_stand_in_is_refused_for_roots_inside_the_account_s_home_whatever_the_marker
         tmpfs: true,
         ..home.clone()
     };
-    let (_, stand_in) = CollectorMask::configured(tool(), Some("1"), &[live.clone()], &tmpfs);
+    let (_, stand_in) = CollectorMask::configured(tool(), Some("1"), std::slice::from_ref(&live), &tmpfs);
     assert!(stand_in.is_some(), "a tmpfs home, a gate's sandbox");
     let unknown = Home {
         path: None,

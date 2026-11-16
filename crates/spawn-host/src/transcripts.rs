@@ -250,7 +250,10 @@ impl TranscriptArchive for LocalTranscriptArchive {
             }
             let directory = root.join(&agent);
             for (name, is_dir) in self.below.list(&directory).map_err(ArchiveError)? {
-                if is_dir || name.starts_with('.') || !name.ends_with(".json") {
+                let record = Path::new(&name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+                if is_dir || name.starts_with('.') || !record {
                     continue;
                 }
                 if let Some(bytes) = self
