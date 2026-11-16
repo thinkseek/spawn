@@ -752,4 +752,43 @@ pub trait TranscriptArchive: Send + Sync {
     /// Every native session's latest [`Self::put_progress`]. One that
     /// cannot be read is left out.
     fn progress(&self) -> Result<Vec<crate::transcripts::ArchiveProgress>, ArchiveError>;
+
+    /// Copy `copy`'s record ([`crate::transcripts::CopySource`], objective
+    /// 175): where in the transcript it stands. `None` when none was put
+    /// (a copy made before 175, or none at all).
+    fn source(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+    ) -> Result<Option<crate::transcripts::CopySource>, ArchiveError>;
+
+    /// Replace copy `copy`'s record whole, durably: after each append, so a
+    /// copy whose length is not its record's was cut by a crash between the
+    /// two.
+    fn put_source(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        source: &crate::transcripts::CopySource,
+    ) -> Result<(), ArchiveError>;
+}
+
+/// The credential mask the transcript archive copies through (objective
+/// 175): built from the places the value collector gives, never from a
+/// value passed through a file, a pipe or an argument.
+pub trait ArchiveMask: Send + Sync {
+    /// The mask for this pass, or why it cannot be had (paths only, never
+    /// a value): without it nothing is copied.
+    ///
+    /// # Errors
+    ///
+    /// Why the mask cannot be built now.
+    fn mask(&self) -> Result<std::sync::Arc<crate::mask::Mask>, String>;
+
+    /// Whether `mask`, given by [`Self::mask`], is still the one its
+    /// sources give: false once a credential file, a watched directory or a
+    /// probed path changed since it was built.
+    fn current(&self, mask: &std::sync::Arc<crate::mask::Mask>) -> bool;
 }

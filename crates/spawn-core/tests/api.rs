@@ -1526,3 +1526,240 @@ fn lease_ttl_expires_and_takes_the_command_again() {
         .finish(&second, &Outcome::Succeeded)
         .expect("the current attempt finishes");
 }
+
+/// A made-up credential mask that rotates (objective 175 R3): its values
+/// change when told, it can be not had (a credential file unreadable), and
+/// it can rotate right after it gives a mask, before the copy reads.
+struct Rotating {
+    state: std::sync::Mutex<RotatingState>,
+}
+
+struct RotatingState {
+    value: String,
+    had: bool,
+    rotate_after_next: Option<String>,
+    built: Option<(String, Arc<spawn_core::mask::Mask>)>,
+}
+
+impl Rotating {
+    fn new(value: &str) -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(RotatingState {
+                value: value.to_string(),
+                had: true,
+                rotate_after_next: None,
+                built: None,
+            }),
+        })
+    }
+
+    fn rotate(&self, value: &str) {
+        self.state.lock().expect("lock").value = value.to_string();
+    }
+
+    fn had(&self, had: bool) {
+        self.state.lock().expect("lock").had = had;
+    }
+
+    fn rotate_after_next(&self, value: &str) {
+        self.state.lock().expect("lock").rotate_after_next = Some(value.to_string());
+    }
+}
+
+impl spawn_core::port::ArchiveMask for Rotating {
+    fn mask(&self) -> Result<Arc<spawn_core::mask::Mask>, String> {
+        let mut state = self.state.lock().expect("lock");
+        if !state.had {
+            return Err("/made-up/cred/spawn.env is unreadable".to_string());
+        }
+        let mask = match &state.built {
+            Some((value, mask)) if *value == state.value => mask.clone(),
+            _ => {
+                let mask = Arc::new(spawn_core::mask::Mask::new(
+                    &[(
+                        "spawn.env:API_TOKEN".to_string(),
+                        state.value.as_bytes().to_vec(),
+                    )],
+                    spawn_core::transcripts::ARCHIVE_MARKER,
+                ));
+                state.built = Some((state.value.clone(), mask.clone()));
+                mask
+            }
+        };
+        if let Some(next) = state.rotate_after_next.take() {
+            state.value = next;
+        }
+        Ok(mask)
+    }
+
+    fn current(&self, mask: &Arc<spawn_core::mask::Mask>) -> bool {
+        let state = self.state.lock().expect("lock");
+        state.had
+            && state
+                .built
+                .as_ref()
+                .is_some_and(|(value, built)| *value == state.value && Arc::ptr_eq(built, mask))
+    }
+}
+
+const ROTATED_ONE: &str = "made-up-rotation-one-0123456789";
+const ROTATED_TWO: &str = "made-up-rotation-two-9876543210";
+
+/// A line of the transcript saying `text`.
+fn said_line(uuid: &str, text: &str) -> String {
+    format!(
+        "{{\"type\":\"assistant\",\"uuid\":\"{uuid}\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\
+         \"message\":{{\"content\":\"{text}\"}}}}\n"
+    )
+}
+
+/// A masked archiving Bridge with a started execution: the store, the
+/// Bridge, the mask source, the native session and its transcript.
+fn masked_following() -> (Arc<MemoryStore>, Bridge, Arc<Rotating>, String, String) {
+    let store = store();
+    for command in 1..=3 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    let source = Rotating::new(ROTATED_ONE);
+    let mut bridge = archiving_bridge(&store).with_archive_mask(source.clone());
+    submit_start(&store, "first");
+    bridge.tick().expect("start");
+    let (native, path) = transcript_of_latest(&store);
+    (store, bridge, source, native, path)
+}
+
+/// Everything the archive holds of `native`.
+fn archived(store: &MemoryStore, native: &str) -> String {
+    use spawn_core::port::TranscriptArchive;
+    let copies = store.copies(&agent(), native).expect("copies");
+    (0..copies.len())
+        .map(|copy| {
+            String::from_utf8(
+                store
+                    .read(&agent(), native, copy, 0, usize::MAX)
+                    .expect("read"),
+            )
+            .expect("utf-8")
+        })
+        .collect()
+}
+
+fn resume(store: &MemoryStore, key: &str) {
+    submit(
+        store,
+        key,
+        CommandAction::Resume {
+            prompt: Some("go on".to_string()),
+            model: None,
+        },
+    );
+}
+
+#[test]
+fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
+    let (store, mut bridge, source, native, path) = masked_following();
+    store.append_file(&path, &said_line("u1", ROTATED_ONE));
+    bridge.tick().expect("copy");
+    bridge.tick().expect("copy");
+    let first = archived(&store, &native);
+    assert!(
+        first.contains("[REDACTED:spawn.env:API_TOKEN]") && !first.contains(ROTATED_ONE),
+        "{first}"
+    );
+    source.had(false);
+    store.append_file(&path, &said_line("u2", ROTATED_ONE));
+    let report = bridge.tick().expect("no mask");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("the credential mask")),
+        "{:?}",
+        report.warnings
+    );
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    resume(&store, "key_resume");
+    let report = bridge.tick().expect("resume");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("the credential mask")),
+        "{:?}",
+        report.warnings
+    );
+    // The resumed engine says the value again, still without the mask.
+    let (_, resumed) = transcript_of_latest(&store);
+    store.append_file(&resumed, &said_line("u3", ROTATED_ONE));
+    bridge.tick().expect("no mask");
+    assert_eq!(
+        archived(&store, &native),
+        first,
+        "nothing copied without the mask, across the stop and the resume"
+    );
+    source.had(true);
+    for _ in 0..3 {
+        bridge.tick().expect("copy");
+    }
+    let after = archived(&store, &native);
+    assert!(
+        after.contains("u3") && !after.contains(ROTATED_ONE),
+        "{after}"
+    );
+}
+
+#[test]
+fn a_rotation_between_a_pass_and_a_resume_is_masked_with_the_new_value() {
+    let (store, mut bridge, source, native, path) = masked_following();
+    store.append_file(&path, &said_line("u1", ROTATED_ONE));
+    bridge.tick().expect("copy");
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    // Rotated while stopped; the resumed engine says the new value.
+    source.rotate(ROTATED_TWO);
+    resume(&store, "key_resume");
+    bridge.tick().expect("resume");
+    let (_, resumed) = transcript_of_latest(&store);
+    store.append_file(&resumed, &said_line("u2", ROTATED_TWO));
+    bridge.tick().expect("copy");
+    bridge.tick().expect("copy");
+    let after = archived(&store, &native);
+    assert!(after.contains("u2"), "{after}");
+    assert!(
+        !after.contains(ROTATED_TWO) && !after.contains(ROTATED_ONE),
+        "{after}"
+    );
+}
+
+#[test]
+fn a_rotation_between_the_mask_and_the_read_copies_nothing_that_pass() {
+    let (store, mut bridge, source, native, path) = masked_following();
+    store.append_file(&path, &said_line("u1", ROTATED_ONE));
+    bridge.tick().expect("copy");
+    let before = archived(&store, &native);
+    source.rotate_after_next(ROTATED_TWO);
+    store.append_file(&path, &said_line("u2", ROTATED_TWO));
+    let report = bridge.tick().expect("stale");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(spawn_core::transcripts::MASK_CHANGED)),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(
+        archived(&store, &native),
+        before,
+        "nothing copied that pass"
+    );
+    bridge.tick().expect("copy");
+    let after = archived(&store, &native);
+    assert!(
+        after.contains("u2") && !after.contains(ROTATED_TWO),
+        "{after}"
+    );
+}

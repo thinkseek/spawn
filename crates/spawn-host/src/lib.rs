@@ -11,7 +11,10 @@
 //! starts its server would reach every pane, the engine's included.
 
 pub mod agent_files;
+pub mod archive_mask;
+pub mod beneath;
 pub mod git;
+pub mod home;
 pub mod process;
 pub mod root;
 #[cfg(any(test, feature = "testing"))]

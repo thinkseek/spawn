@@ -45,15 +45,37 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         eprintln!("sources: {error}; a push lost with the last process waits for its next");
     }
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
-    let terminals: Arc<dyn TerminalHost> = Arc::new(crate::config::terminal_host());
-
     let config = bridge_config()?;
+    // The transcript archive's credential mask (objective 175): the
+    // installed collector's places, or a stand-in honoured only in a gate's
+    // sandbox and only for roots outside the account's home, said in one
+    // line. With a stand-in both roots are pinned, and every file below them
+    // is reached without following a link.
+    let roots = [
+        std::path::PathBuf::from(&root),
+        std::path::PathBuf::from(&config.claude_projects),
+    ];
+    let (archive_mask, stand_in) = spawn_host::archive_mask::CollectorMask::from_env(&roots);
+    if let Some(stand_in) = &stand_in {
+        eprintln!("{}", stand_in.said());
+    }
+    let pinned = spawn_host::archive_mask::loop_roots(
+        stand_in.as_ref(),
+        &roots[0],
+        &roots[1],
+        &spawn_host::home::Home::of_account(),
+    )?;
+    let mut host = crate::config::terminal_host();
+    if let Some(projects) = pinned.projects {
+        host = host.with_files_beneath(projects);
+    }
+    let terminals: Arc<dyn TerminalHost> = Arc::new(host);
+
     let log: Arc<dyn EventLog> = store.clone();
     let queue: Arc<dyn CommandQueue> = store.clone();
-    // Beside the workspaces: the transcripts are the agents' history.
-    let transcripts = spawn_host::LocalTranscriptArchive::new(
-        std::path::Path::new(&root).join(spawn_host::TRANSCRIPT_DIRECTORY),
-    );
+    // Beside the workspaces: the transcripts are the agents' history,
+    // reached from the workspace root (pinned with a stand-in).
+    let transcripts = spawn_host::LocalTranscriptArchive::for_loop(pinned.workspace);
     // This Bridge types each message's marker: the first loop that did
     // is recorded once (`host.messages_marked`), from when a command never
     // typed is a message whose taking is tracked (crate::alerts,
@@ -73,7 +95,8 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         Arc::clone(&terminals),
         config,
     )
-    .with_transcript_archive(Arc::new(transcripts));
+    .with_transcript_archive(Arc::new(transcripts))
+    .with_archive_mask(Arc::new(archive_mask));
     bridge.recover().map_err(|error| error.to_string())?;
 
     let context = context::HostContext::new(open_store()?, terminals);

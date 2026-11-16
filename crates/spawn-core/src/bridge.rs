@@ -478,7 +478,8 @@ struct Archiving {
     /// The transcript may hold bytes the archive lacks (it was read
     /// growing, or a copy failed): a copy is made on this pass.
     due: bool,
-    /// The length of the latest copy after the last copy that succeeded.
+    /// How far into the transcript the archive reaches after the last copy
+    /// that succeeded ([`transcripts::Archived::offset`]).
     archived: Option<u64>,
     /// The time of the first line the archive lacks, after a copy failed.
     behind_ms: Option<i64>,
@@ -846,6 +847,10 @@ pub struct Bridge {
     warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
+    /// The credential mask every copy goes through (objective 175): without
+    /// it a pass copies nothing. `None`: none is configured, copies are the
+    /// transcript's bytes, as before 175.
+    archive_mask: Option<Arc<dyn crate::port::ArchiveMask>>,
     /// Ended executions whose transcripts the archive may lack, per agent
     /// and native session: copied again on every pass until the copy is
     /// made. Rebuilt after a restart from the progress records
@@ -961,6 +966,7 @@ impl Bridge {
             unrecorded_commits: std::sync::Mutex::default(),
             warned: std::sync::Mutex::default(),
             transcripts: None,
+            archive_mask: None,
             ended_archives: std::sync::Mutex::default(),
             pass_started: i64::MIN,
             held: HashMap::new(),
@@ -979,6 +985,24 @@ impl Bridge {
     pub fn with_transcript_archive(mut self, archive: Arc<dyn TranscriptArchive>) -> Self {
         self.transcripts = Some(archive);
         self
+    }
+
+    /// Copy every transcript through the credential mask `mask` gives
+    /// (objective 175): each copy takes the mask first, and without it the
+    /// pass copies nothing and fails as a copy failure does (warned when it
+    /// changes, tried again every pass, the progress record's `behind_ms`
+    /// saying from when the archive lacks lines). A resume's restore is
+    /// given it too.
+    #[must_use]
+    pub fn with_archive_mask(mut self, mask: Arc<dyn crate::port::ArchiveMask>) -> Self {
+        self.archive_mask = Some(mask);
+        self
+    }
+
+    /// [`Self::with_archive_mask`] on a Bridge already built (tests).
+    #[cfg(test)]
+    fn set_archive_mask(&mut self, mask: Arc<dyn crate::port::ArchiveMask>) {
+        self.archive_mask = Some(mask);
     }
 
     /// Use `clock` for screen refreshes instead of the system clock.
@@ -3315,9 +3339,38 @@ impl Bridge {
             .sessions
             .get(&claimed.session_id)
             .is_some_and(|view| view.transcript_read);
+        let had = self
+            .archive_mask
+            .as_deref()
+            .map(crate::port::ArchiveMask::mask);
+        let current = |mask: &Arc<crate::mask::Mask>| {
+            self.archive_mask
+                .as_deref()
+                .is_some_and(|source| source.current(mask))
+        };
+        let (mask, why) = match &had {
+            None => (None, None),
+            Some(Ok(mask)) => (Some(mask.clone()), None),
+            Some(Err(why)) => (None, Some(format!("the credential mask: {why}"))),
+        };
+        let still = || mask.as_ref().is_some_and(&current);
+        let keeper = self
+            .transcripts
+            .as_deref()
+            .map(|archive| transcripts::Keeper {
+                archive,
+                mask: match (&mask, &why) {
+                    (_, Some(why)) => Err(why.as_str()),
+                    (Some(mask), None) => Ok(Some(transcripts::Masking {
+                        mask: mask.clone(),
+                        current: &still,
+                    })),
+                    (None, None) => Ok(None),
+                },
+            });
         let restored = transcripts::restore(
             self.terminals.as_ref(),
-            self.transcripts.as_deref(),
+            keeper,
             workspace,
             &path,
             &claimed.agent_id,
@@ -3335,10 +3388,15 @@ impl Bridge {
                 claimed.session_id
             )),
             Some(transcripts::Restored::Left { had }) => report.warnings.push(format!(
-                "{}: {path} ({had} bytes) is not the transcript archive's latest copy of it, so \
-                 it was not restored from the archive; it is resumed as it is, and the archive \
-                 keeps every copy it made",
-                claimed.session_id
+                "{}: {path} ({had} bytes) was not restored from the transcript archive: it is \
+                 not the archive's latest copy of it, or a copy of it is masked (a present file \
+                 is never replaced by masked bytes), or the credential mask could not be had to \
+                 archive it first{}; it is resumed as it is, and the archive keeps every copy it \
+                 made",
+                claimed.session_id,
+                why.as_deref()
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default()
             )),
             None => {}
         }
@@ -3456,17 +3514,41 @@ impl Bridge {
         let known = |known_ms: &mut Option<i64>| {
             *known_ms = Some(known_ms.map_or(read_at, |was| was.max(read_at)));
         };
-        match transcripts::archive_to(
-            self.terminals.as_ref(),
-            archive,
-            workspace,
-            path,
-            agent_id,
-            native,
-        ) {
+        // The mask first: without it nothing is copied (objective 175).
+        let copied = match self.archive_mask.as_deref() {
+            None => transcripts::archive_to(
+                self.terminals.as_ref(),
+                archive,
+                None,
+                workspace,
+                path,
+                agent_id,
+                native,
+            ),
+            Some(source) => match source.mask() {
+                Err(why) => Err(format!("the credential mask: {why}")),
+                Ok(mask) => {
+                    let current = || source.current(&mask);
+                    let masking = transcripts::Masking {
+                        mask: mask.clone(),
+                        current: &current,
+                    };
+                    transcripts::archive_to(
+                        self.terminals.as_ref(),
+                        archive,
+                        Some(&masking),
+                        workspace,
+                        path,
+                        agent_id,
+                        native,
+                    )
+                }
+            },
+        };
+        match copied {
             Ok(done) => {
-                if done.length.is_some() {
-                    *archived = done.length;
+                if done.offset.is_some() {
+                    *archived = done.offset;
                 }
                 *behind_ms = None;
                 known(known_ms);
@@ -5754,6 +5836,80 @@ mod tests {
         world.tick();
         assert!(world.archived().ends_with(&second));
         assert_eq!(world.archived().matches("msg_c1").count(), 1, "copied once");
+    }
+
+    /// A made-up credential mask that can be had or not, as a credential
+    /// file readable or not makes the collector's.
+    struct Flip {
+        mask: Arc<crate::mask::Mask>,
+        had: Mutex<bool>,
+    }
+
+    impl crate::port::ArchiveMask for Flip {
+        fn mask(&self) -> Result<Arc<crate::mask::Mask>, String> {
+            if *self.had.lock().expect("lock") {
+                Ok(self.mask.clone())
+            } else {
+                Err("/made-up/cred/spawn.env is unreadable".to_string())
+            }
+        }
+
+        fn current(&self, mask: &Arc<crate::mask::Mask>) -> bool {
+            *self.had.lock().expect("lock") && Arc::ptr_eq(mask, &self.mask)
+        }
+    }
+
+    /// Objective 175: with a credential mask, what the archive copies is
+    /// masked; without it a pass copies nothing, says why, and the record
+    /// says from when the archive lacks lines; once it is had, the waiting
+    /// lines are copied masked.
+    #[test]
+    fn the_archive_masks_values_and_copies_nothing_without_the_mask() {
+        const VALUE: &str = "made-up-token-0123456789";
+        let mut world = World::with_archive();
+        let flip = Arc::new(Flip {
+            mask: Arc::new(crate::mask::Mask::new(
+                &[("spawn.env:API_TOKEN".to_string(), VALUE.as_bytes().to_vec())],
+                crate::transcripts::ARCHIVE_MARKER,
+            )),
+            had: Mutex::new(false),
+        });
+        world.bridge.set_archive_mask(flip.clone());
+        world.advance(20_000);
+        let said =
+            call_line("c1", 18).replace("\"model\":\"m\"", &format!("\"model\":\"{VALUE}\""));
+        assert!(said.contains(VALUE));
+        world.engine_writes(&said);
+        let warnings = world.tick();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("the credential mask: /made-up/cred/spawn.env")),
+            "{warnings:?}"
+        );
+        assert_eq!(world.archived(), "", "nothing copied without the mask");
+        assert!(world.progress().behind_ms.is_some());
+        *flip.had.lock().expect("lock") = true;
+        world.watch.changed(&world.path.clone());
+        world.tick();
+        let archived = world.archived();
+        assert!(
+            archived.contains("[REDACTED:spawn.env:API_TOKEN]") && !archived.contains(VALUE),
+            "{archived}"
+        );
+        assert_eq!(world.progress().behind_ms, None);
+        assert!(
+            String::from_utf8(
+                world
+                    .store
+                    .read_from(&world.progress().workspace, &world.path, 0)
+                    .expect("read")
+                    .expect("present")
+            )
+            .expect("utf-8")
+            .contains(VALUE),
+            "the transcript is never written"
+        );
     }
 
     /// S33: a failing copy whose first read of what the archive lacks meets
