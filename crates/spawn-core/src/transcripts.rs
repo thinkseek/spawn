@@ -534,6 +534,7 @@ pub fn restore(
         return Ok(None);
     };
     let archive = keeper.archive;
+    // Its own bytes first: whatever happens next, the archive has them.
     let unarchived = present && !archived_first(host, &keeper, workspace, path, agent, native)?;
     let copies = archive
         .copies(agent, native)
