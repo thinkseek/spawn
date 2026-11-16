@@ -89,11 +89,16 @@ fn mount_type<'a>(text: &'a str, info: bool, path: &Path) -> Option<&'a str> {
     let mut best: Option<(usize, &str)> = None;
     for line in text.lines() {
         let fields: Vec<&str> = line.split(' ').collect();
-        let (point, kind) = if info {
-            let dash = fields.iter().position(|field| *field == "-")?;
-            (*fields.get(4)?, *fields.get(dash + 1)?)
+        let parts = if info {
+            fields
+                .iter()
+                .position(|field| *field == "-")
+                .and_then(|dash| Some((*fields.get(4)?, *fields.get(dash + 1)?)))
         } else {
-            (*fields.get(1)?, *fields.get(2)?)
+            fields.get(1).zip(fields.get(2)).map(|(a, b)| (*a, *b))
+        };
+        let Some((point, kind)) = parts else {
+            continue;
         };
         let point = point.replace("\\040", " ");
         if path.starts_with(&point) && best.is_none_or(|(depth, _)| point.len() >= depth) {
