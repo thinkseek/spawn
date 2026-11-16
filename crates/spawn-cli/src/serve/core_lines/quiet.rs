@@ -98,7 +98,10 @@ mod tests {
         let zero = json!(0);
         let week = WEEK_MS + 2 * H;
         let full = hourly(week, zeros);
-        assert!(zero_for_a_week(KEY, &zero, &full, NOW), "a full week of zeros");
+        assert!(
+            zero_for_a_week(KEY, &zero, &full, NOW),
+            "a full week of zeros"
+        );
 
         // Older non-zero samples outside the week do not count.
         let older = hourly(10 * 24 * H, |ago| {
@@ -111,9 +114,17 @@ mod tests {
         assert!(!zero_for_a_week(KEY, &Value::Null, &full, NOW), "null now");
 
         // One sample in the week at 3, null, or without the figure.
-        for odd in [json!({KEY: 3}), json!({KEY: null}), json!({"storage.free_bytes": 1})] {
+        for odd in [
+            json!({KEY: 3}),
+            json!({KEY: null}),
+            json!({"storage.free_bytes": 1}),
+        ] {
             let samples = hourly(week, |ago| {
-                Some(if ago == 3 * 24 * H { odd.clone() } else { json!({KEY: 0}) })
+                Some(if ago == 3 * 24 * H {
+                    odd.clone()
+                } else {
+                    json!({KEY: 0})
+                })
             });
             assert!(!zero_for_a_week(KEY, &zero, &samples, NOW), "{odd}");
         }
@@ -138,6 +149,9 @@ mod tests {
         let two = hourly(week, |ago| (ago % GAP_MS == 0).then(|| json!({KEY: 0})));
         assert!(zero_for_a_week(KEY, &zero, &two, NOW), "two hours apart");
         let three = hourly(week, |ago| (ago % (3 * H) == 0).then(|| json!({KEY: 0})));
-        assert!(!zero_for_a_week(KEY, &zero, &three, NOW), "three hours apart");
+        assert!(
+            !zero_for_a_week(KEY, &zero, &three, NOW),
+            "three hours apart"
+        );
     }
 }

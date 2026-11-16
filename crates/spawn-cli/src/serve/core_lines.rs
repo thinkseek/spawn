@@ -122,9 +122,9 @@ mod unowned;
 
 use observability::{Observed, count_not_measured, observability_line};
 use performance::{measured_samples, performance_line, performance_now};
+use quiet::{samples_since, zero_for_a_week};
 use recoverability::{nightly_facts, recoverability};
 use storage::storage_line;
-use quiet::{samples_since, zero_for_a_week};
 use trends::trends;
 
 /// The file's name under the workspace root, when `SPAWN_CORE_LINES_FILE`
@@ -1083,12 +1083,7 @@ pub(super) fn core_lines_timed(
     let set = adopted_at(&figures, &samples.0, now_ms);
     let samples = measured_samples(samples.0, samples.1);
     let file = path.map_or(Value::Null, |path| json!(path.display().to_string()));
-    let mut view = answer(
-        &set,
-        &file,
-        contents,
-        &trends(&samples, now_ms),
-    );
+    let mut view = answer(&set, &file, contents, &trends(&samples, now_ms));
     view["drills"] = extras.drills;
     with_groups(&mut view, extras.groups);
     view["scratch"] = extras.scratch;
@@ -1629,7 +1624,12 @@ mod tests {
         super::aged(&mut figures, &[], 2_000_000);
         assert_eq!(figures, before);
         let trends = std::collections::BTreeMap::new();
-        let view = super::answer(&super::adopted(&figures, false), &Value::Null, Ok(None), &trends);
+        let view = super::answer(
+            &super::adopted(&figures, false),
+            &Value::Null,
+            Ok(None),
+            &trends,
+        );
         let mut grouped = view.clone();
         super::with_groups(&mut grouped, Vec::new());
         assert_eq!(grouped, view, "no `groups` key");
