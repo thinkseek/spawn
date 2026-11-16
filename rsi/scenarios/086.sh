@@ -24,7 +24,10 @@
 #       7-day usd_per_landing. State and range as for every figure (084).
 #       Since objective 176 (the owner's core metric set) dollars per
 #       landing is a diagnostic, read from the answer's `diagnostics`, and
-#       the line is the other four.
+#       the line is the other four. Since objective 182 it is a plain
+#       reading of the sustainability line (`readings`): the same value, no
+#       range (the file's {"max": 10} is not applied), state no_range (or
+#       not_collected without a value).
 #   (2) coreLinesView says the new units: ms as a span ("45 s", "14 min",
 #       "1 h 32 min", "2 h"), share as a percent to one decimal ("74.9%"),
 #       usd as dollars and cents ("$8.08"), ranges in the same words.
@@ -282,7 +285,7 @@ if [ "$code" != 200 ]; then
 else
     perf() { jq -c ".lines[] | select(.line == \"performance\") | $1" "$WORK/lines.json"; }
     # Objective 176: dollars per landing is read from the diagnostics.
-    figure() { jq -c "([.lines[] | select(.line == \"performance\") | .north_star, .guardrails[]] + (.diagnostics // []))[] | select(.key == \"$1\") | {unit, value, range, state}" "$WORK/lines.json"; }
+    figure() { jq -c "([.lines[] | select(.line == \"performance\") | .north_star, .guardrails[]] + (.diagnostics // []) + [.lines[] | .readings[]?])[] | select(.key == \"$1\") | {unit, value, range, state}" "$WORK/lines.json"; }
     expect_eq "$(perf '[.north_star.key] + [.guardrails[].key]')" \
         '["performance.report_to_live","performance.gate_time","performance.decided_nothing","performance.first_pass"]' \
         "(1) the performance line's north star and guardrails, in order"
@@ -309,9 +312,10 @@ else
         "{\"unit\":\"share\",\"value\":$pass,\"range\":{\"min\":0.7},\"state\":\"$(state "$pass" "$(awk -v v="$pass" 'BEGIN { if (v != "null" && v >= 0.7) print "in" }')")\"}" \
         "(1) landings that pass first time: the Scorecard's fleet value"
     usd=$(jq -c '.usd_per_landing' "$WORK/cost.json")
+    if [ "$usd" = null ]; then usd_state=not_collected; else usd_state=no_range; fi
     expect_eq "$(figure performance.usd_per_landing)" \
-        "{\"unit\":\"usd\",\"value\":$usd,\"range\":{\"max\":10},\"state\":\"$(state "$usd" "$(awk -v v="$usd" 'BEGIN { if (v != "null" && v <= 10) print "in" }')")\"}" \
-        "(1) dollars per landing: the Cost page's 7-day usd_per_landing"
+        "{\"unit\":\"usd\",\"value\":$usd,\"range\":null,\"state\":\"$usd_state\"}" \
+        "(1) dollars per landing: the Cost page's 7-day usd_per_landing, a reading with no range (objective 182)"
     note "(1) checked: the performance line"
 fi
 
