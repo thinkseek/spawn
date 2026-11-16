@@ -677,31 +677,19 @@ pub(super) fn adopted(readings: &[Line], leaked_quiet: bool) -> Set {
     }
 }
 
-/// The entries of `ranges` for a figure in [`NO_RANGE`] not applied (its
-/// bounds and target dropped) and listed in `ignored` with why.
-fn no_range(ranges: &mut Ranges, given: &[&str]) {
+/// The file's entry for a figure in [`NO_RANGE`], whatever it gives (a
+/// bound, a target, or neither), not applied: listed in `ignored` with why.
+fn no_range(ranges: &mut Ranges) {
     for (key, reason) in NO_RANGE {
-        if !given.contains(&key) {
-            continue;
+        let bound = ranges.bounds.remove(key).is_some();
+        let target = ranges.targets.remove(key).is_some();
+        let listed = ranges.ignored.iter().any(|(ignored, _)| ignored == key);
+        if bound || target || listed {
+            ranges.ignored.retain(|(ignored, _)| ignored != key);
+            ranges.ignored.push((key.to_string(), reason));
         }
-        ranges.bounds.remove(key);
-        ranges.targets.remove(key);
-        ranges.ignored.retain(|(ignored, _)| ignored != key);
-        ranges.ignored.push((key.to_string(), reason));
     }
     ranges.ignored.sort();
-}
-
-/// The figure keys the ranges file `text` gives an entry, whatever it holds.
-fn entries_of(text: Option<&str>) -> Vec<String> {
-    text.and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .and_then(|value| {
-            value
-                .get("ranges")
-                .and_then(Value::as_object)
-                .map(|entries| entries.keys().cloned().collect())
-        })
-        .unwrap_or_default()
 }
 
 /// The answer from the lines, the ranges file's path (null when there is
@@ -719,13 +707,7 @@ pub(super) fn answer(
     let mut ranges = match contents {
         Ok(text) => {
             let mut ranges = parse_ranges(text.as_deref(), &known);
-            let entries = entries_of(text.as_deref());
-            let given: Vec<&str> = entries
-                .iter()
-                .map(String::as_str)
-                .filter(|key| known.contains(key))
-                .collect();
-            no_range(&mut ranges, &given);
+            no_range(&mut ranges);
             ranges
         }
         Err(error) => Ranges {
