@@ -145,11 +145,20 @@ impl Stamps {
     fn changed(&self) -> bool {
         self.sources.iter().any(|(path, stamp)| {
             std::fs::metadata(path).map_or(true, |metadata| Stamp::of(&metadata) != *stamp)
-        }) || self.accepted.iter().any(|path| path.symlink_metadata().is_ok())
+        }) || self
+            .accepted
+            .iter()
+            .any(|path| path.symlink_metadata().is_ok())
             || self.watch.iter().any(|(path, mtime)| {
-                std::fs::metadata(path).ok().map(|metadata| mtime_ns(&metadata)) != *mtime
+                std::fs::metadata(path)
+                    .ok()
+                    .map(|metadata| mtime_ns(&metadata))
+                    != *mtime
             })
-            || self.probe.iter().any(|(path, exists)| path.exists() != *exists)
+            || self
+                .probe
+                .iter()
+                .any(|(path, exists)| path.exists() != *exists)
     }
 }
 
@@ -379,7 +388,8 @@ fn run(tool: &Path) -> Result<Value, String> {
     if !status.success() {
         return Err(format!("the location tool {shown} exited {status}"));
     }
-    serde_json::from_slice(&bytes).map_err(|_| format!("the location tool {shown} answered no JSON"))
+    serde_json::from_slice(&bytes)
+        .map_err(|_| format!("the location tool {shown} answered no JSON"))
 }
 
 /// The strings of the answer's list `name`, as paths.
@@ -436,7 +446,9 @@ fn build(answer: &Value) -> Result<(Vec<(String, Vec<u8>)>, Stamps), String> {
     }
     for probed in answer["probe"].as_array().into_iter().flatten() {
         let path = PathBuf::from(probed["path"].as_str().unwrap_or_default());
-        stamps.probe.push((path, probed["exists"].as_bool().unwrap_or(false)));
+        stamps
+            .probe
+            .push((path, probed["exists"].as_bool().unwrap_or(false)));
     }
     let mut read: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut values = Vec::new();
@@ -481,15 +493,20 @@ fn read_stamped(path: &Path, stamp: Stamp) -> Result<Vec<u8>, String> {
              ctime differs): the mask is built again"
         )
     };
-    let mut file = std::fs::File::open(path).map_err(|error| format!("{shown}: cannot be read: {error}"))?;
-    let before = file.metadata().map_err(|error| format!("stat {shown}: {error}"))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("{shown}: cannot be read: {error}"))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("stat {shown}: {error}"))?;
     if Stamp::of(&before) != stamp {
         return Err(not_it());
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|error| format!("{shown}: cannot be read: {error}"))?;
-    let after = file.metadata().map_err(|error| format!("stat {shown}: {error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("stat {shown}: {error}"))?;
     if Stamp::of(&after) != stamp {
         return Err(not_it());
     }
@@ -535,7 +552,9 @@ fn place_text(bytes: &[u8], entry: &Value, path: &Path) -> Result<Vec<u8>, Strin
             .ok_or_else(|| format!("{shown} has no line {number} that the location tool places"));
     }
     let Some(pointer) = entry["ptr"].as_array() else {
-        return Err(format!("a place in {shown} names neither a line nor a pointer"));
+        return Err(format!(
+            "a place in {shown} names neither a line nor a pointer"
+        ));
     };
     let document: Value = serde_json::from_slice(bytes)
         .map_err(|_| format!("{shown} is not the JSON the location tool read"))?;
@@ -643,7 +662,11 @@ fn base64(bytes: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {

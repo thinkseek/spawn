@@ -100,11 +100,17 @@ fn each_kind_of_place_is_read_and_masked() {
     let encoded = LINKED.replace('/', "%2F").replace('=', "%3D");
     std::fs::write(
         &cred,
-        format!("NOTE=x\rAPI_TOKEN={TOKEN}\nLINK=https://h/?k={encoded}\nDB=postgres://bb:mUp5x@h/d\n"),
+        format!(
+            "NOTE=x\rAPI_TOKEN={TOKEN}\nLINK=https://h/?k={encoded}\nDB=postgres://bb:mUp5x@h/d\n"
+        ),
     )
     .expect("cred");
     let doc = world.path("creds.json");
-    std::fs::write(&doc, json!({"zeta": {"token": LEAF}, "alpha": 1}).to_string()).expect("doc");
+    std::fs::write(
+        &doc,
+        json!({"zeta": {"token": LEAF}, "alpha": 1}).to_string(),
+    )
+    .expect("doc");
     let link_line = format!("LINK=https://h/?k={encoded}");
     let at = link_line.find("?k=").expect("k") + 3;
     world.spec(&json!({
@@ -128,10 +134,21 @@ fn each_kind_of_place_is_read_and_masked() {
         TOKEN.replace('/', "%2F").replace('+', "%2B")
     );
     let said = masked(&source, &text);
-    for marker in ["spawn.env:API_TOKEN", "spawn.env:LINK", "spawn.env:DB", "creds.json:token"] {
-        assert!(said.contains(&format!("[REDACTED:{marker}]")), "{marker}: {said}");
+    for marker in [
+        "spawn.env:API_TOKEN",
+        "spawn.env:LINK",
+        "spawn.env:DB",
+        "creds.json:token",
+    ] {
+        assert!(
+            said.contains(&format!("[REDACTED:{marker}]")),
+            "{marker}: {said}"
+        );
     }
-    assert!(!said.contains("made-up") && !said.contains("mUp5x"), "{said}");
+    assert!(
+        !said.contains("made-up") && !said.contains("mUp5x"),
+        "{said}"
+    );
 }
 
 /// A place that does not hold is an error naming the source, never a
@@ -167,7 +184,11 @@ fn a_place_that_does_not_hold_is_an_error_naming_the_source_only() {
     ];
     for spec in cases {
         world.spec(&spec);
-        let error = world.mask().mask().err().unwrap_or_else(|| panic!("refused: {spec}"));
+        let error = world
+            .mask()
+            .mask()
+            .err()
+            .unwrap_or_else(|| panic!("refused: {spec}"));
         assert!(!error.contains("made-up"), "{error}");
         assert!(
             error.contains(&shown(&cred)) || error.contains(&shown(&doc)),
@@ -219,7 +240,10 @@ fn the_mask_is_built_again_when_what_it_was_built_from_changes() {
     };
     // A same-size rewrite, its mtime set back: only the ctime moves.
     again("a same-size rewrite with its old mtime", true, &|| {
-        let old = std::fs::metadata(&cred).expect("stat").modified().expect("mtime");
+        let old = std::fs::metadata(&cred)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
         let rotated = TOKEN.replace('0', "9");
         std::fs::write(&cred, format!("API_TOKEN={rotated}\n")).expect("rewrite");
         std::fs::File::options()
@@ -265,8 +289,14 @@ fn a_source_changed_after_the_answer_is_refused_and_read_again() {
     }));
     let source = world.mask();
     let error = source.mask().err().expect("refused");
-    assert!(error.contains("is not the file the location tool read"), "{error}");
-    assert!(error.contains(&shown(&cred)) && !error.contains("made-up"), "{error}");
+    assert!(
+        error.contains("is not the file the location tool read"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&shown(&cred)) && !error.contains("made-up"),
+        "{error}"
+    );
     std::fs::write(world.tool(), TOOL).expect("tool");
     let said = masked(&source, &format!("say {}", TOKEN.replace('0', "9")));
     assert!(said.contains("[REDACTED:"), "{said}");
@@ -320,7 +350,11 @@ fn a_stand_in_is_honoured_only_in_a_gates_sandbox() {
     for sandbox in [None, Some(""), Some("0"), Some("yes"), Some("1 ")] {
         let (mask, stand_in) = CollectorMask::configured(tool.clone(), sandbox, &roots, &home);
         assert_eq!(stand_in, None, "{sandbox:?}");
-        assert_eq!(mask.mask().err().as_deref(), Some(SANDBOX_ONLY), "{sandbox:?}");
+        assert_eq!(
+            mask.mask().err().as_deref(),
+            Some(SANDBOX_ONLY),
+            "{sandbox:?}"
+        );
     }
     assert_eq!(world.runs(), 0, "no tool ran");
     let (mask, stand_in) = CollectorMask::configured(tool, Some("1"), &roots, &home);
@@ -353,8 +387,12 @@ fn a_stand_in_is_refused_for_roots_inside_the_account_s_home_whatever_the_marker
     let live = home_path.join(".local/share/spawn-rsi/ws");
     let outside = [world.path("ws"), world.path("projects")];
     let tool = || Some(world.tool());
-    let (mask, stand_in) =
-        CollectorMask::configured(tool(), Some("1"), &[live.clone(), outside[1].clone()], &home);
+    let (mask, stand_in) = CollectorMask::configured(
+        tool(),
+        Some("1"),
+        &[live.clone(), outside[1].clone()],
+        &home,
+    );
     assert_eq!(stand_in, None, "not said accepted");
     let why = mask.mask().err().expect("refused");
     assert!(why.contains("inside the account's home"), "{why}");
@@ -394,8 +432,12 @@ fn the_live_loop_s_roots_refuse_a_stand_in() {
     ];
     let world = World::new("mask-live");
     for root in &roots {
-        let (_, stand_in) =
-            CollectorMask::configured(Some(world.tool()), Some("1"), std::slice::from_ref(root), &home);
+        let (_, stand_in) = CollectorMask::configured(
+            Some(world.tool()),
+            Some("1"),
+            std::slice::from_ref(root),
+            &home,
+        );
         assert_eq!(stand_in.is_some(), home.tmpfs, "{}", root.display());
     }
 }

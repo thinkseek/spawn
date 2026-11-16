@@ -77,7 +77,8 @@ impl Directory {
     ///
     /// The sync's failure, naming the directory.
     pub fn sync(&self) -> Result<(), String> {
-        rustix::fs::fsync(&self.fd).map_err(|error| format!("sync {}: {error}", self.shown.display()))
+        rustix::fs::fsync(&self.fd)
+            .map_err(|error| format!("sync {}: {error}", self.shown.display()))
     }
 }
 
@@ -106,7 +107,11 @@ fn refusal(shown: &Path, what: &str, errno: Errno) -> String {
             shown.display()
         )
     } else {
-        format!("{what} {}: {}", shown.display(), std::io::Error::from(errno))
+        format!(
+            "{what} {}: {}",
+            shown.display(),
+            std::io::Error::from(errno)
+        )
     }
 }
 
@@ -188,7 +193,8 @@ impl Beneath {
             rest.push(name.to_os_string());
             base = parent.to_path_buf();
         }
-        let opened = File::open(&base).map_err(|error| format!("open {}: {error}", base.display()))?;
+        let opened =
+            File::open(&base).map_err(|error| format!("open {}: {error}", base.display()))?;
         let held = opened
             .metadata()
             .map_err(|error| format!("stat {}: {error}", base.display()))?;
@@ -268,7 +274,8 @@ impl Beneath {
                             std::io::Error::from(errno)
                         )
                     })?;
-                let stat = rustix::fs::fstat(&fd).map_err(|errno| refusal(&pin.base, "stat", errno))?;
+                let stat =
+                    rustix::fs::fstat(&fd).map_err(|errno| refusal(&pin.base, "stat", errno))?;
                 if (stat.st_dev, stat.st_ino) != (pin.device, pin.inode) {
                     return Err(format!(
                         "{} is no longer the directory pinned for {}: not followed",
@@ -301,7 +308,12 @@ impl Beneath {
         if path.as_os_str().is_empty() {
             return Ok(Some(Directory { fd: base, shown }));
         }
-        match open_below(&base, &path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()) {
+        match open_below(
+            &base,
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
             Ok(fd) => Ok(Some(Directory { fd, shown })),
             Err(Errno::NOENT) => Ok(None),
             Err(errno) => Err(refusal(&shown, "open", errno)),
@@ -457,15 +469,14 @@ impl Beneath {
             }
             let is_dir = match entry.file_type() {
                 rustix::fs::FileType::Directory => true,
-                rustix::fs::FileType::Unknown => rustix::fs::statat(
-                    &dir.fd,
-                    name.as_str(),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .is_ok_and(|stat| {
-                    rustix::fs::FileType::from_raw_mode(stat.st_mode)
-                        == rustix::fs::FileType::Directory
-                }),
+                rustix::fs::FileType::Unknown => {
+                    rustix::fs::statat(&dir.fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
+                        |stat| {
+                            rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                                == rustix::fs::FileType::Directory
+                        },
+                    )
+                }
                 _ => false,
             };
             names.push((name, is_dir));
@@ -519,7 +530,13 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, or another failure, naming the path.
-    pub fn replace_whole(&self, dir: &Directory, name: &str, bytes: &[u8], durable: bool) -> Result<(), String> {
+    pub fn replace_whole(
+        &self,
+        dir: &Directory,
+        name: &str,
+        bytes: &[u8],
+        durable: bool,
+    ) -> Result<(), String> {
         let temporary = Self::temporary(dir, name, "tmp", bytes, None)?;
         if let Err(errno) = rustix::fs::renameat(&dir.fd, temporary.as_str(), &dir.fd, name) {
             let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
@@ -542,7 +559,13 @@ impl Beneath {
         let (parent, name) = split(relative)?;
         let dir = self.make_dir(parent)?;
         let temporary = Self::temporary(&dir, &name, "spawn-write", bytes, None)?;
-        let linked = rustix::fs::linkat(&dir.fd, temporary.as_str(), &dir.fd, name.as_str(), AtFlags::empty());
+        let linked = rustix::fs::linkat(
+            &dir.fd,
+            temporary.as_str(),
+            &dir.fd,
+            name.as_str(),
+            AtFlags::empty(),
+        );
         let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
         match linked {
             Ok(()) => {
@@ -562,7 +585,12 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, a second hard link, or another failure, naming the path.
-    pub fn replace_grown(&self, relative: &Path, bytes: &[u8], current: &[u8]) -> Result<bool, String> {
+    pub fn replace_grown(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        current: &[u8],
+    ) -> Result<bool, String> {
         let shown = self.shown(relative);
         if bytes.len() < current.len() {
             return Err(format!(
@@ -591,7 +619,9 @@ impl Beneath {
             return Ok(false);
         }
         let temporary = Self::temporary(&dir, &name, "spawn-replace", bytes, Some(mode))?;
-        if let Err(errno) = rustix::fs::renameat(&dir.fd, temporary.as_str(), &dir.fd, name.as_str()) {
+        if let Err(errno) =
+            rustix::fs::renameat(&dir.fd, temporary.as_str(), &dir.fd, name.as_str())
+        {
             let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
             return Err(refusal(&shown, "replace", errno));
         }

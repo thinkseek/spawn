@@ -29,7 +29,11 @@ impl Home {
                     .ok()
                     .map(|text| (text, false))
             });
-        Self::from_parts(&passwd, crate::current_uid(), mounts.as_ref().map(|(text, info)| (text.as_str(), *info)))
+        Self::from_parts(
+            &passwd,
+            crate::current_uid(),
+            mounts.as_ref().map(|(text, info)| (text.as_str(), *info)),
+        )
     }
 
     /// The home `passwd` names for `uid` (its sixth field), canonical when
@@ -126,11 +130,26 @@ mod tests {
         assert!(!plain.tmpfs);
         assert!(plain.holds(Path::new("/srv/bb-home/.local/ws")));
         assert!(!plain.holds(Path::new("/srv/bb-homes/ws")));
-        assert!(plain.refuses(Path::new("/srv/bb-home/ws"), Path::new("/ws")).is_some());
-        assert!(plain.refuses(Path::new("/tmp/ws"), Path::new("/tmp/ws")).is_none());
-        assert!(home.refuses(Path::new("/srv/bb-home/ws"), Path::new("/ws")).is_none());
+        assert!(
+            plain
+                .refuses(Path::new("/srv/bb-home/ws"), Path::new("/ws"))
+                .is_some()
+        );
+        assert!(
+            plain
+                .refuses(Path::new("/tmp/ws"), Path::new("/tmp/ws"))
+                .is_none()
+        );
+        assert!(
+            home.refuses(Path::new("/srv/bb-home/ws"), Path::new("/ws"))
+                .is_none()
+        );
         let unknown = Home::from_parts(PASSWD, 7, None);
         assert_eq!(unknown.path, None);
-        assert!(unknown.refuses(Path::new("/tmp/ws"), Path::new("/tmp/ws")).is_some());
+        assert!(
+            unknown
+                .refuses(Path::new("/tmp/ws"), Path::new("/tmp/ws"))
+                .is_some()
+        );
     }
 }

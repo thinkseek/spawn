@@ -49,7 +49,13 @@ impl World {
     fn home_untouched(&self) {
         let names: Vec<String> = std::fs::read_dir(self.home().join("secret"))
             .expect("list")
-            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(names, ["kept.jsonl"], "nothing written into the home");
     }
@@ -63,7 +69,10 @@ fn agent() -> AgentId {
 /// stand-in's).
 fn archives(world: &World, root: &Path) -> Vec<(&'static str, LocalTranscriptArchive)> {
     vec![
-        ("unpinned", LocalTranscriptArchive::for_loop(Beneath::new(root))),
+        (
+            "unpinned",
+            LocalTranscriptArchive::for_loop(Beneath::new(root)),
+        ),
         (
             "pinned",
             LocalTranscriptArchive::for_loop(Beneath::pinned(root, &world.home).expect("pinned")),
@@ -75,7 +84,8 @@ fn archives(world: &World, root: &Path) -> Vec<(&'static str, LocalTranscriptArc
 fn an_archive_whose_directory_links_into_the_home_appends_nothing_there() {
     let world = World::new("beneath-archive-link");
     let root = world.root();
-    std::os::unix::fs::symlink(world.home().join("secret"), root.join(".transcripts")).expect("link");
+    std::os::unix::fs::symlink(world.home().join("secret"), root.join(".transcripts"))
+        .expect("link");
     for (what, archive) in archives(&world, &root) {
         let error = archive
             .append(&agent(), NATIVE, 0, 0, b"made-up line\n")
@@ -94,9 +104,13 @@ fn an_agent_directory_or_a_copy_that_links_into_the_home_is_refused() {
     let root = world.root();
     let archive_dir = root.join(".transcripts");
     std::fs::create_dir_all(&archive_dir).expect("archive");
-    std::os::unix::fs::symlink(world.home().join("secret"), archive_dir.join("agent_local")).expect("link");
+    std::os::unix::fs::symlink(world.home().join("secret"), archive_dir.join("agent_local"))
+        .expect("link");
     for (what, archive) in archives(&world, &root) {
-        let error = archive.append(&agent(), NATIVE, 0, 0, b"x\n").expect_err(what).0;
+        let error = archive
+            .append(&agent(), NATIVE, 0, 0, b"x\n")
+            .expect_err(what)
+            .0;
         assert!(error.contains("not followed"), "{what}: {error}");
     }
     std::fs::remove_file(archive_dir.join("agent_local")).expect("unlink");
@@ -107,7 +121,10 @@ fn an_agent_directory_or_a_copy_that_links_into_the_home_is_refused() {
     )
     .expect("copy link");
     for (what, archive) in archives(&world, &root) {
-        let error = archive.append(&agent(), NATIVE, 0, 15, b"x\n").expect_err(what).0;
+        let error = archive
+            .append(&agent(), NATIVE, 0, 15, b"x\n")
+            .expect_err(what)
+            .0;
         assert!(error.contains("not followed"), "{what}: {error}");
         let error = archive.read(&agent(), NATIVE, 0, 0, 100).expect_err(what).0;
         assert!(error.contains("not followed"), "{what}: {error}");
@@ -129,7 +146,10 @@ fn a_magic_link_into_the_home_is_not_followed() {
     ));
     std::os::unix::fs::symlink(&through_proc, root.join(".transcripts")).expect("link");
     for (what, archive) in archives(&world, &root) {
-        let error = archive.append(&agent(), NATIVE, 0, 0, b"x\n").expect_err(what).0;
+        let error = archive
+            .append(&agent(), NATIVE, 0, 0, b"x\n")
+            .expect_err(what)
+            .0;
         assert!(error.contains("not followed"), "{what}: {error}");
     }
     world.home_untouched();
@@ -194,7 +214,11 @@ fn a_missing_root_is_pinned_at_its_deepest_directory_and_walked_below_it() {
     let root = world.path("projects/deeper");
     let pinned = Beneath::pinned(&root, &world.home).expect("pinned");
     assert_eq!(pinned.read(Path::new("p/n.jsonl")).expect("read"), None);
-    assert!(pinned.write_new(Path::new("p/n.jsonl"), b"line\n").expect("written"));
+    assert!(
+        pinned
+            .write_new(Path::new("p/n.jsonl"), b"line\n")
+            .expect("written")
+    );
     assert_eq!(
         std::fs::read(root.join("p/n.jsonl")).expect("there"),
         b"line\n"
@@ -211,34 +235,79 @@ fn files_below_a_root_are_made_listed_moved_linked_and_removed() {
     let world = World::new("beneath-files");
     let below = Beneath::pinned(world.root(), &world.home).expect("pinned");
     let dir = below.make_dir(Path::new("a/b")).expect("made");
-    below.replace_whole(&dir, "r.json", b"{}\n", true).expect("replaced");
-    below.replace_whole(&dir, "r.json", b"{\"n\":1}\n", false).expect("again");
+    below
+        .replace_whole(&dir, "r.json", b"{}\n", true)
+        .expect("replaced");
+    below
+        .replace_whole(&dir, "r.json", b"{\"n\":1}\n", false)
+        .expect("again");
     assert_eq!(
         below.read(Path::new("a/b/r.json")).expect("read"),
         Some(b"{\"n\":1}\n".to_vec())
     );
-    let (mut file, made) = below.open_append(&dir, "c.jsonl", true).expect("open").expect("made");
+    let (mut file, made) = below
+        .open_append(&dir, "c.jsonl", true)
+        .expect("open")
+        .expect("made");
     assert!(made);
     std::io::Write::write_all(&mut file, b"one\n").expect("write");
-    assert!(below.open_append(&dir, "none.jsonl", false).expect("open").is_none());
+    assert!(
+        below
+            .open_append(&dir, "none.jsonl", false)
+            .expect("open")
+            .is_none()
+    );
     let mut listed = below.list(Path::new("a/b")).expect("list");
     listed.sort();
     assert_eq!(
         listed,
-        [("c.jsonl".to_string(), false), ("r.json".to_string(), false)]
+        [
+            ("c.jsonl".to_string(), false),
+            ("r.json".to_string(), false)
+        ]
     );
-    assert_eq!(below.list(Path::new("a")).expect("list"), [("b".to_string(), true)]);
-    assert!(below.write_new(Path::new("a/b/n.jsonl"), b"new\n").expect("new"));
-    assert!(!below.write_new(Path::new("a/b/n.jsonl"), b"other\n").expect("there"));
-    assert!(below.replace_grown(Path::new("a/b/n.jsonl"), b"new\nmore\n", b"new\n").expect("grown"));
-    assert!(!below.replace_grown(Path::new("a/b/n.jsonl"), b"x\n\n\n\n\n\n\n\n\n\n", b"new\n").expect("not it"));
-    assert!(below.replace_grown(Path::new("a/b/n.jsonl"), b"n\n", b"new\nmore\n").is_err(), "never shorter");
-    assert!(below.read(Path::new("../x")).is_err() && below.read(Path::new("/etc/hostname")).is_err());
+    assert_eq!(
+        below.list(Path::new("a")).expect("list"),
+        [("b".to_string(), true)]
+    );
+    assert!(
+        below
+            .write_new(Path::new("a/b/n.jsonl"), b"new\n")
+            .expect("new")
+    );
+    assert!(
+        !below
+            .write_new(Path::new("a/b/n.jsonl"), b"other\n")
+            .expect("there")
+    );
+    assert!(
+        below
+            .replace_grown(Path::new("a/b/n.jsonl"), b"new\nmore\n", b"new\n")
+            .expect("grown")
+    );
+    assert!(
+        !below
+            .replace_grown(Path::new("a/b/n.jsonl"), b"x\n\n\n\n\n\n\n\n\n\n", b"new\n")
+            .expect("not it")
+    );
+    assert!(
+        below
+            .replace_grown(Path::new("a/b/n.jsonl"), b"n\n", b"new\nmore\n")
+            .is_err(),
+        "never shorter"
+    );
+    assert!(
+        below.read(Path::new("../x")).is_err() && below.read(Path::new("/etc/hostname")).is_err()
+    );
     // No temporary file is left behind.
     assert!(
         std::fs::read_dir(world.root().join("a/b"))
             .expect("list")
-            .all(|entry| !entry.expect("entry").file_name().to_string_lossy().starts_with('.'))
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.'))
     );
 }
 
@@ -255,10 +324,16 @@ fn a_link_that_stays_below_the_root_is_refused_too() {
     )
     .expect("link");
     for (what, archive) in archives(&world, &root) {
-        let error = archive.append(&agent(), NATIVE, 0, 5, b"more\n").expect_err(what).0;
+        let error = archive
+            .append(&agent(), NATIVE, 0, 5, b"more\n")
+            .expect_err(what)
+            .0;
         assert!(error.contains("not followed"), "{what}: {error}");
     }
-    assert_eq!(std::fs::read(root.join("inside/copy.jsonl")).expect("read"), b"same\n");
+    assert_eq!(
+        std::fs::read(root.join("inside/copy.jsonl")).expect("read"),
+        b"same\n"
+    );
 }
 
 #[test]
@@ -268,13 +343,25 @@ fn a_copy_hard_linked_to_a_file_elsewhere_is_never_written_or_read() {
     std::fs::create_dir_all(root.join(".transcripts/agent_local")).expect("agent");
     let outside = world.path("outside.jsonl");
     std::fs::write(&outside, b"kept\n").expect("outside");
-    std::fs::hard_link(&outside, root.join(format!(".transcripts/agent_local/{NATIVE}.jsonl")))
-        .expect("hard link");
+    std::fs::hard_link(
+        &outside,
+        root.join(format!(".transcripts/agent_local/{NATIVE}.jsonl")),
+    )
+    .expect("hard link");
     for (what, archive) in archives(&world, &root) {
-        let error = archive.append(&agent(), NATIVE, 0, 5, b"more\n").expect_err(what).0;
-        assert!(error.contains("hard links: not followed"), "{what}: {error}");
+        let error = archive
+            .append(&agent(), NATIVE, 0, 5, b"more\n")
+            .expect_err(what)
+            .0;
+        assert!(
+            error.contains("hard links: not followed"),
+            "{what}: {error}"
+        );
         let error = archive.read(&agent(), NATIVE, 0, 0, 10).expect_err(what).0;
-        assert!(error.contains("hard links: not followed"), "{what}: {error}");
+        assert!(
+            error.contains("hard links: not followed"),
+            "{what}: {error}"
+        );
     }
     assert_eq!(std::fs::read(&outside).expect("read"), b"kept\n");
 }
@@ -296,7 +383,10 @@ fn a_transcript_hard_linked_to_a_file_elsewhere_is_not_read() {
     std::fs::write(&transcript, b"line\n").expect("transcript");
     let (host, workspace) = host_over(&world, &projects);
     let path = transcript.display().to_string();
-    assert_eq!(host.read_from(&workspace, &path, 0).expect("read"), Some(b"line\n".to_vec()));
+    assert_eq!(
+        host.read_from(&workspace, &path, 0).expect("read"),
+        Some(b"line\n".to_vec())
+    );
     std::fs::hard_link(&transcript, world.path("second-name")).expect("hard link");
     let error = host.read_from(&workspace, &path, 0).expect_err("refused").0;
     assert!(error.contains("hard links: not followed"), "{error}");
@@ -314,7 +404,15 @@ fn a_project_directory_that_links_into_the_home_is_not_read_restored_or_replaced
     assert!(read.contains("not followed"), "{read}");
     let new = projects.join("-w/new.jsonl").display().to_string();
     assert!(host.write_new(&workspace, &new, b"restored\n").is_err());
-    assert!(host.replace_grown(&workspace, &path, b"the home's own\nmore\n", b"the home's own\n").is_err());
+    assert!(
+        host.replace_grown(
+            &workspace,
+            &path,
+            b"the home's own\nmore\n",
+            b"the home's own\n"
+        )
+        .is_err()
+    );
     world.home_untouched();
     assert_eq!(
         std::fs::read(world.home().join("secret/kept.jsonl")).expect("read"),
@@ -335,7 +433,8 @@ fn a_stand_in_mask_pins_its_roots_and_the_installed_one_pins_none() {
         .expect("pinned");
     assert!(pinned.workspace.is_pinned());
     assert!(pinned.projects.as_ref().is_some_and(Beneath::is_pinned));
-    let installed = crate::archive_mask::loop_roots(None, &root, &projects, &world.home).expect("plain");
+    let installed =
+        crate::archive_mask::loop_roots(None, &root, &projects, &world.home).expect("plain");
     assert!(!installed.workspace.is_pinned());
     assert!(installed.projects.is_none());
 }
@@ -344,12 +443,18 @@ fn a_stand_in_mask_pins_its_roots_and_the_installed_one_pins_none() {
 fn the_loop_s_archive_keeps_the_pin_of_its_workspace_root() {
     let world = World::new("beneath-loop-pin");
     let root = world.root();
-    let archive = LocalTranscriptArchive::for_loop(Beneath::pinned(&root, &world.home).expect("pinned"));
-    archive.append(&agent(), NATIVE, 0, 0, b"one\n").expect("appended");
+    let archive =
+        LocalTranscriptArchive::for_loop(Beneath::pinned(&root, &world.home).expect("pinned"));
+    archive
+        .append(&agent(), NATIVE, 0, 0, b"one\n")
+        .expect("appended");
     std::fs::rename(&root, world.path("ws-away")).expect("away");
     std::fs::create_dir_all(world.home().join("secret/.transcripts")).expect("decoy");
     std::os::unix::fs::symlink(world.home().join("secret"), &root).expect("link");
-    let error = archive.append(&agent(), NATIVE, 0, 4, b"two\n").expect_err("swapped").0;
+    let error = archive
+        .append(&agent(), NATIVE, 0, 4, b"two\n")
+        .expect_err("swapped")
+        .0;
     assert!(error.contains("not followed"), "{error}");
     assert!(
         std::fs::read_dir(world.home().join("secret/.transcripts"))
@@ -377,9 +482,15 @@ fn a_native_transcript_inside_the_workspace_is_read_through_the_pinned_projects_
         .with_files_beneath(Beneath::pinned(&projects, &world.home).expect("pinned"));
     let workspace = WorkspaceId::new(format!("w:{}", workspace_dir.display())).expect("workspace");
     let path = transcript.display().to_string();
-    assert_eq!(host.read_from(&workspace, &path, 0).expect("read"), Some(b"line\n".to_vec()));
+    assert_eq!(
+        host.read_from(&workspace, &path, 0).expect("read"),
+        Some(b"line\n".to_vec())
+    );
     let status = workspace_dir.join("status").display().to_string();
-    assert_eq!(host.read_from(&workspace, &status, 0).expect("read"), Some(b"0\n".to_vec()));
+    assert_eq!(
+        host.read_from(&workspace, &status, 0).expect("read"),
+        Some(b"0\n".to_vec())
+    );
     std::fs::hard_link(&transcript, world.path("outside-native")).expect("hard link");
     let error = host.read_from(&workspace, &path, 0).expect_err("refused").0;
     assert!(error.contains("hard links: not followed"), "{error}");

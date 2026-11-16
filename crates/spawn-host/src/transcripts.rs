@@ -83,7 +83,12 @@ impl LocalTranscriptArchive {
     }
 
     /// Copy `copy` of `native`, relative to the directory above.
-    fn copy_path(&self, agent: &AgentId, native: &str, copy: usize) -> Result<PathBuf, ArchiveError> {
+    fn copy_path(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+    ) -> Result<PathBuf, ArchiveError> {
         Ok(self
             .agent_dir("", agent)
             .join(Self::copy_name(agent, native, copy)?))
@@ -179,7 +184,11 @@ impl TranscriptArchive for LocalTranscriptArchive {
             .below
             .make_dir(&self.agent_dir("", agent))
             .map_err(ArchiveError)?;
-        let shown = self.below.root().join(self.agent_dir("", agent)).join(&name);
+        let shown = self
+            .below
+            .root()
+            .join(self.agent_dir("", agent))
+            .join(&name);
         // Only a copy's first append creates it: a refused one leaves no
         // empty copy behind.
         let Some((mut file, created)) = self
@@ -193,7 +202,8 @@ impl TranscriptArchive for LocalTranscriptArchive {
         };
         // Two writers of one copy take turns; each checks the length under
         // the lock, so neither writes over the other.
-        file.lock().map_err(|error| failed("lock", &shown, &error))?;
+        file.lock()
+            .map_err(|error| failed("lock", &shown, &error))?;
         let length = file
             .metadata()
             .map_err(|error| failed("stat", &shown, &error))?
@@ -243,7 +253,11 @@ impl TranscriptArchive for LocalTranscriptArchive {
                 if is_dir || name.starts_with('.') || !name.ends_with(".json") {
                     continue;
                 }
-                if let Some(bytes) = self.below.read(&directory.join(&name)).map_err(ArchiveError)? {
+                if let Some(bytes) = self
+                    .below
+                    .read(&directory.join(&name))
+                    .map_err(ArchiveError)?
+                {
                     records.extend(ArchiveProgress::from_json(&bytes));
                 }
             }
@@ -288,7 +302,12 @@ impl TranscriptArchive for LocalTranscriptArchive {
         let mut line = source.to_json();
         line.push('\n');
         self.below
-            .replace_whole(&directory, &format!("{native}.{copy}.json"), line.as_bytes(), true)
+            .replace_whole(
+                &directory,
+                &format!("{native}.{copy}.json"),
+                line.as_bytes(),
+                true,
+            )
             .map_err(ArchiveError)
     }
 }

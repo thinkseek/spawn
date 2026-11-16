@@ -89,7 +89,9 @@ pub struct Masking<'a> {
 
 /// The sha256, in hex, of the last [`OVERLAP`] bytes of `bytes`.
 pub fn tail_sha256(bytes: &[u8]) -> String {
-    let width = usize::try_from(OVERLAP).unwrap_or(usize::MAX).min(bytes.len());
+    let width = usize::try_from(OVERLAP)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
     let digest = Sha256::digest(&bytes[bytes.len() - width..]);
     digest.iter().fold(String::new(), |mut hex, byte| {
         use std::fmt::Write as _;
@@ -538,7 +540,15 @@ pub fn restore(
         match &keeper.mask {
             Err(_) => unarchived = true,
             Ok(masking) => {
-                match archive_to(host, archive, masking.as_ref(), workspace, path, agent, native) {
+                match archive_to(
+                    host,
+                    archive,
+                    masking.as_ref(),
+                    workspace,
+                    path,
+                    agent,
+                    native,
+                ) {
                     Err(error) if error == MASK_CHANGED => unarchived = true,
                     Err(error) => return Err(error),
                     Ok(_) => {}
@@ -1204,7 +1214,11 @@ mod tests {
         let yes = || true;
         store.append_file(PATH, "{\"a\":\"plain\"}\n{\"b\":\"made-up-tok");
         let first = masked_step(&store, &agent, &workspace, &yes).expect("archive");
-        assert_eq!(joined(&store, &agent), "{\"a\":\"plain\"}\n", "the half line waits");
+        assert_eq!(
+            joined(&store, &agent),
+            "{\"a\":\"plain\"}\n",
+            "the half line waits"
+        );
         assert_eq!(first.offset, Some(14));
         store.append_file(PATH, "en-0123456789\"}\n");
         masked_step(&store, &agent, &workspace, &yes).expect("archive");
@@ -1219,7 +1233,10 @@ mod tests {
                 .contains(SECRET)
         );
         // Its record stands where the transcript is, not where the copy is.
-        let record = store.source(&agent, "n1", 0).expect("source").expect("a record");
+        let record = store
+            .source(&agent, "n1", 0)
+            .expect("source")
+            .expect("a record");
         assert_eq!(
             record.source_offset,
             u64::try_from(file(&store, &workspace).len()).expect("fits")
@@ -1290,7 +1307,10 @@ mod tests {
         assert!(copies(&store, &agent).is_empty());
     }
 
-    fn masked_keeper<'a>(store: &'a MemoryStore, current: &'a dyn Fn() -> bool) -> Option<Keeper<'a>> {
+    fn masked_keeper<'a>(
+        store: &'a MemoryStore,
+        current: &'a dyn Fn() -> bool,
+    ) -> Option<Keeper<'a>> {
         Some(Keeper {
             archive: store,
             mask: Ok(Some(super::Masking {
@@ -1315,7 +1335,15 @@ mod tests {
         assert_eq!(copies(&store, &agent).len(), 2);
         let had = u64::try_from(file(&store, &workspace).len()).expect("fits");
         assert_eq!(
-            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true),
+            restore(
+                &store,
+                masked_keeper(&store, &yes),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                true
+            ),
             Ok(Some(Restored::Left { had })),
             "never replaced by masked copies"
         );
@@ -1323,7 +1351,15 @@ mod tests {
         // Its records lost: a copy holding the marker is masked all the same.
         store.forget_copy_sources();
         assert_eq!(
-            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true),
+            restore(
+                &store,
+                masked_keeper(&store, &yes),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                true
+            ),
             Ok(Some(Restored::Left { had }))
         );
         // The mask not had: not archived first, left.
@@ -1337,14 +1373,31 @@ mod tests {
             restore(&store, gone, &workspace, PATH, &agent, "n1", true),
             Ok(Some(Restored::Left { .. }))
         ));
-        assert_eq!(copies(&store, &agent), before, "nothing copied without the mask");
+        assert_eq!(
+            copies(&store, &agent),
+            before,
+            "nothing copied without the mask"
+        );
         // Gone: put back from the copies, masked.
         store.remove_file(PATH);
-        let restored =
-            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true);
-        assert!(matches!(restored, Ok(Some(Restored::Written { .. }))), "{restored:?}");
+        let restored = restore(
+            &store,
+            masked_keeper(&store, &yes),
+            &workspace,
+            PATH,
+            &agent,
+            "n1",
+            true,
+        );
+        assert!(
+            matches!(restored, Ok(Some(Restored::Written { .. }))),
+            "{restored:?}"
+        );
         let back = String::from_utf8(file(&store, &workspace)).expect("utf-8");
-        assert!(back.contains("[REDACTED:cred:TOKEN]") && !back.contains(SECRET), "{back}");
+        assert!(
+            back.contains("[REDACTED:cred:TOKEN]") && !back.contains(SECRET),
+            "{back}"
+        );
     }
 
     /// A gone file put back is the transcript from then on: the next lines
@@ -1358,8 +1411,15 @@ mod tests {
         store.replace_file(PATH, b"{\"uuid\":\"u2\"}\n");
         masked_step(&store, &agent, &workspace, &yes).expect("archive");
         store.remove_file(PATH);
-        let restored =
-            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true);
+        let restored = restore(
+            &store,
+            masked_keeper(&store, &yes),
+            &workspace,
+            PATH,
+            &agent,
+            "n1",
+            true,
+        );
         let Ok(Some(Restored::Written { bytes })) = restored else {
             panic!("put back: {restored:?}");
         };

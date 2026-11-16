@@ -3339,7 +3339,10 @@ impl Bridge {
             .sessions
             .get(&claimed.session_id)
             .is_some_and(|view| view.transcript_read);
-        let had = self.archive_mask.as_deref().map(crate::port::ArchiveMask::mask);
+        let had = self
+            .archive_mask
+            .as_deref()
+            .map(crate::port::ArchiveMask::mask);
         let current = |mask: &Arc<crate::mask::Mask>| {
             self.archive_mask
                 .as_deref()
@@ -3351,17 +3354,20 @@ impl Bridge {
             Some(Err(why)) => (None, Some(format!("the credential mask: {why}"))),
         };
         let still = || mask.as_ref().is_some_and(&current);
-        let keeper = self.transcripts.as_deref().map(|archive| transcripts::Keeper {
-            archive,
-            mask: match (&mask, &why) {
-                (_, Some(why)) => Err(why.as_str()),
-                (Some(mask), None) => Ok(Some(transcripts::Masking {
-                    mask: mask.clone(),
-                    current: &still,
-                })),
-                (None, None) => Ok(None),
-            },
-        });
+        let keeper = self
+            .transcripts
+            .as_deref()
+            .map(|archive| transcripts::Keeper {
+                archive,
+                mask: match (&mask, &why) {
+                    (_, Some(why)) => Err(why.as_str()),
+                    (Some(mask), None) => Ok(Some(transcripts::Masking {
+                        mask: mask.clone(),
+                        current: &still,
+                    })),
+                    (None, None) => Ok(None),
+                },
+            });
         let restored = transcripts::restore(
             self.terminals.as_ref(),
             keeper,
@@ -3388,7 +3394,9 @@ impl Bridge {
                  archive it first{}; it is resumed as it is, and the archive keeps every copy it \
                  made",
                 claimed.session_id,
-                why.as_deref().map(|why| format!(" ({why})")).unwrap_or_default()
+                why.as_deref()
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default()
             )),
             None => {}
         }
@@ -5868,7 +5876,8 @@ mod tests {
         });
         world.bridge.set_archive_mask(flip.clone());
         world.advance(20_000);
-        let said = call_line("c1", 18).replace("\"model\":\"m\"", &format!("\"model\":\"{VALUE}\""));
+        let said =
+            call_line("c1", 18).replace("\"model\":\"m\"", &format!("\"model\":\"{VALUE}\""));
         assert!(said.contains(VALUE));
         world.engine_writes(&said);
         let warnings = world.tick();
