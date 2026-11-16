@@ -111,6 +111,8 @@ struct State {
     transcripts: HashMap<(AgentId, String), Vec<Vec<u8>>>,
     /// The archive's progress records, per (agent, native session).
     archive_progress: BTreeMap<(AgentId, String), crate::transcripts::ArchiveProgress>,
+    /// Each copy's record (objective 175), per (agent, native session, copy).
+    archive_sources: BTreeMap<(AgentId, String, usize), crate::transcripts::CopySource>,
     /// Agents whose archive refuses every write, as a directory that is not
     /// one would ([`MemoryStore::hold_archive`]).
     archive_held: HashSet<AgentId>,
@@ -273,6 +275,12 @@ impl MemoryStore {
     /// rewrites or truncates it would. Test helper.
     pub fn replace_file(&self, path: &str, bytes: &[u8]) {
         self.lock().files.insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Forget every copy's record, as a lost `-sources` directory would
+    /// (objective 175): copies made before records were kept.
+    pub fn forget_copy_sources(&self) {
+        self.lock().archive_sources.clear();
     }
 
     /// Make the transcript archive of `agent` refuse (`true`) or take
@@ -1082,6 +1090,48 @@ impl TranscriptArchive for MemoryStore {
 
     fn progress(&self) -> Result<Vec<crate::transcripts::ArchiveProgress>, ArchiveError> {
         Ok(self.lock().archive_progress.values().cloned().collect())
+    }
+
+    fn source(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+    ) -> Result<Option<crate::transcripts::CopySource>, ArchiveError> {
+        let state = self.lock();
+        if state.archive_held.contains(agent) {
+            return Err(ArchiveError(format!("the archive of {agent} is held")));
+        }
+        Ok(state
+            .archive_sources
+            .get(&(agent.clone(), native.to_string(), copy))
+            .cloned())
+    }
+
+    fn put_source(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        source: &crate::transcripts::CopySource,
+    ) -> Result<(), ArchiveError> {
+        let mut state = self.lock();
+        if state.archive_held.contains(agent) {
+            return Err(ArchiveError(format!("the archive of {agent} is held")));
+        }
+        let made = state
+            .transcripts
+            .get(&(agent.clone(), native.to_string()))
+            .is_some_and(|copies| copy < copies.len());
+        if !made {
+            return Err(ArchiveError(format!(
+                "no copy {copy} of {native} to record"
+            )));
+        }
+        state
+            .archive_sources
+            .insert((agent.clone(), native.to_string(), copy), source.clone());
+        Ok(())
     }
 }
 
