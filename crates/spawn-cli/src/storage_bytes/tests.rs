@@ -1,6 +1,6 @@
 use super::{
-    BOUND_SECS, DAY_MS, Flight, RETRY_MS, Sampler, Source, World, live_database, quiet_hold,
-    run_script, script_input, script_sources, session_backups, source_hold, sources,
+    BOUND_SECS, DAY_MS, Flight, RETRY_MS, Sampler, Source, WHY_MAX_CHARS, World, live_database,
+    quiet_hold, run_script, script_input, script_sources, session_backups, source_hold, sources,
     test_databases,
 };
 use crate::core_lines_sample::Reading;
@@ -351,6 +351,65 @@ fn a_source_over_its_bound_or_unread_is_not_measured() {
             .as_str()
             .is_some_and(|why| why.contains("down"))
     );
+}
+
+#[test]
+fn a_source_the_script_did_not_walk_keeps_the_scripts_reason() {
+    let rooted = |name: &'static str| Source {
+        name,
+        roots: vec![PathBuf::from("/r")],
+        exclude: Vec::new(),
+    };
+    let three = [
+        rooted("transcripts"),
+        rooted("build_cache"),
+        rooted("scratch"),
+    ];
+    let reason = "not walked: build_cache, before it, was over its bound, so which extents \
+                  it held first is unknown";
+    // The real script's shapes (cc-astra A82): measured, over its bound, not walked.
+    let entries = script_sources(
+        &three,
+        &Ok(json!({"sources": [
+            {"name": "transcripts", "bytes": 4096, "files": 2, "unreadable": 0, "seconds": 0.1},
+            {"name": "build_cache", "over_bound": true, "files": 7, "seconds": 1200.3},
+            {"name": "scratch", "not_measured": reason},
+        ]})),
+    );
+    assert_eq!(entries["scratch"], json!({"not_measured": reason}));
+    assert_eq!(
+        entries["build_cache"],
+        json!({"not_measured": "over its bound of 1200 s (7 files read)"})
+    );
+    assert_eq!(
+        entries["transcripts"],
+        json!({"bytes": 4096, "files": 2, "unreadable": 0, "seconds": 0.1})
+    );
+    let one = |why: &str| {
+        script_sources(
+            &three[2..],
+            &Ok(json!({"sources": [{"name": "scratch", "not_measured": why}]})),
+        )["scratch"]["not_measured"]
+            .as_str()
+            .expect("a reason")
+            .to_string()
+    };
+    // A control character is dropped.
+    assert_eq!(
+        one("not walked:\n build\u{1b}_cache"),
+        "not walked: build_cache"
+    );
+    // A long reason is cut at WHY_MAX_CHARS characters.
+    let long = "é".repeat(WHY_MAX_CHARS + 50);
+    assert_eq!(WHY_MAX_CHARS, 300);
+    assert_eq!(one(&long), "é".repeat(WHY_MAX_CHARS));
+    // A blank reason is no reason: the generic one stands.
+    for blank in ["", "  ", "\n\t\u{7}"] {
+        assert_eq!(
+            one(blank),
+            "the extents script's answer for it has no bytes"
+        );
+    }
 }
 
 #[test]
