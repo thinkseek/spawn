@@ -1166,4 +1166,210 @@ mod tests {
             Ok(None)
         );
     }
+
+    // --- objective 175: the archive masks credential values -------------
+
+    const SECRET: &str = "made-up-token-0123456789";
+
+    fn made_up_mask() -> Arc<crate::mask::Mask> {
+        Arc::new(crate::mask::Mask::new(
+            &[("cred:TOKEN".to_string(), SECRET.as_bytes().to_vec())],
+            super::ARCHIVE_MARKER,
+        ))
+    }
+
+    fn masked_step(
+        store: &MemoryStore,
+        agent: &AgentId,
+        workspace: &WorkspaceId,
+        current: &dyn Fn() -> bool,
+    ) -> Result<super::Archived, String> {
+        let masking = super::Masking {
+            mask: made_up_mask(),
+            current,
+        };
+        archive_to(store, store, Some(&masking), workspace, PATH, agent, "n1")
+    }
+
+    fn joined(store: &MemoryStore, agent: &AgentId) -> String {
+        String::from_utf8(copies(store, agent).concat()).expect("utf-8")
+    }
+
+    /// Whole lines only, each masked: a line the engine is still writing
+    /// waits for the next pass, so a value cut across two writes is copied
+    /// once, whole, and masked.
+    #[test]
+    fn whole_lines_are_masked_and_a_value_cut_across_passes_is_copied_whole() {
+        let (store, agent, workspace) = setup();
+        let yes = || true;
+        store.append_file(PATH, "{\"a\":\"plain\"}\n{\"b\":\"made-up-tok");
+        let first = masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        assert_eq!(joined(&store, &agent), "{\"a\":\"plain\"}\n", "the half line waits");
+        assert_eq!(first.offset, Some(14));
+        store.append_file(PATH, "en-0123456789\"}\n");
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        assert_eq!(
+            joined(&store, &agent),
+            "{\"a\":\"plain\"}\n{\"b\":\"[REDACTED:cred:TOKEN]\"}\n"
+        );
+        // The transcript is never written.
+        assert!(
+            String::from_utf8(file(&store, &workspace))
+                .expect("utf-8")
+                .contains(SECRET)
+        );
+        // Its record stands where the transcript is, not where the copy is.
+        let record = store.source(&agent, "n1", 0).expect("source").expect("a record");
+        assert_eq!(
+            record.source_offset,
+            u64::try_from(file(&store, &workspace).len()).expect("fits")
+        );
+        assert_ne!(record.archive_length, record.source_offset);
+        assert!(record.masked);
+    }
+
+    /// A masked copy goes on from its record; a file replaced under it
+    /// (the bytes before the record's offset changed) is copied whole as the
+    /// next copy, masked.
+    #[test]
+    fn a_masked_copy_goes_on_from_its_record_and_a_replaced_file_is_copied_whole() {
+        let (store, agent, workspace) = setup();
+        let yes = || true;
+        store.append_file(PATH, &format!("one {SECRET}\n"));
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        store.append_file(PATH, "two\n");
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        assert_eq!(
+            copies(&store, &agent),
+            vec![b"one [REDACTED:cred:TOKEN]\ntwo\n".to_vec()]
+        );
+        store.replace_file(PATH, format!("ONE {SECRET}\n").as_bytes());
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        assert_eq!(
+            copies(&store, &agent),
+            vec![
+                b"one [REDACTED:cred:TOKEN]\ntwo\n".to_vec(),
+                b"ONE [REDACTED:cred:TOKEN]\n".to_vec()
+            ]
+        );
+    }
+
+    /// A copy whose length is not its record's was cut by a crash between
+    /// an append and its record: the next copy starts with the whole file.
+    /// A copy with no record (made before 175) is the transcript's own
+    /// bytes, and goes on.
+    #[test]
+    fn a_cut_copy_starts_the_next_and_a_copy_without_a_record_goes_on() {
+        let (store, agent, workspace) = setup();
+        store.append_file(PATH, "a\n");
+        step(&store, &agent, &workspace);
+        store.forget_copy_sources();
+        store.append_file(PATH, "b\n");
+        step(&store, &agent, &workspace);
+        assert_eq!(copies(&store, &agent), vec![b"a\nb\n".to_vec()], "went on");
+        // A crash after an append, before its record.
+        store.append(&agent, "n1", 0, 4, b"c\n").expect("append");
+        store.append_file(PATH, "c\nd\n");
+        step(&store, &agent, &workspace);
+        assert_eq!(
+            copies(&store, &agent),
+            vec![b"a\nb\nc\n".to_vec(), b"a\nb\nc\nd\n".to_vec()],
+            "never appended to again"
+        );
+    }
+
+    /// The mask went stale between its build and an append: nothing more
+    /// is copied that pass, and the copy fails with MASK_CHANGED.
+    #[test]
+    fn a_mask_gone_stale_before_an_append_copies_nothing() {
+        let (store, agent, workspace) = setup();
+        let no = || false;
+        store.append_file(PATH, &format!("{SECRET}\n"));
+        let error = masked_step(&store, &agent, &workspace, &no).expect_err("stale");
+        assert_eq!(error, super::MASK_CHANGED);
+        assert!(copies(&store, &agent).is_empty());
+    }
+
+    fn masked_keeper<'a>(store: &'a MemoryStore, current: &'a dyn Fn() -> bool) -> Option<Keeper<'a>> {
+        Some(Keeper {
+            archive: store,
+            mask: Ok(Some(super::Masking {
+                mask: made_up_mask(),
+                current,
+            })),
+        })
+    }
+
+    /// A gone file is put back from the copies as they are, masked; a
+    /// present file is never replaced by masked bytes, nor archived first
+    /// when the mask cannot be had.
+    #[test]
+    fn a_gone_file_is_put_back_masked_and_a_present_one_is_left() {
+        let (store, agent, workspace) = setup();
+        let yes = || true;
+        store.append_file(PATH, &format!("{{\"uuid\":\"u1\",\"t\":\"{SECRET}\"}}\n"));
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        // Lost its head: the new file's copy is its own, the older masked.
+        store.replace_file(PATH, b"{\"uuid\":\"u2\"}\n");
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        assert_eq!(copies(&store, &agent).len(), 2);
+        let had = u64::try_from(file(&store, &workspace).len()).expect("fits");
+        assert_eq!(
+            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true),
+            Ok(Some(Restored::Left { had })),
+            "never replaced by masked copies"
+        );
+        assert_eq!(file(&store, &workspace), b"{\"uuid\":\"u2\"}\n");
+        // Its records lost: a copy holding the marker is masked all the same.
+        store.forget_copy_sources();
+        assert_eq!(
+            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true),
+            Ok(Some(Restored::Left { had }))
+        );
+        // The mask not had: not archived first, left.
+        store.append_file(PATH, &format!("{SECRET}\n"));
+        let before = copies(&store, &agent);
+        let gone = Some(Keeper {
+            archive: &store as &dyn crate::port::TranscriptArchive,
+            mask: Err("the credential file cannot be read"),
+        });
+        assert!(matches!(
+            restore(&store, gone, &workspace, PATH, &agent, "n1", true),
+            Ok(Some(Restored::Left { .. }))
+        ));
+        assert_eq!(copies(&store, &agent), before, "nothing copied without the mask");
+        // Gone: put back from the copies, masked.
+        store.remove_file(PATH);
+        let restored =
+            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true);
+        assert!(matches!(restored, Ok(Some(Restored::Written { .. }))), "{restored:?}");
+        let back = String::from_utf8(file(&store, &workspace)).expect("utf-8");
+        assert!(back.contains("[REDACTED:cred:TOKEN]") && !back.contains(SECRET), "{back}");
+    }
+
+    /// A gone file put back is the transcript from then on: the next lines
+    /// go on in the same copy, and the restored bytes are not copied again.
+    #[test]
+    fn a_restored_file_is_archived_on_in_the_same_copy() {
+        let (store, agent, workspace) = setup();
+        let yes = || true;
+        store.append_file(PATH, &format!("{{\"uuid\":\"u1\",\"t\":\"{SECRET}\"}}\n"));
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        store.replace_file(PATH, b"{\"uuid\":\"u2\"}\n");
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        store.remove_file(PATH);
+        let restored =
+            restore(&store, masked_keeper(&store, &yes), &workspace, PATH, &agent, "n1", true);
+        let Ok(Some(Restored::Written { bytes })) = restored else {
+            panic!("put back: {restored:?}");
+        };
+        let before = copies(&store, &agent);
+        store.append_file(PATH, "{\"uuid\":\"u3\"}\n");
+        masked_step(&store, &agent, &workspace, &yes).expect("archive");
+        let after = copies(&store, &agent);
+        assert_eq!(after.len(), before.len(), "no new copy");
+        let grown = after.concat().len() - before.concat().len();
+        assert_eq!(grown, "{\"uuid\":\"u3\"}\n".len());
+        assert!(u64::try_from(grown).expect("fits") < bytes);
+    }
 }
