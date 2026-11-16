@@ -1673,11 +1673,21 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
     /// the recoverability figures (the drills' ages when `drills`), and the
     /// ranges file `ranges`.
     fn adopted_view(drills: bool, ranges: &str) -> Value {
+        super::answer(
+            &super::adopted(&adopted_readings(drills, 1), false),
+            &Value::Null,
+            Ok(Some(ranges.to_string())),
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// [`adopted_view`]'s readings, leaked test schemas reading `leaked`.
+    fn adopted_readings(drills: bool, leaked: u64) -> Vec<super::Line> {
         let storage = json!({
             "days_left": 1234, "free_bytes": 104, "growth_bytes_per_day": 10,
             "database": {"bytes": 300, "log_bytes": 100},
             "test_databases": [{"bytes": 7, "schemas": 3}],
-            "unowned_scratch_bytes": 400_000, "leaked_test_schemas": 1,
+            "unowned_scratch_bytes": 400_000, "leaked_test_schemas": leaked,
             "disk_fall_bytes_per_day": 5, "grew_most": {"store": "archive", "bytes_per_day": 6},
         });
         let performance = json!({"report_to_live": 60_000, "gate_time": 5, "decided_nothing": 0.1,
@@ -1711,13 +1721,7 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
                 json!(5),
             ));
         }
-        let readings = lines(&storage, &performance, &observed, json!(2), guardrails);
-        super::answer(
-            &super::adopted(&readings, false),
-            &Value::Null,
-            Ok(Some(ranges.to_string())),
-            &std::collections::BTreeMap::new(),
-        )
+        lines(&storage, &performance, &observed, json!(2), guardrails)
     }
 
     fn keys(figures: &Value) -> Vec<String> {
@@ -1843,41 +1847,189 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
                 .collect()
         };
         let pair = |line: &str, key: &str| (line.to_string(), key.to_string());
+        // Objective 182: free disk is no alert figure, but the first
+        // diagnostic; dollars per landing is no diagnostic, but a reading.
         assert_eq!(
             lined(&view["alert_figures"]),
             [
-                pair("storage", "storage.free_bytes"),
                 pair("sustainability", "recoverability.cloud_bundle_age"),
                 pair("sustainability", "recoverability.nightly_age"),
                 pair("sustainability", "recoverability.nightly_red"),
             ]
         );
-        assert_eq!(view["alert_figures"][3]["state"], "out");
+        assert_eq!(view["alert_figures"][2]["state"], "out");
         assert_eq!(
             keys(&view["diagnostics"]),
             [
+                "storage.free_bytes",
                 "storage.unowned_scratch_bytes",
                 "storage.disk_fall",
                 "storage.grew_most",
                 "storage.archive_growth",
                 "storage.leaked_test_schemas",
-                "performance.usd_per_landing",
             ]
         );
         assert_eq!(
             lined(&view["diagnostics"]),
             [pair("storage", "storage.leaked_test_schemas")]
         );
-        assert_eq!(view["diagnostics"][2]["store"], "archive");
+        assert_eq!(view["diagnostics"][3]["store"], "archive");
         let with_drills = adopted_view(true, r#"{"ranges": {}}"#);
         assert_eq!(
-            keys(&with_drills["alert_figures"])[4..],
+            keys(&with_drills["alert_figures"])[3..],
             [
                 "recoverability.session_backup_age",
                 "recoverability.oldest_drill_age"
             ]
         );
-        assert_eq!(with_drills["alert_figures"][5]["line"], "sustainability");
+        assert_eq!(with_drills["alert_figures"][4]["line"], "sustainability");
+    }
+
+    /// Objective 182: free disk is a diagnostic and dollars per landing the
+    /// sustainability line's plain reading, neither with a range nor a
+    /// target, each file entry ignored with its reason; another diagnostic
+    /// keeps its range; the reading says its note where the range would be.
+    #[test]
+    fn free_disk_is_a_diagnostic_and_dollars_per_landing_a_reading_with_no_range() {
+        let view = adopted_view(
+            false,
+            r#"{"ranges": {"storage.free_bytes": {"min": 1e18, "target": 5},
+                "performance.usd_per_landing": {"max": 1, "target": 0.5},
+                "storage.disk_fall": {"max": 1}}}"#,
+        );
+        let free = &view["diagnostics"][0];
+        assert_eq!(free["key"], "storage.free_bytes");
+        assert_eq!(
+            (&free["value"], &free["range"], &free["state"]),
+            (&json!(104), &Value::Null, &json!("no_range"))
+        );
+        assert_eq!(free.get("target"), None);
+        assert_eq!(free.get("line"), None, "free disk raises nothing");
+        // Another diagnostic keeps its range.
+        let fall = &view["diagnostics"][2];
+        assert_eq!(fall["key"], "storage.disk_fall");
+        assert_eq!(
+            (&fall["range"], &fall["state"]),
+            (&json!({"max": 1}), &json!("out"))
+        );
+        // The readings of each line.
+        let readings: Vec<(String, Vec<String>)> = view["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|line| {
+                (
+                    line["line"].as_str().expect("a name").to_string(),
+                    keys(&line["readings"]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            readings,
+            [
+                ("storage".to_string(), vec![]),
+                ("performance".to_string(), vec![]),
+                (
+                    "sustainability".to_string(),
+                    vec!["performance.usd_per_landing".to_string()]
+                ),
+            ]
+        );
+        let reading = &view["lines"][2]["readings"][0];
+        assert_eq!(
+            (&reading["value"], &reading["range"], &reading["state"]),
+            (&json!(2.5), &Value::Null, &json!("no_range"))
+        );
+        assert_eq!(reading.get("target"), None);
+        assert_eq!(
+            reading["range_note"],
+            "no range until use with no price is under 10%"
+        );
+        for list in ["alert_figures", "diagnostics"] {
+            assert!(
+                !keys(&view[list]).contains(&"performance.usd_per_landing".to_string()),
+                "{list}"
+            );
+        }
+        assert_eq!(
+            view["ignored_ranges"],
+            json!([
+                {"key": "performance.usd_per_landing", "reason":
+                 "shown with no range until use with no price is under 10% (the owner's core metric set)"},
+                {"key": "storage.free_bytes",
+                 "reason": "an alert of its own (disk_low, objective 204)"},
+            ])
+        );
+        // Both are still sampled.
+        let values = super::values_of(&super::adopted(&adopted_readings(false, 1), false));
+        assert_eq!(values["storage.free_bytes"], 104);
+        assert_eq!(values["performance.usd_per_landing"], 2.5);
+    }
+
+    /// Objective 182: leaked test schemas read 0 for a week (hourly samples
+    /// across it) is the last alert figure, of line storage, and no
+    /// diagnostic, its range applied and still sampled; one sample in the
+    /// week at 2, or a value now of 1, makes it a diagnostic again.
+    #[test]
+    fn leaked_schemas_quiet_for_a_week_is_an_alert_figure_only() {
+        const H: i64 = 3_600_000;
+        let now = 1_800_000_000_000_i64;
+        let week = |odd: Option<i64>| {
+            let samples: Vec<Value> = (0..=(7 * 24 + 2))
+                .map(|hours| {
+                    let leaked = if odd == Some(hours) { 2 } else { 0 };
+                    json!({"at_ms": now - hours * H,
+                           "values": {"storage.leaked_test_schemas": leaked}})
+                })
+                .rev()
+                .collect();
+            Value::Array(samples)
+        };
+        let ranges = r#"{"ranges": {"storage.leaked_test_schemas": {"max": 0}}}"#;
+        let view_of = |set: &super::Set| {
+            super::answer(
+                set,
+                &Value::Null,
+                Ok(Some(ranges.to_string())),
+                &std::collections::BTreeMap::new(),
+            )
+        };
+        let quiet = super::adopted_at(&adopted_readings(true, 0), &week(None), now);
+        let view = view_of(&quiet);
+        let last = view["alert_figures"]
+            .as_array()
+            .and_then(|figures| figures.last())
+            .expect("an alert figure");
+        assert_eq!(last["key"], "storage.leaked_test_schemas");
+        assert_eq!(last["line"], "storage");
+        assert_eq!(
+            (&last["range"], &last["state"]),
+            (&json!({"max": 0}), &json!("in"))
+        );
+        assert!(!keys(&view["diagnostics"]).contains(&"storage.leaked_test_schemas".to_string()));
+        assert_eq!(
+            super::values_of(&quiet)["storage.leaked_test_schemas"],
+            0,
+            "an alert figure stays sampled"
+        );
+
+        // A sample in the week at 2, or 1 now: a diagnostic again.
+        for set in [
+            super::adopted_at(&adopted_readings(true, 0), &week(Some(3 * 24)), now),
+            super::adopted_at(&adopted_readings(true, 1), &week(None), now),
+        ] {
+            let view = view_of(&set);
+            assert!(
+                !keys(&view["alert_figures"]).contains(&"storage.leaked_test_schemas".to_string())
+            );
+            let diagnostic = view["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .find(|figure| figure["key"] == "storage.leaked_test_schemas")
+                .expect("a diagnostic");
+            assert_eq!(diagnostic["line"], "storage");
+        }
     }
 
     /// Objective 176: a dropped figure is in none of the lists, and a range
