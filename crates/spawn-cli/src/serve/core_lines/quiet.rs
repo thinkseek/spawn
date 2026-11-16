@@ -93,7 +93,7 @@ mod tests {
     fn leaked_schemas_read_zero_for_a_week_only_with_samples_across_it() {
         let zero = json!(0);
         let week = WEEK_MS + 2 * H;
-        let full = hourly(week, zeros);
+        let full = hourly(week, |_| Some(json!({KEY: 0})));
         assert!(
             zero_for_a_week(KEY, &zero, &full, NOW),
             "a full week of zeros"
@@ -126,7 +126,7 @@ mod tests {
         }
 
         // A gap at the week's start: the first sample 3 h after it.
-        let late = hourly(WEEK_MS - 3 * H, zeros);
+        let late = hourly(WEEK_MS - 3 * H, |_| Some(json!({KEY: 0})));
         assert!(!zero_for_a_week(KEY, &zero, &late, NOW), "a late start");
         // Inside it: three hours missing four days ago.
         let gap = hourly(week, |ago| {
