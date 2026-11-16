@@ -846,6 +846,10 @@ pub struct Bridge {
     warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
+    /// The credential mask every copy goes through (objective 175): without
+    /// it a pass copies nothing. `None`: none is configured, copies are the
+    /// transcript's bytes, as before 175.
+    archive_mask: Option<Arc<dyn crate::port::ArchiveMask>>,
     /// Ended executions whose transcripts the archive may lack, per agent
     /// and native session: copied again on every pass until the copy is
     /// made. Rebuilt after a restart from the progress records
@@ -961,6 +965,7 @@ impl Bridge {
             unrecorded_commits: std::sync::Mutex::default(),
             warned: std::sync::Mutex::default(),
             transcripts: None,
+            archive_mask: None,
             ended_archives: std::sync::Mutex::default(),
             pass_started: i64::MIN,
             held: HashMap::new(),
@@ -978,6 +983,18 @@ impl Bridge {
     #[must_use]
     pub fn with_transcript_archive(mut self, archive: Arc<dyn TranscriptArchive>) -> Self {
         self.transcripts = Some(archive);
+        self
+    }
+
+    /// Copy every transcript through the credential mask `mask` gives
+    /// (objective 175): each copy takes the mask first, and without it the
+    /// pass copies nothing and fails as a copy failure does (warned when it
+    /// changes, tried again every pass, the progress record's `behind_ms`
+    /// saying from when the archive lacks lines). A resume's restore is
+    /// given it too.
+    #[must_use]
+    pub fn with_archive_mask(mut self, mask: Arc<dyn crate::port::ArchiveMask>) -> Self {
+        self.archive_mask = Some(mask);
         self
     }
 
@@ -3315,9 +3332,32 @@ impl Bridge {
             .sessions
             .get(&claimed.session_id)
             .is_some_and(|view| view.transcript_read);
+        let had = self.archive_mask.as_deref().map(crate::port::ArchiveMask::mask);
+        let current = |mask: &Arc<crate::mask::Mask>| {
+            self.archive_mask
+                .as_deref()
+                .is_some_and(|source| source.current(mask))
+        };
+        let (mask, why) = match &had {
+            None => (None, None),
+            Some(Ok(mask)) => (Some(mask.clone()), None),
+            Some(Err(why)) => (None, Some(format!("the credential mask: {why}"))),
+        };
+        let still = || mask.as_ref().is_some_and(&current);
+        let keeper = self.transcripts.as_deref().map(|archive| transcripts::Keeper {
+            archive,
+            mask: match (&mask, &why) {
+                (_, Some(why)) => Err(why.as_str()),
+                (Some(mask), None) => Ok(Some(transcripts::Masking {
+                    mask: mask.clone(),
+                    current: &still,
+                })),
+                (None, None) => Ok(None),
+            },
+        });
         let restored = transcripts::restore(
             self.terminals.as_ref(),
-            self.transcripts.as_deref(),
+            keeper,
             workspace,
             &path,
             &claimed.agent_id,
@@ -3335,10 +3375,13 @@ impl Bridge {
                 claimed.session_id
             )),
             Some(transcripts::Restored::Left { had }) => report.warnings.push(format!(
-                "{}: {path} ({had} bytes) is not the transcript archive's latest copy of it, so \
-                 it was not restored from the archive; it is resumed as it is, and the archive \
-                 keeps every copy it made",
-                claimed.session_id
+                "{}: {path} ({had} bytes) was not restored from the transcript archive: it is \
+                 not the archive's latest copy of it, or a copy of it is masked (a present file \
+                 is never replaced by masked bytes), or the credential mask could not be had to \
+                 archive it first{}; it is resumed as it is, and the archive keeps every copy it \
+                 made",
+                claimed.session_id,
+                why.as_deref().map(|why| format!(" ({why})")).unwrap_or_default()
             )),
             None => {}
         }
@@ -3456,17 +3499,41 @@ impl Bridge {
         let known = |known_ms: &mut Option<i64>| {
             *known_ms = Some(known_ms.map_or(read_at, |was| was.max(read_at)));
         };
-        match transcripts::archive_to(
-            self.terminals.as_ref(),
-            archive,
-            workspace,
-            path,
-            agent_id,
-            native,
-        ) {
+        // The mask first: without it nothing is copied (objective 175).
+        let copied = match self.archive_mask.as_deref() {
+            None => transcripts::archive_to(
+                self.terminals.as_ref(),
+                archive,
+                None,
+                workspace,
+                path,
+                agent_id,
+                native,
+            ),
+            Some(source) => match source.mask() {
+                Err(why) => Err(format!("the credential mask: {why}")),
+                Ok(mask) => {
+                    let current = || source.current(&mask);
+                    let masking = transcripts::Masking {
+                        mask: mask.clone(),
+                        current: &current,
+                    };
+                    transcripts::archive_to(
+                        self.terminals.as_ref(),
+                        archive,
+                        Some(&masking),
+                        workspace,
+                        path,
+                        agent_id,
+                        native,
+                    )
+                }
+            },
+        };
+        match copied {
             Ok(done) => {
-                if done.length.is_some() {
-                    *archived = done.length;
+                if done.offset.is_some() {
+                    *archived = done.offset;
                 }
                 *behind_ms = None;
                 known(known_ms);
