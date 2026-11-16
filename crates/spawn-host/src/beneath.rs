@@ -309,8 +309,7 @@ impl Beneath {
     }
 
     /// The directory `relative`, made one component at a time where it is
-    /// missing: the directory, and whether any component was made (its
-    /// parent then wants a sync, which this does).
+    /// missing, each new one made durable in its parent.
     ///
     /// # Errors
     ///
@@ -475,9 +474,15 @@ impl Beneath {
     }
 
     /// A temporary file beside `name` in `dir`, made new (`O_EXCL`) after
-    /// any entry at its name is removed, with `mode`, holding `bytes`,
-    /// synced: its name.
-    fn temporary(dir: &Directory, name: &str, what: &str, bytes: &[u8], mode: u32) -> Result<String, String> {
+    /// any entry at its name is removed, with `mode` exactly (else as the
+    /// umask makes it), holding `bytes`, synced: its name.
+    fn temporary(
+        dir: &Directory,
+        name: &str,
+        what: &str,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<String, String> {
         let temporary = format!(".{name}.{}.{what}", std::process::id());
         let shown = dir.shown.join(&temporary);
         match rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty()) {
@@ -488,13 +493,18 @@ impl Beneath {
             &dir.fd,
             Path::new(&temporary),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            Mode::from(mode),
+            Mode::from(mode.unwrap_or(0o666)),
         )
         .map_err(|errno| refusal(&shown, "create", errno))?;
         let mut file = File::from(fd);
         let written = file
             .write_all(bytes)
-            .and_then(|()| file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode)))
+            .and_then(|()| match mode {
+                Some(mode) => {
+                    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
+                }
+                None => Ok(()),
+            })
             .and_then(|()| file.sync_all());
         if let Err(error) = written {
             let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
@@ -510,7 +520,7 @@ impl Beneath {
     ///
     /// A link met, or another failure, naming the path.
     pub fn replace_whole(&self, dir: &Directory, name: &str, bytes: &[u8], durable: bool) -> Result<(), String> {
-        let temporary = Self::temporary(dir, name, "tmp", bytes, 0o666 & !umask())?;
+        let temporary = Self::temporary(dir, name, "tmp", bytes, None)?;
         if let Err(errno) = rustix::fs::renameat(&dir.fd, temporary.as_str(), &dir.fd, name) {
             let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
             return Err(refusal(&dir.shown.join(name), "rename", errno));
@@ -531,7 +541,7 @@ impl Beneath {
     pub fn write_new(&self, relative: &Path, bytes: &[u8]) -> Result<bool, String> {
         let (parent, name) = split(relative)?;
         let dir = self.make_dir(parent)?;
-        let temporary = Self::temporary(&dir, &name, "spawn-write", bytes, 0o666 & !umask())?;
+        let temporary = Self::temporary(&dir, &name, "spawn-write", bytes, None)?;
         let linked = rustix::fs::linkat(&dir.fd, temporary.as_str(), &dir.fd, name.as_str(), AtFlags::empty());
         let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
         match linked {
@@ -580,7 +590,7 @@ impl Beneath {
         if held != current {
             return Ok(false);
         }
-        let temporary = Self::temporary(&dir, &name, "spawn-replace", bytes, mode)?;
+        let temporary = Self::temporary(&dir, &name, "spawn-replace", bytes, Some(mode))?;
         if let Err(errno) = rustix::fs::renameat(&dir.fd, temporary.as_str(), &dir.fd, name.as_str()) {
             let _ = rustix::fs::unlinkat(&dir.fd, temporary.as_str(), AtFlags::empty());
             return Err(refusal(&shown, "replace", errno));
@@ -597,11 +607,4 @@ fn split(relative: &Path) -> Result<(&Path, String), String> {
         (Some(parent), Some(name)) => Ok((parent, name.to_string_lossy().into_owned())),
         _ => Err(format!("{} names no file", relative.display())),
     }
-}
-
-/// The process's umask, read without changing it for long.
-fn umask() -> u32 {
-    let old = rustix::process::umask(Mode::from(0o022));
-    rustix::process::umask(old);
-    old.bits()
 }
