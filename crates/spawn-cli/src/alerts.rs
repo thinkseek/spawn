@@ -132,6 +132,15 @@
 //!   `SPAWN_ALERT_TMPFS_HIGH_MB` (default 8000); clears under
 //!   `SPAWN_ALERT_TMPFS_OK_MB` (default 6000). A threshold of 0 disables its
 //!   check.
+//! - `disk_low`, `host`, key `disk_low:<reading ms>` (objective 204): the
+//!   free space of the filesystem holding the workspace root
+//!   (`SPAWN_WORKSPACE_ROOT`, the Core lines' free disk) under
+//!   `SPAWN_ALERT_DISK_LOW_GB` GiB; clears at or above
+//!   `SPAWN_ALERT_DISK_OK_GB` (default 45). Off by default (0): the gate's
+//!   scenarios run on a 15 GiB tmpfs, so the live loop's unit sets 40 and
+//!   45. No workspace root, nothing read. Apart from the loop's own disk
+//!   watch (crate disk.rs: `host.disk` under `SPAWN_DISK_WARN_GB`, dispatch
+//!   held under `SPAWN_DISK_FLOOR_GB`), which it leaves as it is.
 //! - `database_size`, `database <name>`, key `database_size:<name>:<reading
 //!   ms>` (objective 074): every `SPAWN_ALERT_DATABASE_SECS` (default 600)
 //!   the step reads the live database's size and its event log's bytes (the
@@ -406,6 +415,13 @@ pub(crate) struct Settings {
     pub(crate) tmpfs_path: PathBuf,
     pub(crate) tmpfs_high_mb: u64,
     pub(crate) tmpfs_ok_mb: u64,
+    /// The workspace root, whose filesystem's free space is watched
+    /// (`disk_low`); none, nothing read.
+    pub(crate) disk_root: Option<PathBuf>,
+    /// Free space under this many GiB (0: never read), and the margin it
+    /// clears at.
+    pub(crate) disk_low_gb: u64,
+    pub(crate) disk_ok_gb: u64,
     /// How long a crash line clears itself by silence.
     pub(crate) quiet_ms: i64,
     /// How long no integrator may hold its lock while reported work waits
@@ -523,6 +539,9 @@ impl Settings {
                 .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from),
             tmpfs_high_mb: number("SPAWN_ALERT_TMPFS_HIGH_MB", 8000, &mut warnings),
             tmpfs_ok_mb: number("SPAWN_ALERT_TMPFS_OK_MB", 6000, &mut warnings),
+            disk_root: env_value("SPAWN_WORKSPACE_ROOT").map(PathBuf::from),
+            disk_low_gb: number("SPAWN_ALERT_DISK_LOW_GB", 0, &mut warnings),
+            disk_ok_gb: number("SPAWN_ALERT_DISK_OK_GB", 45, &mut warnings),
             quiet_ms: secs("SPAWN_ALERT_PG_QUIET_SECS", 900, &mut warnings),
             integrator_down_ms: secs("SPAWN_ALERT_INTEGRATOR_DOWN_SECS", 300, &mut warnings),
             controller_behind_ms: secs("SPAWN_ALERT_CONTROLLER_BEHIND_SECS", 1800, &mut warnings),
@@ -2911,6 +2930,7 @@ times in a row)",
     fn read_host(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
         self.read_memory(now, out, lines);
         self.read_tmpfs(now, out, lines);
+        self.read_disk(now, out, lines);
         for index in 0..self.logs.len() {
             self.read_log(index, now, out, lines);
         }
@@ -3670,6 +3690,66 @@ times in a row)",
                         evidence: json!({
                             "path": path.display().to_string(),
                             "measured_mb": measured, "threshold_mb": ok, "reading_ms": now,
+                        }),
+                    });
+                }
+            }
+            Crossing::Nothing => {}
+        }
+    }
+
+    /// The free space under the workspace root (`disk_low`): read with
+    /// `df` when the threshold is set and there is a root; a `df` that
+    /// fails is a line in the loop's log.
+    fn read_disk(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
+        if self.settings.disk_low_gb == 0 {
+            return;
+        }
+        let Some(path) = self.settings.disk_root.clone() else {
+            return;
+        };
+        match crate::disk::free_bytes(&path) {
+            Ok(free) => self.disk_reading(now, &path, free, out),
+            Err(error) => lines.push(format!("alerts: {error}")),
+        }
+    }
+
+    /// One reading of `free` bytes under `path`: fires under the threshold,
+    /// one open at a time; clears at or above the margin; between the two,
+    /// nothing either way.
+    fn disk_reading(&mut self, now: i64, path: &Path, free: u64, out: &mut Vec<Event>) {
+        const GIB: u64 = 1 << 30;
+        let (low, ok) = (self.settings.disk_low_gb, self.settings.disk_ok_gb);
+        let (low_bytes, ok_bytes) = (low.saturating_mul(GIB), ok.saturating_mul(GIB));
+        let open = self.open_keys("disk_low", "host");
+        let shown = path.display().to_string();
+        match crossing(!open.is_empty(), free, low_bytes, ok_bytes, true) {
+            Crossing::Fire => {
+                // Tenths of a GiB, rounded down, as whole numbers.
+                let tenths = free / (GIB / 10);
+                out.push(Event::Fire {
+                    key: format!("disk_low:{now}"),
+                    kind: "disk_low",
+                    subject: "host".to_string(),
+                    evidence: json!({
+                        "path": shown, "free_bytes": free, "threshold_bytes": low_bytes,
+                        "reading_ms": now,
+                    }),
+                    text: format!(
+                        "{shown} has {}.{} GiB free, under {low} GiB",
+                        tenths / 10,
+                        tenths % 10
+                    ),
+                    notice: false,
+                });
+            }
+            Crossing::Clear => {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({
+                            "path": shown, "free_bytes": free, "threshold_bytes": ok_bytes,
+                            "reading_ms": now,
                         }),
                     });
                 }
@@ -5044,6 +5124,9 @@ mod tests {
             tmpfs_path: PathBuf::from("/tmp"),
             tmpfs_high_mb: 8000,
             tmpfs_ok_mb: 6000,
+            disk_root: None,
+            disk_low_gb: 0,
+            disk_ok_gb: 45,
             quiet_ms: 900_000,
             integrator_down_ms: 300_000,
             controller_behind_ms: 1_800_000,
