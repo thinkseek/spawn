@@ -3631,7 +3631,9 @@ mod tests {
                 json!([{"key": "storage.database_ratio",
                         "reason": super::core_lines::RETIRED_REASON},
                        {"key": "storage.free_bites", "reason": "unknown figure"},
-                       {"key": "storage.free_bytes", "reason": "needs a number min or max"}])
+                       // Free disk takes no range at all (objective 182).
+                       {"key": "storage.free_bytes",
+                        "reason": "an alert of its own (disk_low, objective 204)"}])
             );
             let ratio = figure(&ranged, "storage.leaked_test_schemas");
             assert_eq!(
