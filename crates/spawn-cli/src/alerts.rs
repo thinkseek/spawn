@@ -7288,7 +7288,7 @@ mod tests {
             disk_ok_gb: 45,
             ..settings()
         });
-        let mut step = |monitor: &mut Monitor, now: i64, free: u64| {
+        let step = |monitor: &mut Monitor, now: i64, free: u64| {
             let mut out = Vec::new();
             monitor.disk_reading(now, root, free, &mut out);
             let events = decided(monitor, out);
