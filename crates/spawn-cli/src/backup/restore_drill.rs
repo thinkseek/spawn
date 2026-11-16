@@ -942,7 +942,7 @@ struct Report {
 /// alone are unpacked, through a pipe, and the transcripts are neither
 /// unpacked nor restored nor compared. With `--only transcripts`, each
 /// bundle's manifest and transcript slices alone are unpacked the same way
-/// (each unpacked tree plain: [`plain_tree`]), restored into the drill's
+/// (every drill's unpacked tree plain: [`unpacked_manifest`]), restored into the drill's
 /// folder and judged by the newest record alone ([`judge_alone`]); nothing
 /// live is read.
 fn run(
@@ -962,11 +962,7 @@ fn run(
             // `--only controllers` never comes here (its own drill, above).
             Only::Both | Only::Controllers => fetch_bundle(settings, record, seal, &here)?,
             Only::Missions => fetch_members(settings, record, seal, &here, missions_members)?,
-            Only::Transcripts => {
-                let manifest = fetch_members(settings, record, seal, &here, transcripts_members)?;
-                plain_tree(&here.join("unpacked"))?;
-                manifest
-            }
+            Only::Transcripts => fetch_members(settings, record, seal, &here, transcripts_members)?,
         };
         unpacked.push((here.join("unpacked"), manifest));
     }
@@ -1315,7 +1311,7 @@ fn fetch_bundle(
         ));
     }
     fs::remove_file(&tar).map_err(|error| format!("{}: {error}", tar.display()))?;
-    read_manifest(key, record, &unpacked)
+    unpacked_manifest(key, record, &unpacked)
 }
 
 /// One stored bundle's ciphertext fetched into `here/bundle.gpg`: the
@@ -1345,13 +1341,46 @@ fn fetch_ciphertext(
     Ok(encrypted)
 }
 
-/// The manifest unpacked into `unpacked`, its kind the record's.
+/// Every drill's way into a bundle's unpacked tree (objective 203): the
+/// tree judged first ([`plain_tree`]: only directories and regular files,
+/// nothing followed), so nothing of a bundle (its manifest, a transcript
+/// slice, a repository bundle) is read before then; then its manifest.
+fn unpacked_manifest(key: &str, record: &BundleRecord, unpacked: &Path) -> Result<Value, String> {
+    plain_tree(unpacked).map_err(|why| format!("{key}: {why}"))?;
+    read_manifest(key, record, unpacked)
+}
+
+/// A file's bytes, opened without following a symlink and without waiting
+/// (`O_NOFOLLOW | O_NONBLOCK`), and read only when the open file is a
+/// regular one: a symlink, a FIFO, a device or a directory is refused,
+/// never read nor waited on.
+fn read_plain_file(path: &Path) -> Result<Vec<u8>, String> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use rustix::io::Errno;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|error| match error {
+        Errno::LOOP => "a symlink, never followed".to_string(),
+        Errno::NOENT => "not in the bundle".to_string(),
+        other => other.to_string(),
+    })?;
+    let stat = rustix::fs::fstat(&fd).map_err(|error| error.to_string())?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err("not a regular file, never read".to_string());
+    }
+    let mut bytes = Vec::new();
+    fs::File::from(fd)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+/// The manifest unpacked into `unpacked`, read through [`read_plain_file`]
+/// (never through a symlink), its kind the record's.
 fn read_manifest(key: &str, record: &BundleRecord, unpacked: &Path) -> Result<Value, String> {
-    let manifest: Value = serde_json::from_slice(
-        &fs::read(unpacked.join("manifest.json"))
-            .map_err(|error| format!("{key} holds no manifest.json: {error}"))?,
-    )
-    .map_err(|error| format!("{key}'s manifest.json: {error}"))?;
+    let bytes = read_plain_file(&unpacked.join("manifest.json"))
+        .map_err(|why| format!("{key}'s manifest.json: {why}"))?;
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{key}'s manifest.json: {error}"))?;
     let kind = record.record["kind"].as_str().unwrap_or_default();
     if manifest["kind"].as_str() != Some(kind) {
         return Err(format!(
@@ -1406,7 +1435,7 @@ fn fetch_members(
     extracted.judge(key, expected, "tar -x")?;
     fs::remove_file(&encrypted).map_err(|error| format!("{}: {error}", encrypted.display()))?;
     fs::remove_file(&names).map_err(|error| format!("{}: {error}", names.display()))?;
-    read_manifest(key, record, &unpacked)
+    unpacked_manifest(key, record, &unpacked)
 }
 
 /// What a bundle's listing names that `--only missions` extracts: the
@@ -2941,6 +2970,102 @@ mod tests {
         write(&path.join("transcripts/a.jsonl"), b"{}\n");
         drill.remove().expect("removed");
         assert!(!path.exists());
+    }
+
+    /// Objective 203: every drill reaches a bundle's unpacked tree through
+    /// `unpacked_manifest` (the tree judged first), and the manifest is read
+    /// only through a no-follow, non-blocking, regular-only open. The
+    /// symlink's target is a FIFO a witness waits to open for writing: an
+    /// open for reading would let it through, so "never opened" is seen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_manifest_is_refused_before_its_target_is_opened() {
+        use super::{read_manifest, unpacked_manifest};
+        use rustix::fs::{CWD, FileType, Mode, OFlags};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fifo = |path: &Path| {
+            rustix::fs::mknodat(CWD, path, FileType::Fifo, Mode::from_raw_mode(0o600), 0)
+                .expect("mkfifo");
+        };
+        let own = Own::new("manifest");
+        let outside = own.0.join("outside");
+        fs::create_dir(&outside).expect("outside");
+        let target = outside.join("fifo");
+        fifo(&target);
+        let opened = Arc::new(AtomicBool::new(false));
+        let witness = {
+            let (target, opened) = (target.clone(), Arc::clone(&opened));
+            std::thread::spawn(move || {
+                let file = fs::OpenOptions::new().write(true).open(&target);
+                opened.store(true, Ordering::SeqCst);
+                drop(file);
+            })
+        };
+        let unpacked = own.0.join("bundle-0").join("unpacked");
+        fs::create_dir_all(&unpacked).expect("unpacked");
+        let manifest = unpacked.join("manifest.json");
+        std::os::unix::fs::symlink(&target, &manifest).expect("symlink");
+        let full = record(1, "full", None, true);
+
+        let judged = unpacked_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert!(
+            judged.contains("manifest.json") && judged.contains("a symlink"),
+            "{judged}"
+        );
+        let read = read_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert_eq!(
+            read,
+            "bundles/k1's manifest.json: a symlink, never followed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!opened.load(Ordering::SeqCst), "the FIFO was opened");
+        assert!(!witness.is_finished(), "the witness still waits");
+
+        // The manifest a FIFO itself: refused, never waited on.
+        fs::remove_file(&manifest).expect("unlink");
+        fifo(&manifest);
+        let judged = unpacked_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert!(
+            judged.contains("manifest.json")
+                && judged.contains("neither a directory nor a regular file"),
+            "{judged}"
+        );
+        let read = read_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert_eq!(
+            read,
+            "bundles/k1's manifest.json: not a regular file, never read"
+        );
+
+        // A regular manifest of the record's kind: read both ways.
+        fs::remove_file(&manifest).expect("unlink");
+        write(&manifest, br#"{"kind":"full"}"#);
+        let value = unpacked_manifest("bundles/k1", &full, &unpacked).expect("read");
+        assert_eq!(value["kind"], "full");
+        let value = read_manifest("bundles/k1", &full, &unpacked).expect("read");
+        assert_eq!(value["kind"], "full");
+
+        // A repository bundle beside it that is a symlink: the tree refuses it.
+        fs::create_dir(unpacked.join("repos")).expect("repos");
+        std::os::unix::fs::symlink(&target, unpacked.join("repos/x.bundle")).expect("symlink");
+        let judged = unpacked_manifest("bundles/k1", &full, &unpacked).expect_err("refused");
+        assert!(
+            judged.contains("repos/x.bundle") && judged.contains("a symlink"),
+            "{judged}"
+        );
+        assert!(!opened.load(Ordering::SeqCst), "the FIFO was opened");
+        assert!(!witness.is_finished(), "the witness still waits");
+
+        // Let the witness go: a reader of the test's own, then joined.
+        let reader = rustix::fs::open(
+            &target,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("reader");
+        witness.join().expect("witness");
+        drop(reader);
+        assert!(target.exists(), "the FIFO is still there");
     }
 
     /// Objective 200: the bytes a transcripts drill writes are counted from
