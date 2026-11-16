@@ -1,0 +1,25 @@
+[Unit]
+Description=Spawn: sanitized agent presence for observe3 (scripts/observe3/agent_presence.py)
+# Reads one local URL of the page service (/api/fleet) and writes one private
+# file. It serves nothing, opens no port, starts no process and changes nothing
+# it reads. No other unit depends on it; it shares nothing with
+# spawn-shadow-observe or spawn-viz-export.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/.local/share/spawn-rsi/controllers/spawn/scripts/observe3/agent_presence.py
+# No EnvironmentFile: this unit gets no credential and no Spawn setting.
+Environment=PATH=/usr/bin:/bin
+TimeoutStartSec=20
+CPUQuota=10%
+MemoryMax=64M
+TasksMax=8
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+# rev-e n4: ProtectSystem=strict needs a user manager with private user namespaces;
+# not set here. The code keeps to its own folder.
+# No Restart=: a failed run is one document not refreshed; the consumer
+# expires it by stale_after_s on its own.
+# Turn off: touch ~/.config/spawn-agent-presence/disabled, or
+# systemctl --user disable --now spawn-agent-presence.timer

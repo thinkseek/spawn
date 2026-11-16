@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: agent presence for observe3 every 15 s (see the .service)
+
+[Timer]
+OnBootSec=2min
+# Every 15 s: one uncached /api/fleet read costs the page service about
+# 0.16-0.34 s (timed on live 2026-11-16 by the author and rev-e), plus two
+# small session reads (0.01-0.03 s each) per open-turn agent. The document's stale_after_s is 60, so four missed runs mark it stale.
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
