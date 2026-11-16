@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 use spawn_core::bridge::{
-    Bridge, BridgeConfig, CREDENTIAL_DENY, LaunchEnvironment, ModelRelay, TickReport,
-    claude_settings,
+    Bridge, BridgeConfig, CREDENTIAL_DENY, CROSS_SESSION_INBOUND, LaunchEnvironment, ModelRelay,
+    TickReport, claude_settings,
 };
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent};
@@ -429,6 +429,50 @@ fn every_engine_the_bridge_starts_is_denied_the_credential_files() {
             .iter()
             .any(|rule| rule.contains("spawn-rsi*") || rule.contains("/ws"))
     );
+}
+
+/// Objective 206 (issue #42): every engine the Bridge starts refuses
+/// cross-session peer messages, through the relay (cheap, then default
+/// resumed), without one, and on the fallback when the relay is down, its
+/// other settings as before: the deny list, no startup dialog, and the
+/// relay's models where the relay is up.
+#[test]
+fn every_launch_refuses_cross_session_peer_messages() {
+    assert_eq!(CROSS_SESSION_INBOUND, "refuse");
+    let (_listener, up) = listening();
+    let mut fleet = Fleet::new(Some(relay(&up)));
+    fleet.start(Some(ModelProfile::Cheap));
+    fleet.send(CommandAction::Stop);
+    fleet.resume(Some(ModelProfile::Default));
+    let through_relay = fleet.store.launches();
+    let mut launches = through_relay.clone();
+    for relay in [None, Some(relay(&closed()))] {
+        let mut fleet = Fleet::new(relay);
+        fleet.start(None);
+        assert!(fleet.failure().is_none(), "{:?}", fleet.failure());
+        launches.extend(fleet.store.launches());
+    }
+    assert_eq!(launches.len(), 4);
+    for launch in &launches {
+        let settings = Fleet::settings(launch);
+        let value: Value = serde_json::from_str(&settings).expect("settings are JSON");
+        assert_eq!(value["crossSessionInbound"], "refuse", "{settings}");
+        assert_eq!(
+            value["skipDangerousModePermissionPrompt"], true,
+            "{settings}"
+        );
+        assert_eq!(denied(launch), CREDENTIAL_DENY, "{settings}");
+    }
+    // The relay's models are still set where it is up; none on the others.
+    let cheap = env(&Fleet::settings(&through_relay[0])).expect("an env");
+    assert_eq!(cheap["ANTHROPIC_BASE_URL"], up.as_str());
+    assert_eq!(cheap["ANTHROPIC_MODEL"], "deepseek-v4-pro");
+    let default = env(&Fleet::settings(&through_relay[1])).expect("an env");
+    assert_eq!(default["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek-flash");
+    assert!(default.get("ANTHROPIC_MODEL").is_none());
+    for launch in &launches[2..] {
+        assert!(env(&Fleet::settings(launch)).is_none());
+    }
 }
 
 /// A launch environment withheld at the first launch and given after.

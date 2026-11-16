@@ -4963,7 +4963,8 @@ pub const CREDENTIAL_DENY: &[&str] = &[
 ///
 /// Every engine is denied the host's credential files and the programs
 /// that read them ([`CREDENTIAL_DENY`]): a fleet worker read the loop's
-/// environment file once (2026-11-08).
+/// environment file once (2026-11-08). Every engine also refuses
+/// cross-session peer messages ([`CROSS_SESSION_INBOUND`]).
 pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> String {
     let mut settings = json!({
         "permissions": {
@@ -4971,6 +4972,7 @@ pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> Str
             "deny": CREDENTIAL_DENY,
         },
         "skipDangerousModePermissionPrompt": true,
+        "crossSessionInbound": CROSS_SESSION_INBOUND,
     });
     if let Some(relay) = relay {
         let mut env = serde_json::Map::new();
@@ -4992,6 +4994,19 @@ pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> Str
     }
     settings.to_string()
 }
+
+/// What every engine does with a cross-session peer message (objective
+/// 206, issue #42): Claude Code's `crossSessionInbound`, "refuse". Every
+/// Claude Code session of this user lists the others from the shared
+/// `~/.claude/sessions` records and can `SendMessage` into one; the engines
+/// skip permission prompts, so under Claude Code's default (mode parity) a
+/// message from another bypassing session would be delivered with no one
+/// approving it. Refused, its sender gets a "refused" receipt. The inline
+/// `--settings` value wins over the user's own file (only managed settings
+/// override it); a Claude Code without the setting ignores the key. Spawn's
+/// own input, typed into the engine's pane, is no peer message and is
+/// unchanged. Claude Code enforces it; Spawn only hands it over.
+pub const CROSS_SESSION_INBOUND: &str = "refuse";
 
 /// Claude arguments for the session `native`: a new one with that id, or
 /// the earlier one resumed, with `settings` from [`claude_settings`]. The
