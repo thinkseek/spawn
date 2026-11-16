@@ -534,28 +534,7 @@ pub fn restore(
         return Ok(None);
     };
     let archive = keeper.archive;
-    let mut unarchived = false;
-    if present {
-        // Its own bytes first: whatever happens next, the archive has them.
-        match &keeper.mask {
-            Err(_) => unarchived = true,
-            Ok(masking) => {
-                match archive_to(
-                    host,
-                    archive,
-                    masking.as_ref(),
-                    workspace,
-                    path,
-                    agent,
-                    native,
-                ) {
-                    Err(error) if error == MASK_CHANGED => unarchived = true,
-                    Err(error) => return Err(error),
-                    Ok(_) => {}
-                }
-            }
-        }
-    }
+    let unarchived = present && !archived_first(host, &keeper, workspace, path, agent, native)?;
     let copies = archive
         .copies(agent, native)
         .map_err(|error| error.to_string())?;
@@ -576,19 +555,7 @@ pub fn restore(
     if present && copies.len() == 1 {
         return Ok(None);
     }
-    let mut all = Vec::with_capacity(copies.len());
-    let mut masked = false;
-    for (copy, length) in copies.iter().enumerate() {
-        let bytes = read_copy(archive, agent, native, copy, *length)?;
-        masked |= match archive
-            .source(agent, native, copy)
-            .map_err(|error| error.to_string())?
-        {
-            Some(record) => record.masked,
-            None => holds_marker(&bytes),
-        };
-        all.push(bytes);
-    }
+    let (all, masked) = read_copies(archive, agent, native, &copies)?;
     let joined = whole(&all);
     let length = length_of(&joined);
     // The put-back file is the transcript from now on: the latest copy
@@ -644,6 +611,58 @@ pub fn restore(
         bytes: length,
         had: length_of(&current),
     }))
+}
+
+/// A present file archived through `keeper`'s mask first: false when it
+/// could not be, the mask not had or gone stale (`MASK_CHANGED`) meanwhile.
+fn archived_first(
+    host: &dyn TerminalHost,
+    keeper: &Keeper<'_>,
+    workspace: &WorkspaceId,
+    path: &str,
+    agent: &AgentId,
+    native: &str,
+) -> Result<bool, String> {
+    let Ok(masking) = &keeper.mask else {
+        return Ok(false);
+    };
+    match archive_to(
+        host,
+        keeper.archive,
+        masking.as_ref(),
+        workspace,
+        path,
+        agent,
+        native,
+    ) {
+        Err(error) if error == MASK_CHANGED => Ok(false),
+        Err(error) => Err(error),
+        Ok(_) => Ok(true),
+    }
+}
+
+/// Every copy, all its bytes, and whether any is masked (by its record, or
+/// by holding the marker when its record is lost).
+fn read_copies(
+    archive: &dyn TranscriptArchive,
+    agent: &AgentId,
+    native: &str,
+    copies: &[u64],
+) -> Result<(Vec<Vec<u8>>, bool), String> {
+    let mut all = Vec::with_capacity(copies.len());
+    let mut masked = false;
+    for (copy, length) in copies.iter().enumerate() {
+        let bytes = read_copy(archive, agent, native, copy, *length)?;
+        masked |= match archive
+            .source(agent, native, copy)
+            .map_err(|error| error.to_string())?
+        {
+            Some(record) => record.masked,
+            None => holds_marker(&bytes),
+        };
+        all.push(bytes);
+    }
+    Ok((all, masked))
 }
 
 /// Whether a copy holds the archive's marker: masked, though its record
@@ -1008,12 +1027,28 @@ mod tests {
         store.replace_file(PATH, b"new\n");
         step(&store, &agent, &workspace);
         store.remove_file(PATH);
-        let restored = restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true);
+        let restored = restore(
+            &store,
+            Some(keep(&store)),
+            &workspace,
+            PATH,
+            &agent,
+            "n1",
+            true,
+        );
         assert_eq!(restored, Ok(Some(Restored::Written { bytes: 8 })));
         assert_eq!(file(&store, &workspace), b"old\nnew\n");
         // Present now: nothing to do, and the archive goes on.
         assert_eq!(
-            restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true),
+            restore(
+                &store,
+                Some(keep(&store)),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                true
+            ),
             Ok(None)
         );
         store.append_file(PATH, "more\n");
@@ -1036,7 +1071,15 @@ mod tests {
             if archived {
                 step(&store, &agent, &workspace);
             }
-            let restored = restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true);
+            let restored = restore(
+                &store,
+                Some(keep(&store)),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                true,
+            );
             assert_eq!(
                 restored,
                 Ok(Some(Restored::Replaced { bytes: 6, had: 2 })),
@@ -1049,7 +1092,15 @@ mod tests {
             );
             // Restored once: the next resume finds it whole.
             assert_eq!(
-                restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true),
+                restore(
+                    &store,
+                    Some(keep(&store)),
+                    &workspace,
+                    PATH,
+                    &agent,
+                    "n1",
+                    true
+                ),
                 Ok(None),
                 "archived {archived}"
             );
@@ -1079,7 +1130,15 @@ mod tests {
         // resume, though the mismatch stays.
         for resume in 0..2 {
             assert_eq!(
-                restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true),
+                restore(
+                    &store,
+                    Some(keep(&store)),
+                    &workspace,
+                    PATH,
+                    &agent,
+                    "n1",
+                    true
+                ),
                 Ok(Some(Restored::Left { had })),
                 "resume {resume}"
             );
@@ -1098,14 +1157,30 @@ mod tests {
         step(&store, &agent, &workspace);
         store.replace_file(PATH, b"a\n");
         assert_eq!(
-            restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true),
+            restore(
+                &store,
+                Some(keep(&store)),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                true
+            ),
             Ok(Some(Restored::Replaced { bytes: 4, had: 2 }))
         );
         assert_eq!(file(&store, &workspace), b"a\nb\n");
         // A file that only went on is the transcript itself: left as it is.
         store.append_file(PATH, "c\n");
         assert_eq!(
-            restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true),
+            restore(
+                &store,
+                Some(keep(&store)),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                true
+            ),
             Ok(None)
         );
         assert_eq!(file(&store, &workspace), b"a\nb\nc\n");
@@ -1166,13 +1241,29 @@ mod tests {
     #[test]
     fn a_transcript_gone_without_a_copy_fails_the_resume() {
         let (store, agent, workspace) = setup();
-        let gone = restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", true)
-            .expect_err("events were read from it");
+        let gone = restore(
+            &store,
+            Some(keep(&store)),
+            &workspace,
+            PATH,
+            &agent,
+            "n1",
+            true,
+        )
+        .expect_err("events were read from it");
         assert!(gone.contains("start the agent blank"), "{gone}");
         assert!(restore(&store, None, &workspace, PATH, &agent, "n1", true).is_err());
         // A session that never wrote a transcript has nothing to lose.
         assert_eq!(
-            restore(&store, Some(keep(&store)), &workspace, PATH, &agent, "n1", false),
+            restore(
+                &store,
+                Some(keep(&store)),
+                &workspace,
+                PATH,
+                &agent,
+                "n1",
+                false
+            ),
             Ok(None)
         );
     }
@@ -1307,10 +1398,7 @@ mod tests {
         assert!(copies(&store, &agent).is_empty());
     }
 
-    fn masked_keeper<'a>(
-        store: &'a MemoryStore,
-        current: &'a dyn Fn() -> bool,
-    ) -> Keeper<'a> {
+    fn masked_keeper<'a>(store: &'a MemoryStore, current: &'a dyn Fn() -> bool) -> Keeper<'a> {
         Keeper {
             archive: store,
             mask: Ok(Some(super::Masking {
