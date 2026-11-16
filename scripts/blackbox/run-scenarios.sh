@@ -64,6 +64,9 @@ if [ "${SPAWN_TIMING:-}" = adversarial ]; then
     . "$root/scripts/timing/timing.sh"
 fi
 
+# Said once, as gate.sh says it (175 R6): every scenario's loop masks its
+# archive with an empty stand-in tool, and says WARNING when it uses one.
+echo "blackbox: archive locations: an empty stand-in tool (no credential places) unless a scenario sets its own (SPAWN_GATE_SANDBOX=1; a loop says WARNING when it uses one)"
 for scenario in "$root"/scripts/blackbox/scenarios/$pattern; do
     [ -f "$scenario" ] || continue
     matched=$((matched + 1))
@@ -115,6 +118,14 @@ FAKE
     WORK=$work
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
         SPAWN_CLAUDE_PROGRAM SPAWN_TMUX_SOCKET SPAWN_WORKER WORK
+    # The archive's location tool, as the gate's sandbox gives it (objective
+    # 175): an empty stand-in that places no credential value, so a run
+    # never depends on the host's installed collector; a scenario may name
+    # its own. SPAWN_GATE_SANDBOX=1 lets the binary honour a stand-in.
+    printf '%s\n' 'print("{\"sources\": [], \"entries\": [], \"missing\": [], \"unreadable\": [], \"accepted\": [], \"accepted_paths\": [], \"watch\": [], \"probe\": []}")' >"$work/empty-locations.py"
+    SPAWN_GATE_SANDBOX=1
+    SPAWN_ARCHIVE_LOCATIONS_TOOL=$work/empty-locations.py
+    export SPAWN_GATE_SANDBOX SPAWN_ARCHIVE_LOCATIONS_TOOL
 
     PATH=$base_path
     timing_out=""
