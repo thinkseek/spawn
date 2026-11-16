@@ -2690,6 +2690,47 @@ impl PostgresStore {
 mod tests {
     use spawn_core::mission::TaskState;
 
+    /// Objective 171: free text for a control record is masked; a reason
+    /// within its limit stays within it once masked (in chars or in bytes,
+    /// as the store counts it), cut at a char boundary; text already over
+    /// its limit is not cut; every string of a JSON value is masked.
+    #[test]
+    fn text_for_a_control_record_is_masked_within_its_limit() {
+        use super::{masked, masked_strings, masked_within};
+        use serde_json::json;
+        let token = "ghp_171madeup0123456789abcdefghijklmnopq";
+        let said = masked(&format!("curl -H 'Authorization: Bearer {token}'"));
+        assert!(!said.contains(token) && said.contains("[redacted]"), "{said}");
+        assert_eq!(masked("no secret here"), "no secret here");
+
+        // 494 é and " PWD=x": 500 chars, masked longer, cut back to 500.
+        let reason = format!("{} PWD=x", "é".repeat(494));
+        assert_eq!(reason.chars().count(), 500);
+        let kept = masked_within(&reason, 500, true);
+        assert_eq!(kept.chars().count(), 500, "{kept}");
+        assert!(!kept.contains("PWD=x"), "{kept}");
+        // 997 é and " PWD=x": 2000 bytes, kept within 2000 bytes.
+        let reason = format!("{} PWD=x", "é".repeat(997));
+        assert_eq!(reason.len(), 2000);
+        let kept = masked_within(&reason, 2000, false);
+        assert!(kept.len() <= 2000 && kept.len() >= 1998, "{}", kept.len());
+        assert!(!kept.contains("PWD=x"));
+        // Short text is masked whole, not cut.
+        assert_eq!(masked_within("PWD=x", 500, true), masked("PWD=x"));
+        // Already over: not cut, so the store refuses it as before.
+        let over = format!("{} PWD=x", "r".repeat(600));
+        assert_eq!(masked_within(&over, 500, true), masked(&over));
+        assert!(masked_within(&over, 500, true).chars().count() > 500);
+
+        let nested = masked_strings(&json!({"attempts": [
+            {"command": 3, "error": format!("token {token}")}, "PGPASSWORD=hunter171"],
+            "n": 2}));
+        let text = nested.to_string();
+        assert!(!text.contains(token) && !text.contains("hunter171"), "{text}");
+        assert_eq!(nested["n"], 2);
+        assert_eq!(nested["attempts"][0]["command"], 3);
+    }
+
     /// Objective 190: the integrator's polled read of the gated missions
     /// reads each baseline, base and candidate, the red's main and the
     /// gate's two pushed commits (objective 177's) through the commit map
