@@ -3,7 +3,16 @@ Description=Spawn: local relay to the hosted TypeSafe Jev API
 After=network-online.target
 
 [Service]
-EnvironmentFile=%h/.config/spawn/typesafe.env
+# The API key from Keep (objective 201): systemd copies
+# /run/keep/typesafe.api-key into this unit's own credentials directory, and
+# the relay reads it there; it never enters an environment. Without that
+# file the start fails (status 243/CREDENTIALS) and is not retried: the
+# unit stays stopped, and `systemctl --user status spawn-jev-relay` says why.
+# A file that is there but empty or unreadable makes the relay exit with 78
+# (it logs why): not retried either. spawn-jev-relay.path (enabled beside
+# this unit) starts it again when Keep writes the file (objective 201 R4).
+LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key
+RestartPreventExitStatus=243 78
 Environment=https_proxy=http://127.0.0.1:10801
 Environment=JEV_RELAY_ADDRESS=127.0.0.1:8790
 ExecStart=/usr/bin/python3 -I %h/.local/share/spawn-rsi/bin/jev-relay.py

@@ -9,8 +9,16 @@ over HTTPS. Only that one path is forwarded.
 The key stays in this process. It never enters Spawn's environment, the
 event log, or the agent's terminal.
 
+The key (objective 201): under systemd's LoadCredential, the unit's
+credential `typesafe.api-key` (Keep's /run/keep/typesafe.api-key, copied by
+systemd into the unit's own $CREDENTIALS_DIRECTORY), and only that: with a
+credentials directory and no readable, non-empty `typesafe.api-key` in it,
+the relay refuses to start and says which. Without a credentials directory
+(the unit before its move), TYPESAFE_API_KEY.
+
 Environment:
-  TYPESAFE_API_KEY      required
+  CREDENTIALS_DIRECTORY set by systemd for a unit with LoadCredential=
+  TYPESAFE_API_KEY      the key when there is no credentials directory
   TYPESAFE_BASE_URL     default https://api.typesafe.ai
   JEV_RELAY_ADDRESS     default 127.0.0.1:8790; a bare port (":8790" or
                         "8790") means host 127.0.0.1
@@ -34,7 +42,50 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-KEY = os.environ.get("TYPESAFE_API_KEY", "")
+# The key's name as a credential: Keep's file name, LoadCredential's name.
+CREDENTIAL = "typesafe.api-key"
+# The exit status when systemd gives a credentials directory but the
+# credential in it is no key (unreadable, not UTF-8 or empty): the unit lists
+# it in RestartPreventExitStatus beside 243, so such a start stops once,
+# saying why, as a missing file does, rather than restarting every 3 s.
+CREDENTIAL_EXIT = 78  # EX_CONFIG
+
+
+def key_from(environ):
+    """(the API key, why there is none): the credential CREDENTIAL in
+    $CREDENTIALS_DIRECTORY when systemd gives the relay one (objective 201),
+    and nothing else then; else TYPESAFE_API_KEY. A why names the
+    credential or the variable, never a value. The key is the file's text
+    as Keep writes it (the raw value, no newline); one trailing newline, as
+    a file written by hand ends, is taken off, and nothing else."""
+    directory = environ.get("CREDENTIALS_DIRECTORY", "")
+    if directory:
+        try:
+            with open(os.path.join(directory, CREDENTIAL), "rb") as credential:
+                key = credential.read().decode("utf-8")
+            key = key[:-1] if key.endswith("\n") else key
+        except OSError as error:
+            return "", f"the credential {CREDENTIAL} cannot be read ({error.strerror})"
+        except UnicodeDecodeError:
+            return "", f"the credential {CREDENTIAL} is not UTF-8 text"
+        if not key:
+            return "", f"the credential {CREDENTIAL} is empty"
+        return key, None
+    key = environ.get("TYPESAFE_API_KEY", "")
+    if not key:
+        return "", f"TYPESAFE_API_KEY is not set, and there is no credential {CREDENTIAL}"
+    return key, None
+
+
+
+
+def exit_status(environ):
+    """The status the relay exits with when it has no key: CREDENTIAL_EXIT
+    under a credentials directory (the unit stays stopped), else 1."""
+    return CREDENTIAL_EXIT if environ.get("CREDENTIALS_DIRECTORY", "") else 1
+
+
+KEY, KEY_MISSING = key_from(os.environ)
 BASE = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/")
 HOST, _, PORT = os.environ.get("JEV_RELAY_ADDRESS", "127.0.0.1:8790").rpartition(":")
 # An empty host would bind every interface; a bare port means loopback.
@@ -61,38 +112,70 @@ MAX_BODY = 256 * 1024
 
 
 def error_text(payload):
-    """An error's text for the log: one line, at most ERROR_CHARS, with the
-    key and any bearer token taken out. Never a header: only the body or
-    the exception's own words reach it."""
+    """An error's text for the log and for the caller: one line, at most
+    ERROR_CHARS, with the key and any bearer token taken out. Never a header:
+    only the body or the exception's own words reach it.
+    The exact key, and its JSON-escaped forms, go first, before anything
+    changes the text's whitespace (201 R5, cc-astra A86: a key with a space at
+    either end no longer matched once the text was joined into one line).
+    Then its words joined by one space, as the line now is: what of the key a
+    text holds without its spaces."""
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8", "replace")
-    text = " ".join(str(payload).split())
+    text = str(payload)
     if KEY:
-        text = text.replace(KEY, "[key]")
+        escaped = json.dumps(KEY)[1:-1]
+        # A JSON writer may also escape "/" as "\/" (rev-e's n2).
+        for form in (KEY, escaped, escaped.replace("/", "\\/")):
+            text = text.replace(form, "[key]")
+    text = " ".join(text.split())
+    words = " ".join(KEY.split())
+    if words:
+        text = text.replace(words, "[key]")
     text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
     return text[:ERROR_CHARS]
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The key goes to BASE only (201 R6, rev-e's n1): urllib copies the
+    Authorization header to any host a 301, 302 or 303 names, and turns the
+    POST into a GET. So no redirect is followed: it is the hosted API's
+    status, answered as any error status is (forward)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
 def forward(body):
-    """POST `body` to the hosted API: (status, payload, error), `error` the
-    reason of a failure the relay itself answers 502 for, else None."""
+    """POST `body` to the hosted API: (status, payload, error). An answer
+    passes through (error None); for any failure, the hosted API's error
+    status included, the payload is the relay's own {"error": error}."""
     request = urllib.request.Request(
         BASE + PATH,
         data=body,
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {KEY}",
-        },
+        headers={"Content-Type": "application/json"},
     )
+    # Never copied to a redirect's request either (201 R6: a second guard
+    # beside NoRedirect).
+    request.add_unredirected_header("Authorization", f"Bearer {KEY}")
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with OPENER.open(request, timeout=TIMEOUT) as response:
             return response.status, response.read(), None
     except urllib.error.HTTPError as error:
         # Its status stands even when its body cannot be read (cut short,
-        # reset, timed out): the reason then says so.
+        # reset, timed out): the reason then says so. Its body never goes back
+        # as it came (201 R5, cc-astra A85: one echoing the key would hand it
+        # to the caller, which puts it in its own error): the caller gets the
+        # relay's own payload, the status and the body's text as error_text
+        # leaves it, as the log has it.
         try:
-            return error.code, error.read(), None
+            text = error_text(error.read())
+            reason = f"relay: the hosted API answered {error.code}: {text or '(no body)'}"
+            return error.code, json.dumps({"error": reason}).encode(), reason
         except Exception as cut:  # noqa: BLE001 - any failure of that read
             reason = (
                 f"relay: the hosted API answered {error.code} and its body could not be read "
@@ -167,8 +250,9 @@ class Relay(BaseHTTPRequestHandler):
         elapsed = (time.monotonic() - started) * 1000
         line = f"jev-relay: {status} {elapsed:.0f}ms {len(body)}B"
         if status >= 400:
-            # Every failure says why: the relay's own reason, or the hosted
-            # API's answer (its body, never its headers).
+            # Every failure says why: the relay's reason, for the hosted
+            # API's error status its body's text as error_text leaves it
+            # (never its headers), the same the caller gets.
             line += f": {reason or error_text(payload) or '(no body)'}"
         sys.stderr.write(line + "\n")
         try:
@@ -184,8 +268,8 @@ class Relay(BaseHTTPRequestHandler):
 
 def not_dumpable():
     """Makes this process not dumpable (prctl PR_SET_DUMPABLE=0): another
-    process of this user can no longer read its environment, where the
-    key lives. A child it execs is dumpable again (the kernel resets the
+    process of this user can no longer read its memory or its environment,
+    where the key lives. A child it execs is dumpable again (the kernel resets the
     flag at execve), so nothing else changes. Best effort: a kernel without
     prctl leaves the relay as it was."""
     try:
@@ -197,18 +281,23 @@ def not_dumpable():
 
 
 def main():
-    not_dumpable()  # its environment holds the key
+    not_dumpable()  # its memory (and, without a credential, its environment) holds the key
     if not KEY:
-        sys.exit("jev-relay: TYPESAFE_API_KEY is not set")
+        sys.stderr.write(f"jev-relay: {KEY_MISSING}\n")
+        sys.exit(exit_status(os.environ))
     if TIMEOUT is None:
         sys.exit("jev-relay: JEV_RELAY_TIMEOUT_SECS must be a number of seconds from 1 to 300")
     # Whoever reaches the relay spends the key, so it serves loopback only.
     if HOST not in ("127.0.0.1", "::1", "[::1]", "localhost"):
         sys.exit(f"jev-relay: refusing to listen on {HOST}; use 127.0.0.1")
     server = ThreadingHTTPServer((HOST, int(PORT)), Relay)
+    # The port it listens on, as bound: with port 0 the system's pick, which
+    # a test reads from this line instead of guessing a free one (201 R6').
+    port = server.server_address[1]
     sys.stderr.write(
-        f"jev-relay: http://{HOST}:{PORT}{PATH} -> {BASE}{PATH} (timeout {TIMEOUT:g} s)\n"
+        f"jev-relay: http://{HOST}:{port}{PATH} -> {BASE}{PATH} (timeout {TIMEOUT:g} s)\n"
     )
+    sys.stderr.flush()
     server.serve_forever()
 
 
