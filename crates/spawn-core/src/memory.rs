@@ -699,23 +699,22 @@ impl WorkspaceStore for MemoryStore {
         if state.stale {
             return Err(stale_refusal());
         }
-        let Some(mount) = state.mounts.get_mut(workspace) else {
+        let Some(mount) = state.mounts.get(workspace) else {
             return Err(WorkspaceError::Refused {
                 code: "NoSuchWorkspace".to_string(),
                 message: workspace.to_string(),
             });
         };
-        let branch = mount.branch.clone();
+        let (branch, dirty) = (mount.branch.clone(), mount.dirty);
         // A branch gone from the store is made again from the workspace, on
         // the base, whether or not the workspace changed.
         let lost = !state.heads.contains_key(&branch);
-        let Some(mount) = state.mounts.get_mut(workspace) else {
-            unreachable!("read above");
-        };
-        if !mount.dirty && !lost {
+        if !dirty && !lost {
             return Ok(Commit::Unchanged);
         }
-        mount.dirty = false;
+        if let Some(mount) = state.mounts.get_mut(workspace) {
+            mount.dirty = false;
+        }
         state.commits += 1;
         let commit = CommitId::new(format!("{:040x}", state.commits))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
