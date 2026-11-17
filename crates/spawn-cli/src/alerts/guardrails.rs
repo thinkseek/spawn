@@ -17,10 +17,41 @@
 //! from raising and clearing every hour: Needs you being right is the
 //! observability north star.
 //!
-//! The counts live in the step's memory: a restarted loop counts again from
-//! its first reading, and adopts an alert the record already holds open
-//! (one open per figure, across restarts). A reading that fails is a line in
-//! the loop's log and decides nothing.
+//! The counts live in the step's memory, and a restarted loop adopts an
+//! alert the record already holds open (one open per figure, across
+//! restarts). A reading that fails is a line in the loop's log and decides
+//! nothing.
+//!
+//! A restart does not restart the raise hold (objective 192): every deploy
+//! restarts the loop, mostly within the hold, so a count kept in memory alone
+//! never completed. The loop's first reading carries the hourly
+//! `host.core_lines` samples of the hold plus two sample periods
+//! ([`crate::serve::core_lines::reading_with_samples`]), and at it each
+//! figure out of range, not stale and not counted yet takes its out-since
+//! from them ([`out_since`]): the oldest sample of the newest unbroken run
+//! out of its current range that reaches the reading. A sample in range, one
+//! that does not carry the figure as a number, or a gap of more than two
+//! periods (from the reading to the newest sample, or between two) ends the
+//! run; without one the count starts at that reading, as before. This is
+//! done once per loop, whatever it finds; a samples error is a line in the
+//! loop's log, and the holds start then. It is an estimate from samples, not
+//! proof of time out of range: the seeded out-since is never before a
+//! sample that saw the figure out, but a dip back in range between two
+//! hourly samples is not seen. The alert fires once the seeded time is a
+//! hold old: never later than before, with the same key, text and evidence
+//! (`out_since_ms` the seeded time).
+//!
+//! A judged stretch keeps its key (objective 192 (5)): a figure whose newest
+//! alert the owner judged while open (its cleared evidence `{judged}`, from
+//! the alert rows the loop starts with) keeps that alert's out-since, so it
+//! is not raised again, the seeding window having slid past where the
+//! stretch began. It is taken by the first fresh reading that finds the
+//! figure out, and from then on lives as any other count. Only positive
+//! evidence ends it before: a fresh reading with the figure in range (`in`;
+//! no range, no value and a stale figure are none), or a sample in range
+//! after that out-since among the first reading's samples (none for a figure
+//! with no range now). A samples error keeps it. Ended, the next stretch out
+//! is new, seeded from the samples at the first reading as above.
 //!
 //! A reading is the whole answer (the 7-day Scorecard with its transcript
 //! walk, the cost window, the storage report...), and its one-minute cache
@@ -236,11 +267,126 @@ fn read_line(
     )
 }
 
+/// The figure's bounds in `range` (`{min?, max?}`), `None` without one.
+fn bounds(range: &Value) -> Option<(Option<f64>, Option<f64>)> {
+    let bounds = (
+        range.get("min").and_then(Value::as_f64),
+        range.get("max").and_then(Value::as_f64),
+    );
+    (bounds != (None, None)).then_some(bounds)
+}
+
+/// Whether `value` lies within `bounds`, bounds included.
+fn within((min, max): (Option<f64>, Option<f64>), value: f64) -> bool {
+    min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
+}
+
+/// The samples' `(at_ms, the figure's number)`, oldest first, up to `now`
+/// (`[]` when `samples` is no list).
+fn sampled(samples: &Value, key: &str, now: i64) -> Vec<(i64, Option<f64>)> {
+    let mut list: Vec<(i64, Option<f64>)> = samples
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sample| {
+            let at = sample["at_ms"].as_i64()?;
+            (at <= now).then(|| (at, sample["values"][key].as_f64()))
+        })
+        .collect();
+    list.sort_by_key(|(at, _)| *at);
+    list
+}
+
+/// When figure `key` has been out of `range` (its current range) by the
+/// `host.core_lines` `samples` (`[{at_ms, values}]`) at `now`: the time of
+/// the oldest sample of the newest unbroken run of samples out of it, the
+/// run reaching `now`. A sample in range, a sample not carrying the figure
+/// as a number, or a gap of more than two `period_ms` (from `now` to the
+/// newest sample, or between two samples) ends the run. `None` without such
+/// a run, or without a range.
+pub(super) fn out_since(
+    samples: &Value,
+    key: &str,
+    range: &Value,
+    now: i64,
+    period_ms: i64,
+) -> Option<i64> {
+    let bounds = bounds(range)?;
+    let gap = period_ms.saturating_mul(2);
+    let mut reached = now;
+    let mut since = None;
+    for (at, value) in sampled(samples, key, now).into_iter().rev() {
+        if reached.saturating_sub(at) > gap {
+            break;
+        }
+        match value {
+            Some(value) if !within(bounds, value) => {
+                since = Some(at);
+                reached = at;
+            }
+            _ => break,
+        }
+    }
+    since
+}
+
+/// Whether a sample after `after` has figure `key` back within `range` (its
+/// current range): positive evidence a judged stretch ended. Never for a
+/// figure with no range.
+fn back_after(samples: &Value, key: &str, range: &Value, after: i64) -> bool {
+    let Some(bounds) = bounds(range) else {
+        return false;
+    };
+    sampled(samples, key, i64::MAX)
+        .into_iter()
+        .any(|(at, value)| at > after && value.is_some_and(|value| within(bounds, value)))
+}
+
 impl Monitor {
     /// The figures are due at `now`: start a reading on a thread of its
-    /// own ([`crate::serve::core_lines::reading`]).
+    /// own ([`crate::serve::core_lines::reading`]); the loop's first one
+    /// carries the samples since the hold plus two sample periods ago
+    /// ([`crate::serve::core_lines::reading_with_samples`], objective 192).
     pub(super) fn start_guardrails(&mut self, now: i64) {
-        self.start_guardrails_with(now, || Pending::spawn(crate::serve::core_lines::reading));
+        if self.guardrail_seeded {
+            self.start_guardrails_with(now, || Pending::spawn(crate::serve::core_lines::reading));
+        } else {
+            let (period, _) = crate::core_lines_sample::every_ms_from_env();
+            let since = now
+                .saturating_sub(self.settings.guardrail_raise_ms)
+                .saturating_sub(period.saturating_mul(2));
+            self.start_guardrails_with(now, || {
+                Pending::spawn(move || crate::serve::core_lines::reading_with_samples(since))
+            });
+        }
+    }
+
+    /// The judged stretches in the alert `rows` the loop starts with (the
+    /// store's, oldest first): each figure whose newest
+    /// `guardrail_out_of_range` alert was cleared by a judgement (its
+    /// cleared evidence `{judged}`), with that alert's out-since.
+    pub(super) fn seed_judged(&mut self, rows: &Value) {
+        let mut newest: std::collections::BTreeMap<String, (i64, Option<i64>)> =
+            std::collections::BTreeMap::new();
+        for row in rows.as_array().into_iter().flatten() {
+            if row["kind"] != KIND {
+                continue;
+            }
+            let figure = figure_of(row["subject"].as_str().unwrap_or(""), &row["evidence"]);
+            let fired = row["fired_at_ms"].as_i64().unwrap_or(0);
+            let judged = row["cleared_evidence"]["judged"]
+                .is_string()
+                .then(|| row["evidence"]["out_since_ms"].as_i64())
+                .flatten();
+            if newest.get(&figure).is_none_or(|(at, _)| fired >= *at) {
+                newest.insert(figure, (fired, judged));
+            }
+        }
+        for (figure, (_, judged)) in newest {
+            if let Some(since) = judged {
+                self.guardrail_judged.insert(figure, since);
+            }
+        }
     }
 
     /// Start a reading through `start`, unless one is in flight or one
@@ -325,6 +471,7 @@ impl Monitor {
             }
         };
         let figures = figures(&answer);
+        let seeding = self.seeding(&answer, &figures, lines);
         for figure in &figures {
             if figure.stale {
                 // Not current: it neither raises nor clears; the stale
@@ -335,7 +482,7 @@ impl Monitor {
             let open = self.open_keys(KIND, &subject);
             if figure.state == "out" {
                 self.guardrail_back.remove(&figure.key);
-                let since = *self.guardrail_out.entry(figure.key.clone()).or_insert(now);
+                let since = self.out_since_of(figure, now, seeding.as_ref());
                 // The stretch's alert, once judged by the owner (objective
                 // 092), is not open and is not raised again: the next stretch
                 // out of range is a new occurrence.
@@ -367,6 +514,10 @@ impl Monitor {
                 }
             } else {
                 self.guardrail_out.remove(&figure.key);
+                if figure.state == "in" {
+                    // Positive evidence the judged stretch ended.
+                    self.guardrail_judged.remove(&figure.key);
+                }
                 if open.is_empty() {
                     self.guardrail_back.remove(&figure.key);
                     continue;
@@ -406,6 +557,59 @@ impl Monitor {
             });
         }
         self.stale_events(now, &answer, out);
+    }
+
+    /// Since when `figure`, out at `now`, has been out: its count, else a
+    /// judged stretch's out-since (taken by this first fresh reading out),
+    /// else, at the first reading, the samples' ([`out_since`]), else now.
+    fn out_since_of(&mut self, figure: &Reading, now: i64, seeding: Option<&(Value, i64)>) -> i64 {
+        if let Some(since) = self.guardrail_out.get(&figure.key) {
+            return *since;
+        }
+        let since = self
+            .guardrail_judged
+            .remove(&figure.key)
+            .unwrap_or_else(|| {
+                seeding
+                    .and_then(|(samples, period)| {
+                        out_since(samples, &figure.key, &figure.range, now, *period)
+                    })
+                    .unwrap_or(now)
+            });
+        self.guardrail_out.insert(figure.key.clone(), since);
+        since
+    }
+
+    /// At the loop's first answered reading (once per loop): its samples
+    /// and the sample period, `None` at any other reading or when the
+    /// samples could not be read (said, and each hold starts now). A judged
+    /// stretch with a sample in range after its out-since is ended here.
+    fn seeding(
+        &mut self,
+        answer: &Value,
+        figures: &[Reading],
+        lines: &mut Vec<String>,
+    ) -> Option<(Value, i64)> {
+        if self.guardrail_seeded {
+            return None;
+        }
+        self.guardrail_seeded = true;
+        if let Some(error) = answer["recent_samples_error"].as_str() {
+            lines.push(format!(
+                "alerts: the guardrails' samples: {}; each hold starts at this reading",
+                super::scrub(error)
+            ));
+            return None;
+        }
+        let samples = answer["recent_samples"].clone();
+        let (period, _) = crate::core_lines_sample::every_ms_from_env();
+        self.guardrail_judged.retain(|key, since| {
+            !figures
+                .iter()
+                .find(|figure| &figure.key == key)
+                .is_some_and(|figure| back_after(&samples, key, &figure.range, *since))
+        });
+        Some((samples, period))
     }
 
     /// `core_lines_stale`, from one reading's `groups`.
@@ -486,7 +690,8 @@ impl Monitor {
 mod tests {
     use super::super::{Event, Monitor, Row, Settings};
     use super::{
-        KIND, POLL_MS, Parts, Pending, READ_LIMIT_MS, STALE_KIND, range_words, read_line, words,
+        KIND, POLL_MS, Parts, Pending, READ_LIMIT_MS, STALE_KIND, out_since, range_words,
+        read_line, words,
     };
     use serde_json::{Value, json};
 
@@ -1220,5 +1425,411 @@ mod tests {
             panic!("a clear");
         };
         assert_eq!(evidence["state"], "gone");
+    }
+
+    const H: i64 = 3_600_000;
+    /// The sample period the tests run with (the default, 3600 s).
+    const PERIOD: i64 = 3_600_000;
+    const FREE: &str = "storage.free_bytes";
+    /// Free disk out of its range (min 40 GiB) and in it.
+    const OUT: i64 = 1_000;
+    const IN: i64 = 50_000_000_000;
+
+    /// Samples of free disk at each `(at_ms, value)` (`None`: a sample
+    /// without the figure).
+    fn samples(points: &[(i64, Option<i64>)]) -> Value {
+        Value::Array(
+            points
+                .iter()
+                .map(|(at, value)| match value {
+                    Some(value) => json!({"at_ms": at, "values": {FREE: value}}),
+                    None => json!({"at_ms": at, "values": {"storage.disk_fall": 1}}),
+                })
+                .collect(),
+        )
+    }
+
+    /// [`answer`] with free disk out, as the loop's first reading gives it:
+    /// with `samples` as its `recent_samples`.
+    fn first(samples: Value) -> Value {
+        let mut answer = answer("out", &json!(OUT));
+        answer["recent_samples"] = samples;
+        answer
+    }
+
+    fn fires(events: &[Event]) -> Vec<(String, Value)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Fire { key, evidence, .. } => Some((key.clone(), evidence.clone())),
+                Event::Clear { .. } => None,
+            })
+            .collect()
+    }
+
+    /// One reading at `at`, recorded: the keys it fired.
+    fn step(monitor: &mut Monitor, at: i64, answer: Value) -> Vec<String> {
+        let (events, _) = read(monitor, at, Ok(answer));
+        commit(monitor, &events);
+        fires(&events).into_iter().map(|(key, _)| key).collect()
+    }
+
+    fn key_at(since: i64) -> String {
+        format!("{KIND}:{FREE}:{since}")
+    }
+
+    /// Objective 192: a figure's out-since from the samples is the oldest
+    /// sample of the newest unbroken run out of its current range reaching
+    /// now; a sample in range, one without the figure, or a gap of more
+    /// than two periods ends the run.
+    #[test]
+    fn a_figure_out_takes_its_out_since_from_the_newest_unbroken_run_of_samples() {
+        let now = 100 * H;
+        let range = json!({"min": 42_949_672_960_i64});
+        let seed =
+            |points: &[(i64, Option<i64>)]| out_since(&samples(points), FREE, &range, now, PERIOD);
+        // A run.
+        assert_eq!(
+            seed(&[
+                (now - 3 * H, Some(OUT)),
+                (now - 2 * H, Some(OUT)),
+                (now - H, Some(OUT))
+            ]),
+            Some(now - 3 * H)
+        );
+        // The newest of two runs.
+        assert_eq!(
+            seed(&[
+                (now - 4 * H, Some(OUT)),
+                (now - 3 * H, Some(IN)),
+                (now - 2 * H, Some(OUT)),
+                (now - H, Some(OUT)),
+            ]),
+            Some(now - 2 * H)
+        );
+        // The newest sample in range.
+        assert_eq!(seed(&[(now - 2 * H, Some(OUT)), (now - H, Some(IN))]), None);
+        // A sample without the figure.
+        assert_eq!(
+            seed(&[
+                (now - 3 * H, Some(OUT)),
+                (now - 2 * H, None),
+                (now - H, Some(OUT))
+            ]),
+            Some(now - H)
+        );
+        // A gap from the start: the newest sample more than two periods ago.
+        assert_eq!(seed(&[(now - 2 * H - 1, Some(OUT))]), None);
+        assert_eq!(seed(&[(now - 2 * H, Some(OUT))]), Some(now - 2 * H));
+        // A gap between samples.
+        assert_eq!(
+            seed(&[
+                (now - 5 * H, Some(OUT)),
+                (now - 2 * H, Some(OUT)),
+                (now - H, Some(OUT))
+            ]),
+            Some(now - 2 * H)
+        );
+        // No samples, and samples that are not a list.
+        assert_eq!(seed(&[]), None);
+        assert_eq!(out_since(&Value::Null, FREE, &range, now, PERIOD), None);
+        assert_eq!(out_since(&json!({"a": 1}), FREE, &range, now, PERIOD), None);
+        // Judged against the current range, not an old one: 30 is out of
+        // {min: 40} now, whatever range it was read against then.
+        let points = samples(&[(now - H, Some(30))]);
+        assert_eq!(
+            out_since(&points, FREE, &json!({"min": 40}), now, PERIOD),
+            Some(now - H)
+        );
+        assert_eq!(
+            out_since(&points, FREE, &json!({"min": 20}), now, PERIOD),
+            None
+        );
+        // No range: no run.
+        assert_eq!(out_since(&points, FREE, &Value::Null, now, PERIOD), None);
+    }
+
+    /// Objective 192: a restarted loop raises a figure out since an hour in
+    /// the samples at that sample's time plus the hold, not a hold after the
+    /// restart; it seeds once; a run broken by a sample in range seeds
+    /// nothing; a samples error is said and the hold starts then.
+    #[test]
+    fn a_restarted_loop_raises_at_the_hold_its_samples_began_not_a_hold_after_the_restart() {
+        let start = 100 * H;
+        let mut seeded = monitor();
+        let out = samples(&[(start - 2 * H, Some(IN)), (start - H, Some(OUT))]);
+        assert_eq!(step(&mut seeded, start, first(out)), Vec::<String>::new());
+        assert_eq!(
+            step(&mut seeded, start + H - 1, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+        let (events, _) = read(&mut seeded, start + H, Ok(answer("out", &json!(OUT))));
+        let fired = fires(&events);
+        assert_eq!(fired.len(), 1, "{events:?}");
+        assert_eq!(fired[0].0, key_at(start - H));
+        assert_eq!(fired[0].1["out_since_ms"], start - H);
+        assert_eq!(fired[0].1["reading_ms"], start + H);
+
+        // Seeded once: a later reading's samples change nothing.
+        let mut once = monitor();
+        assert_eq!(
+            step(&mut once, start, first(json!([]))),
+            Vec::<String>::new()
+        );
+        let later = first(samples(&[(start + H - 1, Some(OUT))]));
+        let mut later = later;
+        later["recent_samples"] = samples(&[(start - 5 * H, Some(OUT)), (start, Some(OUT))]);
+        assert_eq!(step(&mut once, start + H, later), Vec::<String>::new());
+        assert_eq!(
+            step(&mut once, start + 2 * H, answer("out", &json!(OUT))),
+            [key_at(start)]
+        );
+
+        // A run broken by a sample in range seeds nothing: the hold begins
+        // at the restart.
+        let mut broken = monitor();
+        let points = samples(&[(start - 2 * H, Some(OUT)), (start - H, Some(IN))]);
+        assert_eq!(
+            step(&mut broken, start, first(points)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut broken, start + 2 * H - 1, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut broken, start + 2 * H, answer("out", &json!(OUT))),
+            [key_at(start)]
+        );
+
+        // A samples error is said, and the hold starts at this reading.
+        let mut failed = monitor();
+        let mut answer_failed = answer("out", &json!(OUT));
+        answer_failed["recent_samples_error"] = json!("connection reset");
+        let (events, lines) = read(&mut failed, start, Ok(answer_failed));
+        assert!(fires(&events).is_empty());
+        assert!(
+            lines.iter().any(
+                |line| line.contains("the guardrails' samples: connection reset")
+                    && line.contains("each hold starts at this reading")
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            step(&mut failed, start + 2 * H, answer("out", &json!(OUT))),
+            [key_at(start)]
+        );
+    }
+
+    /// The alert rows a restarted loop starts with: `key`'s alert, fired on
+    /// free disk out since `since`, cleared with `cleared` (`{judged}` for a
+    /// judgement, else its condition's evidence).
+    fn rows(key: &str, since: i64, cleared: &Value) -> Value {
+        json!([{
+            "key": key, "kind": KIND, "subject": format!("guardrail {FREE}"),
+            "state": "cleared",
+            "evidence": {"line": "storage", "key": FREE, "out_since_ms": since},
+            "fired_at_ms": since + RAISE, "cleared_evidence": cleared,
+        }])
+    }
+
+    /// A Monitor rebuilt from the persisted `rows`, as `start` reads them.
+    fn restarted(rows: &Value) -> Monitor {
+        let mut monitor = monitor();
+        for row in rows.as_array().into_iter().flatten() {
+            if let Some((key, row)) = Row::from_value(row) {
+                monitor.known.insert(key, row);
+            }
+        }
+        monitor.seed_judged(rows);
+        monitor
+    }
+
+    /// Objective 192 (5): a stretch the owner judged false stays judged after
+    /// a restart over a slid window, however long it stays out; a samples
+    /// error keeps it; a sample in range after it began makes a new stretch,
+    /// one before it does not; a newest alert cleared by its condition is
+    /// seeded as before.
+    #[test]
+    fn a_judged_stretch_still_out_after_a_restart_is_not_raised_again() {
+        let start = 100 * H;
+        // Seed, fire, judge false.
+        let mut first_loop = monitor();
+        step(
+            &mut first_loop,
+            start,
+            first(samples(&[(start - H, Some(OUT))])),
+        );
+        let fired = step(&mut first_loop, start + H, answer("out", &json!(OUT)));
+        assert_eq!(fired, [key_at(start - H)]);
+        let judged = rows(&fired[0], start - H, &json!({"judged": "false"}));
+
+        // Restarted hours later: the window has slid past where it began.
+        let restart = start + 5 * H;
+        let still_out = samples(&[
+            (restart - 3 * H, Some(OUT)),
+            (restart - 2 * H, Some(OUT)),
+            (restart - H, Some(OUT)),
+        ]);
+        let mut again = restarted(&judged);
+        assert_eq!(
+            step(&mut again, restart, first(still_out.clone())),
+            Vec::<String>::new()
+        );
+        for later in [restart + H, restart + 10 * H, restart + 100 * H] {
+            assert_eq!(
+                step(&mut again, later, answer("out", &json!(OUT))),
+                Vec::<String>::new(),
+                "{later}"
+            );
+        }
+
+        // A samples error: nothing shows the stretch ended.
+        let mut failed = restarted(&judged);
+        let mut answer_failed = answer("out", &json!(OUT));
+        answer_failed["recent_samples_error"] = json!("timeout");
+        assert!(read(&mut failed, restart, Ok(answer_failed)).0.is_empty());
+        assert_eq!(
+            step(&mut failed, restart + 10 * H, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+
+        // A sample in range after the stretch began: a new stretch, seeded.
+        let back = samples(&[
+            (restart - 3 * H, Some(IN)),
+            (restart - 2 * H, Some(OUT)),
+            (restart - H, Some(OUT)),
+        ]);
+        let mut new = restarted(&judged);
+        assert_eq!(
+            step(&mut new, restart, first(back)),
+            [key_at(restart - 2 * H)]
+        );
+
+        // One in range before it began is no evidence.
+        let before = samples(&[
+            (start - 2 * H, Some(IN)),
+            (restart - 2 * H, Some(OUT)),
+            (restart - H, Some(OUT)),
+        ]);
+        let mut kept = restarted(&judged);
+        assert_eq!(
+            step(&mut kept, restart, first(before)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut kept, restart + 10 * H, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+
+        // A newest alert cleared by its condition: seeded as before.
+        let by_condition = rows(
+            &fired[0],
+            start - H,
+            &json!({"key": FREE, "state": "in", "reading_ms": start + 2 * H}),
+        );
+        let mut seeded = restarted(&by_condition);
+        assert_eq!(
+            step(&mut seeded, restart, first(still_out)),
+            [key_at(restart - 3 * H)]
+        );
+    }
+
+    /// [`answer`] with free disk `state`, its value `value`, stale.
+    fn stale(state: &str, value: &Value) -> Value {
+        let mut answer = answer(state, value);
+        answer["lines"][1]["guardrails"][0]["stale"] = json!(true);
+        answer
+    }
+
+    /// Objective 192 (6), cc-astra A87: a first reading where the figure is
+    /// stale, then not collected, loses nothing: the judged out-since is
+    /// taken by the first fresh reading out (no second alert); only a fresh
+    /// reading in range ends it, after which a new stretch out is raised
+    /// after its own hold.
+    #[test]
+    fn a_judged_stretch_survives_a_first_reading_with_no_fresh_figure() {
+        let since = 50 * H;
+        let judged = rows(&key_at(since), since, &json!({"judged": "false"}));
+        let restart = 100 * H;
+        let mut monitor = restarted(&judged);
+        let mut first_stale = stale("out", &json!(OUT));
+        first_stale["recent_samples"] = samples(&[(restart - H, Some(OUT))]);
+        assert_eq!(
+            step(&mut monitor, restart, first_stale),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(
+                &mut monitor,
+                restart + 300_000,
+                answer("not_collected", &Value::Null)
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut monitor, restart + 600_000, stale("in", &json!(IN))),
+            Vec::<String>::new()
+        );
+        // The first fresh reading out takes the judged out-since.
+        for later in [restart + H, restart + 10 * H] {
+            assert_eq!(
+                step(&mut monitor, later, answer("out", &json!(OUT))),
+                Vec::<String>::new(),
+                "{later}"
+            );
+        }
+        // A fresh reading in range ends it; the next stretch is new.
+        let back = restart + 11 * H;
+        step(&mut monitor, back, answer("in", &json!(IN)));
+        let out = back + 300_000;
+        assert_eq!(
+            step(&mut monitor, out, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut monitor, out + RAISE, answer("out", &json!(OUT))),
+            [key_at(out)]
+        );
+    }
+
+    /// Objective 192 (6), R4: once taken, a judged out-since lives as any
+    /// other count: a fresh reading with no range ends it, and the next
+    /// reading out starts a new stretch, raised after its own hold.
+    #[test]
+    fn a_taken_judged_stretch_ends_like_any_other() {
+        let since = 50 * H;
+        let judged = rows(&key_at(since), since, &json!({"judged": "false"}));
+        let restart = 100 * H;
+        let mut monitor = restarted(&judged);
+        assert_eq!(
+            step(
+                &mut monitor,
+                restart,
+                first(samples(&[(restart - H, Some(OUT))]))
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(
+                &mut monitor,
+                restart + 300_000,
+                answer("no_range", &json!(OUT))
+            ),
+            Vec::<String>::new()
+        );
+        let out = restart + 600_000;
+        assert_eq!(
+            step(&mut monitor, out, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut monitor, out + RAISE - 1, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut monitor, out + RAISE, answer("out", &json!(OUT))),
+            [key_at(out)]
+        );
     }
 }

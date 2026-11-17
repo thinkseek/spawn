@@ -794,6 +794,15 @@ pub(crate) struct Monitor {
     /// The Core lines reading in flight on a thread of its own, and one
     /// given up that may still run (cc-astra A18: never inside a pass).
     guardrail_reads: guardrails::Reads,
+    /// Whether this loop's first answered reading has seeded the counts
+    /// from the hourly samples (objective 192): once per loop, whatever it
+    /// found.
+    guardrail_seeded: bool,
+    /// Each figure whose newest `guardrail_out_of_range` alert the owner
+    /// judged while open, with that alert's out-since (objective 192 (5)):
+    /// taken by the first fresh reading that finds the figure out, ended by
+    /// positive evidence it was back in range.
+    guardrail_judged: BTreeMap<String, i64>,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -912,6 +921,8 @@ impl Monitor {
             guardrail_out: BTreeMap::new(),
             guardrail_back: BTreeMap::new(),
             guardrail_reads: guardrails::Reads::default(),
+            guardrail_seeded: false,
+            guardrail_judged: BTreeMap::new(),
         }
     }
 
@@ -1038,6 +1049,7 @@ impl Monitor {
                 self.known.insert(key, row);
             }
         }
+        self.seed_judged(&rows["rows"]);
         self.seed_red();
         self.seed_defects();
         self.seed_parked();
