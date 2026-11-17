@@ -1019,6 +1019,29 @@ pub(crate) fn reading() -> Result<(Value, Parts), String> {
     Ok((view, parts))
 }
 
+/// The loop's first guardrail reading (objective 192): [`reading`], plus
+/// the `host.core_lines` samples recorded at or after `since` on the same
+/// connection, as `recent_samples` (`[{at_ms, values}]`, oldest first), or
+/// why they could not be read, as `recent_samples_error`. A figure out at
+/// that reading takes its out-since from them (crate alerts/guardrails.rs),
+/// so a restart does not restart the raise hold. Never part of `GET
+/// /api/core-lines`; later readings are [`reading`]'s.
+pub(crate) fn reading_with_samples(since: i64) -> Result<(Value, Parts), String> {
+    let mut parts = Parts::default();
+    let store = timed(&mut parts.open, super::open_store)?;
+    let mut view = core_lines_timed(
+        &store,
+        ranges_path().as_deref(),
+        nightly_dir().as_deref(),
+        &mut parts,
+    )?;
+    match timed(&mut parts.trends, || store.host_core_lines(since)) {
+        Ok(samples) => view["recent_samples"] = samples,
+        Err(error) => view["recent_samples_error"] = json!(super::err(error)),
+    }
+    Ok((view, parts))
+}
+
 /// Warm the reading at serve's start (the lead, 2026-11-13: the first GET
 /// after each restart took about 3 s, later ones 0.05 s): one reading run
 /// now, as a request would run it, so the kept performance figures, the

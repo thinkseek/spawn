@@ -125,27 +125,36 @@ pub(crate) struct Sampler {
     abandoned: Option<Reading>,
 }
 
+/// The interval between samples `SPAWN_CORE_LINES_SAMPLE_SECS` sets, in
+/// ms, with a warning for a setting that is not a number of seconds above
+/// 0: the sampler's, and the period the guardrails' seeding judges a gap
+/// between samples by (objective 192, crate alerts/guardrails.rs).
+pub(crate) fn every_ms_from_env() -> (i64, Option<String>) {
+    let name = "SPAWN_CORE_LINES_SAMPLE_SECS";
+    let (secs, warning) = match crate::config::env_value(name) {
+        None => (SAMPLE_EVERY_SECS, None),
+        Some(text) => match text.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => (secs, None),
+            _ => (
+                SAMPLE_EVERY_SECS,
+                Some(format!(
+                    "{name}: {text:?} is not a number of seconds above 0; using {SAMPLE_EVERY_SECS}"
+                )),
+            ),
+        },
+    };
+    (
+        i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX),
+        warning,
+    )
+}
+
 impl Sampler {
     /// The sampler `SPAWN_CORE_LINES_SAMPLE_SECS` sets, with a warning for
     /// a setting that is not a number of seconds above 0.
     pub(crate) fn from_env() -> (Self, Option<String>) {
-        let name = "SPAWN_CORE_LINES_SAMPLE_SECS";
-        let (secs, warning) = match crate::config::env_value(name) {
-            None => (SAMPLE_EVERY_SECS, None),
-            Some(text) => match text.trim().parse::<u64>() {
-                Ok(secs) if secs > 0 => (secs, None),
-                _ => (
-                    SAMPLE_EVERY_SECS,
-                    Some(format!(
-                        "{name}: {text:?} is not a number of seconds above 0; using {SAMPLE_EVERY_SECS}"
-                    )),
-                ),
-            },
-        };
-        (
-            Self::every(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX)),
-            warning,
-        )
+        let (every_ms, warning) = every_ms_from_env();
+        (Self::every(every_ms), warning)
     }
 
     /// A sampler taking one sample every `every_ms`, the first at once.
