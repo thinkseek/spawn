@@ -515,7 +515,11 @@ const READING_NOTE: &str = "no range until use with no price is under 10%";
 /// stale, or 10% or more, it is not.
 fn priced(share: Option<&Figure>) -> bool {
     share.is_some_and(|share| {
-        !share.stale && share.value.as_f64().is_some_and(|value| value < PRICED_UNDER)
+        !share.stale
+            && share
+                .value
+                .as_f64()
+                .is_some_and(|value| value < PRICED_UNDER)
     })
 }
 
@@ -2021,6 +2025,104 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
         let values = super::values_of(&super::adopted(&adopted_readings(false, 1), false));
         assert_eq!(values["storage.free_bytes"], 104);
         assert_eq!(values["performance.usd_per_landing"], 2.5);
+    }
+
+    /// Objective 207: dollars per landing takes its configured range and
+    /// target while use with no price is a fresh number under 10%, and is a
+    /// reading with no range, its note and its entry ignored, when the share
+    /// is 10% or more, missing, not a number or stale; a reading either way,
+    /// in no other list.
+    #[test]
+    fn dollars_per_landing_takes_its_range_while_use_with_no_price_is_under_ten_percent() {
+        let ranges = r#"{"ranges": {"performance.usd_per_landing": {"max": 10, "target": 5}}}"#;
+        let view_with = |share: Value, stale: bool| {
+            let mut readings = adopted_readings(false, 1);
+            for line in &mut readings {
+                for figure in std::iter::once(&mut line.north_star).chain(&mut line.guardrails) {
+                    if figure.key == "observability.unpriced_share" {
+                        figure.value = share.clone();
+                        figure.stale = stale;
+                    }
+                }
+            }
+            super::answer(
+                &super::adopted(&readings, false),
+                &Value::Null,
+                Ok(Some(ranges.to_string())),
+                &std::collections::BTreeMap::new(),
+            )
+        };
+        let reason = "shown with no range until use with no price is under 10% (the owner's core metric set)";
+        for (share, stale, priced) in [
+            (Value::Null, false, false),
+            (json!(0.10), false, false),
+            (json!(0.048), false, true),
+            (json!(0.2), false, false),
+            (json!(0.048), true, false),
+            (json!("0.01"), false, false),
+        ] {
+            let view = view_with(share.clone(), stale);
+            let what = format!("share {share} stale {stale}");
+            let reading = &view["lines"][2]["readings"][0];
+            assert_eq!(reading["key"], "performance.usd_per_landing", "{what}");
+            assert_eq!(reading["value"], 2.5, "{what}");
+            let ignored: Vec<&Value> = view["ignored_ranges"]
+                .as_array()
+                .expect("ignored")
+                .iter()
+                .filter(|entry| entry["key"] == "performance.usd_per_landing")
+                .collect();
+            if priced {
+                assert_eq!(reading["range"], json!({"max": 10}), "{what}");
+                assert_eq!(reading["target"], 5, "{what}");
+                assert_eq!(reading["state"], "in", "{what}");
+                assert_eq!(reading.get("range_note"), None, "{what}");
+                assert!(ignored.is_empty(), "{what}");
+            } else {
+                assert_eq!(reading["range"], Value::Null, "{what}");
+                assert_eq!(reading.get("target"), None, "{what}");
+                assert_eq!(reading["state"], "no_range", "{what}");
+                assert_eq!(
+                    reading["range_note"], "no range until use with no price is under 10%",
+                    "{what}"
+                );
+                assert_eq!(
+                    ignored,
+                    [&json!({"key": "performance.usd_per_landing", "reason": reason})],
+                    "{what}"
+                );
+            }
+            // A reading either way: in no other list.
+            for line in view["lines"].as_array().expect("lines") {
+                assert_ne!(line["north_star"]["key"], "performance.usd_per_landing");
+                assert!(
+                    !keys(&line["guardrails"]).contains(&"performance.usd_per_landing".to_string())
+                );
+            }
+            for list in ["alert_figures", "diagnostics"] {
+                assert!(
+                    !keys(&view[list]).contains(&"performance.usd_per_landing".to_string()),
+                    "{what}: {list}"
+                );
+            }
+        }
+        // Out of its range while priced: out on the card, still a reading.
+        let tight = r#"{"ranges": {"performance.usd_per_landing": {"max": 1}}}"#;
+        let mut readings = adopted_readings(false, 1);
+        for line in &mut readings {
+            for figure in std::iter::once(&mut line.north_star).chain(&mut line.guardrails) {
+                if figure.key == "observability.unpriced_share" {
+                    figure.value = json!(0.01);
+                }
+            }
+        }
+        let view = super::answer(
+            &super::adopted(&readings, false),
+            &Value::Null,
+            Ok(Some(tight.to_string())),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(view["lines"][2]["readings"][0]["state"], "out");
     }
 
     /// Objective 182: leaked test schemas read 0 for a week (hourly samples
