@@ -160,13 +160,14 @@ pub const VERBATIM: &[&str] = &[
 
 /// The (record type, top-level field) pairs the store limits to 500
 /// characters (spawn_backup_record, spawn_deploy_record,
-/// spawn_verification_record).
+/// spawn_verification_record, spawn_objective_retire).
 pub const LIMITED: &[(&str, &str)] = &[
     ("backup.drilled.transcripts", "reason"),
     ("backup.drilled.missions", "reason"),
     ("backup.drilled.controllers", "reason"),
     ("deploy.finished", "reason"),
     ("objective.verified", "how"),
+    ("objective.retired", "reason"),
 ];
 
 /// The store's limit on a [`LIMITED`] field, in characters.
