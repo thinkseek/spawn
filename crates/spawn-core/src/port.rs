@@ -146,7 +146,7 @@ pub trait CommandQueue: Send + Sync {
 }
 
 /// Workspace store refusal or failure.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum WorkspaceError {
     /// The store refused the call with a structured code.
     #[error("workspace refused: {code}: {message}")]
