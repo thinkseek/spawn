@@ -5,6 +5,8 @@
 import { readApi } from "./api";
 import type { Labels } from "./label.ts";
 import { labels } from "./label.ts";
+import { normalizeActivity } from "./taskActivity.ts";
+import type { TaskActivity } from "./taskActivity.ts";
 import type { RsiSummary } from "./api";
 import { normalizeHolds } from "./attention";
 import type { SourceHold } from "./attention";
@@ -132,6 +134,9 @@ export interface MissionTask extends Labels {
   /** The gate's metric line of the accepted candidate. */
   metric: string | null;
   last_gate: LastGate | null;
+  /** What its worker did since a delivered task reached it (objective
+   * 211); null for every other task, and from an older server. */
+  activity: TaskActivity | null;
   /** Every record of the task, oldest first; empty when the server has none. */
   stages: TaskStage[];
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
@@ -306,6 +311,7 @@ function normalizeTask(value: unknown): MissionTask | null {
     objective: optionalNumber(value.objective),
     metric: optionalText(value.metric),
     last_gate: normalizeLastGate(value.last_gate),
+    activity: normalizeActivity(value.activity),
     stages: list(value.stages)
       .map(normalizeStage)
       .filter((stage): stage is TaskStage => stage !== null),
