@@ -3141,9 +3141,11 @@ const GET_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
 /// fixed cap, and has a cap that grows with the bytes still to come
 /// ([`get_options`]). Up to [`GET_ATTEMPTS`] attempts, apart by
 /// [`get_pause_secs`]. It returns only a body whose length is the object's
-/// (Content-Range or Content-Length) and, when the ETag is a plain MD5 (one
-/// PUT), whose MD5 is the ETag; callers still check the
-/// `x-amz-meta-sha256` and, after decryption, the record's sha256.
+/// (Content-Range or Content-Length) and, when it was joined from more than
+/// one answer and the ETag is a plain MD5 (one PUT), whose MD5 is the ETag.
+/// A body from one whole answer is what the server sent; callers check it
+/// as before: the `x-amz-meta-sha256` and, after decryption, the record's
+/// sha256 (scenario 186 (7) asserts that last check names the failure).
 fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, String)>, String> {
     get_object_with(settings, key, get_pause_secs)
 }
@@ -3162,6 +3164,10 @@ fn get_object_with(
     let mut total: Option<u64> = None;
     let mut headers = String::new();
     let mut errors: Vec<String> = Vec::new();
+    // Whether the body was joined from more than one answer (an attempt
+    // that resumed after bytes already there): only such a join is checked
+    // against the ETag, the one thing a splice can get wrong.
+    let mut joined = false;
     for attempt in 0..GET_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(pause(attempt)));
@@ -3169,6 +3175,9 @@ fn get_object_with(
         let have = size(&body);
         if total == Some(have) {
             break;
+        }
+        if have > 0 {
+            joined = true;
         }
         let mut options = get_options(have, total.map(|total| total.saturating_sub(have)));
         // A resumed attempt asks for the same object only (rev-b n3): an
@@ -3240,7 +3249,7 @@ fn get_object_with(
         .unwrap_or_default()
         .trim_matches('"')
         .to_ascii_lowercase();
-    if is_plain_md5(&etag) {
+    if joined && is_plain_md5(&etag) {
         let found = md5_file(&body)?;
         if found != etag {
             return Err(format!(
@@ -4319,14 +4328,40 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
     }
 
     #[test]
-    fn a_get_whose_bytes_are_not_its_etag_fails() {
+    fn a_joined_get_whose_bytes_are_not_its_etag_fails() {
+        // A cut, then the rest by Range: the joined body is checked against
+        // the ETag, and a mismatch is an error, never the body.
         let body = made_up_object();
-        let (endpoint, _log) = serve_object(body, "0".repeat(32), |_, _| Answer::Whole);
+        let (endpoint, log) = serve_object(body, "0".repeat(32), |index, _| {
+            if index == 0 {
+                Answer::WholeCutAt(100_000)
+            } else {
+                Answer::Ranged
+            }
+        });
         let mut settings = made_up_r2_settings(None);
         settings.r2.endpoint = endpoint;
         let error = super::get_object_with(&settings, "bundles/made-up.tar.zst.gpg", no_pause)
             .expect_err("a wrong MD5");
         assert!(error.contains("not the ETag"), "{error}");
+        assert_eq!(log.lock().expect("log").len(), 2);
+    }
+
+    #[test]
+    fn a_whole_answer_is_left_to_the_callers_sha256_checks() {
+        // One whole answer whose ETag is not its MD5 (scenario 186 (7):
+        // the stored bytes replaced, the object's metadata left): the GET
+        // returns what the server sent, so the caller's decrypted-sha256
+        // check names the failure, as it did before resumable GETs.
+        let body = made_up_object();
+        let (endpoint, log) = serve_object(body.clone(), "0".repeat(32), |_, _| Answer::Whole);
+        let mut settings = made_up_r2_settings(None);
+        settings.r2.endpoint = endpoint;
+        let (got, _) = super::get_object_with(&settings, "bundles/made-up.tar.zst.gpg", no_pause)
+            .expect("the GET")
+            .expect("the object");
+        assert_eq!(got, body);
+        assert_eq!(log.lock().expect("log").len(), 1);
     }
 
     #[test]
