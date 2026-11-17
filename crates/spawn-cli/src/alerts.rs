@@ -803,10 +803,16 @@ pub(crate) struct Monitor {
     /// found.
     guardrail_seeded: bool,
     /// Each figure whose newest `guardrail_out_of_range` alert the owner
-    /// judged while open, with that alert's out-since (objective 192 (5)):
-    /// taken by the first fresh reading that finds the figure out, ended by
-    /// positive evidence it was back in range.
+    /// judged while open, with that alert's out-since (objective 192 (5)),
+    /// from the alert rows the loop starts with or an `alert.judged` record
+    /// it reads while it runs (objective 209): taken by every fresh reading
+    /// that finds the figure out, ended only by positive evidence it was
+    /// back in range.
     guardrail_judged: BTreeMap<String, i64>,
+    /// Each figure's newest fresh reading in range (`in`), by key: a
+    /// judgement read after it of an alert out since before it keeps no
+    /// stretch (objective 209 (1)).
+    guardrail_in: BTreeMap<String, i64>,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -927,6 +933,7 @@ impl Monitor {
             guardrail_reads: guardrails::Reads::default(),
             guardrail_seeded: false,
             guardrail_judged: BTreeMap::new(),
+            guardrail_in: BTreeMap::new(),
         }
     }
 
@@ -1213,16 +1220,25 @@ impl Monitor {
     /// open one is cleared by it, so the step clears it no more, and a later
     /// occurrence of its kind and subject fires anew. Judged `right`
     /// (objective 148) it stays open: its condition still clears it.
+    /// A `guardrail_out_of_range` alert judged so keeps its stretch
+    /// (objective 209): [`Monitor::judged_stretch`].
     fn judged_record(&mut self, record: &Value) {
         if record["verdict"] == "right" {
             return;
         }
+        let mut stretch = None;
         if let Some(row) = record["key"]
             .as_str()
             .and_then(|key| self.known.get_mut(key))
             && row.open()
         {
             row.state = "cleared".to_string();
+            if row.kind == guardrails::KIND {
+                stretch = Some((row.subject.clone(), row.evidence.clone()));
+            }
+        }
+        if let Some((subject, evidence)) = stretch {
+            self.judged_stretch(&subject, &evidence);
         }
     }
 
