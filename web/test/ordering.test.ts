@@ -59,6 +59,7 @@ function task(
     objective: null,
     metric: null,
     last_gate: null,
+    activity: null,
     stages: list,
     model: "default",
     created_by: "spawn-integrate",

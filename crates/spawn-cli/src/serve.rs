@@ -1474,6 +1474,8 @@ fn missions() -> Result<Value, String> {
     let mut board = store.mission_board(50).map_err(err)?;
     let gates = store.last_gates().map_err(err)?;
     with_last_gates(&mut board, &gates);
+    let activity = store.task_activity().map_err(err)?;
+    with_activity(&mut board, &activity);
     labels::label_board(&mut board);
     answers::slim_board(&mut board);
     Ok(board)
@@ -1519,6 +1521,32 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
             .unwrap_or(Value::Null);
         if let Some(fields) = task.as_object_mut() {
             fields.insert("last_gate".to_string(), gate);
+        }
+    }
+}
+
+/// Put on each task what its worker did since the task reached it
+/// (objective 211), from `activity` (keyed by task id, the delivered tasks
+/// alone): `{since_ms, at_ms, event, tool_calls}` for a delivered task,
+/// null for every other.
+fn with_activity(board: &mut Value, activity: &Value) {
+    let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for task in missions
+        .iter_mut()
+        .filter_map(|mission| mission.get_mut("tasks").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let delivered = task["state"] == "delivered";
+        let found = task["id"]
+            .as_i64()
+            .and_then(|id| activity.get(id.to_string()))
+            .filter(|_| delivered)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(fields) = task.as_object_mut() {
+            fields.insert("activity".to_string(), found);
         }
     }
 }
@@ -2530,7 +2558,7 @@ mod tests {
         keep_listening, listen_again_pause, local_exemption, log_window, objective_json,
         objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
         rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
-        tokenless_request, typed_text, with_last_gates, with_objectives,
+        tokenless_request, typed_text, with_activity, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -4552,6 +4580,35 @@ mod tests {
         );
         assert_eq!(board["missions"][0]["tasks"][0]["stages"], stages);
         assert!(board["missions"][0]["tasks"][1]["last_gate"].is_null());
+    }
+
+    /// Objective 211: a delivered task carries its activity; every other
+    /// task, and a delivered one the read has none for, carries null.
+    #[test]
+    fn a_delivered_task_carries_its_activity_and_every_other_null() {
+        let mut board = json!({"missions": [{"tasks": [
+            {"id": 1, "state": "delivered"},
+            {"id": 2, "state": "reported"},
+            {"id": 3, "state": "delivered"},
+        ]}]});
+        let found = json!({"since_ms": 10, "at_ms": 20, "event": "tool.completed",
+                           "tool_calls": 2});
+        with_activity(
+            &mut board,
+            &json!({"1": found, "2": {"since_ms": 1, "at_ms": null, "event": null,
+                                      "tool_calls": 0}}),
+        );
+        let tasks = &board["missions"][0]["tasks"];
+        assert_eq!(tasks[0]["activity"], found);
+        assert!(tasks[1]["activity"].is_null(), "not delivered: null");
+        assert!(tasks[2]["activity"].is_null(), "no activity read: null");
+        assert!(
+            tasks[2]
+                .as_object()
+                .expect("a task")
+                .contains_key("activity"),
+            "the key is always there"
+        );
     }
 
     #[test]

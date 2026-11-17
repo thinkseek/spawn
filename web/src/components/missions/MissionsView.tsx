@@ -43,6 +43,7 @@ import {
 } from "../../ordering";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
+import { TaskActivityLine } from "./TaskActivity";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
 import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
@@ -729,6 +730,7 @@ function TaskRow({
       ) : (
         <Pipeline task={task} steps={pipelineOf(mission)} />
       )}
+      <TaskActivityLine activity={task.activity} now={Date.now()} />
 
       {(task.objective !== null ||
         task.candidate ||
