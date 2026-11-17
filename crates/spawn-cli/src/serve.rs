@@ -1678,7 +1678,9 @@ fn task_in_flight(task: &Value, gated: bool) -> bool {
 }
 
 /// One mission row with `backlog`, `backlog_error`, `objectives` and
-/// `next_objective` added. The row's `solved_on_base` (the mission's
+/// `next_objective` added. A retired objective's row (the row's `retired`,
+/// objective 210) has status `retired` and its `retired` row, and
+/// `next_objective` never names it. The row's `solved_on_base` (the mission's
 /// `objective.solved` records) and `outcomes` (its tasks' outcomes, when
 /// read) are taken out: each objective row names its own record, and
 /// `next_objective` is what [`crate::objectives::choose`] gives one free
@@ -1713,6 +1715,11 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
     let outcomes: Vec<Outcome> = outcomes
         .and_then(|outcomes| serde_json::from_value(outcomes).ok())
         .unwrap_or_default();
+    let retired: Vec<Value> = mission
+        .get("retired")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let record = |id: u32| {
         solved
             .iter()
@@ -1720,9 +1727,18 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
     };
     let rows: Vec<Value> = objectives
         .iter()
-        .map(|objective| objective_json(objective, &tasks, record(objective.id)))
+        .map(|objective| {
+            retired_row(
+                objective_json(objective, &tasks, record(objective.id)),
+                retired_of(&retired, objective.id),
+            )
+        })
         .collect();
-    let next = next_objective(&mission, &objectives, &tasks, &solved, &outcomes);
+    let closed = Closed {
+        solved: &solved,
+        retired: &retired,
+    };
+    let next = next_objective(&mission, &objectives, &tasks, &closed, &outcomes);
     if let Some(fields) = mission.as_object_mut() {
         fields.insert("backlog".to_string(), json!(backlog));
         fields.insert("backlog_error".to_string(), json!(error));
@@ -1732,14 +1748,42 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
     mission
 }
 
+/// The mission's `retired` row of objective `id` (objective 210), if it was
+/// retired by hand.
+fn retired_of(retired: &[Value], id: u32) -> Option<&Value> {
+    retired
+        .iter()
+        .find(|row| row["objective"].as_u64() == Some(u64::from(id)))
+}
+
+/// An objective row with its `retired` row (`{objective, by, reason,
+/// caller, at_ms}`, null when it was not retired): a retired objective's
+/// status is `retired`, whatever its kind (objective 210).
+fn retired_row(mut row: Value, retired: Option<&Value>) -> Value {
+    if let Some(fields) = row.as_object_mut() {
+        if retired.is_some() {
+            fields.insert("status".to_string(), json!("retired"));
+        }
+        fields.insert("retired".to_string(), json!(retired));
+    }
+    row
+}
+
+/// The records that close an objective besides a landing: the mission's
+/// `objective.solved` records and its objectives retired by hand.
+struct Closed<'a> {
+    solved: &'a [Value],
+    retired: &'a [Value],
+}
+
 /// What the integrator assigns next in `mission`: the objective
 /// [`crate::objectives::choose`] gives one free slot, from the same inputs
-/// as `crate::objectives::assign_next`.
+/// as `crate::objectives::assign_next` (a retired objective is never it).
 fn next_objective(
     mission: &Value,
     objectives: &[Task],
     tasks: &[Value],
-    solved: &[Value],
+    closed: &Closed<'_>,
     outcomes: &[Outcome],
 ) -> Option<u32> {
     // Newest first, as `OBJECTIVE_LANDINGS` gives them (`landed_value`
@@ -1757,12 +1801,21 @@ fn next_objective(
             Some(Landing {
                 objective: u32::try_from(task["objective"].as_u64()?).ok()?,
                 metric: task["metric"].as_str().map(str::to_string),
+                retired: false,
             })
         })
-        .chain(solved.iter().filter_map(|record| {
+        .chain(closed.solved.iter().filter_map(|record| {
             Some(Landing {
                 objective: u32::try_from(record["objective"].as_u64()?).ok()?,
                 metric: None,
+                retired: false,
+            })
+        }))
+        .chain(closed.retired.iter().filter_map(|row| {
+            Some(Landing {
+                objective: u32::try_from(row["objective"].as_u64()?).ok()?,
+                metric: None,
+                retired: true,
             })
         }))
         .collect();
@@ -1815,6 +1868,7 @@ fn objective_json(objective: &Task, tasks: &[Value], solved: Option<&Value>) -> 
         .map(|task| Landing {
             objective: objective.id,
             metric: task["metric"].as_str().map(str::to_string),
+            retired: false,
         })
         .collect();
     let current = landed_value(objective, &landings);
