@@ -3669,12 +3669,48 @@ times in a row)",
         }
     }
 
+    /// The tmpfs at `SPAWN_ALERT_TMPFS_PATH` (`tmpfs_high`): read only when
+    /// the path's filesystem is a tmpfs (objective 215); a statfs that fails
+    /// is a line in the loop's log.
     fn read_tmpfs(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
         if self.settings.tmpfs_high_mb == 0 {
             return;
         }
         let path = self.settings.tmpfs_path.clone();
-        let measured = match used_mb(&path) {
+        match fs_type(&path) {
+            Ok(kind) => self.tmpfs_reading(now, &path, kind, || used_mb(&path), out, lines),
+            Err(error) => lines.push(format!("alerts: {error}")),
+        }
+    }
+
+    /// One reading of the filesystem of type `kind` at `path`, its used MiB
+    /// from `measure` (df) when it is a tmpfs. A filesystem that is not a
+    /// tmpfs (a `/tmp` on the root disk, whose "used" is the whole disk's)
+    /// has no reading of a tmpfs: nothing fires, and an open `tmpfs_high`
+    /// clears, naming the type. Free disk is `disk_low`'s (objective 204).
+    fn tmpfs_reading(
+        &mut self,
+        now: i64,
+        path: &Path,
+        kind: u64,
+        measure: impl FnOnce() -> Result<u64, String>,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        if kind != TMPFS_MAGIC {
+            for key in self.open_keys("tmpfs_high", "host") {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({
+                        "path": path.display().to_string(), "not_tmpfs": true,
+                        "fs_type": format!("{kind:#x}"), "reading_ms": now,
+                    }),
+                });
+            }
+            return;
+        }
+        let path = path.to_path_buf();
+        let measured = match measure() {
             Ok(measured) => measured,
             Err(error) => {
                 lines.push(format!("alerts: {error}"));
@@ -4311,6 +4347,20 @@ fn names(list: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect()
+}
+
+/// The statfs type of a tmpfs (`TMPFS_MAGIC`, linux/magic.h).
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+
+/// The statfs type of the filesystem holding `path`.
+fn fs_type(path: &Path) -> Result<u64, String> {
+    let stat = rustix::fs::statfs(path)
+        .map_err(|error| format!("statfs {}: {error}", path.display()))?;
+    // `f_type` is a signed word on some targets; the magic numbers are
+    // positive and fit in 32 bits.
+    #[allow(clippy::cast_sign_loss, clippy::useless_conversion)]
+    let kind = u64::try_from(stat.f_type).unwrap_or(stat.f_type as u64);
+    Ok(kind)
 }
 
 fn crossing(open: bool, measured: u64, turn_on: u64, turn_off: u64, under: bool) -> Crossing {
