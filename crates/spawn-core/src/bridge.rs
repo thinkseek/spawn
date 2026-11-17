@@ -428,6 +428,13 @@ struct Follow {
     /// so the execution is ended (and its workspace unmounted) instead of
     /// retried.
     stale: Option<String>,
+    /// The key ([`failure_key`]) of the commit failure this execution's
+    /// checkpoints are in, while one is (objective 205): a failing commit
+    /// is retried every pass, but logged only when it starts failing or
+    /// fails for another cause, and once more ("commit available again")
+    /// when a commit gets through after it. In memory only: a restarted
+    /// loop logs a failure that is still there once more.
+    commit_failed: Option<String>,
     /// The engine's version, once read from this execution's transcript
     /// and recorded.
     version: Option<String>,
@@ -2450,7 +2457,11 @@ impl Bridge {
     /// Commit the workspace and record a new commit. Returns whether the
     /// workspace's state is now on its branch, or kept off it by a store
     /// that answered [`WORKSPACE_STALE`] (`follow.stale` then holds why and the
-    /// execution ends); false: the commit failed and was reported.
+    /// execution ends); false: the commit failed, and was reported if it
+    /// started failing or failed for another cause ([`failure_key`]). A
+    /// branch the store made again from the workspace ([`Commit::Recreated`])
+    /// is logged once and recorded before the checkpoint
+    /// ([`Self::record_recreated`]).
     fn checkpoint(
         &self,
         agent_id: &AgentId,
@@ -2460,26 +2471,31 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         let message = format!("spawn checkpoint {}", active.execution_id);
-        match self.workspaces.commit(&active.workspace, &message) {
+        let outcome = self.workspaces.commit(&active.workspace, &message);
+        if outcome.is_ok() && active.follow.commit_failed.take().is_some() {
+            report
+                .notes
+                .push(format!("{session}: commit available again"));
+        }
+        match outcome {
             Ok(Commit::Unchanged) => {}
             Ok(Commit::Created(commit)) => {
-                let artifact = ArtifactRef {
-                    project: self.workspaces.project().to_string(),
-                    branch: BranchName::for_agent(agent_id),
-                    commit,
-                };
-                self.record_commit(
-                    agent_id,
-                    session,
-                    Some(&active.execution_id),
-                    Source::Bridge,
-                    Some(format!("commit:{}", artifact.commit)),
-                    EventKind::ArtifactCommitted {
-                        reason,
-                        artifact,
-                        files: Vec::new(),
-                    },
-                )?;
+                self.record_checkpoint(agent_id, session, active, reason, commit)?;
+            }
+            Ok(Commit::Recreated { commit, parent }) => {
+                let branch = BranchName::for_agent(agent_id);
+                report.warnings.push(match &parent {
+                    Some(parent) => format!(
+                        "{session}: branch {branch} was gone from its store; made again at \
+                         {commit} from the workspace, on {parent}"
+                    ),
+                    None => format!(
+                        "{session}: branch {branch} was gone from its store; made again at \
+                         {commit} from the workspace, with no parent (the store has no main)"
+                    ),
+                });
+                self.record_recreated(agent_id, session, active, &commit, parent);
+                self.record_checkpoint(agent_id, session, active, reason, commit)?;
             }
             // The store kept the workspace's state off its branch: an
             // unmount loses nothing, and the execution ends.
@@ -2491,14 +2507,17 @@ impl Bridge {
                 }
                 active.follow.stale = Some(message);
             }
-            Err(WorkspaceError::Refused { code, message }) => {
-                report
-                    .warnings
-                    .push(format!("commit refused {code}: {message}"));
-                return Ok(false);
-            }
-            Err(WorkspaceError::Unavailable(text)) => {
-                report.warnings.push(format!("commit unavailable: {text}"));
+            Err(error) => {
+                let key = failure_key(&error);
+                if active.follow.commit_failed.as_deref() != Some(key.as_str()) {
+                    report.warnings.push(match &error {
+                        WorkspaceError::Refused { code, message } => {
+                            format!("commit refused {code}: {message}")
+                        }
+                        WorkspaceError::Unavailable(text) => format!("commit unavailable: {text}"),
+                    });
+                }
+                active.follow.commit_failed = Some(key);
                 return Ok(false);
             }
         }
@@ -2516,6 +2535,76 @@ impl Bridge {
             }
         }
         Ok(true)
+    }
+
+    /// Record the checkpoint `commit` of the active execution
+    /// (`artifact.committed`, [`Self::record_commit`]).
+    fn record_checkpoint(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        reason: CheckpointReason,
+        commit: CommitId,
+    ) -> Result<(), StoreError> {
+        let artifact = ArtifactRef {
+            project: self.workspaces.project().to_string(),
+            branch: BranchName::for_agent(agent_id),
+            commit,
+        };
+        self.record_commit(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("commit:{}", artifact.commit)),
+            EventKind::ArtifactCommitted {
+                reason,
+                artifact,
+                files: Vec::new(),
+            },
+        )
+    }
+
+    /// Queue the `artifact.branch_recreated` of a branch the store made
+    /// again at `commit` (objective 205): the branch already moved, so it
+    /// waits with the session's commit records ([`Self::queue_commit`]), and
+    /// the checkpoint's own `artifact.committed`, recorded next, appends
+    /// both in order. A log down at the first append loses neither: the
+    /// next pass appends both. Keyed `recreated:<id>`, so a second append
+    /// of one that did land is a no-op.
+    fn record_recreated(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        commit: &CommitId,
+        parent: Option<CommitId>,
+    ) {
+        self.queue_commit(NewEvent {
+            agent_id: agent_id.clone(),
+            session_id: session.clone(),
+            execution_id: Some(active.execution_id.clone()),
+            source: Source::Bridge,
+            source_event_id: Some(format!("recreated:{commit}")),
+            kind: EventKind::ArtifactBranchRecreated {
+                artifact: ArtifactRef {
+                    project: self.workspaces.project().to_string(),
+                    branch: BranchName::for_agent(agent_id),
+                    commit: commit.clone(),
+                },
+                parent,
+            },
+        });
+    }
+
+    /// Put `event` behind the session's waiting commit records, without
+    /// appending it yet ([`Self::record_unrecorded_commit`] appends them).
+    fn queue_commit(&self, event: NewEvent) {
+        self.unrecorded_commits_lock()
+            .entry(event.session_id.clone())
+            .or_default()
+            .push(event);
     }
 
     fn append(
@@ -2561,10 +2650,7 @@ impl Bridge {
             source_event_id: key,
             kind,
         };
-        self.unrecorded_commits_lock()
-            .entry(session.clone())
-            .or_default()
-            .push(event.clone());
+        self.queue_commit(event);
         self.record_unrecorded_commit(session)
     }
 
