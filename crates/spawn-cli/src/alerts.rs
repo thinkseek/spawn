@@ -131,7 +131,11 @@
 //!   the filesystem holding `SPAWN_ALERT_TMPFS_PATH` (default `/tmp`) over
 //!   `SPAWN_ALERT_TMPFS_HIGH_MB` (default 8000); clears under
 //!   `SPAWN_ALERT_TMPFS_OK_MB` (default 6000). A threshold of 0 disables its
-//!   check.
+//!   check. Only a tmpfs is read (objective 215): on a path whose
+//!   filesystem is not one (a `/tmp` on the root disk, whose "used" is the
+//!   whole disk's) nothing fires, and an open one clears with `{path,
+//!   not_tmpfs: true, fs_type: "0x<hex>", reading_ms}`; free disk is
+//!   `disk_low`'s. A path statfs cannot read is a line in the loop's log.
 //! - `disk_low`, `host`, key `disk_low:<reading ms>` (objective 204): the
 //!   free space of the filesystem holding the workspace root
 //!   (`SPAWN_WORKSPACE_ROOT`, the Core lines' free disk) under
@@ -3685,12 +3689,48 @@ times in a row)",
         }
     }
 
+    /// The tmpfs at `SPAWN_ALERT_TMPFS_PATH` (`tmpfs_high`): read only when
+    /// the path's filesystem is a tmpfs (objective 215); a statfs that fails
+    /// is a line in the loop's log.
     fn read_tmpfs(&mut self, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
         if self.settings.tmpfs_high_mb == 0 {
             return;
         }
         let path = self.settings.tmpfs_path.clone();
-        let measured = match used_mb(&path) {
+        match fs_type(&path) {
+            Ok(kind) => self.tmpfs_reading(now, &path, kind, || used_mb(&path), out, lines),
+            Err(error) => lines.push(format!("alerts: {error}")),
+        }
+    }
+
+    /// One reading of the filesystem of type `kind` at `path`, its used MiB
+    /// from `measure` (df) when it is a tmpfs. A filesystem that is not a
+    /// tmpfs (a `/tmp` on the root disk, whose "used" is the whole disk's)
+    /// has no reading of a tmpfs: nothing fires, and an open `tmpfs_high`
+    /// clears, naming the type. Free disk is `disk_low`'s (objective 204).
+    fn tmpfs_reading(
+        &mut self,
+        now: i64,
+        path: &Path,
+        kind: u64,
+        measure: impl FnOnce() -> Result<u64, String>,
+        out: &mut Vec<Event>,
+        lines: &mut Vec<String>,
+    ) {
+        if kind != TMPFS_MAGIC {
+            for key in self.open_keys("tmpfs_high", "host") {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({
+                        "path": path.display().to_string(), "not_tmpfs": true,
+                        "fs_type": format!("{kind:#x}"), "reading_ms": now,
+                    }),
+                });
+            }
+            return;
+        }
+        let path = path.to_path_buf();
+        let measured = match measure() {
             Ok(measured) => measured,
             Err(error) => {
                 lines.push(format!("alerts: {error}"));
@@ -4327,6 +4367,23 @@ fn names(list: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect()
+}
+
+/// The statfs type of a tmpfs (`TMPFS_MAGIC`, linux/magic.h).
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+
+/// The statfs type of the filesystem holding `path`.
+fn fs_type(path: &Path) -> Result<u64, String> {
+    let stat =
+        rustix::fs::statfs(path).map_err(|error| format!("statfs {}: {error}", path.display()))?;
+    // `f_type` is a signed word here; the magic numbers are positive.
+    u64::try_from(stat.f_type).map_err(|_| {
+        format!(
+            "statfs {}: type {} is not a magic number",
+            path.display(),
+            stat.f_type
+        )
+    })
 }
 
 fn crossing(open: bool, measured: u64, turn_on: u64, turn_off: u64, under: bool) -> Crossing {
@@ -7298,6 +7355,77 @@ mod tests {
             crossing(false, 4000, 100_000_000, 100_000_000, false),
             Crossing::Nothing
         );
+    }
+
+    /// Objective 215 (GitHub #66): `tmpfs_high` reads a tmpfs alone. On a
+    /// tmpfs it fires over its threshold and clears under its margin as
+    /// before; on a filesystem that is not a tmpfs nothing is measured,
+    /// nothing fires, and an open one clears naming the type; the real
+    /// paths read their own type.
+    #[test]
+    fn tmpfs_high_reads_a_tmpfs_alone_and_clears_on_a_path_that_is_not_one() {
+        const EXT4: u64 = 0xef53;
+        let path = Path::new("/tmp");
+        let mut monitor = monitor();
+        let step = |monitor: &mut Monitor, now: i64, kind: u64, used: u64| {
+            let (mut out, mut lines) = (Vec::new(), Vec::new());
+            monitor.tmpfs_reading(now, path, kind, || Ok(used), &mut out, &mut lines);
+            let events = decided(monitor, out);
+            commit(monitor, &events);
+            (events, lines)
+        };
+        // A tmpfs over its threshold: one alert, as before.
+        let (fired, _) = step(&mut monitor, 1, super::TMPFS_MAGIC, 9000);
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        let Event::Fire {
+            key,
+            kind,
+            evidence,
+            text,
+            ..
+        } = &fired[0]
+        else {
+            panic!("a fire: {fired:?}");
+        };
+        assert_eq!((key.as_str(), *kind), ("tmpfs_high:1", "tmpfs_high"));
+        assert_eq!(evidence["measured_mb"], 9000);
+        assert_eq!(text, "/tmp holds 9000 MiB, over 8000");
+        // The same path read as the root disk: it clears, naming the type,
+        // and nothing is measured.
+        let (mut out, mut lines) = (Vec::new(), Vec::new());
+        monitor.tmpfs_reading(
+            2,
+            path,
+            EXT4,
+            || panic!("a disk that is not a tmpfs is not measured"),
+            &mut out,
+            &mut lines,
+        );
+        let cleared = decided(&monitor, out);
+        assert_eq!(
+            cleared,
+            [Event::Clear {
+                key: "tmpfs_high:1".to_string(),
+                evidence: json!({"path": "/tmp", "not_tmpfs": true, "fs_type": "0xef53",
+                                 "reading_ms": 2}),
+            }]
+        );
+        assert!(lines.is_empty());
+        commit(&mut monitor, &cleared);
+        // However full it is, nothing fires on it.
+        let (none, _) = step(&mut monitor, 3, EXT4, 61_053);
+        assert!(none.is_empty(), "{none:?}");
+        // A tmpfs under its margin with an alert open: cleared as before.
+        step(&mut monitor, 4, super::TMPFS_MAGIC, 9000);
+        let (cleared, _) = step(&mut monitor, 5, super::TMPFS_MAGIC, 5000);
+        assert!(
+            matches!(&cleared[..], [Event::Clear { evidence, .. }] if evidence["measured_mb"] == 5000),
+            "{cleared:?}"
+        );
+        // The real type: /proc is no tmpfs; a missing path is a line.
+        assert_ne!(super::fs_type(Path::new("/proc")), Ok(super::TMPFS_MAGIC));
+        let missing = super::fs_type(Path::new("/no/such/path/215"));
+        assert!(missing.is_err_and(|error| error.contains("statfs /no/such/path/215")));
     }
 
     /// Objective 204: free disk under its threshold fires one `disk_low`
