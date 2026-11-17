@@ -816,7 +816,7 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// whatever their kind; no other row carries `retired`). `$1` mission.
 pub(crate) const OBJECTIVE_LANDINGS: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric', x.metric)
-                          || case when x.retired then '{"retired": true}'::jsonb
+                          || case when x.retired then jsonb_build_object('retired', true)
                                   else '{}'::jsonb end
                           order by x.at_ms desc, x.id desc), '[]'::jsonb)
   from (
