@@ -1018,6 +1018,22 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
+    thread_local! {
+        /// What [`before_store_commit`] runs on this thread, once: a test's
+        /// step between the routed commit's start and the store's lock.
+        static BEFORE_STORE: std::cell::RefCell<Option<Box<dyn FnOnce(&str)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The pause [`super::commit_routed`] makes right before the store
+    /// (R6): a test deletes the branch there, as another writer could
+    /// between a pass's first look and the store's lock.
+    pub(super) fn before_store_commit(agent: &str) {
+        if let Some(step) = BEFORE_STORE.with(|step| step.borrow_mut().take()) {
+            step(agent);
+        }
+    }
+
     /// One host's checkpoint of `agent` in its mirror: a new file.
     fn checkpoint(store: &GitWorkspace, agent: &str, file: &str) -> String {
         let branch = BranchName::new(agent).expect("valid branch");
