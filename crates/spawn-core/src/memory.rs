@@ -359,8 +359,9 @@ impl MemoryStore {
         self.lock().stale = stale;
     }
 
-    /// Make the next append of an `artifact.committed` or `merge.conflicted`
-    /// event fail, as a log that is down would. Test helper.
+    /// Make the next append of an `artifact.committed`,
+    /// `artifact.branch_recreated` or `merge.conflicted` event fail, as a log
+    /// that is down would. Test helper.
     pub fn fail_next_branch_record(&self) {
         self.lock().branch_record_fails = true;
     }
@@ -413,7 +414,9 @@ impl EventLog for MemoryStore {
         let mut state = self.lock();
         let branch_record = matches!(
             event.kind,
-            EventKind::ArtifactCommitted { .. } | EventKind::MergeConflicted { .. }
+            EventKind::ArtifactCommitted { .. }
+                | EventKind::ArtifactBranchRecreated { .. }
+                | EventKind::MergeConflicted { .. }
         );
         if state.branch_record_fails && branch_record {
             state.branch_record_fails = false;
