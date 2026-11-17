@@ -1499,8 +1499,14 @@ fn a_commit_failure_is_reported_once_per_cause() {
         logged.extend(commit_failures(&report));
     }
     assert_eq!(logged.len(), 2, "one line per cause: {logged:?}");
-    assert!(logged[0].starts_with("commit unavailable: git add -A"), "{logged:?}");
-    assert!(logged[1].starts_with("commit refused Locked: update-ref"), "{logged:?}");
+    assert!(
+        logged[0].starts_with("commit unavailable: git add -A"),
+        "{logged:?}"
+    );
+    assert!(
+        logged[1].starts_with("commit refused Locked: update-ref"),
+        "{logged:?}"
+    );
     store.fail_commits_saying(None);
     let report = bridge.tick().expect("through");
     assert!(commit_failures(&report).is_empty());
@@ -1607,7 +1613,11 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
     assert_eq!(
         made,
         [
-            ("artifact.branch_recreated", head.clone(), Some(base.clone())),
+            (
+                "artifact.branch_recreated",
+                head.clone(),
+                Some(base.clone())
+            ),
             ("artifact.committed", head.clone(), None),
         ],
         "made again, then the checkpoint"
@@ -1625,7 +1635,8 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
         .collect();
     assert_eq!(lines.len(), 1, "{:?}", report.warnings);
     assert!(
-        lines[0].starts_with("session_one: branch agent_one was gone from its store; made again at ")
+        lines[0]
+            .starts_with("session_one: branch agent_one was gone from its store; made again at ")
             && lines[0].ends_with(&format!("from the workspace, on {base}")),
         "{}",
         lines[0]

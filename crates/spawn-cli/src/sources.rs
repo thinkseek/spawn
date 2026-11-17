@@ -749,15 +749,22 @@ pub(crate) fn restore_published(
             ))
         })
     })
-    .and_then(|head| {
-        match git(&["--git-dir", &path, "update-ref", &branch, &head, ""]) {
+    .and_then(
+        |head| match git(&["--git-dir", &path, "update-ref", &branch, &head, ""]) {
             Ok(_) => Ok(Some(head)),
             Err(error) => {
-                let there = git(&["--git-dir", &path, "rev-parse", "--verify", "--quiet", &branch]);
+                let there = git(&[
+                    "--git-dir",
+                    &path,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &branch,
+                ]);
                 if there.is_ok() { Ok(None) } else { Err(error) }
             }
-        }
-    });
+        },
+    );
     let _ = git(&["--git-dir", &path, "update-ref", "-d", &private]);
     restored
 }
@@ -798,7 +805,9 @@ fn commit_routed(
                 error_text(&error)
             ))
         })?;
-        *taken.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = head;
+        *taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = head;
         Ok(())
     };
     #[cfg(test)]
@@ -1853,8 +1862,14 @@ mod tests {
     }
 
     fn delete_ref(repo: &Path, reference: &str) {
-        git(&["--git-dir", &repo.to_string_lossy(), "update-ref", "-d", reference])
-            .expect("delete the ref");
+        git(&[
+            "--git-dir",
+            &repo.to_string_lossy(),
+            "update-ref",
+            "-d",
+            reference,
+        ])
+        .expect("delete the ref");
     }
 
     /// Objective 205: a branch gone from a mission's mirror is taken back
@@ -1996,7 +2011,10 @@ mod tests {
         };
         assert_eq!(parent.as_ref().map(CommitId::as_str), Some(pushed.as_str()));
         assert_eq!(rev(&mirror, &format!("{commit}^")), Some(pushed));
-        assert_eq!(rev(&mirror, "refs/heads/agent_x"), Some(commit.as_str().to_string()));
+        assert_eq!(
+            rev(&mirror, "refs/heads/agent_x"),
+            Some(commit.as_str().to_string())
+        );
         host.unmount(&workspace).expect("unmount");
         let _ = std::fs::remove_dir_all(&base);
     }

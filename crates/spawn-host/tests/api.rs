@@ -901,10 +901,17 @@ fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace
     else {
         panic!("the branch is made again");
     };
-    assert_eq!(parent.as_ref().map(|parent| parent.as_str()), Some(main.as_str()));
+    assert_eq!(
+        parent.as_ref().map(|parent| parent.as_str()),
+        Some(main.as_str())
+    );
     assert_eq!(git_out(&repo, &["rev-parse", &reference]), commit.as_str());
     assert_eq!(parents(&repo, commit.as_str()), [main.clone()]);
-    for (file, text) in [("README.md", "base"), ("one.txt", "one"), ("two.txt", "two")] {
+    for (file, text) in [
+        ("README.md", "base"),
+        ("one.txt", "one"),
+        ("two.txt", "two"),
+    ] {
         assert_eq!(
             git_out(&repo, &["show", &format!("{commit}:{file}")]),
             text,
@@ -918,7 +925,10 @@ fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace
         panic!("an ordinary checkpoint");
     };
     assert_eq!(parents(&repo, next.as_str()), [commit.as_str().to_string()]);
-    assert_eq!(store.commit(&workspace, "same").expect("commit"), Commit::Unchanged);
+    assert_eq!(
+        store.commit(&workspace, "same").expect("commit"),
+        Commit::Unchanged
+    );
 
     // No main: a commit with no parent, holding the workspace's files.
     git_out(&repo, &["update-ref", "-d", &reference]);
@@ -930,7 +940,11 @@ fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace
     };
     assert_eq!(parent, None);
     assert!(parents(&repo, commit.as_str()).is_empty());
-    for (file, text) in [("one.txt", "one"), ("two.txt", "two"), ("three.txt", "three")] {
+    for (file, text) in [
+        ("one.txt", "one"),
+        ("two.txt", "two"),
+        ("three.txt", "three"),
+    ] {
         assert_eq!(
             git_out(&repo, &["show", &format!("{commit}:{file}")]),
             text,
@@ -963,7 +977,10 @@ fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace
     fs::write(directory.join("four.txt"), "four\n").expect("write");
     let refused = store.commit(&workspace, "four");
     assert!(refused.is_err(), "{refused:?}");
-    assert_eq!(fs::read_to_string(&loose).expect("the ref"), format!("{blob}\n"));
+    assert_eq!(
+        fs::read_to_string(&loose).expect("the ref"),
+        format!("{blob}\n")
+    );
     store.unmount(&workspace).expect("unmount");
 }
 
@@ -1010,7 +1027,10 @@ fn a_take_back_is_asked_under_the_lock_only_when_the_branch_is_gone() {
         "{failed:?}"
     );
     assert_eq!(asked.get(), 1);
-    assert_eq!(git_out(&repo, &["rev-parse", "--verify", "--quiet", &reference]), "");
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "--verify", "--quiet", &reference]),
+        ""
+    );
 
     // Gone, and the take-back makes it: the commit goes on what it made.
     let commit = store
@@ -1024,7 +1044,13 @@ fn a_take_back_is_asked_under_the_lock_only_when_the_branch_is_gone() {
     let Commit::Created(on_it) = commit else {
         panic!("an ordinary commit on what the take-back made: {commit:?}");
     };
-    assert_eq!(parents(&repo, on_it.as_str()), [published.as_str().to_string()]);
-    assert_eq!(git_out(&repo, &["show", &format!("{on_it}:two.txt")]), "two");
+    assert_eq!(
+        parents(&repo, on_it.as_str()),
+        [published.as_str().to_string()]
+    );
+    assert_eq!(
+        git_out(&repo, &["show", &format!("{on_it}:two.txt")]),
+        "two"
+    );
     store.unmount(&workspace).expect("unmount");
 }
