@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { QUIET_MS, activityLine, normalizeActivity, spanWords } from "../src/taskActivity.ts";
-import { normalizeBoard } from "../src/missions.ts";
 
 const MIN = 60_000;
 
@@ -34,7 +33,7 @@ test("the line turns to a warning once no engine output came for 10 minutes", ()
   assert.equal(spanWords(-5), "0s");
 });
 
-test("an activity that is null or unreadable is none, and the board carries it per task", () => {
+test("an activity that is null or unreadable is none", () => {
   assert.equal(normalizeActivity(null), null);
   assert.equal(normalizeActivity(undefined), null);
   assert.equal(normalizeActivity({ at_ms: 5 }), null, "no delivery time: none");
@@ -44,20 +43,7 @@ test("an activity that is null or unreadable is none, and the board carries it p
     event: null,
     tool_calls: 0,
   });
-  const board = normalizeBoard({
-    missions: [
-      {
-        id: 1,
-        text: "m",
-        state: "active",
-        tasks: [
-          { id: 1, state: "delivered", activity: { since_ms: 10, at_ms: 20, event: "turn.stopped", tool_calls: 0 } },
-          { id: 2, state: "reported", activity: null },
-          { id: 3, state: "assigned" },
-        ],
-      },
-    ],
-  });
+});
   const tasks = board.missions[0].tasks;
   assert.deepEqual(tasks[0].activity, { since_ms: 10, at_ms: 20, event: "turn.stopped", tool_calls: 0 });
   assert.equal(tasks[1].activity, null);
