@@ -1304,7 +1304,17 @@ A message's id is its command's id, carried end to end:
   line's uuid and the id (`<uuid>:taken:<id>`), so a line read again after
   any restart records nothing, a line with two markers takes both, and an
   engine that wrote its line twice took it twice. The `message.received`
-  the line is stays as it was.
+  the line is stays as it was. An input typed while the agent works is
+  given to it at its next step, and Claude Code writes it only as an
+  `attachment` line of type `queued_command` with `commandMode` `prompt`
+  (objective 214, GitHub #66): that line takes its markers the same way
+  (`<uuid>:taken:<id>`) and starts no turn (no `message.received`).
+  Without it, every input to a busy worker raised `message_not_taken`
+  and kept it open until the session ended. A `queued_command` of any
+  other mode (a background job's notification) is the engine's own text:
+  it ends its jobs and takes nothing, whatever it quotes. The clear rule
+  stays the marker, never transcript lines after the typing, which can be
+  the agent's own output.
 - **The lifecycle, from records only.** `GET /api/fleet/<session>/commands`
   gives each command a `message` (`spawn_command_message` in the schema),
   null for a command that types nothing: `{state, typed_at_ms, taken_at_ms,
