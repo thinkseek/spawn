@@ -408,6 +408,13 @@ elif [ "$(fstype /dev/shm)" = tmpfs ] && [ -w /dev/shm ]; then
     ram=$ram_outside
 fi
 host_kinds="memory_low tmpfs_high"
+# Which of the three (6) takes, always said: the skip must never be the
+# gate's quiet normal (the lead's condition, 23:5x).
+if [ "$ram" = "$WORK/ram" ]; then
+    echo "j12: [030 (6)] tmpfs_high reads WORK/ram (WORK is a tmpfs)"
+elif [ -n "$ram" ]; then
+    echo "j12: [030 (6)] tmpfs_high reads $ram (WORK is $(fstype "$WORK"), /dev/shm is a tmpfs)"
+fi
 if [ -z "$ram" ]; then
     mkdir -p "$WORK/ram"
     host_kinds="memory_low"
