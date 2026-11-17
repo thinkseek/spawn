@@ -44,4 +44,3 @@ test("an activity that is null or unreadable is none", () => {
     tool_calls: 0,
   });
 });
-});
