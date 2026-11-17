@@ -44,8 +44,4 @@ test("an activity that is null or unreadable is none", () => {
     tool_calls: 0,
   });
 });
-  const tasks = board.missions[0].tasks;
-  assert.deepEqual(tasks[0].activity, { since_ms: 10, at_ms: 20, event: "turn.stopped", tool_calls: 0 });
-  assert.equal(tasks[1].activity, null);
-  assert.equal(tasks[2].activity, null);
 });
