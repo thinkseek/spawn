@@ -14,14 +14,6 @@
 # first to go and never take a FAILED line's place. The integrator reads
 # only the FAILED lines (integrate/host.rs check_tests_failures).
 #
-# The lines come from scripts/rsi/failed-tests.awk (objective 208 (d)): a
-# FAILED line's message is the panic's own, and a Python-backed test's names
-# its first failing Python test and its error. The run is --no-fail-fast, so
-# each run names every failing test, not only those in the first test binary
-# that failed: the gate compares the tests two runs failed (gate.sh, the
-# shared failing test it needs before it goes to the base, objective 208
-# (b)).
-#
 # A run whose tests all pass leaves nothing behind (objectives 54 and 55,
 # whose scenarios this folds). The tests are built first, outside what is
 # judged (below), so the toolchain's own writes are not counted:
@@ -105,8 +97,19 @@ if ! cargo test --quiet --workspace --no-run >"$log" 2>&1; then
     exit 1
 fi
 if ! SPAWN_TEST_DATABASE_URL="$server_url/$db${pg_url_query:+?$pg_url_query}" TMPDIR="$scratch" \
-    cargo test --quiet --workspace --no-fail-fast >"$log" 2>&1; then
-    awk -f "$controller/scripts/rsi/failed-tests.awk" "$log"
+    cargo test --quiet --workspace >"$log" 2>&1; then
+    awk '
+        function flush() {
+            if (name != "") failed = failed sprintf("FAILED %s: %s%s\n", name, at, msg)
+            name = ""; at = ""; msg = ""
+        }
+        /^---- .* stdout ----$/ { flush(); name = $2; next }
+        /^(failures:|test result:)/ { flush(); next }
+        name != "" && at == "" && /panicked at/ { sub(/^thread .* panicked at /, ""); at = $0 " "; next }
+        name != "" && msg == "" && NF { msg = substr($0, 1, 200); next }
+        name != "" && /^(FAIL|ERROR): |Error: |Error\(/ && kept[name]++ < 5 { printf "  in %s: %s\n", name, substr($0, 1, 200) }
+        END { flush(); printf "%s", failed }
+    ' "$log"
     grep -E 'FAILED|panicked|^error' -A5 "$log" | head -n 40
     exit 1
 fi
