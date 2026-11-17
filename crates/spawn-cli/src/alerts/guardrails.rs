@@ -1553,14 +1553,14 @@ mod tests {
     #[test]
     fn a_restarted_loop_raises_at_the_hold_its_samples_began_not_a_hold_after_the_restart() {
         let start = 100 * H;
-        let mut monitor = monitor();
+        let mut seeded = monitor();
         let out = samples(&[(start - 2 * H, Some(IN)), (start - H, Some(OUT))]);
-        assert_eq!(step(&mut monitor, start, first(out)), Vec::<String>::new());
+        assert_eq!(step(&mut seeded, start, first(out)), Vec::<String>::new());
         assert_eq!(
-            step(&mut monitor, start + H - 1, answer("out", &json!(OUT))),
+            step(&mut seeded, start + H - 1, answer("out", &json!(OUT))),
             Vec::<String>::new()
         );
-        let (events, _) = read(&mut monitor, start + H, Ok(answer("out", &json!(OUT))));
+        let (events, _) = read(&mut seeded, start + H, Ok(answer("out", &json!(OUT))));
         let fired = fires(&events);
         assert_eq!(fired.len(), 1, "{events:?}");
         assert_eq!(fired[0].0, key_at(start - H));
@@ -1651,13 +1651,13 @@ mod tests {
     fn a_judged_stretch_still_out_after_a_restart_is_not_raised_again() {
         let start = 100 * H;
         // Seed, fire, judge false.
-        let mut monitor = monitor();
+        let mut first_loop = monitor();
         step(
-            &mut monitor,
+            &mut first_loop,
             start,
             first(samples(&[(start - H, Some(OUT))])),
         );
-        let fired = step(&mut monitor, start + H, answer("out", &json!(OUT)));
+        let fired = step(&mut first_loop, start + H, answer("out", &json!(OUT)));
         assert_eq!(fired, [key_at(start - H)]);
         let judged = rows(&fired[0], start - H, &json!({"judged": "false"}));
 
