@@ -1599,7 +1599,25 @@ fn bucket_request(settings: &Settings, url: &str, options: &str) -> Result<Respo
     let scratch = Scratch::new("curl")?;
     let body_file = scratch.join("body");
     let headers_file = scratch.join("headers");
-    let secret = curl_config(settings, url, options, &body_file, &headers_file);
+    let status = run_curl(settings, url, options, &body_file, &headers_file)?;
+    Ok(Response {
+        status,
+        body: fs::read(&body_file).unwrap_or_default(),
+        headers: fs::read_to_string(&headers_file).unwrap_or_default(),
+    })
+}
+
+/// One curl run for `url` with the signed config on its stdin (never on its
+/// command line), the body to `body_file` and the headers to `headers_file`:
+/// the HTTP status, or curl's own error (its exit and message).
+fn run_curl(
+    settings: &Settings,
+    url: &str,
+    options: &str,
+    body_file: &Path,
+    headers_file: &Path,
+) -> Result<u16, String> {
+    let secret = curl_config(settings, url, options, body_file, headers_file);
     let mut command = Command::new("curl");
     command
         .arg("--config")
@@ -1618,20 +1636,19 @@ fn bucket_request(settings: &Settings, url: &str, options: &str) -> Result<Respo
         .map_err(|error| format!("curl: {error}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("curl: {}", stderr.trim()));
+        return Err(format!(
+            "curl: exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let status = stdout
+    stdout
         .trim()
         .lines()
         .last()
         .and_then(|line| line.trim().parse::<u16>().ok())
-        .ok_or_else(|| format!("curl: no status in its output ({})", stdout.trim()))?;
-    Ok(Response {
-        status,
-        body: fs::read(&body_file).unwrap_or_default(),
-        headers: fs::read_to_string(&headers_file).unwrap_or_default(),
-    })
+        .ok_or_else(|| format!("curl: no status in its output ({})", stdout.trim()))
 }
 
 fn escape_config(text: &str) -> String {
@@ -3104,14 +3121,149 @@ fn restore_and_compare(
     }
 }
 
+/// Attempts of one whole-object GET before it fails (t494u).
+const GET_ATTEMPTS: u32 = 6;
+/// A transfer slower than this many bytes a second for [`GET_STALL_SECS`]
+/// is cut and resumed, not waited out.
+const GET_STALL_BYTES: u64 = 4096;
+const GET_STALL_SECS: u64 = 60;
+/// The per-attempt time cap is a backstop only: 600 s plus the bytes still
+/// to come at this rate.
+const GET_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
+
 /// The object's bytes, as they are (not through a String), and its headers.
+///
+/// Robust to a slow or cut transfer (t494u: the controllers drill of 11-17
+/// 16:31 lost a 146 MB bundle to one 600 s attempt at ~155 KB/s): the body
+/// goes to a scratch file, and each attempt resumes from the bytes already
+/// there (`continue-at`, an HTTP Range), cuts a stalled transfer
+/// ([`GET_STALL_BYTES`] for [`GET_STALL_SECS`]) instead of waiting for a
+/// fixed cap, and has a cap that grows with the bytes still to come
+/// ([`get_options`]). Up to [`GET_ATTEMPTS`] attempts, apart by
+/// [`get_pause_secs`]. It returns only a body whose length is the object's
+/// (Content-Range or Content-Length) and, when the ETag is a plain MD5 (one
+/// PUT), whose MD5 is the ETag; callers still check the
+/// `x-amz-meta-sha256` and, after decryption, the record's sha256.
 fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, String)>, String> {
-    let response = bucket_request(settings, &settings.r2.url(key), "")?;
-    match response.status {
-        200 => Ok(Some((response.body, response.headers))),
-        404 => Ok(None),
-        status => Err(format!("GET {key} answered {status}")),
+    let url = settings.r2.url(key);
+    let scratch = Scratch::new("get")?;
+    let body = scratch.join("body");
+    let headers_file = scratch.join("headers");
+    let mut total: Option<u64> = None;
+    let mut headers = String::new();
+    let mut errors: Vec<String> = Vec::new();
+    for attempt in 0..GET_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(get_pause_secs(attempt)));
+        }
+        let have = fs::metadata(&body).map_or(0, |meta| meta.len());
+        if total.is_some_and(|total| have == total) {
+            break;
+        }
+        let options = get_options(have, total.map(|total| total.saturating_sub(have)));
+        match run_curl(settings, &url, &options, &body, &headers_file) {
+            Ok(status) => {
+                let these = fs::read_to_string(&headers_file).unwrap_or_default();
+                match status {
+                    404 => return Ok(None),
+                    200 | 206 => {
+                        if let Some(length) = object_length(status, &these) {
+                            total = Some(length);
+                        }
+                        headers = these;
+                    }
+                    // Asked from the end of a body already whole.
+                    416 if total.is_some_and(|total| have == total) => break,
+                    status => return Err(format!("GET {key} answered {status}")),
+                }
+            }
+            Err(error) => {
+                // curl 33: the server ignored the Range; start again whole.
+                if error.contains("exit 33:") {
+                    let _ = fs::remove_file(&body);
+                }
+                errors.push(format!("attempt {}: {error}", attempt + 1));
+            }
+        }
+        let have = fs::metadata(&body).map_or(0, |meta| meta.len());
+        if total.is_some_and(|total| have == total) {
+            break;
+        }
     }
+    let have = fs::metadata(&body).map_or(0, |meta| meta.len());
+    let Some(total) = total.filter(|total| *total == have) else {
+        return Err(format!(
+            "GET {key}: {have} of {} bytes after {GET_ATTEMPTS} attempts ({})",
+            total.map_or_else(
+                || "an unknown number of".to_string(),
+                |total| total.to_string()
+            ),
+            errors.join("; ")
+        ));
+    };
+    let etag = header_value(&headers, "etag")
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    if is_plain_md5(&etag) {
+        let found = md5_file(&body)?;
+        if found != etag {
+            return Err(format!(
+                "GET {key}: the {total} bytes have MD5 {found}, not the ETag {etag}"
+            ));
+        }
+    }
+    let bytes = fs::read(&body).map_err(|error| format!("{}: {error}", body.display()))?;
+    Ok(Some((bytes, headers)))
+}
+
+/// The curl options of one GET attempt: resume after `have` bytes, cut a
+/// stall, and a time cap of 600 s plus the bytes still to come at
+/// [`GET_FLOOR_BYTES_PER_SEC`] (unknown before the first answer: 600 s plus
+/// 256 MiB at that rate). The last `max-time` of a config wins.
+pub(crate) fn get_options(have: u64, remaining: Option<u64>) -> String {
+    let remaining = remaining.unwrap_or(256 * 1024 * 1024);
+    let cap = 600 + remaining / GET_FLOOR_BYTES_PER_SEC;
+    let mut options = format!(
+        "max-time = \"{cap}\"\nspeed-limit = \"{GET_STALL_BYTES}\"\nspeed-time = \"{GET_STALL_SECS}\"\n"
+    );
+    if have > 0 {
+        let _ = writeln!(options, "continue-at = \"{have}\"");
+    }
+    options
+}
+
+/// Seconds before attempt `attempt` (1-based retries): 5, 15, 30, 60, 120.
+pub(crate) fn get_pause_secs(attempt: u32) -> u64 {
+    match attempt {
+        0 => 0,
+        1 => 5,
+        2 => 15,
+        3 => 30,
+        4 => 60,
+        _ => 120,
+    }
+}
+
+/// The whole object's length from one answer: a 206's Content-Range
+/// `bytes a-b/total`, or a 200's Content-Length.
+pub(crate) fn object_length(status: u16, headers: &str) -> Option<u64> {
+    match status {
+        206 => header_value(headers, "content-range")
+            .and_then(|range| {
+                range
+                    .rsplit_once('/')
+                    .map(|(_, total)| total.trim().to_string())
+            })
+            .and_then(|total| total.parse().ok()),
+        200 => header_value(headers, "content-length").and_then(|text| text.parse().ok()),
+        _ => None,
+    }
+}
+
+/// An ETag that is one PUT's MD5 (32 hex), not a multipart one (`…-n`).
+pub(crate) fn is_plain_md5(etag: &str) -> bool {
+    etag.len() == 32 && etag.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn spawn_unix_seconds() -> i64 {
@@ -3340,9 +3492,10 @@ fn record_verified(
 mod tests {
     use super::{
         R2, Settings, Stamp, Tier, bundle_compression, bundle_stamps, copy_events, full_bundle,
-        md5_hex, not_locked_forever, parse_env_file, parse_listing, parse_listing_tagged,
-        parse_pg_url, put_object, read_bundle_records, read_dump_records, server_major, suspect,
-        tiers_for, transcript_offset, window_files, within_limit, without_transaction_timeout,
+        get_options, get_pause_secs, is_plain_md5, md5_hex, not_locked_forever, object_length,
+        parse_env_file, parse_listing, parse_listing_tagged, parse_pg_url, put_object,
+        read_bundle_records, read_dump_records, server_major, suspect, tiers_for,
+        transcript_offset, window_files, within_limit, without_transaction_timeout,
     };
 
     /// `SPAWN_BACKUP_PREFIX` is a bucket prefix and nothing else: unset or
@@ -3972,6 +4125,150 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
 
     /// Objective 136: a made-up bucket's settings, for a config read and
     /// never sent.
+    /// A one-object HTTP stand-in on 127.0.0.1 for the GET tests (t494u):
+    /// `behaviour` decides each request's answer from its index and its
+    /// Range; every request's Range (or "-") is returned through the log.
+    fn serve_object(
+        body: Vec<u8>,
+        etag: String,
+        behaviour: fn(usize, Option<u64>) -> Answer,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::fmt::Write as _;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            for (index, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut range: Option<u64> = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("range")
+                    {
+                        range = value
+                            .trim()
+                            .trim_start_matches("bytes=")
+                            .trim_end_matches('-')
+                            .parse()
+                            .ok();
+                    }
+                }
+                seen.lock()
+                    .expect("log")
+                    .push(range.map_or("-".to_string(), |at| at.to_string()));
+                let total = body.len();
+                let (status, from, send) = match behaviour(index, range) {
+                    Answer::Whole => (200, 0, total),
+                    Answer::WholeCutAt(cut) => (200, 0, cut),
+                    Answer::Ranged => {
+                        let from = usize::try_from(range.unwrap_or(0)).expect("range");
+                        (206, from, total - from)
+                    }
+                };
+                let mut head = format!(
+                    "HTTP/1.1 {status} {}\r\nETag: \"{etag}\"\r\nx-amz-meta-sha256: made-up\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    if status == 206 {
+                        "Partial Content"
+                    } else {
+                        "OK"
+                    },
+                    total - from
+                );
+                if status == 206 {
+                    let _ = write!(
+                        head,
+                        "Content-Range: bytes {from}-{}/{total}\r\n",
+                        total - 1
+                    );
+                }
+                head.push_str("\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body[from..from + send]);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), log)
+    }
+
+    enum Answer {
+        Whole,
+        WholeCutAt(usize),
+        Ranged,
+    }
+
+    fn made_up_object() -> Vec<u8> {
+        (0..300_000u32)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn a_cut_get_resumes_from_its_bytes_and_checks_the_whole() {
+        // The first answer is cut after 100,000 of 300,000 bytes, as the
+        // 16:31 drill's was; the second asks for the rest with a Range.
+        let body = made_up_object();
+        let etag = super::md5_hex(&body);
+        let (endpoint, log) = serve_object(body.clone(), etag, |index, _| {
+            if index == 0 {
+                Answer::WholeCutAt(100_000)
+            } else {
+                Answer::Ranged
+            }
+        });
+        let mut settings = made_up_r2_settings(None);
+        settings.r2.endpoint = endpoint;
+        let (got, headers) = super::get_object_bytes(&settings, "bundles/made-up.tar.zst.gpg")
+            .expect("the GET")
+            .expect("the object");
+        assert_eq!(got, body);
+        assert!(
+            headers.to_ascii_lowercase().contains("x-amz-meta-sha256"),
+            "{headers}"
+        );
+        let requests = log.lock().expect("log").clone();
+        assert_eq!(requests, ["-", "100000"]);
+    }
+
+    #[test]
+    fn a_get_whose_bytes_are_not_its_etag_fails() {
+        let body = made_up_object();
+        let (endpoint, _log) = serve_object(body, "0".repeat(32), |_, _| Answer::Whole);
+        let mut settings = made_up_r2_settings(None);
+        settings.r2.endpoint = endpoint;
+        let error = super::get_object_bytes(&settings, "bundles/made-up.tar.zst.gpg")
+            .expect_err("a wrong MD5");
+        assert!(error.contains("not the ETag"), "{error}");
+    }
+
+    #[test]
+    fn a_server_that_ignores_the_range_gets_the_whole_again() {
+        // A cut, then a 200 to the Range (curl exit 33): the partial body is
+        // dropped and the next attempt takes the whole object.
+        let body = made_up_object();
+        let etag = super::md5_hex(&body);
+        let (endpoint, log) = serve_object(body.clone(), etag, |index, _| match index {
+            0 => Answer::WholeCutAt(50_000),
+            _ => Answer::Whole,
+        });
+        let mut settings = made_up_r2_settings(None);
+        settings.r2.endpoint = endpoint;
+        let (got, _) = super::get_object_bytes(&settings, "bundles/made-up.tar.zst.gpg")
+            .expect("the GET")
+            .expect("the object");
+        assert_eq!(got, body);
+        let requests = log.lock().expect("log").clone();
+        assert_eq!(requests.first().map(String::as_str), Some("-"));
+        assert_eq!(requests.last().map(String::as_str), Some("-"));
+    }
+
     fn made_up_r2_settings(seal: Option<&str>) -> Settings {
         Settings {
             root: "/made-up".into(),
@@ -4188,6 +4485,35 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
 
     /// Objective 167: two bundles in one second (or one millisecond) name
     /// two objects, and the names sort, by byte, as the bundles ran.
+    #[test]
+    fn a_get_resumes_cuts_stalls_and_caps_by_what_is_left() {
+        let first = get_options(0, None);
+        assert!(first.contains("max-time = \"4696\""), "{first}");
+        assert!(first.contains("speed-limit = \"4096\"") && first.contains("speed-time = \"60\""));
+        assert!(!first.contains("continue-at"), "{first}");
+        // 146,466,171 bytes, 92,749,617 already there: resume, cap by the rest.
+        let rest = get_options(92_749_617, Some(146_466_171 - 92_749_617));
+        assert!(rest.contains("continue-at = \"92749617\""), "{rest}");
+        assert!(rest.contains("max-time = \"1419\""), "{rest}");
+        assert_eq!(
+            (1..=5).map(get_pause_secs).collect::<Vec<_>>(),
+            [5, 15, 30, 60, 120]
+        );
+    }
+
+    #[test]
+    fn an_answer_says_the_whole_length() {
+        let range = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 92749617-146466170/146466171\r\nContent-Length: 53716554\r\n";
+        assert_eq!(object_length(206, range), Some(146_466_171));
+        let whole = "HTTP/1.1 200 OK\r\nContent-Length: 146466171\r\n";
+        assert_eq!(object_length(200, whole), Some(146_466_171));
+        assert_eq!(object_length(206, whole), None);
+        assert_eq!(object_length(404, whole), None);
+        assert!(is_plain_md5("0123456789abcdef0123456789abcdef"));
+        assert!(!is_plain_md5("0123456789abcdef0123456789abcdef-3"));
+        assert!(!is_plain_md5(""));
+    }
+
     #[test]
     fn bundles_in_one_second_get_names_that_sort_as_they_ran() {
         use super::bundle_name;
