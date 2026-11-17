@@ -4622,6 +4622,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Objective 210: an objective retired by hand reads as `retired`
+    /// whatever its kind (a recurring one with no value too), its row
+    /// carries the mission's `retired` row of it, every other row carries
+    /// null, and `next_objective` never names it.
+    #[test]
+    fn a_retired_objective_is_retired_and_never_next() {
+        let dir = backlog_dir(
+            "board-retired",
+            &[1, 2, 3],
+            &[(
+                2,
+                r#", "recurring": true, "metric": "m_ms", "target": 1, "direction": "lower""#,
+            )],
+        );
+        let retired = json!([
+            {"objective": 1, "by": "lead", "reason": "renumbered", "caller": "owner", "at_ms": 5},
+            {"objective": 2, "by": "lead", "reason": "parked", "caller": "spawn_supervisor",
+             "at_ms": 6},
+            {"objective": 9, "by": "lead", "reason": "gone", "caller": "owner", "at_ms": 7},
+        ]);
+        let board = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()}, "tasks": [],
+            "retired": retired,
+        }));
+        assert_eq!(board["objectives"][0]["status"], "retired");
+        assert_eq!(board["objectives"][0]["retired"], retired[0]);
+        assert_eq!(board["objectives"][1]["status"], "retired", "recurring");
+        assert_eq!(board["objectives"][1]["retired"]["caller"], "spawn_supervisor");
+        assert_eq!(board["objectives"][2]["status"], "open");
+        assert!(board["objectives"][2]["retired"].is_null());
+        assert_eq!(board["retired"], retired, "the mission keeps its list");
+        assert_eq!(board["next_objective"], json!(3));
+        // With 3 in flight, nothing is next.
+        let busy = with_objectives(json!({
+            "id": 1, "gate": "/g", "objectives": {"backlog": dir.to_str()},
+            "tasks": [task(4, 3, "delivered", 10, None)], "retired": retired,
+        }));
+        assert_eq!(busy["next_objective"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_board_gets_each_tasks_last_gate_and_keeps_its_stages() {
         let stages = json!([{"stage": "assigned", "at_ms": 1},
