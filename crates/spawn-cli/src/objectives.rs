@@ -287,12 +287,18 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
     Ok(tasks)
 }
 
-/// One landed objective task, newest first in a list.
+/// One landed objective task, newest first in a list, or a record that
+/// closes an objective as a landing does: an `objective.solved` (no metric)
+/// or an objective retired by hand (`retired`, objective 210).
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Landing {
     pub(crate) objective: u32,
     #[serde(default)]
     pub(crate) metric: Option<String>,
+    /// The objective was retired by hand (`spawn objective retire`): it is
+    /// closed whatever its kind.
+    #[serde(default)]
+    pub(crate) retired: bool,
 }
 
 /// One gate verdict on an objective's task.
@@ -339,25 +345,35 @@ pub(crate) fn landed_value(task: &Task, landings: &[Landing]) -> Option<f64> {
         .find_map(|landing| candidate_value(landing.metric.as_deref()?, name))
 }
 
-/// Whether an objective is open: a one-shot one with no landing (a landing
-/// or an `objective.solved`: the objective's scenario passed at a base commit
-/// main already holds), or a recurring one whose latest landed metric misses
-/// its target.
+/// Whether an objective is open: never once it is retired by hand (objective
+/// 210: closed whatever its kind, never by a metric it has no value for);
+/// else a one-shot one with no landing (a landing or an `objective.solved`:
+/// the objective's scenario passed at a base commit main already holds), or
+/// a recurring one whose latest landed metric misses its target.
 pub(crate) fn is_open(task: &Task, landings: &[Landing]) -> bool {
-    if task.recurring {
+    if landings
+        .iter()
+        .any(|landing| landing.retired && landing.objective == task.id)
+    {
+        false
+    } else if task.recurring {
         !landed_value(task, landings).is_some_and(|value| task.meets(value))
     } else {
         !landings.iter().any(|landing| landing.objective == task.id)
     }
 }
 
-/// Whether `objective` of `mission` is a one-shot objective: the base-solved
-/// rule (`crate::integrate`'s `solved_on_base`) ends a one-shot objective on
-/// the record; a recurring one stays open until its metric meets its target,
-/// and a scenario passing on the base says nothing about the metric the gate
-/// would land. False when the backlog cannot be read (the old verdict
-/// stands).
-pub(crate) fn one_shot(mission: &Mission, objective: u32) -> bool {
+/// Whether the backlog positively reads `objective` of `mission` as
+/// recurring: the base-solved rule (`crate::integrate`'s `solved_on_base`)
+/// ends every other objective on the record, and a recurring one stays open
+/// until its metric meets its target (a scenario passing on the base says
+/// nothing about the metric the gate would land). False when the mission
+/// names no backlog, the backlog cannot be read (a malformed file), or it
+/// does not hold the objective (renumbered or removed, objective 210): a
+/// worker can never make such an objective's scenario fail on the base, so
+/// the old verdict (a rejection, the task sent back) left it unable to land
+/// or close.
+pub(crate) fn recurring(mission: &Mission, objective: u32) -> bool {
     let Some(backlog) = mission
         .objectives
         .as_ref()
@@ -371,7 +387,7 @@ pub(crate) fn one_shot(mission: &Mission, objective: u32) -> bool {
     load_backlog(backlog)
         .ok()
         .and_then(|tasks| tasks.into_iter().find(|task| task.id == objective))
-        .is_some_and(|task| !task.recurring)
+        .is_some_and(|task| task.recurring)
 }
 
 /// Whether the fleet may be given `task`: open, and not the owner's to
@@ -1177,6 +1193,7 @@ mod tests {
         Landing {
             objective,
             metric: metric.map(str::to_string),
+            retired: false,
         }
     }
 

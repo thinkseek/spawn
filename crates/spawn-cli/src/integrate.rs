@@ -4206,11 +4206,14 @@ impl Judge {
             }
             // The objective's scenario passes on the base: a fact about the
             // objective, not about the task's work. The objective is
-            // recorded solved there and the task ends without a rejection.
+            // recorded solved there and the task ends without a rejection,
+            // whatever the backlog says (objective 210: it may no longer
+            // hold the objective, or not be readable), unless it positively
+            // reads the objective as recurring.
             Ok(verdict)
                 if verdict.reason.trim() == SOLVED_ON_BASE
                     && task.objective.is_some_and(|objective| {
-                        crate::objectives::one_shot(mission, objective)
+                        !crate::objectives::recurring(mission, objective)
                     }) =>
             {
                 solved_on_base(
