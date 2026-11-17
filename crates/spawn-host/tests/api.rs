@@ -902,11 +902,11 @@ fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace
         panic!("the branch is made again");
     };
     assert_eq!(
-        parent.as_ref().map(|parent| parent.as_str()),
+        parent.as_ref().map(spawn_core::id::CommitId::as_str),
         Some(main.as_str())
     );
     assert_eq!(git_out(&repo, &["rev-parse", &reference]), commit.as_str());
-    assert_eq!(parents(&repo, commit.as_str()), [main.clone()]);
+    assert_eq!(parents(&repo, commit.as_str()), std::slice::from_ref(&main));
     for (file, text) in [
         ("README.md", "base"),
         ("one.txt", "one"),

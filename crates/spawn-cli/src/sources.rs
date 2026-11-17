@@ -630,7 +630,7 @@ fn host_directory(source: &str) -> bool {
 /// How long a take-back that failed to read its source marks the source
 /// unreadable for `source_away` ([`source_readable`]): a failing take-back
 /// is tried every pass, so the mark stays while it fails.
-const TAKE_BACK_MARK: Duration = Duration::from_secs(120);
+const TAKE_BACK_MARK: Duration = Duration::from_mins(2);
 
 /// When a take-back from what was published last failed, by source
 /// (objective 205 R5): what `source_away` reads beside `ls-remote`, which
@@ -1035,10 +1035,13 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
+    /// A test's step between the routed commit's start and the store's
+    /// lock, given the agent.
+    type Step = Box<dyn FnOnce(&str)>;
+
     thread_local! {
-        /// What [`before_store_commit`] runs on this thread, once: a test's
-        /// step between the routed commit's start and the store's lock.
-        static BEFORE_STORE: std::cell::RefCell<Option<Box<dyn FnOnce(&str)>>> =
+        /// What [`before_store_commit`] runs on this thread, once.
+        static BEFORE_STORE: std::cell::RefCell<Option<Step>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -1975,11 +1978,11 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("spawn-sources-readable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let bare = base.join("bare.git");
+        let repository = base.join("bare.git");
         let plain = base.join("plain");
         std::fs::create_dir_all(&plain).expect("plain");
-        git(&["init", "-q", "--bare", &bare.to_string_lossy()]).expect("bare");
-        assert!(source_readable(&bare.to_string_lossy()));
+        git(&["init", "-q", "--bare", &repository.to_string_lossy()]).expect("bare");
+        assert!(source_readable(&repository.to_string_lossy()));
         assert!(!source_readable(&plain.to_string_lossy()));
         assert!(!source_readable(&base.join("missing").to_string_lossy()));
         let _ = std::fs::remove_dir_all(&base);
