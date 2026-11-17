@@ -1598,7 +1598,7 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
         .to_string();
     let report = bridge.tick().expect("the log is back");
     quiet(&report);
-    let base = CommitId::new("0".repeat(40)).expect("the base");
+    let base = CommitId::new("b".repeat(40)).expect("the memory store's base");
     let base = base.as_str().to_string();
     let made = recorded(&store);
     assert_eq!(
