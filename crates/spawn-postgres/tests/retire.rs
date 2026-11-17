@@ -244,7 +244,7 @@ fn the_caller_is_the_logins_and_only_the_owner_and_supervisor_may_retire() {
 
 /// The fold is the board's `retired` (oldest first, `[]` when none, read by
 /// the supervisor's login), the RSI page's, and `OBJECTIVE_LANDINGS`'
-/// retired rows; a refold rebuilds it the same, the first record winning.
+/// retired rows (`retired: true`, on no other row); a refold rebuilds it the same, the first record winning.
 #[test]
 fn a_retired_objective_is_on_the_board_and_closes_as_a_landing() {
     let (store, schema) = store("objective_retire_board");
@@ -321,12 +321,20 @@ fn a_retired_objective_is_on_the_board_and_closes_as_a_landing() {
         .map(|row| {
             (
                 row["objective"].as_i64().expect("objective"),
-                row["retired"].as_bool().expect("retired"),
+                row["retired"] == json!(true),
                 row["metric"].is_null(),
             )
         })
         .collect();
     closed.sort_unstable();
+    assert!(
+        landings
+            .as_array()
+            .expect("a list")
+            .iter()
+            .all(|row| row.get("retired").is_none() || row["retired"] == json!(true)),
+        "only a retired row carries retired: {landings}"
+    );
     assert_eq!(
         closed,
         [

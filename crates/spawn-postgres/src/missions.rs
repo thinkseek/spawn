@@ -813,10 +813,11 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// An objective mission's landed tasks: `[{objective, metric}]`, newest
 /// first, then its objectives solved on the base and those retired by hand
 /// (objective 210, `{objective, metric: null, retired: true}`: closed
-/// whatever their kind). `$1` mission.
+/// whatever their kind; no other row carries `retired`). `$1` mission.
 pub(crate) const OBJECTIVE_LANDINGS: &str = r"
-select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric', x.metric,
-                                             'retired', x.retired)
+select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric', x.metric)
+                          || case when x.retired then '{"retired": true}'::jsonb
+                                  else '{}'::jsonb end
                           order by x.at_ms desc, x.id desc), '[]'::jsonb)
   from (
    select k.objective, k.metric, false as retired, k.updated_at_ms as at_ms, k.id
