@@ -475,8 +475,15 @@ until idle busy; do
     sleep 0.5
 done
 # Its task's marker was seen: the session tracks its messages from here on.
-[ "$(q "select count(*) from spawn_events where session_id = '$(get busy session)' and event_name = 'message.taken'")" -ge 1 ] ||
-    harness "the worker's task prompt was never taken: nothing after it is tracked"
+# The engine's turn end is in its own log at once, but the loop records
+# message.taken only when it next ingests the transcript: wait for it,
+# bounded, rather than read once (rev-k 00:09: 1 of 7 runs read 0 here).
+deadline=$(($(date +%s) + 30))
+until [ "$(q "select count(*) from spawn_events where session_id = '$(get busy session)' and event_name = 'message.taken'")" -ge 1 ]; do
+    [ "$(date +%s)" -lt "$deadline" ] ||
+        harness "the worker's task prompt was never taken within 30 s of its turn end: nothing after it is tracked"
+    sleep 0.5
+done
 note "the worker took its task"
 
 fired_count() { # <command id>: message_not_taken alerts ever fired for it, from the records
