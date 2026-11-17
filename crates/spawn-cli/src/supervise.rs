@@ -461,6 +461,21 @@ mod tests {
         assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
     }
 
+    /// Objective 210: an objective that can never land is retired with who
+    /// and why, through a command, never by editing the backlog.
+    #[test]
+    fn the_charter_names_the_objective_retire_command() {
+        let text = charter("spawn", "mission.md");
+        assert!(
+            text.contains(
+                "spawn objective retire --mission N --objective <n> --by <name> --reason <why>"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("never by editing the backlog"), "{text}");
+        assert!(text.contains("its work already on main, renumbered, obsolete"), "{text}");
+    }
+
     /// The monitor retires: the fleet's alerts are Spawn's own records now,
     /// read through the supervisor's restricted login.
     #[test]
