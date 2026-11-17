@@ -4354,13 +4354,16 @@ const TMPFS_MAGIC: u64 = 0x0102_1994;
 
 /// The statfs type of the filesystem holding `path`.
 fn fs_type(path: &Path) -> Result<u64, String> {
-    let stat = rustix::fs::statfs(path)
-        .map_err(|error| format!("statfs {}: {error}", path.display()))?;
-    // `f_type` is a signed word on some targets; the magic numbers are
-    // positive and fit in 32 bits.
-    #[allow(clippy::cast_sign_loss, clippy::useless_conversion)]
-    let kind = u64::try_from(stat.f_type).unwrap_or(stat.f_type as u64);
-    Ok(kind)
+    let stat =
+        rustix::fs::statfs(path).map_err(|error| format!("statfs {}: {error}", path.display()))?;
+    // `f_type` is a signed word here; the magic numbers are positive.
+    u64::try_from(stat.f_type).map_err(|_| {
+        format!(
+            "statfs {}: type {} is not a magic number",
+            path.display(),
+            stat.f_type
+        )
+    })
 }
 
 fn crossing(open: bool, measured: u64, turn_on: u64, turn_off: u64, under: bool) -> Crossing {
