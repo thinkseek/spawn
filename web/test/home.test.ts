@@ -98,6 +98,7 @@ function task(id: number, state: MissionTask["state"], fields: Partial<MissionTa
     objective: null,
     metric: null,
     last_gate: null,
+    activity: null,
     stages: [],
     model: null,
     created_at_ms: NOW - 3 * HOUR,
