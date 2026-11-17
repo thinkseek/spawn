@@ -235,10 +235,10 @@ fn count_agent(
 /// One message as its lines so far say it: its earliest line's time and
 /// model, its largest usage (input, output, cache write, cache read).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Folded {
-    at_ms: i64,
-    model: String,
-    usage: [u64; 4],
+pub(super) struct Folded {
+    pub(super) at_ms: i64,
+    pub(super) model: String,
+    pub(super) usage: [u64; 4],
 }
 
 impl Folded {
@@ -249,7 +249,7 @@ impl Folded {
     }
 
     /// Fold one more line of the same message in.
-    fn fold(&mut self, other: Folded) {
+    pub(super) fn fold(&mut self, other: Folded) {
         if other.at_ms < self.at_ms {
             self.at_ms = other.at_ms;
             self.model = other.model;
@@ -276,7 +276,7 @@ impl Folded {
 }
 
 /// The message one line holds, read as the Bridge reads it.
-fn line_message(line: &[u8]) -> Option<(String, Folded)> {
+pub(super) fn line_message(line: &[u8]) -> Option<(String, Folded)> {
     let text = std::str::from_utf8(line).ok()?;
     match spawn_core::ingest::claude_usage(text.trim_end())?.kind {
         EventKind::ModelUsage {
