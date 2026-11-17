@@ -176,10 +176,53 @@ pub(crate) fn window_of(asked: Option<&str>) -> Result<(&'static str, i64), Stri
         .ok_or_else(|| format!("window is 24h or 7d, not {asked}"))
 }
 
+const HOUR_MS: i64 = 3_600_000;
+const DAY_MS: i64 = 86_400_000;
+
+/// The step of a window's trend: an hour in a day's window, a day in a
+/// longer one.
+fn trend_step(length_ms: i64) -> i64 {
+    if length_ms <= DAY_MS { HOUR_MS } else { DAY_MS }
+}
+
 /// `GET /api/cost?window=`: the cost of the messages timed in [now minus
-/// the window, now), on the database's clock.
+/// the window, now), on the database's clock. For the page's dashboard
+/// (GitHub #64) it also says: `previous`, the window of equal length just
+/// before it, as [`summary`] gives it (`total`, `landed`,
+/// `usd_per_landing`, `since_ms`, `until_ms`); `trend`, the window in steps
+/// of an hour (24h) or a day (7d) ([`PostgresStore::cost_trend`]); and
+/// `budgets`, each mission with a daily budget and its spend of the UTC day
+/// so far, the very reading the `cost_budget` alert takes
+/// ([`PostgresStore::cost_budgets`]).
 pub(crate) fn window(store: &PostgresStore, name: &str, length_ms: i64) -> Result<Value, String> {
-    timed(store, name, length_ms, PostgresStore::cost_window)
+    let mut answer = timed(store, name, length_ms, PostgresStore::cost_window)?;
+    let (Some(since_ms), Some(until_ms)) =
+        (answer["since_ms"].as_i64(), answer["until_ms"].as_i64())
+    else {
+        return Ok(answer);
+    };
+    let previous_since = since_ms.saturating_sub(length_ms);
+    let mut previous = store
+        .cost_summary(previous_since, since_ms)
+        .map_err(|error| error.to_string())?;
+    if let Value::Object(map) = &mut previous {
+        map.insert("since_ms".to_string(), json!(previous_since));
+        map.insert("until_ms".to_string(), json!(since_ms));
+    }
+    let trend = store
+        .cost_trend(since_ms, until_ms, trend_step(length_ms))
+        .map_err(|error| error.to_string())?;
+    let day_start = until_ms - until_ms.rem_euclid(DAY_MS);
+    let budgets = store
+        .cost_budgets(day_start, until_ms.saturating_add(1))
+        .map_err(|error| error.to_string())?;
+    if let Value::Object(map) = &mut answer {
+        map.insert("previous".to_string(), previous);
+        map.insert("trend_step_ms".to_string(), json!(trend_step(length_ms)));
+        map.insert("trend".to_string(), trend);
+        map.insert("budgets".to_string(), budgets);
+    }
+    Ok(answer)
 }
 
 /// The same window's `total`, `landed` and `usd_per_landing` alone
@@ -270,6 +313,12 @@ mod tests {
                 .usd("claude-opus-5-5", [1_000_000, 0, 0, 0])
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_days_trend_steps_by_the_hour_and_a_weeks_by_the_day() {
+        assert_eq!(super::trend_step(86_400_000), 3_600_000);
+        assert_eq!(super::trend_step(7 * 86_400_000), 86_400_000);
     }
 
     #[test]

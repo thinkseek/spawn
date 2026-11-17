@@ -166,6 +166,27 @@ select jsonb_build_object(
                              / nullif((select sum(landed) from landings), 0)
                         from m))";
 
+/// The messages timed in `[$1, $2)` in steps of `$3` ms from `$1`, oldest
+/// first (GitHub #64, the cost page's trend): each step's `since_ms`, its
+/// priced dollars `usd` (0 for a step with none) and its `unpriced_tokens`
+/// (the four counts of its messages with no price). A step with no message
+/// is there, with zeros; the last step ends at `$2`, so it may be shorter.
+const TREND: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object(
+         'since_ms', $1::bigint + s.i * $3::bigint,
+         'usd', coalesce(b.usd, 0),
+         'unpriced_tokens', coalesce(b.unpriced_tokens, 0))
+         order by s.i), '[]'::jsonb)
+  from generate_series(0::bigint, ($2::bigint - $1::bigint - 1) / $3::bigint) as s(i)
+  left join (select (c.at_ms - $1::bigint) / $3::bigint as i,
+                    coalesce(sum(c.usd), 0) as usd,
+                    coalesce(sum(c.input_tokens + c.output_tokens + c.cache_write_tokens
+                                 + c.cache_read_tokens) filter (where c.usd is null), 0)
+                      as unpriced_tokens
+               from spawn_cost_messages c
+              where c.at_ms >= $1::bigint and c.at_ms < $2::bigint
+              group by 1) b on b.i = s.i";
+
 /// Every mission with a daily budget (`budget.daily_usd`) and its cost of
 /// the messages timed in `[$1, $2)` (the UTC day so far).
 const BUDGETS: &str = r"
@@ -202,6 +223,22 @@ impl PostgresStore {
     /// [`Self::cost_window`] gives it.
     pub fn cost_summary(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(SUMMARY, &[&since_ms, &until_ms])
+    }
+
+    /// The cost of the messages timed in `[since_ms, until_ms)` in steps
+    /// of `step_ms` ([`TREND`]): `[{since_ms, usd, unpriced_tokens}]`,
+    /// oldest first, one per step. An empty window or a step under 1 ms
+    /// is no step: `[]`.
+    pub fn cost_trend(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+        step_ms: i64,
+    ) -> Result<Value, StoreError> {
+        if step_ms < 1 || until_ms <= since_ms {
+            return Ok(Value::Array(Vec::new()));
+        }
+        self.query_json(TREND, &[&since_ms, &until_ms, &step_ms])
     }
 
     /// Each mission with a daily budget and its spend in `[since_ms,
