@@ -131,7 +131,11 @@
 //!   the filesystem holding `SPAWN_ALERT_TMPFS_PATH` (default `/tmp`) over
 //!   `SPAWN_ALERT_TMPFS_HIGH_MB` (default 8000); clears under
 //!   `SPAWN_ALERT_TMPFS_OK_MB` (default 6000). A threshold of 0 disables its
-//!   check.
+//!   check. Only a tmpfs is read (objective 215): on a path whose
+//!   filesystem is not one (a `/tmp` on the root disk, whose "used" is the
+//!   whole disk's) nothing fires, and an open one clears with `{path,
+//!   not_tmpfs: true, fs_type: "0x<hex>", reading_ms}`; free disk is
+//!   `disk_low`'s. A path statfs cannot read is a line in the loop's log.
 //! - `disk_low`, `host`, key `disk_low:<reading ms>` (objective 204): the
 //!   free space of the filesystem holding the workspace root
 //!   (`SPAWN_WORKSPACE_ROOT`, the Core lines' free disk) under
