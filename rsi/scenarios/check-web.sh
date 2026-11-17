@@ -59,6 +59,7 @@ cd web
 # The UI's pure modules have tests of their own (web/test), run by node
 # itself (it strips the types); no package is added for them.
 # Node 22.23+ no longer accepts a test directory as a positional argument;
-# no-arg run auto-discovers the test/ directory (103 tests, node 20 and 22).
+# a run with no argument discovers web/test/*.test.ts itself (node_modules
+# is not searched).
 node --test
 npm run build -- --configLoader runner
