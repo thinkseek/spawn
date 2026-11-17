@@ -11,6 +11,7 @@ import { VerdictBadge } from "../rsi/Phase";
 import { cx } from "../ui";
 import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
+import { TaskActivityLine } from "./TaskActivity";
 import { PHASE_COLOR, verdictColor } from "./timelineStyle";
 
 const OUTCOME_LABEL: Record<TaskBar["outcome"], string> = {
@@ -90,6 +91,9 @@ export function TaskPanel({
           )}
           <div className="mt-1 flex min-w-0 items-center gap-2">
             <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
+          </div>
+          <div className="mt-1">
+            <TaskActivityLine activity={task.activity} now={now} />
           </div>
         </div>
         <button
