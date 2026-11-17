@@ -471,7 +471,7 @@ impl Monitor {
             }
         };
         let figures = figures(&answer);
-        let seeding = self.seeding(now, &answer, &figures, lines);
+        let seeding = self.seeding(&answer, &figures, lines);
         for figure in &figures {
             if figure.stale {
                 // Not current: it neither raises nor clears; the stale
@@ -580,7 +580,6 @@ impl Monitor {
     /// stretch with a sample in range after its out-since is ended here.
     fn seeding(
         &mut self,
-        now: i64,
         answer: &Value,
         figures: &[Reading],
         lines: &mut Vec<String>,
@@ -604,7 +603,6 @@ impl Monitor {
                 .find(|figure| &figure.key == key)
                 .is_some_and(|figure| back_after(&samples, key, &figure.range, *since))
         });
-        let _ = now;
         Some((samples, period))
     }
 
