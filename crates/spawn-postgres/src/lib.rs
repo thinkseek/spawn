@@ -81,6 +81,7 @@ macro_rules! lost_before_ready {
 }
 
 mod acks;
+mod activity;
 mod alerts;
 mod command_queue;
 mod commit_map;
