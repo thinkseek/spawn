@@ -17,10 +17,41 @@
 //! from raising and clearing every hour: Needs you being right is the
 //! observability north star.
 //!
-//! The counts live in the step's memory: a restarted loop counts again from
-//! its first reading, and adopts an alert the record already holds open
-//! (one open per figure, across restarts). A reading that fails is a line in
-//! the loop's log and decides nothing.
+//! The counts live in the step's memory, and a restarted loop adopts an
+//! alert the record already holds open (one open per figure, across
+//! restarts). A reading that fails is a line in the loop's log and decides
+//! nothing.
+//!
+//! A restart does not restart the raise hold (objective 192): every deploy
+//! restarts the loop, mostly within the hold, so a count kept in memory alone
+//! never completed. The loop's first reading carries the hourly
+//! `host.core_lines` samples of the hold plus two sample periods
+//! ([`crate::serve::core_lines::reading_with_samples`]), and at it each
+//! figure out of range, not stale and not counted yet takes its out-since
+//! from them ([`out_since`]): the oldest sample of the newest unbroken run
+//! out of its current range that reaches the reading. A sample in range, one
+//! that does not carry the figure as a number, or a gap of more than two
+//! periods (from the reading to the newest sample, or between two) ends the
+//! run; without one the count starts at that reading, as before. This is
+//! done once per loop, whatever it finds; a samples error is a line in the
+//! loop's log, and the holds start then. It is an estimate from samples, not
+//! proof of time out of range: the seeded out-since is never before a
+//! sample that saw the figure out, but a dip back in range between two
+//! hourly samples is not seen. The alert fires once the seeded time is a
+//! hold old: never later than before, with the same key, text and evidence
+//! (`out_since_ms` the seeded time).
+//!
+//! A judged stretch keeps its key (objective 192 (5)): a figure whose newest
+//! alert the owner judged while open (its cleared evidence `{judged}`, from
+//! the alert rows the loop starts with) keeps that alert's out-since, so it
+//! is not raised again, the seeding window having slid past where the
+//! stretch began. It is taken by the first fresh reading that finds the
+//! figure out, and from then on lives as any other count. Only positive
+//! evidence ends it before: a fresh reading with the figure in range (`in`;
+//! no range, no value and a stale figure are none), or a sample in range
+//! after that out-since among the first reading's samples (none for a figure
+//! with no range now). A samples error keeps it. Ended, the next stretch out
+//! is new, seeded from the samples at the first reading as above.
 //!
 //! A reading is the whole answer (the 7-day Scorecard with its transcript
 //! walk, the cost window, the storage report...), and its one-minute cache
@@ -236,11 +267,126 @@ fn read_line(
     )
 }
 
+/// The figure's bounds in `range` (`{min?, max?}`), `None` without one.
+fn bounds(range: &Value) -> Option<(Option<f64>, Option<f64>)> {
+    let bounds = (
+        range.get("min").and_then(Value::as_f64),
+        range.get("max").and_then(Value::as_f64),
+    );
+    (bounds != (None, None)).then_some(bounds)
+}
+
+/// Whether `value` lies within `bounds`, bounds included.
+fn within((min, max): (Option<f64>, Option<f64>), value: f64) -> bool {
+    min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
+}
+
+/// The samples' `(at_ms, the figure's number)`, oldest first, up to `now`
+/// (`[]` when `samples` is no list).
+fn sampled(samples: &Value, key: &str, now: i64) -> Vec<(i64, Option<f64>)> {
+    let mut list: Vec<(i64, Option<f64>)> = samples
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sample| {
+            let at = sample["at_ms"].as_i64()?;
+            (at <= now).then(|| (at, sample["values"][key].as_f64()))
+        })
+        .collect();
+    list.sort_by_key(|(at, _)| *at);
+    list
+}
+
+/// When figure `key` has been out of `range` (its current range) by the
+/// `host.core_lines` `samples` (`[{at_ms, values}]`) at `now`: the time of
+/// the oldest sample of the newest unbroken run of samples out of it, the
+/// run reaching `now`. A sample in range, a sample not carrying the figure
+/// as a number, or a gap of more than two `period_ms` (from `now` to the
+/// newest sample, or between two samples) ends the run. `None` without such
+/// a run, or without a range.
+pub(super) fn out_since(
+    samples: &Value,
+    key: &str,
+    range: &Value,
+    now: i64,
+    period_ms: i64,
+) -> Option<i64> {
+    let bounds = bounds(range)?;
+    let gap = period_ms.saturating_mul(2);
+    let mut reached = now;
+    let mut since = None;
+    for (at, value) in sampled(samples, key, now).into_iter().rev() {
+        if reached.saturating_sub(at) > gap {
+            break;
+        }
+        match value {
+            Some(value) if !within(bounds, value) => {
+                since = Some(at);
+                reached = at;
+            }
+            _ => break,
+        }
+    }
+    since
+}
+
+/// Whether a sample after `after` has figure `key` back within `range` (its
+/// current range): positive evidence a judged stretch ended. Never for a
+/// figure with no range.
+fn back_after(samples: &Value, key: &str, range: &Value, after: i64) -> bool {
+    let Some(bounds) = bounds(range) else {
+        return false;
+    };
+    sampled(samples, key, i64::MAX)
+        .into_iter()
+        .any(|(at, value)| at > after && value.is_some_and(|value| within(bounds, value)))
+}
+
 impl Monitor {
     /// The figures are due at `now`: start a reading on a thread of its
-    /// own ([`crate::serve::core_lines::reading`]).
+    /// own ([`crate::serve::core_lines::reading`]); the loop's first one
+    /// carries the samples since the hold plus two sample periods ago
+    /// ([`crate::serve::core_lines::reading_with_samples`], objective 192).
     pub(super) fn start_guardrails(&mut self, now: i64) {
-        self.start_guardrails_with(now, || Pending::spawn(crate::serve::core_lines::reading));
+        if self.guardrail_seeded {
+            self.start_guardrails_with(now, || Pending::spawn(crate::serve::core_lines::reading));
+        } else {
+            let (period, _) = crate::core_lines_sample::every_ms_from_env();
+            let since = now
+                .saturating_sub(self.settings.guardrail_raise_ms)
+                .saturating_sub(period.saturating_mul(2));
+            self.start_guardrails_with(now, || {
+                Pending::spawn(move || crate::serve::core_lines::reading_with_samples(since))
+            });
+        }
+    }
+
+    /// The judged stretches in the alert `rows` the loop starts with (the
+    /// store's, oldest first): each figure whose newest
+    /// `guardrail_out_of_range` alert was cleared by a judgement (its
+    /// cleared evidence `{judged}`), with that alert's out-since.
+    pub(super) fn seed_judged(&mut self, rows: &Value) {
+        let mut newest: std::collections::BTreeMap<String, (i64, Option<i64>)> =
+            std::collections::BTreeMap::new();
+        for row in rows.as_array().into_iter().flatten() {
+            if row["kind"] != KIND {
+                continue;
+            }
+            let figure = figure_of(row["subject"].as_str().unwrap_or(""), &row["evidence"]);
+            let fired = row["fired_at_ms"].as_i64().unwrap_or(0);
+            let judged = row["cleared_evidence"]["judged"]
+                .is_string()
+                .then(|| row["evidence"]["out_since_ms"].as_i64())
+                .flatten();
+            if newest.get(&figure).is_none_or(|(at, _)| fired >= *at) {
+                newest.insert(figure, (fired, judged));
+            }
+        }
+        for (figure, (_, judged)) in newest {
+            if let Some(since) = judged {
+                self.guardrail_judged.insert(figure, since);
+            }
+        }
     }
 
     /// Start a reading through `start`, unless one is in flight or one
@@ -325,6 +471,7 @@ impl Monitor {
             }
         };
         let figures = figures(&answer);
+        let seeding = self.seeding(now, &answer, &figures, lines);
         for figure in &figures {
             if figure.stale {
                 // Not current: it neither raises nor clears; the stale
@@ -335,7 +482,22 @@ impl Monitor {
             let open = self.open_keys(KIND, &subject);
             if figure.state == "out" {
                 self.guardrail_back.remove(&figure.key);
-                let since = *self.guardrail_out.entry(figure.key.clone()).or_insert(now);
+                let since = if let Some(since) = self.guardrail_out.get(&figure.key) {
+                    *since
+                } else {
+                    // A judged stretch is taken by the first fresh reading
+                    // out; else the first reading seeds from the samples.
+                    let since = self.guardrail_judged.remove(&figure.key).unwrap_or_else(|| {
+                        seeding
+                            .as_ref()
+                            .and_then(|(samples, period)| {
+                                out_since(samples, &figure.key, &figure.range, now, *period)
+                            })
+                            .unwrap_or(now)
+                    });
+                    self.guardrail_out.insert(figure.key.clone(), since);
+                    since
+                };
                 // The stretch's alert, once judged by the owner (objective
                 // 092), is not open and is not raised again: the next stretch
                 // out of range is a new occurrence.
@@ -367,6 +529,10 @@ impl Monitor {
                 }
             } else {
                 self.guardrail_out.remove(&figure.key);
+                if figure.state == "in" {
+                    // Positive evidence the judged stretch ended.
+                    self.guardrail_judged.remove(&figure.key);
+                }
                 if open.is_empty() {
                     self.guardrail_back.remove(&figure.key);
                     continue;
@@ -406,6 +572,40 @@ impl Monitor {
             });
         }
         self.stale_events(now, &answer, out);
+    }
+
+    /// At the loop's first answered reading (once per loop): its samples
+    /// and the sample period, `None` at any other reading or when the
+    /// samples could not be read (said, and each hold starts now). A judged
+    /// stretch with a sample in range after its out-since is ended here.
+    fn seeding(
+        &mut self,
+        now: i64,
+        answer: &Value,
+        figures: &[Reading],
+        lines: &mut Vec<String>,
+    ) -> Option<(Value, i64)> {
+        if self.guardrail_seeded {
+            return None;
+        }
+        self.guardrail_seeded = true;
+        if let Some(error) = answer["recent_samples_error"].as_str() {
+            lines.push(format!(
+                "alerts: the guardrails' samples: {}; each hold starts at this reading",
+                super::scrub(error)
+            ));
+            return None;
+        }
+        let samples = answer["recent_samples"].clone();
+        let (period, _) = crate::core_lines_sample::every_ms_from_env();
+        self.guardrail_judged.retain(|key, since| {
+            !figures
+                .iter()
+                .find(|figure| &figure.key == key)
+                .is_some_and(|figure| back_after(&samples, key, &figure.range, *since))
+        });
+        let _ = now;
+        Some((samples, period))
     }
 
     /// `core_lines_stale`, from one reading's `groups`.
