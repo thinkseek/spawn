@@ -862,3 +862,169 @@ fn a_terminal_server_is_told_by_its_identity_and_asking_never_starts_one() {
     assert_ne!(second, first, "a new server is another server");
     host.terminate(&again, &workspace()).expect("clean up");
 }
+
+/// The parents of `commit`, in order.
+fn parents(repo: &PathBuf, commit: &str) -> Vec<String> {
+    git_out(repo, &["rev-list", "--parents", "-n", "1", commit])
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Objective 205 (incident I-006): a branch deleted under its mounted
+/// workspace is made again by the next checkpoint, from the workspace: on
+/// the store's main, with the workspace's files; the checkpoint after it is
+/// an ordinary one. With no main, the commit has no parent. A branch ref
+/// that exists but names no commit (written by hand) is refused, never
+/// written over (the empty old value).
+#[test]
+fn a_branch_deleted_under_its_mounted_workspace_is_made_again_from_the_workspace() {
+    let _exclusive = exclusive();
+    let (_scratch, repo, root) = repository("recreate");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch(), None).expect("branch");
+    let workspace = store.mount(&branch()).expect("mount");
+    let directory = PathBuf::from(workspace.path());
+    fs::write(directory.join("one.txt"), "one\n").expect("write");
+    let Commit::Created(_) = store.commit(&workspace, "one").expect("commit") else {
+        panic!("a change");
+    };
+    let main = git_out(&repo, &["rev-parse", "refs/heads/main"]);
+    let reference = format!("refs/heads/{}", branch());
+
+    // Deleted under the workspace: made again on main, from the workspace.
+    git_out(&repo, &["update-ref", "-d", &reference]);
+    fs::write(directory.join("two.txt"), "two\n").expect("write");
+    let Commit::Recreated { commit, parent } =
+        store.commit(&workspace, "again").expect("made again")
+    else {
+        panic!("the branch is made again");
+    };
+    assert_eq!(parent.as_ref().map(|parent| parent.as_str()), Some(main.as_str()));
+    assert_eq!(git_out(&repo, &["rev-parse", &reference]), commit.as_str());
+    assert_eq!(parents(&repo, commit.as_str()), [main.clone()]);
+    for (file, text) in [("README.md", "base"), ("one.txt", "one"), ("two.txt", "two")] {
+        assert_eq!(
+            git_out(&repo, &["show", &format!("{commit}:{file}")]),
+            text,
+            "{file}"
+        );
+    }
+
+    // The next checkpoint is an ordinary one, on it.
+    fs::write(directory.join("three.txt"), "three\n").expect("write");
+    let Commit::Created(next) = store.commit(&workspace, "three").expect("commit") else {
+        panic!("an ordinary checkpoint");
+    };
+    assert_eq!(parents(&repo, next.as_str()), [commit.as_str().to_string()]);
+    assert_eq!(store.commit(&workspace, "same").expect("commit"), Commit::Unchanged);
+
+    // No main: a commit with no parent, holding the workspace's files.
+    git_out(&repo, &["update-ref", "-d", &reference]);
+    git_out(&repo, &["update-ref", "-d", "refs/heads/main"]);
+    let Commit::Recreated { commit, parent } =
+        store.commit(&workspace, "again").expect("made again")
+    else {
+        panic!("the branch is made again with no main");
+    };
+    assert_eq!(parent, None);
+    assert!(parents(&repo, commit.as_str()).is_empty());
+    for (file, text) in [("one.txt", "one"), ("two.txt", "two"), ("three.txt", "three")] {
+        assert_eq!(
+            git_out(&repo, &["show", &format!("{commit}:{file}")]),
+            text,
+            "{file}"
+        );
+    }
+
+    // A ref that names no commit: refused, never written over.
+    let blob = {
+        let mut child = spawn_host::test_git_command()
+            .arg("--git-dir")
+            .arg(&repo)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("git");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"not a commit\n")
+            .expect("write");
+        let output = child.wait_with_output().expect("hash");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    git_out(&repo, &["pack-refs", "--all"]);
+    let loose = repo.join("refs/heads").join(branch().as_str());
+    fs::write(&loose, format!("{blob}\n")).expect("write the ref by hand");
+    fs::write(directory.join("four.txt"), "four\n").expect("write");
+    let refused = store.commit(&workspace, "four");
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(fs::read_to_string(&loose).expect("the ref"), format!("{blob}\n"));
+    store.unmount(&workspace).expect("unmount");
+}
+
+/// Objective 205 R6: the store asks the take-back under the branch's lock,
+/// and only when the branch is gone. Not asked while it is there; asked
+/// when it is gone, its error is the commit's and leaves no branch; what it
+/// makes is the commit's parent, as on any branch.
+#[test]
+fn a_take_back_is_asked_under_the_lock_only_when_the_branch_is_gone() {
+    let _exclusive = exclusive();
+    let (_scratch, repo, root) = repository("take-back");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch(), None).expect("branch");
+    let workspace = store.mount(&branch()).expect("mount");
+    let directory = PathBuf::from(workspace.path());
+    let reference = format!("refs/heads/{}", branch());
+    let asked = std::cell::Cell::new(0);
+
+    // There: not asked.
+    fs::write(directory.join("one.txt"), "one\n").expect("write");
+    let Commit::Created(published) = store
+        .commit_or_take_back(&workspace, "one", &|| {
+            asked.set(asked.get() + 1);
+            Ok(())
+        })
+        .expect("commit")
+    else {
+        panic!("a change");
+    };
+    assert_eq!(asked.get(), 0, "not asked while the branch is there");
+
+    // Gone, and the take-back fails: the commit fails, no branch is made.
+    git_out(&repo, &["update-ref", "-d", &reference]);
+    fs::write(directory.join("two.txt"), "two\n").expect("write");
+    let failed = store.commit_or_take_back(&workspace, "two", &|| {
+        asked.set(asked.get() + 1);
+        Err(spawn_core::port::WorkspaceError::Unavailable(
+            "the source cannot be read".to_string(),
+        ))
+    });
+    assert!(
+        matches!(&failed, Err(spawn_core::port::WorkspaceError::Unavailable(text))
+                 if text == "the source cannot be read"),
+        "{failed:?}"
+    );
+    assert_eq!(asked.get(), 1);
+    assert_eq!(git_out(&repo, &["rev-parse", "--verify", "--quiet", &reference]), "");
+
+    // Gone, and the take-back makes it: the commit goes on what it made.
+    let commit = store
+        .commit_or_take_back(&workspace, "two", &|| {
+            asked.set(asked.get() + 1);
+            git_out(&repo, &["update-ref", &reference, published.as_str(), ""]);
+            Ok(())
+        })
+        .expect("commit");
+    assert_eq!(asked.get(), 2);
+    let Commit::Created(on_it) = commit else {
+        panic!("an ordinary commit on what the take-back made: {commit:?}");
+    };
+    assert_eq!(parents(&repo, on_it.as_str()), [published.as_str().to_string()]);
+    assert_eq!(git_out(&repo, &["show", &format!("{on_it}:two.txt")]), "two");
+    store.unmount(&workspace).expect("unmount");
+}
