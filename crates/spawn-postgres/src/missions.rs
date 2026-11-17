@@ -631,8 +631,11 @@ macro_rules! active_holds {
 /// on its source (the active hold's event id, or null) and the `halt` it
 /// is in (`{event, reason, at_ms, gone}`: its `mission.halted` record's
 /// event id and time, and the scenarios a halt on the floor names gone, else
-/// null; null while it is not halted); `holds` is every active hold
-/// ([`SOURCE_HOLDS`]).
+/// null; null while it is not halted) and the objectives `retired` by hand
+/// (objective 210: `[{objective, by, reason, caller, at_ms}]`, oldest first,
+/// `[]` when none, read from `mission_retired_objectives`, never from
+/// `spawn_events`, so the supervisor's login reads it); `holds` is every
+/// active hold ([`SOURCE_HOLDS`]).
 pub(crate) const MISSION_BOARD: &str = concat!(
     r"
 select jsonb_build_object(
@@ -649,6 +652,12 @@ select jsonb_build_object(
                  'at_ms', m.pause_at_ms, 'event_id', m.pause_event,
                  'reason', m.pause_reason) end as paused,
              (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
+             -- The objectives retired by hand (objective 210), oldest first.
+             coalesce((select jsonb_agg(jsonb_build_object(
+                 'objective', o.objective, 'by', o.by, 'reason', o.reason,
+                 'caller', o.caller, 'at_ms', o.at_ms) order by o.at_ms, o.event)
+               from mission_retired_objectives o where o.mission_id = m.id), '[]'::jsonb)
+               as retired,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
                  'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
@@ -802,24 +811,34 @@ select coalesce(jsonb_agg(jsonb_build_object(
 // Checked decisions, one SQL function each.
 
 /// An objective mission's landed tasks: `[{objective, metric}]`, newest
-/// first. `$1` mission.
+/// first, then its objectives solved on the base and those retired by hand
+/// (objective 210, `{objective, metric: null, retired: true}`: closed
+/// whatever their kind; no other row carries `retired`). `$1` mission.
 pub(crate) const OBJECTIVE_LANDINGS: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object('objective', x.objective, 'metric', x.metric)
+                          || case when x.retired then jsonb_build_object('retired', true)
+                                  else '{}'::jsonb end
                           order by x.at_ms desc, x.id desc), '[]'::jsonb)
   from (
-   select k.objective, k.metric, k.updated_at_ms as at_ms, k.id
+   select k.objective, k.metric, false as retired, k.updated_at_ms as at_ms, k.id
      from mission_tasks k
     where k.mission_id = $1 and k.state = 'landed' and k.objective is not null
    union all
    -- An objective solved on the base (its scenario passes at the base
    -- commit, so no task of it can change anything) is solved as a landing
    -- solves it: no task for it is assigned again.
-   select (e.kind -> 'detail' -> 'record' ->> 'objective')::integer, null,
+   select (e.kind -> 'detail' -> 'record' ->> 'objective')::integer, null, false,
           e.recorded_at_ms, e.id
      from spawn_events e
     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
       and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
-      and e.kind -> 'detail' -> 'record' ->> 'id' = $1::text) x";
+      and e.kind -> 'detail' -> 'record' ->> 'id' = $1::text
+   union all
+   -- An objective retired by hand (objective 210): closed whatever its
+   -- kind, never by a metric it has no value for.
+   select o.objective, null, true, o.at_ms, o.event
+     from mission_retired_objectives o
+    where o.mission_id = $1) x";
 
 /// The outcomes of an objective mission's tasks, oldest first, from the
 /// control stream: `[{seq, type, task, objective, verdict, merge, measure, yielded}]`, the
@@ -1420,7 +1439,10 @@ select coalesce(jsonb_agg(jsonb_build_object('mission', m.id,
 /// [`GATED`] reads it: an overrun chain's hold ends with a newer one) and
 /// `solved_on_base`, the mission's `objective.solved` records, oldest first
 /// (`[{event, objective, task, base, at_ms}]`): the records
-/// [`OBJECTIVE_LANDINGS`] counts as landings, by the same condition.
+/// [`OBJECTIVE_LANDINGS`] counts as landings, by the same condition; and
+/// `retired`, the objectives retired by hand (objective 210, `[{objective,
+/// by, reason, caller, at_ms}]`, oldest first), as [`MISSION_BOARD`] gives
+/// them.
 pub(crate) const OBJECTIVE_MISSIONS: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
@@ -1442,6 +1464,11 @@ from (
                       and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
                       and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text), '[]'::jsonb)
            as solved_on_base,
+         coalesce((select jsonb_agg(jsonb_build_object(
+                     'objective', o.objective, 'by', o.by, 'reason', o.reason,
+                     'caller', o.caller, 'at_ms', o.at_ms) order by o.at_ms, o.event)
+                     from mission_retired_objectives o where o.mission_id = m.id), '[]'::jsonb)
+           as retired,
          (select jsonb_build_object('name', r.name, 'agent_id', r.agent_id,
                                     'session_id', r.session_id, 'state', r.state)
             from mission_residents r where r.name = m.objectives ->> 'resident') as resident,
@@ -1889,6 +1916,20 @@ impl PostgresStore {
     /// An objective mission's landed tasks, newest first.
     pub fn objective_landings(&self, mission: i64) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_LANDINGS, &[&mission])
+    }
+
+    /// Retire an objective by hand (objective 210): one `objective.retired`
+    /// through `spawn_objective_retire`, which checks the record's shape,
+    /// the mission and the objective's state, and sets `caller` from the
+    /// login (the owner's or the supervisor's; any other is refused).
+    /// Returns the event's id.
+    pub fn objective_retire(&self, record: &Value) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_objective_retire($1)",
+                &[&crate::control_mask::masked(record)],
+            )?
+            .get(0))
     }
 
     /// Gate verdicts on one objective's tasks, newest first.

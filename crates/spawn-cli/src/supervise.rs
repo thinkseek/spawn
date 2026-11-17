@@ -231,6 +231,9 @@ execution of its own session on its workspace (its work kept); `{spawn} task rea
 --reason <why>` — the task moves to a fresh worker whose branch starts from the old worker's work. \
 Prefer them to a cancel and a new assign: nothing the worker did is lost.
 - `{spawn} resident propose --name <name> --charter <text>`, `{spawn} resident retire --name <name>`
+- `{spawn} objective retire --mission N --objective <n> --by <name> --reason <why>` — an objective \
+that can never land (its work already on main, renumbered, obsolete): retire it with who and why, \
+never by editing the backlog. It is closed and never assigned again.
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
 - `{spawn} alerts --once` (the alerts now) and `{spawn} alerts --follow` (each as it is recorded) — what Spawn raised on its own: a halted mission, an agent stuck by its judgement, an execution or a gate waiting to be admitted, a backup older than its schedule, a failed restore drill, an expired model login, a crash line in a database's log, low memory, /tmp filling. Each is recorded once, with its evidence, and cleared with what cleared it; there is no monitor of your own to run.
 - `{spawn} tail --session <id>` — one agent's judgement, recent events, judgements and commands.
@@ -456,6 +459,24 @@ mod tests {
             Charter::of(charter("/opt/spawn", "mission.md")).hash
         );
         assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
+    }
+
+    /// Objective 210: an objective that can never land is retired with who
+    /// and why, through a command, never by editing the backlog.
+    #[test]
+    fn the_charter_names_the_objective_retire_command() {
+        let text = charter("spawn", "mission.md");
+        assert!(
+            text.contains(
+                "spawn objective retire --mission N --objective <n> --by <name> --reason <why>"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("never by editing the backlog"), "{text}");
+        assert!(
+            text.contains("its work already on main, renumbered, obsolete"),
+            "{text}"
+        );
     }
 
     /// The monitor retires: the fleet's alerts are Spawn's own records now,

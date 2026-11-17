@@ -1592,6 +1592,23 @@ create table if not exists mission_source_holds (
     expires_ms bigint not null
 );
 
+-- The objectives retired by hand (objective 210, GitHub #65): the fold of
+-- `objective.retired` (`spawn objective retire`, through
+-- spawn_objective_retire), keyed by mission and objective, the first record
+-- winning. A retired objective is closed whatever its kind: no task of it
+-- is assigned again. `caller` is the login that recorded it (`owner` or
+-- `spawn_supervisor`), `event` the record's event id and `at_ms` its time.
+create table if not exists mission_retired_objectives (
+    mission_id bigint  not null,
+    objective  integer not null,
+    by         text    not null,
+    reason     text    not null,
+    caller     text    not null,
+    event      bigint  not null,
+    at_ms      bigint  not null,
+    primary key (mission_id, objective)
+);
+
 -- A source whose main is red on a check (docs/fleet-architecture.md §10.3,
 -- "Main is red"): the fold of the integrator's `source.main_red` records
 -- (keyed by source: a red on a later main moves `main` on, keeping `since_ms`)
@@ -2789,6 +2806,14 @@ begin
         -- reads this record as a landing (OBJECTIVE_LANDINGS), and the task
         -- it ends is cancelled on it. Folded into no table.
         null;
+    when 'objective.retired' then
+        -- An objective retired by hand (spawn_objective_retire, objective
+        -- 210): closed whatever its kind. The first record wins.
+        insert into mission_retired_objectives (mission_id, objective, by, reason, caller,
+                                                event, at_ms)
+        values (v_id, (p_record ->> 'objective')::integer, p_record ->> 'by',
+                p_record ->> 'reason', p_record ->> 'caller', p_event, p_at)
+        on conflict (mission_id, objective) do nothing;
     when 'task.shadow_gated' then
         -- A gate runner's judging of a copy of what the primary judged
         -- (spawn-cli integrate/shadow.rs), beside the primary's verdict: it
@@ -2865,6 +2890,7 @@ declare
 begin
     perform pg_advisory_xact_lock(1399957335);
     delete from mission_source_holds;
+    delete from mission_retired_objectives;
     delete from mission_source_reds;
     delete from spawn_alerts;
     delete from mission_tasks;
@@ -5577,6 +5603,90 @@ begin
     return spawn_control_record(p_record);
 end $$;
 
+-- An objective retired by hand (objective 210, GitHub #65): `spawn
+-- objective retire` writes one `objective.retired` {type, id: mission,
+-- objective, by, reason, caller} through `spawn_objective_retire`, for an
+-- objective that can never land (its work already on main, renumbered,
+-- obsolete). Only the owner's and the supervisor's logins may; `caller` is
+-- set here from the login, never taken from the input. The input has
+-- exactly type, id, objective, by and reason; the mission must exist and
+-- have a backlog; the objective need not be in it (retiring a renumbered
+-- one is the point). Refused, recording nothing: an objective with a task
+-- in flight, or one already closed (a landed task, an objective.solved or
+-- an objective.retired).
+create or replace function spawn_objective_retire(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_caller text := spawn_mission_caller();
+    v_mission bigint;
+    v_objective integer;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if v_caller is null then
+        raise exception '% may not retire objectives', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' is distinct from 'objective.retired' then
+        raise exception 'not a retirement record: %', p_record ->> 'type';
+    end if;
+    if exists (select 1 from jsonb_object_keys(p_record) k
+                where k not in ('type', 'id', 'objective', 'by', 'reason'))
+       or exists (select 1 from unnest(array['id', 'objective', 'by', 'reason']) f
+                   where not p_record ? f) then
+        raise exception 'a retirement record has type, id, objective, by and reason, and nothing else';
+    end if;
+    if exists (select 1 from unnest(array['id', 'objective']) f
+                where case when jsonb_typeof(p_record -> f) = 'number'
+                           then (p_record ->> f)::numeric < 1
+                                or (p_record ->> f)::numeric > 2147483647
+                                or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)
+                           else true end) then
+        raise exception 'a retirement record''s mission and objective are whole numbers from 1';
+    end if;
+    if jsonb_typeof(p_record -> 'by') is distinct from 'string'
+       or char_length(p_record ->> 'by') not between 1 and 80
+       or p_record ->> 'by' ~ '^[[:space:]]*$' then
+        raise exception 'a retirement record''s by is 1 to 80 characters, not blank';
+    end if;
+    if jsonb_typeof(p_record -> 'reason') is distinct from 'string'
+       or char_length(p_record ->> 'reason') not between 1 and 500
+       or p_record ->> 'reason' ~ '^[[:space:]]*$' then
+        raise exception 'a retirement record''s reason is 1 to 500 characters, not blank';
+    end if;
+    v_mission := (p_record ->> 'id')::numeric::bigint;
+    v_objective := (p_record ->> 'objective')::numeric::integer;
+    if not exists (select 1 from mission_missions where id = v_mission) then
+        raise exception 'mission % does not exist', v_mission;
+    end if;
+    if not exists (select 1 from mission_missions
+                    where id = v_mission and jsonb_typeof(objectives -> 'backlog') = 'string') then
+        raise exception 'mission % has no backlog: it is no objective mission', v_mission;
+    end if;
+    if exists (select 1 from mission_tasks
+                where mission_id = v_mission and objective = v_objective
+                  and state in ('assigned', 'delivered', 'revise', 'reported', 'accepted',
+                                'landing')) then
+        raise exception 'objective %/% has a task in flight', v_mission, v_objective;
+    end if;
+    if exists (select 1 from mission_tasks
+                where mission_id = v_mission and objective = v_objective and state = 'landed') then
+        raise exception 'objective %/% is closed: a task of it landed', v_mission, v_objective;
+    end if;
+    if exists (select 1 from spawn_events e
+                where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                  and e.kind -> 'detail' -> 'record' ->> 'type' = 'objective.solved'
+                  and e.kind -> 'detail' -> 'record' ->> 'id' = v_mission::text
+                  and e.kind -> 'detail' -> 'record' ->> 'objective' = v_objective::text) then
+        raise exception 'objective %/% is closed: solved on the base', v_mission, v_objective;
+    end if;
+    if exists (select 1 from mission_retired_objectives
+                where mission_id = v_mission and objective = v_objective) then
+        raise exception 'objective %/% is closed: already retired', v_mission, v_objective;
+    end if;
+    return spawn_control_record(jsonb_build_object(
+        'type', 'objective.retired', 'id', v_mission, 'objective', v_objective,
+        'by', p_record ->> 'by', 'reason', p_record ->> 'reason', 'caller', v_caller));
+end $$;
+
 -- The landings and the deploy records, found without reading the rest of
 -- the stream: deploy/on-landing.sh reads main's landing and the last deploy
 -- every minute (`MAIN_LANDING`).
@@ -6232,7 +6342,7 @@ where c.principal = 'spawn-dispatch' and c.session_id = 'session_supervisor'
 order by g.tag, c.id;
 
 revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds,
-               mission_source_reds, spawn_alerts from public;
+               mission_source_reds, spawn_alerts, mission_retired_objectives from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -6262,7 +6372,7 @@ begin
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
         'spawn_deploy_record(jsonb)', 'spawn_verification_record(jsonb)',
-        'spawn_cost_record(jsonb)',
+        'spawn_objective_retire(jsonb)', 'spawn_cost_record(jsonb)',
         'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
         'spawn_cost_archive_record(jsonb, jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
@@ -6280,12 +6390,14 @@ begin
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
         'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text)',
-        'spawn_resident_retire(text)', 'spawn_task_stages(bigint)'] loop
+        'spawn_resident_retire(text)', 'spawn_task_stages(bigint)',
+        'spawn_objective_retire(jsonb)'] loop
         execute format('grant execute on function %s to %I', v_function,
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
                    'mission_source_holds, mission_source_reds, spawn_alerts, '
+                   'mission_retired_objectives, '
                    'spawn_alert_scores, spawn_decisions, spawn_interventions, spawn_outcomes, '
                    'spawn_escalations, spawn_human_intents to %I',
                    spawn_login_role('spawn_supervisor'));

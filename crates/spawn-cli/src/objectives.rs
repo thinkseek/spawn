@@ -287,12 +287,18 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
     Ok(tasks)
 }
 
-/// One landed objective task, newest first in a list.
+/// One landed objective task, newest first in a list, or a record that
+/// closes an objective as a landing does: an `objective.solved` (no metric)
+/// or an objective retired by hand (`retired`, objective 210).
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Landing {
     pub(crate) objective: u32,
     #[serde(default)]
     pub(crate) metric: Option<String>,
+    /// The objective was retired by hand (`spawn objective retire`): it is
+    /// closed whatever its kind.
+    #[serde(default)]
+    pub(crate) retired: bool,
 }
 
 /// One gate verdict on an objective's task.
@@ -339,25 +345,35 @@ pub(crate) fn landed_value(task: &Task, landings: &[Landing]) -> Option<f64> {
         .find_map(|landing| candidate_value(landing.metric.as_deref()?, name))
 }
 
-/// Whether an objective is open: a one-shot one with no landing (a landing
-/// or an `objective.solved`: the objective's scenario passed at a base commit
-/// main already holds), or a recurring one whose latest landed metric misses
-/// its target.
+/// Whether an objective is open: never once it is retired by hand (objective
+/// 210: closed whatever its kind, never by a metric it has no value for);
+/// else a one-shot one with no landing (a landing or an `objective.solved`:
+/// the objective's scenario passed at a base commit main already holds), or
+/// a recurring one whose latest landed metric misses its target.
 pub(crate) fn is_open(task: &Task, landings: &[Landing]) -> bool {
-    if task.recurring {
+    if landings
+        .iter()
+        .any(|landing| landing.retired && landing.objective == task.id)
+    {
+        false
+    } else if task.recurring {
         !landed_value(task, landings).is_some_and(|value| task.meets(value))
     } else {
         !landings.iter().any(|landing| landing.objective == task.id)
     }
 }
 
-/// Whether `objective` of `mission` is a one-shot objective: the base-solved
-/// rule (`crate::integrate`'s `solved_on_base`) ends a one-shot objective on
-/// the record; a recurring one stays open until its metric meets its target,
-/// and a scenario passing on the base says nothing about the metric the gate
-/// would land. False when the backlog cannot be read (the old verdict
-/// stands).
-pub(crate) fn one_shot(mission: &Mission, objective: u32) -> bool {
+/// Whether the backlog positively reads `objective` of `mission` as
+/// recurring: the base-solved rule (`crate::integrate`'s `solved_on_base`)
+/// ends every other objective on the record, and a recurring one stays open
+/// until its metric meets its target (a scenario passing on the base says
+/// nothing about the metric the gate would land). False when the mission
+/// names no backlog, the backlog cannot be read (a malformed file), or it
+/// does not hold the objective (renumbered or removed, objective 210): a
+/// worker can never make such an objective's scenario fail on the base, so
+/// the old verdict (a rejection, the task sent back) left it unable to land
+/// or close.
+pub(crate) fn recurring(mission: &Mission, objective: u32) -> bool {
     let Some(backlog) = mission
         .objectives
         .as_ref()
@@ -371,7 +387,7 @@ pub(crate) fn one_shot(mission: &Mission, objective: u32) -> bool {
     load_backlog(backlog)
         .ok()
         .and_then(|tasks| tasks.into_iter().find(|task| task.id == objective))
-        .is_some_and(|task| !task.recurring)
+        .is_some_and(|task| task.recurring)
 }
 
 /// Whether the fleet may be given `task`: open, and not the owner's to
@@ -1144,15 +1160,83 @@ fn assign(
     Ok(assigned)
 }
 
+const RETIRE_USAGE: &str = "usage: spawn objective retire --mission <m> --objective <n> \
+                            --by <name> --reason <text>";
+
+/// `spawn objective retire --mission <m> --objective <n> --by <name>
+/// --reason <text>` (objective 210): close by hand an objective that can
+/// never land (its work already on main, renumbered, obsolete), naming who
+/// and why. One `objective.retired` through the store's
+/// `spawn_objective_retire`, which sets `caller` from the login (the
+/// owner's or the supervisor's) and refuses, recording nothing, a blank
+/// `by` or `reason`, a mission that does not exist or has no backlog, an
+/// objective with a task in flight, and one already closed (landed,
+/// solved on the base or retired). The objective need not be in the
+/// backlog. Prints `{event, objective: "<m>/<NNN>"}`.
+pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
+    match rest.first().map(String::as_str) {
+        Some("retire") => {}
+        Some(other) => return Err(format!("unknown objective command {other}\n{RETIRE_USAGE}")),
+        None => return Err(RETIRE_USAGE.to_string()),
+    }
+    let record = retire_record(&crate::Flags::parse(&rest[1..])?)?;
+    let store = crate::open_store()?;
+    let event = store
+        .objective_retire(&record)
+        .map_err(|error| error.to_string())?;
+    let answer = json!({"event": event, "objective": crate::verify::name(
+        record["id"].as_i64().unwrap_or_default(),
+        record["objective"].as_i64().unwrap_or_default())});
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&answer).unwrap_or_else(|_| "{}".to_string())
+    );
+    Ok(0)
+}
+
+/// The `objective.retired` record `spawn objective retire <flags>` asks
+/// for: `--mission` and `--objective` whole numbers from 1, `--by` and
+/// `--reason`, and no other flag. Their lengths and blankness are the
+/// store's to check, so one rule refuses them.
+fn retire_record(flags: &crate::Flags) -> Result<serde_json::Value, String> {
+    if let Some(other) = flags
+        .names()
+        .find(|flag| !["mission", "objective", "by", "reason"].contains(flag))
+    {
+        return Err(format!("unknown flag --{other}\n{RETIRE_USAGE}"));
+    }
+    let required = |flag: &str| {
+        flags
+            .get(flag)
+            .ok_or_else(|| format!("--{flag} is required\n{RETIRE_USAGE}"))
+    };
+    let number = |flag: &str, most: i64| -> Result<i64, String> {
+        let text = required(flag)?;
+        text.parse::<i64>()
+            .ok()
+            .filter(|number| {
+                (1..=most).contains(number) && text.bytes().all(|b| b.is_ascii_digit())
+            })
+            .ok_or_else(|| format!("--{flag} is a whole number from 1, not '{text}'"))
+    };
+    let mission = number("mission", i64::MAX)?;
+    let objective = number("objective", i64::from(i32::MAX))?;
+    Ok(
+        json!({"type": "objective.retired", "id": mission, "objective": objective,
+              "by": required("by")?, "reason": required("reason")?}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ACTIVE_MEASURE, Attempts, Landing, Outcome, PriorWork, Task, attempt_limit, attempts,
-        brief, choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns,
-        workers, yields,
+        brief, choose, holds, is_open, load_backlog, metric_lines, next_open, order_problems,
+        overruns, recurring, workers, yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
 
     fn untried() -> BTreeMap<u32, Attempts> {
         BTreeMap::new()
@@ -1177,6 +1261,7 @@ mod tests {
         Landing {
             objective,
             metric: metric.map(str::to_string),
+            retired: false,
         }
     }
 
@@ -2187,5 +2272,80 @@ mod tests {
         )
         .expect("the backlog");
         assert!(order_problems(&backlog).is_empty());
+    }
+
+    /// Objective 210: the base-solved rule ends every objective but one the
+    /// backlog positively reads as recurring. A mission with no backlog, a
+    /// backlog missing, malformed or without the objective all read "not
+    /// recurring"; a recurring objective in a readable backlog reads so.
+    #[test]
+    fn only_a_backlog_that_reads_the_objective_as_recurring_keeps_it_from_the_base_solved_rule() {
+        let dir =
+            std::env::temp_dir().join(format!("spawn-backlog-recurring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the backlog");
+        let at = |path: &Path| -> crate::integrate::Mission {
+            serde_json::from_value(json!({
+                "id": 4, "gate": "/g", "accept": "gate",
+                "objectives": {"backlog": path.to_string_lossy(), "resident": "rsi", "workers": 1},
+            }))
+            .expect("a mission")
+        };
+        let mission = at(&dir);
+        std::fs::write(
+            dir.join("1.json"),
+            r#"{"id": 1, "title": "One", "prompt": "Do it."}"#,
+        )
+        .expect("one");
+        std::fs::write(
+            dir.join("2.json"),
+            r#"{"id": 2, "title": "Two", "prompt": "Do it.", "recurring": true,
+                "metric": "made_up_ms", "target": 100, "direction": "lower"}"#,
+        )
+        .expect("two");
+        assert!(!recurring(&mission, 1), "one-shot");
+        assert!(recurring(&mission, 2), "recurring");
+        assert!(!recurring(&mission, 3), "not in the backlog");
+        // A malformed file: the backlog cannot be read at all.
+        std::fs::write(dir.join("x.json"), "{\n").expect("malformed");
+        assert!(!recurring(&mission, 2), "malformed backlog");
+        std::fs::remove_file(dir.join("x.json")).expect("unmalformed");
+        assert!(recurring(&mission, 2), "readable again");
+        // No such directory, and a mission naming no backlog.
+        assert!(!recurring(&at(&dir.join("gone")), 2), "missing backlog");
+        let none: crate::integrate::Mission =
+            serde_json::from_value(json!({"id": 4, "gate": "/g", "accept": "gate"}))
+                .expect("a mission");
+        assert!(!recurring(&none, 2), "no backlog named");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Objective 210: a retired objective is closed whatever its kind, before
+    /// the recurring rule, and never assigned: a recurring one with no value
+    /// and a one-shot one alike. A retirement of another objective closes
+    /// nothing.
+    #[test]
+    fn a_retired_objective_is_closed_whatever_its_kind() {
+        let retired = |objective: u32| Landing {
+            objective,
+            metric: None,
+            retired: true,
+        };
+        let backlog = [objective(1, false), objective(2, true), objective(3, false)];
+        assert!(!is_open(&backlog[0], &[retired(1)]));
+        assert!(!is_open(&backlog[1], &[retired(2)]), "recurring, no value");
+        assert!(is_open(&backlog[2], &[retired(1), retired(2)]));
+        assert!(is_open(&backlog[1], &[retired(1)]));
+        let landings = [retired(1), retired(2)];
+        assert_eq!(next_open(&backlog, &landings).map(|task| task.id), Some(3));
+        let chosen = choose(
+            &backlog,
+            &landings,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            3,
+        );
+        assert_eq!(chosen.iter().map(|task| task.id).collect::<Vec<_>>(), [3]);
     }
 }

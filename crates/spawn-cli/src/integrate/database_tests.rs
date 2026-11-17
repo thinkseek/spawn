@@ -8514,6 +8514,72 @@ fn an_objective_solved_on_the_base_ends_its_task_without_a_rejection() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Objective 210 (GitHub #65): "scenario already passes on the base" ends
+/// an objective's task as solved on the base whatever the backlog says:
+/// the objective gone from it (renumbered), a malformed file in it (it
+/// cannot be read at all), or the backlog gone. The one exception is an
+/// objective the backlog positively reads as recurring: its task is
+/// rejected and sent back, as before.
+#[test]
+fn an_objective_solved_on_the_base_is_solved_unless_the_backlog_reads_it_recurring() {
+    let gate = "echo '| == base: 023.sh'\n\
+                    echo '| verdict rejected scenario already passes on the base'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"scenario already passes on the base\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+    for case in ["absent", "malformed", "missing", "recurring"] {
+        let (base, source, scenarios, integrator) = world(&format!("solved-backlog-{case}"), gate);
+        let db = Db::new(&format!("solved_backlog_{case}"));
+        let mission = backlog_mission(&db, &base, "solved", &[23], 1, None);
+        std::fs::write(scenarios.join("023.sh"), "exit 0\n").expect("the scenario");
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("assign");
+        let task = objective_task(&db, mission, 23);
+        db.store.task_delivered(task.id, 1).expect("delivered");
+        assert!(db.store.task_reported(task.id, "done").expect("reported"));
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let backlog = base.join("backlog");
+        match case {
+            "absent" => std::fs::remove_file(backlog.join("023.json")).expect("renumbered"),
+            "malformed" => std::fs::write(backlog.join("x.json"), "{\n").expect("malformed"),
+            "missing" => std::fs::remove_dir_all(&backlog).expect("gone"),
+            _ => std::fs::write(
+                backlog.join("023.json"),
+                json!({"id": 23, "title": "Objective 23", "prompt": "Do it.",
+                       "recurring": true, "metric": "made_up_ms", "target": 100,
+                       "direction": "lower"})
+                .to_string(),
+            )
+            .expect("recurring"),
+        }
+
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let solved = control_records(&db, "objective.solved");
+        let rejected = control_records(&db, "task.gated");
+        let after = gated(&db, mission);
+        let state = db.mission(mission)["tasks"][0]["state"].clone();
+        if case == "recurring" {
+            assert!(solved.is_empty(), "{case}: {solved:?}");
+            assert_eq!(rejected.len(), 1, "{case}: {rejected:?}");
+            assert_eq!(rejected[0]["verdict"], "rejected", "{case}");
+            assert_eq!(after.gate_rejections, 1, "{case}");
+            assert_eq!(state, "revise", "{case}");
+        } else {
+            assert_eq!(solved.len(), 1, "{case}: {solved:?}");
+            assert_eq!(solved[0]["objective"], json!(23), "{case}");
+            assert_eq!(solved[0]["task"], json!(task.id), "{case}");
+            assert!(rejected.is_empty(), "{case}: {rejected:?}");
+            assert_eq!(after.gate_rejections, 0, "{case}");
+            assert_eq!(state, "cancelled", "{case}");
+        }
+        assert!(db.mission(mission)["halted"].is_null(), "{case}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
 /// The same for the other wording mission 4's task 182 hit: a candidate
 /// whose tree is main's is not rejected at once in an objective mission,
 /// but judged — the gate's base check answers "solved on the base"
