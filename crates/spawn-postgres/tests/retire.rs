@@ -192,7 +192,7 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
 
 /// `caller` is the login's: `owner` for the owner, `spawn_supervisor` for
 /// the supervisor's; the reader's and the human's logins are refused
-/// (42501) and record nothing.
+/// (42501: the function is closed to them) and record nothing.
 #[test]
 fn the_caller_is_the_logins_and_only_the_owner_and_supervisor_may_retire() {
     let (store, schema) = store("objective_retire_callers");
@@ -207,7 +207,12 @@ fn the_caller_is_the_logins_and_only_the_owner_and_supervisor_may_retire() {
             .objective_retire(&retire(1, 6, "lead", "obsolete"))
             .expect_err(role)
             .to_string();
-        assert!(error.contains("may not"), "{role}: {error}");
+        // Closed to the login (the reader's), or refused by the function
+        // (the human's, which may execute it as public may not): both 42501.
+        assert!(
+            error.contains("may not retire objectives") || error.contains("permission denied"),
+            "{role}: {error}"
+        );
         assert_eq!((recorded(&mut client), rows(&mut client)), (0, 0), "{role}");
     }
     store
