@@ -317,7 +317,10 @@ pub trait WorkspaceStore: Send + Sync {
         workspace.clone()
     }
 
-    /// Commit the workspace. No changes is [`Commit::Unchanged`].
+    /// Commit the workspace. No changes is [`Commit::Unchanged`]. A branch
+    /// gone from the store while its workspace is mounted is made again
+    /// from the workspace ([`Commit::Recreated`], objective 205), never over
+    /// a ref someone made meanwhile.
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError>;
 
     /// Unmount the workspace. Committed state stays on the branch.
