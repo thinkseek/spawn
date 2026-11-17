@@ -1824,11 +1824,13 @@ mod tests {
         );
     }
 
-    /// Objective 192 (6), R4: once taken, a judged out-since lives as any
-    /// other count: a fresh reading with no range ends it, and the next
-    /// reading out starts a new stretch, raised after its own hold.
+    /// Objective 209 (2), replacing 192 R4's rule (a): every fresh reading
+    /// out takes the judged out-since again, so a fresh reading with no
+    /// range (or no value) ends nothing, before or after a take: the figure
+    /// out again is not raised, however long. A reading in range ends it,
+    /// and the next stretch out is raised after its own hold.
     #[test]
-    fn a_taken_judged_stretch_ends_like_any_other() {
+    fn a_taken_judged_stretch_ends_only_on_a_reading_in_range() {
         let since = 50 * H;
         let judged = rows(&key_at(since), since, &json!({"judged": "false"}));
         let restart = 100 * H;
@@ -1849,18 +1851,131 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+        assert_eq!(
+            step(
+                &mut monitor,
+                restart + 450_000,
+                answer("not_collected", &Value::Null)
+            ),
+            Vec::<String>::new()
+        );
         let out = restart + 600_000;
+        for later in [out, out + RAISE, out + 10 * RAISE] {
+            assert_eq!(
+                step(&mut monitor, later, answer("out", &json!(OUT))),
+                Vec::<String>::new(),
+                "{later}"
+            );
+        }
+        // In range: ended; the next stretch out is new.
+        let back = out + 10 * RAISE + 1;
+        step(&mut monitor, back, answer("in", &json!(IN)));
+        let again = back + 1;
         assert_eq!(
-            step(&mut monitor, out, answer("out", &json!(OUT))),
+            step(&mut monitor, again, answer("out", &json!(OUT))),
             Vec::<String>::new()
         );
         assert_eq!(
-            step(&mut monitor, out + RAISE - 1, answer("out", &json!(OUT))),
+            step(&mut monitor, again + RAISE, answer("out", &json!(OUT))),
+            [key_at(again)]
+        );
+    }
+
+    /// Objective 209 (1): an alert judged false while the loop runs keeps
+    /// its stretch as a restarted loop does: no range, no value end
+    /// nothing, and out again is not raised however long; a reading in
+    /// range ends it. Judged after this loop read the figure in range (open
+    /// in its clear hold, rev-i's probe), it keeps nothing: the next stretch
+    /// is raised after its hold. Judged `right`, it keeps nothing either.
+    #[test]
+    fn an_alert_judged_while_the_loop_runs_stays_judged_through_no_range() {
+        let judge = |monitor: &mut Monitor, at: i64, key: &str, verdict: &str| {
+            let mut out = Vec::new();
+            monitor.feed(
+                50,
+                at,
+                &json!({"type": "alert.judged", "key": key, "verdict": verdict}),
+                &mut out,
+            );
+            assert!(out.is_empty());
+        };
+        let mut monitor = monitor();
+        let t0 = 10 * H;
+        step(&mut monitor, t0, answer("out", &json!(OUT)));
+        assert_eq!(
+            step(&mut monitor, t0 + RAISE, answer("out", &json!(OUT))),
+            [key_at(t0)]
+        );
+        judge(&mut monitor, t0 + RAISE, &key_at(t0), "false");
+        let t1 = t0 + RAISE + 1;
+        assert_eq!(
+            step(&mut monitor, t1, answer("no_range", &json!(OUT))),
             Vec::<String>::new()
         );
         assert_eq!(
-            step(&mut monitor, out + RAISE, answer("out", &json!(OUT))),
-            [key_at(out)]
+            step(&mut monitor, t1 + 1, answer("not_collected", &Value::Null)),
+            Vec::<String>::new()
+        );
+        for later in [t1 + 2, t1 + 2 + RAISE, t1 + 2 + 2 * RAISE] {
+            assert_eq!(
+                step(&mut monitor, later, answer("out", &json!(OUT))),
+                Vec::<String>::new(),
+                "{later}"
+            );
+        }
+        // No range again after a take: still nothing ends it.
+        let t2 = t1 + 3 + 2 * RAISE;
+        step(&mut monitor, t2, answer("no_range", &json!(OUT)));
+        assert_eq!(
+            step(&mut monitor, t2 + 1 + RAISE, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+
+        // In range ends it: the next stretch is raised after its hold.
+        let back = t2 + 2 + RAISE;
+        step(&mut monitor, back, answer("in", &json!(IN)));
+        let t3 = back + 1;
+        step(&mut monitor, t3, answer("out", &json!(OUT)));
+        assert_eq!(
+            step(&mut monitor, t3 + RAISE, answer("out", &json!(OUT))),
+            [key_at(t3)]
+        );
+
+        // rev-i's probe: open in its clear hold, read in range, then no
+        // range, then judged false: nothing kept, out again is new.
+        let t4 = t3 + RAISE + 1;
+        step(&mut monitor, t4, answer("in", &json!(IN)));
+        step(&mut monitor, t4 + 1, answer("no_range", &json!(OUT)));
+        assert!(monitor.known[&key_at(t3)].open(), "in its clear hold");
+        judge(&mut monitor, t4 + 2, &key_at(t3), "false");
+        let t5 = t4 + 3;
+        assert_eq!(
+            step(&mut monitor, t5, answer("out", &json!(OUT))),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            step(&mut monitor, t5 + RAISE, answer("out", &json!(OUT))),
+            [key_at(t5)]
+        );
+
+        // Judged right: nothing kept; no range clears it by its condition
+        // after the clear hold, and out again is new.
+        judge(&mut monitor, t5 + RAISE, &key_at(t5), "right");
+        assert!(monitor.known[&key_at(t5)].open());
+        let t6 = t5 + RAISE + 1;
+        step(&mut monitor, t6, answer("no_range", &json!(OUT)));
+        let (cleared, _) = read(
+            &mut monitor,
+            t6 + CLEAR,
+            Ok(answer("no_range", &json!(OUT))),
+        );
+        assert_eq!(keys(&cleared), [format!("clear {}", key_at(t5))]);
+        commit(&mut monitor, &cleared);
+        let t7 = t6 + CLEAR + 1;
+        step(&mut monitor, t7, answer("out", &json!(OUT)));
+        assert_eq!(
+            step(&mut monitor, t7 + RAISE, answer("out", &json!(OUT))),
+            [key_at(t7)]
         );
     }
 }
