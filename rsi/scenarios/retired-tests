@@ -43,3 +43,6 @@ serve::core_lines::performance::tests::report_to_live_waits_until_the_live_recor
 # 166 (rev-b, 11-14): the notice fold moved from serve to alerts (alerts::window folds);
 # the same test, now alerts::notices::tests::a_notice_is_superseded_by_its_subjects_next_one.
 serve::notices::tests::a_notice_is_superseded_by_its_subjects_next_one
+# 209 (rev-e, 11-17): 192 R4's rule (a) flipped (only a reading in range ends a judged stretch, taken or not);
+# the same case, now alerts::guardrails::tests::a_taken_judged_stretch_ends_only_on_a_reading_in_range.
+alerts::guardrails::tests::a_taken_judged_stretch_ends_like_any_other
