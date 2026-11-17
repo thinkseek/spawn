@@ -182,6 +182,7 @@ fn a_changed_workspace_advances_the_branch() {
     match store.commit(&workspace, "work").expect("commit succeeds") {
         Commit::Created(id) => assert_eq!(id.as_str().len(), 40, "{id}"),
         Commit::Unchanged => panic!("a changed workspace must produce a commit"),
+        Commit::Recreated { .. } => panic!("the branch is there: nothing to make again"),
     }
     let head = spawn_host::test_git_command()
         .arg("--git-dir")
