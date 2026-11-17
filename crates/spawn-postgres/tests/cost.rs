@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 use spawn_core::event::{ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::port::EventLog;
-use spawn_postgres::{ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore};
+use spawn_postgres::{
+    ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore, SessionFile, SessionMessage,
+};
 
 mod common;
 use common::{admin, store};
@@ -759,4 +761,121 @@ fn a_trend_cuts_the_window_into_steps_each_with_its_dollars_and_unpriced_tokens(
         json!([])
     );
     assert_eq!(store.cost_trend(since, until, 0).expect("trend"), json!([]));
+}
+
+fn session_message(id: &str, model: &str, at_ms: i64, counts: [i64; 4]) -> SessionMessage {
+    let [input, output, cache_write, cache_read] = counts;
+    SessionMessage {
+        project: "-data-tmp-ccd-rev-x".to_string(),
+        session_id: "s1".to_string(),
+        message_id: id.to_string(),
+        model: model.to_string(),
+        at_ms,
+        input,
+        output,
+        cache_write,
+        cache_read,
+    }
+}
+
+#[test]
+fn the_sessions_count_apart_from_the_engines_and_never_twice() {
+    let (store, schema) = store("cost_sessions");
+    let (_mission, _task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    started(&store, &worker, 1);
+    // An engine's message, in the engines' record.
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_engine", "model-x", now),
+        [100_000, 0, 0, 0],
+    );
+    store.cost_record(&prices(3.0)).expect("record");
+    let engines = || store.cost_window(now - DAY_MS, now + 1000).expect("window");
+    let before = engines();
+
+    let mark = |offset: i64| SessionFile {
+        file: "-data-tmp-ccd-rev-x/s1.jsonl".to_string(),
+        inode: 42,
+        offset_bytes: offset,
+        length: offset,
+        modified_ms: 7,
+    };
+    let first = [
+        // $3 a million input: $0.30.
+        session_message("msg_s1", "model-x", now, [100_000, 0, 0, 0]),
+        // A model with no price: its tokens, no cost.
+        session_message("msg_s2", "model-z", now + 1, [500, 50, 0, 0]),
+        // The engine's message, also in this session's file: left to it.
+        session_message("msg_engine", "model-x", now, [100_000, 0, 0, 0]),
+    ];
+    let done = store
+        .cost_session_record(&prices(3.0), &first, &[mark(100)])
+        .expect("record");
+    assert_eq!((done.counted, done.changed, done.engine), (2, 0, 1));
+    // Read again: nothing changes.
+    let again = store
+        .cost_session_record(&prices(3.0), &first[..2], &[mark(100)])
+        .expect("record");
+    assert_eq!((again.counted, again.changed, again.engine), (0, 0, 0));
+    // A later line of msg_s1 whose usage grew: the larger usage, the
+    // earlier time, repriced.
+    let grown = store
+        .cost_session_record(
+            &prices(6.0),
+            &[session_message(
+                "msg_s1",
+                "model-x",
+                now + 5,
+                [200_000, 0, 0, 0],
+            )],
+            &[mark(250)],
+        )
+        .expect("record");
+    assert_eq!((grown.counted, grown.changed), (0, 1));
+    assert_eq!(store.cost_session_files().expect("marks"), vec![mark(250)]);
+
+    let sessions = store
+        .cost_sessions(now - DAY_MS, now + 1000)
+        .expect("sessions");
+    near(
+        &sessions["total"]["usd"],
+        1.2,
+        "msg_s1 at $6 a million, 200,000 tokens",
+    );
+    assert_eq!(sessions["total"]["unpriced_tokens"], 550);
+    assert_eq!(sessions["rows"][0]["project"], "-data-tmp-ccd-rev-x");
+    assert_eq!(sessions["counted_since_ms"], now);
+    // A window ending at msg_s1's time leaves it out (the end is open).
+    let edge = store.cost_sessions(now - DAY_MS, now).expect("sessions");
+    assert_eq!(edge["rows"], json!([]), "{edge}");
+    // A window before them holds none.
+    let earlier = store
+        .cost_sessions(now - DAY_MS, now - 1)
+        .expect("sessions");
+    assert_eq!(earlier["rows"], json!([]));
+    near(&earlier["total"]["usd"], 0.0, "nothing before");
+    // The engines' figures are as they were.
+    assert_eq!(engines()["total"], before["total"]);
+    assert_eq!(engines()["missions"], before["missions"]);
+
+    let mut reader = common::as_login(&schema, "spawn_reader");
+    let refused = reader
+        .query_one(
+            "select spawn_cost_session_record('{}'::jsonb, '[]'::jsonb, '[]'::jsonb)",
+            &[],
+        )
+        .expect_err("the reader may not record");
+    assert!(
+        refused.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+        "{refused}"
+    );
+    // The reader reads the sessions' part, as /api/cost does.
+    let rows = reader
+        .query_one("select count(*) from spawn_cost_session_messages", &[])
+        .expect("the reader reads")
+        .get::<_, i64>(0);
+    assert_eq!(rows, 2);
 }
