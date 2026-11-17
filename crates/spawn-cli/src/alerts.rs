@@ -3674,6 +3674,23 @@ times in a row)",
             return;
         }
         let path = self.settings.tmpfs_path.clone();
+        // The reading is a tmpfs's own used space. On a host whose path is
+        // not a tmpfs (a /tmp on the root filesystem) `df` measures the root,
+        // which is usually over the bound and never comes under it: the
+        // alert would stay open for a filesystem nobody asked about.
+        if !on_tmpfs(&path) {
+            for key in self.open_keys("tmpfs_high", "host") {
+                out.push(Event::Clear {
+                    key,
+                    evidence: json!({
+                        "path": path.display().to_string(),
+                        "reason": "not a tmpfs on this host",
+                        "reading_ms": now,
+                    }),
+                });
+            }
+            return;
+        }
         let measured = match used_mb(&path) {
             Ok(measured) => measured,
             Err(error) => {
@@ -4520,6 +4537,36 @@ fn available_mb() -> Result<u64, String> {
     Ok(kb / 1024)
 }
 
+/// Whether `path` is on a tmpfs, by the longest mount point of
+/// `/proc/mounts` that holds it. A host whose `/proc/mounts` cannot be read
+/// is not told apart: the reading goes on as before.
+fn on_tmpfs(path: &Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return true;
+    };
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let mut best: Option<(usize, bool)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(_), Some(mount), Some(fstype)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let mount = mount.replace("\\040", " ");
+        let mount = std::path::Path::new(&mount);
+        if !path.starts_with(mount) {
+            continue;
+        }
+        let depth = mount.components().count();
+        if best.is_none_or(|(known, _)| depth >= known) {
+            best = Some((depth, fstype == "tmpfs"));
+        }
+    }
+    best.is_some_and(|(_, tmpfs)| tmpfs)
+}
+
 /// The used MiB of the filesystem that holds `path`, as `df -Pk` reports it.
 fn used_mb(path: &Path) -> Result<u64, String> {
     let output = std::process::Command::new("df")
@@ -5116,7 +5163,8 @@ mod notices;
 mod tests {
     use super::{
         Crossing, Event, LIKELY, Monitor, Row, Settings, civil, crash_stamp, crossing,
-        days_from_civil, host_sources, line, parse_span, scrub, scrub_value, time_text, window_ms,
+        days_from_civil, host_sources, line, on_tmpfs, parse_span, scrub, scrub_value, time_text,
+        window_ms,
     };
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet};
@@ -7257,6 +7305,45 @@ mod tests {
         assert_eq!(
             watched,
             [(4, "/srv/a.git".to_string()), (6, "/srv/a.git".to_string())]
+        );
+    }
+
+    /// GitHub #66: on a host whose `/tmp` is not a tmpfs, `df` measured the
+    /// root filesystem, so the alert fired on a filesystem nobody asked
+    /// about and never came under its bound. A path that is not a tmpfs is
+    /// not measured: what it opened is cleared and nothing fires.
+    #[test]
+    fn a_path_that_is_not_a_tmpfs_clears_its_alert_and_fires_none() {
+        if std::fs::read_to_string("/proc/mounts").is_err() {
+            // Without it the reading goes on as before; nothing to assert.
+            return;
+        }
+        let root = Path::new("/");
+        assert!(!on_tmpfs(root), "the test host's root is not a tmpfs");
+        let mut monitor = Monitor::with(Settings {
+            tmpfs_path: root.to_path_buf(),
+            tmpfs_high_mb: 1,
+            tmpfs_ok_mb: 1,
+            ..settings()
+        });
+        monitor.known.insert(
+            "tmpfs_high:1".to_string(),
+            Row {
+                kind: "tmpfs_high".to_string(),
+                subject: "host".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"reading_ms": 1}),
+                fired_event_id: 1,
+                fired_at_ms: 1,
+            },
+        );
+        let mut out = Vec::new();
+        monitor.read_tmpfs(2, &mut out, &mut Vec::new());
+        let events = decided(&monitor, out);
+        assert_eq!(events.len(), 1, "the open alert clears: {events:?}");
+        assert!(
+            matches!(events[0], Event::Clear { .. }),
+            "nothing fires on a path that is not a tmpfs: {events:?}"
         );
     }
 
