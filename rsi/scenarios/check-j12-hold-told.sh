@@ -123,6 +123,8 @@ loop_pid=""
 serve_pid=""
 follow_pid=""
 judge_pid=""
+# (6)'s tmpfs directory when it is not in WORK (/dev/shm): removed by cleanup.
+ram_outside=""
 stop_pid() { # <pid>: TERM, then KILL after 30 s; only our own children
     [ -n "$1" ] || return 0
     kill "$1" 2>/dev/null || true
@@ -149,6 +151,7 @@ cleanup() {
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
+    [ -z "$ram_outside" ] || rm -rf "$ram_outside"
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
 }
@@ -390,7 +393,26 @@ livelog=$WORK/live-pg.log
 stamp() { date -u '+%Y-%m-%d %H:%M:%S.%3N UTC'; }
 printf '%s [1] LOG:  database system is ready to accept connections\n' "$(stamp)" >"$testlog"
 printf '%s [1] LOG:  database system is ready to accept connections\n' "$(stamp)" >"$livelog"
-mkdir -p "$WORK/ram"
+# (6) fills a tmpfs and expects tmpfs_high on it. Since 215, tmpfs_high reads
+# a tmpfs alone: a path on any other filesystem never alerts, and in the gate
+# WORK is not on a tmpfs. So: WORK/ram when WORK is on a tmpfs, else a
+# directory of the scenario's own under /dev/shm (removed by cleanup), else
+# none, and (6) checks memory_low alone, saying why on stderr.
+fstype() { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
+ram=""
+if [ "$(fstype "$WORK")" = tmpfs ]; then
+    ram=$WORK/ram
+    mkdir -p "$ram"
+elif [ "$(fstype /dev/shm)" = tmpfs ] && [ -w /dev/shm ]; then
+    ram_outside=$(mktemp -d /dev/shm/bb-j12-XXXXXX) || ram_outside=""
+    ram=$ram_outside
+fi
+host_kinds="memory_low tmpfs_high"
+if [ -z "$ram" ]; then
+    mkdir -p "$WORK/ram"
+    host_kinds="memory_low"
+    echo "j12: [030 (6)] no writable tmpfs (WORK is $(fstype "$WORK"), /dev/shm is $(fstype /dev/shm)): tmpfs_high is not checked here" >&2
+fi
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS SPAWN_SERVE_TOKEN \
@@ -428,7 +450,7 @@ SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS=4
 SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS=4
 SPAWN_TEST_DATABASE_LOG=$testlog
 SPAWN_DATABASE_LOG=$livelog
-SPAWN_ALERT_TMPFS_PATH=$WORK/ram
+SPAWN_ALERT_TMPFS_PATH=${ram:-$WORK/ram}
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
     SPAWN_SUPERVISOR SPAWN_MISSION_FILE SPAWN_LOOP_INTERVAL_MS SPAWN_JUDGE_URL \
@@ -821,12 +843,12 @@ fi
 # --- (6) host thresholds and an undelivered task, across restarts ------------------------------
 echo "j12: [030 (6)] memory_low, tmpfs_high and task_undelivered across restarts, then cleared"
 
-dd if=/dev/zero of="$WORK/ram/fill" bs=1048576 count=4 2>/dev/null || harness "cannot write $WORK/ram/fill"
+[ -z "$ram" ] || dd if=/dev/zero of="$ram/fill" bs=1048576 count=4 2>/dev/null || harness "cannot write $ram/fill"
 stop_loop
 restart_at=$(now_ms)
 # shellcheck disable=SC2086
 start_loop $CROSSED
-for kind in memory_low tmpfs_high; do
+for kind in $host_kinds; do
     if fired 20 "$kind" host "(6) $kind" "the loop restarted with a $kind threshold the host crosses"; then
         within "(6) $kind after the restart" "$restart_at" 20000
     fi
@@ -836,10 +858,12 @@ if [ -z "$missing" ]; then
         [ "$(field '.evidence.measured_mb < .evidence.threshold_mb')" = true ] &&
         [ "$(field .evidence.threshold_mb)" = 100000000 ] ||
         measured_fail "(6) the memory_low alert's evidence lacks the measured MiB under the threshold (100000000): $alert"
-    one tmpfs_high host "(6) tmpfs_high" &&
-        [ "$(field '.evidence.measured_mb > .evidence.threshold_mb')" = true ] &&
-        [ "$(field .evidence.threshold_mb)" = 1 ] && [ "$(field .evidence.path)" = "$WORK/ram" ] ||
-        measured_fail "(6) the tmpfs_high alert's evidence lacks the used MiB over the threshold (1) and the path ($WORK/ram): $alert"
+    if [ -n "$ram" ]; then
+        one tmpfs_high host "(6) tmpfs_high" &&
+            [ "$(field '.evidence.measured_mb > .evidence.threshold_mb')" = true ] &&
+            [ "$(field .evidence.threshold_mb)" = 1 ] && [ "$(field .evidence.path)" = "$ram" ] ||
+            measured_fail "(6) the tmpfs_high alert's evidence lacks the used MiB over the threshold (1) and the path ($ram): $alert"
+    fi
 fi
 capture "$SPAWN_BIN" task assign --mission "$mission" --kind ephemeral --worker hold \
     --brief "Nothing to do. BB:NOOP"
@@ -857,12 +881,12 @@ fi
 if [ -z "$missing" ]; then
     pause 5 # more readings: nothing fires again
     refresh
-    for kind in memory_low tmpfs_high; do one "$kind" host "(6) $kind read again" || true; done
+    for kind in $host_kinds; do one "$kind" host "(6) $kind read again" || true; done
 fi
 stop_loop
 # shellcheck disable=SC2086
 start_loop $USUAL
-for kind in memory_low tmpfs_high; do
+for kind in $host_kinds; do
     if [ -z "$missing" ] && cleared 20 "$kind" host "(6) $kind under the usual thresholds"; then
         provoked cleared
     fi
