@@ -95,7 +95,10 @@ fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() 
     }
     // Before task 1's delivery: a call of an earlier task.
     sql.push(event("a", 1_500, "claude", "tool.started"));
-    sql.push(record(2_000, &json!({"type": "task.delivered", "id": 1, "command_id": 1})));
+    sql.push(record(
+        2_000,
+        &json!({"type": "task.delivered", "id": 1, "command_id": 1}),
+    ));
     // After it: the brief arriving (input), two calls, a Bridge call and a
     // Bridge completion of the same names (none), a busy pane and a
     // judgement (none).
@@ -109,25 +112,43 @@ fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() 
     sql.push(event("a", 2_600, "bridge", "screen.observed"));
     sql.push(event("a", 2_700, "observer", "observation.recorded"));
     // Task 2: delivered, only its brief arriving after.
-    sql.push(record(3_000, &json!({"type": "task.delivered", "id": 2, "command_id": 2})));
+    sql.push(record(
+        3_000,
+        &json!({"type": "task.delivered", "id": 2, "command_id": 2}),
+    ));
     sql.push(event("b", 3_000, "claude", "message.received"));
     sql.push(event("b", 3_000, "claude", "message.taken"));
     // Task 3: delivered, a call, sent back, delivered again: it counts from
     // the latest delivery.
-    sql.push(record(4_000, &json!({"type": "task.delivered", "id": 3, "command_id": 3})));
+    sql.push(record(
+        4_000,
+        &json!({"type": "task.delivered", "id": 3, "command_id": 3}),
+    ));
     sql.push(event("c", 4_100, "claude", "tool.started"));
     sql.push(event("c", 4_200, "claude", "turn.stopped"));
-    sql.push(record(4_300, &json!({"type": "task.reported", "id": 3, "report": "r"})));
+    sql.push(record(
+        4_300,
+        &json!({"type": "task.reported", "id": 3, "report": "r"}),
+    ));
     sql.push(record(
         4_400,
         &json!({"type": "task.reviewed", "id": 3, "accepted": false, "note": "again"}),
     ));
-    sql.push(record(5_000, &json!({"type": "task.delivered", "id": 3, "command_id": 4})));
+    sql.push(record(
+        5_000,
+        &json!({"type": "task.delivered", "id": 3, "command_id": 4}),
+    ));
     sql.push(event("c", 5_100, "claude", "job.started"));
     // Task 4: delivered and reported; task 5: assigned only.
-    sql.push(record(6_000, &json!({"type": "task.delivered", "id": 4, "command_id": 5})));
+    sql.push(record(
+        6_000,
+        &json!({"type": "task.delivered", "id": 4, "command_id": 5}),
+    ));
     sql.push(event("d", 6_100, "claude", "tool.started"));
-    sql.push(record(6_200, &json!({"type": "task.reported", "id": 4, "report": "r"})));
+    sql.push(record(
+        6_200,
+        &json!({"type": "task.reported", "id": 4, "report": "r"}),
+    ));
     seed(&mut client, &sql.join("\n"));
     assert_eq!(
         states(&mut client),
@@ -175,5 +196,8 @@ fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() 
     // The dashboard's reader login reads it.
     let login = role_url(&schema_url(&schema), "spawn_reader").expect("the reader's URL");
     let reader = PostgresStore::connect(&login).expect("log in");
-    assert_eq!(reader.task_activity().expect("the reader reads it"), activity);
+    assert_eq!(
+        reader.task_activity().expect("the reader reads it"),
+        activity
+    );
 }
