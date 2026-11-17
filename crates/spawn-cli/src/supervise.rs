@@ -231,6 +231,9 @@ execution of its own session on its workspace (its work kept); `{spawn} task rea
 --reason <why>` — the task moves to a fresh worker whose branch starts from the old worker's work. \
 Prefer them to a cancel and a new assign: nothing the worker did is lost.
 - `{spawn} resident propose --name <name> --charter <text>`, `{spawn} resident retire --name <name>`
+- `{spawn} objective retire --mission N --objective <n> --by <name> --reason <why>` — an objective \
+that can never land (its work already on main, renumbered, obsolete): retire it with who and why, \
+never by editing the backlog. It is closed and never assigned again.
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
 - `{spawn} alerts --once` (the alerts now) and `{spawn} alerts --follow` (each as it is recorded) — what Spawn raised on its own: a halted mission, an agent stuck by its judgement, an execution or a gate waiting to be admitted, a backup older than its schedule, a failed restore drill, an expired model login, a crash line in a database's log, low memory, /tmp filling. Each is recorded once, with its evidence, and cleared with what cleared it; there is no monitor of your own to run.
 - `{spawn} tail --session <id>` — one agent's judgement, recent events, judgements and commands.
