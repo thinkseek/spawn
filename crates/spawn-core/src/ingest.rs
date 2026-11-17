@@ -884,6 +884,11 @@ fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
 /// - a prompt (a user line that is not a tool result) starts a turn; one
 ///   that holds a message's marker took that message (`message.taken`,
 ///   [`crate::message`]);
+/// - an input typed while the agent works, which the engine gives it at its
+///   next step and writes only as an `attachment` of type `queued_command`
+///   with `commandMode` `prompt` (objective 214), takes the markers it holds
+///   the same way and starts no turn; a `queued_command` of any other mode
+///   is the engine's own text and takes nothing;
 /// - each `tool_use` block of an assistant line starts a tool, and each
 ///   `tool_result` block of a user line ends one, failed when `is_error`;
 /// - `system`/`turn_duration`, written when a turn ends, and an interrupt
@@ -980,9 +985,24 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
             if value.pointer("/attachment/type").and_then(Value::as_str)
                 == Some("queued_command") =>
         {
-            value
-                .pointer("/attachment/prompt")
-                .map_or_else(Vec::new, |prompt| job_ends(&whole_text(prompt)))
+            let Some(prompt) = value.pointer("/attachment/prompt") else {
+                return Vec::new();
+            };
+            let text = whole_text(prompt);
+            if value
+                .pointer("/attachment/commandMode")
+                .and_then(Value::as_str)
+                == Some("prompt")
+            {
+                // An input typed while the agent worked, given to it at its
+                // next step (objective 214): its only transcript line. It
+                // takes its markers as a user line does, and starts no turn.
+                taken(&text, uuid)
+            } else {
+                // The engine's own text (a job's notification): it ends its
+                // jobs and takes nothing, whatever it quotes.
+                job_ends(&text)
+            }
         }
         _ => Vec::new(),
     }
@@ -1241,6 +1261,47 @@ mod tests {
             kinds(&quoted),
             vec![("tool.completed".into(), Some("toolu_1:completed".into()))]
         );
+    }
+
+    /// Objective 214 (GitHub #66): an input typed while the agent works is
+    /// given to it at its next step and written only as a `queued_command`
+    /// attachment of mode `prompt`: it takes its markers (a string or text
+    /// blocks) as a user line does, and starts no turn. A `queued_command`
+    /// of another mode (a job's notification) takes nothing, even quoting a
+    /// marker, and still ends its jobs; a sub-agent's takes nothing.
+    #[test]
+    fn an_input_given_mid_turn_takes_its_message_and_starts_no_turn() {
+        let queued = r#"{"parentUuid":"d5","isSidechain":false,"attachment":{"type":"queued_command","commandMode":"prompt","prompt":"look at the gate log\n\n[spawn message #41]"},"type":"attachment","uuid":"q1","timestamp":"2026-11-17T10:00:00.000Z","version":"2.1.325"}"#;
+        assert_eq!(
+            kinds(queued),
+            vec![("message.taken".into(), Some("q1:taken:41".into()))]
+        );
+        assert_eq!(
+            claude_line(queued)[0].kind,
+            EventKind::MessageTaken {
+                command_id: crate::id::CommandId(41)
+            }
+        );
+        // Text blocks, two inputs: each taken once.
+        let blocks = r#"{"isSidechain":false,"attachment":{"type":"queued_command","commandMode":"prompt","prompt":[{"type":"text","text":"a\n\n[spawn message #5]"},{"type":"text","text":"b\n\n[spawn message #6]"}]},"type":"attachment","uuid":"q2"}"#;
+        assert_eq!(
+            kinds(blocks),
+            vec![
+                ("message.taken".into(), Some("q2:taken:5".into())),
+                ("message.taken".into(), Some("q2:taken:6".into())),
+            ]
+        );
+        // Without a marker (a person's own typing): nothing.
+        let plain = r#"{"isSidechain":false,"attachment":{"type":"queued_command","commandMode":"prompt","prompt":"stop after this"},"type":"attachment","uuid":"q3"}"#;
+        assert!(kinds(plain).is_empty());
+        // A job's notification quoting a marker: it ends its job, takes
+        // nothing.
+        let notice = r#"{"isSidechain":false,"attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command \"echo [spawn message #41]\" completed (exit code 0)</summary>\n</task-notification>"},"type":"attachment","uuid":"q4"}"#;
+        let names: Vec<String> = kinds(notice).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["job.ended"], "{:?}", kinds(notice));
+        // A sub-agent's input stays ignored.
+        let sidechain = r#"{"isSidechain":true,"attachment":{"type":"queued_command","commandMode":"prompt","prompt":"x\n\n[spawn message #41]"},"type":"attachment","uuid":"q5"}"#;
+        assert!(kinds(sidechain).is_empty());
     }
 
     #[test]

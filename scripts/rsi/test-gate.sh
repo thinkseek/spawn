@@ -316,7 +316,11 @@ branch broken-probe
 printf 'two\n' >"$seed/value"
 printf 'echo "probe: broken"\nexit 1\n' >"$seed/probe.sh"
 broken_probe=$(commit broken-probe)
-expect "a check that fails twice and passes on the base is a regression" "$(judge "$broken_probe")" \
+# One job at a time (objective 208 (c)): beside other jobs, a check that
+# failed twice and passes on the base runs once more alone first (5a-alone,
+# below); here the serial rule's own words.
+expect "a check that fails twice and passes on the base is a regression" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$broken_probe")" \
     'exit=0 {"verdict":"rejected","reason":"regression: check-probe.sh fails on the candidate"}'
 expect "a rejection names the regressions that passed before it, not the one that failed" "$(passed_of)" \
     'passed="007.sh","check-built.sh"'
@@ -342,6 +346,205 @@ expect "a flake that passed again is a regression that passed too" "$(passed_of)
     'passed="check-probe.sh","007.sh","check-built.sh"'
 expect "the log says it" "$(cat "$work/gate.out")" \
     'check-probe.sh failed once (1) and passed again on the candidate: a flake, not a regression'
+# 5a-tests (objective 208 (b), rev-f on #28): a check that fails twice on
+# the candidate goes to the base only when one test failed in both runs.
+# Two runs that each name their failing tests (`FAILED <test>:`) and share
+# none: each failing test passed in the other run, a flake, accepted and
+# named. One test in both runs, or a run that names none (a build that
+# failed, a crash), goes to the base as before. One job at a time, so
+# that the base's verdict is the serial rule's (5a-alone has the other).
+apart_dir() { # <name> <first run's line> <second run's line> [<first run's second line> [<second run's second line> [<first run's exit status, 1>]]]
+    mkdir -p "$work/apart-$1"
+    cp -r "$scenarios/." "$work/apart-$1/"
+    cat >"$work/apart-$1/check-zz.sh" <<EOF
+#!/bin/sh
+# Passes on the base (value one); on the candidate, its runs by these lines.
+[ "\$(cat value)" = one ] && exit 0
+n=1
+while [ -e ran.zz.\$n ]; do n=\$((n + 1)); done
+: >ran.zz.\$n
+case \$n in
+1) printf '%s\\n' "$2" "${4-}"; exit ${6:-1} ;;
+2) printf '%s\\n' "$3" "${5-}"; exit 1 ;;
+esac
+exit 0
+EOF
+}
+apart_dir apart "FAILED lib::tests::first: boom" "FAILED lib::tests::second: boom"
+expect "two failing runs that share no failing test are a flake, accepted and named" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-apart")" 'exit=0 {"verdict":"accepted","flakes":["check-zz.sh"]}'
+expect "the log names the tests of each run" "$(cat "$work/gate.out")" \
+    '| check-zz.sh failed twice on the candidate (1, then 1) but no test failed in both runs (lib::tests::first; then lib::tests::second): each failing test passed in the other run, a flake, not a regression'
+refuse "and it never went to the base" "$(cat "$work/gate.out")" '| == base: check-zz.sh'
+apart_dir shared "FAILED lib::tests::first: boom" "FAILED lib::tests::first: boom again"
+expect "one test failing in both runs goes to the base: a regression" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-shared")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+expect "after its run on the base" "$(cat "$work/gate.out")" \
+    'check-zz.sh passes on the base and failed twice on the candidate: a regression'
+apart_dir silent "error: could not compile" "FAILED lib::tests::second: boom"
+expect "a run that names no failing test goes to the base: a regression" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-silent")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+# A run that also crashed a test binary (`CRASHED <target>:`, rev-g's F1 on
+# 208 R1): the crash names no test, so the runs cannot be compared; to the
+# base, as before.
+apart_dir crashed "FAILED lib::tests::first: boom" "FAILED lib::tests::second: boom" "CRASHED -p a --lib: signal: 6, SIGABRT: process abort signal"
+expect "a run that crashed a test binary goes to the base: a regression" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-crashed")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+refuse "never a flake" "$(cat "$work/gate.out")" 'a flake, not a regression'
+# The mirror of the silent case (rev-b's F1 on 208 R4): the first run names
+# a failing test, the second exits 1 naming none (a build error, a leftover
+# check): nothing to compare, so to the base, never a flake.
+apart_dir silent2 "FAILED lib::tests::first: boom" "error: could not compile"
+expect "a second run that names no failing test goes to the base: a regression" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-silent2")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+refuse "never a flake, silent in the second run" "$(cat "$work/gate.out")" 'a flake, not a regression'
+# A first run that exits 2 (a harness failure) though it names a failing
+# test, the second naming another (rev-b's b-any-exit on 208 R4): the rule
+# reads only runs that both exit 1, so not a flake.
+apart_dir exit2 "FAILED lib::tests::first: boom" "FAILED lib::tests::second: boom" "" "" 2
+(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-exit2") >"$work/exit2.verdict"
+refuse "a run that exited 2 is never half of a flake" "$(cat "$work/gate.out")" 'a flake, not a regression'
+refuse "nor accepted" "$(cat "$work/exit2.verdict")" '"verdict":"accepted"'
+# The same with the crash in the second run only (rev-g's F1 on 208 R2: each
+# run's CRASHED line is looked for).
+apart_dir crashed2 "FAILED lib::tests::first: boom" "FAILED lib::tests::second: boom" "" "CRASHED -p a --lib: signal: 6, SIGABRT: process abort signal"
+expect "a second run that crashed a test binary goes to the base: a regression" \
+    "$(export SPAWN_GATE_JOBS=1; judge "$good" "" "$work/apart-crashed2")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+refuse "never a flake, crashed in the second run" "$(cat "$work/gate.out")" 'a flake, not a regression'
+# 5a-nofailfast (rev-b's F2 on 208 R4): the real rsi/scenarios/check-tests.sh
+# names the failing tests of every test binary, not only the first one's
+# (cargo's --no-fail-fast; (b)'s flake rule compares the tests two runs
+# failed, so a run that stopped at its first failing binary hides the
+# rest). A two-crate workspace with no dependencies (offline), a failing
+# test in each; the script runs as it is, from a copy of its directory
+# layout with what it needs beside it (scripts/pg-url.sh, failed-tests.awk);
+# only its database is a stand-in: psql and scenario-db.sh that answer
+# nothing (the run's tests read no database).
+ct_ctl=$work/ct-ctl
+mkdir -p "$ct_ctl/rsi/scenarios" "$ct_ctl/scripts/rsi" "$ct_ctl/scripts/blackbox" "$work/ct-bin"
+ct_root=$(cd "$(dirname "$gate")/../.." && pwd)
+cp "$ct_root/rsi/scenarios/check-tests.sh" "$ct_ctl/rsi/scenarios/"
+cp "$ct_root/scripts/pg-url.sh" "$ct_ctl/scripts/"
+cp "$(dirname "$gate")/failed-tests.awk" "$ct_ctl/scripts/rsi/"
+printf '#!/bin/sh\nexit 0\n' >"$ct_ctl/scripts/blackbox/scenario-db.sh"
+printf '#!/bin/sh\nexit 0\n' >"$work/ct-bin/psql"
+chmod 755 "$work/ct-bin/psql"
+ct_ws=$work/ct-ws
+mkdir -p "$ct_ws/a/src" "$ct_ws/b/src"
+printf '[workspace]\nmembers = ["a", "b"]\nresolver = "2"\n' >"$ct_ws/Cargo.toml"
+for c in a b; do
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$c" >"$ct_ws/$c/Cargo.toml"
+    printf '#[cfg(test)]\nmod tests {\n    #[test]\n    fn %s_fails() {\n        panic!("%s breaks");\n    }\n}\n' "$c" "$c" >"$ct_ws/$c/src/lib.rs"
+done
+(cd "$ct_ws" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
+ct_status=0
+ct_out=$(cd "$ct_ws" && PATH="$work/ct-bin:$PATH" CARGO_NET_OFFLINE=true CARGO_TARGET_DIR="$ct_ws/target" \
+    SPAWN_TEST_DATABASE_URL="postgres://u@localhost:5432/ct" sh "$ct_ctl/rsi/scenarios/check-tests.sh" 2>&1) || ct_status=$?
+expect "check-tests.sh names the first crate's failing test" "$ct_out" 'FAILED tests::a_fails: '
+expect "and the second crate's: every test binary runs (--no-fail-fast)" "$ct_out" 'FAILED tests::b_fails: '
+expect "and fails" "exit=$ct_status" 'exit=1'
+# 5a-newline (objective 208 (a)): a stage line starts on a line of its own,
+# whatever the scenario printed last. The check's first run prints its
+# last words with no newline, fails, and passes again.
+nonl=$work/nonl
+cp -r "$scenarios" "$nonl"
+cat >"$nonl/check-nonl.sh" <<'EOF'
+#!/bin/sh
+[ -f .nonl-ran ] && exit 0
+: >.nonl-ran
+printf 'nonl: no newline at the end'
+exit 1
+EOF
+expect "a check whose output ends with no newline" "$(judge "$good" "" "$nonl")" 'exit=0 {"verdict":"accepted","flakes":["check-nonl.sh"]}'
+expect "has its last words on a line of their own" \
+    "lines=$(grep -cx '| nonl: no newline at the end' "$work/gate.out")." 'lines=1.'
+refuse "never glued to the stage line after them" "$(cat "$work/gate.out")" 'no newline at the end| stage'
+refuse "nor to any other line" "$(grep -F 'no newline at the end' "$work/gate.out" | grep -vx '| nonl: no newline at the end' || true)" 'no newline'
+# 5a-messages (objective 208 (d)): check-tests.sh's FAILED lines
+# (scripts/rsi/failed-tests.awk): a test's message is its panic's, not its
+# first line of output; a Python-backed test names its failing Python test
+# and its error.
+failed_awk=$(dirname "$gate")/failed-tests.awk
+cat >"$work/cargo-rust.log" <<'EOF'
+---- a::prints_then_panics stdout ----
+some printed line
+thread 'a::prints_then_panics' panicked at src/lib.rs:10:5:
+assertion `left == right` failed
+  left: 1
+---- a::plain stdout ----
+thread 'a::plain' panicked at src/lib.rs:20:5:
+boom
+
+failures:
+test result: FAILED. 0 passed; 2 failed
+EOF
+cat >"$work/cargo-python.log" <<'EOF'
+---- the_model_relay_passes_its_self_test stdout ----
+thread 'the_model_relay_passes_its_self_test' panicked at crates/spawn-cli/tests/model_relay.rs:17:5:
+
+..F.
+======================================================================
+FAIL: test_x (__main__.RelayTest.test_x)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "model-relay-test.py", line 3, in test_x
+AssertionError: 0.71 not less than 0.7
+
+failures:
+test result: FAILED. 0 passed; 1 failed
+EOF
+expect "a test that printed before it panicked: the panic's message" "$(awk -f "$failed_awk" "$work/cargo-rust.log")" \
+    'FAILED a::prints_then_panics: src/lib.rs:10:5: assertion `left == right` failed'
+expect "a plain panic, as before" "$(awk -f "$failed_awk" "$work/cargo-rust.log")" \
+    'FAILED a::plain: src/lib.rs:20:5: boom'
+expect "a Python-backed test: its failing Python test and the assertion" "$(awk -f "$failed_awk" "$work/cargo-python.log")" \
+    'FAILED the_model_relay_passes_its_self_test: crates/spawn-cli/tests/model_relay.rs:17:5: FAIL: test_x (__main__.RelayTest.test_x): AssertionError: 0.71 not less than 0.7'
+expect "its Python lines still listed before it" "$(awk -f "$failed_awk" "$work/cargo-python.log")" \
+    '  in the_model_relay_passes_its_self_test: AssertionError: 0.71 not less than 0.7'
+cat >"$work/cargo-crash.log" <<'EOF'
+running 2 tests
+.error: test failed, to rerun pass `-p a --lib`
+
+Caused by:
+  process didn't exit successfully: `/x/target/debug/deps/a-d4b1 --quiet` (signal: 6, SIGABRT: process abort signal)
+
+running 1 test
+---- tests::flaky_one stdout ----
+noise
+thread 'tests::flaky_one' (3152561) panicked at b/src/lib.rs:4:41:
+boom one
+
+failures:
+test result: FAILED. 0 passed; 1 failed
+error: test failed, to rerun pass `-p b --lib`
+
+Caused by:
+  process didn't exit successfully: `/x/target/debug/deps/b-9f2e --quiet` (exit status: 101)
+error: 2 targets failed:
+EOF
+expect "a test binary that aborted: CRASHED, with cargo's target and its status" "$(awk -f "$failed_awk" "$work/cargo-crash.log")" \
+    'CRASHED -p a --lib: signal: 6, SIGABRT: process abort signal'
+expect "beside the other binary's failing test" "$(awk -f "$failed_awk" "$work/cargo-crash.log")" \
+    'FAILED tests::flaky_one: b/src/lib.rs:4:41: boom one'
+# b's cause line is the shape an older cargo prints for a failed test's
+# binary (cargo 1.99 prints none for exit 101: rev-g's F2 on 208 R2); it
+# must not read as a crash.
+refuse "a binary whose tests failed (exit 101) is no crash" "$(awk -f "$failed_awk" "$work/cargo-crash.log")" 'CRASHED -p b'
+cat >"$work/cargo-rusty.log" <<'EOF'
+---- t::rusty stdout ----
+ERROR: a line the test printed
+thread 't::rusty' panicked at src/a.rs:1:1:
+the real message
+
+failures:
+EOF
+expect "a Rust test that prints ERROR: keeps its panic's message" "$(awk -f "$failed_awk" "$work/cargo-rusty.log")" \
+    'FAILED t::rusty: src/a.rs:1:1: the real message'
 broken_scenarios=$work/broken
 cp -r "$scenarios" "$broken_scenarios"
 printf '#!/bin/sh\necho "broken: fails on every tree"\nexit 1\n' >"$broken_scenarios/check-broken.sh"
@@ -2388,7 +2591,11 @@ gone_within() {
 # are checks: a check's runs after its failure (again, then on the base)
 # go on beside the gate's other runs, where a numbered scenario that fails
 # waits for those to end before the base's run of it ("Three classes of a
-# failing regression", case 29), and would wait out 064.
+# failing regression", case 29), and would wait out 064. 062 fails on the
+# base too (a host or harness fault, no verdict): since objective 208 (c) a
+# check that passes on the base runs once more alone, which waits for the
+# runs beside it as a numbered scenario's does (5a-alone); one that fails
+# there needs no run alone, and its verdict comes at once.
 pfail=$work/parallel-fail
 mkdir -p "$pfail"
 cp "$scenarios/protected" "$scenarios/build" "$pfail/"
@@ -2396,12 +2603,12 @@ on_candidate() { # <name> <the candidate's commands>: passes on the base
     printf '#!/bin/sh\n[ "$(cat value)" = one ] && exit 0\n%s\n' "$2" >"$pfail/$1"
 }
 on_candidate 061.sh 'sleep 2'
-on_candidate check-062.sh 'sleep 3; echo "062 failed"; exit 1'
+printf '#!/bin/sh\nsleep 3; echo "062 failed"; exit 1\n' >"$pfail/check-062.sh"
 on_candidate check-063.sh 'echo "063 failed"; exit 1'
 on_candidate check-064.sh 'sleep 120.25'
 started=$(date +%s)
 expect "the first failure in order is the verdict, not the first to end" \
-    "$(with_jobs 4 pfail "$good" "$pfail")" '"reason":"regression: check-062.sh fails on the candidate"'
+    "$(with_jobs 4 pfail "$good" "$pfail")" '{"host_fault":true,"scenario":"check-062.sh","on":"candidate and base"'
 outer=$(($(date +%s) - started))
 # The candidate phase's own wall clock, not the gate's: its setup (the
 # exports, the socket scan, the build) took 22 s of a 26 s gate at load 17
@@ -4536,6 +4743,37 @@ printf '769.sh\n' >"$classes/loadserial/serial"
 expect "1, then 1 on the serial list at 4 at a time: rejected with no run alone" \
     "$(class_judge loadserial "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: 769.sh fails on the candidate"}'
 expect "two stage lines, none alone" "$(alone_stage 769)" 'loaded=2 alone=0.'
+# 5a-alone (objective 208 (c), rev-f on #28): a check, likewise. Two exit
+# 1s at load and a pass on the base, which runs alone: the candidate runs
+# once more alone, on a fresh server, before any rejection. Its schedule's
+# third run is that run alone.
+check_stage() { # its candidate stage lines: loaded and alone
+    printf 'loaded=%s alone=%s.' \
+        "$(grep -cE "^\| stage gate exit [0-9]+ [0-9]+ms regression: check-zz\.sh must still pass( \(again\))?\$" "$work/gate.out")" \
+        "$(grep -cE "^\| stage gate exit [0-9]+ [0-9]+ms regression: check-zz\.sh must still pass \(alone\)\$" "$work/gate.out")"
+}
+class_dir checkload
+scheduled checkload check-zz PPP FFP
+expect "a check: 1, then 1 at 4 at a time and 0 alone, the base passes alone: load-sensitive, cannot judge" \
+    "$(class_judge checkload "$good")" \
+    'exit=6 {"cannot_judge":true,"scenario":"check-zz.sh","runs":"1, then 1 at 4 at a time, then 0 alone on the candidate; 0 on the base, run now","reason":"load-sensitive on the candidate: fails at 4 at a time (1, then 1), passes alone (0) as the base does (0): no verdict"'
+expect "two stage lines at load and one alone" "$(check_stage)" 'loaded=2 alone=1.'
+refuse "never a rejection" "$(cat "$work/gate.out")" '"verdict":"rejected"'
+class_dir checkfail
+scheduled checkfail check-zz PPP FFF
+expect "a check: 1, then 1 at load and 1 alone: rejected" \
+    "$(class_judge checkfail "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+expect "as a candidate failure, alone too" "$(cat "$work/gate.out")" \
+    '| check-zz.sh fails on the candidate (1, then 1 at 4 at a time, then 1 alone) and passes on the base, run now (0): candidate failure, alone too'
+expect "with its stage line alone" "$(check_stage)" 'loaded=2 alone=1.'
+expect "saying the base ran beside the other runs" "$(cat "$work/gate.out")" \
+    'the base passes it beside the gate'"'"'s other runs: once more on the candidate, alone, on a fresh test server'
+class_dir checkserial
+scheduled checkserial check-zz PPP FF
+printf 'check-zz.sh\n' >"$classes/checkserial/serial"
+expect "a check on the serial list: 1, then 1 at 4 at a time: rejected with no run alone" \
+    "$(class_judge checkserial "$good")" 'exit=0 {"verdict":"rejected","reason":"regression: check-zz.sh fails on the candidate"}'
+expect "two stage lines, none alone" "$(check_stage)" 'loaded=2 alone=0.'
 # 768: 1, then 1 at load, 0 alone but slower than the base by twice and the
 # slack (SPAWN_GATE_SOLO_SLOW_MS 1000 here, 15 s on a host): rejected.
 class_dir loadslow
