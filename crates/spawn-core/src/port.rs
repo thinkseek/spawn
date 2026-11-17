@@ -185,6 +185,20 @@ pub enum Commit {
     Created(CommitId),
     /// The workspace had no changes.
     Unchanged,
+    /// The branch was gone from the store while its workspace was mounted
+    /// (objective 205, incident I-006: deleted under it), and the checkpoint
+    /// made it again from the workspace: `commit` holds the workspace's
+    /// state and is the branch's head now. `parent` is the commit it was
+    /// made on: what this host had published of the branch (taken back
+    /// from the source; `commit` is that head itself when the workspace
+    /// held nothing new), else the store's main; `None` with neither (a
+    /// commit with no parent).
+    Recreated {
+        /// The branch's new head.
+        commit: CommitId,
+        /// What it was made on, if anything.
+        parent: Option<CommitId>,
+    },
 }
 
 /// Result of [`WorkspaceStore::set_aside`].

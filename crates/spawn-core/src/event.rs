@@ -588,6 +588,19 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
     },
+    /// A checkpoint found the agent's branch gone from its store while its
+    /// workspace was mounted, and made it again from the workspace
+    /// (objective 205): `artifact` is the branch's new head, `parent` what it
+    /// was made on (what was published of the branch, or the store's main;
+    /// null with neither). The checkpoint's own `artifact.committed` of the
+    /// same commit follows it.
+    #[serde(rename = "artifact.branch_recreated")]
+    ArtifactBranchRecreated {
+        /// The made-again commit.
+        artifact: ArtifactRef,
+        /// What it was made on, if anything.
+        parent: Option<CommitId>,
+    },
     /// Merging the source's `main` into an agent's branch conflicted: the
     /// branch stayed as it was.
     #[serde(rename = "merge.conflicted")]
@@ -672,6 +685,7 @@ impl EventKind {
             Self::ExecutionUnmounting => "execution.unmounting",
             Self::CommandStepped { .. } => "command.step",
             Self::ArtifactCommitted { .. } => "artifact.committed",
+            Self::ArtifactBranchRecreated { .. } => "artifact.branch_recreated",
             Self::MergeConflicted { .. } => "merge.conflicted",
             Self::CommandAccepted { .. } => "command.accepted",
             Self::CommandFinished { .. } => "command.finished",
