@@ -1016,12 +1016,12 @@ impl Drop for MissionWorkspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        MissionSource, ensure_mirror, fetch_pushed_into, mirror_name, port_is_digits,
-        receives_branches, test_git as git,
+        MissionSource, Routed, commit_routed, ensure_mirror, fetch_pushed_into, mirror_name,
+        port_is_digits, receives_branches, restore_published, source_readable, test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
-    use spawn_core::id::{BranchName, WorkspaceId};
-    use spawn_core::port::{Commit, WorkspaceStore};
+    use spawn_core::id::{BranchName, CommitId, WorkspaceId};
+    use spawn_core::port::{Commit, WorkspaceError, WorkspaceStore};
     use spawn_host::GitWorkspace;
     use std::ffi::OsStr;
     use std::path::Path;
@@ -1829,5 +1829,175 @@ mod tests {
         assert!(b.starts_with("widget-"));
         assert_ne!(a, b);
         assert!(mirror_name("git@host:team/x y.git").starts_with("xy-"));
+    }
+
+    /// `agent_x`'s store on `mirror`, routed as a mission's agent on
+    /// `source` is.
+    fn routed_x(mirror: &Path, root: &Path, source: &str) -> Routed {
+        Routed {
+            store: std::sync::Arc::new(GitWorkspace::new(mirror, root)),
+            mirror: Some((mirror.to_path_buf(), source.to_string())),
+        }
+    }
+
+    fn rev(mirror: &Path, reference: &str) -> Option<String> {
+        git(&[
+            "--git-dir",
+            &mirror.to_string_lossy(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            reference,
+        ])
+        .ok()
+    }
+
+    fn delete_ref(repo: &Path, reference: &str) {
+        git(&["--git-dir", &repo.to_string_lossy(), "update-ref", "-d", reference])
+            .expect("delete the ref");
+    }
+
+    /// Objective 205: a branch gone from a mission's mirror is taken back
+    /// from what this host published. Nothing published: `None`. Published:
+    /// the pushed head, made the branch, and no private ref left. A branch
+    /// that is there is never moved. A source that cannot be read (R5: gone)
+    /// is an error, and leaves no branch.
+    #[test]
+    fn a_branch_gone_from_the_mirror_is_taken_back_from_what_was_published() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-take-back-{}", std::process::id()));
+        let (source, mirror, _host) = published_source(&base);
+        let pushed = rev(&mirror, "refs/heads/agent_x").expect("the published head");
+        let private = "refs/spawn-restore/agent_x";
+
+        assert_eq!(
+            restore_published(&mirror, &source, "agent_y").expect("read"),
+            None,
+            "nothing published"
+        );
+        delete_ref(&mirror, "refs/heads/agent_x");
+        assert_eq!(
+            restore_published(&mirror, &source, "agent_x").expect("taken back"),
+            Some(pushed.clone())
+        );
+        assert_eq!(rev(&mirror, "refs/heads/agent_x"), Some(pushed.clone()));
+        assert_eq!(rev(&mirror, private), None, "no private ref left");
+
+        // There: never moved.
+        let main = rev(&mirror, "refs/heads/main").expect("main");
+        git(&[
+            "--git-dir",
+            &mirror.to_string_lossy(),
+            "update-ref",
+            "refs/heads/agent_x",
+            &main,
+        ])
+        .expect("move");
+        assert_eq!(
+            restore_published(&mirror, &source, "agent_x").expect("read"),
+            None
+        );
+        assert_eq!(rev(&mirror, "refs/heads/agent_x"), Some(main));
+        assert_eq!(rev(&mirror, private), None);
+
+        // The source gone: an error, and no branch.
+        delete_ref(&mirror, "refs/heads/agent_x");
+        let away = format!("{source}.away");
+        std::fs::rename(&source, &away).expect("move the source away");
+        assert!(restore_published(&mirror, &source, "agent_x").is_err());
+        assert_eq!(rev(&mirror, "refs/heads/agent_x"), None);
+        std::fs::rename(&away, &source).expect("move it back");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Objective 205 R5: a published ref the source lists but cannot send
+    /// (an id it has no object for) fails the commit, which says it could
+    /// not take the branch back, makes no branch, and reads the source as
+    /// away until a take-back gets through, on what was published.
+    #[test]
+    fn a_published_ref_the_source_cannot_send_is_an_error_and_reads_as_away() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-unsent-{}", std::process::id()));
+        let (source, mirror, host) = published_source(&base);
+        let pushed = rev(&mirror, "refs/heads/agent_x").expect("the published head");
+        let routed = routed_x(&mirror, &base.join("host"), &source);
+        let branch = BranchName::new("agent_x").expect("valid branch");
+        let workspace = host.mount(&branch).expect("mount");
+        std::fs::write(Path::new(workspace.path()).join("two.txt"), "two").expect("write");
+        assert!(source_readable(&source));
+
+        let published = Path::new(&source).join("refs/heads/spawn/agent_x");
+        delete_ref(Path::new(&source), "refs/heads/spawn/agent_x");
+        std::fs::create_dir_all(published.parent().expect("a parent")).expect("refs");
+        std::fs::write(&published, format!("{}\n", "1".repeat(40))).expect("a broken ref");
+        delete_ref(&mirror, "refs/heads/agent_x");
+        let failed = commit_routed(&routed, &workspace, "two");
+        assert!(
+            matches!(&failed, Err(WorkspaceError::Unavailable(text))
+                     if text.starts_with("take agent_x back from what was published: ")),
+            "{failed:?}"
+        );
+        assert_eq!(rev(&mirror, "refs/heads/agent_x"), None, "no branch made");
+        assert!(!source_readable(&source), "away while the take-back fails");
+
+        std::fs::write(&published, format!("{pushed}\n")).expect("mend the ref");
+        let made = commit_routed(&routed, &workspace, "two").expect("taken back");
+        let Commit::Recreated { commit, parent } = made else {
+            panic!("taken back: {made:?}");
+        };
+        assert_eq!(parent.as_ref().map(CommitId::as_str), Some(pushed.as_str()));
+        assert_eq!(rev(&mirror, &format!("{commit}^")), Some(pushed));
+        assert!(source_readable(&source), "there again");
+        host.unmount(&workspace).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Objective 205 R5: a source is there for `source_away` only when git
+    /// can read it: a bare repository is, a plain directory and a missing
+    /// path are away.
+    #[test]
+    fn a_source_is_there_only_when_git_can_read_it() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-readable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bare = base.join("bare.git");
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).expect("plain");
+        git(&["init", "-q", "--bare", &bare.to_string_lossy()]).expect("bare");
+        assert!(source_readable(&bare.to_string_lossy()));
+        assert!(!source_readable(&plain.to_string_lossy()));
+        assert!(!source_readable(&base.join("missing").to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Objective 205 R6: a branch deleted between a pass's start and the
+    /// store's lock is still taken back from what was published (the store
+    /// reads whether it is there under its lock), never made again on main
+    /// beside it.
+    #[test]
+    fn a_branch_deleted_on_the_way_to_the_store_is_still_taken_back() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-on-the-way-{}", std::process::id()));
+        let (source, mirror, host) = published_source(&base);
+        let pushed = rev(&mirror, "refs/heads/agent_x").expect("the published head");
+        let routed = routed_x(&mirror, &base.join("host"), &source);
+        let branch = BranchName::new("agent_x").expect("valid branch");
+        let workspace = host.mount(&branch).expect("mount");
+        std::fs::write(Path::new(workspace.path()).join("two.txt"), "two").expect("write");
+        let deleted = mirror.clone();
+        BEFORE_STORE.with(|step| {
+            *step.borrow_mut() = Some(Box::new(move |agent: &str| {
+                delete_ref(&deleted, &format!("refs/heads/{agent}"));
+            }));
+        });
+        let made = commit_routed(&routed, &workspace, "two").expect("taken back");
+        let Commit::Recreated { commit, parent } = made else {
+            panic!("taken back: {made:?}");
+        };
+        assert_eq!(parent.as_ref().map(CommitId::as_str), Some(pushed.as_str()));
+        assert_eq!(rev(&mirror, &format!("{commit}^")), Some(pushed));
+        assert_eq!(rev(&mirror, "refs/heads/agent_x"), Some(commit.as_str().to_string()));
+        host.unmount(&workspace).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
