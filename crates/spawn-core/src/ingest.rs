@@ -884,6 +884,11 @@ fn user_turn(content: &Value, uuid: &str) -> Vec<Normalized> {
 /// - a prompt (a user line that is not a tool result) starts a turn; one
 ///   that holds a message's marker took that message (`message.taken`,
 ///   [`crate::message`]);
+/// - an input typed while the agent works, which the engine gives it at its
+///   next step and writes only as an `attachment` of type `queued_command`
+///   with `commandMode` `prompt` (objective 214), takes the markers it holds
+///   the same way and starts no turn; a `queued_command` of any other mode
+///   is the engine's own text and takes nothing;
 /// - each `tool_use` block of an assistant line starts a tool, and each
 ///   `tool_result` block of a user line ends one, failed when `is_error`;
 /// - `system`/`turn_duration`, written when a turn ends, and an interrupt
@@ -980,9 +985,20 @@ pub fn claude_line(line: &str) -> Vec<Normalized> {
             if value.pointer("/attachment/type").and_then(Value::as_str)
                 == Some("queued_command") =>
         {
-            value
-                .pointer("/attachment/prompt")
-                .map_or_else(Vec::new, |prompt| job_ends(&whole_text(prompt)))
+            let Some(prompt) = value.pointer("/attachment/prompt") else {
+                return Vec::new();
+            };
+            let text = whole_text(prompt);
+            if value.pointer("/attachment/commandMode").and_then(Value::as_str) == Some("prompt") {
+                // An input typed while the agent worked, given to it at its
+                // next step (objective 214): its only transcript line. It
+                // takes its markers as a user line does, and starts no turn.
+                taken(&text, uuid)
+            } else {
+                // The engine's own text (a job's notification): it ends its
+                // jobs and takes nothing, whatever it quotes.
+                job_ends(&text)
+            }
         }
         _ => Vec::new(),
     }
