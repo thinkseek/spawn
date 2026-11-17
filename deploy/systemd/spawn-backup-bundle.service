@@ -13,6 +13,11 @@ EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=SPAWN_WORKSPACE_ROOT=%h/.local/share/spawn-rsi/ws
 Environment=PATH=%h/.local/share/spawn-rsi/bin:/usr/local/bin:/usr/bin:/bin
 Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+# The fleet's notes folder in the same bundle (objective 216): read only,
+# scanned for credential values (/usr/local/lib/spawn/redact/secret-scan-files.py)
+# before it is archived; a hit, a place the scan could not search or a file
+# it cannot read drops that part only. Staged on the workspace disk, not /tmp.
+Environment=SPAWN_BACKUP_SYNC_DIR=/var/tmp/spawn/sync
 Restart=on-failure
 RestartSec=15min
 # 2 = the settings were refused (a retry changes nothing); a failed run's
