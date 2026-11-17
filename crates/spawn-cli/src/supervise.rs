@@ -473,7 +473,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("never by editing the backlog"), "{text}");
-        assert!(text.contains("its work already on main, renumbered, obsolete"), "{text}");
+        assert!(
+            text.contains("its work already on main, renumbered, obsolete"),
+            "{text}"
+        );
     }
 
     /// The monitor retires: the fleet's alerts are Spawn's own records now,

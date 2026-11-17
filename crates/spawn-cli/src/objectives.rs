@@ -1214,13 +1214,17 @@ fn retire_record(flags: &crate::Flags) -> Result<serde_json::Value, String> {
         let text = required(flag)?;
         text.parse::<i64>()
             .ok()
-            .filter(|number| (1..=most).contains(number) && text.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|number| {
+                (1..=most).contains(number) && text.bytes().all(|b| b.is_ascii_digit())
+            })
             .ok_or_else(|| format!("--{flag} is a whole number from 1, not '{text}'"))
     };
     let mission = number("mission", i64::MAX)?;
     let objective = number("objective", i64::from(i32::MAX))?;
-    Ok(json!({"type": "objective.retired", "id": mission, "objective": objective,
-              "by": required("by")?, "reason": required("reason")?}))
+    Ok(
+        json!({"type": "objective.retired", "id": mission, "objective": objective,
+              "by": required("by")?, "reason": required("reason")?}),
+    )
 }
 
 #[cfg(test)]
@@ -1230,9 +1234,9 @@ mod tests {
         brief, choose, holds, is_open, load_backlog, metric_lines, next_open, order_problems,
         overruns, recurring, workers, yields,
     };
-    use std::path::Path;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
 
     fn untried() -> BTreeMap<u32, Attempts> {
         BTreeMap::new()
@@ -2276,7 +2280,8 @@ mod tests {
     /// recurring"; a recurring objective in a readable backlog reads so.
     #[test]
     fn only_a_backlog_that_reads_the_objective_as_recurring_keeps_it_from_the_base_solved_rule() {
-        let dir = std::env::temp_dir().join(format!("spawn-backlog-recurring-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("spawn-backlog-recurring-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the backlog");
         let at = |path: &Path| -> crate::integrate::Mission {
@@ -2308,10 +2313,9 @@ mod tests {
         assert!(recurring(&mission, 2), "readable again");
         // No such directory, and a mission naming no backlog.
         assert!(!recurring(&at(&dir.join("gone")), 2), "missing backlog");
-        let none: crate::integrate::Mission = serde_json::from_value(
-            json!({"id": 4, "gate": "/g", "accept": "gate"}),
-        )
-        .expect("a mission");
+        let none: crate::integrate::Mission =
+            serde_json::from_value(json!({"id": 4, "gate": "/g", "accept": "gate"}))
+                .expect("a mission");
         assert!(!recurring(&none, 2), "no backlog named");
         let _ = std::fs::remove_dir_all(&dir);
     }

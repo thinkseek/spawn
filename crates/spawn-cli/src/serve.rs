@@ -4649,7 +4649,10 @@ mod tests {
         assert_eq!(board["objectives"][0]["status"], "retired");
         assert_eq!(board["objectives"][0]["retired"], retired[0]);
         assert_eq!(board["objectives"][1]["status"], "retired", "recurring");
-        assert_eq!(board["objectives"][1]["retired"]["caller"], "spawn_supervisor");
+        assert_eq!(
+            board["objectives"][1]["retired"]["caller"],
+            "spawn_supervisor"
+        );
         assert_eq!(board["objectives"][2]["status"], "open");
         assert!(board["objectives"][2]["retired"].is_null());
         assert_eq!(board["retired"], retired, "the mission keeps its list");

@@ -126,7 +126,10 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
         (retire(1, 4, "lead", "obsolete"), "solved on the base"),
         (retire(1, 6, "  ", "obsolete"), "by is 1 to 80 characters"),
         (retire(1, 6, "", "obsolete"), "by is 1 to 80 characters"),
-        (retire(1, 6, &"b".repeat(81), "obsolete"), "by is 1 to 80 characters"),
+        (
+            retire(1, 6, &"b".repeat(81), "obsolete"),
+            "by is 1 to 80 characters",
+        ),
         (retire(1, 6, "lead", " \t"), "reason is 1 to 500 characters"),
         (retire(1, 6, "lead", ""), "reason is 1 to 500 characters"),
         (retire(999_999, 6, "lead", "obsolete"), "does not exist"),
@@ -207,8 +210,8 @@ fn the_caller_is_the_logins_and_only_the_owner_and_supervisor_may_retire() {
             .objective_retire(&retire(1, 6, "lead", "obsolete"))
             .expect_err(role)
             .to_string();
-        // Closed to the login (the reader's), or refused by the function
-        // (the human's, which may execute it as public may not): both 42501.
+        // Closed to the login, or refused by the function's caller check:
+        // 42501 either way.
         assert!(
             error.contains("may not retire objectives") || error.contains("permission denied"),
             "{role}: {error}"
@@ -232,7 +235,10 @@ fn the_caller_is_the_logins_and_only_the_owner_and_supervisor_may_retire() {
         .collect();
     assert_eq!(
         callers,
-        [(5, "spawn_supervisor".to_string()), (6, "owner".to_string())]
+        [
+            (5, "spawn_supervisor".to_string()),
+            (6, "owner".to_string())
+        ]
     );
 }
 
@@ -323,7 +329,12 @@ fn a_retired_objective_is_on_the_board_and_closes_as_a_landing() {
     closed.sort_unstable();
     assert_eq!(
         closed,
-        [(3, false, true), (4, false, true), (5, true, true), (6, true, true)],
+        [
+            (3, false, true),
+            (4, false, true),
+            (5, true, true),
+            (6, true, true)
+        ],
         "landed 3, solved 4, retired 5 and 6"
     );
 
