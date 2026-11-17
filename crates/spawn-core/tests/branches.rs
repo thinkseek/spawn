@@ -1403,12 +1403,12 @@ fn commit_failures(report: &TickReport) -> Vec<String> {
         .collect()
 }
 
-/// A started execution with a checkpoint due (a tool call read) and work in
-/// its workspace.
+/// A started execution with a checkpoint due (a tool call read: the next
+/// tick takes it) and work in its workspace.
 fn checkpoint_due(store: &MemoryStore, bridge: &mut Bridge, call: &str) {
     transcript(store, &tool_call(call));
     store.mark_dirty(&first_workspace());
-    let _ = bridge.tick();
+    quiet(&bridge.tick().expect("read the tool call"));
 }
 
 /// Objective 205 (incident I-006: about 4 lines a second for days): a commit
@@ -1427,6 +1427,7 @@ fn a_failing_commit_is_reported_once_until_it_gets_through() {
     )));
     transcript(&store, &tool_call("toolu_1"));
     store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
     let report = bridge.tick().expect("the first failure");
     assert_eq!(
         commit_failures(&report),
@@ -1455,6 +1456,7 @@ fn a_failing_commit_is_reported_once_until_it_gets_through() {
     )));
     transcript(&store, &tool_call("toolu_2"));
     store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
     let report = bridge.tick().expect("failing again");
     assert_eq!(commit_failures(&report).len(), 1, "{:?}", report.warnings);
 }
@@ -1496,8 +1498,9 @@ fn a_commit_failure_is_reported_once_per_cause() {
         let report = bridge.tick().expect("a retry");
         logged.extend(commit_failures(&report));
     }
-    assert_eq!(logged.len(), 1, "one more line, for the second cause: {logged:?}");
-    assert!(logged[0].starts_with("commit refused Locked: update-ref"), "{logged:?}");
+    assert_eq!(logged.len(), 2, "one line per cause: {logged:?}");
+    assert!(logged[0].starts_with("commit unavailable: git add -A"), "{logged:?}");
+    assert!(logged[1].starts_with("commit refused Locked: update-ref"), "{logged:?}");
     store.fail_commits_saying(None);
     let report = bridge.tick().expect("through");
     assert!(commit_failures(&report).is_empty());
@@ -1568,9 +1571,9 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
     let branch = BranchName::new("agent_one").expect("valid branch");
     store.lose_branch(&branch);
     transcript(&store, &tool_call("toolu_1"));
+    quiet(&bridge.tick().expect("read the tool call"));
     store.fail_next_branch_record();
-    let report = bridge.tick().expect_err("the log is down");
-    let _ = report;
+    bridge.tick().expect_err("the log is down");
     let recorded = |store: &MemoryStore| -> Vec<(&'static str, String, Option<String>)> {
         events(store)
             .into_iter()
@@ -1613,6 +1616,7 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
     // Logged once: a second loss logs one line naming the branch and parent.
     store.lose_branch(&branch);
     transcript(&store, &tool_call("toolu_2"));
+    quiet(&bridge.tick().expect("read the tool call"));
     let report = bridge.tick().expect("made again, recorded");
     let lines: Vec<&String> = report
         .warnings
@@ -1631,6 +1635,7 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
     // The next checkpoint is an ordinary one.
     transcript(&store, &tool_call("toolu_3"));
     store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
     quiet(&bridge.tick().expect("an ordinary checkpoint"));
     let all = recorded(&store);
     assert_eq!(all.len(), 5);
