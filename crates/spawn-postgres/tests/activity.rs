@@ -69,16 +69,12 @@ fn states(client: &mut Client) -> Vec<(i64, String)> {
         .collect()
 }
 
-/// Objective 211: each delivered task's activity is its worker's latest
-/// engine output (source claude) after its latest delivery and the tool
-/// calls it started since. The engine's input (the brief arriving), the
-/// Bridge's and the Observer's events, and anything before the delivery
-/// are none; a task sent back and delivered again counts from the latest
-/// delivery; a task not delivered has none; the reader login reads it.
-#[test]
-fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() {
-    let (store, schema) = store("task_activity");
-    let mut client = admin(&schema);
+/// The seeded world: a mission and five tasks; task 1 delivered with its
+/// worker's earlier call before the delivery and, after it, the brief
+/// arriving, two calls, a usage, the Bridge's events and a judgement; task 2
+/// delivered with only its brief arriving; task 3 delivered, sent back and
+/// delivered again; task 4 delivered and reported; task 5 assigned.
+fn world() -> String {
     let mut sql = vec![
         record(
             900,
@@ -149,7 +145,20 @@ fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() 
         6_200,
         &json!({"type": "task.reported", "id": 4, "report": "r"}),
     ));
-    seed(&mut client, &sql.join("\n"));
+    sql.join("\n")
+}
+
+/// Objective 211: each delivered task's activity is its worker's latest
+/// engine output (source claude) after its latest delivery and the tool
+/// calls it started since. The engine's input (the brief arriving), the
+/// Bridge's and the Observer's events, and anything before the delivery
+/// are none; a task sent back and delivered again counts from the latest
+/// delivery; a task not delivered has none; the reader login reads it.
+#[test]
+fn a_delivered_tasks_activity_is_its_engines_output_since_its_latest_delivery() {
+    let (store, schema) = store("task_activity");
+    let mut client = admin(&schema);
+    seed(&mut client, &world());
     assert_eq!(
         states(&mut client),
         [
