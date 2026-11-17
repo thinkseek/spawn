@@ -542,17 +542,11 @@ impl Observer {
             observation.attention_reason = Some("judge_unavailable".to_string());
             return (observation, true);
         };
-        // The raw answer is stored and narrowed; a session that never ends
-        // is never COMPLETED, so its COMPLETED is folded into WAITING after
-        // the facts have narrowed the answer. Folding before narrowing drops
-        // the mass it gave COMPLETED for an exit, whose allowed states do not
-        // include WAITING, and a sliver of BLOCKED then wins.
+        // The raw answer is stored and narrowed. An idle perpetual session
+        // at its prompt is already settled as Waiting by the rules, with no
+        // model call. A clean exit is Completed (ended_execution); do not
+        // rewrite it to Waiting, which is the idle-prompt state.
         let (state, confidence) = narrow(ambiguity, guess, &raw);
-        let (state, confidence) = if input.perpetual && state == SemanticState::Completed {
-            (SemanticState::Waiting, confidence)
-        } else {
-            (state, confidence)
-        };
         let mut observation = model_observation(state, wait_reason(state, input), confidence);
         observation.probabilities = raw.probabilities.map(|values| {
             SemanticState::ALL

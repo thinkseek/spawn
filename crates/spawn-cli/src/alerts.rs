@@ -4545,7 +4545,9 @@ fn on_tmpfs(path: &Path) -> bool {
         return true;
     };
     let Ok(path) = std::fs::canonicalize(path) else {
-        return false;
+        // Inaccessible is not "not a tmpfs". Let used_mb record the error
+        // and leave any open alert, the same as a failed df.
+        return true;
     };
     let mut best: Option<(usize, bool)> = None;
     for line in mounts.lines() {
@@ -7346,6 +7348,48 @@ mod tests {
             "nothing fires on a path that is not a tmpfs: {events:?}"
         );
     }
+
+
+    /// A path that cannot be resolved is inaccessible, not "not a tmpfs".
+    /// Clearing an open tmpfs_high as if the host had no tmpfs would hide a
+    /// real reading error. The used_mb error path logs and leaves the alert.
+    #[test]
+    fn a_missing_path_is_not_cleared_as_not_a_tmpfs() {
+        if std::fs::read_to_string("/proc/mounts").is_err() {
+            return;
+        }
+        let missing = Path::new("/tmp/pr70-proof-missing-path-does-not-exist");
+        assert!(
+            std::fs::canonicalize(missing).is_err(),
+            "the proof needs a path that cannot be canonicalized"
+        );
+        let mut monitor = Monitor::with(Settings {
+            tmpfs_path: missing.to_path_buf(),
+            tmpfs_high_mb: 1,
+            tmpfs_ok_mb: 1,
+            ..settings()
+        });
+        monitor.known.insert(
+            "tmpfs_high:1".to_string(),
+            Row {
+                kind: "tmpfs_high".to_string(),
+                subject: "host".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"reading_ms": 1}),
+                fired_event_id: 1,
+                fired_at_ms: 1,
+            },
+        );
+        let mut out = Vec::new();
+        let mut lines = Vec::new();
+        monitor.read_tmpfs(2, &mut out, &mut lines);
+        let events = decided(&monitor, out);
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::Clear { .. })),
+            "an inaccessible path must not clear tmpfs_high as not a tmpfs: {events:?} lines={lines:?}"
+        );
+    }
+
 
     #[test]
     fn memory_and_tmpfs_do_not_flap_between_their_thresholds() {

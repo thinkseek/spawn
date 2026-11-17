@@ -135,15 +135,14 @@ fn at_prompt(input: &JudgeInput) -> bool {
 }
 
 /// The question for a person in the engine's latest reply, without the tag:
-/// its last line that starts with `HUMAN:`. The reply is what the engine
-/// wrote since the last prompt, so a question someone answered is no longer
-/// in it. A `HUMAN:` line in a tool's output is on the screen, not in the
-/// reply, and asks nobody.
+/// the reply's last non-empty line starts with `HUMAN:`. An earlier or
+/// quoted `HUMAN:` line followed by later work is not a question. The reply
+/// is what the engine wrote since the last prompt, so a question someone
+/// answered is no longer in it. A `HUMAN:` line in a tool's output is on
+/// the screen, not in the reply, and asks nobody.
 pub(super) fn human_question(reply: &str) -> Option<&str> {
-    reply
-        .lines()
-        .rev()
-        .find_map(|line| line.trim_start().strip_prefix("HUMAN:"))
+    let last = reply.lines().rev().find(|line| !line.trim().is_empty())?;
+    last.trim_start().strip_prefix("HUMAN:")
 }
 
 /// The running execution stopped its turn at its prompt with at least one

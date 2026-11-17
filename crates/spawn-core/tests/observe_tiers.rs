@@ -842,8 +842,9 @@ fn a_question_for_a_person_blocks_without_a_model() {
     assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
 }
 
-/// A session that never ends has its COMPLETED folded into WAITING, and the
-/// raw answer is kept.
+/// A perpetual session that exits on its own stays Completed. The raw
+/// answer is kept. Idle perpetual sessions at a live prompt are Waiting
+/// by rule, without a model.
 #[test]
 fn a_perpetual_session_is_never_completed() {
     // Live: Jev put the idle supervisor at COMPLETED 0.71.
@@ -876,10 +877,9 @@ fn a_perpetual_session_is_never_completed() {
     let last = observations(&store).pop().expect("an observation");
     assert_eq!(
         last.state,
-        SemanticState::Waiting,
-        "COMPLETED folds into WAITING"
+        SemanticState::Completed,
+        "a clean exit stays Completed; idle waiting is a live prompt"
     );
-    assert!(last.confidence.value() > 0.95, "0.98 of the allowed mass");
     assert_eq!(
         last.probabilities.and_then(|p| p.get("COMPLETED").copied()),
         Some(0.71),
@@ -887,6 +887,115 @@ fn a_perpetual_session_is_never_completed() {
     );
     assert_eq!(judge.calls(), 1, "an exit is still the model's to judge");
 }
+
+
+/// A context that supplies a reply and is not the supervisor.
+struct ReplyOnly(String);
+
+impl ObservationContext for ReplyOnly {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        Some(self.0.clone())
+    }
+}
+
+/// Documented intent of PR #69: a question is a reply whose last line starts
+/// with `HUMAN:`. A `HUMAN:` line earlier in the same reply, followed by later
+/// work, or a quoted historical marker, is not itself a question for a person.
+fn tick_reply(reply: &str) -> (Observation, usize) {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Waiting,
+        confidence: confidence(0.9),
+        probabilities: None,
+        needs_human: Some(0.05),
+        stuck: Some(0.05),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(clock)
+        .with_context(Arc::new(ReplyOnly(reply.to_string())));
+    started(&store);
+    native(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    (last, judge.calls())
+}
+
+#[test]
+fn a_quoted_or_followed_human_line_is_not_a_question() {
+    for reply in [
+        "HUMAN: which region?\nI will use us-east.",
+        "Earlier you asked:\nHUMAN: which region?\nDeploying us-east now.",
+    ] {
+        let (last, calls) = tick_reply(reply);
+        assert_eq!(last.human_question, None, "no question kept for {reply:?}: {last:?}");
+        assert_ne!(last.attention_reason.as_deref(), Some("human_question"));
+        assert_eq!(
+            last.ambiguity,
+            Some(Ambiguity::TurnStoppedIdle),
+            "an earlier or quoted HUMAN: line leaves the idle-prompt case to the model: {reply:?} -> {last:?}"
+        );
+        assert_eq!(last.state, SemanticState::Waiting, "{reply:?} -> {last:?}");
+        assert_eq!(calls, 1, "not settled by the HUMAN: rule: {reply:?}");
+    }
+}
+
+/// A clean exit is Completed in ended_execution. A perpetual session that
+/// actually exited must not be rewritten to Waiting, which is the state for
+/// an idle live prompt, not for an ended execution.
+#[test]
+fn a_perpetual_session_that_exits_cleanly_stays_completed() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Completed,
+        confidence: confidence(0.71),
+        probabilities: Some([0.0, 0.27, 0.02, 0.71, 0.0]),
+        needs_human: Some(0.2),
+        stuck: Some(0.05),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(clock)
+        .with_context(Arc::new(Perpetual));
+    started(&store);
+    append(
+        &store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+            signal: None,
+            evidence: None,
+        },
+    );
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(
+        last.state,
+        SemanticState::Completed,
+        "a clean exit is Completed, not an idle wait: {last:?}"
+    );
+    assert_eq!(
+        last.probabilities.as_ref().and_then(|p| p.get("COMPLETED").copied()),
+        Some(0.71),
+        "the raw answer is kept"
+    );
+    assert_eq!(judge.calls(), 1, "an exit is still the model's to judge");
+}
+
 
 #[test]
 fn attention_says_why() {
