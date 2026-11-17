@@ -3145,38 +3145,74 @@ const GET_FLOOR_BYTES_PER_SEC: u64 = 64 * 1024;
 /// PUT), whose MD5 is the ETag; callers still check the
 /// `x-amz-meta-sha256` and, after decryption, the record's sha256.
 fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+    get_object_with(settings, key, get_pause_secs)
+}
+
+/// [`get_object_bytes`] with its pause schedule given (tests pass none).
+fn get_object_with(
+    settings: &Settings,
+    key: &str,
+    pause: fn(u32) -> u64,
+) -> Result<Option<(Vec<u8>, String)>, String> {
     let url = settings.r2.url(key);
     let scratch = Scratch::new("get")?;
     let body = scratch.join("body");
     let headers_file = scratch.join("headers");
+    let size = |path: &Path| fs::metadata(path).map_or(0, |meta| meta.len());
     let mut total: Option<u64> = None;
     let mut headers = String::new();
     let mut errors: Vec<String> = Vec::new();
     for attempt in 0..GET_ATTEMPTS {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(get_pause_secs(attempt)));
+            std::thread::sleep(std::time::Duration::from_secs(pause(attempt)));
         }
-        let have = fs::metadata(&body).map_or(0, |meta| meta.len());
-        if total.is_some_and(|total| have == total) {
+        let have = size(&body);
+        if total == Some(have) {
             break;
         }
-        let options = get_options(have, total.map(|total| total.saturating_sub(have)));
-        match run_curl(settings, &url, &options, &body, &headers_file) {
-            Ok(status) => {
-                let these = fs::read_to_string(&headers_file).unwrap_or_default();
-                match status {
-                    404 => return Ok(None),
-                    200 | 206 => {
-                        if let Some(length) = object_length(status, &these) {
-                            total = Some(length);
-                        }
-                        headers = these;
-                    }
-                    // Asked from the end of a body already whole.
-                    416 if total.is_some_and(|total| have == total) => break,
-                    status => return Err(format!("GET {key} answered {status}")),
+        let mut options = get_options(have, total.map(|total| total.saturating_sub(have)));
+        // A resumed attempt asks for the same object only (rev-b n3): an
+        // object rewritten between attempts answers 412, never a splice.
+        if have > 0
+            && let Some(etag) = header_value(&headers, "etag")
+        {
+            let _ = writeln!(options, "header = \"If-Match: {}\"", escape_config(&etag));
+        }
+        let _ = fs::remove_file(&headers_file);
+        let result = run_curl(settings, &url, &options, &body, &headers_file);
+        let these = fs::read_to_string(&headers_file).unwrap_or_default();
+        // The answer's head is read even when curl failed part way (a cut
+        // or a stall after the headers came): its length is learned then
+        // too, so the next attempt's cap is the object's (rev-b n1, n2).
+        let status = match &result {
+            Ok(status) => Some(*status),
+            Err(_) => last_status(&these),
+        };
+        match status {
+            Some(200 | 206) => {
+                if let Some(length) = object_length(status.unwrap_or(0), &these) {
+                    total = Some(length);
+                }
+                headers = these;
+            }
+            Some(416) => {
+                if let Some(length) = unsatisfiable_length(&these) {
+                    total = Some(length);
                 }
             }
+            _ => {}
+        }
+        match result {
+            Ok(200 | 206) => {}
+            Ok(404) => return Ok(None),
+            // Asked from the end of a body already whole.
+            Ok(416) if total == Some(have) => break,
+            Ok(412) => {
+                return Err(format!(
+                    "GET {key}: the object changed between attempts (If-Match answered 412)"
+                ));
+            }
+            Ok(status) => return Err(format!("GET {key} answered {status}")),
             Err(error) => {
                 // curl 33: the server ignored the Range; start again whole.
                 if error.contains("exit 33:") {
@@ -3185,12 +3221,11 @@ fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, S
                 errors.push(format!("attempt {}: {error}", attempt + 1));
             }
         }
-        let have = fs::metadata(&body).map_or(0, |meta| meta.len());
-        if total.is_some_and(|total| have == total) {
+        if total == Some(size(&body)) {
             break;
         }
     }
-    let have = fs::metadata(&body).map_or(0, |meta| meta.len());
+    let have = size(&body);
     let Some(total) = total.filter(|total| *total == have) else {
         return Err(format!(
             "GET {key}: {have} of {} bytes after {GET_ATTEMPTS} attempts ({})",
@@ -3264,6 +3299,27 @@ pub(crate) fn object_length(status: u16, headers: &str) -> Option<u64> {
 /// An ETag that is one PUT's MD5 (32 hex), not a multipart one (`…-n`).
 pub(crate) fn is_plain_md5(etag: &str) -> bool {
     etag.len() == 32 && etag.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The status of the last HTTP head in a dumped header file, if any.
+pub(crate) fn last_status(headers: &str) -> Option<u16> {
+    headers
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("HTTP/"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+}
+
+/// A 416's whole length: `Content-Range: bytes */<total>`.
+pub(crate) fn unsatisfiable_length(headers: &str) -> Option<u64> {
+    header_value(headers, "content-range")
+        .and_then(|range| {
+            range
+                .strip_prefix("bytes */")
+                .map(|total| total.trim().to_string())
+        })
+        .and_then(|total| total.parse().ok())
 }
 
 fn spawn_unix_seconds() -> i64 {
@@ -4123,8 +4179,6 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         );
     }
 
-    /// Objective 136: a made-up bucket's settings, for a config read and
-    /// never sent.
     /// A one-object HTTP stand-in on 127.0.0.1 for the GET tests (t494u):
     /// `behaviour` decides each request's answer from its index and its
     /// Range; every request's Range (or "-") is returned through the log.
@@ -4145,10 +4199,16 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
                 let Ok(mut stream) = stream else { continue };
                 let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                 let mut range: Option<u64> = None;
+                let mut if_match: Option<String> = None;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("if-match")
+                    {
+                        if_match = Some(value.trim().trim_matches('"').to_string());
                     }
                     if let Some((name, value)) = line.split_once(':')
                         && name.eq_ignore_ascii_case("range")
@@ -4161,16 +4221,29 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
                             .ok();
                     }
                 }
-                seen.lock()
-                    .expect("log")
-                    .push(range.map_or("-".to_string(), |at| at.to_string()));
+                let mark = match &if_match {
+                    None => "",
+                    Some(tag) if *tag == etag => "+if-match",
+                    Some(_) => "+if-match-other",
+                };
+                seen.lock().expect("log").push(format!(
+                    "{}{mark}",
+                    range.map_or("-".to_string(), |at| at.to_string())
+                ));
                 let total = body.len();
+                let from_range = || usize::try_from(range.unwrap_or(0)).expect("range");
                 let (status, from, send) = match behaviour(index, range) {
                     Answer::Whole => (200, 0, total),
                     Answer::WholeCutAt(cut) => (200, 0, cut),
-                    Answer::Ranged => {
-                        let from = usize::try_from(range.unwrap_or(0)).expect("range");
-                        (206, from, total - from)
+                    Answer::Ranged => (206, from_range(), total - from_range()),
+                    Answer::RangedCutAfter(bytes) => {
+                        (206, from_range(), bytes.min(total - from_range()))
+                    }
+                    Answer::NotFound => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        continue;
                     }
                 };
                 let mut head = format!(
@@ -4202,6 +4275,12 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         Whole,
         WholeCutAt(usize),
         Ranged,
+        RangedCutAfter(usize),
+        NotFound,
+    }
+
+    fn no_pause(_attempt: u32) -> u64 {
+        0
     }
 
     fn made_up_object() -> Vec<u8> {
@@ -4225,16 +4304,18 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         });
         let mut settings = made_up_r2_settings(None);
         settings.r2.endpoint = endpoint;
-        let (got, headers) = super::get_object_bytes(&settings, "bundles/made-up.tar.zst.gpg")
-            .expect("the GET")
-            .expect("the object");
+        let (got, headers) =
+            super::get_object_with(&settings, "bundles/made-up.tar.zst.gpg", no_pause)
+                .expect("the GET")
+                .expect("the object");
         assert_eq!(got, body);
         assert!(
             headers.to_ascii_lowercase().contains("x-amz-meta-sha256"),
             "{headers}"
         );
         let requests = log.lock().expect("log").clone();
-        assert_eq!(requests, ["-", "100000"]);
+        // The resumed request asks for the same object (If-Match, rev-b n3).
+        assert_eq!(requests, ["-", "100000+if-match"]);
     }
 
     #[test]
@@ -4243,7 +4324,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         let (endpoint, _log) = serve_object(body, "0".repeat(32), |_, _| Answer::Whole);
         let mut settings = made_up_r2_settings(None);
         settings.r2.endpoint = endpoint;
-        let error = super::get_object_bytes(&settings, "bundles/made-up.tar.zst.gpg")
+        let error = super::get_object_with(&settings, "bundles/made-up.tar.zst.gpg", no_pause)
             .expect_err("a wrong MD5");
         assert!(error.contains("not the ETag"), "{error}");
     }
@@ -4260,7 +4341,7 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         });
         let mut settings = made_up_r2_settings(None);
         settings.r2.endpoint = endpoint;
-        let (got, _) = super::get_object_bytes(&settings, "bundles/made-up.tar.zst.gpg")
+        let (got, _) = super::get_object_with(&settings, "bundles/made-up.tar.zst.gpg", no_pause)
             .expect("the GET")
             .expect("the object");
         assert_eq!(got, body);
@@ -4269,6 +4350,46 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         assert_eq!(requests.last().map(String::as_str), Some("-"));
     }
 
+    #[test]
+    fn a_get_that_never_completes_fails_and_returns_no_part() {
+        // rev-b F1: every answer is cut, and the ETag is multipart (no MD5
+        // to catch a short body): six attempts, then an error naming the
+        // bytes, never the partial body as the object.
+        let body = made_up_object();
+        let etag = "0123456789abcdef0123456789abcdef-2".to_string();
+        let (endpoint, log) = serve_object(body, etag, |index, _| {
+            if index == 0 {
+                Answer::WholeCutAt(10_000)
+            } else {
+                Answer::RangedCutAfter(10_000)
+            }
+        });
+        let mut settings = made_up_r2_settings(None);
+        settings.r2.endpoint = endpoint;
+        let error = super::get_object_with(&settings, "bundles/made-up.tar.zst.gpg", no_pause)
+            .expect_err("an incomplete object");
+        assert!(
+            error.contains("60000 of 300000 bytes after 6 attempts"),
+            "{error}"
+        );
+        assert_eq!(log.lock().expect("log").len(), 6);
+    }
+
+    #[test]
+    fn a_missing_object_is_none_after_one_request() {
+        // rev-b F2: a 404 is "no such object" (None), asked once.
+        let (endpoint, log) =
+            serve_object(made_up_object(), "x".to_string(), |_, _| Answer::NotFound);
+        let mut settings = made_up_r2_settings(None);
+        settings.r2.endpoint = endpoint;
+        let found = super::get_object_with(&settings, "bundles/none.tar.zst.gpg", no_pause)
+            .expect("a 404 is no error");
+        assert!(found.is_none());
+        assert_eq!(log.lock().expect("log").len(), 1);
+    }
+
+    /// Objective 136: a made-up bucket's settings, for a config read and
+    /// never sent.
     fn made_up_r2_settings(seal: Option<&str>) -> Settings {
         Settings {
             root: "/made-up".into(),
@@ -4483,8 +4604,6 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         }
     }
 
-    /// Objective 167: two bundles in one second (or one millisecond) name
-    /// two objects, and the names sort, by byte, as the bundles ran.
     #[test]
     fn a_get_resumes_cuts_stalls_and_caps_by_what_is_left() {
         let first = get_options(0, None);
@@ -4512,8 +4631,16 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
         assert!(is_plain_md5("0123456789abcdef0123456789abcdef"));
         assert!(!is_plain_md5("0123456789abcdef0123456789abcdef-3"));
         assert!(!is_plain_md5(""));
+        let cut = "HTTP/1.1 200 OK\r\nContent-Length: 146466171\r\n\r\n";
+        assert_eq!(super::last_status(cut), Some(200));
+        assert_eq!(super::last_status(""), None);
+        let late = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */146466171\r\n";
+        assert_eq!(super::last_status(late), Some(416));
+        assert_eq!(super::unsatisfiable_length(late), Some(146_466_171));
     }
 
+    /// Objective 167: two bundles in one second (or one millisecond) name
+    /// two objects, and the names sort, by byte, as the bundles ran.
     #[test]
     fn bundles_in_one_second_get_names_that_sort_as_they_ran() {
         use super::bundle_name;
