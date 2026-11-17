@@ -105,8 +105,10 @@ export interface CoreLine {
   line: string;
   north_star: CoreFigure;
   guardrails: CoreFigure[];
-  /** The line's plain readings (objective 182): no range, never judged,
-   * each with its `range_note`; empty for most lines. */
+  /** The line's plain readings (objective 182): they raise nothing.
+   * Dollars per landing takes its configured range while use with no price
+   * is a fresh number under 10% (objective 207), and otherwise has no range
+   * and its `range_note`. Empty for most lines. */
   readings?: CoreFigure[];
 }
 
@@ -210,7 +212,8 @@ export interface CoreRow {
   north_star: CoreMark;
   guardrails: CoreMark[];
   /** The line's plain readings (objective 182), shown under its
-   * guardrails: the note where the range would be. */
+   * guardrails: their range, or the note where the range would be
+   * (objective 207). */
   readings: CoreMark[];
 }
 
