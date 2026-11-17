@@ -12,3 +12,4 @@ export { EmptyState } from "../ui/empty-state";
 export { KpiChart } from "../ui/kpi-chart";
 export { Loading, Skeleton } from "../ui/skeleton";
 export { Tooltip } from "../ui/tooltip";
+export { SegmentedControl } from "../ui/segmented-control";

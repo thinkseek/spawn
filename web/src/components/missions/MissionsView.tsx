@@ -946,7 +946,8 @@ function remainingSteps(
 
 /** The task's stepper from its records: one step per record, so a second
  * round shows as steps of its own, each with the time it took, then the
- * steps still ahead. The first of those counts the wait so far. */
+ * steps still ahead, after a "waiting" step that counts the wait so far
+ * (the next state carries no duration of its own, GitHub #61). */
 function StageSteps({
   task,
   steps,
@@ -1005,20 +1006,27 @@ function StageSteps({
           />
         );
       })}
-      {ahead.map((step, index) => (
+      {waiting !== null && (
+        <StepItem
+          key="waiting"
+          first={false}
+          pending
+          title={`waiting for ${stateWords(ahead[0])} since ${absolute(last.at_ms) ?? "an unknown time"}`}
+          chip="text-faint-foreground ring-surface-border"
+          label="waiting"
+          took={waiting}
+          slow={slow[slow.length - 1]}
+        />
+      )}
+      {ahead.map((step) => (
         <StepItem
           key={`ahead-${step}`}
           first={false}
           pending
-          title={
-            index === 0 && waiting !== null
-              ? `waiting since ${absolute(last.at_ms) ?? "an unknown time"}`
-              : undefined
-          }
           chip="text-faint-foreground ring-surface-border"
           label={stateWords(step)}
-          took={index === 0 ? waiting : null}
-          slow={index === 0 && waiting !== null && slow[slow.length - 1]}
+          took={null}
+          slow={false}
         />
       ))}
     </ol>

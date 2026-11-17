@@ -58,5 +58,8 @@ ln -s "$controller/web/node_modules" web/node_modules
 cd web
 # The UI's pure modules have tests of their own (web/test), run by node
 # itself (it strips the types); no package is added for them.
-node --test test/
+# Node 22.23+ no longer accepts a test directory as a positional argument;
+# a run with no argument discovers web/test/*.test.ts itself (node_modules
+# is not searched).
+node --test
 npm run build -- --configLoader runner
