@@ -146,7 +146,7 @@ pub trait CommandQueue: Send + Sync {
 }
 
 /// Workspace store refusal or failure.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum WorkspaceError {
     /// The store refused the call with a structured code.
     #[error("workspace refused: {code}: {message}")]
@@ -185,6 +185,20 @@ pub enum Commit {
     Created(CommitId),
     /// The workspace had no changes.
     Unchanged,
+    /// The branch was gone from the store while its workspace was mounted
+    /// (objective 205, incident I-006: deleted under it), and the checkpoint
+    /// made it again from the workspace: `commit` holds the workspace's
+    /// state and is the branch's head now. `parent` is the commit it was
+    /// made on: what this host had published of the branch (taken back
+    /// from the source; `commit` is that head itself when the workspace
+    /// held nothing new), else the store's main; `None` with neither (a
+    /// commit with no parent).
+    Recreated {
+        /// The branch's new head.
+        commit: CommitId,
+        /// What it was made on, if anything.
+        parent: Option<CommitId>,
+    },
 }
 
 /// Result of [`WorkspaceStore::set_aside`].
@@ -303,7 +317,10 @@ pub trait WorkspaceStore: Send + Sync {
         workspace.clone()
     }
 
-    /// Commit the workspace. No changes is [`Commit::Unchanged`].
+    /// Commit the workspace. No changes is [`Commit::Unchanged`]. A branch
+    /// gone from the store while its workspace is mounted is made again
+    /// from the workspace ([`Commit::Recreated`], objective 205), never over
+    /// a ref someone made meanwhile.
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError>;
 
     /// Unmount the workspace. Committed state stays on the branch.

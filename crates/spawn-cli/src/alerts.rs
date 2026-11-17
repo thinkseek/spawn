@@ -115,7 +115,10 @@
 //! - `source_away`, `mission #<id>`, key `source_away:<mission>:<reading
 //!   ms>`, evidence its `source`: at two readings in a row, a source of an
 //!   open or active mission that is a path on this host (absolute) is not a
-//!   directory: an unmounted volume, a moved checkout (one reading only
+//!   directory, or not one git can read (`git ls-remote --heads` fails, or a
+//!   take-back of a branch gone from its mirror failed to fetch from it in
+//!   the last 120 s: objective 205 R5): an unmounted volume, a moved
+//!   checkout, an empty directory in its place (one reading only
 //!   notes it, so a path that comes and goes does not flap). Its agents' branches
 //!   are not published to it until it is back (the pusher retries, and says
 //!   so only once, in its log: fix-core-b item 6). One per mission and
@@ -2972,7 +2975,9 @@ times in a row)",
     /// the fold has a reported task of a mission open and not halted, or the
     /// alert is open.
     /// The open and active missions' sources that are paths on this host,
-    /// and whether each is a directory now (`source_away`).
+    /// and whether each is there now: a directory git can read, from which
+    /// no take-back of a gone branch failed lately
+    /// ([`crate::sources::source_readable`], `source_away`).
     fn read_sources(
         &mut self,
         store: &PostgresStore,
@@ -2988,7 +2993,9 @@ times in a row)",
             }
         };
         let watched = host_sources(&listed);
-        out.extend(self.source_events(&watched, |path| Path::new(path).is_dir(), now));
+        // There only when git can read it, and no take-back from it failed
+        // lately (objective 205 R5): one ls-remote per watched source.
+        out.extend(self.source_events(&watched, crate::sources::source_readable, now));
     }
 
     /// The open missions' gate directories, when a `validator_defect` is
@@ -3139,8 +3146,8 @@ times in a row)",
                     "reading_ms": now,
                 }),
                 text: format!(
-                    "{source} is not a directory on this host: mission #{mission}'s \
-                     branches are not published to it until it is back"
+                    "{source} is not a directory on this host, or not one git can read: \
+                     mission #{mission}'s branches are not published to it until it is back"
                 ),
                 notice: false,
             });

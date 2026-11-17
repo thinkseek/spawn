@@ -540,7 +540,8 @@ select jsonb_build_object(
     left join lateral (
       select e.session_seq, e.event_name, e.recorded_at_ms from spawn_events e
        where e.session_id = s.session_id and e.source <> 'observer'
-         and e.event_name not in ('artifact.committed', 'merge.conflicted', 'message.acted')
+         and e.event_name not in ('artifact.committed', 'artifact.branch_recreated',
+                                'merge.conflicted', 'message.acted')
          and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
        order by e.session_seq desc limit 1) f on true), '[]'::jsonb),
   'halted', coalesce((select jsonb_agg(jsonb_build_object(

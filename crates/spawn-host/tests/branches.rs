@@ -95,6 +95,7 @@ impl Fixture {
         match self.store.commit(workspace, "work").expect("commit") {
             Commit::Created(commit) => commit.as_str().to_string(),
             Commit::Unchanged => panic!("the work changed something"),
+            Commit::Recreated { .. } => panic!("the branch is there: nothing to make again"),
         }
     }
 }

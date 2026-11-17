@@ -1387,3 +1387,268 @@ fn a_runner_that_outlives_its_kill_holds_its_workspace_until_it_is_gone() {
     assert_eq!(store.unmounted_dirty(), Vec::new());
     assert_eq!(unmounts(&store), 1);
 }
+
+/// The first execution's workspace in the memory store.
+fn first_workspace() -> spawn_core::id::WorkspaceId {
+    spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid workspace")
+}
+
+/// The warnings of `report` that say a commit failed.
+fn commit_failures(report: &TickReport) -> Vec<String> {
+    report
+        .warnings
+        .iter()
+        .filter(|warning| warning.starts_with("commit "))
+        .cloned()
+        .collect()
+}
+
+/// A started execution with a checkpoint due (a tool call read: the next
+/// tick takes it) and work in its workspace.
+fn checkpoint_due(store: &MemoryStore, bridge: &mut Bridge, call: &str) {
+    transcript(store, &tool_call(call));
+    store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
+}
+
+/// Objective 205 (incident I-006: about 4 lines a second for days): a commit
+/// that keeps failing is retried every pass, its checkpoint still due, but
+/// logged once when it starts failing; the passes after it are quiet; one
+/// note says when a commit gets through after it; a new failure is logged
+/// again.
+#[test]
+fn a_failing_commit_is_reported_once_until_it_gets_through() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    store.fail_commits_saying(Some(spawn_core::port::WorkspaceError::Unavailable(
+        "git rev-parse refs/heads/agent_one: fatal: ambiguous argument".to_string(),
+    )));
+    transcript(&store, &tool_call("toolu_1"));
+    store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
+    let report = bridge.tick().expect("the first failure");
+    assert_eq!(
+        commit_failures(&report),
+        ["commit unavailable: git rev-parse refs/heads/agent_one: fatal: ambiguous argument"]
+    );
+    let before = commits(&store);
+    for _ in 0..5 {
+        let report = bridge.tick().expect("a quiet retry");
+        quiet(&report);
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+    }
+    assert_eq!(commits(&store), before + 5, "retried every pass");
+    assert!(checkpoints(&store).is_empty());
+
+    store.fail_commits_saying(None);
+    let report = bridge.tick().expect("through");
+    quiet(&report);
+    assert_eq!(report.notes, ["session_one: commit available again"]);
+    assert_eq!(checkpoints(&store).len(), 1);
+    let report = bridge.tick().expect("idle");
+    assert!(report.notes.is_empty(), "said once: {:?}", report.notes);
+
+    // A new failure is logged again.
+    store.fail_commits_saying(Some(spawn_core::port::WorkspaceError::Unavailable(
+        "git rev-parse refs/heads/agent_one: fatal: ambiguous argument".to_string(),
+    )));
+    transcript(&store, &tool_call("toolu_2"));
+    store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
+    let report = bridge.tick().expect("failing again");
+    assert_eq!(commit_failures(&report).len(), 1, "{:?}", report.warnings);
+}
+
+/// Objective 205 R2 (rev-f's F1): a failure is logged once per cause, its
+/// kind and its message's first line with ids masked. One cause at two files
+/// (git add's later lines) is one line; the same refusal naming a fresh
+/// commit id each pass is one line; a second cause is a second line; then
+/// the note when a commit gets through.
+#[test]
+fn a_commit_failure_is_reported_once_per_cause() {
+    use spawn_core::port::WorkspaceError::{Refused, Unavailable};
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    let add = |file: &str| {
+        Unavailable(format!(
+            "git add -A: error: insufficient permission for adding an object to repository \
+             database /store/objects\nerror: {file}: failed to insert into database"
+        ))
+    };
+    let locked = |commit: &str| Refused {
+        code: "Locked".to_string(),
+        message: format!("update-ref refs/heads/agent_one {commit}: cannot lock ref"),
+    };
+    let mut logged = Vec::new();
+    store.fail_commits_saying(Some(add("five.txt")));
+    checkpoint_due(&store, &mut bridge, "toolu_1");
+    for step in [
+        add("five.txt"),
+        add("a5.txt"),
+        add("five.txt"),
+        locked(&"1".repeat(40)),
+        locked(&"2".repeat(40)),
+        locked(&format!("{:040x}", 0xabc_u64)),
+    ] {
+        store.fail_commits_saying(Some(step));
+        let report = bridge.tick().expect("a retry");
+        logged.extend(commit_failures(&report));
+    }
+    assert_eq!(logged.len(), 2, "one line per cause: {logged:?}");
+    assert!(
+        logged[0].starts_with("commit unavailable: git add -A"),
+        "{logged:?}"
+    );
+    assert!(
+        logged[1].starts_with("commit refused Locked: update-ref"),
+        "{logged:?}"
+    );
+    store.fail_commits_saying(None);
+    let report = bridge.tick().expect("through");
+    assert!(commit_failures(&report).is_empty());
+    assert_eq!(report.notes, ["session_one: commit available again"]);
+}
+
+/// The key a failing commit is logged by: its kind, its message's first
+/// line, each run of seven or more hex digits read as `<id>`.
+#[test]
+fn a_failure_key_masks_ids_and_reads_the_first_line() {
+    use spawn_core::bridge::failure_key;
+    use spawn_core::port::WorkspaceError::{Refused, Unavailable};
+    let fresh = |commit: &str| {
+        failure_key(&Unavailable(format!(
+            "git update-ref refs/heads/a {commit} {}: fatal: cannot lock ref",
+            "f".repeat(40)
+        )))
+    };
+    assert_eq!(fresh(&"1".repeat(40)), fresh(&"2".repeat(40)));
+    assert_eq!(
+        fresh(&"a".repeat(40)),
+        "unavailable: git update-ref refs/heads/a <id> <id>: fatal: cannot lock ref"
+    );
+    assert_eq!(
+        failure_key(&Unavailable("one\ntwo".to_string())),
+        failure_key(&Unavailable("one\nthree".to_string()))
+    );
+    assert_ne!(
+        failure_key(&Unavailable("one".to_string())),
+        failure_key(&Unavailable("two".to_string()))
+    );
+    // Short hex runs (a word, a pid) stay.
+    assert_eq!(
+        failure_key(&Unavailable("added cafe 123456".to_string())),
+        "unavailable: added cafe 123456"
+    );
+    assert_eq!(
+        failure_key(&Refused {
+            code: "NoCommit".to_string(),
+            message: "abcdef0 gone\nmore".to_string(),
+        }),
+        "refused NoCommit: <id> gone"
+    );
+    assert_ne!(
+        failure_key(&Refused {
+            code: "A".to_string(),
+            message: "x".to_string()
+        }),
+        failure_key(&Refused {
+            code: "B".to_string(),
+            message: "x".to_string()
+        })
+    );
+}
+
+/// Objective 205: a checkpoint that finds the branch gone makes it again
+/// from the workspace; the Bridge logs one line, records
+/// `artifact.branch_recreated {artifact, parent}` and then the checkpoint's
+/// `artifact.committed`, in that order (R4: a log down at the first append
+/// loses neither; the next pass appends both). The checkpoint after it is
+/// an ordinary one.
+#[test]
+fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    let branch = BranchName::new("agent_one").expect("valid branch");
+    store.lose_branch(&branch);
+    transcript(&store, &tool_call("toolu_1"));
+    quiet(&bridge.tick().expect("read the tool call"));
+    store.fail_next_branch_record();
+    bridge.tick().expect_err("the log is down");
+    let recorded = |store: &MemoryStore| -> Vec<(&'static str, String, Option<String>)> {
+        events(store)
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ArtifactBranchRecreated { artifact, parent } => Some((
+                    "artifact.branch_recreated",
+                    artifact.commit.as_str().to_string(),
+                    parent.map(|parent| parent.as_str().to_string()),
+                )),
+                EventKind::ArtifactCommitted { artifact, .. } => Some((
+                    "artifact.committed",
+                    artifact.commit.as_str().to_string(),
+                    None,
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(recorded(&store).is_empty(), "neither recorded yet");
+    let head = store
+        .branch_head(&branch)
+        .expect("head")
+        .expect("made again")
+        .as_str()
+        .to_string();
+    let report = bridge.tick().expect("the log is back");
+    quiet(&report);
+    let base = CommitId::new("b".repeat(40)).expect("the memory store's base");
+    let base = base.as_str().to_string();
+    let made = recorded(&store);
+    assert_eq!(
+        made,
+        [
+            (
+                "artifact.branch_recreated",
+                head.clone(),
+                Some(base.clone())
+            ),
+            ("artifact.committed", head.clone(), None),
+        ],
+        "made again, then the checkpoint"
+    );
+
+    // Logged once: a second loss logs one line naming the branch and parent.
+    store.lose_branch(&branch);
+    transcript(&store, &tool_call("toolu_2"));
+    quiet(&bridge.tick().expect("read the tool call"));
+    let report = bridge.tick().expect("made again, recorded");
+    let lines: Vec<&String> = report
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains("was gone from its store"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{:?}", report.warnings);
+    assert!(
+        lines[0]
+            .starts_with("session_one: branch agent_one was gone from its store; made again at ")
+            && lines[0].ends_with(&format!("from the workspace, on {base}")),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(recorded(&store).len(), 4);
+
+    // The next checkpoint is an ordinary one.
+    transcript(&store, &tool_call("toolu_3"));
+    store.mark_dirty(&first_workspace());
+    quiet(&bridge.tick().expect("read the tool call"));
+    quiet(&bridge.tick().expect("an ordinary checkpoint"));
+    let all = recorded(&store);
+    assert_eq!(all.len(), 5);
+    assert_eq!(all[4].0, "artifact.committed");
+}

@@ -1160,6 +1160,154 @@ impl GitWorkspace {
     }
 }
 
+impl GitWorkspace {
+    /// Commit the workspace (the [`WorkspaceStore::commit`] of this store),
+    /// asking `take_back` first when its branch is gone (objective 205,
+    /// incident I-006: deleted under the mounted workspace).
+    ///
+    /// Everything happens under the branch's index lock, so whether the
+    /// branch is there is read where it is used: `take_back` is called only
+    /// when `refs/heads/<branch>` names no commit, and may make the branch
+    /// (a mission's store takes it back from what this host published);
+    /// the branch is then read again. Made, the commit goes on it as on any
+    /// branch. Still absent, the store makes it again from the workspace
+    /// ([`Self::recreate`]). An error from `take_back` is the commit's, and
+    /// nothing is written.
+    pub fn commit_or_take_back(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+        take_back: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<Commit, WorkspaceError> {
+        let branch = workspace.sandbox().to_string();
+        let directory = self.checked_path(workspace)?;
+        let index = self.index(&branch);
+        if let Some(parent) = index.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+        // The Bridge and the integrator both commit workspaces under one
+        // root: the branch's index is theirs one at a time.
+        let lock_path = index.with_extension("spawn-lock");
+        let lock = std::fs::File::create(&lock_path).map_err(|error| {
+            WorkspaceError::Unavailable(format!("create {}: {error}", lock_path.display()))
+        })?;
+        lock.lock().map_err(|error| {
+            WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
+        })?;
+        if self.is_stale(&branch) {
+            let kept = self.keep_stale(&branch, &directory)?;
+            return Err(stale_refusal(&branch, Some(&kept)));
+        }
+        let reference = format!("refs/heads/{branch}");
+        if !self.names_commit(&reference) {
+            take_back()?;
+            if !self.names_commit(&reference) {
+                return self.recreate(&branch, &directory, &index, message);
+            }
+        }
+        let parent = self.git_output(&["rev-parse", &reference])?;
+        let tree = self.tree_of(&directory, &index, &branch, &parent);
+        if tree.is_err() {
+            let _ = std::fs::remove_file(&index);
+        }
+        let (tree, oversized) = tree?;
+        self.record_oversized(&branch, &oversized);
+
+        let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
+        // A merge of main whose conflicts are now resolved: main is the
+        // second parent, even when the tree did not change.
+        let merged = self.resolved_merge(&branch, &directory);
+        if tree == parent_tree && merged.is_none() {
+            return Ok(Commit::Unchanged);
+        }
+        let mut arguments = vec!["commit-tree", tree.as_str(), "-p", parent.as_str()];
+        if let Some(main) = merged.as_deref() {
+            arguments.extend(["-p", main]);
+        }
+        arguments.extend(["-m", message]);
+        let commit = self.git_output(&arguments)?;
+        // Expected old value: a branch that moved is not overwritten.
+        self.git_output(&["update-ref", &reference, &commit, &parent])
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("{error} (branch moved under the commit)"))
+            })?;
+        if merged.is_some() {
+            self.clear_pending(&branch);
+        }
+        CommitId::new(commit)
+            .map(Commit::Created)
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+    }
+
+    /// Whether `reference` names a commit now.
+    fn names_commit(&self, reference: &str) -> bool {
+        self.git_output(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ])
+        .is_ok()
+    }
+
+    /// Make `branch`, gone from the store, again from the workspace in
+    /// `directory` (objective 205): a commit of its tree, built by the
+    /// checkpoint's own rules ([`Self::tree_of`]: files over the cap, the
+    /// engine's runtime files and build output left out), on the store's
+    /// main, or with no parent when the store has no main (the empty tree
+    /// is then the head the rules read). Why main and not the last
+    /// checkpoint: the store keeps no record of it once the ref is gone
+    /// (the reflog goes with the ref), and its objects may be pruned; on
+    /// main, the branch's diff against main is exactly the workspace's
+    /// work. The ref is made only while it is still absent (`update-ref`
+    /// with the empty old value): a branch made meanwhile, or a ref that
+    /// names no commit, is never written over.
+    fn recreate(
+        &self,
+        branch: &str,
+        directory: &Path,
+        index: &Path,
+        message: &str,
+    ) -> Result<Commit, WorkspaceError> {
+        let main = self.commit_id_of(&format!("refs/heads/{BASE}")).ok();
+        let head = match &main {
+            Some(main) => main.clone(),
+            None => self.git_output(&["mktree"])?,
+        };
+        let tree = self.tree_of(directory, index, branch, &head);
+        if tree.is_err() {
+            let _ = std::fs::remove_file(index);
+        }
+        let (tree, oversized) = tree?;
+        self.record_oversized(branch, &oversized);
+        let mut arguments = vec!["commit-tree", tree.as_str()];
+        if let Some(main) = main.as_deref() {
+            arguments.extend(["-p", main]);
+        }
+        arguments.extend(["-m", message]);
+        let commit = self.git_output(&arguments)?;
+        let reference = format!("refs/heads/{branch}");
+        self.git_output(&["update-ref", &reference, &commit, ""])
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!(
+                    "{error} (making the gone branch again: it is there now, or names no commit)"
+                ))
+            })?;
+        // A merge of main that waited on the gone branch's markers waits
+        // no more: the branch is made again on main.
+        self.clear_pending(branch);
+        let parent = main
+            .map(CommitId::new)
+            .transpose()
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
+        CommitId::new(commit)
+            .map(|commit| Commit::Recreated { commit, parent })
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+    }
+}
+
 impl WorkspaceStore for GitWorkspace {
     fn project(&self) -> &str {
         self.repo.to_str().unwrap_or("")
@@ -1261,61 +1409,11 @@ impl WorkspaceStore for GitWorkspace {
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
     }
 
+    /// [`GitWorkspace::commit_or_take_back`] with a take-back that does
+    /// nothing: a branch gone from the store is made again from the
+    /// workspace, on main ([`Commit::Recreated`]).
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
-        let branch = workspace.sandbox().to_string();
-        let directory = self.checked_path(workspace)?;
-        let index = self.index(&branch);
-        if let Some(parent) = index.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
-            })?;
-        }
-        // The Bridge and the integrator both commit workspaces under one
-        // root: the branch's index is theirs one at a time.
-        let lock_path = index.with_extension("spawn-lock");
-        let lock = std::fs::File::create(&lock_path).map_err(|error| {
-            WorkspaceError::Unavailable(format!("create {}: {error}", lock_path.display()))
-        })?;
-        lock.lock().map_err(|error| {
-            WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
-        })?;
-        if self.is_stale(&branch) {
-            let kept = self.keep_stale(&branch, &directory)?;
-            return Err(stale_refusal(&branch, Some(&kept)));
-        }
-        let reference = format!("refs/heads/{branch}");
-        let parent = self.git_output(&["rev-parse", &reference])?;
-        let tree = self.tree_of(&directory, &index, &branch, &parent);
-        if tree.is_err() {
-            let _ = std::fs::remove_file(&index);
-        }
-        let (tree, oversized) = tree?;
-        self.record_oversized(&branch, &oversized);
-
-        let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
-        // A merge of main whose conflicts are now resolved: main is the
-        // second parent, even when the tree did not change.
-        let merged = self.resolved_merge(&branch, &directory);
-        if tree == parent_tree && merged.is_none() {
-            return Ok(Commit::Unchanged);
-        }
-        let mut arguments = vec!["commit-tree", tree.as_str(), "-p", parent.as_str()];
-        if let Some(main) = merged.as_deref() {
-            arguments.extend(["-p", main]);
-        }
-        arguments.extend(["-m", message]);
-        let commit = self.git_output(&arguments)?;
-        // Expected old value: a branch that moved is not overwritten.
-        self.git_output(&["update-ref", &reference, &commit, &parent])
-            .map_err(|error| {
-                WorkspaceError::Unavailable(format!("{error} (branch moved under the commit)"))
-            })?;
-        if merged.is_some() {
-            self.clear_pending(&branch);
-        }
-        CommitId::new(commit)
-            .map(Commit::Created)
-            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+        self.commit_or_take_back(workspace, message, &|| Ok(()))
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {

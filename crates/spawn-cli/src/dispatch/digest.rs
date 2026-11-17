@@ -69,7 +69,10 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateBaseDisagrees => "the base disagreed with itself at the gate (the host's)",
         Why::MainRed => "a source's main is red on a check (its gates wait)",
         Why::MainGreen => "a source's main is green again",
-        Why::SourceAway => "a mission's source is not a directory on this host (its branches wait)",
+        Why::SourceAway => {
+            "a mission's source is not a directory on this host, or not one git can read (its \
+             branches wait)"
+        }
         Why::SourceBack => "a mission's source is back on this host",
         Why::ShadowDisagrees => {
             "a gate runner's shadow verdict disagreed with the primary's (it decided nothing)"
@@ -431,9 +434,9 @@ pub(crate) fn source_away_news(records: &[Value]) -> Vec<Escalation> {
                     id: format!("source-away-{id}"),
                     why: Why::SourceAway,
                     line: format!(
-                        "{subject}'s source {source} is not a directory on this host: its \
-                         agents' branches are not published to it until it is back. Check \
-                         the mount or the path; Spawn retries on its own."
+                        "{subject}'s source {source} is not a directory on this host, or not \
+                         one git can read: its agents' branches are not published to it until \
+                         it is back. Check the mount or the path; Spawn retries on its own."
                     ),
                     since_ms: record["at_ms"].as_i64(),
                 }),

@@ -77,6 +77,9 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
+    /// What every commit fails saying, while set
+    /// ([`MemoryStore::fail_commits_saying`]).
+    commit_failure: Option<WorkspaceError>,
     /// How many of the next `submit_staged` calls fail (the keys broke
     /// midway), after their text may have reached the engine; the staged
     /// text stays for a retry.
@@ -336,6 +339,19 @@ impl MemoryStore {
         self.lock().commit_fails = fail;
     }
 
+    /// Make every commit fail with `error` (`Some`), or work again. Test
+    /// helper.
+    pub fn fail_commits_saying(&self, error: Option<WorkspaceError>) {
+        self.lock().commit_failure = error;
+    }
+
+    /// Delete `branch` from the store, as a branch deleted under its
+    /// mounted workspace is (objective 205): the next commit of a workspace
+    /// on it makes it again from the workspace, on the base. Test helper.
+    pub fn lose_branch(&self, branch: &BranchName) {
+        self.lock().heads.remove(branch);
+    }
+
     /// Make every commit and merge answer `WorkspaceStale` (`true`), as a
     /// store does that kept the workspace's state off its branch, or work
     /// again. Test helper.
@@ -343,8 +359,9 @@ impl MemoryStore {
         self.lock().stale = stale;
     }
 
-    /// Make the next append of an `artifact.committed` or `merge.conflicted`
-    /// event fail, as a log that is down would. Test helper.
+    /// Make the next append of an `artifact.committed`,
+    /// `artifact.branch_recreated` or `merge.conflicted` event fail, as a log
+    /// that is down would. Test helper.
     pub fn fail_next_branch_record(&self) {
         self.lock().branch_record_fails = true;
     }
@@ -397,7 +414,9 @@ impl EventLog for MemoryStore {
         let mut state = self.lock();
         let branch_record = matches!(
             event.kind,
-            EventKind::ArtifactCommitted { .. } | EventKind::MergeConflicted { .. }
+            EventKind::ArtifactCommitted { .. }
+                | EventKind::ArtifactBranchRecreated { .. }
+                | EventKind::MergeConflicted { .. }
         );
         if state.branch_record_fails && branch_record {
             state.branch_record_fails = false;
@@ -677,20 +696,28 @@ impl WorkspaceStore for MemoryStore {
         if state.commit_fails {
             return Err(WorkspaceError::Unavailable("commit fails".to_string()));
         }
+        if let Some(error) = state.commit_failure.clone() {
+            return Err(error);
+        }
         if state.stale {
             return Err(stale_refusal());
         }
-        let Some(mount) = state.mounts.get_mut(workspace) else {
+        let Some(mount) = state.mounts.get(workspace) else {
             return Err(WorkspaceError::Refused {
                 code: "NoSuchWorkspace".to_string(),
                 message: workspace.to_string(),
             });
         };
-        if !mount.dirty {
+        let (branch, dirty) = (mount.branch.clone(), mount.dirty);
+        // A branch gone from the store is made again from the workspace, on
+        // the base, whether or not the workspace changed.
+        let lost = !state.heads.contains_key(&branch);
+        if !dirty && !lost {
             return Ok(Commit::Unchanged);
         }
-        mount.dirty = false;
-        let branch = mount.branch.clone();
+        if let Some(mount) = state.mounts.get_mut(workspace) {
+            mount.dirty = false;
+        }
         state.commits += 1;
         let commit = CommitId::new(format!("{:040x}", state.commits))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
@@ -701,6 +728,12 @@ impl WorkspaceStore for MemoryStore {
             .or_default()
             .insert(commit.clone());
         state.heads.insert(branch, commit.clone());
+        if lost {
+            return Ok(Commit::Recreated {
+                commit,
+                parent: Some(base_commit()),
+            });
+        }
         Ok(Commit::Created(commit))
     }
 

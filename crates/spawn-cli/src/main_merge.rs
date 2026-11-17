@@ -415,7 +415,9 @@ fn marked_in_workspace(
         Ok(Commit::Unchanged)
     };
     let unmounted = workspaces.unmount(&workspace);
-    if let Commit::Created(commit) = committed? {
+    // A branch made again by that commit (objective 205) holds the
+    // markers' checkpoint as a created one does.
+    if let Commit::Created(commit) | Commit::Recreated { commit, .. } = committed? {
         let markers = Merge::Merged {
             commit: commit.as_str().to_string(),
             files: Vec::new(),
