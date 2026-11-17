@@ -679,6 +679,17 @@ gate_started=$(stage_now)
 base_ms=0
 candidate_ms=0
 base_runs=0
+# bar <prefix> [<file>]: each line of <file> (stdin when none) after
+# <prefix>, every line ending in a newline, a last line written without one
+# too. Every log, scenario output or build output the gate copies into its
+# own output goes through it, so the stage line printed next always starts
+# on a line of its own (objective 208 (a): sed kept a last line with no
+# newline, and the stage line was glued onto the scenario's last words).
+# The prefix goes through the environment: awk -v would read its
+# backslashes.
+bar() {
+    BAR_PREFIX=$1 awk '{ print ENVIRON["BAR_PREFIX"] $0 }' ${2+"$2"}
+}
 stage_emit() { # <suite> <result> <ms> <name>
     case "$4" in
     total) ;;
@@ -712,7 +723,7 @@ gate_times() {
     # A sandbox started again after a masked path went away (`sandbox`):
     # said in the gate's own output whatever the command's log shows.
     if [ -s "${work-}/sandbox-retries" ]; then
-        sed 's/^/| /' "$work/sandbox-retries"
+        bar '| ' "$work/sandbox-retries"
     fi
 }
 # section <name>: a gate stage starts (and the one before it ends as ok).
@@ -936,6 +947,12 @@ shared_failed() {
         $1 == "FAILED" { t = $2; sub(/:$/, "", t); if (t in seen && !(t in said)) { said[t] = 1; print } }
     ' "$2" "$1" >"$3" 2>/dev/null
     [ -s "$3" ]
+}
+
+# failed_names <out>: the first five tests a run names failed (`FAILED
+# <test>:`), on one line.
+failed_names() {
+    awk '$1 == "FAILED" { t = $2; sub(/:$/, "", t); if (n++ < 5) printf "%s%s", (n > 1 ? " " : ""), t }' "$1"
 }
 
 # cannot_judge <scenario> <runs> [<prerequisite> [<reason>]]: the scenario says this
@@ -1996,7 +2013,7 @@ build() {
         build_status=$?
     sandbox_hold_here=""
     [ "$build_status" -eq 0 ] || {
-        sed 's/^/| build: /' "$work/build.log" | tail -n 30
+        bar '| build: ' "$work/build.log" | tail -n 30
         return 2
     }
 }
@@ -2298,7 +2315,7 @@ job_run() {
 # The job's block, written by the job ($job, $job_part): text, and a stage
 # line between two texts.
 job_say() { printf '%s\n' "$*" >>"$job/text.$job_part"; }
-job_output() { sed 's/^/| /' "$job/log.$1" | tail -n 60 >>"$job/text.$job_part"; }
+job_output() { bar '| ' "$job/log.$1" | tail -n 60 >>"$job/text.$job_part"; }
 job_stage() { # <ms> <result> <name>
     printf 'text %s\nstage %s %s|%s\n' "$job/text.$job_part" "$1" "$2" "$3" >>"$job/events"
     job_part=$((job_part + 1))
@@ -2344,7 +2361,7 @@ snapshot_bin() {
     sandbox "$1" sh -c '[ -f target/debug/spawn ] || exit 0
         mkdir -p target/gate && cp target/debug/spawn target/gate/spawn.new &&
         mv -f target/gate/spawn.new target/gate/spawn' >"$work/snapshot.log" 2>&1 || {
-        sed 's/^/| snapshot: /' "$work/snapshot.log" | tail -n 5
+        bar '| snapshot: ' "$work/snapshot.log" | tail -n 5
         return 1
     }
 }
@@ -2378,7 +2395,8 @@ runs_alone() {
 }
 # solo_run <job> <name>: a regression that failed twice (two exit 1s) on the
 # candidate beside the gate's other jobs, and passed on the base alone on a
-# fresh server, runs once more on the candidate under the base's
+# fresh server (a check: on the base beside the other jobs, $solo_base_how,
+# objective 208 (c)), runs once more on the candidate under the base's
 # conditions: alone (the job holds alone.now since the base's runs), on a
 # fresh test server of its own from the gate's template, in a fresh
 # sandbox ("Like for like before a rejection" in the header). It sets
@@ -2387,7 +2405,9 @@ runs_alone() {
 # (slot-waited), for the caller to stop as after any run.
 solo_run() {
     solo_name="$run_name (alone)"
-    job_say "| == $solo_name: it failed at $gate_jobs at a time on the candidate and the base passes it alone: once more on the candidate, alone, on a fresh test server, as the base ran"
+    solo_as=", as the base ran"
+    [ -z "${solo_base_how-}" ] || solo_as=""
+    job_say "| == $solo_name: it failed at $gate_jobs at a time on the candidate and the base passes it ${solo_base_how-alone}: once more on the candidate, alone, on a fresh test server$solo_as"
     solo_pg=""
     if [ -n "$gate_pg" ]; then
         gate_pg_pid=""
@@ -2431,7 +2451,7 @@ solo_run() {
             echo "load-sensitive on the candidate: fails at $gate_jobs at a time ($loaded), passes alone ($solo) as the base does ($base_runs): no verdict" >"$1/reason"
             printf '{"scenario":"%s","runs":"%s","base":"%s","solo_ms":%s,"base_ms":[%s]}\n' \
                 "$(json_string "$2")" "$(json_string "$loaded at $gate_jobs at a time; $solo alone")" \
-                "$(json_string "$base_runs alone")" "$solo_ms" "$base_ms_list" >"$1/load-sensitive"
+                "$(json_string "$base_runs ${solo_base_how-alone}")" "$solo_ms" "$base_ms_list" >"$1/load-sensitive"
             run_status=load_sensitive
         fi
         ;;
@@ -2633,7 +2653,7 @@ run_jobs() {
             if [ ! -e "$rj_job/result" ] && ! kill -0 "$(cat "$rj_job/job.pid")" 2>/dev/null &&
                 [ ! -e "$rj_job/result" ]; then
                 { echo "gate: the run of $(basename "$(cat "$rj_job/scenario")") was killed"; cat "$rj_job/errors"; } |
-                    sed 's/^/| /' >"$rj_job/text.killed"
+                    bar '| ' >"$rj_job/text.killed"
                 printf 'text %s\n' "$rj_job/text.killed" >>"$rj_job/events"
                 echo error >"$rj_job/result"
             fi
@@ -2801,7 +2821,7 @@ fi
 if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     if ! sandbox "$work/candidate" cargo metadata --no-deps --offline --format-version 1 \
         >"$work/metadata.json" 2>"$work/metadata.log"; then
-        sed 's/^/| metadata: /' "$work/metadata.log" | tail -n 20
+        bar '| metadata: ' "$work/metadata.log" | tail -n 20
         verdict rejected "candidate's manifests do not parse"
         exit 0
     fi
@@ -2847,7 +2867,7 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     }
     : >"$work/build-time.base"
     if ! local_build_time "$work/candidate" "$work/candidate" >"$work/build-time.candidate"; then
-        sed 's/^/| metadata: /' "$work/metadata.log" | tail -n 20
+        bar '| metadata: ' "$work/metadata.log" | tail -n 20
         # Only a candidate whose base resolves here is rejected for it. A
         # base that does not resolve either says this host's registry lacks
         # a crate main needs (a runner never sent it, a pruned cache): a
@@ -3688,7 +3708,7 @@ if [ -s "$work/needs" ]; then
     # A preflight that never ran found nothing missing.
     if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started" preflight; fi
     if [ "$preflight_rc" -ne 0 ]; then
-        sed 's/^/| preflight: /' "$work/needs.log" | tail -n 5
+        bar '| preflight: ' "$work/needs.log" | tail -n 5
         echo "gate: the preflight could not ask for the scenarios' prerequisites (exit $preflight_rc)" >&2
         exit 3
     fi
@@ -4058,7 +4078,7 @@ base_ready() {
             snapshot_bin "$work/baseline" >>"$work/base-build.out" 2>&1; then
             : >"$work/base-built"
         else
-            sed 's/^/| /' "$work/base-build.out" | tail -n 20 >>"$job/text.$job_part"
+            bar '| ' "$work/base-build.out" | tail -n 20 >>"$job/text.$job_part"
         fi
     fi
     exec 7>&-
@@ -4094,7 +4114,7 @@ if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
         else
             base_check_first=0
             job_run "$job" 1 "$work/baseline" "$base_check_file" || base_check_first=$?
-            sed 's/^/| /' "$job/log.1" | tail -n 20
+            bar '| ' "$job/log.1" | tail -n 20
             # Outside run_jobs, so no printer reads the job's note of a
             # sandbox that never started (sandbox_never): read here, before
             # the status, which then says nothing. The base's tree: a host
@@ -4115,7 +4135,7 @@ if [ -n "${SPAWN_GATE_BASE_CHECK-}" ]; then
             else
                 base_check_again=0
                 job_run "$job" 2 "$work/baseline" "$base_check_file" || base_check_again=$?
-                sed 's/^/| /' "$job/log.2" | tail -n 20
+                bar '| ' "$job/log.2" | tail -n 20
                 if [ -s "$job/never-started" ]; then sandbox_fault "$job/never-started" "$base_check_name"; fi
                 if [ ! -e "$job/slot-waited" ] && [ "$base_check_first" -eq 1 ] &&
                     [ "$base_check_again" -eq 1 ] &&
@@ -4213,7 +4233,7 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ] &&
     : >"$tests_log"
     if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target" \
         "$work/tests.candidate-names"); then
-        sed 's/^/| tests: /' "$tests_log" | tail -n 30
+        bar '| tests: ' "$tests_log" | tail -n 30
         verdict rejected "candidate tests do not build"
         exit 0
     fi
@@ -4312,57 +4332,100 @@ candidate_job() {
             job_stage "$again_ms" "exit $again" "$run_name (again)"
             run_at=$(stage_now)
             base_name="base: $(basename "$job_scenario") (it failed twice on the candidate)"
-            job_say "| == $base_name"
-            if ! base_ready; then
-                job_say "| the base cannot be built to run it: no verdict on the candidate"
-                printf '%s\n' "$run_status, then $again on the candidate; the base does not build" >"$job/runs"
-                run_status=abort
+            # Failed twice, but no test failed in both runs (objective 208
+            # (b), rev-f on #28): each failing test passed in the other run,
+            # the check's flake rule test by test. Only when both runs exit
+            # 1 and both name their failing tests (`FAILED <test>:`, as
+            # check-tests.sh prints them, each run naming every failing test:
+            # --no-fail-fast); a run that names none (a build that failed, a
+            # crash) still goes to the base, and so does one with a test
+            # binary that ended without naming its failure (`CRASHED
+            # <target>:`, an abort or a kill: it names no test, so the two
+            # runs cannot be compared; rev-g's F1 on 208 R1).
+            apart=""
+            if [ "$run_status" -eq 1 ] && [ "$again" -eq 1 ] &&
+                grep -q '^FAILED ' "$job/out.1" 2>/dev/null && grep -q '^FAILED ' "$job/out.2" 2>/dev/null &&
+                ! grep -q '^CRASHED ' "$job/out.1" 2>/dev/null && ! grep -q '^CRASHED ' "$job/out.2" 2>/dev/null &&
+                ! shared_failed "$job/out.1" "$job/out.2" "$job/shared"; then
+                apart=1
+            fi
+            if [ -n "$apart" ]; then
+                job_say "| $(basename "$job_scenario") failed twice on the candidate (1, then 1) but no test failed in both runs ($(failed_names "$job/out.1"); then $(failed_names "$job/out.2")): each failing test passed in the other run, a flake, not a regression"
+                basename "$job_scenario" >"$job/flake"
+                run_status=0
             else
-                on_base=0
-                job_run "$job" 3 "$work/baseline" "$job_scenario" || on_base=$?
-                [ ! -e "$job/slot-waited" ] || return 0
-                job_output 3
-                job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name"
-                if [ "$on_base" -eq 0 ]; then
-                    job_say "| $(basename "$job_scenario") passes on the base and failed twice on the candidate: a regression"
-                    run_status=$again
-                else
-                    # Once more on the base: two runs that fail with the same
-                    # failing tests say main is red on the check (main_red),
-                    # not this candidate's doing and not the host's for one
-                    # run; anything else stays the host's or the harness's.
-                    job_say "| == $base_name (again: is main red on it?)"
-                    run_at=$(stage_now)
-                    on_base2=0
-                    job_run "$job" 4 "$work/baseline" "$job_scenario" || on_base2=$?
-                    [ ! -e "$job/slot-waited" ] || return 0
-                    job_output 4
-                    job_stage "$(($(stage_now) - run_at))" "exit $on_base2" "$base_name (again)"
-                    # scripts/rsi/nightly.sh reads these words exactly (a check
-                    # main fails on every run, judged against itself, is its
-                    # red): reword them there too.
-                    printf '%s\n' "$run_status, then $again on the candidate; $on_base, then $on_base2 on the base" >"$job/runs"
-                    if [ "$on_base" -eq 1 ] && [ "$on_base2" -eq 1 ] &&
-                        shared_failed "$job/out.3" "$job/out.4" "$job/main-red"; then
-                        job_say "| $(basename "$job_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict on the candidate"
-                        run_status=main_red
-                        # An owner's push: unsolved on the base only for the
-                        # tests main fails; one more the candidate fails is
-                        # its own regression.
-                        if [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
-                            red_new=$(new_failures "$job/main-red" "$job/out.1" "$job/out.2")
-                            if [ -n "$red_new" ]; then
-                                job_say "| $(basename "$job_scenario"): the candidate fails what main's red runs do not ($(printf '%s' "$red_new" | tr '\n' ' ' | sed 's/ $//')): a regression"
-                                run_status=$again
-                            fi
-                        fi
-                    else
-                        rm -f "$job/main-red"
-                        job_say "| $(basename "$job_scenario") fails on the base too ($on_base, then $on_base2): a host or harness fault, no verdict on the candidate"
-                        run_status=abort
-                    fi
+                # Like for like before a rejection (objective 208 (c), rev-f on
+                # #28): beside the gate's other jobs, a pass on the base sends
+                # the candidate to a run alone on a fresh server (solo_run)
+                # before any rejection. The base's run stays beside the other
+                # jobs, so a check that fails there too waits for nothing.
+                check_alone=""
+                if [ "$gate_jobs" -gt 1 ] && ! runs_alone "$job_scenario"; then
+                    check_alone=1
                 fi
-                run_name=$base_name
+                job_say "| == $base_name"
+                if ! base_ready; then
+                    job_say "| the base cannot be built to run it: no verdict on the candidate"
+                    printf '%s\n' "$run_status, then $again on the candidate; the base does not build" >"$job/runs"
+                    run_status=abort
+                else
+                    on_base=0
+                    job_run "$job" 3 "$work/baseline" "$job_scenario" || on_base=$?
+                    [ ! -e "$job/slot-waited" ] || return 0
+                    job_output 3
+                    base_ms=$(($(stage_now) - run_at))
+                    job_stage "$base_ms" "exit $on_base" "$base_name"
+                    if [ "$on_base" -eq 0 ] && [ -n "$check_alone" ]; then
+                        # The decisive run: the candidate alone, on a fresh
+                        # server, as the base just ran (solo_run's words and
+                        # results, a regression's).
+                        on_candidate="$run_status, then $again"
+                        base_runs=$on_base base_ms_list=$base_ms base_ms_max=$base_ms
+                        : >"$job/alone.asked"
+                        until [ -e "$job/alone.now" ]; do sleep 0.2; done
+                        solo_base_how="beside the gate's other runs"
+                        solo_run "$job" "$(basename "$job_scenario")" || return 0
+                    elif [ "$on_base" -eq 0 ]; then
+                        job_say "| $(basename "$job_scenario") passes on the base and failed twice on the candidate: a regression"
+                        run_status=$again
+                    else
+                        # Once more on the base: two runs that fail with the same
+                        # failing tests say main is red on the check (main_red),
+                        # not this candidate's doing and not the host's for one
+                        # run; anything else stays the host's or the harness's.
+                        job_say "| == $base_name (again: is main red on it?)"
+                        run_at=$(stage_now)
+                        on_base2=0
+                        job_run "$job" 4 "$work/baseline" "$job_scenario" || on_base2=$?
+                        [ ! -e "$job/slot-waited" ] || return 0
+                        job_output 4
+                        job_stage "$(($(stage_now) - run_at))" "exit $on_base2" "$base_name (again)"
+                        # scripts/rsi/nightly.sh reads these words exactly (a check
+                        # main fails on every run, judged against itself, is its
+                        # red): reword them there too.
+                        printf '%s\n' "$run_status, then $again on the candidate; $on_base, then $on_base2 on the base" >"$job/runs"
+                        if [ "$on_base" -eq 1 ] && [ "$on_base2" -eq 1 ] &&
+                            shared_failed "$job/out.3" "$job/out.4" "$job/main-red"; then
+                            job_say "| $(basename "$job_scenario") fails on the base twice with the same failing tests: main is red on it, no verdict on the candidate"
+                            run_status=main_red
+                            # An owner's push: unsolved on the base only for the
+                            # tests main fails; one more the candidate fails is
+                            # its own regression.
+                            if [ "${SPAWN_GATE_RED_UNSOLVED-}" = 1 ]; then
+                                red_new=$(new_failures "$job/main-red" "$job/out.1" "$job/out.2")
+                                if [ -n "$red_new" ]; then
+                                    job_say "| $(basename "$job_scenario"): the candidate fails what main's red runs do not ($(printf '%s' "$red_new" | tr '\n' ' ' | sed 's/ $//')): a regression"
+                                    run_status=$again
+                                fi
+                            fi
+                        else
+                            rm -f "$job/main-red"
+                            job_say "| $(basename "$job_scenario") fails on the base too ($on_base, then $on_base2): a host or harness fault, no verdict on the candidate"
+                            run_status=abort
+                        fi
+                    fi
+                    run_name=$base_name
+                fi
             fi
         fi
     fi
@@ -4848,7 +4911,7 @@ listing_printed() {
     [ ! -e "$1/slot-waited" ] || slot_no_room "$1"
     if [ -s "$work/sandbox-never-started" ]; then sandbox_fault "$work/sandbox-never-started"; fi
     if [ "$(cat "$1/result")" != 0 ]; then
-        sed 's/^/| tests: /' "$1/tests.log" 2>/dev/null | tail -n 30
+        bar '| tests: ' "$1/tests.log" 2>/dev/null | tail -n 30
         phase_time candidate
         verdict rejected "base tests do not build"
         exit 0
