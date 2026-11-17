@@ -440,8 +440,8 @@ pub(crate) enum Why {
     /// ([`digest::main_red_news`]).
     MainGreen,
     /// A mission's source is not a directory on this host, or not one git
-    /// can read: its branches are
-    /// not published to it ([`digest::source_away_news`], told once).
+    /// can read: its branches are not published to it
+    /// ([`digest::source_away_news`], told once).
     SourceAway,
     /// A mission's source that was away is back, or no longer watched
     /// ([`digest::source_away_news`]).
