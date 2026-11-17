@@ -1160,6 +1160,69 @@ fn assign(
     Ok(assigned)
 }
 
+const RETIRE_USAGE: &str = "usage: spawn objective retire --mission <m> --objective <n> \
+                            --by <name> --reason <text>";
+
+/// `spawn objective retire --mission <m> --objective <n> --by <name>
+/// --reason <text>` (objective 210): close by hand an objective that can
+/// never land (its work already on main, renumbered, obsolete), naming who
+/// and why. One `objective.retired` through the store's
+/// `spawn_objective_retire`, which sets `caller` from the login (the
+/// owner's or the supervisor's) and refuses, recording nothing, a blank
+/// `by` or `reason`, a mission that does not exist or has no backlog, an
+/// objective with a task in flight, and one already closed (landed,
+/// solved on the base or retired). The objective need not be in the
+/// backlog. Prints `{event, objective: "<m>/<NNN>"}`.
+pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
+    match rest.first().map(String::as_str) {
+        Some("retire") => {}
+        Some(other) => return Err(format!("unknown objective command {other}\n{RETIRE_USAGE}")),
+        None => return Err(RETIRE_USAGE.to_string()),
+    }
+    let record = retire_record(&crate::Flags::parse(&rest[1..])?)?;
+    let store = crate::open_store()?;
+    let event = store
+        .objective_retire(&record)
+        .map_err(|error| error.to_string())?;
+    let answer = json!({"event": event, "objective": crate::verify::name(
+        record["id"].as_i64().unwrap_or_default(),
+        record["objective"].as_i64().unwrap_or_default())});
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&answer).unwrap_or_else(|_| "{}".to_string())
+    );
+    Ok(0)
+}
+
+/// The `objective.retired` record `spawn objective retire <flags>` asks
+/// for: `--mission` and `--objective` whole numbers from 1, `--by` and
+/// `--reason`, and no other flag. Their lengths and blankness are the
+/// store's to check, so one rule refuses them.
+fn retire_record(flags: &crate::Flags) -> Result<serde_json::Value, String> {
+    if let Some(other) = flags
+        .names()
+        .find(|flag| !["mission", "objective", "by", "reason"].contains(flag))
+    {
+        return Err(format!("unknown flag --{other}\n{RETIRE_USAGE}"));
+    }
+    let required = |flag: &str| {
+        flags
+            .get(flag)
+            .ok_or_else(|| format!("--{flag} is required\n{RETIRE_USAGE}"))
+    };
+    let number = |flag: &str, most: i64| -> Result<i64, String> {
+        let text = required(flag)?;
+        text.parse::<i64>()
+            .ok()
+            .filter(|number| (1..=most).contains(number) && text.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| format!("--{flag} is a whole number from 1, not '{text}'"))
+    };
+    let mission = number("mission", i64::MAX)?;
+    let objective = number("objective", i64::from(i32::MAX))?;
+    Ok(json!({"type": "objective.retired", "id": mission, "objective": objective,
+              "by": required("by")?, "reason": required("reason")?}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
