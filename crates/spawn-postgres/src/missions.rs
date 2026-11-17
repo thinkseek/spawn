@@ -1917,6 +1917,20 @@ impl PostgresStore {
         self.query_json(OBJECTIVE_LANDINGS, &[&mission])
     }
 
+    /// Retire an objective by hand (objective 210): one `objective.retired`
+    /// through `spawn_objective_retire`, which checks the record's shape,
+    /// the mission and the objective's state, and sets `caller` from the
+    /// login (the owner's or the supervisor's; any other is refused).
+    /// Returns the event's id.
+    pub fn objective_retire(&self, record: &Value) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_objective_retire($1)",
+                &[&crate::control_mask::masked(record)],
+            )?
+            .get(0))
+    }
+
     /// Gate verdicts on one objective's tasks, newest first.
     pub fn objective_history(
         &self,
