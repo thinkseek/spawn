@@ -81,6 +81,33 @@ export interface CostAnswer extends CostLandings {
   /** The time of the earliest message the cost record holds; null when it
    * holds none (objective 048). */
   counted_since_ms: number | null;
+  /** The window of equal length just before this one (GitHub #64); absent
+   * in an answer from before it. */
+  previous?: CostPrevious;
+  /** The window in steps of `trend_step_ms`, oldest first. */
+  trend?: CostStep[];
+  trend_step_ms?: number;
+  /** Each mission with a daily budget and its spend of the UTC day so far:
+   * the reading the `cost_budget` alert takes. */
+  budgets?: CostBudget[];
+}
+
+export interface CostPrevious extends CostLandings {
+  total: CostEntry;
+  since_ms: number;
+  until_ms: number;
+}
+
+export interface CostStep {
+  since_ms: number;
+  usd: number;
+  unpriced_tokens: number;
+}
+
+export interface CostBudget {
+  mission: number;
+  budget_usd: number;
+  spent_usd: number;
 }
 
 /** One line of the page: its id, its cost as shown, whether any of its use
@@ -408,5 +435,239 @@ export function costView(answer: Partial<CostAnswer> | null | undefined): CostVi
     agents: agents.rows.slice(0, TOP_ROWS),
     agents_more: fold(agents.dollars, "agent"),
     since: countedSince(answer),
+  };
+}
+
+// --- The dashboard (GitHub #64): four tiles, the trend, the budgets and the
+// ranked bars, from the same answer. Presentation only.
+
+/** One tile of the KPI row: its value as shown, the line under it, and the
+ * unpriced mark's compact text when part of the figure has no price. */
+export interface Tile {
+  value: string;
+  detail: string;
+  title: string;
+  unpriced_short: string | null;
+  /** The same count in full ("+ 1,250,000 tokens unpriced"), for its title. */
+  unpriced_text: string | null;
+}
+
+/** One step of the trend: its bar's height (0-100, of the costliest step),
+ * whether it holds use with no price, and its words for the hover. */
+export interface TrendBar {
+  label: string;
+  title: string;
+  height: number;
+  unpriced: boolean;
+}
+
+/** A mission's daily budget as a gauge: how full (0-100, capped), and
+ * `over` exactly when the alert fires (spend at or past the budget). */
+export interface BudgetGauge {
+  key: string;
+  label: string | null;
+  text: string;
+  percent: string;
+  width: number;
+  over: boolean;
+}
+
+/** One ranked bar: its row, and its width (0-100) as its share of the
+ * window's priced dollars. A row with use on no price (`unpriced`) keeps
+ * its mark; one of only such use has width 0 and reads "unpriced". */
+export interface RankBar extends Row {
+  width: number;
+}
+
+export interface Dashboard {
+  spend: Tile;
+  tokens: Tile;
+  cache: Tile;
+  landing: Tile;
+  trend: TrendBar[];
+  /** What the trend's steps are: "hours back from now, UTC" or "days
+   * back from now, UTC". */
+  trend_note: string;
+  /** How many steps had use with no price (not in their bar's height). */
+  trend_unpriced: number;
+  budgets: BudgetGauge[];
+  missions: RankBar[];
+  models: RankBar[];
+}
+
+/** How many bars each ranking shows. */
+export const TOP_BARS = 5;
+
+function finiteOr(value: unknown, otherwise: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : otherwise;
+}
+
+/** A window's length in words: "24 h", "7 days". */
+function lengthWords(answer: Partial<CostAnswer> | null | undefined): string {
+  const length = finiteOr(answer?.until_ms, 0) - finiteOr(answer?.since_ms, 0);
+  if (length > 0 && length <= 86_400_000) return `${Math.round(length / 3_600_000)} h`;
+  if (length > 86_400_000) return `${Math.round(length / 86_400_000)} days`;
+  return String(answer?.window ?? "window");
+}
+
+/** The spend's change against the previous window of equal length:
+ * "▲ 23% vs previous 24 h", "▼ 8% …", "same as previous 24 h"; when the
+ * previous window cost nothing priced, its amount ("previous 24 h:
+ * $0.00"); null with no previous window in the answer. */
+export function spendDelta(answer: Partial<CostAnswer> | null | undefined): string | null {
+  const previous = answer?.previous;
+  if (!previous || typeof previous !== "object") return null;
+  const now = finiteOr(answer?.total?.usd, 0);
+  const before = finiteOr(previous.total?.usd, 0);
+  const span = `previous ${lengthWords(answer)}`;
+  if (before <= 0) return `${span}: ${shown(previous.total).usd}`;
+  const percent = Math.round(((now - before) * 100) / before);
+  if (percent === 0) return `same as ${span}`;
+  return `${percent > 0 ? "▲" : "▼"} ${Math.abs(percent)}% vs ${span}`;
+}
+
+function tokenParts(entry: Partial<CostEntry> | null | undefined) {
+  const t = (entry?.tokens ?? {}) as Partial<CostTokens>;
+  return { input: count(t.input), cache_read: count(t.cache_read), all: tokenSum(entry?.tokens) };
+}
+
+/** The cache-read share: cache_read / (cache_read + input), a whole
+ * percent ("<1%" above zero, ">99%" below all); "—" when neither was read. */
+export function cacheShare(entry: Partial<CostEntry> | null | undefined): string {
+  const { input, cache_read } = tokenParts(entry);
+  const read = cache_read + input;
+  if (read <= 0) return "—";
+  // Not all of it: never "100%" (99.6% rounds there), as "<1%" is never 0%.
+  if (cache_read < read && (cache_read * 100) / read >= 99.5) return ">99%";
+  return shareText(cache_read, read) ?? "—";
+}
+
+const HOUR_MS = 3_600_000;
+
+/** A time to the minute, UTC: "2026-11-16 06:45"; "" when not a time. */
+function utcMinute(ms: number): string {
+  const at = new Date(ms);
+  if (Number.isNaN(at.getTime())) return "";
+  return at.toISOString().slice(0, 16).replace("T", " ");
+}
+
+/** A step's label on the axis. The steps run back from the answer's
+ * `until_ms` (now), not on clock hours or calendar days (rev-j's n1), so
+ * the label is the step's own start, UTC: "06:45" in a step of an hour or
+ * less, "11-16" (its start's day) in a longer one, its full span in the
+ * bar's title. */
+function stepLabel(sinceMs: number, stepMs: number): string {
+  const minute = utcMinute(sinceMs);
+  if (minute === "") return "";
+  return stepMs <= HOUR_MS ? minute.slice(11) : minute.slice(5, 10);
+}
+
+/** The trend's bars: each step's height of the costliest step's (a step
+ * that cost anything at least 2, so it never looks empty), and its hover:
+ * "<start> – <end> UTC: $1.20", to the minute, with its unpriced count
+ * when it has one. */
+export function trendBars(answer: Partial<CostAnswer> | null | undefined): TrendBar[] {
+  const steps = Array.isArray(answer?.trend) ? answer.trend : [];
+  const step = finiteOr(answer?.trend_step_ms, HOUR_MS);
+  const until = finiteOr(answer?.until_ms, Number.POSITIVE_INFINITY);
+  const top = steps.reduce((max, s) => Math.max(max, finiteOr(s?.usd, 0)), 0);
+  return steps.map((s) => {
+    const usd = finiteOr(s?.usd, 0);
+    const unpricedTokens = count(s?.unpriced_tokens);
+    const since = finiteOr(s?.since_ms, 0);
+    const extra = unpricedText(unpricedTokens);
+    return {
+      label: stepLabel(since, step),
+      title: `${utcMinute(since)} – ${utcMinute(Math.min(since + step, until))} UTC: ${formatUsd(usd)}${extra ? ` ${extra}` : ""}`,
+      height: top > 0 && usd > 0 ? Math.max(2, Math.round((usd * 100) / top)) : 0,
+      unpriced: unpricedTokens > 0,
+    };
+  });
+}
+
+/** Each mission's daily budget as a gauge, named as the mission rows name
+ * it: "$3.20 of $5.00 today (UTC)", "64%"; `over` at or past the budget,
+ * the `cost_budget` alert's rule. A budget not above zero is no gauge. */
+export function budgetGauges(answer: Partial<CostAnswer> | null | undefined): BudgetGauge[] {
+  const budgets = Array.isArray(answer?.budgets) ? answer.budgets : [];
+  const names = new Map<number, string | null>();
+  for (const m of Array.isArray(answer?.missions) ? answer.missions : []) names.set(m.mission, missionName(m));
+  return budgets
+    .filter((b) => finiteOr(b?.budget_usd, 0) > 0)
+    .map((b) => {
+      const budget = finiteOr(b.budget_usd, 0);
+      const spent = finiteOr(b.spent_usd, 0);
+      const ratio = spent / budget;
+      return {
+        key: `#${b.mission}`,
+        label: names.get(b.mission) ?? null,
+        text: `${formatUsd(spent)} of ${formatUsd(budget)} today (UTC)`,
+        percent: ratio > 0 && ratio < 0.01 ? "<1%" : `${Math.round(ratio * 100)}%`,
+        width: Math.min(100, Math.max(0, ratio * 100)),
+        over: spent >= budget,
+      };
+    });
+}
+
+function bars(rowsOf: Row[], dollars: number[], windowUsd: number): RankBar[] {
+  return rowsOf.slice(0, TOP_BARS).map((row, index) => ({
+    ...row,
+    // A row of only unpriced use has no share of the dollars to say: "0%"
+    // would read as costing nothing.
+    share: row.usd === "unpriced" ? null : row.share,
+    width: windowUsd > 0 ? Math.min(100, Math.max(0, (finiteOr(dollars[index], 0) * 100) / windowUsd)) : 0,
+  }));
+}
+
+/** The dashboard of one window's answer: the four tiles (spend with its
+ * change, tokens priced and unpriced, the cache-read share, the cost of a
+ * landed task), the trend, the budget gauges, and the top missions and
+ * models as bars of their share. */
+export function dashboard(answer: Partial<CostAnswer> | null | undefined): Dashboard {
+  const total = shown(answer?.total);
+  const windowUsd = total.order;
+  const { all, input, cache_read } = tokenParts(answer?.total);
+  const unpricedTokens = count(answer?.total?.unpriced_tokens);
+  const landed = count(answer?.landed);
+  const perLandingUsd = answer?.usd_per_landing;
+  const missions = rows<CostMission>(answer?.missions, windowUsd, (entry) => `#${entry.mission}`, missionName);
+  const models = rows<CostModel>(answer?.models, windowUsd, (entry) => String(entry.model));
+  const trend = trendBars(answer);
+  const step = finiteOr(answer?.trend_step_ms, HOUR_MS);
+  return {
+    spend: {
+      value: total.usd,
+      detail: spendDelta(answer) ?? `last ${lengthWords(answer)}`,
+      title: "The window's priced dollars, against the window of equal length just before it",
+      unpriced_short: unpricedShort(unpricedTokens),
+      unpriced_text: unpricedText(unpricedTokens),
+    },
+    tokens: {
+      value: compactCount(all),
+      detail: `${compactCount(Math.max(0, all - unpricedTokens))} priced`,
+      title: `${formatTokens(all)} tokens: input, output, cache write and cache read`,
+      unpriced_short: unpricedShort(unpricedTokens),
+      unpriced_text: unpricedText(unpricedTokens),
+    },
+    cache: {
+      value: cacheShare(answer?.total),
+      detail: `${compactCount(cache_read)} of ${compactCount(cache_read + input)} read from cache`,
+      title: "Cache-read tokens over cache-read plus input tokens",
+      unpriced_short: null,
+      unpriced_text: null,
+    },
+    landing: {
+      value: landed > 0 ? formatUsd(finiteOr(perLandingUsd, Number.NaN)) : "—",
+      detail: landed > 0 ? `${COUNT.format(landed)} landed` : "no landing in the window",
+      title: "The window's priced dollars over the tasks that landed or were accepted in it",
+      unpriced_short: null,
+      unpriced_text: null,
+    },
+    trend,
+    trend_note: step <= HOUR_MS ? "hours back from now, UTC" : "days back from now, UTC",
+    trend_unpriced: trend.filter((bar) => bar.unpriced).length,
+    budgets: budgetGauges(answer),
+    missions: bars(missions.rows, missions.dollars, windowUsd),
+    models: bars(models.rows, models.dollars, windowUsd),
   };
 }

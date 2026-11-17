@@ -1,33 +1,39 @@
+import { useState } from "react";
 import { CircleDollarSign } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
 import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
-import { costView, rowLines } from "../../cost.ts";
+import { costView, dashboard, rowLines } from "../../cost.ts";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
+import { CostDashboard } from "./CostDashboard";
+import { SegmentedControl } from "../aui/kit";
 
 const POLL_MS = 30_000;
 
-/** The windows the page shows, side by side. */
+/** The windows the page can show; one at a time (GitHub #64). */
 const WINDOWS = [
   { id: "24h", label: "Last 24 h" },
   { id: "7d", label: "Last 7 days" },
 ] as const;
+
+type WindowId = (typeof WINDOWS)[number]["id"];
 
 function fetchCost(window: string, signal: AbortSignal): Promise<CostAnswer> {
   return readApi(`/api/cost?window=${window}`, signal, (raw) => raw as CostAnswer);
 }
 
 /** The mark of a row whose figure leaves out use on a model with no
- * price: how many tokens, compact ("+485M unpriced"), the full count
- * ("+ 485,321,042 tokens unpriced") in its title. */
-function UnpricedMark({ text }: { text: string }) {
+ * price: `text` says how many tokens in full ("+ 485,321,042 tokens
+ * unpriced"), in its title; it shows `label` when given, compact ("+485M
+ * unpriced"), else `text`. CostDashboard's tiles and bars use it too. */
+export function UnpricedMark({ text, label = text }: { text: string; label?: string }) {
   return (
     <span
       data-cost-unpriced
       title={`${text}: these tokens ran on a model SPAWN_MODEL_PRICES does not price; they are counted, their cost is not`}
       className="min-w-0 break-words rounded bg-wait-tint px-1 py-px font-medium text-warning"
     >
-      {text}
+      {label}
     </span>
   );
 }
@@ -176,42 +182,49 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
 }
 
 /**
- * What the fleet's model calls cost over the last 24 hours and 7 days, in
- * US dollars: the total and what a landing cost, each mission (with its
- * own dollars per landing) and the ten costliest tasks and agents, most
- * costly first, the rest of each folded into one line ("3 more tasks ·
- * $1.80"); each row says its share of the window
- * (crates/spawn-cli/src/cost.rs prices each call when it is recorded).
- * Each mission row shows its name beside its id ("#4 Spawn RSI"), each
- * task row its label; a long name truncates so the dollars stay whole. Under each window's total a
- * note says once how many tokens no price counts, on which models, and how
- * to price them; a row with such use says its count compact ("+485M
- * unpriced", the full count in its title), and a figure of only
- * such use reads "unpriced", never $0.00. A window that starts before the earliest
- * message the record holds says since when it counts. Strictly read-only.
+ * What the fleet's model calls cost over the last 24 hours or 7 days (one
+ * window at a time, picked at the top), in US dollars. First the dashboard
+ * (GitHub #64, [`CostDashboard`]): four tiles (the spend and its change
+ * against the window before, the tokens priced and unpriced, the
+ * cache-read share, the cost of a landed task), the spend by hour or day,
+ * each mission's daily budget as a gauge, and the top five missions and
+ * models as bars of their share. Under it the detail: the total and what a
+ * landing cost, each mission (with its own dollars per landing) and the ten
+ * costliest tasks and agents, most costly first, the rest of each folded
+ * into one line ("3 more tasks · $1.80"); each row says its share of the
+ * window (crates/spawn-cli/src/cost.rs prices each call when it is
+ * recorded). Each mission row shows its name beside its id ("#4 Spawn
+ * RSI"), each task row its label; a long name truncates so the dollars stay
+ * whole. Under the window's total a note says once how many tokens no price
+ * counts, on which models, and how to price them; a row with such use says
+ * its count compact ("+485M unpriced", the full count in its title), and a
+ * figure of only such use reads "unpriced", never $0.00. A window that
+ * starts before the earliest message the record holds says since when it
+ * counts. Strictly read-only.
  */
 export function CostView() {
-  const day = usePoll("cost-24h", (signal) => fetchCost("24h", signal), POLL_MS);
-  const week = usePoll("cost-7d", (signal) => fetchCost("7d", signal), POLL_MS);
-  const polls = { "24h": day, "7d": week } as const;
-  const error = day.error ?? week.error;
+  const [picked, setPicked] = useState<WindowId>("24h");
+  const poll = usePoll(`cost-${picked}`, (signal) => fetchCost(picked, signal), POLL_MS);
+  const label = WINDOWS.find((window) => window.id === picked)?.label ?? picked;
+  // A poll of the window picked before keeps its data until the new one
+  // answers: show it only when it is the picked window's.
+  const data = poll.data && poll.data.window === picked ? poll.data : null;
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
       <PageHeader title={<h1 className="text-body font-semibold text-foreground">Cost</h1>}>
-        <LiveStatus error={error} label="" />
+        <SegmentedControl
+          size="sm"
+          aria-label="Cost window"
+          value={picked}
+          onChange={(value) => setPicked(value)}
+          options={WINDOWS.map((window) => ({ value: window.id, label: window.label }))}
+        />
+        <LiveStatus error={poll.error} label="" />
       </PageHeader>
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
         <div className="flex flex-col gap-4">
-          {WINDOWS.map((window) => {
-            const data = polls[window.id].data;
-            return (
-              <WindowCard
-                key={window.id}
-                label={window.label}
-                figures={data ? costView(data) : null}
-              />
-            );
-          })}
+          {data ? <CostDashboard view={dashboard(data)} /> : <EmptyState title="Loading…" />}
+          <WindowCard label={`${label} · detail`} figures={data ? costView(data) : null} />
         </div>
       </div>
     </main>
