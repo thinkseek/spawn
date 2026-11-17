@@ -488,13 +488,36 @@ const DIAGNOSTICS: [&str; 6] = [
 /// for 7 days, then an alert only" ([`zero_for_a_week`]).
 const LEAKED_SCHEMAS: &str = "storage.leaked_test_schemas";
 
-/// Each line's plain readings (objective 182), with the line: shown with
-/// no range, never judged, raising nothing. Dollars per landing is "shown
-/// under sustainability as a plain reading, no range".
-const READINGS: [(&str, &str); 1] = [("sustainability", "performance.usd_per_landing")];
+/// Each line's plain readings (objective 182), with the line: never a
+/// north star, guardrail, alert figure or diagnostic, so raising nothing.
+/// Dollars per landing is "shown under sustainability as a plain reading",
+/// with "no range until use with no price is under 10%": it takes its
+/// configured range while the 7-day cost window is priced ([`priced`],
+/// objective 207), and has none otherwise.
+const READINGS: [(&str, &str); 1] = [("sustainability", USD_PER_LANDING)];
+
+/// Dollars per landing.
+const USD_PER_LANDING: &str = "performance.usd_per_landing";
+
+/// Use with no price: the share of the 7-day cost window's tokens no price
+/// covers, read from the same cost summary as dollars per landing.
+const UNPRICED_SHARE: &str = "observability.unpriced_share";
+
+/// Under this share of unpriced use, dollars per landing takes its range.
+const PRICED_UNDER: f64 = 0.10;
 
 /// What a reading says where its range would be.
 const READING_NOTE: &str = "no range until use with no price is under 10%";
+
+/// Whether the 7-day cost window is priced enough for dollars per landing
+/// to take its configured range (objective 207): use with no price is a
+/// fresh number under 10%. Missing (no tokens in the window), not a number,
+/// stale, or 10% or more, it is not.
+fn priced(share: Option<&Figure>) -> bool {
+    share.is_some_and(|share| {
+        !share.stale && share.value.as_f64().is_some_and(|value| value < PRICED_UNDER)
+    })
+}
 
 /// The figures a ranges file entry is never applied to, with why: said in
 /// `ignored_ranges` (objective 182).
@@ -648,11 +671,14 @@ pub(super) fn adopted(readings: &[Line], leaked_quiet: bool) -> Set {
         },
     ];
     let leaked = leaked_quiet.then_some(("storage", LEAKED_SCHEMAS));
+    let priced = priced(find(UNPRICED_SHARE).as_ref());
     Set {
         lines,
         readings: READINGS
             .iter()
-            .filter_map(|(line, key)| find(key).map(|figure| (*line, plain_reading(figure))))
+            .filter_map(|(line, key)| {
+                find(key).map(|figure| (*line, plain_reading(figure, priced)))
+            })
             .collect(),
         alert_figures: ALERT_FIGURES
             .iter()
@@ -667,9 +693,13 @@ pub(super) fn adopted(readings: &[Line], leaked_quiet: bool) -> Set {
     }
 }
 
-/// `figure` as a line's plain reading: no range, its note where the range
-/// would be.
-fn plain_reading(figure: Figure) -> Figure {
+/// `figure` as a line's plain reading: with its configured range while
+/// `priced` ([`priced`]), else no range and its note where the range would
+/// be.
+fn plain_reading(figure: Figure, priced: bool) -> Figure {
+    if priced {
+        return figure;
+    }
     Figure {
         range_note: Some(READING_NOTE.to_string()),
         ..figure
@@ -678,8 +708,12 @@ fn plain_reading(figure: Figure) -> Figure {
 
 /// The file's entry for a figure in [`NO_RANGE`], whatever it gives (a
 /// bound, a target, or neither), not applied: listed in `ignored` with why.
-fn no_range(ranges: &mut Ranges) {
+/// Dollars per landing's is applied as configured while `priced`.
+fn no_range(ranges: &mut Ranges, priced: bool) {
     for (key, reason) in NO_RANGE {
+        if priced && key == USD_PER_LANDING {
+            continue;
+        }
         let bound = ranges.bounds.remove(key).is_some();
         let target = ranges.targets.remove(key).is_some();
         let listed = ranges.ignored.iter().any(|(ignored, _)| ignored == key);
@@ -706,7 +740,8 @@ pub(super) fn answer(
     let mut ranges = match contents {
         Ok(text) => {
             let mut ranges = parse_ranges(text.as_deref(), &known);
-            no_range(&mut ranges);
+            let share = set.figures().find(|figure| figure.key == UNPRICED_SHARE);
+            no_range(&mut ranges, priced(share));
             ranges
         }
         Err(error) => Ranges {
