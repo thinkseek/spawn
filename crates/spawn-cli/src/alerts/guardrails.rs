@@ -45,13 +45,19 @@
 //! alert the owner judged while open (its cleared evidence `{judged}`, from
 //! the alert rows the loop starts with) keeps that alert's out-since, so it
 //! is not raised again, the seeding window having slid past where the
-//! stretch began. It is taken by the first fresh reading that finds the
-//! figure out, and from then on lives as any other count. Only positive
-//! evidence ends it before: a fresh reading with the figure in range (`in`;
-//! no range, no value and a stale figure are none), or a sample in range
-//! after that out-since among the first reading's samples (none for a figure
-//! with no range now). A samples error keeps it. Ended, the next stretch out
-//! is new, seeded from the samples at the first reading as above.
+//! stretch began. A loop that keeps running does the same (objective 209):
+//! an `alert.judged` record (a verdict other than `right`) of an open alert
+//! it knows keeps that alert's out-since, unless this loop already read the
+//! figure in range after it (the alert was open in its clear hold, its
+//! stretch ended). Every fresh reading that finds the figure out takes the
+//! judged out-since, so its key is known and no reading out raises it again,
+//! however long the figure stays out. Only positive evidence ends it: a
+//! fresh reading with the figure in range (`in`; no range, no value and a
+//! stale figure are none, before or after a reading out), or a sample in
+//! range after that out-since among a restarted loop's first reading's
+//! samples (none for a figure with no range now). A samples error keeps it.
+//! Ended, the next stretch out is new, from that reading or seeded from the
+//! samples at the first reading as above.
 //!
 //! A reading is the whole answer (the 7-day Scorecard with its transcript
 //! walk, the cost window, the storage report...), and its one-minute cache
@@ -389,6 +395,28 @@ impl Monitor {
         }
     }
 
+    /// An open `guardrail_out_of_range` alert (`subject`, `evidence`) the
+    /// owner judged while this loop runs (objective 209 (1)): its figure
+    /// keeps the alert's out-since as a judged stretch, as a restarted loop
+    /// seeds it from the alert rows ([`Monitor::seed_judged`]). Unless this
+    /// loop read the figure in range after that out-since: the stretch had
+    /// ended (the alert was still open in its clear hold), and nothing is
+    /// kept.
+    pub(super) fn judged_stretch(&mut self, subject: &str, evidence: &Value) {
+        let figure = figure_of(subject, evidence);
+        let Some(since) = evidence["out_since_ms"].as_i64() else {
+            return;
+        };
+        if self
+            .guardrail_in
+            .get(&figure)
+            .is_some_and(|back| *back > since)
+        {
+            return;
+        }
+        self.guardrail_judged.insert(figure, since);
+    }
+
     /// Start a reading through `start`, unless one is in flight or one
     /// given up still runs (then this turn has none).
     pub(super) fn start_guardrails_with(
@@ -515,8 +543,10 @@ impl Monitor {
             } else {
                 self.guardrail_out.remove(&figure.key);
                 if figure.state == "in" {
-                    // Positive evidence the judged stretch ended.
+                    // Positive evidence the judged stretch ended; no range,
+                    // no value end nothing (objective 209 (2)).
                     self.guardrail_judged.remove(&figure.key);
+                    self.guardrail_in.insert(figure.key.clone(), now);
                 }
                 if open.is_empty() {
                     self.guardrail_back.remove(&figure.key);
@@ -559,23 +589,24 @@ impl Monitor {
         self.stale_events(now, &answer, out);
     }
 
-    /// Since when `figure`, out at `now`, has been out: its count, else a
-    /// judged stretch's out-since (taken by this first fresh reading out),
-    /// else, at the first reading, the samples' ([`out_since`]), else now.
+    /// Since when `figure`, out at `now`, has been out: a judged stretch's
+    /// out-since (taken by every fresh reading out, kept until a reading in
+    /// range ends it: objective 209 (2)), else its count, else, at the first
+    /// reading, the samples' ([`out_since`]), else now.
     fn out_since_of(&mut self, figure: &Reading, now: i64, seeding: Option<&(Value, i64)>) -> i64 {
+        if let Some(since) = self.guardrail_judged.get(&figure.key) {
+            let since = *since;
+            self.guardrail_out.insert(figure.key.clone(), since);
+            return since;
+        }
         if let Some(since) = self.guardrail_out.get(&figure.key) {
             return *since;
         }
-        let since = self
-            .guardrail_judged
-            .remove(&figure.key)
-            .unwrap_or_else(|| {
-                seeding
-                    .and_then(|(samples, period)| {
-                        out_since(samples, &figure.key, &figure.range, now, *period)
-                    })
-                    .unwrap_or(now)
-            });
+        let since = seeding
+            .and_then(|(samples, period)| {
+                out_since(samples, &figure.key, &figure.range, now, *period)
+            })
+            .unwrap_or(now);
         self.guardrail_out.insert(figure.key.clone(), since);
         since
     }
