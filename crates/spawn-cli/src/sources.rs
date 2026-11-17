@@ -707,6 +707,12 @@ pub(crate) fn restore_published(
     let source = source.as_str();
     let remote = pushed_ref(agent);
     let path = mirror.to_string_lossy().to_string();
+    // A fixed first line for each step, git's own lines after it: git's
+    // processes write their errors in no set order, and a failing commit is
+    // logged by its first line (`spawn_core::bridge::failure_key`).
+    let step = |what: String| {
+        move |error: WorkspaceError| unavailable(format!("{what} failed:\n{}", error_text(&error)))
+    };
     let listed = git(&[
         "--git-dir",
         &path,
@@ -715,7 +721,8 @@ pub(crate) fn restore_published(
         "--",
         source,
         &remote,
-    ])?;
+    ])
+    .map_err(step(format!("listing {remote} in {source}")))?;
     if !listed
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(remote.as_str()))
@@ -734,6 +741,7 @@ pub(crate) fn restore_published(
         source,
         &format!("{remote}:{private}"),
     ])
+    .map_err(step(format!("fetching {remote} from {source}")))
     .and_then(|_| {
         ref_commit(mirror, &private).ok_or_else(|| {
             unavailable(format!(
