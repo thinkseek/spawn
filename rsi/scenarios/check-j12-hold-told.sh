@@ -396,8 +396,9 @@ printf '%s [1] LOG:  database system is ready to accept connections\n' "$(stamp)
 # (6) fills a tmpfs and expects tmpfs_high on it. Since 215, tmpfs_high reads
 # a tmpfs alone: a path on any other filesystem never alerts, and in the gate
 # WORK is not on a tmpfs. So: WORK/ram when WORK is on a tmpfs, else a
-# directory of the scenario's own under /dev/shm (removed by cleanup), else
-# none, and (6) checks memory_low alone, saying why on stderr.
+# directory of the scenario's own under /dev/shm (removed by cleanup). With
+# neither, the host cannot run (6) as written: a harness exit (2), never a
+# quiet pass without tmpfs_high (rev-j's n1 on the j12 fix).
 fstype() { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
 ram=""
 if [ "$(fstype "$WORK")" = tmpfs ]; then
@@ -408,18 +409,14 @@ elif [ "$(fstype /dev/shm)" = tmpfs ] && [ -w /dev/shm ]; then
     ram=$ram_outside
 fi
 host_kinds="memory_low tmpfs_high"
-# Which of the three (6) takes, always said: the skip must never be the
-# gate's quiet normal (the lead's condition, 23:5x).
+# Which of the two (6) takes, always said.
 if [ "$ram" = "$WORK/ram" ]; then
     echo "j12: [030 (6)] tmpfs_high reads WORK/ram (WORK is a tmpfs)"
 elif [ -n "$ram" ]; then
     echo "j12: [030 (6)] tmpfs_high reads $ram (WORK is $(fstype "$WORK"), /dev/shm is a tmpfs)"
 fi
-if [ -z "$ram" ]; then
-    mkdir -p "$WORK/ram"
-    host_kinds="memory_low"
-    echo "j12: [030 (6)] no writable tmpfs (WORK is $(fstype "$WORK"), /dev/shm is $(fstype /dev/shm)): tmpfs_high is not checked here" >&2
-fi
+[ -n "$ram" ] ||
+    harness "[030 (6)] no writable tmpfs for tmpfs_high (WORK is $(fstype "$WORK"), /dev/shm is $(fstype /dev/shm)$([ -w /dev/shm ] || echo ', not writable'))"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS SPAWN_SERVE_TOKEN \
