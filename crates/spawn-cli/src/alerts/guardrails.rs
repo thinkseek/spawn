@@ -482,25 +482,7 @@ impl Monitor {
             let open = self.open_keys(KIND, &subject);
             if figure.state == "out" {
                 self.guardrail_back.remove(&figure.key);
-                let since = if let Some(since) = self.guardrail_out.get(&figure.key) {
-                    *since
-                } else {
-                    // A judged stretch is taken by the first fresh reading
-                    // out; else the first reading seeds from the samples.
-                    let since = self
-                        .guardrail_judged
-                        .remove(&figure.key)
-                        .unwrap_or_else(|| {
-                            seeding
-                                .as_ref()
-                                .and_then(|(samples, period)| {
-                                    out_since(samples, &figure.key, &figure.range, now, *period)
-                                })
-                                .unwrap_or(now)
-                        });
-                    self.guardrail_out.insert(figure.key.clone(), since);
-                    since
-                };
+                let since = self.out_since_of(figure, now, seeding.as_ref());
                 // The stretch's alert, once judged by the owner (objective
                 // 092), is not open and is not raised again: the next stretch
                 // out of range is a new occurrence.
@@ -575,6 +557,27 @@ impl Monitor {
             });
         }
         self.stale_events(now, &answer, out);
+    }
+
+    /// Since when `figure`, out at `now`, has been out: its count, else a
+    /// judged stretch's out-since (taken by this first fresh reading out),
+    /// else, at the first reading, the samples' ([`out_since`]), else now.
+    fn out_since_of(&mut self, figure: &Reading, now: i64, seeding: Option<&(Value, i64)>) -> i64 {
+        if let Some(since) = self.guardrail_out.get(&figure.key) {
+            return *since;
+        }
+        let since = self
+            .guardrail_judged
+            .remove(&figure.key)
+            .unwrap_or_else(|| {
+                seeding
+                    .and_then(|(samples, period)| {
+                        out_since(samples, &figure.key, &figure.range, now, *period)
+                    })
+                    .unwrap_or(now)
+            });
+        self.guardrail_out.insert(figure.key.clone(), since);
+        since
     }
 
     /// At the loop's first answered reading (once per loop): its samples
