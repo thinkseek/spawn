@@ -3146,8 +3146,8 @@ times in a row)",
                     "reading_ms": now,
                 }),
                 text: format!(
-                    "{source} is not a directory on this host: mission #{mission}'s \
-                     branches are not published to it until it is back"
+                    "{source} is not a directory on this host, or not one git can read: \
+                     mission #{mission}'s branches are not published to it until it is back"
                 ),
                 notice: false,
             });

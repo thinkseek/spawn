@@ -434,9 +434,9 @@ pub(crate) fn source_away_news(records: &[Value]) -> Vec<Escalation> {
                     id: format!("source-away-{id}"),
                     why: Why::SourceAway,
                     line: format!(
-                        "{subject}'s source {source} is not a directory on this host: its \
-                         agents' branches are not published to it until it is back. Check \
-                         the mount or the path; Spawn retries on its own."
+                        "{subject}'s source {source} is not a directory on this host, or not \
+                         one git can read: its agents' branches are not published to it until \
+                         it is back. Check the mount or the path; Spawn retries on its own."
                     ),
                     since_ms: record["at_ms"].as_i64(),
                 }),
