@@ -658,18 +658,27 @@ class RelayTest(unittest.TestCase):
 
     def test_a_stall_ends_at_the_silence_bound_not_at_the_next_keep_alive(self):
         self.fast_retries()
-        self.patch("DEEPSEEK_SILENCE", 0.5)
+        silence = 2
+        self.patch("DEEPSEEK_SILENCE", silence)
         self.deepseek.release.set()
-        # Keep-alives at 0, 0.4 and 0.8 s: the one at 0.4 s must not let the
-        # next read wait its whole socket timeout (to 0.8 s); the attempt
-        # ends at 0.5 s.
-        self.deepseek.keepalive_every = 0.4
+        # Keep-alives at 0, 1.9 and 3.8 s: the one at 1.9 s, just inside the
+        # bound, must not let the next read wait its whole socket timeout
+        # (to the keep-alive at 3.8 s); the attempt ends at 2 s.
+        #
+        # Objective 208 (e): with the bound at 0.5 s and keep-alives every
+        # 0.4 s, the two answers were 0.5 s and 0.8 s apart, judged at 0.7 s
+        # on the fake's clock, which counts two loopback transits and the
+        # accept; it flaked under load (11-15 17:15). Now the answers are 2 s
+        # and 3.8 s, judged on the relay's own clock (each attempt's start,
+        # as recorded), halfway between: 0.9 s of room each side.
+        self.deepseek.keepalive_every = silence - 0.1
         self.deepseek.cuts = ["stall"]
+        attempts = self.record_attempts()
         connection, response = self.stream()
         self.assertEqual(response.read(), WHOLE)
         connection.close()
-        first, second = (seen["at"] for seen in self.deepseek.requests)
-        self.assertLess(second - first, 0.7)
+        (_, first), (_, second) = attempts
+        self.assertLess(second - first, silence * 1.45)
 
     def test_a_non_stream_deepseek_answer_may_take_longer_than_the_silence(self):
         self.fast_retries()

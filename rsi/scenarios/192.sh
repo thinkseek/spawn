@@ -52,9 +52,10 @@
 #       from the first reading, (h2) no range at the first reading then out,
 #       each for more than two holds: no new alert; (h3) no range at the
 #       first reading, in range at later ones, then out: a new alert, out
-#       since after the switch; (h4) (R4) (h3)'s alert judged false, out
-#       from the first reading, then no range, then out: a new alert, out
-#       since after the second switch (the taken stretch ends like any other).
+#       since after the switch; (h4) (R4, flipped by objective 209) (h3)'s
+#       alert judged false, out from the first reading, then no range, then
+#       out for more than two holds: no new alert (only a fresh reading in
+#       range ends a judged stretch, taken or not; 209.sh holds the rest).
 # On the base, (c) gets no alert: its hold starts at the loop's start; and (e)
 #   fires a second alert at once.
 #
@@ -588,12 +589,11 @@ else
         stop_loop
         note "(h3) checked: a fresh reading in range ends the judged stretch"
 
-        # (h4) (R4, rev-g's F1 on R3, the lead's rule (a)): (h3)'s alert judged
+        # (h4) (R4; objective 209 flips its rule (a)): (h3)'s alert judged
         # false; out from the restarted loop's first reading (it takes the
-        # judged out-since), then no range, then out again: the taken stretch
-        # ended like any other, so a new alert fires a hold after the second
-        # switch. (A loop that keeps the judged out-since after taking it
-        # goes on with the judged stretch and raises nothing.)
+        # judged out-since), then no range, then out for more than two holds:
+        # still the judged stretch, so no new alert. (A loop that ends a taken
+        # stretch at a reading with no range fires a hold after the switch.)
         judged_h4=$(alerts_of | jq -r '[.[] | select(.state == "open")][0].key // empty')
         if [ -z "$judged_h4" ]; then
             check_failed "(h4) no open alert from (h3) to judge: (h4) not run"
@@ -607,17 +607,12 @@ else
             sleep 3
             write_ranges
             sleep 5
-            switched=$(db_now)
             ranges_out
-            if wait_until 60 open_alert; then
-                expect_eq "$(alerts_of | jq -c --arg judged "$judged_h4" --argjson switched "$switched" '[.[] | select(.state == "open") | {new: (.key != $judged), after_the_switch: (.evidence.out_since_ms >= $switched)}]')" \
-                    '[{"new":true,"after_the_switch":true}]' \
-                    "(h4) one new open alert, out since a reading after leaked test schemas was found out again"
-            else
-                check_failed "(h4) leaked test schemas out at the restarted loop's first reading (taking the judged out-since), then no range, then out: no new alert within 60 s (the taken stretch did not end at the reading with no range)"
-            fi
+            sleep 35
+            expect_eq "$(alerts_of | jq -c '[.[] | select(.state == "open")] | length')" 0 \
+                "(h4) leaked test schemas out at the restarted loop's first reading (taking the judged out-since), then no range, then out for more than two holds: no new alert (a reading with no range does not end a taken judged stretch)"
             stop_loop
-            note "(h4) checked: a taken judged stretch ends like any other"
+            note "(h4) checked: a taken judged stretch outlives a reading with no range"
         fi
     fi
 fi
