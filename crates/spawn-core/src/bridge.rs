@@ -834,6 +834,40 @@ pub struct TickReport {
     pub notes: Vec<String>,
 }
 
+/// What a failing commit is logged by (objective 205): its kind
+/// (`unavailable`, or `refused <code>`) and its message's first line, with
+/// each run of seven or more hex digits read as `<id>`. A commit that keeps
+/// failing for one cause keeps its key: `update-ref` names the pass's fresh
+/// commit id, and `git add`'s later lines name the files it failed at. A
+/// checkpoint logs a failure only when the key changes.
+pub fn failure_key(error: &WorkspaceError) -> String {
+    let (kind, message) = match error {
+        WorkspaceError::Refused { code, message } => (format!("refused {code}"), message),
+        WorkspaceError::Unavailable(text) => ("unavailable".to_string(), text),
+    };
+    let first = message.lines().next().unwrap_or_default();
+    let mut masked = String::with_capacity(first.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, masked: &mut String| {
+        if run.len() >= 7 {
+            masked.push_str("<id>");
+        } else {
+            masked.push_str(run);
+        }
+        run.clear();
+    };
+    for character in first.chars() {
+        if character.is_ascii_hexdigit() {
+            run.push(character);
+        } else {
+            flush(&mut run, &mut masked);
+            masked.push(character);
+        }
+    }
+    flush(&mut run, &mut masked);
+    format!("{kind}: {masked}")
+}
+
 /// Agent Bridge.
 pub struct Bridge {
     log: Arc<dyn EventLog>,
