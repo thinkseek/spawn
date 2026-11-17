@@ -161,7 +161,7 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
             "not a retirement record",
         ),
     ] {
-        refused(&store, &mut client, &record, &why);
+        refused(&store, &mut client, &record, why);
     }
     assert_eq!((recorded(&mut client), rows(&mut client)), (0, 0));
 
