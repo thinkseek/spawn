@@ -692,3 +692,71 @@ fn a_summary_gives_the_windows_total_landings_and_cost_per_landing() {
         "model-z's tokens are unpriced: {window}"
     );
 }
+
+#[test]
+fn a_trend_cuts_the_window_into_steps_each_with_its_dollars_and_unpriced_tokens() {
+    const HOUR_MS: i64 = 3_600_000;
+    let (store, _schema) = store("cost_trend");
+    let (_mission, _task, worker) = one_task(&store);
+    started(&store, &worker, 1);
+    let since = store.database_now_ms().expect("now") - 4 * HOUR_MS;
+    // A window of 3.5 hours in steps of an hour: four steps, the last half.
+    let until = since + 3 * HOUR_MS + HOUR_MS / 2;
+    let lines: [(&str, &str, i64, [u64; 4]); 6] = [
+        ("before", "model-x", since - 1, [1_000_000, 0, 0, 0]),
+        ("first", "model-x", since, [100_000, 0, 0, 0]),
+        (
+            "third_a",
+            "model-x",
+            since + 2 * HOUR_MS + 5,
+            [200_000, 0, 0, 0],
+        ),
+        (
+            "third_z",
+            "model-z",
+            since + 2 * HOUR_MS + 10,
+            [7000, 300, 20, 5],
+        ),
+        ("last", "model-x", until - 1, [10_000, 0, 0, 0]),
+        ("at_end", "model-x", until, [1_000_000, 0, 0, 0]),
+    ];
+    for (id, model, at, counts) in lines {
+        usage(&store, &worker, 1, (id, model, at), counts);
+    }
+    assert_eq!(store.cost_record(&prices(3.0)).expect("record"), 6);
+
+    let trend = store.cost_trend(since, until, HOUR_MS).expect("trend");
+    let steps = trend.as_array().expect("an array");
+    assert_eq!(steps.len(), 4, "{trend}");
+    for (step, (usd, unpriced), index) in [(0.3, 0), (0.0, 0), (0.6, 7325), (0.03, 0)]
+        .into_iter()
+        .zip(0_i64..)
+        .zip(steps)
+        .map(|((expected, index), step)| (step, expected, index))
+    {
+        assert_eq!(step["since_ms"], json!(since + index * HOUR_MS), "{trend}");
+        near(&step["usd"], usd, &format!("step {index}'s dollars"));
+        assert_eq!(
+            step["unpriced_tokens"],
+            json!(unpriced),
+            "step {index}: {trend}"
+        );
+    }
+    // The steps add up to the window.
+    let window = store.cost_window(since, until).expect("window");
+    let summed: f64 = steps.iter().map(|step| usd(&step["usd"])).sum();
+    near(&window["total"]["usd"], summed, "the window's total");
+    assert_eq!(window["total"]["unpriced_tokens"], json!(7325));
+
+    // A window an exact number of steps long has no extra step.
+    let exact = store
+        .cost_trend(since, since + 2 * HOUR_MS, HOUR_MS)
+        .expect("trend");
+    assert_eq!(exact.as_array().map(Vec::len), Some(2), "{exact}");
+    // An empty window, or a step under a millisecond, is no step.
+    assert_eq!(
+        store.cost_trend(since, since, HOUR_MS).expect("trend"),
+        json!([])
+    );
+    assert_eq!(store.cost_trend(since, until, 0).expect("trend"), json!([]));
+}

@@ -3799,6 +3799,175 @@ mod tests {
         });
     }
 
+    /// One model call of `worker`'s execution 1, timed `at_ms`, of `input`
+    /// tokens on `model-x` (the test's price: $3 a million input tokens).
+    fn spend(
+        store: &spawn_postgres::PostgresStore,
+        agent: &str,
+        session: &str,
+        id: &str,
+        at_ms: i64,
+        input: u64,
+    ) {
+        use spawn_core::event::{EventKind, NewEvent, Source};
+        use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId};
+        use spawn_core::port::EventLog;
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new(agent).expect("valid agent"),
+                session_id: SessionId::new(session).expect("valid session"),
+                execution_id: Some(ExecutionId::for_command(CommandId(1))),
+                source: Source::Claude,
+                source_event_id: Some(format!("usage:{id}")),
+                kind: EventKind::ModelUsage {
+                    message_id: id.to_string(),
+                    model: "model-x".to_string(),
+                    at_ms,
+                    input_tokens: input,
+                    output_tokens: 0,
+                    cache_write_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            })
+            .expect("append");
+    }
+
+    /// A worker's task of `mission` and its execution 1 started: the
+    /// worker's agent and session.
+    fn started_worker(store: &spawn_postgres::PostgresStore, mission: i64) -> (String, String) {
+        use spawn_core::event::{ENGINE, EventKind, ModelProfile, NewEvent, Source};
+        use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+        use spawn_core::port::EventLog;
+        let task = store
+            .task_assign(mission, "ephemeral", "w1", "brief", "default")
+            .expect("a task");
+        let (agent, session) = (
+            format!("agent_worker_w1_{task}"),
+            format!("session_worker_w1_{task}"),
+        );
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new(&agent).expect("valid agent"),
+                session_id: SessionId::new(&session).expect("valid session"),
+                execution_id: Some(ExecutionId::for_command(CommandId(1))),
+                source: Source::Claude,
+                source_event_id: Some("start-1".to_string()),
+                kind: EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: CommandId(1),
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            })
+            .expect("started");
+        (agent, session)
+    }
+
+    /// GitHub #64, through the real store: `/api/cost`'s window also says
+    /// the window of equal length before it, its trend by the hour (24h) or
+    /// the day (7d), and each budgeted mission's spend of the UTC day.
+    #[test]
+    fn a_cost_window_says_the_window_before_its_trend_and_the_budgets() {
+        const HOUR: i64 = 3_600_000;
+        const DAY: i64 = 24 * HOUR;
+        in_test_schema(|_owner, store| {
+            let mission = store
+                .mission_add("Budgeted work", &json!([]), "human")
+                .expect("a mission");
+            store
+                .mission_configure(
+                    mission,
+                    None,
+                    "review",
+                    Some(&json!({"daily_usd": 2.5})),
+                    None,
+                )
+                .expect("a daily budget");
+            let (agent, session) = started_worker(store, mission);
+            let now = store.database_now_ms().expect("now");
+            // Today (UTC) $3.00; last night, just before the UTC day and
+            // inside the last 24 h, $0.60 (not today's budget); 30 h ago
+            // $1.50 (the 24h window's previous one); 10 days ago $0.30 (the
+            // week's previous window).
+            let day_start = now - now.rem_euclid(DAY);
+            let calls = [
+                ("today", (now - 1000).max(day_start), 1_000_000, 3.0),
+                ("last_night", day_start - 1, 200_000, 0.6),
+                ("yesterday", now - 30 * HOUR, 500_000, 1.5),
+                ("ancient", now - 10 * DAY, 100_000, 0.3),
+            ];
+            for (id, at_ms, input, _usd) in calls {
+                spend(store, &agent, &session, id, at_ms, input);
+            }
+            let prices = json!({"model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3}});
+            assert_eq!(store.cost_record(&prices).expect("record"), 4);
+            let usd = |value: &serde_json::Value| value.as_f64().unwrap_or(f64::NAN);
+            let near = |value: &serde_json::Value, expected: f64, what: &str| {
+                assert!(
+                    (usd(value) - expected).abs() < 1e-9,
+                    "{what}: {value}, expected {expected}"
+                );
+            };
+            for (name, length_ms, steps, step_ms, before) in
+                [("24h", DAY, 24, HOUR, 1.5), ("7d", 7 * DAY, 7, DAY, 0.3)]
+            {
+                let answer = crate::cost::window(store, name, length_ms).expect("the window");
+                let since = answer["since_ms"].as_i64().expect("since");
+                let previous = &answer["previous"];
+                assert_eq!(
+                    previous["since_ms"],
+                    json!(since - length_ms),
+                    "{name}: {answer}"
+                );
+                assert_eq!(previous["until_ms"], json!(since), "{name}: {answer}");
+                near(
+                    &previous["total"]["usd"],
+                    before,
+                    &format!("{name}: the window before"),
+                );
+                assert_eq!(previous["landed"], json!(0), "{name}: {answer}");
+                assert_eq!(answer["trend_step_ms"], json!(step_ms), "{name}: {answer}");
+                let trend = answer["trend"].as_array().expect("a trend");
+                assert_eq!(trend.len(), steps, "{name}: {answer}");
+                for (index, step) in (0_i64..).zip(trend) {
+                    assert_eq!(
+                        step["since_ms"],
+                        json!(since + index * step_ms),
+                        "{name}: {answer}"
+                    );
+                }
+                // Each call in the step its time falls in, nothing elsewhere.
+                let until = answer["until_ms"].as_i64().expect("until");
+                let mut expected = vec![0.0; steps];
+                for (_id, at_ms, _input, usd) in calls {
+                    if at_ms >= since && at_ms < until {
+                        expected
+                            [usize::try_from((at_ms - since) / step_ms).expect("in the window")] +=
+                            usd;
+                    }
+                }
+                for (index, (step, usd)) in trend.iter().zip(expected).enumerate() {
+                    near(&step["usd"], usd, &format!("{name}: step {index}"));
+                }
+                let budgets = answer["budgets"].as_array().expect("budgets");
+                assert_eq!(budgets.len(), 1, "{name}: {answer}");
+                assert_eq!(budgets[0]["mission"], json!(mission), "{name}: {answer}");
+                near(
+                    &budgets[0]["budget_usd"],
+                    2.5,
+                    &format!("{name}: the budget"),
+                );
+                near(
+                    &budgets[0]["spent_usd"],
+                    3.0,
+                    &format!("{name}: today's spend alone, from the UTC day's start"),
+                );
+            }
+        });
+    }
+
     #[test]
     fn a_cost_mission_row_carries_its_name_as_the_missions_board_gives_it() {
         in_test_schema(|_owner, store| {
