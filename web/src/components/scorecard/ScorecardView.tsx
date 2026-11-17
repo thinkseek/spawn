@@ -1,5 +1,5 @@
 import { CalendarDays, Gauge, OctagonAlert, Target } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { readApi, usePoll } from "../../api";
 import type { FleetHealth } from "../../fleet";
@@ -93,7 +93,13 @@ export function ScorecardView({
     }),
     POLL_MS,
   );
-  const data = scorecard.data?.card ?? null;
+  // Keep the last card on screen while a new window or scope loads: a click
+  // on the window toggle must not blank the table and re-render it.
+  const lastLoaded = useRef<Loaded | null>(null);
+  if (scorecard.data) lastLoaded.current = scorecard.data;
+  const loaded = scorecard.data ?? lastLoaded.current;
+  const refreshing = scorecard.data === null && lastLoaded.current !== null;
+  const data = loaded?.card ?? null;
   // "How the fleet decides" over the page's window, from the experience
   // views; home's health (the last hour and 24 h) until it answers.
   const fleetWindow = usePoll(
@@ -160,9 +166,11 @@ export function ScorecardView({
         <LiveStatus
           error={scorecard.error}
           label={
-            scorecard.data
-              ? `Updated ${relativeTime(scorecard.data.at_ms)}`
-              : "Connecting"
+            refreshing
+              ? "Updating…"
+              : loaded
+                ? `Updated ${relativeTime(loaded.at_ms)}`
+                : "Connecting"
           }
         />
       </PageHeader>
