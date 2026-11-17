@@ -1164,9 +1164,10 @@ fn assign(
 mod tests {
     use super::{
         ACTIVE_MEASURE, Attempts, Landing, Outcome, PriorWork, Task, attempt_limit, attempts,
-        brief, choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns,
-        workers, yields,
+        brief, choose, holds, is_open, load_backlog, metric_lines, next_open, order_problems,
+        overruns, recurring, workers, yields,
     };
+    use std::path::Path;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2204,5 +2205,80 @@ mod tests {
         )
         .expect("the backlog");
         assert!(order_problems(&backlog).is_empty());
+    }
+
+    /// Objective 210: the base-solved rule ends every objective but one the
+    /// backlog positively reads as recurring. A mission with no backlog, a
+    /// backlog missing, malformed or without the objective all read "not
+    /// recurring"; a recurring objective in a readable backlog reads so.
+    #[test]
+    fn only_a_backlog_that_reads_the_objective_as_recurring_keeps_it_from_the_base_solved_rule() {
+        let dir = std::env::temp_dir().join(format!("spawn-backlog-recurring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the backlog");
+        let at = |path: &Path| -> crate::integrate::Mission {
+            serde_json::from_value(json!({
+                "id": 4, "gate": "/g", "accept": "gate",
+                "objectives": {"backlog": path.to_string_lossy(), "resident": "rsi", "workers": 1},
+            }))
+            .expect("a mission")
+        };
+        let mission = at(&dir);
+        std::fs::write(
+            dir.join("1.json"),
+            r#"{"id": 1, "title": "One", "prompt": "Do it."}"#,
+        )
+        .expect("one");
+        std::fs::write(
+            dir.join("2.json"),
+            r#"{"id": 2, "title": "Two", "prompt": "Do it.", "recurring": true,
+                "metric": "made_up_ms", "target": 100, "direction": "lower"}"#,
+        )
+        .expect("two");
+        assert!(!recurring(&mission, 1), "one-shot");
+        assert!(recurring(&mission, 2), "recurring");
+        assert!(!recurring(&mission, 3), "not in the backlog");
+        // A malformed file: the backlog cannot be read at all.
+        std::fs::write(dir.join("x.json"), "{\n").expect("malformed");
+        assert!(!recurring(&mission, 2), "malformed backlog");
+        std::fs::remove_file(dir.join("x.json")).expect("unmalformed");
+        assert!(recurring(&mission, 2), "readable again");
+        // No such directory, and a mission naming no backlog.
+        assert!(!recurring(&at(&dir.join("gone")), 2), "missing backlog");
+        let none: crate::integrate::Mission = serde_json::from_value(
+            json!({"id": 4, "gate": "/g", "accept": "gate"}),
+        )
+        .expect("a mission");
+        assert!(!recurring(&none, 2), "no backlog named");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Objective 210: a retired objective is closed whatever its kind, before
+    /// the recurring rule, and never assigned: a recurring one with no value
+    /// and a one-shot one alike. A retirement of another objective closes
+    /// nothing.
+    #[test]
+    fn a_retired_objective_is_closed_whatever_its_kind() {
+        let retired = |objective: u32| Landing {
+            objective,
+            metric: None,
+            retired: true,
+        };
+        let backlog = [objective(1, false), objective(2, true), objective(3, false)];
+        assert!(!is_open(&backlog[0], &[retired(1)]));
+        assert!(!is_open(&backlog[1], &[retired(2)]), "recurring, no value");
+        assert!(is_open(&backlog[2], &[retired(1), retired(2)]));
+        assert!(is_open(&backlog[1], &[retired(1)]));
+        let landings = [retired(1), retired(2)];
+        assert_eq!(next_open(&backlog, &landings).map(|task| task.id), Some(3));
+        let chosen = choose(
+            &backlog,
+            &landings,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            3,
+        );
+        assert_eq!(chosen.iter().map(|task| task.id).collect::<Vec<_>>(), [3]);
     }
 }
