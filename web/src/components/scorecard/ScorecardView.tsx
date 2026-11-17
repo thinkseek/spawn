@@ -40,6 +40,7 @@ import { useNow } from "../rsi/Phase";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
+import { keptAnswer } from "../../keptAnswer.ts";
 import { settlingNote } from "../../settling.ts";
 import { tokenReachNote } from "../../tokenReach.ts";
 import { FleetDecisions } from "./FleetDecisions";
@@ -95,10 +96,15 @@ export function ScorecardView({
   );
   // Keep the last card on screen while a new window or scope loads: a click
   // on the window toggle must not blank the table and re-render it.
+  // A failed read of the new window or scope shows that it failed, never
+  // the previous selection's card (keptAnswer).
   const lastLoaded = useRef<Loaded | null>(null);
   if (scorecard.data) lastLoaded.current = scorecard.data;
-  const loaded = scorecard.data ?? lastLoaded.current;
-  const refreshing = scorecard.data === null && lastLoaded.current !== null;
+  const { shown: loaded, refreshing } = keptAnswer(
+    scorecard.data,
+    scorecard.error,
+    lastLoaded.current,
+  );
   const data = loaded?.card ?? null;
   // "How the fleet decides" over the page's window, from the experience
   // views; home's health (the last hour and 24 h) until it answers.
@@ -208,7 +214,7 @@ export function ScorecardView({
                   <span className="text-foreground/85"> — {scorecard.error}</span>
                   <div className="text-caption text-muted-foreground">
                     Showing the answer from{" "}
-                    {relativeTime(scorecard.data?.at_ms ?? null)}.
+                    {relativeTime(loaded?.at_ms)}.
                   </div>
                 </div>
               </div>
