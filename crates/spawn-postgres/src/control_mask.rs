@@ -165,6 +165,7 @@ pub const LIMITED: &[(&str, &str)] = &[
     ("backup.drilled.transcripts", "reason"),
     ("backup.drilled.missions", "reason"),
     ("backup.drilled.controllers", "reason"),
+    ("backup.drilled.sync", "reason"),
     ("deploy.finished", "reason"),
     ("objective.verified", "how"),
     ("objective.retired", "reason"),
