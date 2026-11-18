@@ -414,6 +414,14 @@ impl Stop {
         self.key.starts_with(KEY_PREFIX)
     }
 
+    /// Whether the dispatcher sent it to stop a cancelled task's turn
+    /// (`cancel-stop-<task>-<execution>`). It interrupts a turn; the
+    /// dispatcher's notice resumes the session after it. It does not end the
+    /// session, so the recovery must not record it as `final`.
+    pub(crate) fn cancelled_task(&self) -> bool {
+        self.principal == crate::dispatch::DISPATCHER && self.key.starts_with("cancel-stop-")
+    }
+
     /// Whether it may have stopped the engine: one refused before typing
     /// stopped nothing.
     pub(crate) fn reached(&self) -> bool {
@@ -1719,7 +1727,7 @@ impl One<'_> {
             disk: below.as_ref(),
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
-            task_cancelled: false,
+            task_cancelled: self.last_stop().is_some_and(Stop::cancelled_task),
             model_error: self.refused_turn(end),
             moved: moved(&self.row.stops, &self.row.session_id, self.work),
         };
@@ -1730,6 +1738,19 @@ impl One<'_> {
             self.row.native_session_id.is_some(),
             self.failures_in_a_row(),
         );
+        // A cancelled task's stop interrupts its turn so the notice can be
+        // typed; it does not end the session. `final` here left the session
+        // dead for good when the notice's resume did not follow, and the
+        // dispatcher went on assigning work to it: the resident of mission 9
+        // died ten times by 2026-11-18 this way (`cancel-stop-63-*`). As a
+        // `resume`, the recovery brings the session back when no delivery or
+        // notice does; a `wait` would never clear, since a stop leaves nothing
+        // to observe.
+        let path = if cause == Cause::Stopped && facts.task_cancelled {
+            Path::Resume
+        } else {
+            path
+        };
         evidence.append(&mut gains);
         let due = match path {
             Path::Final => None,
@@ -1960,12 +1981,17 @@ impl One<'_> {
         let Some(cause) = Cause::from_name(last.cause().unwrap_or_default()) else {
             return Ok(());
         };
-        // A wait made final (a transient model error's retries spent) is
-        // never revived, whatever its cause's own path.
-        if last.path() == Some(Path::Final.name()) {
-            return Ok(());
-        }
-        match cause.path() {
+        // The record's own path is what the last interruption took: a
+        // cancelled task's stop is recorded as a `resume` where its cause's
+        // default is `final`. A wait made final (a transient model error's
+        // retries spent) is never revived, whatever its cause's own path.
+        let path = match last.path() {
+            Some("resume") => Path::Resume,
+            Some("handoff") => Path::Handoff,
+            Some("wait") => Path::Wait,
+            _ => cause.path(),
+        };
+        match path {
             Path::Final => Ok(()),
             Path::Wait => self.wait_path(&last, cause),
             Path::Resume | Path::Handoff => self.revive(&last, cause, false),
@@ -2601,6 +2627,28 @@ mod tests {
         resume_failed, retry_at, server_gone, way,
     };
     use serde_json::json;
+
+    /// A cancelled task's stop is the dispatcher's interrupt: the notice's
+    /// resume follows it, so the recovery must not record it as `final`
+    /// (`interrupt_end`). A person's stop, and the recovery's own, still end
+    /// the session.
+    #[test]
+    fn only_a_dispatchers_cancel_stop_is_an_interrupt() {
+        let stop = |principal: &str, key: &str| Stop {
+            command_id: 1,
+            principal: principal.to_string(),
+            key: key.to_string(),
+            action: "stop".to_string(),
+            created_at_ms: 0,
+            succeeded: Some(true),
+            error: None,
+        };
+        assert!(stop("spawn-dispatch", "cancel-stop-63-exec_482").cancelled_task());
+        assert!(!stop("spawn-dispatch", "restart-18-1-stop").cancelled_task());
+        assert!(!stop("spawn-dispatch", "pause-8-23954-exec_206").cancelled_task());
+        assert!(!stop("chenkailun", "cancel-stop-63-exec_482").cancelled_task());
+        assert!(!stop("spawn-liveness", "recover-exec_4-1-stop").cancelled_task());
+    }
     use spawn_core::port::{ServerSeen, TerminalServer};
 
     /// A host restart is the server that ran the execution gone, told by

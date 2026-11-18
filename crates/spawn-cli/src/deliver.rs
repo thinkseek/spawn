@@ -1674,6 +1674,23 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
         }
     };
     if facts.live {
+        // Its turn was stopped for this task already: typing the notice is
+        // the step after. Stopping again on every revival kept a resident
+        // from ever working (2026-11-18: stopped ten seconds after each
+        // recovery resume, forever, and its notice never came).
+        let stopped_for_task = facts.dispatched.iter().any(|sent| {
+            sent.key.starts_with(&format!("cancel-stop-{}-", cancelled.id))
+                && sent.succeeded != Some(false)
+        });
+        if stopped_for_task {
+            return Some(cancelled.command(
+                format!("{prefix}{}", attempts.len()),
+                CommandAction::Input {
+                    text: cancel_notice(cancelled),
+                    tags: Vec::new(),
+                },
+            ));
+        }
         let execution = facts.execution_id.as_deref().unwrap_or("none");
         let key = match cancelled.reassigned_as {
             Some(_) if facts.sent(&reassign_stop_key(cancelled.id)).is_none() => {
