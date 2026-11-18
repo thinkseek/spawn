@@ -491,9 +491,22 @@ mod tests {
         )
     }
 
+    /// A fake HOME in scratch, removed when dropped (a failing test too).
+    struct FakeHome {
+        projects: PathBuf,
+    }
+
+    impl Drop for FakeHome {
+        fn drop(&mut self) {
+            if let Some(home) = self.projects.parent().and_then(Path::parent) {
+                let _ = std::fs::remove_dir_all(home);
+            }
+        }
+    }
+
     /// A fake `$HOME/.claude/projects` in scratch, never under the real home
     /// (tests of anything reading the native transcripts use a fake HOME).
-    fn fake_projects(case: &str) -> PathBuf {
+    fn fake_projects(case: &str) -> FakeHome {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
@@ -511,7 +524,7 @@ mod tests {
         }
         let projects = home.join(".claude").join("projects");
         std::fs::create_dir_all(&projects).expect("fake projects");
-        projects
+        FakeHome { projects }
     }
 
     fn append(path: &Path, text: &str) {
@@ -540,7 +553,8 @@ mod tests {
 
     #[test]
     fn only_regular_jsonl_files_of_project_directories_are_transcripts() {
-        let projects = fake_projects("list");
+        let home = fake_projects("list");
+        let projects = &home.projects;
         let rev = projects.join("-data-tmp-ccd-rev-x");
         let engine = projects.join("-ws-agent-resident-rsi");
         std::fs::create_dir_all(rev.join("sub")).expect("dirs");
@@ -553,17 +567,17 @@ mod tests {
         append(&engine.join("e.jsonl"), "");
         std::os::unix::fs::symlink(rev.join("a.jsonl"), rev.join("link.jsonl")).expect("link");
         std::os::unix::fs::symlink(&rev, projects.join("linked-project")).expect("link");
-        let found: Vec<String> = transcripts(&projects, Some("-ws-"))
+        let found: Vec<String> = transcripts(projects, Some("-ws-"))
             .into_iter()
             .map(|(project, _, name)| format!("{project}/{name}"))
             .collect();
-        let _ = std::fs::remove_dir_all(projects.parent().and_then(Path::parent).expect("home"));
         assert_eq!(found, vec!["-data-tmp-ccd-rev-x/a.jsonl".to_string()]);
     }
 
     #[test]
     fn the_projects_of_the_workspace_root_are_skipped_and_no_other() {
-        let projects = fake_projects("skip");
+        let home = fake_projects("skip");
+        let projects = &home.projects;
         let root = Path::new("/home/u/.local/share/spawn-rsi/ws");
         // Claude Code's names for: an engine under the root, the root
         // itself, a sibling sharing the root's name as a prefix, a reviewer.
@@ -576,11 +590,10 @@ mod tests {
             std::fs::create_dir_all(projects.join(project)).expect("dirs");
             append(&projects.join(project).join("s.jsonl"), "");
         }
-        let found: Vec<String> = transcripts(&projects, Some(&engine_prefix(root)))
+        let found: Vec<String> = transcripts(projects, Some(&engine_prefix(root)))
             .into_iter()
             .map(|(project, _, _)| project)
             .collect();
-        let _ = std::fs::remove_dir_all(projects.parent().and_then(Path::parent).expect("home"));
         assert_eq!(
             found,
             vec![
@@ -593,7 +606,8 @@ mod tests {
 
     #[test]
     fn a_file_is_read_from_its_mark_whole_lines_only_and_never_changed() {
-        let projects = fake_projects("read");
+        let home = fake_projects("read");
+        let projects = &home.projects;
         let path = projects.join("s.jsonl");
         let first = line("m1", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]);
         append(&path, &first);
@@ -664,14 +678,14 @@ mod tests {
         // A link is not followed.
         std::os::unix::fs::symlink(&path, projects.join("l.jsonl")).expect("link");
         assert!(read_file(&projects.join("l.jsonl"), None, 1 << 20).is_err());
-        let _ = std::fs::remove_dir_all(projects.parent().and_then(Path::parent).expect("home"));
     }
 
     #[test]
     fn a_pass_counts_appended_messages_once_and_skips_the_engines() {
         let schema = spawn_postgres::testing::TestSchema::new("cost_sessions_pass");
         let store = schema.store();
-        let projects = fake_projects("pass");
+        let home = fake_projects("pass");
+        let projects = &home.projects;
         let rev = projects.join("-data-tmp-ccd-rev-x");
         let engine = projects.join("-ws-agent-worker-1");
         std::fs::create_dir_all(&rev).expect("dirs");
@@ -693,14 +707,14 @@ mod tests {
             r#"{"model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3}}"#,
         )
         .expect("prices");
-        let first = pass(&store, &projects, Some("-ws-"), &prices, budget());
+        let first = pass(&store, projects, Some("-ws-"), &prices, budget());
         assert_eq!(
             (first.counted, first.changed, first.files),
             (1, 0, 1),
             "{first:?}"
         );
         // Nothing appended: nothing read.
-        let quiet = pass(&store, &projects, Some("-ws-"), &prices, budget());
+        let quiet = pass(&store, projects, Some("-ws-"), &prices, budget());
         assert_eq!(
             (quiet.counted, quiet.files, quiet.bytes),
             (0, 0, 0),
@@ -709,7 +723,7 @@ mod tests {
         // One message appended: only it is read and counted.
         let more = line("m2", "2026-11-17T09:00:00.000Z", [0, 1000, 0, 0]);
         append(&path, &more);
-        let next = pass(&store, &projects, Some("-ws-"), &prices, budget());
+        let next = pass(&store, projects, Some("-ws-"), &prices, budget());
         assert_eq!(
             (next.counted, next.bytes),
             (1, u64::try_from(more.len()).expect("small"))
@@ -721,7 +735,6 @@ mod tests {
                 at("2026-11-18T00:00:00.000Z"),
             )
             .expect("sessions");
-        let _ = std::fs::remove_dir_all(projects.parent().and_then(Path::parent).expect("home"));
         // m1 $3.00 + m2 $0.015; the engine's file is not read.
         assert_eq!(
             sessions["rows"].as_array().map(Vec::len),
