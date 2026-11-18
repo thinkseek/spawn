@@ -454,8 +454,29 @@
 //!
 //! Like the dispatcher, it keeps no state of its own beyond the gates it is
 //! running: the control stream says what was judged and landed. An advisory
-//! lock allows one integrator per database; it belongs to the connection,
-//! which the integrator keeps while any of its gates runs.
+//! lock allows one integrator per database (and schema); it belongs to the
+//! connection.
+//!
+//! **One integrator per database, for its life** (objective 221: at 15:03 a
+//! second integrator, started by hand where its default gate script was not,
+//! took every pass the unit's integrator left idle and aborted every gate it
+//! ran). At start, before the database is touched, the gate script must be
+//! a file this process can read (the gate runs it with sh); otherwise the
+//! start is refused, saying whether SPAWN_GATE named it or its default was
+//! read from the working directory. Then the lock is taken on a connection
+//! of its own, named "spawn integrate pid=<pid>" (`application_name`),
+//! before anything is written, and kept for the process's life, idle or not
+//! (`--once` too). A start that finds it held says so and asks every 0.5 s
+//! for 15 s, so a deploy's restart takes it; still held, it exits 1 naming
+//! the holder (its connection's name and start), nothing recorded and no
+//! root made. Under the unit (Restart=always, RestartSec=10) a refused start
+//! is started again 10 s later, each start waiting its 15 s, so systemd's
+//! start limit is never reached. After a pass that failed it reads once
+//! whether its connection still holds the lock, and keeps it if so; a
+//! connection that ended is dropped, and the next pass asks for the lock on
+//! a new one: refused by its own old connection it waits, refused by
+//! another integrator it stops (exit 1, naming the holder). Nothing is read
+//! on every pass.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
