@@ -237,11 +237,17 @@ fn a_release_finds_a_removed_folder_gone_and_nothing_else() {
         !super::gone(&root.join("x").join("..").join("g")),
         "a .. part"
     );
-    assert!(!super::gone(Path::new(&format!("{}/./g", root.display()))), "a . part");
+    assert!(
+        !super::gone(Path::new(&format!("{}/./g", root.display()))),
+        "a . part"
+    );
     assert!(!super::gone(root), "a folder still there");
     std::fs::create_dir_all(root.join("real")).expect("mkdir");
     std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("symlink");
-    assert!(!super::gone(&root.join("link").join("g")), "under a symlink");
+    assert!(
+        !super::gone(&root.join("link").join("g")),
+        "under a symlink"
+    );
     std::fs::write(root.join("file"), "x").expect("a file");
     assert!(!super::gone(&root.join("file").join("g")), "under a file");
 }

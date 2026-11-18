@@ -21,8 +21,11 @@
 //! reading and never waits for a refresh. Only the first read after start
 //! is waited for, at most [`FIRST_WAIT`]; past that the figures are null
 //! (not collected) until it ends. A walk past its bound keeps the previous
-//! scratch figure and says so in the log, never a partial count; a test
-//! server that does not answer is left out and says why.
+//! scratch figure and says so in the log, never a partial count; of the
+//! previous claimed folders it keeps only those still a real directory
+//! (objective 220, [`still_there`]: one removed since, or now a symlink or
+//! a file, is left out). A test server that does not answer is left out and
+//! says why.
 //!
 //! Read only: nothing here removes, moves, renames or touches a file or a
 //! schema. No gate, integrator or deploy step reads any of it.
@@ -238,7 +241,7 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
             Err(why) => {
                 eprintln!("core-lines: scratch nobody owns: {why}; the previous figure is kept");
                 previous.map_or((None, Vec::new()), |previous| {
-                    (previous.unowned.clone(), previous.claimed.clone())
+                    (previous.unowned.clone(), still_there(&previous.claimed))
                 })
             }
         }
@@ -293,6 +296,20 @@ pub(super) fn read(plan: &Plan, previous: Option<&Reading>, now_ms: i64, bound: 
 
 /// The `(mission, objective)` pairs the reading's claimed folders name, each
 /// once, in order: what [`scratch_json`]'s `landed` is read for.
+/// Of a kept reading's claimed folders, those still a real directory
+/// (lstat, never followed): one removed since, or replaced by a symlink or a
+/// file, is no claim to show (objective 220).
+fn still_there(claimed: &[Claimed]) -> Vec<Claimed> {
+    claimed
+        .iter()
+        .filter(|folder| {
+            std::fs::symlink_metadata(&folder.path)
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+        })
+        .cloned()
+        .collect()
+}
+
 pub(super) fn claimed_pairs(reading: Option<&Reading>) -> Vec<(i64, i64)> {
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     for claimed in reading
@@ -773,6 +790,41 @@ mod tests {
             read(&plan, Some(&reading(42)), far, Bound::DEFAULT).unowned_bytes(),
             json!(10)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Objective 220: a walk over its bound keeps the previous figure, and
+    /// of the previous claimed folders only those still a real directory:
+    /// one removed since and one now a symlink are left out.
+    #[test]
+    fn a_kept_reading_leaves_out_a_claimed_folder_removed_since() {
+        let root = crate::storage::tests::scratch("unowned_kept_claims");
+        for n in 0..10 {
+            let entry = root.join(format!("e{n}"));
+            std::fs::create_dir_all(&entry).expect("mkdir");
+            std::fs::write(entry.join("f"), b"x").expect("write");
+        }
+        let here = root.join("e0");
+        let removed = root.join("removed");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&here, &link).expect("symlink");
+        let mut previous = reading(42);
+        previous.claimed = [&here, &removed, &link]
+            .iter()
+            .map(|path| claimed(&path.display().to_string(), "rev-j", "4/220"))
+            .collect();
+        let plan = Plan {
+            roots: vec![root.clone()],
+            ..Plan::default()
+        };
+        let tight = Bound {
+            entries: 3,
+            time: Duration::from_secs(5),
+        };
+        let kept = read(&plan, Some(&previous), 0, tight);
+        assert_eq!(kept.unowned_bytes(), json!(42), "the previous figure");
+        let paths: Vec<&PathBuf> = kept.claimed.iter().map(|folder| &folder.path).collect();
+        assert_eq!(paths, [&here], "here only");
         let _ = std::fs::remove_dir_all(&root);
     }
 
