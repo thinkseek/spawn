@@ -150,7 +150,14 @@ fn an_open_alert_is_updated_in_place_and_nothing_else_is() {
     let row = alert(&mut client, "memory_low:1");
     assert_eq!(row["text"], "MemAvailable is 900 MiB, under 4096");
     assert_eq!(row["evidence"], json!({"old": 2, "fired_old": 1}));
-    for field in ["state", "fired_event_id", "fired_at_ms", "verdict", "kind", "subject"] {
+    for field in [
+        "state",
+        "fired_event_id",
+        "fired_at_ms",
+        "verdict",
+        "kind",
+        "subject",
+    ] {
         assert_eq!(row[field], before[field], "{field} unchanged");
     }
     assert_eq!(row["fired_event_id"], fired_id);
@@ -169,10 +176,19 @@ fn an_open_alert_is_updated_in_place_and_nothing_else_is() {
             "another kind",
         ),
         (
-            updated("memory_low:1", "memory_low", "elsewhere", "other subject", 3),
+            updated(
+                "memory_low:1",
+                "memory_low",
+                "elsewhere",
+                "other subject",
+                3,
+            ),
             "another subject",
         ),
-        (updated("memory_low:1", "memory_low", "host", " ", 3), "no text"),
+        (
+            updated("memory_low:1", "memory_low", "host", " ", 3),
+            "no text",
+        ),
         (
             json!({"type": "alert.updated", "key": "memory_low:1", "kind": "memory_low",
                    "subject": "host", "evidence": {"old": 3}}),
