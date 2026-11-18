@@ -6,6 +6,11 @@
 //! closed. The fold `mission_retired_objectives` feeds the board's
 //! `retired`, the RSI page's and `OBJECTIVE_LANDINGS`' retired rows.
 //!
+//! Every retirement names its kind (objective 223): on-main, renumbered or
+//! obsolete. on-main is recorded only when an accepted gate of a landed
+//! task of the mission saw the objective's scenario pass, with no gate since
+//! finding it red on main.
+//!
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`); every case runs
 //! in a schema of its own.
 
@@ -135,18 +140,10 @@ fn red_since(mission: i64, objective: i64, scenario: &str, task: i64, base: &str
     )
 }
 
-/// Each refusal, one at a time, records nothing; an objective of a mission
-/// with a backlog, cancelled only or never assigned (not in any backlog
-/// file: the store does not read the files), is retired with the owner's
-/// caller, and retiring it again is refused.
-#[test]
-fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
-    let (store, schema) = store("objective_retire_refusals");
-    let mut client = admin(&schema);
-    world(&mut client);
-
+/// Each refusal of [`world`] with the text it holds.
+fn refusals() -> Vec<(Value, String)> {
     let none_shown = no_record(1, 6, "006.sh");
-    for (record, why) in [
+    [
         (retire(1, 2, "lead", "obsolete"), "has a task in flight"),
         (retire(1, 3, "lead", "obsolete"), "a task of it landed"),
         (retire(1, 4, "lead", "obsolete"), "solved on the base"),
@@ -216,8 +213,24 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
             retire_as("on-main", 1, 3, "lead", "on main"),
             "a task of it landed",
         ),
-    ] {
-        refused(&store, &mut client, &record, why);
+    ]
+    .into_iter()
+    .map(|(record, why)| (record, why.to_string()))
+    .collect()
+}
+
+/// Each refusal, one at a time, records nothing; an objective of a mission
+/// with a backlog, cancelled only or never assigned (not in any backlog
+/// file: the store does not read the files), is retired with the owner's
+/// caller, and retiring it again is refused.
+#[test]
+fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
+    let (store, schema) = store("objective_retire_refusals");
+    let mut client = admin(&schema);
+    world(&mut client);
+
+    for (record, why) in refusals() {
+        refused(&store, &mut client, &record, &why);
     }
     assert_eq!((recorded(&mut client), rows(&mut client)), (0, 0));
 
@@ -452,72 +465,93 @@ fn on_main_needs_a_landed_gate_that_saw_the_scenario_pass() {
     let mut client = admin(&schema);
     world(&mut client);
     mission(&mut client, 3, true);
-    let base = |c: char| c.to_string().repeat(40);
+    shows_nothing(&store, &mut client);
+    shows_it(&store, &mut client);
+    red_since_the_pass(&store, &mut client);
 
+    // renumbered and obsolete need no record.
+    for (kind, objective) in [("renumbered", 20), ("obsolete", 21)] {
+        store
+            .objective_retire(&retire_as(kind, 1, objective, "lead", "no record"))
+            .expect(kind);
+    }
+    assert_eq!(rows(&mut client), 8);
+}
+
+/// A base commit of `c`s.
+fn base(c: char) -> String {
+    c.to_string().repeat(40)
+}
+
+/// Mission 1's gates that show nothing for 009.sh.
+fn shows_nothing(store: &PostgresStore, client: &mut Client) {
     // Shows nothing: a rejected gate's pass on a task that then landed
     // through another gate (10); an accepted gate of a task that never
     // landed (11); another mission's landed gate (12); names that only
     // look like 009.sh, and 009.sh among the gate's scenario_names (13).
-    assigned(&mut client, 10, 1, 101);
+    assigned(client, 10, 1, 101);
     gated(
-        &mut client,
+        client,
         10,
         "rejected",
         &base('1'),
         &json!({"passed": ["009.sh"]}),
     );
     gated(
-        &mut client,
+        client,
         10,
         "accepted",
         &base('1'),
         &json!({"passed": ["001.sh"]}),
     );
-    landed(&mut client, 10);
-    assigned(&mut client, 11, 1, 102);
+    landed(client, 10);
+    assigned(client, 11, 1, 102);
     gated(
-        &mut client,
+        client,
         11,
         "accepted",
         &base('1'),
         &json!({"passed": ["009.sh"]}),
     );
-    assigned(&mut client, 12, 3, 1);
+    assigned(client, 12, 3, 1);
     gated(
-        &mut client,
+        client,
         12,
         "accepted",
         &base('1'),
         &json!({"passed": ["009.sh"]}),
     );
-    landed(&mut client, 12);
-    assigned(&mut client, 13, 1, 103);
+    landed(client, 12);
+    assigned(client, 13, 1, 103);
     gated(
-        &mut client,
+        client,
         13,
         "accepted",
         &base('1'),
         &json!({"passed": ["1009.sh", "9.sh", "0009.sh"], "scenario_names": ["009.sh"]}),
     );
-    landed(&mut client, 13);
-    let before = (recorded(&mut client), rows(&mut client));
-    let error = on_main(&store, 9).expect_err("shows nothing");
+    landed(client, 13);
+    let before = (recorded(client), rows(client));
+    let error = on_main(store, 9).expect_err("shows nothing");
     assert!(error.contains(&no_record(1, 9, "009.sh")), "{error}");
-    assert_eq!((recorded(&mut client), rows(&mut client)), before);
+    assert_eq!((recorded(client), rows(client)), before);
+}
 
+/// Gates that show it: passed and reused, 1234.sh, a red before the pass.
+fn shows_it(store: &PostgresStore, client: &mut Client) {
     // Shows it: a red before the pass (15 on 011.sh), then 14's pass of
     // 009.sh, 1234.sh, 011.sh, 015.sh and 017.sh and reuse of 010.sh.
-    assigned(&mut client, 15, 1, 105);
+    assigned(client, 15, 1, 105);
     gated(
-        &mut client,
+        client,
         15,
         "rejected",
         &base('2'),
         &json!({"main_red_scenarios": ["011.sh"]}),
     );
-    assigned(&mut client, 14, 1, 104);
+    assigned(client, 14, 1, 104);
     gated(
-        &mut client,
+        client,
         14,
         "accepted",
         &base('3'),
@@ -525,14 +559,14 @@ fn on_main_needs_a_landed_gate_that_saw_the_scenario_pass() {
                 "reused": ["010.sh"]}),
     );
     assert!(
-        on_main(&store, 10)
+        on_main(store, 10)
             .expect_err("not landed yet")
             .contains(&no_record(1, 10, "010.sh")),
         "an accepted gate of a task not landed"
     );
-    landed(&mut client, 14);
+    landed(client, 14);
     for objective in [9, 1234, 10, 11] {
-        on_main(&store, objective).unwrap_or_else(|error| panic!("{objective}: {error}"));
+        on_main(store, objective).unwrap_or_else(|error| panic!("{objective}: {error}"));
     }
     let kinds: Vec<(i32, String)> = client
         .query(
@@ -552,20 +586,23 @@ fn on_main_needs_a_landed_gate_that_saw_the_scenario_pass() {
         kinds,
         [9, 1234, 10, 11].map(|objective| (objective, "on-main".to_string()))
     );
+}
 
+/// A red after the pass, and a pass again after the red.
+fn red_since_the_pass(store: &PostgresStore, client: &mut Client) {
     // A red after the pass (16 on 015.sh and 017.sh): the second text,
     // naming the first red gate after it and its base.
-    assigned(&mut client, 16, 1, 106);
+    assigned(client, 16, 1, 106);
     gated(
-        &mut client,
+        client,
         16,
         "rejected",
         &base('4'),
         &json!({"main_red_scenarios": ["015.sh", "017.sh"]}),
     );
-    assigned(&mut client, 18, 1, 108);
+    assigned(client, 18, 1, 108);
     gated(
-        &mut client,
+        client,
         18,
         "rejected",
         &base('5'),
@@ -573,7 +610,7 @@ fn on_main_needs_a_landed_gate_that_saw_the_scenario_pass() {
     );
     for objective in [15, 17] {
         let scenario = format!("0{objective}.sh");
-        let error = on_main(&store, objective).expect_err("red since");
+        let error = on_main(store, objective).expect_err("red since");
         assert!(
             error.contains(&red_since(1, objective, &scenario, 16, &base('4'))),
             "{error}"
@@ -581,30 +618,22 @@ fn on_main_needs_a_landed_gate_that_saw_the_scenario_pass() {
     }
     // (R3) a pass, a red, then a pass again: shown. (R4) one gate naming
     // 016.sh both passed and red on main: its red is not after its pass.
-    assigned(&mut client, 17, 1, 107);
+    assigned(client, 17, 1, 107);
     gated(
-        &mut client,
+        client,
         17,
         "accepted",
         &base('6'),
         &json!({"passed": ["015.sh", "016.sh"], "main_red_scenarios": ["016.sh"]}),
     );
-    landed(&mut client, 17);
-    on_main(&store, 15).expect("passed again");
-    on_main(&store, 16).expect("repaired in one gate");
-    let error = on_main(&store, 17).expect_err("still red");
+    landed(client, 17);
+    on_main(store, 15).expect("passed again");
+    on_main(store, 16).expect("repaired in one gate");
+    let error = on_main(store, 17).expect_err("still red");
     assert!(
         error.contains(&red_since(1, 17, "017.sh", 16, &base('4'))),
         "{error}"
     );
-
-    // renumbered and obsolete need no record.
-    for (kind, objective) in [("renumbered", 20), ("obsolete", 21)] {
-        store
-            .objective_retire(&retire_as(kind, 1, objective, "lead", "no record"))
-            .expect(kind);
-    }
-    assert_eq!(rows(&mut client), 8);
 }
 
 /// Objective 223 (R2): an on-main retire reads the gates before the append
