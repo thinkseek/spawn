@@ -269,7 +269,11 @@ read_api() { # <path> <file>
     [ "$code" = 200 ] || harness "GET $1 answered $code: $(head -c 300 "$2")"
 }
 start_serve() {
-    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >"$WORK/serve.log" 2>&1 &
+    # Emptied here, in the scenario's shell: a redirect in the background
+    # serve truncates only in the child process, so the port read below
+    # could still see the last serve's port (the 155.sh pattern).
+    : >"$WORK/serve.log" || harness "cannot empty serve.log"
+    "$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" >>"$WORK/serve.log" 2>&1 &
     serve_pid=$!
     port=""
     i=0
