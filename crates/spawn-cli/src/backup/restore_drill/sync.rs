@@ -468,4 +468,5 @@ pub(super) fn compare(restored: &Restored, live: &Path, start_ms: i64) -> Compar
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+__TESTS__}
