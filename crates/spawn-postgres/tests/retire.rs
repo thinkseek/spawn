@@ -14,7 +14,7 @@
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`); every case runs
 //! in a schema of its own.
 
-use postgres::Client;
+use postgres::{Client, Transaction};
 use serde_json::{Value, json};
 use spawn_postgres::{PostgresStore, role_url};
 
@@ -643,6 +643,9 @@ fn red_since_the_pass(store: &PostgresStore, client: &mut Client) {
 #[test]
 fn on_main_reads_the_gates_recorded_while_it_waits_for_the_lock() {
     let (_store, schema) = store("objective_retire_waits");
+    let waits = |objective: i64, meanwhile: &dyn Fn(&mut Transaction)| {
+        retire_while_held(&schema, objective, meanwhile)
+    };
     let mut client = admin(&schema);
     world(&mut client);
     mission(&mut client, 3, true);
@@ -670,71 +673,13 @@ fn on_main_reads_the_gates_recorded_while_it_waits_for_the_lock() {
     assigned(&mut client, 23, 3, 1);
     assigned(&mut client, 24, 1, 124);
 
-    // While the lock is held: `meanwhile` records what it records, after
-    // the retire of `objective` waits on the lock.
-    let waits = |objective: i64, meanwhile: &dyn Fn(&mut postgres::Transaction)| {
-        let mut holder = admin(&schema);
-        let mut hold = holder.transaction().expect("a transaction");
-        hold.execute("select pg_advisory_xact_lock(1399957335)", &[])
-            .expect("the append lock");
-        let mut retirer = admin(&schema);
-        let pid: i32 = retirer
-            .query_one("select pg_backend_pid()", &[])
-            .expect("its pid")
-            .get(0);
-        let record = retire_as("on-main", 1, objective, "lead", "on main");
-        let retiring = std::thread::spawn(move || {
-            retirer
-                .query_one("select spawn_objective_retire($1)", &[&record])
-                .map(|row| row.get::<_, i64>(0))
-                .map_err(|error| {
-                    error
-                        .as_db_error()
-                        .map_or_else(|| error.to_string(), |db| db.message().to_string())
-                })
-        });
-        let mut watcher = admin(&schema);
-        let started = std::time::Instant::now();
-        while !watcher
-            .query_one(
-                "select exists (select 1 from pg_locks
-                                 where pid = $1 and locktype = 'advisory' and not granted)",
-                &[&pid],
-            )
-            .expect("its locks")
-            .get::<_, bool>(0)
-        {
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(30),
-                "the retire of {objective} never waited on the lock"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        meanwhile(&mut hold);
-        hold.commit().expect("commit");
-        retiring.join().expect("the retire's thread")
-    };
-    let record = |hold: &mut postgres::Transaction, record: Value| {
-        hold.query_one("select spawn_control_record($1)", &[&record])
-            .expect("a control record");
-    };
-    let land = |task: i64| json!({"type": "task.landed", "id": task, "from": "a".repeat(40), "to": "b".repeat(40)});
-    let gate = |task: i64, verdict: &str, extra: Value| {
-        let mut gate = json!({"type": "task.gated", "id": task, "verdict": verdict,
-                              "base": "f".repeat(40)});
-        if let (Some(gate), Some(extra)) = (gate.as_object_mut(), extra.as_object()) {
-            gate.extend(extra.clone());
-        }
-        gate
-    };
-
     // The landing of a task whose gate the retire had read.
-    waits(30, &|hold| record(hold, land(20))).expect("the landing counts");
+    waits(30, &|hold| record(hold, &land(20))).expect("the landing counts");
     // A red on main since.
     let error = waits(31, &|hold| {
         record(
             hold,
-            gate(22, "rejected", json!({"main_red_scenarios": ["031.sh"]})),
+            &gate(22, "rejected", &json!({"main_red_scenarios": ["031.sh"]})),
         );
     })
     .expect_err("the red counts");
@@ -745,16 +690,86 @@ fn on_main_reads_the_gates_recorded_while_it_waits_for_the_lock() {
     // (R4) a passing gate of a task that lands, the first record after the
     // retire's read.
     waits(32, &|hold| {
-        record(hold, gate(24, "accepted", json!({"passed": ["032.sh"]})));
-        record(hold, land(24));
+        record(hold, &gate(24, "accepted", &json!({"passed": ["032.sh"]})));
+        record(hold, &land(24));
     })
     .expect("the gate and the landing count");
     // Another mission's landed gate shows nothing.
     let error = waits(33, &|hold| {
-        record(hold, gate(23, "accepted", json!({"passed": ["033.sh"]})));
-        record(hold, land(23));
+        record(hold, &gate(23, "accepted", &json!({"passed": ["033.sh"]})));
+        record(hold, &land(23));
     })
     .expect_err("another mission's");
     assert!(error.contains(&no_record(1, 33, "033.sh")), "{error}");
     assert_eq!(rows(&mut client), 2);
+}
+
+/// The retire of mission 1's `objective` as on-main while another
+/// connection holds the append lock: `meanwhile` records what it records
+/// once the retire waits on the lock, then the holder commits.
+fn retire_while_held(
+    schema: &str,
+    objective: i64,
+    meanwhile: &dyn Fn(&mut Transaction),
+) -> Result<i64, String> {
+    let mut holder = admin(schema);
+    let mut hold = holder.transaction().expect("a transaction");
+    hold.execute("select pg_advisory_xact_lock(1399957335)", &[])
+        .expect("the append lock");
+    let mut retirer = admin(schema);
+    let pid: i32 = retirer
+        .query_one("select pg_backend_pid()", &[])
+        .expect("its pid")
+        .get(0);
+    let record = retire_as("on-main", 1, objective, "lead", "on main");
+    let retiring = std::thread::spawn(move || {
+        retirer
+            .query_one("select spawn_objective_retire($1)", &[&record])
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(|error| {
+                error
+                    .as_db_error()
+                    .map_or_else(|| error.to_string(), |db| db.message().to_string())
+            })
+    });
+    let mut watcher = admin(schema);
+    let started = std::time::Instant::now();
+    while !watcher
+        .query_one(
+            "select exists (select 1 from pg_locks
+                             where pid = $1 and locktype = 'advisory' and not granted)",
+            &[&pid],
+        )
+        .expect("its locks")
+        .get::<_, bool>(0)
+    {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the retire of {objective} never waited on the lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    meanwhile(&mut hold);
+    hold.commit().expect("commit");
+    retiring.join().expect("the retire's thread")
+}
+
+/// A control record in the holder's transaction.
+fn record(hold: &mut Transaction, record: &Value) {
+    hold.query_one("select spawn_control_record($1)", &[record])
+        .expect("a control record");
+}
+
+fn land(task: i64) -> Value {
+    json!({"type": "task.landed", "id": task, "from": "a".repeat(40), "to": "b".repeat(40)})
+}
+
+/// A gate's verdict on `task` with `extra`, on base `f…`.
+fn gate(task: i64, verdict: &str, extra: &Value) -> Value {
+    let mut gate = json!({"type": "task.gated", "id": task, "verdict": verdict,
+                          "base": "f".repeat(40)});
+    if let (Some(gate), Some(extra)) = (gate.as_object_mut(), extra.as_object()) {
+        gate.extend(extra.clone());
+    }
+    gate
 }
