@@ -675,7 +675,10 @@ unit_run() {
     ur_exec=$(sed -n 's/^ExecStart=//p' "$ur_file" | head -n 1 | sed "s#%h#$HOME#g")
     ur_envfile=$(sed -n 's/^EnvironmentFile=//p' "$ur_file" | head -n 1 | sed "s#%h#$HOME#g")
     [ -n "$ur_exec" ] && [ -n "$ur_envfile" ] || return 3
-    sed -n 's/^Environment=//p' "$ur_file" | sed "s#%h#$HOME#g" >"$WORK/unit.environment"
+    # The bundle unit's notes folder (objective 216) is the live one: left
+    # out here, as nothing live is read; 216.sh runs it on a scratch folder.
+    sed -n 's/^Environment=//p' "$ur_file" | sed "s#%h#$HOME#g" |
+        sed '/^SPAWN_BACKUP_SYNC_DIR=/d' >"$WORK/unit.environment"
     (
         for ur_name in $(env | sed -n 's/^\(SPAWN_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(PG[A-Z]*\)=.*/\1/p'); do
             unset "$ur_name"
