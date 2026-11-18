@@ -3686,7 +3686,7 @@ times in a row)",
         let text = format!(
             "{old} landed {objectives} unverified for over {span}: spawn verify list names {them}"
         );
-        let mut evidence = json!({
+        let evidence = json!({
             "old": old, "unverified": unverified, "unverified_ms": bound,
             "newest_landed_ms": newest, "listed_since_ms": crate::verify::LISTED_SINCE_MS,
             "reading_ms": now,
@@ -4123,6 +4123,54 @@ times in a row)",
         }
     }
 
+    /// The record `event` writes, or none when it writes nothing: a fire
+    /// already known, a clear that clears nothing ([`Self::clears`]), an
+    /// update of an alert not open.
+    fn record_of(&self, event: &Event, now: i64) -> Option<Value> {
+        let key = event.key().to_string();
+        Some(match event {
+            Event::Fire {
+                kind,
+                subject,
+                evidence,
+                text,
+                notice,
+                ..
+            } => {
+                if self.known.contains_key(&key) {
+                    return None;
+                }
+                json!({
+                    "type": "alert.fired", "key": key, "kind": kind,
+                    "subject": subject, "evidence": scrub_value(evidence),
+                    "text": text, "notice": notice,
+                })
+            }
+            Event::Clear { evidence, .. } => {
+                if !self.clears(&key, evidence, now) {
+                    return None;
+                }
+                let Some(row) = self.known.get(&key) else {
+                    return None;
+                };
+                json!({
+                    "type": "alert.cleared", "key": key, "kind": row.kind,
+                    "subject": row.subject, "evidence": scrub_value(evidence),
+                })
+            }
+            Event::Update { evidence, text, .. } => {
+                let Some(row) = self.known.get(&key).filter(|row| row.open()) else {
+                    return None;
+                };
+                json!({
+                    "type": "alert.updated", "key": key, "kind": row.kind,
+                    "subject": row.subject, "text": text,
+                    "evidence": scrub_value(evidence),
+                })
+            }
+        })
+    }
+
     /// Record `events`, in order, each once: the store refuses a second
     /// `alert.fired` for a key, so two loops at once still fire once.
     fn flush(
@@ -4134,46 +4182,8 @@ times in a row)",
     ) {
         for event in events {
             let key = event.key().to_string();
-            let record = match event {
-                Event::Fire {
-                    kind,
-                    subject,
-                    evidence,
-                    text,
-                    notice,
-                    ..
-                } => {
-                    if self.known.contains_key(&key) {
-                        continue;
-                    }
-                    json!({
-                        "type": "alert.fired", "key": key, "kind": kind,
-                        "subject": subject, "evidence": scrub_value(evidence),
-                        "text": text, "notice": notice,
-                    })
-                }
-                Event::Clear { evidence, .. } => {
-                    if !self.clears(&key, evidence, now) {
-                        continue;
-                    }
-                    let Some(row) = self.known.get(&key) else {
-                        continue;
-                    };
-                    json!({
-                        "type": "alert.cleared", "key": key, "kind": row.kind,
-                        "subject": row.subject, "evidence": scrub_value(evidence),
-                    })
-                }
-                Event::Update { evidence, text, .. } => {
-                    let Some(row) = self.known.get(&key).filter(|row| row.open()) else {
-                        continue;
-                    };
-                    json!({
-                        "type": "alert.updated", "key": key, "kind": row.kind,
-                        "subject": row.subject, "text": text,
-                        "evidence": scrub_value(evidence),
-                    })
-                }
+            let Some(record) = self.record_of(event, now) else {
+                continue;
             };
             match store.alert_record(&record) {
                 Ok(id) => {
