@@ -2891,7 +2891,7 @@ begin
         null;
     when 'backup.dumped', 'backup.bundled', 'backup.verified', 'backup.stored',
          'backup.drilled.transcripts', 'backup.drilled.missions',
-         'backup.drilled.controllers' then
+         'backup.drilled.controllers', 'backup.drilled.sync' then
         -- What `spawn backup` did (crate backup.rs; `backup.stored`: a
         -- `spawn store put` run, its manifest's key): read from the log by the
         -- next run, folded into no table. What a copy holds is in its record
@@ -5627,7 +5627,7 @@ begin
     if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified',
                                    'backup.stored', 'backup.drilled.transcripts',
                                    'backup.drilled.missions',
-                                   'backup.drilled.controllers') then
+                                   'backup.drilled.controllers', 'backup.drilled.sync') then
         raise exception 'not a backup record: %', p_record ->> 'type';
     end if;
     -- A `spawn store put` run (crate backup/store.rs): its shape is fixed,
@@ -5664,7 +5664,10 @@ begin
     -- A restore drill's verdict on one resource (`spawn backup
     -- restore-drill`, objective 104): its shape is fixed, every field
     -- checked, and nothing else is taken.
-    if p_record ->> 'type' in ('backup.drilled.transcripts', 'backup.drilled.missions') then
+    -- The notes folder's drill (objective 217, `--only sync`) has the same
+    -- shape.
+    if p_record ->> 'type' in ('backup.drilled.transcripts', 'backup.drilled.missions',
+                               'backup.drilled.sync') then
         if exists (select 1 from jsonb_object_keys(p_record) k
                     where k not in ('type', 'ok', 'reason', 'bundle', 'bundle_event_id',
                                     'mismatches', 'duration_ms')) then
@@ -5745,7 +5748,7 @@ begin
         end if;
     end if;
     if p_record ->> 'type' in ('backup.drilled.transcripts', 'backup.drilled.missions',
-                               'backup.drilled.controllers') then
+                               'backup.drilled.controllers', 'backup.drilled.sync') then
         if jsonb_typeof(p_record -> 'ok') is distinct from 'boolean'
            or jsonb_typeof(p_record -> 'reason') is distinct from 'string'
            or length(p_record ->> 'reason') > 500
