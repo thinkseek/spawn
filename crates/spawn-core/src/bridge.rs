@@ -571,7 +571,7 @@ fn archive_reason(reason: &str) -> String {
 }
 
 /// What a pass wants the log told of a transcript's archive state.
-enum Wanted {
+enum ArchiveWanted {
     /// Nothing new: a first stale mask, or a transcript gone whose failure is
     /// already told or waiting to be.
     Nothing,
@@ -580,19 +580,19 @@ enum Wanted {
 }
 
 /// What `pass` wants the log told, given what it was told (`entry`).
-fn wanted_archive_state(entry: &mut ArchiveEvents, pass: &Pass) -> Wanted {
+fn wanted_archive_state(entry: &mut ArchiveEvents, pass: &Pass) -> ArchiveWanted {
     match pass {
         Pass::Copied(_) => {
             entry.stale = false;
-            Wanted::State(None)
+            ArchiveWanted::State(None)
         }
         Pass::Failed(reason) if reason == transcripts::MASK_CHANGED && !entry.stale => {
             entry.stale = true;
-            Wanted::Nothing
+            ArchiveWanted::Nothing
         }
         Pass::Failed(reason) => {
             entry.stale = reason == transcripts::MASK_CHANGED;
-            Wanted::State(Some(archive_reason(reason)))
+            ArchiveWanted::State(Some(archive_reason(reason)))
         }
         Pass::Gone => {
             entry.stale = false;
@@ -603,9 +603,9 @@ fn wanted_archive_state(entry: &mut ArchiveEvents, pass: &Pass) -> Wanted {
             let told = entry.failed.is_some()
                 || entry.pending.as_ref().is_some_and(|p| p.failed.is_some());
             if told {
-                Wanted::Nothing
+                ArchiveWanted::Nothing
             } else {
-                Wanted::State(Some(ARCHIVE_GONE.to_string()))
+                ArchiveWanted::State(Some(ARCHIVE_GONE.to_string()))
             }
         }
     }
@@ -3864,7 +3864,7 @@ impl Bridge {
         let entry = events
             .entry((agent_id.clone(), native.to_string()))
             .or_default();
-        if let Wanted::State(wanted) = wanted_archive_state(entry, pass) {
+        if let ArchiveWanted::State(wanted) = wanted_archive_state(entry, pass) {
             if wanted == entry.failed {
                 entry.pending = None;
             } else if entry
