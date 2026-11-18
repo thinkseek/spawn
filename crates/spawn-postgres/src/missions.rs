@@ -1539,6 +1539,16 @@ select (select jsonb_build_object(
 /// contend for it.
 pub(crate) const INTEGRATOR_LOCK_KEY: i32 = 1_399_957_336;
 
+/// The integrator's lock as `pg_locks` has it on this store: the two-key
+/// form, `$1` and the schema's `hashtext`, in this database.
+const INTEGRATOR_LOCK_ROWS: &str = r"
+  from pg_locks l
+ where l.locktype = 'advisory' and l.granted
+   and l.database = (select d.oid from pg_database d where d.datname = current_database())
+   and l.classid = $1::int4::oid
+   and l.objid = hashtext(current_schema())::oid
+   and l.objsubid = 2";
+
 /// Tool calls a session started after a moment. `$1` session, `$2` ms.
 pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
                   where session_id = $1 and event_name = 'tool.started' and recorded_at_ms > $2";
@@ -1972,6 +1982,53 @@ impl PostgresStore {
                 &[&INTEGRATOR_LOCK_KEY],
             )?
             .get("held"))
+    }
+
+    /// Take the integrator's lock on this connection, named `name` first
+    /// (`application_name`, objective 221: "spawn integrate pid=<pid>"), so
+    /// a refused integrator can say who holds it. False means another
+    /// connection holds it.
+    pub fn integrator_lock(&self, name: &str) -> Result<bool, StoreError> {
+        self.execute(
+            "select set_config('application_name', $1, false)",
+            &[&name],
+        )?;
+        self.integrator_try_lock()
+    }
+
+    /// This connection's server pid (`pg_backend_pid()`).
+    pub fn backend_pid(&self) -> Result<i32, StoreError> {
+        Ok(self.query_one("select pg_backend_pid()", &[])?.get(0))
+    }
+
+    /// Who holds the integrator's lock now, read once (objective 221):
+    /// `{pid, name, connected_ms}` (the server pid, the connection's
+    /// `application_name`, when it connected), or `None` when it is free.
+    pub fn integrator_lock_holder(&self) -> Result<Option<Value>, StoreError> {
+        let sql = format!(
+            "select jsonb_build_object(
+                 'pid', l.pid, 'name', coalesce(a.application_name, ''),
+                 'connected_ms', (extract(epoch from a.backend_start) * 1000)::bigint)
+             {INTEGRATOR_LOCK_ROWS}
+               and true
+             limit 1"
+        )
+        .replace(
+            "from pg_locks l",
+            "from pg_locks l left join pg_stat_activity a on a.pid = l.pid",
+        );
+        Ok(self
+            .query_opt(&sql, &[&INTEGRATOR_LOCK_KEY])?
+            .map(|row| row.get::<_, Value>(0)))
+    }
+
+    /// Whether this connection holds the integrator's lock, read once
+    /// (after a pass that failed, objective 221).
+    pub fn integrator_holds_lock(&self) -> Result<bool, StoreError> {
+        let sql = format!(
+            "select exists (select 1 {INTEGRATOR_LOCK_ROWS} and l.pid = pg_backend_pid())"
+        );
+        Ok(self.query_one(&sql, &[&INTEGRATOR_LOCK_KEY])?.get(0))
     }
 
     /// Hold `task`'s landing for its compare-and-swap push (owner only):
