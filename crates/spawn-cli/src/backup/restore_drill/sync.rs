@@ -481,7 +481,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::super::super::{BundleRecord, hex};
-    use super::{Compared, NoteFile, Restored, bytes, compare, members, no_part, restore};
+    use super::{NoteFile, Restored, bytes, compare, members, no_part, restore};
 
     /// A scratch folder, removed when the test ends.
     struct Scratch(PathBuf);
@@ -727,12 +727,11 @@ mod tests {
                 .line(&live)
                 .ends_with("1 the same, 1 changed since, 1 removed since, 1 made since, 1 skipped or changed while bundled, 3 mismatch(es)")
         );
-        assert!(
-            !compared.mismatches.iter().any(|line| line.contains("other")
-                && line.contains("bundled")
-                && line.contains("same")),
-            "no file content in a line"
-        );
+        for line in &compared.mismatches {
+            for content in ["other", "same", "a file where a link was"] {
+                assert!(!line.contains(&format!(" {content}\n")), "{line}");
+            }
+        }
     }
 
     /// A folder that cannot be read is one mismatch naming it; a live file
@@ -767,14 +766,17 @@ mod tests {
         }
         fs::set_permissions(live.join("a.md"), fs::Permissions::from_mode(0o644)).expect("chmod");
 
-        // Removed between the listing and the read: its bytes are gone.
+        // Removed between the listing and the read: its bytes are gone, so
+        // it reads as removed since, never as a mismatch.
         assert!(matches!(
             super::read_live(&live.join("c.md")),
             super::Live::Gone
         ));
-        let mut listed_only = Compared::default();
-        listed_only.removed += 1;
-        assert_eq!(listed_only.removed, 1);
+        std::os::unix::fs::symlink("b.md", live.join("d.md")).expect("symlink");
+        assert!(
+            matches!(super::read_live(&live.join("d.md")), super::Live::Gone),
+            "a symlink is never followed"
+        );
     }
 
     /// The listing takes the manifest and the notes part alone; the floor
