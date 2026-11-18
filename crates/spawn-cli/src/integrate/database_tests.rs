@@ -10117,14 +10117,25 @@ fn no_verdict_twice_at_the_500_char_boundary_is_refused() {
     }
 }
 
+/// A test's world, removed when the test ends.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// An integrator whose connections are made in `db`'s schema (objective
-/// 221: `pass` takes and keeps the lock on a connection of its own).
-fn locking_integrator(db: &Db, tag: &str) -> Integrator {
-    let (_, _, _, integrator) = world(tag, "exit 0\n");
+/// 221: `pass` takes and keeps the lock on a connection of its own), and
+/// its world, removed when dropped.
+fn locking_integrator(db: &Db, tag: &str) -> (Integrator, Gone) {
+    let (base, _, _, integrator) = world(tag, "exit 0\n");
     let (url, schema) = (db.url.clone(), db.schema.name().to_string());
-    integrator.with_connect(Box::new(move || {
+    let integrator = integrator.with_connect(Box::new(move || {
         PostgresStore::connect_in_schema(&url, &schema).map_err(|error| error.to_string())
-    }))
+    }));
+    (integrator, Gone(base))
 }
 
 /// A connection in `db`'s schema.
@@ -10139,8 +10150,8 @@ fn connection(db: &Db) -> PostgresStore {
 #[test]
 fn a_second_integrator_is_refused_while_the_first_is_idle() {
     let db = Db::new("lock_idle");
-    let first = locking_integrator(&db, "lock-idle-a");
-    let second = locking_integrator(&db, "lock-idle-b");
+    let (first, _first_world) = locking_integrator(&db, "lock-idle-a");
+    let (second, _second_world) = locking_integrator(&db, "lock-idle-b");
     first.pass().expect("the first pass");
     assert!(first.held.borrow().is_some(), "the lock is kept while idle");
     first.pass().expect("an idle pass");
@@ -10212,7 +10223,7 @@ fn a_start_takes_a_lock_freed_within_its_wait() {
 #[test]
 fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
     let db = Db::new("lock_lost");
-    let integrator = locking_integrator(&db, "lock-lost");
+    let (integrator, _world) = locking_integrator(&db, "lock-lost");
     let end = |pid: i32| {
         db.admin()
             .execute("select pg_terminate_backend($1)", &[&pid])
