@@ -354,4 +354,201 @@ mod tests {
         with_disk(&mut storage, &json!([sample(first, &json!(80 * GIB))]), now);
         assert_eq!(storage["days_left_measuring_since_ms"], first + D);
     }
+
+    #[test]
+    fn the_days_fall_is_from_the_latest_sample_a_day_old_not_the_oldest() {
+        let samples = json!([
+            sample(NOW - 35 * H, &json!(500 * GIB)),
+            sample(NOW - 30 * H, &json!(400 * GIB)),
+            // The latest a day old: 100 GiB lost over the day.
+            sample(NOW - D, &json!(200 * GIB)),
+            // Under a day old: not taken.
+            sample(NOW - D + 1, &json!(900 * GIB)),
+            sample(NOW - H, &json!(105 * GIB)),
+        ]);
+        assert_eq!(
+            day_fall(&samples, Some(100 * GIB), NOW),
+            Some(i64::try_from(100 * GIB).expect("fits"))
+        );
+        // Scaled by the days between: 30 h old, 90 GiB lost.
+        let samples = json!([sample(NOW - 30 * H, &json!(190 * GIB))]);
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let scaled = ((90 * GIB) as f64 / 1.25).round() as i64;
+        assert_eq!(day_fall(&samples, Some(100 * GIB), NOW), Some(scaled));
+    }
+
+    #[test]
+    fn the_days_fall_takes_36_hours_exactly_and_nothing_older() {
+        let taken = json!([sample(NOW - 36 * H, &json!(250))]);
+        assert_eq!(
+            day_fall(&taken, Some(100), NOW),
+            Some(100),
+            "150 over 1.5 days"
+        );
+        let older = json!([sample(NOW - 36 * H - 1, &json!(250))]);
+        assert_eq!(
+            day_fall(&older, Some(100), NOW),
+            None,
+            "a millisecond older"
+        );
+    }
+
+    #[test]
+    fn the_days_fall_takes_no_sample_under_a_day_old() {
+        let samples = json!([
+            sample(NOW - D + 1, &json!(250)),
+            sample(NOW - H, &json!(200)),
+        ]);
+        assert_eq!(day_fall(&samples, Some(100), NOW), None);
+    }
+
+    #[test]
+    fn the_days_fall_is_none_without_a_sample_or_a_free_disk_now() {
+        let samples = json!([sample(NOW - D, &json!(200))]);
+        assert_eq!(day_fall(&samples, None, NOW), None, "no free disk now");
+        assert_eq!(day_fall(&json!([]), Some(100), NOW), None, "no sample");
+        // A sample without a number for the free disk is no sample.
+        let without = json!([
+            sample(NOW - D, &Value::Null),
+            json!({"at_ms": NOW - D - H, "values": {"storage.days_left": 4}}),
+        ]);
+        assert_eq!(day_fall(&without, Some(100), NOW), None);
+    }
+
+    #[test]
+    fn a_day_that_gained_falls_below_zero() {
+        let samples = json!([sample(NOW - D, &json!(100))]);
+        assert_eq!(day_fall(&samples, Some(130), NOW), Some(-30));
+    }
+
+    #[test]
+    fn the_worse_of_the_fit_and_the_day_with_its_basis() {
+        assert_eq!(
+            worse(Some(10), Some(80)),
+            Some((80, "day")),
+            "the day larger"
+        );
+        assert_eq!(
+            worse(Some(80), Some(10)),
+            Some((80, "fit")),
+            "the fit larger"
+        );
+        assert_eq!(
+            worse(Some(40), Some(40)),
+            Some((40, "fit")),
+            "a tie is the fit's"
+        );
+        assert_eq!(
+            worse(Some(-5), Some(-20)),
+            Some((-5, "fit")),
+            "both gaining"
+        );
+        assert_eq!(
+            worse(Some(-20), Some(-5)),
+            Some((-5, "day")),
+            "both gaining"
+        );
+        assert_eq!(worse(Some(-3), None), Some((-3, "fit")), "the fit alone");
+        assert_eq!(worse(None, Some(-3)), Some((-3, "day")), "the day alone");
+        assert_eq!(worse(None, None), None);
+    }
+
+    /// The week of 2026-11-18: each UTC day's last sample (hourly, at
+    /// hh:54:59 UTC) and df's reading a day before now (179.0 GB at
+    /// 14:54:59 +08), now 101.9 GB at 14:55:50 +08. Bytes that round to
+    /// the GB said.
+    fn replay_of_2026_11_18(day_old_free: u64) -> (Value, i64) {
+        let last = 23 * H + 54 * 60_000 + 59_000;
+        let now = MIDNIGHT + 6 * H + 55 * 60_000 + 50_000;
+        let week: [u64; 6] = [
+            129_140_000_000,
+            61_630_000_000,
+            163_710_000_000,
+            158_590_000_000,
+            171_370_000_000,
+            144_946_804_614,
+        ];
+        let mut samples: Vec<Value> = (0_i64..)
+            .zip(week)
+            .map(|(day, free)| sample(MIDNIGHT - (6 - day) * D + last, &json!(free)))
+            .collect();
+        samples.push(sample(now - D - 51_000, &json!(day_old_free)));
+        samples.push(sample(
+            now - D + 59 * 60_000 + 9_000,
+            &json!(170_000_000_000_u64),
+        ));
+        (Value::Array(samples), now)
+    }
+
+    #[test]
+    fn the_replay_of_2026_11_18_says_the_days_fall() {
+        let free_now = 101_900_000_000_u64;
+        let (samples, now) = replay_of_2026_11_18(179_049_896_704);
+        let fit = fall(&readings(&samples, Some(free_now), now));
+        assert_eq!(fit, Some(-4_739_443_506), "the fit: gaining");
+        let day = day_fall(&samples, Some(free_now), now);
+        assert_eq!(day, Some(77_104_383_700), "the day: 77 GB lost");
+        let mut storage = json!({"free_bytes": free_now});
+        with_disk(&mut storage, &samples, now);
+        assert_eq!(storage["disk_fall_bytes_per_day"], 77_104_383_700_i64);
+        assert_eq!(storage["disk_fall_basis"], "day");
+        assert_eq!(storage["days_left"], 1);
+        assert_eq!(storage["days_left_measuring_since_ms"], Value::Null);
+
+        // The same week with a day that gained 10 GB: the fit's.
+        let (samples, now) = replay_of_2026_11_18(free_now - 10_000_000_000);
+        assert!(day_fall(&samples, Some(free_now), now).expect("a day") < 0);
+        let mut storage = json!({"free_bytes": free_now});
+        with_disk(&mut storage, &samples, now);
+        assert_eq!(storage["disk_fall_bytes_per_day"], -4_739_443_506_i64);
+        assert_eq!(storage["disk_fall_basis"], "fit");
+        assert_eq!(storage["days_left"], Value::Null, "gaining: no days");
+    }
+
+    #[test]
+    fn a_days_fall_with_no_fit_is_said() {
+        // Both samples yesterday's: the readings span under a day.
+        let samples = json!([
+            sample(NOW - D - 60_000, &json!(125 * GIB)),
+            sample(MIDNIGHT - 60_000, &json!(110 * GIB)),
+        ]);
+        let free = 100 * GIB;
+        assert_eq!(fall(&readings(&samples, Some(free), NOW)), None);
+        let mut storage = json!({"free_bytes": free});
+        with_disk(&mut storage, &samples, NOW);
+        let day = day_fall(&samples, Some(free), NOW).expect("a day");
+        assert!((day - 25 * i64::try_from(GIB).expect("fits")).abs() < 20_000_000);
+        assert_eq!(storage["disk_fall_bytes_per_day"], day);
+        assert_eq!(storage["disk_fall_basis"], "day");
+        assert_eq!(storage["days_left"], 4);
+        assert_eq!(storage["days_left_measuring_since_ms"], Value::Null);
+        assert_eq!(storage["grew_most"], Value::Null, "no fit: none");
+    }
+
+    #[test]
+    fn the_store_that_grew_most_is_judged_over_the_week_not_the_day() {
+        // A flat week at 100 GiB, then 20 GiB into the archive in the last
+        // day; the archive's growth over the week, a seventh of it.
+        let archive = 20 * GIB / 7;
+        let mut samples: Vec<Value> = (1..=6)
+            .map(|days| sample(MIDNIGHT - days * D + 12 * H, &json!(100 * GIB)))
+            .collect();
+        samples.push(sample(NOW - D, &json!(100 * GIB)));
+        let samples = Value::Array(samples);
+        let free = 80 * GIB;
+        let mut storage = json!({"free_bytes": free, "growth_parts": {"archive": archive}});
+        with_disk(&mut storage, &samples, NOW);
+        assert_eq!(storage["disk_fall_basis"], "day");
+        assert_eq!(storage["disk_fall_bytes_per_day"], 20 * GIB);
+        let fit = fall(&readings(&samples, Some(free), NOW)).expect("a fit");
+        let (store, grew) = grew_most(&storage["growth_parts"], Some(fit)).expect("a store");
+        assert_eq!(
+            storage["grew_most"],
+            json!({"store": store, "bytes_per_day": grew})
+        );
+        // The day's would call the archive's day unattributed.
+        let unattributed = i64::try_from(20 * GIB - archive).expect("fits");
+        assert_ne!(storage["grew_most"]["bytes_per_day"], unattributed);
+        assert!(grew < unattributed, "{grew}");
+    }
 }
