@@ -5,7 +5,8 @@
 // stays a thin layer over them.
 
 import { readApi } from "./api";
-import { formatCost, formatDecimal, modelCostText } from "./scorecardFormat.ts";
+import { compactCount } from "./format.ts";
+import { formatCost, formatDecimal, modelCostText, modelCostTitle } from "./scorecardFormat.ts";
 import { tokenReachOf } from "./tokenReach.ts";
 
 export { formatDecimal };
@@ -659,7 +660,7 @@ export function dimensionParts(
         {
           title: null,
           parts: [
-            { label: "tokens", value: formatDecimal(d.tokens, 0) },
+            { label: "tokens", value: compactCount(d.tokens), title: `${formatDecimal(d.tokens, 0)} tokens` },
             { label: "gate time", value: formatSpan(d.gate_ms), title: msTitle(d.gate_ms) },
             {
               label: "gate time per landing",
@@ -673,10 +674,7 @@ export function dimensionParts(
           parts: Object.entries(d.by_model).map(([model, entry]) => ({
             label: model,
             value: modelCostText(entry.tokens, entry.per_landed),
-            title:
-              entry.per_landed === null
-                ? `${model}: ${entry.tokens} tokens`
-                : `${model}: ${entry.tokens} tokens, ${entry.per_landed} per landing`,
+            title: modelCostTitle(model, entry.tokens, entry.per_landed),
           })),
         },
       ];

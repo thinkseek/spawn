@@ -75,3 +75,31 @@ export function absoluteTitle(ms: number | null | undefined): string | undefined
   if (ms == null || !Number.isFinite(ms) || ms <= 0) return undefined;
   return `${localDateTime(ms, true)} local · ${utcDateTime(ms)}`;
 }
+
+/** Token counts and other large counts, in decimal units (K = 10^3, M =
+ * 10^6, B = 10^9; counts, not bytes). Moved here from cost.ts (t505u P4)
+ * so every page shows a count the same way. */
+/** A count's step: its divisor and its letter. */
+const STEPS: ReadonlyArray<[number, string]> = [
+  [1e3, "K"],
+  [1e6, "M"],
+  [1e9, "B"],
+];
+
+/** A count made compact: "950", "55K", "1.1M", "17M", "485M", "1.5B"; one
+ * decimal under 10, whole from 10, K, M or B by thousands. It is rounded
+ * first and the step picked after, so 9,960 is "10K" and 999,600 "1.0M". */
+export function compactCount(value: number): string {
+  const n = Number.isFinite(value) ? Math.abs(value) : 0;
+  const sign = Number.isFinite(value) && value < 0 ? "-" : "";
+  const whole = Math.round(n);
+  if (whole < 1000) return `${sign}${whole}`;
+  let said = "";
+  for (const [size, letter] of STEPS) {
+    const scaled = n / size;
+    const rounded = scaled < 10 ? Math.round(scaled * 10) / 10 : Math.round(scaled);
+    said = `${rounded < 10 ? rounded.toFixed(1) : String(rounded)}${letter}`;
+    if (rounded < 1000) break;
+  }
+  return `${sign}${said}`;
+}

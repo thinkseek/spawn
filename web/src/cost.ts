@@ -1,12 +1,16 @@
 // The cost page's figures (objective 041), from what `GET /api/cost?window=`
 // answers (crates/spawn-cli/src/cost.rs): the total, and each mission, task
-// and agent, in dollars, most costly first. Pure, with no import, so node
-// loads it alone (type stripping, no bundler): the page's fetch lives in
-// components/cost/CostView.tsx.
+// and agent, in dollars, most costly first. Pure, importing only format.ts
+// (itself import-free), so node loads it alone (type stripping, no bundler):
+// the page's fetch lives in components/cost/CostView.tsx.
 //
 // The scorecard's rule holds here too (GitHub #16 item 3): a cost that is
 // not zero never reads as zero. Use on a model no price names is "unpriced",
 // never "$0.00": it cost something no price says.
+
+import { compactCount } from "./format.ts";
+
+export { compactCount };
 
 /** Token counts of one entry: every message, priced or not. */
 export interface CostTokens {
@@ -168,6 +172,10 @@ export interface CostView {
    * which models, and how to price them (SPAWN_MODEL_PRICES); null when
    * every token is priced. */
   unpriced_note: string | null;
+  /** The same note with its counts compact ("275K of 385K tokens"), as the
+   * page shows it (t505u P4); `unpriced_note` keeps them in full (scenario
+   * 059 reads it) and is the note's title. */
+  unpriced_note_compact: string | null;
   /** "<dollars> per landing (<n> landed)", or "no landing in the window". */
   per_landing: string;
   missions: Row[];
@@ -214,31 +222,6 @@ export function formatTokens(tokens: number): string {
 export function unpricedText(tokens: number): string | null {
   if (!Number.isFinite(tokens) || tokens <= 0) return null;
   return `+ ${formatTokens(tokens)} token${tokens === 1 ? "" : "s"} unpriced`;
-}
-
-/** A count's step: its divisor and its letter. */
-const STEPS: ReadonlyArray<[number, string]> = [
-  [1e3, "K"],
-  [1e6, "M"],
-  [1e9, "B"],
-];
-
-/** A count made compact: "950", "55K", "1.1M", "17M", "485M", "1.5B"; one
- * decimal under 10, whole from 10, K, M or B by thousands. It is rounded
- * first and the step picked after, so 9,960 is "10K" and 999,600 "1.0M". */
-export function compactCount(value: number): string {
-  const n = Number.isFinite(value) ? Math.abs(value) : 0;
-  const sign = Number.isFinite(value) && value < 0 ? "-" : "";
-  const whole = Math.round(n);
-  if (whole < 1000) return `${sign}${whole}`;
-  let said = "";
-  for (const [size, letter] of STEPS) {
-    const scaled = n / size;
-    const rounded = scaled < 10 ? Math.round(scaled * 10) / 10 : Math.round(scaled);
-    said = `${rounded < 10 ? rounded.toFixed(1) : String(rounded)}${letter}`;
-    if (rounded < 1000) break;
-  }
-  return `${sign}${said}`;
 }
 
 /** A row's unpriced badge, short enough to keep its dollars on the page:
@@ -361,8 +344,12 @@ function missionName(entry: CostMission): string | null {
  * 385,000 tokens (71%) ran on models with no price (bb-model-z): their
  * cost is not in these figures. Price them in SPAWN_MODEL_PRICES." Each
  * unpriced model is named, with its count when there are several; a priced
- * model is not. Null when every token is priced. */
-export function unpricedNote(answer: Partial<CostAnswer> | null | undefined): string | null {
+ * model is not. Counts are in full (`say`, [`formatTokens`]); pass
+ * [`compactCount`] for the same note compact. Null when every token is priced. */
+export function unpricedNote(
+  answer: Partial<CostAnswer> | null | undefined,
+  say: (tokens: number) => string = formatTokens,
+): string | null {
   const unpriced = count(answer?.total?.unpriced_tokens);
   if (unpriced <= 0) return null;
   const all = tokenSum(answer?.total?.tokens);
@@ -378,16 +365,16 @@ export function unpricedNote(answer: Partial<CostAnswer> | null | undefined): st
     .sort((a, b) => b.tokens - a.tokens || a.name.localeCompare(b.name));
   const share = all > 0 ? unpriced / all : 0;
   const percent = share >= 0.01 ? `${Math.round(share * 100)}%` : "under 1%";
-  const of = all >= unpriced && all > 0 ? ` of ${formatTokens(all)} tokens (${percent})` : " tokens";
+  const of = all >= unpriced && all > 0 ? ` of ${say(all)} tokens (${percent})` : " tokens";
   const named =
     models.length === 1
       ? ` (${models[0].name})`
       : models.length > 1
-        ? ` (${models.map((model) => `${model.name} ${formatTokens(model.tokens)}`).join(", ")})`
+        ? ` (${models.map((model) => `${model.name} ${say(model.tokens)}`).join(", ")})`
         : "";
   const noun = models.length === 1 ? "a model" : "models";
   return (
-    `${formatTokens(unpriced)}${of} ran on ${noun} with no price${named}: their cost is not in ` +
+    `${say(unpriced)}${of} ran on ${noun} with no price${named}: their cost is not in ` +
     `these figures. Price ${models.length === 1 ? "it" : "them"} in SPAWN_MODEL_PRICES ` +
     `(US dollars per million tokens: input, output, cache_write, cache_read).`
   );
@@ -418,6 +405,15 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
  * line, most costly first, each with its unpriced count and its share of
  * the window; and since when the record counts, when the window starts
  * before it. */
+/** The title of the cost page's unpriced note (t505u P4): the note with
+ * every count in full (`unpriced_note`), a blank line, then how to price a
+ * model. The page shows the note compact; this keeps it exact. */
+export function unpricedNoteTitle(view: Pick<CostView, "unpriced_note">): string {
+  const hint =
+    "SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set.";
+  return view.unpriced_note ? `${view.unpriced_note}\n\n${hint}` : hint;
+}
+
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
   const windowUsd = total.order;
@@ -428,6 +424,7 @@ export function costView(answer: Partial<CostAnswer> | null | undefined): CostVi
     total: total.usd,
     unpriced: total.unpriced,
     unpriced_note: unpricedNote(answer),
+    unpriced_note_compact: unpricedNote(answer, compactCount),
     per_landing: perLanding(answer),
     missions: missions.rows,
     tasks: tasks.rows.slice(0, TOP_ROWS),

@@ -3,7 +3,7 @@ import { CircleDollarSign } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
 import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
-import { costView, dashboard, rowLines } from "../../cost.ts";
+import { costView, dashboard, rowLines, unpricedNoteTitle } from "../../cost.ts";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { CostDashboard } from "./CostDashboard";
 import { SegmentedControl } from "../aui/kit";
@@ -101,7 +101,7 @@ function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?:
                     {second.map((text, index) =>
                       // rowLines puts the unpriced mark's text first.
                       index === 0 && row.unpriced_text ? (
-                        <UnpricedMark key={text} text={text} />
+                        <UnpricedMark key={text} text={text} label={row.unpriced_short ?? text} />
                       ) : (
                         <span
                           key={text}
@@ -154,10 +154,10 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
       />
       {figures?.unpriced_note && (
         <p
-          title="SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set."
+          title={unpricedNoteTitle(figures)}
           className="px-4 pt-2 text-caption text-warning"
         >
-          {figures.unpriced_note}
+          {figures.unpriced_note_compact ?? figures.unpriced_note}
         </p>
       )}
       {figures?.since && (
