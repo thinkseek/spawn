@@ -111,6 +111,7 @@ use crate::config::{env_or, env_value, open_store, workspace_root};
 
 mod restore_drill;
 mod store;
+mod sync_dir;
 
 /// The default limits, in decimal megabytes (1,000,000 bytes each): R2's
 /// free tier is 10 GB-month of storage, and the owner's alert is at 8 GB.
@@ -707,6 +708,11 @@ struct Scratch {
 
 impl Scratch {
     fn new(what: &str) -> Result<Self, String> {
+        Self::new_in(&std::env::temp_dir(), &format!("spawn-{what}"))
+    }
+
+    /// A scratch directory `<parent>/<name>-<pid>-<random>`.
+    fn new_in(parent: &Path, name: &str) -> Result<Self, String> {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -714,8 +720,8 @@ impl Scratch {
             builder.mode(0o700);
         }
         for attempt in 0..10u32 {
-            let path = std::env::temp_dir().join(format!(
-                "spawn-{what}-{}-{}{attempt}",
+            let path = parent.join(format!(
+                "{name}-{}-{}{attempt}",
                 std::process::id(),
                 random_hex(4)?
             ));
@@ -1821,6 +1827,49 @@ fn put_object(
     events: i64,
     sealed_with: &str,
 ) -> Result<(), String> {
+    put_object_with(settings, key, file, sha256, (events, sealed_with), "")
+}
+
+/// The scratch directories of the bundle in the workspace root, when it
+/// takes the notes folder: `<root>/.spawn-backup-bundle-<pid>-<random>`.
+const BUNDLE_SCRATCH: &str = ".spawn-backup-bundle";
+
+/// Remove the bundle scratch directories a killed run left in `root`
+/// (SIGKILL runs no cleanup). Called under the backup lock, so no other
+/// run is using one.
+fn sweep_bundle_scratch(root: &Path) {
+    let Ok(listing) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in listing.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&format!("{BUNDLE_SCRATCH}-"))
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// A bundle's PUT may take 600 s plus its size at 100 KB/s (objective 216):
+/// a backstop sized to the object, not a speed relied on. Given as the last
+/// `max-time` of its curl config, which curl takes.
+pub(crate) fn bundle_put_seconds(bytes: u64) -> u64 {
+    600 + bytes / 100_000
+}
+
+/// [`put_object`] with `extra` appended to its curl config (`events` and
+/// the sealing key's name as its metadata).
+fn put_object_with(
+    settings: &Settings,
+    key: &str,
+    file: &Path,
+    sha256: &str,
+    (events, sealed_with): (i64, &str),
+    extra: &str,
+) -> Result<(), String> {
     // Again at the PUT itself, before any request (settings are checked
     // when read; this holds whatever built them).
     not_locked_forever(&settings.r2.bucket)?;
@@ -1828,7 +1877,7 @@ fn put_object(
     let options = format!(
         "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
 header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n\
-header = \"x-amz-meta-spawn-seal: {}\"\n",
+header = \"x-amz-meta-spawn-seal: {}\"\n{extra}",
         escape_config(&file.display().to_string()),
         sha256,
         events,
@@ -2163,7 +2212,18 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         .unwrap_or_default();
     let archive = settings.root.join(".transcripts");
     let window = window_files(&archive, now_ms, settings.transcript_days)?;
-    let scratch = Scratch::new("backup-bundle")?;
+    // With the notes folder (objective 216) the scratch (its staged files,
+    // the tar and its compressed, encrypted and decrypted-back copies) is on
+    // the workspace's disk beside the lock, never in TMPDIR, which may be
+    // memory; a scratch a killed run left there goes first (the lock says no
+    // other run is using one). Unset, it stays where it was.
+    let sync_dir = env_value("SPAWN_BACKUP_SYNC_DIR").filter(|dir| !dir.trim().is_empty());
+    let scratch = if sync_dir.is_some() {
+        sweep_bundle_scratch(&settings.root);
+        Scratch::new_in(&settings.root, BUNDLE_SCRATCH)?
+    } else {
+        Scratch::new("backup-bundle")?
+    };
     let staging = scratch.join("stage");
     fs::create_dir_all(staging.join("repos"))
         .map_err(|error| format!("{}: {error}", staging.display()))?;
@@ -2355,13 +2415,29 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         }
     }
 
-    let manifest = json!({
+    let sync = sync_dir.as_deref().map(|dir| {
+        let scan = env_value("SPAWN_BACKUP_SYNC_SCAN")
+            .filter(|tool| !tool.trim().is_empty())
+            .unwrap_or_else(|| sync_dir::DEFAULT_SCAN.to_string());
+        sync_dir::take(&sync_dir::Run {
+            dir: Path::new(dir),
+            stage: &staging,
+            full,
+            base: base.map(|base| &base.record),
+            root: &settings.root,
+            scan: &scan,
+        })
+    });
+    let mut manifest = json!({
         "kind": if full { "full" } else { "incremental" },
         "base_event_id": base.map(|base| base.event_id),
         "transcripts": transcript_entries,
         "repos": repos_manifest,
         "created_at_ms": now_ms,
     });
+    if let Some(sync) = &sync {
+        manifest["sync"] = sync.manifest.clone();
+    }
     fs::write(
         staging.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
@@ -2411,14 +2487,21 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut skipped: Vec<Value> = Vec::new();
     let mut written = 0u64;
     if within_limit(held, written, stored_bytes, settings.limit_bytes) {
-        put_object(&settings, &key, &encrypted, &sha256, 0, &seal.name)?;
+        put_object_with(
+            &settings,
+            &key,
+            &encrypted,
+            &sha256,
+            (0, &seal.name),
+            &format!("max-time = \"{}\"\n", bundle_put_seconds(stored_bytes)),
+        )?;
         written = written.saturating_add(stored_bytes);
         keys.push(key);
     } else {
         skipped.push(skip(tier, held, written, stored_bytes, &settings));
     }
     let over_alert = held.saturating_add(written) > settings.alert_bytes;
-    let record = json!({
+    let mut record = json!({
         "type": "backup.bundled",
         "sealed_with": seal.name,
         "kind": if full { "full" } else { "incremental" },
@@ -2444,9 +2527,29 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         "over_alert": over_alert,
         "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     });
+    if let Some(sync) = &sync {
+        record["sync"] = sync.record.clone();
+    }
     store
         .backup_record(&record)
         .map_err(|error| format!("backup.bundled: {error}"))?;
+    // The next increment's base: the manifest of a stored bundle that holds
+    // the notes folder, vouched for by this record's manifest_sha256.
+    if let Some(local) = sync.as_ref().and_then(|sync| sync.local.as_deref())
+        && !keys.is_empty()
+        && let Err(error) = sync_dir::write_local(&settings.root, local)
+    {
+        eprintln!("spawn backup bundle: the notes manifest's local copy: {error}");
+    }
+    if let Some(sync) = &sync {
+        match sync.record["refused"].as_str() {
+            Some(reason) => println!("spawn backup bundle: the notes folder was left out: {reason}"),
+            None => println!(
+                "spawn backup bundle: the notes folder: {} files, {} taken ({} bytes)",
+                sync.record["files"], sync.record["taken"], sync.record["taken_bytes"]
+            ),
+        }
+    }
     if over_alert {
         println!(
             "R2 holds {} bytes, over the alert at {}",
