@@ -3857,7 +3857,6 @@ impl Bridge {
         pass: &Pass,
         report: &mut TickReport,
     ) {
-        eprintln!("DBG pass {pass:?} {:?}", self.archive_events.lock().unwrap().get(&(agent_id.clone(), native.to_string())).map(|e| (e.failed.clone(), e.stale, e.pending.is_some())));
         let mut events = self
             .archive_events
             .lock()
@@ -3909,7 +3908,7 @@ impl Bridge {
                     entry.pending = None;
                 }
                 Err(error) => report.warnings.push(format!(
-                    "{session}: record the transcript archive's state: {error:?}"
+                    "{session}: record the transcript archive's state: {error}"
                 )),
             }
         }
@@ -3917,13 +3916,24 @@ impl Bridge {
 
     /// What the log holds of a transcript's archive state, read as it is
     /// folded (objective 179 R2): its last `archive.failed` stands until an
-    /// `archive.resumed` of it.
+    /// `archive.resumed` of it. The keys' `<n>` go on past every one the log
+    /// holds, so a restarted Bridge whose clock reads the same millisecond
+    /// never makes a key again.
     fn fold_archive_event(&self, event: &NewEvent) {
         let (native, failed) = match &event.kind {
             EventKind::ArchiveFailed { native, reason } => (native, Some(reason.clone())),
             EventKind::ArchiveResumed { native, .. } => (native, None),
             _ => return,
         };
+        if let Some(n) = event
+            .source_event_id
+            .as_deref()
+            .and_then(|key| key.rsplit(':').next())
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            self.archive_keys
+                .fetch_max(n.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
         self.archive_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
