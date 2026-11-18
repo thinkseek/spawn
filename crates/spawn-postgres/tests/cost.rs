@@ -896,15 +896,29 @@ fn project_message(
 /// One session message as stored, read as the reader reads it:
 /// `(model, at_ms, input_tokens, usd, rates)`.
 fn held_message(schema: &str, id: &str) -> (String, i64, i64, f64, Value) {
+    let (model, at_ms, counts, usd, rates) = held_counts(schema, id);
+    (model, at_ms, counts[0], usd, rates)
+}
+
+/// [`held_message`] with all four counts: `(model, at_ms, [input, output,
+/// cache_write, cache_read], usd, rates)`.
+fn held_counts(schema: &str, id: &str) -> (String, i64, [i64; 4], f64, Value) {
     let mut reader = common::as_login(schema, "spawn_reader");
     let row = reader
         .query_one(
-            "select model, at_ms, input_tokens, usd::float8, rates
+            "select model, at_ms, input_tokens, output_tokens, cache_write_tokens,
+                    cache_read_tokens, usd::float8, rates
                from spawn_cost_session_messages where message_id = $1",
             &[&id],
         )
         .expect("the message is held");
-    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+    (
+        row.get(0),
+        row.get(1),
+        [row.get(2), row.get(3), row.get(4), row.get(5)],
+        row.get(6),
+        row.get(7),
+    )
 }
 
 /// Cost coverage 1a R2 (rev-b F1): the sessions' answer whole. Each project
@@ -1031,13 +1045,24 @@ fn a_sessions_message_folds_by_its_largest_usage_and_earliest_line() {
     assert!((usd - 1.8).abs() < 1e-9, "300,000 at model-x's $6: {usd}");
     assert_eq!(rates, priced(6.0)["model-x"]);
 
-    // The same usage at an earlier time: the time moves, nothing else.
+    // An earlier line with a smaller usage, every count of it non-zero (a
+    // streamed message's earlier line, read again after a mark reset): the
+    // time moves; the held counts, dollars and rates stay (rev-b R2 F1).
     let earlier = store
-        .cost_session_record(&priced(3.0), &[line("model-x", now - 5, 300_000)], &[])
+        .cost_session_record(
+            &priced(3.0),
+            &[session_message(
+                "msg_f",
+                "model-x",
+                now - 5,
+                [50_000, 7, 8, 9],
+            )],
+            &[],
+        )
         .expect("record");
     assert_eq!((earlier.counted, earlier.changed), (0, 1));
-    let (_, at_ms, input, usd, rates) = held_message(&schema, "msg_f");
-    assert_eq!((at_ms, input), (now - 5, 300_000));
+    let (_, at_ms, counts, usd, rates) = held_counts(&schema, "msg_f");
+    assert_eq!((at_ms, counts), (now - 5, [300_000, 0, 0, 0]));
     assert!((usd - 1.8).abs() < 1e-9, "not repriced: {usd}");
     assert_eq!(rates, priced(6.0)["model-x"]);
 
