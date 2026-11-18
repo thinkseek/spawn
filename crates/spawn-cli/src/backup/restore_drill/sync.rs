@@ -34,8 +34,17 @@
 //!   (expected); a file that cannot be read, a mismatch;
 //! - a live file the manifest lacks: listed in the newest manifest's
 //!   `skipped` or `changed_during_read`, said apart; else written at or
-//!   after the start, made since (expected); else a mismatch (the backup
-//!   lacks a file older than it);
+//!   after the start, made since (expected); else (objective 224) it is
+//!   read once, the same way: when its size and sha256 are those of a file
+//!   of the newest manifest, under any path, moved or copied since
+//!   (expected: its bytes are in the backup, under another path; `mv`
+//!   and `cp -p` keep a file's mtime, so a round moved aside with `mkdir`
+//!   + `mv` after the bundle reads as older than it); gone by then,
+//!   nothing; it cannot be read, a mismatch; else a mismatch (the backup
+//!   lacks a file older than it, under this path or any other). A manifest
+//!   file whose path is gone live stays removed since, even when its copy
+//!   elsewhere counts as moved or copied; only these files are read beyond
+//!   the manifest's own;
 //! - a folder that cannot be read is one mismatch naming it.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -280,6 +289,9 @@ pub(super) struct Compared {
     pub(super) changed: u64,
     pub(super) removed: u64,
     pub(super) made: u64,
+    /// Objective 224: live files the manifest lacks under their path,
+    /// older than the bundle, whose bytes it holds under another.
+    pub(super) moved: u64,
     pub(super) apart: u64,
     pub(super) mismatches: Vec<String>,
 }
@@ -288,12 +300,14 @@ impl Compared {
     pub(super) fn line(&self, live: &Path) -> String {
         format!(
             "restore-drill: the notes folder against live {}: {} the same, {} changed since, {} \
-             removed since, {} made since, {} skipped or changed while bundled, {} mismatch(es)",
+             removed since, {} made since, {} moved or copied since, {} skipped or changed while \
+             bundled, {} mismatch(es)",
             live.display(),
             self.same,
             self.changed,
             self.removed,
             self.made,
+            self.moved,
             self.apart,
             self.mismatches.len()
         )
@@ -363,8 +377,8 @@ fn list_live(live: &Path) -> Result<Listed, String> {
 
 /// What reading a live file found.
 enum Live {
-    /// Its sha256 and mtime, read through the one open file.
-    Read(String, i64),
+    /// Its sha256, mtime and size, read through the one open file.
+    Read(String, i64, u64),
     /// No longer a regular file there (not found, now a symlink or other).
     Gone,
     /// It cannot be read.
@@ -391,15 +405,19 @@ fn read_live(path: &Path) -> Live {
     }
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; CHUNK];
+    let mut size = 0u64;
     loop {
         match file.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => hasher.update(&buffer[..read]),
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                size += read as u64;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Live::Gone,
             Err(error) => return Live::Unreadable(error.to_string()),
         }
     }
-    Live::Read(hex(&hasher.finalize()), mtime_ms(&meta))
+    Live::Read(hex(&hasher.finalize()), mtime_ms(&meta), size)
 }
 
 /// An epoch in ms as UTC text.
@@ -441,9 +459,9 @@ pub(super) fn compare(restored: &Restored, live: &Path, start_ms: i64) -> Compar
             Live::Unreadable(why) => out
                 .mismatches
                 .push(format!("sync/{}: live cannot be read: {why}", file.path)),
-            Live::Read(sha256, _) if sha256 == file.sha256 => out.same += 1,
-            Live::Read(_, mtime) if mtime >= start_ms => out.changed += 1,
-            Live::Read(_, mtime) => out.mismatches.push(format!(
+            Live::Read(sha256, _, _) if sha256 == file.sha256 => out.same += 1,
+            Live::Read(_, mtime, _) if mtime >= start_ms => out.changed += 1,
+            Live::Read(_, mtime, _) => out.mismatches.push(format!(
                 "sync/{}: live has other bytes than the backup, last written {}, before the \
                  bundle began ({}): the backup holds older bytes than the folder had then",
                 file.path,
@@ -452,21 +470,38 @@ pub(super) fn compare(restored: &Restored, live: &Path, start_ms: i64) -> Compar
             )),
         }
     }
+    // Objective 224: the bytes the backup holds, under any path.
+    let held: BTreeSet<(u64, &str)> = restored
+        .files
+        .iter()
+        .map(|file| (file.size, file.sha256.as_str()))
+        .collect();
     for (path, mtime) in &listed {
         if manifest.contains(path.as_str()) {
             continue;
         }
         if restored.apart.contains(path) {
             out.apart += 1;
-        } else if *mtime >= start_ms {
+            continue;
+        }
+        if *mtime >= start_ms {
             out.made += 1;
-        } else {
-            out.mismatches.push(format!(
+            continue;
+        }
+        match read_live(&live.join(path)) {
+            Live::Gone => {}
+            Live::Unreadable(why) => out
+                .mismatches
+                .push(format!("sync/{path}: live cannot be read: {why}")),
+            Live::Read(sha256, _, size) if held.contains(&(size, sha256.as_str())) => {
+                out.moved += 1;
+            }
+            Live::Read(..) => out.mismatches.push(format!(
                 "sync/{path}: live, last written {}, before the bundle began ({}), is not in \
-                 the backup",
+                 the backup, under this path or any other",
                 when(*mtime),
                 when(start_ms)
-            ));
+            )),
         }
     }
     out
@@ -726,7 +761,7 @@ mod tests {
         assert!(
             compared
                 .line(&live)
-                .ends_with("1 the same, 1 changed since, 1 removed since, 1 made since, 1 skipped or changed while bundled, 3 mismatch(es)")
+                .ends_with("1 the same, 1 changed since, 1 removed since, 1 made since, 0 moved or copied since, 1 skipped or changed while bundled, 3 mismatch(es)")
         );
         for line in &compared.mismatches {
             for content in ["other", "same", "a file where a link was"] {
@@ -777,6 +812,92 @@ mod tests {
             matches!(super::read_live(&live.join("d.md")), super::Live::Gone),
             "a symlink is never followed"
         );
+    }
+
+    /// Objective 224: a subfolder moved aside and a file copied beside
+    /// itself, their mtimes kept (older than the bundle), are moved or
+    /// copied since, their old paths removed since; old bytes the backup
+    /// does not hold stay mismatches, a file of a held size with other
+    /// bytes included.
+    #[test]
+    fn a_file_moved_or_copied_since_is_not_a_mismatch() {
+        let scratch = Scratch::new("sync_moved");
+        let live = scratch.0.join("live");
+        let start = 1_800_000_000_000_i64;
+        let old = start - 86_400_000;
+        let restored = Restored {
+            files: vec![
+                file("obj-7/a.md", b"seven a"),
+                file("obj-7/b/c.md", b"seven c"),
+                file("kept.md", b"kept"),
+            ],
+            ..Restored::default()
+        };
+        for (path, content) in [
+            ("r1/obj-7/a.md", &b"seven a"[..]),
+            ("r1/obj-7/b/c.md", b"seven c"),
+            ("kept.md", b"kept"),
+            ("kept copy.md", b"kept"),
+            ("foreign.md", b"never bundled"),
+            ("same-size.md", b"KEPT"),
+        ] {
+            write(&live.join(path), content);
+            set_mtime(&live.join(path), old);
+        }
+        let compared = compare(&restored, &live, start);
+        assert_eq!(
+            (
+                compared.same,
+                compared.removed,
+                compared.made,
+                compared.moved
+            ),
+            (1, 2, 0, 3),
+            "{compared:?}"
+        );
+        assert_eq!(compared.mismatches.len(), 2, "{compared:?}");
+        assert!(compared.mismatches[0].starts_with("sync/foreign.md: live, last written"));
+        assert!(compared.mismatches[1].starts_with("sync/same-size.md: live, last written"));
+        for line in &compared.mismatches {
+            assert!(
+                line.ends_with("is not in the backup, under this path or any other"),
+                "{line}"
+            );
+            assert!(!line.contains("KEPT") && !line.contains("never bundled"), "{line}");
+        }
+        assert!(compared.line(&live).contains(
+            "1 the same, 0 changed since, 2 removed since, 0 made since, 3 moved or copied since"
+        ));
+    }
+
+    /// Objective 224: an old file the manifest lacks that cannot be read is
+    /// a mismatch, never moved or copied.
+    #[test]
+    fn an_old_copy_that_cannot_be_read_is_a_mismatch_never_moved() {
+        let scratch = Scratch::new("sync_moved_unreadable");
+        let live = scratch.0.join("live");
+        let start = 1_800_000_000_000_i64;
+        let restored = Restored {
+            files: vec![file("a.md", b"a")],
+            ..Restored::default()
+        };
+        write(&live.join("a.md"), b"a");
+        write(&live.join("copy.md"), b"a");
+        set_mtime(&live.join("copy.md"), start - 1_000);
+        fs::set_permissions(live.join("copy.md"), fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        if fs::read(live.join("copy.md")).is_err() {
+            let compared = compare(&restored, &live, start);
+            assert_eq!(compared.moved, 0, "{compared:?}");
+            assert_eq!(compared.same, 1, "{compared:?}");
+            assert_eq!(compared.mismatches.len(), 1, "{compared:?}");
+            assert!(
+                compared.mismatches[0].starts_with("sync/copy.md: live cannot be read"),
+                "{compared:?}"
+            );
+        }
+        fs::set_permissions(live.join("copy.md"), fs::Permissions::from_mode(0o644))
+            .expect("chmod");
     }
 
     /// The listing takes the manifest and the notes part alone; the floor
