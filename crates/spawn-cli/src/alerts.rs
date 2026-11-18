@@ -6572,7 +6572,7 @@ mod tests {
                     evidence["cause"].clone(),
                     evidence["event_id"].clone(),
                 )),
-                Event::Fire { .. } => None,
+                Event::Fire { .. } | Event::Update { .. } => None,
             })
             .collect()
     }
@@ -7014,7 +7014,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
-                Event::Fire { .. } => None,
+                Event::Fire { .. } | Event::Update { .. } => None,
             })
             .collect();
         cleared.sort_by(|left, right| left.0.cmp(&right.0));
