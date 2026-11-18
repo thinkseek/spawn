@@ -343,26 +343,7 @@ mod tests {
         assert_eq!(diagnostic("storage.grew_most")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall").get("store"), None);
-        // The fall says its basis (objective 222); no other figure does.
-        assert_eq!(diagnostic("storage.disk_fall")["basis"], "day");
-        let with_basis: Vec<&Value> = view["diagnostics"]
-            .as_array()
-            .expect("diagnostics")
-            .iter()
-            .chain(
-                view["lines"]
-                    .as_array()
-                    .expect("lines")
-                    .iter()
-                    .flat_map(|line| {
-                        std::iter::once(&line["north_star"])
-                            .chain(line["guardrails"].as_array().into_iter().flatten())
-                    }),
-            )
-            .filter(|figure| figure.get("basis").is_some())
-            .map(|figure| &figure["key"])
-            .collect();
-        assert_eq!(with_basis, [&json!("storage.disk_fall")]);
+        only_the_fall_says_a_basis(&view);
         // Free disk is the first diagnostic, with no line (objective 182).
         assert_eq!(view["diagnostics"][0]["key"], "storage.free_bytes");
         assert_eq!(view["diagnostics"][0]["value"], 104);
@@ -390,6 +371,35 @@ mod tests {
         assert_eq!(view["lines"][2]["guardrails"][0]["state"], "not_collected");
         assert_eq!(view["ranges_error"], Value::Null);
         assert_eq!(view["ignored_ranges"], json!([]));
+    }
+
+    /// The fall says its basis (objective 222); no other figure does.
+    fn only_the_fall_says_a_basis(view: &Value) {
+        let with_basis: Vec<&Value> = view["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .chain(
+                view["lines"]
+                    .as_array()
+                    .expect("lines")
+                    .iter()
+                    .flat_map(|line| {
+                        std::iter::once(&line["north_star"])
+                            .chain(line["guardrails"].as_array().into_iter().flatten())
+                    }),
+            )
+            .filter(|figure| figure.get("basis").is_some())
+            .map(|figure| &figure["key"])
+            .collect();
+        assert_eq!(with_basis, [&json!("storage.disk_fall")]);
+        let fall = view["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .find(|figure| figure["key"] == "storage.disk_fall")
+            .expect("the fall");
+        assert_eq!(fall["basis"], "day");
     }
 
     /// Still measuring (objective 141): days left say from when, and no
