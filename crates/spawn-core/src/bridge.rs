@@ -1452,6 +1452,7 @@ impl Bridge {
                 return Ok(());
             }
             for record in &batch {
+                self.fold_archive_event(&record.event);
                 self.fold(record);
             }
             if let Some(last) = batch.last() {
@@ -1469,7 +1470,6 @@ impl Bridge {
         if event.kind.is_control() {
             return;
         }
-        self.fold_archive_event(event);
         let view = self
             .sessions
             .entry(event.session_id.clone())
