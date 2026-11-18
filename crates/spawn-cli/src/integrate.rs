@@ -1381,7 +1381,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     crate::config::require_git()?;
     // The integrator's lock, on a connection of its own, before anything is
     // written, kept for the process's life (objective 221).
-    let lock = take_lock_at_start(LOCK_WAIT)?;
+    let lock = take_lock_at_start(&open_store, LOCK_WAIT)?;
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
     let gate_env = gate::gate_env(|name| std::env::var(name).ok());
@@ -1471,6 +1471,9 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     run_passes(&integrator, &drain_asked, drain_bound)
 }
 
+/// How the integrator opens a connection to its store.
+type Connect = dyn Fn() -> Result<PostgresStore, String>;
+
 /// How long a start waits for a lock another integrator holds: a deploy's
 /// restart (the old integrator just stopped) takes it within this.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
@@ -1532,8 +1535,11 @@ pub(crate) fn gate_refusal(gate: &Path, from_env: bool, cwd: &Path) -> Option<St
 /// says so and asks every [`LOCK_ASK`] for `wait`, so a deploy's restart
 /// takes it; still held then, it is refused, naming the holder. The store
 /// and its server pid.
-fn take_lock_at_start(wait: Duration) -> Result<(Arc<PostgresStore>, i32), String> {
-    let store = open_store()?;
+fn take_lock_at_start(
+    connect: &Connect,
+    wait: Duration,
+) -> Result<(Arc<PostgresStore>, i32), String> {
+    let store = connect()?;
     let name = lock_name();
     let deadline = std::time::Instant::now() + wait;
     let mut said = false;
@@ -1771,6 +1777,9 @@ struct Integrator {
     lock_pid: std::cell::Cell<Option<i32>>,
     /// Why this integrator stops (its lock lost to another integrator).
     stopped: RefCell<Option<String>>,
+    /// How a new connection to the store is made: `open_store`, the
+    /// environment's (tests: a schema of their own).
+    connect: Box<Connect>,
     /// The waits already said, by task and kind ([`Wait`]): each is said
     /// once, when the task starts waiting, and again only after the task
     /// has had a gate ([`Integrator::wait_over`]).
@@ -2108,6 +2117,7 @@ impl Integrator {
             held: RefCell::new(None),
             lock_pid: std::cell::Cell::new(None),
             stopped: RefCell::new(None),
+            connect: Box::new(open_store),
             waiting: RefCell::new(std::collections::HashSet::new()),
             owner: RefCell::new(owner::Kept::default()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
@@ -2119,6 +2129,13 @@ impl Integrator {
             drain: RefCell::new(None),
             unlanded: std::cell::Cell::new(false),
         }
+    }
+
+    /// Its connections made by `connect` (tests: a schema of their own).
+    #[cfg(test)]
+    fn with_connect(mut self, connect: Box<Connect>) -> Self {
+        self.connect = connect;
+        self
     }
 
     /// The lock taken at start ([`take_lock_at_start`]), kept for life.
@@ -2138,7 +2155,7 @@ impl Integrator {
         if let Some(store) = self.held.borrow().clone() {
             return Ok(Some(store));
         }
-        let store = open_store()?;
+        let store = (self.connect)()?;
         if store
             .integrator_lock(&lock_name())
             .map_err(|error| error.to_string())?
