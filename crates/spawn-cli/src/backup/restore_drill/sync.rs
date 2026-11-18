@@ -469,4 +469,298 @@ pub(super) fn compare(restored: &Restored, live: &Path, start_ms: i64) -> Compar
 
 #[cfg(test)]
 mod tests {
-__TESTS__}
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    use super::super::super::{BundleRecord, hex};
+    use super::{Compared, NoteFile, Restored, bytes, compare, members, no_part, restore};
+
+    /// A scratch folder, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root = crate::storage::tests::scratch(tag);
+            fs::create_dir_all(&root).expect("mkdir");
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, bytes).expect("write");
+    }
+
+    /// A link: its record, and its unpacked tree holding `files` (taken)
+    /// and a notes manifest listing `listed` (path, bytes), with `extra`
+    /// fields merged in.
+    fn link(
+        root: &Path,
+        event_id: i64,
+        taken: &[(&str, &[u8])],
+        listed: &[(&str, &[u8])],
+        extra: &Value,
+    ) -> (BundleRecord, (PathBuf, Value)) {
+        let unpacked = root.join(format!("bundle-{event_id}/unpacked"));
+        for (path, content) in taken {
+            write(&unpacked.join("sync/files").join(path), content);
+        }
+        let mut manifest = json!({
+            "files": listed.iter().map(|(path, content)| json!({
+                "path": path, "size": content.len(), "mtime_ms": 1, "mode": 420,
+                "sha256": sha(content),
+            })).collect::<Vec<_>>(),
+            "taken": taken.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            "removed": [], "skipped": [], "changed_during_read": [],
+        });
+        if let (Some(manifest), Some(extra)) = (manifest.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                manifest.insert(key.clone(), value.clone());
+            }
+        }
+        let text = serde_json::to_vec_pretty(&manifest).expect("json");
+        write(&unpacked.join("sync/manifest.json"), &text);
+        let record = BundleRecord {
+            event_id,
+            at_ms: 0,
+            record: json!({"sync": {"dir": "/notes", "manifest_sha256": sha(&text),
+                                    "taken_bytes": 10, "bytes": 100},
+                           "stored_bytes": 1000}),
+        };
+        (record, (unpacked, json!({"created_at_ms": 0})))
+    }
+
+    fn restored_of(
+        links: &[(BundleRecord, (PathBuf, Value))],
+        into: &Path,
+    ) -> Result<Restored, String> {
+        let chain: Vec<&BundleRecord> = links.iter().map(|(record, _)| record).collect();
+        let unpacked: Vec<(PathBuf, Value)> =
+            links.iter().map(|(_, unpacked)| unpacked.clone()).collect();
+        fs::create_dir_all(into).expect("mkdir");
+        restore(&chain, &unpacked, into)
+    }
+
+    /// Objective 217: each file comes from the newest link that took it;
+    /// the newest manifest's `skipped` and `changed_during_read` are said
+    /// apart, never an older link's.
+    #[test]
+    fn each_file_comes_from_the_newest_link_that_took_it() {
+        let scratch = Scratch::new("sync_restore");
+        let full = link(
+            &scratch.0,
+            1,
+            &[("a.md", b"old a"), ("b/c.md", b"c")],
+            &[("a.md", b"old a"), ("b/c.md", b"c")],
+            &json!({"skipped": ["old-link"]}),
+        );
+        let increment = link(
+            &scratch.0,
+            2,
+            &[("a.md", b"new a")],
+            &[("a.md", b"new a"), ("b/c.md", b"c")],
+            &json!({"skipped": ["latest"], "changed_during_read": ["busy.md"]}),
+        );
+        let into = scratch.0.join("sync");
+        let restored = restored_of(&[full, increment], &into).expect("restored");
+        assert_eq!(fs::read(into.join("a.md")).expect("a"), b"new a");
+        assert_eq!(fs::read(into.join("b/c.md")).expect("c"), b"c");
+        assert_eq!(restored.files.len(), 2);
+        assert_eq!(restored.bytes, 6);
+        assert_eq!(restored.links, 2);
+        assert_eq!(
+            restored.apart.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["busy.md", "latest"]
+        );
+        assert!(restored.line().contains("the notes folder: 2 file(s), 6 bytes"));
+    }
+
+    /// A path no link took, a manifest whose sha256 is not its record's, a
+    /// taken file whose bytes are not the newest manifest's, and a newest
+    /// record with no part or a dropped one: the backup cannot be restored.
+    #[test]
+    fn what_the_chain_cannot_give_back_is_refused() {
+        let scratch = Scratch::new("sync_refused");
+        let untaken = link(&scratch.0, 1, &[], &[("a.md", b"a")], &json!({}));
+        let error = restored_of(&[untaken], &scratch.0.join("r1")).expect_err("no link took it");
+        assert!(error.contains("sync/a.md: no bundle of the chain holds it"), "{error}");
+
+        let (mut record, unpacked) = link(&scratch.0, 2, &[("a.md", b"a")], &[("a.md", b"a")], &json!({}));
+        record.record["sync"]["manifest_sha256"] = json!("0".repeat(64));
+        let error = restored_of(&[(record, unpacked)], &scratch.0.join("r2"))
+            .expect_err("another manifest");
+        assert!(error.contains("not its record's"), "{error}");
+
+        let wrong = link(&scratch.0, 3, &[("a.md", b"other")], &[("a.md", b"a")], &json!({}));
+        let error = restored_of(&[wrong], &scratch.0.join("r3")).expect_err("other bytes");
+        assert!(error.contains("sync/a.md: restored at 5 bytes"), "{error}");
+
+        let (mut none, unpacked) = link(&scratch.0, 4, &[], &[], &json!({}));
+        none.record = json!({"stored_bytes": 1});
+        assert!(no_part(&none).is_some_and(|why| why.contains("holds no notes folder")));
+        let error = restored_of(&[(none, unpacked)], &scratch.0.join("r4")).expect_err("no part");
+        assert!(error.contains("holds no notes folder"), "{error}");
+
+        let (mut dropped, unpacked) = link(&scratch.0, 5, &[], &[], &json!({}));
+        dropped.record = json!({"sync": {"dir": "/notes", "refused": "a value in a file"}});
+        let error =
+            restored_of(&[(dropped, unpacked)], &scratch.0.join("r5")).expect_err("dropped");
+        assert!(
+            error.contains("dropped its notes folder: a value in a file"),
+            "{error}"
+        );
+    }
+
+    fn set_mtime(path: &Path, ms: i64) {
+        let time = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(u64::try_from(ms).expect("positive"));
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(time)
+            .expect("set the mtime");
+    }
+
+    fn file(path: &str, content: &[u8]) -> NoteFile {
+        NoteFile {
+            path: path.to_string(),
+            size: content.len() as u64,
+            sha256: sha(content),
+        }
+    }
+
+    /// Objective 217: the comparison by bytes, then by the bundle's start.
+    #[test]
+    fn live_is_compared_by_bytes_then_by_the_bundles_start() {
+        let scratch = Scratch::new("sync_compare");
+        let live = scratch.0.join("live");
+        let start = 1_800_000_000_000_i64;
+        let restored = Restored {
+            files: vec![
+                file("same.md", b"same"),
+                file("changed.md", b"before"),
+                file("set-back.md", b"bundled"),
+                file("between.md", b"bundled"),
+                file("removed.md", b"gone"),
+            ],
+            bytes: 0,
+            links: 1,
+            apart: ["latest".to_string()].into_iter().collect(),
+        };
+        write(&live.join("same.md"), b"same");
+        write(&live.join("changed.md"), b"after");
+        set_mtime(&live.join("changed.md"), start + 5_000);
+        write(&live.join("set-back.md"), b"other");
+        set_mtime(&live.join("set-back.md"), start - 86_400_000);
+        write(&live.join("between.md"), b"other");
+        set_mtime(&live.join("between.md"), start - 1_000);
+        write(&live.join("new.md"), b"new");
+        set_mtime(&live.join("new.md"), start + 1);
+        write(&live.join("latest"), b"a file where a link was");
+        set_mtime(&live.join("latest"), start - 86_400_000);
+        write(&live.join("old.md"), b"old");
+        set_mtime(&live.join("old.md"), start - 2 * 86_400_000);
+        std::os::unix::fs::symlink("same.md", live.join("link")).expect("symlink");
+
+        let compared = compare(&restored, &live, start);
+        assert_eq!(
+            (compared.same, compared.changed, compared.removed, compared.made, compared.apart),
+            (1, 1, 1, 1, 1),
+            "{compared:?}"
+        );
+        assert_eq!(compared.mismatches.len(), 3, "{compared:?}");
+        assert!(compared.mismatches[0].starts_with("sync/set-back.md: live has other bytes"));
+        assert!(compared.mismatches[1].starts_with("sync/between.md: live has other bytes"));
+        assert!(compared.mismatches[2].starts_with("sync/old.md: live, last written"));
+        assert!(
+            compared
+                .line(&live)
+                .ends_with("1 the same, 1 changed since, 1 removed since, 1 made since, 1 skipped or changed while bundled, 3 mismatch(es)")
+        );
+        assert!(
+            !compared.mismatches.iter().any(|line| line.contains("other")
+                && line.contains("bundled")
+                && line.contains("same")),
+            "no file content in a line"
+        );
+    }
+
+    /// A folder that cannot be read is one mismatch naming it; a live file
+    /// that cannot be read is a mismatch; a file removed while live is read
+    /// is removed since.
+    #[test]
+    fn what_live_cannot_give_is_said() {
+        let scratch = Scratch::new("sync_unreadable");
+        let restored = Restored {
+            files: vec![file("a.md", b"a"), file("b.md", b"b")],
+            ..Restored::default()
+        };
+        let gone = scratch.0.join("no-such-folder");
+        let compared = compare(&restored, &gone, 0);
+        assert_eq!(compared.mismatches.len(), 1, "{compared:?}");
+        assert!(compared.mismatches[0].contains(&format!("the notes folder {}", gone.display())));
+        assert_eq!(compared.removed, 0, "nothing else counted");
+
+        let live = scratch.0.join("live");
+        write(&live.join("a.md"), b"a");
+        write(&live.join("b.md"), b"b");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(live.join("a.md"), fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read(live.join("a.md")).is_err() {
+            let compared = compare(&restored, &live, 0);
+            assert_eq!(compared.mismatches.len(), 1, "{compared:?}");
+            assert!(
+                compared.mismatches[0].starts_with("sync/a.md: live cannot be read"),
+                "{compared:?}"
+            );
+            assert_eq!(compared.same, 1);
+        }
+        fs::set_permissions(live.join("a.md"), fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // Removed between the listing and the read: its bytes are gone.
+        assert!(matches!(super::read_live(&live.join("c.md")), super::Live::Gone));
+        let mut listed_only = Compared::default();
+        listed_only.removed += 1;
+        assert_eq!(listed_only.removed, 1);
+    }
+
+    /// The listing takes the manifest and the notes part alone; the floor
+    /// counts each link's ciphertext and taken notes, and the newest
+    /// record's folder.
+    #[test]
+    fn the_listing_takes_the_notes_part_alone_and_the_floor_counts_its_bytes() {
+        let listing = "./\n./manifest.json\n./sync/\n./sync/manifest.json\n./sync/files/\n\
+                       ./sync/files/a.md\n./sync/files/obj/b.md\n./sync/files/../x\n\
+                       ./transcripts/t.jsonl\n./repos/r.bundle\n./sync/other.json\n";
+        assert_eq!(
+            members(listing).expect("members"),
+            [
+                "./manifest.json",
+                "./sync/manifest.json",
+                "./sync/files/a.md",
+                "./sync/files/obj/b.md"
+            ]
+        );
+        assert!(members("./sync/manifest.json\n").is_err(), "no manifest.json");
+        let scratch = Scratch::new("sync_floor");
+        let (one, _) = link(&scratch.0, 1, &[], &[], &json!({}));
+        let (two, _) = link(&scratch.0, 2, &[], &[], &json!({}));
+        assert_eq!(bytes(&[&one, &two]), 1000 + 10 + 1000 + 10 + 100);
+    }
+}
