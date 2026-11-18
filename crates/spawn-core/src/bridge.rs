@@ -102,8 +102,8 @@ use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
 use crate::event::{
-    ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind, EventRecord, Fork,
-    GlobalPosition, ModelProfile, NewEvent, Source,
+    ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind,
+    EventRecord, Fork, GlobalPosition, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
@@ -512,6 +512,105 @@ impl Default for Archiving {
     }
 }
 
+/// What one copy of a transcript into the archive did (objective 179).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pass {
+    /// It copied: how far the transcript's archived offset moved.
+    Copied(u64),
+    /// It copied nothing, failing so (the loop's warning's words).
+    Failed(String),
+    /// The transcript is gone (Claude Code's cleanup deleted it) while the
+    /// archive lacks lines of it: nothing can be copied, nor ever resumed.
+    Gone,
+}
+
+impl Pass {
+    /// The failure the loop warns of, if the pass did not copy.
+    fn error(&self) -> Option<String> {
+        match self {
+            Self::Copied(_) => None,
+            Self::Failed(error) => Some(error.clone()),
+            Self::Gone => Some(ARCHIVE_GONE.to_string()),
+        }
+    }
+}
+
+/// The `archive.failed` reason of a transcript removed before the archive
+/// had every line of it (objective 179 R4).
+pub const ARCHIVE_GONE: &str = "the transcript was removed before the archive had every line of it";
+
+/// What the log was told of one transcript's archive state
+/// ([`Bridge::record_archive_pass`]).
+#[derive(Debug, Clone, Default)]
+struct ArchiveEvents {
+    /// The reason of the `archive.failed` the log holds last, `None` when it
+    /// holds none or an `archive.resumed` after it.
+    failed: Option<String>,
+    /// The last pass failed with [`transcripts::MASK_CHANGED`]: a second in
+    /// a row is a failure (a rotation between the mask and the read is
+    /// copied on the next pass).
+    stale: bool,
+    /// A change tried and not yet taken by the log: tried again each pass
+    /// under its key until it is, or until a newer change replaces it.
+    pending: Option<PendingArchiveEvent>,
+}
+
+/// An archive event waiting for the log: its key, the state it tells
+/// (`failed` as in [`ArchiveEvents`]) and the event.
+#[derive(Debug, Clone)]
+struct PendingArchiveEvent {
+    key: String,
+    failed: Option<String>,
+    kind: EventKind,
+}
+
+/// `reason` cut to [`ARCHIVE_REASON_MAX`] characters, on a character
+/// boundary.
+fn archive_reason(reason: &str) -> String {
+    reason.chars().take(ARCHIVE_REASON_MAX).collect()
+}
+
+/// What a pass wants the log told of a transcript's archive state.
+enum Wanted {
+    /// Nothing new: a first stale mask, or a transcript gone whose failure is
+    /// already told or waiting to be.
+    Nothing,
+    /// The state `failed` as in [`ArchiveEvents`].
+    State(Option<String>),
+}
+
+/// What `pass` wants the log told, given what it was told (`entry`).
+fn wanted_archive_state(entry: &mut ArchiveEvents, pass: &Pass) -> Wanted {
+    match pass {
+        Pass::Copied(_) => {
+            entry.stale = false;
+            Wanted::State(None)
+        }
+        Pass::Failed(reason) if reason == transcripts::MASK_CHANGED && !entry.stale => {
+            entry.stale = true;
+            Wanted::Nothing
+        }
+        Pass::Failed(reason) => {
+            entry.stale = reason == transcripts::MASK_CHANGED;
+            Wanted::State(Some(archive_reason(reason)))
+        }
+        Pass::Gone => {
+            entry.stale = false;
+            // A gone transcript never reads resumed.
+            if entry.pending.as_ref().is_some_and(|p| p.failed.is_none()) {
+                entry.pending = None;
+            }
+            let told = entry.failed.is_some()
+                || entry.pending.as_ref().is_some_and(|p| p.failed.is_some());
+            if told {
+                Wanted::Nothing
+            } else {
+                Wanted::State(Some(ARCHIVE_GONE.to_string()))
+            }
+        }
+    }
+}
+
 /// An ended execution whose transcript the archive may still lack
 /// ([`Bridge::archive_ended`]): its last record, and the copy's last failure.
 #[derive(Debug, Clone)]
@@ -897,6 +996,12 @@ pub struct Bridge {
     /// made. Rebuilt after a restart from the progress records
     /// ([`Bridge::recover`]): never only in memory.
     ended_archives: std::sync::Mutex<BTreeMap<(AgentId, String), EndedArchive>>,
+    /// Per agent and native session, what the log was told of the
+    /// transcript's archive state and what waits to be told (objective 179,
+    /// [`Bridge::record_archive_pass`]); seeded from the log as it is folded.
+    archive_events: std::sync::Mutex<HashMap<(AgentId, String), ArchiveEvents>>,
+    /// The archive events' keys made by this Bridge, for their `<n>`.
+    archive_keys: std::sync::atomic::AtomicU64,
     /// When this pass began, by the Bridge's clock: a transcript the watch
     /// says nothing of is known unchanged until then.
     pass_started: i64,
@@ -1009,6 +1114,8 @@ impl Bridge {
             transcripts: None,
             archive_mask: None,
             ended_archives: std::sync::Mutex::default(),
+            archive_events: std::sync::Mutex::default(),
+            archive_keys: std::sync::atomic::AtomicU64::new(0),
             pass_started: i64::MIN,
             held: HashMap::new(),
             touched: HashSet::new(),
@@ -1362,6 +1469,7 @@ impl Bridge {
         if event.kind.is_control() {
             return;
         }
+        self.fold_archive_event(event);
         let view = self
             .sessions
             .entry(event.session_id.clone())
@@ -3549,7 +3657,7 @@ impl Bridge {
         let path = transcript_path(&self.config.claude_projects, &active.workspace, &native);
         let state = &mut active.follow.archiving;
         if state.due || !live {
-            let error = self.copy_transcript(
+            let pass = self.copy_transcript(
                 archive,
                 agent_id,
                 &native,
@@ -3561,6 +3669,15 @@ impl Bridge {
                     &mut state.known_ms,
                 ),
             );
+            self.record_archive_pass(
+                agent_id,
+                session,
+                Some(&active.execution_id),
+                &native,
+                &pass,
+                report,
+            );
+            let error = pass.error();
             state.due = error.is_some();
             if let Some(error) = &error
                 && state.error.as_ref() != Some(error)
@@ -3620,7 +3737,10 @@ impl Bridge {
     /// One copy of the transcript at `path` into the archive: on success the
     /// archive's length and nothing behind, known until the read; on
     /// failure the time of the first line the archive lacks, if the
-    /// transcript can be read. The copy's failure, if it failed.
+    /// transcript can be read. A transcript gone while the archive lacks
+    /// lines of it (`behind_ms` set) keeps `behind_ms`: nothing is behind
+    /// only once every line was copied, never because the file went
+    /// (objective 179 R3). What the pass did.
     fn copy_transcript(
         &self,
         archive: &dyn TranscriptArchive,
@@ -3629,7 +3749,7 @@ impl Bridge {
         workspace: &WorkspaceId,
         path: &str,
         (archived, behind_ms, known_ms): (&mut Option<u64>, &mut Option<i64>, &mut Option<i64>),
-    ) -> Option<String> {
+    ) -> Pass {
         let read_at = self.clock.now().0.saturating_sub(ARCHIVE_SLACK_MS);
         let known = |known_ms: &mut Option<i64>| {
             *known_ms = Some(known_ms.map_or(read_at, |was| was.max(read_at)));
@@ -3666,13 +3786,20 @@ impl Bridge {
             },
         };
         match copied {
+            Ok(done) if done.gone && behind_ms.is_some() => {
+                known(known_ms);
+                Pass::Gone
+            }
             Ok(done) => {
+                let moved = done
+                    .offset
+                    .map_or(0, |offset| offset.saturating_sub(archived.unwrap_or(0)));
                 if done.offset.is_some() {
                     *archived = done.offset;
                 }
                 *behind_ms = None;
                 known(known_ms);
-                None
+                Pass::Copied(moved)
             }
             Err(error) => {
                 // The first line it lacks stays the first while nothing more
@@ -3690,14 +3817,118 @@ impl Bridge {
                             *behind_ms = at;
                             known(known_ms);
                         }
-                        Err(_) => return Some(error),
+                        Err(_) => return Pass::Failed(error),
                     }
                 } else {
                     known(known_ms);
                 }
-                Some(error)
+                Pass::Failed(error)
             }
         }
+    }
+
+    /// Record a change of one transcript's archive state (objective 179),
+    /// after each pass that tried a copy, on the session's own stream:
+    /// - `archive.failed {native, reason}` when the pass failed for a reason
+    ///   other than the one recorded last (cut to [`ARCHIVE_REASON_MAX`]);
+    ///   a first [`transcripts::MASK_CHANGED`] records nothing (a rotation
+    ///   between the mask and the read is copied next pass), a second in a
+    ///   row does;
+    /// - `archive.resumed {native, copied}` at the first pass that copied
+    ///   after a recorded failure;
+    /// - for a transcript gone with lines the archive lacks ([`Pass::Gone`]),
+    ///   never a resume: a recorded failure, or one still waiting, stands;
+    ///   with neither, the loss is recorded once ([`ARCHIVE_GONE`]);
+    /// - nothing while the state is what the log holds.
+    ///
+    /// A change gets its key (`archive:<native>:<ms>:<n>`) when it is first
+    /// tried and keeps it until the log takes it: a failed append is warned
+    /// and tried again next pass under the same key, so a log that took it
+    /// and lost its answer stores it once; a newer change replaces it. What
+    /// the log holds is also read back as it is folded
+    /// ([`Self::fold_archive_event`]), so a restarted Bridge neither says a
+    /// failure again nor leaves one ended while it was down unended.
+    fn record_archive_pass(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        execution: Option<&ExecutionId>,
+        native: &str,
+        pass: &Pass,
+        report: &mut TickReport,
+    ) {
+        let mut events = self
+            .archive_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = events
+            .entry((agent_id.clone(), native.to_string()))
+            .or_default();
+        if let Wanted::State(wanted) = wanted_archive_state(entry, pass) {
+            if wanted == entry.failed {
+                entry.pending = None;
+            } else if entry
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.failed != wanted)
+            {
+                let n = self
+                    .archive_keys
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let kind = match (&wanted, pass) {
+                    (Some(reason), _) => EventKind::ArchiveFailed {
+                        native: native.to_string(),
+                        reason: reason.clone(),
+                    },
+                    (None, Pass::Copied(copied)) => EventKind::ArchiveResumed {
+                        native: native.to_string(),
+                        copied: *copied,
+                    },
+                    // Only a copy wants the state resumed.
+                    (None, _) => return,
+                };
+                entry.pending = Some(PendingArchiveEvent {
+                    key: format!("archive:{native}:{}:{n}", self.clock.now().0),
+                    failed: wanted,
+                    kind,
+                });
+            }
+        }
+        if let Some(pending) = entry.pending.clone() {
+            match self.append(
+                agent_id,
+                session,
+                execution,
+                Source::Bridge,
+                Some(pending.key),
+                pending.kind,
+            ) {
+                Ok(()) => {
+                    entry.failed = pending.failed;
+                    entry.pending = None;
+                }
+                Err(error) => report.warnings.push(format!(
+                    "{session}: record the transcript archive's state: {error}"
+                )),
+            }
+        }
+    }
+
+    /// What the log holds of a transcript's archive state, read as it is
+    /// folded (objective 179 R2): its last `archive.failed` stands until an
+    /// `archive.resumed` of it.
+    fn fold_archive_event(&self, event: &NewEvent) {
+        let (native, failed) = match &event.kind {
+            EventKind::ArchiveFailed { native, reason } => (native, Some(reason.clone())),
+            EventKind::ArchiveResumed { native, .. } => (native, None),
+            _ => return,
+        };
+        self.archive_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((event.agent_id.clone(), native.clone()))
+            .or_default()
+            .failed = failed;
     }
 
     /// The ended executions whose transcripts the archive may lack, copied
@@ -3732,7 +3963,7 @@ impl Bridge {
                     &progress.native,
                 );
                 let mut known = (progress.known_ms != i64::MIN).then_some(progress.known_ms);
-                let error = self.copy_transcript(
+                let pass = self.copy_transcript(
                     archive,
                     &progress.agent,
                     &progress.native,
@@ -3740,6 +3971,15 @@ impl Bridge {
                     &path,
                     (&mut progress.archived, &mut progress.behind_ms, &mut known),
                 );
+                self.record_archive_pass(
+                    &progress.agent,
+                    &progress.session,
+                    Some(&progress.execution),
+                    &progress.native,
+                    &pass,
+                    report,
+                );
+                let error = pass.error();
                 if let Some(error) = &error
                     && entry.error.as_ref() != Some(error)
                 {
