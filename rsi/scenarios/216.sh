@@ -31,6 +31,8 @@
 #   (2b) The local copy of the base manifest edited (other bytes than the
 #       stored bundle's): not trusted; the next increment says its base is
 #       unusable and takes every file.
+#   (2c) A file given other bytes at the same size and mtime (rev-k's F1 on
+#       R1): the next increment uses its base and takes that file alone.
 #   (3) A file holding a credential value: the sync part is refused, the
 #       bundle holds no sync/ and is stored with its transcripts.
 #   (4) A place the scan could not search: refused the same way.
@@ -726,6 +728,17 @@ esac
 want=$(files_now | grep -c .)
 [ "$(field "$bun" '.sync.taken')" = "$want" ] || fail "(2b) with no usable base the bundle took $(field "$bun" '.sync.taken') files, not all $want"
 note "(2b) checked: an edited local manifest is not a base; every file taken"
+
+# --- (2c) other bytes at the same size and mtime are taken (rev-k's F1) -----------
+cp -p "$SYNC/obj-7/notes.md" "$WORK/notes.ref"
+printf 'NEW PACKAGE\n' >"$SYNC/obj-7/notes.md"
+touch -r "$WORK/notes.ref" "$SYNC/obj-7/notes.md"
+[ "$(size "$SYNC/obj-7/notes.md")" = "$(size "$WORK/notes.ref")" ] || harness "(2c) the rewrite changed the size"
+bundle_run 2c "SPAWN_BACKUP_SYNC_DIR=$SYNC" "SPAWN_BACKUP_SYNC_SCAN=$SCAN" "TMPDIR=$WORK/tmp" "PATH=$WORK/bin:$PATH"
+[ "$(field "$bun" '.sync.base_manifest')" = used ] || fail "(2c) the base manifest was not used: $(field "$bun" '.sync.base_manifest')"
+[ "$(cd "$dir/sync/files" && find . -type f | sed 's#^\./##' | tr '\n' ' ')" = "obj-7/notes.md " ] ||
+    fail "(2c) a file with other bytes at the same size and mtime was not taken: [$(cd "$dir/sync/files" 2>/dev/null && find . -type f | tr '\n' ' ')]"
+note "(2c) checked: other bytes at the same size and mtime are taken"
 
 # --- (3) a credential value drops the part ----------------------------------------
 printf 'a note that should not be here: %s\n' "$made_value" >"$SYNC/obj-7/leak.md"
