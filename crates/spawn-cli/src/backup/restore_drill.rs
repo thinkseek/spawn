@@ -65,9 +65,9 @@
 //! newest record with no notes part, or a dropped one, cannot be
 //! restored); then the folder the newest record names is compared with it,
 //! read only, against the newest bundle's start (its manifest's
-//! `created_at_ms`): changed, removed or made since is expected, other
-//! bytes with an earlier mtime or an older file the backup lacks is a
-//! mismatch. Its folder is plain only, never under the notes folder (exit
+//! `created_at_ms`): changed, removed, made, moved or copied since is
+//! expected, other bytes with an earlier mtime or an older file whose
+//! bytes the backup lacks under any path is a mismatch. Its folder is plain only, never under the notes folder (exit
 //! 2), and the floor counts each link's ciphertext and taken notes and the
 //! newest record's notes bytes. It records `backup.drilled.sync` alone, in
 //! the drill record's shape.
