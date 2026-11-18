@@ -299,13 +299,10 @@ other bytes, or a newest record whose notes part is missing or was dropped
 names (`sync.dir`, `/var/tmp/spawn/sync`) is compared with it, read only:
 the same bytes; changed since (other bytes, written at or after the
 bundle's start), removed since and made since (written at or after the
-bundle's start) are expected; so is a file moved or copied since (an older
-file under a path the manifest lacks whose size and sha256 are a bundled
-file's under another path, such as a round moved aside with `mkdir` + `mv`,
-which keeps the mtimes); a file listed as skipped or changed while bundled is
+bundle's start) are expected; a file listed as skipped or changed while bundled is
 said apart; anything else, such as other bytes last written before the
 bundle started (the backup holds older bytes than the folder had then) or
-an older file whose bytes the backup lacks under any path, is a mismatch. Nothing is written to, created
+an older file the backup lacks, is a mismatch. Nothing is written to, created
 in or removed from the notes folder. The drill's folder (under `/data/tmp`,
 never under `$HOME`, `$SPAWN_LIVE`, the workspace root or the notes folder)
 holds only directories and regular files and is removed as the transcripts
