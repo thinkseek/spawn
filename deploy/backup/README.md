@@ -17,7 +17,7 @@ the drill's test.
 | --- | --- |
 | Bucket | `spawn-store`, account q1293822641@gmail.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
 | Format | dumps: `pg_dump -Fc` (compression `SPAWN_BACKUP_DUMP_COMPRESS`, default `zstd:9`) and `gpg --symmetric` AES-256; bundles: a tar (zstd) of `manifest.json`, `repos/*.bundle` and `transcripts/`, the same `gpg` passphrase |
-| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below), `spawn-backup-restore-drill-missions.timer` (daily 05:45, `spawn backup restore-drill --only missions`, objective 186: the mission repositories alone, below); `spawn-backup-restore-drill-transcripts.timer` (daily 06:15, `spawn backup restore-drill --only transcripts`, objective 200: the transcript archive alone, judged by its record, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
+| Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below), `spawn-backup-restore-drill-missions.timer` (daily 05:45, `spawn backup restore-drill --only missions`, objective 186: the mission repositories alone, below); `spawn-backup-restore-drill-transcripts.timer` (daily 06:15, `spawn backup restore-drill --only transcripts`, objective 200: the transcript archive alone, judged by its record, below), `spawn-backup-restore-drill-sync.timer` (daily 06:30, `spawn backup restore-drill --only sync`, objective 217: the fleet's notes folder alone, installed disabled, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
 | Records | every run writes a `backup.dumped`, `backup.bundled` or `backup.verified` control record (owner-only `spawn_backup_record`); the tiers, the bundle's base and the plausibility check are read from them, never from a state file |
 | Settings | `SPAWN_BACKUP_KEY_FILE`, `SPAWN_R2_ENV_FILE`, `SPAWN_BACKUP_R2_LIMIT_MB` (10000), `SPAWN_BACKUP_R2_ALERT_MB` (8000), `SPAWN_BACKUP_TRANSCRIPT_DAYS` (14), `SPAWN_BACKUP_DRILL_DATABASE_URL` (the drill's disposable server), `SPAWN_BACKUP_PREFIX` (empty in the fleet; a test run's `locktest/`) |
 
@@ -286,6 +286,39 @@ lines file's `recoverability.drills`, an owner config change made after
 landing) names the unit: `{"name": "transcripts", "unit":
 "spawn-backup-restore-drill-transcripts.service"}`: passed when its last
 run exited 0.
+
+The notes folder's drill (objective 217) runs on its own, daily at 06:30:
+`spawn backup restore-drill --only sync` unpacks from each bundle of the
+newest chain only `manifest.json`, `sync/manifest.json` and `sync/files/*`
+(decrypted in a pipe, as the transcripts drill does). Each link's notes
+manifest must be the sha256 its record names (`sync.manifest_sha256`), and
+every file of the newest manifest is restored from the newest link that
+took it, with the newest manifest's size and sha256; a file no link holds,
+other bytes, or a newest record whose notes part is missing or was dropped
+(`refused`) is a backup that cannot be restored. Then the folder the record
+names (`sync.dir`, `/var/tmp/spawn/sync`) is compared with it, read only:
+the same bytes; changed since (other bytes, written at or after the
+bundle's start), removed since and made since (written at or after the
+bundle's start) are expected; a file listed as skipped or changed while bundled is
+said apart; anything else, such as other bytes last written before the
+bundle started (the backup holds older bytes than the folder had then) or
+an older file the backup lacks, is a mismatch. Nothing is written to, created
+in or removed from the notes folder. The drill's folder (under `/data/tmp`,
+never under `$HOME`, `$SPAWN_LIVE`, the workspace root or the notes folder)
+holds only directories and regular files and is removed as the transcripts
+drill's; the floor counts the chain's ciphertext and notes files. It
+records `backup.drilled.sync` alone and prints counts and paths, never a
+file's content. Exit 0 passed, 1 failed, 2 cannot run. The timer ships
+disabled: the lead enables it after one supervised run on live, and adds
+the recovery table's row then (not part of 217):
+
+```sh
+install -m 644 deploy/systemd/spawn-backup-restore-drill-sync.service \
+  deploy/systemd/spawn-backup-restore-drill-sync.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user start spawn-backup-restore-drill-sync.service   # supervised; then:
+systemctl --user enable --now spawn-backup-restore-drill-sync.timer
+```
 
 `SPAWN_BACKUP_DRILL_DATABASE_URL` must be in `spawn.env` before the drill
 timer is enabled: a disposable server (the fleet's test database), never the
