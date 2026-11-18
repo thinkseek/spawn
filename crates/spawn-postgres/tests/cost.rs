@@ -1205,3 +1205,148 @@ fn an_engine_fold_takes_a_message_the_sessions_counted_first() {
     assert_eq!((again.counted, again.engine), (0, 1));
     near(&sessions_usd(), 0.0, "the raced copy is gone");
 }
+
+/// The sessions' record of `id` on a connection of its own, on a thread:
+/// its backend's pid at once, then its answer.
+fn sessions_record_aside(
+    schema: &str,
+    id: &str,
+    at_ms: i64,
+    input: i64,
+) -> (
+    i32,
+    std::sync::mpsc::Receiver<Result<Value, String>>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut client = admin(schema);
+    let pid: i32 = client
+        .query_one("select pg_backend_pid()", &[])
+        .expect("pid")
+        .get(0);
+    let messages = serde_json::to_value([session_message(id, "model-x", at_ms, [input, 0, 0, 0])])
+        .expect("messages");
+    let (sent, answer) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let done = client
+            .query_one(
+                "select spawn_cost_session_record($1, $2, '[]'::jsonb)",
+                &[&prices(3.0), &messages],
+            )
+            .map(|row| row.get::<_, Value>(0))
+            .map_err(|error| error.to_string());
+        let _ = sent.send(done);
+    });
+    (pid, answer, thread)
+}
+
+/// Whether backend `pid` waits for the cost record's lock.
+fn waits_for_the_cost_lock(watch: &mut postgres::Client, pid: i32) -> bool {
+    for _ in 0..100 {
+        let waiting: i64 = watch
+            .query_one(
+                "select count(*) from pg_locks
+                  where locktype = 'advisory' and not granted and pid = $1
+                    and classid = 0 and objid = 1399957341 and objsubid = 1",
+                &[&pid],
+            )
+            .expect("locks")
+            .get(0);
+        if waiting == 1 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// Cost coverage 1b (rev-h n1): the engine folds and the sessions' record
+/// take the cost record's lock, so they commit one after another. A
+/// sessions' read of a message an engine fold has taken but not committed
+/// waits for that commit, then leaves the message to the engines; it never
+/// holds a copy beside theirs. Through the live fold and the archive's.
+#[test]
+fn the_sessions_record_waits_for_an_open_engine_fold_and_then_yields() {
+    let (store, schema) = store("cost_sessions_lock");
+    let (_mission, _task, worker) = one_task(&store);
+    let now = store.database_now_ms().expect("now");
+    started(&store, &worker, 1);
+    usage(
+        &store,
+        &worker,
+        1,
+        ("msg_live", "model-x", now),
+        [100_000, 0, 0, 0],
+    );
+    let mut watch = admin(&schema);
+    let held = |watch: &mut postgres::Client| -> i64 {
+        watch
+            .query_one("select count(*) from spawn_cost_session_messages", &[])
+            .expect("held")
+            .get(0)
+    };
+    let wait = std::time::Duration::from_secs(2);
+
+    // The live fold, open.
+    let mut fold = admin(&schema);
+    let mut open = fold.transaction().expect("begin");
+    let folded: i32 = open
+        .query_one("select spawn_cost_record($1)", &[&prices(3.0)])
+        .expect("fold")
+        .get(0);
+    assert_eq!(folded, 1);
+    let (pid, answer, thread) = sessions_record_aside(&schema, "msg_live", now, 100_000);
+    assert!(
+        waits_for_the_cost_lock(&mut watch, pid),
+        "the sessions' record waits for the lock"
+    );
+    assert!(answer.recv_timeout(wait).is_err(), "no answer while open");
+    open.commit().expect("commit");
+    let done = answer
+        .recv_timeout(wait * 5)
+        .expect("answered")
+        .expect("record");
+    thread.join().expect("thread");
+    assert_eq!(
+        (&done["counted"], &done["engine"]),
+        (&json!(0), &json!(1)),
+        "{done}"
+    );
+    assert_eq!(held(&mut watch), 0, "no sessions' copy");
+
+    // The archive's fold, open.
+    let messages = serde_json::to_value([archived(
+        &worker.agent,
+        "msg_old",
+        "model-x",
+        now + 1,
+        200_000,
+    )])
+    .expect("messages");
+    let mut open = fold.transaction().expect("begin");
+    let archived_now: Value = open
+        .query_one(
+            "select spawn_cost_archive_record($1, $2)",
+            &[&prices(3.0), &messages],
+        )
+        .expect("archive")
+        .get(0);
+    assert_eq!(archived_now["counted"], json!(1), "{archived_now}");
+    let (pid, answer, thread) = sessions_record_aside(&schema, "msg_old", now + 1, 200_000);
+    assert!(
+        waits_for_the_cost_lock(&mut watch, pid),
+        "the sessions' record waits for the lock"
+    );
+    assert!(answer.recv_timeout(wait).is_err(), "no answer while open");
+    open.commit().expect("commit");
+    let done = answer
+        .recv_timeout(wait * 5)
+        .expect("answered")
+        .expect("record");
+    thread.join().expect("thread");
+    assert_eq!(
+        (&done["counted"], &done["engine"]),
+        (&json!(0), &json!(1)),
+        "{done}"
+    );
+    assert_eq!(held(&mut watch), 0, "no sessions' copy");
+}

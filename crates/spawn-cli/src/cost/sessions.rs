@@ -142,6 +142,9 @@ impl Budget {
 pub(super) struct Pass {
     pub(super) counted: i64,
     pub(super) changed: i64,
+    /// Messages the store did not count (`invalid`: no id, model, time,
+    /// project or session); their file's mark moved past them.
+    pub(super) invalid: i64,
     pub(super) files: usize,
     pub(super) bytes: u64,
     /// Files read from 0 again: their inode changed, or they shrank.
@@ -149,6 +152,9 @@ pub(super) struct Pass {
     pub(super) errors: Vec<String>,
     /// The pass stopped at its byte or time bound.
     pub(super) bounded: bool,
+    /// The longest one call to the store took: it holds the cost record's
+    /// lock that long, and the loop's cost step waits for it.
+    pub(super) longest_call: Duration,
 }
 
 /// One pass over `projects`: the lines for the loop's log.
@@ -173,6 +179,17 @@ pub(super) fn count(
             pass.bytes,
             started.elapsed().as_secs(),
             if pass.bounded { "; the rest next pass" } else { "" }
+        ));
+        lines.push(format!(
+            "cost: sessions: the longest call to the store took {} ms",
+            pass.longest_call.as_millis()
+        ));
+    }
+    if pass.invalid > 0 {
+        lines.push(format!(
+            "cost: sessions: {} message{} not counted (no id, model, time, project or session)",
+            pass.invalid,
+            if pass.invalid == 1 { "" } else { "s" }
         ));
     }
     if !pass.restarted.is_empty() {
@@ -225,7 +242,7 @@ pub(super) fn pass(
                 if read.bounded {
                     done.bounded = true;
                 }
-                let session = name.trim_end_matches(".jsonl").to_string();
+                let session = name.strip_suffix(".jsonl").unwrap_or(&name).to_string();
                 let mark = SessionFile {
                     file: key.clone(),
                     inode: read.inode,
@@ -233,12 +250,16 @@ pub(super) fn pass(
                     length: read.length,
                     modified_ms: read.modified_ms,
                 };
-                match record(store, prices, &project, &session, read.messages, &mark) {
-                    Ok((counted, changed)) => {
-                        done.counted += counted;
-                        done.changed += changed;
-                        done.files += 1;
-                    }
+                match record(
+                    store,
+                    prices,
+                    &project,
+                    &session,
+                    read.messages,
+                    &mark,
+                    &mut done,
+                ) {
+                    Ok(()) => done.files += 1,
                     Err(error) => done.errors.push(format!("{key}: {error}")),
                 }
             }
@@ -248,7 +269,9 @@ pub(super) fn pass(
     done
 }
 
-/// Send one file's messages in batches, its mark with the last.
+/// Send one file's messages in batches, its mark with the last; what each
+/// call did is added to `done`. Each batch is one call, one transaction:
+/// the cost record's lock is held for one batch at most.
 fn record(
     store: &PostgresStore,
     prices: &Prices,
@@ -256,7 +279,8 @@ fn record(
     session: &str,
     messages: BTreeMap<String, Folded>,
     mark: &SessionFile,
-) -> Result<(i64, i64), String> {
+    done: &mut Pass,
+) -> Result<(), String> {
     let count = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
     let messages: Vec<SessionMessage> = messages
         .into_iter()
@@ -280,20 +304,22 @@ fn record(
         batches.push(&[]);
     }
     let last = batches.len() - 1;
-    let (mut counted, mut changed) = (0, 0);
     for (index, batch) in batches.into_iter().enumerate() {
         let files = if index == last {
             std::slice::from_ref(mark)
         } else {
             &[]
         };
-        let done = store
+        let started = Instant::now();
+        let call = store
             .cost_session_record(prices.as_value(), batch, files)
             .map_err(|error| format!("recording: {error}"))?;
-        counted += done.counted;
-        changed += done.changed;
+        done.longest_call = done.longest_call.max(started.elapsed());
+        done.counted += call.counted;
+        done.changed += call.changed;
+        done.invalid += call.invalid;
     }
-    Ok((counted, changed))
+    Ok(())
 }
 
 /// The transcripts under `projects`: `(project, path, file name)` of each
@@ -321,6 +347,8 @@ pub(super) fn transcripts(projects: &Path, skip: Option<&str>) -> Vec<(String, P
             let Ok(name) = file.file_name().into_string() else {
                 continue;
             };
+            // `<session>.jsonl`: a file named `.jsonl` alone has no
+            // extension (`Path::extension`), so no empty session is counted.
             if Path::new(&name)
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
@@ -445,7 +473,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{Budget, engine_prefix, pass, read_file, transcripts};
+    use super::{Budget, Folded, engine_prefix, pass, read_file, record, transcripts};
     use crate::cost::Prices;
 
     fn line(id: &str, at: &str, usage: [u64; 4]) -> String {
@@ -519,6 +547,8 @@ mod tests {
         std::fs::create_dir_all(&engine).expect("dirs");
         append(&rev.join("a.jsonl"), "");
         append(&rev.join("notes.txt"), "");
+        // No session in its name: not a transcript.
+        append(&rev.join(".jsonl"), "");
         append(&rev.join("sub").join("deep.jsonl"), "");
         append(&engine.join("e.jsonl"), "");
         std::os::unix::fs::symlink(rev.join("a.jsonl"), rev.join("link.jsonl")).expect("link");
@@ -529,6 +559,36 @@ mod tests {
             .collect();
         let _ = std::fs::remove_dir_all(projects.parent().and_then(Path::parent).expect("home"));
         assert_eq!(found, vec!["-data-tmp-ccd-rev-x/a.jsonl".to_string()]);
+    }
+
+    #[test]
+    fn the_projects_of_the_workspace_root_are_skipped_and_no_other() {
+        let projects = fake_projects("skip");
+        let root = Path::new("/home/u/.local/share/spawn-rsi/ws");
+        // Claude Code's names for: an engine under the root, the root
+        // itself, a sibling sharing the root's name as a prefix, a reviewer.
+        for project in [
+            "-home-u--local-share-spawn-rsi-ws-agent-worker-1",
+            "-home-u--local-share-spawn-rsi-ws",
+            "-home-u--local-share-spawn-rsi-wsx",
+            "-data-tmp-ccd-rev-x",
+        ] {
+            std::fs::create_dir_all(projects.join(project)).expect("dirs");
+            append(&projects.join(project).join("s.jsonl"), "");
+        }
+        let found: Vec<String> = transcripts(&projects, Some(&engine_prefix(root)))
+            .into_iter()
+            .map(|(project, _, _)| project)
+            .collect();
+        let _ = std::fs::remove_dir_all(projects.parent().and_then(Path::parent).expect("home"));
+        assert_eq!(
+            found,
+            vec![
+                "-data-tmp-ccd-rev-x".to_string(),
+                "-home-u--local-share-spawn-rsi-ws".to_string(),
+                "-home-u--local-share-spawn-rsi-wsx".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -672,5 +732,72 @@ mod tests {
         let usd = sessions["total"]["usd"].as_f64().expect("usd");
         assert!((usd - 3.015).abs() < 1e-9, "{sessions}");
         assert!(!sessions.to_string().contains("never stored"));
+    }
+
+    #[test]
+    fn the_messages_the_store_does_not_count_are_counted_back() {
+        let schema = spawn_postgres::testing::TestSchema::new("cost_sessions_invalid");
+        let store = schema.store();
+        let prices = Prices::parse(
+            r#"{"model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3}}"#,
+        )
+        .expect("prices");
+        let folded = |at_ms| Folded {
+            at_ms,
+            model: "model-x".to_string(),
+            usage: [10, 1, 0, 0],
+        };
+        let mark = |file: &str| spawn_postgres::SessionFile {
+            file: file.to_string(),
+            inode: 1,
+            offset_bytes: 10,
+            length: 10,
+            modified_ms: 1,
+        };
+        // No session: the store counts none and says so; the mark still moves.
+        let messages = [
+            ("m1".to_string(), folded(1_000)),
+            ("m2".to_string(), folded(2_000)),
+        ];
+        let mut done = super::Pass::default();
+        let none = record(
+            &store,
+            &prices,
+            "p",
+            "",
+            messages.clone().into(),
+            &mark("p/.jsonl"),
+            &mut done,
+        );
+        assert_eq!(none, Ok(()));
+        assert_eq!(
+            (done.counted, done.changed, done.invalid),
+            (0, 0, 2),
+            "{done:?}"
+        );
+        let mut done = super::Pass::default();
+        let some = record(
+            &store,
+            &prices,
+            "p",
+            "s",
+            messages.into(),
+            &mark("p/s.jsonl"),
+            &mut done,
+        );
+        assert_eq!(some, Ok(()));
+        assert_eq!(
+            (done.counted, done.changed, done.invalid),
+            (2, 0, 0),
+            "{done:?}"
+        );
+        assert!(done.longest_call > Duration::ZERO, "{done:?}");
+        let marks: Vec<String> = store
+            .cost_session_files()
+            .expect("marks")
+            .into_iter()
+            .map(|mark| mark.file)
+            .collect();
+        assert_eq!(marks, vec!["p/.jsonl".to_string(), "p/s.jsonl".to_string()]);
     }
 }
