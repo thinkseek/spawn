@@ -20,6 +20,18 @@
 //! - The store that grew most ([`grew_most`]): of health.storage's
 //!   `growth_parts` that have a value and `unattributed` (the fall less
 //!   their sum), the one that grew most; a tie goes to the one named first.
+//!   It is judged on the fit's fall, the week's: the growth parts grow over
+//!   the same week, and a day's fall less a week's growth would call a
+//!   store's sudden day unattributed.
+//!
+//! The fall said is the worse of the fit's and the last day's (objective
+//! 222, [`worse`]), with its basis (`fit` or `day`). A disk swept by hand
+//! rises and falls in steps: on 2026-11-18 df's free disk fell 77 GB in a
+//! day while the week's sawtooth (sweeps lifting it between) fitted a line
+//! that gained 4.7 GB a day, and a robust line reads the week's gain too.
+//! The day's fall ([`day_fall`]) is from the latest sample a day old or
+//! more, no older than 36 h, to the free disk now, over the days between:
+//! from the same samples, no read of its own.
 
 use serde_json::{Value, json};
 
@@ -101,6 +113,44 @@ pub(super) fn fall(readings: &[(i64, f64)]) -> Option<i64> {
     Some((-slope).round() as i64)
 }
 
+/// The oldest a day-old sample the day's fall is read from may be.
+const DAY_FALL_STALE_MS: i64 = 36 * 3_600_000;
+
+/// The free disk lost over the last day, in bytes a day, rounded; below
+/// zero when the disk gained. From the latest of `samples` carrying a
+/// number for the free disk at or before `now_ms` less a day, when it is at
+/// or after `now_ms` less 36 h, to `free_now` at `now_ms`, over the days
+/// between them. None without such a sample or a free disk now.
+pub(super) fn day_fall(samples: &Value, free_now: Option<u64>, now_ms: i64) -> Option<i64> {
+    let free_now = free_now?;
+    let (at, then) = samples
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sample| Some((sample["at_ms"].as_i64()?, sample["values"][FREE].as_f64()?)))
+        .filter(|(at, _)| *at <= now_ms - DAY_MS && *at >= now_ms - DAY_FALL_STALE_MS)
+        .max_by_key(|(at, _)| *at)?;
+    #[allow(clippy::cast_precision_loss)]
+    let days = (now_ms - at) as f64 / DAY_MS as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let lost = then - free_now as f64;
+    // A disk's bytes a day fit an i64 many times over.
+    #[allow(clippy::cast_possible_truncation)]
+    Some((lost / days).round() as i64)
+}
+
+/// The worse of the fit's fall and the day's, with its basis (`fit` or
+/// `day`): the larger; a tie is the fit's; either alone when the other is
+/// none; none when both are.
+pub(super) fn worse(fit: Option<i64>, day: Option<i64>) -> Option<(i64, &'static str)> {
+    match (fit, day) {
+        (Some(fit), Some(day)) if day > fit => Some((day, "day")),
+        (Some(fit), _) => Some((fit, "fit")),
+        (None, Some(day)) => Some((day, "day")),
+        (None, None) => None,
+    }
+}
+
 /// How many days `free` lasts at `fall` a day, rounded down; none when
 /// either is unknown or the disk does not fall.
 pub(super) fn days_left(free: Option<u64>, fall: Option<i64>) -> Option<u64> {
@@ -135,21 +185,25 @@ pub(super) fn grew_most(parts: &Value, fall: Option<i64>) -> Option<(&'static st
 
 /// `storage` (health.storage as the line reads it) with the disk's
 /// figures from `samples` (the window's `host.core_lines` samples) and its
-/// own `free_bytes` now, at `now_ms`: `days_left` from the fit (and
-/// `days_left_measuring_since_ms` while the fall has no value),
-/// `disk_fall_bytes_per_day` and `grew_most` (`{store, bytes_per_day}`).
+/// own `free_bytes` now, at `now_ms`: `disk_fall_bytes_per_day`, the worse
+/// of the fit's and the day's ([`worse`]), and its `disk_fall_basis`;
+/// `days_left` from that fall (and `days_left_measuring_since_ms` while it
+/// has no value); `grew_most` (`{store, bytes_per_day}`) from the fit's.
 pub(super) fn with_disk(storage: &mut Value, samples: &Value, now_ms: i64) {
     let free = storage["free_bytes"].as_u64();
     let readings = readings(samples, free, now_ms);
-    let fall = fall(&readings);
+    let fit = fall(&readings);
+    let said = worse(fit, day_fall(samples, free, now_ms));
+    let fall = said.map(|(fall, _)| fall);
     let measuring_since = match fall {
         Some(_) => None,
         None => readings.first().map(|(at, _)| at + DAY_MS),
     };
-    let most = grew_most(&storage["growth_parts"], fall);
+    let most = grew_most(&storage["growth_parts"], fit);
     storage["days_left"] = json!(days_left(free, fall));
     storage["days_left_measuring_since_ms"] = json!(measuring_since);
     storage["disk_fall_bytes_per_day"] = json!(fall);
+    storage["disk_fall_basis"] = json!(said.map(|(_, basis)| basis));
     storage["grew_most"] = most.map_or(
         Value::Null,
         |(store, grew)| json!({"store": store, "bytes_per_day": grew}),

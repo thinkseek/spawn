@@ -81,13 +81,17 @@ pub(super) fn storage_line(storage: &Value) -> Line {
                 storage["leaked_test_schemas"].clone(),
             ),
             // Objective 141, after the seven: the disk's own fall and the
-            // store that grew most, said with its store.
-            Figure::new(
-                "storage.disk_fall",
-                "Free disk lost a day",
-                "bytes_per_day",
-                storage["disk_fall_bytes_per_day"].clone(),
-            ),
+            // store that grew most, said with its store. The fall says its
+            // basis, the week's fit or the last day (objective 222).
+            Figure {
+                basis: storage["disk_fall_basis"].as_str().map(str::to_string),
+                ..Figure::new(
+                    "storage.disk_fall",
+                    "Free disk lost a day",
+                    "bytes_per_day",
+                    storage["disk_fall_bytes_per_day"].clone(),
+                )
+            },
             Figure {
                 store: storage["grew_most"]["store"].as_str().map(str::to_string),
                 ..Figure::new(

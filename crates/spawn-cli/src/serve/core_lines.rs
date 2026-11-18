@@ -177,6 +177,9 @@ pub(super) struct Figure {
     /// in its first week of judged data): said as `range_note`; while it is
     /// set the figure has no range, so it is never out.
     pub(super) range_note: Option<String>,
+    /// What a figure's value is read from, when it says (objective 222:
+    /// storage.disk_fall's `fit` or `day`): said as `basis`.
+    pub(super) basis: Option<String>,
 }
 
 impl Figure {
@@ -198,6 +201,7 @@ impl Figure {
             by_source: None,
             of: None,
             range_note: None,
+            basis: None,
         }
     }
 
@@ -372,6 +376,9 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     }
     if let Some(range_note) = &figure.range_note {
         answer["range_note"] = json!(range_note);
+    }
+    if let Some(basis) = &figure.basis {
+        answer["basis"] = json!(basis);
     }
     answer
 }
