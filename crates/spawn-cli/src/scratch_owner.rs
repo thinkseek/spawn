@@ -17,6 +17,14 @@
 //! symlink is followed: a folder named through one, or a build path
 //! through one, is refused. `spawn scratch sweep` (crate::scratch_sweep,
 //! objective 145) is the one that removes build paths.
+//!
+//! A folder removed whole (`rm -rf`, the usual end of a round) took its
+//! claim with it: `release` of one that is gone prints `{"gone":"<dir>"}`
+//! and exits 0, writing nothing (objective 220, [`gone`]). Gone is narrow:
+//! an absolute name with no `.` or `..` part, every part of it that exists
+//! a real directory (never followed), up to one that does not exist. Any
+//! other name is released, or refused, as before; `renew` of a gone folder
+//! is refused (a lease cannot run on nothing).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -162,6 +170,10 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         }
         "release" => {
             flags.only(&[])?;
+            if gone(Path::new(dir)) {
+                println!("{}", json!({ "gone": dir }));
+                return Ok(0);
+            }
             change(Path::new(dir), |claim| claim.lease_until_ms = now)?
         }
         other => return Err(format!("unknown scratch command {other}\n{USAGE}")),
@@ -359,6 +371,34 @@ fn claim(dir: &Path, flags: &Parsed, now: i64) -> Result<Claim, String> {
     };
     write(dir, &claim)?;
     Ok(claim)
+}
+
+/// Whether `dir` is gone, its claim with it (objective 220): absolute, no
+/// `.` or `..` part, and walking it from `/`, every part that exists is a
+/// real directory (lstat, never followed), until one part does not exist
+/// (`NotFound`). A symlink or a file on the way, a folder still there, or
+/// any other error (a directory that cannot be searched) is not gone.
+pub(crate) fn gone(dir: &Path) -> bool {
+    let Some(text) = dir.to_str() else {
+        return false;
+    };
+    if !dir.is_absolute() || text.split('/').any(|part| part == "." || part == "..") {
+        return false;
+    }
+    let mut at = PathBuf::from("/");
+    for part in dir.components() {
+        match part {
+            Component::RootDir => continue,
+            Component::Normal(name) => at.push(name),
+            _ => return false,
+        }
+        match std::fs::symlink_metadata(&at) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return false,
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+    false
 }
 
 /// `renew` and `release`: `dir`'s claim, changed and written again.
