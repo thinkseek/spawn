@@ -3857,6 +3857,7 @@ impl Bridge {
         pass: &Pass,
         report: &mut TickReport,
     ) {
+        eprintln!("DBG pass {pass:?} {:?}", self.archive_events.lock().unwrap().get(&(agent_id.clone(), native.to_string())).map(|e| (e.failed.clone(), e.stale, e.pending.is_some())));
         let mut events = self
             .archive_events
             .lock()
