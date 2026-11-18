@@ -2543,7 +2543,9 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     }
     if let Some(sync) = &sync {
         match sync.record["refused"].as_str() {
-            Some(reason) => println!("spawn backup bundle: the notes folder was left out: {reason}"),
+            Some(reason) => {
+                println!("spawn backup bundle: the notes folder was left out: {reason}")
+            }
             None => println!(
                 "spawn backup bundle: the notes folder: {} files, {} taken ({} bytes)",
                 sync.record["files"], sync.record["taken"], sync.record["taken_bytes"]
@@ -4837,5 +4839,40 @@ COPY public.spawn_events (id, agent_id, session_id) FROM stdin;
             Stamp::parse(&format!("locktest/{first}")).map(|stamp| stamp.text()),
             Some("20251114-030509".to_string())
         );
+    }
+
+    /// Objective 216 (9): a bundle's PUT is given 600 s plus its size at
+    /// 100 KB/s, sized to the object; a small one keeps the 600 s every
+    /// request has.
+    #[test]
+    fn a_bundle_put_is_given_600_s_plus_its_size_at_100_kb_s() {
+        assert_eq!(super::bundle_put_seconds(0), 600);
+        assert_eq!(super::bundle_put_seconds(99_999), 600);
+        assert_eq!(super::bundle_put_seconds(229_000_000), 600 + 2290);
+    }
+
+    /// Objective 216 (8): a bundle scratch a killed run left in the
+    /// workspace root goes, and nothing else there.
+    #[test]
+    fn a_bundle_scratch_a_killed_run_left_is_swept() {
+        let root = std::env::temp_dir().join(format!("spawn-bundle-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".spawn-backup-bundle-41-0a1b2c3d0/stage/sync"))
+            .expect("left");
+        std::fs::create_dir_all(root.join(".transcripts")).expect("transcripts");
+        std::fs::write(root.join(".backup.lock"), "").expect("lock");
+        super::sweep_bundle_scratch(&root);
+        assert!(!root.join(".spawn-backup-bundle-41-0a1b2c3d0").exists());
+        assert!(root.join(".transcripts").is_dir());
+        assert!(root.join(".backup.lock").is_file());
+        let made = super::Scratch::new_in(&root, super::BUNDLE_SCRATCH).expect("scratch");
+        assert!(made.path.starts_with(&root));
+        assert!(
+            made.path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".spawn-backup-bundle-"))
+        );
+        drop(made);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

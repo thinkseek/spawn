@@ -141,7 +141,8 @@ fn walk(dir: &Path) -> Result<(Vec<(String, PathBuf)>, Vec<String>), String> {
     let mut pending = vec![(String::new(), dir.to_path_buf())];
     while let Some((relative, path)) = pending.pop() {
         let shown = if relative.is_empty() { "." } else { &relative };
-        let listing = fs::read_dir(&path).map_err(|error| format!("cannot read {shown}: {error}"))?;
+        let listing =
+            fs::read_dir(&path).map_err(|error| format!("cannot read {shown}: {error}"))?;
         let mut names: Vec<_> = Vec::new();
         for entry in listing {
             let entry = entry.map_err(|error| format!("cannot read {shown}: {error}"))?;
@@ -268,7 +269,8 @@ pub(super) fn base_manifest(
         .as_str()
         .ok_or("the base bundle holds no notes folder")?;
     let path = root.join(LOCAL_MANIFEST);
-    let bytes = fs::read(&path).map_err(|error| format!("no local copy of its manifest: {error}"))?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("no local copy of its manifest: {error}"))?;
     if super::hex(&Sha256::digest(&bytes)) != want {
         return Err("the local copy of its manifest is not the stored one".to_string());
     }
@@ -438,7 +440,9 @@ pub(super) fn judge_scan(code: Option<i32>, stdout: &str, prefix: &str) -> Resul
     };
     match code {
         Some(0) => Ok(json!({"exit": 0, "unseen": []})),
-        Some(1) => Err("the value scan found a credential value or a private key block".to_string()),
+        Some(1) => {
+            Err("the value scan found a credential value or a private key block".to_string())
+        }
         Some(3) => {
             let blind: BTreeSet<&str> = unseen
                 .iter()
@@ -520,13 +524,15 @@ mod tests {
                 {"path": "manifest.json", "why": "high entropy"},
             ]})
         );
-        let blind = format!(
-            "{raw}not seen into (damaged zstd (ZstdError)): {prefix}files/old.zst\n"
-        );
+        let blind =
+            format!("{raw}not seen into (damaged zstd (ZstdError)): {prefix}files/old.zst\n");
         let refused = judge_scan(Some(3), &blind, prefix).expect_err("a blind place");
         assert!(refused.contains("damaged zstd"), "{refused}");
         assert!(!refused.contains("old.zst"), "{refused}");
-        assert!(judge_scan(Some(3), "files: 1\n", prefix).is_err(), "none named");
+        assert!(
+            judge_scan(Some(3), "files: 1\n", prefix).is_err(),
+            "none named"
+        );
         let hit = format!("value in {prefix}files/leak.md\n");
         let refused = judge_scan(Some(1), &hit, prefix).expect_err("a hit");
         assert!(!refused.contains("leak.md"), "{refused}");
@@ -587,9 +593,18 @@ mod tests {
         let base = entry("a.md", 2, 5, "ab");
         assert!(!changed(&base, Some(&base)), "equal");
         assert!(changed(&base, None), "new");
-        assert!(changed(&entry("a.md", 2, 6, "ab"), Some(&base)), "equal bytes, new mtime");
-        assert!(changed(&entry("a.md", 2, 5, "cd"), Some(&base)), "other bytes, same size and mtime");
-        assert!(changed(&entry("a.md", 3, 5, "ab"), Some(&base)), "other size");
+        assert!(
+            changed(&entry("a.md", 2, 6, "ab"), Some(&base)),
+            "equal bytes, new mtime"
+        );
+        assert!(
+            changed(&entry("a.md", 2, 5, "cd"), Some(&base)),
+            "other bytes, same size and mtime"
+        );
+        assert!(
+            changed(&entry("a.md", 3, 5, "ab"), Some(&base)),
+            "other size"
+        );
     }
 
     /// A full run takes every regular file, skips a symbolic link (never
