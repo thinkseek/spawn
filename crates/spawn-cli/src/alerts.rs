@@ -7932,7 +7932,7 @@ connections\n";
 
         // A restarted monitor reads the evidence back: nothing until it
         // moves.
-        let mut restarted = super::monitor();
+        let mut restarted = Monitor::with(settings());
         restarted
             .known
             .insert(key.clone(), monitor.known[&key].clone());
