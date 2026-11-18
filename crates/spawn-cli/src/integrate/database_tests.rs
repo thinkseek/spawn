@@ -10146,7 +10146,10 @@ fn a_second_integrator_is_refused_while_the_first_is_idle() {
     first.pass().expect("an idle pass");
     second.pass().expect("the second's pass does nothing");
     assert!(second.held.borrow().is_none(), "the second is refused");
-    assert!(second.stopped.borrow().is_none(), "it never held it: no stop");
+    assert!(
+        second.stopped.borrow().is_none(),
+        "it never held it: no stop"
+    );
 
     // A pass that fails on a live connection keeps the lock.
     let mut admin = db.admin();
@@ -10194,11 +10197,9 @@ fn a_start_takes_a_lock_freed_within_its_wait() {
         std::thread::sleep(std::time::Duration::from_millis(800));
         drop(old);
     });
-    let (store, pid) = super::take_lock_at_start(
-        &|| Ok(connection(&db)),
-        std::time::Duration::from_secs(10),
-    )
-    .expect("the lock, once freed");
+    let (store, pid) =
+        super::take_lock_at_start(&|| Ok(connection(&db)), std::time::Duration::from_secs(10))
+            .expect("the lock, once freed");
     freed.join().expect("freed");
     assert!(store.integrator_holds_lock().expect("holds"));
     assert_eq!(store.backend_pid().expect("pid"), pid);
@@ -10220,7 +10221,10 @@ fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
     integrator.pass().expect("the first pass");
     end(integrator.lock_pid.get().expect("its connection"));
     assert!(integrator.pass().is_err(), "a pass on an ended connection");
-    assert!(integrator.held.borrow().is_none(), "the connection is dropped");
+    assert!(
+        integrator.held.borrow().is_none(),
+        "the connection is dropped"
+    );
     integrator.pass().expect("the lock taken again");
     assert!(integrator.held.borrow().is_some());
     assert!(integrator.stopped.borrow().is_none());
@@ -10230,7 +10234,9 @@ fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
     let other = connection(&db);
     let mut taken = false;
     for _ in 0..50 {
-        taken = other.integrator_lock("spawn integrate pid=999").expect("lock");
+        taken = other
+            .integrator_lock("spawn integrate pid=999")
+            .expect("lock");
         if taken {
             break;
         }
@@ -10245,5 +10251,8 @@ fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
         ) && stopped.ends_with(" UTC); this one stops"),
         "{stopped}"
     );
-    assert_eq!(integrator.stopped.borrow().as_deref(), Some(stopped.as_str()));
+    assert_eq!(
+        integrator.stopped.borrow().as_deref(),
+        Some(stopped.as_str())
+    );
 }

@@ -2005,10 +2005,7 @@ impl PostgresStore {
     /// a refused integrator can say who holds it. False means another
     /// connection holds it.
     pub fn integrator_lock(&self, name: &str) -> Result<bool, StoreError> {
-        self.execute(
-            "select set_config('application_name', $1, false)",
-            &[&name],
-        )?;
+        self.execute("select set_config('application_name', $1, false)", &[&name])?;
         self.integrator_try_lock()
     }
 

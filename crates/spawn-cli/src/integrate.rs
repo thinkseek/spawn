@@ -1498,10 +1498,7 @@ pub(crate) fn holder_text(holder: &Value) -> String {
             str::to_string,
         );
     match holder["connected_ms"].as_i64() {
-        Some(ms) => format!(
-            "{name}, connected at {} UTC",
-            crate::alerts::time_text(ms)
-        ),
+        Some(ms) => format!("{name}, connected at {} UTC", crate::alerts::time_text(ms)),
         None => name,
     }
 }
@@ -1554,10 +1551,9 @@ fn take_lock_at_start(
         let holder = store
             .integrator_lock_holder()
             .map_err(|error| error.to_string())?;
-        let named = holder.as_ref().map_or_else(
-            || "it was let go as it was read".to_string(),
-            holder_text,
-        );
+        let named = holder
+            .as_ref()
+            .map_or_else(|| "it was let go as it was read".to_string(), holder_text);
         if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "integrate: another integrator holds this database's lock ({named}); this one \

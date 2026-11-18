@@ -1292,7 +1292,11 @@ fn one_integrator_holds_the_lock() {
 fn the_integrators_lock_names_its_holder_and_says_who_holds_it() {
     let (first, schema) = store("control_integrator_holder");
     let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
-    assert_eq!(second.integrator_lock_holder().expect("holder"), None, "free");
+    assert_eq!(
+        second.integrator_lock_holder().expect("holder"),
+        None,
+        "free"
+    );
     assert!(
         first
             .integrator_lock("spawn integrate pid=4242")

@@ -2672,3 +2672,86 @@ fn a_checkpoint_the_mirror_lacks_is_named_an_unknown_commit() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Objective 221: a gate script that is not there, a directory, or a file
+/// this process cannot read refuses the start, saying where its name came
+/// from; a readable file does not.
+#[test]
+fn a_gate_script_that_is_not_a_readable_file_refuses_the_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("spawn-gate-refusal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cwd = std::path::Path::new("/somewhere");
+    let missing = dir.join("scripts/rsi/gate.sh");
+    assert_eq!(
+        super::gate_refusal(&missing, false, cwd).as_deref(),
+        Some(
+            format!(
+                "integrate: the gate script {} does not exist (SPAWN_GATE is unset: its default \
+                 scripts/rsi/gate.sh is read from the working directory /somewhere); this \
+                 integrator does not start",
+                missing.display()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        super::gate_refusal(&missing, true, cwd).as_deref(),
+        Some(
+            format!(
+                "integrate: the gate script {} does not exist (from SPAWN_GATE); this integrator \
+                 does not start",
+                missing.display()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        super::gate_refusal(&dir, true, cwd).as_deref(),
+        Some(
+            format!(
+                "integrate: the gate script {} is not a readable file (from SPAWN_GATE); this \
+                 integrator does not start",
+                dir.display()
+            )
+            .as_str()
+        )
+    );
+    let gate = dir.join("gate.sh");
+    std::fs::write(&gate, "exit 0\n").expect("gate");
+    assert_eq!(
+        super::gate_refusal(&gate, true, cwd),
+        None,
+        "a readable file"
+    );
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read(&gate).is_err() {
+        assert!(
+            super::gate_refusal(&gate, true, cwd)
+                .is_some_and(|refusal| refusal.contains("is not a readable file (from SPAWN_GATE)")),
+            "a file this process cannot read"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Objective 221: the lock's holder for a person: its connection's name and
+/// when it connected, in UTC; an unnamed one by its server pid.
+#[test]
+fn the_locks_holder_is_named_with_when_it_connected() {
+    assert_eq!(
+        super::holder_text(&serde_json::json!({
+            "pid": 77, "name": "spawn integrate pid=4242", "connected_ms": 1_794_110_400_000_i64,
+        })),
+        "spawn integrate pid=4242, connected at 2026-11-08 04:00:00 UTC"
+    );
+    assert_eq!(
+        super::holder_text(&serde_json::json!({"pid": 77, "name": "", "connected_ms": null})),
+        "an unnamed connection, server pid 77"
+    );
+    assert_eq!(
+        super::lock_name(),
+        format!("spawn integrate pid={}", std::process::id())
+    );
+}
