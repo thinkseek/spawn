@@ -187,6 +187,43 @@ select coalesce(jsonb_agg(jsonb_build_object(
               where c.at_ms >= $1::bigint and c.at_ms < $2::bigint
               group by 1) b on b.i = s.i";
 
+/// The other Claude Code sessions' messages timed in `[$1, $2)` (cost
+/// coverage; `spawn_cost_session_messages`, apart from the engines'
+/// record): `total` (`usd`, `tokens`, `unpriced_tokens`, as [`WINDOW`]'s),
+/// `rows` one per project directory, most costly first, and
+/// `counted_since_ms`, the earliest message the sessions' record holds
+/// (null: none yet).
+const SESSIONS: &str = r"
+with m as materialized (
+  select c.project, c.usd, c.input_tokens, c.output_tokens, c.cache_write_tokens,
+         c.cache_read_tokens,
+         c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens as total
+    from spawn_cost_session_messages c
+   where c.at_ms >= $1 and c.at_ms < $2
+)
+select jsonb_build_object(
+  'total', (select jsonb_build_object(
+              'usd', coalesce(sum(usd), 0),
+              'tokens', jsonb_build_object(
+                  'input', coalesce(sum(input_tokens), 0),
+                  'output', coalesce(sum(output_tokens), 0),
+                  'cache_write', coalesce(sum(cache_write_tokens), 0),
+                  'cache_read', coalesce(sum(cache_read_tokens), 0)),
+              'unpriced_tokens', coalesce(sum(total) filter (where usd is null), 0))
+              from m),
+  'rows', coalesce((select jsonb_agg(jsonb_build_object(
+                'project', project, 'usd', usd, 'tokens', tokens,
+                'unpriced_tokens', unpriced_tokens)
+                order by usd desc, unpriced_tokens desc, project)
+              from (select project, coalesce(sum(usd), 0) as usd,
+                           jsonb_build_object('input', sum(input_tokens),
+                                              'output', sum(output_tokens),
+                                              'cache_write', sum(cache_write_tokens),
+                                              'cache_read', sum(cache_read_tokens)) as tokens,
+                           coalesce(sum(total) filter (where usd is null), 0) as unpriced_tokens
+                      from m group by project) g), '[]'::jsonb),
+  'counted_since_ms', (select min(at_ms) from spawn_cost_session_messages))";
+
 /// Every mission with a daily budget (`budget.daily_usd`) and its cost of
 /// the messages timed in `[$1, $2)` (the UTC day so far).
 const BUDGETS: &str = r"
@@ -245,6 +282,60 @@ impl PostgresStore {
     /// until_ms)` ([`BUDGETS`]): `[{mission, budget_usd, spent_usd}]`.
     pub fn cost_budgets(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
         self.query_json(BUDGETS, &[&since_ms, &until_ms])
+    }
+
+    /// The other Claude Code sessions' cost in `[since_ms, until_ms)`
+    /// ([`SESSIONS`]): `{total, rows, counted_since_ms}`.
+    pub fn cost_sessions(&self, since_ms: i64, until_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(SESSIONS, &[&since_ms, &until_ms])
+    }
+
+    /// Record the sessions' `messages` and how far `files` were read, in
+    /// one transaction (`spawn_cost_session_record`, owner only), each new
+    /// message priced by `prices`.
+    pub fn cost_session_record(
+        &self,
+        prices: &Value,
+        messages: &[SessionMessage],
+        files: &[SessionFile],
+    ) -> Result<SessionCounted, StoreError> {
+        let to_value = |what: &str, value: Result<Value, serde_json::Error>| {
+            value.map_err(|error| StoreError::Rejected(format!("the {what}: {error}")))
+        };
+        let messages = to_value("messages", serde_json::to_value(messages))?;
+        let files = to_value("files", serde_json::to_value(files))?;
+        let answer: Value = self
+            .query_one(
+                "select spawn_cost_session_record($1, $2, $3)",
+                &[prices, &messages, &files],
+            )?
+            .get(0);
+        let count = |name: &str| answer[name].as_i64().unwrap_or_default();
+        Ok(SessionCounted {
+            counted: count("counted"),
+            changed: count("changed"),
+            engine: count("engine"),
+            invalid: count("invalid"),
+        })
+    }
+
+    /// Every sessions' transcript file read so far, and how far: by file.
+    pub fn cost_session_files(&self) -> Result<Vec<SessionFile>, StoreError> {
+        let rows = self.query(
+            "select file, inode, offset_bytes, length, modified_ms
+               from spawn_cost_session_files order by file",
+            &[],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| SessionFile {
+                file: row.get(0),
+                inode: row.get(1),
+                offset_bytes: row.get(2),
+                length: row.get(3),
+                modified_ms: row.get(4),
+            })
+            .collect())
     }
 
     /// Count archived messages the record lacks
@@ -340,4 +431,45 @@ pub struct ArchiveFile {
     pub file: String,
     pub length: i64,
     pub modified_ms: i64,
+}
+
+/// One assistant message of another Claude Code session on this host, folded
+/// over its lines read so far (its largest usage, its earliest line's time
+/// and model): `project` is its project directory's name, `session_id` its
+/// transcript file's stem.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionMessage {
+    pub project: String,
+    pub session_id: String,
+    pub message_id: String,
+    pub model: String,
+    pub at_ms: i64,
+    pub input: i64,
+    pub output: i64,
+    pub cache_write: i64,
+    pub cache_read: i64,
+}
+
+/// A sessions' transcript file and how far it was read: `file` is
+/// `<project>/<session>.jsonl`, `offset_bytes` the end of its last whole
+/// line read, with its inode, length and modification time then.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionFile {
+    pub file: String,
+    pub inode: i64,
+    pub offset_bytes: i64,
+    pub length: i64,
+    pub modified_ms: i64,
+}
+
+/// What [`PostgresStore::cost_session_record`] did: messages added, held
+/// messages that grew or moved earlier, messages left to the engines'
+/// record, and lines not counted (no message id, project, session, model or
+/// time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionCounted {
+    pub counted: i64,
+    pub changed: i64,
+    pub engine: i64,
+    pub invalid: i64,
 }

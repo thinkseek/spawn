@@ -105,7 +105,9 @@ mod wake;
 
 pub use acks::{AckRecord, ReportAnswer};
 pub use control_mask::stored_text as control_stored_text;
-pub use cost::{ArchiveCounted, ArchiveFile, ArchivedMessage};
+pub use cost::{
+    ArchiveCounted, ArchiveFile, ArchivedMessage, SessionCounted, SessionFile, SessionMessage,
+};
 pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
