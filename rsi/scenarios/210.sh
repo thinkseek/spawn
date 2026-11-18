@@ -22,9 +22,11 @@
 #   as solved on the base (`objective.solved`, the task cancelled, no
 #   rejection counted). The one exception is an objective the backlog
 #   reads as recurring.
-# - `spawn objective retire --mission <m> --objective <n> --by <name>
-#   --reason <text>` records `objective.retired` {id: m, objective: n, by,
-#   reason, caller}. The store sets caller to `owner` or `spawn_supervisor`;
+# - `spawn objective retire --mission <m> --objective <n> --kind <kind>
+#   --by <name> --reason <text>` records `objective.retired` {id: m,
+#   objective: n, kind, by, reason, caller} (--kind, objective 223: on-main,
+#   renumbered or obsolete; this scenario retires as renumbered and
+#   obsolete, which need no gate record, and 223.sh covers on-main). The store sets caller to `owner` or `spawn_supervisor`;
 #   any other login is refused. A retired objective is closed the way a
 #   landing closes one: no task for it is assigned again.
 # - It refuses, recording nothing:
@@ -407,12 +409,12 @@ note "(a), (c) checked"
 # --- (b) and (r): retire ---------------------------------------------------------------
 
 as=""
-retire() { # <mission> <objective> <by> <reason>: as the login $as names (sup, reader, human), else the owner
+retire() { # <mission> <objective> <by> <reason> [<kind>, obsolete]: as the login $as names (sup, reader, human), else the owner
     if [ -n "$as" ]; then
         capture env -u PGPASSWORD SPAWN_DATABASE_URL="$(cat "$WORK/$as.url")" PGPASSFILE="$WORK/$as.pass" \
-            "$SPAWN_BIN" objective retire --mission "$1" --objective "$2" --by "$3" --reason "$4"
+            "$SPAWN_BIN" objective retire --mission "$1" --objective "$2" --kind "${5:-obsolete}" --by "$3" --reason "$4"
     else
-        capture "$SPAWN_BIN" objective retire --mission "$1" --objective "$2" --by "$3" --reason "$4"
+        capture "$SPAWN_BIN" objective retire --mission "$1" --objective "$2" --kind "${5:-obsolete}" --by "$3" --reason "$4"
     fi
 }
 before=$(count_records objective.retired)
@@ -444,13 +446,13 @@ as=human
 refused "of objective 3 by the human login" "$mission" 3 lead "made-up reason"
 as=""
 reason="renumbered: its work is objective 4 in this made-up backlog"
-retire "$mission" 3 "rev-f bb" "$reason"
+retire "$mission" 3 "rev-f bb" "$reason" renumbered
 if [ "$status" -ne 0 ]; then
     check_failed "(b) retire of objective 3 exited $status: $(err | head -c 300)"
 else
     rec=$(records objective.retired | tail -n 1)
     want=$(jq -cn --argjson m "$mission" --arg r "$reason" \
-        '{type: "objective.retired", id: $m, objective: 3, by: "rev-f bb", reason: $r, caller: "owner"}')
+        '{type: "objective.retired", id: $m, objective: 3, kind: "renumbered", by: "rev-f bb", reason: $r, caller: "owner"}')
     [ "$(printf '%s' "$rec" | jq -cS .)" = "$(printf '%s' "$want" | jq -cS .)" ] ||
         check_failed "(b) the objective.retired record: [$rec], expected [$want]"
 fi
@@ -465,14 +467,14 @@ if [ "$status" -ne 0 ]; then
 else
     rec=$(records objective.retired | tail -n 1)
     want=$(jq -cn --argjson m "$mission" --arg r "$reason5" \
-        '{type: "objective.retired", id: $m, objective: 5, by: "rev-f bb", reason: $r, caller: "spawn_supervisor"}')
+        '{type: "objective.retired", id: $m, objective: 5, kind: "obsolete", by: "rev-f bb", reason: $r, caller: "spawn_supervisor"}')
     [ "$(printf '%s' "$rec" | jq -cS .)" = "$(printf '%s' "$want" | jq -cS .)" ] ||
         check_failed "(b) the supervisor's objective.retired record: [$rec], expected [$want]"
 fi
 # R3 (rev-j's F2): an objective with no file in the backlog (renumbered
 # away before it was ever assigned) is retired too.
 reason6="renumbered away before it was ever assigned"
-retire "$mission" 6 "rev-f bb" "$reason6"
+retire "$mission" 6 "rev-f bb" "$reason6" renumbered
 [ "$status" -eq 0 ] || check_failed "(b) retire of objective 6 (no file in the backlog) exited $status: $(err | head -c 300)"
 
 capture "$SPAWN_BIN" mission list
