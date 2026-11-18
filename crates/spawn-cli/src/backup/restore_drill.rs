@@ -55,6 +55,23 @@
 //! a directory or a regular file, else the drill fails and the folder is
 //! left, said.
 //!
+//! `--only sync` (objective 217, [`sync`]) drills the fleet's notes folder
+//! alone, through the same chain, key rules and pipe: from each bundle it
+//! unpacks by name only `manifest.json`, `sync/manifest.json` and the files
+//! under `sync/files/`, never a transcript slice or a repository bundle.
+//! Each link's notes manifest must be its record's sha256, every file of
+//! the newest manifest is restored under the drill's `sync/` from the
+//! newest link that took it, at the newest manifest's size and sha256 (a
+//! newest record with no notes part, or a dropped one, cannot be
+//! restored); then the folder the newest record names is compared with it,
+//! read only, against the newest bundle's start (its manifest's
+//! `created_at_ms`): changed, removed or made since is expected, other
+//! bytes with an earlier mtime or an older file the backup lacks is a
+//! mismatch. Its folder is plain only, never under the notes folder (exit
+//! 2), and the floor counts each link's ciphertext and taken notes and the
+//! newest record's notes bytes. It records `backup.drilled.sync` alone, in
+//! the drill record's shape.
+//!
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
 //! window file as bundled, so a restored file whose sha256 is not the
