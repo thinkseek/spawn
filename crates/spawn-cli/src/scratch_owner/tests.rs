@@ -214,3 +214,34 @@ fn the_temporary_owner_file_is_never_followed() {
     std::fs::remove_file(&temporary).expect("rm");
     assert!(claimed(&dir, &["--agent", "a", "--objective", "4/145"], 1_000).is_ok());
 }
+
+/// Objective 220: a claimed folder removed whole, and one whose parent was
+/// removed, are gone; a relative name, a name with `..`, a folder still
+/// there, a missing folder under a symlink or under a file are not; renew of
+/// the gone folder fails as before.
+#[test]
+fn a_release_finds_a_removed_folder_gone_and_nothing_else() {
+    let scratch = Scratch::new("scratch_gone");
+    let root = &scratch.0;
+    let folder = root.join("g");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    claimed(&folder, &["--agent", "a", "--objective", "4/220"], 1_000).expect("claimed");
+    std::fs::remove_dir_all(&folder).expect("rm -rf");
+    assert!(super::gone(&folder), "removed whole");
+    assert!(super::gone(&root.join("p").join("q")), "its parent removed");
+    let renewed = change(&folder, |claim| claim.lease_until_ms = 0).expect_err("renew");
+    assert!(renewed.contains("No such file"), "{renewed}");
+
+    assert!(!super::gone(Path::new("relative/g")), "relative");
+    assert!(
+        !super::gone(&root.join("x").join("..").join("g")),
+        "a .. part"
+    );
+    assert!(!super::gone(Path::new(&format!("{}/./g", root.display()))), "a . part");
+    assert!(!super::gone(root), "a folder still there");
+    std::fs::create_dir_all(root.join("real")).expect("mkdir");
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("symlink");
+    assert!(!super::gone(&root.join("link").join("g")), "under a symlink");
+    std::fs::write(root.join("file"), "x").expect("a file");
+    assert!(!super::gone(&root.join("file").join("g")), "under a file");
+}
