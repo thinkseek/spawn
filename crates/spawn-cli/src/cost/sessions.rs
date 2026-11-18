@@ -155,6 +155,8 @@ pub(super) struct Pass {
     /// The longest one call to the store took: it holds the cost record's
     /// lock that long, and the loop's cost step waits for it.
     pub(super) longest_call: Duration,
+    /// Calls to the store: one per batch of at most [`BATCH`] messages.
+    pub(super) calls: usize,
 }
 
 /// One pass over `projects`: the lines for the loop's log.
@@ -315,6 +317,7 @@ fn record(
             .cost_session_record(prices.as_value(), batch, files)
             .map_err(|error| format!("recording: {error}"))?;
         done.longest_call = done.longest_call.max(started.elapsed());
+        done.calls += 1;
         done.counted += call.counted;
         done.changed += call.changed;
         done.invalid += call.invalid;
@@ -473,7 +476,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{Budget, Folded, engine_prefix, pass, read_file, record, transcripts};
+    use super::{BATCH, Budget, Folded, engine_prefix, pass, read_file, record, transcripts};
     use crate::cost::Prices;
 
     fn line(id: &str, at: &str, usage: [u64; 4]) -> String {
@@ -812,5 +815,133 @@ mod tests {
             .map(|mark| mark.file)
             .collect();
         assert_eq!(marks, vec!["p/.jsonl".to_string(), "p/s.jsonl".to_string()]);
+    }
+
+    fn prices() -> Prices {
+        Prices::parse(
+            r#"{"model-x": {"input": 3, "output": 15, "cache_write": 3.75, "cache_read": 0.3}}"#,
+        )
+        .expect("prices")
+    }
+
+    fn marks(store: &spawn_postgres::PostgresStore) -> Vec<String> {
+        store
+            .cost_session_files()
+            .expect("marks")
+            .into_iter()
+            .map(|mark| mark.file)
+            .collect()
+    }
+
+    /// rev-h F2 and n1: a file's messages go in calls of at most [`BATCH`],
+    /// each its own transaction, and its mark with the last only: a later
+    /// batch that fails leaves the file unmarked, read again next pass.
+    #[test]
+    fn a_files_messages_go_in_batches_and_its_mark_with_the_last() {
+        let schema = spawn_postgres::testing::TestSchema::new("cost_sessions_batches");
+        let store = schema.store();
+        let mark = spawn_postgres::SessionFile {
+            file: "p/s.jsonl".to_string(),
+            inode: 1,
+            offset_bytes: 10,
+            length: 10,
+            modified_ms: 1,
+        };
+        let folded = |usage| Folded {
+            at_ms: 1_000,
+            model: "model-x".to_string(),
+            usage,
+        };
+        let messages = |last: [u64; 4]| {
+            let mut all: std::collections::BTreeMap<String, Folded> = (0..BATCH)
+                .map(|n| (format!("m{n:04}"), folded([10, 1, 0, 0])))
+                .collect();
+            // Sorted last by its id: alone in the second batch.
+            all.insert("z-last".to_string(), folded(last));
+            all
+        };
+        // The second batch fails (its message's counts overflow a bigint
+        // in the store): the first batch's messages stay, the mark does not.
+        let mut done = super::Pass::default();
+        let failed = record(
+            &store,
+            &prices(),
+            "p",
+            "s",
+            messages([u64::MAX, 1, 0, 0]),
+            &mark,
+            &mut done,
+        );
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(
+            (done.calls, done.counted),
+            (1, i64::try_from(BATCH).expect("small"))
+        );
+        assert_eq!(
+            marks(&store),
+            Vec::<String>::new(),
+            "no mark before the last batch"
+        );
+        // Again, every batch whole: two calls, and the mark.
+        let mut done = super::Pass::default();
+        let whole = record(
+            &store,
+            &prices(),
+            "p",
+            "s",
+            messages([10, 1, 0, 0]),
+            &mark,
+            &mut done,
+        );
+        assert_eq!(whole, Ok(()));
+        assert_eq!((done.calls, done.counted), (2, 1), "{done:?}");
+        assert_eq!(marks(&store), vec!["p/s.jsonl".to_string()]);
+    }
+
+    /// rev-h F3 and n2: a pass past its time, or with no bytes left, starts
+    /// no file and says it stopped at its bound; the next pass reads them.
+    #[test]
+    fn a_pass_past_its_bound_starts_no_file_and_the_next_reads_them() {
+        let schema = spawn_postgres::testing::TestSchema::new("cost_sessions_bounds");
+        let store = schema.store();
+        let home = fake_projects("bounds");
+        let projects = &home.projects;
+        let rev = projects.join("-data-tmp-ccd-rev-x");
+        std::fs::create_dir_all(&rev).expect("dirs");
+        append(
+            &rev.join("a.jsonl"),
+            &line("m1", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]),
+        );
+        append(
+            &rev.join("b.jsonl"),
+            &line("m2", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]),
+        );
+        let late = Budget {
+            bytes: 1 << 20,
+            until: Instant::now(),
+        };
+        let none = pass(&store, projects, None, &prices(), late);
+        assert_eq!(
+            (none.files, none.bytes, none.bounded),
+            (0, 0, true),
+            "{none:?}"
+        );
+        let empty = Budget {
+            bytes: 0,
+            until: Instant::now() + Duration::from_mins(1),
+        };
+        let none = pass(&store, projects, None, &prices(), empty);
+        assert_eq!(
+            (none.files, none.bytes, none.bounded),
+            (0, 0, true),
+            "{none:?}"
+        );
+        assert_eq!(marks(&store), Vec::<String>::new());
+        let next = pass(&store, projects, None, &prices(), budget());
+        assert_eq!(
+            (next.files, next.counted, next.bounded),
+            (2, 2, false),
+            "{next:?}"
+        );
     }
 }
