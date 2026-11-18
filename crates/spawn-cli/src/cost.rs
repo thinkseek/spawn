@@ -27,6 +27,7 @@ use serde_json::{Map, Value, json};
 use spawn_postgres::PostgresStore;
 
 pub(crate) mod archive;
+pub(crate) mod sessions;
 
 use crate::config::env_value;
 
@@ -193,7 +194,10 @@ fn trend_step(length_ms: i64) -> i64 {
 /// of an hour (24h) or a day (7d) ([`PostgresStore::cost_trend`]); and
 /// `budgets`, each mission with a daily budget and its spend of the UTC day
 /// so far, the very reading the `cost_budget` alert takes
-/// ([`PostgresStore::cost_budgets`]).
+/// ([`PostgresStore::cost_budgets`]). And `sessions`: the other Claude Code
+/// sessions on this host in the same window, KEPT APART from every figure
+/// above (`{total, rows (one per project directory), counted_since_ms}`,
+/// [`PostgresStore::cost_sessions`]; counted by [`sessions`]).
 pub(crate) fn window(store: &PostgresStore, name: &str, length_ms: i64) -> Result<Value, String> {
     let mut answer = timed(store, name, length_ms, PostgresStore::cost_window)?;
     let (Some(since_ms), Some(until_ms)) =
@@ -216,11 +220,15 @@ pub(crate) fn window(store: &PostgresStore, name: &str, length_ms: i64) -> Resul
     let budgets = store
         .cost_budgets(day_start, until_ms.saturating_add(1))
         .map_err(|error| error.to_string())?;
+    let sessions = store
+        .cost_sessions(since_ms, until_ms)
+        .map_err(|error| error.to_string())?;
     if let Value::Object(map) = &mut answer {
         map.insert("previous".to_string(), previous);
         map.insert("trend_step_ms".to_string(), json!(trend_step(length_ms)));
         map.insert("trend".to_string(), trend);
         map.insert("budgets".to_string(), budgets);
+        map.insert("sessions".to_string(), sessions);
     }
     Ok(answer)
 }

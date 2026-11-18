@@ -25,7 +25,9 @@
 //! - the cost step ([`cost::record`]), which folds the Bridge's
 //!   `model.usage` records into each message's priced cost, and waits for
 //!   nothing but them (what only the transcript archive holds is
-//!   counted once at start, beside the passes: [`cost::archive::start`]);
+//!   counted once at start, beside the passes: [`cost::archive::start`];
+//!   the other Claude Code sessions' transcripts, apart from the engines'
+//!   record, at start and hourly: [`cost::sessions::start`]);
 //! - the alerts ([`alerts::Monitor::check`]), which waits for its next host
 //!   reading (`SPAWN_ALERT_CHECK_SECS`, 30 s) or a bound's due time.
 //!
@@ -430,6 +432,9 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let root = workspace_root(flags).map(std::path::PathBuf::from);
     // What only the transcript archive holds, counted beside the passes.
     cost::archive::start(root.as_deref(), &prices);
+    // The other Claude Code sessions on this host, counted apart from the
+    // engines' record: at start, then hourly, read only, appended bytes only.
+    cost::sessions::start(root.as_deref(), &prices);
     let monitor = disk::Monitor::new(root.as_deref());
     let sampler = crate::storage::Sampler::new(root.as_deref());
     let mut fleet = Fleet {

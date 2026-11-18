@@ -5,7 +5,7 @@
 //! alone, so an execution the Bridge read before it emitted them (every one
 //! that ended before 041), or whose events are gone, is in the archive and
 //! in no cost. Each time the loop starts, [`start`] counts, beside its
-//! passes and without holding any of them up, every assistant message of
+//! passes on a thread of its own, every assistant message of
 //! the archive (`<root>/.transcripts/<agent>/<native>.jsonl` and its copies
 //! `<native>.<n>.jsonl`; never the live transcripts, never the event log)
 //! that the cost record lacks: by 041's rules (once per `message.id` across
@@ -24,11 +24,15 @@
 //! in batches of [`BATCH`]. A file that cannot be read, or a line that is
 //! not JSON, is skipped; an agent whose count fails is logged and left
 //! unmarked, so the next start counts it again.
+//!
+//! Each batch is one call to the store, one transaction, under the cost
+//! record's lock (cost coverage 1b): while it runs the loop's cost step
+//! waits for it, one batch at most. The log says the longest call.
 
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use spawn_core::event::EventKind;
 use spawn_postgres::{ArchiveCounted, ArchiveFile, ArchivedMessage, PostgresStore};
@@ -85,8 +89,9 @@ pub(crate) fn count(store: &PostgresStore, archive: &Path, prices: &Prices) -> V
     let mut lines = Vec::new();
     let mut total = ArchiveCounted::default();
     let mut unplaced_agents = 0_usize;
+    let mut longest = None;
     for (agent, directory) in agents(archive) {
-        match count_agent(store, &agent, &directory, prices) {
+        match count_agent(store, &agent, &directory, prices, &mut longest) {
             Ok(counted) => {
                 total.counted += counted.counted;
                 total.unplaced += counted.unplaced;
@@ -110,6 +115,12 @@ pub(crate) fn count(store: &PostgresStore, archive: &Path, prices: &Prices) -> V
             total.unplaced,
             plural(total.unplaced),
             if unplaced_agents == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(longest) = longest {
+        lines.push(format!(
+            "cost: archive: the longest call to the store took {} ms",
+            longest.as_millis()
         ));
     }
     lines
@@ -190,12 +201,13 @@ fn files(directory: &Path) -> Result<Vec<ArchiveFile>, String> {
 
 /// Count one agent: nothing when its files are as last marked; else read
 /// them all, send what they hold in batches, and mark the files read once
-/// every message found its execution.
+/// every message found its execution. `longest` keeps the longest call.
 fn count_agent(
     store: &PostgresStore,
     agent: &str,
     directory: &Path,
     prices: &Prices,
+    longest: &mut Option<Duration>,
 ) -> Result<ArchiveCounted, String> {
     let now = files(directory)?;
     let marked = store
@@ -218,9 +230,12 @@ fn count_agent(
         .collect();
     let mut counted = ArchiveCounted::default();
     for batch in messages.chunks(BATCH) {
+        let started = Instant::now();
         let done = store
             .cost_archive_record(prices.as_value(), batch)
             .map_err(|error| format!("recording its messages: {error}"))?;
+        let took = started.elapsed();
+        *longest = Some(longest.map_or(took, |was| was.max(took)));
         counted.counted += done.counted;
         counted.unplaced += done.unplaced;
     }
@@ -235,10 +250,10 @@ fn count_agent(
 /// One message as its lines so far say it: its earliest line's time and
 /// model, its largest usage (input, output, cache write, cache read).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Folded {
-    at_ms: i64,
-    model: String,
-    usage: [u64; 4],
+pub(super) struct Folded {
+    pub(super) at_ms: i64,
+    pub(super) model: String,
+    pub(super) usage: [u64; 4],
 }
 
 impl Folded {
@@ -249,7 +264,7 @@ impl Folded {
     }
 
     /// Fold one more line of the same message in.
-    fn fold(&mut self, other: Folded) {
+    pub(super) fn fold(&mut self, other: Folded) {
         if other.at_ms < self.at_ms {
             self.at_ms = other.at_ms;
             self.model = other.model;
@@ -276,7 +291,7 @@ impl Folded {
 }
 
 /// The message one line holds, read as the Bridge reads it.
-fn line_message(line: &[u8]) -> Option<(String, Folded)> {
+pub(super) fn line_message(line: &[u8]) -> Option<(String, Folded)> {
     let text = std::str::from_utf8(line).ok()?;
     match spawn_core::ingest::claude_usage(text.trim_end())?.kind {
         EventKind::ModelUsage {
@@ -514,6 +529,14 @@ mod tests {
         );
     }
 
+    /// The log's lines without the longest call's, and whether it was said.
+    fn timed(lines: Vec<String>) -> (Vec<String>, bool) {
+        let (said, rest): (Vec<String>, Vec<String>) = lines.into_iter().partition(|line| {
+            line.starts_with("cost: archive: the longest call to the store took ")
+        });
+        (rest, said.len() == 1)
+    }
+
     /// An archive of two agents: `agent_w_1`'s transcript (one message
     /// before its executions, one in each) and `agent_none_2`'s, with no
     /// execution. The worker's directory.
@@ -563,7 +586,8 @@ mod tests {
             started(&mut client, "agent_w_1", "exec_b", ten + 3_600_000);
             let worker = archive_of_two(&root);
 
-            let lines = count(&store, &root, &prices);
+            let (lines, longest) = timed(count(&store, &root, &prices));
+            assert!(longest, "the longest call is said");
             assert_eq!(
                 lines,
                 vec![
@@ -603,7 +627,7 @@ mod tests {
 
             // Again: nothing more; only the agent with no execution is said.
             assert_eq!(
-                count(&store, &root, &prices),
+                timed(count(&store, &root, &prices)).0,
                 vec![
                     "cost: skipped 1 archived model call of 1 agent with no recorded execution"
                         .to_string()

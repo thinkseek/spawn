@@ -4046,6 +4046,13 @@ mod tests {
                     3.0,
                     &format!("{name}: today's spend alone, from the UTC day's start"),
                 );
+                // The other sessions' part: there, apart, and empty here.
+                assert_eq!(answer["sessions"]["rows"], json!([]), "{name}: {answer}");
+                near(
+                    &answer["sessions"]["total"]["usd"],
+                    0.0,
+                    &format!("{name}: sessions"),
+                );
             }
         });
     }

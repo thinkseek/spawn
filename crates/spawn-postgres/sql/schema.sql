@@ -1747,6 +1747,10 @@ begin
     if jsonb_typeof(p_prices) is distinct from 'object' then
         raise exception 'the prices are a JSON object, not %', p_prices;
     end if;
+    -- The cost record's lock (cost coverage 1b): the engine folds and the
+    -- sessions' record commit one after another on every connection, so a
+    -- message is never taken by both sides at once.
+    perform pg_advisory_xact_lock(1399957341);
     select coalesce(max(event_at_ms), 0) - 600000 into v_since from spawn_cost_messages;
     with fresh as (
         select e.id, e.recorded_at_ms, e.agent_id, e.session_id, e.execution_id,
@@ -1898,6 +1902,10 @@ begin
     if jsonb_typeof(p_messages) is distinct from 'array' then
         raise exception 'the messages are a JSON array, not %', p_messages;
     end if;
+    -- The cost record's lock (cost coverage 1b): the engine folds and the
+    -- sessions' record commit one after another on every connection, so a
+    -- message is never taken by both sides at once.
+    perform pg_advisory_xact_lock(1399957341);
     with given as (
         select distinct on (x.message_id) x.*
           from jsonb_to_recordset(p_messages)
@@ -2041,6 +2049,10 @@ begin
        or jsonb_typeof(p_files) is distinct from 'array' then
         raise exception 'the messages and the files are JSON arrays';
     end if;
+    -- The cost record's lock (cost coverage 1b): the engine folds and the
+    -- sessions' record commit one after another on every connection, so a
+    -- message is never taken by both sides at once.
+    perform pg_advisory_xact_lock(1399957341);
     with lines as (
         select x.project, x.session_id, x.message_id, x.model, x.at_ms,
                coalesce(x.input, 0) as input, coalesce(x.output, 0) as output,
