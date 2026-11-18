@@ -104,7 +104,10 @@ const USAGE: &str = "usage:
   spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
-                    [--model default|cheap]   (cheap: every model on DeepSeek)
+                    [--model default|cheap] [--again]   (cheap: every model on DeepSeek)
+      (the supervisor's brief that a task of the mission in flight already has, trimmed of
+       space, tab, CR and LF, is refused, naming that task; --again assigns it on purpose.
+       Every duplicate assigned names the task it repeats in its record: duplicate_of)
   spawn task accept --id N [--revision R]
   spawn task reject --id N [--revision R] --note <what to fix>
       (R: the report's revision as read; refused once the task has moved on)
@@ -316,6 +319,16 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
     } else {
         &[]
     };
+    Ok((verb.as_str(), Flags::parse_with_switches(rest, switches)?))
+}
+
+/// As [`split`], with `assign`'s `--again`, which takes no value
+/// (objective 212).
+fn split_task(rest: &[String]) -> Result<(&str, Flags), String> {
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(USAGE.to_string());
+    };
+    let switches: &[&str] = if verb == "assign" { &["again"] } else { &[] };
     Ok((verb.as_str(), Flags::parse_with_switches(rest, switches)?))
 }
 
@@ -917,19 +930,20 @@ fn put_in_source(source: &str, repo: &str, wanted: &str) -> Result<(String, Stri
 
 /// `spawn task ...`
 pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
-    let (verb, flags) = split(rest)?;
+    let (verb, flags) = split_task(rest)?;
     let store = open_store()?;
     let err = |error: spawn_core::port::StoreError| error.to_string();
     match verb {
         "assign" => {
             let model = model(&flags)?;
             let task = store
-                .task_assign(
+                .task_assign_again(
                     id(&flags, "mission")?,
                     &text(&flags, "kind")?,
                     &flags.get("worker").unwrap_or_default(),
                     &text(&flags, "brief")?,
                     model.as_str(),
+                    flags.switch("again"),
                 )
                 .map_err(err)?;
             print(&json!({ "task": task, "model": model.as_str() }));
