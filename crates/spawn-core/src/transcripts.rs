@@ -158,12 +158,16 @@ pub fn settling(progress: &[ArchiveProgress], until_ms: i64) -> bool {
 }
 
 /// What one [`archive_to`] did: the bytes copied, the length of the
-/// latest copy after it, and how far into the transcript it reaches.
+/// latest copy after it, how far into the transcript it reaches, and
+/// whether the transcript was gone (no file to read: Claude Code's cleanup
+/// may delete it), which copies nothing and says nothing of lines the
+/// archive may lack (objective 179 R3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Archived {
     pub copied: u64,
     pub length: Option<u64>,
     pub offset: Option<u64>,
+    pub gone: bool,
 }
 
 /// Bytes before the end of the latest copy that are compared with the file
@@ -288,6 +292,7 @@ pub fn archive_to(
             copied: 0,
             length: latest,
             offset: latest.map(|_| at.offset),
+            gone: true,
         });
     };
     let mut full = bytes.len() >= READ_LIMIT;
@@ -351,6 +356,7 @@ pub fn archive_to(
                 copied: total,
                 length: Some(at.length),
                 offset: Some(at.offset),
+                gone: false,
             });
         }
         let next = at.offset + u64::try_from(bytes.len()).unwrap_or(u64::MAX);

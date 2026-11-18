@@ -88,6 +88,9 @@ struct State {
     stale: bool,
     /// The next append of an `artifact.committed` event fails.
     branch_record_fails: bool,
+    /// How many of the next `archive.failed` or `archive.resumed` appends
+    /// are stored, then answered with an error.
+    archive_answers_lost: u32,
     /// Sessions whose `artifact.committed` and `merge.conflicted` appends
     /// all fail, as a record the log can never take would.
     branch_records_refused: HashSet<SessionId>,
@@ -366,6 +369,13 @@ impl MemoryStore {
         self.lock().branch_record_fails = true;
     }
 
+    /// Make the next append of an `archive.failed` or `archive.resumed`
+    /// event store the event and then answer with an error, as a log whose
+    /// answer was lost on the way back would (objective 179). Test helper.
+    pub fn lose_next_archive_answer(&self) {
+        self.lock().archive_answers_lost += 1;
+    }
+
     /// Make every append of an `artifact.committed` or `merge.conflicted`
     /// event of `session` fail (`true`) or work again. Test helper.
     pub fn refuse_branch_records_of(&self, session: &SessionId, refuse: bool) {
@@ -436,7 +446,15 @@ impl EventLog for MemoryStore {
                 event.session_id
             )));
         }
+        let archive_record = matches!(
+            event.kind,
+            EventKind::ArchiveFailed { .. } | EventKind::ArchiveResumed { .. }
+        );
         let (record, inserted) = state.insert(event, now);
+        if archive_record && state.archive_answers_lost > 0 {
+            state.archive_answers_lost -= 1;
+            return Err(StoreError::Backend("the answer was lost".to_string()));
+        }
         Ok(Appended { record, inserted })
     }
 

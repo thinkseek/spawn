@@ -12,6 +12,10 @@ use crate::observation::Observation;
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
 
+/// The longest `archive.failed` reason, in characters: a longer one is cut
+/// on a character boundary (objective 179).
+pub const ARCHIVE_REASON_MAX: usize = 500;
+
 /// Wire name of the engine every execution runs: Claude Code, interactive
 /// in a terminal. Executions and native sessions record it in their
 /// `engine` field, which the `agent_executions` view shows; nothing
@@ -601,6 +605,28 @@ pub enum EventKind {
         /// What it was made on, if anything.
         parent: Option<CommitId>,
     },
+    /// One transcript's pass to the transcript archive copied nothing
+    /// (objective 179), for a reason other than the one recorded last: the
+    /// error as the loop's warning says it (paths and errors, never a
+    /// value), at most [`ARCHIVE_REASON_MAX`] characters. Recorded by the
+    /// Bridge on a change only; objective 193's alert reads it.
+    #[serde(rename = "archive.failed")]
+    ArchiveFailed {
+        /// The engine's native session id: which transcript.
+        native: String,
+        /// Why the pass copied nothing.
+        reason: String,
+    },
+    /// The first pass that copied a transcript after an `archive.failed` of
+    /// it (objective 179): `copied` is how far the transcript's offset
+    /// moved in that pass.
+    #[serde(rename = "archive.resumed")]
+    ArchiveResumed {
+        /// The engine's native session id: which transcript.
+        native: String,
+        /// How far that pass moved the transcript's archived offset.
+        copied: u64,
+    },
     /// Merging the source's `main` into an agent's branch conflicted: the
     /// branch stayed as it was.
     #[serde(rename = "merge.conflicted")]
@@ -687,6 +713,8 @@ impl EventKind {
             Self::ArtifactCommitted { .. } => "artifact.committed",
             Self::ArtifactBranchRecreated { .. } => "artifact.branch_recreated",
             Self::MergeConflicted { .. } => "merge.conflicted",
+            Self::ArchiveFailed { .. } => "archive.failed",
+            Self::ArchiveResumed { .. } => "archive.resumed",
             Self::CommandAccepted { .. } => "command.accepted",
             Self::CommandFinished { .. } => "command.finished",
             Self::ScreenObserved { .. } => "screen.observed",
