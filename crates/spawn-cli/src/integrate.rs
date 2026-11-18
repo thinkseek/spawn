@@ -1366,11 +1366,22 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let drain_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&drain_asked))
         .map_err(|error| format!("cannot take drain requests (SIGUSR1): {error}"))?;
-    crate::config::require_git()?;
     // Resolved against the working directory: the gate must not resolve
-    // inside the tree it judges.
+    // inside the tree it judges. A gate script that is not a readable file
+    // refuses the start, before the database is touched (objective 221: a
+    // second integrator started where scripts/rsi/gate.sh is not aborted
+    // every gate it ran).
     let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
         .map_err(|error| format!("SPAWN_GATE: {error}"))?;
+    let from_env = crate::config::env_value("SPAWN_GATE").is_some();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if let Some(refusal) = gate_refusal(&gate, from_env, &cwd) {
+        return Err(refusal);
+    }
+    crate::config::require_git()?;
+    // The integrator's lock, on a connection of its own, before anything is
+    // written, kept for the process's life (objective 221).
+    let lock = take_lock_at_start(LOCK_WAIT)?;
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
     let gate_env = gate::gate_env(|name| std::env::var(name).ok());
@@ -1418,7 +1429,8 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     }
     let mut integrator = Integrator::new(root, gate, gate_env, host_room, gates)
         .with_cpu(cpu)
-        .with_units(units);
+        .with_units(units)
+        .with_lock(lock);
     // The base warm after each landing (warm.rs), unless the owner turned
     // it off; its logs and pid file under the user's cache, beside the base
     // cache it fills.
@@ -1459,6 +1471,106 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     run_passes(&integrator, &drain_asked, drain_bound)
 }
 
+/// How long a start waits for a lock another integrator holds: a deploy's
+/// restart (the old integrator just stopped) takes it within this.
+const LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// How often a waiting start asks for the lock again.
+const LOCK_ASK: Duration = Duration::from_millis(500);
+
+/// The name of the connection that holds the integrator's lock
+/// (`application_name`): the pid alone, since the server keeps 63 bytes.
+fn lock_name() -> String {
+    format!("spawn integrate pid={}", std::process::id())
+}
+
+/// The lock's holder for a person: "<its connection's name>, connected at
+/// <YYYY-MM-DD HH:MM:SS> UTC" (`integrator_lock_holder`'s answer).
+pub(crate) fn holder_text(holder: &Value) -> String {
+    let name = holder["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || format!("an unnamed connection, server pid {}", holder["pid"]),
+            str::to_string,
+        );
+    match holder["connected_ms"].as_i64() {
+        Some(ms) => format!(
+            "{name}, connected at {} UTC",
+            crate::alerts::time_text(ms)
+        ),
+        None => name,
+    }
+}
+
+/// Why the gate script `gate` refuses the start, if it does: not there, or
+/// not a file this process can read (the gate runs it with sh). `from_env`
+/// says SPAWN_GATE named it; else its default was read from `cwd`.
+pub(crate) fn gate_refusal(gate: &Path, from_env: bool, cwd: &Path) -> Option<String> {
+    let what = match std::fs::metadata(gate) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "does not exist",
+        Ok(meta) if meta.is_file() && std::fs::File::open(gate).is_ok() => return None,
+        _ => "is not a readable file",
+    };
+    let named = if from_env {
+        "(from SPAWN_GATE)".to_string()
+    } else {
+        format!(
+            "(SPAWN_GATE is unset: its default scripts/rsi/gate.sh is read from the working \
+             directory {})",
+            cwd.display()
+        )
+    };
+    Some(format!(
+        "integrate: the gate script {} {what} {named}; this integrator does not start",
+        gate.display()
+    ))
+}
+
+/// The integrator's lock taken at start, on a connection of its own named
+/// by this process ([`lock_name`]): held by another integrator, the start
+/// says so and asks every [`LOCK_ASK`] for `wait`, so a deploy's restart
+/// takes it; still held then, it is refused, naming the holder. The store
+/// and its server pid.
+fn take_lock_at_start(wait: Duration) -> Result<(Arc<PostgresStore>, i32), String> {
+    let store = open_store()?;
+    let name = lock_name();
+    let deadline = std::time::Instant::now() + wait;
+    let mut said = false;
+    loop {
+        if store
+            .integrator_lock(&name)
+            .map_err(|error| error.to_string())?
+        {
+            let pid = store.backend_pid().map_err(|error| error.to_string())?;
+            return Ok((Arc::new(store), pid));
+        }
+        let holder = store
+            .integrator_lock_holder()
+            .map_err(|error| error.to_string())?;
+        let named = holder.as_ref().map_or_else(
+            || "it was let go as it was read".to_string(),
+            holder_text,
+        );
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "integrate: another integrator holds this database's lock ({named}); this one \
+                 does not start. Stop that one first, or drain it with `spawn integrate --drain \
+                 --root <its root>`."
+            ));
+        }
+        if !said {
+            println!(
+                "integrate: another integrator holds this database's lock ({named}); waiting up \
+                 to {} s for it to end",
+                wait.as_secs()
+            );
+            said = true;
+        }
+        std::thread::sleep(LOCK_ASK);
+    }
+}
+
 /// Pass after pass, until a drain asked by `drain_asked` ends (drained, or
 /// at its bound of `drain_bound` seconds): then Ok(0). TERM ends the
 /// process at once, wherever it is.
@@ -1474,6 +1586,9 @@ fn run_passes(
             integrator.begin_drain(integrator.own_store().as_deref(), drain_bound);
         }
         let pass = integrator.pass();
+        if let Some(stopped) = integrator.stopped.borrow_mut().take() {
+            return Err(stopped);
+        }
         if let Err(error) = &pass {
             eprintln!("integrate: {error}");
         }
@@ -1645,9 +1760,17 @@ struct Integrator {
     cpu: Option<gate::Cpu>,
     /// The judgings in flight, one per mission at most.
     running: RefCell<Vec<Running>>,
-    /// The store whose connection holds the integrator's lock, kept while
-    /// a judging runs: its thread records through it.
+    /// The store whose connection holds the integrator's lock, kept for the
+    /// process's life, idle or not (objective 221); the judgings' threads
+    /// record through it. Dropped only after a pass that failed when the
+    /// connection no longer holds the lock.
     held: RefCell<Option<Arc<PostgresStore>>>,
+    /// The server pid of the connection that last held the lock: a re-take
+    /// refused by it is this integrator's own old connection (wait); one
+    /// refused by any other is a lock lost to another integrator.
+    lock_pid: std::cell::Cell<Option<i32>>,
+    /// Why this integrator stops (its lock lost to another integrator).
+    stopped: RefCell<Option<String>>,
     /// The waits already said, by task and kind ([`Wait`]): each is said
     /// once, when the task starts waiting, and again only after the task
     /// has had a gate ([`Integrator::wait_over`]).
@@ -1983,6 +2106,8 @@ impl Integrator {
             cpu: None,
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
+            lock_pid: std::cell::Cell::new(None),
+            stopped: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
             owner: RefCell::new(owner::Kept::default()),
             last_judged: RefCell::new(std::collections::HashMap::new()),
@@ -1993,6 +2118,55 @@ impl Integrator {
             ),
             drain: RefCell::new(None),
             unlanded: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The lock taken at start ([`take_lock_at_start`]), kept for life.
+    fn with_lock(self, (store, pid): (Arc<PostgresStore>, i32)) -> Self {
+        *self.held.borrow_mut() = Some(store);
+        self.lock_pid.set(Some(pid));
+        self
+    }
+
+    /// The store that holds the integrator's lock: the one held, else a new
+    /// connection that takes it. `None` when another connection holds it:
+    /// this integrator's own old one (asked again at the next pass), or,
+    /// for one that never held it, another integrator. A lock this
+    /// integrator held and lost to another integrator stops it
+    /// ([`Self::stopped`], and an error).
+    fn lock_store(&self) -> Result<Option<Arc<PostgresStore>>, String> {
+        if let Some(store) = self.held.borrow().clone() {
+            return Ok(Some(store));
+        }
+        let store = open_store()?;
+        if store
+            .integrator_lock(&lock_name())
+            .map_err(|error| error.to_string())?
+        {
+            let pid = store.backend_pid().map_err(|error| error.to_string())?;
+            let store = Arc::new(store);
+            *self.held.borrow_mut() = Some(Arc::clone(&store));
+            self.lock_pid.set(Some(pid));
+            return Ok(Some(store));
+        }
+        let Some(old) = self.lock_pid.get() else {
+            return Ok(None);
+        };
+        let holder = store
+            .integrator_lock_holder()
+            .map_err(|error| error.to_string())?;
+        match holder {
+            None => Ok(None),
+            Some(holder) if holder["pid"].as_i64() == Some(i64::from(old)) => Ok(None),
+            Some(holder) => {
+                let why = format!(
+                    "integrate: this integrator's connection to the database ended and another \
+                     integrator holds the lock now ({}); this one stops",
+                    holder_text(&holder)
+                );
+                *self.stopped.borrow_mut() = Some(why.clone());
+                Err(why)
+            }
         }
     }
 
@@ -2568,30 +2742,18 @@ impl Integrator {
     fn pass(&self) -> Result<(), String> {
         self.unlanded.set(false);
         self.reap();
-        // A store per pass while no gate runs: the advisory lock belongs to
-        // the connection, and is released with it. While one runs, its
-        // thread holds the store, so the lock stays this integrator's.
-        if self.running.borrow().is_empty() {
-            self.held.borrow_mut().take();
-        }
-        let held = self.held.borrow().clone();
-        let store = if let Some(store) = held {
-            store
-        } else {
-            let store = Arc::new(open_store()?);
-            if !store
-                .integrator_try_lock()
-                .map_err(|error| error.to_string())?
-            {
-                return Ok(());
-            }
-            store
+        // The lock is kept for the process's life, idle or not (objective
+        // 221): a second integrator never gets a pass this one leaves idle.
+        let Some(store) = self.lock_store()? else {
+            return Ok(());
         };
         let pass = self.pass_on(&store);
-        // A pass that failed may have lost the connection: the next pass
-        // asks for the lock again (refused while the old connection lives).
-        *self.held.borrow_mut() =
-            (pass.is_ok() && !self.running.borrow().is_empty()).then_some(store);
+        // A pass that failed may have lost the connection: read once
+        // whether it still holds the lock, and keep it if so; else the next
+        // pass asks for the lock on a new connection.
+        if pass.is_err() && !store.integrator_holds_lock().unwrap_or(false) {
+            self.held.borrow_mut().take();
+        }
         pass
     }
 
