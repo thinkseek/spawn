@@ -1161,12 +1161,15 @@ fn assign(
 }
 
 const RETIRE_USAGE: &str = "usage: spawn objective retire --mission <m> --objective <n> \
-                            --by <name> --reason <text>";
+                            --kind on-main|renumbered|obsolete --by <name> --reason <text>";
 
-/// `spawn objective retire --mission <m> --objective <n> --by <name>
-/// --reason <text>` (objective 210): close by hand an objective that can
-/// never land (its work already on main, renumbered, obsolete), naming who
-/// and why. One `objective.retired` through the store's
+/// `spawn objective retire --mission <m> --objective <n> --kind
+/// on-main|renumbered|obsolete --by <name> --reason <text>` (objective
+/// 210): close by hand an objective that can never land (its work already
+/// on main, renumbered, obsolete), naming its kind (objective 223), who and
+/// why. The store refuses a kind not of the three, and an on-main one no
+/// accepted gate of a landed task of the mission shows passing (with no
+/// gate since finding it red on main). One `objective.retired` through the store's
 /// `spawn_objective_retire`, which sets `caller` from the login (the
 /// owner's or the supervisor's) and refuses, recording nothing, a blank
 /// `by` or `reason`, a mission that does not exist or has no backlog, an
@@ -1195,13 +1198,13 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
 }
 
 /// The `objective.retired` record `spawn objective retire <flags>` asks
-/// for: `--mission` and `--objective` whole numbers from 1, `--by` and
-/// `--reason`, and no other flag. Their lengths and blankness are the
-/// store's to check, so one rule refuses them.
+/// for: `--mission` and `--objective` whole numbers from 1, `--kind`,
+/// `--by` and `--reason`, and no other flag. The kind's value, the lengths
+/// and blankness are the store's to check, so one rule refuses them.
 fn retire_record(flags: &crate::Flags) -> Result<serde_json::Value, String> {
     if let Some(other) = flags
         .names()
-        .find(|flag| !["mission", "objective", "by", "reason"].contains(flag))
+        .find(|flag| !["mission", "objective", "kind", "by", "reason"].contains(flag))
     {
         return Err(format!("unknown flag --{other}\n{RETIRE_USAGE}"));
     }
@@ -1223,7 +1226,7 @@ fn retire_record(flags: &crate::Flags) -> Result<serde_json::Value, String> {
     let objective = number("objective", i64::from(i32::MAX))?;
     Ok(
         json!({"type": "objective.retired", "id": mission, "objective": objective,
-              "by": required("by")?, "reason": required("reason")?}),
+              "kind": required("kind")?, "by": required("by")?, "reason": required("reason")?}),
     )
 }
 
@@ -2347,5 +2350,33 @@ mod tests {
             3,
         );
         assert_eq!(chosen.iter().map(|task| task.id).collect::<Vec<_>>(), [3]);
+    }
+
+    /// Objective 223: a retire names its kind; without `--kind` it is
+    /// refused with the usage, and the kind given is passed into the record
+    /// as it is (the store judges its value).
+    #[test]
+    fn a_retire_needs_its_kind() {
+        let flags = |kind: Option<&str>| {
+            let mut args: Vec<String> = ["--mission", "4", "--objective", "61"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            if let Some(kind) = kind {
+                args.extend(["--kind".to_string(), kind.to_string()]);
+            }
+            args.extend(["--by", "lead", "--reason", "renumbered to 63"].map(String::from));
+            crate::Flags::parse(&args).expect("flags")
+        };
+        let error = super::retire_record(&flags(None)).expect_err("no kind");
+        assert!(error.starts_with("--kind is required\n"), "{error}");
+        assert!(error.contains(super::RETIRE_USAGE), "{error}");
+        for kind in ["renumbered", "on-main", "landed"] {
+            assert_eq!(
+                super::retire_record(&flags(Some(kind))).expect("a record"),
+                json!({"type": "objective.retired", "id": 4, "objective": 61, "kind": kind,
+                       "by": "lead", "reason": "renumbered to 63"})
+            );
+        }
     }
 }

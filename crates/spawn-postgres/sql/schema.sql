@@ -5864,23 +5864,47 @@ end $$;
 
 -- An objective retired by hand (objective 210, GitHub #65): `spawn
 -- objective retire` writes one `objective.retired` {type, id: mission,
--- objective, by, reason, caller} through `spawn_objective_retire`, for an
--- objective that can never land (its work already on main, renumbered,
--- obsolete). Only the owner's and the supervisor's logins may; `caller` is
--- set here from the login, never taken from the input. The input has
--- exactly type, id, objective, by and reason; the mission must exist and
--- have a backlog; the objective need not be in it (retiring a renumbered
--- one is the point). Refused, recording nothing: an objective with a task
--- in flight, or one already closed (a landed task, an objective.solved or
--- an objective.retired).
+-- objective, kind, by, reason, caller} through `spawn_objective_retire`,
+-- for an objective that can never land. Only the owner's and the
+-- supervisor's logins may; `caller` is set here from the login, never
+-- taken from the input. The input has exactly type, id, objective, kind,
+-- by and reason; the mission must exist and have a backlog; the objective
+-- need not be in it (retiring a renumbered one is the point). Refused,
+-- recording nothing: an objective with a task in flight, or one already
+-- closed (a landed task, an objective.solved or an objective.retired).
+--
+-- The kind (objective 223) is on-main, renumbered or obsolete, named by
+-- the caller, never guessed from the reason's words. on-main is a claim
+-- the gate's own records must show: an accepted `task.gated` of a task of
+-- the same mission, that task now landed, whose `passed` or `reused` names
+-- the objective's scenario (`<NNN>.sh`, the number zero-padded to three
+-- digits, as objectives.rs names it), with no `task.gated` of the mission
+-- recorded after the newest such gate naming it in `main_red_scenarios`
+-- (a gate that repairs a red scenario names it in both lists: its own red
+-- is not after its pass). A landing's title is not a gate record (9/61 on
+-- 2026-11-18: retired "already on main" while 061.sh was red on main).
+-- renumbered and obsolete need no record.
+--
+-- Cost: the gates that may show it are read before the append lock, up to
+-- the newest control event when the read began (v_seen: every append
+-- takes the lock and numbers its event max + 1, so every event up to it is
+-- committed); under the lock only the control events after v_seen are
+-- read, and the states of the tasks read, so a landing or a gate recorded
+-- meanwhile counts. Only an on-main retire reads them.
 create or replace function spawn_objective_retire(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
     v_mission bigint;
     v_objective integer;
+    v_kind text;
+    v_scenario text;
+    v_seen bigint;
+    v_gates jsonb := '[]'::jsonb;
+    v_part jsonb;
+    v_pass bigint;
+    v_red record;
 begin
-    perform pg_advisory_xact_lock(1399957335);
     if v_caller is null then
         raise exception '% may not retire objectives', session_user using errcode = '42501';
     end if;
@@ -5888,10 +5912,10 @@ begin
         raise exception 'not a retirement record: %', p_record ->> 'type';
     end if;
     if exists (select 1 from jsonb_object_keys(p_record) k
-                where k not in ('type', 'id', 'objective', 'by', 'reason'))
-       or exists (select 1 from unnest(array['id', 'objective', 'by', 'reason']) f
+                where k not in ('type', 'id', 'objective', 'kind', 'by', 'reason'))
+       or exists (select 1 from unnest(array['id', 'objective', 'kind', 'by', 'reason']) f
                    where not p_record ? f) then
-        raise exception 'a retirement record has type, id, objective, by and reason, and nothing else';
+        raise exception 'a retirement record has type, id, objective, kind, by and reason, and nothing else';
     end if;
     if exists (select 1 from unnest(array['id', 'objective']) f
                 where case when jsonb_typeof(p_record -> f) = 'number'
@@ -5900,6 +5924,11 @@ begin
                                 or (p_record ->> f)::numeric <> trunc((p_record ->> f)::numeric)
                            else true end) then
         raise exception 'a retirement record''s mission and objective are whole numbers from 1';
+    end if;
+    if jsonb_typeof(p_record -> 'kind') is distinct from 'string'
+       or p_record ->> 'kind' not in ('on-main', 'renumbered', 'obsolete') then
+        raise exception 'a retirement record''s kind is on-main, renumbered or obsolete, not %',
+            coalesce(p_record ->> 'kind', 'null');
     end if;
     if jsonb_typeof(p_record -> 'by') is distinct from 'string'
        or char_length(p_record ->> 'by') not between 1 and 80
@@ -5913,6 +5942,37 @@ begin
     end if;
     v_mission := (p_record ->> 'id')::numeric::bigint;
     v_objective := (p_record ->> 'objective')::numeric::integer;
+    v_kind := p_record ->> 'kind';
+    -- At least three digits: lpad alone would cut 1234 to 123.
+    v_scenario := lpad(v_objective::text, greatest(3, char_length(v_objective::text)), '0')
+                  || '.sh';
+
+    -- on-main, before the lock: the mission's gates that may show it, up
+    -- to v_seen.
+    if v_kind = 'on-main' then
+        select coalesce(max(session_seq), 0) into v_seen
+          from spawn_events where session_id = 'session_control';
+        select coalesce(jsonb_agg(jsonb_build_object(
+                   'seq', e.session_seq, 'task', t.id, 'base', r ->> 'base',
+                   'pass', r ->> 'verdict' = 'accepted'
+                           and (coalesce(r -> 'passed' ? v_scenario, false)
+                                or coalesce(r -> 'reused' ? v_scenario, false)),
+                   'red', coalesce(r -> 'main_red_scenarios' ? v_scenario, false))), '[]'::jsonb)
+          into v_part
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+          join mission_tasks t on to_jsonb(t.id) = r -> 'id' and t.mission_id = v_mission
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and r ->> 'type' = 'task.gated'
+           and e.session_seq > 0 and e.session_seq <= v_seen
+           and ((r ->> 'verdict' = 'accepted'
+                 and (coalesce(r -> 'passed' ? v_scenario, false)
+                      or coalesce(r -> 'reused' ? v_scenario, false)))
+                or coalesce(r -> 'main_red_scenarios' ? v_scenario, false));
+        v_gates := v_part;
+    end if;
+
+    perform pg_advisory_xact_lock(1399957335);
     if not exists (select 1 from mission_missions where id = v_mission) then
         raise exception 'mission % does not exist', v_mission;
     end if;
@@ -5941,9 +6001,50 @@ begin
                 where mission_id = v_mission and objective = v_objective) then
         raise exception 'objective %/% is closed: already retired', v_mission, v_objective;
     end if;
+
+    if v_kind = 'on-main' then
+        -- Under the lock: the control events after v_seen, and the tasks'
+        -- states now.
+        select coalesce(jsonb_agg(jsonb_build_object(
+                   'seq', e.session_seq, 'task', t.id, 'base', r ->> 'base',
+                   'pass', r ->> 'verdict' = 'accepted'
+                           and (coalesce(r -> 'passed' ? v_scenario, false)
+                                or coalesce(r -> 'reused' ? v_scenario, false)),
+                   'red', coalesce(r -> 'main_red_scenarios' ? v_scenario, false))), '[]'::jsonb)
+          into v_part
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+          join mission_tasks t on to_jsonb(t.id) = r -> 'id' and t.mission_id = v_mission
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and r ->> 'type' = 'task.gated'
+           and e.session_seq > v_seen
+           and ((r ->> 'verdict' = 'accepted'
+                 and (coalesce(r -> 'passed' ? v_scenario, false)
+                      or coalesce(r -> 'reused' ? v_scenario, false)))
+                or coalesce(r -> 'main_red_scenarios' ? v_scenario, false));
+        v_gates := v_gates || v_part;
+        select max((g ->> 'seq')::bigint) into v_pass
+          from jsonb_array_elements(v_gates) g
+          join mission_tasks t on t.id = (g ->> 'task')::bigint
+         where (g ->> 'pass')::boolean and t.state = 'landed';
+        if v_pass is null then
+            raise exception 'objective %/% is not shown on main: no accepted gate of a landed task of mission % lists % as passed (a landing''s title is not a gate record); run its scenario through a gate, or retire it as renumbered or obsolete',
+                v_mission, v_objective, v_mission, v_scenario;
+        end if;
+        select (g ->> 'task')::bigint as task, g ->> 'base' as base into v_red
+          from jsonb_array_elements(v_gates) g
+         where (g ->> 'red')::boolean and (g ->> 'seq')::bigint > v_pass
+         order by (g ->> 'seq')::bigint
+         limit 1;
+        if found then
+            raise exception 'objective %/% is not shown on main: % is red on main since task #%''s gate (%); run its scenario through a gate, or retire it as renumbered or obsolete',
+                v_mission, v_objective, v_scenario, v_red.task, coalesce(v_red.base, 'no base');
+        end if;
+    end if;
     return spawn_control_record(jsonb_build_object(
         'type', 'objective.retired', 'id', v_mission, 'objective', v_objective,
-        'by', p_record ->> 'by', 'reason', p_record ->> 'reason', 'caller', v_caller));
+        'kind', v_kind, 'by', p_record ->> 'by', 'reason', p_record ->> 'reason',
+        'caller', v_caller));
 end $$;
 
 -- The landings and the deploy records, found without reading the rest of
