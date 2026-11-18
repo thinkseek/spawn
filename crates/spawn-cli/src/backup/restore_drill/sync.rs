@@ -475,6 +475,7 @@ pub(super) fn compare(restored: &Restored, live: &Path, start_ms: i64) -> Compar
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use serde_json::{Value, json};
@@ -753,7 +754,6 @@ mod tests {
         let live = scratch.0.join("live");
         write(&live.join("a.md"), b"a");
         write(&live.join("b.md"), b"b");
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(live.join("a.md"), fs::Permissions::from_mode(0o000)).expect("chmod");
         if fs::read(live.join("a.md")).is_err() {
             let compared = compare(&restored, &live, 0);

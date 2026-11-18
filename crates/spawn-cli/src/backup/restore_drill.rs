@@ -222,32 +222,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(unrestorable(&store, &records, &reason, started, resources));
         }
     };
-    // The notes folder's drill never makes its folder under the notes
-    // folder (objective 217): refused, exit 2, nothing recorded.
-    if only == Only::Sync
-        && let Some(notes) = sync::named_dir(chain[chain.len() - 1])
-        && let Ok(notes) = notes.canonicalize()
-        && parent.starts_with(&notes)
-    {
-        eprintln!(
-            "spawn backup restore-drill: --into {} is under the notes folder ({}): a drill \
-             restores into scratch, never there",
-            parent.display(),
-            notes.display()
-        );
-        return Ok(2);
-    }
-    // Before anything is fetched: the transcripts or the notes drill's
-    // bytes above the floor, or no drill (exit 2, nothing recorded, nothing
-    // made).
-    let needed = match only {
-        Only::Transcripts => Some(transcripts_bytes(&chain)),
-        Only::Sync => Some(sync::bytes(&chain)),
-        _ => None,
-    };
-    if let Some(needed) = needed
-        && let Err(refusal) = above_floor(needed, &parent)
-    {
+    if let Some(refusal) = refused_before_fetch(only, &chain, &parent) {
         eprintln!("spawn backup restore-drill: {refusal}");
         return Ok(2);
     }
@@ -278,6 +253,31 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         duration_ms: elapsed_ms(started),
     };
     Ok(record_verdicts(&store, &verdict, &outcomes).unwrap_or(code))
+}
+
+/// Why a drill is refused before anything is fetched (exit 2, nothing
+/// recorded, nothing made): the notes drill's folder under the notes folder
+/// (objective 217), or the transcripts or the notes drill's bytes that would
+/// leave its file system under the floor.
+fn refused_before_fetch(only: Only, chain: &[&BundleRecord], parent: &Path) -> Option<String> {
+    if only == Only::Sync
+        && let Some(notes) = sync::named_dir(chain[chain.len() - 1])
+        && let Ok(notes) = notes.canonicalize()
+        && parent.starts_with(&notes)
+    {
+        return Some(format!(
+            "--into {} is under the notes folder ({}): a drill restores into scratch, never \
+             there",
+            parent.display(),
+            notes.display()
+        ));
+    }
+    let needed = match only {
+        Only::Transcripts => transcripts_bytes(chain),
+        Only::Sync => sync::bytes(chain),
+        Only::Both | Only::Missions | Only::Controllers => return None,
+    };
+    above_floor(needed, parent).err()
 }
 
 /// The transcripts drill's folder left (not plain, or no longer the one
