@@ -78,6 +78,17 @@
 //! 8000) is the alert: the record says `over_alert` and the run says it on
 //! its output; objective 030 raises its own alert from the record.
 //!
+//! With `SPAWN_BACKUP_SYNC_DIR` set (objective 216; the bundle unit sets
+//! `/var/tmp/spawn/sync`), the bundle also takes the fleet's notes folder,
+//! read only: every file in a full, the new or changed ones (size, mtime,
+//! sha256) in an increment, and a manifest of the whole folder inside the
+//! bundle (`sync/files`, `sync/manifest.json`), the part scanned for
+//! credential values first; a hit, a place the scan could not search, a
+//! failed scan or a file the run cannot read drops that part only
+//! ([`sync_dir`]). Its scratch is then a hidden directory in the workspace
+//! root, never in TMPDIR. Unset, the bundle is as it was. A bundle's PUT is
+//! given 600 s plus its size at 100 KB/s ([`bundle_put_seconds`]).
+//!
 //! The bundle's tar is compressed before it is encrypted — zstd (`-3`) when
 //! the host has it, gzip when it does not, plain otherwise — and the key
 //! names what it holds (`<...>.tar.zst.gpg`, `.tar.gz.gpg`, `.tar.gpg`): on
