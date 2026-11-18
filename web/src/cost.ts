@@ -1,12 +1,16 @@
 // The cost page's figures (objective 041), from what `GET /api/cost?window=`
 // answers (crates/spawn-cli/src/cost.rs): the total, and each mission, task
-// and agent, in dollars, most costly first. Pure, with no import, so node
-// loads it alone (type stripping, no bundler): the page's fetch lives in
-// components/cost/CostView.tsx.
+// and agent, in dollars, most costly first. Pure, importing only format.ts
+// (itself import-free), so node loads it alone (type stripping, no bundler):
+// the page's fetch lives in components/cost/CostView.tsx.
 //
 // The scorecard's rule holds here too (GitHub #16 item 3): a cost that is
 // not zero never reads as zero. Use on a model no price names is "unpriced",
 // never "$0.00": it cost something no price says.
+
+import { compactCount } from "./format.ts";
+
+export { compactCount };
 
 /** Token counts of one entry: every message, priced or not. */
 export interface CostTokens {
@@ -204,10 +208,6 @@ export function formatUsd(usd: number | null): string {
   return DOLLARS.format(usd);
 }
 
-import { compactCount } from "./format.ts";
-
-export { compactCount };
-
 const TOKENS = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
 /** A token count grouped the "en-US" way ("275,000"). */
@@ -221,7 +221,6 @@ export function unpricedText(tokens: number): string | null {
   if (!Number.isFinite(tokens) || tokens <= 0) return null;
   return `+ ${formatTokens(tokens)} token${tokens === 1 ? "" : "s"} unpriced`;
 }
-
 
 /** A row's unpriced badge, short enough to keep its dollars on the page:
  * "+485M unpriced" ([`compactCount`]); null when it has none. */
@@ -404,6 +403,15 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
  * line, most costly first, each with its unpriced count and its share of
  * the window; and since when the record counts, when the window starts
  * before it. */
+/** The title of the cost page's unpriced note (t505u P4): the note with
+ * every count in full (`unpriced_note_exact`), a blank line, then how to
+ * price a model. The page shows the note compact; this keeps it exact. */
+export function unpricedNoteTitle(view: Pick<CostView, "unpriced_note_exact">): string {
+  const hint =
+    "SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set.";
+  return view.unpriced_note_exact ? `${view.unpriced_note_exact}\n\n${hint}` : hint;
+}
+
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
   const total = shown(answer?.total);
   const windowUsd = total.order;

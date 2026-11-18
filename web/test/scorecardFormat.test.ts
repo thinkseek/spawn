@@ -38,6 +38,9 @@ test("a model's cost line keeps a small cost per landing", () => {
   assert.equal(modelCostText(6100, 2033.333), "6.1K tokens · 2.0K per landing");
   assert.equal(modelCostText(1_463_163_060, 999.6), "1.5B tokens · 1,000 per landing");
   assert.equal(modelCostText(485_321_042, 26_129_000), "485M tokens · 26M per landing");
+  // rev-h n1: the boundary: exactly 1,000 per landing is compact, 999 is not.
+  assert.equal(modelCostText(5_000, 1_000), "5.0K tokens · 1.0K per landing");
+  assert.equal(modelCostText(5_000, 999), "5.0K tokens · 999 per landing");
   assert.equal(modelCostText(0, 0), "0 tokens · 0 per landing");
   assert.equal(modelCostText(5, null), "5 tokens · — per landing");
 });

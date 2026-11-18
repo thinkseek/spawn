@@ -3,7 +3,7 @@ import { CircleDollarSign } from "lucide-react";
 
 import { readApi, usePoll } from "../../api";
 import type { CostAnswer, CostView as Figures, Fold, Row } from "../../cost.ts";
-import { costView, dashboard, rowLines } from "../../cost.ts";
+import { costView, dashboard, rowLines, unpricedNoteTitle } from "../../cost.ts";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { CostDashboard } from "./CostDashboard";
 import { SegmentedControl } from "../aui/kit";
@@ -154,7 +154,7 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
       />
       {figures?.unpriced_note && (
         <p
-          title={`${figures.unpriced_note_exact ? `${figures.unpriced_note_exact}\n\n` : ""}SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set.`}
+          title={unpricedNoteTitle(figures)}
           className="px-4 pt-2 text-caption text-warning"
         >
           {figures.unpriced_note}

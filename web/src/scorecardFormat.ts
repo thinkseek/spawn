@@ -29,6 +29,14 @@ export function modelCostText(tokens: number, perLanded: number | null): string 
   return `${compactCount(tokens)} tokens · ${per} per landing`;
 }
 
+/** A model's cost line's title, every count in full (t505u P4):
+ * "m: 1,463,163,060 tokens, 209,023,294 per landing"; without the
+ * per-landing part when there is none. */
+export function modelCostTitle(model: string, tokens: number, perLanded: number | null): string {
+  const head = `${model}: ${formatDecimal(tokens, 0)} tokens`;
+  return perLanded === null ? head : `${head}, ${formatDecimal(perLanded)} per landing`;
+}
+
 /** A gate time's spending in words: whole minutes under an hour ("35m"),
  * hours to one decimal from one ("1.1 h", "10.0 h"). */
 function gateSpan(ms: number): string {

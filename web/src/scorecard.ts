@@ -6,7 +6,7 @@
 
 import { readApi } from "./api";
 import { compactCount } from "./format.ts";
-import { formatCost, formatDecimal, modelCostText } from "./scorecardFormat.ts";
+import { formatCost, formatDecimal, modelCostText, modelCostTitle } from "./scorecardFormat.ts";
 import { tokenReachOf } from "./tokenReach.ts";
 
 export { formatDecimal };
@@ -674,10 +674,7 @@ export function dimensionParts(
           parts: Object.entries(d.by_model).map(([model, entry]) => ({
             label: model,
             value: modelCostText(entry.tokens, entry.per_landed),
-            title:
-              entry.per_landed === null
-                ? `${model}: ${formatDecimal(entry.tokens, 0)} tokens`
-                : `${model}: ${formatDecimal(entry.tokens, 0)} tokens, ${formatDecimal(entry.per_landed)} per landing`,
+            title: modelCostTitle(model, entry.tokens, entry.per_landed),
           })),
         },
       ];

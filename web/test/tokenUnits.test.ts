@@ -4,8 +4,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { compactCount as fromCost, formatTokens, unpricedNote } from "../src/cost.ts";
+import { compactCount as fromCost, costView, formatTokens, unpricedNote, unpricedNoteTitle } from "../src/cost.ts";
 import { compactCount } from "../src/format.ts";
+import { modelCostTitle } from "../src/scorecardFormat.ts";
 
 test("compactCount lives in format.ts, and cost.ts re-exports the same function", () => {
   assert.equal(fromCost, compactCount);
@@ -41,10 +42,29 @@ test("the unpriced note is compact by default and in full with formatTokens", ()
   assert.equal(unpricedNote({ total: { tokens: {}, unpriced_tokens: 0 } } as unknown as Parameters<typeof unpricedNote>[0]), null);
 });
 
-test("the cost page titles the note with its exact twin; the scorecard titles its compact counts in full", () => {
+// rev-k F1: the exact note is reached through costView and the page's title
+// function, not only by calling unpricedNote directly.
+test("costView carries the note compact and its exact twin; the note's title starts with the exact one", () => {
+  const view = costView(answer as Parameters<typeof costView>[0]);
+  assert.match(view.unpriced_note ?? "", /^275K of 385K tokens \(71%\)/);
+  assert.match(view.unpriced_note_exact ?? "", /^275,000 of 385,000 tokens \(71%\)/);
+  const title = unpricedNoteTitle(view);
+  assert.equal(title.split("\n\n")[0], view.unpriced_note_exact);
+  assert.match(title, /\n\nSPAWN_MODEL_PRICES is a JSON object/);
+  assert.match(unpricedNoteTitle({ unpriced_note_exact: null }), /^SPAWN_MODEL_PRICES is a JSON object/);
+});
+
+// rev-k n1: the per-model title in full, per landing included.
+test("a model's cost line is titled with every count in full", () => {
+  assert.equal(modelCostTitle("m", 1_463_163_060, 209_023_294), "m: 1,463,163,060 tokens, 209,023,294 per landing");
+  assert.equal(modelCostTitle("m", 6_100, 2_033.333), "m: 6,100 tokens, 2,033.333 per landing");
+  assert.equal(modelCostTitle("m", 6_100, null), "m: 6,100 tokens");
+});
+
+test("the pages use those titles: the cost note's and the scorecard's", () => {
   const page = readFileSync(new URL("../src/components/cost/CostView.tsx", import.meta.url), "utf8");
-  assert.match(page, /figures\.unpriced_note_exact \?/);
+  assert.match(page, /title=\{unpricedNoteTitle\(figures\)\}/);
   const scorecard = readFileSync(new URL("../src/scorecard.ts", import.meta.url), "utf8");
   assert.match(scorecard, /\{ label: "tokens", value: compactCount\(d\.tokens\), title: `\$\{formatDecimal\(d\.tokens, 0\)\} tokens` \}/);
-  assert.match(scorecard, /\$\{model\}: \$\{formatDecimal\(entry\.tokens, 0\)\} tokens/);
+  assert.match(scorecard, /title: modelCostTitle\(model, entry\.tokens, entry\.per_landed\)/);
 });
