@@ -29,6 +29,12 @@
 #   (7) that task, once its gate accepts it (the integrator's task.gated:
 #       landing), is still in flight: refused, naming it "landing"; once
 #       landed (task.landed) it is done: its brief is assigned again.
+#   (8) both briefs are trimmed of space, tab, CR and LF: a brief stored with
+#       a tab, a space, a CR and an LF around it refuses its bare text, and
+#       the bare text with a tab before and a CR after.
+#   (9) with two tasks of the brief in flight (the supervisor's, then the
+#       owner's duplicate), the refusal names the lowest id, and so does the
+#       owner's second duplicate's record.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -338,6 +344,69 @@ after_landed=$(assign "$m3")
     check_failed "(7) the brief of task $gated, landed, is refused: $(head -c 300 "$WORK/err.txt")"
 BRIEF=$BRIEF_SAVED
 note "(7) checked: landing is in flight, landed is done"
+
+# (8) and (9) each use a mission and a brief of their own, so they stand
+# whatever (1)-(7) found; a step they need that fails is a failed check, so a
+# wrong refusal stays an assertion (rc 1), never a harness exit.
+
+# --- (8) both briefs trimmed of space, tab, CR and LF (R3, rev-g's F1) -------------------------
+
+TAB=$(printf '\t')
+CR=$(printf '\r')
+BARE="$BRIEF_SAVED (trim)"
+m5=$(mission_add "212 trim mission")
+[ -n "$m5" ] && [ "$m5" != null ] || harness "the trim mission was not made"
+BRIEF="$TAB $BARE$CR
+"
+padded=$(assign "$m5")
+if [ -z "$padded" ] || [ "$padded" = null ]; then
+    check_failed "(8) a brief with a tab, a space, a CR and an LF around it is assigned: $(head -c 300 "$WORK/err.txt")"
+else
+    BRIEF=$BARE
+    bare_dup=$(assign "$m5")
+    expect_eq "$bare_dup" "" "(8) the bare text of task $padded's brief (stored with a tab, a space, a CR and an LF around it) is refused"
+    grep -q "task $padded of mission $m5 has the same brief and is assigned" "$WORK/err.txt" ||
+        check_failed "(8) the refusal of the bare text names task $padded: [$(head -c 300 "$WORK/err.txt")]"
+    BRIEF="$TAB$BARE$CR"
+    tabcr_dup=$(assign "$m5")
+    expect_eq "$tabcr_dup" "" "(8) the bare text with a tab before and a CR after is refused"
+    grep -q "task $padded of mission $m5 has the same brief and is assigned" "$WORK/err.txt" ||
+        check_failed "(8) the refusal of the tab/CR brief names task $padded: [$(head -c 300 "$WORK/err.txt")]"
+    expect_eq "$(count_tasks "$m5")" 1 "(8) no task is made by a refused assign"
+fi
+BRIEF=$BRIEF_SAVED
+note "(8) checked: both briefs trimmed of space, tab, CR and LF"
+
+# --- (9) two in flight: the lowest id is named (R3, rev-g's F2) --------------------------------
+
+# <mission>: the owner's assign of $BRIEF; the task id, or "" when refused
+owner_assign() {
+    capture "$SPAWN_BIN" task assign --mission "$1" --kind ephemeral --worker judge --brief "$BRIEF"
+    if [ "$status" -eq 0 ]; then out | jq -r '.task'; else echo ""; fi
+}
+BRIEF="$BRIEF_SAVED (two in flight)"
+m6=$(mission_add "212 two in flight")
+[ -n "$m6" ] && [ "$m6" != null ] || harness "the two-in-flight mission was not made"
+lowest=$(assign "$m6")
+[ -n "$lowest" ] && [ "$lowest" != null ] || harness "the supervisor's assign in mission $m6 failed: $(err)"
+next_owner=$(owner_assign "$m6")
+if [ -z "$next_owner" ] || [ "$next_owner" = null ]; then
+    check_failed "(9) the owner's duplicate of task $lowest is assigned: $(err)"
+else
+    two_dup=$(assign "$m6")
+    expect_eq "$two_dup" "" "(9) the same brief while tasks $lowest and $next_owner are in flight is refused"
+    grep -q "task $lowest of mission $m6 has the same brief and is assigned" "$WORK/err.txt" ||
+        check_failed "(9) the refusal names task $lowest, the lowest id in flight, not $next_owner: [$(head -c 300 "$WORK/err.txt")]"
+    last_owner=$(owner_assign "$m6")
+    if [ -z "$last_owner" ] || [ "$last_owner" = null ]; then
+        check_failed "(9) the owner's second duplicate is assigned: $(err)"
+    else
+        expect_eq "$(repeats_of "$last_owner")" "$lowest" \
+            "(9) the owner's second duplicate's record names task $lowest, the lowest id in flight"
+    fi
+fi
+BRIEF=$BRIEF_SAVED
+note "(9) checked: the lowest id in flight is named"
 
 if [ -s "$WORK/failures" ]; then
     asserted=1
