@@ -327,6 +327,24 @@
 //!   that can be one, and the open alerts), then when the log moved (the
 //!   new commands, the pending messages due, the open alerts whose session
 //!   took a message or ended since) and when a pending one falls due.
+//! - `archive_failed`, the agent, key `archive_failed:<agent>:<native>:<the
+//!   occurrence's first archive.failed>` (objective 193, alerts/archives.rs):
+//!   a transcript the archive copies nothing of, from the Bridge's
+//!   `archive.failed` and `archive.resumed` (objective 179). Per transcript
+//!   (agent and native session), an occurrence runs from its first
+//!   `archive.failed` after the last `archive.resumed`; a repeat (a
+//!   restarted Bridge says it again) or a new reason fires nothing more.
+//!   Evidence `{agent_id, session_id, native, reason (scrubbed), since_ms,
+//!   event_id}`, the line "the transcript archive of <agent> (session <s>,
+//!   native session <n>) copies nothing: <reason>; unarchived since <time>
+//!   UTC; at risk from Claude Code's cleanup". Clears at the transcript's
+//!   next `archive.resumed`, each open one fired before it at once, so a
+//!   failure after it in the same read is a new occurrence. A session that
+//!   ended while failing keeps it open: its transcript is still at risk.
+//!   The archive events are read after the last one read: at the first
+//!   check, even on a log that does not move (from the first event, so a
+//!   restarted loop rebuilds every occurrence), when the log moved, and
+//!   again after a read that failed.
 //! - `model_auth`, the session id, key
 //!   `model_auth:<its execution.interrupted>`: an `execution.interrupted`
 //!   (028) with cause `model_auth`; clears at that execution's
@@ -816,6 +834,16 @@ pub(crate) struct Monitor {
     /// judgement read after it of an alert out since before it keeps no
     /// stretch (objective 209 (1)).
     guardrail_in: BTreeMap<String, i64>,
+    /// The last archive event the step read (`archive_failed`, objective
+    /// 193): the next read is of the ones after it. `0` at start, so the
+    /// first read rebuilds every occurrence.
+    archives_after: i64,
+    /// Whether the archive events are read at the next check whatever the
+    /// log does: at the first check, and after a read that failed.
+    archives_due: bool,
+    /// Each transcript's current `archive_failed` occurrence, by agent and
+    /// native session.
+    archive_occurrences: BTreeMap<(String, String), archives::Occurrence>,
 }
 
 /// What the supervisor has to dispatch, as one read of the attention view
@@ -937,6 +965,9 @@ impl Monitor {
             guardrail_seeded: false,
             guardrail_judged: BTreeMap::new(),
             guardrail_in: BTreeMap::new(),
+            archives_after: 0,
+            archives_due: true,
+            archive_occurrences: BTreeMap::new(),
         }
     }
 
@@ -953,7 +984,12 @@ impl Monitor {
         let bound_due = self.next_bound_ms.is_some_and(|due| now >= due);
         // A Core lines reading in flight is looked at by every check.
         let guardrails_due = self.guardrail_reads.in_flight();
-        if watermark <= self.watermark && !reading_due && !bound_due && !guardrails_due {
+        if watermark <= self.watermark
+            && !reading_due
+            && !bound_due
+            && !guardrails_due
+            && !self.archives_due
+        {
             return Ok(lines);
         }
         let mut events = Vec::new();
@@ -1001,6 +1037,9 @@ impl Monitor {
         if moved || self.messages_due.is_some_and(|due| now >= due) {
             self.read_messages(store, now, &mut events, &mut lines);
         }
+        // The transcript archive's events: at the first check, when the log
+        // moved, and after a read that failed (objective 193).
+        self.read_archives(store, now, moved, &mut lines);
         if reading_due {
             self.next_reading_ms = now.saturating_add(self.settings.check_ms);
             self.read_host(now, &mut events, &mut lines);
@@ -5189,6 +5228,7 @@ fn host_sources(listed: &Value) -> BTreeSet<(i64, String)> {
     out
 }
 
+mod archives;
 mod guardrails;
 mod notices;
 
