@@ -1285,6 +1285,57 @@ fn one_integrator_holds_the_lock() {
     assert!(held, "a dead integrator never blocks the next one");
 }
 
+/// Objective 221: the lock taken under a connection name; who holds it is
+/// read once (its server pid, its name, when it connected), and so is
+/// whether a connection holds it; a free lock has no holder.
+#[test]
+fn the_integrators_lock_names_its_holder_and_says_who_holds_it() {
+    let (first, schema) = store("control_integrator_holder");
+    let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
+    assert_eq!(
+        second.integrator_lock_holder().expect("holder"),
+        None,
+        "free"
+    );
+    assert!(
+        first
+            .integrator_lock("spawn integrate pid=4242")
+            .expect("lock"),
+        "the first takes it"
+    );
+    assert!(
+        !second
+            .integrator_lock("spawn integrate pid=4343")
+            .expect("lock"),
+        "the second is refused"
+    );
+    let holder = second
+        .integrator_lock_holder()
+        .expect("holder")
+        .expect("a holder");
+    assert_eq!(holder["name"], "spawn integrate pid=4242");
+    assert_eq!(
+        holder["pid"].as_i64(),
+        Some(i64::from(first.backend_pid().expect("pid")))
+    );
+    assert!(
+        holder["connected_ms"].as_i64().is_some_and(|ms| ms > 0),
+        "{holder}"
+    );
+    assert!(first.integrator_holds_lock().expect("holds"));
+    assert!(!second.integrator_holds_lock().expect("holds"));
+    drop(first);
+    let mut free = false;
+    for _ in 0..50 {
+        free = second.integrator_lock_holder().expect("holder").is_none();
+        if free {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(free, "the lock dies with its connection");
+}
+
 /// The RSI page's reads on the objective mission built above: the mission
 /// with its resident and its tasks' gate verdicts, newest task first; one
 /// task with its logs; and the board's last verdict per task.

@@ -10116,3 +10116,154 @@ fn no_verdict_twice_at_the_500_char_boundary_is_refused() {
         assert!(stored.starts_with(prefix), "{stored}");
     }
 }
+
+/// A test's world, removed when the test ends.
+struct Gone(PathBuf);
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An integrator whose connections are made in `db`'s schema (objective
+/// 221: `pass` takes and keeps the lock on a connection of its own), and
+/// its world, removed when dropped.
+fn locking_integrator(db: &Db, tag: &str) -> (Integrator, Gone) {
+    let (base, _, _, integrator) = world(tag, "exit 0\n");
+    let (url, schema) = (db.url.clone(), db.schema.name().to_string());
+    let integrator = integrator.with_connect(Box::new(move || {
+        PostgresStore::connect_in_schema(&url, &schema).map_err(|error| error.to_string())
+    }));
+    (integrator, Gone(base))
+}
+
+/// A connection in `db`'s schema.
+fn connection(db: &Db) -> PostgresStore {
+    PostgresStore::connect_in_schema(&db.url, db.schema.name()).expect("connect")
+}
+
+/// Objective 221: an idle integrator keeps its lock between passes, so a
+/// second one is refused while the first is idle, and after a pass of the
+/// first that failed on a live connection too; a start finds it held and,
+/// past its wait, is refused naming the holder.
+#[test]
+fn a_second_integrator_is_refused_while_the_first_is_idle() {
+    let db = Db::new("lock_idle");
+    let (first, _first_world) = locking_integrator(&db, "lock-idle-a");
+    let (second, _second_world) = locking_integrator(&db, "lock-idle-b");
+    first.pass().expect("the first pass");
+    assert!(first.held.borrow().is_some(), "the lock is kept while idle");
+    first.pass().expect("an idle pass");
+    second.pass().expect("the second's pass does nothing");
+    assert!(second.held.borrow().is_none(), "the second is refused");
+    assert!(
+        second.stopped.borrow().is_none(),
+        "it never held it: no stop"
+    );
+
+    // A pass that fails on a live connection keeps the lock.
+    let mut admin = db.admin();
+    admin
+        .batch_execute("alter function spawn_now_ms() rename to spawn_now_ms_k")
+        .expect("rename");
+    let failed = first.pass();
+    admin
+        .batch_execute("alter function spawn_now_ms_k() rename to spawn_now_ms")
+        .expect("rename back");
+    assert!(failed.is_err(), "the pass fails");
+    assert!(first.held.borrow().is_some(), "and keeps the lock");
+    second.pass().expect("the second's pass does nothing");
+    assert!(second.held.borrow().is_none(), "still refused");
+
+    let started = std::time::Instant::now();
+    let refused = super::take_lock_at_start(
+        &|| Ok(connection(&db)),
+        std::time::Duration::from_millis(1200),
+    )
+    .err()
+    .expect("a start is refused past its wait");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1200));
+    assert!(
+        refused.starts_with(&format!(
+            "integrate: another integrator holds this database's lock (spawn integrate pid={}, \
+             connected at ",
+            std::process::id()
+        )) && refused.ends_with(
+            " UTC); this one does not start. Stop that one first, or drain it with `spawn \
+             integrate --drain --root <its root>`."
+        ),
+        "{refused}"
+    );
+}
+
+/// Objective 221: a start that finds the lock held takes it once it is
+/// freed within its wait (a deploy's restart).
+#[test]
+fn a_start_takes_a_lock_freed_within_its_wait() {
+    let db = Db::new("lock_restart");
+    let old = connection(&db);
+    assert!(old.integrator_lock("spawn integrate pid=1").expect("lock"));
+    let freed = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        drop(old);
+    });
+    let (store, pid) =
+        super::take_lock_at_start(&|| Ok(connection(&db)), std::time::Duration::from_secs(10))
+            .expect("the lock, once freed");
+    freed.join().expect("freed");
+    assert!(store.integrator_holds_lock().expect("holds"));
+    assert_eq!(store.backend_pid().expect("pid"), pid);
+}
+
+/// Objective 221: an integrator holds its lock for life; a connection that
+/// ended is dropped after the pass it failed, and the next pass takes the
+/// lock again on a new one. Lost to another integrator by then, it stops,
+/// naming the holder.
+#[test]
+fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
+    let db = Db::new("lock_lost");
+    let (integrator, _world) = locking_integrator(&db, "lock-lost");
+    let end = |pid: i32| {
+        db.admin()
+            .execute("select pg_terminate_backend($1)", &[&pid])
+            .expect("end the connection");
+    };
+    integrator.pass().expect("the first pass");
+    end(integrator.lock_pid.get().expect("its connection"));
+    assert!(integrator.pass().is_err(), "a pass on an ended connection");
+    assert!(
+        integrator.held.borrow().is_none(),
+        "the connection is dropped"
+    );
+    integrator.pass().expect("the lock taken again");
+    assert!(integrator.held.borrow().is_some());
+    assert!(integrator.stopped.borrow().is_none());
+
+    end(integrator.lock_pid.get().expect("its connection"));
+    assert!(integrator.pass().is_err());
+    let other = connection(&db);
+    let mut taken = false;
+    for _ in 0..50 {
+        taken = other
+            .integrator_lock("spawn integrate pid=999")
+            .expect("lock");
+        if taken {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(taken, "another integrator takes the freed lock");
+    let stopped = integrator.pass().expect_err("it stops");
+    assert!(
+        stopped.starts_with(
+            "integrate: this integrator's connection to the database ended and another \
+             integrator holds the lock now (spawn integrate pid=999, connected at "
+        ) && stopped.ends_with(" UTC); this one stops"),
+        "{stopped}"
+    );
+    assert_eq!(
+        integrator.stopped.borrow().as_deref(),
+        Some(stopped.as_str())
+    );
+}
