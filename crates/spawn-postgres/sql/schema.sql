@@ -5944,7 +5944,8 @@ begin
     v_objective := (p_record ->> 'objective')::numeric::integer;
     v_kind := p_record ->> 'kind';
     -- At least three digits: lpad alone would cut 1234 to 123.
-    v_scenario := to_char(v_objective, 'FM000') || '.sh';
+    v_scenario := lpad(v_objective::text, greatest(3, char_length(v_objective::text)), '0')
+                  || '.sh';
 
     -- on-main, before the lock: the mission's gates that may show it, up
     -- to v_seen.
