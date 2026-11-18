@@ -1797,7 +1797,7 @@ begin
                               and s.execution_id = m.execution_id)
                      order by k.created_at_ms desc, k.id desc limit 1)) as task_id) t
           left join mission_tasks k on k.id = t.task_id
-    )
+    ), upserted as (
     insert into spawn_cost_messages as c
         (message_id, execution_id, agent_id, session_id, task_id, mission_id, model, at_ms,
          input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, usd, rates,
@@ -1838,8 +1838,18 @@ begin
         recorded_at_ms = case when (excluded.input_tokens + excluded.output_tokens + excluded.cache_write_tokens
                  + excluded.cache_read_tokens
                  > c.input_tokens + c.output_tokens + c.cache_write_tokens + c.cache_read_tokens)
-            then excluded.recorded_at_ms else c.recorded_at_ms end;
-    get diagnostics v_count = row_count;
+            then excluded.recorded_at_ms else c.recorded_at_ms end
+    returning c.message_id
+    ), dropped as (
+        -- A message an engine's record now holds is the engines' (cost
+        -- coverage R2): the sessions' copy, counted first when their pass
+        -- read the transcript before this fold, goes, so no message counts
+        -- twice. Only this call's messages: an index lookup each.
+        delete from spawn_cost_session_messages s
+         where s.message_id in (select message_id from upserted)
+        returning 1
+    )
+    select count(*) into v_count from upserted;
     return v_count;
 end $$;
 
@@ -1939,6 +1949,12 @@ begin
                t.rates, 0, 0, spawn_now_ms()
           from tasked t
         on conflict (message_id) do nothing
+        returning message_id
+    ), dropped as (
+        -- As in spawn_cost_record: the engines' record holds it now, so the
+        -- sessions' copy goes (cost coverage R2).
+        delete from spawn_cost_session_messages s
+         where s.message_id in (select message_id from added)
         returning 1
     )
     select (select count(*) from added),
@@ -1993,11 +2009,19 @@ create table if not exists spawn_cost_session_files (
 -- transaction (owner only), so a mark never runs ahead of what it counted:
 -- `p_messages` `[{project, session_id, message_id, model, at_ms, input,
 -- output, cache_write, cache_read}]`, `p_files` `[{file, inode,
--- offset_bytes, length, modified_ms}]`. A message an engine's record
--- already holds (`spawn_cost_messages`) is not counted again; one already
--- held here keeps its earliest time and model and takes a larger usage
--- (repriced then by `p_prices`). Returns `{counted, changed, engine}`:
--- messages added, messages that grew, messages left to the engines' record.
+-- offset_bytes, length, modified_ms}]`. Lines of one message in one call are
+-- folded by 041's rules: its largest usage, at its earliest line's time,
+-- under that line's model, project and session. A message an engine's
+-- record already holds (`spawn_cost_messages`) is not counted again, and a
+-- copy of it held here goes; an engine fold that takes one later removes
+-- it from here too, so no message counts twice. One already held
+-- here keeps its model and takes a larger usage, repriced by `p_prices`
+-- under that model; a smaller or equal usage never replaces it; an earlier
+-- time moves its time and nothing else. A line without a message id,
+-- project, session, model or time is not counted (`invalid`: the caller
+-- decides what its mark then means). Returns `{counted, changed, engine,
+-- invalid}`: messages added, held messages that grew or moved earlier,
+-- messages left to the engines' record, lines not counted.
 create or replace function spawn_cost_session_record(p_prices jsonb, p_messages jsonb,
                                                      p_files jsonb)
 returns jsonb language plpgsql security definer as $$
@@ -2005,6 +2029,7 @@ declare
     v_counted bigint;
     v_changed bigint;
     v_engine bigint;
+    v_invalid bigint;
 begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record costs', session_user using errcode = '42501';
@@ -2016,8 +2041,10 @@ begin
        or jsonb_typeof(p_files) is distinct from 'array' then
         raise exception 'the messages and the files are JSON arrays';
     end if;
-    with given as (
-        select distinct on (x.message_id) x.*,
+    with lines as (
+        select x.project, x.session_id, x.message_id, x.model, x.at_ms,
+               coalesce(x.input, 0) as input, coalesce(x.output, 0) as output,
+               coalesce(x.cache_write, 0) as cache_write, coalesce(x.cache_read, 0) as cache_read,
                coalesce(x.input, 0) + coalesce(x.output, 0) + coalesce(x.cache_write, 0)
                  + coalesce(x.cache_read, 0) as total
           from jsonb_to_recordset(p_messages)
@@ -2026,27 +2053,40 @@ begin
          where nullif(x.message_id, '') is not null and nullif(x.project, '') is not null
            and nullif(x.session_id, '') is not null and nullif(x.model, '') is not null
            and x.at_ms is not null
-         order by x.message_id,
-                  coalesce(x.input, 0) + coalesce(x.output, 0) + coalesce(x.cache_write, 0)
-                    + coalesce(x.cache_read, 0) desc
+    ), given as (
+        -- 041's fold of one call's lines: the largest usage, and the
+        -- earliest line's time, model, project and session.
+        select t.message_id, t.project, t.session_id, t.model, t.at_ms,
+               b.input, b.output, b.cache_write, b.cache_read, b.total
+          from (select distinct on (message_id) message_id, project, session_id, model, at_ms
+                  from lines order by message_id, at_ms, total desc) t
+          join (select distinct on (message_id) message_id, input, output, cache_write,
+                       cache_read, total
+                  from lines order by message_id, total desc, at_ms) b using (message_id)
     ), engine as (
         select g.message_id from given g
          where exists (select 1 from spawn_cost_messages c where c.message_id = g.message_id)
+    ), yielded as (
+        -- Held here but in an engine's record now (a fold on another
+        -- connection that raced this one): the engines' alone.
+        delete from spawn_cost_session_messages s
+         where s.message_id in (select message_id from engine)
+        returning 1
     ), held as (
         select h.message_id, h.at_ms,
                h.input_tokens + h.output_tokens + h.cache_write_tokens + h.cache_read_tokens
                  as total
           from spawn_cost_session_messages h
          where h.message_id in (select message_id from given)
+           and h.message_id not in (select message_id from engine)
     ), added as (
         insert into spawn_cost_session_messages
             (message_id, project, session_id, model, at_ms, input_tokens, output_tokens,
              cache_write_tokens, cache_read_tokens, usd, rates, recorded_at_ms)
         select g.message_id, g.project, g.session_id, g.model, g.at_ms,
-               coalesce(g.input, 0), coalesce(g.output, 0), coalesce(g.cache_write, 0),
-               coalesce(g.cache_read, 0),
-               spawn_cost_usd(p_prices -> g.model, coalesce(g.input, 0), coalesce(g.output, 0),
-                              coalesce(g.cache_write, 0), coalesce(g.cache_read, 0)),
+               g.input, g.output, g.cache_write, g.cache_read,
+               spawn_cost_usd(p_prices -> g.model, g.input, g.output, g.cache_write,
+                              g.cache_read),
                p_prices -> g.model, spawn_now_ms()
           from given g
          where g.message_id not in (select message_id from engine)
@@ -2054,17 +2094,24 @@ begin
         on conflict (message_id) do nothing
         returning 1
     ), grown as (
+        -- A larger usage replaces the held one, priced under the held
+        -- model; an earlier time moves the time alone.
         update spawn_cost_session_messages m
-           set input_tokens = coalesce(g.input, 0), output_tokens = coalesce(g.output, 0),
-               cache_write_tokens = coalesce(g.cache_write, 0),
-               cache_read_tokens = coalesce(g.cache_read, 0),
+           set input_tokens = case when g.total > h.total then g.input else m.input_tokens end,
+               output_tokens = case when g.total > h.total then g.output else m.output_tokens end,
+               cache_write_tokens = case when g.total > h.total then g.cache_write
+                                         else m.cache_write_tokens end,
+               cache_read_tokens = case when g.total > h.total then g.cache_read
+                                        else m.cache_read_tokens end,
+               usd = case when g.total > h.total
+                          then spawn_cost_usd(p_prices -> m.model, g.input, g.output,
+                                              g.cache_write, g.cache_read)
+                          else m.usd end,
+               rates = case when g.total > h.total then p_prices -> m.model else m.rates end,
                at_ms = least(m.at_ms, g.at_ms),
-               usd = spawn_cost_usd(p_prices -> m.model, coalesce(g.input, 0),
-                                    coalesce(g.output, 0), coalesce(g.cache_write, 0),
-                                    coalesce(g.cache_read, 0)),
-               rates = p_prices -> m.model, recorded_at_ms = spawn_now_ms()
+               recorded_at_ms = spawn_now_ms()
           from given g join held h on h.message_id = g.message_id
-         where m.message_id = g.message_id and g.total > h.total
+         where m.message_id = g.message_id and (g.total > h.total or g.at_ms < h.at_ms)
         returning 1
     ), marked as (
         insert into spawn_cost_session_files
@@ -2083,9 +2130,11 @@ begin
     )
     -- `marked` runs whether read or not (a data-modifying WITH always does).
     select (select count(*) from added), (select count(*) from grown),
-           (select count(*) from engine)
-      into v_counted, v_changed, v_engine;
-    return jsonb_build_object('counted', v_counted, 'changed', v_changed, 'engine', v_engine);
+           (select count(*) from engine),
+           jsonb_array_length(p_messages) - (select count(*) from lines)
+      into v_counted, v_changed, v_engine, v_invalid;
+    return jsonb_build_object('counted', v_counted, 'changed', v_changed, 'engine', v_engine,
+                              'invalid', v_invalid);
 end $$;
 
 -- Who may call the mission functions: the owner (humans' CLI, the

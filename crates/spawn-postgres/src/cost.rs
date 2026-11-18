@@ -315,6 +315,7 @@ impl PostgresStore {
             counted: count("counted"),
             changed: count("changed"),
             engine: count("engine"),
+            invalid: count("invalid"),
         })
     }
 
@@ -461,11 +462,14 @@ pub struct SessionFile {
     pub modified_ms: i64,
 }
 
-/// What [`PostgresStore::cost_session_record`] did: messages added, messages
-/// that grew, and messages left to the engines' record.
+/// What [`PostgresStore::cost_session_record`] did: messages added, held
+/// messages that grew or moved earlier, messages left to the engines'
+/// record, and lines not counted (no message id, project, session, model or
+/// time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SessionCounted {
     pub counted: i64,
     pub changed: i64,
     pub engine: i64,
+    pub invalid: i64,
 }
