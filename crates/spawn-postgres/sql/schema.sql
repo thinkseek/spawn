@@ -3217,9 +3217,21 @@ end $$;
 -- Assign one task. A resident must be approved; an ephemeral worker gets a
 -- new agent named after the label and the task, used for this task only.
 -- `p_model` is the profile the worker runs the task on.
+--
+-- A duplicate (objective 212, GitHub #63): a task of the same mission in
+-- flight whose brief equals this one, both trimmed of space, tab, CR and LF
+-- (exact, never "looks alike"; the lowest such id). In flight: assigned,
+-- delivered, reported, revise or landing, or accepted in a mission with a
+-- gate (it still waits for its gate), as the board counts it. The
+-- supervisor's duplicate is refused, naming that task, unless `p_again`
+-- (`spawn task assign --again`); the owner's (a person or a script giving
+-- several workers one brief means it) is assigned. Whenever there is one,
+-- the `task.assigned` record names it (`duplicate_of`).
 drop function if exists spawn_task_assign(bigint, text, text, text);
+drop function if exists spawn_task_assign(bigint, text, text, text, text);
 create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text,
-                                             p_brief text, p_model text default 'default')
+                                             p_brief text, p_model text default 'default',
+                                             p_again boolean default false)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3227,6 +3239,8 @@ declare
     v_agent text;
     v_session text;
     v_label text;
+    v_duplicate bigint;
+    v_duplicate_state text;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -3259,10 +3273,25 @@ begin
     else
         raise exception 'a task is resident or ephemeral, not %', p_kind;
     end if;
+    select k.id, k.state into v_duplicate, v_duplicate_state
+      from mission_tasks k
+      join mission_missions m on m.id = k.mission_id
+     where k.mission_id = p_mission
+       and btrim(k.brief, E' \t\r\n') = btrim(p_brief, E' \t\r\n')
+       and (k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
+            or (k.state = 'accepted' and m.gate is not null))
+     order by k.id
+     limit 1;
+    if v_duplicate is not null and v_caller = 'spawn_supervisor' and p_again is not true then
+        raise exception 'task % of mission % has the same brief and is %: a duplicate is not assigned (cancel it first, or assign again on purpose with --again)',
+            v_duplicate, p_mission, v_duplicate_state;
+    end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', p_kind,
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief, 'model', p_model,
-        'created_by', case when v_caller = 'owner' then 'human' else v_caller end));
+        'created_by', case when v_caller = 'owner' then 'human' else v_caller end)
+        || case when v_duplicate is not null
+                then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end);
     return v_id;
 end $$;
 
@@ -6541,7 +6570,7 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
@@ -6576,7 +6605,7 @@ begin
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
         'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text)',

@@ -2303,7 +2303,9 @@ impl PostgresStore {
             .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
-    /// Assign a task, run on the model profile `model`; returns its id.
+    /// Assign a task, run on the model profile `model`; returns its id. The
+    /// supervisor's duplicate of a task in flight is refused
+    /// ([`Self::task_assign_again`] with `again` false).
     pub fn task_assign(
         &self,
         mission: i64,
@@ -2312,9 +2314,25 @@ impl PostgresStore {
         brief: &str,
         model: &str,
     ) -> Result<i64, StoreError> {
+        self.task_assign_again(mission, kind, worker, brief, model, false)
+    }
+
+    /// As [`Self::task_assign`]; with `again`, a brief a task of the mission
+    /// in flight already has is assigned on purpose, from the supervisor too
+    /// (objective 212, `spawn task assign --again`). Whenever there is such
+    /// a task, the `task.assigned` record names it (`duplicate_of`).
+    pub fn task_assign_again(
+        &self,
+        mission: i64,
+        kind: &str,
+        worker: &str,
+        brief: &str,
+        model: &str,
+        again: bool,
+    ) -> Result<i64, StoreError> {
         let row = self.query_one(
-            "select spawn_task_assign($1, $2, $3, $4, $5)",
-            &[&mission, &kind, &worker, &masked(brief), &model],
+            "select spawn_task_assign($1, $2, $3, $4, $5, $6)",
+            &[&mission, &kind, &worker, &masked(brief), &model, &again],
         )?;
         Ok(row.get(0))
     }
