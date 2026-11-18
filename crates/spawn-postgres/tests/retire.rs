@@ -50,9 +50,15 @@ fn assigned(client: &mut Client, task: i64, mission: i64, objective: i64) {
     );
 }
 
+/// A retirement as obsolete, which needs no record (objective 223).
 fn retire(mission: i64, objective: i64, by: &str, reason: &str) -> Value {
+    retire_as("obsolete", mission, objective, by, reason)
+}
+
+/// A retirement of `kind` (objective 223).
+fn retire_as(kind: &str, mission: i64, objective: i64, by: &str, reason: &str) -> Value {
     json!({"type": "objective.retired", "id": mission, "objective": objective,
-           "by": by, "reason": reason})
+           "kind": kind, "by": by, "reason": reason})
 }
 
 fn recorded(client: &mut Client) -> i64 {
@@ -110,6 +116,25 @@ fn world(client: &mut Client) {
     control(client, &json!({"type": "task.cancelled", "id": 4}));
 }
 
+/// The refusal of an on-main retire no gate shows (objective 223).
+fn no_record(mission: i64, objective: i64, scenario: &str) -> String {
+    format!(
+        "objective {mission}/{objective} is not shown on main: no accepted gate of a landed task \
+         of mission {mission} lists {scenario} as passed (a landing's title is not a gate \
+         record); run its scenario through a gate, or retire it as renumbered or obsolete"
+    )
+}
+
+/// The refusal of an on-main retire whose scenario a gate found red on
+/// main since its pass (objective 223).
+fn red_since(mission: i64, objective: i64, scenario: &str, task: i64, base: &str) -> String {
+    format!(
+        "objective {mission}/{objective} is not shown on main: {scenario} is red on main since \
+         task #{task}'s gate ({base}); run its scenario through a gate, or retire it as \
+         renumbered or obsolete"
+    )
+}
+
 /// Each refusal, one at a time, records nothing; an objective of a mission
 /// with a backlog, cancelled only or never assigned (not in any backlog
 /// file: the store does not read the files), is retired with the owner's
@@ -137,28 +162,58 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
         (retire(0, 6, "lead", "obsolete"), "whole numbers from 1"),
         (retire(1, 0, "lead", "obsolete"), "whole numbers from 1"),
         (
-            json!({"type": "objective.retired", "id": 1, "objective": 6.5, "by": "lead",
-                   "reason": "obsolete"}),
+            json!({"type": "objective.retired", "id": 1, "objective": 6.5, "kind": "obsolete",
+                   "by": "lead", "reason": "obsolete"}),
             "whole numbers from 1",
         ),
         (
-            json!({"type": "objective.retired", "id": "1", "objective": 6, "by": "lead",
-                   "reason": "obsolete"}),
+            json!({"type": "objective.retired", "id": "1", "objective": 6, "kind": "obsolete",
+                   "by": "lead", "reason": "obsolete"}),
             "whole numbers from 1",
         ),
+        (
+            json!({"type": "objective.retired", "id": 1, "objective": 6, "kind": "obsolete",
+                   "by": "lead", "reason": "obsolete", "caller": "owner"}),
+            "and nothing else",
+        ),
+        (
+            json!({"type": "objective.retired", "id": 1, "objective": 6, "kind": "obsolete",
+                   "by": "lead"}),
+            "and nothing else",
+        ),
+        (
+            json!({"type": "objective.solved", "id": 1, "objective": 6, "kind": "obsolete",
+                   "by": "lead", "reason": "obsolete"}),
+            "not a retirement record",
+        ),
+        // Objective 223: the kind is required, and one of three; on-main
+        // needs a gate's record.
         (
             json!({"type": "objective.retired", "id": 1, "objective": 6, "by": "lead",
-                   "reason": "obsolete", "caller": "owner"}),
-            "and nothing else",
-        ),
-        (
-            json!({"type": "objective.retired", "id": 1, "objective": 6, "by": "lead"}),
-            "and nothing else",
-        ),
-        (
-            json!({"type": "objective.solved", "id": 1, "objective": 6, "by": "lead",
                    "reason": "obsolete"}),
-            "not a retirement record",
+            "a retirement record has type, id, objective, kind, by and reason, and nothing else",
+        ),
+        (
+            retire_as("landed", 1, 6, "lead", "obsolete"),
+            "a retirement record's kind is on-main, renumbered or obsolete, not landed",
+        ),
+        (
+            json!({"type": "objective.retired", "id": 1, "objective": 6, "kind": 3,
+                   "by": "lead", "reason": "obsolete"}),
+            "a retirement record's kind is on-main, renumbered or obsolete, not 3",
+        ),
+        (
+            retire_as("on-main", 1, 6, "lead", "its work is on main"),
+            &no_record(1, 6, "006.sh"),
+        ),
+        // The refusals before it keep their texts with on-main.
+        (
+            retire_as("on-main", 1, 2, "lead", "on main"),
+            "has a task in flight",
+        ),
+        (
+            retire_as("on-main", 1, 3, "lead", "on main"),
+            "a task of it landed",
         ),
     ] {
         refused(&store, &mut client, &record, why);
@@ -169,8 +224,8 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
     let event = store
         .objective_retire(&retire(1, 5, "lead", "its work is already on main"))
         .expect("retired");
-    store
-        .objective_retire(&retire(1, 6, "lead", "renumbered away"))
+    let renumbered = store
+        .objective_retire(&retire_as("renumbered", 1, 6, "lead", "renumbered away"))
         .expect("retired");
     let record: Value = client
         .query_one(
@@ -181,9 +236,17 @@ fn a_retirement_is_refused_for_each_reason_and_records_nothing() {
         .get(0);
     assert_eq!(
         record,
-        json!({"type": "objective.retired", "id": 1, "objective": 5, "by": "lead",
-               "reason": "its work is already on main", "caller": "owner"})
+        json!({"type": "objective.retired", "id": 1, "objective": 5, "kind": "obsolete",
+               "by": "lead", "reason": "its work is already on main", "caller": "owner"})
     );
+    let record: Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events where id = $1",
+            &[&renumbered],
+        )
+        .expect("the record")
+        .get(0);
+    assert_eq!(record["kind"], "renumbered", "{record}");
     assert_eq!((recorded(&mut client), rows(&mut client)), (2, 2));
     refused(
         &store,
