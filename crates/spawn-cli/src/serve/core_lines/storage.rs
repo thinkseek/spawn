@@ -81,13 +81,17 @@ pub(super) fn storage_line(storage: &Value) -> Line {
                 storage["leaked_test_schemas"].clone(),
             ),
             // Objective 141, after the seven: the disk's own fall and the
-            // store that grew most, said with its store.
-            Figure::new(
-                "storage.disk_fall",
-                "Free disk lost a day",
-                "bytes_per_day",
-                storage["disk_fall_bytes_per_day"].clone(),
-            ),
+            // store that grew most, said with its store. The fall says its
+            // basis, the week's fit or the last day (objective 222).
+            Figure {
+                basis: storage["disk_fall_basis"].as_str().map(str::to_string),
+                ..Figure::new(
+                    "storage.disk_fall",
+                    "Free disk lost a day",
+                    "bytes_per_day",
+                    storage["disk_fall_bytes_per_day"].clone(),
+                )
+            },
             Figure {
                 store: storage["grew_most"]["store"].as_str().map(str::to_string),
                 ..Figure::new(
@@ -276,7 +280,7 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
             "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
-            "disk_fall_bytes_per_day": 2_000_000,
+            "disk_fall_bytes_per_day": 2_000_000, "disk_fall_basis": "day",
             "grew_most": {"store": "unattributed", "bytes_per_day": 1_500_000},
         });
         let readings = lines(
@@ -339,6 +343,7 @@ mod tests {
         assert_eq!(diagnostic("storage.grew_most")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall").get("store"), None);
+        only_the_fall_says_a_basis(&view);
         // Free disk is the first diagnostic, with no line (objective 182).
         assert_eq!(view["diagnostics"][0]["key"], "storage.free_bytes");
         assert_eq!(view["diagnostics"][0]["value"], 104);
@@ -368,6 +373,35 @@ mod tests {
         assert_eq!(view["ignored_ranges"], json!([]));
     }
 
+    /// The fall says its basis (objective 222); no other figure does.
+    fn only_the_fall_says_a_basis(view: &Value) {
+        let with_basis: Vec<&Value> = view["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .chain(
+                view["lines"]
+                    .as_array()
+                    .expect("lines")
+                    .iter()
+                    .flat_map(|line| {
+                        std::iter::once(&line["north_star"])
+                            .chain(line["guardrails"].as_array().into_iter().flatten())
+                    }),
+            )
+            .filter(|figure| figure.get("basis").is_some())
+            .map(|figure| &figure["key"])
+            .collect();
+        assert_eq!(with_basis, [&json!("storage.disk_fall")]);
+        let fall = view["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .find(|figure| figure["key"] == "storage.disk_fall")
+            .expect("the fall");
+        assert_eq!(fall["basis"], "day");
+    }
+
     /// Still measuring (objective 141): days left say from when, and no
     /// store is said.
     fn still_measuring() {
@@ -383,6 +417,10 @@ mod tests {
         let days = figure_json(&measuring[1].north_star, None);
         assert_eq!(days["measuring_since_ms"], 86_400_000);
         assert_eq!(days["state"], "not_collected");
+        // No fall: no basis said (objective 222).
+        let fall = figure_json(&measuring[1].guardrails[7], None);
+        assert_eq!(fall["key"], "storage.disk_fall");
+        assert_eq!(fall.get("basis"), None);
         let grew = figure_json(&measuring[1].guardrails[8], None);
         assert_eq!(
             (grew["value"].clone(), grew.get("store")),
