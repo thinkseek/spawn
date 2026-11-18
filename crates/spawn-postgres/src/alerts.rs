@@ -262,6 +262,20 @@ select jsonb_build_object(
       order by b.id), '[]'::jsonb))
 from batch b";
 
+/// The transcript archive's events with an id after `$1`, oldest first
+/// (objective 193, `archive_failed`): the Bridge's `archive.failed` and
+/// `archive.resumed` (objective 179), written on a change only, so the rows
+/// are few; the index on `(event_name, recorded_at_ms)` finds them.
+pub(crate) const ARCHIVES: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object(
+      'event_id', e.id, 'name', e.event_name, 'agent_id', e.agent_id,
+      'session_id', e.session_id, 'at_ms', e.recorded_at_ms,
+      'native', e.kind -> 'detail' ->> 'native',
+      'reason', e.kind -> 'detail' ->> 'reason')
+    order by e.id), '[]'::jsonb)
+from spawn_events e
+where e.event_name in ('archive.failed', 'archive.resumed') and e.id > $1";
+
 /// The records the alert conditions read, newest last, since `$1`: the ones
 /// objectives 028, 029, 031 and 033 define, and the halt and resume, so a
 /// loop that restarted still knows what is pending.
@@ -518,6 +532,12 @@ impl PostgresStore {
     /// The alert-family records since `since_ms` ([`HISTORY`]).
     pub fn alert_history(&self, since_ms: i64, limit: i64) -> Result<Value, StoreError> {
         self.query_json(HISTORY, &[&since_ms, &limit])
+    }
+
+    /// The transcript archive's events after the event id `after`, oldest
+    /// first ([`ARCHIVES`]).
+    pub fn alert_archives(&self, after: i64) -> Result<Value, StoreError> {
+        self.query_json(ARCHIVES, &[&after])
     }
 
     /// Every session's latest judgement ([`OBSERVATIONS`]).
