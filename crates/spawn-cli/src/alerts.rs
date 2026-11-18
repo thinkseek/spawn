@@ -603,12 +603,19 @@ pub(crate) enum Event {
         key: String,
         evidence: Value,
     },
+    /// An open alert's text and evidence as its condition is now
+    /// (`alert.updated`, objective 219): not a fire, nothing new is told.
+    Update {
+        key: String,
+        evidence: Value,
+        text: String,
+    },
 }
 
 impl Event {
     fn key(&self) -> &str {
         match self {
-            Self::Fire { key, .. } | Self::Clear { key, .. } => key,
+            Self::Fire { key, .. } | Self::Clear { key, .. } | Self::Update { key, .. } => key,
         }
     }
 }
@@ -3664,9 +3671,6 @@ times in a row)",
             }
             return;
         }
-        if !open.is_empty() {
-            return;
-        }
         let newest = reading["newest_old_ms"].as_i64().unwrap_or_default();
         let bound = self.settings.unverified_ms;
         let span = if bound == DAY_MS {
@@ -3679,19 +3683,46 @@ times in a row)",
         } else {
             ("objectives", "them")
         };
+        let text = format!(
+            "{old} landed {objectives} unverified for over {span}: spawn verify list names {them}"
+        );
+        let mut evidence = json!({
+            "old": old, "unverified": unverified, "unverified_ms": bound,
+            "newest_landed_ms": newest, "listed_since_ms": crate::verify::LISTED_SINCE_MS,
+            "reading_ms": now,
+        });
+        // One open at a time (135): while it is, a reading whose count or
+        // newest old landing moved says so in place, the same alert
+        // (objective 219); one that finds the same records nothing.
+        if !open.is_empty() {
+            for key in open {
+                let Some(row) = self.known.get(&key) else {
+                    continue;
+                };
+                if row.evidence["old"].as_i64() == Some(old)
+                    && row.evidence["newest_landed_ms"].as_i64() == Some(newest)
+                {
+                    continue;
+                }
+                let fired_old = row.evidence["fired_old"]
+                    .as_i64()
+                    .or_else(|| row.evidence["old"].as_i64());
+                let mut evidence = evidence.clone();
+                evidence["fired_old"] = json!(fired_old);
+                out.push(Event::Update {
+                    key,
+                    evidence,
+                    text: text.clone(),
+                });
+            }
+            return;
+        }
         out.push(Event::Fire {
             key: format!("{KIND}:{newest}:{now}"),
             kind: KIND,
             subject: SUBJECT.to_string(),
-            evidence: json!({
-                "old": old, "unverified": unverified, "unverified_ms": bound,
-                "newest_landed_ms": newest, "listed_since_ms": crate::verify::LISTED_SINCE_MS,
-                "reading_ms": now,
-            }),
-            text: format!(
-                "{old} landed {objectives} unverified for over {span}: spawn verify list names \
-                 {them}"
-            ),
+            evidence,
+            text,
             notice: false,
         });
     }
@@ -4133,13 +4164,28 @@ times in a row)",
                         "subject": row.subject, "evidence": scrub_value(evidence),
                     })
                 }
+                Event::Update { evidence, text, .. } => {
+                    let Some(row) = self.known.get(&key).filter(|row| row.open()) else {
+                        continue;
+                    };
+                    json!({
+                        "type": "alert.updated", "key": key, "kind": row.kind,
+                        "subject": row.subject, "text": text,
+                        "evidence": scrub_value(evidence),
+                    })
+                }
             };
             match store.alert_record(&record) {
                 Ok(id) => {
                     let kind = record["kind"].as_str().unwrap_or_default().to_string();
                     let subject = record["subject"].as_str().unwrap_or_default().to_string();
                     let fired = record["type"] == "alert.fired";
-                    if fired {
+                    if record["type"] == "alert.updated" {
+                        if let Some(row) = self.known.get_mut(&key) {
+                            row.evidence = record["evidence"].clone();
+                        }
+                        lines.push(format!("alerts: updated {key} ({subject})"));
+                    } else if fired {
                         self.known.insert(
                             key.clone(),
                             Row {
@@ -4178,6 +4224,9 @@ times in a row)",
                             fired_event_id: 0,
                             fired_at_ms: 0,
                         });
+                    } else if record["type"] == "alert.updated" {
+                        // An update the store refused changes nothing here:
+                        // the alert stays as the step knows it.
                     } else if let Some(row) = self.known.get_mut(&key) {
                         // A clear the store refused: the alert is not open
                         // there (cleared or judged), so it is not retried.
