@@ -77,9 +77,9 @@ pub(super) fn bytes(chain: &[&BundleRecord]) -> u64 {
         sum.saturating_add(link.record["stored_bytes"].as_u64().unwrap_or(0))
             .saturating_add(link.record["sync"]["taken_bytes"].as_u64().unwrap_or(0))
     });
-    let restored = chain
-        .last()
-        .map_or(0, |newest| newest.record["sync"]["bytes"].as_u64().unwrap_or(0));
+    let restored = chain.last().map_or(0, |newest| {
+        newest.record["sync"]["bytes"].as_u64().unwrap_or(0)
+    });
     fetched.saturating_add(restored)
 }
 
@@ -422,10 +422,15 @@ pub(super) fn compare(restored: &Restored, live: &Path, start_ms: i64) -> Compar
         }
     };
     for (directory, why) in unreadable {
-        out.mismatches
-            .push(format!("sync/{directory}: this folder cannot be read: {why}"));
+        out.mismatches.push(format!(
+            "sync/{directory}: this folder cannot be read: {why}"
+        ));
     }
-    let manifest: BTreeSet<&str> = restored.files.iter().map(|file| file.path.as_str()).collect();
+    let manifest: BTreeSet<&str> = restored
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
     for file in &restored.files {
         if !listed.contains_key(&file.path) {
             out.removed += 1;
@@ -584,10 +589,18 @@ mod tests {
         assert_eq!(restored.bytes, 6);
         assert_eq!(restored.links, 2);
         assert_eq!(
-            restored.apart.iter().map(String::as_str).collect::<Vec<_>>(),
+            restored
+                .apart
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             ["busy.md", "latest"]
         );
-        assert!(restored.line().contains("the notes folder: 2 file(s), 6 bytes"));
+        assert!(
+            restored
+                .line()
+                .contains("the notes folder: 2 file(s), 6 bytes")
+        );
     }
 
     /// A path no link took, a manifest whose sha256 is not its record's, a
@@ -598,15 +611,30 @@ mod tests {
         let scratch = Scratch::new("sync_refused");
         let untaken = link(&scratch.0, 1, &[], &[("a.md", b"a")], &json!({}));
         let error = restored_of(&[untaken], &scratch.0.join("r1")).expect_err("no link took it");
-        assert!(error.contains("sync/a.md: no bundle of the chain holds it"), "{error}");
+        assert!(
+            error.contains("sync/a.md: no bundle of the chain holds it"),
+            "{error}"
+        );
 
-        let (mut record, unpacked) = link(&scratch.0, 2, &[("a.md", b"a")], &[("a.md", b"a")], &json!({}));
+        let (mut record, unpacked) = link(
+            &scratch.0,
+            2,
+            &[("a.md", b"a")],
+            &[("a.md", b"a")],
+            &json!({}),
+        );
         record.record["sync"]["manifest_sha256"] = json!("0".repeat(64));
         let error = restored_of(&[(record, unpacked)], &scratch.0.join("r2"))
             .expect_err("another manifest");
         assert!(error.contains("not its record's"), "{error}");
 
-        let wrong = link(&scratch.0, 3, &[("a.md", b"other")], &[("a.md", b"a")], &json!({}));
+        let wrong = link(
+            &scratch.0,
+            3,
+            &[("a.md", b"other")],
+            &[("a.md", b"a")],
+            &json!({}),
+        );
         let error = restored_of(&[wrong], &scratch.0.join("r3")).expect_err("other bytes");
         assert!(error.contains("sync/a.md: restored at 5 bytes"), "{error}");
 
@@ -680,7 +708,13 @@ mod tests {
 
         let compared = compare(&restored, &live, start);
         assert_eq!(
-            (compared.same, compared.changed, compared.removed, compared.made, compared.apart),
+            (
+                compared.same,
+                compared.changed,
+                compared.removed,
+                compared.made,
+                compared.apart
+            ),
             (1, 1, 1, 1, 1),
             "{compared:?}"
         );
@@ -734,7 +768,10 @@ mod tests {
         fs::set_permissions(live.join("a.md"), fs::Permissions::from_mode(0o644)).expect("chmod");
 
         // Removed between the listing and the read: its bytes are gone.
-        assert!(matches!(super::read_live(&live.join("c.md")), super::Live::Gone));
+        assert!(matches!(
+            super::read_live(&live.join("c.md")),
+            super::Live::Gone
+        ));
         let mut listed_only = Compared::default();
         listed_only.removed += 1;
         assert_eq!(listed_only.removed, 1);
@@ -757,7 +794,10 @@ mod tests {
                 "./sync/files/obj/b.md"
             ]
         );
-        assert!(members("./sync/manifest.json\n").is_err(), "no manifest.json");
+        assert!(
+            members("./sync/manifest.json\n").is_err(),
+            "no manifest.json"
+        );
         let scratch = Scratch::new("sync_floor");
         let (one, _) = link(&scratch.0, 1, &[], &[], &json!({}));
         let (two, _) = link(&scratch.0, 2, &[], &[], &json!({}));
