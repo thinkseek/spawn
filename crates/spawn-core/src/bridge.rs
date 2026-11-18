@@ -6384,6 +6384,295 @@ mod tests {
         assert!(world.bridge.ended_archives.lock().expect("lock").is_empty());
     }
 
+    /// What a scripted credential mask answers (objective 179's tests).
+    #[derive(Clone)]
+    enum MaskMode {
+        Had,
+        Unreadable(String),
+        /// Had, but stale by the time the lines are masked.
+        Stale,
+    }
+
+    /// A made-up credential mask whose answer the test sets.
+    struct Scripted {
+        mask: Arc<crate::mask::Mask>,
+        mode: Mutex<MaskMode>,
+    }
+
+    impl Scripted {
+        fn new(mode: MaskMode) -> Arc<Self> {
+            Arc::new(Self {
+                mask: Arc::new(crate::mask::Mask::new(
+                    &[(
+                        "spawn.env:API_TOKEN".to_string(),
+                        b"made-up-token-0123456789".to_vec(),
+                    )],
+                    crate::transcripts::ARCHIVE_MARKER,
+                )),
+                mode: Mutex::new(mode),
+            })
+        }
+
+        fn set(&self, mode: MaskMode) {
+            *self.mode.lock().expect("lock") = mode;
+        }
+    }
+
+    impl crate::port::ArchiveMask for Scripted {
+        fn mask(&self) -> Result<Arc<crate::mask::Mask>, String> {
+            match &*self.mode.lock().expect("lock") {
+                MaskMode::Unreadable(why) => Err(why.clone()),
+                MaskMode::Had | MaskMode::Stale => Ok(self.mask.clone()),
+            }
+        }
+
+        fn current(&self, mask: &Arc<crate::mask::Mask>) -> bool {
+            matches!(*self.mode.lock().expect("lock"), MaskMode::Had)
+                && Arc::ptr_eq(mask, &self.mask)
+        }
+    }
+
+    impl World {
+        /// A Bridge with an archive whose credential mask the test scripts,
+        /// a call of the session's written and not yet archived.
+        fn with_scripted_mask(mode: MaskMode) -> (Self, Arc<Scripted>) {
+            let mut world = Self::with_archive();
+            let mask = Scripted::new(mode);
+            world.bridge.set_archive_mask(mask.clone());
+            world.advance(20_000);
+            world.engine_writes(&call_line("c1", 18));
+            (world, mask)
+        }
+
+        /// The archive events the log holds, in order.
+        fn archive_events(&self) -> Vec<EventKind> {
+            self.store
+                .read_global(GlobalPosition(0), 10_000)
+                .expect("read")
+                .into_iter()
+                .map(|record| record.event.kind)
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        EventKind::ArchiveFailed { .. } | EventKind::ArchiveResumed { .. }
+                    )
+                })
+                .collect()
+        }
+
+        /// How many `archive.failed` and `archive.resumed` the log holds.
+        fn archive_counts(&self) -> (usize, usize) {
+            let events = self.archive_events();
+            let failed = events
+                .iter()
+                .filter(|kind| matches!(kind, EventKind::ArchiveFailed { .. }))
+                .count();
+            (failed, events.len() - failed)
+        }
+
+        /// The execution ends: its terminal is gone.
+        fn end(&mut self) {
+            self.store.untrack(
+                &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+                "gone",
+            );
+            self.tick();
+            self.tick();
+        }
+    }
+
+    /// Objective 179: a failing copy is recorded once per reason, on a
+    /// change only, and its end once, with how far the copy moved.
+    #[test]
+    fn an_archive_failure_is_recorded_on_a_change_and_its_end_once() {
+        let (mut world, mask) =
+            World::with_scripted_mask(MaskMode::Unreadable("/made-up/cred/a".to_string()));
+        world.tick();
+        world.tick();
+        let native = world.progress().native;
+        assert_eq!(
+            world.archive_events(),
+            vec![EventKind::ArchiveFailed {
+                native: native.clone(),
+                reason: "the credential mask: /made-up/cred/a".to_string(),
+            }],
+            "one failure, the loop's words"
+        );
+        mask.set(MaskMode::Unreadable("/made-up/cred/b".to_string()));
+        world.tick();
+        world.tick();
+        assert_eq!(world.archive_counts(), (2, 0), "a new reason is a change");
+        mask.set(MaskMode::Had);
+        world.tick();
+        let length = u64::try_from(world.archived().len()).expect("length");
+        assert!(length > 0);
+        assert_eq!(
+            world.archive_events().last(),
+            Some(&EventKind::ArchiveResumed {
+                native,
+                copied: length,
+            })
+        );
+        world.engine_writes(&call_line("c2", 19));
+        world.tick();
+        world.tick();
+        assert_eq!(world.archive_counts(), (2, 1), "its end recorded once");
+    }
+
+    /// Objective 179: one stale mask records nothing (the next pass copies),
+    /// two in a row record a failure.
+    #[test]
+    fn one_stale_mask_records_nothing_and_two_in_a_row_a_failure() {
+        let (mut world, mask) = World::with_scripted_mask(MaskMode::Stale);
+        world.tick();
+        assert_eq!(world.archive_counts(), (0, 0), "a first stale mask");
+        mask.set(MaskMode::Had);
+        world.tick();
+        assert!(world.archived().contains("msg_c1"));
+        assert_eq!(world.archive_counts(), (0, 0), "copied: nothing to end");
+        mask.set(MaskMode::Stale);
+        world.engine_writes(&call_line("c2", 19));
+        world.tick();
+        assert_eq!(world.archive_counts(), (0, 0), "not two in a row");
+        world.tick();
+        assert_eq!(
+            world.archive_events(),
+            vec![EventKind::ArchiveFailed {
+                native: world.progress().native,
+                reason: crate::transcripts::MASK_CHANGED.to_string(),
+            }],
+            "two in a row"
+        );
+    }
+
+    /// Objective 179: a reason is cut to ARCHIVE_REASON_MAX characters, on a
+    /// character boundary.
+    #[test]
+    fn an_archive_failure_reason_is_cut_to_its_limit() {
+        let (mut world, _mask) = World::with_scripted_mask(MaskMode::Unreadable("é".repeat(600)));
+        world.tick();
+        let events = world.archive_events();
+        let [EventKind::ArchiveFailed { reason, .. }] = events.as_slice() else {
+            panic!("one failure: {events:?}");
+        };
+        assert_eq!(reason.chars().count(), crate::event::ARCHIVE_REASON_MAX);
+        assert!(reason.starts_with("the credential mask: éé"), "{reason}");
+    }
+
+    /// Objective 179: an archive event the log took without its answer
+    /// coming back is warned, tried again under the same key, and stored
+    /// once.
+    #[test]
+    fn a_failed_archive_record_is_retried_under_the_same_key() {
+        let (mut world, mask) =
+            World::with_scripted_mask(MaskMode::Unreadable("/made-up/cred/a".to_string()));
+        world.store.lose_next_archive_answer();
+        let warnings = world.tick();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("record the transcript archive's state")),
+            "{warnings:?}"
+        );
+        world.tick();
+        world.tick();
+        assert_eq!(world.archive_counts(), (1, 0), "stored once");
+        world.store.lose_next_archive_answer();
+        mask.set(MaskMode::Had);
+        world.tick();
+        world.tick();
+        assert_eq!(world.archive_counts(), (1, 1), "its end stored once");
+    }
+
+    /// Objective 179 R2: a failure recorded before a restart is read back:
+    /// still failing the same way records nothing, and the first copying
+    /// pass after a later restart, on the ended execution's retry, records
+    /// its end.
+    #[test]
+    fn a_failure_recorded_before_a_restart_is_ended_by_the_restarted_bridge() {
+        let why = MaskMode::Unreadable("/made-up/cred/a".to_string());
+        let (mut world, mask) = World::with_scripted_mask(why);
+        world.tick();
+        assert_eq!(world.archive_counts(), (1, 0));
+        world.restart();
+        world.bridge.set_archive_mask(mask.clone());
+        world.tick();
+        world.tick();
+        assert_eq!(world.archive_counts(), (1, 0), "still failing: nothing");
+        world.end();
+        assert_eq!(world.archive_counts(), (1, 0), "nor once ended");
+        world.restart();
+        world.bridge.set_archive_mask(mask.clone());
+        mask.set(MaskMode::Had);
+        world.tick();
+        world.tick();
+        assert!(world.archived().contains("msg_c1"));
+        assert_eq!(world.archive_counts(), (1, 1), "its end, once");
+        assert!(matches!(
+            world.archive_events().last(),
+            Some(EventKind::ArchiveResumed { copied, .. }) if *copied > 0
+        ));
+    }
+
+    /// Objective 179 R3: a transcript removed while the archive lacks lines
+    /// of it stays behind and never reads resumed.
+    #[test]
+    fn a_transcript_gone_with_lines_unarchived_never_reads_resumed() {
+        let (mut world, mask) =
+            World::with_scripted_mask(MaskMode::Unreadable("/made-up/cred/a".to_string()));
+        world.tick();
+        assert_eq!(world.archive_counts(), (1, 0));
+        world.store.remove_file(&world.path.clone());
+        mask.set(MaskMode::Had);
+        world.tick();
+        world.tick();
+        assert_eq!(world.archive_counts(), (1, 0), "no resume, nothing new");
+        assert!(world.progress().behind_ms.is_some(), "still behind");
+        world.end();
+        assert_eq!(world.archive_counts(), (1, 0));
+        assert!(world.progress().behind_ms.is_some(), "still behind");
+    }
+
+    /// Objective 179 R4: a transcript removed with lines the archive lacks is
+    /// a failure whatever the log holds: a failure still waiting for the log
+    /// stands and is stored once; with none told, the loss is recorded once.
+    #[test]
+    fn a_transcript_removed_with_lines_unarchived_is_a_failure_whatever_the_log_holds() {
+        // A lost answer: the failure waits, under its key.
+        let (mut world, mask) =
+            World::with_scripted_mask(MaskMode::Unreadable("/made-up/cred/a".to_string()));
+        world.store.lose_next_archive_answer();
+        world.tick();
+        world.store.remove_file(&world.path.clone());
+        mask.set(MaskMode::Had);
+        world.tick();
+        world.tick();
+        let events = world.archive_events();
+        assert_eq!(world.archive_counts(), (1, 0), "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(EventKind::ArchiveFailed { reason, .. }) if reason.contains("/made-up/cred/a")
+        ));
+        // A first stale mask: nothing told, then the transcript goes.
+        let (mut world, mask) = World::with_scripted_mask(MaskMode::Stale);
+        world.tick();
+        assert_eq!(world.archive_counts(), (0, 0));
+        assert!(world.progress().behind_ms.is_some());
+        world.store.remove_file(&world.path.clone());
+        mask.set(MaskMode::Had);
+        world.tick();
+        world.tick();
+        world.end();
+        assert_eq!(
+            world.archive_events(),
+            vec![EventKind::ArchiveFailed {
+                native: world.progress().native,
+                reason: super::ARCHIVE_GONE.to_string(),
+            }]
+        );
+        assert!(world.progress().behind_ms.is_some(), "still behind");
+    }
+
     #[test]
     fn a_killed_terminal_ends_its_execution_on_the_next_pass() {
         let mut world = World::new();
