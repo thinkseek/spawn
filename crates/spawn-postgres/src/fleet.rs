@@ -414,7 +414,8 @@ from (
       from spawn_events e
      where e.source <> 'observer'
        and e.event_name not in ('artifact.committed', 'artifact.branch_recreated',
-                                'merge.conflicted', 'message.acted')
+                                'merge.conflicted', 'message.acted',
+                                'archive.failed', 'archive.resumed')
        and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
      group by e.session_id) ev on ev.session_id = s.session_id
   left join (
