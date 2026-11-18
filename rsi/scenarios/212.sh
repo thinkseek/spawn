@@ -22,9 +22,13 @@
 #       the duplicate is assigned, and its task.assigned record names the
 #       task it repeats (duplicate_of); so does the record of (3)'s --again.
 #   (6) a task accepted in a mission with no gate is done: its brief is
-#       assigned again; one accepted in a gated mission (it still waits for
-#       its gate) is in flight: from the supervisor, its brief is refused,
-#       naming it "accepted".
+#       assigned again. In a gated mission a task is in flight while
+#       delivered, reported, sent back (revise) and accepted (it still waits
+#       for its gate): from the supervisor, its brief is refused, naming the
+#       state.
+#   (7) that task, once its gate accepts it (the integrator's task.gated:
+#       landing), is still in flight: refused, naming it "landing"; once
+#       landed (task.landed) it is done: its brief is assigned again.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -290,13 +294,50 @@ scalar "select spawn_mission_configure($m3, '$WORK/scenarios', 'review', null, n
     harness "mission $m3 has no gate"
 gated=$(assign "$m3")
 [ -n "$gated" ] || harness "the supervisor's assign in the gated mission failed: $(err)"
+# On its way: delivered, reported, sent back (revise), each in flight (R2).
+# <state>: the supervisor's same brief is refused, naming task $gated and <state>
+refused_while() {
+    [ "$(scalar "select state from mission_tasks where id = $gated")" = "$1" ] ||
+        harness "task $gated is $(scalar "select state from mission_tasks where id = $gated"), not $1"
+    dup=$(assign "$m3")
+    expect_eq "$dup" "" "(6) the same brief while task $gated is $1 is refused"
+    grep -q "task $gated of mission $m3 has the same brief and is $1" "$WORK/err.txt" ||
+        check_failed "(6) the refusal names task $gated, mission $m3 and $1: [$(head -c 300 "$WORK/err.txt")]"
+}
+scalar "select spawn_task_delivered($gated, 1)" >/dev/null
+refused_while delivered
+scalar "select spawn_task_reported($gated, 'done')" >/dev/null
+refused_while reported
+capture "$SPAWN_BIN" task reject --id "$gated" --note "made-up: again"
+[ "$status" -eq 0 ] || harness "task reject $gated failed: $(err)"
+refused_while revise
 accept_task "$gated"
 waiting=$(assign "$m3")
 expect_eq "$waiting" "" "(6) the same brief while task $gated is accepted in a gated mission is refused"
 grep -q "task $gated of mission $m3 has the same brief and is accepted" "$WORK/err.txt" ||
     check_failed "(6) the refusal names task $gated, mission $m3 and accepted: [$(head -c 300 "$WORK/err.txt")]"
-BRIEF=$BRIEF_SAVED
 note "(6) checked: accepted is done without a gate, in flight with one"
+
+# --- (7) landing in flight, landed done (R2, rev-i's F1 and n1) ---------------------------------
+
+# <record json>: as the integrator records it (the owner may)
+integrator() { scalar "select spawn_integrator_record('$1'::jsonb)" >/dev/null; }
+rev=$(scalar "select revisions from mission_tasks where id = $gated")
+integrator "{\"type\": \"task.gated\", \"id\": $gated, \"revision\": ${rev:-0}, \"verdict\": \"accepted\", \"base\": \"1111111111111111111111111111111111111111\", \"candidate\": \"2222222222222222222222222222222222222222\", \"judging\": \"0193a2b4c5d6e7f80123456789abcdef\"}"
+[ "$(scalar "select state from mission_tasks where id = $gated")" = landing ] ||
+    harness "task $gated is $(scalar "select state from mission_tasks where id = $gated") after its gate accepted it, not landing"
+landing_dup=$(assign "$m3")
+expect_eq "$landing_dup" "" "(7) the same brief while task $gated is landing is refused"
+grep -q "task $gated of mission $m3 has the same brief and is landing" "$WORK/err.txt" ||
+    check_failed "(7) the refusal names task $gated, mission $m3 and landing: [$(head -c 300 "$WORK/err.txt")]"
+integrator "{\"type\": \"task.landed\", \"id\": $gated, \"from\": \"1111111111111111111111111111111111111111\", \"to\": \"2222222222222222222222222222222222222222\", \"judging\": \"0193a2b4c5d6e7f80123456789abcdef\"}"
+[ "$(scalar "select state from mission_tasks where id = $gated")" = landed ] ||
+    harness "task $gated is $(scalar "select state from mission_tasks where id = $gated") after task.landed, not landed"
+after_landed=$(assign "$m3")
+[ -n "$after_landed" ] ||
+    check_failed "(7) the brief of task $gated, landed, is refused: $(head -c 300 "$WORK/err.txt")"
+BRIEF=$BRIEF_SAVED
+note "(7) checked: landing is in flight, landed is done"
 
 if [ -s "$WORK/failures" ]; then
     asserted=1
