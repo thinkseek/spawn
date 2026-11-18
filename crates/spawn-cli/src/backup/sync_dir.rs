@@ -135,7 +135,11 @@ pub(super) fn write_local(root: &Path, bytes: &[u8]) -> Result<(), String> {
 /// real path), in path order, and what was skipped (a symbolic link, a
 /// special file), relative. A directory the run cannot read is an error
 /// naming it.
-fn walk(dir: &Path) -> Result<(Vec<(String, PathBuf)>, Vec<String>), String> {
+/// What [`walk`] found: the regular files (relative path, real path) and
+/// what was skipped (relative).
+type Walked = (Vec<(String, PathBuf)>, Vec<String>);
+
+fn walk(dir: &Path) -> Result<Walked, String> {
     let mut files = Vec::new();
     let mut skipped = Vec::new();
     let mut pending = vec![(String::new(), dir.to_path_buf())];

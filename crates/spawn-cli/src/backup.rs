@@ -2544,7 +2544,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     if let Some(sync) = &sync {
         match sync.record["refused"].as_str() {
             Some(reason) => {
-                println!("spawn backup bundle: the notes folder was left out: {reason}")
+                println!("spawn backup bundle: the notes folder was left out: {reason}");
             }
             None => println!(
                 "spawn backup bundle: the notes folder: {} files, {} taken ({} bytes)",
