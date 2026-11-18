@@ -7827,9 +7827,10 @@ connections\n";
                     "newest_landed_ms": landed, "listed_since_ms": since,
                     "reading_ms": now + 2000})
         );
-        // More readings, more grown old: nothing more while one is open.
+        // More readings, more grown old: no other alert fires while one is
+        // open (its update in place: objective 219's test).
         assert!(read(&mut monitor, now + 4000, reading(3, 2, Some(landed))).is_empty());
-        assert!(read(&mut monitor, now + 6000, reading(4, 3, Some(landed + 1))).is_empty());
+        assert!(fires(&read(&mut monitor, now + 6000, reading(4, 3, Some(landed + 1)))).is_empty());
         // None old: cleared, with what the reading saw.
         let cleared = read(&mut monitor, now + 8000, reading(1, 0, None));
         assert!(
@@ -7852,6 +7853,101 @@ connections\n";
             text,
             "1 landed objective unverified for over a day: spawn verify list names it"
         );
+    }
+
+    /// Objective 219: an open unverified_landings alert says the count as it
+    /// is now: up, the same count with a newer old landing, down to the
+    /// singular, each one `Update` of the same key with `fired_old`; a
+    /// reading that finds the same says nothing; a restarted monitor reads
+    /// the evidence back and says nothing until the count moves; the clear
+    /// is as before.
+    #[test]
+    fn an_open_unverified_alert_says_the_count_as_it_is_now() {
+        let mut monitor = monitor();
+        let since = crate::verify::LISTED_SINCE_MS;
+        let now = since + 3 * super::DAY_MS;
+        let reading = |unverified: i64, old: i64, newest: i64| {
+            json!({"unverified": unverified, "old": old, "newest_old_ms": newest})
+        };
+        let read = |monitor: &mut Monitor, at: i64, value: Value| {
+            let mut out = Vec::new();
+            monitor.unverified(at, &value, &mut out);
+            let out = decided(monitor, out);
+            commit(monitor, &out);
+            out
+        };
+        let updated = |events: &[Event]| -> Vec<(String, String, Value)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Update {
+                        key,
+                        evidence,
+                        text,
+                    } => Some((key.clone(), text.clone(), evidence.clone())),
+                    Event::Fire { .. } | Event::Clear { .. } => None,
+                })
+                .collect()
+        };
+        let landed = now - super::DAY_MS - 60_000;
+        let fired = read(&mut monitor, now, reading(2, 1, landed));
+        let key = format!("unverified_landings:{landed}:{now}");
+        assert_eq!(fires(&fired), [key.as_str()]);
+        assert!(read(&mut monitor, now + 1000, reading(2, 1, landed)).is_empty());
+
+        // Up: a second one old.
+        let up = updated(&read(&mut monitor, now + 2000, reading(3, 2, landed + 10)));
+        assert_eq!(up.len(), 1, "{up:?}");
+        assert_eq!(up[0].0, key, "the same alert");
+        assert_eq!(
+            up[0].1,
+            "2 landed objectives unverified for over a day: spawn verify list names them"
+        );
+        assert_eq!(
+            up[0].2,
+            json!({"old": 2, "unverified": 3, "unverified_ms": super::DAY_MS,
+                   "newest_landed_ms": landed + 10, "listed_since_ms": since,
+                   "reading_ms": now + 2000, "fired_old": 1})
+        );
+        assert!(
+            read(&mut monitor, now + 3000, reading(3, 2, landed + 10)).is_empty(),
+            "the same: nothing"
+        );
+
+        // The same count with a newer old landing.
+        let newer = updated(&read(&mut monitor, now + 4000, reading(3, 2, landed + 30_000)));
+        assert_eq!(newer.len(), 1, "{newer:?}");
+        assert_eq!(newer[0].2["old"], 2);
+        assert_eq!(newer[0].2["newest_landed_ms"], landed + 30_000);
+        assert_eq!(newer[0].2["fired_old"], 1);
+
+        // A restarted monitor reads the evidence back: nothing until it
+        // moves.
+        let mut restarted = super::monitor();
+        restarted
+            .known
+            .insert(key.clone(), monitor.known[&key].clone());
+        assert!(read(&mut restarted, now + 5000, reading(3, 2, landed + 30_000)).is_empty());
+
+        // Down to the singular.
+        let down = updated(&read(&mut restarted, now + 6000, reading(1, 1, landed + 30_000)));
+        assert_eq!(down.len(), 1, "{down:?}");
+        assert_eq!(down[0].0, key);
+        assert_eq!(
+            down[0].1,
+            "1 landed objective unverified for over a day: spawn verify list names it"
+        );
+        assert_eq!(down[0].2["old"], 1);
+        assert_eq!(down[0].2["fired_old"], 1);
+
+        // None old: cleared, as before.
+        let cleared = read(&mut restarted, now + 8000, reading(0, 0, 0));
+        assert!(
+            matches!(&cleared[..], [Event::Clear { key: cleared, evidence }]
+                if *cleared == key && evidence["old"] == 0),
+            "{cleared:?}"
+        );
+        assert!(updated(&read(&mut restarted, now + 9000, reading(0, 0, 0))).is_empty());
     }
 
     #[test]
