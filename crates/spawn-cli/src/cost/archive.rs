@@ -529,9 +529,6 @@ mod tests {
         );
     }
 
-    /// An archive of two agents: `agent_w_1`'s transcript (one message
-    /// before its executions, one in each) and `agent_none_2`'s, with no
-    /// execution. The worker's directory.
     /// The log's lines without the longest call's, and whether it was said.
     fn timed(lines: Vec<String>) -> (Vec<String>, bool) {
         let (said, rest): (Vec<String>, Vec<String>) = lines.into_iter().partition(|line| {
@@ -540,6 +537,9 @@ mod tests {
         (rest, said.len() == 1)
     }
 
+    /// An archive of two agents: `agent_w_1`'s transcript (one message
+    /// before its executions, one in each) and `agent_none_2`'s, with no
+    /// execution. The worker's directory.
     fn archive_of_two(root: &Path) -> PathBuf {
         let worker = root.join("agent_w_1");
         let stranger = root.join("agent_none_2");

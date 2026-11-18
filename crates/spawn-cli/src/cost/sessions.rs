@@ -476,7 +476,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{BATCH, Budget, Folded, engine_prefix, pass, read_file, record, transcripts};
+    use super::{
+        BATCH, Budget, Folded, count, engine_prefix, pass, read_file, record, transcripts,
+    };
     use crate::cost::Prices;
 
     fn line(id: &str, at: &str, usage: [u64; 4]) -> String {
@@ -908,10 +910,8 @@ mod tests {
         let projects = &home.projects;
         let rev = projects.join("-data-tmp-ccd-rev-x");
         std::fs::create_dir_all(&rev).expect("dirs");
-        append(
-            &rev.join("a.jsonl"),
-            &line("m1", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]),
-        );
+        let first = line("m1", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]);
+        append(&rev.join("a.jsonl"), &first);
         append(
             &rev.join("b.jsonl"),
             &line("m2", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]),
@@ -937,11 +937,63 @@ mod tests {
             "{none:?}"
         );
         assert_eq!(marks(&store), Vec::<String>::new());
+        // rev-b R2 F1: the bytes are the whole pass's, not each file's: a
+        // budget of a.jsonl's bytes reads it and starts no other.
+        let one = Budget {
+            bytes: u64::try_from(first.len()).expect("small"),
+            until: Instant::now() + Duration::from_mins(1),
+        };
+        let some = pass(&store, projects, None, &prices(), one);
+        assert_eq!(
+            (some.files, some.counted, some.bounded),
+            (1, 1, true),
+            "{some:?}"
+        );
+        assert_eq!(
+            marks(&store),
+            vec!["-data-tmp-ccd-rev-x/a.jsonl".to_string()]
+        );
         let next = pass(&store, projects, None, &prices(), budget());
         assert_eq!(
             (next.files, next.counted, next.bounded),
-            (2, 2, false),
+            (1, 1, false),
             "{next:?}"
+        );
+    }
+
+    /// rev-b R2 F2: the loop's log of a pass: what it counted, the longest
+    /// call to the store (the lead's live hold), and a file read from 0
+    /// again by its name.
+    #[test]
+    fn the_log_says_the_count_the_longest_call_and_each_file_read_again() {
+        let schema = spawn_postgres::testing::TestSchema::new("cost_sessions_log");
+        let store = schema.store();
+        let home = fake_projects("log");
+        let projects = &home.projects;
+        let rev = projects.join("-data-tmp-ccd-rev-x");
+        std::fs::create_dir_all(&rev).expect("dirs");
+        let text = line("m1", "2026-11-17T08:00:00.000Z", [10, 1, 0, 0]);
+        append(&rev.join("s.jsonl"), &text);
+        let lines = count(&store, projects, None, &prices(), budget());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("cost: sessions: counted 1 model call (0 grew) from 1 file, "),
+            "{lines:?}"
+        );
+        let ms = lines[1]
+            .strip_prefix("cost: sessions: the longest call to the store took ")
+            .and_then(|rest| rest.strip_suffix(" ms"));
+        assert!(ms.is_some_and(|ms| ms.parse::<u64>().is_ok()), "{lines:?}");
+        // The file replaced by another (a new inode: written beside it while
+        // it exists, then renamed over it), with the same message.
+        append(&rev.join("s.new"), &text);
+        std::fs::rename(rev.join("s.new"), rev.join("s.jsonl")).expect("rename");
+        assert_eq!(
+            count(&store, projects, None, &prices(), budget()),
+            vec![
+                "cost: sessions: read from 0 again (inode changed or shorter): -data-tmp-ccd-rev-x/s.jsonl"
+                    .to_string()
+            ]
         );
     }
 }
