@@ -1366,18 +1366,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let drain_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&drain_asked))
         .map_err(|error| format!("cannot take drain requests (SIGUSR1): {error}"))?;
-    // Resolved against the working directory: the gate must not resolve
-    // inside the tree it judges. A gate script that is not a readable file
-    // refuses the start, before the database is touched (objective 221: a
-    // second integrator started where scripts/rsi/gate.sh is not aborted
-    // every gate it ran).
-    let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
-        .map_err(|error| format!("SPAWN_GATE: {error}"))?;
-    let from_env = crate::config::env_value("SPAWN_GATE").is_some();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    if let Some(refusal) = gate_refusal(&gate, from_env, &cwd) {
-        return Err(refusal);
-    }
+    let gate = gate_script()?;
     crate::config::require_git()?;
     // The integrator's lock, on a connection of its own, before anything is
     // written, kept for the process's life (objective 221).
@@ -1500,6 +1489,22 @@ pub(crate) fn holder_text(holder: &Value) -> String {
     match holder["connected_ms"].as_i64() {
         Some(ms) => format!("{name}, connected at {} UTC", crate::alerts::time_text(ms)),
         None => name,
+    }
+}
+
+/// The gate script, resolved against the working directory (the gate must
+/// not resolve inside the tree it judges), or the refusal of the start when
+/// it is not a readable file: checked before the database is touched
+/// (objective 221: a second integrator started where scripts/rsi/gate.sh is
+/// not aborted every gate it ran).
+fn gate_script() -> Result<PathBuf, String> {
+    let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
+        .map_err(|error| format!("SPAWN_GATE: {error}"))?;
+    let from_env = crate::config::env_value("SPAWN_GATE").is_some();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match gate_refusal(&gate, from_env, &cwd) {
+        Some(refusal) => Err(refusal),
+        None => Ok(gate),
     }
 }
 
