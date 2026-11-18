@@ -3909,7 +3909,7 @@ impl Bridge {
                     entry.pending = None;
                 }
                 Err(error) => report.warnings.push(format!(
-                    "{session}: record the transcript archive's state: {error}"
+                    "{session}: record the transcript archive's state: {error:?}"
                 )),
             }
         }
