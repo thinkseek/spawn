@@ -7830,7 +7830,14 @@ connections\n";
         // More readings, more grown old: no other alert fires while one is
         // open (its update in place: objective 219's test).
         assert!(read(&mut monitor, now + 4000, reading(3, 2, Some(landed))).is_empty());
-        assert!(fires(&read(&mut monitor, now + 6000, reading(4, 3, Some(landed + 1)))).is_empty());
+        assert!(
+            fires(&read(
+                &mut monitor,
+                now + 6000,
+                reading(4, 3, Some(landed + 1))
+            ))
+            .is_empty()
+        );
         // None old: cleared, with what the reading saw.
         let cleared = read(&mut monitor, now + 8000, reading(1, 0, None));
         assert!(
@@ -7866,9 +7873,7 @@ connections\n";
         let mut monitor = monitor();
         let since = crate::verify::LISTED_SINCE_MS;
         let now = since + 3 * super::DAY_MS;
-        let reading = |unverified: i64, old: i64, newest: i64| {
-            json!({"unverified": unverified, "old": old, "newest_old_ms": newest})
-        };
+        let reading = |unverified: i64, old: i64, newest: i64| json!({"unverified": unverified, "old": old, "newest_old_ms": newest});
         let read = |monitor: &mut Monitor, at: i64, value: Value| {
             let mut out = Vec::new();
             monitor.unverified(at, &value, &mut out);
@@ -7915,7 +7920,11 @@ connections\n";
         );
 
         // The same count with a newer old landing.
-        let newer = updated(&read(&mut monitor, now + 4000, reading(3, 2, landed + 30_000)));
+        let newer = updated(&read(
+            &mut monitor,
+            now + 4000,
+            reading(3, 2, landed + 30_000),
+        ));
         assert_eq!(newer.len(), 1, "{newer:?}");
         assert_eq!(newer[0].2["old"], 2);
         assert_eq!(newer[0].2["newest_landed_ms"], landed + 30_000);
@@ -7930,7 +7939,11 @@ connections\n";
         assert!(read(&mut restarted, now + 5000, reading(3, 2, landed + 30_000)).is_empty());
 
         // Down to the singular.
-        let down = updated(&read(&mut restarted, now + 6000, reading(1, 1, landed + 30_000)));
+        let down = updated(&read(
+            &mut restarted,
+            now + 6000,
+            reading(1, 1, landed + 30_000),
+        ));
         assert_eq!(down.len(), 1, "{down:?}");
         assert_eq!(down[0].0, key);
         assert_eq!(
