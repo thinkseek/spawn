@@ -55,6 +55,23 @@
 //! a directory or a regular file, else the drill fails and the folder is
 //! left, said.
 //!
+//! `--only sync` (objective 217, [`sync`]) drills the fleet's notes folder
+//! alone, through the same chain, key rules and pipe: from each bundle it
+//! unpacks by name only `manifest.json`, `sync/manifest.json` and the files
+//! under `sync/files/`, never a transcript slice or a repository bundle.
+//! Each link's notes manifest must be its record's sha256, every file of
+//! the newest manifest is restored under the drill's `sync/` from the
+//! newest link that took it, at the newest manifest's size and sha256 (a
+//! newest record with no notes part, or a dropped one, cannot be
+//! restored); then the folder the newest record names is compared with it,
+//! read only, against the newest bundle's start (its manifest's
+//! `created_at_ms`): changed, removed or made since is expected, other
+//! bytes with an earlier mtime or an older file the backup lacks is a
+//! mismatch. Its folder is plain only, never under the notes folder (exit
+//! 2), and the floor counts each link's ciphertext and taken notes and the
+//! newest record's notes bytes. It records `backup.drilled.sync` alone, in
+//! the drill record's shape.
+//!
 //! Each restored transcript is first judged against the newest record
 //! itself (objective 149): `transcripts.sha256` names the sha256 of every
 //! window file as bundled, so a restored file whose sha256 is not the
@@ -144,6 +161,7 @@ use crate::commit_now::CommitNow;
 use crate::config::{env_value, open_store};
 
 mod controllers;
+mod sync;
 
 /// Where the scratch directory goes when `--into` is not given.
 const DEFAULT_PARENT: &str = "/data/tmp";
@@ -155,7 +173,7 @@ const DRILL_PREFIX: &str = "spawn-restore-drill-";
 const NAMED: usize = 20;
 
 /// `spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep]
-/// [--only missions|controllers|transcripts]`.
+/// [--only missions|controllers|transcripts|sync]`.
 pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
     let Some((only, resources)) = resources_of(flags) else {
         return Ok(2);
@@ -221,16 +239,12 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
             return Ok(unrestorable(&store, &records, &reason, started, resources));
         }
     };
-    // Before anything is fetched: the transcripts drill's bytes above the
-    // floor, or no drill (exit 2, nothing recorded, nothing made).
-    if only == Only::Transcripts
-        && let Err(refusal) = above_floor(&chain, &parent)
-    {
+    if let Some(refusal) = refused_before_fetch(only, &chain, &parent) {
         eprintln!("spawn backup restore-drill: {refusal}");
         return Ok(2);
     }
     let mut drill = DrillDir::create(&parent)?;
-    if only == Only::Transcripts {
+    if matches!(only, Only::Transcripts | Only::Sync) {
         drill.plain_only();
     }
     let result = run(&store, &settings, &chain, &seal, drill.path(), only);
@@ -244,7 +258,7 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         drill.remove()
     };
     if let Err(error) = removed {
-        if only != Only::Transcripts {
+        if !matches!(only, Only::Transcripts | Only::Sync) {
             return Err(error);
         }
         code = folder_left(&error, code, &mut outcomes);
@@ -256,6 +270,31 @@ pub(super) fn restore_drill(flags: &Flags) -> Result<i32, String> {
         duration_ms: elapsed_ms(started),
     };
     Ok(record_verdicts(&store, &verdict, &outcomes).unwrap_or(code))
+}
+
+/// Why a drill is refused before anything is fetched (exit 2, nothing
+/// recorded, nothing made): the notes drill's folder under the notes folder
+/// (objective 217), or the transcripts or the notes drill's bytes that would
+/// leave its file system under the floor.
+fn refused_before_fetch(only: Only, chain: &[&BundleRecord], parent: &Path) -> Option<String> {
+    if only == Only::Sync
+        && let Some(notes) = sync::named_dir(chain[chain.len() - 1])
+        && let Ok(notes) = notes.canonicalize()
+        && parent.starts_with(&notes)
+    {
+        return Some(format!(
+            "--into {} is under the notes folder ({}): a drill restores into scratch, never \
+             there",
+            parent.display(),
+            notes.display()
+        ));
+    }
+    let needed = match only {
+        Only::Transcripts => transcripts_bytes(chain),
+        Only::Sync => sync::bytes(chain),
+        Only::Both | Only::Missions | Only::Controllers => return None,
+    };
+    above_floor(needed, parent).err()
 }
 
 /// The transcripts drill's folder left (not plain, or no longer the one
@@ -298,6 +337,14 @@ fn resources_of(flags: &Flags) -> Option<(Only, &'static [&'static str])> {
                  newest record; no repository bundle unpacked, nothing live read"
             );
             &[TRANSCRIPTS]
+        }
+        Only::Sync => {
+            println!(
+                "restore-drill: --only sync: the fleet's notes folder alone, restored from the \
+                 bundle chain into the drill's own folder and compared read only with the folder \
+                 its record names; no transcript or repository bundle unpacked"
+            );
+            &[sync::SYNC]
         }
     };
     Some((only, resources))
@@ -348,9 +395,10 @@ pub(super) fn floor_refusal(
     ))
 }
 
-/// The transcripts drill's bytes (`transcripts_bytes`) against the free
-/// space of `parent`'s file system and the floor.
-fn above_floor(chain: &[&BundleRecord], parent: &Path) -> Result<(), String> {
+/// A drill's bytes (`transcripts_bytes`, or the notes drill's
+/// `sync::bytes`) against the free space of `parent`'s file system and the
+/// floor.
+fn above_floor(needed: u64, parent: &Path) -> Result<(), String> {
     let floor_mb = match env_value("SPAWN_BACKUP_DRILL_FLOOR_MB") {
         None => FLOOR_MB,
         Some(value) => value.trim().parse::<u64>().map_err(|_| {
@@ -360,7 +408,7 @@ fn above_floor(chain: &[&BundleRecord], parent: &Path) -> Result<(), String> {
     };
     let free = crate::disk::free_bytes(parent)
         .map_err(|error| format!("refused: the floor cannot be checked: {error}"))?;
-    floor_refusal(transcripts_bytes(chain), free, floor_mb, parent)
+    floor_refusal(needed, free, floor_mb, parent)
 }
 
 /// A drill's result said, and its exit and the outcome of each resource
@@ -411,6 +459,9 @@ pub(super) enum Only {
     /// live controllers, and their sources restored from the bundle chain;
     /// it records `backup.drilled.controllers` per controller.
     Controllers,
+    /// `--only sync` (objective 217, [`sync`]): the fleet's notes folder
+    /// restored from the bundle chain and compared with live, read only.
+    Sync,
 }
 
 /// `--only`'s value: absent, both resources; `missions`, `controllers` or
@@ -422,9 +473,10 @@ pub(super) fn only_of(value: Option<&str>) -> Result<Only, String> {
         Some(MISSIONS) => Ok(Only::Missions),
         Some(TRANSCRIPTS) => Ok(Only::Transcripts),
         Some(controllers::CONTROLLERS) => Ok(Only::Controllers),
+        Some(sync::SYNC) => Ok(Only::Sync),
         Some(_) => Err(
-            "--only takes missions, controllers or transcripts (the mission repositories, the \
-             live controllers, the transcript archive)"
+            "--only takes missions, controllers, transcripts or sync (the mission repositories, \
+             the live controllers, the transcript archive, the fleet's notes folder)"
                 .to_string(),
         ),
     }
@@ -529,7 +581,12 @@ fn said(report: &Report) -> i32 {
     for line in &report.lines {
         println!("{line}");
     }
-    let mismatches: Vec<&String> = report.transcripts.iter().chain(&report.missions).collect();
+    let mismatches: Vec<&String> = report
+        .transcripts
+        .iter()
+        .chain(&report.missions)
+        .chain(&report.sync)
+        .collect();
     for line in mismatches.iter().take(NAMED) {
         eprintln!("restore-drill: mismatch: {line}");
     }
@@ -575,8 +632,12 @@ fn counted(mismatches: usize, unknown: usize) -> String {
 }
 
 /// Each resource's outcome from a drill that ran.
-fn outcomes(report: &Report) -> [(&'static str, Outcome); 2] {
+fn outcomes(report: &Report) -> [(&'static str, Outcome); 3] {
     [
+        (
+            sync::SYNC,
+            outcome(sync::SYNC, &report.sync, &[], &report.key),
+        ),
         (
             TRANSCRIPTS,
             outcome(TRANSCRIPTS, &report.transcripts, &[], &report.key),
@@ -932,6 +993,8 @@ struct Report {
     /// The mission repositories' restored heads in neither the commit map
     /// nor live (objective 178): they fail the drill, never as mismatches.
     unknown: Vec<String>,
+    /// The notes folder's mismatches (`--only sync`, objective 217).
+    sync: Vec<String>,
     /// What a passed drill matches: live, or the newest record alone (the
     /// transcripts drill).
     against: &'static str,
@@ -954,6 +1017,13 @@ fn run(
     only: Only,
 ) -> Result<Report, String> {
     let newest = chain[chain.len() - 1];
+    // A newest bundle with no notes part cannot give the folder back:
+    // nothing is fetched.
+    if only == Only::Sync
+        && let Some(why) = sync::no_part(newest)
+    {
+        return Err(why);
+    }
     let mut unpacked: Vec<(PathBuf, Value)> = Vec::new();
     for (index, record) in chain.iter().enumerate() {
         let here = drill.join(format!("bundle-{index}"));
@@ -963,6 +1033,7 @@ fn run(
             Only::Both | Only::Controllers => fetch_bundle(settings, record, seal, &here)?,
             Only::Missions => fetch_members(settings, record, seal, &here, missions_members)?,
             Only::Transcripts => fetch_members(settings, record, seal, &here, transcripts_members)?,
+            Only::Sync => fetch_members(settings, record, seal, &here, sync::members)?,
         };
         unpacked.push((here.join("unpacked"), manifest));
     }
@@ -1003,7 +1074,41 @@ fn run(
             transcripts: found,
             missions,
             unknown: Vec::new(),
+            sync: Vec::new(),
             against: "the newest record",
+        });
+    }
+    if only == Only::Sync {
+        lines.push(format!(
+            "restore-drill: chain {chain_text}: {} bundle(s) fetched, decrypted in a pipe, \
+             sha256 as recorded; manifest.json, sync/manifest.json and sync/files/* alone \
+             unpacked",
+            chain.len()
+        ));
+        let restored_dir = drill.join(sync::SYNC);
+        fs::create_dir(&restored_dir)
+            .map_err(|error| format!("{}: {error}", restored_dir.display()))?;
+        let restored = sync::restore(chain, &unpacked, &restored_dir)?;
+        lines.push(restored.line());
+        // Everything the drill wrote is plain, or it fails (and its folder
+        // is left).
+        plain_tree(drill)?;
+        let live = sync::named_dir(newest).ok_or("the newest record names no notes folder")?;
+        // The bundle's start: a file it read was read at or after it.
+        let start_ms = unpacked[unpacked.len() - 1].1["created_at_ms"]
+            .as_i64()
+            .unwrap_or(newest.at_ms);
+        let compared = sync::compare(&restored, &live, start_ms);
+        lines.push(compared.line(&live));
+        return Ok(Report {
+            key,
+            event_id: newest.event_id,
+            lines,
+            transcripts: mismatches,
+            missions,
+            unknown: Vec::new(),
+            sync: compared.mismatches,
+            against: "live",
         });
     }
     if only == Only::Missions {
@@ -1026,6 +1131,7 @@ fn run(
             transcripts: mismatches,
             missions,
             unknown,
+            sync: Vec::new(),
             against: "live",
         });
     }
@@ -1077,6 +1183,7 @@ fn run(
         transcripts: mismatches,
         missions,
         unknown,
+        sync: Vec::new(),
         against: "live",
     })
 }

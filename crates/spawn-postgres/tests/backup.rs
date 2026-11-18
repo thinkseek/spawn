@@ -342,6 +342,49 @@ fn a_drill_verdict_is_a_backup_drilled_record_of_fixed_shape() {
     );
 }
 
+/// Objective 217: the notes folder's drill (`backup.drilled.sync`) is
+/// accepted in the drill record's shape and refused outside it, as the
+/// other drill records; the reason is masked as theirs is.
+#[test]
+fn a_notes_drill_verdict_is_a_backup_drilled_sync_record_of_the_drill_shape() {
+    let (store, schema) = store("backup_drilled_sync");
+    let mut client = admin(&schema);
+    store
+        .backup_record(&drilled("backup.drilled.sync"))
+        .expect("a passed notes drill");
+    let mut failed = drilled("backup.drilled.sync");
+    failed["ok"] = json!(false);
+    failed["reason"] = json!("sync: 1 mismatch(es) older than bundle k; the first: sync/a.md");
+    failed["mismatches"] = json!(1);
+    store.backup_record(&failed).expect("a failed notes drill");
+    let with = |field: &str, value: Value| {
+        let mut record = drilled("backup.drilled.sync");
+        record[field] = value;
+        record
+    };
+    for (what, record) in [
+        ("another field", with("files", json!(3))),
+        ("a controllers field", with("controller", json!("spawn"))),
+        ("ok false with no reason", with("ok", json!(false))),
+        ("ok true with a reason", with("reason", json!("a mismatch"))),
+        ("a reason over 500 characters", {
+            let mut record = with("ok", json!(false));
+            record["reason"] = json!("r".repeat(501));
+            record
+        }),
+        ("no bundle", with("bundle", Value::Null)),
+        ("a negative count", with("mismatches", json!(-1))),
+        ("a fractional duration", with("duration_ms", json!(1.5))),
+    ] {
+        assert!(store.backup_record(&record).is_err(), "{what}: {record}");
+    }
+    assert_eq!(
+        control_records(&mut client, "backup.drilled.sync"),
+        2,
+        "nothing refused was recorded"
+    );
+}
+
 fn controllers_drilled() -> Value {
     json!({
         "type": "backup.drilled.controllers", "ok": true, "reason": "",
