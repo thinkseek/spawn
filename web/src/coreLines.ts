@@ -53,6 +53,10 @@ export interface CoreFigure {
   /** Why the file's range is held (objective 181: U2 in its first week of
    * judged data): said where the range would be. */
   range_note?: string;
+  /** Which fall a figure is (objective 222: storage.disk_fall, "fit" for
+   * the week's least-squares fit, "day" for the last day's fall), said
+   * after its name (objective 225). */
+  basis?: string | null;
 }
 
 /** One mission's report to live (objective 159): its median (null below
@@ -413,6 +417,15 @@ function storeWords(store: unknown): string {
   return typeof store === "string" && store !== "" ? `: ${store}` : "";
 }
 
+/** Which fall a figure is, after its name (objective 225): " (the week's
+ * fit)" for "fit", " (the last day's fall)" for "day"; nothing without a
+ * basis, for null, or for one it does not know. */
+function basisWords(basis: unknown): string {
+  if (basis === "fit") return " (the week's fit)";
+  if (basis === "day") return " (the last day's fall)";
+  return "";
+}
+
 /** What a judged share is read from, after its name: " (5 judged, 1
  * unjudged of 6)", nothing without it. */
 function judgedWords(judged: unknown): string {
@@ -432,7 +445,7 @@ function mark(raw: unknown): CoreMark {
   const target = finite(figure.target);
   const held = typeof figure.range_note === "string" && figure.range_note !== "" ? figure.range_note : null;
   const said: CoreMark = {
-    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}${judgedWords(figure.judged)}`,
+    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}${basisWords(figure.basis)}${judgedWords(figure.judged)}`,
     value:
       value !== null
         ? `${unitWords(unit, value)}${of !== null ? ` of ${GROUPED.format(of)}` : ""}`

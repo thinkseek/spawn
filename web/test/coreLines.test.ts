@@ -482,6 +482,28 @@ test("a figure that names its store says it after its name", () => {
   assert.equal(view.rows[0].north_star.name, "Days until the disk is full");
 });
 
+// Objective 225: storage.disk_fall says which fall it is (its basis since
+// 222) after its name; without a basis, for null or for one it does not
+// know, the name is as it was, and the value never carries it.
+test("the free disk lost a day says its basis after its name", () => {
+  const fall = (basis?: unknown) => {
+    const view = coreLinesView({
+      lines: [],
+      diagnostics: [
+        { key: "storage.disk_fall", name: "Free disk lost a day", unit: "bytes_per_day", value: 77104383700, range: null, state: "no_range", ...(basis === undefined ? {} : { basis }) } as CoreFigure,
+      ],
+    });
+    const mark = view.diagnostics[0];
+    assert.doesNotMatch(mark.value, /fit|fall/);
+    return mark.name;
+  };
+  assert.equal(fall("day"), "Free disk lost a day (the last day's fall)");
+  assert.equal(fall("fit"), "Free disk lost a day (the week's fit)");
+  assert.equal(fall(), "Free disk lost a day");
+  assert.equal(fall(null), "Free disk lost a day");
+  assert.equal(fall("median"), "Free disk lost a day");
+});
+
 // Objective 148: "Needs you is right" says what it is read from after its
 // name, the needs judged and not; a figure without it is named as it was.
 test("a judged share says what it is read from after its name", () => {
