@@ -1499,7 +1499,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Fire { key, evidence, .. } => Some((key.clone(), evidence.clone())),
-                Event::Clear { .. } => None,
+                Event::Clear { .. } | Event::Update { .. } => None,
             })
             .collect()
     }

@@ -4150,18 +4150,14 @@ times in a row)",
                 if !self.clears(&key, evidence, now) {
                     return None;
                 }
-                let Some(row) = self.known.get(&key) else {
-                    return None;
-                };
+                let row = self.known.get(&key)?;
                 json!({
                     "type": "alert.cleared", "key": key, "kind": row.kind,
                     "subject": row.subject, "evidence": scrub_value(evidence),
                 })
             }
             Event::Update { evidence, text, .. } => {
-                let Some(row) = self.known.get(&key).filter(|row| row.open()) else {
-                    return None;
-                };
+                let row = self.known.get(&key).filter(|row| row.open())?;
                 json!({
                     "type": "alert.updated", "key": key, "kind": row.kind,
                     "subject": row.subject, "text": text,
@@ -5349,6 +5345,7 @@ mod tests {
             .filter(|event| match event {
                 Event::Fire { .. } => !monitor.known.contains_key(event.key()),
                 Event::Clear { key, evidence } => monitor.clears(key, evidence, i64::MAX),
+                Event::Update { key, .. } => monitor.is_open(key),
             })
             .collect()
     }
@@ -5381,6 +5378,11 @@ mod tests {
                         row.state = "cleared".to_string();
                     }
                 }
+                Event::Update { key, evidence, .. } => {
+                    if let Some(row) = monitor.known.get_mut(key) {
+                        row.evidence = evidence.clone();
+                    }
+                }
             }
         }
     }
@@ -5397,7 +5399,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Fire { key, .. } => Some(key.as_str()),
-                Event::Clear { .. } => None,
+                Event::Clear { .. } | Event::Update { .. } => None,
             })
             .collect()
     }
@@ -6627,7 +6629,7 @@ mod tests {
                     text,
                     ..
                 } => Some((key.as_str(), subject.as_str(), evidence, text.clone())),
-                Event::Clear { .. } => None,
+                Event::Clear { .. } | Event::Update { .. } => None,
             })
             .collect();
         assert_eq!(fired.len(), 1, "{moved:?}");
@@ -8679,7 +8681,7 @@ connections\n";
                 .iter()
                 .filter_map(|event| match event {
                     Event::Clear { key, .. } => Some(key.as_str()),
-                    Event::Fire { .. } => None,
+                    Event::Fire { .. } | Event::Update { .. } => None,
                 })
                 .collect()
         }
@@ -9671,7 +9673,7 @@ connections\n";
                 .iter()
                 .filter_map(|event| match event {
                     Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
-                    Event::Fire { .. } => None,
+                    Event::Fire { .. } | Event::Update { .. } => None,
                 })
                 .collect()
         }
@@ -10231,7 +10233,7 @@ connections\n";
                 .iter()
                 .filter_map(|event| match event {
                     Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
-                    Event::Fire { .. } => None,
+                    Event::Fire { .. } | Event::Update { .. } => None,
                 })
                 .collect();
             clears.sort_by(|a, b| a.0.cmp(&b.0));
