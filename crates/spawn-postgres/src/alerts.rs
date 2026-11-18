@@ -5,7 +5,10 @@
 //! The loop computes each transition from records and readings and records it
 //! through the owner-only `spawn_alert_record`; the store refuses a second
 //! `alert.fired` for a key, an `alert.cleared` without its `alert.fired`, and
-//! a second `alert.cleared`. The reads below are the loop's way back after a
+//! a second `alert.cleared`. An `alert.updated` (objective 219) sets an open
+//! alert's `text` and `evidence` as its condition is now (its fire, state
+//! and verdict unchanged), refused unless the key's alert is open, not a
+//! notice, of that kind and subject, and the text is not empty. The reads below are the loop's way back after a
 //! restart (its alerts and the facts it evaluates), and what
 //! `spawn alerts --once`, `spawn alerts --follow` and `/api/alerts` show.
 
@@ -465,9 +468,10 @@ select jsonb_build_object(
                        '[]'::jsonb))";
 
 impl PostgresStore {
-    /// Record an `alert.fired` or `alert.cleared` record (owner only).
-    /// Returns the event's id; a second `fired` for a key, a `cleared`
-    /// without its `fired` and a second `cleared` are refused.
+    /// Record an `alert.fired`, `alert.cleared` or `alert.updated` record
+    /// (owner only). Returns the event's id; a second `fired` for a key, a
+    /// `cleared` without its `fired`, a second `cleared`, and an `updated`
+    /// of anything but an open alert of its kind and subject are refused.
     pub fn alert_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
             .query_one(

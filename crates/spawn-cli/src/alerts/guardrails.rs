@@ -795,6 +795,11 @@ mod tests {
                         row.state = "cleared".to_string();
                     }
                 }
+                Event::Update { key, evidence, .. } => {
+                    if let Some(row) = monitor.known.get_mut(key).filter(|row| row.open()) {
+                        row.evidence = evidence.clone();
+                    }
+                }
             }
         }
     }
@@ -805,6 +810,7 @@ mod tests {
             .map(|event| match event {
                 Event::Fire { key, .. } => format!("fire {key}"),
                 Event::Clear { key, .. } => format!("clear {key}"),
+                Event::Update { key, .. } => format!("update {key}"),
             })
             .collect()
     }
@@ -1493,7 +1499,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Fire { key, evidence, .. } => Some((key.clone(), evidence.clone())),
-                Event::Clear { .. } => None,
+                Event::Clear { .. } | Event::Update { .. } => None,
             })
             .collect()
     }
