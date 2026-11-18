@@ -5943,7 +5943,8 @@ begin
     v_mission := (p_record ->> 'id')::numeric::bigint;
     v_objective := (p_record ->> 'objective')::numeric::integer;
     v_kind := p_record ->> 'kind';
-    v_scenario := lpad(v_objective::text, 3, '0') || '.sh';
+    -- At least three digits: lpad alone would cut 1234 to 123.
+    v_scenario := to_char(v_objective, 'FM000') || '.sh';
 
     -- on-main, before the lock: the mission's gates that may show it, up
     -- to v_seen.
@@ -6015,7 +6016,7 @@ begin
           join mission_tasks t on to_jsonb(t.id) = r -> 'id' and t.mission_id = v_mission
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
            and r ->> 'type' = 'task.gated'
-           and e.session_seq > v_seen and true
+           and e.session_seq > v_seen
            and ((r ->> 'verdict' = 'accepted'
                  and (coalesce(r -> 'passed' ? v_scenario, false)
                       or coalesce(r -> 'reused' ? v_scenario, false)))
