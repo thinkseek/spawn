@@ -4,7 +4,8 @@
 //! pane; nothing of it was recorded, its state lived in its process, and no
 //! view of Spawn showed an alert. The loop now raises its own
 //! (docs/fleet-architecture.md, "Alerts"): each transition is a control
-//! record, `alert.fired` or `alert.cleared`, written through the owner-only
+//! record, `alert.fired` or `alert.cleared` (and `alert.updated`, an open
+//! alert's current text and evidence), written through the owner-only
 //! `spawn_alert_record`, folded into `spawn_alerts` and shown by
 //! `spawn alerts --once`, `spawn alerts --follow` and `GET /api/alerts`.
 //!
@@ -299,7 +300,13 @@
 //!   reads nothing) or more ago. Evidence how many (`old`), how many are
 //!   unverified at all, the bound, the newest of the old landings, the
 //!   listing's start and the reading. One open at a time: more growing old
-//!   while it is open fire nothing. Clears at the first reading with none
+//!   while it is open fire nothing. While it is open, a reading whose count
+//!   (`old`) or newest old landing differs from its evidence records one
+//!   `alert.updated` (objective 219): the same alert, its text and evidence
+//!   as the count is now, with `fired_old`, the count it fired at; a reading
+//!   that finds the same records nothing, and a restarted loop reads the
+//!   evidence back from the table. An update is not a fire: nothing new is
+//!   told. Clears at the first reading with none
 //!   old; a fail recorded after a pass makes an objective unverified
 //!   again, and a later reading fires a new one.
 //! - `message_not_taken`, the session id, key `message_not_taken:<command>`,
@@ -603,12 +610,19 @@ pub(crate) enum Event {
         key: String,
         evidence: Value,
     },
+    /// An open alert's text and evidence as its condition is now
+    /// (`alert.updated`, objective 219): not a fire, nothing new is told.
+    Update {
+        key: String,
+        evidence: Value,
+        text: String,
+    },
 }
 
 impl Event {
     fn key(&self) -> &str {
         match self {
-            Self::Fire { key, .. } | Self::Clear { key, .. } => key,
+            Self::Fire { key, .. } | Self::Clear { key, .. } | Self::Update { key, .. } => key,
         }
     }
 }
@@ -3664,9 +3678,6 @@ times in a row)",
             }
             return;
         }
-        if !open.is_empty() {
-            return;
-        }
         let newest = reading["newest_old_ms"].as_i64().unwrap_or_default();
         let bound = self.settings.unverified_ms;
         let span = if bound == DAY_MS {
@@ -3679,19 +3690,46 @@ times in a row)",
         } else {
             ("objectives", "them")
         };
+        let text = format!(
+            "{old} landed {objectives} unverified for over {span}: spawn verify list names {them}"
+        );
+        let evidence = json!({
+            "old": old, "unverified": unverified, "unverified_ms": bound,
+            "newest_landed_ms": newest, "listed_since_ms": crate::verify::LISTED_SINCE_MS,
+            "reading_ms": now,
+        });
+        // One open at a time (135): while it is, a reading whose count or
+        // newest old landing moved says so in place, the same alert
+        // (objective 219); one that finds the same records nothing.
+        if !open.is_empty() {
+            for key in open {
+                let Some(row) = self.known.get(&key) else {
+                    continue;
+                };
+                if row.evidence["old"].as_i64() == Some(old)
+                    && row.evidence["newest_landed_ms"].as_i64() == Some(newest)
+                {
+                    continue;
+                }
+                let fired_old = row.evidence["fired_old"]
+                    .as_i64()
+                    .or_else(|| row.evidence["old"].as_i64());
+                let mut evidence = evidence.clone();
+                evidence["fired_old"] = json!(fired_old);
+                out.push(Event::Update {
+                    key,
+                    evidence,
+                    text: text.clone(),
+                });
+            }
+            return;
+        }
         out.push(Event::Fire {
             key: format!("{KIND}:{newest}:{now}"),
             kind: KIND,
             subject: SUBJECT.to_string(),
-            evidence: json!({
-                "old": old, "unverified": unverified, "unverified_ms": bound,
-                "newest_landed_ms": newest, "listed_since_ms": crate::verify::LISTED_SINCE_MS,
-                "reading_ms": now,
-            }),
-            text: format!(
-                "{old} landed {objectives} unverified for over {span}: spawn verify list names \
-                 {them}"
-            ),
+            evidence,
+            text,
             notice: false,
         });
     }
@@ -4092,6 +4130,50 @@ times in a row)",
         }
     }
 
+    /// The record `event` writes, or none when it writes nothing: a fire
+    /// already known, a clear that clears nothing ([`Self::clears`]), an
+    /// update of an alert not open.
+    fn record_of(&self, event: &Event, now: i64) -> Option<Value> {
+        let key = event.key().to_string();
+        Some(match event {
+            Event::Fire {
+                kind,
+                subject,
+                evidence,
+                text,
+                notice,
+                ..
+            } => {
+                if self.known.contains_key(&key) {
+                    return None;
+                }
+                json!({
+                    "type": "alert.fired", "key": key, "kind": kind,
+                    "subject": subject, "evidence": scrub_value(evidence),
+                    "text": text, "notice": notice,
+                })
+            }
+            Event::Clear { evidence, .. } => {
+                if !self.clears(&key, evidence, now) {
+                    return None;
+                }
+                let row = self.known.get(&key)?;
+                json!({
+                    "type": "alert.cleared", "key": key, "kind": row.kind,
+                    "subject": row.subject, "evidence": scrub_value(evidence),
+                })
+            }
+            Event::Update { evidence, text, .. } => {
+                let row = self.known.get(&key).filter(|row| row.open())?;
+                json!({
+                    "type": "alert.updated", "key": key, "kind": row.kind,
+                    "subject": row.subject, "text": text,
+                    "evidence": scrub_value(evidence),
+                })
+            }
+        })
+    }
+
     /// Record `events`, in order, each once: the store refuses a second
     /// `alert.fired` for a key, so two loops at once still fire once.
     fn flush(
@@ -4103,43 +4185,20 @@ times in a row)",
     ) {
         for event in events {
             let key = event.key().to_string();
-            let record = match event {
-                Event::Fire {
-                    kind,
-                    subject,
-                    evidence,
-                    text,
-                    notice,
-                    ..
-                } => {
-                    if self.known.contains_key(&key) {
-                        continue;
-                    }
-                    json!({
-                        "type": "alert.fired", "key": key, "kind": kind,
-                        "subject": subject, "evidence": scrub_value(evidence),
-                        "text": text, "notice": notice,
-                    })
-                }
-                Event::Clear { evidence, .. } => {
-                    if !self.clears(&key, evidence, now) {
-                        continue;
-                    }
-                    let Some(row) = self.known.get(&key) else {
-                        continue;
-                    };
-                    json!({
-                        "type": "alert.cleared", "key": key, "kind": row.kind,
-                        "subject": row.subject, "evidence": scrub_value(evidence),
-                    })
-                }
+            let Some(record) = self.record_of(event, now) else {
+                continue;
             };
             match store.alert_record(&record) {
                 Ok(id) => {
                     let kind = record["kind"].as_str().unwrap_or_default().to_string();
                     let subject = record["subject"].as_str().unwrap_or_default().to_string();
                     let fired = record["type"] == "alert.fired";
-                    if fired {
+                    if record["type"] == "alert.updated" {
+                        if let Some(row) = self.known.get_mut(&key) {
+                            row.evidence = record["evidence"].clone();
+                        }
+                        lines.push(format!("alerts: updated {key} ({subject})"));
+                    } else if fired {
                         self.known.insert(
                             key.clone(),
                             Row {
@@ -4178,6 +4237,9 @@ times in a row)",
                             fired_event_id: 0,
                             fired_at_ms: 0,
                         });
+                    } else if record["type"] == "alert.updated" {
+                        // An update the store refused changes nothing here:
+                        // the alert stays as the step knows it.
                     } else if let Some(row) = self.known.get_mut(&key) {
                         // A clear the store refused: the alert is not open
                         // there (cleared or judged), so it is not retried.
@@ -5290,6 +5352,7 @@ mod tests {
             .filter(|event| match event {
                 Event::Fire { .. } => !monitor.known.contains_key(event.key()),
                 Event::Clear { key, evidence } => monitor.clears(key, evidence, i64::MAX),
+                Event::Update { key, .. } => monitor.is_open(key),
             })
             .collect()
     }
@@ -5322,6 +5385,11 @@ mod tests {
                         row.state = "cleared".to_string();
                     }
                 }
+                Event::Update { key, evidence, .. } => {
+                    if let Some(row) = monitor.known.get_mut(key) {
+                        row.evidence = evidence.clone();
+                    }
+                }
             }
         }
     }
@@ -5338,7 +5406,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Fire { key, .. } => Some(key.as_str()),
-                Event::Clear { .. } => None,
+                Event::Clear { .. } | Event::Update { .. } => None,
             })
             .collect()
     }
@@ -6511,7 +6579,7 @@ mod tests {
                     evidence["cause"].clone(),
                     evidence["event_id"].clone(),
                 )),
-                Event::Fire { .. } => None,
+                Event::Fire { .. } | Event::Update { .. } => None,
             })
             .collect()
     }
@@ -6568,7 +6636,7 @@ mod tests {
                     text,
                     ..
                 } => Some((key.as_str(), subject.as_str(), evidence, text.clone())),
-                Event::Clear { .. } => None,
+                Event::Clear { .. } | Event::Update { .. } => None,
             })
             .collect();
         assert_eq!(fired.len(), 1, "{moved:?}");
@@ -6953,7 +7021,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
-                Event::Fire { .. } => None,
+                Event::Fire { .. } | Event::Update { .. } => None,
             })
             .collect();
         cleared.sort_by(|left, right| left.0.cmp(&right.0));
@@ -7766,9 +7834,17 @@ connections\n";
                     "newest_landed_ms": landed, "listed_since_ms": since,
                     "reading_ms": now + 2000})
         );
-        // More readings, more grown old: nothing more while one is open.
+        // More readings, more grown old: no other alert fires while one is
+        // open (its update in place: objective 219's test).
         assert!(read(&mut monitor, now + 4000, reading(3, 2, Some(landed))).is_empty());
-        assert!(read(&mut monitor, now + 6000, reading(4, 3, Some(landed + 1))).is_empty());
+        assert!(
+            fires(&read(
+                &mut monitor,
+                now + 6000,
+                reading(4, 3, Some(landed + 1))
+            ))
+            .is_empty()
+        );
         // None old: cleared, with what the reading saw.
         let cleared = read(&mut monitor, now + 8000, reading(1, 0, None));
         assert!(
@@ -7791,6 +7867,107 @@ connections\n";
             text,
             "1 landed objective unverified for over a day: spawn verify list names it"
         );
+    }
+
+    /// Objective 219: an open unverified_landings alert says the count as it
+    /// is now: up, the same count with a newer old landing, down to the
+    /// singular, each one `Update` of the same key with `fired_old`; a
+    /// reading that finds the same says nothing; a restarted monitor reads
+    /// the evidence back and says nothing until the count moves; the clear
+    /// is as before.
+    #[test]
+    fn an_open_unverified_alert_says_the_count_as_it_is_now() {
+        let mut monitor = monitor();
+        let since = crate::verify::LISTED_SINCE_MS;
+        let now = since + 3 * super::DAY_MS;
+        let reading = |unverified: i64, old: i64, newest: i64| json!({"unverified": unverified, "old": old, "newest_old_ms": newest});
+        let read = |monitor: &mut Monitor, at: i64, value: Value| {
+            let mut out = Vec::new();
+            monitor.unverified(at, &value, &mut out);
+            let out = decided(monitor, out);
+            commit(monitor, &out);
+            out
+        };
+        let updated = |events: &[Event]| -> Vec<(String, String, Value)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Update {
+                        key,
+                        evidence,
+                        text,
+                    } => Some((key.clone(), text.clone(), evidence.clone())),
+                    Event::Fire { .. } | Event::Clear { .. } => None,
+                })
+                .collect()
+        };
+        let landed = now - super::DAY_MS - 60_000;
+        let fired = read(&mut monitor, now, reading(2, 1, landed));
+        let key = format!("unverified_landings:{landed}:{now}");
+        assert_eq!(fires(&fired), [key.as_str()]);
+        assert!(read(&mut monitor, now + 1000, reading(2, 1, landed)).is_empty());
+
+        // Up: a second one old.
+        let up = updated(&read(&mut monitor, now + 2000, reading(3, 2, landed + 10)));
+        assert_eq!(up.len(), 1, "{up:?}");
+        assert_eq!(up[0].0, key, "the same alert");
+        assert_eq!(
+            up[0].1,
+            "2 landed objectives unverified for over a day: spawn verify list names them"
+        );
+        assert_eq!(
+            up[0].2,
+            json!({"old": 2, "unverified": 3, "unverified_ms": super::DAY_MS,
+                   "newest_landed_ms": landed + 10, "listed_since_ms": since,
+                   "reading_ms": now + 2000, "fired_old": 1})
+        );
+        assert!(
+            read(&mut monitor, now + 3000, reading(3, 2, landed + 10)).is_empty(),
+            "the same: nothing"
+        );
+
+        // The same count with a newer old landing.
+        let newer = updated(&read(
+            &mut monitor,
+            now + 4000,
+            reading(3, 2, landed + 30_000),
+        ));
+        assert_eq!(newer.len(), 1, "{newer:?}");
+        assert_eq!(newer[0].2["old"], 2);
+        assert_eq!(newer[0].2["newest_landed_ms"], landed + 30_000);
+        assert_eq!(newer[0].2["fired_old"], 1);
+
+        // A restarted monitor reads the evidence back: nothing until it
+        // moves.
+        let mut restarted = Monitor::with(settings());
+        restarted
+            .known
+            .insert(key.clone(), monitor.known[&key].clone());
+        assert!(read(&mut restarted, now + 5000, reading(3, 2, landed + 30_000)).is_empty());
+
+        // Down to the singular.
+        let down = updated(&read(
+            &mut restarted,
+            now + 6000,
+            reading(1, 1, landed + 30_000),
+        ));
+        assert_eq!(down.len(), 1, "{down:?}");
+        assert_eq!(down[0].0, key);
+        assert_eq!(
+            down[0].1,
+            "1 landed objective unverified for over a day: spawn verify list names it"
+        );
+        assert_eq!(down[0].2["old"], 1);
+        assert_eq!(down[0].2["fired_old"], 1);
+
+        // None old: cleared, as before.
+        let cleared = read(&mut restarted, now + 8000, reading(0, 0, 0));
+        assert!(
+            matches!(&cleared[..], [Event::Clear { key: cleared, evidence }]
+                if *cleared == key && evidence["old"] == 0),
+            "{cleared:?}"
+        );
+        assert!(updated(&read(&mut restarted, now + 9000, reading(0, 0, 0))).is_empty());
     }
 
     #[test]
@@ -8620,7 +8797,7 @@ connections\n";
                 .iter()
                 .filter_map(|event| match event {
                     Event::Clear { key, .. } => Some(key.as_str()),
-                    Event::Fire { .. } => None,
+                    Event::Fire { .. } | Event::Update { .. } => None,
                 })
                 .collect()
         }
@@ -9612,7 +9789,7 @@ connections\n";
                 .iter()
                 .filter_map(|event| match event {
                     Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
-                    Event::Fire { .. } => None,
+                    Event::Fire { .. } | Event::Update { .. } => None,
                 })
                 .collect()
         }
@@ -10172,7 +10349,7 @@ connections\n";
                 .iter()
                 .filter_map(|event| match event {
                     Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
-                    Event::Fire { .. } => None,
+                    Event::Fire { .. } | Event::Update { .. } => None,
                 })
                 .collect();
             clears.sort_by(|a, b| a.0.cmp(&b.0));

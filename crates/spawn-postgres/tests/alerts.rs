@@ -119,6 +119,110 @@ fn a_notice_is_recorded_once_and_never_clears() {
     assert_eq!(alert(&mut client, "task_state:7:10")["state"], "notice");
 }
 
+fn updated(key: &str, kind: &str, subject: &str, text: &str, old: i64) -> Value {
+    json!({
+        "type": "alert.updated", "key": key, "kind": kind, "subject": subject,
+        "text": text, "evidence": {"old": old, "fired_old": 1},
+    })
+}
+
+/// Objective 219: an `alert.updated` sets an open alert's text and evidence
+/// only (its fire, state and verdict stay), and is refused, writing nothing,
+/// for another kind or subject, an empty text, a key never fired, a notice
+/// and a cleared alert. A refold gives the same rows.
+#[test]
+fn an_open_alert_is_updated_in_place_and_nothing_else_is() {
+    let (store, schema) = store("alerts_updated");
+    let mut client = admin(&schema);
+    let fired_id = store
+        .alert_record(&fired("memory_low:1", false))
+        .expect("fire");
+    let before = alert(&mut client, "memory_low:1");
+    store
+        .alert_record(&updated(
+            "memory_low:1",
+            "memory_low",
+            "host",
+            "MemAvailable is 900 MiB, under 4096",
+            2,
+        ))
+        .expect("an update of the open alert");
+    let row = alert(&mut client, "memory_low:1");
+    assert_eq!(row["text"], "MemAvailable is 900 MiB, under 4096");
+    assert_eq!(row["evidence"], json!({"old": 2, "fired_old": 1}));
+    for field in [
+        "state",
+        "fired_event_id",
+        "fired_at_ms",
+        "verdict",
+        "kind",
+        "subject",
+    ] {
+        assert_eq!(row[field], before[field], "{field} unchanged");
+    }
+    assert_eq!(row["fired_event_id"], fired_id);
+
+    store
+        .alert_record(&fired("task_state:7:10", true))
+        .expect("a notice");
+    store
+        .alert_record(&fired("memory_low:2", false))
+        .expect("fire");
+    store.alert_record(&cleared("memory_low:2")).expect("clear");
+    let rows = alert_rows(&mut client);
+    for (record, why) in [
+        (
+            updated("memory_low:1", "disk_low", "host", "other kind", 3),
+            "another kind",
+        ),
+        (
+            updated(
+                "memory_low:1",
+                "memory_low",
+                "elsewhere",
+                "other subject",
+                3,
+            ),
+            "another subject",
+        ),
+        (
+            updated("memory_low:1", "memory_low", "host", " ", 3),
+            "no text",
+        ),
+        (
+            json!({"type": "alert.updated", "key": "memory_low:1", "kind": "memory_low",
+                   "subject": "host", "evidence": {"old": 3}}),
+            "no text at all",
+        ),
+        (
+            updated("memory_low:9", "memory_low", "host", "never fired", 3),
+            "a key never fired",
+        ),
+        (
+            updated("task_state:7:10", "memory_low", "host", "a notice", 3),
+            "a notice",
+        ),
+        (
+            updated("memory_low:2", "memory_low", "host", "cleared", 3),
+            "a cleared alert",
+        ),
+    ] {
+        assert!(store.alert_record(&record).is_err(), "{why} is refused");
+        assert_eq!(alert_rows(&mut client), rows, "{why}: nothing written");
+    }
+    assert_eq!(
+        control_types(&mut client, "memory_low:1"),
+        ["alert.fired", "alert.updated"],
+        "only the update that was taken"
+    );
+
+    // A refold of the log gives the same rows.
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold the control stream");
+    assert_eq!(alert_rows(&mut client), rows);
+}
+
 /// How many `alert.judged` records the log holds.
 fn judgements(client: &mut Client) -> i64 {
     client

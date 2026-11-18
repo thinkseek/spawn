@@ -2930,6 +2930,18 @@ begin
                                                jsonb_build_object('judged', p_record ->> 'verdict'))
              where key = p_record ->> 'key';
         end if;
+    when 'alert.updated' then
+        -- An open alert's text and evidence as its condition is now
+        -- (objective 219: `unverified_landings` says the count of the
+        -- current reading). Only those two change: its fire, state and
+        -- verdict stay. Checked by spawn_alert_record before it is written;
+        -- a row that is not the open alert of that kind and subject is left
+        -- as it is.
+        update spawn_alerts
+           set text = p_record ->> 'text',
+               evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
+         where key = p_record ->> 'key' and state = 'open' and not notice
+           and kind = p_record ->> 'kind' and subject = p_record ->> 'subject';
     when 'alert.cleared' then
         -- What cleared an alert, once: the row must be open (a notice never
         -- clears, and a cleared alert is cleared at most once).
@@ -5290,7 +5302,7 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record alerts', session_user using errcode = '42501';
     end if;
-    if v_type not in ('alert.fired', 'alert.cleared', 'alert.judged') then
+    if v_type not in ('alert.fired', 'alert.cleared', 'alert.judged', 'alert.updated') then
         raise exception 'not an alert record: %', v_type;
     end if;
     -- The owner's judgement (objective 092): `{type, key, verdict}`, checked
@@ -5323,6 +5335,20 @@ begin
     if v_type = 'alert.fired' then
         if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
             raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+    elsif v_type = 'alert.updated' then
+        -- An open alert's current text and evidence (objective 219): the
+        -- key's alert open (not a notice, not cleared), of that kind and
+        -- subject, and a text.
+        if not exists (select 1 from spawn_alerts
+                        where key = p_record ->> 'key' and state = 'open' and not notice
+                          and kind = p_record ->> 'kind'
+                          and subject = p_record ->> 'subject') then
+            raise exception 'alert % is not an open % alert of %: nothing to update',
+                            p_record ->> 'key', p_record ->> 'kind', p_record ->> 'subject';
+        end if;
+        if coalesce(btrim(p_record ->> 'text'), '') = '' then
+            raise exception 'an alert update names its text: %', p_record ->> 'key';
         end if;
     else
         if not exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
