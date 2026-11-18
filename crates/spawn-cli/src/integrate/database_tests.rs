@@ -10164,7 +10164,7 @@ fn a_second_integrator_is_refused_while_the_first_is_idle() {
 
     let started = std::time::Instant::now();
     let refused = super::take_lock_at_start(
-        &|| connection(&db).pipe_ok(),
+        &|| Ok(connection(&db)),
         std::time::Duration::from_millis(1200),
     )
     .err()
@@ -10195,7 +10195,7 @@ fn a_start_takes_a_lock_freed_within_its_wait() {
         drop(old);
     });
     let (store, pid) = super::take_lock_at_start(
-        &|| connection(&db).pipe_ok(),
+        &|| Ok(connection(&db)),
         std::time::Duration::from_secs(10),
     )
     .expect("the lock, once freed");
@@ -10247,12 +10247,3 @@ fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
     );
     assert_eq!(integrator.stopped.borrow().as_deref(), Some(stopped.as_str()));
 }
-
-/// `Ok` of a connection, as the integrator's opener answers.
-trait PipeOk: Sized {
-    fn pipe_ok(self) -> Result<Self, String> {
-        Ok(self)
-    }
-}
-
-impl PipeOk for PostgresStore {}

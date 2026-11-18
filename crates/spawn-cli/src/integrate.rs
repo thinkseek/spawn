@@ -1536,7 +1536,7 @@ pub(crate) fn gate_refusal(gate: &Path, from_env: bool, cwd: &Path) -> Option<St
 /// takes it; still held then, it is refused, naming the holder. The store
 /// and its server pid.
 fn take_lock_at_start(
-    connect: &Connect,
+    connect: &dyn Fn() -> Result<PostgresStore, String>,
     wait: Duration,
 ) -> Result<(Arc<PostgresStore>, i32), String> {
     let store = connect()?;
