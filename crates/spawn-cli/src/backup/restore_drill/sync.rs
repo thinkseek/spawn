@@ -38,8 +38,8 @@
 //!   read once, the same way: when its size and sha256 are those of a file
 //!   of the newest manifest, under any path, moved or copied since
 //!   (expected: its bytes are in the backup, under another path; `mv`
-//!   and `cp -p` keep a file's mtime, so a round moved aside with `mkdir`
-//!   + `mv` after the bundle reads as older than it); gone by then,
+//!   and `cp -p` keep a file's mtime, so a round moved aside with
+//!   `mkdir` and `mv` after the bundle reads as older than it); gone by then,
 //!   nothing; it cannot be read, a mismatch; else a mismatch (the backup
 //!   lacks a file older than it, under this path or any other). A manifest
 //!   file whose path is gone live stays removed since, even when its copy
@@ -863,7 +863,10 @@ mod tests {
                 line.ends_with("is not in the backup, under this path or any other"),
                 "{line}"
             );
-            assert!(!line.contains("KEPT") && !line.contains("never bundled"), "{line}");
+            assert!(
+                !line.contains("KEPT") && !line.contains("never bundled"),
+                "{line}"
+            );
         }
         assert!(compared.line(&live).contains(
             "1 the same, 0 changed since, 2 removed since, 0 made since, 3 moved or copied since"
