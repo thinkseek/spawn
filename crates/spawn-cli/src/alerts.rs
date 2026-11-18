@@ -8582,6 +8582,231 @@ connections\n";
     /// An alert clears only on evidence after what it fired on, whatever
     /// restarts (objective 050): the step meets a history with a halt, its
     /// resume and a second halt, two dumps and a good then a failed drill.
+    /// Objective 193: `archive_failed`, from the archive's events
+    /// (alerts/archives.rs).
+    mod archive_failed {
+        use super::super::{Event, Monitor};
+        use super::{commit, decided, fires, monitor};
+        use serde_json::{Value, json};
+
+        fn failed(id: i64, native: &str, reason: &str) -> Value {
+            json!({"event_id": id, "name": "archive.failed", "agent_id": "agent_a",
+                   "session_id": "session_a", "at_ms": 1_763_200_000_000_i64 + id,
+                   "native": native, "reason": reason})
+        }
+
+        fn resumed(id: i64, native: &str) -> Value {
+            json!({"event_id": id, "name": "archive.resumed", "agent_id": "agent_a",
+                   "session_id": "session_a", "at_ms": 1_763_200_000_000_i64 + id,
+                   "native": native, "reason": null})
+        }
+
+        /// One read of `rows`, each event's transitions recorded before the
+        /// next is applied, as the step's flush does: what was recorded.
+        fn read(monitor: &mut Monitor, rows: &[Value]) -> Vec<Event> {
+            let mut recorded = Vec::new();
+            let mut lines = Vec::new();
+            monitor.archives_read(Ok(json!(rows)), &mut lines, |monitor, events, _| {
+                let events = decided(monitor, events);
+                commit(monitor, &events);
+                recorded.extend(events);
+            });
+            assert!(lines.is_empty(), "{lines:?}");
+            recorded
+        }
+
+        fn clears(events: &[Event]) -> Vec<&str> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Clear { key, .. } => Some(key.as_str()),
+                    Event::Fire { .. } => None,
+                })
+                .collect()
+        }
+
+        fn open(monitor: &Monitor) -> Vec<&str> {
+            monitor
+                .known
+                .iter()
+                .filter(|(_, row)| row.open() && row.kind == "archive_failed")
+                .map(|(key, _)| key.as_str())
+                .collect()
+        }
+
+        /// A failure fires once, with its line and evidence; a repeat and a
+        /// new reason fire nothing more; another transcript is its own
+        /// occurrence; a resume clears its transcript's alert only.
+        #[test]
+        fn a_failure_fires_once_and_its_resume_clears_it() {
+            let mut monitor = monitor();
+            let first = read(
+                &mut monitor,
+                &[failed(
+                    10,
+                    "n1",
+                    "the credential mask: /c/spawn.env is unreadable",
+                )],
+            );
+            assert_eq!(fires(&first), ["archive_failed:agent_a:n1:10"]);
+            let Event::Fire {
+                subject,
+                evidence,
+                text,
+                notice,
+                ..
+            } = &first[0]
+            else {
+                panic!("a fire");
+            };
+            assert_eq!(subject, "agent_a");
+            assert!(!notice);
+            assert_eq!(evidence["session_id"], "session_a");
+            assert_eq!(evidence["native"], "n1");
+            assert_eq!(evidence["event_id"], 10);
+            assert_eq!(evidence["since_ms"], 1_763_200_000_010_i64);
+            assert_eq!(
+                text,
+                "the transcript archive of agent_a (session session_a, native session n1) copies \
+                 nothing: the credential mask: /c/spawn.env is unreadable; unarchived since \
+                 2025-11-15 09:46:40 UTC; at risk from Claude Code's cleanup"
+            );
+            let again = read(
+                &mut monitor,
+                &[
+                    failed(11, "n1", "the credential mask: /c/spawn.env is unreadable"),
+                    failed(12, "n1", "another reason"),
+                ],
+            );
+            assert!(again.is_empty(), "one occurrence, one alert: {again:?}");
+            let other = read(&mut monitor, &[failed(13, "n2", "a reason")]);
+            assert_eq!(fires(&other), ["archive_failed:agent_a:n2:13"]);
+            let ended = read(&mut monitor, &[resumed(14, "n1")]);
+            assert_eq!(clears(&ended), ["archive_failed:agent_a:n1:10"]);
+            let Event::Clear { evidence, .. } = &ended[0] else {
+                panic!("a clear");
+            };
+            assert_eq!(evidence["event_id"], 14);
+            assert_eq!(open(&monitor), ["archive_failed:agent_a:n2:13"]);
+            assert!(read(&mut monitor, &[resumed(15, "n1")]).is_empty());
+        }
+
+        /// A transcript that fails again after its resume is a new
+        /// occurrence, open, under its own key.
+        #[test]
+        fn a_transcripts_new_failure_after_its_resume_stays_open() {
+            let mut monitor = monitor();
+            read(&mut monitor, &[failed(10, "n1", "a"), resumed(11, "n1")]);
+            assert!(open(&monitor).is_empty());
+            let again = read(&mut monitor, &[failed(12, "n1", "a")]);
+            assert_eq!(fires(&again), ["archive_failed:agent_a:n1:12"]);
+            assert!(read(&mut monitor, &[failed(13, "n1", "a")]).is_empty());
+            assert_eq!(open(&monitor), ["archive_failed:agent_a:n1:12"]);
+        }
+
+        /// A restarted step reads from the first event and rebuilds its
+        /// occurrences: one still failing (said again by a restarted
+        /// Bridge) fires nothing a second time, one resumed while the loop
+        /// was down clears.
+        #[test]
+        fn a_restarted_step_rebuilds_its_occurrences_from_every_event() {
+            let mut before = monitor();
+            let recorded = read(&mut before, &[failed(10, "n1", "a"), failed(11, "n2", "b")]);
+            assert_eq!(recorded.len(), 2);
+            let mut restarted = monitor();
+            commit(&mut restarted, &recorded);
+            let rebuilt = read(
+                &mut restarted,
+                &[
+                    failed(10, "n1", "a"),
+                    failed(11, "n2", "b"),
+                    failed(12, "n2", "b"),
+                    resumed(13, "n1"),
+                ],
+            );
+            assert!(fires(&rebuilt).is_empty(), "nothing twice: {rebuilt:?}");
+            assert_eq!(clears(&rebuilt), ["archive_failed:agent_a:n1:10"]);
+            assert_eq!(open(&restarted), ["archive_failed:agent_a:n2:11"]);
+            assert!(read(&mut restarted, &[failed(14, "n2", "b")]).is_empty());
+        }
+
+        /// cc-astra A79: the events of one read are applied in order: a
+        /// resume clears its transcript's open alert at once, and a failure
+        /// after it in the same read is a new occurrence, the clear
+        /// standing; so too for a restarted step reading every event.
+        #[test]
+        fn a_resume_then_a_failure_in_one_read_clears_the_old_alert_and_fires_the_new() {
+            let mut monitor = monitor();
+            let first = read(&mut monitor, &[failed(10, "n1", "a")]);
+            let both = read(&mut monitor, &[resumed(11, "n1"), failed(12, "n1", "a")]);
+            assert_eq!(clears(&both), ["archive_failed:agent_a:n1:10"]);
+            assert_eq!(fires(&both), ["archive_failed:agent_a:n1:12"]);
+            assert_eq!(open(&monitor), ["archive_failed:agent_a:n1:12"]);
+            let mut restarted = super::monitor();
+            commit(&mut restarted, &first);
+            let rebuilt = read(
+                &mut restarted,
+                &[
+                    failed(10, "n1", "a"),
+                    resumed(11, "n1"),
+                    failed(12, "n1", "a"),
+                ],
+            );
+            assert_eq!(clears(&rebuilt), ["archive_failed:agent_a:n1:10"]);
+            assert_eq!(fires(&rebuilt), ["archive_failed:agent_a:n1:12"]);
+            assert_eq!(open(&restarted), ["archive_failed:agent_a:n1:12"]);
+        }
+
+        /// rev-g n2: a read of the archive's events that failed is said and
+        /// due again at the next check, and the next read applies its
+        /// events; a read that succeeded is not due again by itself.
+        #[test]
+        fn a_failed_archive_read_is_due_again_and_the_next_applies_its_events() {
+            let mut monitor = monitor();
+            assert!(monitor.archives_due, "due at the first check");
+            let mut lines = Vec::new();
+            monitor.archives_read(
+                Err("connection reset".to_string()),
+                &mut lines,
+                |_, _, _| {
+                    panic!("nothing to record");
+                },
+            );
+            assert_eq!(
+                lines,
+                ["alerts: read the transcript archive's events: connection reset"]
+            );
+            assert!(monitor.archives_due, "due again");
+            assert_eq!(monitor.archives_after, 0, "read again from where it was");
+            let recorded = read(&mut monitor, &[failed(10, "n1", "a")]);
+            assert_eq!(fires(&recorded), ["archive_failed:agent_a:n1:10"]);
+            assert!(!monitor.archives_due);
+            assert_eq!(monitor.archives_after, 10);
+        }
+
+        /// The reason is scrubbed: a password in a URL is never in the text
+        /// or the evidence.
+        #[test]
+        fn the_archive_failure_reason_is_scrubbed_in_the_line() {
+            let mut monitor = monitor();
+            let recorded = read(
+                &mut monitor,
+                &[failed(
+                    10,
+                    "n1",
+                    "copy to postgres://spawn:hunter2secret@db/spawn failed",
+                )],
+            );
+            let Event::Fire { evidence, text, .. } = &recorded[0] else {
+                panic!("a fire");
+            };
+            for said in [text.clone(), evidence.to_string()] {
+                assert!(!said.contains("hunter2secret"), "{said}");
+                assert!(said.contains("postgres://spawn:***@db/spawn"), "{said}");
+            }
+        }
+    }
+
     mod restarts {
         use super::super::Monitor;
         use super::settings;
@@ -9600,6 +9825,88 @@ connections\n";
                 assert_eq!(orphan.len(), 1, "the up with no down known: {orphan:?}");
                 assert_eq!(orphan[0].0, key);
                 assert_eq!(orphan[0].1["event_id"], up);
+            });
+        }
+
+        /// cc-astra A80: the archive's events are read at the first check
+        /// even on a log that does not move, so a failure recorded before
+        /// the step started fires then; one recorded after a read that
+        /// succeeded fires at the next check, the log having moved; and its
+        /// resume clears it.
+        #[test]
+        fn a_step_started_on_a_quiet_log_reads_the_archive_events_once() {
+            in_schema("archive_failed", |store| {
+                let mut worker = Session::new("archivist");
+                worker.started(store);
+                let failure = worker.append(
+                    store,
+                    Source::Bridge,
+                    EventKind::ArchiveFailed {
+                        native: "native_one".to_string(),
+                        reason: "the credential mask: /cred/spawn.env is unreadable".to_string(),
+                    },
+                );
+                let archive_alerts = |state: &str| -> Vec<Value> {
+                    store
+                        .alerts(0)
+                        .expect("the alerts")
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|row| row["kind"] == "archive_failed" && row["state"] == state)
+                        .cloned()
+                        .collect()
+                };
+                let mut monitor = monitor();
+                monitor.check(store).expect("the step checks");
+                let open = archive_alerts("open");
+                assert_eq!(open.len(), 1, "fired at the first check: {open:?}");
+                assert_eq!(
+                    open[0]["key"],
+                    format!("archive_failed:agent_archivist:native_one:{failure}")
+                );
+                assert_eq!(open[0]["subject"], "agent_archivist");
+                assert!(
+                    open[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("/cred/spawn.env")
+                            && text.contains("at risk from Claude Code's cleanup")),
+                    "{open:?}"
+                );
+                assert!(!monitor.archives_due, "read once");
+                monitor.check(store).expect("the step checks");
+                assert_eq!(archive_alerts("open").len(), 1);
+                let second = worker.append(
+                    store,
+                    Source::Bridge,
+                    EventKind::ArchiveFailed {
+                        native: "native_two".to_string(),
+                        reason: "the archive is held".to_string(),
+                    },
+                );
+                monitor.check(store).expect("the step checks");
+                let open = archive_alerts("open");
+                assert_eq!(open.len(), 2, "fired at the next check: {open:?}");
+                assert!(open.iter().any(|row| row["key"]
+                    == format!("archive_failed:agent_archivist:native_two:{second}")));
+                let resumed = worker.append(
+                    store,
+                    Source::Bridge,
+                    EventKind::ArchiveResumed {
+                        native: "native_one".to_string(),
+                        copied: 120,
+                    },
+                );
+                monitor.check(store).expect("the step checks");
+                let cleared = archive_alerts("cleared");
+                assert_eq!(cleared.len(), 1, "{cleared:?}");
+                assert_eq!(cleared[0]["cleared_evidence"]["event_id"], resumed);
+                assert_eq!(archive_alerts("open").len(), 1);
+                // A restarted step rebuilds both: nothing fires again.
+                let mut restarted = super::monitor();
+                restarted.check(store).expect("the step checks");
+                assert_eq!(archive_alerts("open").len(), 1);
+                assert_eq!(archive_alerts("cleared").len(), 1);
             });
         }
 
