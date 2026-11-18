@@ -111,7 +111,7 @@ pub(super) fn no_part(newest: &BundleRecord) -> Option<String> {
 
 /// One file of a notes manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct File_ {
+pub(super) struct NoteFile {
     pub(super) path: String,
     pub(super) size: u64,
     pub(super) sha256: String,
@@ -121,7 +121,7 @@ pub(super) struct File_ {
 /// links of the chain gave them, and what the newest manifest says apart.
 #[derive(Debug, Default)]
 pub(super) struct Restored {
-    pub(super) files: Vec<File_>,
+    pub(super) files: Vec<NoteFile>,
     pub(super) bytes: u64,
     pub(super) links: usize,
     /// The newest manifest's `skipped` and `changed_during_read`.
@@ -263,7 +263,7 @@ pub(super) fn restore(
             ));
         }
         out.bytes += size;
-        out.files.push(File_ {
+        out.files.push(NoteFile {
             path: named.to_string(),
             size,
             sha256,
