@@ -280,7 +280,7 @@ mod tests {
                 {"role": "x", "bytes": 9, "schemas": 1},
             ],
             "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
-            "disk_fall_bytes_per_day": 2_000_000,
+            "disk_fall_bytes_per_day": 2_000_000, "disk_fall_basis": "day",
             "grew_most": {"store": "unattributed", "bytes_per_day": 1_500_000},
         });
         let readings = lines(
@@ -343,6 +343,26 @@ mod tests {
         assert_eq!(diagnostic("storage.grew_most")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall")["unit"], "bytes_per_day");
         assert_eq!(diagnostic("storage.disk_fall").get("store"), None);
+        // The fall says its basis (objective 222); no other figure does.
+        assert_eq!(diagnostic("storage.disk_fall")["basis"], "day");
+        let with_basis: Vec<&Value> = view["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .chain(
+                view["lines"]
+                    .as_array()
+                    .expect("lines")
+                    .iter()
+                    .flat_map(|line| {
+                        std::iter::once(&line["north_star"])
+                            .chain(line["guardrails"].as_array().into_iter().flatten())
+                    }),
+            )
+            .filter(|figure| figure.get("basis").is_some())
+            .map(|figure| &figure["key"])
+            .collect();
+        assert_eq!(with_basis, [&json!("storage.disk_fall")]);
         // Free disk is the first diagnostic, with no line (objective 182).
         assert_eq!(view["diagnostics"][0]["key"], "storage.free_bytes");
         assert_eq!(view["diagnostics"][0]["value"], 104);
@@ -387,6 +407,10 @@ mod tests {
         let days = figure_json(&measuring[1].north_star, None);
         assert_eq!(days["measuring_since_ms"], 86_400_000);
         assert_eq!(days["state"], "not_collected");
+        // No fall: no basis said (objective 222).
+        let fall = figure_json(&measuring[1].guardrails[7], None);
+        assert_eq!(fall["key"], "storage.disk_fall");
+        assert_eq!(fall.get("basis"), None);
         let grew = figure_json(&measuring[1].guardrails[8], None);
         assert_eq!(
             (grew["value"].clone(), grew.get("store")),
