@@ -4,7 +4,8 @@
 //! pane; nothing of it was recorded, its state lived in its process, and no
 //! view of Spawn showed an alert. The loop now raises its own
 //! (docs/fleet-architecture.md, "Alerts"): each transition is a control
-//! record, `alert.fired` or `alert.cleared`, written through the owner-only
+//! record, `alert.fired` or `alert.cleared` (and `alert.updated`, an open
+//! alert's current text and evidence), written through the owner-only
 //! `spawn_alert_record`, folded into `spawn_alerts` and shown by
 //! `spawn alerts --once`, `spawn alerts --follow` and `GET /api/alerts`.
 //!
@@ -299,7 +300,13 @@
 //!   reads nothing) or more ago. Evidence how many (`old`), how many are
 //!   unverified at all, the bound, the newest of the old landings, the
 //!   listing's start and the reading. One open at a time: more growing old
-//!   while it is open fire nothing. Clears at the first reading with none
+//!   while it is open fire nothing. While it is open, a reading whose count
+//!   (`old`) or newest old landing differs from its evidence records one
+//!   `alert.updated` (objective 219): the same alert, its text and evidence
+//!   as the count is now, with `fired_old`, the count it fired at; a reading
+//!   that finds the same records nothing, and a restarted loop reads the
+//!   evidence back from the table. An update is not a fire: nothing new is
+//!   told. Clears at the first reading with none
 //!   old; a fail recorded after a pass makes an objective unverified
 //!   again, and a later reading fires a new one.
 //! - `message_not_taken`, the session id, key `message_not_taken:<command>`,
