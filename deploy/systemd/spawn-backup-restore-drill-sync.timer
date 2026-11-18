@@ -1,0 +1,13 @@
+[Unit]
+Description=Spawn: daily restore drill of the fleet's notes folder (objective 217)
+
+[Timer]
+# 06:30 local: after the 04:00 bundle (and its retries) and the transcripts
+# drill's 06:15. Installed disabled; enabled after a supervised first run on
+# live (the lead).
+OnCalendar=*-*-* 06:30:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
