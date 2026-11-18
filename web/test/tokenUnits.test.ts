@@ -34,9 +34,11 @@ const answer = {
   ],
 } as unknown as Parameters<typeof unpricedNote>[0];
 
-test("the unpriced note is compact by default and in full with formatTokens", () => {
-  const compact = unpricedNote(answer) ?? "";
-  const exact = unpricedNote(answer, formatTokens) ?? "";
+// Scenario 059 (2) reads costView(answer).unpriced_note for the full count
+// ("275,000"): the note stays in full by default; the page shows the compact twin.
+test("the unpriced note is in full by default and compact with compactCount", () => {
+  const exact = unpricedNote(answer) ?? "";
+  const compact = unpricedNote(answer, compactCount) ?? "";
   assert.match(compact, /^275K of 385K tokens \(71%\) ran on models with no price \(bb-model-y 200K, bb-model-z 75K\)/);
   assert.match(exact, /^275,000 of 385,000 tokens \(71%\) ran on models with no price \(bb-model-y 200,000, bb-model-z 75,000\)/);
   assert.equal(unpricedNote({ total: { tokens: {}, unpriced_tokens: 0 } } as unknown as Parameters<typeof unpricedNote>[0]), null);
@@ -46,12 +48,12 @@ test("the unpriced note is compact by default and in full with formatTokens", ()
 // function, not only by calling unpricedNote directly.
 test("costView carries the note compact and its exact twin; the note's title starts with the exact one", () => {
   const view = costView(answer as Parameters<typeof costView>[0]);
-  assert.match(view.unpriced_note ?? "", /^275K of 385K tokens \(71%\)/);
-  assert.match(view.unpriced_note_exact ?? "", /^275,000 of 385,000 tokens \(71%\)/);
+  assert.match(view.unpriced_note ?? "", /^275,000 of 385,000 tokens \(71%\)/);
+  assert.match(view.unpriced_note_compact ?? "", /^275K of 385K tokens \(71%\)/);
   const title = unpricedNoteTitle(view);
-  assert.equal(title.split("\n\n")[0], view.unpriced_note_exact);
+  assert.equal(title.split("\n\n")[0], view.unpriced_note);
   assert.match(title, /\n\nSPAWN_MODEL_PRICES is a JSON object/);
-  assert.match(unpricedNoteTitle({ unpriced_note_exact: null }), /^SPAWN_MODEL_PRICES is a JSON object/);
+  assert.match(unpricedNoteTitle({ unpriced_note: null }), /^SPAWN_MODEL_PRICES is a JSON object/);
 });
 
 // rev-k n1: the per-model title in full, per landing included.
@@ -64,6 +66,8 @@ test("a model's cost line is titled with every count in full", () => {
 test("the pages use those titles: the cost note's and the scorecard's", () => {
   const page = readFileSync(new URL("../src/components/cost/CostView.tsx", import.meta.url), "utf8");
   assert.match(page, /title=\{unpricedNoteTitle\(figures\)\}/);
+  // The page shows the compact note.
+  assert.match(page, /\{figures\.unpriced_note_compact \?\? figures\.unpriced_note\}/);
   const scorecard = readFileSync(new URL("../src/scorecard.ts", import.meta.url), "utf8");
   assert.match(scorecard, /\{ label: "tokens", value: compactCount\(d\.tokens\), title: `\$\{formatDecimal\(d\.tokens, 0\)\} tokens` \}/);
   assert.match(scorecard, /title: modelCostTitle\(model, entry\.tokens, entry\.per_landed\)/);

@@ -157,7 +157,7 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
           title={unpricedNoteTitle(figures)}
           className="px-4 pt-2 text-caption text-warning"
         >
-          {figures.unpriced_note}
+          {figures.unpriced_note_compact ?? figures.unpriced_note}
         </p>
       )}
       {figures?.since && (

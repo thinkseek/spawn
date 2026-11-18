@@ -172,8 +172,10 @@ export interface CostView {
    * which models, and how to price them (SPAWN_MODEL_PRICES); null when
    * every token is priced. */
   unpriced_note: string | null;
-  /** The same note with every count in full ("275,000"), for its title. */
-  unpriced_note_exact: string | null;
+  /** The same note with its counts compact ("275K of 385K tokens"), as the
+   * page shows it (t505u P4); `unpriced_note` keeps them in full (scenario
+   * 059 reads it) and is the note's title. */
+  unpriced_note_compact: string | null;
   /** "<dollars> per landing (<n> landed)", or "no landing in the window". */
   per_landing: string;
   missions: Row[];
@@ -338,15 +340,15 @@ function missionName(entry: CostMission): string | null {
   return typeof name === "string" && name.trim() !== "" ? name : null;
 }
 
-/** The window's note on what no price counts, said once: "275K of 385K
- * tokens (71%) ran on models with no price (bb-model-z): their
+/** The window's note on what no price counts, said once: "275,000 of
+ * 385,000 tokens (71%) ran on models with no price (bb-model-z): their
  * cost is not in these figures. Price them in SPAWN_MODEL_PRICES." Each
  * unpriced model is named, with its count when there are several; a priced
- * model is not. Counts are compact (`say`, [`compactCount`]); pass
- * [`formatTokens`] for the same note in full. Null when every token is priced. */
+ * model is not. Counts are in full (`say`, [`formatTokens`]); pass
+ * [`compactCount`] for the same note compact. Null when every token is priced. */
 export function unpricedNote(
   answer: Partial<CostAnswer> | null | undefined,
-  say: (tokens: number) => string = compactCount,
+  say: (tokens: number) => string = formatTokens,
 ): string | null {
   const unpriced = count(answer?.total?.unpriced_tokens);
   if (unpriced <= 0) return null;
@@ -404,12 +406,12 @@ export function countedSince(answer: Partial<CostAnswer> | null | undefined): st
  * the window; and since when the record counts, when the window starts
  * before it. */
 /** The title of the cost page's unpriced note (t505u P4): the note with
- * every count in full (`unpriced_note_exact`), a blank line, then how to
- * price a model. The page shows the note compact; this keeps it exact. */
-export function unpricedNoteTitle(view: Pick<CostView, "unpriced_note_exact">): string {
+ * every count in full (`unpriced_note`), a blank line, then how to price a
+ * model. The page shows the note compact; this keeps it exact. */
+export function unpricedNoteTitle(view: Pick<CostView, "unpriced_note">): string {
   const hint =
     "SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set.";
-  return view.unpriced_note_exact ? `${view.unpriced_note_exact}\n\n${hint}` : hint;
+  return view.unpriced_note ? `${view.unpriced_note}\n\n${hint}` : hint;
 }
 
 export function costView(answer: Partial<CostAnswer> | null | undefined): CostView {
@@ -422,7 +424,7 @@ export function costView(answer: Partial<CostAnswer> | null | undefined): CostVi
     total: total.usd,
     unpriced: total.unpriced,
     unpriced_note: unpricedNote(answer),
-    unpriced_note_exact: unpricedNote(answer, formatTokens),
+    unpriced_note_compact: unpricedNote(answer, compactCount),
     per_landing: perLanding(answer),
     missions: missions.rows,
     tasks: tasks.rows.slice(0, TOP_ROWS),
