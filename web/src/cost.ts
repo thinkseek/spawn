@@ -168,6 +168,8 @@ export interface CostView {
    * which models, and how to price them (SPAWN_MODEL_PRICES); null when
    * every token is priced. */
   unpriced_note: string | null;
+  /** The same note with every count in full ("275,000"), for its title. */
+  unpriced_note_exact: string | null;
   /** "<dollars> per landing (<n> landed)", or "no landing in the window". */
   per_landing: string;
   missions: Row[];
@@ -202,6 +204,10 @@ export function formatUsd(usd: number | null): string {
   return DOLLARS.format(usd);
 }
 
+import { compactCount } from "./format.ts";
+
+export { compactCount };
+
 const TOKENS = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
 /** A token count grouped the "en-US" way ("275,000"). */
@@ -216,30 +222,6 @@ export function unpricedText(tokens: number): string | null {
   return `+ ${formatTokens(tokens)} token${tokens === 1 ? "" : "s"} unpriced`;
 }
 
-/** A count's step: its divisor and its letter. */
-const STEPS: ReadonlyArray<[number, string]> = [
-  [1e3, "K"],
-  [1e6, "M"],
-  [1e9, "B"],
-];
-
-/** A count made compact: "950", "55K", "1.1M", "17M", "485M", "1.5B"; one
- * decimal under 10, whole from 10, K, M or B by thousands. It is rounded
- * first and the step picked after, so 9,960 is "10K" and 999,600 "1.0M". */
-export function compactCount(value: number): string {
-  const n = Number.isFinite(value) ? Math.abs(value) : 0;
-  const sign = Number.isFinite(value) && value < 0 ? "-" : "";
-  const whole = Math.round(n);
-  if (whole < 1000) return `${sign}${whole}`;
-  let said = "";
-  for (const [size, letter] of STEPS) {
-    const scaled = n / size;
-    const rounded = scaled < 10 ? Math.round(scaled * 10) / 10 : Math.round(scaled);
-    said = `${rounded < 10 ? rounded.toFixed(1) : String(rounded)}${letter}`;
-    if (rounded < 1000) break;
-  }
-  return `${sign}${said}`;
-}
 
 /** A row's unpriced badge, short enough to keep its dollars on the page:
  * "+485M unpriced" ([`compactCount`]); null when it has none. */
@@ -357,12 +339,16 @@ function missionName(entry: CostMission): string | null {
   return typeof name === "string" && name.trim() !== "" ? name : null;
 }
 
-/** The window's note on what no price counts, said once: "275,000 of
- * 385,000 tokens (71%) ran on models with no price (bb-model-z): their
+/** The window's note on what no price counts, said once: "275K of 385K
+ * tokens (71%) ran on models with no price (bb-model-z): their
  * cost is not in these figures. Price them in SPAWN_MODEL_PRICES." Each
  * unpriced model is named, with its count when there are several; a priced
- * model is not. Null when every token is priced. */
-export function unpricedNote(answer: Partial<CostAnswer> | null | undefined): string | null {
+ * model is not. Counts are compact (`say`, [`compactCount`]); pass
+ * [`formatTokens`] for the same note in full. Null when every token is priced. */
+export function unpricedNote(
+  answer: Partial<CostAnswer> | null | undefined,
+  say: (tokens: number) => string = compactCount,
+): string | null {
   const unpriced = count(answer?.total?.unpriced_tokens);
   if (unpriced <= 0) return null;
   const all = tokenSum(answer?.total?.tokens);
@@ -378,16 +364,16 @@ export function unpricedNote(answer: Partial<CostAnswer> | null | undefined): st
     .sort((a, b) => b.tokens - a.tokens || a.name.localeCompare(b.name));
   const share = all > 0 ? unpriced / all : 0;
   const percent = share >= 0.01 ? `${Math.round(share * 100)}%` : "under 1%";
-  const of = all >= unpriced && all > 0 ? ` of ${formatTokens(all)} tokens (${percent})` : " tokens";
+  const of = all >= unpriced && all > 0 ? ` of ${say(all)} tokens (${percent})` : " tokens";
   const named =
     models.length === 1
       ? ` (${models[0].name})`
       : models.length > 1
-        ? ` (${models.map((model) => `${model.name} ${formatTokens(model.tokens)}`).join(", ")})`
+        ? ` (${models.map((model) => `${model.name} ${say(model.tokens)}`).join(", ")})`
         : "";
   const noun = models.length === 1 ? "a model" : "models";
   return (
-    `${formatTokens(unpriced)}${of} ran on ${noun} with no price${named}: their cost is not in ` +
+    `${say(unpriced)}${of} ran on ${noun} with no price${named}: their cost is not in ` +
     `these figures. Price ${models.length === 1 ? "it" : "them"} in SPAWN_MODEL_PRICES ` +
     `(US dollars per million tokens: input, output, cache_write, cache_read).`
   );
@@ -428,6 +414,7 @@ export function costView(answer: Partial<CostAnswer> | null | undefined): CostVi
     total: total.usd,
     unpriced: total.unpriced,
     unpriced_note: unpricedNote(answer),
+    unpriced_note_exact: unpricedNote(answer, formatTokens),
     per_landing: perLanding(answer),
     missions: missions.rows,
     tasks: tasks.rows.slice(0, TOP_ROWS),

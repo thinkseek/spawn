@@ -35,7 +35,9 @@ test("zero is zero and a token or more is whole tokens", () => {
 
 test("a model's cost line keeps a small cost per landing", () => {
   assert.equal(modelCostText(1, 0.333), "1 tokens · 0.333 per landing");
-  assert.equal(modelCostText(6100, 2033.333), "6,100 tokens · 2,033 per landing");
+  assert.equal(modelCostText(6100, 2033.333), "6.1K tokens · 2.0K per landing");
+  assert.equal(modelCostText(1_463_163_060, 999.6), "1.5B tokens · 1,000 per landing");
+  assert.equal(modelCostText(485_321_042, 26_129_000), "485M tokens · 26M per landing");
   assert.equal(modelCostText(0, 0), "0 tokens · 0 per landing");
   assert.equal(modelCostText(5, null), "5 tokens · — per landing");
 });

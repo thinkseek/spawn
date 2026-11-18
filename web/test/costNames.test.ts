@@ -94,7 +94,9 @@ test("(b) the compact count: one decimal under 10, whole from 10, rounded before
 
 test("(c) the page's unpriced mark sits on the row's second line, its full count in its title; the dollars never shrink or wrap (objectives 059, 079)", () => {
   const page = readFileSync(new URL("../src/components/cost/CostView.tsx", import.meta.url), "utf8");
-  assert.match(page, /<UnpricedMark key=\{text\} text=\{text\} \/>/);
+  // t505u P4: the mark shows the compact count (row.unpriced_short), the
+  // full one stays in its title (`text`).
+  assert.match(page, /<UnpricedMark key=\{text\} text=\{text\} label=\{row\.unpriced_short \?\? text\} \/>/);
   assert.match(page, /title=\{`\$\{text\}: these tokens ran on a model SPAWN_MODEL_PRICES does not price/);
   assert.match(page, /"tnum ml-auto shrink-0 whitespace-nowrap"/);
   assert.match(page, /first\.label \? "shrink-0" : "min-w-0 truncate"/);

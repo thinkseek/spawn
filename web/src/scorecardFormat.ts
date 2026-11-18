@@ -3,7 +3,7 @@
 // (web/test/scorecardFormat.test.ts); scorecard.ts, which also fetches,
 // cannot be loaded there.
 
-import { localDateTime } from "./format.ts";
+import { compactCount, localDateTime } from "./format.ts";
 
 /** A plain number with at most `digits` decimals, grouped: 2,033.333. */
 export function formatDecimal(value: number | null, digits = 3): string {
@@ -20,10 +20,13 @@ export function formatCost(value: number | null): string {
   return value !== 0 && shown === formatDecimal(0) ? `${value < 0 ? "-" : ""}<0.001` : shown;
 }
 
-/** A model's line of the cost breakdown: "6,100 tokens · 2,033 per
- * landing", "—" per landing below the minimum. */
+/** A model's line of the cost breakdown, its counts compact (t505u P4):
+ * "6.1K tokens · 2.0K per landing"; under 1,000 per landing as
+ * [`formatCost`] says it ("0.333"), "—" below the minimum. The exact
+ * figures are in the line's title (scorecard.ts). */
 export function modelCostText(tokens: number, perLanded: number | null): string {
-  return `${formatDecimal(tokens, 0)} tokens · ${formatCost(perLanded)} per landing`;
+  const per = perLanded !== null && Number.isFinite(perLanded) && Math.abs(perLanded) >= 1000 ? compactCount(perLanded) : formatCost(perLanded);
+  return `${compactCount(tokens)} tokens · ${per} per landing`;
 }
 
 /** A gate time's spending in words: whole minutes under an hour ("35m"),

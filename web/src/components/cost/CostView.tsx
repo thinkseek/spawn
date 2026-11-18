@@ -101,7 +101,7 @@ function Rows({ title, rows, more = null }: { title: string; rows: Row[]; more?:
                     {second.map((text, index) =>
                       // rowLines puts the unpriced mark's text first.
                       index === 0 && row.unpriced_text ? (
-                        <UnpricedMark key={text} text={text} />
+                        <UnpricedMark key={text} text={text} label={row.unpriced_short ?? text} />
                       ) : (
                         <span
                           key={text}
@@ -154,7 +154,7 @@ function WindowCard({ label, figures }: { label: string; figures: Figures | null
       />
       {figures?.unpriced_note && (
         <p
-          title="SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set."
+          title={`${figures.unpriced_note_exact ? `${figures.unpriced_note_exact}\n\n` : ""}SPAWN_MODEL_PRICES is a JSON object from model name to its four rates; set, it replaces the built-in prices whole. A price applies to calls recorded after it is set.`}
           className="px-4 pt-2 text-caption text-warning"
         >
           {figures.unpriced_note}
