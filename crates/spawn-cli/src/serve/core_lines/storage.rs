@@ -105,24 +105,28 @@ pub(super) fn storage_line(storage: &Value) -> Line {
             // from the storage readings (objective 180) `lines_at` sets.
             bytes_per_landing(&storage["readings"]),
             rebuildable_bytes(&storage["readings"]),
-            // Objective 232, a diagnostic: the scratch of landed objectives
-            // by agent and objective, `lines_at` sets from the scratch walk.
-            Figure {
-                note: storage["landed_scratch"]["note"]
-                    .as_str()
-                    .map(str::to_string),
-                by_owner: storage["landed_scratch"]
-                    .get("by_owner")
-                    .filter(|rows| rows.is_array())
-                    .cloned(),
-                ..Figure::new(
-                    "storage.landed_scratch_bytes",
-                    "Scratch of landed objectives",
-                    "bytes",
-                    storage["landed_scratch"]["bytes"].clone(),
-                )
-            },
+            landed_scratch(storage),
         ],
+    }
+}
+
+/// Objective 232, a diagnostic: the scratch of landed objectives by agent
+/// and objective, which `lines_at` sets from the scratch walk
+/// ([`super::unowned::landed_scratch`]), with its note while it has none.
+fn landed_scratch(storage: &Value) -> Figure {
+    let landed = &storage["landed_scratch"];
+    Figure {
+        note: landed["note"].as_str().map(str::to_string),
+        by_owner: landed
+            .get("by_owner")
+            .filter(|rows| rows.is_array())
+            .cloned(),
+        ..Figure::new(
+            "storage.landed_scratch_bytes",
+            "Scratch of landed objectives",
+            "bytes",
+            landed["bytes"].clone(),
+        )
     }
 }
 

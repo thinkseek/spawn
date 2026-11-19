@@ -383,6 +383,15 @@ pub(super) fn scratch_json(
     })
 }
 
+/// One agent's scratch of one landed objective (objective 232): its
+/// pair, bytes, folders, and the folders counted by their build output only.
+struct Owned {
+    pair: (i64, i64),
+    bytes: u64,
+    folders: u64,
+    leased: u64,
+}
+
 /// `storage.landed_scratch_bytes` (objective 232): over `reading`'s claimed
 /// folders whose objective `landed` holds, each folder's bytes, or its
 /// build bytes while its lease runs (a leased folder is never walked whole,
@@ -412,8 +421,7 @@ pub(super) fn landed_scratch(reading: Option<&Reading>, landed: Option<&[(i64, i
     let Some(landed) = landed else {
         return unmeasured("the claimed folders' landings could not be read");
     };
-    // (agent, objective) -> (pair, bytes, folders, leased)
-    let mut rows: BTreeMap<(String, String), ((i64, i64), u64, u64, u64)> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, String), Owned> = BTreeMap::new();
     for folder in &reading.claimed {
         let Some(pair) = folder.claim.pair() else {
             continue;
@@ -423,34 +431,36 @@ pub(super) fn landed_scratch(reading: Option<&Reading>, landed: Option<&[(i64, i
         }
         let row = rows
             .entry((folder.claim.agent.clone(), folder.claim.objective.clone()))
-            .or_insert((pair, 0, 0, 0));
-        row.1 = row
-            .1
+            .or_insert(Owned {
+                pair,
+                bytes: 0,
+                folders: 0,
+                leased: 0,
+            });
+        row.bytes = row
+            .bytes
             .saturating_add(folder.bytes.unwrap_or(folder.build_bytes));
-        row.2 += 1;
+        row.folders += 1;
         if folder.bytes.is_none() {
-            row.3 += 1;
+            row.leased += 1;
         }
     }
-    let mut rows: Vec<_> = rows.into_iter().collect();
-    rows.sort_by(
-        |((agent_a, objective_a), (pair_a, bytes_a, ..)),
-         ((agent_b, objective_b), (pair_b, bytes_b, ..))| {
-            bytes_b
-                .cmp(bytes_a)
-                .then_with(|| agent_a.cmp(agent_b))
-                .then_with(|| pair_a.cmp(pair_b))
-                .then_with(|| objective_a.cmp(objective_b))
-        },
-    );
+    let mut rows: Vec<((String, String), Owned)> = rows.into_iter().collect();
+    rows.sort_by(|((agent_a, objective_a), a), ((agent_b, objective_b), b)| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| agent_a.cmp(agent_b))
+            .then_with(|| a.pair.cmp(&b.pair))
+            .then_with(|| objective_a.cmp(objective_b))
+    });
     let total = rows
         .iter()
-        .fold(0_u64, |sum, (_, (_, bytes, ..))| sum.saturating_add(*bytes));
+        .fold(0_u64, |sum, (_, row)| sum.saturating_add(row.bytes));
     let by_owner: Vec<Value> = rows
         .into_iter()
-        .map(|((agent, objective), (_, bytes, folders, leased))| {
-            json!({"agent": agent, "objective": objective, "bytes": bytes,
-                   "folders": folders, "leased": leased})
+        .map(|((agent, objective), row)| {
+            json!({"agent": agent, "objective": objective, "bytes": row.bytes,
+                   "folders": row.folders, "leased": row.leased})
         })
         .collect();
     json!({"bytes": total, "by_owner": by_owner, "note": null})
