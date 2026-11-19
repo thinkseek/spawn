@@ -299,6 +299,8 @@ mod tests {
             "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
             "disk_fall_bytes_per_day": 2_000_000, "disk_fall_basis": "day",
             "grew_most": {"store": "unattributed", "bytes_per_day": 1_500_000},
+            "landed_scratch": {"bytes": 12_000, "note": null, "by_owner": [
+                {"agent": "rev-e", "objective": "1/007", "bytes": 12_000, "folders": 1, "leased": 0}]},
         });
         let readings = lines(
             &storage,
@@ -343,6 +345,8 @@ mod tests {
                 // Objective 185: no storage readings here, no value.
                 ("storage.bytes_per_landing", Value::Null),
                 ("storage.rebuildable_bytes", Value::Null),
+                // Objective 232: the scratch of landed objectives.
+                ("storage.landed_scratch_bytes", json!(12_000)),
             ]
         );
         // The store that grew most is said beside it (objective 141), now a
