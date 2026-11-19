@@ -20,6 +20,13 @@ pub enum RulesVerdict {
         /// Decided state.
         state: SemanticState,
     },
+    /// The engine stopped its turn at its prompt with a question for a
+    /// person (a `HUMAN:` line in its reply): BLOCKED, settled without a
+    /// model. It is still a turn stopped at the prompt, so the observation
+    /// keeps [`Ambiguity::TurnStoppedIdle`], which the dispatcher, the
+    /// delivery and the attention view key on, as a model's BLOCKED of the
+    /// same turn did.
+    Asks,
     /// The facts leave several states open.
     Ambiguous {
         /// Why.
@@ -47,7 +54,7 @@ pub fn rules(input: &JudgeInput) -> RulesVerdict {
 
 /// Rules for a session whose execution is running.
 fn live_execution(input: &JudgeInput) -> RulesVerdict {
-    use RulesVerdict::{Ambiguous, Certain};
+    use RulesVerdict::{Ambiguous, Asks, Certain};
     // A permission dialog is a fact only while its pane exists.
     if input.permission_pending || input.screen == Some(ScreenState::Permission) {
         return Certain {
@@ -98,19 +105,13 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
     // The engine wrote a question for a person and stopped at its prompt: a
     // question is a fact of the reply, not something a model decides.
     if at_prompt(input) && input.reply.as_deref().and_then(human_question).is_some() {
-        return Certain {
-            state: SemanticState::Blocked,
-        };
+        return Asks;
     }
-    // A session that never ends (the supervisor) at its prompt waits for the
-    // next prompt. Its COMPLETED is folded into WAITING anyway, so a model
-    // can only say Waiting or Blocked here, and a Blocked one is the question
-    // the rule above already settles.
-    if at_prompt(input) && input.perpetual {
-        return Certain {
-            state: SemanticState::Waiting,
-        };
-    }
+    // A session that never ends (the supervisor) at its prompt with no
+    // question still goes to the model: its judgement carries `stuck` and
+    // `needs_human`, which the alert step's agent_stuck and the attention
+    // view's untagged ask read (objectives 057, 064, 070, 078). Its
+    // COMPLETED is folded into WAITING after the narrowing.
     if at_prompt(input) {
         return Ambiguous {
             ambiguity: Ambiguity::TurnStoppedIdle,
@@ -130,7 +131,7 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
 }
 
 /// The turn stopped, or the pane waits at its prompt.
-fn at_prompt(input: &JudgeInput) -> bool {
+pub(super) fn at_prompt(input: &JudgeInput) -> bool {
     input.turn == Some(TurnFact::Stopped) || input.screen == Some(ScreenState::Ready)
 }
 

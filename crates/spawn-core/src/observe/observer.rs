@@ -22,7 +22,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::classify::{RulesVerdict, attention_reason, exited_failing, narrow, rules, wait_reason};
+use super::classify::{
+    RulesVerdict, at_prompt, attention_reason, exited_failing, narrow, rules, wait_reason,
+};
 use super::judge::{JudgeInput, StateJudge};
 use super::snapshot::Snapshot;
 use super::{RECHECK_EVERY, RETRY_BASE, RETRY_MAX, SETTLE};
@@ -359,23 +361,30 @@ impl Observer {
             return Ok(0);
         };
         let mut input = tracked.snapshot.input(&tracked.agent_id, session, now);
-        // The reply and whether the session never ends are facts two rules
-        // settle cases with (a `HUMAN:` question, a perpetual session at its
-        // prompt); attach them before the rules run, so those cases cost no
-        // model call. What a model would be shown is unchanged.
-        attach_context(
-            &mut input,
-            self.context.as_deref(),
-            session,
-            tracked.snapshot.transcript(),
-        );
+        // The reply is the one fact a rule settles a case with (a `HUMAN:`
+        // question at the prompt), so it is read before the rules, and only
+        // at the prompt: a session there was always ambiguous, and its reply
+        // was read for the model anyway. A working session reads nothing; the
+        // rest of the context is attached on the ambiguous path, as before.
+        if at_prompt(&input) {
+            attach_reply(
+                &mut input,
+                self.context.as_deref(),
+                tracked.snapshot.transcript(),
+            );
+        }
         let agent = tracked.agent_id.clone();
         let seq = tracked.snapshot.evidence_seq;
 
         let classified = match rules(&input) {
             RulesVerdict::Certain { state } => Self::certain(state, &input, seq),
+            RulesVerdict::Asks => {
+                let mut asks = Self::certain(SemanticState::Blocked, &input, seq);
+                asks.observation.ambiguity = Some(Ambiguity::TurnStoppedIdle);
+                asks
+            }
             RulesVerdict::Ambiguous { ambiguity, guess } => {
-                self.ambiguous(tracked, input, ambiguity, guess, seq)
+                self.ambiguous(tracked, session, input, ambiguity, guess, seq)
             }
         };
         let Classified {
@@ -457,14 +466,19 @@ impl Observer {
     fn ambiguous(
         &self,
         tracked: &Tracked,
+        session: &SessionId,
         mut input: JudgeInput,
         ambiguity: Ambiguity,
         guess: SemanticState,
         seq: SessionSeq,
     ) -> Classified {
         input.ambiguity = Some(ambiguity);
-        // `attach_context` ran in `observe`, before the rules: the input
-        // arrives with the reply attached.
+        attach_context(
+            &mut input,
+            self.context.as_deref(),
+            session,
+            tracked.snapshot.transcript(),
+        );
         let fingerprint = fingerprint_of(&input, tracked.snapshot.progress_seq);
         if tracked.failures == 0 && tracked.asked.as_deref() == Some(fingerprint.as_str()) {
             let standing = tracked
@@ -633,8 +647,23 @@ fn attach_context(
     input.task = context
         .task(session)
         .map(|text| head_chars(&text, TASK_CHARS));
-    input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
+    // At the prompt `observe` read the reply before the rules already.
+    if !at_prompt(input) {
+        input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
+    }
     input.perpetual = context.perpetual(session);
+}
+
+/// Read the session's latest reply from its transcript, the fact the
+/// `HUMAN:` rule needs. Without a context it stays empty.
+fn attach_reply(
+    input: &mut JudgeInput,
+    context: Option<&dyn ObservationContext>,
+    transcript: Option<(&WorkspaceId, &str)>,
+) {
+    if let Some(context) = context {
+        input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
+    }
 }
 
 /// The question for a person in the model's latest reply, without the tag:
@@ -642,7 +671,8 @@ fn attach_context(
 /// wrote since the last prompt, so a question someone answered is no longer
 /// in it.
 fn human_question(reply: &str) -> Option<String> {
-    super::classify::human_question(reply).map(|question| head_chars(question.trim(), QUESTION_CHARS))
+    super::classify::human_question(reply)
+        .map(|question| head_chars(question.trim(), QUESTION_CHARS))
 }
 
 /// Stable digest of what the model is shown (FNV-1a over its JSON), so a

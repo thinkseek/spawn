@@ -1276,6 +1276,29 @@ mod tests {
         )
     }
 
+    /// The observation the Observer writes when a rule settles the
+    /// supervisor's `HUMAN:` question (judge "rules", BLOCKED, no
+    /// needs_human, the question kept, a turn stopped at its prompt): the
+    /// page shows the question (rev-f F2 and rev-i F2 on t515u).
+    #[test]
+    fn a_question_settled_by_rule_is_shown() {
+        let ruled = json!({
+            "state": "BLOCKED", "reason": null, "based_on_seq": 1351, "confidence": 1.0,
+            "judge": "rules", "ambiguity": "turn_stopped_idle", "needs_human": null,
+            "stuck": null, "attention": true, "attention_reason": "human_question",
+            "human_question": "which region?",
+        });
+        let supervisor = facts(&row(
+            "session_supervisor",
+            "agent_supervisor",
+            &ruled,
+            NOW - 60_000,
+        ));
+        assert!(supervisor.observation.is_some(), "the row parses");
+        assert!(asking(&supervisor).is_some(), "asked, of this turn");
+        assert!(asks(&supervisor, None).is_some(), "and shown");
+    }
+
     #[test]
     fn a_supervisor_blocked_at_its_prompt_shows_its_question() {
         let (rows, work, host) = situation();

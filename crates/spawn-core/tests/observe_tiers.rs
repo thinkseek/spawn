@@ -796,10 +796,19 @@ impl ObservationContext for Perpetual {
     }
 }
 
-/// An idle supervisor waits for the next prompt: a fact, not a model call.
+/// An idle supervisor with no question still goes to the model: its
+/// `stuck` and `needs_human` are what the alert step's agent_stuck and the
+/// attention view's untagged ask read (objectives 057, 064, 070, 078). The
+/// observation stays a turn stopped at its prompt.
 #[test]
-fn a_perpetual_session_at_its_prompt_is_waiting_without_a_model() {
-    let judge = Scripted::new(Ok(blocked_answer()));
+fn an_idle_perpetual_session_is_still_judged_for_its_stuck_reading() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Waiting,
+        confidence: confidence(0.9),
+        probabilities: None,
+        needs_human: Some(0.1),
+        stuck: Some(0.9),
+    }));
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
@@ -812,9 +821,10 @@ fn a_perpetual_session_at_its_prompt_is_waiting_without_a_model() {
     turn_stopped(&store);
     observer.tick().expect("tick");
     let last = observations(&store).pop().expect("an observation");
+    assert_eq!(judge.calls(), 1, "an idle supervisor is judged");
     assert_eq!(last.state, SemanticState::Waiting);
-    assert_eq!(last.judge, "rules");
-    assert_eq!(judge.calls(), 0, "an idle supervisor needs no model");
+    assert_eq!(last.stuck, Some(0.9));
+    assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
 }
 
 /// A `HUMAN:` question in the reply is a fact: the session is blocked without
@@ -840,6 +850,72 @@ fn a_question_for_a_person_blocks_without_a_model() {
     assert_eq!(last.human_question.as_deref(), Some("which region?"));
     assert!(last.attention);
     assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
+    // Still a turn stopped at its prompt, as a model's BLOCKED of it was:
+    // the dispatcher, the delivery and the attention view key on it.
+    assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+}
+
+/// A context that counts what the Observer reads from it.
+#[derive(Default)]
+struct Counting {
+    screen: AtomicUsize,
+    task: AtomicUsize,
+    reply: AtomicUsize,
+}
+
+impl ObservationContext for Counting {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        self.screen.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        self.task.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        self.reply.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+/// The context's reads (a terminal capture, the task and the transcript)
+/// are paid where they were before the `HUMAN:` rule: a working session
+/// reads none of them, and a session at its prompt reads each once.
+#[test]
+fn a_working_session_reads_no_context_and_a_prompt_reads_each_once() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let counting = Arc::new(Counting::default());
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(clock)
+        .with_context(counting.clone());
+    started(&store);
+    native(&store);
+    tool_started(&store, "t1");
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    let reads = |c: &Counting| {
+        (
+            c.screen.load(Ordering::SeqCst),
+            c.task.load(Ordering::SeqCst),
+            c.reply.load(Ordering::SeqCst),
+        )
+    };
+    assert_eq!(
+        reads(&counting),
+        (0, 0, 0),
+        "a working session reads nothing"
+    );
+    tool_completed(&store, "t1");
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    assert_eq!(reads(&counting), (1, 1, 1), "at its prompt, each once");
 }
 
 /// A session that never ends has its COMPLETED folded into WAITING, and the
