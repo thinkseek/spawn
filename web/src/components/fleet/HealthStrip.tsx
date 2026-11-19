@@ -276,7 +276,14 @@ export function StorageCard({
 }
 
 /** The storage diagnostics (objective 176): each figure's name, value and
- * range, the out-of-range ones in the warning tone. Nothing without any. */
+ * range, the out-of-range ones in the warning tone. Nothing without any.
+ *
+ * A name wraps rather than truncates (objective 227): what it says can sit
+ * at its end (225's basis, "Free disk lost a day (the last day's fall)"),
+ * and on a phone's one column (the viewport less 56 px) a cut name loses
+ * it. The value stays whole on the name's first line (`shrink-0`, the row
+ * `items-baseline`). Not a title: a phone has no hover, and the row's title
+ * is already its range. */
 function DiagnosticRows({ diagnostics }: { diagnostics: CoreMark[] }) {
   if (diagnostics.length === 0) return null;
   return (
@@ -284,7 +291,7 @@ function DiagnosticRows({ diagnostics }: { diagnostics: CoreMark[] }) {
       <li className="text-micro font-medium text-faint-foreground">Diagnostics</li>
       {diagnostics.map((mark) => (
         <li key={mark.name} className="flex min-w-0 items-baseline gap-2" title={mark.range !== "" ? mark.range : undefined}>
-          <span className="min-w-0 truncate text-muted-foreground">{mark.name}</span>
+          <span className="min-w-0 text-pretty text-muted-foreground">{mark.name}</span>
           <span
             className={cx(
               "tnum ml-auto shrink-0",
