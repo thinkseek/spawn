@@ -46,3 +46,9 @@ serve::notices::tests::a_notice_is_superseded_by_its_subjects_next_one
 # 209 (rev-e, 11-17): 192 R4's rule (a) flipped (only a reading in range ends a judged stretch, taken or not);
 # the same case, now alerts::guardrails::tests::a_taken_judged_stretch_ends_only_on_a_reading_in_range.
 alerts::guardrails::tests::a_taken_judged_stretch_ends_like_any_other
+# 228 (rev-g, 11-19): the day's fall reads each end as a 6 h window's median, not the one latest
+# sample a day old within 36 h. Both asserted that one-sample rule. Its cases are now
+# serve::core_lines::disk::tests::the_days_fall_ends_are_medians_at_their_mean_times and
+# serve::core_lines::disk::tests::the_days_fall_windows_are_six_hours_each.
+serve::core_lines::disk::tests::the_days_fall_is_from_the_latest_sample_a_day_old_not_the_oldest
+serve::core_lines::disk::tests::the_days_fall_takes_36_hours_exactly_and_nothing_older

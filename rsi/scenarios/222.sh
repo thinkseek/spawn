@@ -12,13 +12,17 @@
 # loop records them, their free disk set against the free disk F the serve
 # reads, "now" the database's clock):
 #   (1) a week rising 10 GB a day up to F + 80 GB a day ago, then falling
-#       through the last day to F: disk_fall is the day's, within 2 GB of
-#       80 GB a day, its basis "day"; the store that grew most (no store
+#       through the last day to F: disk_fall is the day's, its basis "day",
+#       within 2 GB of 70.625 GB a day (objective 228: each end the median of
+#       a 6 h window, a day ago F + 80 - 10 * 2.5 / 24 GB at 26.5 h, now F +
+#       80 * 2.5 / 24 GB at 2.5 h; it was 80 from the one sample a day old);
+#       the store that grew most (no store
 #       measured: unattributed) is the week's fit, under 40 GB a day, never
 #       the day's 80 (R2, rev-e's F1);
-#   (1b) the same, but no sample between 23 h and 29 h ago (the latest a
-#       day old is 30 h old, F + 77.5 GB): 77.5 GB over 30 h, within 2 GB of
-#       62 GB a day, basis "day";
+#   (1b) the same, but no sample between 23 h and 28 h ago (228: was 29 h;
+#       the window a day ago reaches 30 h, so its one reading is 29 h old,
+#       F + 77.92 GB): 69.58 GB over 26.5 h (now's median at 2.5 h), within
+#       2 GB of 63.02 GB a day, basis "day" (it was 77.5 GB over 30 h, 62);
 #   (2) a week falling 10 GB a day down to F - 10 GB a day ago, then rising
 #       through the last day to F: disk_fall is the fit's, above 0 and not
 #       the day's (below 0), its basis "fit";
@@ -29,7 +33,10 @@
 #   (5) two samples only: F + 25 GB at 24 h + 60 s ago (yesterday, UTC) and
 #       F + 10 GB 60 s before today's UTC midnight (yesterday's last
 #       reading): the readings span under a day, so no fit; disk_fall is
-#       the day's, within 2 GB of 25 GB a day, basis "day".
+#       the day's, basis "day", within 2 GB of: 25 GB a day when midnight's
+#       sample is 6 h old or more; under 6 h (228: it is in now's window),
+#       F + 25 less the median of F + 10 and F (F + 5) over the days between
+#       24 h + 60 s and the mean of their ages.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -241,8 +248,9 @@ note "(4) checked: no sample, no value and no basis (F = $F)"
 samples "$F" 80 -10 "$HOUR"
 answer "a week rising, a day falling 80 GB"
 set -- $(fall_said)
-within_gb "$1" $((80 * GB)) ||
-    check_failed "(1) disk_fall after a day that lost 80 GB: expected within 2 GB of $((80 * GB)), got [$1]"
+# 228: the medians of the two 6 h windows (header).
+within_gb "$1" 70625000000 ||
+    check_failed "(1) disk_fall after a day that lost 80 GB: expected within 2 GB of 70625000000 (the windows' medians), got [$1]"
 expect_eq "$2" day "(1) disk_fall's basis after a day that lost 80 GB"
 # No store is measured in this world, so the store that grew most is what
 # none accounts for: the week's fit (a few GB a day), never the day's 80.
@@ -255,12 +263,12 @@ note "(1) checked: a week that rose and a day that lost 80 GB says the day's fal
 
 # --- (1b) the latest day-old sample 30 h old: scaled by the days between ---------------------
 F=$(free_now)
-samples "$F" 80 -10 "$HOUR" $((23 * HOUR)) $((29 * HOUR))
-answer "the latest day-old sample 30 h old"
+samples "$F" 80 -10 "$HOUR" $((23 * HOUR)) $((28 * HOUR))
+answer "the window a day ago holding one sample, 29 h old"
 set -- $(fall_said)
-within_gb "$1" $((62 * GB)) ||
-    check_failed "(1b) disk_fall from a sample 30 h old at F + 77.5 GB: expected within 2 GB of $((62 * GB)), got [$1]"
-expect_eq "$2" day "(1b) disk_fall's basis from a sample 30 h old"
+within_gb "$1" 63019000000 ||
+    check_failed "(1b) disk_fall from one sample 29 h old at F + 77.92 GB: expected within 2 GB of 63019000000, got [$1]"
+expect_eq "$2" day "(1b) disk_fall's basis from one sample 29 h old"
 note "(1b) checked: the day's fall is scaled by the days between"
 
 # --- (2) the week fell, the last day gained 10 GB: the fit's ----------------------------------
@@ -311,8 +319,20 @@ capture psql -d "$SPAWN_DB_NAME" -q -v ON_ERROR_STOP=1 \
 [ "$status" -eq 0 ] || harness "seeding the two samples failed: $(err)"
 answer "two samples, no fit"
 set -- $(fall_said)
-within_gb "$1" $((25 * GB)) ||
-    check_failed "(5) disk_fall with no fit and F + 25 GB a day and a minute ago: expected within 2 GB of $((25 * GB)), got [$1]"
+# 228: midnight's sample is in now's 6 h window when under 6 h old. The
+# serve reads its clock after tod was read; within 2 minutes of that edge
+# the two figures (2 GB apart) cannot be told (R2, rev-b's F2).
+edge=$((tod + 60000 - 6 * HOUR))
+if [ "${edge#-}" -lt $((2 * 60000)) ]; then
+    harness "(5) midnight's sample is within 2 minutes of 6 h old; run again"
+fi
+if [ $((tod + 60000)) -lt $((6 * HOUR)) ]; then
+    want=$((20 * GB * (DAY / 1000) / ((DAY + 60000 - (tod + 60000) / 2) / 1000)))
+else
+    want=$((25 * GB * (DAY / 1000) / ((DAY + 60000) / 1000)))
+fi
+within_gb "$1" "$want" ||
+    check_failed "(5) disk_fall with no fit and F + 25 GB a day and a minute ago: expected within 2 GB of $want, got [$1]"
 expect_eq "$2" day "(5) disk_fall's basis with no fit"
 note "(5) checked: the day's fall is said when the fit has none"
 
