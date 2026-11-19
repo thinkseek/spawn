@@ -1392,25 +1392,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // The integrator's lock, on a connection of its own, before anything is
     // written, kept for the process's life (objective 221).
     let lock = take_lock_at_start(&open_store, LOCK_WAIT)?;
-    // Who this start is (objective 234), on the lock's connection before
-    // anything else is written: a stray is named from the store. A refused
-    // record does not stop the start (the lock keeps a second one out).
-    let started = started_record(
-        Path::new("/proc"),
-        std::process::id(),
-        std::os::unix::process::parent_id(),
-        std::env::current_dir().ok().as_deref(),
-        &Start {
-            gate: &gate,
-            gate_from_env: crate::config::env_value("SPAWN_GATE").is_some(),
-            root: &std::path::absolute(&root).unwrap_or_else(|_| root.clone()),
-            once,
-        },
-    );
-    println!("{}", started_line(&started));
-    if let Err(error) = lock.0.integrator_record(&started) {
-        eprintln!("integrate: cannot record integrator.started: {error}");
-    }
+    record_start(&lock.0, &gate, &root, once);
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
     let gate_env = gate::gate_env(|name| std::env::var(name).ok());
@@ -1572,6 +1554,29 @@ pub(crate) fn gate_refusal(gate: &Path, from_env: bool, cwd: &Path) -> Option<St
     ))
 }
 
+/// Who this start is (objective 234), recorded on the lock's connection
+/// `store` before anything else is written and said on stdout: a stray is
+/// named from the store. A refused record is said on stderr and does not
+/// stop the start (the lock keeps a second integrator out, not the record).
+fn record_start(store: &PostgresStore, gate: &Path, root: &Path, once: bool) {
+    let started = started_record(
+        Path::new("/proc"),
+        std::process::id(),
+        std::os::unix::process::parent_id(),
+        std::env::current_dir().ok().as_deref(),
+        &Start {
+            gate,
+            gate_from_env: crate::config::env_value("SPAWN_GATE").is_some(),
+            root: &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+            once,
+        },
+    );
+    println!("{}", started_line(&started));
+    if let Err(error) = store.integrator_record(&started) {
+        eprintln!("integrate: cannot record integrator.started: {error}");
+    }
+}
+
 /// At most this many ancestors are named in `integrator.started`.
 const MAX_ANCESTORS: usize = 16;
 
@@ -1620,9 +1625,9 @@ pub(crate) fn started_record(
     cwd: Option<&Path>,
     start: &Start,
 ) -> Value {
-    let ppid = proc_ppid(proc, pid).unwrap_or(parent_id);
+    let parent = proc_ppid(proc, pid).unwrap_or(parent_id);
     let mut ancestors = Vec::new();
-    let mut at = ppid;
+    let mut at = parent;
     while at != 0 && ancestors.len() < MAX_ANCESTORS {
         let Some(comm) = proc_comm(proc, at) else {
             break;
@@ -1639,8 +1644,8 @@ pub(crate) fn started_record(
     json!({
         "type": "integrator.started",
         "pid": pid,
-        "ppid": ppid,
-        "parent_comm": proc_comm(proc, ppid),
+        "ppid": parent,
+        "parent_comm": proc_comm(proc, parent),
         "ancestors": ancestors,
         "cwd": cwd.map(|cwd| cwd.display().to_string()),
         "cgroup": proc_cgroup(proc, pid),

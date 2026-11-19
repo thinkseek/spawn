@@ -2772,21 +2772,21 @@ impl FakeProc {
     }
 
     /// Process `pid` named `comm` (none: no comm file) whose parent is
-    /// `ppid` (none: no stat file).
-    fn process(&self, pid: u32, comm: Option<&str>, ppid: Option<u32>) {
+    /// `parent` (none: no stat file).
+    fn process(&self, pid: u32, comm: Option<&str>, parent: Option<u32>) {
         let dir = self.0.join(pid.to_string());
         std::fs::create_dir_all(&dir).expect("a process");
         if let Some(comm) = comm {
             std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm");
-            if let Some(ppid) = ppid {
+            if let Some(parent) = parent {
                 std::fs::write(
                     dir.join("stat"),
-                    format!("{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 4194560 100 0 0 0\n"),
+                    format!("{pid} ({comm}) S {parent} {pid} {pid} 0 -1 4194560 100 0 0 0\n"),
                 )
                 .expect("stat");
             }
-        } else if let Some(ppid) = ppid {
-            std::fs::write(dir.join("stat"), format!("{pid} (x) S {ppid} 1 1\n")).expect("stat");
+        } else if let Some(parent) = parent {
+            std::fs::write(dir.join("stat"), format!("{pid} (x) S {parent} 1 1\n")).expect("stat");
         }
     }
 
