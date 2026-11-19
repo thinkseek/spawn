@@ -95,6 +95,17 @@
 # `.thin-dry-run-done` and removes nothing; later runs remove. With
 # --dry-run it only prints, always.
 #
+# Thinning keeps its verdicts (objective 229): a judged pair of versions is
+# written to <account>/.thin-judged with both manifests' sha256, and a later
+# run says that pair's "would remove" or "kept" from the line, without
+# reading the versions, while both manifests still hash so. A removal is
+# never taken from a line: it is judged with holds() at the moment, as
+# above. A run judges for SPAWN_SESSION_THIN_BUDGET seconds at most (300),
+# says how many versions wait, and the next run goes on from its verdicts,
+# so a copy and a thin stay inside a drill's lock wait (600 s). A first
+# (print-only) thinning that the budget cut leaves no `.thin-dry-run-done`:
+# the root's print-only thinning is done only once every version was judged.
+#
 # Restore copies one version into a directory that is empty or absent,
 # never inside a home it copies (restoring onto the live sessions is the
 # owner's step, by hand, from that scratch copy), and checks every file
@@ -568,8 +579,54 @@ holds() {
 }
 
 # thin [--dry-run] (as the backup user).
+# The verdicts thin keeps (objective 229): <account dir>/.thin-judged, one
+# line per judged pair, "<version> <next> <held|kept> <sha256 of version's
+# manifest> <sha256 of next's manifest>", written by the backup user under
+# the backup lock (a temp file, synced, renamed). A line is used only while
+# both versions are there and both manifests still hash as it says; any
+# other line is dropped at the next write. A "would remove" line and a
+# "kept" verdict may come from a kept line (keeping is always safe); a
+# removal never does: it judges with holds() at the moment of the removal.
+th_judged_load() { # <account dir>: fills th_judged (pair -> "verdict sha sha")
+  local jl_v jl_next jl_verdict jl_ms jl_ns
+  th_judged=()
+  [ -f "$1/.thin-judged" ] || return 0
+  while read -r jl_v jl_next jl_verdict jl_ms jl_ns; do
+    valid_version "$jl_v" && valid_version "$jl_next" || continue
+    case $jl_verdict in held | kept) ;; *) continue ;; esac
+    [[ $jl_ms =~ ^[0-9a-f]{64}$ && $jl_ns =~ ^[0-9a-f]{64}$ ]] || continue
+    th_judged["$jl_v $jl_next"]="$jl_verdict $jl_ms $jl_ns"
+  done <"$1/.thin-judged"
+}
+th_manifest_sha() { # <account dir> <version>: sets th_got to the sha256 of its manifest (hashed once a run), or ""
+  if [ -z "${th_sha[$2]+x}" ]; then
+    if [ -f "$1/$2.manifest" ]; then
+      th_sha[$2]=$(sha256sum <"$1/$2.manifest" | cut -d' ' -f1)
+    else
+      th_sha[$2]=""
+    fi
+  fi
+  th_got=${th_sha[$2]}
+}
+th_judged_write() { # <account dir>: the lines of pairs whose versions are both still there
+  local jw_pair jw_v jw_next jw_tmp
+  jw_tmp=$1/.thin-judged.$$.tmp
+  : >"$jw_tmp" || die "cannot write $jw_tmp"
+  chmod 600 -- "$jw_tmp"
+  for jw_pair in "${!th_judged[@]}"; do
+    jw_v=${jw_pair% *}
+    jw_next=${jw_pair#* }
+    [ -d "$1/$jw_v" ] && [ -d "$1/$jw_next" ] || continue
+    printf '%s %s\n' "$jw_pair" "${th_judged[$jw_pair]}"
+  done | sort >"$jw_tmp"
+  sync -- "$jw_tmp" 2>/dev/null || true
+  mv -f -- "$jw_tmp" "$1/.thin-judged"
+}
+
 thin() {
   local th_dry=0 th_account_dir th_account th_now th_all th_i th_v th_next th_day th_keep th_age
+  local th_budget th_start th_left=0 th_line th_verdict th_ms th_ns th_cached th_got
+  local -A th_judged th_sha
   [ "${1-}" = --dry-run ] && th_dry=1
   if [ "$th_dry" = 1 ]; then
     # Asked for (the units run it so until the owner allows removal):
@@ -580,10 +637,17 @@ thin() {
     say "the first thinning of $root is print-only (rule (c)); the next one without --dry-run removes"
   fi
   th_now=${SPAWN_SESSION_BACKUP_NOW:-$(date -u +%s)}
+  # The time this run may spend judging (objective 229), so that a copy and
+  # a thin together stay inside another run's lock wait (600 s).
+  th_budget=${SPAWN_SESSION_THIN_BUDGET:-300}
+  [[ $th_budget =~ ^[0-9]+$ ]] || die "SPAWN_SESSION_THIN_BUDGET must be a number of seconds"
+  th_start=$SECONDS
   for th_account_dir in "$root"/*/; do
     [ -d "$th_account_dir" ] || continue
     th_account_dir=${th_account_dir%/}
     th_account=$(basename "$th_account_dir")
+    th_judged_load "$th_account_dir"
+    th_sha=()
     mapfile -t th_all < <(versions "$th_account_dir")
     for ((th_i = 0; th_i + 1 < ${#th_all[@]}; th_i++)); do
       th_v=${th_all[th_i]}
@@ -593,10 +657,45 @@ thin() {
       th_next=${th_all[th_i + 1]}
       # The day's last version is kept.
       [ "${th_next:0:8}" = "$th_day" ] || continue
-      th_keep=1
-      if [ -f "$th_account_dir/$th_v.manifest" ] &&
-        holds "$th_account_dir/$th_v" "$th_account_dir/$th_v.manifest" "$th_account_dir/$th_next"; then
-        th_keep=0
+      # A kept verdict, if both manifests still hash as it says.
+      th_cached=""
+      th_line=${th_judged["$th_v $th_next"]-}
+      if [ -n "$th_line" ]; then
+        read -r th_verdict th_ms th_ns <<<"$th_line"
+        th_manifest_sha "$th_account_dir" "$th_v"
+        if [ "$th_ms" = "$th_got" ]; then
+          th_manifest_sha "$th_account_dir" "$th_next"
+          [ "$th_ns" = "$th_got" ] && th_cached=$th_verdict
+        fi
+      fi
+      # A removal is judged now, whatever a kept verdict says.
+      if [ "$th_cached" = held ] && [ "$th_dry" = 0 ]; then
+        th_cached=""
+      fi
+      if [ -n "$th_cached" ]; then
+        th_keep=1
+        [ "$th_cached" = held ] && th_keep=0
+      else
+        if [ $((SECONDS - th_start)) -ge "$th_budget" ]; then
+          th_left=$((th_left + 1))
+          continue
+        fi
+        th_keep=1
+        if [ -f "$th_account_dir/$th_v.manifest" ] &&
+          holds "$th_account_dir/$th_v" "$th_account_dir/$th_v.manifest" "$th_account_dir/$th_next"; then
+          th_keep=0
+        fi
+        th_manifest_sha "$th_account_dir" "$th_v"
+        th_ms=$th_got
+        th_manifest_sha "$th_account_dir" "$th_next"
+        th_ns=$th_got
+        if [ -n "$th_ms" ] && [ -n "$th_ns" ]; then
+          if [ "$th_keep" = 1 ]; then
+            th_judged["$th_v $th_next"]="kept $th_ms $th_ns"
+          else
+            th_judged["$th_v $th_next"]="held $th_ms $th_ns"
+          fi
+        fi
       fi
       if [ "$th_keep" = 1 ]; then
         say "$th_account: kept $th_v: a file of it is in no later version"
@@ -613,8 +712,15 @@ thin() {
       rm -f -- "$th_account_dir/$th_v.manifest" "$th_account_dir/$th_v.counts" "$th_account_dir/$th_v.blocks"
       say "$th_account: removed $th_v (every file of it is in $th_next)"
     done
+    th_judged_write "$th_account_dir"
   done
-  if [ ! -e "$root/.thin-dry-run-done" ]; then
+  if [ "$th_left" -gt 0 ]; then
+    say "thin: $th_left version(s) not judged yet (budget ${th_budget}s); the next run goes on"
+  fi
+  # The print-only first thinning is done only when it judged every version
+  # (rev-j's R0 F1): one the budget cut leaves no marker, so the next run is
+  # print-only too, and nothing is removed that no print-only run printed.
+  if [ ! -e "$root/.thin-dry-run-done" ] && [ "$th_left" -eq 0 ]; then
     : >"$root/.thin-dry-run-done"
   fi
 }
