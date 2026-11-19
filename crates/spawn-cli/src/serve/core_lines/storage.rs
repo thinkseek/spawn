@@ -105,6 +105,23 @@ pub(super) fn storage_line(storage: &Value) -> Line {
             // from the storage readings (objective 180) `lines_at` sets.
             bytes_per_landing(&storage["readings"]),
             rebuildable_bytes(&storage["readings"]),
+            // Objective 232, a diagnostic: the scratch of landed objectives
+            // by agent and objective, `lines_at` sets from the scratch walk.
+            Figure {
+                note: storage["landed_scratch"]["note"]
+                    .as_str()
+                    .map(str::to_string),
+                by_owner: storage["landed_scratch"]
+                    .get("by_owner")
+                    .filter(|rows| rows.is_array())
+                    .cloned(),
+                ..Figure::new(
+                    "storage.landed_scratch_bytes",
+                    "Scratch of landed objectives",
+                    "bytes",
+                    storage["landed_scratch"]["bytes"].clone(),
+                )
+            },
         ],
     }
 }

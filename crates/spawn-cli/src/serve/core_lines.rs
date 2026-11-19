@@ -170,6 +170,9 @@ pub(super) struct Figure {
     pub(super) note: Option<String>,
     /// The figure split by source (objective 185): said as `by_source`.
     pub(super) by_source: Option<Value>,
+    /// The figure split by agent and objective (objective 232: the scratch
+    /// of landed objectives): said as `by_owner`.
+    pub(super) by_owner: Option<Value>,
     /// What a count is out of (objective 181: U1 out of the recovery
     /// table's rows): said as `of`.
     pub(super) of: Option<usize>,
@@ -199,6 +202,7 @@ impl Figure {
             not_measured_yet: false,
             note: None,
             by_source: None,
+            by_owner: None,
             of: None,
             range_note: None,
             basis: None,
@@ -371,6 +375,9 @@ pub(super) fn figure_json(figure: &Figure, range: Option<Range>) -> Value {
     if let Some(by_source) = &figure.by_source {
         answer["by_source"] = by_source.clone();
     }
+    if let Some(by_owner) = &figure.by_owner {
+        answer["by_owner"] = by_owner.clone();
+    }
     if let Some(of) = figure.of {
         answer["of"] = json!(of);
     }
@@ -481,14 +488,16 @@ const ALERT_FIGURES: [(&str, &str); 5] = [
 /// those in [`ALERTING_DIAGNOSTICS`]. Free disk (objective 182) is first,
 /// with no range: its alert is disk_low's (objective 204), and its fall is
 /// how a sweep's effect is read. Leaked test schemas leaves them once it has
-/// read 0 for a week ([`LEAKED_SCHEMAS`]).
-const DIAGNOSTICS: [&str; 6] = [
+/// read 0 for a week ([`LEAKED_SCHEMAS`]). The scratch of landed objectives
+/// (objective 232) is last, with no range.
+const DIAGNOSTICS: [&str; 7] = [
     "storage.free_bytes",
     "storage.unowned_scratch_bytes",
     "storage.disk_fall",
     "storage.grew_most",
     "storage.archive_growth",
     "storage.leaked_test_schemas",
+    "storage.landed_scratch_bytes",
 ];
 
 /// Leaked test schemas (objective 182): "stays visible until it has read 0
@@ -532,7 +541,7 @@ fn priced(share: Option<&Figure>) -> bool {
 
 /// The figures a ranges file entry is never applied to, with why: said in
 /// `ignored_ranges` (objective 182).
-const NO_RANGE: [(&str, &str); 2] = [
+const NO_RANGE: [(&str, &str); 3] = [
     (
         "storage.free_bytes",
         "an alert of its own (disk_low, objective 204)",
@@ -540,6 +549,10 @@ const NO_RANGE: [(&str, &str); 2] = [
     (
         "performance.usd_per_landing",
         "shown with no range until use with no price is under 10% (the owner's core metric set)",
+    ),
+    (
+        "storage.landed_scratch_bytes",
+        "a diagnostic with no range: whose scratch it is, never out (objective 232)",
     ),
 ];
 
@@ -1230,6 +1243,9 @@ fn lines_at(
     };
     storage["unowned_scratch_bytes"] = reading.map_or(Value::Null, unowned::Reading::unowned_bytes);
     storage["leaked_test_schemas"] = reading.map_or(Value::Null, unowned::Reading::leaked);
+    // The scratch landed objectives left behind (objective 232), from the
+    // same reading and landings: no read of its own.
+    storage["landed_scratch"] = unowned::landed_scratch(reading, landed.as_deref());
     disk::with_disk(&mut storage, samples, now_ms);
     let (performance, cost_total) = performance_now(store, now_ms, parts);
     // The Home card's figure (objective 100): `/api/interventions?window=24h`

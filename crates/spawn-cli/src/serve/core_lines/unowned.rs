@@ -383,6 +383,79 @@ pub(super) fn scratch_json(
     })
 }
 
+/// `storage.landed_scratch_bytes` (objective 232): over `reading`'s claimed
+/// folders whose objective `landed` holds, each folder's bytes, or its
+/// build bytes while its lease runs (a leased folder is never walked whole,
+/// objective 155), as `{bytes, by_owner, note}`. `by_owner` has one row per
+/// agent and objective {agent, objective, bytes, folders, leased}, `leased`
+/// the row's folders counted by their build output only; largest bytes
+/// first, then agent, then objective. A folder of an objective not landed,
+/// or whose objective names no pair, adds nothing; an unclaimed folder is
+/// never among them. Null with a note, never 0: no reading yet, no complete
+/// walk in it (no roots, none within the bound yet), a root refused (as
+/// `storage.unowned_scratch_bytes`), or landings that could not be read.
+/// A landed folder whose lease ended also counts in
+/// `storage.unowned_scratch_bytes`: the two overlap, never added together.
+pub(super) fn landed_scratch(reading: Option<&Reading>, landed: Option<&[(i64, i64)]>) -> Value {
+    let unmeasured = |note: &str| json!({"bytes": null, "by_owner": null, "note": note});
+    let Some(reading) = reading else {
+        return unmeasured("no scratch reading yet");
+    };
+    if !reading.refused.is_empty() {
+        return unmeasured("a scratch root is refused (scratch.refused says why)");
+    }
+    if reading.unowned.is_none() {
+        return unmeasured(
+            "no complete scratch walk yet (no scratch roots, or none within storage.scratch_bound)",
+        );
+    }
+    let Some(landed) = landed else {
+        return unmeasured("the claimed folders' landings could not be read");
+    };
+    // (agent, objective) -> (pair, bytes, folders, leased)
+    let mut rows: BTreeMap<(String, String), ((i64, i64), u64, u64, u64)> = BTreeMap::new();
+    for folder in &reading.claimed {
+        let Some(pair) = folder.claim.pair() else {
+            continue;
+        };
+        if !landed.contains(&pair) {
+            continue;
+        }
+        let row = rows
+            .entry((folder.claim.agent.clone(), folder.claim.objective.clone()))
+            .or_insert((pair, 0, 0, 0));
+        row.1 = row
+            .1
+            .saturating_add(folder.bytes.unwrap_or(folder.build_bytes));
+        row.2 += 1;
+        if folder.bytes.is_none() {
+            row.3 += 1;
+        }
+    }
+    let mut rows: Vec<_> = rows.into_iter().collect();
+    rows.sort_by(
+        |((agent_a, objective_a), (pair_a, bytes_a, ..)),
+         ((agent_b, objective_b), (pair_b, bytes_b, ..))| {
+            bytes_b
+                .cmp(bytes_a)
+                .then_with(|| agent_a.cmp(agent_b))
+                .then_with(|| pair_a.cmp(pair_b))
+                .then_with(|| objective_a.cmp(objective_b))
+        },
+    );
+    let total = rows
+        .iter()
+        .fold(0_u64, |sum, (_, (_, bytes, ..))| sum.saturating_add(*bytes));
+    let by_owner: Vec<Value> = rows
+        .into_iter()
+        .map(|((agent, objective), (_, bytes, folders, leased))| {
+            json!({"agent": agent, "objective": objective, "bytes": bytes,
+                   "folders": folders, "leased": leased})
+        })
+        .collect();
+    json!({"bytes": total, "by_owner": by_owner, "note": null})
+}
+
 /// The answer's `test_schemas`: each server that answered, in order.
 pub(super) fn test_schemas_json(reading: Option<&Reading>) -> Value {
     json!(
