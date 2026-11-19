@@ -57,6 +57,21 @@ export interface CoreFigure {
    * the week's least-squares fit, "day" for the last day's fall), said
    * after its name (objective 225). */
   basis?: string | null;
+  /** The figure by agent and objective (objective 232: the scratch of
+   * landed objectives), largest first. */
+  by_owner?: CoreOwnedScratch[] | null;
+}
+
+/** One agent's scratch of one landed objective (objective 232). */
+export interface CoreOwnedScratch {
+  agent: string;
+  /** "<mission>/<NNN>". */
+  objective: string;
+  bytes: number;
+  folders: number;
+  /** How many of the folders were counted by their build output only
+   * (their lease runs). */
+  leased: number;
 }
 
 /** One mission's report to live (objective 159): its median (null below
@@ -183,6 +198,15 @@ export interface CoreScratchMark {
   detail: string;
 }
 
+/** One agent's scratch of one landed objective on the card (objective
+ * 232). */
+export interface CoreLandedScratchMark {
+  /** "<agent> · <objective>". */
+  name: string;
+  /** "<size> · <n> folder(s)", then " · <k> leased, build only" when k > 0. */
+  text: string;
+}
+
 /** A drill on the card, under the recoverability row. */
 export interface CoreDrillMark {
   name: string;
@@ -238,6 +262,10 @@ export interface CoreLinesView {
   /** Scratch by owner (objective 140): each claimed folder, as the answer
    * lists them; empty when none is claimed. */
   scratch: CoreScratchMark[];
+  /** The scratch of landed objectives by agent and objective (objective
+   * 232): storage.landed_scratch_bytes's `by_owner` in words, largest
+   * first; empty without it. */
+  landedScratch: CoreLandedScratchMark[];
   /** Report to live by mission (objective 159): the performance line's
    * north star `by_mission`, in words; empty without it. */
   byMission: CoreMissionMark[];
@@ -294,6 +322,19 @@ export function scratchMark(raw: Partial<CoreClaimed> | null | undefined, now: n
     text: parts.join(" · "),
     tone: raw?.landed === true && !leased ? "warning" : "plain",
     detail: typeof raw?.path === "string" ? raw.path : "",
+  };
+}
+
+/** One `by_owner` row of the scratch of landed objectives in words
+ * (objective 232). */
+export function landedScratchMark(raw: Partial<CoreOwnedScratch> | null | undefined): CoreLandedScratchMark {
+  const folders = finite(raw?.folders) ?? 0;
+  const leased = finite(raw?.leased) ?? 0;
+  const parts = [unitWords("bytes", finite(raw?.bytes) ?? 0), `${folders} ${folders === 1 ? "folder" : "folders"}`];
+  if (leased > 0) parts.push(`${leased} leased, build only`);
+  return {
+    name: `${typeof raw?.agent === "string" ? raw.agent : ""} · ${typeof raw?.objective === "string" ? raw.objective : ""}`,
+    text: parts.join(" · "),
   };
 }
 
@@ -549,6 +590,10 @@ export function coreLinesView(answer: Partial<CoreLinesAnswer> | null | undefine
     scratch: (Array.isArray(answer?.scratch?.claimed) ? answer.scratch.claimed : []).map((claimed) =>
       scratchMark(claimed, now),
     ),
+    landedScratch: (() => {
+      const rows = diagnostics.find((figure) => figure?.key === "storage.landed_scratch_bytes")?.by_owner;
+      return Array.isArray(rows) ? rows.map(landedScratchMark) : [];
+    })(),
     byMission: (() => {
       const performance = lines.find((line) => line?.line === "performance");
       const byMission = performance?.north_star?.by_mission;

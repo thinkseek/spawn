@@ -191,6 +191,17 @@ export function CoreLinesCard({
                           ))}
                         </ul>
                       )}
+                      {line?.line === "storage" && view.landedScratch.length > 0 && (
+                        <ul className="space-y-0.5" aria-label="Scratch of landed objectives">
+                          <li className="text-micro font-medium text-faint-foreground">Scratch of landed objectives</li>
+                          {view.landedScratch.map((owned, at) => (
+                            <li key={`${at}:${owned.name}`} className="flex min-w-0 items-baseline gap-2 text-caption">
+                              <span className="min-w-0 truncate text-muted-foreground">{owned.name}</span>
+                              <span className="tnum ml-auto shrink-0 text-foreground">{owned.text}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                       {row.guardrails.length > 0 && (
                         <ul className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
                           {row.guardrails.map((mark, at) => (

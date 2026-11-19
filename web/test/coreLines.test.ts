@@ -161,7 +161,7 @@ test("each unit in words, and each range form", () => {
 });
 
 test("an answer missing its parts, or none, reads as an empty card", () => {
-  const empty = { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], byMission: [], diagnostics: [] };
+  const empty = { rows: [], notice: null, ignored: [], pending: [], drills: [], scratch: [], landedScratch: [], byMission: [], diagnostics: [] };
   assert.deepEqual(coreLinesView(null), empty);
   assert.deepEqual(coreLinesView({}), empty);
 });
@@ -584,6 +584,40 @@ test("the day's gain says day once, and a name without the turned words is not t
     assert.equal(mark.value, unitWords("bytes_per_day", gained));
     assert.match(mark.value, /^-/);
   }
+});
+
+// Objective 232: the scratch of landed objectives, one row per agent and
+// objective in the diagnostic's by_owner, under the storage line.
+test("the scratch of landed objectives says each owner's size and folders", () => {
+  const view = coreLinesView({
+    lines: [],
+    diagnostics: [
+      {
+        key: "storage.landed_scratch_bytes",
+        name: "Scratch of landed objectives",
+        unit: "bytes",
+        value: 9_000_000,
+        range: null,
+        state: "no_range",
+        by_owner: [
+          { agent: "rev-e", objective: "1/007", bytes: 5_000_000, folders: 1, leased: 0 },
+          { agent: "rev-e", objective: "1/009", bytes: 4_000_000, folders: 2, leased: 1 },
+        ],
+      } as CoreFigure,
+    ],
+  });
+  assert.equal(view.diagnostics[0].name, "Scratch of landed objectives");
+  assert.equal(view.diagnostics[0].value, unitWords("bytes", 9_000_000));
+  assert.deepEqual(view.landedScratch, [
+    { name: "rev-e · 1/007", text: `${unitWords("bytes", 5_000_000)} · 1 folder` },
+    { name: "rev-e · 1/009", text: `${unitWords("bytes", 4_000_000)} · 2 folders · 1 leased, build only` },
+  ]);
+  // No rows (none claimed, or not measured): none.
+  const bare = coreLinesView({
+    lines: [],
+    diagnostics: [{ key: "storage.landed_scratch_bytes", name: "Scratch of landed objectives", unit: "bytes", value: null, range: null, state: "not_collected" } as CoreFigure],
+  });
+  assert.deepEqual(bare.landedScratch, []);
 });
 
 // Objective 148: "Needs you is right" says what it is read from after its
