@@ -3782,6 +3782,145 @@ end
 $$;
 
 -- A resident starts only after a human approves it.
+-- Whether `p_session`'s resident has a cancel notice not yet told: its
+-- latest delivered task is cancelled, and no `cancel-notice-<task>-<n>`
+-- command of the dispatcher's reached it (deliver::Work::blocked, as
+-- CANCELLED_DELIVERIES reads it).
+create or replace function spawn_cancel_notice_untold(p_session text)
+returns boolean language sql stable as $$
+    select exists (
+        select 1
+          from mission_tasks k
+          join mission_residents r on r.agent_id = k.agent_id and r.state <> 'retired'
+         where k.session_id = p_session and k.state = 'cancelled' and k.kind = 'resident'
+           and k.delivered_at_ms is not null
+           and not exists (select 1 from mission_tasks later
+                            where later.session_id = k.session_id and later.id <> k.id
+                              and later.delivered_at_ms is not null
+                              and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
+           and not exists (select 1 from spawn_commands c
+                            where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
+                              and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
+                              and c.succeeded))
+$$;
+
+-- Work stealing (objective 239, docs/fleet-architecture.md §3.2 "Work
+-- stealing"): move `p_task`, queued and unstarted, to the idle resident
+-- `p_to` of its worker's pool, `p_by` (`spawn-dispatch`, or `human` for
+-- the owner's `spawn task steal`) naming who and `p_reason` why. Owner only
+-- (the dispatcher's login and the owner's are the owner). Under the append
+-- lock it checks, in this order, and refuses with the first rule that
+-- fails, recording nothing: the task is queued (resident, assigned, never
+-- revised, no `deliver-<task>-` command); not pinned; its mission open, not
+-- paused, not halted; the taker an approved resident, not its worker; both
+-- in one pool; the taker idle (no open task of its own, no cancel notice
+-- not yet told); the task in its worker's queue, never the one delivery
+-- gives its worker now. Then one `task.stolen`, folded onto the task's
+-- session and agent. Returns {task, from_session, to_session, agent_id}.
+create or replace function spawn_task_steal(p_task bigint, p_to text, p_by text,
+                                            p_reason text default null)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_task mission_tasks;
+    v_mission mission_missions;
+    v_worker mission_residents;
+    v_taker mission_residents;
+    v_open record;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not move tasks', session_user using errcode = '42501';
+    end if;
+    if coalesce(trim(p_by), '') = '' then
+        raise exception 'a move names who moves it';
+    end if;
+    select * into v_task from mission_tasks where id = p_task;
+    if not found then
+        raise exception 'task % is not queued (no such task)', p_task;
+    end if;
+    if v_task.kind <> 'resident' then
+        raise exception 'task % is not queued (not a resident task)', p_task;
+    end if;
+    if v_task.state <> 'assigned' then
+        raise exception 'task % is not queued (%)', p_task, v_task.state;
+    end if;
+    if v_task.revisions <> 0 then
+        raise exception 'task % is not queued (revised)', p_task;
+    end if;
+    if exists (select 1 from spawn_commands
+                where idempotency_key like 'deliver-' || p_task || '-%') then
+        raise exception 'task % is not queued (a delivery command exists)', p_task;
+    end if;
+    select * into v_worker from mission_residents where agent_id = v_task.agent_id;
+    if v_task.pinned then
+        raise exception 'task % is pinned to %', p_task, coalesce(v_worker.name, v_task.agent_id);
+    end if;
+    select * into v_mission from mission_missions where id = v_task.mission_id;
+    if v_mission.state not in ('open', 'active') then
+        raise exception 'task % waits for its mission % (closed)', p_task, v_task.mission_id;
+    end if;
+    if v_mission.pause_event is not null then
+        raise exception 'task % waits for its mission % (paused)', p_task, v_task.mission_id;
+    end if;
+    if v_mission.halted is not null then
+        raise exception 'task % waits for its mission % (halted)', p_task, v_task.mission_id;
+    end if;
+    select * into v_taker from mission_residents where name = p_to;
+    if not found then
+        raise exception 'task % cannot go to % (no such resident)', p_task, p_to;
+    end if;
+    if v_taker.state = 'proposed' then
+        raise exception 'task % cannot go to % (not approved)', p_task, p_to;
+    end if;
+    if v_taker.state = 'retired' then
+        raise exception 'task % cannot go to % (retired)', p_task, p_to;
+    end if;
+    if v_taker.agent_id = v_task.agent_id then
+        raise exception 'task % cannot go to % (already its worker)', p_task, p_to;
+    end if;
+    if v_worker.pool is null or v_taker.pool is null then
+        raise exception 'task % cannot go to % (no pool)', p_task, p_to;
+    end if;
+    if v_worker.pool <> v_taker.pool then
+        raise exception 'task % cannot go to % (pool % is not %)', p_task, p_to,
+            v_worker.pool, v_taker.pool;
+    end if;
+    select k.id, k.state into v_open
+      from mission_tasks k join mission_missions m on m.id = k.mission_id
+     where k.session_id = v_taker.session_id
+       and (k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
+            or (k.state = 'accepted' and m.gate is not null))
+     order by k.id limit 1;
+    if found then
+        raise exception 'task % cannot go to % (not idle: task % %)', p_task, p_to,
+            v_open.id, v_open.state;
+    end if;
+    if spawn_cancel_notice_untold(v_taker.session_id) then
+        raise exception 'task % cannot go to % (not idle: a cancel notice is not told)',
+            p_task, p_to;
+    end if;
+    -- In its worker's queue: the worker holds an open task delivery waits
+    -- on, a cancel notice not yet told, or an older task of its own. A
+    -- worker's own assigned tasks do not make it busy: an idle worker's
+    -- oldest task is the one delivery gives it now.
+    if not exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
+                    where k.session_id = v_task.session_id and k.id <> p_task
+                      and (k.state in ('delivered', 'reported', 'revise', 'landing')
+                           or (k.state = 'accepted' and m.gate is not null)
+                           or (k.state = 'assigned' and k.id < p_task)))
+       and not spawn_cancel_notice_untold(v_task.session_id) then
+        raise exception 'task % is its worker''s next (its worker is idle)', p_task;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.stolen', 'id', p_task,
+        'from_session', v_task.session_id, 'from_agent', v_task.agent_id,
+        'to_session', v_taker.session_id, 'to_agent', v_taker.agent_id,
+        'pool', v_taker.pool, 'by', p_by, 'reason', nullif(trim(coalesce(p_reason, '')), ''),
+        'queued_since_ms', v_task.created_at_ms));
+    return jsonb_build_object('task', p_task, 'from_session', v_task.session_id,
+                              'to_session', v_taker.session_id, 'agent_id', v_taker.agent_id);
+end $$;
+
 drop function if exists spawn_resident_propose(text, text);
 -- `p_pool` (objective 239): the resident's pool, whose members may take
 -- each other's queued tasks once approved; null, none.
