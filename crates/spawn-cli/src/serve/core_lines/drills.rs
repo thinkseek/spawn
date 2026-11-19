@@ -621,8 +621,9 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, Drill, Last, Reading, Source, config, drills_json, figures, out_of_rows,
-        parse_last, parse_show, readings, record_reading, show, status_at_ms, unit_allowed,
+        Config, Drill, Last, Reading, Source, config, drills_json, figures, not_found, out_of_rows,
+        parse_last, parse_show, read_unit, readings, record_reading, show, status_at_ms,
+        unit_allowed,
     };
     use serde_json::{Value, json};
     use std::process::{Command, Stdio};
