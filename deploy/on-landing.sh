@@ -53,12 +53,16 @@
 #   is between its report and its landing (`spawn mission landing`'s
 #   judging: reported, accepted or landing; a review mission's task never
 #   lands, 168): no landing for SPAWN_DEPLOY_QUIET_SECS (default
-#   300) since main's, so a burst of landings makes one deploy, or else
+#   60) since main's, so a burst of landings makes one deploy, or else
 #   SPAWN_DEPLOY_MAX_WAIT_SECS (default 1800) have passed since the first
 #   landing after the live commit's, so landings that keep coming still
 #   reach the live system within that bound. With none judging, no landing
 #   can follow sooner than a report and its gate (minutes), so there is no
-#   burst to wait for: main deploys at once (objective 160);
+#   burst to wait for: main deploys at once (objective 160). The quiet is
+#   60 s (objective 235): a landing follows a whole gate and the source's
+#   gates run one at a time, so in the 7 days to 2026-11-19 no two landings
+#   came within 300 s; the 300 s it was batched none and cost each landing
+#   about 4 min of its report to live;
 # - no deploy holds <live>/deploy.lock.
 #
 # Then it brings its checkout (<live>/deploy-checkout, a clone of the
@@ -151,7 +155,7 @@ tick() {
     say_once "paused: SPAWN_DEPLOY_ON_LANDING=0"
     return 0
   fi
-  local quiet=${SPAWN_DEPLOY_QUIET_SECS:-300} max_wait=${SPAWN_DEPLOY_MAX_WAIT_SECS:-1800}
+  local quiet=${SPAWN_DEPLOY_QUIET_SECS:-60} max_wait=${SPAWN_DEPLOY_MAX_WAIT_SECS:-1800}
   local retry=${SPAWN_DEPLOY_RETRY_SECS:-1800} hold_secs=${SPAWN_DEPLOY_HOLD_SECS:-3600}
   whole SPAWN_DEPLOY_QUIET_SECS "$quiet"
   whole SPAWN_DEPLOY_MAX_WAIT_SECS "$max_wait"
