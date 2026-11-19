@@ -29,9 +29,15 @@
 //! rises and falls in steps: on 2026-11-18 df's free disk fell 77 GB in a
 //! day while the week's sawtooth (sweeps lifting it between) fitted a line
 //! that gained 4.7 GB a day, and a robust line reads the week's gain too.
-//! The day's fall ([`day_fall`]) is from the latest sample a day old or
-//! more, no older than 36 h, to the free disk now, over the days between:
-//! from the same samples, no read of its own.
+//! The day's fall ([`day_fall`]) is from a day ago to now, each end the
+//! median of a 6 h window of readings at the mean of their times
+//! (objective 228): a day ago, the samples 24 to 30 h old; now, those under
+//! 6 h old and the free disk now. A gate holding build trees moves df's
+//! free disk by about 6 GB within minutes, and one sample at each end
+//! moved the figure by as much a day with whether a gate held trees at
+//! either end's minute; the median halves that jitter, still says a day
+//! that lost 77 GB, and lags a sweep by about half its window. From the
+//! same samples, no read of its own.
 
 use serde_json::{Value, json};
 
@@ -113,30 +119,63 @@ pub(super) fn fall(readings: &[(i64, f64)]) -> Option<i64> {
     Some((-slope).round() as i64)
 }
 
-/// The oldest a day-old sample the day's fall is read from may be.
-const DAY_FALL_STALE_MS: i64 = 36 * 3_600_000;
+/// The span of each end's window of the day's fall (objective 228).
+const DAY_FALL_WINDOW_MS: i64 = 6 * 3_600_000;
+
+/// The median of `readings` (an even count's is the mean of the middle
+/// two) at the mean of their times; none without one.
+fn median_at(readings: &mut [(i64, f64)]) -> Option<(f64, f64)> {
+    if readings.is_empty() {
+        return None;
+    }
+    readings.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let middle = readings.len() / 2;
+    let median = if readings.len() % 2 == 0 {
+        f64::midpoint(readings[middle - 1].1, readings[middle].1)
+    } else {
+        readings[middle].1
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let at = readings.iter().map(|(at, _)| *at as f64).sum::<f64>() / readings.len() as f64;
+    Some((median, at))
+}
 
 /// The free disk lost over the last day, in bytes a day, rounded; below
-/// zero when the disk gained. From the latest of `samples` carrying a
-/// number for the free disk at or before `now_ms` less a day, when it is at
-/// or after `now_ms` less 36 h, to `free_now` at `now_ms`, over the days
-/// between them. None without such a sample or a free disk now.
+/// zero when the disk gained (objective 228). Each end is the median of its
+/// window's readings at the mean of their times: a day ago, the `samples`
+/// carrying a number for the free disk at or after `now_ms` less 30 h and
+/// at or before `now_ms` less 24 h; now, those after `now_ms` less 6 h and
+/// before `now_ms`, and `free_now` at `now_ms`. The fall is the first
+/// median less the second over the days between their times. None when the
+/// window a day ago holds no reading or there is no free disk now.
 pub(super) fn day_fall(samples: &Value, free_now: Option<u64>, now_ms: i64) -> Option<i64> {
     let free_now = free_now?;
-    let (at, then) = samples
+    let readings: Vec<(i64, f64)> = samples
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|sample| Some((sample["at_ms"].as_i64()?, sample["values"][FREE].as_f64()?)))
-        .filter(|(at, _)| *at <= now_ms - DAY_MS && *at >= now_ms - DAY_FALL_STALE_MS)
-        .max_by_key(|(at, _)| *at)?;
+        .collect();
+    let ago_end = now_ms - DAY_MS;
+    let mut ago: Vec<(i64, f64)> = readings
+        .iter()
+        .copied()
+        .filter(|(at, _)| *at >= ago_end - DAY_FALL_WINDOW_MS && *at <= ago_end)
+        .collect();
+    let mut now: Vec<(i64, f64)> = readings
+        .iter()
+        .copied()
+        .filter(|(at, _)| *at > now_ms - DAY_FALL_WINDOW_MS && *at < now_ms)
+        .collect();
     #[allow(clippy::cast_precision_loss)]
-    let days = (now_ms - at) as f64 / DAY_MS as f64;
+    now.push((now_ms, free_now as f64));
+    let (then, then_at) = median_at(&mut ago)?;
+    let (free, free_at) = median_at(&mut now)?;
     #[allow(clippy::cast_precision_loss)]
-    let lost = then - free_now as f64;
+    let days = (free_at - then_at) / DAY_MS as f64;
     // A disk's bytes a day fit an i64 many times over.
     #[allow(clippy::cast_possible_truncation)]
-    Some((lost / days).round() as i64)
+    Some(((then - free) / days).round() as i64)
 }
 
 /// The worse of the fit's fall and the day's, with its basis (`fit` or
