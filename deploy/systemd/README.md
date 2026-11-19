@@ -465,6 +465,7 @@ regression (scripts/rsi/gate.sh).
 | Objective | Scenario | Why the gate cannot judge it |
 | --- | --- | --- |
 | 029 | `rsi/scenarios/029.sh` | every execution and gate runs in a systemd user scope with memory and CPU limits; the sandbox has no user manager to make one |
+| 238 | `rsi/scenarios/238.sh` | spawn-backup.service's start limit is the user manager's: the scenario runs the unit's settings in a transient user timer and service, and the sandbox has no user manager to make them |
 
 A new objective of this kind says so in its scenario's header and adds a row
 here.

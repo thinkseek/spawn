@@ -2,11 +2,15 @@
 Description=Spawn: hourly encrypted dump of the event log to Cloudflare R2, locked against deletion (deploy/backup)
 # The dump records through the live database; nothing else must run first.
 After=network-online.target
-# Retry a failed run (proxy or network down) twice, 15 minutes apart within
-# the hour: a run at 04:00 that fails and succeeds at 04:15 is still the
-# hour's copy.
-StartLimitIntervalSec=2h
-StartLimitBurst=3
+# A failed run (proxy or network down) is retried every 15 minutes
+# (Restart= below) until one succeeds: a run at 04:00 that fails and succeeds
+# at 04:15 is still the hour's copy. No start limit (objective 238). The
+# limit counted the timer's hourly starts with the retries, so with the
+# 2 h / 3 starts it had, one outage used it up. On 2026-11-19 that was the
+# 17:05 run, then 18:03 and 18:19 failing. systemd then refused the 18:34
+# retry and the 19:02 timer run ("Start request repeated too quickly"), and
+# R2 had no dump from 17:05 to 20:20. Exit 3 and 4 are still never retried.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
