@@ -86,7 +86,7 @@ select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
          k.revisions, k.review_note, k.delivered_at_ms, k.model, k.reissue_of,
-         k.reassign_of,
+         k.reassign_of, k.pinned,
          (select o.session_id from mission_tasks o where o.id = k.reassign_of)
            as reassign_from_session,
          (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
@@ -1650,6 +1650,13 @@ pub(crate) const RESIDENTS_TO_KEEP: &str = "select r.agent_id, r.session_id, r.c
                   order by r.name";
 
 /// Retired residents, as (agent, session).
+/// Every resident, by name, with its state and pool (objective 239).
+pub(crate) const RESIDENT_ROSTER: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object('name', name, 'agent_id', agent_id,
+                                             'session_id', session_id, 'state', state,
+                                             'pool', pool) order by name), '[]'::jsonb)
+  from mission_residents";
+
 pub(crate) const RETIRED_RESIDENTS: &str =
     "select agent_id, session_id from mission_residents where state = 'retired'";
 
@@ -2387,11 +2394,54 @@ impl PostgresStore {
         model: &str,
         again: bool,
     ) -> Result<i64, StoreError> {
+        self.task_assign_with(mission, kind, worker, brief, model, again, false)
+    }
+
+    /// As [`Self::task_assign_again`]; with `pin`, the task stays with its
+    /// worker, never stolen (objective 239, `spawn task assign --pin`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_assign_with(
+        &self,
+        mission: i64,
+        kind: &str,
+        worker: &str,
+        brief: &str,
+        model: &str,
+        again: bool,
+        pin: bool,
+    ) -> Result<i64, StoreError> {
         let row = self.query_one(
-            "select spawn_task_assign($1, $2, $3, $4, $5, $6)",
-            &[&mission, &kind, &worker, &masked(brief), &model, &again],
+            "select spawn_task_assign($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &mission,
+                &kind,
+                &worker,
+                &masked(brief),
+                &model,
+                &again,
+                &pin,
+            ],
         )?;
         Ok(row.get(0))
+    }
+
+    /// Move `task`, queued and unstarted, to the idle resident `to` of its
+    /// worker's pool (objective 239, `spawn_task_steal`): `by` names who,
+    /// `reason` why. Refused, recording nothing, naming the first rule that
+    /// fails. Returns `{task, from_session, to_session, agent_id}`.
+    pub fn task_steal(
+        &self,
+        task: i64,
+        to: &str,
+        by: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_task_steal($1, $2, $3, $4)",
+                &[&task, &to, &by, &reason.map(masked)],
+            )?
+            .get(0))
     }
 
     /// Accept a report, or send the task back with a note. `revision` names
@@ -2495,11 +2545,29 @@ impl PostgresStore {
 
     /// Propose a resident (or revise a pending proposal).
     pub fn resident_propose(&self, name: &str, charter: &str) -> Result<(), StoreError> {
+        self.resident_propose_in(name, charter, None)
+    }
+
+    /// As [`Self::resident_propose`], in `pool` (objective 239): approved,
+    /// its members may take each other's queued tasks.
+    pub fn resident_propose_in(
+        &self,
+        name: &str,
+        charter: &str,
+        pool: Option<&str>,
+    ) -> Result<(), StoreError> {
         self.execute(
-            "select spawn_resident_propose($1, $2)",
-            &[&name, &masked(charter)],
+            "select spawn_resident_propose($1, $2, $3)",
+            &[&name, &masked(charter), &pool],
         )?;
         Ok(())
+    }
+
+    /// Every resident, by name: `[{name, agent_id, session_id, state,
+    /// pool}]` ([`RESIDENT_ROSTER`]): the dispatcher's retired residents and
+    /// pools, in one read.
+    pub fn resident_roster(&self) -> Result<Value, StoreError> {
+        self.query_json_prepared(RESIDENT_ROSTER, &[])
     }
 
     /// Approve a proposed resident. Only the owner's login (a human) may.

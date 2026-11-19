@@ -1538,6 +1538,11 @@ alter table mission_tasks add column if not exists metric text;
 alter table mission_tasks add column if not exists objective integer;
 alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
+-- Work stealing (objective 239): a resident's pool (null: none, it neither
+-- takes nor gives a task), from its `resident.proposed`. The task's
+-- columns of objective 239 come after the others (below), so a migrated
+-- schema keeps a fresh one's column order.
+alter table mission_residents add column if not exists pool text;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
@@ -1555,6 +1560,11 @@ alter table mission_tasks add column if not exists reassign_of bigint;
 alter table mission_tasks add column if not exists gate_load_sensitive_pushed text;
 alter table mission_tasks add column if not exists gate_load_sensitive_scenarios jsonb;
 alter table mission_tasks add column if not exists gate_parked_pushed text;
+-- Work stealing (objective 239): a task pinned to its worker (`spawn task
+-- assign --pin`), from its `task.assigned`; when it last moved (its
+-- `task.stolen`), null if never.
+alter table mission_tasks add column if not exists pinned boolean not null default false;
+alter table mission_tasks add column if not exists stolen_at_ms bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -2388,13 +2398,14 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   continues, reassign_of, created_at_ms, updated_at_ms)
+                                   continues, reassign_of, pinned, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
-                (p_record ->> 'reassign_of')::bigint, p_at, p_at);
+                (p_record ->> 'reassign_of')::bigint,
+                coalesce((p_record ->> 'pinned')::boolean, false), p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -2820,14 +2831,21 @@ begin
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, updated_at_ms = p_at
          where gate_room_task = v_id;
+    when 'task.stolen' then
+        -- A queued task moved, unstarted, to an idle resident of its pool
+        -- (objective 239, spawn_task_steal): its worker is the taker now.
+        update mission_tasks set session_id = p_record ->> 'to_session',
+                                 agent_id = p_record ->> 'to_agent', stolen_at_ms = p_at,
+                                 updated_at_ms = p_at
+         where id = v_id;
     when 'resident.proposed' then
         insert into mission_residents (name, agent_id, session_id, charter, proposed_by,
-                                       created_at_ms, updated_at_ms)
+                                       pool, created_at_ms, updated_at_ms)
         values (p_record ->> 'name', 'agent_resident_' || (p_record ->> 'name'),
                 'session_resident_' || (p_record ->> 'name'), p_record ->> 'charter',
-                p_record ->> 'proposed_by', p_at, p_at)
+                p_record ->> 'proposed_by', p_record ->> 'pool', p_at, p_at)
         on conflict (name) do update
-           set charter = excluded.charter, updated_at_ms = p_at;
+           set charter = excluded.charter, pool = excluded.pool, updated_at_ms = p_at;
     when 'resident.approved' then
         update mission_residents set state = 'approved', approved_by = 'human', updated_at_ms = p_at
          where name = p_record ->> 'name';
@@ -3054,7 +3072,7 @@ begin
         when 'mission_tasks' then
             insert into mission_tasks
             select * from jsonb_populate_record(null::mission_tasks,
-                jsonb_build_object('model', 'default') || (p_record -> 'row'));
+                jsonb_build_object('model', 'default', 'pinned', false) || (p_record -> 'row'));
         else
             raise exception 'legacy record of unknown table %', p_record ->> 'table';
         end case;
@@ -3257,9 +3275,13 @@ end $$;
 -- the `task.assigned` record names it (`duplicate_of`).
 drop function if exists spawn_task_assign(bigint, text, text, text);
 drop function if exists spawn_task_assign(bigint, text, text, text, text);
+drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean);
+-- `p_pin` (objective 239, `--pin`): the task stays with its worker, never
+-- stolen; the record names `pinned` true, and nothing otherwise.
 create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text,
                                              p_brief text, p_model text default 'default',
-                                             p_again boolean default false)
+                                             p_again boolean default false,
+                                             p_pin boolean default false)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3319,7 +3341,8 @@ begin
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief, 'model', p_model,
         'created_by', case when v_caller = 'owner' then 'human' else v_caller end)
         || case when v_duplicate is not null
-                then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end);
+                then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end
+        || case when p_pin then jsonb_build_object('pinned', true) else '{}'::jsonb end);
     return v_id;
 end $$;
 
@@ -3338,6 +3361,15 @@ begin
     -- delivered (the closure rule).
     if not exists (select 1 from mission_tasks where id = p_task and state in ('assigned', 'revise'))
        or not spawn_task_may_move(p_task, 'delivered') then
+        return false;
+    end if;
+    -- A delivery planned before a move (objective 239, task.stolen) is
+    -- never recorded for the old worker: the command's session must be the
+    -- task's worker's now. Only a moved task is checked: a task never moved
+    -- keeps the session it was assigned to.
+    if exists (select 1 from spawn_commands c join mission_tasks k on k.id = p_task
+                where c.id = p_command and k.stolen_at_ms is not null
+                  and c.session_id is distinct from k.session_id) then
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
@@ -3758,7 +3790,150 @@ end
 $$;
 
 -- A resident starts only after a human approves it.
-create or replace function spawn_resident_propose(p_name text, p_charter text)
+-- Whether `p_session`'s resident has a cancel notice not yet told: its
+-- latest delivered task is cancelled, and no `cancel-notice-<task>-<n>`
+-- command of the dispatcher's reached it (deliver::Work::blocked, as
+-- CANCELLED_DELIVERIES reads it).
+create or replace function spawn_cancel_notice_untold(p_session text)
+returns boolean language sql stable as $$
+    select exists (
+        select 1
+          from mission_tasks k
+          join mission_residents r on r.agent_id = k.agent_id and r.state <> 'retired'
+         where k.session_id = p_session and k.state = 'cancelled' and k.kind = 'resident'
+           and k.delivered_at_ms is not null
+           and not exists (select 1 from mission_tasks later
+                            where later.session_id = k.session_id and later.id <> k.id
+                              and later.delivered_at_ms is not null
+                              and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
+           and not exists (select 1 from spawn_commands c
+                            where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
+                              and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
+                              and c.succeeded))
+$$;
+
+-- Work stealing (objective 239, docs/fleet-architecture.md §3.2 "Work
+-- stealing"): move `p_task`, queued and unstarted, to the idle resident
+-- `p_to` of its worker's pool, `p_by` (`spawn-dispatch`, or `human` for
+-- the owner's `spawn task steal`) naming who and `p_reason` why. Owner only
+-- (the dispatcher's login and the owner's are the owner). Under the append
+-- lock it checks, in this order, and refuses with the first rule that
+-- fails, recording nothing: the task is queued (resident, assigned, never
+-- revised, no `deliver-<task>-` command); not pinned; its mission open, not
+-- paused, not halted; the taker an approved resident, not its worker; both
+-- in one pool; the taker idle (no open task of its own, no cancel notice
+-- not yet told); the task in its worker's queue, never the one delivery
+-- gives its worker now. Then one `task.stolen`, folded onto the task's
+-- session and agent. Returns {task, from_session, to_session, agent_id}.
+create or replace function spawn_task_steal(p_task bigint, p_to text, p_by text,
+                                            p_reason text default null)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_task mission_tasks;
+    v_mission mission_missions;
+    v_worker mission_residents;
+    v_taker mission_residents;
+    v_open record;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not move tasks', session_user using errcode = '42501';
+    end if;
+    if coalesce(trim(p_by), '') = '' then
+        raise exception 'a move names who moves it';
+    end if;
+    select * into v_task from mission_tasks where id = p_task;
+    if not found then
+        raise exception 'task % is not queued (no such task)', p_task;
+    end if;
+    if v_task.kind <> 'resident' then
+        raise exception 'task % is not queued (not a resident task)', p_task;
+    end if;
+    if v_task.state <> 'assigned' then
+        raise exception 'task % is not queued (%)', p_task, v_task.state;
+    end if;
+    if v_task.revisions <> 0 then
+        raise exception 'task % is not queued (revised)', p_task;
+    end if;
+    if exists (select 1 from spawn_commands
+                where idempotency_key like 'deliver-' || p_task || '-%') then
+        raise exception 'task % is not queued (a delivery command exists)', p_task;
+    end if;
+    select * into v_worker from mission_residents where agent_id = v_task.agent_id;
+    if v_task.pinned then
+        raise exception 'task % is pinned to %', p_task, coalesce(v_worker.name, v_task.agent_id);
+    end if;
+    select * into v_mission from mission_missions where id = v_task.mission_id;
+    if v_mission.state not in ('open', 'active') then
+        raise exception 'task % waits for its mission % (closed)', p_task, v_task.mission_id;
+    end if;
+    if v_mission.pause_event is not null then
+        raise exception 'task % waits for its mission % (paused)', p_task, v_task.mission_id;
+    end if;
+    if v_mission.halted is not null then
+        raise exception 'task % waits for its mission % (halted)', p_task, v_task.mission_id;
+    end if;
+    select * into v_taker from mission_residents where name = p_to;
+    if not found then
+        raise exception 'task % cannot go to % (no such resident)', p_task, p_to;
+    end if;
+    if v_taker.state = 'proposed' then
+        raise exception 'task % cannot go to % (not approved)', p_task, p_to;
+    end if;
+    if v_taker.state = 'retired' then
+        raise exception 'task % cannot go to % (retired)', p_task, p_to;
+    end if;
+    if v_taker.agent_id = v_task.agent_id then
+        raise exception 'task % cannot go to % (already its worker)', p_task, p_to;
+    end if;
+    if v_worker.pool is null or v_taker.pool is null then
+        raise exception 'task % cannot go to % (no pool)', p_task, p_to;
+    end if;
+    if v_worker.pool <> v_taker.pool then
+        raise exception 'task % cannot go to % (pool % is not %)', p_task, p_to,
+            v_worker.pool, v_taker.pool;
+    end if;
+    select k.id, k.state into v_open
+      from mission_tasks k join mission_missions m on m.id = k.mission_id
+     where k.session_id = v_taker.session_id
+       and (k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
+            or (k.state = 'accepted' and m.gate is not null))
+     order by k.id limit 1;
+    if found then
+        raise exception 'task % cannot go to % (not idle: task % %)', p_task, p_to,
+            v_open.id, v_open.state;
+    end if;
+    if spawn_cancel_notice_untold(v_taker.session_id) then
+        raise exception 'task % cannot go to % (not idle: a cancel notice is not told)',
+            p_task, p_to;
+    end if;
+    -- In its worker's queue: the worker holds an open task delivery waits
+    -- on, a cancel notice not yet told, or an older task of its own. A
+    -- worker's own assigned tasks do not make it busy: an idle worker's
+    -- oldest task is the one delivery gives it now.
+    if not exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
+                    where k.session_id = v_task.session_id and k.id <> p_task
+                      and (k.state in ('delivered', 'reported', 'revise', 'landing')
+                           or (k.state = 'accepted' and m.gate is not null)
+                           or (k.state = 'assigned' and k.id < p_task)))
+       and not spawn_cancel_notice_untold(v_task.session_id) then
+        raise exception 'task % is its worker''s next (its worker is idle)', p_task;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.stolen', 'id', p_task,
+        'from_session', v_task.session_id, 'from_agent', v_task.agent_id,
+        'to_session', v_taker.session_id, 'to_agent', v_taker.agent_id,
+        'pool', v_taker.pool, 'by', p_by, 'reason', nullif(trim(coalesce(p_reason, '')), ''),
+        'queued_since_ms', v_task.created_at_ms));
+    return jsonb_build_object('task', p_task, 'from_session', v_task.session_id,
+                              'to_session', v_taker.session_id, 'agent_id', v_taker.agent_id);
+end $$;
+
+drop function if exists spawn_resident_propose(text, text);
+-- `p_pool` (objective 239): the resident's pool, whose members may take
+-- each other's queued tasks once approved; null, none.
+create or replace function spawn_resident_propose(p_name text, p_charter text,
+                                                  p_pool text default null)
 returns void language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3774,12 +3949,17 @@ begin
     if coalesce(p_name, '') !~ '^[a-z][a-z0-9_]{0,30}$' then
         raise exception 'resident name % is not [a-z][a-z0-9_]{0,30}', p_name;
     end if;
+    if p_pool is not null and p_pool !~ '^[a-z][a-z0-9_]{0,30}$' then
+        raise exception 'pool % is not [a-z][a-z0-9_]{0,30}', p_pool;
+    end if;
     if exists (select 1 from mission_residents where name = p_name and state <> 'proposed') then
         raise exception 'resident % exists and is not a proposal', p_name;
     end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'resident.proposed', 'name', p_name, 'charter', p_charter,
-        'proposed_by', case when v_caller = 'owner' then 'human' else v_caller end));
+        'proposed_by', case when v_caller = 'owner' then 'human' else v_caller end)
+        || case when p_pool is not null then jsonb_build_object('pool', p_pool)
+                else '{}'::jsonb end);
 end $$;
 
 create or replace function spawn_resident_approve(p_name text)
@@ -6177,6 +6357,11 @@ returns jsonb language sql stable security definer as $$
                    case when r.record ->> 'type' = 'task.gated' then
                      r.record - array(select k from jsonb_object_keys(r.record) k
                                        where k not in ('class', 'inputs', 'env', 'head_inputs'))
+                   -- A move (objective 239): from and to whose session, by whom.
+                   when r.record ->> 'type' = 'task.stolen' then
+                     jsonb_build_object('from', r.record ->> 'from_session',
+                                        'to', r.record ->> 'to_session',
+                                        'by', r.record ->> 'by')
                    else '{}'::jsonb end as binding,
                    case r.record ->> 'type'
                      when 'task.gated' then r.record ->> 'verdict'
@@ -6764,13 +6949,14 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
         'spawn_task_restart_as(bigint, text, text)', 'spawn_task_reassign_as(bigint, text, text)',
-        'spawn_resident_propose(text, text)',
+        'spawn_resident_propose(text, text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
+        'spawn_task_steal(bigint, text, text, text)', 'spawn_cancel_notice_untold(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
         'spawn_task_report_unfinished(bigint, text, jsonb, text, bigint)',
@@ -6799,10 +6985,10 @@ begin
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
-        'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text)',
+        'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text, text)',
         'spawn_resident_retire(text)', 'spawn_task_stages(bigint)',
         'spawn_objective_retire(jsonb)'] loop
         execute format('grant execute on function %s to %I', v_function,

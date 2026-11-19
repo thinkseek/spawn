@@ -88,6 +88,7 @@ mod jobs;
 #[cfg(test)]
 mod resume_replay;
 mod stall;
+mod steal;
 mod stops;
 mod worker;
 
@@ -900,6 +901,24 @@ pub(crate) fn read_plan(
     })
 }
 
+/// Work stealing (objective 239), before the pass plans its deliveries:
+/// unless `SPAWN_WORK_STEALING` is 0, each idle pool member takes one queued
+/// task of a busy one ([`steal`]), each move or refusal said in `lines`;
+/// after any, the pass reads its facts and work again.
+fn steal_first(
+    store: &PostgresStore,
+    waits: deliver::Waits,
+    read: (Vec<Facts>, Work),
+    lines: &mut Vec<String>,
+) -> Result<(Vec<Facts>, Work), String> {
+    if steal::enabled(crate::config::env_value(steal::ENV).as_deref())
+        && steal::run(store, &read.1, lines)
+    {
+        return load(store, waits);
+    }
+    Ok(read)
+}
+
 /// Run one dispatcher step against the store: collect reports from idle
 /// workers under `root` (a draft is not taken: its worker is told instead,
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
@@ -924,6 +943,8 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store, waits)?;
     }
+    // Work stealing (objective 239), before deliveries are planned.
+    (rows, work) = steal_first(store, waits, (rows, work), &mut lines)?;
     // The agents' answers to their messages and the reports' answers to
     // their deliveries: changing no task and nothing this pass decides.
     lines.extend(crate::ack::answers(store, &rows, root, now_ms()));
