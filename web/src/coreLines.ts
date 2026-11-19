@@ -420,10 +420,9 @@ function storeWords(store: unknown): string {
 /** Which fall a figure is, after its name (objective 225): " (the week's
  * fit)" for "fit", " (the last day's fall)" for "day"; nothing without a
  * basis, for null, or for one it does not know. */
-function basisWords(basis: unknown, gained = false): string {
+function basisWords(basis: unknown): string {
   if (basis === "fit") return " (the week's fit)";
-  // A disk that gained (objective 230): never "fall" for a gain.
-  if (basis === "day") return gained ? " (over the last day)" : " (the last day's fall)";
+  if (basis === "day") return " (the last day's fall)";
   return "";
 }
 
@@ -445,6 +444,22 @@ const TURNED: Record<string, [string, string]> = {
   "storage.grew_most": [" grew most", " shrank least"],
 };
 
+/** The disk's gain over the last day (objective 233): its words say the
+ * day once, "Free disk gained over the last day", with no basis words
+ * after them (never "a day (over the last day)", never "fall" for a gain). */
+const GAINED_OVER_THE_DAY: [string, string] = [" lost a day", " gained over the last day"];
+
+/** How a figure below zero is turned, or null: its words and what they
+ * become, and whether its basis words still follow. Only a name that
+ * holds the words is turned (objective 233): a name the serve said
+ * otherwise keeps its words, its basis and its sign. */
+function turning(figure: Partial<CoreFigure>, name: string, signed: number | null): { words: [string, string]; basis: boolean } | null {
+  if (typeof figure.key !== "string" || !Object.hasOwn(TURNED, figure.key) || signed === null || signed >= 0) return null;
+  const day = figure.key === "storage.disk_fall" && figure.basis === "day";
+  const words = day ? GAINED_OVER_THE_DAY : TURNED[figure.key];
+  return name.includes(words[0]) ? { words, basis: !day } : null;
+}
+
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
@@ -452,16 +467,16 @@ function mark(raw: unknown): CoreMark {
   // Below zero, a turned figure says its other words and the size as a
   // positive number (objective 230: "Free disk gained a day", never "lost
   // -2662.8 MB a day"); its range and tone are as they were.
-  const turn = typeof figure.key === "string" && Object.hasOwn(TURNED, figure.key) && signed !== null && signed < 0 ? TURNED[figure.key] : null;
-  const value = turn !== null && signed !== null ? Math.abs(signed) : signed;
   const ownName = typeof figure.name === "string" ? figure.name : String(figure.key ?? "");
-  const baseName = turn !== null ? ownName.replace(turn[0], turn[1]) : ownName;
+  const turn = turning(figure, ownName, signed);
+  const value = turn !== null && signed !== null ? Math.abs(signed) : signed;
+  const baseName = turn !== null ? ownName.replace(turn.words[0], turn.words[1]) : ownName;
   const since = finite(figure.measuring_since_ms);
   const of = finite(figure.of);
   const target = finite(figure.target);
   const held = typeof figure.range_note === "string" && figure.range_note !== "" ? figure.range_note : null;
   const said: CoreMark = {
-    name: `${baseName}${windowWords(figure.window)}${storeWords(figure.store)}${basisWords(figure.basis, turn !== null && figure.key === "storage.disk_fall")}${judgedWords(figure.judged)}`,
+    name: `${baseName}${windowWords(figure.window)}${storeWords(figure.store)}${turn === null || turn.basis ? basisWords(figure.basis) : ""}${judgedWords(figure.judged)}`,
     value:
       value !== null
         ? `${unitWords(unit, value)}${of !== null ? ` of ${GROUPED.format(of)}` : ""}`

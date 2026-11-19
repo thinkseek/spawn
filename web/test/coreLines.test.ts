@@ -520,7 +520,7 @@ test("a disk that gained and stores that all shrank say so with positive sizes",
   // Below zero under each basis, and none: gained, the size positive.
   for (const [basis, words] of [
     ["fit", "Free disk gained a day (the week's fit)"],
-    ["day", "Free disk gained a day (over the last day)"],
+    ["day", "Free disk gained over the last day"],
     [undefined, "Free disk gained a day"],
     [null, "Free disk gained a day"],
   ] as const) {
@@ -555,6 +555,35 @@ test("a disk that gained and stores that all shrank say so with positive sizes",
   const other = one({ key: "storage.archive_growth", name: "Archive grows a day, lost or grew most", value: -5e9 });
   assert.equal(other.name, "Archive grows a day, lost or grew most");
   assert.equal(other.value, unitWords("bytes_per_day", -5e9));
+});
+
+// Objective 233: the last day's gain says "day" once, the size positive;
+// a turned key under a name without the words it turns is said as any
+// other figure, its basis words and its minus kept.
+test("the day's gain says day once, and a name without the turned words is not turned", () => {
+  const one = (figure: Partial<CoreFigure>) =>
+    coreLinesView({
+      lines: [],
+      diagnostics: [{ unit: "bytes_per_day", range: null, state: "no_range", ...figure } as CoreFigure],
+    }).diagnostics[0];
+  const gained = -5e9;
+  const day = one({ key: "storage.disk_fall", name: "Free disk lost a day", value: gained, basis: "day" });
+  assert.equal(day.name, "Free disk gained over the last day");
+  assert.equal(day.name.match(/\bday\b/g)?.length, 1);
+  assert.equal(day.value, unitWords("bytes_per_day", -gained));
+  assert.doesNotMatch(day.value, /-/);
+
+  for (const [key, name, basis, words] of [
+    ["storage.disk_fall", "Free disk fell", "fit", "Free disk fell (the week's fit)"],
+    ["storage.disk_fall", "Free disk fell", "day", "Free disk fell (the last day's fall)"],
+    ["storage.disk_fall", "Free disk lost per day", "day", "Free disk lost per day (the last day's fall)"],
+    ["storage.grew_most", "Largest store growth", undefined, "Largest store growth"],
+  ] as const) {
+    const mark = one({ key, name, value: gained, ...(basis === undefined ? {} : { basis }) });
+    assert.equal(mark.name, words, `${key} ${name} ${String(basis)}`);
+    assert.equal(mark.value, unitWords("bytes_per_day", gained));
+    assert.match(mark.value, /^-/);
+  }
 });
 
 // Objective 148: "Needs you is right" says what it is read from after its
