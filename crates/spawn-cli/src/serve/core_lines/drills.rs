@@ -18,14 +18,23 @@
 //! `record_verified`); its newest drill (`last`, objective 105) is the
 //! newest record of that type whatever its `ok`, both read in one statement
 //! (`drill_of_type`). A row with `unit` is read without root through
-//! `$SPAWN_SYSTEMCTL show -p Result,ExecMainStatus,ExecMainExitTimestamp
-//! --timestamp=unix -- <unit>` (default `systemctl`), its arguments as argv
+//! `$SPAWN_SYSTEMCTL show -p
+//! LoadState,Result,ExecMainStatus,ExecMainExitTimestamp --timestamp=unix --
+//! <unit>` (default `systemctl`), its arguments as argv
 //! and no shell, each call bounded ([`UNIT_LIMIT`]; one that runs over is no
 //! pass) and its duration logged: it passed when `Result` is `success` and
 //! `ExecMainStatus` 0, at its exit timestamp, and the same output gives its
 //! newest run (`last`: not ok, with "Result=<Result>,
 //! ExecMainStatus=<status>", otherwise). A reading is kept for
-//! [`UNIT_KEPT_MS`]. A unit name other than
+//! [`UNIT_KEPT_MS`]. The system manager is asked first; when it does not
+//! know the unit (`LoadState=not-found`, where it also answers
+//! `Result=success`, `ExecMainStatus=0` and no exit: no pass), the user
+//! manager is asked once (`--user show ...`, the same bound, logged, kept
+//! the same), since a drill can be a `--user` unit (objective 231: the
+//! controllers' drill, installed in ~/.config/systemd/user, read as never
+//! passed). A unit both managers know is the system manager's, and so is
+//! an answer with no `LoadState` line (a stand-in, an older systemd); a
+//! system call that fails is no reading, never asked again. A unit name other than
 //! `[A-Za-z0-9][A-Za-z0-9@._-]*.service` is never run ([`unit_allowed`]) and
 //! the log names it as refused: systemctl reads a leading `-` as an option
 //! (`-H<host>` is an SSH connection to that host), and a `.timer` has no
@@ -239,21 +248,24 @@ pub(super) fn record_reading(answer: Option<&Value>) -> Reading {
     }
 }
 
-/// `<program> show -p Result,ExecMainStatus,ExecMainExitTimestamp
-/// --timestamp=unix -- <unit>`, as argv, no stdin, its output read: `Err`
-/// when it could not start, ran over `limit` (killed, with what it
-/// started) or failed. A name [`unit_allowed`] refuses is never run.
-pub(super) fn show(program: &str, unit: &str, limit: Duration) -> Result<String, String> {
+/// `<program> [--user] show -p
+/// LoadState,Result,ExecMainStatus,ExecMainExitTimestamp --timestamp=unix --
+/// <unit>`, as argv, no stdin, its output read: the system manager's, or
+/// the user manager's with `user` (objective 231). `Err` when it could not
+/// start, ran over `limit` (killed, with what it started) or failed. A name
+/// [`unit_allowed`] refuses is never run.
+pub(super) fn show(program: &str, unit: &str, user: bool, limit: Duration) -> Result<String, String> {
     use std::os::unix::process::CommandExt as _;
 
     if !unit_allowed(unit) {
         return Err(format!("unit {unit:?} refused"));
     }
     let mut child = Command::new(program)
+        .args(user.then_some("--user"))
         .args([
             "show",
             "-p",
-            "Result,ExecMainStatus,ExecMainExitTimestamp",
+            "LoadState,Result,ExecMainStatus,ExecMainExitTimestamp",
             "--timestamp=unix",
             "--",
             unit,
@@ -356,27 +368,61 @@ fn unit_reading(unit: &str, now_ms: i64) -> Reading {
         return reading;
     }
     let program = crate::env_value("SPAWN_SYSTEMCTL").unwrap_or_else(|| "systemctl".to_string());
-    let started = Instant::now();
-    let shown = show(&program, unit, UNIT_LIMIT);
-    let took = started.elapsed().as_millis();
-    let reading = match shown {
-        Ok(text) => {
-            eprintln!("core-lines: {program} show {unit}: {took} ms");
-            Reading {
-                passed_at_ms: parse_show(&text),
-                last: parse_last(&text),
-            }
-        }
-        Err(why) => {
-            eprintln!("core-lines: {program} show {unit}: {why} ({took} ms)");
-            Reading::default()
-        }
-    };
+    let reading = read_unit(&program, unit, UNIT_LIMIT);
     UNITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(unit.to_string(), (now_ms, reading.clone()));
     reading
+}
+
+/// Whether a `systemctl show` answer says the manager does not know the
+/// unit: a `LoadState=not-found` line, and no other load state (masked,
+/// error, bad-setting, merged, stub are known units).
+pub(super) fn not_found(text: &str) -> bool {
+    text.lines().any(|line| line.trim_end() == "LoadState=not-found")
+}
+
+/// A unit's last pass and last run from `program`, each call logged with
+/// its duration: the system manager's answer, or, when it says the unit is
+/// not found, the user manager's (objective 231), asked once with the same
+/// `limit`. A system call that fails is no reading and is not asked again.
+fn read_unit(program: &str, unit: &str, limit: Duration) -> Reading {
+    let started = Instant::now();
+    let shown = show(program, unit, false, limit);
+    let took = started.elapsed().as_millis();
+    let text = match shown {
+        Ok(text) if not_found(&text) => {
+            eprintln!(
+                "core-lines: {program} show {unit}: not a system unit ({took} ms); asking the user manager"
+            );
+            let started = Instant::now();
+            let shown = show(program, unit, true, limit);
+            let took = started.elapsed().as_millis();
+            match shown {
+                Ok(text) => {
+                    eprintln!("core-lines: {program} --user show {unit}: {took} ms");
+                    text
+                }
+                Err(why) => {
+                    eprintln!("core-lines: {program} --user show {unit}: {why} ({took} ms)");
+                    return Reading::default();
+                }
+            }
+        }
+        Ok(text) => {
+            eprintln!("core-lines: {program} show {unit}: {took} ms");
+            text
+        }
+        Err(why) => {
+            eprintln!("core-lines: {program} show {unit}: {why} ({took} ms)");
+            return Reading::default();
+        }
+    };
+    Reading {
+        passed_at_ms: parse_show(&text),
+        last: parse_last(&text),
+    }
 }
 
 /// Each row's reading, in order: a record's from `record` (each type read
@@ -992,11 +1038,11 @@ mod tests {
                 calls.display()
             ),
         );
-        let text = show(&program, "a.service", Duration::from_secs(5)).expect("shown");
+        let text = show(&program, "a.service", false, Duration::from_secs(5)).expect("shown");
         assert_eq!(parse_show(&text), Some(5000));
         assert_eq!(
             std::fs::read_to_string(&calls).expect("the call"),
-            "show\n-p\nResult,ExecMainStatus,ExecMainExitTimestamp\n--timestamp=unix\n--\na.service\n"
+            "show\n-p\nLoadState,Result,ExecMainStatus,ExecMainExitTimestamp\n--timestamp=unix\n--\na.service\n"
         );
     }
 
@@ -1005,7 +1051,7 @@ mod tests {
         let dir = Scratch::new();
         let program = script(dir.as_path(), "sleep 30\necho Result=success");
         let started = Instant::now();
-        let shown = show(&program, "a.service", Duration::from_millis(300));
+        let shown = show(&program, "a.service", false, Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5), "bounded");
         assert!(
             shown.as_ref().is_err_and(|why| why.contains("ran over")),
@@ -1021,7 +1067,7 @@ mod tests {
         let dir = Scratch::new();
         let program = script(dir.as_path(), "echo Result=success\nsleep 30 &\nexit 0");
         let started = Instant::now();
-        let shown = show(&program, "a.service", Duration::from_millis(300));
+        let shown = show(&program, "a.service", false, Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5), "bounded");
         assert!(
             shown
@@ -1043,7 +1089,7 @@ mod tests {
             "bb drill; touch x",
             "bb-drill-a.timer",
         ] {
-            let shown = show(&program, bad, Duration::from_secs(5));
+            let shown = show(&program, bad, false, Duration::from_secs(5));
             assert!(
                 shown.as_ref().is_err_and(|why| why.contains("refused")),
                 "{bad}: {shown:?}"
@@ -1051,7 +1097,7 @@ mod tests {
         }
         assert!(!ran.exists(), "systemctl was never run");
         // The good name runs it.
-        let shown = show(&program, "a.service", Duration::from_secs(5));
+        let shown = show(&program, "a.service", false, Duration::from_secs(5));
         assert!(shown.is_ok(), "a.service: {shown:?}");
         assert!(ran.exists());
     }
