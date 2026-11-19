@@ -280,8 +280,14 @@ lost() {
   done
 }
 
+echo "== thinning: a first run the budget cuts is not the print-only run (rev-j's 229 R0 F1)"
+sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" SPAWN_SESSION_THIN_BUDGET=0 -- thin
+check "a first thin with a budget of 0 prints only, judges nothing and leaves no marker (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "is print-only (rule (c))" "$2" && ! grep -qE ": (would remove|kept|removed) " "$2" && grep -q "not judged yet (budget 0s)" "$2" && [ ! -e "$3/.thin-dry-run-done" ]' _ "$status" "$out" "$root"
+check "and removed none" [ "$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)" -eq "$count_all" ]
 echo "== thinning: the first run on a root only prints"
 sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin
+cp -- "$out" "$scratch/thin-first.out"
 check "says it is print-only (status $status)" grep -q "is print-only (rule (c))" "$out"
 check "would remove versions" grep -q "would remove 20261101T" "$out"
 check "removed none" [ "$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" | wc -l)" -eq "$count_all" ]
@@ -292,6 +298,55 @@ check "--dry-run after it removes none either" \
 check "and says it removes nothing, not that a next one removes" \
   bash -c 'grep -q "thin --dry-run: prints what it would remove, removes nothing" "$1" && ! grep -q "the next one" "$1"' _ "$out"
 
+echo "== thinning keeps its verdicts (objective 229)"
+# verdicts <file>: the lines of a thin's verdicts, in its order.
+verdicts() { grep -E '^session-backup: alice: (would remove|kept) ' "$1" || true; }
+v_first=$(verdicts "$scratch/thin-first.out")
+check "the first run judged pairs, among them a version it would remove ($(wc -l <<<"$v_first") verdicts)" \
+  bash -c 'grep -q ": would remove 20261101T070000Z " <<<"$1" && grep -q ": would remove 20261101T060000Z " <<<"$1"' _ "$v_first"
+check "and kept them, one line a pair, under the account" \
+  bash -c '[ "$(wc -l <"$1/alice/.thin-judged")" -eq "$(wc -l <<<"$2")" ] && [ "$(stat -c %a "$1/alice/.thin-judged")" = 600 ]' _ "$root" "$v_first"
+check "the --dry-run after it says the same verdicts" bash -c '[ "$1" = "$2" ]' _ "$v_first" "$(verdicts "$out")"
+# A kept verdict is used without reading the versions: with every file of
+# 20261101T060000Z and of the version after it unreadable, a --dry-run still
+# says it would remove 20261101T060000Z (a fresh judgment could not read
+# them, and would keep it).
+unreadable=$(find "$root/alice/20261101T060000Z" "$root/alice/20261101T061500Z" -type f)
+while read -r f; do chmod 000 -- "$f"; done <<<"$unreadable"
+sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin --dry-run
+check "a --dry-run reads no version it has a verdict for: the same verdicts with both versions unreadable (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && [ "$2" = "$3" ]' _ "$status" "$v_first" "$(verdicts "$out")"
+# A line is used only while both manifests hash as it says: with the
+# line's sha256 for the next version's manifest made wrong, the pair is
+# judged again, and (its files still unreadable) kept.
+[ ! -e "$root/alice/.thin-judged" ] || sed -i 's/^\(20261101T060000Z 20261101T061500Z [a-z]* [0-9a-f]* \)[0-9a-f]*$/\10000000000000000000000000000000000000000000000000000000000000000/' "$root/alice/.thin-judged"
+sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin --dry-run
+while read -r f; do chmod 400 -- "$f"; done <<<"$unreadable"
+check "a line whose manifest sha256 no longer matches is not used: 20261101T060000Z judged again, and kept (status $status)" \
+  bash -c '[ "$1" -eq 0 ] && grep -q "alice: kept 20261101T060000Z: " "$2" && ! grep -q "alice: would remove 20261101T060000Z " "$2"' _ "$status" "$out"
+# The budget: with none, nothing new is judged and the run says so; with
+# one, the next run judges the rest, and says what a full run says.
+# (moved only if there: a missing file is the check above failing, not a harness stop)
+[ ! -e "$root/alice/.thin-judged" ] || mv -- "$root/alice/.thin-judged" "$scratch/thin-judged.saved"
+sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" SPAWN_SESSION_THIN_BUDGET=0 -- thin --dry-run
+# (bob's verdicts are still kept, so bob's lines are said; alice's are not.)
+check "a budget of 0 judges nothing new and says how many wait (status $status; $(grep -o "thin: .*" "$out"))" \
+  bash -c '[ "$1" -eq 0 ] && ! grep -qE "^session-backup: alice: (would remove|kept) " "$2" && grep -qE "^session-backup: bob: would remove " "$2" && grep -q "thin: $3 version(s) not judged yet (budget 0s); the next run goes on" "$2"' _ "$status" "$out" "$(wc -l <<<"$v_first")"
+sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin --dry-run
+check "the next run, with the default budget, judges them all: the same verdicts, none waiting" \
+  bash -c '[ "$1" = "$2" ] && ! grep -q "not judged yet" "$3"' _ "$v_first" "$(verdicts "$out")" "$out"
+sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" SPAWN_SESSION_THIN_BUDGET=soon -- thin --dry-run
+check "a budget that is no number is refused (status $status)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "SPAWN_SESSION_THIN_BUDGET must be a number of seconds" "$2"' _ "$status" "$out"
+# A removal judges at the moment of removal: 20261101T070000Z has a kept
+# "held" verdict, but its next version's a.jsonl is changed now (same size,
+# its first byte), so the version no longer holds in the next one. The
+# thinning below must keep it, and say so.
+nf=$root/alice/20261101T071500Z/projects/p1/a.jsonl
+nf_byte=$(head -c 1 "$nf")
+chmod 600 -- "$nf"
+printf 'X' | dd of="$nf" bs=1 seek=0 count=1 conv=notrunc status=none
+chmod 400 -- "$nf"
 echo "== thinning"
 sb SPAWN_SESSION_BACKUP_NOW="$(at "$now")" -- thin
 kept=$(find "$root/alice" -mindepth 1 -maxdepth 1 -type d -name "2*Z" -printf '%f\n' | sort)
@@ -299,6 +354,14 @@ check "removed versions (status $status; $(wc -l <<<"$kept") kept of $count_all)
   bash -c '[ "$1" -eq 0 ] && [ "$(wc -l <<<"$2")" -lt "$3" ] && grep -q "removed 20261101T" "$4"' _ "$status" "$kept" "$count_all" "$out"
 check "nothing ever copied is lost" bash -c '[ -z "$1" ]' _ "$(lost)"
 check "the last version before b.jsonl's deletion at hour 3 is kept" grep -qx 20261101T024500Z <<<"$kept"
+check "a removal does not trust a kept verdict: 20261101T070000Z, whose next changed, is kept and said so" \
+  bash -c 'grep -qx 20261101T070000Z <<<"$1" && grep -q "alice: kept 20261101T070000Z: a file of it is in no later version" "$2"' _ "$kept" "$out"
+check "after the removals, every kept line names two versions that are still there" \
+  bash -c 'while read -r v n rest; do [ -d "$1/$v" ] && [ -d "$1/$n" ] || exit 1; done <"$1/.thin-judged"; [ -s "$1/.thin-judged" ]' _ "$root/alice"
+# The byte put back: the version is its manifest's again.
+chmod 600 -- "$nf"
+printf '%s' "$nf_byte" | dd of="$nf" bs=1 seek=0 count=1 conv=notrunc status=none
+chmod 400 -- "$nf"
 check "and holds b.jsonl" [ -f "$root/alice/20261101T024500Z/projects/p1/b.jsonl" ]
 check "the last version before c.jsonl's rewrite at hour 5 is kept" grep -qx 20261101T044500Z <<<"$kept"
 check "and those after the rewrite and in the 48 hours' days, every file of which is in the next, are gone" \

@@ -17,8 +17,9 @@
 #       for |value|, no minus); "Store that shrank least: unattributed" with
 #       |value|;
 #   (2) a week gaining 20 GB a day up to F - 5 GB a day ago, then gaining 5 GB
-#       (disk_fall below zero, basis "day"): "Free disk gained a day (over
-#       the last day)", |value|; the store that shrank least, |value|;
+#       (disk_fall below zero, basis "day"): "Free disk gained over the last
+#       day" (objective 233: "day" once), |value|; the store that shrank
+#       least, |value|;
 #   (3) a week falling 10 GB a day, then a day losing 10 GB (both figures
 #       above zero): "Free disk lost a day (the week's fit)" or "(the last
 #       day's fall)" by the answer's basis, and "Store that grew most:
@@ -266,12 +267,13 @@ const marks = (v) => [...v.rows.flatMap((row) => [row.north_star, ...row.guardra
 const mark = (a, key) => coreLinesView(a).diagnostics[a.diagnostics.findIndex((d) => d.key === key)];
 const words = (v) => unitWords("bytes_per_day", v);
 
-for (const [name, basisWords] of [["fitgain", " (the week's fit)"], ["daygain", " (over the last day)"]]) {
+// The last day's gain says its day once since objective 233.
+for (const [name, said] of [["fitgain", "Free disk gained a day (the week's fit)"], ["daygain", "Free disk gained over the last day"]]) {
   test(`(${name === "fitgain" ? 1 : 2}) a disk that gained: gained, the size positive`, () => {
     const a = answer(name);
     const fall = raw(a, "storage.disk_fall");
     const m = mark(a, "storage.disk_fall");
-    assert.equal(m.name, `Free disk gained a day${basisWords}`);
+    assert.equal(m.name, said);
     assert.equal(m.value, words(-fall.value));
     assert.doesNotMatch(m.value, /-/);
     const grew = raw(a, "storage.grew_most");
