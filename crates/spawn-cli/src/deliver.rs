@@ -2280,6 +2280,7 @@ mod tests {
             reassigned_as: None,
             reassigned_to_session: None,
             restart: None,
+            pinned: false,
         }
     }
 
