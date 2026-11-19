@@ -1032,7 +1032,7 @@ mod tests {
         let mut got = reading(7);
         got.claimed = vec![
             folder("/s/a", "rev-e", "1/007", Some(5000), 100),
-            folder("/s/d", "rev-i", "1/007", Some(4000), 0),
+            folder("/s/d", "rev-i", "1/007", Some(4500), 0),
             folder("/s/q", "rev-e", "1/009", Some(1000), 10),
             // Leased: only its build output is known.
             folder("/s/o", "rev-e", "1/009", None, 3000),
@@ -1044,9 +1044,9 @@ mod tests {
         let landed = [(1, 7), (1, 9)];
         assert_eq!(
             super::landed_scratch(Some(&got), Some(&landed)),
-            json!({"bytes": 13_000, "note": null, "by_owner": [
+            json!({"bytes": 13_500, "note": null, "by_owner": [
                 {"agent": "rev-e", "objective": "1/007", "bytes": 5000, "folders": 1, "leased": 0},
-                {"agent": "rev-i", "objective": "1/007", "bytes": 4000, "folders": 1, "leased": 0},
+                {"agent": "rev-i", "objective": "1/007", "bytes": 4500, "folders": 1, "leased": 0},
                 {"agent": "rev-e", "objective": "1/009", "bytes": 4000, "folders": 2, "leased": 1},
             ]})
         );
