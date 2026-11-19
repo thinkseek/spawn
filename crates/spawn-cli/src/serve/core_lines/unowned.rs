@@ -1006,4 +1006,130 @@ mod tests {
         );
         assert_eq!(super::scratch_json(&plan, None, None)["claimed"], json!([]));
     }
+
+    /// A claimed folder of `bytes` (`None`: leased, its build output only
+    /// known, `build` bytes of it).
+    fn folder(
+        path: &str,
+        agent: &str,
+        objective: &str,
+        bytes: Option<u64>,
+        build: u64,
+    ) -> super::Claimed {
+        super::Claimed {
+            bytes,
+            build_bytes: build,
+            ..claimed(path, agent, objective)
+        }
+    }
+
+    /// Objective 232: the scratch of landed objectives sums each landed
+    /// claimed folder's bytes (its build bytes while leased), by agent and
+    /// objective; a folder of an objective not landed, or with no pair,
+    /// adds nothing.
+    #[test]
+    fn the_scratch_of_landed_objectives_is_summed_by_agent_and_objective() {
+        let mut got = reading(7);
+        got.claimed = vec![
+            folder("/s/a", "rev-e", "1/007", Some(5000), 100),
+            folder("/s/d", "rev-i", "1/007", Some(4000), 0),
+            folder("/s/q", "rev-e", "1/009", Some(1000), 10),
+            // Leased: only its build output is known.
+            folder("/s/o", "rev-e", "1/009", None, 3000),
+            // Not landed.
+            folder("/s/b", "rev-e", "1/008", Some(9000), 0),
+            // No pair.
+            folder("/s/z", "rev-e", "nonsense", Some(9000), 0),
+        ];
+        let landed = [(1, 7), (1, 9)];
+        assert_eq!(
+            super::landed_scratch(Some(&got), Some(&landed)),
+            json!({"bytes": 13_000, "note": null, "by_owner": [
+                {"agent": "rev-e", "objective": "1/007", "bytes": 5000, "folders": 1, "leased": 0},
+                {"agent": "rev-i", "objective": "1/007", "bytes": 4000, "folders": 1, "leased": 0},
+                {"agent": "rev-e", "objective": "1/009", "bytes": 4000, "folders": 2, "leased": 1},
+            ]})
+        );
+        // None claimed: 0 and no rows.
+        let none = reading(7);
+        assert_eq!(
+            super::landed_scratch(Some(&none), Some(&[])),
+            json!({"bytes": 0, "note": null, "by_owner": []})
+        );
+        // Claimed, none landed: 0.
+        assert_eq!(super::landed_scratch(Some(&got), Some(&[]))["bytes"], 0);
+    }
+
+    /// Objective 232 (R2): ties on bytes go by agent, then by objective.
+    #[test]
+    fn the_scratch_of_landed_objectives_ties_go_by_agent_then_objective() {
+        let mut got = reading(0);
+        got.claimed = vec![
+            folder("/s/m", "rev-i", "1/009", Some(5000), 0),
+            folder("/s/n", "rev-e", "1/009", Some(5000), 0),
+            folder("/s/p", "rev-e", "1/010", Some(5000), 0),
+            folder("/s/r", "rev-e", "1/007", Some(5000), 0),
+        ];
+        let rows = super::landed_scratch(Some(&got), Some(&[(1, 7), (1, 9), (1, 10)]));
+        let names: Vec<String> = rows["by_owner"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {}",
+                    row["agent"].as_str().unwrap_or(""),
+                    row["objective"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["rev-e 1/007", "rev-e 1/009", "rev-e 1/010", "rev-i 1/009"]
+        );
+    }
+
+    /// Objective 232 (R2): no complete walk, or landings not readable, is
+    /// null with a note, never 0.
+    #[test]
+    fn the_scratch_of_landed_objectives_is_null_with_a_note_without_a_complete_walk() {
+        let unmeasured = |value: &Value| {
+            value["bytes"].is_null()
+                && value["by_owner"].is_null()
+                && value["note"].as_str().is_some_and(|note| !note.is_empty())
+        };
+        let mut got = reading(0);
+        got.claimed = vec![folder("/s/a", "rev-e", "1/007", Some(5000), 0)];
+        // Landed unknown: the store could not say.
+        assert!(unmeasured(&super::landed_scratch(Some(&got), None)));
+        // No reading yet.
+        assert!(unmeasured(&super::landed_scratch(None, Some(&[(1, 7)]))));
+        // No complete walk: no roots, or none within the bound.
+        let mut walkless = got.clone();
+        walkless.unowned = None;
+        assert!(unmeasured(&super::landed_scratch(
+            Some(&walkless),
+            Some(&[(1, 7)])
+        )));
+        // A root refused.
+        let mut refused = got.clone();
+        refused.refused = vec![(PathBuf::from("/s"), "is a symlink".to_string())];
+        assert!(unmeasured(&super::landed_scratch(
+            Some(&refused),
+            Some(&[(1, 7)])
+        )));
+        // Each note says which.
+        let notes: Vec<Value> = [
+            super::landed_scratch(Some(&got), None),
+            super::landed_scratch(None, Some(&[(1, 7)])),
+            super::landed_scratch(Some(&walkless), Some(&[(1, 7)])),
+            super::landed_scratch(Some(&refused), Some(&[(1, 7)])),
+        ]
+        .iter()
+        .map(|value| value["note"].clone())
+        .collect();
+        let distinct: std::collections::BTreeSet<String> =
+            notes.iter().map(Value::to_string).collect();
+        assert_eq!(distinct.len(), 4, "{notes:?}");
+    }
 }
