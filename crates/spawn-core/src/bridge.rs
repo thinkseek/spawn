@@ -1807,7 +1807,12 @@ impl Bridge {
     /// pass when no watch could be set for the execution
     /// ([`Follow::poll`]). A read that leaves a line half-written, or a
     /// checkpoint uncommitted, keeps the execution due, so the next pass
-    /// reads again: a line is never lost to the moment it was written.
+    /// reads again: a line is never lost to the moment it was written. So
+    /// does a read that came back full (objective 241): a backlog over one
+    /// read ([`READ_LIMIT`]), such as a long transcript read again from its
+    /// execution's start after a restart, is read through in passes, never
+    /// left waiting for the next change of the file (LOOK 4082: an idle
+    /// session's new turn was never reached, its message read as not taken).
     ///
     /// A transcript that shrank below the offset, or was replaced (other
     /// bytes than the ones read just before the offset: a rewrite, a
@@ -1870,13 +1875,15 @@ impl Bridge {
                 return Ok(());
             }
         };
+        // The file is there (no grace to wait for): due next pass only when
+        // this read came back full, so more of it waits to be read.
+        active.follow.due_at = (bytes.len() >= limit).then(|| self.clock.now().0);
         if !bytes.is_empty() {
             // The transcript grew: the archive copies it on this pass.
             active.follow.archiving.due = true;
             // Its screen is looked at once it holds still, not while it is
             // being written.
             active.follow.unread_since = Some(self.clock.now().0);
-            active.follow.due_at = None;
         }
         let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
             // A full read without a newline is one line longer than the
