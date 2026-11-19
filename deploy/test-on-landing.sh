@@ -52,7 +52,9 @@ test_url_file=${SPAWN_DEPLOY_TEST_URL_FILE:-$HOME/.config/spawn/test-database.ur
 [ -f "$test_url_file" ] || die "no $test_url_file"
 test_url=$(cat "$test_url_file")
 case $test_url in *:15433/*) die "the test URL names port 15433, the live database" ;; esac
-db=spawn_on_landing_test_$$
+# Not $$ alone: in a gate's PID namespace it is the same small number in
+# every run, and two runs on one server would share (and drop) a database.
+db=spawn_on_landing_test_$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
 live_url=${test_url%/*}/$db
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/spawn-on-landing-test.XXXXXX")
