@@ -453,9 +453,9 @@ refused "$t2" gus "not idle" "a taker that is not idle (a task assigned only)"
 
 # --- (2) two takers of one task ----------------------------------------------------
 
-("$SPAWN_BIN" task steal --id "$t2" --to ann >"$WORK/ann.out" 2>"$WORK/ann.err"; echo $? >"$WORK/ann.rc") &
+(set +e; "$SPAWN_BIN" task steal --id "$t2" --to ann >"$WORK/ann.out" 2>"$WORK/ann.err"; echo $? >"$WORK/ann.rc") &
 a_pid=$!
-("$SPAWN_BIN" task steal --id "$t2" --to dee >"$WORK/dee.out" 2>"$WORK/dee.err"; echo $? >"$WORK/dee.rc") &
+(set +e; "$SPAWN_BIN" task steal --id "$t2" --to dee >"$WORK/dee.out" 2>"$WORK/dee.err"; echo $? >"$WORK/dee.rc") &
 d_pid=$!
 wait "$a_pid" || true
 wait "$d_pid" || true
