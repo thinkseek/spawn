@@ -538,7 +538,11 @@ impl Observer {
         // (at its prompt) its COMPLETED mass is folded into WAITING before
         // the narrowing. Where they do not (an exit), folding first would
         // drop that mass and let a sliver of BLOCKED win (GitHub PR #69,
-        // 061b2c4d), so the narrowed answer is folded instead.
+        // 061b2c4d), so the narrowed answer is folded instead. That covers
+        // a lost terminal too (UNKNOWN, BLOCKED, COMPLETED): a supervisor the
+        // model calls mostly COMPLETED there reads WAITING, and draws
+        // attention only by needs_human, stuck or a disagreement; its
+        // recovery runs on its end cause, not on this judgement.
         let fold_first = input.perpetual && ambiguity.allowed().contains(&SemanticState::Waiting);
         let judgement = if fold_first {
             fold_completed(&raw)

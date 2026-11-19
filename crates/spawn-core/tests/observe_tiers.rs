@@ -865,6 +865,49 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
 }
 
+/// The fold is the perpetual session's alone: any other session the model
+/// calls COMPLETED stays COMPLETED, at its prompt and on an exit, where the
+/// dispatcher escalates it as finished (rev-i on t515u R3).
+#[test]
+fn a_session_that_can_end_stays_completed_at_its_prompt_and_on_an_exit() {
+    let completed = || {
+        Scripted::new(Ok(Judgement {
+            state: SemanticState::Completed,
+            confidence: confidence(0.71),
+            probabilities: Some([0.0, 0.27, 0.02, 0.71, 0.0]),
+            needs_human: Some(0.05),
+            stuck: Some(0.05),
+        }))
+    };
+    let mut at_prompt = fixture(completed());
+    started(&at_prompt.store);
+    native(&at_prompt.store);
+    turn_stopped(&at_prompt.store);
+    at_prompt.observer.tick().expect("tick");
+    let last = observations(&at_prompt.store)
+        .pop()
+        .expect("an observation");
+    assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+    assert_eq!(last.state, SemanticState::Completed, "at its prompt");
+
+    let mut exited = fixture(completed());
+    started(&exited.store);
+    append(
+        &exited.store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+            signal: None,
+            evidence: None,
+        },
+    );
+    exited.observer.tick().expect("tick");
+    let last = observations(&exited.store).pop().expect("an observation");
+    assert_eq!(last.ambiguity, Some(Ambiguity::ExitedOnItsOwn));
+    assert_eq!(last.state, SemanticState::Completed, "on an exit");
+}
+
 /// A context that counts what the Observer reads from it.
 #[derive(Default)]
 struct Counting {
