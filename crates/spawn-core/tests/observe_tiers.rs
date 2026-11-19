@@ -779,6 +779,54 @@ fn a_human_line_in_a_tools_output_asks_nobody() {
     assert_ne!(last.attention_reason.as_deref(), Some("human_question"));
 }
 
+/// The supervisor's context with no question for a person.
+struct Perpetual;
+
+impl ObservationContext for Perpetual {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn perpetual(&self, _session: &SessionId) -> bool {
+        true
+    }
+}
+
+/// An idle supervisor with no question still goes to the model: its
+/// `stuck` and `needs_human` are what the alert step's agent_stuck and the
+/// attention view's untagged ask read (objectives 057, 064, 070, 078). The
+/// observation stays a turn stopped at its prompt.
+#[test]
+fn an_idle_perpetual_session_is_still_judged_for_its_stuck_reading() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Waiting,
+        confidence: confidence(0.9),
+        probabilities: None,
+        needs_human: Some(0.1),
+        stuck: Some(0.9),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(clock)
+        .with_context(Arc::new(Perpetual));
+    started(&store);
+    native(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(judge.calls(), 1, "an idle supervisor is judged");
+    assert_eq!(last.state, SemanticState::Waiting);
+    assert_eq!(last.stuck, Some(0.9));
+    assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+}
+
 #[test]
 fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     // Live: Jev put the idle supervisor at COMPLETED 0.71.
@@ -815,6 +863,158 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     assert_eq!(last.human_question.as_deref(), Some("which region?"));
     assert!(last.attention);
     assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
+}
+
+/// The fold is the perpetual session's alone: any other session the model
+/// calls COMPLETED stays COMPLETED, at its prompt and on an exit, where the
+/// dispatcher escalates it as finished (rev-i on t515u R3).
+#[test]
+fn a_session_that_can_end_stays_completed_at_its_prompt_and_on_an_exit() {
+    let completed = || {
+        Scripted::new(Ok(Judgement {
+            state: SemanticState::Completed,
+            confidence: confidence(0.71),
+            probabilities: Some([0.0, 0.27, 0.02, 0.71, 0.0]),
+            needs_human: Some(0.05),
+            stuck: Some(0.05),
+        }))
+    };
+    let mut at_prompt = fixture(completed());
+    started(&at_prompt.store);
+    native(&at_prompt.store);
+    turn_stopped(&at_prompt.store);
+    at_prompt.observer.tick().expect("tick");
+    let last = observations(&at_prompt.store)
+        .pop()
+        .expect("an observation");
+    assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
+    assert_eq!(last.state, SemanticState::Completed, "at its prompt");
+
+    let mut exited = fixture(completed());
+    started(&exited.store);
+    append(
+        &exited.store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+            signal: None,
+            evidence: None,
+        },
+    );
+    exited.observer.tick().expect("tick");
+    let last = observations(&exited.store).pop().expect("an observation");
+    assert_eq!(last.ambiguity, Some(Ambiguity::ExitedOnItsOwn));
+    assert_eq!(last.state, SemanticState::Completed, "on an exit");
+}
+
+/// A context that counts what the Observer reads from it.
+#[derive(Default)]
+struct Counting {
+    screen: AtomicUsize,
+    task: AtomicUsize,
+    reply: AtomicUsize,
+}
+
+impl ObservationContext for Counting {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        self.screen.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        self.task.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        self.reply.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+/// The context's reads (a terminal capture, the task and the transcript)
+/// are paid where they were before the `HUMAN:` rule: a working session
+/// reads none of them, and a session at its prompt reads each once.
+#[test]
+fn a_working_session_reads_no_context_and_a_prompt_reads_each_once() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let counting = Arc::new(Counting::default());
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(clock)
+        .with_context(counting.clone());
+    started(&store);
+    native(&store);
+    tool_started(&store, "t1");
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    let reads = |c: &Counting| {
+        (
+            c.screen.load(Ordering::SeqCst),
+            c.task.load(Ordering::SeqCst),
+            c.reply.load(Ordering::SeqCst),
+        )
+    };
+    assert_eq!(
+        reads(&counting),
+        (0, 0, 0),
+        "a working session reads nothing"
+    );
+    tool_completed(&store, "t1");
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    assert_eq!(reads(&counting), (1, 1, 1), "at its prompt, each once");
+}
+
+/// A session that never ends has its COMPLETED folded into WAITING, and the
+/// raw answer is kept.
+#[test]
+fn a_perpetual_session_is_never_completed() {
+    // Live: Jev put the idle supervisor at COMPLETED 0.71.
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Completed,
+        confidence: confidence(0.71),
+        probabilities: Some([0.0, 0.27, 0.02, 0.71, 0.0]),
+        needs_human: Some(0.2),
+        stuck: Some(0.05),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(clock)
+        .with_context(Arc::new(Perpetual));
+    started(&store);
+    append(
+        &store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+            signal: None,
+            evidence: None,
+        },
+    );
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(
+        last.state,
+        SemanticState::Waiting,
+        "COMPLETED folds into WAITING"
+    );
+    assert!(last.confidence.value() > 0.95, "0.98 of the allowed mass");
+    assert_eq!(
+        last.probabilities.and_then(|p| p.get("COMPLETED").copied()),
+        Some(0.71),
+        "the raw answer is kept"
+    );
+    assert_eq!(judge.calls(), 1, "an exit is still the model's to judge");
 }
 
 #[test]

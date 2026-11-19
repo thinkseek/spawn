@@ -251,6 +251,146 @@ mod tests {
         Charter::of("You are the Spawn supervisor (old).".to_string())
     }
 
+    // From rev-i's t515u review (a throwaway there, kept here): the real
+    // Observer's verdict on a session that ends its turn on a `HUMAN:`
+    // question at its prompt, fed to the dispatcher's readers. However the
+    // Observer settles it, it must still read as at its prompt: no test tied
+    // the Observer's output to the dispatcher before.
+    struct Asks(bool);
+
+    impl spawn_core::observe::ObservationContext for Asks {
+        fn screen_tail(&self, _session: &spawn_core::id::SessionId) -> Option<String> {
+            None
+        }
+        fn task(&self, _session: &spawn_core::id::SessionId) -> Option<String> {
+            None
+        }
+        fn reply(
+            &self,
+            _workspace: &spawn_core::id::WorkspaceId,
+            _transcript: &str,
+        ) -> Option<String> {
+            Some("The build is green.\nHUMAN: which region?".to_string())
+        }
+        fn perpetual(&self, _session: &spawn_core::id::SessionId) -> bool {
+            self.0
+        }
+    }
+
+    /// A model that answers BLOCKED, needing a person.
+    struct WouldBlock;
+
+    impl spawn_core::observe::StateJudge for WouldBlock {
+        fn name(&self) -> &'static str {
+            "jev"
+        }
+        fn judge(
+            &self,
+            _input: &spawn_core::observe::JudgeInput,
+        ) -> Result<spawn_core::observe::Judgement, spawn_core::observe::JudgeError> {
+            Ok(spawn_core::observe::Judgement {
+                state: SemanticState::Blocked,
+                confidence: Confidence::new(0.82).expect("confidence"),
+                probabilities: Some([0.0, 0.18, 0.82, 0.0, 0.0]),
+                needs_human: Some(0.96),
+                stuck: Some(0.22),
+            })
+        }
+    }
+
+    fn observed_asking(perpetual: bool) -> Observation {
+        use spawn_core::event::{ENGINE, EventKind, GlobalPosition, NewEvent, Source};
+        use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+        use spawn_core::port::EventLog;
+        let clock = std::sync::Arc::new(spawn_core::time::ManualClock::new(
+            spawn_core::time::Timestamp(1_000),
+        ));
+        let store =
+            std::sync::Arc::new(spawn_core::memory::MemoryStore::new("shop", clock.clone()));
+        let log: std::sync::Arc<dyn EventLog> = store.clone();
+        let mut observer = spawn_core::observe::Observer::new(log)
+            .with_judge(std::sync::Arc::new(WouldBlock))
+            .with_clock(clock)
+            .with_context(std::sync::Arc::new(Asks(perpetual)));
+        let append = |source: Source, kind: EventKind| {
+            store
+                .append(NewEvent {
+                    agent_id: AgentId::new("agent_supervisor").expect("agent"),
+                    session_id: SessionId::new("session_supervisor").expect("session"),
+                    execution_id: Some(ExecutionId::for_command(CommandId(1))),
+                    source,
+                    source_event_id: None,
+                    kind,
+                })
+                .expect("append");
+        };
+        append(
+            Source::Bridge,
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("workspace"),
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        );
+        append(
+            Source::Bridge,
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: "n1".to_string(),
+                transcript_path: Some("/root/.claude/projects/w/n1.jsonl".to_string()),
+                engine_version: None,
+            },
+        );
+        append(
+            Source::Claude,
+            EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        );
+        observer.tick().expect("tick");
+        let observation = store
+            .read_global(GlobalPosition(0), 50)
+            .expect("read")
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.event.kind {
+                EventKind::ObservationRecorded { observation } => Some(observation),
+                _ => None,
+            })
+            .expect("an observation");
+        assert_eq!(observation.state, SemanticState::Blocked);
+        assert_eq!(observation.human_question.as_deref(), Some("which region?"));
+        observation
+    }
+
+    fn facts_of(observation: Observation) -> Facts {
+        let mut facts = supervisor(None, Vec::new());
+        facts.evidence_seq = Some(observation.based_on_seq.0);
+        facts.observation = Some(observation);
+        facts
+    }
+
+    /// digest.rs: a supervisor whose turn ended on a question for the human
+    /// sits at its prompt all the same, or one question would silence every
+    /// escalation until someone answered it.
+    #[test]
+    fn a_supervisor_that_asks_still_takes_digests() {
+        let facts = facts_of(observed_asking(true));
+        assert!(crate::dispatch::digest::supervisor_idle(&facts));
+    }
+
+    /// A worker whose turn ended on a question is at its prompt: its report
+    /// is its answer, and the revision that answers it can be typed.
+    #[test]
+    fn a_worker_that_asks_is_at_its_prompt() {
+        let facts = facts_of(observed_asking(false));
+        assert!(facts.turn_stopped_idle());
+    }
+
     /// The supervisor live and idle at its prompt on a current judgement,
     /// its native session begun by start command 40 with `given`.
     fn supervisor(given: Option<&Charter>, inputs: Vec<Input>) -> Facts {

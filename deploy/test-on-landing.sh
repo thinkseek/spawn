@@ -185,6 +185,9 @@ judging() { spawn_live mission landing --source "$missions" | jq -r '.judging'; 
 
 export FAKE_LOG=$scratch/deploys.log
 : >"$FAKE_LOG"
+# The default quiet spell is a case of its own (235): a tick given no
+# SPAWN_DEPLOY_QUIET_SECS uses on-landing.sh's, never the caller's.
+unset SPAWN_DEPLOY_QUIET_SECS
 # tick [ENV=VALUE...]: one tick, as the timer runs it; output in $out.
 tick() {
   guard_home
@@ -231,6 +234,7 @@ check "says so" grep -qF "main $c1 has no gate-accepted landing in the store" "$
 
 echo "== the debounce: while another task is judged, a landing a moment ago waits for a quiet spell"
 land "$c1"
+landed_s=$(date +%s)
 pending=$(judged reported)
 check "the store counts the task judged" [ "$(judging)" = 1 ]
 tick SPAWN_DEPLOY_QUIET_SECS=600
@@ -240,6 +244,12 @@ check "naming the task judged" grep -qF "and 1 task(s) of the source are judged 
 check "and names the bounds" grep -qF "deployed after 600 s without a landing (SPAWN_DEPLOY_QUIET_SECS), at the latest 1800 s" "$out"
 tick SPAWN_DEPLOY_QUIET_SECS=600
 check "said once" [ ! -s "$out" ]
+
+echo "== the default quiet spell is 60 s (235): a landing a moment ago waits"
+tick
+check "not deployed yet" [ "$(deploys)" -eq 0 ]
+check "names the default bounds" grep -qF "main $c1 waits: landed" "$out"
+check "60 s without a landing, at the latest 1800 s" grep -qF "deployed after 60 s without a landing (SPAWN_DEPLOY_QUIET_SECS), at the latest 1800 s" "$out"
 
 echo "== a held source waits for its holder"
 spawn_live mission hold --source "$missions" --reason "owner gate $c1" >/dev/null
@@ -311,6 +321,22 @@ check "says so" grep -qF "main $c1 waits: the nightly's fact $scratch/ws/nightly
 echo '[]' >"$scratch/ws/nightly/spawn.json"
 tick SPAWN_DEPLOY_QUIET_SECS=1
 check "nor does a fact that is no object" [ "$(deploys)" -eq 0 ]
+
+echo "== past the default 60 s, the quiet spell holds nothing (235): the tick goes on to the next wait"
+printf '{"v":1,"state":"green","failed":[],"red_since":null}\n' >"$scratch/ws/nightly/spawn.json"
+check "the store still counts the task judged" [ "$(judging)" = 1 ]
+while [ $(($(date +%s) - landed_s)) -lt 62 ]; do sleep 1; done
+flock -o "$live/deploy.lock" sleep 60 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  flock -n "$live/deploy.lock" true || break
+  sleep 0.2
+done
+tick
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+check "not deployed while another deploy holds the lock" [ "$(deploys)" -eq 0 ]
+check "the quiet spell is over: it waits for the lock, not for a landing" grep -qF "main $c1 waits: another deploy holds $live/deploy.lock" "$out"
 
 echo "== the off switch and a busy deploy lock"
 printf '{"v":1,"state":"green","failed":[],"red_since":null}\n' >"$scratch/ws/nightly/spawn.json"

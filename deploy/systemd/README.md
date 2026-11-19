@@ -273,7 +273,7 @@ journalctl --user -u spawn-nightly@spawn -n 20
   the missions main when the store holds a gate-accepted landing of exactly
   that commit (`spawn mission landing`: a task.landed of a task of a
   mission on the source, or an owner's gated source.moved; never a file)
-  and no landing came for `SPAWN_DEPLOY_QUIET_SECS` (300), or
+  and no landing came for `SPAWN_DEPLOY_QUIET_SECS` (60; objective 235), or
   `SPAWN_DEPLOY_MAX_WAIT_SECS` (1800) after the first landing not live yet.
   It waits while the source is held (an owner gate, or another deploy),
   while `deploy.pending` exists, while another deploy holds the lock, and
