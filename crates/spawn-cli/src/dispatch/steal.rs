@@ -126,10 +126,10 @@ pub(crate) fn run(store: &PostgresStore, work: &Work, lines: &mut Vec<String>) -
     let moves = choices(work);
     for (task, to) in &moves {
         match store.task_steal(*task, to, BY, Some(REASON)) {
-            Ok(moved) => lines.push(format!(
+            Ok(answer) => lines.push(format!(
                 "dispatch: task #{task} stolen from {} to {}",
-                moved["from_session"].as_str().unwrap_or("?"),
-                moved["to_session"].as_str().unwrap_or("?")
+                answer["from_session"].as_str().unwrap_or("?"),
+                answer["to_session"].as_str().unwrap_or("?")
             )),
             Err(error) => lines.push(format!(
                 "dispatch: task #{task} not stolen by {to}: {error}"

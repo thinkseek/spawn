@@ -137,6 +137,78 @@ fn refused(store: &PostgresStore, client: &mut Client, task: i64, to: &str, why:
     );
 }
 
+/// The mission rule: closed, paused, halted, each refused while it holds.
+fn mission_rule(store: &PostgresStore, client: &mut Client, mission: i64, queued: i64) {
+    // The mission rule: closed, paused, halted.
+    for (column, value, why) in [
+        ("state", "'done'", "(closed)"),
+        ("pause_event", "1", "(paused)"),
+        ("halted", "'red'", "(halted)"),
+    ] {
+        client
+            .batch_execute(&format!(
+                "update mission_missions set {column} = {value} where id = {mission}"
+            ))
+            .expect("the mission");
+        refused(
+            &store,
+            client,
+            queued,
+            "ann",
+            &format!("waits for its mission {mission} {why}"),
+        );
+        client
+            .batch_execute(&format!(
+                "update mission_missions set state = 'active', pause_event = null, halted = null \
+                 where id = {mission}"
+            ))
+            .expect("open again");
+    }
+}
+
+/// The move, to an idle member of the pool: the answer, the record, the
+/// fold, and the same owner after a refold.
+fn moves_to_an_idle_member(store: &PostgresStore, client: &mut Client, queued: i64) {
+    // And it moves, to an idle member of the pool.
+    let moved = store
+        .task_steal(queued, "ann", "human", Some("ann is idle"))
+        .expect("moved");
+    assert_eq!(
+        moved,
+        json!({"task": queued, "from_session": "session_resident_ben",
+               "to_session": "session_resident_ann", "agent_id": "agent_resident_ann"})
+    );
+    let record: serde_json::Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events where session_id = 'session_control'
+               and kind -> 'detail' -> 'record' ->> 'type' = 'task.stolen'",
+            &[],
+        )
+        .expect("the record")
+        .get(0);
+    let created: i64 = client
+        .query_one(
+            "select created_at_ms from mission_tasks where id = $1",
+            &[&queued],
+        )
+        .expect("created")
+        .get(0);
+    assert_eq!(
+        record,
+        json!({"type": "task.stolen", "id": queued,
+               "from_session": "session_resident_ben", "from_agent": "agent_resident_ben",
+               "to_session": "session_resident_ann", "to_agent": "agent_resident_ann",
+               "pool": "logs", "by": "human", "reason": "ann is idle",
+               "queued_since_ms": created})
+    );
+    assert_eq!(session(client, queued), "session_resident_ann");
+    // A refold gives the same owner.
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold");
+    assert_eq!(session(client, queued), "session_resident_ann");
+}
+
 /// Every reason of every check, in order, each recording nothing.
 #[test]
 fn a_move_is_refused_for_each_rule_and_records_nothing() {
@@ -211,31 +283,7 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
         .expect("not revised");
     refused(&store, &mut client, pinned, "ann", "is pinned to ben");
 
-    // The mission rule: closed, paused, halted.
-    for (column, value, why) in [
-        ("state", "'done'", "(closed)"),
-        ("pause_event", "1", "(paused)"),
-        ("halted", "'red'", "(halted)"),
-    ] {
-        client
-            .batch_execute(&format!(
-                "update mission_missions set {column} = {value} where id = {mission}"
-            ))
-            .expect("the mission");
-        refused(
-            &store,
-            &mut client,
-            queued,
-            "ann",
-            &format!("waits for its mission {mission} {why}"),
-        );
-        client
-            .batch_execute(&format!(
-                "update mission_missions set state = 'active', pause_event = null, halted = null \
-                 where id = {mission}"
-            ))
-            .expect("open again");
-    }
+    mission_rule(&store, &mut client, mission, queued);
 
     refused(
         &store,
@@ -281,44 +329,7 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
     );
     assert_eq!(stolen(&mut client), 0);
 
-    // And it moves, to an idle member of the pool.
-    let moved = store
-        .task_steal(queued, "ann", "human", Some("ann is idle"))
-        .expect("moved");
-    assert_eq!(
-        moved,
-        json!({"task": queued, "from_session": "session_resident_ben",
-               "to_session": "session_resident_ann", "agent_id": "agent_resident_ann"})
-    );
-    let record: serde_json::Value = client
-        .query_one(
-            "select kind -> 'detail' -> 'record' from spawn_events where session_id = 'session_control'
-               and kind -> 'detail' -> 'record' ->> 'type' = 'task.stolen'",
-            &[],
-        )
-        .expect("the record")
-        .get(0);
-    let created: i64 = client
-        .query_one(
-            "select created_at_ms from mission_tasks where id = $1",
-            &[&queued],
-        )
-        .expect("created")
-        .get(0);
-    assert_eq!(
-        record,
-        json!({"type": "task.stolen", "id": queued,
-               "from_session": "session_resident_ben", "from_agent": "agent_resident_ben",
-               "to_session": "session_resident_ann", "to_agent": "agent_resident_ann",
-               "pool": "logs", "by": "human", "reason": "ann is idle",
-               "queued_since_ms": created})
-    );
-    assert_eq!(session(&mut client, queued), "session_resident_ann");
-    // A refold gives the same owner.
-    client
-        .batch_execute("select spawn_control_refold()")
-        .expect("refold");
-    assert_eq!(session(&mut client, queued), "session_resident_ann");
+    moves_to_an_idle_member(&store, &mut client, queued);
 }
 
 /// The taker must be idle: a task of its own assigned, delivered,
