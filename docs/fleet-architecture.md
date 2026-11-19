@@ -1014,8 +1014,7 @@ serially while a peer sits idle. What moves and what never does:
   twice; a refold of the log gives the same owner.
 - *Seen.* `spawn task stages --id N` shows the stage `stolen` {from, to, by}
   between `assigned` and `delivered`; `GET /api/missions` shows the task
-  under its new worker. A move is not a stall: the moved task's delivery is
-  measured from its `task.stolen`.
+  under its new worker.
 
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,

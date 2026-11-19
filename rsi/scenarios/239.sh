@@ -15,15 +15,23 @@
 # moves only); the second with stealing on. Checked:
 #   (0) `spawn resident propose --pool` and `spawn task assign --pin` are
 #       taken;
-#   (1) `spawn task steal` refuses, exit 1 naming the rule, nothing recorded
-#       and the owner unchanged: T1 (delivered: "not queued"); T4 ("pinned");
-#       T5 ("paused"); T6 ("not queued"); T2 to sol ("pool"), to una
-#       ("pool"), to cid ("not idle": T8 delivered), to gus ("not idle": a
-#       task assigned only); after (2), T3 to the winner ("not idle": T2
-#       delivered or reported);
+#   (1) `spawn task steal` refuses, exit 1 with "spawn: task steal: task <id> "
+#       and the rule's reason, nothing recorded and the owner unchanged: T1
+#       ("not queued (delivered"); T4 ("pinned"); T5 ("(paused)"); T6 ("not
+#       queued (cancelled"); Tc, of mission C closed after it was queued (the
+#       closure rule cancels it first: "not queued (cancelled"; a closed
+#       mission's task is never refused by the mission rule in a black box,
+#       and a halted mission needs the integrator's record: both are the
+#       store tests'); T2 to sol ("is not other"), to una ("(no pool)"), to
+#       hal, proposed and never approved ("not approved"), to ivy, approved
+#       and retired ("retired"), to ben ("already its worker"), to nobody ("no
+#       such resident"), to cid ("not idle": T8 delivered), to gus ("not
+#       idle": a task assigned only); after (2), T3 to the winner ("not idle":
+#       T2 delivered or reported);
 #   (2) T2 stolen to ann and to dee at once: exactly one exits 0, one
 #       task.stolen record for T2 (by human, from ben's session to the
-#       winner's), T2's session the winner's; the other exits 1;
+#       winner's), T2's session the winner's; the other exits 1 with "spawn:
+#       task steal: task <T2> ";
 #   (3) T2 is delivered once, into the winner's session: every
 #       `deliver-<T2>-` command is the winner's, none ben's, one
 #       task.delivered record;
@@ -38,7 +46,8 @@
 #       task moved (three task.stolen records in all: T2, TB, T3);
 #   (7) T3 is delivered once, into the loser's session, none into ben's;
 #   (8) T4 (pinned) and T5 (paused mission) are still ben's, and gus's task
-#       still gus's, with no task.stolen record; sol and una hold no task;
+#       still gus's, with no task.stolen record; sol, una, hal (unapproved) and
+#       ivy (retired) hold no task;
 #   (9) `spawn task stages --id T3` shows a stage `stolen`.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -169,7 +178,7 @@ git init -q --initial-branch=main "$WORK/seed"
 printf 'base\n' >"$WORK/seed/README.md"
 git -C "$WORK/seed" add -A
 git -C "$WORK/seed" commit -qm "base"
-for bare in "$repo" "$WORK/source-m.git" "$WORK/source-p.git"; do
+for bare in "$repo" "$WORK/source-m.git" "$WORK/source-p.git" "$WORK/source-c.git"; do
     git init -q --bare --initial-branch=main "$bare"
     git -C "$WORK/seed" push -q "$bare" main:main
 done
@@ -355,6 +364,8 @@ refused() {
     records=$(all_stolen)
     capture "$SPAWN_BIN" task steal --id "$1" --to "$2"
     [ "$status" -ne 0 ] || fail "(1) $4: spawn task steal --id $1 --to $2 exited 0: $(out)"
+    grep -q -- "spawn: task steal: task $1 " "$WORK/err.txt" ||
+        fail "(1) $4: the refusal does not start [spawn: task steal: task $1 ]: $(err)"
     grep -q -- "$3" "$WORK/err.txt" ||
         fail "(1) $4: the refusal does not name [$3]: $(err)"
     expect_eq "$(all_stolen)" "$records" "(1) $4: task.stolen records"
@@ -369,6 +380,8 @@ spawn_ok mission add --text "239 work" --source "$WORK/source-m.git"
 mission=$(jq -r .mission "$WORK/out.txt")
 spawn_ok mission add --text "239 paused work" --source "$WORK/source-p.git"
 paused=$(jq -r .mission "$WORK/out.txt")
+spawn_ok mission add --text "239 closed work" --source "$WORK/source-c.git"
+closed=$(jq -r .mission "$WORK/out.txt")
 
 capture "$SPAWN_BIN" resident propose --name ben --charter "Analyses the 239 logs." --pool logs
 [ "$status" -eq 0 ] || fail "(0) spawn resident propose --pool exited $status: $(err)"
@@ -376,10 +389,13 @@ for name in ann cid dee eve fay gus; do
     spawn_ok resident propose --name "$name" --charter "Analyses the 239 logs." --pool logs
 done
 spawn_ok resident propose --name sol --charter "Analyses other 239 logs." --pool other
+spawn_ok resident propose --name hal --charter "Analyses the 239 logs." --pool logs
+spawn_ok resident propose --name ivy --charter "Analyses the 239 logs." --pool logs
 spawn_ok resident propose --name una --charter "Owns its own 239 concern."
-for name in ben ann cid dee eve fay gus sol una; do
+for name in ben ann cid dee eve fay gus sol una ivy; do
     spawn_ok resident approve --name "$name"
 done
+spawn_ok resident retire --name ivy
 expect_eq "$(q "select coalesce(pool, '-') from mission_residents where name = 'ben'")" logs \
     "(0) ben's pool"
 expect_eq "$(q "select coalesce(pool, '-') from mission_residents where name = 'una'")" - \
@@ -413,17 +429,25 @@ tg=$task
 assign "$mission" ben "Analyse log six. BB:WRITE:six" || harness "assign T6: $(err)"
 t6=$task
 spawn_ok task cancel --id "$t6"
+assign "$closed" ben "Analyse log c. BB:WRITE:cc" || harness "assign Tc: $(err)"
+tc=$task
+spawn_ok mission close --id "$closed" --state dropped
 sleep 2
 expect_eq "$(session_of "$t2")" "$ben" "the queued T2 waits for ben (stealing is off)"
 
 # --- (1) refusals ----------------------------------------------------------------
 
-refused "$t1" ann "not queued" "a running task"
+refused "$t1" ann "not queued (delivered" "a running task"
 refused "$t4" ann "pinned" "a pinned task"
-refused "$t5" ann "paused" "a task of a paused mission"
-refused "$t6" ann "not queued" "a cancelled task"
-refused "$t2" sol "pool" "a taker in another pool"
-refused "$t2" una "pool" "a taker with no pool"
+refused "$t5" ann "(paused)" "a task of a paused mission"
+refused "$t6" ann "not queued (cancelled" "a cancelled task"
+refused "$tc" ann "not queued (cancelled" "a task of a closed mission (the closure rule cancelled it)"
+refused "$t2" sol "is not other" "a taker in another pool"
+refused "$t2" una "(no pool)" "a taker with no pool"
+refused "$t2" hal "not approved" "a taker never approved"
+refused "$t2" ivy "retired" "a retired taker"
+refused "$t2" ben "already its worker" "the task's own worker"
+refused "$t2" nobody "no such resident" "no such resident"
 refused "$t2" cid "not idle" "a taker that is not idle (a task delivered)"
 refused "$t2" gus "not idle" "a taker that is not idle (a task assigned only)"
 
@@ -443,6 +467,8 @@ case "$ann_rc:$dee_rc" in
 *:0) winner=dee loser=ann ;;
 *) fail "(2) neither taker won T2: ann $ann_rc ($(head -c 200 "$WORK/ann.err")), dee $dee_rc ($(head -c 200 "$WORK/dee.err"))" ;;
 esac
+grep -q -- "spawn: task steal: task $t2 " "$WORK/$loser.err" ||
+    fail "(2) the loser's refusal does not start [spawn: task steal: task $t2 ]: $(head -c 300 "$WORK/$loser.err")"
 expect_eq "$(stolen_count "$t2")" 1 "(2) task.stolen records of T2"
 expect_eq "$(session_of "$t2")" "session_resident_$winner" "(2) T2's session"
 expect_eq "$(stolen_field "$t2" from_session)" "$ben" "(2) T2's record from_session"
@@ -519,8 +545,9 @@ done
 expect_eq "$(session_of "$tg")" session_resident_gus "(8) gus's task's session"
 expect_eq "$(stolen_count "$tg")" 0 "(8) task.stolen records of gus's task"
 expect_eq "$(q "select count(*) from mission_tasks
-               where session_id in ('session_resident_sol', 'session_resident_una')")" 0 \
-    "(8) tasks of sol and una"
+               where session_id in ('session_resident_sol', 'session_resident_una',
+                                    'session_resident_hal', 'session_resident_ivy')")" 0 \
+    "(8) tasks of sol, una, hal and ivy"
 expect_eq "$(state_of "$t1")" delivered "(8) T1's state after the second loop"
 expect_eq "$(session_of "$t1")" "$ben" "(8) T1's session after the second loop"
 
