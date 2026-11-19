@@ -29,9 +29,15 @@
 //! rises and falls in steps: on 2026-11-18 df's free disk fell 77 GB in a
 //! day while the week's sawtooth (sweeps lifting it between) fitted a line
 //! that gained 4.7 GB a day, and a robust line reads the week's gain too.
-//! The day's fall ([`day_fall`]) is from the latest sample a day old or
-//! more, no older than 36 h, to the free disk now, over the days between:
-//! from the same samples, no read of its own.
+//! The day's fall ([`day_fall`]) is from a day ago to now, each end the
+//! median of a 6 h window of readings at the mean of their times
+//! (objective 228): a day ago, the samples 24 to 30 h old; now, those under
+//! 6 h old and the free disk now. A gate holding build trees moves df's
+//! free disk by about 6 GB within minutes, and one sample at each end
+//! moved the figure by as much a day with whether a gate held trees at
+//! either end's minute; the median halves that jitter, still says a day
+//! that lost 77 GB, and lags a sweep by about half its window. From the
+//! same samples, no read of its own.
 
 use serde_json::{Value, json};
 
@@ -113,30 +119,63 @@ pub(super) fn fall(readings: &[(i64, f64)]) -> Option<i64> {
     Some((-slope).round() as i64)
 }
 
-/// The oldest a day-old sample the day's fall is read from may be.
-const DAY_FALL_STALE_MS: i64 = 36 * 3_600_000;
+/// The span of each end's window of the day's fall (objective 228).
+const DAY_FALL_WINDOW_MS: i64 = 6 * 3_600_000;
+
+/// The median of `readings` (an even count's is the mean of the middle
+/// two) at the mean of their times; none without one.
+fn median_at(readings: &mut [(i64, f64)]) -> Option<(f64, f64)> {
+    if readings.is_empty() {
+        return None;
+    }
+    readings.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let middle = readings.len() / 2;
+    let median = if readings.len().is_multiple_of(2) {
+        f64::midpoint(readings[middle - 1].1, readings[middle].1)
+    } else {
+        readings[middle].1
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let at = readings.iter().map(|(at, _)| *at as f64).sum::<f64>() / readings.len() as f64;
+    Some((median, at))
+}
 
 /// The free disk lost over the last day, in bytes a day, rounded; below
-/// zero when the disk gained. From the latest of `samples` carrying a
-/// number for the free disk at or before `now_ms` less a day, when it is at
-/// or after `now_ms` less 36 h, to `free_now` at `now_ms`, over the days
-/// between them. None without such a sample or a free disk now.
+/// zero when the disk gained (objective 228). Each end is the median of its
+/// window's readings at the mean of their times: a day ago, the `samples`
+/// carrying a number for the free disk at or after `now_ms` less 30 h and
+/// at or before `now_ms` less 24 h; now, those after `now_ms` less 6 h and
+/// before `now_ms`, and `free_now` at `now_ms`. The fall is the first
+/// median less the second over the days between their times. None when the
+/// window a day ago holds no reading or there is no free disk now.
 pub(super) fn day_fall(samples: &Value, free_now: Option<u64>, now_ms: i64) -> Option<i64> {
     let free_now = free_now?;
-    let (at, then) = samples
+    let readings: Vec<(i64, f64)> = samples
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|sample| Some((sample["at_ms"].as_i64()?, sample["values"][FREE].as_f64()?)))
-        .filter(|(at, _)| *at <= now_ms - DAY_MS && *at >= now_ms - DAY_FALL_STALE_MS)
-        .max_by_key(|(at, _)| *at)?;
+        .collect();
+    let ago_end = now_ms - DAY_MS;
+    let mut ago: Vec<(i64, f64)> = readings
+        .iter()
+        .copied()
+        .filter(|(at, _)| *at >= ago_end - DAY_FALL_WINDOW_MS && *at <= ago_end)
+        .collect();
+    let mut now: Vec<(i64, f64)> = readings
+        .iter()
+        .copied()
+        .filter(|(at, _)| *at > now_ms - DAY_FALL_WINDOW_MS && *at < now_ms)
+        .collect();
     #[allow(clippy::cast_precision_loss)]
-    let days = (now_ms - at) as f64 / DAY_MS as f64;
+    now.push((now_ms, free_now as f64));
+    let (then, then_at) = median_at(&mut ago)?;
+    let (free, free_at) = median_at(&mut now)?;
     #[allow(clippy::cast_precision_loss)]
-    let lost = then - free_now as f64;
+    let days = (free_at - then_at) / DAY_MS as f64;
     // A disk's bytes a day fit an i64 many times over.
     #[allow(clippy::cast_possible_truncation)]
-    Some((lost / days).round() as i64)
+    Some(((then - free) / days).round() as i64)
 }
 
 /// The worse of the fit's fall and the day's, with its basis (`fit` or
@@ -356,44 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn the_days_fall_is_from_the_latest_sample_a_day_old_not_the_oldest() {
-        let samples = json!([
-            sample(NOW - 35 * H, &json!(500 * GIB)),
-            sample(NOW - 30 * H, &json!(400 * GIB)),
-            // The latest a day old: 100 GiB lost over the day.
-            sample(NOW - D, &json!(200 * GIB)),
-            // Under a day old: not taken.
-            sample(NOW - D + 1, &json!(900 * GIB)),
-            sample(NOW - H, &json!(105 * GIB)),
-        ]);
-        assert_eq!(
-            day_fall(&samples, Some(100 * GIB), NOW),
-            Some(i64::try_from(100 * GIB).expect("fits"))
-        );
-        // Scaled by the days between: 30 h old, 90 GiB lost.
-        let samples = json!([sample(NOW - 30 * H, &json!(190 * GIB))]);
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-        let scaled = ((90 * GIB) as f64 / 1.25).round() as i64;
-        assert_eq!(day_fall(&samples, Some(100 * GIB), NOW), Some(scaled));
-    }
-
-    #[test]
-    fn the_days_fall_takes_36_hours_exactly_and_nothing_older() {
-        let taken = json!([sample(NOW - 36 * H, &json!(250))]);
-        assert_eq!(
-            day_fall(&taken, Some(100), NOW),
-            Some(100),
-            "150 over 1.5 days"
-        );
-        let older = json!([sample(NOW - 36 * H - 1, &json!(250))]);
-        assert_eq!(
-            day_fall(&older, Some(100), NOW),
-            None,
-            "a millisecond older"
-        );
-    }
-
-    #[test]
     fn the_days_fall_takes_no_sample_under_a_day_old() {
         let samples = json!([
             sample(NOW - D + 1, &json!(250)),
@@ -517,7 +518,11 @@ mod tests {
         let mut storage = json!({"free_bytes": free});
         with_disk(&mut storage, &samples, NOW);
         let day = day_fall(&samples, Some(free), NOW).expect("a day");
-        assert!((day - 25 * i64::try_from(GIB).expect("fits")).abs() < 20_000_000);
+        // The windows' (objective 228): a day ago 125 GiB at 24 h 1 min;
+        // now the median of 110 GiB 2 h 40 min ago and 100 GiB now, 105 GiB
+        // at 1 h 20 min; 20 GiB over 1361/1440 of a day.
+        let windows = 20 * 1440 * i64::try_from(GIB).expect("fits") / 1361;
+        assert!((day - windows).abs() <= 1, "{day} against {windows}");
         assert_eq!(storage["disk_fall_bytes_per_day"], day);
         assert_eq!(storage["disk_fall_basis"], "day");
         assert_eq!(storage["days_left"], 4);
@@ -550,5 +555,117 @@ mod tests {
         let unattributed = i64::try_from(20 * GIB - archive).expect("fits");
         assert_ne!(storage["grew_most"]["bytes_per_day"], unattributed);
         assert!(grew < unattributed, "{grew}");
+    }
+
+    /// The free disk on each hourly sample of the last 31 h: `free(age)` for
+    /// the sample `age` hours old.
+    fn hourly(free: impl Fn(i64) -> u64) -> Value {
+        Value::Array(
+            (1..=31)
+                .map(|age| sample(NOW - age * H, &json!(free(age))))
+                .collect(),
+        )
+    }
+
+    /// Objective 228: a gate holding build trees at one end's minute (a
+    /// 6 GiB dip in one sample) moves the day's fall by much less than the
+    /// one-sample rule's 6 GiB a day; a real fall is still said.
+    #[test]
+    fn a_gate_holding_trees_at_one_end_moves_the_days_fall_no_more() {
+        let gib = i64::try_from(GIB).expect("fits");
+        // Steady: 200 GiB throughout, nothing lost.
+        let steady = hourly(|_| 200 * GIB);
+        assert_eq!(day_fall(&steady, Some(200 * GIB), NOW), Some(0));
+        // A 6 GiB dip in the sample 24 h old: the median a day ago is not
+        // moved at all.
+        let dip_ago = hourly(|age| if age == 24 { 194 * GIB } else { 200 * GIB });
+        assert_eq!(day_fall(&dip_ago, Some(200 * GIB), NOW), Some(0));
+        // A dip now (the free disk read while a gate holds trees): the
+        // median of 1..5 h ago and now is not moved either.
+        assert_eq!(day_fall(&steady, Some(194 * GIB), NOW), Some(0));
+        // And a dip in the sample 1 h old with a dip now: the median of
+        // six readings moves by half of one gap at most.
+        let dip_now = hourly(|age| if age == 1 { 194 * GIB } else { 200 * GIB });
+        let moved = day_fall(&dip_now, Some(194 * GIB), NOW).expect("a day");
+        assert!(moved.abs() < 6 * gib / 2, "{moved}");
+        // A real fall: 77 GiB lost from 30 h ago, linearly, to now.
+        let real = hourly(|age| {
+            let age = u64::try_from(age).expect("an age");
+            100 * GIB + 77 * GIB * age / 24
+        });
+        let fall = day_fall(&real, Some(100 * GIB), NOW).expect("a day");
+        assert!((fall - 77 * gib).abs() < gib / 100, "{fall}");
+    }
+
+    /// Objective 228: each end is its window's median, an even count's the
+    /// mean of the middle two, at the mean of the window's times.
+    #[test]
+    fn the_days_fall_ends_are_medians_at_their_mean_times() {
+        // A day ago: 24 and 26 h old, 300 and 100: median 200 at 25 h. Now:
+        // 2 h old 900, 1 h old 50, and 80 now: median 80 at 1 h. 120 over
+        // a day.
+        let samples = json!([
+            sample(NOW - 26 * H, &json!(100)),
+            sample(NOW - 24 * H, &json!(300)),
+            sample(NOW - 2 * H, &json!(900)),
+            sample(NOW - H, &json!(50)),
+        ]);
+        assert_eq!(day_fall(&samples, Some(80), NOW), Some(120));
+        // An even count now: 1 h old 50 and 100 now, median 75 at 0.5 h;
+        // a day ago 200 at 25 h: 125 over 24.5/24 of a day.
+        let samples = json!([
+            sample(NOW - 26 * H, &json!(100)),
+            sample(NOW - 24 * H, &json!(300)),
+            sample(NOW - H, &json!(50)),
+        ]);
+        assert_eq!(day_fall(&samples, Some(100), NOW), Some(122));
+        assert_eq!(
+            median_at(&mut [(0, 4.0), (10, 1.0), (20, 3.0), (30, 2.0)]),
+            Some((2.5, 15.0))
+        );
+        assert_eq!(median_at(&mut []), None);
+    }
+
+    /// Objective 228: a day ago is 24 to 30 h old, both edges taken; now is
+    /// under 6 h old, its edge not taken, with the free disk now.
+    #[test]
+    fn the_days_fall_windows_are_six_hours_each() {
+        let ago = |at: i64| day_fall(&json!([sample(at, &json!(148))]), Some(100), NOW);
+        assert_eq!(ago(NOW - D), Some(48), "24 h exactly");
+        assert_eq!(
+            ago(NOW - 30 * H),
+            Some(38),
+            "30 h exactly: 48 over 1.25 days, 38.4"
+        );
+        assert_eq!(ago(NOW - 30 * H - 1), None, "a millisecond older");
+        assert_eq!(ago(NOW - D + 1), None, "a millisecond younger");
+        // Now's window: a sample 6 h old exactly is not in it; one a
+        // millisecond younger is.
+        let now = |at: i64| {
+            day_fall(
+                &json!([sample(NOW - D, &json!(100)), sample(at, &json!(52))]),
+                Some(52),
+                NOW,
+            )
+        };
+        assert_eq!(
+            now(NOW - 6 * H),
+            Some(48),
+            "6 h old: out, 48 lost over the day"
+        );
+        let within = now(NOW - 6 * H + 1).expect("a day");
+        assert_eq!(
+            within, 55,
+            "in: the mean time is 3 h, 48 over 21/24 of a day"
+        );
+        // Without the free disk now: none; with no reading a day ago: none.
+        assert_eq!(
+            day_fall(&json!([sample(NOW - D, &json!(100))]), None, NOW),
+            None
+        );
+        assert_eq!(
+            day_fall(&json!([sample(NOW - H, &json!(100))]), Some(50), NOW),
+            None
+        );
     }
 }
