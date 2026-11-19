@@ -634,8 +634,8 @@ mod tests {
         assert_eq!(ago(NOW - D), Some(48), "24 h exactly");
         assert_eq!(
             ago(NOW - 30 * H),
-            Some(40),
-            "30 h exactly: 48 over 1.25 days"
+            Some(38),
+            "30 h exactly: 48 over 1.25 days, 38.4"
         );
         assert_eq!(ago(NOW - 30 * H - 1), None, "a millisecond older");
         assert_eq!(ago(NOW - D + 1), None, "a millisecond younger");
