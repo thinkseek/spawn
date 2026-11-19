@@ -363,12 +363,25 @@ cmp -s "$WORK/before.txt" "$WORK/after4.txt" ||
     check_failed "(4) a refused sweep changed the scratch: $(diff "$WORK/before.txt" "$WORK/after4.txt" | head -n 6 | tr '\n' ' ' | head -c 400)"
 
 # --- (3) the reviewed list, then --apply on exactly it ------------------------------------------------
-# Another session's process of this user can start, unreadable, at any time
-# (a gate's sandboxed spawn): the reviewed list then keeps the paths, or
-# --apply finds the list changed and removes nothing; one that was excused
-# can end before --apply, which then refuses its excuse. Each is the sweep
-# being right; the round is tried again, three times at most, and only a
-# round that saw no new unreadable process is judged.
+# Another process of this user can start, unreadable, at any time, and end
+# again (objective 236, sync/flaky/145.md): gpg-agent makes itself
+# non-dumpable, and every backup scenario starts one in its scratch home for
+# its run, about one a minute on a busy host. The reviewed list then keeps
+# the paths, or --apply finds the list changed and removes nothing, or an
+# excused one has ended and its excuse is refused. Each is the sweep being
+# right. So only a quiet round is judged: one whose reviewed list and
+# --apply saw exactly the unreadable set the list named, and --apply kept
+# no path for a process it met only when judging that path again. One that
+# starts during --apply, after a path went, leaves no planted scratch to try
+# again on: exit 2, run again. A round that was
+# not quiet is tried again after 2 s, for SPAWN_145_QUIET_SECS (120) in all;
+# with no quiet round by then this is no verdict: a harness exit 2, "run
+# again" (the gate's cannot_judge, judged again after its backoff), never 1.
+quiet_secs=${SPAWN_145_QUIET_SECS:-120}
+case "$quiet_secs" in '' | *[!0-9]*) harness "SPAWN_145_QUIET_SECS is not a number of seconds: [$quiet_secs]" ;; esac
+quiet_from=$(date +%s)
+# A path --apply kept for a process it met only when judging that path again.
+late='^stays	.*: in use unknown: process [0-9]+ \(.*\) of its owner cannot be read$'
 round=0
 while :; do
     round=$((round + 1))
@@ -378,22 +391,40 @@ while :; do
     while read -r pair; do set -- "$@" --excuse "$pair"; done <"$WORK/pairs.txt"
     # The list a reviewer reads, with this host's unreadable processes
     # excused: it would remove exactly the two build paths.
-    "$SPAWN_BIN" scratch sweep "$@" >"$WORK/reviewed.out" 2>&1 || check_failed "(3) the reviewed list failed: $(head -c 300 "$WORK/reviewed.out")"
-    if grep -q '^unreadable	' "$WORK/reviewed.out" && [ "$round" -lt 3 ]; then
-        note "(3) round $round: an unreadable process started since the list; again"
-        continue
+    unquiet=""
+    "$SPAWN_BIN" scratch sweep "$@" >"$WORK/reviewed.out" 2>&1 && status=0 || status=$?
+    if [ "$status" -ne 0 ] && grep -q 'is no unreadable process of yours running now' "$WORK/reviewed.out"; then
+        unquiet="an excused process ended before the reviewed list"
+    elif [ "$status" -ne 0 ]; then
+        check_failed "(3) the reviewed list failed: $(head -c 300 "$WORK/reviewed.out")"
+    elif grep -q '^unreadable	' "$WORK/reviewed.out"; then
+        unquiet="an unreadable process started since the list"
+    else
+        reviewed=$(sed -n 's/^digest	//p' "$WORK/reviewed.out")
+        "$SPAWN_BIN" scratch sweep --apply "$@" --expect-digest "$reviewed" >"$WORK/sweep.out" 2>"$WORK/sweep.err" && status=0 || status=$?
+        if [ "$status" -ne 0 ] && grep -q 'is not the one read' "$WORK/sweep.err"; then
+            unquiet="the list changed before --apply (nothing removed)"
+        elif [ "$status" -ne 0 ] && grep -q 'is no unreadable process of yours running now; nothing removed' "$WORK/sweep.err"; then
+            unquiet="an excused process ended before --apply (nothing removed)"
+        elif [ "$status" -eq 0 ] && grep -q -E "$late" "$WORK/sweep.out"; then
+            # One started during --apply, after its first look: its judgement
+            # again just before each removal kept a path it could not clear,
+            # "stays <path> <who>: in use unknown: process N (comm) of its
+            # owner cannot be read" (rev-b's 236 F1). A path kept for any
+            # other reason is judged below. With nothing removed the round is
+            # tried again; with a path already gone the scratch is not the
+            # one planted, so this run cannot judge.
+            if grep -q '^removed	' "$WORK/sweep.out"; then
+                harness "(3) an unreadable process started during --apply after $(grep -c '^removed	' "$WORK/sweep.out") path(s) went ($(grep -m 1 -E "$late" "$WORK/sweep.out" | cut -f3-)): run again"
+            fi
+            unquiet="an unreadable process started during --apply (nothing removed)"
+        fi
     fi
-    reviewed=$(sed -n 's/^digest	//p' "$WORK/reviewed.out")
-    "$SPAWN_BIN" scratch sweep --apply "$@" --expect-digest "$reviewed" >"$WORK/sweep.out" 2>"$WORK/sweep.err" && status=0 || status=$?
-    if [ "$status" -ne 0 ] && grep -q 'is not the one read' "$WORK/sweep.err" && [ "$round" -lt 3 ]; then
-        note "(3) round $round: the list changed before --apply (nothing removed); again"
-        continue
-    fi
-    if [ "$status" -ne 0 ] && grep -q 'is no unreadable process of yours running now; nothing removed' "$WORK/sweep.err" && [ "$round" -lt 3 ]; then
-        note "(3) round $round: an excused process ended before --apply (nothing removed); again"
-        continue
-    fi
-    break
+    [ -n "$unquiet" ] || break
+    [ $(($(date +%s) - quiet_from)) -lt "$quiet_secs" ] ||
+        harness "(3) no quiet round in ${quiet_secs} s ($round rounds; the last: $unquiet): unreadable processes of this user kept coming (gpg-agent is non-dumpable); run again"
+    note "(3) round $round: $unquiet; again in 2 s"
+    sleep 2
 done
 expect_eq "$(grep '^would-remove	' "$WORK/reviewed.out" | cut -f2 | sort | tr '\n' ' ')" "$S/go/t/target $S/sess/deep/target " \
     "(3) the reviewed list would remove the two build paths"
