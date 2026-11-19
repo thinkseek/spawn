@@ -532,7 +532,8 @@ test("a disk that gained and stores that all shrank say so with positive sizes",
     assert.equal(mark.range, fall(-gained, basis).range);
     assert.equal(mark.tone, "plain");
   }
-  assert.equal(fall(gained).value, "2662.8 MB a day");
+  // rev-j's "lost -2662.8 MB a day": the positive size's own words now.
+  assert.equal(fall(gained).value, "2.6 GB a day");
   // Above zero and at zero: as before.
   assert.equal(fall(10e9, "day").name, "Free disk lost a day (the last day's fall)");
   assert.equal(fall(10e9, "fit").name, "Free disk lost a day (the week's fit)");
