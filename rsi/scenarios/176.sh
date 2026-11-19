@@ -441,8 +441,8 @@ expect_eq "$(answer '[(.alert_figures // [])[] | select(.key == "recoverability.
     '[{"line":"sustainability","value":1,"range":{"max":0},"state":"out"}]' \
     "(3) nightly sources held red: one (supply), out of its range of none, under sustainability"
 expect_eq "$(answer '[(.diagnostics // [])[].key]')" \
-    '["storage.free_bytes","storage.unowned_scratch_bytes","storage.disk_fall","storage.grew_most","storage.archive_growth","storage.leaked_test_schemas"]' \
-    "(3) the diagnostics, in order"
+    '["storage.free_bytes","storage.unowned_scratch_bytes","storage.disk_fall","storage.grew_most","storage.archive_growth","storage.leaked_test_schemas","storage.landed_scratch_bytes"]' \
+    "(3) the diagnostics, in order (objective 232: landed objectives' scratch last)"
 expect_eq "$(answer '[(.diagnostics // [])[] | select(.key == "storage.unowned_scratch_bytes") | {name, value, range, state}]')" \
     "[{\"name\":\"Scratch nobody owns\",\"value\":$idle_bytes,\"range\":{\"max\":0},\"state\":\"out\"}]" \
     "(3) scratch nobody owns: the idle folder's bytes, out of 0 or less"
@@ -482,7 +482,7 @@ test("(5) the three rows, not measured yet, the diagnostics apart", () => {
   assert.ok(!["not measured yet", "not collected yet"].includes(star.value), `a value in words: ${star.value}`);
   const names = view.rows.flatMap((row) => [row.north_star, ...row.guardrails]).map((mark) => mark.name);
   assert.ok(!names.includes("Free disk") && !names.some((name) => name.startsWith("Scratch nobody owns")), `no alert figure or diagnostic on a row: ${names}`);
-  assert.equal(view.diagnostics.length, 6);
+  assert.equal(view.diagnostics.length, 7, "the six and landed objectives' scratch (objective 232)");
   assert.match(view.diagnostics[0].name, /^Free disk/);
   assert.notEqual(view.diagnostics[0].tone, "warning", "free disk has no range (objective 182)");
   assert.deepEqual(view.diagnostics[1].tone, "warning", "scratch nobody owns is out of its range");
