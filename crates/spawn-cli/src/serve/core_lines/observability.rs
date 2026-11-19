@@ -413,7 +413,8 @@ mod tests {
             .collect();
         // Not measured: the five performance figures (none read) and the
         // two other north stars not collected, the disk's fall and the
-        // store that grew most (objective 141: no readings here), every
+        // store that grew most (objective 141: no readings here), the scratch
+        // of landed objectives (objective 232: no scratch reading here), every
         // other storage figure measured, itself left out though it starts
         // with no value.
         assert_eq!(
@@ -425,7 +426,7 @@ mod tests {
                     "ratio",
                     json!(0.125)
                 ),
-                ("observability.not_measured", "count", json!(9)),
+                ("observability.not_measured", "count", json!(10)),
             ]
         );
         // Nothing read: the two guardrails count too.
@@ -438,7 +439,7 @@ mod tests {
         );
         assert_eq!(bare[2].guardrails[0].value, Value::Null);
         assert_eq!(bare[2].guardrails[1].value, Value::Null);
-        assert_eq!(bare[2].guardrails[2].value, json!(11));
+        assert_eq!(bare[2].guardrails[2].value, json!(12));
         // Its range and state as for every figure.
         // Its range and state as for every figure, where the owner's set
         // (objective 176) puts it: the interventions are the sustainability

@@ -105,7 +105,28 @@ pub(super) fn storage_line(storage: &Value) -> Line {
             // from the storage readings (objective 180) `lines_at` sets.
             bytes_per_landing(&storage["readings"]),
             rebuildable_bytes(&storage["readings"]),
+            landed_scratch(storage),
         ],
+    }
+}
+
+/// Objective 232, a diagnostic: the scratch of landed objectives by agent
+/// and objective, which `lines_at` sets from the scratch walk
+/// ([`super::unowned::landed_scratch`]), with its note while it has none.
+fn landed_scratch(storage: &Value) -> Figure {
+    let landed = &storage["landed_scratch"];
+    Figure {
+        note: landed["note"].as_str().map(str::to_string),
+        by_owner: landed
+            .get("by_owner")
+            .filter(|rows| rows.is_array())
+            .cloned(),
+        ..Figure::new(
+            "storage.landed_scratch_bytes",
+            "Scratch of landed objectives",
+            "bytes",
+            landed["bytes"].clone(),
+        )
     }
 }
 
@@ -282,6 +303,8 @@ mod tests {
             "unowned_scratch_bytes": 401_000, "leaked_test_schemas": 4,
             "disk_fall_bytes_per_day": 2_000_000, "disk_fall_basis": "day",
             "grew_most": {"store": "unattributed", "bytes_per_day": 1_500_000},
+            "landed_scratch": {"bytes": 12_000, "note": null, "by_owner": [
+                {"agent": "rev-e", "objective": "1/007", "bytes": 12_000, "folders": 1, "leased": 0}]},
         });
         let readings = lines(
             &storage,
@@ -326,6 +349,8 @@ mod tests {
                 // Objective 185: no storage readings here, no value.
                 ("storage.bytes_per_landing", Value::Null),
                 ("storage.rebuildable_bytes", Value::Null),
+                // Objective 232: the scratch of landed objectives.
+                ("storage.landed_scratch_bytes", json!(12_000)),
             ]
         );
         // The store that grew most is said beside it (objective 141), now a
