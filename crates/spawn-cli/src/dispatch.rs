@@ -88,6 +88,7 @@ mod jobs;
 #[cfg(test)]
 mod resume_replay;
 mod stall;
+mod steal;
 mod stops;
 mod worker;
 
@@ -922,6 +923,14 @@ pub(crate) fn step(
     });
     if !lines.is_empty() {
         // Collecting a report changed a task's state.
+        (rows, work) = load(store, waits)?;
+    }
+    // Work stealing (objective 239), before deliveries are planned: each
+    // idle pool member takes one queued task of a busy one; the pass then
+    // reads its work again.
+    if steal::enabled(crate::config::env_value(steal::ENV).as_deref())
+        && steal::run(store, &work, &mut lines)
+    {
         (rows, work) = load(store, waits)?;
     }
     // The agents' answers to their messages and the reports' answers to
