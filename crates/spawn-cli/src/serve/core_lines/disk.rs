@@ -130,7 +130,7 @@ fn median_at(readings: &mut [(i64, f64)]) -> Option<(f64, f64)> {
     }
     readings.sort_by(|a, b| a.1.total_cmp(&b.1));
     let middle = readings.len() / 2;
-    let median = if readings.len() % 2 == 0 {
+    let median = if readings.len().is_multiple_of(2) {
         f64::midpoint(readings[middle - 1].1, readings[middle].1)
     } else {
         readings[middle].1
@@ -655,9 +655,8 @@ mod tests {
         );
         let within = now(NOW - 6 * H + 1).expect("a day");
         assert_eq!(
-            within,
-            (48.0 * 24.0 / 21.0_f64).round() as i64,
-            "in: the mean time is 3 h"
+            within, 55,
+            "in: the mean time is 3 h, 48 over 21/24 of a day"
         );
         // Without the free disk now: none; with no reading a day ago: none.
         assert_eq!(
