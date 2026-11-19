@@ -2821,7 +2821,10 @@ fn the_start_record_names_the_process_its_ancestors_and_cgroup() {
     proc.process(40, Some("sshd"), Some(1));
     proc.process(50, Some("st) 1 (234"), Some(40));
     proc.process(60, Some("spawn"), Some(50));
-    proc.cgroup(60, "12:pids:/user.slice\n0::/user.slice/spawn-integrate.service\n");
+    proc.cgroup(
+        60,
+        "12:pids:/user.slice\n0::/user.slice/spawn-integrate.service\n",
+    );
     let record = super::started_record(
         &proc.0,
         60,
@@ -2881,7 +2884,8 @@ fn what_the_start_record_cannot_read_is_null_and_the_ancestors_end() {
         deep.process(pid, Some("sh"), Some(pid - 1));
     }
     deep.process(100, Some("spawn"), Some(21));
-    let ancestors = super::started_record(&deep.0, 100, 0, None, &start(false, false))["ancestors"].clone();
+    let ancestors =
+        super::started_record(&deep.0, 100, 0, None, &start(false, false))["ancestors"].clone();
     assert_eq!(ancestors.as_array().map(Vec::len), Some(16));
     assert_eq!(ancestors[0]["pid"], 21);
     assert_eq!(ancestors[15]["pid"], 6);

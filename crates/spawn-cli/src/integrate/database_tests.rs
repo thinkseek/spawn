@@ -10341,7 +10341,10 @@ fn the_store_takes_an_integrator_start_and_refuses_each_bad_field() {
             .integrator_record(&record)
             .expect_err(&format!("{field} {value:?} refused"));
         let text = format!("{error:?}");
-        assert!(text.contains("integrator.started"), "{field} {value:?}: {text}");
+        assert!(
+            text.contains("integrator.started"),
+            "{field} {value:?}: {text}"
+        );
         assert!(text.contains("22023"), "{field} {value:?}: {text}");
     }
     let count: i64 = db
