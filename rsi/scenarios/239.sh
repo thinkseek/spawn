@@ -7,17 +7,20 @@
 #
 # A real loop (the Bridge, its pusher, the dispatcher) runs residents of two
 # missions on a fake engine. Pool `logs`: ben (the busy worker), ann and dee
-# (idle), cid (busy); pool `other`: sol; no pool: una. ben runs task T1 (it
-# never ends its turn) and holds, queued: T2, T3 (oldest first), T4 (pinned),
-# T7; T5 in mission P, which the owner pauses; T6, cancelled. The first loop
-# runs with SPAWN_WORK_STEALING=0 (the owner's moves only); the second with
-# stealing on. Checked:
+# (idle), cid (busy), eve and fay (idle until the loop stops), gus (holding
+# only a task of the paused mission); pool `other`: sol; no pool: una. ben
+# runs task T1 (it never ends its turn) and holds, queued: T2, T3 (oldest
+# first), T4 (pinned), T7; T5 in mission P, which the owner pauses; T6,
+# cancelled. The first loop runs with SPAWN_WORK_STEALING=0 (the owner's
+# moves only); the second with stealing on. Checked:
 #   (0) `spawn resident propose --pool` and `spawn task assign --pin` are
 #       taken;
 #   (1) `spawn task steal` refuses, exit 1 naming the rule, nothing recorded
 #       and the owner unchanged: T1 (delivered: "not queued"); T4 ("pinned");
 #       T5 ("paused"); T6 ("not queued"); T2 to sol ("pool"), to una
-#       ("pool"), to cid ("not idle");
+#       ("pool"), to cid ("not idle": T8 delivered), to gus ("not idle": a
+#       task assigned only); after (2), T3 to the winner ("not idle": T2
+#       delivered or reported);
 #   (2) T2 stolen to ann and to dee at once: exactly one exits 0, one
 #       task.stolen record for T2 (by human, from ben's session to the
 #       winner's), T2's session the winner's; the other exits 1;
@@ -26,13 +29,16 @@
 #       task.delivered record;
 #   (4) T1 stays ben's: delivered, ben's session, no task.stolen record;
 #   (5) after the loop stops, a refold of the log and init-db again change no
-#       task's session and add no task.stolen record;
+#       task's session and add no task.stolen record; then, the loop still
+#       stopped, eve (idle) is assigned TA and TB: TA, eve's next, is refused
+#       to fay ("its worker's next"); TB is taken by fay (exit 0);
 #   (6) a loop started again with stealing on: the idle loser takes T3, ben's
 #       oldest stealable task, by itself (task.stolen by spawn-dispatch), and
-#       only T3: 15 s later T7 is still ben's and no other task moved;
+#       only T3: 15 s later T7 is still ben's, TA still eve's, and no other
+#       task moved (three task.stolen records in all: T2, TB, T3);
 #   (7) T3 is delivered once, into the loser's session, none into ben's;
-#   (8) T4 (pinned) and T5 (paused mission) are still ben's with no
-#       task.stolen record, and sol and una hold no task;
+#   (8) T4 (pinned) and T5 (paused mission) are still ben's, and gus's task
+#       still gus's, with no task.stolen record; sol and una hold no task;
 #   (9) `spawn task stages --id T3` shows a stage `stolen`.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
@@ -366,12 +372,12 @@ paused=$(jq -r .mission "$WORK/out.txt")
 
 capture "$SPAWN_BIN" resident propose --name ben --charter "Analyses the 239 logs." --pool logs
 [ "$status" -eq 0 ] || fail "(0) spawn resident propose --pool exited $status: $(err)"
-for name in ann cid dee; do
+for name in ann cid dee eve fay gus; do
     spawn_ok resident propose --name "$name" --charter "Analyses the 239 logs." --pool logs
 done
 spawn_ok resident propose --name sol --charter "Analyses other 239 logs." --pool other
 spawn_ok resident propose --name una --charter "Owns its own 239 concern."
-for name in ben ann cid dee sol una; do
+for name in ben ann cid dee eve fay gus sol una; do
     spawn_ok resident approve --name "$name"
 done
 expect_eq "$(q "select coalesce(pool, '-') from mission_residents where name = 'ben'")" logs \
@@ -402,6 +408,8 @@ t7=$task
 assign "$paused" ben "Analyse log five. BB:WRITE:five" || harness "assign T5: $(err)"
 t5=$task
 spawn_ok mission pause --id "$paused" --reason "239: the owner holds this mission"
+assign "$paused" gus "Analyse log nine. BB:WRITE:nine" || harness "assign Tg: $(err)"
+tg=$task
 assign "$mission" ben "Analyse log six. BB:WRITE:six" || harness "assign T6: $(err)"
 t6=$task
 spawn_ok task cancel --id "$t6"
@@ -416,7 +424,8 @@ refused "$t5" ann "paused" "a task of a paused mission"
 refused "$t6" ann "not queued" "a cancelled task"
 refused "$t2" sol "pool" "a taker in another pool"
 refused "$t2" una "pool" "a taker with no pool"
-refused "$t2" cid "not idle" "a taker that is not idle"
+refused "$t2" cid "not idle" "a taker that is not idle (a task delivered)"
+refused "$t2" gus "not idle" "a taker that is not idle (a task assigned only)"
 
 # --- (2) two takers of one task ----------------------------------------------------
 
@@ -439,6 +448,7 @@ expect_eq "$(session_of "$t2")" "session_resident_$winner" "(2) T2's session"
 expect_eq "$(stolen_field "$t2" from_session)" "$ben" "(2) T2's record from_session"
 expect_eq "$(stolen_field "$t2" to_session)" "session_resident_$winner" "(2) T2's record to_session"
 expect_eq "$(stolen_field "$t2" by)" human "(2) T2's record by"
+refused "$t3" "$winner" "not idle" "the winner as a taker (T2 its own)"
 
 # --- (3) delivered once, to the winner ------------------------------------------
 
@@ -467,6 +477,15 @@ expect_eq "$(owners)" "$before_owners" "(5) the tasks' sessions after a refold"
 init_db
 expect_eq "$(owners)" "$before_owners" "(5) the tasks' sessions after init-db"
 expect_eq "$(all_stolen)" "$before_records" "(5) task.stolen records after the refold"
+# An idle worker's next task is never taken; its second one is.
+assign "$mission" eve "Analyse log a. BB:WRITE:aa" || harness "assign TA: $(err)"
+ta=$task
+assign "$mission" eve "Analyse log b. BB:WRITE:bb" || harness "assign TB: $(err)"
+tb=$task
+refused "$ta" fay "next" "(5) an idle worker's next task"
+capture "$SPAWN_BIN" task steal --id "$tb" --to fay
+[ "$status" -eq 0 ] || fail "(5) eve's second task TB to the idle fay exited $status: $(err)"
+expect_eq "$(session_of "$tb")" session_resident_fay "(5) TB's session"
 
 # --- (6) the second loop: stealing on ------------------------------------------------
 
@@ -478,7 +497,8 @@ expect_eq "$(stolen_field "$t3" by)" spawn-dispatch "(6) T3's record by"
 expect_eq "$(session_of "$t3")" "session_resident_$loser" "(6) T3's session"
 sleep 15
 expect_eq "$(session_of "$t7")" "$ben" "(6) T7 (ben's next) is still ben's"
-expect_eq "$(all_stolen)" 2 "(6) task.stolen records in all (T2 by the owner, T3 by the dispatcher)"
+expect_eq "$(session_of "$ta")" session_resident_eve "(6) TA is still eve's"
+expect_eq "$(all_stolen)" 3 "(6) task.stolen records in all (T2 and TB by the owner, T3 by the dispatcher)"
 expect_eq "$(stolen_count "$t2")" 1 "(6) T2 is not moved again after the restart"
 
 # --- (7) delivered once, to the taker --------------------------------------------------
@@ -496,6 +516,8 @@ for t in "$t4" "$t5"; do
     expect_eq "$(session_of "$t")" "$ben" "(8) task $t's session"
     expect_eq "$(stolen_count "$t")" 0 "(8) task.stolen records of task $t"
 done
+expect_eq "$(session_of "$tg")" session_resident_gus "(8) gus's task's session"
+expect_eq "$(stolen_count "$tg")" 0 "(8) task.stolen records of gus's task"
 expect_eq "$(q "select count(*) from mission_tasks
                where session_id in ('session_resident_sol', 'session_resident_una')")" 0 \
     "(8) tasks of sol and una"
