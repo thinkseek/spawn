@@ -370,6 +370,22 @@ pub(crate) struct TaskRow {
     /// A delivered task's latest restart (`task.restarted`).
     #[serde(default)]
     pub(crate) restart: Option<Restart>,
+    /// Pinned to its worker (`spawn task assign --pin`, objective 239):
+    /// never stolen.
+    #[serde(default)]
+    pub(crate) pinned: bool,
+}
+
+/// A resident of the roster (objective 239): its state and pool.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct Resident {
+    pub(crate) name: String,
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    /// `proposed`, `approved` or `retired`.
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) pool: Option<String>,
 }
 
 /// A delivered task's latest restart, as its `task.restarted` record names
@@ -677,6 +693,8 @@ pub(crate) struct Work {
     pub(crate) news: News,
     /// Retired residents, as (agent, session).
     pub(crate) retired: Vec<(String, String)>,
+    /// Every resident, by name (objective 239: work stealing's pools).
+    pub(crate) residents: Vec<Resident>,
     /// Residents whose latest delivered task is cancelled.
     pub(crate) cancelled: Vec<Cancelled>,
     /// The latest `source.moved` record, if any.
@@ -691,12 +709,22 @@ impl Work {
     /// Read the mission layer's rows.
     pub(crate) fn load(store: &PostgresStore) -> Result<Self, String> {
         let error = |error: spawn_core::port::StoreError| error.to_string();
+        // The roster, read once: the retired residents and the pools.
+        let residents: Vec<Resident> =
+            serde_json::from_value(store.resident_roster().map_err(error)?)
+                .map_err(|error| format!("resident roster: {error}"))?;
+        let retired = residents
+            .iter()
+            .filter(|resident| resident.state == "retired")
+            .map(|resident| (resident.agent_id.clone(), resident.session_id.clone()))
+            .collect();
         Ok(Self {
             tasks: serde_json::from_value(store.delivery_rows().map_err(error)?)
                 .map_err(|error| format!("delivery rows: {error}"))?,
             news: serde_json::from_value(store.mission_news().map_err(error)?)
                 .map_err(|error| format!("mission news: {error}"))?,
-            retired: store.retired_residents().map_err(error)?,
+            retired,
+            residents,
             cancelled: serde_json::from_value(store.cancelled_deliveries().map_err(error)?)
                 .map_err(|error| format!("cancelled deliveries: {error}"))?,
             moved: serde_json::from_value(store.latest_source_moved().map_err(error)?)
