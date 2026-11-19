@@ -139,7 +139,6 @@ fn refused(store: &PostgresStore, client: &mut Client, task: i64, to: &str, why:
 
 /// The mission rule: closed, paused, halted, each refused while it holds.
 fn mission_rule(store: &PostgresStore, client: &mut Client, mission: i64, queued: i64) {
-    // The mission rule: closed, paused, halted.
     for (column, value, why) in [
         ("state", "'done'", "(closed)"),
         ("pause_event", "1", "(paused)"),
@@ -151,7 +150,7 @@ fn mission_rule(store: &PostgresStore, client: &mut Client, mission: i64, queued
             ))
             .expect("the mission");
         refused(
-            &store,
+            store,
             client,
             queued,
             "ann",
@@ -169,7 +168,6 @@ fn mission_rule(store: &PostgresStore, client: &mut Client, mission: i64, queued
 /// The move, to an idle member of the pool: the answer, the record, the
 /// fold, and the same owner after a refold.
 fn moves_to_an_idle_member(store: &PostgresStore, client: &mut Client, queued: i64) {
-    // And it moves, to an idle member of the pool.
     let moved = store
         .task_steal(queued, "ann", "human", Some("ann is idle"))
         .expect("moved");
@@ -233,41 +231,15 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
         )
         .expect("ephemeral");
 
-    refused(
-        &store,
-        &mut client,
-        999_999,
-        "ann",
-        "not queued (no such task)",
-    );
-    refused(
-        &store,
-        &mut client,
-        ephemeral,
-        "ann",
-        "not queued (not a resident task)",
-    );
-    refused(
-        &store,
-        &mut client,
-        running,
-        "ann",
-        "not queued (delivered)",
-    );
-    refused(
-        &store,
-        &mut client,
-        cancelled,
-        "ann",
-        "not queued (cancelled)",
-    );
-    refused(
-        &store,
-        &mut client,
-        typed,
-        "ann",
-        "not queued (a delivery command exists)",
-    );
+    for (task, why) in [
+        (999_999, "not queued (no such task)"),
+        (ephemeral, "not queued (not a resident task)"),
+        (running, "not queued (delivered)"),
+        (cancelled, "not queued (cancelled)"),
+        (typed, "not queued (a delivery command exists)"),
+    ] {
+        refused(&store, &mut client, task, "ann", why);
+    }
     client
         .execute(
             "update mission_tasks set revisions = 1 where id = $1",
@@ -285,48 +257,16 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
 
     mission_rule(&store, &mut client, mission, queued);
 
-    refused(
-        &store,
-        &mut client,
-        queued,
-        "nobody",
-        "cannot go to nobody (no such resident)",
-    );
-    refused(
-        &store,
-        &mut client,
-        queued,
-        "hal",
-        "cannot go to hal (not approved)",
-    );
-    refused(
-        &store,
-        &mut client,
-        queued,
-        "ivy",
-        "cannot go to ivy (retired)",
-    );
-    refused(
-        &store,
-        &mut client,
-        queued,
-        "ben",
-        "cannot go to ben (already its worker)",
-    );
-    refused(
-        &store,
-        &mut client,
-        queued,
-        "una",
-        "cannot go to una (no pool)",
-    );
-    refused(
-        &store,
-        &mut client,
-        queued,
-        "sol",
-        "cannot go to sol (pool logs is not other)",
-    );
+    for (to, why) in [
+        ("nobody", "cannot go to nobody (no such resident)"),
+        ("hal", "cannot go to hal (not approved)"),
+        ("ivy", "cannot go to ivy (retired)"),
+        ("ben", "cannot go to ben (already its worker)"),
+        ("una", "cannot go to una (no pool)"),
+        ("sol", "cannot go to sol (pool logs is not other)"),
+    ] {
+        refused(&store, &mut client, queued, to, why);
+    }
     assert_eq!(stolen(&mut client), 0);
 
     moves_to_an_idle_member(&store, &mut client, queued);
