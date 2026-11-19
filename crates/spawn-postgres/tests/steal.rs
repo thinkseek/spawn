@@ -112,12 +112,12 @@ fn stolen(client: &mut Client) -> i64 {
 
 fn session(client: &mut Client, task: i64) -> String {
     client
-        .query_one(
+        .query_opt(
             "select session_id from mission_tasks where id = $1",
             &[&task],
         )
         .expect("the task")
-        .get(0)
+        .map_or_else(|| "no such task".to_string(), |row| row.get(0))
 }
 
 /// Whether moving `task` to `to` is refused with a message starting `task
