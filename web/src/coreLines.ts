@@ -420,9 +420,10 @@ function storeWords(store: unknown): string {
 /** Which fall a figure is, after its name (objective 225): " (the week's
  * fit)" for "fit", " (the last day's fall)" for "day"; nothing without a
  * basis, for null, or for one it does not know. */
-function basisWords(basis: unknown): string {
+function basisWords(basis: unknown, gained = false): string {
   if (basis === "fit") return " (the week's fit)";
-  if (basis === "day") return " (the last day's fall)";
+  // A disk that gained (objective 230): never "fall" for a gain.
+  if (basis === "day") return gained ? " (over the last day)" : " (the last day's fall)";
   return "";
 }
 
@@ -436,16 +437,31 @@ function judgedWords(judged: unknown): string {
   return ` (${done} judged, ${unjudged} unjudged of ${fired})`;
 }
 
+/** The figures said the other way round below zero (objective 230), each
+ * its name's words and what they become: free disk that gained, and the
+ * store that shrank least when every store shrank. */
+const TURNED: Record<string, [string, string]> = {
+  "storage.disk_fall": [" lost ", " gained "],
+  "storage.grew_most": [" grew most", " shrank least"],
+};
+
 function mark(raw: unknown): CoreMark {
   const figure = (typeof raw === "object" && raw !== null ? raw : {}) as Partial<CoreFigure>;
   const unit = typeof figure.unit === "string" ? figure.unit : "count";
-  const value = finite(figure.value);
+  const signed = finite(figure.value);
+  // Below zero, a turned figure says its other words and the size as a
+  // positive number (objective 230: "Free disk gained a day", never "lost
+  // -2662.8 MB a day"); its range and tone are as they were.
+  const turn = typeof figure.key === "string" && Object.hasOwn(TURNED, figure.key) && signed !== null && signed < 0 ? TURNED[figure.key] : null;
+  const value = turn !== null && signed !== null ? Math.abs(signed) : signed;
+  const ownName = typeof figure.name === "string" ? figure.name : String(figure.key ?? "");
+  const baseName = turn !== null ? ownName.replace(turn[0], turn[1]) : ownName;
   const since = finite(figure.measuring_since_ms);
   const of = finite(figure.of);
   const target = finite(figure.target);
   const held = typeof figure.range_note === "string" && figure.range_note !== "" ? figure.range_note : null;
   const said: CoreMark = {
-    name: `${typeof figure.name === "string" ? figure.name : String(figure.key ?? "")}${windowWords(figure.window)}${storeWords(figure.store)}${basisWords(figure.basis)}${judgedWords(figure.judged)}`,
+    name: `${baseName}${windowWords(figure.window)}${storeWords(figure.store)}${basisWords(figure.basis, turn !== null && figure.key === "storage.disk_fall")}${judgedWords(figure.judged)}`,
     value:
       value !== null
         ? `${unitWords(unit, value)}${of !== null ? ` of ${GROUPED.format(of)}` : ""}`
