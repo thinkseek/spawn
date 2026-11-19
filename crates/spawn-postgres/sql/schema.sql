@@ -1543,6 +1543,8 @@ alter table mission_tasks add column if not exists delivered_at_ms bigint;
 -- its worker (`spawn task assign --pin`), from its `task.assigned`.
 alter table mission_residents add column if not exists pool text;
 alter table mission_tasks add column if not exists pinned boolean not null default false;
+-- When the task last moved (objective 239, task.stolen); null if never.
+alter table mission_tasks add column if not exists stolen_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
@@ -2830,7 +2832,8 @@ begin
         -- A queued task moved, unstarted, to an idle resident of its pool
         -- (objective 239, spawn_task_steal): its worker is the taker now.
         update mission_tasks set session_id = p_record ->> 'to_session',
-                                 agent_id = p_record ->> 'to_agent', updated_at_ms = p_at
+                                 agent_id = p_record ->> 'to_agent', stolen_at_ms = p_at,
+                                 updated_at_ms = p_at
          where id = v_id;
     when 'resident.proposed' then
         insert into mission_residents (name, agent_id, session_id, charter, proposed_by,
@@ -3359,9 +3362,11 @@ begin
     end if;
     -- A delivery planned before a move (objective 239, task.stolen) is
     -- never recorded for the old worker: the command's session must be the
-    -- task's worker's now.
+    -- task's worker's now. Only a moved task is checked: a task never moved
+    -- keeps the session it was assigned to.
     if exists (select 1 from spawn_commands c join mission_tasks k on k.id = p_task
-                where c.id = p_command and c.session_id is distinct from k.session_id) then
+                where c.id = p_command and k.stolen_at_ms is not null
+                  and c.session_id is distinct from k.session_id) then
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
