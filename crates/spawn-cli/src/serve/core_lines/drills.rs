@@ -254,7 +254,12 @@ pub(super) fn record_reading(answer: Option<&Value>) -> Reading {
 /// the user manager's with `user` (objective 231). `Err` when it could not
 /// start, ran over `limit` (killed, with what it started) or failed. A name
 /// [`unit_allowed`] refuses is never run.
-pub(super) fn show(program: &str, unit: &str, user: bool, limit: Duration) -> Result<String, String> {
+pub(super) fn show(
+    program: &str,
+    unit: &str,
+    user: bool,
+    limit: Duration,
+) -> Result<String, String> {
     use std::os::unix::process::CommandExt as _;
 
     if !unit_allowed(unit) {
@@ -380,7 +385,8 @@ fn unit_reading(unit: &str, now_ms: i64) -> Reading {
 /// unit: a `LoadState=not-found` line, and no other load state (masked,
 /// error, bad-setting, merged, stub are known units).
 pub(super) fn not_found(text: &str) -> bool {
-    text.lines().any(|line| line.trim_end() == "LoadState=not-found")
+    text.lines()
+        .any(|line| line.trim_end() == "LoadState=not-found")
 }
 
 /// A unit's last pass and last run from `program`, each call logged with
@@ -1100,5 +1106,161 @@ mod tests {
         let shown = show(&program, "a.service", false, Duration::from_secs(5));
         assert!(shown.is_ok(), "a.service: {shown:?}");
         assert!(ran.exists());
+    }
+
+    /// A fake systemctl answering `system` as the system manager and
+    /// `user` as the user manager (its first argument `--user`), each
+    /// call's argv appended to `calls`, one line a call.
+    fn managers(dir: &std::path::Path, system: &str, user: &str) -> (String, std::path::PathBuf) {
+        let calls = dir.join("calls");
+        let program = script(
+            dir,
+            &format!(
+                "echo \"$*\" >>{calls}\nif [ \"$1\" = --user ]; then printf '{user}'; else printf '{system}'; fi",
+                calls = calls.display()
+            ),
+        );
+        (program, calls)
+    }
+
+    const NOT_FOUND: &str =
+        "LoadState=not-found\\nResult=success\\nExecMainStatus=0\\nExecMainExitTimestamp=\\n";
+    const SYSTEM_CALL: &str = "show -p LoadState,Result,ExecMainStatus,ExecMainExitTimestamp --timestamp=unix -- a.service";
+
+    /// Objective 231: a unit the system manager does not know is asked of
+    /// the user manager once, and its answer is the reading.
+    #[test]
+    fn a_unit_the_system_manager_does_not_know_is_read_from_the_user_manager() {
+        let dir = Scratch::new();
+        let (program, calls) = managers(
+            dir.as_path(),
+            NOT_FOUND,
+            "LoadState=loaded\\nResult=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@7\\n",
+        );
+        let reading = read_unit(&program, "a.service", Duration::from_secs(5));
+        assert_eq!(reading.passed_at_ms, Some(7000));
+        assert_eq!(
+            reading.last,
+            Some(Last {
+                at_ms: Some(7000),
+                ok: true,
+                reason: String::new()
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).expect("the calls"),
+            format!("{SYSTEM_CALL}\n--user {SYSTEM_CALL}\n")
+        );
+    }
+
+    #[test]
+    fn a_failed_user_unit_says_its_result() {
+        let dir = Scratch::new();
+        let (program, _) = managers(
+            dir.as_path(),
+            NOT_FOUND,
+            "LoadState=loaded\\nResult=exit-code\\nExecMainStatus=1\\nExecMainExitTimestamp=@7\\n",
+        );
+        let reading = read_unit(&program, "a.service", Duration::from_secs(5));
+        assert_eq!(reading.passed_at_ms, None);
+        assert_eq!(
+            reading.last,
+            Some(Last {
+                at_ms: Some(7000),
+                ok: false,
+                reason: "Result=exit-code, ExecMainStatus=1".to_string()
+            })
+        );
+    }
+
+    /// A system unit, failed, passed or answering with no LoadState line,
+    /// is the system manager's: the user manager (which would say another
+    /// pass) is never asked.
+    #[test]
+    fn a_system_unit_is_never_asked_of_the_user_manager() {
+        let user =
+            "LoadState=loaded\\nResult=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@99\\n";
+        for (system, passed) in [
+            (
+                "LoadState=loaded\\nResult=exit-code\\nExecMainStatus=1\\nExecMainExitTimestamp=@5\\n",
+                None,
+            ),
+            (
+                "LoadState=loaded\\nResult=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@5\\n",
+                Some(5000),
+            ),
+            (
+                "Result=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@5\\n",
+                Some(5000),
+            ),
+            (
+                "LoadState=masked\\nResult=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@5\\n",
+                Some(5000),
+            ),
+        ] {
+            let dir = Scratch::new();
+            let (program, calls) = managers(dir.as_path(), system, user);
+            let reading = read_unit(&program, "a.service", Duration::from_secs(5));
+            assert_eq!(reading.passed_at_ms, passed, "{system}");
+            assert_eq!(
+                std::fs::read_to_string(&calls).expect("the calls"),
+                format!("{SYSTEM_CALL}\n"),
+                "{system}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unit_neither_manager_knows_has_no_pass() {
+        let dir = Scratch::new();
+        let (program, calls) = managers(dir.as_path(), NOT_FOUND, NOT_FOUND);
+        assert_eq!(
+            read_unit(&program, "a.service", Duration::from_secs(5)),
+            Reading::default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls)
+                .expect("the calls")
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    /// A system call that fails (exits 1) is no reading, and the user
+    /// manager is not asked.
+    #[test]
+    fn a_system_call_that_fails_is_not_asked_of_the_user_manager() {
+        let dir = Scratch::new();
+        let calls = dir.as_path().join("calls");
+        let program = script(
+            dir.as_path(),
+            &format!(
+                "echo \"$*\" >>{}\nif [ \"$1\" = --user ]; then printf 'Result=success\\nExecMainStatus=0\\nExecMainExitTimestamp=@9\\n'; exit 0; fi\nprintf 'LoadState=not-found\\n'\nexit 1",
+                calls.display()
+            ),
+        );
+        assert_eq!(
+            read_unit(&program, "a.service", Duration::from_secs(5)),
+            Reading::default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).expect("the calls"),
+            format!("{SYSTEM_CALL}\n")
+        );
+    }
+
+    /// Only `LoadState=not-found` is not found; every other load state is
+    /// a unit the manager knows, and other properties are never read for it.
+    #[test]
+    fn not_found_reads_only_the_load_state() {
+        assert!(not_found("LoadState=not-found\nResult=success\n"));
+        assert!(not_found("Result=success\nLoadState=not-found"));
+        for known in ["loaded", "masked", "error", "bad-setting", "merged", "stub"] {
+            assert!(!not_found(&format!("LoadState={known}\n")), "{known}");
+        }
+        assert!(!not_found("Result=not-found\nExecMainStatus=0\n"));
+        assert!(!not_found("SubState=not-found\n"));
+        assert!(!not_found(""));
     }
 }
