@@ -104,10 +104,11 @@ const USAGE: &str = "usage:
   spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
-                    [--model default|cheap] [--again]   (cheap: every model on DeepSeek)
+                    [--model default|cheap] [--again] [--pin]   (cheap: every model on DeepSeek)
       (the supervisor's brief that a task of the mission in flight already has, trimmed of
        space, tab, CR and LF, is refused, naming that task; --again assigns it on purpose.
-       Every duplicate assigned names the task it repeats in its record: duplicate_of)
+       Every duplicate assigned names the task it repeats in its record: duplicate_of.
+       --pin keeps the task with its worker: it is never stolen)
   spawn task accept --id N [--revision R]
   spawn task reject --id N [--revision R] --note <what to fix>
       (R: the report's revision as read; refused once the task has moved on)
@@ -124,8 +125,11 @@ const USAGE: &str = "usage:
       (a delivered task moves to a fresh ephemeral worker whose branch starts from the old
        worker's last checkpoint: the task is cancelled, a new one assigned, the old worker
        stopped. Prints the new task and its worker; any task not delivered is refused)
+  spawn task steal --id N --to <resident> [--reason <text>]
+      (owner: a queued, unstarted task of a busy resident moves to an idle resident of the
+       same pool, recorded as task.stolen; refused, naming the rule, otherwise)
   spawn task stages --id N   (each stage with its verdict, time, and how long since the one before)
-  spawn resident propose --name <name> --charter <text>
+  spawn resident propose --name <name> --charter <text> [--pool <pool>]
   spawn resident approve --name <name>
   spawn resident retire --name <name>";
 
@@ -322,13 +326,13 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
     Ok((verb.as_str(), Flags::parse_with_switches(rest, switches)?))
 }
 
-/// As [`split`], with `assign`'s `--again`, which takes no value
-/// (objective 212).
+/// As [`split`], with `assign`'s `--again` (objective 212) and `--pin`
+/// (objective 239), which take no value.
 fn split_task(rest: &[String]) -> Result<(&str, Flags), String> {
     let Some((verb, rest)) = rest.split_first() else {
         return Err(USAGE.to_string());
     };
-    let switches: &[&str] = if verb == "assign" { &["again"] } else { &[] };
+    let switches: &[&str] = if verb == "assign" { &["again", "pin"] } else { &[] };
     Ok((verb.as_str(), Flags::parse_with_switches(rest, switches)?))
 }
 
@@ -937,13 +941,14 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
         "assign" => {
             let model = model(&flags)?;
             let task = store
-                .task_assign_again(
+                .task_assign_with(
                     id(&flags, "mission")?,
                     &text(&flags, "kind")?,
                     &flags.get("worker").unwrap_or_default(),
                     &text(&flags, "brief")?,
                     model.as_str(),
                     flags.switch("again"),
+                    flags.switch("pin"),
                 )
                 .map_err(err)?;
             print(&json!({ "task": task, "model": model.as_str() }));
@@ -991,10 +996,39 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
             let reason = flags.get("reason");
             print(&store.task_reassign(task, reason.as_deref()).map_err(err)?);
         }
+        // Work stealing (objective 239): the owner's move, by `human`.
+        "steal" => {
+            let task = id(&flags, "id")?;
+            let reason = flags.get("reason");
+            let moved = store
+                .task_steal(task, &text(&flags, "to")?, "human", reason.as_deref())
+                .map_err(|error| format!("task steal: {}", refusal(&error)))?;
+            print(&moved);
+        }
         "stages" => print(&store.task_stages(id(&flags, "id")?).map_err(err)?),
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// The store's own words of a refusal: its message, without the driver's
+/// wrapping or the SQLSTATE after it.
+fn refusal(error: &spawn_core::port::StoreError) -> String {
+    use spawn_core::port::StoreError;
+    let text = match error {
+        StoreError::Backend(text) | StoreError::Rejected(text) => text.trim_end(),
+        other => return other.to_string(),
+    };
+    match text.rsplit_once(" (") {
+        Some((message, code))
+            if code.len() == 6
+                && code.ends_with(')')
+                && code[..5].bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            message.to_string()
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// `spawn resident ...`
@@ -1005,7 +1039,11 @@ pub(crate) fn resident(rest: &[String]) -> Result<i32, String> {
     let name = text(&flags, "name")?;
     match verb {
         "propose" => store
-            .resident_propose(&name, &text(&flags, "charter")?)
+            .resident_propose_in(
+                &name,
+                &text(&flags, "charter")?,
+                flags.get("pool").as_deref(),
+            )
             .map_err(err)?,
         "approve" => store.resident_approve(&name).map_err(err)?,
         "retire" => store.resident_retire(&name).map_err(err)?,
