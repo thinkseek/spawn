@@ -2755,3 +2755,167 @@ fn the_locks_holder_is_named_with_when_it_connected() {
         format!("spawn integrate pid={}", std::process::id())
     );
 }
+
+/// A fake /proc under a scratch directory, removed on drop: each process
+/// a directory with the files given.
+struct FakeProc(std::path::PathBuf);
+
+impl FakeProc {
+    fn new(case: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-fake-proc-{case}-{}-{}",
+            std::process::id(),
+            fastrand_name()
+        ));
+        std::fs::create_dir_all(&dir).expect("the fake /proc");
+        Self(dir)
+    }
+
+    /// Process `pid` named `comm` (none: no comm file) whose parent is
+    /// `parent` (none: no stat file).
+    fn process(&self, pid: u32, comm: Option<&str>, parent: Option<u32>) {
+        let dir = self.0.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("a process");
+        if let Some(comm) = comm {
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).expect("comm");
+            if let Some(parent) = parent {
+                std::fs::write(
+                    dir.join("stat"),
+                    format!("{pid} ({comm}) S {parent} {pid} {pid} 0 -1 4194560 100 0 0 0\n"),
+                )
+                .expect("stat");
+            }
+        } else if let Some(parent) = parent {
+            std::fs::write(dir.join("stat"), format!("{pid} (x) S {parent} 1 1\n")).expect("stat");
+        }
+    }
+
+    fn cgroup(&self, pid: u32, text: &str) {
+        std::fs::write(self.0.join(pid.to_string()).join("cgroup"), text).expect("cgroup");
+    }
+}
+
+impl Drop for FakeProc {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn start(from_env: bool, once: bool) -> super::Start<'static> {
+    super::Start {
+        gate: std::path::Path::new("/w/scripts/rsi/gate.sh"),
+        gate_from_env: from_env,
+        root: std::path::Path::new("/w/ws"),
+        once,
+    }
+}
+
+/// Objective 234: `integrator.started` names the process, its parent's
+/// comm, its ancestors up to pid 1 (a comm holding ")" read by the last
+/// ")"), the unified cgroup's path after a v1 line, and the start's own
+/// fields.
+#[test]
+fn the_start_record_names_the_process_its_ancestors_and_cgroup() {
+    let proc = FakeProc::new("names");
+    proc.process(1, Some("systemd"), Some(0));
+    proc.process(40, Some("sshd"), Some(1));
+    proc.process(50, Some("st) 1 (234"), Some(40));
+    proc.process(60, Some("spawn"), Some(50));
+    proc.cgroup(
+        60,
+        "12:pids:/user.slice\n0::/user.slice/spawn-integrate.service\n",
+    );
+    let record = super::started_record(
+        &proc.0,
+        60,
+        999,
+        Some(std::path::Path::new("/w")),
+        &start(true, true),
+    );
+    assert_eq!(
+        record,
+        json!({
+            "type": "integrator.started", "pid": 60, "ppid": 50, "parent_comm": "st) 1 (234",
+            "ancestors": [{"pid": 50, "comm": "st) 1 (234"}, {"pid": 40, "comm": "sshd"},
+                          {"pid": 1, "comm": "systemd"}],
+            "cwd": "/w", "cgroup": "/user.slice/spawn-integrate.service",
+            "gate": "/w/scripts/rsi/gate.sh", "gate_from_env": true, "root": "/w/ws", "once": true,
+        })
+    );
+}
+
+/// What cannot be read is null; a missing stat or ancestor ends the list;
+/// the list stops at 16.
+#[test]
+fn what_the_start_record_cannot_read_is_null_and_the_ancestors_end() {
+    // No stat of its own: the parent pid given; no comm, no cgroup.
+    let proc = FakeProc::new("unread");
+    proc.process(60, Some("spawn"), None);
+    let record = super::started_record(&proc.0, 60, 77, None, &start(false, false));
+    assert_eq!(record["ppid"], 77);
+    assert_eq!(record["parent_comm"], json!(null));
+    assert_eq!(record["ancestors"], json!([]));
+    assert_eq!(record["cwd"], json!(null));
+    assert_eq!(record["cgroup"], json!(null));
+    // A v1-only cgroup: null.
+    proc.cgroup(60, "12:pids:/user.slice\n");
+    assert_eq!(
+        super::started_record(&proc.0, 60, 77, None, &start(false, false))["cgroup"],
+        json!(null)
+    );
+    // An ancestor with no stat ends the list after it; one with no comm
+    // ends it before it.
+    proc.process(70, Some("bash"), None);
+    proc.process(61, Some("spawn"), Some(70));
+    assert_eq!(
+        super::started_record(&proc.0, 61, 0, None, &start(false, false))["ancestors"],
+        json!([{"pid": 70, "comm": "bash"}])
+    );
+    proc.process(80, None, Some(1));
+    proc.process(62, Some("spawn"), Some(80));
+    assert_eq!(
+        super::started_record(&proc.0, 62, 0, None, &start(false, false))["ancestors"],
+        json!([])
+    );
+    // A chain of 20 above it: 16 named.
+    let deep = FakeProc::new("deep");
+    deep.process(1, Some("init"), Some(0));
+    for pid in 2..=21 {
+        deep.process(pid, Some("sh"), Some(pid - 1));
+    }
+    deep.process(100, Some("spawn"), Some(21));
+    let ancestors =
+        super::started_record(&deep.0, 100, 0, None, &start(false, false))["ancestors"].clone();
+    assert_eq!(ancestors.as_array().map(Vec::len), Some(16));
+    assert_eq!(ancestors[0]["pid"], 21);
+    assert_eq!(ancestors[15]["pid"], 6);
+}
+
+/// The start's line on stdout, in both SPAWN_GATE forms; unknown values
+/// say "unknown".
+#[test]
+fn the_start_line_says_who_started_it_and_where_its_gate_is_from() {
+    let proc = FakeProc::new("line");
+    proc.process(50, Some("bash"), Some(1));
+    proc.process(60, Some("spawn"), Some(50));
+    proc.cgroup(60, "0::/user.slice/session-3.scope\n");
+    let record = super::started_record(
+        &proc.0,
+        60,
+        0,
+        Some(std::path::Path::new("/w")),
+        &start(true, false),
+    );
+    assert_eq!(
+        super::started_line(&record),
+        "integrate: started as pid 60 by bash (pid 50) in /w, cgroup /user.slice/session-3.scope; \
+         gate /w/scripts/rsi/gate.sh (from SPAWN_GATE)"
+    );
+    let bare = FakeProc::new("bare");
+    let record = super::started_record(&bare.0, 60, 7, None, &start(false, false));
+    assert_eq!(
+        super::started_line(&record),
+        "integrate: started as pid 60 by unknown (pid 7) in unknown, cgroup unknown; gate \
+         /w/scripts/rsi/gate.sh (SPAWN_GATE unset: the default, read from the working directory)"
+    );
+}

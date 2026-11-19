@@ -10267,3 +10267,94 @@ fn a_lock_held_for_life_is_lost_only_to_another_integrator() {
         Some(stopped.as_str())
     );
 }
+
+/// Objective 234: the store takes `integrator.started`, full or with every
+/// unreadable value null, as written, and refuses each field's bad shape
+/// or absence alone (22023).
+#[test]
+fn the_store_takes_an_integrator_start_and_refuses_each_bad_field() {
+    let db = Db::new("integrator_started");
+    let full = json!({
+        "type": "integrator.started", "pid": 60, "ppid": 50, "parent_comm": "st) 1 (234",
+        "ancestors": [{"pid": 50, "comm": "st) 1 (234"}, {"pid": 1, "comm": "systemd"}],
+        "cwd": "/w", "cgroup": "/user.slice/spawn-integrate.service",
+        "gate": "/w/scripts/rsi/gate.sh", "gate_from_env": true, "root": "/w/ws", "once": false,
+    });
+    let bare = json!({
+        "type": "integrator.started", "pid": 61, "ppid": 0, "parent_comm": null,
+        "ancestors": [], "cwd": null, "cgroup": null,
+        "gate": "/w/g.sh", "gate_from_env": false, "root": "/w/ws", "once": true,
+    });
+    for record in [&full, &bare] {
+        let event = db.store.integrator_record(record).expect("taken");
+        let read: Value = db
+            .admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events where id = $1",
+                &[&event],
+            )
+            .expect("read back")
+            .get(0);
+        assert_eq!(&read, record);
+    }
+    let with = |field: &str, value: Option<Value>| {
+        let mut record = full.clone();
+        match value {
+            Some(value) => record[field] = value,
+            None => {
+                record.as_object_mut().expect("an object").remove(field);
+            }
+        }
+        record
+    };
+    for (field, value) in [
+        ("pid", Some(json!(0))),
+        ("pid", Some(json!("60"))),
+        ("pid", None),
+        ("ppid", Some(json!(-1))),
+        ("ppid", None),
+        ("gate", Some(json!(""))),
+        ("gate", Some(json!(null))),
+        ("gate", None),
+        ("root", Some(json!(""))),
+        ("root", None),
+        ("gate_from_env", Some(json!("true"))),
+        ("gate_from_env", None),
+        ("once", Some(json!(1))),
+        ("once", None),
+        ("parent_comm", Some(json!(5))),
+        ("parent_comm", None),
+        ("cwd", Some(json!([]))),
+        ("cwd", None),
+        ("cgroup", Some(json!({}))),
+        ("cgroup", None),
+        ("ancestors", Some(json!(null))),
+        ("ancestors", Some(json!([{"pid": "1", "comm": "init"}]))),
+        ("ancestors", Some(json!([{"pid": 1}]))),
+        ("ancestors", Some(json!([1]))),
+        ("ancestors", None),
+        ("extra", Some(json!(1))),
+    ] {
+        let record = with(field, value.clone());
+        let error = db
+            .store
+            .integrator_record(&record)
+            .expect_err(&format!("{field} {value:?} refused"));
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("integrator.started"),
+            "{field} {value:?}: {text}"
+        );
+        assert!(text.contains("22023"), "{field} {value:?}: {text}");
+    }
+    let count: i64 = db
+        .admin()
+        .query_one(
+            "select count(*) from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'integrator.started'",
+            &[],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(count, 2);
+}

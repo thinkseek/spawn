@@ -3013,6 +3013,10 @@ begin
         -- The integrator's drain (spawn_integrator_record): read from the
         -- log, folded into no table.
         null;
+    when 'integrator.started' then
+        -- Who an integrator start that took the lock is (objective 234,
+        -- spawn_integrator_record): read from the log, folded into no table.
+        null;
     when 'objective.solved' then
         -- The objective's scenario passes at a base commit main already
         -- holds, so no task of it can change anything: the assignment rule
@@ -4348,7 +4352,8 @@ begin
                                       'source.main_red', 'source.main_probe',
                                       'source.main_green', 'task.shadow_gated',
                                       'integrator.draining', 'integrator.drained',
-                                      'integrator.drain_expired', 'task.released') then
+                                      'integrator.drain_expired', 'task.released',
+                                      'integrator.started') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- A release of a task the load-sensitive bound parked: by a person or
@@ -4382,6 +4387,53 @@ begin
                and jsonb_array_length(p_record -> 'unequal') > 0) then
             raise exception 'a task.shadow_gated names its task, runner, inputs and unequal, and agrees only on equal inputs: %',
                             p_record;
+        end if;
+        return spawn_control_record(p_record);
+    end if;
+    -- Who an integrator start that took the lock is (objective 234): its
+    -- process, parent, ancestors, working directory, cgroup, gate, root and
+    -- once, so a stray is named from the store. Each field's shape is
+    -- checked alone, never its value; what /proc could not say is null.
+    if p_record ->> 'type' = 'integrator.started' then
+        if exists (select 1 from jsonb_object_keys(p_record) k
+                    where k not in ('type', 'pid', 'ppid', 'parent_comm', 'ancestors', 'cwd',
+                                    'cgroup', 'gate', 'gate_from_env', 'root', 'once')) then
+            raise exception 'an integrator.started has type, pid, ppid, parent_comm, ancestors, cwd, cgroup, gate, gate_from_env, root and once, and nothing else: %',
+                p_record using errcode = '22023';
+        end if;
+        if jsonb_typeof(p_record -> 'pid') is distinct from 'number'
+           or (p_record ->> 'pid')::numeric < 1 then
+            raise exception 'an integrator.started''s pid is a number from 1: %', p_record -> 'pid'
+                using errcode = '22023';
+        end if;
+        if jsonb_typeof(p_record -> 'ppid') is distinct from 'number'
+           or (p_record ->> 'ppid')::numeric < 0 then
+            raise exception 'an integrator.started''s ppid is a number from 0: %', p_record -> 'ppid'
+                using errcode = '22023';
+        end if;
+        if exists (select 1 from unnest(array['gate', 'root']) f
+                    where jsonb_typeof(p_record -> f) is distinct from 'string'
+                       or p_record ->> f = '') then
+            raise exception 'an integrator.started''s gate and root are non-empty strings: %',
+                p_record using errcode = '22023';
+        end if;
+        if exists (select 1 from unnest(array['gate_from_env', 'once']) f
+                    where jsonb_typeof(p_record -> f) is distinct from 'boolean') then
+            raise exception 'an integrator.started''s gate_from_env and once are booleans: %',
+                p_record using errcode = '22023';
+        end if;
+        if exists (select 1 from unnest(array['parent_comm', 'cwd', 'cgroup']) f
+                    where coalesce(jsonb_typeof(p_record -> f), 'absent') not in ('string', 'null')) then
+            raise exception 'an integrator.started''s parent_comm, cwd and cgroup are strings or null: %',
+                p_record using errcode = '22023';
+        end if;
+        if jsonb_typeof(p_record -> 'ancestors') is distinct from 'array'
+           or exists (select 1 from jsonb_array_elements(p_record -> 'ancestors') a
+                       where jsonb_typeof(a) is distinct from 'object'
+                          or jsonb_typeof(a -> 'pid') is distinct from 'number'
+                          or jsonb_typeof(a -> 'comm') is distinct from 'string') then
+            raise exception 'an integrator.started''s ancestors are [{pid, comm}]: %',
+                p_record -> 'ancestors' using errcode = '22023';
         end if;
         return spawn_control_record(p_record);
     end if;

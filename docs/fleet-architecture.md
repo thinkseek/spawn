@@ -789,7 +789,15 @@ it, on the same ladder.
   Neither can write observations or runtime events.
 - **The integrator** (`spawn integrate`) lands work: it judges ready tasks
   with the mission's gate and lands them host-side (§10.3). RSI is a mission
-  like any other, not a separate controller.
+  like any other, not a separate controller. One integrator holds a
+  database's lock for its life (objective 221). Each start that takes it
+  records who it is, on the lock's connection before anything else
+  (objective 234): one `integrator.started` {pid, ppid, parent_comm,
+  ancestors [{pid, comm}] up to pid 1 (at most 16), cwd, cgroup (the unified
+  cgroup's path: the unit or scope it runs in), gate, gate_from_env, root,
+  once}, and the same on its stdout, so a stray is named from the store. A
+  record the store refuses is said on stderr and the start goes on; a start
+  the gate check or the lock refuses records nothing.
 
 ### 3.1 The supervisor session never ends
 

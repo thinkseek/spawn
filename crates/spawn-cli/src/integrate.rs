@@ -1392,6 +1392,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // The integrator's lock, on a connection of its own, before anything is
     // written, kept for the process's life (objective 221).
     let lock = take_lock_at_start(&open_store, LOCK_WAIT)?;
+    record_start(&lock.0, &gate, &root, once);
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
     let gate_env = gate::gate_env(|name| std::env::var(name).ok());
@@ -1551,6 +1552,132 @@ pub(crate) fn gate_refusal(gate: &Path, from_env: bool, cwd: &Path) -> Option<St
         "integrate: the gate script {} {what} {named}; this integrator does not start",
         gate.display()
     ))
+}
+
+/// Who this start is (objective 234), recorded on the lock's connection
+/// `store` before anything else is written and said on stdout: a stray is
+/// named from the store. A refused record is said on stderr and does not
+/// stop the start (the lock keeps a second integrator out, not the record).
+fn record_start(store: &PostgresStore, gate: &Path, root: &Path, once: bool) {
+    let started = started_record(
+        Path::new("/proc"),
+        std::process::id(),
+        std::os::unix::process::parent_id(),
+        std::env::current_dir().ok().as_deref(),
+        &Start {
+            gate,
+            gate_from_env: crate::config::env_value("SPAWN_GATE").is_some(),
+            root: &std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+            once,
+        },
+    );
+    println!("{}", started_line(&started));
+    if let Err(error) = store.integrator_record(&started) {
+        eprintln!("integrate: cannot record integrator.started: {error}");
+    }
+}
+
+/// At most this many ancestors are named in `integrator.started`.
+const MAX_ANCESTORS: usize = 16;
+
+/// The start's own fields of `integrator.started` (objective 234).
+pub(crate) struct Start<'a> {
+    pub(crate) gate: &'a Path,
+    pub(crate) gate_from_env: bool,
+    pub(crate) root: &'a Path,
+    pub(crate) once: bool,
+}
+
+/// `<proc>/<pid>/comm`, its newline trimmed; `None` when it cannot be read.
+fn proc_comm(proc: &Path, pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(proc.join(pid.to_string()).join("comm")).ok()?;
+    Some(text.strip_suffix('\n').unwrap_or(&text).to_string())
+}
+
+/// The parent pid in `<proc>/<pid>/stat`, read after the comm's last `)`
+/// (a comm may hold `)` itself); `None` when it cannot be read.
+fn proc_ppid(proc: &Path, pid: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(proc.join(pid.to_string()).join("stat")).ok()?;
+    let (_, rest) = text.rsplit_once(')')?;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The unified cgroup's path in `<proc>/<pid>/cgroup` (its `0::<path>`
+/// line, after any v1 line); `None` without one or with an empty path.
+fn proc_cgroup(proc: &Path, pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(proc.join(pid.to_string()).join("cgroup")).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+}
+
+/// `integrator.started` (objective 234): who this start is, read from
+/// `proc` for `pid` (its parent pid from its stat, else `parent_id`): its
+/// parent's comm, its ancestors [{pid, comm}] from the parent up to pid 1
+/// (at most [`MAX_ANCESTORS`]; one whose comm or stat cannot be read ends
+/// the list), its working directory, its unified cgroup, and `start`'s
+/// fields. What cannot be read is null.
+pub(crate) fn started_record(
+    proc: &Path,
+    pid: u32,
+    parent_id: u32,
+    cwd: Option<&Path>,
+    start: &Start,
+) -> Value {
+    let parent = proc_ppid(proc, pid).unwrap_or(parent_id);
+    let mut ancestors = Vec::new();
+    let mut at = parent;
+    while at != 0 && ancestors.len() < MAX_ANCESTORS {
+        let Some(comm) = proc_comm(proc, at) else {
+            break;
+        };
+        ancestors.push(json!({"pid": at, "comm": comm}));
+        if at == 1 {
+            break;
+        }
+        match proc_ppid(proc, at) {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    json!({
+        "type": "integrator.started",
+        "pid": pid,
+        "ppid": parent,
+        "parent_comm": proc_comm(proc, parent),
+        "ancestors": ancestors,
+        "cwd": cwd.map(|cwd| cwd.display().to_string()),
+        "cgroup": proc_cgroup(proc, pid),
+        "gate": start.gate.display().to_string(),
+        "gate_from_env": start.gate_from_env,
+        "root": start.root.display().to_string(),
+        "once": start.once,
+    })
+}
+
+/// The start's line on stdout (objective 234), from its
+/// `integrator.started`: unknown values say "unknown".
+pub(crate) fn started_line(record: &Value) -> String {
+    let said = |field: &str| match &record[field] {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        _ => "unknown".to_string(),
+    };
+    let from = if record["gate_from_env"] == Value::Bool(true) {
+        "from SPAWN_GATE"
+    } else {
+        "SPAWN_GATE unset: the default, read from the working directory"
+    };
+    format!(
+        "integrate: started as pid {} by {} (pid {}) in {}, cgroup {}; gate {} ({from})",
+        said("pid"),
+        said("parent_comm"),
+        said("ppid"),
+        said("cwd"),
+        said("cgroup"),
+        said("gate"),
+    )
 }
 
 /// The integrator's lock taken at start, on a connection of its own named
