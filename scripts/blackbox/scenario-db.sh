@@ -16,6 +16,16 @@
 #        it starts, before it makes its database. An empty prefix sweeps
 #        every database's logins only, never a database (by hand, once).
 #
+# Every drop is bounded (objective 237): each statement this script sends
+# runs under statement_timeout, SPAWN_SCENARIO_DB_DROP_SECS seconds (default
+# 60; a setting that is not a whole number from 1 to 3600 is refused, exit 2).
+# A DROP DATABASE ... WITH (FORCE) waits on the server's ProcSignalBarrier,
+# which a backend blocked sending to a client that reads nothing (a LISTEN
+# left undrained) never absorbs: unbounded, the drop waited 19 minutes on the
+# shared test server on 2026-11-19, holding suite.lock for every run. Past
+# the bound the drop fails, says so ("could not drop database <name>: ..."),
+# and the database is left for a later sweep.
+#
 # A leftover database is one that nothing is connected to AND that is older
 # than SPAWN_SCENARIO_DB_SWEEP_MINUTES (default 180). "Nothing connected"
 # alone is not proof that a run is dead. A live run holds no connection
@@ -78,12 +88,25 @@ if [ "${PGPORT-}" = 15433 ]; then
     echo "$action $name: skipped: port 15433 is the live server"
     exit 0
 fi
+drop_secs=${SPAWN_SCENARIO_DB_DROP_SECS:-60}
+case "$drop_secs" in
+'' | *[!0-9]* | 0*)
+    echo "scenario-db: SPAWN_SCENARIO_DB_DROP_SECS is a whole number of seconds from 1 to 3600, not '$drop_secs'" >&2
+    exit 2
+    ;;
+esac
+[ "$drop_secs" -le 3600 ] || {
+    echo "scenario-db: SPAWN_SCENARIO_DB_DROP_SECS is a whole number of seconds from 1 to 3600, not '$drop_secs'" >&2
+    exit 2
+}
+bound="set statement_timeout = '${drop_secs}s'"
 sql=$(cat "$sql_file") || exit 1
 
 if [ "$action" = drop ]; then
     # shellcheck disable=SC2086 # the command is a prefix, split on purpose
-    $psql_command -X -d postgres -tA -c "drop database if exists $name with (force)" >/dev/null 2>&1 ||
-        echo "scenario-db: could not drop database $name" >&2
+    if ! dropped=$($psql_command -X -d postgres -tAq -c "$bound" -c "drop database if exists $name with (force)" 2>&1); then
+        echo "scenario-db: could not drop database $name: $(printf '%s\n' "$dropped" | tail -n 1)" >&2
+    fi
     database=$name
     prefix=""
 else
@@ -109,7 +132,7 @@ else
         # databases are never in scope. An empty prefix sweeps logins only
         # (below).
         # shellcheck disable=SC2086 # the command is a prefix, split on purpose
-        leftovers=$($psql_command -X -d postgres -tA -c \
+        leftovers=$($psql_command -X -d postgres -tAq -c "$bound" -c \
             "select d.datname from pg_database d
               where starts_with(d.datname, '$prefix')
                 and d.datname not in ('postgres', 'template0', 'template1', 'spawn_test')
@@ -125,8 +148,8 @@ else
         for left in $leftovers; do
             case "$left" in
             *[!A-Za-z0-9_]*) ;;
-            *) $psql_command -X -d postgres -tA -c "drop database if exists $left" >/dev/null 2>&1 ||
-                echo "scenario-db: could not drop database $left" >&2 ;;
+            *) dropped=$($psql_command -X -d postgres -tAq -c "$bound" -c "drop database if exists $left" 2>&1) ||
+                echo "scenario-db: could not drop database $left: $(printf '%s\n' "$dropped" | tail -n 1)" >&2 ;;
             esac
         done
         set +f
@@ -134,7 +157,7 @@ else
 fi
 # One session: the settings, the statement, its result.
 # shellcheck disable=SC2086
-output=$($psql_command -X -d postgres -tAq \
+output=$($psql_command -X -d postgres -tAq -c "$bound" \
     -c "select set_config('spawn_logins.database', '$database', false) is null,
                set_config('spawn_logins.prefix', '$prefix', false) is null" \
     -c "$sql" \

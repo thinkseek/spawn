@@ -208,9 +208,10 @@ section_004() {
             tail -n 15 "$WORK/integrate.log" >&2
         fi
         tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-        if [ -n "$database_made" ]; then
-            sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
-        fi
+        # Its database is not dropped here: section L's loop may still hold
+        # LISTEN on the run's other database, and a DROP ... WITH (FORCE)
+        # then waits on the server's barrier (objective 237). The main part
+        # drops it after that loop has stopped, or the run's cleanup does.
         if [ "$rc" -eq 0 ]; then exit 0; fi
         if [ "$rc" -eq 1 ] && [ -n "$asserted" ]; then exit 1; fi
         [ "$rc" -eq 2 ] || echo "j02: [004] harness: unexpected exit $rc" >&2
@@ -1225,6 +1226,15 @@ assert_eq "$(main_file "$src1" CHARLIE.txt)" charlie "(2) CHARLIE.txt on main"
 
 rc004=0
 wait "$s004_pid" || rc004=$?
+# Section L's loop holds LISTEN on this run's database and drains it only
+# between passes: while it runs, a DROP ... WITH (FORCE) of any database can
+# wait on the server's barrier behind it (objective 237; twice on the shared
+# test server on 2026-11-19). It stops before 004's database is dropped.
+if [ -n "$loop_pid" ]; then
+    kill "$loop_pid" 2>/dev/null || true
+    wait "$loop_pid" 2>/dev/null || true
+    loop_pid=""
+fi
 s004_pid=""
 sh "$controller/scripts/blackbox/scenario-db.sh" drop "$DB004" >/dev/null 2>&1 || true
 case "$rc004" in
