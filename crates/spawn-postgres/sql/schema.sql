@@ -1538,6 +1538,11 @@ alter table mission_tasks add column if not exists metric text;
 alter table mission_tasks add column if not exists objective integer;
 alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
+-- Work stealing (objective 239): a resident's pool (null: none, it neither
+-- takes nor gives a task), from its `resident.proposed`; a task pinned to
+-- its worker (`spawn task assign --pin`), from its `task.assigned`.
+alter table mission_residents add column if not exists pool text;
+alter table mission_tasks add column if not exists pinned boolean not null default false;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
@@ -2388,13 +2393,14 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   continues, reassign_of, created_at_ms, updated_at_ms)
+                                   continues, reassign_of, pinned, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
-                (p_record ->> 'reassign_of')::bigint, p_at, p_at);
+                (p_record ->> 'reassign_of')::bigint,
+                coalesce((p_record ->> 'pinned')::boolean, false), p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -2820,14 +2826,20 @@ begin
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, updated_at_ms = p_at
          where gate_room_task = v_id;
+    when 'task.stolen' then
+        -- A queued task moved, unstarted, to an idle resident of its pool
+        -- (objective 239, spawn_task_steal): its worker is the taker now.
+        update mission_tasks set session_id = p_record ->> 'to_session',
+                                 agent_id = p_record ->> 'to_agent', updated_at_ms = p_at
+         where id = v_id;
     when 'resident.proposed' then
         insert into mission_residents (name, agent_id, session_id, charter, proposed_by,
-                                       created_at_ms, updated_at_ms)
+                                       pool, created_at_ms, updated_at_ms)
         values (p_record ->> 'name', 'agent_resident_' || (p_record ->> 'name'),
                 'session_resident_' || (p_record ->> 'name'), p_record ->> 'charter',
-                p_record ->> 'proposed_by', p_at, p_at)
+                p_record ->> 'proposed_by', p_record ->> 'pool', p_at, p_at)
         on conflict (name) do update
-           set charter = excluded.charter, updated_at_ms = p_at;
+           set charter = excluded.charter, pool = excluded.pool, updated_at_ms = p_at;
     when 'resident.approved' then
         update mission_residents set state = 'approved', approved_by = 'human', updated_at_ms = p_at
          where name = p_record ->> 'name';
@@ -3257,9 +3269,13 @@ end $$;
 -- the `task.assigned` record names it (`duplicate_of`).
 drop function if exists spawn_task_assign(bigint, text, text, text);
 drop function if exists spawn_task_assign(bigint, text, text, text, text);
+drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean);
+-- `p_pin` (objective 239, `--pin`): the task stays with its worker, never
+-- stolen; the record names `pinned` true, and nothing otherwise.
 create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text,
                                              p_brief text, p_model text default 'default',
-                                             p_again boolean default false)
+                                             p_again boolean default false,
+                                             p_pin boolean default false)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3319,7 +3335,8 @@ begin
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief, 'model', p_model,
         'created_by', case when v_caller = 'owner' then 'human' else v_caller end)
         || case when v_duplicate is not null
-                then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end);
+                then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end
+        || case when p_pin then jsonb_build_object('pinned', true) else '{}'::jsonb end);
     return v_id;
 end $$;
 
@@ -3338,6 +3355,13 @@ begin
     -- delivered (the closure rule).
     if not exists (select 1 from mission_tasks where id = p_task and state in ('assigned', 'revise'))
        or not spawn_task_may_move(p_task, 'delivered') then
+        return false;
+    end if;
+    -- A delivery planned before a move (objective 239, task.stolen) is
+    -- never recorded for the old worker: the command's session must be the
+    -- task's worker's now.
+    if exists (select 1 from spawn_commands c join mission_tasks k on k.id = p_task
+                where c.id = p_command and c.session_id is distinct from k.session_id) then
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
@@ -3758,7 +3782,11 @@ end
 $$;
 
 -- A resident starts only after a human approves it.
-create or replace function spawn_resident_propose(p_name text, p_charter text)
+drop function if exists spawn_resident_propose(text, text);
+-- `p_pool` (objective 239): the resident's pool, whose members may take
+-- each other's queued tasks once approved; null, none.
+create or replace function spawn_resident_propose(p_name text, p_charter text,
+                                                  p_pool text default null)
 returns void language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3774,12 +3802,17 @@ begin
     if coalesce(p_name, '') !~ '^[a-z][a-z0-9_]{0,30}$' then
         raise exception 'resident name % is not [a-z][a-z0-9_]{0,30}', p_name;
     end if;
+    if p_pool is not null and p_pool !~ '^[a-z][a-z0-9_]{0,30}$' then
+        raise exception 'pool % is not [a-z][a-z0-9_]{0,30}', p_pool;
+    end if;
     if exists (select 1 from mission_residents where name = p_name and state <> 'proposed') then
         raise exception 'resident % exists and is not a proposal', p_name;
     end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'resident.proposed', 'name', p_name, 'charter', p_charter,
-        'proposed_by', case when v_caller = 'owner' then 'human' else v_caller end));
+        'proposed_by', case when v_caller = 'owner' then 'human' else v_caller end)
+        || case when p_pool is not null then jsonb_build_object('pool', p_pool)
+                else '{}'::jsonb end);
 end $$;
 
 create or replace function spawn_resident_approve(p_name text)
@@ -6177,6 +6210,11 @@ returns jsonb language sql stable security definer as $$
                    case when r.record ->> 'type' = 'task.gated' then
                      r.record - array(select k from jsonb_object_keys(r.record) k
                                        where k not in ('class', 'inputs', 'env', 'head_inputs'))
+                   -- A move (objective 239): from and to whose session, by whom.
+                   when r.record ->> 'type' = 'task.stolen' then
+                     jsonb_build_object('from', r.record ->> 'from_session',
+                                        'to', r.record ->> 'to_session',
+                                        'by', r.record ->> 'by')
                    else '{}'::jsonb end as binding,
                    case r.record ->> 'type'
                      when 'task.gated' then r.record ->> 'verdict'
@@ -6764,13 +6802,14 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
         'spawn_task_restart_as(bigint, text, text)', 'spawn_task_reassign_as(bigint, text, text)',
-        'spawn_resident_propose(text, text)',
+        'spawn_resident_propose(text, text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
+        'spawn_task_steal(bigint, text, text, text)', 'spawn_cancel_notice_untold(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
         'spawn_task_report_unfinished(bigint, text, jsonb, text, bigint)',
@@ -6799,10 +6838,10 @@ begin
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
-        'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text)',
+        'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text, text)',
         'spawn_resident_retire(text)', 'spawn_task_stages(bigint)',
         'spawn_objective_retire(jsonb)'] loop
         execute format('grant execute on function %s to %I', v_function,
