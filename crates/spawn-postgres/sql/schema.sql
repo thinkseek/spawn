@@ -1539,12 +1539,10 @@ alter table mission_tasks add column if not exists objective integer;
 alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 -- Work stealing (objective 239): a resident's pool (null: none, it neither
--- takes nor gives a task), from its `resident.proposed`; a task pinned to
--- its worker (`spawn task assign --pin`), from its `task.assigned`.
+-- takes nor gives a task), from its `resident.proposed`. The task's
+-- columns of objective 239 come after the others (below), so a migrated
+-- schema keeps a fresh one's column order.
 alter table mission_residents add column if not exists pool text;
-alter table mission_tasks add column if not exists pinned boolean not null default false;
--- When the task last moved (objective 239, task.stolen); null if never.
-alter table mission_tasks add column if not exists stolen_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
@@ -1562,6 +1560,11 @@ alter table mission_tasks add column if not exists reassign_of bigint;
 alter table mission_tasks add column if not exists gate_load_sensitive_pushed text;
 alter table mission_tasks add column if not exists gate_load_sensitive_scenarios jsonb;
 alter table mission_tasks add column if not exists gate_parked_pushed text;
+-- Work stealing (objective 239): a task pinned to its worker (`spawn task
+-- assign --pin`), from its `task.assigned`; when it last moved (its
+-- `task.stolen`), null if never.
+alter table mission_tasks add column if not exists pinned boolean not null default false;
+alter table mission_tasks add column if not exists stolen_at_ms bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -3069,7 +3072,7 @@ begin
         when 'mission_tasks' then
             insert into mission_tasks
             select * from jsonb_populate_record(null::mission_tasks,
-                jsonb_build_object('model', 'default') || (p_record -> 'row'));
+                jsonb_build_object('model', 'default', 'pinned', false) || (p_record -> 'row'));
         else
             raise exception 'legacy record of unknown table %', p_record ->> 'table';
         end case;
