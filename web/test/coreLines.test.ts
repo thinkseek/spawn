@@ -504,6 +504,58 @@ test("the free disk lost a day says its basis after its name", () => {
   assert.equal(fall("median"), "Free disk lost a day");
 });
 
+// Objective 230: below zero, the disk fall says "gained" and the store that
+// grew most "shrank least", each with the size as a positive number; at
+// zero and above, and for every other figure, the mark is as it was.
+test("a disk that gained and stores that all shrank say so with positive sizes", () => {
+  const range = { min: 0, max: 50e9 };
+  const one = (figure: Partial<CoreFigure>) =>
+    coreLinesView({
+      lines: [],
+      diagnostics: [{ unit: "bytes_per_day", range: null, state: "no_range", ...figure } as CoreFigure],
+    }).diagnostics[0];
+  const fall = (value: number, basis?: unknown) =>
+    one({ key: "storage.disk_fall", name: "Free disk lost a day", value, range, state: "in", ...(basis === undefined ? {} : { basis }) });
+  const gained = -2_792_160_000;
+  // Below zero under each basis, and none: gained, the size positive.
+  for (const [basis, words] of [
+    ["fit", "Free disk gained a day (the week's fit)"],
+    ["day", "Free disk gained a day (over the last day)"],
+    [undefined, "Free disk gained a day"],
+    [null, "Free disk gained a day"],
+  ] as const) {
+    const mark = fall(gained, basis);
+    assert.equal(mark.name, words, String(basis));
+    assert.equal(mark.value, unitWords("bytes_per_day", -gained));
+    assert.doesNotMatch(mark.value, /-|−/);
+    // The range and the tone are as they were.
+    assert.equal(mark.range, fall(-gained, basis).range);
+    assert.equal(mark.tone, "plain");
+  }
+  assert.equal(fall(gained).value, "2662.8 MB a day");
+  // Above zero and at zero: as before.
+  assert.equal(fall(10e9, "day").name, "Free disk lost a day (the last day's fall)");
+  assert.equal(fall(10e9, "fit").name, "Free disk lost a day (the week's fit)");
+  assert.equal(fall(10e9, "day").value, unitWords("bytes_per_day", 10e9));
+  assert.equal(fall(0, "day").name, "Free disk lost a day (the last day's fall)");
+  assert.equal(fall(0, "fit").value, unitWords("bytes_per_day", 0));
+
+  // The store that grew most: below zero shrank least, the size positive.
+  const most = (value: number) =>
+    one({ key: "storage.grew_most", name: "Store that grew most", value, store: "unattributed" });
+  assert.equal(most(-5e9).name, "Store that shrank least: unattributed");
+  assert.equal(most(-5e9).value, unitWords("bytes_per_day", 5e9));
+  assert.equal(most(-5e9).tone, "muted");
+  assert.equal(most(5e9).name, "Store that grew most: unattributed");
+  assert.equal(most(5e9).value, unitWords("bytes_per_day", 5e9));
+  assert.equal(most(0).name, "Store that grew most: unattributed");
+
+  // Another figure below zero: as before, minus and all.
+  const other = one({ key: "storage.archive_growth", name: "Archive grows a day, lost or grew most", value: -5e9 });
+  assert.equal(other.name, "Archive grows a day, lost or grew most");
+  assert.equal(other.value, unitWords("bytes_per_day", -5e9));
+});
+
 // Objective 148: "Needs you is right" says what it is read from after its
 // name, the needs judged and not; a figure without it is named as it was.
 test("a judged share says what it is read from after its name", () => {
