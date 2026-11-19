@@ -22,9 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::classify::{
-    RulesVerdict, attention_reason, exited_failing, fold_completed, narrow, rules, wait_reason,
-};
+use super::classify::{RulesVerdict, attention_reason, exited_failing, narrow, rules, wait_reason};
 use super::judge::{JudgeInput, StateJudge};
 use super::snapshot::Snapshot;
 use super::{RECHECK_EVERY, RETRY_BASE, RETRY_MAX, SETTLE};
@@ -360,14 +358,24 @@ impl Observer {
         let Some(tracked) = self.sessions.get(session) else {
             return Ok(0);
         };
-        let input = tracked.snapshot.input(&tracked.agent_id, session, now);
+        let mut input = tracked.snapshot.input(&tracked.agent_id, session, now);
+        // The reply and whether the session never ends are facts two rules
+        // settle cases with (a `HUMAN:` question, a perpetual session at its
+        // prompt); attach them before the rules run, so those cases cost no
+        // model call. What a model would be shown is unchanged.
+        attach_context(
+            &mut input,
+            self.context.as_deref(),
+            session,
+            tracked.snapshot.transcript(),
+        );
         let agent = tracked.agent_id.clone();
         let seq = tracked.snapshot.evidence_seq;
 
         let classified = match rules(&input) {
             RulesVerdict::Certain { state } => Self::certain(state, &input, seq),
             RulesVerdict::Ambiguous { ambiguity, guess } => {
-                self.ambiguous(tracked, session, input, ambiguity, guess, seq)
+                self.ambiguous(tracked, input, ambiguity, guess, seq)
             }
         };
         let Classified {
@@ -421,12 +429,18 @@ impl Observer {
         );
         observation.attention = state == SemanticState::Blocked;
         if observation.attention {
-            let reason = if input.stalled_end.is_some() {
+            // The question the rules settled this with: kept on the
+            // observation, and named as the reason over the others.
+            let question = input.reply.as_deref().and_then(human_question);
+            let reason = if question.is_some() {
+                "human_question"
+            } else if input.stalled_end.is_some() {
                 "end_stalled"
             } else {
                 "permission"
             };
             observation.attention_reason = Some(reason.to_string());
+            observation.human_question = question;
         }
         Classified {
             observation,
@@ -443,19 +457,14 @@ impl Observer {
     fn ambiguous(
         &self,
         tracked: &Tracked,
-        session: &SessionId,
         mut input: JudgeInput,
         ambiguity: Ambiguity,
         guess: SemanticState,
         seq: SessionSeq,
     ) -> Classified {
         input.ambiguity = Some(ambiguity);
-        attach_context(
-            &mut input,
-            self.context.as_deref(),
-            session,
-            tracked.snapshot.transcript(),
-        );
+        // `attach_context` ran in `observe`, before the rules: the input
+        // arrives with the reply attached.
         let fingerprint = fingerprint_of(&input, tracked.snapshot.progress_seq);
         if tracked.failures == 0 && tracked.asked.as_deref() == Some(fingerprint.as_str()) {
             let standing = tracked
@@ -533,13 +542,17 @@ impl Observer {
             observation.attention_reason = Some("judge_unavailable".to_string());
             return (observation, true);
         };
-        // The raw answer is stored; the folded one is what counts.
-        let judgement = if input.perpetual {
-            fold_completed(&raw)
+        // The raw answer is stored and narrowed; a session that never ends
+        // is never COMPLETED, so its COMPLETED is folded into WAITING after
+        // the facts have narrowed the answer. Folding before narrowing drops
+        // the mass it gave COMPLETED for an exit, whose allowed states do not
+        // include WAITING, and a sliver of BLOCKED then wins.
+        let (state, confidence) = narrow(ambiguity, guess, &raw);
+        let (state, confidence) = if input.perpetual && state == SemanticState::Completed {
+            (SemanticState::Waiting, confidence)
         } else {
-            raw
+            (state, confidence)
         };
-        let (state, confidence) = narrow(ambiguity, guess, &judgement);
         let mut observation = model_observation(state, wait_reason(state, input), confidence);
         observation.probabilities = raw.probabilities.map(|values| {
             SemanticState::ALL
@@ -548,12 +561,12 @@ impl Observer {
                 .map(|(state, value)| (state.key().to_string(), value))
                 .collect::<BTreeMap<_, _>>()
         });
-        observation.needs_human = judgement.needs_human;
-        observation.stuck = judgement.stuck;
+        observation.needs_human = raw.needs_human;
+        observation.stuck = raw.stuck;
         // A process that exited with a failing status gets a look whatever
         // the model says about it.
         let failing_exit = ambiguity == Ambiguity::ExitedOnItsOwn && exited_failing(input);
-        let reason = attention_reason(Some(ambiguity), state, confidence, &judgement)
+        let reason = attention_reason(Some(ambiguity), state, confidence, &raw)
             .or(failing_exit.then_some("failing_exit"));
         observation.attention = reason.is_some();
         observation.attention_reason = reason.map(str::to_string);
@@ -629,11 +642,7 @@ fn attach_context(
 /// wrote since the last prompt, so a question someone answered is no longer
 /// in it.
 fn human_question(reply: &str) -> Option<String> {
-    reply.lines().rev().find_map(|line| {
-        line.trim_start()
-            .strip_prefix("HUMAN:")
-            .map(|question| head_chars(question.trim(), QUESTION_CHARS))
-    })
+    super::classify::human_question(reply).map(|question| head_chars(question.trim(), QUESTION_CHARS))
 }
 
 /// Stable digest of what the model is shown (FNV-1a over its JSON), so a

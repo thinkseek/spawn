@@ -779,8 +779,73 @@ fn a_human_line_in_a_tools_output_asks_nobody() {
     assert_ne!(last.attention_reason.as_deref(), Some("human_question"));
 }
 
+/// The supervisor's context with no question for a person.
+struct Perpetual;
+
+impl ObservationContext for Perpetual {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn perpetual(&self, _session: &SessionId) -> bool {
+        true
+    }
+}
+
+/// An idle supervisor waits for the next prompt: a fact, not a model call.
 #[test]
-fn a_perpetual_session_is_never_completed_and_its_question_pages() {
+fn a_perpetual_session_at_its_prompt_is_waiting_without_a_model() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(clock)
+        .with_context(Arc::new(Perpetual));
+    started(&store);
+    native(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Waiting);
+    assert_eq!(last.judge, "rules");
+    assert_eq!(judge.calls(), 0, "an idle supervisor needs no model");
+}
+
+/// A `HUMAN:` question in the reply is a fact: the session is blocked without
+/// a model call, and the question is kept with attention on it.
+#[test]
+fn a_question_for_a_person_blocks_without_a_model() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(clock)
+        .with_context(Arc::new(Supervisor));
+    started(&store);
+    native(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Blocked);
+    assert_eq!(last.judge, "rules");
+    assert_eq!(judge.calls(), 0, "a question is not a model's to decide");
+    assert_eq!(last.human_question.as_deref(), Some("which region?"));
+    assert!(last.attention);
+    assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
+}
+
+/// A session that never ends has its COMPLETED folded into WAITING, and the
+/// raw answer is kept.
+#[test]
+fn a_perpetual_session_is_never_completed() {
     // Live: Jev put the idle supervisor at COMPLETED 0.71.
     let judge = Scripted::new(Ok(Judgement {
         state: SemanticState::Completed,
@@ -793,12 +858,20 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
     let mut observer = Observer::new(log)
-        .with_judge(judge)
+        .with_judge(judge.clone())
         .with_clock(clock)
-        .with_context(Arc::new(Supervisor));
+        .with_context(Arc::new(Perpetual));
     started(&store);
-    native(&store);
-    turn_stopped(&store);
+    append(
+        &store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+            signal: None,
+            evidence: None,
+        },
+    );
     observer.tick().expect("tick");
     let last = observations(&store).pop().expect("an observation");
     assert_eq!(
@@ -812,9 +885,7 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
         Some(0.71),
         "the raw answer is kept"
     );
-    assert_eq!(last.human_question.as_deref(), Some("which region?"));
-    assert!(last.attention);
-    assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
+    assert_eq!(judge.calls(), 1, "an exit is still the model's to judge");
 }
 
 #[test]
