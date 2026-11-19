@@ -857,7 +857,9 @@ input of a mission.
 1. One session, one concern. A task goes to a resident only when it falls
    inside that resident's charter; anything else gets an ephemeral worker.
 2. Serial inside a session. A resident starts its next task only after it has
-   reported the last one; its queue waits in storage, not in its context.
+   reported the last one; its queue waits in storage, not in its context. A
+   task still waiting there may move, unstarted, to an idle resident of the
+   same pool ("Work stealing" below); a started one never moves.
 3. Briefs, not histories. A worker receives a self-contained brief (goal,
    inputs, done criteria, report format), never the supervisor's conversation.
 4. Reports, not transcripts. A worker ends by writing `.spawn/report.md`
@@ -879,10 +881,12 @@ input of a mission.
 
 **Commands.** `spawn mission add --text ... [--source <repo>]` (a human),
 `spawn task assign --mission N --kind resident|ephemeral --worker <name>
---brief <text> [--model default|cheap]` (the supervisor; checked like the
-gateway; the model profile is §3.3), `spawn task
+--brief <text> [--model default|cheap] [--pin]` (the supervisor; checked like the
+gateway; the model profile is §3.3; `--pin` keeps the task with its worker,
+"Work stealing"), `spawn task
 accept` /
-`reject`, `spawn resident propose` / `approve` / `retire`, `spawn mission
+`reject`, `spawn task steal` (the owner, "Work stealing"), `spawn resident
+propose [--pool P]` / `approve` / `retire`, `spawn mission
 close`. Every one is a checked SQL function that appends to the control
 stream (§10.1).
 
@@ -952,6 +956,73 @@ session_id, agent_id}`: the task and the worker that now carry the work.
   new task goes without waiting further, from the last recorded checkpoint.
   `GET /api/session/<id>` links the two: `reassigned_to` on the old
   session, `reassigned_from` on the new, each `{task, session_id}`.
+
+**Work stealing (objective 239).** Each resident's pending queue is its
+tasks in `assigned` that delivery does not give it in this pass: `Work::blocked`
+holds its session (a task delivered, under review, accepted and waiting for
+the gate, landing, or a cancel notice not yet told), or another of its tasks
+has the turn (`next_up`: a revision first, then the oldest). The queue stays
+where it is today, in `mission_tasks`, folded from the control stream; there
+is no other queue. A task in it may move, still unstarted, to another
+resident that has nothing to do, so the waiting worker does not finish it
+serially while a peer sits idle. What moves and what never does:
+
+- *Pools: who may run whose task.* Context cohesion (rule 1) routes a task
+  to the resident whose charter holds it, so a task may move only between
+  residents a human approved as interchangeable: a resident proposed with
+  `spawn resident propose --name N --charter C --pool P` (`resident.proposed`
+  names `pool`; `mission_residents.pool`) is in pool P once a human approves
+  it. A resident without a pool neither takes nor gives a task. The pool is
+  the whole capability rule: Spawn's residents run one engine with one set of
+  grants, a task carries its mission, model profile and brief with it, and
+  delivery merges the mission's main into the new worker's workspace as for
+  any of its tasks.
+- *Stealable.* A task may move when all hold, read under the control
+  stream's append lock: it is `kind` resident, in `assigned`, with
+  `revisions` 0 and no delivery command (no `spawn_commands` key
+  `deliver-<task>-…`: nothing was ever typed for it, by any attempt); it is
+  in its worker's queue as above, never the task delivery gives that worker
+  in this pass; it is not pinned (`spawn task assign --pin` records `pinned`
+  true in `task.assigned`; `mission_tasks.pinned`, default false: work that
+  needs its worker's context, such as a follow-up of the worker's unlanded
+  candidate); and its mission is open, not paused and not halted (a task
+  waiting for anything but its worker is not taken).
+- *Idle.* The resident that takes it is approved, not retired, in the same
+  pool as the task's worker, and holds no open task of its own (none
+  `assigned`, `delivered`, `reported`, `revise`, `landing`, or accepted and
+  waiting for the gate) and no cancel notice not yet told.
+- *Never stolen.* A task delivered, under review, sent back, accepted,
+  landing or closed stays with its worker until it ends, is cancelled, or
+  follows the restart and reassign rules above. A revision always goes back
+  to the worker that wrote it.
+- *Who moves it, and when.* The dispatcher, in each pass, before it plans
+  the pass's deliveries: for each pool, its idle residents in name order each
+  take one task, the pool's oldest stealable task (lowest id, across every
+  other member's queue). A resident that took a task is no longer idle, so
+  one pass moves at most one task to each, a busy worker keeps the rest of
+  its queue, and no idle resident drains the pool. It is local rule work: no
+  model call, no judge, no digest item, no read beyond the pass's own
+  `Work`. `SPAWN_WORK_STEALING=0` switches the automatic moves off (the
+  owner's manual move still works); unset, they are on.
+- *One owner, recorded.* A move is the store's `spawn_task_steal(task,
+  resident, by)`, the dispatcher's (`by` `spawn-dispatch`) or the owner's
+  (`spawn task steal --id N --to <resident> [--reason <text>]`, `by` `human`).
+  Under the append lock it checks every rule above against the folded tables
+  and either appends `task.stolen` {id, from_session, from_agent, to_session,
+  to_agent, pool, by, reason, queued_since_ms (the task's `created_at_ms`)},
+  folded onto the task's `session_id` and `agent_id`, or refuses naming the
+  first rule that failed, recording nothing. The task keeps its id, brief,
+  mission, model, objective and scenario; nothing is cancelled or re-issued.
+  Two takers of one task: the first moves it, and the second is refused (the
+  task is no longer in a busy worker's queue). A delivery that started
+  first wins the same way (its command exists), and `spawn_task_delivered`
+  refuses a command into a session that is not the task's worker, so a
+  delivery planned before a move is never recorded for the old worker. A
+  restarted loop reads the owner from the folded record and moves nothing
+  twice; a refold of the log gives the same owner.
+- *Seen.* `spawn task stages --id N` shows the stage `stolen` {from, to, by}
+  between `assigned` and `delivered`; `GET /api/missions` shows the task
+  under its new worker.
 
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
