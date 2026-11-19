@@ -1951,6 +1951,7 @@ storage_ms=none unowned_ms=none health_ms=none lock_wait_ms=none performance=mea
                 "storage.grew_most",
                 "storage.archive_growth",
                 "storage.leaked_test_schemas",
+                "storage.landed_scratch_bytes",
             ]
         );
         assert_eq!(
