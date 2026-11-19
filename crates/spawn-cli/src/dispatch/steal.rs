@@ -107,9 +107,10 @@ pub(crate) fn choices(work: &Work) -> Vec<(i64, String)> {
         let mut sorted = residents;
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         for resident in sorted.into_iter().filter(|resident| idle(work, resident)) {
-            if let Some(task) = candidates.iter().find(|task| {
-                !taken.contains(&task.id) && task.session_id != resident.session_id
-            }) {
+            if let Some(task) = candidates
+                .iter()
+                .find(|task| !taken.contains(&task.id) && task.session_id != resident.session_id)
+            {
                 taken.insert(task.id);
                 moves.push((task.id, resident.name.clone()));
             }
@@ -130,7 +131,9 @@ pub(crate) fn run(store: &PostgresStore, work: &Work, lines: &mut Vec<String>) -
                 moved["from_session"].as_str().unwrap_or("?"),
                 moved["to_session"].as_str().unwrap_or("?")
             )),
-            Err(error) => lines.push(format!("dispatch: task #{task} not stolen by {to}: {error}")),
+            Err(error) => lines.push(format!(
+                "dispatch: task #{task} not stolen by {to}: {error}"
+            )),
         }
     }
     !moves.is_empty()
@@ -207,10 +210,15 @@ mod tests {
         work.residents.reverse();
         assert_eq!(
             choices(&work),
-            [(2, "ann".to_string()), (3, "cid".to_string()), (4, "dee".to_string())]
+            [
+                (2, "ann".to_string()),
+                (3, "cid".to_string()),
+                (4, "dee".to_string())
+            ]
         );
         // One idle resident: one task, the oldest.
-        work.residents.retain(|resident| ["ben", "dee"].contains(&resident.name.as_str()));
+        work.residents
+            .retain(|resident| ["ben", "dee"].contains(&resident.name.as_str()));
         assert_eq!(choices(&work), [(2, "dee".to_string())]);
     }
 
@@ -235,11 +243,14 @@ mod tests {
         work.tasks.push(task(9, "cid", TaskState::Assigned));
         assert_eq!(choices(&work), []);
         // cid's task 9 is its next (cid is idle otherwise): never taken.
-        work.residents.push(resident("dee", Some("logs"), "approved"));
+        work.residents
+            .push(resident("dee", Some("logs"), "approved"));
         assert_eq!(choices(&work), []);
         // A paused mission's task waits for its mission.
         let mut paused = pool();
-        paused.residents.retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
+        paused
+            .residents
+            .retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
         for task in &mut paused.tasks {
             task.mission_id = 5;
         }
@@ -253,7 +264,8 @@ mod tests {
         // and it takes none.
         let mut told = pool();
         told.tasks = vec![task(2, "ben", TaskState::Assigned)];
-        told.residents.retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
+        told.residents
+            .retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
         assert_eq!(choices(&told), [], "ben is idle: task 2 is its next");
         told.cancelled = vec![Cancelled {
             id: 1,

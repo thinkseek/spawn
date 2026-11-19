@@ -87,8 +87,16 @@ fn fastrand() -> u128 {
 /// `task` delivered to its worker by a command typed in.
 fn deliver(store: &PostgresStore, task: i64, worker: &str) -> i64 {
     let sent = command(store, worker, &format!("deliver-{task}-0"));
-    assert!(store.task_delivered(task, sent).expect("delivered"));
+    store.task_delivered(task, sent).expect("delivered");
     sent
+}
+
+/// What `spawn_task_delivered` answers for `task` and `command`.
+fn delivered(client: &mut Client, task: i64, command: i64) -> bool {
+    client
+        .query_one("select spawn_task_delivered($1, $2)", &[&task, &command])
+        .expect("answered")
+        .get(0)
 }
 
 fn stolen(client: &mut Client) -> i64 {
@@ -104,7 +112,10 @@ fn stolen(client: &mut Client) -> i64 {
 
 fn session(client: &mut Client, task: i64) -> String {
     client
-        .query_one("select session_id from mission_tasks where id = $1", &[&task])
+        .query_one(
+            "select session_id from mission_tasks where id = $1",
+            &[&task],
+        )
         .expect("the task")
         .get(0)
 }
@@ -119,7 +130,11 @@ fn refused(store: &PostgresStore, client: &mut Client, task: i64, to: &str, why:
         .to_string();
     assert!(error.contains(&format!("task {task} ")), "{error}");
     assert!(error.contains(why), "{task} to {to}: {why}: {error}");
-    assert_eq!((stolen(client), session(client, task)), (records, owner), "{why}");
+    assert_eq!(
+        (stolen(client), session(client, task)),
+        (records, owner),
+        "{why}"
+    );
 }
 
 /// Every reason of every check, in order, each recording nothing.
@@ -137,20 +152,62 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
     let cancelled = assign(&store, mission, "ben", false);
     store.task_cancel(cancelled).expect("cancel");
     let ephemeral = store
-        .task_assign(mission, "ephemeral", "helper", "an ephemeral task", "default")
+        .task_assign(
+            mission,
+            "ephemeral",
+            "helper",
+            "an ephemeral task",
+            "default",
+        )
         .expect("ephemeral");
 
-    refused(&store, &mut client, 999_999, "ann", "not queued (no such task)");
-    refused(&store, &mut client, ephemeral, "ann", "not queued (not a resident task)");
-    refused(&store, &mut client, running, "ann", "not queued (delivered)");
-    refused(&store, &mut client, cancelled, "ann", "not queued (cancelled)");
-    refused(&store, &mut client, typed, "ann", "not queued (a delivery command exists)");
+    refused(
+        &store,
+        &mut client,
+        999_999,
+        "ann",
+        "not queued (no such task)",
+    );
+    refused(
+        &store,
+        &mut client,
+        ephemeral,
+        "ann",
+        "not queued (not a resident task)",
+    );
+    refused(
+        &store,
+        &mut client,
+        running,
+        "ann",
+        "not queued (delivered)",
+    );
+    refused(
+        &store,
+        &mut client,
+        cancelled,
+        "ann",
+        "not queued (cancelled)",
+    );
+    refused(
+        &store,
+        &mut client,
+        typed,
+        "ann",
+        "not queued (a delivery command exists)",
+    );
     client
-        .execute("update mission_tasks set revisions = 1 where id = $1", &[&queued])
+        .execute(
+            "update mission_tasks set revisions = 1 where id = $1",
+            &[&queued],
+        )
         .expect("revised");
     refused(&store, &mut client, queued, "ann", "not queued (revised)");
     client
-        .execute("update mission_tasks set revisions = 0 where id = $1", &[&queued])
+        .execute(
+            "update mission_tasks set revisions = 0 where id = $1",
+            &[&queued],
+        )
         .expect("not revised");
     refused(&store, &mut client, pinned, "ann", "is pinned to ben");
 
@@ -161,9 +218,17 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
         ("halted", "'red'", "(halted)"),
     ] {
         client
-            .batch_execute(&format!("update mission_missions set {column} = {value} where id = {mission}"))
+            .batch_execute(&format!(
+                "update mission_missions set {column} = {value} where id = {mission}"
+            ))
             .expect("the mission");
-        refused(&store, &mut client, queued, "ann", &format!("waits for its mission {mission} {why}"));
+        refused(
+            &store,
+            &mut client,
+            queued,
+            "ann",
+            &format!("waits for its mission {mission} {why}"),
+        );
         client
             .batch_execute(&format!(
                 "update mission_missions set state = 'active', pause_event = null, halted = null \
@@ -172,12 +237,48 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
             .expect("open again");
     }
 
-    refused(&store, &mut client, queued, "nobody", "cannot go to nobody (no such resident)");
-    refused(&store, &mut client, queued, "hal", "cannot go to hal (not approved)");
-    refused(&store, &mut client, queued, "ivy", "cannot go to ivy (retired)");
-    refused(&store, &mut client, queued, "ben", "cannot go to ben (already its worker)");
-    refused(&store, &mut client, queued, "una", "cannot go to una (no pool)");
-    refused(&store, &mut client, queued, "sol", "cannot go to sol (pool logs is not other)");
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "nobody",
+        "cannot go to nobody (no such resident)",
+    );
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "hal",
+        "cannot go to hal (not approved)",
+    );
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "ivy",
+        "cannot go to ivy (retired)",
+    );
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "ben",
+        "cannot go to ben (already its worker)",
+    );
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "una",
+        "cannot go to una (no pool)",
+    );
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "sol",
+        "cannot go to sol (pool logs is not other)",
+    );
     assert_eq!(stolen(&mut client), 0);
 
     // And it moves, to an idle member of the pool.
@@ -198,7 +299,10 @@ fn a_move_is_refused_for_each_rule_and_records_nothing() {
         .expect("the record")
         .get(0);
     let created: i64 = client
-        .query_one("select created_at_ms from mission_tasks where id = $1", &[&queued])
+        .query_one(
+            "select created_at_ms from mission_tasks where id = $1",
+            &[&queued],
+        )
         .expect("created")
         .get(0);
     assert_eq!(
@@ -231,34 +335,72 @@ fn a_taker_holding_any_open_task_or_an_untold_cancel_is_not_idle() {
     let own = assign(&store, mission, "cid", false);
     for state in ["assigned", "delivered", "reported", "revise", "landing"] {
         client
-            .execute("update mission_tasks set state = $2 where id = $1", &[&own, &state])
+            .execute(
+                "update mission_tasks set state = $2 where id = $1",
+                &[&own, &state],
+            )
             .expect("a state");
-        refused(&store, &mut client, queued, "cid", &format!("(not idle: task {own} {state})"));
+        refused(
+            &store,
+            &mut client,
+            queued,
+            "cid",
+            &format!("(not idle: task {own} {state})"),
+        );
     }
     // Accepted: open only in a mission with a gate.
     client
-        .execute("update mission_tasks set state = 'accepted' where id = $1", &[&own])
+        .execute(
+            "update mission_tasks set state = 'accepted' where id = $1",
+            &[&own],
+        )
         .expect("accepted");
     client
-        .execute("update mission_missions set gate = '/gate' where id = $1", &[&mission])
+        .execute(
+            "update mission_missions set gate = '/gate' where id = $1",
+            &[&mission],
+        )
         .expect("gated");
-    refused(&store, &mut client, queued, "cid", &format!("(not idle: task {own} accepted)"));
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "cid",
+        &format!("(not idle: task {own} accepted)"),
+    );
     client
-        .execute("update mission_missions set gate = null where id = $1", &[&mission])
+        .execute(
+            "update mission_missions set gate = null where id = $1",
+            &[&mission],
+        )
         .expect("ungated");
     // A cancel notice not yet told: cid's latest delivered task cancelled.
     client
-        .execute("update mission_tasks set state = 'assigned' where id = $1", &[&own])
+        .execute(
+            "update mission_tasks set state = 'assigned' where id = $1",
+            &[&own],
+        )
         .expect("assigned again");
     deliver(&store, own, "cid");
     store.task_cancel(own).expect("cancel");
-    refused(&store, &mut client, queued, "cid", "(not idle: a cancel notice is not told)");
+    refused(
+        &store,
+        &mut client,
+        queued,
+        "cid",
+        "(not idle: a cancel notice is not told)",
+    );
     // Told: idle.
     let notice = command(&store, "cid", &format!("cancel-notice-{own}-0"));
     client
-        .execute("update spawn_commands set succeeded = true where id = $1", &[&notice])
+        .execute(
+            "update spawn_commands set succeeded = true where id = $1",
+            &[&notice],
+        )
         .expect("told");
-    store.task_steal(queued, "cid", "human", None).expect("cid is idle");
+    store
+        .task_steal(queued, "cid", "human", None)
+        .expect("cid is idle");
 }
 
 /// A task that is its worker's next (its worker idle, the task its oldest)
@@ -271,7 +413,13 @@ fn an_idle_workers_next_task_stays_and_two_takers_have_one_winner() {
     let mission = world(&store);
     let next = assign(&store, mission, "ben", false);
     let second = assign(&store, mission, "ben", false);
-    refused(&store, &mut client, next, "ann", "is its worker's next (its worker is idle)");
+    refused(
+        &store,
+        &mut client,
+        next,
+        "ann",
+        "is its worker's next (its worker is idle)",
+    );
     // Two takers of the second task at once: one wins.
     let (url, path) = (common::schema_url(&schema), schema.to_string());
     let takers: Vec<_> = ["ann", "dee"]
@@ -290,13 +438,26 @@ fn an_idle_workers_next_task_stays_and_two_takers_have_one_winner() {
         .into_iter()
         .map(|taker| taker.join().expect("a taker"))
         .collect();
-    assert_eq!(won.iter().filter(|won| **won).count(), 1, "{won:?} ({path})");
+    assert_eq!(
+        won.iter().filter(|won| **won).count(),
+        1,
+        "{won:?} ({path})"
+    );
     assert_eq!(stolen(&mut client), 1);
     let winner = if won[0] { "ann" } else { "dee" };
-    assert_eq!(session(&mut client, second), format!("session_resident_{winner}"));
+    assert_eq!(
+        session(&mut client, second),
+        format!("session_resident_{winner}")
+    );
     // Moved, it is the winner's next: no one else takes it.
     let loser = if won[0] { "dee" } else { "ann" };
-    refused(&store, &mut client, second, loser, "is its worker's next (its worker is idle)");
+    refused(
+        &store,
+        &mut client,
+        second,
+        loser,
+        "is its worker's next (its worker is idle)",
+    );
 }
 
 /// A delivery planned before a move is never recorded for the old worker:
@@ -309,14 +470,16 @@ fn a_delivery_into_a_session_that_is_not_the_tasks_is_refused() {
     let running = assign(&store, mission, "ben", false);
     deliver(&store, running, "ben");
     let queued = assign(&store, mission, "ben", false);
-    store.task_steal(queued, "ann", "human", None).expect("moved");
+    store
+        .task_steal(queued, "ann", "human", None)
+        .expect("moved");
     let old = command(&store, "ben", &format!("deliver-{queued}-0"));
-    assert!(!store.task_delivered(queued, old).expect("answered"));
+    assert!(!delivered(&mut client, queued, old));
     let state: String = client
         .query_one("select state from mission_tasks where id = $1", &[&queued])
         .expect("the task")
         .get(0);
     assert_eq!(state, "assigned");
     let new = command(&store, "ann", &format!("deliver-{queued}-1"));
-    assert!(store.task_delivered(queued, new).expect("delivered"));
+    assert!(delivered(&mut client, queued, new));
 }

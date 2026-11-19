@@ -2412,7 +2412,15 @@ impl PostgresStore {
     ) -> Result<i64, StoreError> {
         let row = self.query_one(
             "select spawn_task_assign($1, $2, $3, $4, $5, $6, $7)",
-            &[&mission, &kind, &worker, &masked(brief), &model, &again, &pin],
+            &[
+                &mission,
+                &kind,
+                &worker,
+                &masked(brief),
+                &model,
+                &again,
+                &pin,
+            ],
         )?;
         Ok(row.get(0))
     }

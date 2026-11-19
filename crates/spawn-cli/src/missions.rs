@@ -332,7 +332,11 @@ fn split_task(rest: &[String]) -> Result<(&str, Flags), String> {
     let Some((verb, rest)) = rest.split_first() else {
         return Err(USAGE.to_string());
     };
-    let switches: &[&str] = if verb == "assign" { &["again", "pin"] } else { &[] };
+    let switches: &[&str] = if verb == "assign" {
+        &["again", "pin"]
+    } else {
+        &[]
+    };
     Ok((verb.as_str(), Flags::parse_with_switches(rest, switches)?))
 }
 
