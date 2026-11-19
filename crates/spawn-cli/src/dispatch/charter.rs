@@ -253,8 +253,9 @@ mod tests {
 
     // From rev-i's t515u review (a throwaway there, kept here): the real
     // Observer's verdict on a session that ends its turn on a `HUMAN:`
-    // question at its prompt, fed to the dispatcher's readers. The rule
-    // settles it without a model, and it must still read as at its prompt.
+    // question at its prompt, fed to the dispatcher's readers. However the
+    // Observer settles it, it must still read as at its prompt: no test tied
+    // the Observer's output to the dispatcher before.
     struct Asks(bool);
 
     impl spawn_core::observe::ObservationContext for Asks {
@@ -276,7 +277,7 @@ mod tests {
         }
     }
 
-    /// A model that would answer BLOCKED, so a verdict without it shows.
+    /// A model that answers BLOCKED, needing a person.
     struct WouldBlock;
 
     impl spawn_core::observe::StateJudge for WouldBlock {
@@ -355,17 +356,14 @@ mod tests {
             .read_global(GlobalPosition(0), 50)
             .expect("read")
             .into_iter()
-            .filter_map(|record| match record.event.kind {
+            .rev()
+            .find_map(|record| match record.event.kind {
                 EventKind::ObservationRecorded { observation } => Some(observation),
                 _ => None,
             })
-            .last()
             .expect("an observation");
-        assert_eq!(
-            observation.judge, "rules",
-            "the question is settled by rule"
-        );
         assert_eq!(observation.state, SemanticState::Blocked);
+        assert_eq!(observation.human_question.as_deref(), Some("which region?"));
         observation
     }
 
@@ -380,7 +378,7 @@ mod tests {
     /// sits at its prompt all the same, or one question would silence every
     /// escalation until someone answered it.
     #[test]
-    fn a_supervisor_that_asks_by_rule_still_takes_digests() {
+    fn a_supervisor_that_asks_still_takes_digests() {
         let facts = facts_of(observed_asking(true));
         assert!(crate::dispatch::digest::supervisor_idle(&facts));
     }
@@ -388,7 +386,7 @@ mod tests {
     /// A worker whose turn ended on a question is at its prompt: its report
     /// is its answer, and the revision that answers it can be typed.
     #[test]
-    fn a_worker_that_asks_by_rule_is_at_its_prompt() {
+    fn a_worker_that_asks_is_at_its_prompt() {
         let facts = facts_of(observed_asking(false));
         assert!(facts.turn_stopped_idle());
     }

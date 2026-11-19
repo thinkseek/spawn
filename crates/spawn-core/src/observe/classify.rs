@@ -20,13 +20,6 @@ pub enum RulesVerdict {
         /// Decided state.
         state: SemanticState,
     },
-    /// The engine stopped its turn at its prompt with a question for a
-    /// person (a `HUMAN:` line in its reply): BLOCKED, settled without a
-    /// model. It is still a turn stopped at the prompt, so the observation
-    /// keeps [`Ambiguity::TurnStoppedIdle`], which the dispatcher, the
-    /// delivery and the attention view key on, as a model's BLOCKED of the
-    /// same turn did.
-    Asks,
     /// The facts leave several states open.
     Ambiguous {
         /// Why.
@@ -54,7 +47,7 @@ pub fn rules(input: &JudgeInput) -> RulesVerdict {
 
 /// Rules for a session whose execution is running.
 fn live_execution(input: &JudgeInput) -> RulesVerdict {
-    use RulesVerdict::{Ambiguous, Asks, Certain};
+    use RulesVerdict::{Ambiguous, Certain};
     // A permission dialog is a fact only while its pane exists.
     if input.permission_pending || input.screen == Some(ScreenState::Permission) {
         return Certain {
@@ -102,16 +95,6 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
             state: SemanticState::Working,
         };
     }
-    // The engine wrote a question for a person and stopped at its prompt: a
-    // question is a fact of the reply, not something a model decides.
-    if at_prompt(input) && input.reply.as_deref().and_then(human_question).is_some() {
-        return Asks;
-    }
-    // A session that never ends (the supervisor) at its prompt with no
-    // question still goes to the model: its judgement carries `stuck` and
-    // `needs_human`, which the alert step's agent_stuck and the attention
-    // view's untagged ask read (objectives 057, 064, 070, 078). Its
-    // COMPLETED is folded into WAITING after the narrowing.
     if at_prompt(input) {
         return Ambiguous {
             ambiguity: Ambiguity::TurnStoppedIdle,
@@ -131,20 +114,8 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
 }
 
 /// The turn stopped, or the pane waits at its prompt.
-pub(super) fn at_prompt(input: &JudgeInput) -> bool {
+fn at_prompt(input: &JudgeInput) -> bool {
     input.turn == Some(TurnFact::Stopped) || input.screen == Some(ScreenState::Ready)
-}
-
-/// The question for a person in the engine's latest reply, without the tag:
-/// its last line that starts with `HUMAN:`. The reply is what the engine
-/// wrote since the last prompt, so a question someone answered is no longer
-/// in it. A `HUMAN:` line in a tool's output is on the screen, not in the
-/// reply, and asks nobody.
-pub(super) fn human_question(reply: &str) -> Option<&str> {
-    reply
-        .lines()
-        .rev()
-        .find_map(|line| line.trim_start().strip_prefix("HUMAN:"))
 }
 
 /// The running execution stopped its turn at its prompt with at least one
@@ -294,4 +265,23 @@ pub fn attention_reason(
         .map(weight)
         .sum();
     (risky / total >= LIKELY).then_some("risky")
+}
+
+/// For a session that never ends (the supervisor), COMPLETED only means it
+/// waits for its next instruction: fold that mass into WAITING.
+pub(super) fn fold_completed(judgement: &Judgement) -> Judgement {
+    let index = |state: SemanticState| index_of(state).unwrap_or(0);
+    let mut folded = *judgement;
+    if let Some(probabilities) = &mut folded.probabilities {
+        let (waiting, completed) = (
+            index(SemanticState::Waiting),
+            index(SemanticState::Completed),
+        );
+        probabilities[waiting] += probabilities[completed];
+        probabilities[completed] = 0.0;
+    }
+    if folded.state == SemanticState::Completed {
+        folded.state = SemanticState::Waiting;
+    }
+    folded
 }

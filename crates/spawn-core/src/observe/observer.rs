@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::classify::{
-    RulesVerdict, at_prompt, attention_reason, exited_failing, narrow, rules, wait_reason,
+    RulesVerdict, attention_reason, exited_failing, fold_completed, narrow, rules, wait_reason,
 };
 use super::judge::{JudgeInput, StateJudge};
 use super::snapshot::Snapshot;
@@ -360,29 +360,12 @@ impl Observer {
         let Some(tracked) = self.sessions.get(session) else {
             return Ok(0);
         };
-        let mut input = tracked.snapshot.input(&tracked.agent_id, session, now);
-        // The reply is the one fact a rule settles a case with (a `HUMAN:`
-        // question at the prompt), so it is read before the rules, and only
-        // at the prompt: a session there was always ambiguous, and its reply
-        // was read for the model anyway. A working session reads nothing; the
-        // rest of the context is attached on the ambiguous path, as before.
-        if at_prompt(&input) {
-            attach_reply(
-                &mut input,
-                self.context.as_deref(),
-                tracked.snapshot.transcript(),
-            );
-        }
+        let input = tracked.snapshot.input(&tracked.agent_id, session, now);
         let agent = tracked.agent_id.clone();
         let seq = tracked.snapshot.evidence_seq;
 
         let classified = match rules(&input) {
             RulesVerdict::Certain { state } => Self::certain(state, &input, seq),
-            RulesVerdict::Asks => {
-                let mut asks = Self::certain(SemanticState::Blocked, &input, seq);
-                asks.observation.ambiguity = Some(Ambiguity::TurnStoppedIdle);
-                asks
-            }
             RulesVerdict::Ambiguous { ambiguity, guess } => {
                 self.ambiguous(tracked, session, input, ambiguity, guess, seq)
             }
@@ -438,18 +421,12 @@ impl Observer {
         );
         observation.attention = state == SemanticState::Blocked;
         if observation.attention {
-            // The question the rules settled this with: kept on the
-            // observation, and named as the reason over the others.
-            let question = input.reply.as_deref().and_then(human_question);
-            let reason = if question.is_some() {
-                "human_question"
-            } else if input.stalled_end.is_some() {
+            let reason = if input.stalled_end.is_some() {
                 "end_stalled"
             } else {
                 "permission"
             };
             observation.attention_reason = Some(reason.to_string());
-            observation.human_question = question;
         }
         Classified {
             observation,
@@ -556,16 +533,23 @@ impl Observer {
             observation.attention_reason = Some("judge_unavailable".to_string());
             return (observation, true);
         };
-        // The raw answer is stored and narrowed; a session that never ends
-        // is never COMPLETED, so its COMPLETED is folded into WAITING after
-        // the facts have narrowed the answer. Folding before narrowing drops
-        // the mass it gave COMPLETED for an exit, whose allowed states do not
-        // include WAITING, and a sliver of BLOCKED then wins.
-        let (state, confidence) = narrow(ambiguity, guess, &raw);
-        let (state, confidence) = if input.perpetual && state == SemanticState::Completed {
-            (SemanticState::Waiting, confidence)
+        // The raw answer is stored; the folded one is what counts. A session
+        // that never ends is never COMPLETED. Where the facts allow WAITING
+        // (at its prompt) its COMPLETED mass is folded into WAITING before
+        // the narrowing. Where they do not (an exit), folding first would
+        // drop that mass and let a sliver of BLOCKED win (GitHub PR #69,
+        // 061b2c4d), so the narrowed answer is folded instead.
+        let fold_first = input.perpetual && ambiguity.allowed().contains(&SemanticState::Waiting);
+        let judgement = if fold_first {
+            fold_completed(&raw)
         } else {
-            (state, confidence)
+            raw
+        };
+        let (state, confidence) = narrow(ambiguity, guess, &judgement);
+        let state = if input.perpetual && state == SemanticState::Completed {
+            SemanticState::Waiting
+        } else {
+            state
         };
         let mut observation = model_observation(state, wait_reason(state, input), confidence);
         observation.probabilities = raw.probabilities.map(|values| {
@@ -575,12 +559,12 @@ impl Observer {
                 .map(|(state, value)| (state.key().to_string(), value))
                 .collect::<BTreeMap<_, _>>()
         });
-        observation.needs_human = raw.needs_human;
-        observation.stuck = raw.stuck;
+        observation.needs_human = judgement.needs_human;
+        observation.stuck = judgement.stuck;
         // A process that exited with a failing status gets a look whatever
         // the model says about it.
         let failing_exit = ambiguity == Ambiguity::ExitedOnItsOwn && exited_failing(input);
-        let reason = attention_reason(Some(ambiguity), state, confidence, &raw)
+        let reason = attention_reason(Some(ambiguity), state, confidence, &judgement)
             .or(failing_exit.then_some("failing_exit"));
         observation.attention = reason.is_some();
         observation.attention_reason = reason.map(str::to_string);
@@ -647,23 +631,8 @@ fn attach_context(
     input.task = context
         .task(session)
         .map(|text| head_chars(&text, TASK_CHARS));
-    // At the prompt `observe` read the reply before the rules already.
-    if !at_prompt(input) {
-        input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
-    }
+    input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
     input.perpetual = context.perpetual(session);
-}
-
-/// Read the session's latest reply from its transcript, the fact the
-/// `HUMAN:` rule needs. Without a context it stays empty.
-fn attach_reply(
-    input: &mut JudgeInput,
-    context: Option<&dyn ObservationContext>,
-    transcript: Option<(&WorkspaceId, &str)>,
-) {
-    if let Some(context) = context {
-        input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
-    }
 }
 
 /// The question for a person in the model's latest reply, without the tag:
@@ -671,8 +640,11 @@ fn attach_reply(
 /// wrote since the last prompt, so a question someone answered is no longer
 /// in it.
 fn human_question(reply: &str) -> Option<String> {
-    super::classify::human_question(reply)
-        .map(|question| head_chars(question.trim(), QUESTION_CHARS))
+    reply.lines().rev().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("HUMAN:")
+            .map(|question| head_chars(question.trim(), QUESTION_CHARS))
+    })
 }
 
 /// Stable digest of what the model is shown (FNV-1a over its JSON), so a

@@ -827,16 +827,21 @@ fn an_idle_perpetual_session_is_still_judged_for_its_stuck_reading() {
     assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
 }
 
-/// A `HUMAN:` question in the reply is a fact: the session is blocked without
-/// a model call, and the question is kept with attention on it.
 #[test]
-fn a_question_for_a_person_blocks_without_a_model() {
-    let judge = Scripted::new(Ok(blocked_answer()));
+fn a_perpetual_session_is_never_completed_and_its_question_pages() {
+    // Live: Jev put the idle supervisor at COMPLETED 0.71.
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Completed,
+        confidence: confidence(0.71),
+        probabilities: Some([0.0, 0.27, 0.02, 0.71, 0.0]),
+        needs_human: Some(0.2),
+        stuck: Some(0.05),
+    }));
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
     let mut observer = Observer::new(log)
-        .with_judge(judge.clone())
+        .with_judge(judge)
         .with_clock(clock)
         .with_context(Arc::new(Supervisor));
     started(&store);
@@ -844,15 +849,20 @@ fn a_question_for_a_person_blocks_without_a_model() {
     turn_stopped(&store);
     observer.tick().expect("tick");
     let last = observations(&store).pop().expect("an observation");
-    assert_eq!(last.state, SemanticState::Blocked);
-    assert_eq!(last.judge, "rules");
-    assert_eq!(judge.calls(), 0, "a question is not a model's to decide");
+    assert_eq!(
+        last.state,
+        SemanticState::Waiting,
+        "COMPLETED folds into WAITING"
+    );
+    assert!(last.confidence.value() > 0.95, "0.98 of the allowed mass");
+    assert_eq!(
+        last.probabilities.and_then(|p| p.get("COMPLETED").copied()),
+        Some(0.71),
+        "the raw answer is kept"
+    );
     assert_eq!(last.human_question.as_deref(), Some("which region?"));
     assert!(last.attention);
     assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
-    // Still a turn stopped at its prompt, as a model's BLOCKED of it was:
-    // the dispatcher, the delivery and the attention view key on it.
-    assert_eq!(last.ambiguity, Some(Ambiguity::TurnStoppedIdle));
 }
 
 /// A context that counts what the Observer reads from it.
