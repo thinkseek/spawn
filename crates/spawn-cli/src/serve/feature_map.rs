@@ -1272,7 +1272,7 @@ fn sources_json(
         let title = source
             .title
             .clone()
-            .or_else(|| native_title(source.native.as_ref(), mission, rows, tasks, checks, facts));
+            .or_else(|| native_title(source.native.as_ref(), mission, rows, checks, facts));
         push_source(
             &mut out,
             &mut seen,
@@ -1366,7 +1366,6 @@ fn native_title(
     native: Option<&Native>,
     mission: &Value,
     rows: &[&Value],
-    tasks: &[&Value],
     checks: &[Value],
     facts: &Facts,
 ) -> Option<String> {
