@@ -316,9 +316,13 @@ def parse_protected(text):
             deny.append(line)
 
     def protected(path):
-        if any(path_matches(path, spec) for spec in allow):
+        # The gate matches these as string prefixes (gate.sh:2772-2784), not
+        # as exact paths or directories: `rust-toolchain` protects
+        # `rust-toolchain.toml` and any `rust-toolchain-*` the gate would
+        # refuse.  Mirror it, so the selector's flag cannot disagree.
+        if any(path.startswith(spec) for spec in allow):
             return False
-        return any(path_matches(path, spec) for spec in deny)
+        return any(path.startswith(spec) for spec in deny)
     return protected
 
 
