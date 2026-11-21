@@ -1485,16 +1485,20 @@ mod tests {
             "tasks": [
                 {"id": 20, "state": "landed", "kind": "ephemeral", "agent_id": "a20",
                  "session_id": "s20", "objective": 2, "revisions": 0, "candidate": "c2",
-                 "base": "b2", "updated_at_ms": 100, "review_note": null, "gates": []},
+                 "base": "b2", "updated_at_ms": 100, "review_note": null, "gates": [],
+                 "created_by": "spawn-integrate", "brief": "objective 2"},
                 {"id": 30, "state": "landed", "kind": "ephemeral", "agent_id": "a30",
                  "session_id": "s30", "objective": 3, "revisions": 0, "candidate": "c3",
-                 "base": "b3", "updated_at_ms": 200, "review_note": null, "gates": []},
+                 "base": "b3", "updated_at_ms": 200, "review_note": null, "gates": [],
+                 "created_by": "spawn-integrate", "brief": "objective 3"},
                 {"id": 40, "state": "landed", "kind": "ephemeral", "agent_id": "a40",
                  "session_id": "s40", "objective": 4, "revisions": 0, "candidate": "c4",
-                 "base": "b4", "updated_at_ms": 300, "review_note": null, "gates": []},
+                 "base": "b4", "updated_at_ms": 300, "review_note": null, "gates": [],
+                 "created_by": "human", "brief": "the owner asked for feature four"},
                 {"id": 50, "state": "accepted", "kind": "ephemeral", "agent_id": "a50",
                  "session_id": "s50", "objective": 5, "revisions": 1, "candidate": null,
-                 "base": null, "updated_at_ms": 400, "review_note": "ok", "gates": []},
+                 "base": null, "updated_at_ms": 400, "review_note": "ok", "gates": [],
+                 "created_by": "spawn_supervisor", "brief": "objective 5"},
             ],
         })
     }
@@ -1556,6 +1560,58 @@ mod tests {
         assert_eq!(live["state"], "live");
         assert_eq!(live["verified"], true);
         assert_eq!(live["evidence"]["deploy"]["event"], 400);
+    }
+
+    /// A capability's provenance includes the native records that already
+    /// exist: its objective, a task a person assigned, its verification and
+    /// the deploy that made it live. External sources stay links; nothing
+    /// here changes the derived state.
+    #[test]
+    fn sources_link_native_objectives_tasks_verifications_and_the_deploy() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 4, "task": 40, "landed_ms": 100, "event": 102})];
+        let verifications = vec![json!({"mission": 4, "objective": 4, "result": "pass",
+                                        "by": "lead", "how": "seen", "at_ms": 150, "event": 152})];
+        let deployments = vec![json!({"event": 400, "at_ms": 250, "ok": true,
+                                      "head": "d".repeat(40), "by": "landing", "reason": ""})];
+        let facts = facts_of(&landings, &verifications, &deployments, &[]);
+        let mut row = mission();
+        row["id"] = json!(4);
+        row["objectives"] = json!([
+            {"id": 4, "title": "Four", "status": "solved", "landings": [],
+             "solved_on_base": null}
+        ]);
+        let feature = derive(&spec("four", &[4]), &row, &facts);
+        let refs: Vec<&str> = feature["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["ref"].as_str().unwrap())
+            .collect();
+        assert!(refs.contains(&"objective:4/004"), "{refs:?}");
+        assert!(refs.contains(&"task:40"), "{refs:?}");
+        assert!(refs.contains(&"verification:4/004"), "{refs:?}");
+        assert!(refs.contains(&"deploy:400"), "{refs:?}");
+        assert_eq!(feature["state"], "live");
+        // An external source is a link, never a native record.
+        let mut external = spec("x", &[4]);
+        external.sources.push(Source {
+            kind: "issue".to_string(),
+            reference: "issue:63".to_string(),
+            url: Some("https://github.com/thinkseek/spawn/issues/63".to_string()),
+            title: None,
+            native: None,
+        });
+        let feature = derive(&external, &row, &facts);
+        let issue = feature["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["ref"] == "issue:63")
+            .expect("the external source");
+        assert_eq!(issue["native"], false);
+        assert_eq!(issue["linked"], false);
+        assert_eq!(issue["url"], "https://github.com/thinkseek/spawn/issues/63");
     }
 
     /// A deploy recorded before the landing shipped nothing of it; a failed
