@@ -392,13 +392,35 @@ def select(opts):
 
     version = policy["policy_version"]
     env = profile.get("env") or {}
+
+    # The defaults are the policy's, not this file's: an operator who omits
+    # the flags must not install a retirement the owner has not approved.
+    modes = policy["historical"].get("modes") or ["cache-only", "nightly"]
+    if opts.historical_mode is None:
+        opts.historical_mode = policy["historical"]["default_mode"]
+    if opts.historical_mode not in modes:
+        raise NoVerdict("historical mode %r is not one of the policy's %s"
+                        % (opts.historical_mode, modes))
+    if opts.unsolved_mode is None:
+        opts.unsolved_mode = policy["historical"]["unsolved_default"]
+    if opts.unsolved_mode not in ("carry", "run"):
+        raise NoVerdict("unsolved mode %r is not one of carry, run"
+                        % opts.unsolved_mode)
+
+    if opts.slots is not None and opts.slots < 1:
+        raise NoVerdict("--slots must be a positive integer, not %d" % opts.slots)
     slots = opts.slots or policy["slots"]
+    if opts.budget is not None and opts.budget <= 0:
+        raise NoVerdict("--budget must be positive, not %r" % opts.budget)
     budget = opts.budget or policy["budget_seconds"]
 
     paths = changed_paths(repo, base, candidate)
     if not paths:
         raise NoVerdict("no paths changed between %s and %s: nothing to land"
                         % (short(base), short(candidate)))
+    if not is_ancestor(repo, base, candidate):
+        raise NoVerdict("base %s is not an ancestor of candidate %s: the diff "
+                        "would not describe a landing" % (short(base), short(candidate)))
 
     result = Selection()
     protected_text = file_text(repo, base, policy["protected_list"])
