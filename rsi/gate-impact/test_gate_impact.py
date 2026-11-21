@@ -274,6 +274,8 @@ class SelectorTest(unittest.TestCase):
                                       "--historical-mode", "cache-only",
                                       "--unsolved-mode", "run")
         self.assertEqual(code, 0, err)
+        # web/src is excepted from the protected prefix in the list.
+        self.assertFalse(res["owner_review_required"])
         ids = {job["id"]: job for job in res["selected"]}
         self.assertIn("check-web.sh", ids)
         self.assertIn("check-tests.sh", ids)
