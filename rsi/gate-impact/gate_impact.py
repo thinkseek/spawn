@@ -862,7 +862,7 @@ def text_report(res, out):
     out.write("owner review  %s\n" % ("required (protected paths changed)"
                                       if res["owner_review_required"] else "not required by path class"))
     out.write("keys\n")
-    for name in ("static", "rust", "web", "scripts"):
+    for name in ("static", "rust", "web", "scripts", "backlog", "readme"):
         out.write("  %-8s sha256:%s  base sha256:%s%s\n" % (
             name, res["keys"][name], res["base_keys"][name],
             "  unchanged" if res["keys"][name] == res["base_keys"][name] else "  CHANGED"))
