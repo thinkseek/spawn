@@ -760,8 +760,8 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         "objectives": spec.objectives,
         "objective_rows": rows.iter().map(|row| json!({
             "id": row["id"], "title": row["title"], "status": row["status"]})).collect::<Vec<_>>(),
-        "issues": links_json(&spec.issues),
-        "prs": links_json(&spec.prs),
+        "sources": sources_json(spec, mission, &rows, &tasks, &checks,
+                                 live.then_some(anchor).flatten(), facts),
         "owner": newest_in_flight.map_or(Value::Null, owner_json),
         "last_owner": newest_task.map_or(Value::Null, owner_json),
         "unowned": state != "live" && newest_in_flight.is_none(),
@@ -1215,12 +1215,171 @@ fn evidence_of(
     })
 }
 
-fn links_json(links: &[Link]) -> Vec<Value> {
-    links
-        .iter()
-        .map(|link| {
-            json!({"url": link.url, "title": link.title, "number": link.number})
-        })
+/// A capability's provenance: the mapping's sources plus the native records
+/// that already exist for it (the objectives themselves, the tasks a person
+/// assigned, the verifications it has, and the deploy that made it live),
+/// deduplicated by stable reference. `linked` says a native record is
+/// present; an external source is a link, never a state.
+fn sources_json(
+    spec: &Spec,
+    mission: &Value,
+    rows: &[&Value],
+    tasks: &[&Value],
+    checks: &[Value],
+    live_deploy: Option<&Value>,
+    facts: &Facts,
+) -> Vec<Value> {
+    let mission_id = mission["id"].as_i64().unwrap_or_default();
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for source in &spec.sources {
+        let linked = source_linked(source, mission_id, rows, tasks, facts);
+        let title = source
+            .title
+            .clone()
+            .or_else(|| native_title(source.native.as_ref(), mission, rows, tasks, checks, facts));
+        push_source(
+            &mut out,
+            &mut seen,
+            json!({
+                "kind": source.kind,
+                "ref": source.reference,
+                "url": source.url,
+                "title": title,
+                "native": source.native.is_some(),
+                "linked": linked,
+            }),
+        );
+    }
+    for task in tasks.iter().filter(|task| task["created_by"] == "human") {
+        push_source(
+            &mut out,
+            &mut seen,
+            json!({
+                "kind": "task",
+                "ref": format!("task:{}", task["id"].as_i64().unwrap_or_default()),
+                "url": Value::Null,
+                "title": first_line(text(&task["brief"])),
+                "native": true,
+                "linked": true,
+            }),
+        );
+    }
+    for check in checks.iter().filter(|check| check["result"] != "none") {
+        let objective = check["objective"].as_u64().unwrap_or_default();
+        push_source(
+            &mut out,
+            &mut seen,
+            json!({
+                "kind": "verification",
+                "ref": format!("verification:{mission_id}/{objective:03}"),
+                "url": Value::Null,
+                "title": format!("{} by {}", text(&check["result"]), text(&check["by"])),
+                "native": true,
+                "linked": true,
+            }),
+        );
+    }
+    if let Some(deploy) = live_deploy {
+        push_source(
+            &mut out,
+            &mut seen,
+            json!({
+                "kind": "deploy",
+                "ref": format!("deploy:{}", deploy["event"].as_i64().unwrap_or_default()),
+                "url": Value::Null,
+                "title": format!("deploys {}", short(&deploy["head"])),
+                "native": true,
+                "linked": true,
+            }),
+        );
+    }
+    out
+}
+
+fn push_source(out: &mut Vec<Value>, seen: &mut BTreeSet<String>, source: Value) {
+    let reference = text(&source["ref"]).to_string();
+    if seen.insert(reference) {
+        out.push(source);
+    }
+}
+
+fn source_linked(
+    source: &Source,
+    mission_id: i64,
+    rows: &[&Value],
+    tasks: &[&Value],
+    facts: &Facts,
+) -> bool {
+    match &source.native {
+        None => false,
+        Some(Native::Objective { objective, .. }) => rows
+            .iter()
+            .any(|row| row["id"].as_u64() == Some(u64::from(*objective))),
+        Some(Native::Mission(mission)) => *mission == mission_id,
+        Some(Native::Task(task)) => tasks.iter().any(|row| row["id"].as_i64() == Some(*task)),
+        Some(Native::Verification { mission, objective }) => facts.verifications.iter().any(|seen| {
+            seen["mission"].as_i64() == Some(*mission)
+                && seen["objective"].as_u64() == Some(u64::from(*objective))
+        }),
+        Some(Native::Deploy(event)) => facts
+            .deployments
+            .iter()
+            .any(|deploy| deploy["event"].as_i64() == Some(*event)),
+    }
+}
+
+fn native_title(
+    native: Option<&Native>,
+    mission: &Value,
+    rows: &[&Value],
+    tasks: &[&Value],
+    checks: &[Value],
+    facts: &Facts,
+) -> Option<String> {
+    match native? {
+        Native::Objective { objective, .. } => rows
+            .iter()
+            .find(|row| row["id"].as_u64() == Some(u64::from(*objective)))
+            .and_then(|row| row["title"].as_str())
+            .map(str::to_string),
+        Native::Mission(id) if mission["id"].as_i64() == Some(*id) => {
+            Some(first_line(text(&mission["text"])))
+        }
+        Native::Mission(id) => Some(format!("mission {id}")),
+        Native::Task(task) => tasks
+            .iter()
+            .find(|row| row["id"].as_i64() == Some(*task))
+            .map(|row| first_line(text(&row["brief"]))),
+        Native::Verification { objective, .. } => checks
+            .iter()
+            .find(|check| check["objective"].as_u64() == Some(u64::from(*objective)))
+            .filter(|check| check["result"] != "none")
+            .map(|check| format!("{} by {}", text(&check["result"]), text(&check["by"]))),
+        Native::Deploy(event) => facts
+            .deployments
+            .iter()
+            .find(|deploy| deploy["event"].as_i64() == Some(*event))
+            .map(|deploy| format!("deploys {}", short(&deploy["head"]))),
+    }
+}
+
+/// A commit as a list shows it.
+fn short(commit: &Value) -> String {
+    commit
+        .as_str()
+        .map(|commit| commit.chars().take(12).collect())
+        .unwrap_or_default()
+}
+
+/// The first line of `text`, trimmed and at most 200 characters.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(200)
         .collect()
 }
 
