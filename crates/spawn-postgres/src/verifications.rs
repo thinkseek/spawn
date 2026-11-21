@@ -18,19 +18,25 @@ use crate::PostgresStore;
 /// What the list decides on, in one snapshot (one statement):
 /// - `landings`: per mission and objective, its newest `task.landed` (by
 ///   the record's time, then its id) `{mission, objective, task,
-///   landed_ms, brief}`, the task's brief in full;
+///   landed_ms, event, brief}`, the task's brief in full and the landing
+///   record's event id;
 /// - `verifications`: every `objective.verified` `{mission, objective,
-///   result, by, how, at_ms}`, oldest first;
+///   result, by, how, at_ms, event}`, oldest first;
 /// - `deploy`: the newest `deploy.finished` `{at_ms, head, ok, reason}`,
 ///   or null.
+///
+/// The event ids are what another read (the feature map) links evidence
+/// by; the list above ignores them.
 const FACTS: &str = r"
 select jsonb_build_object(
   'landings', coalesce((
     select jsonb_agg(jsonb_build_object('mission', l.mission_id, 'objective', l.objective,
-                                        'task', l.task, 'landed_ms', l.at_ms, 'brief', l.brief)
+                                        'task', l.task, 'landed_ms', l.at_ms,
+                                        'event', l.event, 'brief', l.brief)
                      order by l.mission_id, l.objective)
       from (select distinct on (t.mission_id, t.objective)
-                   t.mission_id, t.objective, t.id as task, e.recorded_at_ms as at_ms, t.brief
+                   t.mission_id, t.objective, t.id as task, e.id as event,
+                   e.recorded_at_ms as at_ms, t.brief
               from spawn_events e
               join mission_tasks t on t.id = (e.kind -> 'detail' -> 'record' ->> 'id')::bigint
              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
@@ -40,7 +46,8 @@ select jsonb_build_object(
   'verifications', coalesce((
     select jsonb_agg(jsonb_build_object('mission', r -> 'mission', 'objective', r -> 'objective',
                                         'result', r -> 'result', 'by', r -> 'by',
-                                        'how', r -> 'how', 'at_ms', e.recorded_at_ms)
+                                        'how', r -> 'how', 'at_ms', e.recorded_at_ms,
+                                        'event', e.id)
                      order by e.recorded_at_ms, e.id)
       from spawn_events e
       cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
