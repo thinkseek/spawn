@@ -2285,6 +2285,8 @@ mod tests {
             charter: Some("Owns spawn-core".to_string()),
             resident: Some("core".to_string()),
             gated: false,
+            mission_state: "open".to_string(),
+            mission_halted: false,
             model: ModelProfile::Default,
             reissue_of: None,
             reissued_attempts: None,
