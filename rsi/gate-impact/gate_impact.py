@@ -941,6 +941,15 @@ def main(argv=None):
     except Reject as exc:
         no_verdict_report(str(exc), None, sys.stdout)
         return EXIT_REJECT
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        # A malformed policy, timings or record reaching an unguarded read is
+        # a missing authority, not a refused candidate: no verdict, exit 2.
+        missing = "no verdict: malformed input reached the selector: %r" % (exc,)
+        if opts.format == "json":
+            no_verdict_report(missing, None, sys.stdout)
+        else:
+            sys.stderr.write("gate-impact: %s\n" % missing)
+        return EXIT_NO_VERDICT
     except NoVerdict as exc:
         if opts.format == "json":
             no_verdict_report(str(exc), None, sys.stdout)
