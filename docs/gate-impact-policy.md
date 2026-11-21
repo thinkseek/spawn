@@ -57,8 +57,13 @@ total (1.79 s unassigned), and 74 + 0 + 1232 = 1306 s against 1309.4 s
   implement that count as an always-on check.** It computes a static key
   from the protected list and the core id, but no job compares a test
   listing, and the listing itself is a cache-skippable job keyed on the
-  Rust tree; until C15's wiring exists the ratchet is `gate.sh`'s job
-  (`scripts/rsi/gate.sh:3830-3925`), not a core check this selector models.
+  Rust tree; until C15's wiring exists the ratchet is `gate.sh`'s own
+  `tests_judge` (`scripts/rsi/gate.sh:4176-4206`, called at `:4245` and
+  `:4922`; it reads the listing at `:3830-3956`), not a core check this
+  selector models. `policy.json`'s `core.checks` still lists the count and is
+  **listed-only, not modelled**: the selector hashes only the protected list
+  and the core id into its static key, so no job reads that entry and it
+  cannot change a selection.
 - A versioned evidence record is written: policy version and digest, base
   and candidate commits and tree, the environment key (today the constant
   recorded in `timings.json`, not a live probe: section 9), the selected
@@ -130,8 +135,11 @@ split, every 243-type change pays the full gate.
   pending C15/C16/C19 wiring and is not available on a live landing yet.
 - **Candidate runs never certify a later candidate.** The selector reads
   results; it never writes a cache entry. A new candidate, a changed input, a
-  different toolchain or environment, or a new policy version changes the
-  key and the approval digest.
+  different **recorded** environment key (`env`, the constant in
+  `timings.json`: section 9), or a new policy version changes the key and the
+  approval digest. A toolchain change alone does not change either until C15
+  computes the probe at selection time — the same residual section 9 states:
+  an unchanged profile is a stale *hit*, not merely a stale prediction.
 - **A base change is a new tree, not a stale hit.** The base commit is not a
   key field; the key is the content the job reads. When main moves, the
   accepting gate's candidate run seeds the result for the new main, so the
@@ -146,8 +154,8 @@ split, every 243-type change pays the full gate.
 ### 2.5 Real-time invariants and nightly work
 
 The proposed policy keeps 192/209-style holds and the historical objective
-scenarios off the ordinary landing path, per the owner's approved
-design-gate-v2 Decision 1 (performance bounds and retired scenarios are
+scenarios off the ordinary landing path, per design-gate-v2 Decision 1 —
+**approved, not installed** (performance bounds and retired scenarios are
 checked nightly). The `--historical-mode cache-only` replay models today's
 gate instead: every check stays, and only content-addressed results are
 reused. A scenario listed in `rsi/scenarios/serial` (read at the base, as
@@ -155,7 +163,7 @@ the controller does) is charged alone, outside the four-slot makespan.
 Neither default is this tool's own: `--historical-mode` takes the policy's
 `default_mode` (cache-only) and `--unsolved-mode` its `unsolved_default`
 (run), so an operator who omits the flags gets the conservative replay, not
-the unapproved retirement or the unratified carry.
+the approved-but-not-installed retirement or the unratified carry.
 
 Nothing is hidden outside the clock: section 7 lists exactly what the landing
 does not prove and the nightly owner of each such fact.
@@ -165,9 +173,15 @@ does not prove and the nightly owner of each such fact.
 The target covers selection, the necessary build/listing, and every check the
 policy requires for that change class. It does not apply to the full or
 escalated gate and it does not apply to nightly. There is no universal
-3-minute SLA: the numbers in section 4 show four classes that cannot meet
-it under today's checks, including the measured 243-type change once
-check-tests is keyed on the backlog.
+3-minute SLA: under the policy's **own default** (cache-only, unsolved run)
+the numbers in section 4 show five named classes that cannot meet it — the
+nightly-only change (286.9 s; its two 131.0 s rows need the retirement or the
+carry), the measured 243-type change once check-tests is keyed on the backlog
+(349.2 s), web-only (1101.4 s), Rust (510.5 s) and shared/runtime (1973.8 s)
+— and the fail-closed unknown class pays the same full 1973.8 s. On this
+base every narrow class also pays the unsolved 241 under the default, so no
+class is WITHIN it: the 131.0 s rows are WITHIN only under the retirement or
+the carry, and neither is installed.
 
 ## 3. Change classes
 
@@ -179,6 +193,12 @@ check-tests is keyed on the backlog.
 | rust | `crates/`, `Cargo.toml`, `Cargo.lock` | static core + build + test listing + `check-tests.sh` + `check-clippy.sh` + C1 + journeys + the task scenario |
 | judge / shared | `scripts/`, `deploy/`, `rsi/` (except the two data paths), `web/` config, toolchain | today's full gate (186 candidate jobs + base phase) |
 | unknown | anything else | full gate, `fail_closed: true` |
+
+The job lists above are each class's shape; under the policy's default
+(unsolved run) every narrow class also charges the one unsolved objective on
+this base (241): its two agreeing base runs (119.4 s) and its candidate run
+(59.2 s, packed into the C1 slots). That is why no narrow class is WITHIN
+180 s under the defaults (section 2.6).
 
 Protected paths are reported separately (`owner_review_required: true`). The
 selector does not decide the protected-path rule; `gate.sh` still refuses a
@@ -193,26 +213,30 @@ Command: `sh rsi/gate-impact/replay.sh` (raw output in
 | fixture | mode | selected | predicted | budget |
 | --- | --- | ---: | ---: | --- |
 | 243 `5e416443..865cc4df` | no mode flag: the policy's defaults (cache-only, unsolved run) | 6 | 349.2 s ¹ | OVER |
-| 243 | proposed (historical nightly, unsolved carried) | 5 | 229.8 s ¹ | OVER |
-| 243 | cache-only + carry (no check retired) | 5 | 229.8 s ¹ | OVER |
+| 243 | nightly retirement (approved, not installed), unsolved carried | 5 | 229.8 s ¹ | OVER |
+| 243 | cache-only + carry (no check retired; carry unratified) | 5 | 229.8 s ¹ | OVER |
 | 243 | strict cache, unsolved not carried | 6 | 349.2 s ¹ | OVER |
-| nightly-only (unit fixture) | proposed (historical nightly) | 4 | **131.0 s** ¹ | WITHIN |
-| nightly-only (unit fixture) | cache-only + carry (no check retired) | 4 | **131.0 s** ¹ | WITHIN |
-| 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 510.5 s | OVER |
-| 485 | today's checks + cache | 187 | 1277.1 s | OVER |
-| web-only (`web/src/cost.ts` on 865cc4df, real tree, profile 243) | no mode flag: the policy's defaults (cache-only, unsolved run) | 185 | 1101.4 s | OVER |
-| web-only (same real-tree change) | proposed (historical nightly) | 26 | 380.3 s | OVER |
-| web-only (unit fixture) | conservative journey keys | 14 | 330.9 s | OVER |
+| nightly-only (unit fixture and base 865cc4df) | no mode flag: the policy's defaults (cache-only, unsolved run) | 5 | **286.9 s** ¹ | **OVER** |
+| nightly-only (unit fixture and base 865cc4df) | nightly retirement (approved, not installed) | 4 | **131.0 s** ¹ | WITHIN |
+| nightly-only (unit fixture and base 865cc4df) | cache-only + carry (no check retired; carry unratified) | 4 | **131.0 s** ¹ | WITHIN |
+| 485 `865cc4df..33777df8` | nightly retirement + task 241 | 29 | 510.5 s ¹ | OVER |
+| 485 | today's checks + cache | 187 | 1277.1 s ¹ | OVER |
+| web-only (`web/src/cost.ts` on 865cc4df, real tree, profile 243) | no mode flag: the policy's defaults (cache-only, unsolved run) | 185 | 1101.4 s ¹ | OVER |
+| web-only (same real-tree change) | nightly retirement (approved, not installed) | 26 | 380.3 s ¹ | OVER |
+| web-only (unit fixture) | conservative journey keys | 14 | 330.9 s ¹ | OVER |
 | shared `337c94b5..2e8781ca` | full escalation | 186 | 1973.8 s | OVER |
 | unknown path (unit fixture) | fail-closed | all | 1973.8 s | OVER |
 | `build.rs` (unit fixture) | static trust | - | - | reject, exit 1 |
 | missing timing/policy/record | no verdict | - | - | exit 2 |
 
-The two real-tree web rows are a probe, not a `replay.sh` row: the selector
-was run against a throwaway clone of the mission history at 865cc4df with a
-`web/src/cost.ts` edit (profile 243), because the replay repository holds no
-such commit. The unit-fixture rows, including the 14-job web fixture, are the
-tests' temporary repository.
+The two real-tree web rows and the base-`865cc4df` half of the nightly-only
+rows are a probe, not a `replay.sh` row: the selector was run against a
+throwaway clone of the mission history at 865cc4df with a `web/src/cost.ts`
+or a `rsi/scenarios/nightly/023.sh` edit (profile 243), because the replay
+repository holds no such commit. The unit-fixture rows, including the 14-job
+web fixture and the nightly-only fixture, are the tests' temporary
+repository; the nightly-only numbers agree on both (4 selected /
+130.993 s and 5 / 286.908 s).
 
 ¹ **Depends on pending C15/C16/C19 wiring.** The gate seeds only solved
 objectives today (`scripts/rsi/gate.sh:4839`); the selector's hits on
@@ -220,34 +244,48 @@ checks, journeys and CI jobs are a prediction until the accepting gate
 seeds those results. The 25 such jobs in a narrow run are the build, the
 test listing, check-tests (when its key is unchanged), check-clippy,
 check-web, the eight non-C1 journeys and the twelve non-journey checks. No
-reader should take 131.0 s as an achieved landing yet.
+reader should take 131.0 s — or any ¹ row — as an achieved landing yet.
 
 The 243 pair is **not** 131.0 s, and the reviews of the first draft are why.
 243 edited `rsi/backlog/243.json`, and `cargo test` reads the backlog, so
 `check-tests.sh` is selected by its own key (184.8 s) in every mode. The
 honest 243-type number under the policy's own default (cache-only, unsolved
-run) is 349.2 s; the 229.8 s row needs either the proposed nightly retirement
-or the unratified carried `unsolved` result, and neither is installed. Both
-are over budget until test selection (C14, C15) is proven, and no key fix can
+run) is 349.2 s; the 229.8 s row needs either the approved-but-not-installed
+nightly retirement or the unratified carried `unsolved` result. Both are
+over budget until test selection (C14, C15) is proven, and no key fix can
 bring a backlog edit under 180 s while `check-tests` alone is 184.8 s.
 
 How the 131.0 s is made (a change that touches no key but a nightly data
-file, e.g. `rsi/scenarios/nightly/023.sh`):
+file, e.g. `rsi/scenarios/nightly/023.sh`; the skip account below is base
+`865cc4df`'s 186 jobs, and the 16-scenario unit fixture skips 17 with the
+same 4 selected and 130.993 s):
 
 - setup 45 s (measured, includes the static checks);
 - the four C1 journeys, longest-first on four slots: 85.993 s wall; their own
   time is 305.3 s, so the slots matter (run serially, 350 s);
 - nothing else runs: 186 jobs are skipped, with two different accounts that
-  give the same 4 selected and 131.0 s. Under the proposed retirement: 25
-  cache hits on check, journey and CI results, 159 historical objectives
-  skipped as `nightly-scope` (158 solved ones plus the unsolved 241, which
-  the retirement does not read), and the two task-only scenarios (`029.sh`,
-  `238.sh`). Under cache-only + carry, where no check is retired: 183 cache
+  give the same 4 selected and 131.0 s. Under the nightly retirement
+  (approved, not installed): 25 cache hits on check, journey and CI results,
+  159 historical objectives skipped as `nightly-scope` (158 solved ones plus
+  the unsolved 241, which the retirement does not read), and the two
+  task-only scenarios (`029.sh`, `238.sh`). Under cache-only + carry, where
+  no check is retired: 183 cache
   hits from the base's accepting gate (the 158 solved objectives and the 25
   check/journey/CI results), the 241 result carried as `unsolved` (not a
   pass), and the same two task-only jobs. Neither account is a claim that
   every skipped job recorded a pass; the first draft's "all 186 skipped jobs
   recorded a pass" was wrong.
+
+Under the policy's **own default** (cache-only, unsolved run) the same
+nightly-only change is **286.9 s and OVER** — 286.908 on the unit fixture
+and 286.9 on base `865cc4df`. Setup is 45.0 s; the base phase re-judges the
+unsolved 241 (two agreeing runs, 119.4 s); 241 also runs on the candidate
+(59.2 s), which lands in the shortest C1 slot and makes the parallel phase
+122.5 s; the other 185 jobs are skipped — 158 solved historical objectives
+and 25 check/journey/CI results as cache hits, plus the two task-only
+scenarios. The 131.0 s therefore needs the retirement or the carry, and
+neither is installed: **the class does not meet 180 s under the defaults
+either.**
 
 The table's 243 rows are the same landing under three policies, none under
 budget. **No check is retired in the cache-only + carry row**: its 185
@@ -270,7 +308,9 @@ twelve non-journey checks, and task 241 at 39.9 (one candidate run;
 The web class is deliberately conservative: the prototype keys every journey
 on rust + web + scripts, so a `web/src/` change re-runs the eight non-C1
 journeys too, and it runs check-tests (the `cost_page` test) and
-`check-j04-observe.sh` alone. On the real tree the class also runs the twelve
+`check-j04-observe.sh` alone; under the policy default `historical:107.sh`
+also runs alone (30.3 s, `rsi/scenarios/serial`), which is the default row's
+second serial job. On the real tree the class also runs the twelve
 non-journey `check-*` scenarios and, under the policy default, the 159
 historical objectives, because every scenario's key includes the web tree:
 26 jobs and 380.3 s under the nightly retirement, 185 jobs and 1101.4 s under
@@ -280,7 +320,10 @@ not the class's cost. Narrowing
 that needs the per-journey `depends_on` proof (C14); until then the selector
 over-selects in this class, which is the safe direction.
 
-Assumptions, all printed by the selector:
+Assumptions (printed by the selector: the base-record or no-record line, and
+the `--task-base-cached` caveat only when that flag is *not* used; the slot,
+setup and timing bullets below are this note's, and reach the output only as
+parts of the prediction line, never as assumptions):
 
 - the base record is the accepting gate's candidate passes, bound to exactly
   the base commit (a missing, empty or short commit is no verdict); the
@@ -320,6 +363,11 @@ Assumptions, all printed by the selector:
   totals.
 - `records/base-5e416443.json`, `records/base-865cc4df.json` — the accepting
   gates' candidate passes (the seed), plus the `unsolved` fact for 241.
+  **Both files were transcribed by hand from the two gate logs**: the gate
+  itself seeds only solved objectives today (`scripts/rsi/gate.sh:4839`), so
+  the check, journey and CI entries in these files are hand entries, not
+  gate-written, and the `source` field inside each file ("the gate's accepted
+  candidate") describes where the fact came from, not who wrote the file.
 - `test_gate_impact.py` — 26 tests on a temporary repository: narrow nightly,
   web and rust classes, carry/run, the policy defaults, README -> 008,
   backlog -> check-tests, web/src -> check-tests, the serial list, full
@@ -338,12 +386,16 @@ It runs no check, builds nothing, writes no cache, and is not wired into
 Confirmed:
 
 - A change that touches only a nightly data file predicts **131.0 s**: four
-  C1 journeys and 186 skipped jobs. It is a prediction, not an achieved
-  landing: the seed wiring in the footnote is not installed, and the 131.0 s
-  figure is the same under the proposed nightly retirement and under
-  cache-only + carry. The nightly row therefore depends on the retirement
-  (the 159 historical objectives are skipped, not carried), and the carry
-  row on the carried `unsolved` rule; neither is installed.
+  C1 journeys and 186 skipped jobs. That number is the retirement/carry
+  figure only: under the policy's **own default** (cache-only, unsolved run)
+  the same change is **286.9 s and OVER** — the base re-judges the unsolved
+  241 (two agreeing runs, 119.4 s) and 241 runs on the candidate (59.2 s,
+  122.5 s parallel with the C1 journeys). 131.0 s is the same under the
+  nightly retirement (approved, not installed) and under cache-only + carry
+  (carry unratified). Either way it is a prediction, not an achieved landing:
+  the seed wiring in the footnote is not installed. The nightly row depends
+  on the retirement (the 159 historical objectives are skipped, not carried),
+  and the carry row on the carried `unsolved` rule.
 - The specific cause of the 1973 s 243 landing is the nightly file in the
   landing cache key, not the number of scenarios.
 - Unknown impact and a missing dependency fail closed: full gate or no
@@ -356,10 +408,13 @@ Refuted:
   243-type prediction is 349.2 s under the policy's own default (229.8 s only
   with the nightly retirement or the carried `unsolved`), over budget.
 - "Cache alone is enough." Strict cache-only with the one unsolved objective
-  on main costs 349.2 s, over the budget. The 229.8 s needs a carried
-  `unsolved` result; the retirement alone does not remove check-tests.
-- "A Rust change fits in 180 s." It does not: 510.5 s under the proposed
-  policy, 1277.1 s under today's checks. check-tests alone is 184.8 s.
+  on main costs 349.2 s, over the budget. The 229.8 s needs **either** the
+  approved-but-not-installed retirement **or** the unratified carried
+  `unsolved` result: retirement only, with no carry, measures 229.8 s too.
+  The retirement does not remove check-tests, so it is still over budget.
+- "A Rust change fits in 180 s." It does not: 510.5 s under the nightly
+  retirement (approved, not installed), 1277.1 s under today's checks.
+  check-tests alone is 184.8 s and runs the whole suite.
 - "A web change fits under conservative keys." On the real tree it is
   380.3 s under the retirement and 1101.4 s under the policy default, not the
   14-job unit fixture's 330.9 s, and check-tests must run for `cost.ts`.
@@ -370,12 +425,12 @@ Refuted:
 
 Under the proposed policy the landing does not prove: the changed nightly
 assertion (023/025/013/032/036), the retired objective scenarios, or the
-real-time holds 192/209. Those are the nightly's job under the approved
-Decision 1; a red nightly marks main red, bisects and holds landings (C11,
-C18). The change's own nightly assertion is verified within a day, not before
-its landing. That is the accepted trade-off, and it is not hidden: the
-selector prints every such skip with `nightly-scope` and the install is
-pending.
+real-time holds 192/209. Those are the nightly's job under design-gate-v2
+Decision 1 (approved, not installed); a red nightly marks main red, bisects
+and holds landings (C11, C18). The change's own nightly assertion is verified
+within a day, not before its landing. That is the accepted trade-off, and it
+is not hidden: the selector prints every such skip with `nightly-scope` and
+the install is pending.
 
 The reviews of the first draft also found the opposite error in this
 section: three keys were unproven *downward* and one record rule failed
@@ -397,12 +452,13 @@ which was the bug.
 2. **Owner: approve the landing-key fix** that excludes
    `rsi/scenarios/nightly/` from the base-key material, with a test. This is
    a change to `scripts/rsi/gate.sh` (protected).
-3. **Owner: decide the unsolved result.** Either install the approved
-   design-gate-v2 Decision 1 retirement, or extend the accepting gate's seed
-   to carry an `unsolved` result whose declared inputs are identical in base
-   and candidate. The gate's existing reuse rule already refuses a scenario
-   that declares nothing (`# reads:`), so 241 would need that declaration and
-   its proof. The strict-cache rows are the cost of doing neither.
+3. **Owner: decide the unsolved result.** Either install the design-gate-v2
+   Decision 1 retirement (approved, not installed), or extend the accepting
+   gate's seed to carry an `unsolved` result whose declared inputs are
+   identical in base and candidate. The gate's existing reuse rule already
+   refuses a scenario that declares nothing (`# reads:`), so 241 would need
+   that declaration and its proof. The strict-cache rows are the cost of
+   doing neither.
 4. **Two independent reviews** of the selector, the class split and every
    protected-file diff, then the owner's protected landing path. The first
    pair returned FIX; this revision answers both, and a fresh pair is
@@ -417,8 +473,12 @@ which was the bug.
 7. **Install behind a flag, measure on real landings, then switch.** No live
    `gate.sh` swap in task 490; no check retired; no scenario folded without
    C9's mutant proofs.
-8. **If Rust changes are to meet 180 s**, select tests per crate with the
-   C14/C15 proofs. That is not in this prototype and is not claimed.
+8. **Rust changes cannot meet 180 s without splitting the test run.**
+   `check-tests` is one 184.8 s job that runs the whole suite, so any split is
+   a C14/C15 change to what that job runs, not a selection tuning. Per-crate
+   selection is one possible split and is a guess: it is not measured (a
+   large crate may still exceed 180 s), it is not in this prototype, and it
+   is not claimed.
 
 ## 9. Open questions
 

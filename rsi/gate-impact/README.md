@@ -39,9 +39,9 @@ a missing record file, or a selected job with no measured time); `3`
 Useful switches:
 
 - `--historical-mode cache-only` (the policy's default) / `nightly`: nightly
-  is the proposed design-gate-v2 Decision 1 retirement of the historical
-  objectives and the 192/209 holds, and is never chosen by default; it
-  needs the owner's switch. Cache-only is today's checks with
+  is the design-gate-v2 Decision 1 retirement of the historical objectives
+  and the 192/209 holds — approved but not installed — and is never chosen by
+  default; it needs the owner's switch. Cache-only is today's checks with
   content-addressed results only.
 - `--unsolved-mode run` (the policy's default) / `carry`: run charges the
   base's two agreeing runs for an unchanged, unsolved objective; carry
@@ -61,7 +61,7 @@ Useful switches:
 | `gate_impact.py` | the selector |
 | `policy.json` | policy version 1: classes, jobs, C1 set, scenario inputs, serial list, mode defaults, nightly notes |
 | `timings.json` | own times from the 243 and 485 gate logs, serial times, base runs, measured full-gate totals |
-| `records/base-*.json` | the accepting gates' candidate passes (the seed), plus the `unsolved` fact for 241 |
+| `records/base-*.json` | the accepting gates' candidate passes (the seed), plus the `unsolved` fact for 241 — transcribed by hand from the two gate logs, because the gate seeds only solved objectives today (`scripts/rsi/gate.sh:4839`), so the check, journey and CI entries are hand entries |
 | `test_gate_impact.py` | 26 self-contained tests on a temporary repository |
 | `replay.sh` | the dry-run replay against the local mission mirror |
 | `evidence/` | the replay and test output of 2026-11-22 |
@@ -73,7 +73,8 @@ python3 rsi/gate-impact/test_gate_impact.py
 ```
 
 They build a temporary repository with the real path shapes, use the real
-policy and timings, and check: a narrow nightly change (131.0 s), cache-only
+policy and timings, and check: a narrow nightly change (131.0 s under the
+retirement/carry; 286.9 s, OVER, under the policy's own defaults), cache-only
 with and without the unsolved carry, the policy's own defaults, a README
 edit selecting scenario 008, a backlog edit selecting check-tests, a
 `web/src` edit selecting check-tests, the serial scenario charged alone, a
@@ -98,9 +99,13 @@ diff.
 The 131.0 s row is a change that touches only a nightly data file, and it is
 a prediction, not an achieved landing: the gate seeds only solved objectives
 today, so hits on checks, journeys and CI jobs depend on the pending
-C15/C16/C19 wiring. The measured 243 change also edited `rsi/backlog/243.json`,
-and `cargo test` reads the backlog, so `check-tests.sh` (184.8 s) runs and
-the honest 243-type number is 349.2 s under the policy's own default
-(cache-only, unsolved run), or 229.8 s only with the unapproved nightly
-retirement or the unratified carried `unsolved`; both are over budget.
+C15/C16/C19 wiring. It is also the retirement/carry number only: under the
+policy's own default (cache-only, unsolved run) the same change predicts
+**286.9 s and is OVER**, because the base re-judges the unsolved 241 and 241
+runs on the candidate. The measured 243 change also edited
+`rsi/backlog/243.json`, and `cargo test` reads the backlog, so
+`check-tests.sh` (184.8 s) runs and the honest 243-type number is 349.2 s
+under the policy's own default (cache-only, unsolved run), or 229.8 s only
+with the approved-but-not-installed nightly retirement or the unratified
+carried `unsolved`; both are over budget.
 `docs/gate-impact-policy.md` section 4 carries the full table.

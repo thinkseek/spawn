@@ -218,8 +218,8 @@ class SelectorTest(unittest.TestCase):
 
     def test_defaults_follow_the_policy_not_the_least_conservative_mode(self):
         # No --historical-mode and no --unsolved-mode: both come from
-        # policy.json (cache-only, run), never the unapproved retirement or
-        # the unratified carry.
+        # policy.json (cache-only, run), never the approved-but-not-installed
+        # retirement or the unratified carry.
         code, res, err = run_selector(self.root, self.base, self.nightly_only,
                                       "--base-record", self.record,
                                       "--profile", "243")
@@ -228,7 +228,13 @@ class SelectorTest(unittest.TestCase):
         self.assertEqual(res["unsolved_mode"], "run")
         ids = {job["id"] for job in res["selected"]}
         self.assertIn("historical:241.sh", ids)
-        self.assertGreater(res["predicted"]["wall_seconds"], 180)
+        # The note's table row: 45.0 setup + 119.4 base (241's two agreeing
+        # runs) + 122.5 parallel (241 on the candidate beside the C1
+        # journeys) = 286.9 s, OVER. 131.0 s needs the retirement or carry.
+        self.assertEqual(len(res["selected"]), 5)
+        self.assertAlmostEqual(res["predicted"]["wall_seconds"], 286.9,
+                               places=1)
+        self.assertFalse(res["predicted"]["within_budget"])
 
     def test_readme_change_selects_scenario_008(self):
         # 008.sh greps the tree's README.md for the git floor; a README-only
@@ -264,6 +270,20 @@ class SelectorTest(unittest.TestCase):
         self.assertFalse(res["predicted"]["within_budget"])
         # The 243-type row is no longer 131 s: the backlog edit runs the tests.
         self.assertNotAlmostEqual(res["predicted"]["wall_seconds"], 131.0, places=1)
+        # Retirement only, no carry: 241 is skipped as nightly-scope, so the
+        # 45.0 setup + the 184.8 s check-tests makespan is 229.8 s, OVER.
+        # (The 349.2 s strict-cache number charges the base's two runs too.)
+        code, retired, err = run_selector(self.root, self.base, self.nightly,
+                                          "--base-record", self.record,
+                                          "--profile", "243",
+                                          "--historical-mode", "nightly",
+                                          "--unsolved-mode", "run")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("historical:241.sh",
+                         {job["id"] for job in retired["selected"]})
+        self.assertAlmostEqual(retired["predicted"]["wall_seconds"], 229.8,
+                               places=1)
+        self.assertFalse(retired["predicted"]["within_budget"])
 
     def test_web_change_selects_check_tests_which_reads_web_src(self):
         # crates/spawn-cli/tests/cost_page.rs runs node --test on
