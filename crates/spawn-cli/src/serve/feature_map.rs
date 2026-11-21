@@ -201,7 +201,7 @@ fn mission_row(mission: &Value, facts: &Facts) -> Value {
                     .to_lowercase()
                     .cmp(&text(&right["title"]).to_lowercase())
             })
-            .then_with(|| text(&left["id"]).cmp(&text(&right["id"])))
+            .then_with(|| text(&left["id"]).cmp(text(&right["id"])))
     });
     let covered: BTreeSet<u32> = specs
         .iter()
@@ -601,8 +601,8 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
             "id": row["id"], "title": row["title"], "status": row["status"]})).collect::<Vec<_>>(),
         "issues": links_json(&spec.issues),
         "prs": links_json(&spec.prs),
-        "owner": newest_in_flight.map(owner_json).unwrap_or(Value::Null),
-        "last_owner": newest_task.map(owner_json).unwrap_or(Value::Null),
+        "owner": newest_in_flight.map_or(Value::Null, owner_json),
+        "last_owner": newest_task.map_or(Value::Null, owner_json),
         "unowned": state != "live" && newest_in_flight.is_none(),
         "blocked": blocker,
         "gaps": gaps,
@@ -973,7 +973,7 @@ fn evidence_of(
     tasks: &[&Value],
 ) -> Value {
     let mut sorted: Vec<&Value> = tasks.to_vec();
-    sorted.sort_by(|left, right| task_key(right).cmp(&task_key(left)));
+    sorted.sort_by_key(|task| std::cmp::Reverse(task_key(task)));
     let total = sorted.len();
     let tasks: Vec<Value> = sorted
         .into_iter()
