@@ -171,6 +171,17 @@ def top_level_scenarios(repo, commit, scenarios_dir):
     return sorted(out)
 
 
+def read_list(repo, commit, path):
+    """One entry per non-empty, non-comment line of a gate list file."""
+    text = file_text(repo, commit, path) or ""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # policy
 
