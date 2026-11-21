@@ -8,8 +8,6 @@
 // capability that nobody verified is shown live with "never verified"
 // beside it, not quietly as verified.
 
-import { readApi } from "./api";
-
 export const STATES = ["planned", "implemented", "verified", "live"] as const;
 export type FeatureState = (typeof STATES)[number];
 
@@ -480,11 +478,6 @@ export function normalizeFeatureMap(value: unknown): FeatureMap {
     live_anchor: normalizeDeploy(raw.live_anchor),
     missions: list(raw.missions).map(normalizeMission),
   };
-}
-
-/** GET /api/features: every open objective mission's capability map. */
-export async function fetchFeatureMap(signal: AbortSignal): Promise<FeatureMap> {
-  return readApi("/api/features", signal, normalizeFeatureMap);
 }
 
 /** The capabilities in one column each, planned first; an unknown state is
