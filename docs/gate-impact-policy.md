@@ -376,7 +376,7 @@ which was the bug.
 
 ## 9. Open questions
 
-- Should the web class be 139 s (per-journey keys) or 257.6 s (conservative)?
+- Should the web class be 139 s (per-journey keys) or 330.9 s (conservative)?
   Only the C14 proof decides.
 - Does carrying an `unsolved` result need the base's two-run proof only, or
   two candidate runs on the new main too? Proposal: the base's two-run
