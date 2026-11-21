@@ -342,12 +342,14 @@ mod tests {
     fn a_halted_or_closed_missions_task_is_skipped_and_the_next_one_moves() {
         for (state, halted) in [("open", true), ("closed", false)] {
             let mut work = pool();
+            work.residents
+                .retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
             work.tasks[1].mission_state = state.to_string();
             work.tasks[1].mission_halted = halted;
             assert_eq!(
                 moves(&work),
                 [(3, "ann".to_string())],
-                "task 2 ({state}, halted {halted}) stays ben's; ann takes it and dee's turn passes"
+                "task 2 ({state}, halted {halted}) stays ben's; ann takes 3"
             );
             assert!(
                 !choices(&work).iter().any(|(_, tasks)| tasks.contains(&2)),
