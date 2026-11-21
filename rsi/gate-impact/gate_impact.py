@@ -327,7 +327,7 @@ def parse_protected(text):
 
 
 BUILD_SCRIPT = re.compile(r"(?m)^\s*build\s*=")
-PROC_MACRO = re.compile(r"(?m)^\s*proc-macro\s*=\s*true\s*$")
+PROC_MACRO = re.compile(r"(?m)^\s*proc-macro\s*=\s*true\b")
 
 
 def static_build_time(repo, candidate, paths):
