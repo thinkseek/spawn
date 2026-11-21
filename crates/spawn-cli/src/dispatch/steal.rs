@@ -337,10 +337,26 @@ mod tests {
 
     /// One halt does not stop its pool's stealing: a halted or closed
     /// mission's queued task stays its worker's, and the pool's next
-    /// stealable task goes instead.
+    /// stealable task goes instead. The states are the store's own: a
+    /// mission with queued work is `active`, and `done` and `dropped` are
+    /// what a closed one holds; a mission that is `active` and not halted
+    /// moves as before.
     #[test]
     fn a_halted_or_closed_missions_task_is_skipped_and_the_next_one_moves() {
-        for (state, halted) in [("open", true), ("closed", false)] {
+        let mut active = pool();
+        for task in &mut active.tasks {
+            task.mission_state = "active".to_string();
+        }
+        assert_eq!(
+            moves(&active),
+            [
+                (2, "ann".to_string()),
+                (3, "cid".to_string()),
+                (4, "dee".to_string())
+            ],
+            "every queued task of a mission that is active and not halted may move"
+        );
+        for (state, halted) in [("active", true), ("done", false), ("dropped", false)] {
             let mut work = pool();
             work.residents
                 .retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));

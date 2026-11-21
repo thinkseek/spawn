@@ -904,7 +904,8 @@ pub(crate) fn read_plan(
 /// Work stealing (objective 239), before the pass plans its deliveries:
 /// unless `SPAWN_WORK_STEALING` is 0, each idle pool member takes one queued
 /// task of a busy one ([`steal`]), each move or refusal said in `lines`;
-/// after any, the pass reads its facts and work again.
+/// after a move, and only a move, the pass reads its facts and work again
+/// (a refused try changed nothing).
 fn steal_first(
     store: &PostgresStore,
     waits: deliver::Waits,
