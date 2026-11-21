@@ -349,6 +349,14 @@ fn resolve(mission: &Value, given: &str) -> Result<PathBuf, String> {
     Ok(Path::new(backlog).join(path))
 }
 
+/// Check a mapping file at configure time (`spawn mission configure
+/// --features`), before the mission stores its path. `mission_id` is the
+/// mission being configured when the caller knows it, else 0: an
+/// `objective` source that names another mission is refused here too.
+pub(crate) fn validate_file(path: &Path, mission_id: i64) -> Result<(), String> {
+    read_mapping(path, mission_id).map(|_| ())
+}
+
 /// The mapping at `path`, checked. `mission_id` is the mission the file
 /// belongs to: an objective source may leave its mission out, and may not
 /// name another.

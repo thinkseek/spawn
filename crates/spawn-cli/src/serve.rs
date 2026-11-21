@@ -108,7 +108,7 @@
 mod answers;
 pub(crate) mod attention;
 pub(crate) mod core_lines;
-mod feature_map;
+pub(crate) mod feature_map;
 mod labels;
 mod storage;
 
