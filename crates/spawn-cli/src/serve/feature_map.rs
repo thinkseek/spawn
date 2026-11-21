@@ -1393,8 +1393,6 @@ mod tests {
         let _ = read_mapping(Path::new("/definitely/not/here"));
     }
 
-    use std::path::Path;
-
     /// The whole answer carries the seconds and the deploy it stands on.
     #[test]
     fn the_answer_says_which_deploy_it_stands_on() {
