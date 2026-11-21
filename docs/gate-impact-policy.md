@@ -248,11 +248,13 @@ class, which is the safe direction.
 
 Assumptions, all printed by the selector:
 
-- the base record is the accepting gate's candidate passes for the base
-  commit, seeded into the new main as the gate already does for solved
-  objectives (C16); candidate runs of a later tree are never read;
-- four scenario slots, longest-first (the gate's order); setup includes the
-  static checks; no host noise;
+- the base record is the accepting gate's candidate passes, bound to exactly
+  the base commit (a missing, empty or short commit is no verdict); the
+  checks/journeys/CI seed needs the pending C16 wiring, which exists today
+  only for solved objectives; candidate runs of a later tree are never read;
+- four scenario slots, longest-first (the gate's order), except the
+  scenarios `rsi/scenarios/serial` runs alone; setup includes the static
+  checks; no host noise;
 - the timings are one measured run each (243 and 485) on this host; a
   different host or toolchain needs its own profile, and a missing time is
   no verdict.
@@ -261,23 +263,30 @@ Assumptions, all printed by the selector:
 
 `rsi/gate-impact/` is bounded and read-only:
 
-- `select.py` — the selector. Given `--repo`, `--base`, `--candidate`, it
-  prints the policy version and digest, the changed paths and classes, the
-  content keys (static, rust, web, scripts, per job), every selected and
-  skipped job with a reason and a key, the approval digest, and the
-  predicted wall clock against 180 s. Exit codes: 0 selection, 1 static
-  reject, 2 no verdict, 3 `--require-narrow` not met.
-- `policy.json` — policy version 1: the classes, jobs, C1 set, nightly notes
-  and the non-goals.
+- `gate_impact.py` — the selector (named so it cannot shadow the standard
+  library's `select` module on sys.path[0]). Given `--repo`, `--base`,
+  `--candidate`, it prints the policy version and digest, the changed paths
+  and classes, the content keys (static, rust, web, scripts, backlog,
+  readme, per job), every selected and skipped job with a reason and a key,
+  the approval digest, and the predicted wall clock against 180 s. Exit
+  codes: 0 selection, 1 static reject, 2 no verdict (including malformed
+  policy, negative slots, a base the candidate does not descend from, and a
+  record that does not name exactly the base), 3 `--require-narrow` not met.
+- `policy.json` — policy version 1: the classes, jobs, C1 set, scenario
+  inputs, serial list, mode defaults and the non-goals.
 - `timings.json` — the measured own times from the 243 and 485 gate logs, the
   serial build/listing times, the base-run times, and the measured full-gate
   totals.
 - `records/base-5e416443.json`, `records/base-865cc4df.json` — the accepting
   gates' candidate passes (the seed), plus the `unsolved` fact for 241.
-- `test_select.py` — 13 tests on a temporary repository: narrow nightly, web
-  and rust classes, carry/run, full escalation, unknown path, build.rs,
-  unknown policy version, missing timing, wrong base record, the approval
-  digest, and a no-change diff.
+- `test_gate_impact.py` — 26 tests on a temporary repository: narrow nightly,
+  web and rust classes, carry/run, the policy defaults, README -> 008,
+  backlog -> check-tests, web/src -> check-tests, the serial list, full
+  escalation, unknown path, nested build.rs/.cargo, a proc-macro with a
+  trailing comment, protected prefixes, a subdirectory `--repo`, ancestry,
+  unknown policy version, malformed policy, negative slots, missing timing,
+  missing/empty/short/wrong base record, a cache miss with no record, the
+  approval digest bound to the candidate, and a no-change diff.
 - `replay.sh`, `evidence/` — the runs in section 4.
 
 It runs no check, builds nothing, writes no cache, and is not wired into
