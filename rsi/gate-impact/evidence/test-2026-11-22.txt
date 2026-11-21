@@ -1,18 +1,32 @@
-test_approval_is_bound_to_the_candidate (__main__.SelectorTest.test_approval_is_bound_to_the_candidate) ... ok
+# python3 rsi/gate-impact/test_gate_impact.py
+test_approval_is_bound_to_the_candidate_not_the_selection (__main__.SelectorTest.test_approval_is_bound_to_the_candidate_not_the_selection) ... ok
+test_backlog_change_selects_check_tests (__main__.SelectorTest.test_backlog_change_selects_check_tests) ... ok
 test_base_record_for_another_commit_is_no_verdict (__main__.SelectorTest.test_base_record_for_another_commit_is_no_verdict) ... ok
-test_build_time_code_is_refused (__main__.SelectorTest.test_build_time_code_is_refused) ... ok
+test_base_record_without_a_commit_is_no_verdict (__main__.SelectorTest.test_base_record_without_a_commit_is_no_verdict) ... ok
+test_base_that_is_not_an_ancestor_is_no_verdict (__main__.SelectorTest.test_base_that_is_not_an_ancestor_is_no_verdict) ... ok
+test_cache_hit_needs_a_recorded_result (__main__.SelectorTest.test_cache_hit_needs_a_recorded_result) ... ok
 test_cache_only_carries_an_unsolved_objective (__main__.SelectorTest.test_cache_only_carries_an_unsolved_objective) ... ok
 test_cache_only_without_carry_pays_the_base_and_misses_budget (__main__.SelectorTest.test_cache_only_without_carry_pays_the_base_and_misses_budget) ... ok
+test_defaults_follow_the_policy_not_the_least_conservative_mode (__main__.SelectorTest.test_defaults_follow_the_policy_not_the_least_conservative_mode) ... ok
+test_malformed_policy_is_no_verdict_not_a_reject (__main__.SelectorTest.test_malformed_policy_is_no_verdict_not_a_reject) ... ok
+test_missing_record_file_is_no_verdict (__main__.SelectorTest.test_missing_record_file_is_no_verdict) ... ok
 test_missing_timing_is_no_verdict (__main__.SelectorTest.test_missing_timing_is_no_verdict) ... ok
+test_negative_slots_are_no_verdict (__main__.SelectorTest.test_negative_slots_are_no_verdict) ... ok
+test_nested_build_time_code_is_refused (__main__.SelectorTest.test_nested_build_time_code_is_refused) ... ok
 test_nightly_change_is_narrow_and_under_budget (__main__.SelectorTest.test_nightly_change_is_narrow_and_under_budget) ... ok
 test_no_change_is_no_verdict (__main__.SelectorTest.test_no_change_is_no_verdict) ... ok
+test_proc_macro_with_a_trailing_comment_is_refused (__main__.SelectorTest.test_proc_macro_with_a_trailing_comment_is_refused) ... ok
+test_protected_matching_is_the_gates_prefix_rule (__main__.SelectorTest.test_protected_matching_is_the_gates_prefix_rule) ... ok
+test_readme_change_selects_scenario_008 (__main__.SelectorTest.test_readme_change_selects_scenario_008) ... ok
 test_rust_change_runs_tests_and_cannot_meet_the_budget (__main__.SelectorTest.test_rust_change_runs_tests_and_cannot_meet_the_budget) ... ok
+test_serial_scenario_is_charged_alone_like_the_gate (__main__.SelectorTest.test_serial_scenario_is_charged_alone_like_the_gate) ... ok
 test_shared_change_escalates_to_the_full_gate (__main__.SelectorTest.test_shared_change_escalates_to_the_full_gate) ... ok
+test_subdirectory_repo_still_sees_the_scenarios (__main__.SelectorTest.test_subdirectory_repo_still_sees_the_scenarios) ... ok
 test_unknown_path_fails_closed_to_the_full_gate (__main__.SelectorTest.test_unknown_path_fails_closed_to_the_full_gate) ... ok
 test_unknown_policy_version_is_no_verdict (__main__.SelectorTest.test_unknown_policy_version_is_no_verdict) ... ok
-test_web_change_is_narrow_but_conservative_keys_exceed_budget (__main__.SelectorTest.test_web_change_is_narrow_but_conservative_keys_exceed_budget) ... ok
+test_web_change_selects_check_tests_which_reads_web_src (__main__.SelectorTest.test_web_change_selects_check_tests_which_reads_web_src) ... ok
 
 ----------------------------------------------------------------------
-Ran 13 tests in 0.985s
+Ran 26 tests in 1.196s
 
 OK
