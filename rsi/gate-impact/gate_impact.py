@@ -504,10 +504,11 @@ def select(opts):
             parts["blob"] = scenario_blob
         return key_for(version, env, parts)
 
-    base_tree_keys = {"rust": base_keys["rust"], "web": base_keys["web"],
-                      "scripts": base_keys["scripts"]}
-    cand_tree_keys = {"rust": keys["rust"], "web": keys["web"],
-                      "scripts": keys["scripts"]}
+    base_tree_keys = {name: base_keys[name] for name in
+                      ("rust", "web", "scripts", "backlog", "readme")}
+    cand_tree_keys = {name: keys[name] for name in
+                      ("rust", "web", "scripts", "backlog", "readme")}
+    scenario_inputs = policy.get("scenario_inputs") or {}
 
     def decide(job_id, kind, tree_key_names, name, always=False):
         cand_parts = {k: cand_tree_keys[k] for k in tree_key_names}
