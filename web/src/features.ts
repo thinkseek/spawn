@@ -532,7 +532,10 @@ export function gapText(gap: FeatureGap, mission: number): string {
 /** A source's short name: `Objective 4/003`, `Issue #63`, `Owner request`. */
 export function sourceLabel(source: FeatureSource): string {
   const reference = source.ref;
-  const number = /^(\d+)$/.exec(reference)?.[1] ?? null;
+  const bare = reference.startsWith(`${source.kind}:`)
+    ? reference.slice(source.kind.length + 1)
+    : reference;
+  const number = /^\d+$/.test(bare) ? bare : null;
   switch (source.kind) {
     case "objective":
       return `Objective ${reference.replace(/^objective:/, "")}`;
@@ -545,17 +548,13 @@ export function sourceLabel(source: FeatureSource): string {
     case "deploy":
       return `Deploy #${reference.replace(/^deploy:/, "")}`;
     case "issue":
-      return number ? `Issue #${number}` : `Issue ${reference.replace(/^issue:/, "")}`;
+      return number ? `Issue #${number}` : `Issue ${bare}`;
     case "pr":
-      return number ? `PR #${number}` : `PR ${reference.replace(/^pr:/, "")}`;
+      return number ? `PR #${number}` : `PR ${bare}`;
     case "request":
       return "Owner request";
-    default: {
-      const bare = reference.startsWith(`${source.kind}:`)
-        ? reference.slice(source.kind.length + 1)
-        : reference;
+    default:
       return `${source.kind} ${bare}`;
-    }
   }
 }
 
