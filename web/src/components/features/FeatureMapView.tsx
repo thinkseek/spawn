@@ -1,10 +1,7 @@
 import {
   ArrowUpRight,
   ExternalLink,
-  GitCommitHorizontal,
   OctagonAlert,
-  Rocket,
-  ShieldCheck,
   UserRoundX,
 } from "lucide-react";
 import { useState } from "react";
@@ -14,7 +11,6 @@ import { absoluteTitle, clockTime, relativeTime } from "../../format";
 import { freshAt } from "../../validated";
 import type {
   Feature,
-  FeatureDeploy,
   FeatureLanding,
   FeatureMission,
   FeatureSource,
@@ -23,6 +19,7 @@ import type {
 import {
   blockerText,
   deployNote,
+  fetchFeatureMap,
   gapText,
   groupByState,
   isExternal,
@@ -32,7 +29,7 @@ import {
   sourceLabel,
   verificationNote,
 } from "../../features";
-import { Card, Eyebrow, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
+import { Card, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
 
 interface FeatureMapViewProps {
   /** Open a task's session timeline: the evidence behind a capability. */
@@ -43,7 +40,7 @@ interface FeatureMapViewProps {
  * verified and live, each with the records that say so. The states are the
  * server's, derived from Spawn's log; this page only lays them out. */
 export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
-  const poll = usePoll("features", fetch, 4_000, { checked: true });
+  const poll = usePoll("features", fetchFeatureMap, 4_000, { checked: true });
   const [chosen, setChosen] = useState<number | null>(null);
   const data = poll.data;
   const mission =
@@ -155,10 +152,6 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
       )}
     </main>
   );
-}
-
-function fetch(signal: AbortSignal) {
-  return import("../../features").then((module) => module.fetchFeatureMap(signal));
 }
 
 function MissionBlocker({ mission }: { mission: FeatureMission }) {
@@ -338,7 +331,7 @@ function FeatureCard({
           ) : null}
         </dd>
         <dt className="text-faint-foreground">deployed</dt>
-        <dd className="min-w-0 truncate text-foreground" title={deployTitle(feature.evidence.deploy)}>
+        <dd className="min-w-0 truncate text-foreground" title={deployTitle(feature.evidence.deploy ?? feature.evidence.last_deploy)}>
           {deployNote(feature)}
         </dd>
         {newest && (
@@ -376,7 +369,7 @@ function OwnerLine({
   const owner = feature.owner;
   const last = feature.last_owner;
   const session = owner?.session_id ?? last?.session_id ?? null;
-  const theText = ownerText(owner) ?? (last ? `last: ${ownerText(last)}` : null);
+  const theText = ownerText(owner) ?? (last ? `last: ${ownerText(last) ?? ""}` : null);
   if (theText === null) {
     return <p className="text-micro text-faint-foreground">no task yet</p>;
   }
@@ -481,34 +474,4 @@ function deployTitle(deploy: FeatureDeploy | null): string | undefined {
   ]
     .filter(Boolean)
     .join("\n");
-}
-
-/** A deploy as a one-line chip (the mission header's live anchor). */
-export function DeployBadge({ deploy }: { deploy: FeatureDeploy | null }) {
-  if (!deploy) return null;
-  return (
-    <span
-      title={deployTitle(deploy)}
-      className={cx(
-        "inline-flex items-center gap-1 rounded-chip px-1.5 py-px text-micro",
-        deploy.ok ? "bg-ok-tint text-success" : "bg-fail-tint text-destructive",
-      )}
-    >
-      {deploy.ok ? <Rocket size={10} /> : <GitCommitHorizontal size={10} />}
-      {deploy.head ? deploy.head.slice(0, 10) : "deploy"}
-      <span className="text-faint-foreground">{absoluteTitle(deploy.at_ms)}</span>
-    </span>
-  );
-}
-
-/** A shield for a capability that is live and verified (the card's badge
- * helper, kept exported for tests of the page's vocabulary). */
-export function VerifiedShield({ live }: { live: boolean }) {
-  return (
-    <ShieldCheck
-      size={11}
-      className={live ? "text-success" : "text-muted-foreground"}
-      aria-hidden="true"
-    />
-  );
 }
