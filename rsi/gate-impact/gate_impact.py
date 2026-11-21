@@ -712,6 +712,14 @@ def select(opts):
         measured_candidate = 0.0
         serial_seconds = 0.0
         if decision == "narrow":
+            # rsi/scenarios/serial (read at the base, as the controller does):
+            # a listed scenario runs with nothing else of the gate beside it,
+            # so its time is added whole, not packed into the four slots.
+            serial_names = set(read_list(repo, base, policy["serial_list"]))
+            for job in result.selected:
+                if job["kind"] == "parallel" and job.get("scenario") in serial_names:
+                    job["kind"] = "serial"
+                    job["why"] += " (serial: the gate runs it alone)"
             for job in result.selected:
                 if job["kind"] == "serial":
                     serial_seconds += job["seconds"]
