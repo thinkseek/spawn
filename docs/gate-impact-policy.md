@@ -153,8 +153,9 @@ does not prove and the nightly owner of each such fact.
 The target covers selection, the necessary build/listing, and every check the
 policy requires for that change class. It does not apply to the full or
 escalated gate and it does not apply to nightly. There is no universal
-3-minute SLA: the numbers in section 4 show three classes that cannot meet
-it under today's checks.
+3-minute SLA: the numbers in section 4 show four classes that cannot meet
+it under today's checks, including the measured 243-type change once
+check-tests is keyed on the backlog.
 
 ## 3. Change classes
 
