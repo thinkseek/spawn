@@ -1,17 +1,16 @@
 # gate-impact dry run
-# date: 2026-11-21T16:52:27Z
+# date: 2026-11-21T20:20:22Z
 # host: spawn
 # mirror: /home/ckl/.local/share/spawn-rsi/missions/spawn.git
-# policy: /home/ckl/.local/share/spawn-rsi/ws/agent_worker_gate_impact_490/rsi/gate-impact/policy.json
+# policy: /home/ckl/.local/share/spawn-rsi/ws/agent_worker_gate_impact_fix_493/rsi/gate-impact/policy.json
 
-
-### 243 proposed: historical objectives nightly, unsolved carried
+### 243 with no mode flag: the policy's own defaults (cache-only, unsolved run)
 gate-impact selector: impact-based landing slice (prototype, dry-run only)
-policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
 base          5e416443d48c5639456ecb377ae4f214ec05c11c
 candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
 candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
-approval      sha256:64c8dc3a217a7382e9bba346abbf4a1a08d1dae3b6b63ff040c11bf712412fab
+approval      sha256:ee6c45448615ea8cd1b0d02d39df760b3e63718f85622e70370920edbfadbca6
               bind any approval to this digest; a new candidate changes it
 decision      narrow
 changed       2 path(s)
@@ -23,121 +22,894 @@ keys
   rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
   web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
   scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
-selected      4 job(s)
-  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
-  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
-  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
-  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
-skipped (186):
-  [25] cache-hit
-  [159] nightly-scope
-  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
-  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
-predicted     131.0 s = setup 45.0 + base 0.0 + serial 0.0 + parallel 86.0  [setup + base + serial + longest-first on 4 slots (profile 243)]
-budget        180 s -> WITHIN
-assumptions
-  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
-  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
-
-
-### 243 cache-only plus carry: no check retired, content-addressed results
-gate-impact selector: impact-based landing slice (prototype, dry-run only)
-policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
-base          5e416443d48c5639456ecb377ae4f214ec05c11c
-candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
-candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
-approval      sha256:40da3f276b4b4247496f0b796f7e9638d5d6d8e9014631373728c99630b06ff0
-              bind any approval to this digest; a new candidate changes it
-decision      narrow
-changed       2 path(s)
-  rsi/backlog/243.json                       nightly-only    protected
-  rsi/scenarios/nightly/023.sh               nightly-only    protected
-owner review  required (protected paths changed)
-keys
-  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
-  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
-  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
-  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
-selected      4 job(s)
-  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
-  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
-  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
-  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
-skipped (186):
-  [183] cache-hit
-  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
-  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
-  historical:241.sh                            carried: unsolved on base, inputs unchanged key 4cbb71fe50ba4d87
-predicted     131.0 s = setup 45.0 + base 0.0 + serial 0.0 + parallel 86.0  [setup + base + serial + longest-first on 4 slots (profile 243)]
-budget        180 s -> WITHIN
-assumptions
-  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
-  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
-
-
-### 243 strict cache: an uncarried unsolved objective is re-judged
-gate-impact selector: impact-based landing slice (prototype, dry-run only)
-policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
-base          5e416443d48c5639456ecb377ae4f214ec05c11c
-candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
-candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
-approval      sha256:30091b9fc2400ad64957b72d6403a05d87259ff588df06b4d91e3ede91e09147
-              bind any approval to this digest; a new candidate changes it
-decision      narrow
-changed       2 path(s)
-  rsi/backlog/243.json                       nightly-only    protected
-  rsi/scenarios/nightly/023.sh               nightly-only    protected
-owner review  required (protected paths changed)
-keys
-  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
-  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
-  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
-  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
-selected      5 job(s)
+  backlog  sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  base sha256:981fbdc8ca3219b3123bf572dcae91e409d05a350bd1d3b5aeb137aefb521846  CHANGED
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
+selected      6 job(s)
+  check-tests.sh                               input-changed       184.793s  key e3972a261e27eb88
   journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
   journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
   journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
   journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
   historical:241.sh                            cache-miss: unsolved base result is not carried (--unsolved-mode run)   59.202s  key 4cbb71fe50ba4d87
-skipped (185):
-  [183] cache-hit
+skipped       184 job(s)
+  rust-build                                   cache-hit on base 5e416443 key 8ad34813b86602eb
+  test-listing                                 cache-hit on base 5e416443 key df484acecd7a8345
+  check-clippy.sh                              cache-hit on base 5e416443 key 2e4ba03a6482c7e7
+  check-web.sh                                 cache-hit on base 5e416443 key 4d4759410b45de66
+  journey:check-j02-lands.sh                   cache-hit on base 5e416443 key cf7cd430680b858c
+  journey:check-j04-observe.sh                 cache-hit on base 5e416443 key 8051af3489dd2d49
+  journey:check-j05-operator.sh                cache-hit on base 5e416443 key 1124a233105f03d4
+  journey:check-j08-stuck.sh                   cache-hit on base 5e416443 key 297e2df2ea786573
+  journey:check-j09-stall-cancel.sh            cache-hit on base 5e416443 key 31c1610386ae0ee1
+  journey:check-j10-verdicts.sh                cache-hit on base 5e416443 key 6e12b4fc1bd52a05
+  journey:check-j11-push-drain.sh              cache-hit on base 5e416443 key b8b44b73c1283a42
+  journey:check-j12-hold-told.sh               cache-hit on base 5e416443 key 2ae30d97223a3618
+  historical:007.sh                            cache-hit on base 5e416443 key cf2157b053ec2d55
+  historical:008.sh                            cache-hit on base 5e416443 key 9bc0d7569e198d18
+  historical:017.sh                            cache-hit on base 5e416443 key 88818ed04a2a804f
   historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:034.sh                            cache-hit on base 5e416443 key f05e2d7e8b4c3f5e
+  historical:035.sh                            cache-hit on base 5e416443 key d8dcb8dc96109e9d
+  historical:037.sh                            cache-hit on base 5e416443 key 8915bc81a7e5a42a
+  historical:039.sh                            cache-hit on base 5e416443 key 09d271d56c8b5e55
+  historical:040.sh                            cache-hit on base 5e416443 key 56f2766464e2fc8d
+  historical:041.sh                            cache-hit on base 5e416443 key a8934bf81da9b619
+  historical:042.sh                            cache-hit on base 5e416443 key 6491d10781cd8566
+  historical:043.sh                            cache-hit on base 5e416443 key 63b7373064feccfb
+  historical:044.sh                            cache-hit on base 5e416443 key 23de17ce30c5be63
+  historical:045.sh                            cache-hit on base 5e416443 key 8a285c4c94eed18f
+  historical:046.sh                            cache-hit on base 5e416443 key 5ff4b216e465472c
+  historical:047.sh                            cache-hit on base 5e416443 key a921aa9d63f6ae69
+  historical:048.sh                            cache-hit on base 5e416443 key b2b70a0751f48254
+  historical:049.sh                            cache-hit on base 5e416443 key 4e2b3cea9c7ee12c
+  historical:050.sh                            cache-hit on base 5e416443 key bd180889b0643196
+  historical:051.sh                            cache-hit on base 5e416443 key c1709221e0004133
+  historical:052.sh                            cache-hit on base 5e416443 key 541051f045f0581f
+  historical:053.sh                            cache-hit on base 5e416443 key 7975decc57c5120d
+  historical:056.sh                            cache-hit on base 5e416443 key beaf5c9d612c260a
+  historical:057.sh                            cache-hit on base 5e416443 key 4baad33c204ee209
+  historical:058.sh                            cache-hit on base 5e416443 key dd594eb547492a7c
+  historical:059.sh                            cache-hit on base 5e416443 key 54e207632e2c4a37
+  historical:060.sh                            cache-hit on base 5e416443 key aa0658678bb68109
+  historical:061.sh                            cache-hit on base 5e416443 key 0e52ffbee6f92b78
+  historical:062.sh                            cache-hit on base 5e416443 key 694c3097cb954132
+  historical:063.sh                            cache-hit on base 5e416443 key 2c9d0b5fb3de695c
+  historical:064.sh                            cache-hit on base 5e416443 key bbdffaa881a5e645
+  historical:065.sh                            cache-hit on base 5e416443 key 7bb94220217f3210
+  historical:066.sh                            cache-hit on base 5e416443 key 3de078138de48207
+  historical:067.sh                            cache-hit on base 5e416443 key b53be3c9dcde12d0
+  historical:068.sh                            cache-hit on base 5e416443 key e5afdf65e61df9aa
+  historical:069.sh                            cache-hit on base 5e416443 key 23c10499d6fbec80
+  historical:070.sh                            cache-hit on base 5e416443 key 1cbb0339cbdc9222
+  historical:071.sh                            cache-hit on base 5e416443 key 3e764c63698d150b
+  historical:072.sh                            cache-hit on base 5e416443 key 894cec82899964f0
+  historical:073.sh                            cache-hit on base 5e416443 key ca063433a82fff03
+  historical:074.sh                            cache-hit on base 5e416443 key 991e4936b9105da1
+  historical:075.sh                            cache-hit on base 5e416443 key 565a62b9a65d6970
+  historical:076.sh                            cache-hit on base 5e416443 key 559062496fe4910c
+  historical:077.sh                            cache-hit on base 5e416443 key f2ae7177031a2592
+  historical:078.sh                            cache-hit on base 5e416443 key a4d31f0d34205818
+  historical:079.sh                            cache-hit on base 5e416443 key 764d36381bd28dd8
+  historical:080.sh                            cache-hit on base 5e416443 key c63f3541c9a7ee12
+  historical:081.sh                            cache-hit on base 5e416443 key 75a635cd9d022391
+  historical:082.sh                            cache-hit on base 5e416443 key 0c7113fc36d732a9
+  historical:083.sh                            cache-hit on base 5e416443 key 9d1f80ee6854856e
+  historical:085.sh                            cache-hit on base 5e416443 key 77e3175a310028e1
+  historical:086.sh                            cache-hit on base 5e416443 key fc5753455c85b3bd
+  historical:087.sh                            cache-hit on base 5e416443 key 90da8f40250bfe04
+  historical:089.sh                            cache-hit on base 5e416443 key bd018899274a7de0
+  historical:090.sh                            cache-hit on base 5e416443 key 35c7240befe0d084
+  historical:091.sh                            cache-hit on base 5e416443 key 91f120e046ff3c6e
+  historical:092.sh                            cache-hit on base 5e416443 key 5be0408bc8adfb19
+  historical:093.sh                            cache-hit on base 5e416443 key 4e25ad36371aeda2
+  historical:094.sh                            cache-hit on base 5e416443 key e6b15804f1b0685b
+  historical:095.sh                            cache-hit on base 5e416443 key 8b8dfbe451d5955d
+  historical:096.sh                            cache-hit on base 5e416443 key d87ffe1e5660cdce
+  historical:097.sh                            cache-hit on base 5e416443 key d64ed38cadf01540
+  historical:098.sh                            cache-hit on base 5e416443 key b0c161df7e1f7a1e
+  historical:099.sh                            cache-hit on base 5e416443 key 84cd3c9cbac83571
+  historical:100.sh                            cache-hit on base 5e416443 key a838f72e4a70a016
+  historical:102.sh                            cache-hit on base 5e416443 key d7e88086bf8c2059
+  historical:103.sh                            cache-hit on base 5e416443 key 11ed30e333ca85d3
+  historical:104.sh                            cache-hit on base 5e416443 key e89e072bc32715b2
+  historical:105.sh                            cache-hit on base 5e416443 key 082b67dbd442fb19
+  historical:106.sh                            cache-hit on base 5e416443 key c6e4779fa38de77a
+  historical:107.sh                            cache-hit on base 5e416443 key 61eda29323841584
+  historical:108.sh                            cache-hit on base 5e416443 key 6e0342e5a21e2f4f
+  historical:109.sh                            cache-hit on base 5e416443 key f063f1522b8d6720
+  historical:112.sh                            cache-hit on base 5e416443 key 9b64b411e7acd149
+  historical:113.sh                            cache-hit on base 5e416443 key d816c9cb2dc90bed
+  historical:114.sh                            cache-hit on base 5e416443 key 4e9e97c1090426ad
+  historical:115.sh                            cache-hit on base 5e416443 key f7db25351037348f
+  historical:116.sh                            cache-hit on base 5e416443 key 5cacf57f42b8a081
+  historical:117.sh                            cache-hit on base 5e416443 key 2281c82795de8155
+  historical:119.sh                            cache-hit on base 5e416443 key 0741b3c16bcdcb6b
+  historical:120.sh                            cache-hit on base 5e416443 key e0b41dac6884d94b
+  historical:121.sh                            cache-hit on base 5e416443 key 8068dee70f65e1f8
+  historical:122.sh                            cache-hit on base 5e416443 key 2d566117a259fd5d
+  historical:123.sh                            cache-hit on base 5e416443 key 940f4d6426006378
+  historical:129.sh                            cache-hit on base 5e416443 key 4cdceb7450609bd0
+  historical:131.sh                            cache-hit on base 5e416443 key f4bfea0fafa1fd6d
+  historical:132.sh                            cache-hit on base 5e416443 key e6131af827f2ab2c
+  historical:133.sh                            cache-hit on base 5e416443 key 0396339dc6264e4e
+  historical:135.sh                            cache-hit on base 5e416443 key fbdab096b1af8a86
+  historical:136.sh                            cache-hit on base 5e416443 key 07b4562b501a2b78
+  historical:138.sh                            cache-hit on base 5e416443 key 8adfcd4f6a8ac843
+  historical:139.sh                            cache-hit on base 5e416443 key 62c5d6f1a52478b7
+  historical:140.sh                            cache-hit on base 5e416443 key 4c4360ad30ac826c
+  historical:145.sh                            cache-hit on base 5e416443 key c1168b2e73858a62
+  historical:146.sh                            cache-hit on base 5e416443 key 8d644ac4cc75add5
+  historical:148.sh                            cache-hit on base 5e416443 key 1753da106f1b5037
+  historical:149.sh                            cache-hit on base 5e416443 key 1af6cfe184067e38
+  historical:151.sh                            cache-hit on base 5e416443 key 01bd62304f6f3cfb
+  historical:155.sh                            cache-hit on base 5e416443 key eb82b1d030da8f5c
+  historical:156.sh                            cache-hit on base 5e416443 key 0334c0291f54e834
+  historical:158.sh                            cache-hit on base 5e416443 key e1f9539410e9c3fd
+  historical:159.sh                            cache-hit on base 5e416443 key c0a4a2786a50983b
+  historical:166.sh                            cache-hit on base 5e416443 key ce2af17ed543b4ab
+  historical:167.sh                            cache-hit on base 5e416443 key f14680d5ced503ec
+  historical:168.sh                            cache-hit on base 5e416443 key d8866a724fdd70eb
+  historical:169.sh                            cache-hit on base 5e416443 key 1ffa5ba8a2c5c772
+  historical:170.sh                            cache-hit on base 5e416443 key 12ee5851c56aed23
+  historical:171.sh                            cache-hit on base 5e416443 key 6c4db317c4e87d4a
+  historical:172.sh                            cache-hit on base 5e416443 key ec9b79224d31e9a1
+  historical:173.sh                            cache-hit on base 5e416443 key 870b69df760b4f5a
+  historical:175.sh                            cache-hit on base 5e416443 key 53deb8123c51dbb0
+  historical:176.sh                            cache-hit on base 5e416443 key fc4042d2b986676b
+  historical:177.sh                            cache-hit on base 5e416443 key ae465fb571c6430c
+  historical:178.sh                            cache-hit on base 5e416443 key 807555e588655311
+  historical:179.sh                            cache-hit on base 5e416443 key 9219f3329c4b6a7d
+  historical:180.sh                            cache-hit on base 5e416443 key a5e1b7812eae47ed
+  historical:181.sh                            cache-hit on base 5e416443 key cccc7df327ea2d2f
+  historical:182.sh                            cache-hit on base 5e416443 key 14ef46bd8fe420e3
+  historical:185.sh                            cache-hit on base 5e416443 key 0f8488ae179c7197
+  historical:186.sh                            cache-hit on base 5e416443 key 1cf50096e30d7403
+  historical:192.sh                            cache-hit on base 5e416443 key e53beb34637dafbe
+  historical:193.sh                            cache-hit on base 5e416443 key b44b0babb4985948
+  historical:194.sh                            cache-hit on base 5e416443 key 4868fda959b37b8b
+  historical:195.sh                            cache-hit on base 5e416443 key 6dcd2907aaaa33dc
+  historical:198.sh                            cache-hit on base 5e416443 key a0d23b4668c5beb6
+  historical:199.sh                            cache-hit on base 5e416443 key d0c88355ddbdb888
+  historical:200.sh                            cache-hit on base 5e416443 key 9663f34c0c970f7f
+  historical:201.sh                            cache-hit on base 5e416443 key 6ef0153ed4677479
+  historical:202.sh                            cache-hit on base 5e416443 key 34baa9b21491d267
+  historical:203.sh                            cache-hit on base 5e416443 key 4471a26672d9eb9e
+  historical:204.sh                            cache-hit on base 5e416443 key f611560f76971adb
+  historical:205.sh                            cache-hit on base 5e416443 key 72fa2505ec95906b
+  historical:206.sh                            cache-hit on base 5e416443 key 9e610d456afd5e34
+  historical:207.sh                            cache-hit on base 5e416443 key 7a2726902d660a6a
+  historical:209.sh                            cache-hit on base 5e416443 key 6ad8728dd8334973
+  historical:210.sh                            cache-hit on base 5e416443 key 45b00eb0f26e86f5
+  historical:211.sh                            cache-hit on base 5e416443 key 855590d2faf442ef
+  historical:212.sh                            cache-hit on base 5e416443 key 5e1f4cd714f7994c
+  historical:214.sh                            cache-hit on base 5e416443 key abc50d9c979ea633
+  historical:215.sh                            cache-hit on base 5e416443 key 6c82a63ca42a8dc4
+  historical:216.sh                            cache-hit on base 5e416443 key 1faa4b45b99e811a
+  historical:217.sh                            cache-hit on base 5e416443 key 74dc2e7463fb7efc
+  historical:219.sh                            cache-hit on base 5e416443 key 89cf0ba76bdfec55
+  historical:220.sh                            cache-hit on base 5e416443 key b0eda8dd85466ffc
+  historical:221.sh                            cache-hit on base 5e416443 key 5edbc39002b6a5ff
+  historical:222.sh                            cache-hit on base 5e416443 key 8cf880fcfb179343
+  historical:223.sh                            cache-hit on base 5e416443 key 440854f507f2452b
+  historical:224.sh                            cache-hit on base 5e416443 key 516f07b6f33997bb
+  historical:225.sh                            cache-hit on base 5e416443 key 5790f78d3f14c396
+  historical:227.sh                            cache-hit on base 5e416443 key 775e63c1d8144a16
+  historical:228.sh                            cache-hit on base 5e416443 key 44b2469e4511b646
+  historical:230.sh                            cache-hit on base 5e416443 key ced7b67e78326c9a
+  historical:231.sh                            cache-hit on base 5e416443 key 4464bdd8d0d60187
+  historical:232.sh                            cache-hit on base 5e416443 key ad9d881d67ff9e4c
+  historical:233.sh                            cache-hit on base 5e416443 key cb468b855661bab9
+  historical:234.sh                            cache-hit on base 5e416443 key bf622a7e9e762305
+  historical:236.sh                            cache-hit on base 5e416443 key 21d0e279251d48e3
+  historical:237.sh                            cache-hit on base 5e416443 key 4c2de03af9d43e16
   historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
-predicted     286.9 s = setup 45.0 + base 119.4 + serial 0.0 + parallel 122.5  [setup + base + serial + longest-first on 4 slots (profile 243)]
+  historical:239.sh                            cache-hit on base 5e416443 key 40d3a1dd33cd97f5
+  check:check-agent-presence.sh                cache-hit on base 5e416443 key 6f9df99949b07239
+  check:check-blackbox.sh                      cache-hit on base 5e416443 key 56dc8a3d0a922a7f
+  check:check-credential-health.sh             cache-hit on base 5e416443 key 788966a5db6b1fc0
+  check:check-credential-prints.sh             cache-hit on base 5e416443 key 70f2d3fde140929e
+  check:check-maintenance.sh                   cache-hit on base 5e416443 key d8665e73b0ea224f
+  check:check-model-relay.sh                   cache-hit on base 5e416443 key 933cd8e85f35bcf6
+  check:check-on-landing.sh                    cache-hit on base 5e416443 key 7244cb9982d11d34
+  check:check-presence-upload.sh               cache-hit on base 5e416443 key a3c7fc67e35951ac
+  check:check-schema-upgrade.sh                cache-hit on base 5e416443 key 8fb5ecae6bf17111
+  check:check-shadow-observe.sh                cache-hit on base 5e416443 key f552bfd3bbcb33f5
+  check:check-storage-extents.sh               cache-hit on base 5e416443 key 932e49b380487ff6
+  check:check-test-gate.sh                     cache-hit on base 5e416443 key aac7003a8de3efd1
+predicted     349.2 s = setup 45.0 + base 119.4 + serial 0.0 + parallel 184.8  [setup + base + serial + longest-first on 4 slots (profile 243)]
 budget        180 s -> OVER
 assumptions
-  - unsolved objectives: run (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - historical mode: cache-only; unsolved objectives: run (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
   - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
 
+### 243 proposed: historical objectives nightly, unsolved carried
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
+base          5e416443d48c5639456ecb377ae4f214ec05c11c
+candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
+approval      sha256:0ebf660f92f2ee1e8ddb027b1600ace099dcc6cda8838eb76eeb223b18c0684d
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       2 path(s)
+  rsi/backlog/243.json                       nightly-only    protected
+  rsi/scenarios/nightly/023.sh               nightly-only    protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+  backlog  sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  base sha256:981fbdc8ca3219b3123bf572dcae91e409d05a350bd1d3b5aeb137aefb521846  CHANGED
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
+selected      5 job(s)
+  check-tests.sh                               input-changed       184.793s  key e3972a261e27eb88
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
+skipped       185 job(s)
+  rust-build                                   cache-hit on base 5e416443 key 8ad34813b86602eb
+  test-listing                                 cache-hit on base 5e416443 key df484acecd7a8345
+  check-clippy.sh                              cache-hit on base 5e416443 key 2e4ba03a6482c7e7
+  check-web.sh                                 cache-hit on base 5e416443 key 4d4759410b45de66
+  journey:check-j02-lands.sh                   cache-hit on base 5e416443 key cf7cd430680b858c
+  journey:check-j04-observe.sh                 cache-hit on base 5e416443 key 8051af3489dd2d49
+  journey:check-j05-operator.sh                cache-hit on base 5e416443 key 1124a233105f03d4
+  journey:check-j08-stuck.sh                   cache-hit on base 5e416443 key 297e2df2ea786573
+  journey:check-j09-stall-cancel.sh            cache-hit on base 5e416443 key 31c1610386ae0ee1
+  journey:check-j10-verdicts.sh                cache-hit on base 5e416443 key 6e12b4fc1bd52a05
+  journey:check-j11-push-drain.sh              cache-hit on base 5e416443 key b8b44b73c1283a42
+  journey:check-j12-hold-told.sh               cache-hit on base 5e416443 key 2ae30d97223a3618
+  historical:007.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key cf2157b053ec2d55
+  historical:008.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9bc0d7569e198d18
+  historical:017.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 88818ed04a2a804f
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:034.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f05e2d7e8b4c3f5e
+  historical:035.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d8dcb8dc96109e9d
+  historical:037.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8915bc81a7e5a42a
+  historical:039.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 09d271d56c8b5e55
+  historical:040.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 56f2766464e2fc8d
+  historical:041.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a8934bf81da9b619
+  historical:042.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6491d10781cd8566
+  historical:043.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 63b7373064feccfb
+  historical:044.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 23de17ce30c5be63
+  historical:045.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8a285c4c94eed18f
+  historical:046.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5ff4b216e465472c
+  historical:047.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a921aa9d63f6ae69
+  historical:048.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b2b70a0751f48254
+  historical:049.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4e2b3cea9c7ee12c
+  historical:050.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key bd180889b0643196
+  historical:051.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c1709221e0004133
+  historical:052.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 541051f045f0581f
+  historical:053.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7975decc57c5120d
+  historical:056.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key beaf5c9d612c260a
+  historical:057.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4baad33c204ee209
+  historical:058.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key dd594eb547492a7c
+  historical:059.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 54e207632e2c4a37
+  historical:060.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key aa0658678bb68109
+  historical:061.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0e52ffbee6f92b78
+  historical:062.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 694c3097cb954132
+  historical:063.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2c9d0b5fb3de695c
+  historical:064.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key bbdffaa881a5e645
+  historical:065.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7bb94220217f3210
+  historical:066.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3de078138de48207
+  historical:067.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b53be3c9dcde12d0
+  historical:068.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e5afdf65e61df9aa
+  historical:069.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 23c10499d6fbec80
+  historical:070.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1cbb0339cbdc9222
+  historical:071.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3e764c63698d150b
+  historical:072.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 894cec82899964f0
+  historical:073.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ca063433a82fff03
+  historical:074.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 991e4936b9105da1
+  historical:075.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 565a62b9a65d6970
+  historical:076.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 559062496fe4910c
+  historical:077.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f2ae7177031a2592
+  historical:078.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a4d31f0d34205818
+  historical:079.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 764d36381bd28dd8
+  historical:080.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c63f3541c9a7ee12
+  historical:081.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 75a635cd9d022391
+  historical:082.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0c7113fc36d732a9
+  historical:083.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9d1f80ee6854856e
+  historical:085.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 77e3175a310028e1
+  historical:086.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key fc5753455c85b3bd
+  historical:087.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 90da8f40250bfe04
+  historical:089.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key bd018899274a7de0
+  historical:090.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 35c7240befe0d084
+  historical:091.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 91f120e046ff3c6e
+  historical:092.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5be0408bc8adfb19
+  historical:093.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4e25ad36371aeda2
+  historical:094.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e6b15804f1b0685b
+  historical:095.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8b8dfbe451d5955d
+  historical:096.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d87ffe1e5660cdce
+  historical:097.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d64ed38cadf01540
+  historical:098.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b0c161df7e1f7a1e
+  historical:099.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 84cd3c9cbac83571
+  historical:100.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a838f72e4a70a016
+  historical:102.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d7e88086bf8c2059
+  historical:103.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 11ed30e333ca85d3
+  historical:104.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e89e072bc32715b2
+  historical:105.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 082b67dbd442fb19
+  historical:106.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c6e4779fa38de77a
+  historical:107.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 61eda29323841584
+  historical:108.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6e0342e5a21e2f4f
+  historical:109.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f063f1522b8d6720
+  historical:112.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9b64b411e7acd149
+  historical:113.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d816c9cb2dc90bed
+  historical:114.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4e9e97c1090426ad
+  historical:115.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f7db25351037348f
+  historical:116.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5cacf57f42b8a081
+  historical:117.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2281c82795de8155
+  historical:119.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0741b3c16bcdcb6b
+  historical:120.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e0b41dac6884d94b
+  historical:121.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8068dee70f65e1f8
+  historical:122.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2d566117a259fd5d
+  historical:123.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 940f4d6426006378
+  historical:129.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4cdceb7450609bd0
+  historical:131.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f4bfea0fafa1fd6d
+  historical:132.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e6131af827f2ab2c
+  historical:133.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0396339dc6264e4e
+  historical:135.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key fbdab096b1af8a86
+  historical:136.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 07b4562b501a2b78
+  historical:138.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8adfcd4f6a8ac843
+  historical:139.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 62c5d6f1a52478b7
+  historical:140.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4c4360ad30ac826c
+  historical:145.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c1168b2e73858a62
+  historical:146.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8d644ac4cc75add5
+  historical:148.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1753da106f1b5037
+  historical:149.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1af6cfe184067e38
+  historical:151.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 01bd62304f6f3cfb
+  historical:155.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key eb82b1d030da8f5c
+  historical:156.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0334c0291f54e834
+  historical:158.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e1f9539410e9c3fd
+  historical:159.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c0a4a2786a50983b
+  historical:166.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ce2af17ed543b4ab
+  historical:167.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f14680d5ced503ec
+  historical:168.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d8866a724fdd70eb
+  historical:169.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1ffa5ba8a2c5c772
+  historical:170.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 12ee5851c56aed23
+  historical:171.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6c4db317c4e87d4a
+  historical:172.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ec9b79224d31e9a1
+  historical:173.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 870b69df760b4f5a
+  historical:175.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 53deb8123c51dbb0
+  historical:176.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key fc4042d2b986676b
+  historical:177.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ae465fb571c6430c
+  historical:178.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 807555e588655311
+  historical:179.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9219f3329c4b6a7d
+  historical:180.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a5e1b7812eae47ed
+  historical:181.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key cccc7df327ea2d2f
+  historical:182.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 14ef46bd8fe420e3
+  historical:185.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0f8488ae179c7197
+  historical:186.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1cf50096e30d7403
+  historical:192.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e53beb34637dafbe
+  historical:193.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b44b0babb4985948
+  historical:194.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4868fda959b37b8b
+  historical:195.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6dcd2907aaaa33dc
+  historical:198.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a0d23b4668c5beb6
+  historical:199.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d0c88355ddbdb888
+  historical:200.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9663f34c0c970f7f
+  historical:201.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6ef0153ed4677479
+  historical:202.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 34baa9b21491d267
+  historical:203.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4471a26672d9eb9e
+  historical:204.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f611560f76971adb
+  historical:205.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 72fa2505ec95906b
+  historical:206.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9e610d456afd5e34
+  historical:207.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7a2726902d660a6a
+  historical:209.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6ad8728dd8334973
+  historical:210.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 45b00eb0f26e86f5
+  historical:211.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 855590d2faf442ef
+  historical:212.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5e1f4cd714f7994c
+  historical:214.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key abc50d9c979ea633
+  historical:215.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6c82a63ca42a8dc4
+  historical:216.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1faa4b45b99e811a
+  historical:217.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 74dc2e7463fb7efc
+  historical:219.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 89cf0ba76bdfec55
+  historical:220.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b0eda8dd85466ffc
+  historical:221.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5edbc39002b6a5ff
+  historical:222.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8cf880fcfb179343
+  historical:223.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 440854f507f2452b
+  historical:224.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 516f07b6f33997bb
+  historical:225.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5790f78d3f14c396
+  historical:227.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 775e63c1d8144a16
+  historical:228.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 44b2469e4511b646
+  historical:230.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ced7b67e78326c9a
+  historical:231.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4464bdd8d0d60187
+  historical:232.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ad9d881d67ff9e4c
+  historical:233.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key cb468b855661bab9
+  historical:234.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key bf622a7e9e762305
+  historical:236.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 21d0e279251d48e3
+  historical:237.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4c2de03af9d43e16
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
+  historical:239.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 40d3a1dd33cd97f5
+  historical:241.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4cbb71fe50ba4d87
+  check:check-agent-presence.sh                cache-hit on base 5e416443 key 6f9df99949b07239
+  check:check-blackbox.sh                      cache-hit on base 5e416443 key 56dc8a3d0a922a7f
+  check:check-credential-health.sh             cache-hit on base 5e416443 key 788966a5db6b1fc0
+  check:check-credential-prints.sh             cache-hit on base 5e416443 key 70f2d3fde140929e
+  check:check-maintenance.sh                   cache-hit on base 5e416443 key d8665e73b0ea224f
+  check:check-model-relay.sh                   cache-hit on base 5e416443 key 933cd8e85f35bcf6
+  check:check-on-landing.sh                    cache-hit on base 5e416443 key 7244cb9982d11d34
+  check:check-presence-upload.sh               cache-hit on base 5e416443 key a3c7fc67e35951ac
+  check:check-schema-upgrade.sh                cache-hit on base 5e416443 key 8fb5ecae6bf17111
+  check:check-shadow-observe.sh                cache-hit on base 5e416443 key f552bfd3bbcb33f5
+  check:check-storage-extents.sh               cache-hit on base 5e416443 key 932e49b380487ff6
+  check:check-test-gate.sh                     cache-hit on base 5e416443 key aac7003a8de3efd1
+predicted     229.8 s = setup 45.0 + base 0.0 + serial 0.0 + parallel 184.8  [setup + base + serial + longest-first on 4 slots (profile 243)]
+budget        180 s -> OVER
+assumptions
+  - historical mode: nightly; unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
+  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
+
+### 243 cache-only plus carry: no check retired, content-addressed results
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
+base          5e416443d48c5639456ecb377ae4f214ec05c11c
+candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
+approval      sha256:56d50660c944c5cc27dd0ec069e55a114a01e40ee2f43e51aea24ce4baefff98
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       2 path(s)
+  rsi/backlog/243.json                       nightly-only    protected
+  rsi/scenarios/nightly/023.sh               nightly-only    protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+  backlog  sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  base sha256:981fbdc8ca3219b3123bf572dcae91e409d05a350bd1d3b5aeb137aefb521846  CHANGED
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
+selected      5 job(s)
+  check-tests.sh                               input-changed       184.793s  key e3972a261e27eb88
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
+skipped       185 job(s)
+  rust-build                                   cache-hit on base 5e416443 key 8ad34813b86602eb
+  test-listing                                 cache-hit on base 5e416443 key df484acecd7a8345
+  check-clippy.sh                              cache-hit on base 5e416443 key 2e4ba03a6482c7e7
+  check-web.sh                                 cache-hit on base 5e416443 key 4d4759410b45de66
+  journey:check-j02-lands.sh                   cache-hit on base 5e416443 key cf7cd430680b858c
+  journey:check-j04-observe.sh                 cache-hit on base 5e416443 key 8051af3489dd2d49
+  journey:check-j05-operator.sh                cache-hit on base 5e416443 key 1124a233105f03d4
+  journey:check-j08-stuck.sh                   cache-hit on base 5e416443 key 297e2df2ea786573
+  journey:check-j09-stall-cancel.sh            cache-hit on base 5e416443 key 31c1610386ae0ee1
+  journey:check-j10-verdicts.sh                cache-hit on base 5e416443 key 6e12b4fc1bd52a05
+  journey:check-j11-push-drain.sh              cache-hit on base 5e416443 key b8b44b73c1283a42
+  journey:check-j12-hold-told.sh               cache-hit on base 5e416443 key 2ae30d97223a3618
+  historical:007.sh                            cache-hit on base 5e416443 key cf2157b053ec2d55
+  historical:008.sh                            cache-hit on base 5e416443 key 9bc0d7569e198d18
+  historical:017.sh                            cache-hit on base 5e416443 key 88818ed04a2a804f
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:034.sh                            cache-hit on base 5e416443 key f05e2d7e8b4c3f5e
+  historical:035.sh                            cache-hit on base 5e416443 key d8dcb8dc96109e9d
+  historical:037.sh                            cache-hit on base 5e416443 key 8915bc81a7e5a42a
+  historical:039.sh                            cache-hit on base 5e416443 key 09d271d56c8b5e55
+  historical:040.sh                            cache-hit on base 5e416443 key 56f2766464e2fc8d
+  historical:041.sh                            cache-hit on base 5e416443 key a8934bf81da9b619
+  historical:042.sh                            cache-hit on base 5e416443 key 6491d10781cd8566
+  historical:043.sh                            cache-hit on base 5e416443 key 63b7373064feccfb
+  historical:044.sh                            cache-hit on base 5e416443 key 23de17ce30c5be63
+  historical:045.sh                            cache-hit on base 5e416443 key 8a285c4c94eed18f
+  historical:046.sh                            cache-hit on base 5e416443 key 5ff4b216e465472c
+  historical:047.sh                            cache-hit on base 5e416443 key a921aa9d63f6ae69
+  historical:048.sh                            cache-hit on base 5e416443 key b2b70a0751f48254
+  historical:049.sh                            cache-hit on base 5e416443 key 4e2b3cea9c7ee12c
+  historical:050.sh                            cache-hit on base 5e416443 key bd180889b0643196
+  historical:051.sh                            cache-hit on base 5e416443 key c1709221e0004133
+  historical:052.sh                            cache-hit on base 5e416443 key 541051f045f0581f
+  historical:053.sh                            cache-hit on base 5e416443 key 7975decc57c5120d
+  historical:056.sh                            cache-hit on base 5e416443 key beaf5c9d612c260a
+  historical:057.sh                            cache-hit on base 5e416443 key 4baad33c204ee209
+  historical:058.sh                            cache-hit on base 5e416443 key dd594eb547492a7c
+  historical:059.sh                            cache-hit on base 5e416443 key 54e207632e2c4a37
+  historical:060.sh                            cache-hit on base 5e416443 key aa0658678bb68109
+  historical:061.sh                            cache-hit on base 5e416443 key 0e52ffbee6f92b78
+  historical:062.sh                            cache-hit on base 5e416443 key 694c3097cb954132
+  historical:063.sh                            cache-hit on base 5e416443 key 2c9d0b5fb3de695c
+  historical:064.sh                            cache-hit on base 5e416443 key bbdffaa881a5e645
+  historical:065.sh                            cache-hit on base 5e416443 key 7bb94220217f3210
+  historical:066.sh                            cache-hit on base 5e416443 key 3de078138de48207
+  historical:067.sh                            cache-hit on base 5e416443 key b53be3c9dcde12d0
+  historical:068.sh                            cache-hit on base 5e416443 key e5afdf65e61df9aa
+  historical:069.sh                            cache-hit on base 5e416443 key 23c10499d6fbec80
+  historical:070.sh                            cache-hit on base 5e416443 key 1cbb0339cbdc9222
+  historical:071.sh                            cache-hit on base 5e416443 key 3e764c63698d150b
+  historical:072.sh                            cache-hit on base 5e416443 key 894cec82899964f0
+  historical:073.sh                            cache-hit on base 5e416443 key ca063433a82fff03
+  historical:074.sh                            cache-hit on base 5e416443 key 991e4936b9105da1
+  historical:075.sh                            cache-hit on base 5e416443 key 565a62b9a65d6970
+  historical:076.sh                            cache-hit on base 5e416443 key 559062496fe4910c
+  historical:077.sh                            cache-hit on base 5e416443 key f2ae7177031a2592
+  historical:078.sh                            cache-hit on base 5e416443 key a4d31f0d34205818
+  historical:079.sh                            cache-hit on base 5e416443 key 764d36381bd28dd8
+  historical:080.sh                            cache-hit on base 5e416443 key c63f3541c9a7ee12
+  historical:081.sh                            cache-hit on base 5e416443 key 75a635cd9d022391
+  historical:082.sh                            cache-hit on base 5e416443 key 0c7113fc36d732a9
+  historical:083.sh                            cache-hit on base 5e416443 key 9d1f80ee6854856e
+  historical:085.sh                            cache-hit on base 5e416443 key 77e3175a310028e1
+  historical:086.sh                            cache-hit on base 5e416443 key fc5753455c85b3bd
+  historical:087.sh                            cache-hit on base 5e416443 key 90da8f40250bfe04
+  historical:089.sh                            cache-hit on base 5e416443 key bd018899274a7de0
+  historical:090.sh                            cache-hit on base 5e416443 key 35c7240befe0d084
+  historical:091.sh                            cache-hit on base 5e416443 key 91f120e046ff3c6e
+  historical:092.sh                            cache-hit on base 5e416443 key 5be0408bc8adfb19
+  historical:093.sh                            cache-hit on base 5e416443 key 4e25ad36371aeda2
+  historical:094.sh                            cache-hit on base 5e416443 key e6b15804f1b0685b
+  historical:095.sh                            cache-hit on base 5e416443 key 8b8dfbe451d5955d
+  historical:096.sh                            cache-hit on base 5e416443 key d87ffe1e5660cdce
+  historical:097.sh                            cache-hit on base 5e416443 key d64ed38cadf01540
+  historical:098.sh                            cache-hit on base 5e416443 key b0c161df7e1f7a1e
+  historical:099.sh                            cache-hit on base 5e416443 key 84cd3c9cbac83571
+  historical:100.sh                            cache-hit on base 5e416443 key a838f72e4a70a016
+  historical:102.sh                            cache-hit on base 5e416443 key d7e88086bf8c2059
+  historical:103.sh                            cache-hit on base 5e416443 key 11ed30e333ca85d3
+  historical:104.sh                            cache-hit on base 5e416443 key e89e072bc32715b2
+  historical:105.sh                            cache-hit on base 5e416443 key 082b67dbd442fb19
+  historical:106.sh                            cache-hit on base 5e416443 key c6e4779fa38de77a
+  historical:107.sh                            cache-hit on base 5e416443 key 61eda29323841584
+  historical:108.sh                            cache-hit on base 5e416443 key 6e0342e5a21e2f4f
+  historical:109.sh                            cache-hit on base 5e416443 key f063f1522b8d6720
+  historical:112.sh                            cache-hit on base 5e416443 key 9b64b411e7acd149
+  historical:113.sh                            cache-hit on base 5e416443 key d816c9cb2dc90bed
+  historical:114.sh                            cache-hit on base 5e416443 key 4e9e97c1090426ad
+  historical:115.sh                            cache-hit on base 5e416443 key f7db25351037348f
+  historical:116.sh                            cache-hit on base 5e416443 key 5cacf57f42b8a081
+  historical:117.sh                            cache-hit on base 5e416443 key 2281c82795de8155
+  historical:119.sh                            cache-hit on base 5e416443 key 0741b3c16bcdcb6b
+  historical:120.sh                            cache-hit on base 5e416443 key e0b41dac6884d94b
+  historical:121.sh                            cache-hit on base 5e416443 key 8068dee70f65e1f8
+  historical:122.sh                            cache-hit on base 5e416443 key 2d566117a259fd5d
+  historical:123.sh                            cache-hit on base 5e416443 key 940f4d6426006378
+  historical:129.sh                            cache-hit on base 5e416443 key 4cdceb7450609bd0
+  historical:131.sh                            cache-hit on base 5e416443 key f4bfea0fafa1fd6d
+  historical:132.sh                            cache-hit on base 5e416443 key e6131af827f2ab2c
+  historical:133.sh                            cache-hit on base 5e416443 key 0396339dc6264e4e
+  historical:135.sh                            cache-hit on base 5e416443 key fbdab096b1af8a86
+  historical:136.sh                            cache-hit on base 5e416443 key 07b4562b501a2b78
+  historical:138.sh                            cache-hit on base 5e416443 key 8adfcd4f6a8ac843
+  historical:139.sh                            cache-hit on base 5e416443 key 62c5d6f1a52478b7
+  historical:140.sh                            cache-hit on base 5e416443 key 4c4360ad30ac826c
+  historical:145.sh                            cache-hit on base 5e416443 key c1168b2e73858a62
+  historical:146.sh                            cache-hit on base 5e416443 key 8d644ac4cc75add5
+  historical:148.sh                            cache-hit on base 5e416443 key 1753da106f1b5037
+  historical:149.sh                            cache-hit on base 5e416443 key 1af6cfe184067e38
+  historical:151.sh                            cache-hit on base 5e416443 key 01bd62304f6f3cfb
+  historical:155.sh                            cache-hit on base 5e416443 key eb82b1d030da8f5c
+  historical:156.sh                            cache-hit on base 5e416443 key 0334c0291f54e834
+  historical:158.sh                            cache-hit on base 5e416443 key e1f9539410e9c3fd
+  historical:159.sh                            cache-hit on base 5e416443 key c0a4a2786a50983b
+  historical:166.sh                            cache-hit on base 5e416443 key ce2af17ed543b4ab
+  historical:167.sh                            cache-hit on base 5e416443 key f14680d5ced503ec
+  historical:168.sh                            cache-hit on base 5e416443 key d8866a724fdd70eb
+  historical:169.sh                            cache-hit on base 5e416443 key 1ffa5ba8a2c5c772
+  historical:170.sh                            cache-hit on base 5e416443 key 12ee5851c56aed23
+  historical:171.sh                            cache-hit on base 5e416443 key 6c4db317c4e87d4a
+  historical:172.sh                            cache-hit on base 5e416443 key ec9b79224d31e9a1
+  historical:173.sh                            cache-hit on base 5e416443 key 870b69df760b4f5a
+  historical:175.sh                            cache-hit on base 5e416443 key 53deb8123c51dbb0
+  historical:176.sh                            cache-hit on base 5e416443 key fc4042d2b986676b
+  historical:177.sh                            cache-hit on base 5e416443 key ae465fb571c6430c
+  historical:178.sh                            cache-hit on base 5e416443 key 807555e588655311
+  historical:179.sh                            cache-hit on base 5e416443 key 9219f3329c4b6a7d
+  historical:180.sh                            cache-hit on base 5e416443 key a5e1b7812eae47ed
+  historical:181.sh                            cache-hit on base 5e416443 key cccc7df327ea2d2f
+  historical:182.sh                            cache-hit on base 5e416443 key 14ef46bd8fe420e3
+  historical:185.sh                            cache-hit on base 5e416443 key 0f8488ae179c7197
+  historical:186.sh                            cache-hit on base 5e416443 key 1cf50096e30d7403
+  historical:192.sh                            cache-hit on base 5e416443 key e53beb34637dafbe
+  historical:193.sh                            cache-hit on base 5e416443 key b44b0babb4985948
+  historical:194.sh                            cache-hit on base 5e416443 key 4868fda959b37b8b
+  historical:195.sh                            cache-hit on base 5e416443 key 6dcd2907aaaa33dc
+  historical:198.sh                            cache-hit on base 5e416443 key a0d23b4668c5beb6
+  historical:199.sh                            cache-hit on base 5e416443 key d0c88355ddbdb888
+  historical:200.sh                            cache-hit on base 5e416443 key 9663f34c0c970f7f
+  historical:201.sh                            cache-hit on base 5e416443 key 6ef0153ed4677479
+  historical:202.sh                            cache-hit on base 5e416443 key 34baa9b21491d267
+  historical:203.sh                            cache-hit on base 5e416443 key 4471a26672d9eb9e
+  historical:204.sh                            cache-hit on base 5e416443 key f611560f76971adb
+  historical:205.sh                            cache-hit on base 5e416443 key 72fa2505ec95906b
+  historical:206.sh                            cache-hit on base 5e416443 key 9e610d456afd5e34
+  historical:207.sh                            cache-hit on base 5e416443 key 7a2726902d660a6a
+  historical:209.sh                            cache-hit on base 5e416443 key 6ad8728dd8334973
+  historical:210.sh                            cache-hit on base 5e416443 key 45b00eb0f26e86f5
+  historical:211.sh                            cache-hit on base 5e416443 key 855590d2faf442ef
+  historical:212.sh                            cache-hit on base 5e416443 key 5e1f4cd714f7994c
+  historical:214.sh                            cache-hit on base 5e416443 key abc50d9c979ea633
+  historical:215.sh                            cache-hit on base 5e416443 key 6c82a63ca42a8dc4
+  historical:216.sh                            cache-hit on base 5e416443 key 1faa4b45b99e811a
+  historical:217.sh                            cache-hit on base 5e416443 key 74dc2e7463fb7efc
+  historical:219.sh                            cache-hit on base 5e416443 key 89cf0ba76bdfec55
+  historical:220.sh                            cache-hit on base 5e416443 key b0eda8dd85466ffc
+  historical:221.sh                            cache-hit on base 5e416443 key 5edbc39002b6a5ff
+  historical:222.sh                            cache-hit on base 5e416443 key 8cf880fcfb179343
+  historical:223.sh                            cache-hit on base 5e416443 key 440854f507f2452b
+  historical:224.sh                            cache-hit on base 5e416443 key 516f07b6f33997bb
+  historical:225.sh                            cache-hit on base 5e416443 key 5790f78d3f14c396
+  historical:227.sh                            cache-hit on base 5e416443 key 775e63c1d8144a16
+  historical:228.sh                            cache-hit on base 5e416443 key 44b2469e4511b646
+  historical:230.sh                            cache-hit on base 5e416443 key ced7b67e78326c9a
+  historical:231.sh                            cache-hit on base 5e416443 key 4464bdd8d0d60187
+  historical:232.sh                            cache-hit on base 5e416443 key ad9d881d67ff9e4c
+  historical:233.sh                            cache-hit on base 5e416443 key cb468b855661bab9
+  historical:234.sh                            cache-hit on base 5e416443 key bf622a7e9e762305
+  historical:236.sh                            cache-hit on base 5e416443 key 21d0e279251d48e3
+  historical:237.sh                            cache-hit on base 5e416443 key 4c2de03af9d43e16
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
+  historical:239.sh                            cache-hit on base 5e416443 key 40d3a1dd33cd97f5
+  historical:241.sh                            carried: unsolved on base, inputs unchanged key 4cbb71fe50ba4d87
+  check:check-agent-presence.sh                cache-hit on base 5e416443 key 6f9df99949b07239
+  check:check-blackbox.sh                      cache-hit on base 5e416443 key 56dc8a3d0a922a7f
+  check:check-credential-health.sh             cache-hit on base 5e416443 key 788966a5db6b1fc0
+  check:check-credential-prints.sh             cache-hit on base 5e416443 key 70f2d3fde140929e
+  check:check-maintenance.sh                   cache-hit on base 5e416443 key d8665e73b0ea224f
+  check:check-model-relay.sh                   cache-hit on base 5e416443 key 933cd8e85f35bcf6
+  check:check-on-landing.sh                    cache-hit on base 5e416443 key 7244cb9982d11d34
+  check:check-presence-upload.sh               cache-hit on base 5e416443 key a3c7fc67e35951ac
+  check:check-schema-upgrade.sh                cache-hit on base 5e416443 key 8fb5ecae6bf17111
+  check:check-shadow-observe.sh                cache-hit on base 5e416443 key f552bfd3bbcb33f5
+  check:check-storage-extents.sh               cache-hit on base 5e416443 key 932e49b380487ff6
+  check:check-test-gate.sh                     cache-hit on base 5e416443 key aac7003a8de3efd1
+predicted     229.8 s = setup 45.0 + base 0.0 + serial 0.0 + parallel 184.8  [setup + base + serial + longest-first on 4 slots (profile 243)]
+budget        180 s -> OVER
+assumptions
+  - historical mode: cache-only; unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
+  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
+
+### 243 strict cache: an uncarried unsolved objective is re-judged
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
+base          5e416443d48c5639456ecb377ae4f214ec05c11c
+candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
+approval      sha256:ee6c45448615ea8cd1b0d02d39df760b3e63718f85622e70370920edbfadbca6
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       2 path(s)
+  rsi/backlog/243.json                       nightly-only    protected
+  rsi/scenarios/nightly/023.sh               nightly-only    protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+  backlog  sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  base sha256:981fbdc8ca3219b3123bf572dcae91e409d05a350bd1d3b5aeb137aefb521846  CHANGED
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
+selected      6 job(s)
+  check-tests.sh                               input-changed       184.793s  key e3972a261e27eb88
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
+  historical:241.sh                            cache-miss: unsolved base result is not carried (--unsolved-mode run)   59.202s  key 4cbb71fe50ba4d87
+skipped       184 job(s)
+  rust-build                                   cache-hit on base 5e416443 key 8ad34813b86602eb
+  test-listing                                 cache-hit on base 5e416443 key df484acecd7a8345
+  check-clippy.sh                              cache-hit on base 5e416443 key 2e4ba03a6482c7e7
+  check-web.sh                                 cache-hit on base 5e416443 key 4d4759410b45de66
+  journey:check-j02-lands.sh                   cache-hit on base 5e416443 key cf7cd430680b858c
+  journey:check-j04-observe.sh                 cache-hit on base 5e416443 key 8051af3489dd2d49
+  journey:check-j05-operator.sh                cache-hit on base 5e416443 key 1124a233105f03d4
+  journey:check-j08-stuck.sh                   cache-hit on base 5e416443 key 297e2df2ea786573
+  journey:check-j09-stall-cancel.sh            cache-hit on base 5e416443 key 31c1610386ae0ee1
+  journey:check-j10-verdicts.sh                cache-hit on base 5e416443 key 6e12b4fc1bd52a05
+  journey:check-j11-push-drain.sh              cache-hit on base 5e416443 key b8b44b73c1283a42
+  journey:check-j12-hold-told.sh               cache-hit on base 5e416443 key 2ae30d97223a3618
+  historical:007.sh                            cache-hit on base 5e416443 key cf2157b053ec2d55
+  historical:008.sh                            cache-hit on base 5e416443 key 9bc0d7569e198d18
+  historical:017.sh                            cache-hit on base 5e416443 key 88818ed04a2a804f
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:034.sh                            cache-hit on base 5e416443 key f05e2d7e8b4c3f5e
+  historical:035.sh                            cache-hit on base 5e416443 key d8dcb8dc96109e9d
+  historical:037.sh                            cache-hit on base 5e416443 key 8915bc81a7e5a42a
+  historical:039.sh                            cache-hit on base 5e416443 key 09d271d56c8b5e55
+  historical:040.sh                            cache-hit on base 5e416443 key 56f2766464e2fc8d
+  historical:041.sh                            cache-hit on base 5e416443 key a8934bf81da9b619
+  historical:042.sh                            cache-hit on base 5e416443 key 6491d10781cd8566
+  historical:043.sh                            cache-hit on base 5e416443 key 63b7373064feccfb
+  historical:044.sh                            cache-hit on base 5e416443 key 23de17ce30c5be63
+  historical:045.sh                            cache-hit on base 5e416443 key 8a285c4c94eed18f
+  historical:046.sh                            cache-hit on base 5e416443 key 5ff4b216e465472c
+  historical:047.sh                            cache-hit on base 5e416443 key a921aa9d63f6ae69
+  historical:048.sh                            cache-hit on base 5e416443 key b2b70a0751f48254
+  historical:049.sh                            cache-hit on base 5e416443 key 4e2b3cea9c7ee12c
+  historical:050.sh                            cache-hit on base 5e416443 key bd180889b0643196
+  historical:051.sh                            cache-hit on base 5e416443 key c1709221e0004133
+  historical:052.sh                            cache-hit on base 5e416443 key 541051f045f0581f
+  historical:053.sh                            cache-hit on base 5e416443 key 7975decc57c5120d
+  historical:056.sh                            cache-hit on base 5e416443 key beaf5c9d612c260a
+  historical:057.sh                            cache-hit on base 5e416443 key 4baad33c204ee209
+  historical:058.sh                            cache-hit on base 5e416443 key dd594eb547492a7c
+  historical:059.sh                            cache-hit on base 5e416443 key 54e207632e2c4a37
+  historical:060.sh                            cache-hit on base 5e416443 key aa0658678bb68109
+  historical:061.sh                            cache-hit on base 5e416443 key 0e52ffbee6f92b78
+  historical:062.sh                            cache-hit on base 5e416443 key 694c3097cb954132
+  historical:063.sh                            cache-hit on base 5e416443 key 2c9d0b5fb3de695c
+  historical:064.sh                            cache-hit on base 5e416443 key bbdffaa881a5e645
+  historical:065.sh                            cache-hit on base 5e416443 key 7bb94220217f3210
+  historical:066.sh                            cache-hit on base 5e416443 key 3de078138de48207
+  historical:067.sh                            cache-hit on base 5e416443 key b53be3c9dcde12d0
+  historical:068.sh                            cache-hit on base 5e416443 key e5afdf65e61df9aa
+  historical:069.sh                            cache-hit on base 5e416443 key 23c10499d6fbec80
+  historical:070.sh                            cache-hit on base 5e416443 key 1cbb0339cbdc9222
+  historical:071.sh                            cache-hit on base 5e416443 key 3e764c63698d150b
+  historical:072.sh                            cache-hit on base 5e416443 key 894cec82899964f0
+  historical:073.sh                            cache-hit on base 5e416443 key ca063433a82fff03
+  historical:074.sh                            cache-hit on base 5e416443 key 991e4936b9105da1
+  historical:075.sh                            cache-hit on base 5e416443 key 565a62b9a65d6970
+  historical:076.sh                            cache-hit on base 5e416443 key 559062496fe4910c
+  historical:077.sh                            cache-hit on base 5e416443 key f2ae7177031a2592
+  historical:078.sh                            cache-hit on base 5e416443 key a4d31f0d34205818
+  historical:079.sh                            cache-hit on base 5e416443 key 764d36381bd28dd8
+  historical:080.sh                            cache-hit on base 5e416443 key c63f3541c9a7ee12
+  historical:081.sh                            cache-hit on base 5e416443 key 75a635cd9d022391
+  historical:082.sh                            cache-hit on base 5e416443 key 0c7113fc36d732a9
+  historical:083.sh                            cache-hit on base 5e416443 key 9d1f80ee6854856e
+  historical:085.sh                            cache-hit on base 5e416443 key 77e3175a310028e1
+  historical:086.sh                            cache-hit on base 5e416443 key fc5753455c85b3bd
+  historical:087.sh                            cache-hit on base 5e416443 key 90da8f40250bfe04
+  historical:089.sh                            cache-hit on base 5e416443 key bd018899274a7de0
+  historical:090.sh                            cache-hit on base 5e416443 key 35c7240befe0d084
+  historical:091.sh                            cache-hit on base 5e416443 key 91f120e046ff3c6e
+  historical:092.sh                            cache-hit on base 5e416443 key 5be0408bc8adfb19
+  historical:093.sh                            cache-hit on base 5e416443 key 4e25ad36371aeda2
+  historical:094.sh                            cache-hit on base 5e416443 key e6b15804f1b0685b
+  historical:095.sh                            cache-hit on base 5e416443 key 8b8dfbe451d5955d
+  historical:096.sh                            cache-hit on base 5e416443 key d87ffe1e5660cdce
+  historical:097.sh                            cache-hit on base 5e416443 key d64ed38cadf01540
+  historical:098.sh                            cache-hit on base 5e416443 key b0c161df7e1f7a1e
+  historical:099.sh                            cache-hit on base 5e416443 key 84cd3c9cbac83571
+  historical:100.sh                            cache-hit on base 5e416443 key a838f72e4a70a016
+  historical:102.sh                            cache-hit on base 5e416443 key d7e88086bf8c2059
+  historical:103.sh                            cache-hit on base 5e416443 key 11ed30e333ca85d3
+  historical:104.sh                            cache-hit on base 5e416443 key e89e072bc32715b2
+  historical:105.sh                            cache-hit on base 5e416443 key 082b67dbd442fb19
+  historical:106.sh                            cache-hit on base 5e416443 key c6e4779fa38de77a
+  historical:107.sh                            cache-hit on base 5e416443 key 61eda29323841584
+  historical:108.sh                            cache-hit on base 5e416443 key 6e0342e5a21e2f4f
+  historical:109.sh                            cache-hit on base 5e416443 key f063f1522b8d6720
+  historical:112.sh                            cache-hit on base 5e416443 key 9b64b411e7acd149
+  historical:113.sh                            cache-hit on base 5e416443 key d816c9cb2dc90bed
+  historical:114.sh                            cache-hit on base 5e416443 key 4e9e97c1090426ad
+  historical:115.sh                            cache-hit on base 5e416443 key f7db25351037348f
+  historical:116.sh                            cache-hit on base 5e416443 key 5cacf57f42b8a081
+  historical:117.sh                            cache-hit on base 5e416443 key 2281c82795de8155
+  historical:119.sh                            cache-hit on base 5e416443 key 0741b3c16bcdcb6b
+  historical:120.sh                            cache-hit on base 5e416443 key e0b41dac6884d94b
+  historical:121.sh                            cache-hit on base 5e416443 key 8068dee70f65e1f8
+  historical:122.sh                            cache-hit on base 5e416443 key 2d566117a259fd5d
+  historical:123.sh                            cache-hit on base 5e416443 key 940f4d6426006378
+  historical:129.sh                            cache-hit on base 5e416443 key 4cdceb7450609bd0
+  historical:131.sh                            cache-hit on base 5e416443 key f4bfea0fafa1fd6d
+  historical:132.sh                            cache-hit on base 5e416443 key e6131af827f2ab2c
+  historical:133.sh                            cache-hit on base 5e416443 key 0396339dc6264e4e
+  historical:135.sh                            cache-hit on base 5e416443 key fbdab096b1af8a86
+  historical:136.sh                            cache-hit on base 5e416443 key 07b4562b501a2b78
+  historical:138.sh                            cache-hit on base 5e416443 key 8adfcd4f6a8ac843
+  historical:139.sh                            cache-hit on base 5e416443 key 62c5d6f1a52478b7
+  historical:140.sh                            cache-hit on base 5e416443 key 4c4360ad30ac826c
+  historical:145.sh                            cache-hit on base 5e416443 key c1168b2e73858a62
+  historical:146.sh                            cache-hit on base 5e416443 key 8d644ac4cc75add5
+  historical:148.sh                            cache-hit on base 5e416443 key 1753da106f1b5037
+  historical:149.sh                            cache-hit on base 5e416443 key 1af6cfe184067e38
+  historical:151.sh                            cache-hit on base 5e416443 key 01bd62304f6f3cfb
+  historical:155.sh                            cache-hit on base 5e416443 key eb82b1d030da8f5c
+  historical:156.sh                            cache-hit on base 5e416443 key 0334c0291f54e834
+  historical:158.sh                            cache-hit on base 5e416443 key e1f9539410e9c3fd
+  historical:159.sh                            cache-hit on base 5e416443 key c0a4a2786a50983b
+  historical:166.sh                            cache-hit on base 5e416443 key ce2af17ed543b4ab
+  historical:167.sh                            cache-hit on base 5e416443 key f14680d5ced503ec
+  historical:168.sh                            cache-hit on base 5e416443 key d8866a724fdd70eb
+  historical:169.sh                            cache-hit on base 5e416443 key 1ffa5ba8a2c5c772
+  historical:170.sh                            cache-hit on base 5e416443 key 12ee5851c56aed23
+  historical:171.sh                            cache-hit on base 5e416443 key 6c4db317c4e87d4a
+  historical:172.sh                            cache-hit on base 5e416443 key ec9b79224d31e9a1
+  historical:173.sh                            cache-hit on base 5e416443 key 870b69df760b4f5a
+  historical:175.sh                            cache-hit on base 5e416443 key 53deb8123c51dbb0
+  historical:176.sh                            cache-hit on base 5e416443 key fc4042d2b986676b
+  historical:177.sh                            cache-hit on base 5e416443 key ae465fb571c6430c
+  historical:178.sh                            cache-hit on base 5e416443 key 807555e588655311
+  historical:179.sh                            cache-hit on base 5e416443 key 9219f3329c4b6a7d
+  historical:180.sh                            cache-hit on base 5e416443 key a5e1b7812eae47ed
+  historical:181.sh                            cache-hit on base 5e416443 key cccc7df327ea2d2f
+  historical:182.sh                            cache-hit on base 5e416443 key 14ef46bd8fe420e3
+  historical:185.sh                            cache-hit on base 5e416443 key 0f8488ae179c7197
+  historical:186.sh                            cache-hit on base 5e416443 key 1cf50096e30d7403
+  historical:192.sh                            cache-hit on base 5e416443 key e53beb34637dafbe
+  historical:193.sh                            cache-hit on base 5e416443 key b44b0babb4985948
+  historical:194.sh                            cache-hit on base 5e416443 key 4868fda959b37b8b
+  historical:195.sh                            cache-hit on base 5e416443 key 6dcd2907aaaa33dc
+  historical:198.sh                            cache-hit on base 5e416443 key a0d23b4668c5beb6
+  historical:199.sh                            cache-hit on base 5e416443 key d0c88355ddbdb888
+  historical:200.sh                            cache-hit on base 5e416443 key 9663f34c0c970f7f
+  historical:201.sh                            cache-hit on base 5e416443 key 6ef0153ed4677479
+  historical:202.sh                            cache-hit on base 5e416443 key 34baa9b21491d267
+  historical:203.sh                            cache-hit on base 5e416443 key 4471a26672d9eb9e
+  historical:204.sh                            cache-hit on base 5e416443 key f611560f76971adb
+  historical:205.sh                            cache-hit on base 5e416443 key 72fa2505ec95906b
+  historical:206.sh                            cache-hit on base 5e416443 key 9e610d456afd5e34
+  historical:207.sh                            cache-hit on base 5e416443 key 7a2726902d660a6a
+  historical:209.sh                            cache-hit on base 5e416443 key 6ad8728dd8334973
+  historical:210.sh                            cache-hit on base 5e416443 key 45b00eb0f26e86f5
+  historical:211.sh                            cache-hit on base 5e416443 key 855590d2faf442ef
+  historical:212.sh                            cache-hit on base 5e416443 key 5e1f4cd714f7994c
+  historical:214.sh                            cache-hit on base 5e416443 key abc50d9c979ea633
+  historical:215.sh                            cache-hit on base 5e416443 key 6c82a63ca42a8dc4
+  historical:216.sh                            cache-hit on base 5e416443 key 1faa4b45b99e811a
+  historical:217.sh                            cache-hit on base 5e416443 key 74dc2e7463fb7efc
+  historical:219.sh                            cache-hit on base 5e416443 key 89cf0ba76bdfec55
+  historical:220.sh                            cache-hit on base 5e416443 key b0eda8dd85466ffc
+  historical:221.sh                            cache-hit on base 5e416443 key 5edbc39002b6a5ff
+  historical:222.sh                            cache-hit on base 5e416443 key 8cf880fcfb179343
+  historical:223.sh                            cache-hit on base 5e416443 key 440854f507f2452b
+  historical:224.sh                            cache-hit on base 5e416443 key 516f07b6f33997bb
+  historical:225.sh                            cache-hit on base 5e416443 key 5790f78d3f14c396
+  historical:227.sh                            cache-hit on base 5e416443 key 775e63c1d8144a16
+  historical:228.sh                            cache-hit on base 5e416443 key 44b2469e4511b646
+  historical:230.sh                            cache-hit on base 5e416443 key ced7b67e78326c9a
+  historical:231.sh                            cache-hit on base 5e416443 key 4464bdd8d0d60187
+  historical:232.sh                            cache-hit on base 5e416443 key ad9d881d67ff9e4c
+  historical:233.sh                            cache-hit on base 5e416443 key cb468b855661bab9
+  historical:234.sh                            cache-hit on base 5e416443 key bf622a7e9e762305
+  historical:236.sh                            cache-hit on base 5e416443 key 21d0e279251d48e3
+  historical:237.sh                            cache-hit on base 5e416443 key 4c2de03af9d43e16
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
+  historical:239.sh                            cache-hit on base 5e416443 key 40d3a1dd33cd97f5
+  check:check-agent-presence.sh                cache-hit on base 5e416443 key 6f9df99949b07239
+  check:check-blackbox.sh                      cache-hit on base 5e416443 key 56dc8a3d0a922a7f
+  check:check-credential-health.sh             cache-hit on base 5e416443 key 788966a5db6b1fc0
+  check:check-credential-prints.sh             cache-hit on base 5e416443 key 70f2d3fde140929e
+  check:check-maintenance.sh                   cache-hit on base 5e416443 key d8665e73b0ea224f
+  check:check-model-relay.sh                   cache-hit on base 5e416443 key 933cd8e85f35bcf6
+  check:check-on-landing.sh                    cache-hit on base 5e416443 key 7244cb9982d11d34
+  check:check-presence-upload.sh               cache-hit on base 5e416443 key a3c7fc67e35951ac
+  check:check-schema-upgrade.sh                cache-hit on base 5e416443 key 8fb5ecae6bf17111
+  check:check-shadow-observe.sh                cache-hit on base 5e416443 key f552bfd3bbcb33f5
+  check:check-storage-extents.sh               cache-hit on base 5e416443 key 932e49b380487ff6
+  check:check-test-gate.sh                     cache-hit on base 5e416443 key aac7003a8de3efd1
+predicted     349.2 s = setup 45.0 + base 119.4 + serial 0.0 + parallel 184.8  [setup + base + serial + longest-first on 4 slots (profile 243)]
+budget        180 s -> OVER
+assumptions
+  - historical mode: cache-only; unsolved objectives: run (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
+  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
 
 ### 485 rust change plus its own task scenario 241 (proposed policy)
 gate-impact selector: impact-based landing slice (prototype, dry-run only)
-policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
 base          865cc4df9f88b1c594a78a2aff3a853604930eb0
 candidate     33777df8fe02d26c3e2538ba136983eefffa1b36
 candidate tree 5daa98f9af39a6417a2f2d98febb8b21b32c84df
-approval      sha256:89bbd813d505c0138e709a267190e1b1a41e86822cddc104b67b1f163222c97c
+approval      sha256:dc801ee01a5bf25863a5dde5de4fe608fa02dc7f1928237416e5c9c24ed7901d
               bind any approval to this digest; a new candidate changes it
 decision      narrow
 changed       1 path(s)
-  crates/spawn-core/src/bridge.rs            rust
+  crates/spawn-core/src/bridge.rs            rust          
 owner review  not required by path class
 keys
   static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
   rust     sha256:0defe313ee2376ea847cc036afb143a64b31047f8b2f6d7b0216d923a2abba66  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  CHANGED
   web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
   scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+  backlog  sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  base sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  unchanged
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
 selected      29 job(s)
   rust-build                                   input-changed        20.335s  key 0c0f743a8f4476b8
   test-listing                                 input-changed        73.873s  key 6cdfa329dd42acab
-  check-tests.sh                               input-changed       187.781s  key 2f155a5ca3a2e489
+  check-tests.sh                               input-changed       187.781s  key 4c53dfc9b447a28d
   check-clippy.sh                              input-changed        30.441s  key d408d55fadc161f7
   journey:check-e2e.sh                         always-on (C1 data-loss/control)   82.587s  key bbb8cb8181520a8f
   journey:check-j03-human.sh                   always-on (C1 data-loss/control)   80.867s  key 1003bf73d4b0fcac
   journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   62.855s  key 31a4651788816bb2
   journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   86.962s  key 82a7b000ccd1c89c
   journey:check-j02-lands.sh                   input-changed        55.401s  key 19cffb3589a1f610
-  journey:check-j04-observe.sh                 input-changed        44.293s  key 9d5c846c38aedfc9
+  journey:check-j04-observe.sh                 input-changed (serial: the gate runs it alone)   44.293s  key 9d5c846c38aedfc9
   journey:check-j05-operator.sh                input-changed         8.536s  key 9b982872697cdc8f
   journey:check-j08-stuck.sh                   input-changed       109.724s  key c1f9dbbd1d2d1395
   journey:check-j09-stall-cancel.sh            input-changed       110.907s  key 64009d2b73a6c156
@@ -157,46 +929,205 @@ selected      29 job(s)
   check:check-storage-extents.sh               input-changed         0.066s  key 5124249e960054ed
   check:check-test-gate.sh                     input-changed         0.237s  key 4b3df0c317297e67
   task:241.sh                                  task acceptance test: fail on base, pass on candidate   39.916s  key 90d3b5f3a567df6b
-skipped (161):
-  [1] cache-hit
-  [158] nightly-scope
+skipped       161 job(s)
+  check-web.sh                                 cache-hit on base 865cc4df key 4d4759410b45de66
+  historical:007.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key fae9d7ff9cdebad9
+  historical:008.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4d825241bc6cfd7a
+  historical:017.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0a3a321cdf25b966
   historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 2e6c89e7d3d9864d
+  historical:034.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1c188a4ea719fb98
+  historical:035.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 23b61a897df0119e
+  historical:037.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key fa429c488e166022
+  historical:039.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8d03f27fee927558
+  historical:040.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7546f26b53551402
+  historical:041.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1fed46df8519f3dc
+  historical:042.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4b022c4219e15579
+  historical:043.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 014f8e2a2d197b91
+  historical:044.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key be1c27c142d00281
+  historical:045.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4c273248b6675c45
+  historical:046.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f7591668ae3a82dc
+  historical:047.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 785ea07ba4533a18
+  historical:048.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b957a49721e64a84
+  historical:049.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 31285bad8e050eab
+  historical:050.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c6ed813488b3f059
+  historical:051.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 99eab6a2d0204b40
+  historical:052.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key cf67d56618a9838f
+  historical:053.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key fb0af60bbea9fb0d
+  historical:056.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2d9529c964fc79ad
+  historical:057.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6318d0975469f118
+  historical:058.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b95041688e7ad357
+  historical:059.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 415add1d7605dd84
+  historical:060.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key c0e184774d4625c0
+  historical:061.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 19096190a2d4648c
+  historical:062.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e5869713fe011370
+  historical:063.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f1d61022a9d03f2c
+  historical:064.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2edd4d39f939e0bc
+  historical:065.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7ff83da35568d5b5
+  historical:066.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 67669971ff7054bf
+  historical:067.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key afd11e788e88c3f5
+  historical:068.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e57ecd7b79146853
+  historical:069.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7fbc9f3f18e48c1b
+  historical:070.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e240c896a977354e
+  historical:071.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8711997179176f41
+  historical:072.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2704cdbf1dafb84c
+  historical:073.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 540b6f43406c90d1
+  historical:074.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 341a0a01a33a1aec
+  historical:075.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1ba9274d8337c12f
+  historical:076.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 38ed25061cb943ad
+  historical:077.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ba3f22924acc3a85
+  historical:078.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d13ff704e9e9392e
+  historical:079.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key da1bb06eb9505096
+  historical:080.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8d2a4ac699212b5a
+  historical:081.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 99180f75c117586e
+  historical:082.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 50c29ce7478931a7
+  historical:083.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 409a067faa4f112a
+  historical:085.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 56189e957798cdc1
+  historical:086.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2138a2c8d72076e8
+  historical:087.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3a1f12ce209bdcd1
+  historical:089.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 55601522ccb98944
+  historical:090.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 14f1008e539ae818
+  historical:091.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3f32a7b5c2c4157e
+  historical:092.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key bf9f87ab66440b3e
+  historical:093.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4d53dda3faeaaf16
+  historical:094.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 84f5088fac904e8e
+  historical:095.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f95b4255dfd94333
+  historical:096.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0e77258091e00f0d
+  historical:097.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 03d1fc661c869eea
+  historical:098.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1b8bd4fc32ca21bb
+  historical:099.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key eed7d2a4bd4c22ce
+  historical:100.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a88d9256b165aeea
+  historical:102.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 52867e783fa0a0a5
+  historical:103.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 28d940c574685abe
+  historical:104.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key eb933f6fd871155b
+  historical:105.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5a43147bd4759254
+  historical:106.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key ab9afb5b3987352b
+  historical:107.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 54cec2349e83e83e
+  historical:108.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 01b85be7723a88b3
+  historical:109.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9e5335629f1f02b5
+  historical:112.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f3f7d9b2cdaec234
+  historical:113.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2ec5f4a55918d930
+  historical:114.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d195c9565e16e917
+  historical:115.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 28e334d2522d7b21
+  historical:116.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8fcfee96e9e104ba
+  historical:117.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d65fcfc12d1435c5
+  historical:119.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1e86c32543035fa6
+  historical:120.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f7546de41ea3a44b
+  historical:121.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1a65451b23ea3cd6
+  historical:122.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0751c554e4040da9
+  historical:123.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3d36f31db5370895
+  historical:129.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2699f6075d6602f2
+  historical:131.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8f280567c3860787
+  historical:132.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7528436c5e88af55
+  historical:133.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e04ad99594efc768
+  historical:135.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b734622426a69793
+  historical:136.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key de52272eb1e09964
+  historical:138.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3959b1029e31a7d5
+  historical:139.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6a9d8d437dff58a0
+  historical:140.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 58a7f0f57573ebdb
+  historical:145.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 472fc22e3e561a85
+  historical:146.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f7a794adb0baffeb
+  historical:148.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 61746fbd6d826484
+  historical:149.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key da54d1bb2df2a350
+  historical:151.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 74803f1b3c7fdc67
+  historical:155.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e0e5bf1f0765bb91
+  historical:156.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 82e3a5f32bad1623
+  historical:158.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 768dbb033cad18c3
+  historical:159.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3dfa2ea0327b8fb7
+  historical:166.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 24961c278aa795df
+  historical:167.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 17b07be149ec6974
+  historical:168.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f5f00469c8eba2ff
+  historical:169.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f6c49c606101aec2
+  historical:170.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a30e6adef01f465b
+  historical:171.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 91583504f3df155b
+  historical:172.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 00246c6742aeb9af
+  historical:173.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 04b1fe8cab88e1f7
+  historical:175.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 55245c7f8c3a0a0c
+  historical:176.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7ddf6628befb097e
+  historical:177.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 289fcc5630aba635
+  historical:178.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 657df090d7299224
+  historical:179.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d43cd758f1743ff3
+  historical:180.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 3d362f01558a0f18
+  historical:181.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 9e846a2a11887cc4
+  historical:182.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 761aa55e05c7302c
+  historical:185.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8058883d3f7413c1
+  historical:186.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key af20f63b0fe17126
+  historical:192.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 99564c4431500b26
+  historical:193.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 08b0c816f6a94809
+  historical:194.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 158ea96ca736369b
+  historical:195.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key dabd1fa1552faa86
+  historical:198.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5da7cd1abc58b847
+  historical:199.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 026107d5e64aadfb
+  historical:200.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5180c94bc8fa3138
+  historical:201.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key e0572952d98328c7
+  historical:202.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b0df43870350027d
+  historical:203.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 5c093eb350a5005f
+  historical:204.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b53299671d53646f
+  historical:205.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7c1ee4cf29137e0f
+  historical:206.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key aad1da3d91be0603
+  historical:207.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 644cf4cd7a85c1ca
+  historical:209.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key b8ee1ac4834bcf94
+  historical:210.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key a8e41a91521d115c
+  historical:211.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 378a9bd97ba8ac0c
+  historical:212.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1d1c57e7bcffeb89
+  historical:214.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key f2e15a65914c27b3
+  historical:215.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key d6160e938ea8df91
+  historical:216.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 7032d45728b5263d
+  historical:217.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 78d70fbe73110586
+  historical:219.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 59e610c125dc4543
+  historical:220.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 8c2abcfde3acbb79
+  historical:221.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 693c54d52b1bf67f
+  historical:222.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2712618f814f1003
+  historical:223.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6aa6d6b974e0e79a
+  historical:224.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0a1cacd227dbcdba
+  historical:225.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 11d26f8e341640b8
+  historical:227.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 4dc0a3944031bee3
+  historical:228.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 71693bf009c112ef
+  historical:230.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 762e577ef8aa9d18
+  historical:231.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 17c52a32d3db2b48
+  historical:232.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 1b59880f1269959a
+  historical:233.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 2ada8db9df263ec1
+  historical:234.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 6ee37fa79837d692
+  historical:236.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 07d77590319f8bd5
+  historical:237.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 0bfe9a787bcdb169
   historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 45568b3359ae6a64
-predicted     479.1 s = setup 74.0 + base 0.0 + serial 94.2 + parallel 310.9  [setup + base + serial + longest-first on 4 slots (profile 485)]
+  historical:239.sh                            nightly-scope (design-gate-v2 Decision 1; install pending) key 576644b6a47137ed
+predicted     510.5 s = setup 74.0 + base 0.0 + serial 138.5 + parallel 298.0  [setup + base + serial + longest-first on 4 slots (profile 485)]
 budget        180 s -> OVER
 assumptions
-  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - historical mode: nightly; unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
   - the base record base-865cc4df.json is the accepting gate's candidate passes for 865cc4df; candidate runs of a later tree are never read
-
 
 ### 485 under today's checks plus cache (no retirement)
 gate-impact selector: impact-based landing slice (prototype, dry-run only)
-policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
 base          865cc4df9f88b1c594a78a2aff3a853604930eb0
 candidate     33777df8fe02d26c3e2538ba136983eefffa1b36
 candidate tree 5daa98f9af39a6417a2f2d98febb8b21b32c84df
-approval      sha256:36a16e62c485823a3f6d7e19cf54d9a57a2acd27194792dc66c41837cf7e2f3e
+approval      sha256:ae7552a884190f2b05e76dc32a2983ad318eadbf3cd34a6021c6884213320507
               bind any approval to this digest; a new candidate changes it
 decision      narrow
 changed       1 path(s)
-  crates/spawn-core/src/bridge.rs            rust
+  crates/spawn-core/src/bridge.rs            rust          
 owner review  not required by path class
 keys
   static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
   rust     sha256:0defe313ee2376ea847cc036afb143a64b31047f8b2f6d7b0216d923a2abba66  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  CHANGED
   web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
   scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+  backlog  sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  base sha256:d9b30c78755d9bd9eb2c98e89eb6baa2c650950b29fdab1fae8b2d7c79b16249  unchanged
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
 selected      187 job(s)
   rust-build                                   input-changed        20.335s  key 0c0f743a8f4476b8
   test-listing                                 input-changed        73.873s  key 6cdfa329dd42acab
-  check-tests.sh                               input-changed       187.781s  key 2f155a5ca3a2e489
+  check-tests.sh                               input-changed       187.781s  key 4c53dfc9b447a28d
   check-clippy.sh                              input-changed        30.441s  key d408d55fadc161f7
   journey:check-e2e.sh                         always-on (C1 data-loss/control)   82.587s  key bbb8cb8181520a8f
   journey:check-j03-human.sh                   always-on (C1 data-loss/control)   80.867s  key 1003bf73d4b0fcac
   journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   62.855s  key 31a4651788816bb2
   journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   86.962s  key 82a7b000ccd1c89c
   journey:check-j02-lands.sh                   input-changed        55.401s  key 19cffb3589a1f610
-  journey:check-j04-observe.sh                 input-changed        44.293s  key 9d5c846c38aedfc9
+  journey:check-j04-observe.sh                 input-changed (serial: the gate runs it alone)   44.293s  key 9d5c846c38aedfc9
   journey:check-j05-operator.sh                input-changed         8.536s  key 9b982872697cdc8f
   journey:check-j08-stuck.sh                   input-changed       109.724s  key c1f9dbbd1d2d1395
   journey:check-j09-stall-cancel.sh            input-changed       110.907s  key 64009d2b73a6c156
@@ -204,7 +1135,7 @@ selected      187 job(s)
   journey:check-j11-push-drain.sh              input-changed        79.992s  key 3a21e683ed188741
   journey:check-j12-hold-told.sh               input-changed        52.492s  key f78aa54de4ba22db
   historical:007.sh                            input-changed         3.508s  key fae9d7ff9cdebad9
-  historical:008.sh                            input-changed         2.187s  key 0926028c4c5879e2
+  historical:008.sh                            input-changed         2.187s  key 4d825241bc6cfd7a
   historical:017.sh                            input-changed         2.543s  key 0a3a321cdf25b966
   historical:034.sh                            input-changed        88.160s  key 1c188a4ea719fb98
   historical:035.sh                            input-changed        31.077s  key 23b61a897df0119e
@@ -272,7 +1203,7 @@ selected      187 job(s)
   historical:104.sh                            input-changed         2.998s  key eb933f6fd871155b
   historical:105.sh                            input-changed         1.235s  key 5a43147bd4759254
   historical:106.sh                            input-changed        12.268s  key ab9afb5b3987352b
-  historical:107.sh                            input-changed        30.261s  key 54cec2349e83e83e
+  historical:107.sh                            input-changed (serial: the gate runs it alone)   30.261s  key 54cec2349e83e83e
   historical:108.sh                            input-changed         2.646s  key 01b85be7723a88b3
   historical:109.sh                            input-changed         2.502s  key 9e5335629f1f02b5
   historical:112.sh                            input-changed         1.126s  key f3f7d9b2cdaec234
@@ -374,24 +1305,24 @@ selected      187 job(s)
   check:check-storage-extents.sh               input-changed         0.066s  key 5124249e960054ed
   check:check-test-gate.sh                     input-changed         0.237s  key 4b3df0c317297e67
   task:241.sh                                  task acceptance test: fail on base, pass on candidate   39.916s  key 90d3b5f3a567df6b
-skipped (3):
-  [1] cache-hit
+skipped       3 job(s)
+  check-web.sh                                 cache-hit on base 865cc4df key 4d4759410b45de66
   historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 2e6c89e7d3d9864d
   historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 45568b3359ae6a64
-predicted     1221.2 s = setup 74.0 + base 0.0 + serial 94.2 + parallel 1053.0  [setup + base + serial + longest-first on 4 slots (profile 485)]
+predicted     1277.1 s = setup 74.0 + base 0.0 + serial 168.8 + parallel 1034.3  [setup + base + serial + longest-first on 4 slots (profile 485)]
 budget        180 s -> OVER
 assumptions
-  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - historical mode: cache-only; unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
   - the base record base-865cc4df.json is the accepting gate's candidate passes for 865cc4df; candidate runs of a later tree are never read
-
 
 ### shared/runtime change: gate helper and a journey file (2e8781ca)
 gate-impact selector: impact-based landing slice (prototype, dry-run only)
-policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+policy        v1  sha256:8a6123edd4a9cf23173ec533d814c04a0027d76d7809e0c9275e86dd976a0b31
 base          337c94b52440198d2bb309e6e20f1043e3b2c6d2
 candidate     2e8781ca82ba09240616f412f01adc582144c00a
 candidate tree 6403615eca6f4cb171f5ab04967914cbeebb57fc
-approval      sha256:a9513634e28c7c63ab9bca0a19f84da2b998197d06dea5fbedb913b5d475551d
+approval      sha256:c4e5e348cab4c6e41aa4cab01a688d63ee7b35edecb24cb3e26862225474c4b5
               bind any approval to this digest; a new candidate changes it
 decision      full
               - shared/cross-cutting input changed: rsi/scenarios/237.sh (judge-or-shared)
@@ -408,10 +1339,12 @@ keys
   rust     sha256:4c83a29b74d5c4ce82d10593a9d89b04eea5926c67b292a0ade9338121f4f925  base sha256:4c83a29b74d5c4ce82d10593a9d89b04eea5926c67b292a0ade9338121f4f925  unchanged
   web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
   scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:40ccde3b7e5441155790667b42b7399601562882b7d9e1b3aae3c55dad38c9e9  CHANGED
+  backlog  sha256:44af98cdb92e38cb8defa0f38afab62406a7a8931deede9b380d84675b3d8dc0  base sha256:d82672320951eb1a70ac1fd747a609f235b3efc3ed93f6b39edb70501bbc27a4  CHANGED
+  readme   sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  base sha256:e4b005333d5f536f6b42951a56189a8b9eed2c9c8d13c66984cf3fd6c422d647  unchanged
 selected      186 job(s)
   rust-build                                   full gate            18.232s  key dde5b20a1ae4e7f6
   test-listing                                 full gate            61.219s  key ac16a5d73f7aaf24
-  check-tests.sh                               full gate           184.793s  key c36d31b38438f935
+  check-tests.sh                               full gate           184.793s  key 908bb2897c6b3ee4
   check-clippy.sh                              full gate            25.463s  key 9c4abc9204e8765c
   check-web.sh                                 full gate             7.928s  key 4d4759410b45de66
   journey:check-e2e.sh                         full gate            84.257s  key 979c223b67b8d78f
@@ -427,7 +1360,7 @@ selected      186 job(s)
   journey:check-j11-push-drain.sh              full gate            73.459s  key 8c24b1b8dc8bda74
   journey:check-j12-hold-told.sh               full gate            52.386s  key 20efe2e73e11625e
   historical:007.sh                            full gate             2.288s  key 0dd1bb40b69f6892
-  historical:008.sh                            full gate             2.015s  key 55de70e086496c3d
+  historical:008.sh                            full gate             2.015s  key 166f3872be322d41
   historical:017.sh                            full gate             2.351s  key 83302ffff4a2227c
   historical:034.sh                            full gate            86.901s  key 2a30cb5ef6b715fe
   historical:035.sh                            full gate            37.386s  key 4366da279471c0b2
@@ -595,10 +1528,11 @@ selected      186 job(s)
   check:check-shadow-observe.sh                full gate             3.229s  key 783820241eef78ab
   check:check-storage-extents.sh               full gate             0.048s  key 5aec4e52819da002
   check:check-test-gate.sh                     full gate             0.029s  key 040cb817d2df8f34
-skipped (1):
+skipped       1 job(s)
   historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 83d195fe8d00576a
 predicted     1973.8 s (measured total; setup 45.0, base 778.0, candidate 1149.0)  [measured today's full gate (profile 243)]
 budget        180 s -> OVER
 assumptions
-  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - historical mode: cache-only; unsolved objectives: run (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
   - no base record: every job is a cache miss (fail-closed direction)
