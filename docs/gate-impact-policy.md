@@ -107,12 +107,15 @@ split, every 243-type change pays the full gate.
 
 - A key is a content hash of what a job reads, computed on both trees: the
   Rust tree (`crates/`, `Cargo.toml`, `Cargo.lock`), the web tree, the
-  scripts tree, the scenario blob, the toolchain/environment probe, and the
-  policy version.
+  scripts tree, the backlog tree (`rsi/backlog/`, for `check-tests.sh`),
+  `README.md` (for scenario 008), the scenario blob, the
+  toolchain/environment probe, and the policy version.
 - A result is reused only when the candidate's key equals the base's key and
-  the base's accepting gate recorded the result. The accepting gate's own
-  candidate runs seed the new main (C16; the gate already does this for
-  solved objectives, `scripts/rsi/gate.sh:4814`).
+  the base's accepting gate recorded the result **for exactly this base
+  commit**. The accepting gate's own candidate runs are meant to seed the
+  new main (C16; the gate does this today only for solved objectives,
+  `scripts/rsi/gate.sh:4814`), so a check, journey or CI hit depends on the
+  pending C15/C16/C19 wiring and is not available on a live landing yet.
 - **Candidate runs never certify a later candidate.** The selector reads
   results; it never writes a cache entry. A new candidate, a changed input, a
   different toolchain or environment, or a new policy version changes the
@@ -135,8 +138,12 @@ scenarios off the ordinary landing path, per the owner's approved
 design-gate-v2 Decision 1 (performance bounds and retired scenarios are
 checked nightly). The `--historical-mode cache-only` replay models today's
 gate instead: every check stays, and only content-addressed results are
-reused. The difference is what the retirement buys for a code change; it
-buys nothing for a 243-type change, whose results are all cache hits anyway.
+reused. A scenario listed in `rsi/scenarios/serial` (read at the base, as
+the controller does) is charged alone, outside the four-slot makespan.
+Neither default is this tool's own: `--historical-mode` takes the policy's
+`default_mode` (cache-only) and `--unsolved-mode` its `unsolved_default`
+(run), so an operator who omits the flags gets the conservative replay, not
+the unapproved retirement or the unratified carry.
 
 Nothing is hidden outside the clock: section 7 lists exactly what the landing
 does not prove and the nightly owner of each such fact.
@@ -153,9 +160,9 @@ it under today's checks.
 
 | class | paths | landing jobs |
 | --- | --- | --- |
-| nightly-only / data | `rsi/backlog/`, `rsi/scenarios/nightly/` | static core + C1; the changed nightly scenario is proven by the nightly |
-| docs | `docs/`, `README*` | static core + C1 |
-| web | `web/src/`, `web/test/`, `web/index.html` | static core + `check-web.sh` + C1 + journeys whose key changed |
+| nightly-only / data | `rsi/backlog/`, `rsi/scenarios/nightly/` | static core + C1; a backlog edit also selects `check-tests.sh` (its key names `rsi/backlog/`), and the changed nightly scenario is proven by the nightly |
+| docs | `docs/`, `README*` | static core + C1; a `README.md` edit also selects `008.sh`, which greps the README floor |
+| web | `web/src/`, `web/test/`, `web/index.html` | static core + `check-web.sh` + `check-tests.sh` (its `cost_page` test runs `web/src/cost.ts`) + C1 + journeys whose key changed |
 | rust | `crates/`, `Cargo.toml`, `Cargo.lock` | static core + build + test listing + `check-tests.sh` + `check-clippy.sh` + C1 + journeys + the task scenario |
 | judge / shared | `scripts/`, `deploy/`, `rsi/` (except the two data paths), `web/` config, toolchain | today's full gate (186 candidate jobs + base phase) |
 | unknown | anything else | full gate, `fail_closed: true` |
