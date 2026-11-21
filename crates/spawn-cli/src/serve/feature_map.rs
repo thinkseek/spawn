@@ -1863,6 +1863,126 @@ mod tests {
         let _ = read_mapping(Path::new("/definitely/not/here"), 4);
     }
 
+    /// Through a real store: four objectives, one left planned, one landed
+    /// and unverified, one landed and verified after the deploy, one landed
+    /// and verified before it. The map reads the four states from the
+    /// records, not from the tasks' shapes.
+    #[test]
+    fn the_store_gives_the_map_the_four_states() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("feature_map_states");
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("a schema of its own, migrated");
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let mut client =
+            postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+        let dir = std::env::temp_dir().join(format!("spawn-feature-states-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a backlog");
+        for objective in 1..=4 {
+            std::fs::write(
+                dir.join(format!("{objective:03}.json")),
+                json!({"id": objective, "title": format!("Capability {objective}"),
+                       "prompt": format!("Objective {objective}.")})
+                    .to_string(),
+            )
+            .expect("an objective");
+        }
+        let record = |client: &mut postgres::Client, value: Value| {
+            client
+                .query_one("select spawn_control_record($1)", &[&value])
+                .expect("a control record");
+        };
+        record(
+            &mut client,
+            json!({"type": "mission.added", "id": 4, "text": "Spawn RSI",
+                   "origin": "human", "sources": ["/m/missions/spawn.git"]}),
+        );
+        client
+            .query_one(
+                "select spawn_mission_configure($1, $2, $3, $4, $5)",
+                &[
+                    &4_i64,
+                    &"/g",
+                    &"gate",
+                    &None::<Value>,
+                    &json!({"backlog": dir.display().to_string(), "resident": "rsi"}),
+                ],
+            )
+            .expect("configured");
+        let assign = |client: &mut postgres::Client, task: i64, objective: i64| {
+            record(
+                client,
+                json!({"type": "task.assigned", "id": task, "mission_id": 4,
+                       "kind": "ephemeral", "created_by": "spawn-integrate",
+                       "agent_id": format!("agent_{task}"),
+                       "session_id": format!("session_{task}"),
+                       "objective": objective, "brief": format!("Capability {objective}")}),
+            );
+            record(
+                client,
+                json!({"type": "task.landed", "id": task, "from": "a".repeat(40),
+                       "to": format!("{:040x}", task)}),
+            );
+        };
+        // 3 lands and is verified, then the deploy ships it: live.
+        assign(&mut client, 3, 3);
+        store
+            .verification_record(&json!({"type": "objective.verified", "mission": 4,
+                                         "objective": 3, "by": "lead", "how": "read it",
+                                         "result": "pass"}))
+            .expect("3 verified");
+        store
+            .deploy_record(&json!({"type": "deploy.finished", "ok": true,
+                                   "head": "b".repeat(40), "by": "landing", "reason": ""}))
+            .expect("a deploy");
+        // 2 lands and is verified after it: verified, not live.
+        assign(&mut client, 2, 2);
+        store
+            .verification_record(&json!({"type": "objective.verified", "mission": 4,
+                                         "objective": 2, "by": "lead", "how": "read it",
+                                         "result": "pass"}))
+            .expect("2 verified");
+        // 1 lands and is never verified: implemented.
+        assign(&mut client, 1, 1);
+        // 4 is never assigned: planned.
+        let missions = crate::serve::objective_missions(&store).expect("the missions");
+        let map = build(
+            &missions,
+            &store.verification_facts().expect("the verifications"),
+            &store.deploy_facts(50).expect("the deploys"),
+            &store.mission_blockers().expect("the blockers"),
+            0,
+        );
+        let feature = |id: &str| {
+            map["missions"][0]["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|feature| feature["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} in {map}"))
+        };
+        assert_eq!(feature("objective-004")["state"], "planned");
+        assert_eq!(feature("objective-001")["state"], "implemented");
+        assert_eq!(feature("objective-001")["verified"], false);
+        assert_eq!(feature("objective-002")["state"], "verified");
+        assert_eq!(feature("objective-002")["live"], false);
+        assert_eq!(feature("objective-003")["state"], "live");
+        assert_eq!(
+            feature("objective-003")["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| source["ref"] == "deploy:4"),
+            true,
+            "{map}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The whole answer carries the seconds and the deploy it stands on.
     #[test]
     fn the_answer_says_which_deploy_it_stands_on() {
