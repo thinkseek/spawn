@@ -1152,6 +1152,45 @@ mod tests {
         );
     }
 
+    /// `--features` names an existing, valid feature map; `--no-features`
+    /// clears it. A missing or invalid file is refused at configure time,
+    /// not silently ignored by the page later.
+    #[test]
+    fn configure_sets_and_clears_a_feature_map_only_with_a_valid_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-flag-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("map.json"),
+            r#"{"features":[{"id":"x","title":"X","sources":[{"kind":"objective","objective":1}]}]}"#,
+        )
+        .expect("a mapping");
+        let path = dir.join("map.json").display().to_string();
+        assert_eq!(
+            configure(&["--id", "4", "--features", &path]),
+            Ok(json!({"objectives": {"features": path}}))
+        );
+        assert_eq!(
+            configure(&["--id", "4", "--no-features"]),
+            Ok(json!({"objectives": {"features": null}}))
+        );
+        let refused =
+            configure(&["--id", "4", "--features", "/definitely/not/here"]).expect_err("no file");
+        assert!(refused.contains("is not a file"), "{refused}");
+        std::fs::write(
+            dir.join("bad.json"),
+            r#"{"features":[{"id":"x","title":"X","status":"live"}]}"#,
+        )
+        .expect("a bad mapping");
+        let bad = dir.join("bad.json").display().to_string();
+        let refused = configure(&["--id", "4", "--features", &bad]).expect_err("a status");
+        assert!(refused.contains("unknown field `status`"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn configure_clears_only_what_its_switches_name() {
         assert_eq!(
