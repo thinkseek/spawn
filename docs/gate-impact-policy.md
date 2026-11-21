@@ -296,9 +296,10 @@ It runs no check, builds nothing, writes no cache, and is not wired into
 
 Confirmed:
 
-- A 243-type change lands in **131.0 s** under the proposed policy, and in
-  131.0 s under cache-only with the base's results intact. It is 186 skipped
-  jobs, four C1 journeys, and no retired check in the cache-only row.
+- A change that touches only a nightly data file predicts **131.0 s**: four
+  C1 journeys and 186 skipped jobs. It is a prediction, not an achieved
+  landing (the seed wiring in the footnote, and the carried `unsolved` rule,
+  are not installed).
 - The specific cause of the 1973 s 243 landing is the nightly file in the
   landing cache key, not the number of scenarios.
 - Unknown impact and a missing dependency fail closed: full gate or no
@@ -306,13 +307,16 @@ Confirmed:
 
 Refuted:
 
+- "A 243-type change lands in 131 s." It does not: 243 edited the backlog,
+  `cargo test` reads the backlog, and check-tests is 184.8 s, so the honest
+  243-type prediction is 229.8 s, over budget.
 - "Cache alone is enough." Strict cache-only with the one unsolved objective
-  on main costs 286.9 s, over the budget. The 131 s needs either the
-  approved retirement (row 1) or a carried `unsolved` result (row 2).
-- "A Rust change fits in 180 s." It does not: 479.1 s under the proposed
-  policy, 1221.2 s under today's checks. check-tests alone is 184.8 s.
-- "A web change fits under conservative keys." It is 257.6 s until the
-  per-journey keys are proven.
+  on main costs 349.2 s, over the budget. The 229.8 s needs a carried
+  `unsolved` result; the retirement alone does not remove check-tests.
+- "A Rust change fits in 180 s." It does not: 510.5 s under the proposed
+  policy, 1277.1 s under today's checks. check-tests alone is 184.8 s.
+- "A web change fits under conservative keys." It is 330.9 s until the
+  per-journey keys are proven, and check-tests must run for `cost.ts`.
 - "There is a universal 3-minute SLA." There is not. Runtime/shared changes
   correctly stay at the full 1973.8 s.
 
