@@ -1868,6 +1868,7 @@ mod tests {
     /// and verified before it. The map reads the four states from the
     /// records, not from the tasks' shapes.
     #[test]
+    #[allow(clippy::too_many_lines)] // one mission's four objectives, in order
     fn the_store_gives_the_map_the_four_states() {
         let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
             "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
