@@ -640,7 +640,7 @@ def select(opts):
                 cost = base_cost(name, trust_record=False)
                 result.base_seconds += cost
                 result.selected.append({
-                    "id": job_id, "kind": "parallel",
+                    "id": job_id, "kind": "parallel", "scenario": name,
                     "why": "cache-miss: unsolved base result is not carried (--unsolved-mode run)",
                     "key": ckey, "seconds": require_timing(name),
                     "timing": name, "base_seconds": round(cost, 3)})
@@ -650,6 +650,7 @@ def select(opts):
                 cost = base_cost(name) if is_historical else 0.0
                 result.base_seconds += cost
                 result.selected.append({"id": job_id, "kind": "parallel",
+                                        "scenario": name,
                                         "why": why, "key": ckey,
                                         "seconds": require_timing(name),
                                         "timing": name,
@@ -659,7 +660,7 @@ def select(opts):
         else:
             seconds = timing(name) or 0.0
             result.selected.append({"id": job_id, "kind": "parallel",
-                                    "why": "full gate", "key": ckey,
+                                    "scenario": name, "why": "full gate", "key": ckey,
                                     "seconds": seconds, "timing": name})
 
     # The task's own scenario: always on the landing path when the task names
