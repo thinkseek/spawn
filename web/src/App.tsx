@@ -11,6 +11,7 @@ import { MobileNav, Sidebar } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
 import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
 import { CostView } from "./components/cost/CostView";
+import { FeatureMapView } from "./components/features/FeatureMapView";
 import { FleetView } from "./components/fleet/FleetView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
@@ -32,6 +33,7 @@ const ShowView = lazy(() =>
 export type View =
   | "fleet"
   | "missions"
+  | "features"
   | "rsi"
   | "alerts"
   | "scorecard"
@@ -50,6 +52,7 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
+  if (hash.startsWith("#/features")) return { view: "features", agent: null };
   if (hash.startsWith("#/alerts")) return { view: "alerts", agent: null };
   if (hash.startsWith("#/scorecard")) return { view: "scorecard", agent: null };
   if (hash.startsWith("#/cost")) return { view: "cost", agent: null };
@@ -73,6 +76,7 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "missions") return "#/missions";
+  if (route.view === "features") return "#/features";
   if (route.view === "alerts") return "#/alerts";
   if (route.view === "scorecard") return "#/scorecard";
   if (route.view === "cost") return "#/cost";
@@ -253,6 +257,7 @@ export default function App() {
         openAlerts={openAlerts}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
+        onShowFeatures={() => setView("features")}
         onShowRsi={() => setView("rsi")}
         onShowAlerts={() => setView("alerts")}
         onShowScorecard={() => setView("scorecard")}
@@ -271,6 +276,7 @@ export default function App() {
         attention={humanCount}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
+        onShowFeatures={() => setView("features")}
         onShowRsi={() => setView("rsi")}
         onShowAlerts={() => setView("alerts")}
         openAlerts={openAlerts}
@@ -303,6 +309,8 @@ export default function App() {
         />
       ) : view === "missions" ? (
         <MissionsView missions={missions} />
+      ) : view === "features" ? (
+        <FeatureMapView onOpenSession={openTimeline} />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
       ) : view === "alerts" ? (
