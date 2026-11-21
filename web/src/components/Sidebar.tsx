@@ -1,4 +1,4 @@
-import { Activity, BellRing, CircleDollarSign, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, Boxes, CircleDollarSign, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -41,6 +41,7 @@ interface SidebarProps {
   openAlerts: number;
   onShowFleet: () => void;
   onShowMissions: () => void;
+  onShowFeatures: () => void;
   onShowRsi: () => void;
   onShowAlerts: () => void;
   onShowScorecard: () => void;
@@ -75,6 +76,7 @@ export function Sidebar({
   openAlerts,
   onShowFleet,
   onShowMissions,
+  onShowFeatures,
   onShowRsi,
   onShowAlerts,
   onShowScorecard,
@@ -119,6 +121,12 @@ export function Sidebar({
           onClick={onShowMissions}
           icon={<Target size={15} />}
           label="Missions"
+        />
+        <NavItem
+          active={view === "features"}
+          onClick={onShowFeatures}
+          icon={<Boxes size={15} />}
+          label="Feature map"
         />
         <NavItem
           active={view === "rsi"}
@@ -541,6 +549,7 @@ export function MobileNav({
   openAlerts,
   onShowFleet,
   onShowMissions,
+  onShowFeatures,
   onShowRsi,
   onShowAlerts,
   onShowScorecard,
@@ -569,6 +578,7 @@ export function MobileNav({
           [
             ["fleet", "Home", <House key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
+            ["features", "Map", <Boxes key="f" size={13} />, onShowFeatures],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
             ["alerts", "Alerts", <BellRing key="b" size={13} />, onShowAlerts],
             ["scorecard", "Score", <Gauge key="g" size={13} />, onShowScorecard],
