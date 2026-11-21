@@ -386,7 +386,10 @@ which was the bug.
   which read the candidate binary? The prototype conservatively keys them on
   rust + web + scripts.
 - The host timing profile must be refreshed when the toolchain or host
-  changes; a stale profile is a wrong prediction, not a wrong verdict.
+  changes. `env` is part of every key, so a stale profile is a stale *hit*,
+  not merely a wrong prediction; computing the probe at selection time is
+  the C15 wiring's job, and until it exists the profile is an assumption,
+  not a measurement.
 - The 4-slot assumption is this host's; a smaller host changes every wall
   clock in section 4.
 
