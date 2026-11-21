@@ -6382,7 +6382,7 @@ mod tests {
             &mut monitor,
             14,
             0,
-            json!({"type": "task.released", "id": 7, "by": "ckl", "reason": "099 fixed"}),
+            json!({"type": "task.released", "id": 7, "by": "alice", "reason": "099 fixed"}),
         );
         let released = decided(&monitor, released);
         let [Event::Clear { key, evidence }] = released.as_slice() else {
@@ -6391,7 +6391,7 @@ mod tests {
         assert_eq!(key, "task_parked:7:11");
         assert_eq!(
             *evidence,
-            json!({"event_id": 14, "record": "task.released", "by": "ckl", "reason": "099 fixed"})
+            json!({"event_id": 14, "record": "task.released", "by": "alice", "reason": "099 fixed"})
         );
         commit(&mut monitor, &released);
         // Another task's release, or a release with none open, clears nothing.
@@ -6399,7 +6399,7 @@ mod tests {
             &mut monitor,
             15,
             0,
-            json!({"type": "task.released", "id": 7, "by": "ckl", "reason": "again"}),
+            json!({"type": "task.released", "id": 7, "by": "alice", "reason": "again"}),
         );
         assert!(decided(&monitor, none).is_empty());
 
@@ -9288,7 +9288,7 @@ connections\n";
                         client,
                         0,
                         &format!(
-                            r#"{{"type":"task.released","id":{task},"by":"ckl","reason":"r"}}"#
+                            r#"{{"type":"task.released","id":{task},"by":"alice","reason":"r"}}"#
                         ),
                     )
                 };

@@ -19,7 +19,7 @@ Environment=SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions
 # writes nothing itself (deploy/session-backup.sh, "Who does what").
 Environment=SPAWN_SESSION_BACKUP_USER=spawn-backup
 # Every account that has a ~/.claude, separated by `:`.
-Environment=SPAWN_SESSION_HOMES=/home/ckl
+Environment=SPAWN_SESSION_HOMES=/home/example
 # It reads the homes and writes only its root: a mistake in it cannot
 # change a session.
 ProtectHome=read-only

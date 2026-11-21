@@ -720,7 +720,7 @@ mod tests {
             "mkdir -p crates/x",
             "cargo test -p spawn-cli",
             "git log -p -3",
-            "ps -u ckl",
+            "ps -u alice",
         ] {
             assert_eq!(redact(text), text);
         }

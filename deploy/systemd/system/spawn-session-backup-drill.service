@@ -8,7 +8,7 @@ Environment=SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions
 # The versions' owner: root only starts it and each account (setpriv), and
 # writes nothing itself (deploy/session-backup.sh, "Who does what").
 Environment=SPAWN_SESSION_BACKUP_USER=spawn-backup
-Environment=SPAWN_SESSION_HOMES=/home/ckl
+Environment=SPAWN_SESSION_HOMES=/home/example
 ProtectHome=read-only
 ProtectSystem=strict
 ReadWritePaths=/var/backups/spawn-sessions

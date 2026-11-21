@@ -16,7 +16,7 @@ RestartPreventExitStatus=243 78
 # The hosted API through the Mac host's proxy, as installed live (objective
 # 208 (f)): nothing listens on 127.0.0.1:10801 on the VM, and direct egress
 # answers 451. Live has run 8118 since 201's install (2026-11-16 22:16).
-Environment=https_proxy=http://host.orb.internal:8118
+Environment=https_proxy=http://proxy.example.com:8118
 Environment=JEV_RELAY_ADDRESS=127.0.0.1:8790
 ExecStart=/usr/bin/python3 -I %h/.local/share/spawn-rsi/bin/jev-relay.py
 Restart=always

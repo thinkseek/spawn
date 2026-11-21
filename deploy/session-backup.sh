@@ -9,7 +9,7 @@
 #   deploy/session-backup.sh drill              # restore the newest into scratch, compare
 #   deploy/session-backup.sh list [<account>]   # the versions, with their counts
 #
-# Why: on 2026-11-12 at 00:37:11 a test run removed /home/ckl/.claude/projects
+# Why: on 2026-11-12 at 00:37:11 a test run removed /home/example/.claude/projects
 # (sync/incident-2026-11-12-claude-projects/); no copy existed.
 #
 # Settings, from the unit (deploy/systemd/spawn-session-backup.*), never

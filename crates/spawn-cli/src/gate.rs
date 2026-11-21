@@ -4746,7 +4746,7 @@ mod room_tests {
     fn the_password_never_leaves_the_check() {
         // The password as written (percent-encoded) and decoded, in the
         // probe's words: neither survives, and the server is named alone.
-        let url = "postgres://gate:hun%40ter2@db.internal:5434/spawn_test?sslmode=disable";
+        let url = "postgres://gate:hun%40ter2@db.example.com:5434/spawn_test?sslmode=disable";
         let failure = ProbeFailure {
             probe: "connect within 10 s".to_string(),
             error: format!("password authentication failed for gate:hun@ter2 ({url})"),
@@ -4768,7 +4768,7 @@ mod room_tests {
         );
         assert!(matches!(
             database,
-            Shortfall::Database { ref server, .. } if server == "db.internal:5434/spawn_test"
+            Shortfall::Database { ref server, .. } if server == "db.example.com:5434/spawn_test"
         ));
         assert_eq!(
             without_password(

@@ -88,7 +88,7 @@
 //! client that runs as the owner's uid (Linux: the uid of its socket in
 //! `/proc/net/tcp{,6}`; without `/proc`, no client is exempt), and, with
 //! `SPAWN_SERVE_OPEN_NETWORKS` (comma-separated CIDRs, e.g. the owner's
-//! intranet `192.168.31.0/24`), from a client inside one of them that names
+//! intranet `192.0.2.0/24`), from a client inside one of them that names
 //! this server by an IP address inside one of them (an IP literal `Host`:
 //! a page that rebinds its own name sends its name, so it reads nothing).
 //! Off by default.
@@ -566,7 +566,7 @@ impl std::fmt::Display for Network {
 }
 
 /// `SPAWN_SERVE_OPEN_NETWORKS` (`text`): comma-separated CIDRs, IPv4 or
-/// IPv6 (`192.168.31.0/24`, `fd00::/8`); an address without `/` is that one
+/// IPv6 (`192.0.2.0/24`, `fd00::/8`); an address without `/` is that one
 /// address. Unset or empty: none. A malformed entry stops `serve` from
 /// starting rather than opening more or less than the owner wrote. A
 /// network as wide as the whole address space (`/0`) is refused: that is
@@ -2736,24 +2736,19 @@ mod tests {
     fn open_networks_are_cidrs_and_a_malformed_one_stops_serve() {
         assert!(open_networks(None).expect("unset").is_empty());
         assert!(open_networks(Some(" , ")).expect("empty").is_empty());
-        let open = open_networks(Some("192.168.31.0/24, 100.64.0.0/10,fd00::/8, 10.0.0.5"))
+        let open = open_networks(Some("192.0.2.0/24, 198.51.100.0/24,fd00::/8, 192.0.2.5"))
             .expect("four networks");
         let shown: Vec<String> = open.iter().map(ToString::to_string).collect();
         assert_eq!(
             shown,
             [
-                "192.168.31.0/24",
-                "100.64.0.0/10",
+                "192.0.2.0/24",
+                "198.51.100.0/24",
                 "fd00::/8",
-                "10.0.0.5/32"
+                "192.0.2.5/32"
             ]
         );
-        for wrong in [
-            "192.168.31.0/33",
-            "intranet",
-            "192.168.31.0/x",
-            "fd00::/129",
-        ] {
+        for wrong in ["192.0.2.0/33", "intranet", "192.0.2.0/x", "fd00::/129"] {
             assert!(open_networks(Some(wrong)).is_err(), "{wrong} is refused");
         }
         for everything in ["0.0.0.0/0", "::/0"] {
@@ -2764,15 +2759,15 @@ mod tests {
         }
         let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
         let lan = open[0];
-        assert!(lan.contains(ip("192.168.31.7")));
-        assert!(!lan.contains(ip("192.168.32.7")));
+        assert!(lan.contains(ip("192.0.2.7")));
+        assert!(!lan.contains(ip("198.51.100.7")));
         assert!(
-            lan.contains(ip("::ffff:192.168.31.7")),
+            lan.contains(ip("::ffff:192.0.2.7")),
             "IPv4 mapped into IPv6"
         );
         assert!(!lan.contains(ip("fd00::1")));
         assert!(open[2].contains(ip("fd12:3456::1")));
-        assert!(open[3].contains(ip("10.0.0.5")) && !open[3].contains(ip("10.0.0.6")));
+        assert!(open[3].contains(ip("192.0.2.5")) && !open[3].contains(ip("192.0.2.6")));
     }
 
     /// The owner's intranet reads without the token (2026-11-06, "No token
@@ -2780,21 +2775,21 @@ mod tests {
     /// this server by its address inside it. Nothing else does.
     #[test]
     fn a_client_on_an_open_network_reads_without_the_token_and_nothing_else_does() {
-        let open = open_networks(Some("192.168.31.0/24")).expect("network");
-        let peer = Some(address("192.168.31.50:51234"));
-        let host = Some("192.168.31.112:8787");
+        let open = open_networks(Some("192.0.2.0/24")).expect("network");
+        let peer = Some(address("192.0.2.50:51234"));
+        let host = Some("192.0.2.112:8787");
         let port = Some(8787);
         assert!(open_network_request(peer, host, None, port, &open));
         assert!(open_network_request(
             peer,
             host,
-            Some("http://192.168.31.112:8787"),
+            Some("http://192.0.2.112:8787"),
             port,
             &open
         ));
         assert!(
             open_network_request(
-                Some(address("[::ffff:192.168.31.50]:51234")),
+                Some(address("[::ffff:192.0.2.50]:51234")),
                 host,
                 None,
                 port,
@@ -2804,7 +2799,7 @@ mod tests {
         );
         let refused = [
             (
-                Some(address("100.126.1.1:51234")),
+                Some(address("198.51.100.1:51234")),
                 host,
                 None,
                 "a client outside the network",
@@ -2817,13 +2812,13 @@ mod tests {
             ),
             (
                 peer,
-                Some("192.168.31.112:9999"),
+                Some("192.0.2.112:9999"),
                 None,
                 "a Host naming another port",
             ),
             (
                 peer,
-                Some("192.168.31.112"),
+                Some("192.0.2.112"),
                 None,
                 "a Host with no port (port 80)",
             ),
@@ -2842,7 +2837,7 @@ mod tests {
             (
                 peer,
                 host,
-                Some("https://192.168.31.112:8787"),
+                Some("https://192.0.2.112:8787"),
                 "another scheme",
             ),
             (None, host, None, "no peer address"),
@@ -2888,7 +2883,7 @@ mod tests {
             "a name, not an address: the token"
         );
         assert_eq!(
-            status_with(Some("secret"), "10.0.0.0/8", "/api/overview", named),
+            status_with(Some("secret"), "192.0.2.0/24", "/api/overview", named),
             401,
             "a client outside the open network: the token"
         );
@@ -4321,7 +4316,7 @@ mod tests {
         assert!(
             !local_exemption(
                 true,
-                Some(address("192.168.1.10:5000")),
+                Some(address("192.0.2.10:5000")),
                 Some(1000),
                 Some(1000)
             ),
@@ -4722,7 +4717,7 @@ mod tests {
         assert!(is_loopback("[::1]:8787"));
         assert!(!is_loopback("0.0.0.0:8787"));
         assert!(!is_loopback("[::]:8787"));
-        assert!(!is_loopback("192.168.1.10:8787"));
+        assert!(!is_loopback("192.0.2.10:8787"));
         assert!(!is_loopback("not an address"));
         assert_eq!(access_token("127.0.0.1:8787", None), Ok(None));
         assert!(access_token("0.0.0.0:8787", None).is_err());
@@ -4775,10 +4770,10 @@ mod tests {
         );
         assert_eq!(server_hosts("[::]:8787", 8787), loopback);
         assert_eq!(
-            server_hosts("192.168.1.10:0", 41000)
+            server_hosts("192.0.2.10:0", 41000)
                 .last()
                 .map(String::as_str),
-            Some("192.168.1.10:41000"),
+            Some("192.0.2.10:41000"),
             "the bound port, not the requested 0"
         );
         assert_eq!(
@@ -4791,13 +4786,13 @@ mod tests {
 
     #[test]
     fn only_this_servers_host_and_origin_read_without_the_token() {
-        let hosts = server_hosts("192.168.1.10:8787", 8787);
+        let hosts = server_hosts("192.0.2.10:8787", 8787);
         for host in [
             "127.0.0.1:8787",
             "localhost:8787",
             "LOCALHOST:8787",
             "[::1]:8787",
-            "192.168.1.10:8787",
+            "192.0.2.10:8787",
         ] {
             assert!(tokenless_request(Some(host), None, &hosts), "{host}");
         }

@@ -931,7 +931,7 @@ fn the_sessions_answer_names_each_project_whole() {
     let (store, _schema) = store("cost_sessions_rows");
     let now = store.database_now_ms().expect("now");
     let reviewer = "-data-tmp-ccd-rev-x";
-    let owner = "-home-ckl-projects-Spawn";
+    let owner = "-home-example-projects-Spawn";
     let messages = [
         // $3, $15, $3.75 and $0.30 a million: 0.3 + 0.03 + 0.01125 + 0.012.
         project_message(

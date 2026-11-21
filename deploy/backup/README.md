@@ -15,7 +15,7 @@ the drill's test.
 
 | What | Where |
 | --- | --- |
-| Bucket | `spawn-store`, account q1293822641@gmail.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
+| Bucket | `spawn-store`, account backup-admin@example.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
 | Format | dumps: `pg_dump -Fc` (compression `SPAWN_BACKUP_DUMP_COMPRESS`, default `zstd:9`) and `gpg --symmetric` AES-256; bundles: a tar (zstd) of `manifest.json`, `repos/*.bundle` and `transcripts/`, the same `gpg` passphrase |
 | Schedule | `spawn-backup.timer` (hourly, `spawn backup dump`), `spawn-backup-bundle.timer` (daily 04:00, `spawn backup bundle`), `spawn-backup-verify.timer` (daily 05:00, `spawn backup verify`), `spawn-backup-restore-drill.timer` (daily 05:30, `spawn backup restore-drill`, objective 149; installed and enabled only after 149b passes and lands, below), `spawn-backup-restore-drill-missions.timer` (daily 05:45, `spawn backup restore-drill --only missions`, objective 186: the mission repositories alone, below); `spawn-backup-restore-drill-transcripts.timer` (daily 06:15, `spawn backup restore-drill --only transcripts`, objective 200: the transcript archive alone, judged by its record, below), `spawn-backup-restore-drill-sync.timer` (daily 06:30, `spawn backup restore-drill --only sync`, objective 217: the fleet's notes folder alone, installed disabled, below); all `Persistent=true`, so a run missed while the host was off happens at next boot |
 | Records | every run writes a `backup.dumped`, `backup.bundled` or `backup.verified` control record (owner-only `spawn_backup_record`); the tiers, the bundle's base and the plausibility check are read from them, never from a state file |

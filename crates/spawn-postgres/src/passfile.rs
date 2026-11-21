@@ -226,14 +226,14 @@ mod tests {
             default_socket: socket,
             port: "5432".into(),
             database: "spawn".into(),
-            user: "ckl".into(),
+            user: "alice".into(),
         }
     }
 
     #[test]
     fn the_first_matching_line_wins_past_comments_and_other_users() {
         let text = "# a comment\nhost:5432:spawn:other:nope\n\
-                    host:5432:spawn:ckl:first\nhost:5432:spawn:ckl:second\n";
+                    host:5432:spawn:alice:first\nhost:5432:spawn:alice:second\n";
         assert_eq!(
             password_in(text, &target("host", false)).as_deref(),
             Some("first")
@@ -277,17 +277,17 @@ mod tests {
     fn localhost_matches_a_default_socket_and_a_path_its_own_socket() {
         let socket = target("/var/run/postgresql", true);
         assert_eq!(
-            password_in("localhost:5432:spawn:ckl:pw", &socket).as_deref(),
+            password_in("localhost:5432:spawn:alice:pw", &socket).as_deref(),
             Some("pw")
         );
         assert_eq!(
-            password_in("/var/run/postgresql:5432:spawn:ckl:pw", &socket).as_deref(),
+            password_in("/var/run/postgresql:5432:spawn:alice:pw", &socket).as_deref(),
             Some("pw")
         );
         let other = target("/srv/sock", false);
-        assert_eq!(password_in("localhost:5432:spawn:ckl:pw", &other), None);
+        assert_eq!(password_in("localhost:5432:spawn:alice:pw", &other), None);
         assert_eq!(
-            password_in("localhost:5432:spawn:ckl:pw", &target("127.0.0.1", false)),
+            password_in("localhost:5432:spawn:alice:pw", &target("127.0.0.1", false)),
             None
         );
     }
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn a_target_is_the_urls_first_host_port_database_and_user() {
-        let config: postgres::Config = "postgres://ckl@db.example:6000/spawn"
+        let config: postgres::Config = "postgres://alice@db.example:6000/spawn"
             .parse()
             .expect("parses");
         let got = Target::of(&config);
@@ -330,12 +330,17 @@ mod tests {
             ("db.example", false)
         );
         assert_eq!(got.port, "6000");
-        assert_eq!((got.database.as_str(), got.user.as_str()), ("spawn", "ckl"));
-        let config: postgres::Config = "host=/var/run/postgresql user=ckl".parse().expect("parses");
+        assert_eq!(
+            (got.database.as_str(), got.user.as_str()),
+            ("spawn", "alice")
+        );
+        let config: postgres::Config = "host=/var/run/postgresql user=alice"
+            .parse()
+            .expect("parses");
         let got = Target::of(&config);
         assert!(got.default_socket);
         assert_eq!(got.port, "5432");
-        assert_eq!(got.database, "ckl", "the database defaults to the user");
+        assert_eq!(got.database, "alice", "the database defaults to the user");
     }
 
     /// A field written as a passfile writes it: `:` and `\` escaped.

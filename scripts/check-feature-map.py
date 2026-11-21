@@ -15,7 +15,7 @@ REQUIRED_IDS = {f"FM-{number:02d}" for number in range(1, 20)}
 REQUIRED_TEXT = (
     "mission", "objective", "task", "PostgreSQL", "resident", "worktree", "tmux",
     "Claude Code", "gate", "integrator", "fleet", "alerts", "deploy", "数据工程",
-    "后训练文档", "cancel-notice", "n252", "feature-map-maintainer", "派活先读", "完成回写",
+    "后训练文档", "cancel-notice", "目标运行环境", "feature-map-maintainer", "派活先读", "完成回写",
 )
 REF = re.compile(r"`([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+):(\d+)(?:-(\d+))?`")
 
@@ -69,8 +69,8 @@ def validate(text):
             errors.append(f"{identifier}: no test reference or explicit absence")
     for identifier in ("FM-18", "FM-19"):
         block = entries.get(identifier, "")
-        if "未修复" not in block or "n252" not in block:
-            errors.append(f"{identifier}: must distinguish open code defect from n252 runtime")
+        if "未修复" not in block or "目标运行环境" not in block:
+            errors.append(f"{identifier}: must distinguish open code defect from 目标运行环境 runtime")
 
     references = list(REF.finditer(text))
     for match in references:

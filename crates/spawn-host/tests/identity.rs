@@ -1,7 +1,7 @@
 //! Issue #15, item 1: a workspace has one name, the one its engine sees.
 //!
 //! The workspace root is reached through a symlink (the reporter's `/home`
-//! -> `/data00/home`; every macOS temporary directory is under `/var` ->
+//! -> `/srv/home`; every macOS temporary directory is under `/var` ->
 //! `/private/var`). tmux starts the pane in the workspace, the kernel
 //! resolves the symlink, and Claude Code files its transcript under the
 //! resolved working directory with every character but ASCII letters and

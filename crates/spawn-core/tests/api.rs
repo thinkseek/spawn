@@ -31,7 +31,7 @@ const BUSY: &str = "✽ Effecting… (27m 12s · ↓ 92.3k tokens)\n❯ \n  deep
 const FINISHED: &str = "✻ Sautéed for 6s · done 11:27 PM · 5 shells still running\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
 
 /// A failed hook printed by the engine at the tail.
-const HOOK_ERROR: &str = "⎿ UserPromptSubmit hook error\nFailed with non-blocking status code: /bin/sh: /Users/bytedance/.botmux/bin/botmux: No such file or directory\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+const HOOK_ERROR: &str = "⎿ UserPromptSubmit hook error\nFailed with non-blocking status code: /bin/sh: /Users/example/.botmux/bin/botmux: No such file or directory\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
 
 /// A permission dialog above the input box.
 const PERMISSION: &str = "Do you want to allow this tool call?\n❯ 1. Yes\n  2. No";

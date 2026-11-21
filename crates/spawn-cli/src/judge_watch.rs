@@ -242,7 +242,7 @@ mod tests {
         fn judge(&self, _: &JudgeInput) -> Result<Judgement, JudgeError> {
             if self.down.load(Ordering::SeqCst) {
                 Err(JudgeError::Unavailable(
-                    "502 from http://relay:pa55w0rd@host.orb.internal:8118/v1".to_string(),
+                    "502 from http://relay:pa55w0rd@proxy.example.com:8118/v1".to_string(),
                 ))
             } else {
                 Ok(Judgement::of(

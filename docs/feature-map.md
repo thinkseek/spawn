@@ -2,10 +2,10 @@
 
 ## 读法与证据边界
 
-代码与行号基线为提交 `c17110c5f7d94edf6bb1a50c5643d9a167527ea2`。n199 测试目录与该提交的补丁 SHA-256 均为 `4afdb198826733dde90bce7176ea635c2de8ec7e3f15caa12943a3940d620815`。后续文档提交只更新本图与校验脚本。后续代码修改必须同步更新引用。
+代码与行号基线为提交 `c17110c5f7d94edf6bb1a50c5643d9a167527ea2`。Linux 验证机上的测试目录与该提交的补丁 SHA-256 均为 `4afdb198826733dde90bce7176ea635c2de8ec7e3f15caa12943a3940d620815`。后续文档提交只更新本图与校验脚本。后续代码修改必须同步更新引用。
 
 - 实现状态只使用 `已实现`、`部分实现`、`未实现`、`已知缺陷`。
-- 部署状态只使用 `部署未验证`、`部署已验证`、`未部署`、`不适用`。本次没有执行部署，也没有读取 n252 的进程、数据库或日志，因此没有把源码存在写成线上已部署。
+- 部署状态只使用 `部署未验证`、`部署已验证`、`未部署`、`不适用`。本次没有执行部署，也没有读取目标运行环境中的进程、数据库或日志，因此没有把源码存在写成线上已部署。
 - 测试证据给出测试源码位置。它不等于本次测试通过。每次回写必须另外记录实际运行的命令、环境和结果。
 - 项目运行数据以 PostgreSQL 事件、主机归档和运行记录各自的事实来源为准。后训练文档以其所属项目的事实来源为准。本图只连接这些边界，不复制其数据，不把机器私有路径写进公开代码仓。
 - 本图从 `cdb0fbdc` 恢复到无共同祖先的新主干。FM-01 至 FM-09、FM-11 至 FM-17 的实现叙述和历史测试结果继承旧图；本次只核对并更新其源码引用，不把旧提交的运行结果写成新基线结果。FM-10、FM-18、FM-19 记录本次实际验证。
@@ -122,8 +122,8 @@
 - 入口：`scripts/rsi/gate.sh <repo> <base> <candidate> <scenarios> [scenario]`、`gate::judge`。
 - 代码：`scripts/rsi/gate.sh:5-52`、`scripts/rsi/gate.sh:128-149`、`scripts/rsi/gate.sh:633-650`、`crates/spawn-cli/src/gate.rs:1078-1167`。
 - 实现状态：`已实现`。可信 verdict 来自私有文件且要求 gate 成功退出；host fault、no-room、cannot-judge 与 candidate rejection 分开。
-- 测试证据：`scripts/rsi/test-gate.sh:157-283` 覆盖基本判定、revision 和非 UTF-8 locale；`scripts/rsi/test-gate.sh:2989-3108` 覆盖 base-only 与缓存；`scripts/rsi/test-gate.sh:3958-3975`、`scripts/rsi/test-gate.sh:3976-4047` 是 PostgreSQL toolchain/server 与 schema upgrade 条件路径。代码提交 `c17110c5` 在 Linux/x86_64、Git 2.56.1、Rust 1.95.0、bubblewrap 0.13.1、tmux 3.8、PostgreSQL 19.0 下运行 `LC_ALL=C TMPDIR="$tmp" sh scripts/rsi/test-gate.sh`（`tmp=spawn-fm18-fm19-main-5e416443/gate-tmp-ordinary-r2`），790 个通过、0 失败、2 个跳过，退出状态 0，日志 `test-gate-ordinary-r2.log`；host-programs 扩展组和无本地镜像的 Docker 分支跳过，两个 PostgreSQL 条件路径只打印 note。随后在同一 n199 证据目录（`evidence=spawn-fm18-fm19-main-5e416443`）以真实 `gate.sh` 分别运行独立场景：`sh "$evidence/pg-toolchain-scenario-r3.sh"` 为 5 个断言通过，日志 `pg-toolchain-scenario-r3.log` 含 `psql 19.0 server 190000`；`sh "$evidence/pg-schema-scenario-r4.sh"` 为 10 个断言通过，日志 `pg-schema-scenario-r4.log`。这些退出状态分别记录，不声称普通套件与条件路径的组合套件通过。
-- 部署状态：`部署未验证`。n199 只运行用户态工具链、一次性 bubblewrap、Git、tmux 和 PostgreSQL 测试，没有部署或重启现有服务。
+- 测试证据：`scripts/rsi/test-gate.sh:157-283` 覆盖基本判定、revision 和非 UTF-8 locale；`scripts/rsi/test-gate.sh:2989-3108` 覆盖 base-only 与缓存；`scripts/rsi/test-gate.sh:3958-3975`、`scripts/rsi/test-gate.sh:3976-4047` 是 PostgreSQL toolchain/server 与 schema upgrade 条件路径。代码提交 `c17110c5` 在 Linux/x86_64、Git 2.56.1、Rust 1.95.0、bubblewrap 0.13.1、tmux 3.8、PostgreSQL 19.0 下运行 `LC_ALL=C TMPDIR="$tmp" sh scripts/rsi/test-gate.sh`（`tmp=spawn-fm18-fm19-main-5e416443/gate-tmp-ordinary-r2`），790 个通过、0 失败、2 个跳过，退出状态 0，日志 `test-gate-ordinary-r2.log`；host-programs 扩展组和无本地镜像的 Docker 分支跳过，两个 PostgreSQL 条件路径只打印 note。随后在 Linux 验证机上的同一证据目录（`evidence=spawn-fm18-fm19-main-5e416443`）以真实 `gate.sh` 分别运行独立场景：`sh "$evidence/pg-toolchain-scenario-r3.sh"` 为 5 个断言通过，日志 `pg-toolchain-scenario-r3.log` 含 `psql 19.0 server 190000`；`sh "$evidence/pg-schema-scenario-r4.sh"` 为 10 个断言通过，日志 `pg-schema-scenario-r4.log`。这些退出状态分别记录，不声称普通套件与条件路径的组合套件通过。
+- 部署状态：`部署未验证`。Linux 验证机只运行用户态工具链、一次性 bubblewrap、Git、tmux 和 PostgreSQL 测试，没有部署或重启现有服务。
 - 已知缺口：base cache 仍有 same-UID 信任限制；空 revision 的入口校验及证据单列在 FM-19。host-programs 扩展组、Docker image 分支及组合套件的条件路径仍缺一次共同通过记录。
 - 下一步：在标准 PostgreSQL 路径下复跑组合套件，并在有 `postgres:16-alpine` 镜像时补 Docker 分支；需要抵御同 UID 恶意进程时，把 cache 与执行放进独立 UID 边界。
 
@@ -215,7 +215,7 @@
 - 代码：`crates/spawn-postgres/src/missions.rs:344-385`、`crates/spawn-postgres/sql/schema.sql:3792-3811`、`crates/spawn-cli/src/deliver.rs:769-776`、`crates/spawn-cli/src/deliver.rs:1475-1482`、`crates/spawn-cli/src/dispatch.rs:999-1010`。
 - 实现状态：`已实现`。匹配的 cancel-notice 命令落盘即为 `told=true`，不再要求 `succeeded`；work stealing 使用同一 recorded 语义。首次 notice 前的 `told=false` 仍保证 stop→set-aside→notice；open command 仍串行化输入，failed 或 dispatcher restart 不再阻塞后续任务，也不会重复 notice。事件格式未变。
 - 测试证据：`crates/spawn-postgres/tests/cancelled.rs:91-168` 分别覆盖 submitted、succeeded=true、succeeded=false；`crates/spawn-postgres/tests/steal.rs:328-363` 覆盖 submitted/failed notice 与 idle 判定；`crates/spawn-cli/src/deliver.rs:3640-3685` 覆盖 Assigned/Revise、failed/restart 后空闲 pane 直接 Input 以及 open 时不并发输入。`5e416443` 基线在 Darwin/aarch64、PostgreSQL 18 运行两个数据库回归，cancelled 在 submitted 断言得到 `left: Bool(false), right: true`，steal 在 `succeeded=None` 断言失败，均为 0 通过、1 失败；修复后同一命令各 1 个通过。基线的 idle-pane planner 新回归已 1 个通过，所以 planner 生产代码零移植。Linux/x86_64、Rust 1.95.0、PostgreSQL 19 上运行 `cargo test -p spawn-cli deliver::tests -- --test-threads=1`，63 个通过；`cargo test -p spawn-postgres --test cancelled -- --test-threads=1`，2 个通过；`cargo test -p spawn-postgres --test steal -- --test-threads=1`，4 个通过。最终源码在同一 Linux 环境运行 `cargo test --workspace -- --test-threads=1`，73 个 test binaries 加 5 组 doc-tests 共 2028 个通过、0 失败、5 忽略，日志 `cargo-workspace-candidate-r5.log`，退出状态 0。
-- 部署状态：`部署未验证`。本次只做源码、一次性数据库和纯函数验证，未操作真实 resident 或现有服务；n252 是否未修复或已经部署，本次均未核实。
+- 部署状态：`部署未验证`。本次只做源码、一次性数据库和纯函数验证，未操作真实 resident 或现有服务；目标运行环境是否未修复或已经部署，本次均未核实。
 - 已知缺口：未做真实 tmux/Claude Code pane 的 open→failed→restart 端到端演练。公开议题 [#76](https://github.com/thinkseek/spawn/issues/76) 的 dispatcher cancel-stop 被 recovery 记为 final 是另一条路径，本项不声称修复它。
 - 下一步：在隔离的部署演练中核对真实 queue 与 pane 的 open/failed/restart，并单独验证 #76 的 recovery 路径。
 
@@ -226,15 +226,15 @@
 - 代码：`scripts/rsi/gate.sh:633-650`、`crates/spawn-cli/src/gate.rs:1078-1089`、`crates/spawn-cli/src/gate.rs:1158-1167`、`crates/spawn-cli/src/integrate.rs:4050-4076`、`crates/spawn-cli/src/integrate.rs:4125-4180`、`crates/spawn-cli/src/integrate.rs:4238-4256`、`crates/spawn-cli/src/integrate.rs:4347-4410`、`crates/spawn-cli/src/integrate/landing.rs:17-27`、`crates/spawn-cli/src/integrate/verdicts.rs:1003-1018`、`crates/spawn-cli/src/integrate/owner.rs:1807-1864`、`crates/spawn-postgres/sql/schema.sql:2631-2635`。
 - 实现状态：`已实现`。standalone 在 bwrap/scratch/rev-parse 前对完整 Rust trim 空白集返回专用 exit 64。Rust 在创建私有目录或启动 gate 前返回 `GateFailure::Parameter`。生产 base 入口、normal/adopted candidate 和 stale 检查都记录 `aborted` 加 `evidence=parameter_error`，由现有连续 abort 规则限次；candidate 与 main 前进竞态也不会改写为 stale。合法 nonexistent ref 仍走 rev-parse exit 3 和 `Aborted`。
 - 测试证据：`scripts/rsi/test-gate.sh:220-283` 覆盖 nonexistent ref、empty + 25 个 Rust 空白字符的 52 个 standalone 输入和非 UTF-8 locale；`crates/spawn-cli/src/gate.rs:3010-3058` 覆盖 52 个 Rust 参数错误、gate 未执行和 nonexistent-ref 兼容；`crates/spawn-cli/src/integrate/tests.rs:1219-1267` 覆盖 stale 防护与序列化；`crates/spawn-cli/src/integrate/database_tests.rs:3454-3548` 覆盖 empty/space/U+3000 的 base/candidate 持久化、abort 计数和 main 前进竞态；`crates/spawn-cli/src/integrate/database_tests.rs:5760-5790` 覆盖 owner repeat 分类。`5e416443` 基线的 empty/space/tab/newline 输入均返回 exit 3；修复后 Darwin/aarch64 上 52/52 返回 exit 64，nonexistent ref 为 exit 3。审查发现 `zh_CN.GB18030` 的 NBSP 曾落到 exit 3；固定 `tr` 和 `grep` 为 C locale 后，GB18030 的 52 个输入全部返回 exit 64，6 个非 UTF-8 locale 的 NBSP/U+3000 两侧共 24/24 返回 exit 64。Linux/x86_64、Rust 1.95.0、PostgreSQL 19 上，上述 Rust gate、stale、serialization、empty base、empty candidate 和 repeat 六个命令各 1 个测试通过。竞态回归先得到 `verdict=stale`、0 通过、1 失败，修复后 base/candidate 两个命令各 1 个通过。最终源码运行 `cargo test --workspace -- --test-threads=1`，73 个 test binaries 加 5 组 doc-tests 共 2028 个通过、0 失败、5 忽略，日志 `cargo-workspace-candidate-r5.log`，退出状态 0。
-- 部署状态：`部署未验证`。本次未运行真实 integrator loop，也未读取或改变 n252 的部署；n252 是否未修复或已经部署，本次均未核实。
-- 已知缺口：n252 的空值来源仍未查明。公开议题 [#73](https://github.com/thinkseek/spawn/issues/73) 还包括非空 verdict 的 stale 重试与升级，本项只关闭 empty/whitespace 参数导致的同型循环。
+- 部署状态：`部署未验证`。本次未运行真实 integrator loop，也未读取或改变目标运行环境的部署；目标运行环境是否未修复或已经部署，本次均未核实。
+- 已知缺口：目标运行环境的空值来源仍未查明。公开议题 [#73](https://github.com/thinkseek/spawn/issues/73) 还包括非空 verdict 的 stale 重试与升级，本项只关闭 empty/whitespace 参数导致的同型循环。
 - 下一步：在隔离的 integrator 环境确认连续参数 abort 的计数与 halt，再对 #73 的不可变 stale verdict 单独设计 park/alert。
 
 ## 维护协议
 
 1. **派活先读。** 派活 Agent 在修改 FM-01 至 FM-19 涉及的能力前，先读本图和对应代码，并在任务说明中写明 Feature Map ID。图中状态只对应其基线提交。
 2. **完成回写。** 同一变更更新能力、入口、行号、实现状态、测试证据、部署状态、缺口和下一步。测试证据写实际命令、环境和结果；只有源码与回归测试才能关闭代码缺陷。
-3. **部署另记。** 使用 `部署已验证` 时，在该字段写明 `环境：`、`commit：`、`命令：`、`结果：`、`日期：`。只完成代码合入时保持 `部署未验证`。n252 或其他主机的运行观察先写入该项目运行记录，不能单独把代码状态改成已修复。
+3. **部署另记。** 使用 `部署已验证` 时，在该字段写明 `环境：`、`commit：`、`命令：`、`结果：`、`日期：`。只完成代码合入时保持 `部署未验证`。目标运行环境或其他主机的运行观察先写入该项目运行记录，不能单独把代码状态改成已修复。
 4. **固定复核。** 固定维护 Agent 为 `feature-map-maintainer`。它在核心链路变化、FM-18/FM-19 状态变化、部署后或收到复核请求时检查漂移。这是固定维护职责名，不表示仓库内存在常驻进程。
 5. **事实分源。** 实现以代码和测试为准，运行状态以项目运行数据为准，后训练结论以后训练文档为准。公开仓库只保留可公开引用和通用环境说明，不写机器私有路径、凭据或私有数据。
 6. **每次校验。** 在仓库根目录运行：

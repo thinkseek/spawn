@@ -169,8 +169,8 @@ fn only_the_owner_records_backups() {
 
 fn stored() -> Value {
     json!({
-        "type": "backup.stored", "area": "transcripts", "host": "spawn", "account": "ckl",
-        "manifest": "transcripts/manifests/spawn/ckl/20261113-003117-4460e808.json.gpg",
+        "type": "backup.stored", "area": "transcripts", "host": "spawn", "account": "example",
+        "manifest": "transcripts/manifests/spawn/example/20261113-003117-4460e808.json.gpg",
         "files": 2, "unchanged": 0, "grown": 1, "whole": 1,
         "segments_written": 2, "segments_found": 0, "bytes_written": 714,
     })

@@ -385,7 +385,7 @@ test("a tool row reads as the tool and its key input; a call recorded without on
   assert.equal(shortSummary("Bash", 'cd "/a b"; git status'), "git status");
   assert.equal(shortSummary("Bash", "cd /data/tmp"), "cd /data/tmp", "a bare cd is the command");
   assert.equal(
-    shortSummary("Bash", "B=/home/ckl/.local/share/spawn-rsi/bin/spawn; $B tail --session x"),
+    shortSummary("Bash", "B=/home/example/.local/share/spawn-rsi/bin/spawn; $B tail --session x"),
     "spawn tail --session x",
     "a variable naming a program reads as the program",
   );

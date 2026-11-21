@@ -33,7 +33,7 @@ def agent(i, live=True, turn_open=False, last_age=30, turn_age=40, role="worker"
         "session_id": "session_%d_%s" % (i, SECRET),
         "execution_id": "exec_%d" % i,
         "label": "label %s" % SECRET,
-        "task": "do the thing with %s at /home/ckl/secret/path" % SECRET,
+        "task": "do the thing with %s at /home/example/secret/path" % SECRET,
         "mission_name": "mission %s" % SECRET,
         "task_title": "title %s" % SECRET,
         "attention": True,
@@ -66,7 +66,7 @@ def agent(i, live=True, turn_open=False, last_age=30, turn_age=40, role="worker"
 
 def ev(seq, source, execution, age_s, name="tool.started"):
     return {"session_seq": seq, "event_id": 1000 + seq, "execution_id": execution, "source": source,
-            "event_name": name, "detail": {"summary": SECRET, "path": "/home/ckl/" + SECRET},
+            "event_name": name, "detail": {"summary": SECRET, "path": "/home/example/" + SECRET},
             "recorded_at_ms": t_ms(age_s)}
 
 

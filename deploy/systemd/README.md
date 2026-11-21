@@ -65,9 +65,9 @@ started with. `SPAWN_CHEAP_MODEL` (default `deepseek-flash`) and
 Configuration lives in `~/.local/share/spawn-rsi/spawn.env` (KEY=VALUE),
 including `SPAWN_SUPERVISOR=1`, `SPAWN_MISSION_FILE`, and `SPAWN_SERVE_ADDRESS`
 with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
-`openssl rand -hex 32`). `SPAWN_SERVE_OPEN_NETWORKS` (e.g. `192.168.31.0/24`)
+`openssl rand -hex 32`). `SPAWN_SERVE_OPEN_NETWORKS` (e.g. `192.0.2.0/24`)
 lets the owner's intranet read without the token, by the server's address
-(`http://192.168.31.112:8787/`); a client elsewhere (Tailscale, a container)
+(`http://192.0.2.112:8787/`); a client elsewhere (Tailscale, a container)
 still needs it.
 
 ## Session backups
@@ -129,10 +129,10 @@ copied by hand. `spawn-backup` archives the version, and the account
 extracts it into a directory it made and hashes what it wrote.
 
 ```sh
-sudo SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions SPAWN_SESSION_HOMES=/home/ckl \
-  SPAWN_SESSION_BACKUP_USER=spawn-backup bash /usr/local/lib/spawn/session-backup.sh list ckl
-sudo SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions SPAWN_SESSION_HOMES=/home/ckl \
-  SPAWN_SESSION_BACKUP_USER=spawn-backup bash /usr/local/lib/spawn/session-backup.sh restore ckl <version> /data/tmp/restore-<date>
+sudo SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions SPAWN_SESSION_HOMES=/home/example \
+  SPAWN_SESSION_BACKUP_USER=spawn-backup bash /usr/local/lib/spawn/session-backup.sh list example
+sudo SPAWN_SESSION_BACKUP_ROOT=/var/backups/spawn-sessions SPAWN_SESSION_HOMES=/home/example \
+  SPAWN_SESSION_BACKUP_USER=spawn-backup bash /usr/local/lib/spawn/session-backup.sh restore example <version> /data/tmp/restore-<date>
 ```
 
 ## Fleet test database and credentials
@@ -416,7 +416,7 @@ Confining a deliberate agent takes per-agent uids or a mount per engine,
 which is the owner's decision.
 
 Engines and gates read the store through `SUPPLY_PA_DEPS`: a line
-`SUPPLY_PA_DEPS=/home/ckl/.local/share/spawn-rsi/deps/supply-pa/current`
+`SUPPLY_PA_DEPS=/home/example/.local/share/spawn-rsi/deps/supply-pa/current`
 in `spawn.env` (a literal path, as systemd's EnvironmentFile does not expand
 `$HOME`); Spawn hands it to every engine's pane, and the gate carries it into
 its sandbox. Unset, `gate/scenarios/build`, the drivers and the default in

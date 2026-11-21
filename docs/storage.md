@@ -336,7 +336,7 @@ commit with a key no agent holds cannot hang or fail a test.
   mints workspace ids), and the mount, the pane's working directory, the
   workspace id, the runner's exit file (`.spawn/exit-<execution>`) and the
   transcript path all derive from that one id. A root reached through a
-  symlink (the reporter's `/home` -> `/data00/home`; on macOS `/tmp` and
+  symlink (the reporter's `/home` -> `/srv/home`; on macOS `/tmp` and
   `/var` are links to `/private/...`) used to give each workspace two
   names, and the Bridge watched a transcript no engine wrote: no turn read,
   no report collected. Everything else that names a workspace by path

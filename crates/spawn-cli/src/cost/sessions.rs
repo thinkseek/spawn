@@ -551,8 +551,8 @@ mod tests {
     #[test]
     fn the_engines_project_directories_are_named_from_the_workspace_root() {
         assert_eq!(
-            engine_prefix(Path::new("/home/ckl/.local/share/spawn-rsi/ws")),
-            "-home-ckl--local-share-spawn-rsi-ws-"
+            engine_prefix(Path::new("/home/example/.local/share/spawn-rsi/ws")),
+            "-home-example--local-share-spawn-rsi-ws-"
         );
     }
 

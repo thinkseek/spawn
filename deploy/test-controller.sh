@@ -196,15 +196,15 @@ check "C, once its judging is gone, is removed" [ ! -e "$dir/spawn-$C" ]
 # Back to the state the next sections expect: D current.
 ctl update spawn "$git_dir" "$D" "$modules" 2>/dev/null >/dev/null
 
-echo "== a live directory under a symlink (/home -> /data00/home)"
+echo "== a live directory under a symlink (/home -> /srv/home)"
 # Everything names the live directory through the symlink, as on a host
 # whose /home is one: the controller script, and the three holders, which
 # enter by that path and never resolve the root (the script is pinned to
 # its commit's directory, as the gate pins it, by the path under the
 # symlink). /proc shows their working directory and files under the
 # physical directory.
-mkdir -p "$scratch/data00/live"
-ln -s data00 "$scratch/home"
+mkdir -p "$scratch/srv/live"
+ln -s srv "$scratch/home"
 linked=$scratch/home/live
 lctl() { SPAWN_LIVE=$linked bash "$script" "$@"; }
 lctl update spawn "$git_dir" "$A" "$modules" 2>/dev/null >/dev/null
@@ -219,7 +219,7 @@ holders+=($!)
 held_fd=$!
 sleep 0.5
 check "/proc names the physical path, not the one the holder entered by ($(readlink "/proc/$held_cwd/cwd"))" \
-  [ "$(readlink "/proc/$held_cwd/cwd")" = "$(readlink -f "$scratch/data00")/live/controllers/spawn-$A/rsi/scenarios" ]
+  [ "$(readlink "/proc/$held_cwd/cwd")" = "$(readlink -f "$scratch/srv")/live/controllers/spawn-$A/rsi/scenarios" ]
 lctl update spawn "$git_dir" "$B" "$modules" 2>/dev/null >/dev/null
 lctl update spawn "$git_dir" "$C" "$modules" 2>"$scratch/err" >/dev/null
 check "two switches later spawn is C" [ "$(cat "$linked/controllers/spawn/rsi/scenarios/which")" = C ]

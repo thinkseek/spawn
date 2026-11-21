@@ -35,7 +35,7 @@
 # process still has its working directory, its root or an open file in it
 # (/proc/*/cwd, root, fd): that one goes at a later switch. /proc names the
 # physical path, every symlink resolved, so the directory is compared by its
-# physical path too: with $SPAWN_LIVE under a symlink (/home -> /data00/home)
+# physical path too: with $SPAWN_LIVE under a symlink (/home -> /srv/home)
 # the path as given matches nothing there. When /proc cannot be read, or the
 # directory cannot be resolved, it is kept: nothing shows it is unused.
 # A controller a judging names is kept too (gate v2 step 2, commit 7): a

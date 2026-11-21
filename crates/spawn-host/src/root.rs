@@ -6,7 +6,7 @@
 //! so the process's working directory (`getcwd`, `pwd -P`) is the resolved
 //! path, and Claude Code files its transcript under that path (every
 //! character but ASCII letters and digits replaced by `-`). A root reached
-//! through a symlink (`/home` -> `/data00/home`; on macOS `/tmp` and `/var`
+//! through a symlink (`/home` -> `/srv/home`; on macOS `/tmp` and `/var`
 //! are links to `/private/...`) would otherwise give each workspace two
 //! names: the Bridge would watch the transcript of the one no engine writes.
 //!
