@@ -12,6 +12,19 @@ import {
   sourceLabel,
   verificationNote,
 } from "../src/features.ts";
+import type { FeatureBlocker } from "../src/features.ts";
+
+const blocker = (value: Partial<FeatureBlocker>): FeatureBlocker => ({
+  kind: "unknown",
+  reason: null,
+  event: null,
+  at_ms: null,
+  task: null,
+  agent_id: null,
+  session_id: null,
+  scenario: null,
+  ...value,
+});
 
 const feature = (value: Record<string, unknown>) => ({
   id: "x",
@@ -223,11 +236,11 @@ test("a deploy note distinguishes a failure from a live ship", () => {
 
 test("blockers and owners read as words", () => {
   assert.equal(
-    blockerText({ kind: "mission_paused", reason: "owner hold" } as never),
+    blockerText(blocker({ kind: "mission_paused", reason: "owner hold" })),
     "mission paused: owner hold",
   );
   assert.equal(
-    blockerText({ kind: "sent_back", task: 7, reason: "add a test" } as never),
+    blockerText(blocker({ kind: "sent_back", task: 7, reason: "add a test" })),
     "task #7 sent back: add a test",
   );
   assert.equal(
