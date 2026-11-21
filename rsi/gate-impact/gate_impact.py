@@ -671,7 +671,9 @@ def select(opts):
         if name not in scenario_names:
             raise NoVerdict("task scenario %r is not in %s at the candidate"
                             % (name, scenarios_dir))
-        ckey = job_key("task", name, cand_tree_keys, scenario_keys.get(name))
+        ckey = job_key("task", name,
+                       {k: cand_tree_keys[k] for k in scenario_key_names(name)},
+                       scenario_keys.get(name))
         task_times = (profile.get("task") or {}).get(name)
         if not task_times:
             raise NoVerdict("task scenario %r has no measured time in profile %r"
