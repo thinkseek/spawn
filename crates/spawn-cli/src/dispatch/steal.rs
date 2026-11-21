@@ -361,7 +361,7 @@ mod tests {
         for task in &mut all.tasks[1..] {
             task.mission_halted = true;
         }
-        assert_eq!(choices(&all), []);
+        assert_eq!(moves(&all), []);
     }
 
     /// A refused first candidate (a lost race, a delivery command that
