@@ -41,9 +41,11 @@ Policy (rsi/gate-impact/policy.json, version 1):
 Exit codes:
   0  a selection was produced (decision narrow, full or reject)
   1  static trust refused the candidate (build-time code)
-  2  no verdict: the policy, timings, record or tree could not be read, a
-     selected job has no measured time, or the base record is for another
-     commit.  The caller keeps today's full gate; nothing is narrowed.
+  2  no verdict: the policy, timings, record or tree could not be read or is
+     malformed, the base record does not name exactly the base commit, the
+     candidate does not descend from the base, a slot count is not positive,
+     or a selected job has no measured time.  The caller keeps today's full
+     gate; nothing is narrowed.
   3  --require-narrow was given and the decision is not narrow.
 
 Not done here (deliberately): executing any job, writing a result, deciding
