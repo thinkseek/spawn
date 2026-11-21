@@ -814,9 +814,14 @@ def select(opts):
         "unsolved_mode": opts.unsolved_mode,
         "task_scenario": opts.task_scenario,
         "assumptions": result.assumptions + [
-            "unsolved objectives: %s (carry: an unchanged input carries the base's "
-            "recorded unsolved result to the new main; run: the base's two agreeing "
-            "runs are charged instead)" % opts.unsolved_mode,
+            "historical mode: %s; unsolved objectives: %s (carry: an unchanged "
+            "input carries the base's recorded unsolved result to the new main; "
+            "run: the base's two agreeing runs are charged instead)"
+            % (opts.historical_mode, opts.unsolved_mode),
+            "a cache hit on a check, journey or CI job depends on the pending "
+            "C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved "
+            "objectives only, so the predicted wall clock is conditional until "
+            "that wiring lands",
         ] + ([
             "the base record %s is the accepting gate's candidate passes for %s; "
             "candidate runs of a later tree are never read" % (
