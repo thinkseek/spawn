@@ -27,6 +27,6 @@ test_unknown_policy_version_is_no_verdict (__main__.SelectorTest.test_unknown_po
 test_web_change_selects_check_tests_which_reads_web_src (__main__.SelectorTest.test_web_change_selects_check_tests_which_reads_web_src) ... ok
 
 ----------------------------------------------------------------------
-Ran 26 tests in 1.155s
+Ran 26 tests in 1.196s
 
 OK

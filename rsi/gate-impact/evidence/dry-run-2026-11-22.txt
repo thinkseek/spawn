@@ -1,5 +1,5 @@
 # gate-impact dry run
-# date: 2026-11-21T20:20:22Z
+# date: 2026-11-21T20:22:32Z
 # host: spawn
 # mirror: /home/ckl/.local/share/spawn-rsi/missions/spawn.git
 # policy: /home/ckl/.local/share/spawn-rsi/ws/agent_worker_gate_impact_fix_493/rsi/gate-impact/policy.json
