@@ -138,8 +138,8 @@ def tree_key(repo, commit, specs, policy_version):
 
 
 def top_level_scenarios(repo, commit, scenarios_dir):
-    raw = git(repo, ["ls-tree", "-r", "--name-only", commit, "--", scenarios_dir],
-              text=True)
+    raw = git(repo, ["ls-tree", "-r", "--full-tree", "--name-only", commit,
+                     "--", scenarios_dir], text=True)
     prefix = scenarios_dir.rstrip("/") + "/"
     out = []
     for line in raw.splitlines():
