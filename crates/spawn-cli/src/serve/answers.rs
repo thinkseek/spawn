@@ -95,9 +95,10 @@ fn clocks(path: &str) -> &'static [&'static str] {
 }
 
 /// [`clocks`]' table: a path, or a prefix ending in `*`, and its clocks.
-const CLOCKS: [(&str, &[&str]); 4] = [
+const CLOCKS: [(&str, &[&str]); 5] = [
     ("/api/rsi", &["generated_at_ms"]),
     ("/api/attention", &["generated_at_ms"]),
+    ("/api/features", &["generated_at_ms"]),
     ("/api/rsi/pane", &["captured_at_ms"]),
     ("/api/pane/*", &["captured_at_ms"]),
 ];

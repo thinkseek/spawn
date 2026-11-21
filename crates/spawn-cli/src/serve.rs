@@ -880,6 +880,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/cost" => Box::new(move || cost(query)),
         "/api/core-lines" => Box::new(core_lines::core_lines),
         "/api/verifications" => Box::new(verifications),
+        "/api/features" => Box::new(move || feature_map::feature_map(query)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
