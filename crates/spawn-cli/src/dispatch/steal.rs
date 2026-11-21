@@ -140,7 +140,7 @@ fn attempt(
     mut steal: impl FnMut(i64, &str) -> Result<String, String>,
 ) -> Vec<(i64, String)> {
     let mut moved: BTreeSet<i64> = BTreeSet::new();
-    let mut moves = Vec::new();
+    let mut won = Vec::new();
     for (to, tasks) in tries {
         for task in tasks {
             if moved.contains(task) {
@@ -150,7 +150,7 @@ fn attempt(
                 Ok(where_) => {
                     lines.push(format!("dispatch: task #{task} stolen {where_}"));
                     moved.insert(*task);
-                    moves.push((*task, to.clone()));
+                    won.push((*task, to.clone()));
                     break;
                 }
                 Err(error) => lines.push(format!(
@@ -159,7 +159,7 @@ fn attempt(
             }
         }
     }
-    moves
+    won
 }
 
 /// Make this pass's tries ([`choices`]) through the store, each said in
