@@ -1187,22 +1187,24 @@ mod tests {
 
     /// The four states are four different pieces of evidence: an accepted
     /// task is not implemented, a landing is not verified, a pass is not
-    /// live, and a deploy after the landing is.
+    /// live, and a deploy after the landing is. The booleans stay separate:
+    /// a live capability can be unverified.
     #[test]
     fn planned_implemented_verified_and_live_never_collapse() {
+        // The one deploy came after 3's and 4's landings, before 2's.
         let landings = vec![
-            json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 100, "event": 102, "brief": ""}),
+            json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 300, "event": 302, "brief": ""}),
             json!({"mission": 4, "objective": 3, "task": 30, "landed_ms": 200, "event": 202, "brief": ""}),
-            json!({"mission": 4, "objective": 4, "task": 40, "landed_ms": 300, "event": 302, "brief": ""}),
+            json!({"mission": 4, "objective": 4, "task": 40, "landed_ms": 100, "event": 102, "brief": ""}),
         ];
         let verifications = vec![
-            json!({"mission": 4, "objective": 3, "result": "pass", "by": "lead", "how": "looked",
-                   "at_ms": 250, "event": 252}),
-            json!({"mission": 4, "objective": 4, "result": "pass", "by": "lead", "how": "looked",
+            json!({"mission": 4, "objective": 2, "result": "pass", "by": "lead", "how": "looked",
                    "at_ms": 350, "event": 352}),
+            json!({"mission": 4, "objective": 4, "result": "pass", "by": "lead", "how": "looked",
+                   "at_ms": 150, "event": 152}),
         ];
         let deployments = vec![
-            json!({"event": 400, "at_ms": 400, "ok": true, "head": "d".repeat(40), "by": "landing",
+            json!({"event": 400, "at_ms": 250, "ok": true, "head": "d".repeat(40), "by": "landing",
                    "reason": ""}),
         ];
         let facts = facts_of(&landings, &verifications, &deployments, &[]);
@@ -1213,13 +1215,15 @@ mod tests {
         let accepted = derive(&spec("a", &[5]), &mission(), &facts);
         assert_eq!(accepted["state"], "planned");
         assert_eq!(accepted["implemented"], false);
-        let landed = derive(&spec("i", &[2]), &mission(), &facts);
-        assert_eq!(landed["state"], "implemented");
-        assert_eq!(landed["verified"], false);
-        assert_eq!(landed["live"], false);
-        let verified = derive(&spec("v", &[3]), &mission(), &facts);
+        let verified = derive(&spec("v", &[2]), &mission(), &facts);
         assert_eq!(verified["state"], "verified");
         assert_eq!(verified["live"], false, "a pass is not a deploy");
+        let live_unverified = derive(&spec("u", &[3]), &mission(), &facts);
+        assert_eq!(live_unverified["state"], "live");
+        assert_eq!(
+            live_unverified["verified"], false,
+            "a deploy ships work nobody has verified"
+        );
         let live = derive(&spec("l", &[4]), &mission(), &facts);
         assert_eq!(live["state"], "live");
         assert_eq!(live["verified"], true);
@@ -1316,22 +1320,31 @@ mod tests {
         assert_eq!(idle["unowned"], true);
     }
 
-    /// A sent-back task with nothing newer in flight is blocked, and the
-    /// note is the reason.
+    /// A cancelled task with nothing newer in flight is blocked; a revise
+    /// is still in flight (the worker gets it again), so it is not.
     #[test]
-    fn a_sent_back_task_is_blocked() {
+    fn a_cancelled_task_is_blocked_but_a_revision_is_not() {
+        let facts = facts_of(&[], &[], &[], &[]);
         let mut row = mission();
         row["tasks"] = json!([
-            {"id": 70, "state": "revise", "kind": "ephemeral", "agent_id": "a70",
+            {"id": 70, "state": "cancelled", "kind": "ephemeral", "agent_id": "a70",
              "session_id": "s70", "objective": 1, "revisions": 1, "candidate": null,
-             "base": null, "updated_at_ms": 700, "review_note": "add the test", "gates": []}
+             "base": null, "updated_at_ms": 700, "review_note": null,
+             "gates": [{"verdict": "rejected", "reason": "137.sh failed", "at_ms": 690}]}
         ]);
-        let facts = facts_of(&[], &[], &[], &[]);
         let feature = derive(&spec("one", &[1]), &row, &facts);
         assert_eq!(feature["state"], "planned");
-        assert_eq!(feature["blocked"]["kind"], "sent_back");
-        assert_eq!(feature["blocked"]["reason"], "add the test");
+        assert_eq!(feature["blocked"]["kind"], "cancelled");
+        assert_eq!(feature["blocked"]["reason"], "137.sh failed");
         assert_eq!(feature["unowned"], true);
+        row["tasks"] = json!([
+            {"id": 71, "state": "revise", "kind": "ephemeral", "agent_id": "a71",
+             "session_id": "s71", "objective": 1, "revisions": 1, "candidate": null,
+             "base": null, "updated_at_ms": 710, "review_note": "add the test", "gates": []}
+        ]);
+        let feature = derive(&spec("one", &[1]), &row, &facts);
+        assert_eq!(feature["blocked"], Value::Null);
+        assert_eq!(feature["unowned"], false);
     }
 
     /// A mapping is identities and links only; a typo, a duplicate or a
