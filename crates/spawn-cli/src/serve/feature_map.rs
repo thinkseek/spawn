@@ -112,7 +112,20 @@ pub(crate) fn feature_map(query: &str) -> Result<Value, String> {
         .unwrap_or(10)
         .clamp(1, 50);
     let store = open_store()?;
-    let mut missions = objective_missions(&store)?;
+    read_map(&store, mission, limit)
+}
+
+/// The answer from one store: the live anchor comes from the whole deploy
+/// log (`live_deploy_fact`), not from the display window `deploy_facts(50)`
+/// returns, so a burst of failures never hides the deploy that shipped the
+/// source. The reads are separate so a test can drive this wiring with a
+/// store the way `feature_map` does.
+fn read_map(
+    store: &spawn_postgres::PostgresStore,
+    mission: Option<i64>,
+    limit: usize,
+) -> Result<Value, String> {
+    let mut missions = objective_missions(store)?;
     if let Some(wanted) = mission {
         missions.retain(|mission| mission["id"].as_i64() == Some(wanted));
     }
@@ -121,9 +134,6 @@ pub(crate) fn feature_map(query: &str) -> Result<Value, String> {
         .verification_facts()
         .map_err(|error| error.to_string())?;
     let deployments = store.deploy_facts(50).map_err(|error| error.to_string())?;
-    // The live anchor is the newest success in the whole log: the 50-record
-    // window above is for display, and a burst of failures must not hide the
-    // deploy that shipped the source.
     let live_anchor = store
         .live_deploy_fact()
         .map_err(|error| error.to_string())?;
@@ -493,12 +503,18 @@ fn sources_of(
     for (index, entry) in list.iter().enumerate() {
         let place = format!("{at}.sources[{index}]");
         let source = parse_source(entry, &place, mission_id)?;
-        if let Some(Native::Objective { objective, .. }) = &source.native
-            && let Some(other) = claims.insert(*objective, feature.to_string())
-        {
-            return Err(format!(
-                "objective {objective} is in both `{other}` and `{feature}`: give it to one"
-            ));
+        // The same objective twice in one capability is one source (it is
+        // deduplicated below); two capabilities claiming it would count its
+        // records twice, and that is refused.
+        if let Some(Native::Objective { objective, .. }) = &source.native {
+            if let Some(other) = claims.get(objective)
+                && other != feature
+            {
+                return Err(format!(
+                    "objective {objective} is in both `{other}` and `{feature}`: give it to one"
+                ));
+            }
+            claims.insert(*objective, feature.to_string());
         }
         if let Some(seen) = sources
             .iter_mut()
@@ -1501,8 +1517,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Facts, Native, Source, Spec, build, derive, fallback_specs, parse_mapping, read_mapping,
-        shipped_by_deploy,
+        Facts, Native, Source, Spec, build, derive, fallback_specs, parse_mapping, read_map,
+        read_mapping, shipped_by_deploy,
     };
 
     fn spec(id: &str, objectives: &[u32]) -> Spec {
@@ -1688,6 +1704,131 @@ mod tests {
         );
     }
 
+    /// A capability that names no objective is planned: there is nothing to
+    /// land, verify or deploy. The emptiness must not let `all` over an empty
+    /// list (and its vacuously passing checks) call such a capability live.
+    #[test]
+    fn a_capability_with_no_objective_is_planned() {
+        let specs = parse_mapping(
+            &json!({"features": [{"id": "sources-only", "title": "Sources only",
+                                  "sources": [{"kind": "issue", "ref": "63"}]}]}),
+            4,
+        )
+        .expect("a mapping of identities only");
+        let deployments = vec![json!({"event": 400, "at_ms": 400, "ok": true,
+                                      "head": "d".repeat(40), "by": "landing", "reason": ""})];
+        let facts = facts_of(&[], &[], &deployments, &[]);
+        let feature = derive(&specs[0], &mission(), &facts);
+        assert_eq!(feature["state"], "planned", "{feature}");
+        assert_eq!(feature["implemented"], false);
+        assert_eq!(feature["verified"], false);
+        assert_eq!(feature["live"], false);
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "no_objective"),
+            "{feature}"
+        );
+        assert_eq!(feature["evidence"]["deploy"], Value::Null);
+    }
+
+    /// Only a source ending `/missions/spawn.git` is shipped by Spawn's own
+    /// deploy: a broader suffix would make a mission Spawn does not ship
+    /// eligible for live.
+    #[test]
+    fn only_the_scorecards_exact_source_is_shipped() {
+        let shipped = |source: &str| shipped_by_deploy(&json!({"sources": [source]}));
+        assert!(shipped("/m/missions/spawn.git"));
+        for other in [
+            "/m/missions/supply-pa.git",
+            "/m/missions/not-spawn.git",
+            "/m/missions/myspawn.git",
+            "spawn.git",
+            "/m/missions/spawn.git/",
+            "/m/missions/spawn.git.bak",
+        ] {
+            assert!(!shipped(other), "{other}");
+        }
+        assert!(!shipped_by_deploy(&json!({"sources": []})));
+        assert!(shipped_by_deploy(
+            &json!({"sources": ["/m/missions/flake-doctor.git", "/m/missions/spawn.git"]})
+        ));
+    }
+
+    /// The landing's time is not a deploy's: a deploy at exactly the
+    /// landing's millisecond did not follow it (strict `>`), so the landing
+    /// is not live and the gap names it (delivery waits at `>=`).
+    #[test]
+    fn a_deploy_at_the_landing_time_does_not_ship_it() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 100, "event": 102})];
+        let deployments = vec![json!({"event": 400, "at_ms": 100, "ok": true,
+                                      "head": "d".repeat(40), "by": "landing", "reason": ""})];
+        let facts = facts_of(&landings, &[], &deployments, &[]);
+        let feature = derive(&spec("same", &[2]), &mission(), &facts);
+        assert_eq!(feature["state"], "implemented", "{feature}");
+        assert_eq!(feature["live"], false);
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "not_deployed" && gap["objectives"] == json!([2])),
+            "{feature}"
+        );
+    }
+
+    /// A verification at exactly the landing's millisecond is not after it
+    /// (strict `>`), so it verifies nothing.
+    #[test]
+    fn a_verification_at_the_landing_time_does_not_verify_it() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 100, "event": 102})];
+        let verifications = vec![json!({"mission": 4, "objective": 2, "result": "pass",
+                                        "by": "lead", "how": "looked", "at_ms": 100,
+                                        "event": 103})];
+        let facts = facts_of(&landings, &verifications, &[], &[]);
+        let feature = derive(&spec("same", &[2]), &mission(), &facts);
+        assert_eq!(feature["state"], "implemented", "{feature}");
+        assert_eq!(feature["verified"], false);
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "unverified" && gap["objectives"] == json!([2])),
+            "{feature}"
+        );
+        assert_eq!(feature["evidence"]["verifications"][0]["result"], "none");
+    }
+
+    /// Two verifications in one millisecond: the later event decides, not
+    /// the order the records arrive in (`checks_of`'s `event` tie-break).
+    #[test]
+    fn the_later_event_decides_when_two_verifications_share_a_millisecond() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 100, "event": 102})];
+        let verifications = vec![
+            json!({"mission": 4, "objective": 2, "result": "fail", "by": "lead",
+                   "how": "looked", "at_ms": 300, "event": 302}),
+            json!({"mission": 4, "objective": 2, "result": "pass", "by": "lead",
+                   "how": "looked", "at_ms": 300, "event": 301}),
+        ];
+        let facts = facts_of(&landings, &verifications, &[], &[]);
+        let feature = derive(&spec("tie", &[2]), &mission(), &facts);
+        assert_eq!(feature["verified"], false, "{feature}");
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "verification_failed" && gap["objectives"] == json!([2])),
+            "{feature}"
+        );
+    }
+
     /// A pass recorded before the landing verifies nothing: the newest
     /// verification after the landing is the one that counts.
     #[test]
@@ -1774,6 +1915,109 @@ mod tests {
         );
         assert_eq!(answer["live_anchor"]["event"], 400);
         assert_eq!(answer["deploy"]["event"], 900);
+    }
+
+    /// The anchor the route asks the store for is the whole-log success, not
+    /// the newest of the display window: one successful deploy and then
+    /// sixty failures still leaves the capability live. Regressing
+    /// `read_map` to a window-derived anchor fails here.
+    #[test]
+    fn the_map_reads_the_live_anchor_from_the_whole_deploy_log() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("feature_map_live_anchor");
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("a schema of its own, migrated");
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let mut client =
+            postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-anchor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a backlog");
+        std::fs::write(
+            dir.join("002.json"),
+            json!({"id": 2, "title": "Two", "prompt": "Objective 2."}).to_string(),
+        )
+        .expect("an objective");
+        let record = |client: &mut postgres::Client, value: Value| {
+            client
+                .query_one("select spawn_control_record($1)", &[&value])
+                .expect("a control record");
+        };
+        record(
+            &mut client,
+            json!({"type": "mission.added", "id": 4, "text": "Spawn RSI",
+                   "origin": "human", "sources": ["/m/missions/spawn.git"]}),
+        );
+        client
+            .query_one(
+                "select spawn_mission_configure($1, $2, $3, $4, $5)",
+                &[
+                    &4_i64,
+                    &"/g",
+                    &"gate",
+                    &None::<Value>,
+                    &json!({"backlog": dir.display().to_string(), "resident": "rsi"}),
+                ],
+            )
+            .expect("configured");
+        record(
+            &mut client,
+            json!({"type": "task.assigned", "id": 20, "mission_id": 4,
+                   "kind": "ephemeral", "created_by": "spawn-integrate",
+                   "agent_id": "agent_20", "session_id": "session_20",
+                   "objective": 2, "brief": "Objective 2."}),
+        );
+        record(
+            &mut client,
+            json!({"type": "task.landed", "id": 20, "from": "a".repeat(40),
+                   "to": "b".repeat(40)}),
+        );
+        store
+            .verification_record(&json!({"type": "objective.verified", "mission": 4,
+                                         "objective": 2, "by": "lead", "how": "read it",
+                                         "result": "pass"}))
+            .expect("verified");
+        // The landing and the success must not share a millisecond: live is
+        // strictly after the newest landing.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let anchor = store
+            .deploy_record(&json!({"type": "deploy.finished", "ok": true,
+                                   "head": "c".repeat(40), "by": "landing", "reason": ""}))
+            .expect("the success");
+        for attempt in 0..60 {
+            store
+                .deploy_record(&json!({"type": "deploy.finished", "ok": false,
+                                       "head": format!("{attempt:040x}"), "by": "owner",
+                                       "reason": "the build failed"}))
+                .expect("a failure");
+        }
+        let map = read_map(&store, Some(4), 50).expect("the map");
+        assert_eq!(
+            map["deploy"]["ok"], false,
+            "the display window holds only the failures: {map}"
+        );
+        assert_eq!(
+            map["live_anchor"]["event"], anchor,
+            "the whole log's success"
+        );
+        let feature = map["missions"][0]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|feature| feature["id"] == "objective-002")
+            .cloned()
+            .unwrap_or_else(|| panic!("objective-002 in {map}"));
+        assert_eq!(feature["state"], "live", "{feature}");
+        assert_eq!(feature["evidence"]["deploy"]["event"], anchor);
+        assert_eq!(feature["evidence"]["last_deploy"]["ok"], false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A backlog that could not be read is named in the answer: the page
@@ -2034,6 +2278,15 @@ mod tests {
             specs[0].sources[0].url.as_deref(),
             Some("https://github.com/o/r/issues/1")
         );
+        // The same objective named twice in one capability is one source,
+        // not two capabilities ("in both `a` and `a`").
+        let twice = json!({"features": [{"id": "a", "title": "A", "sources": [
+            {"kind": "objective", "objective": 1},
+            {"kind": "objective", "mission": 4, "objective": 1}
+        ]}]});
+        let specs = parse_mapping(&twice, 4).expect("one source, not a conflict");
+        assert_eq!(specs[0].objectives, vec![1]);
+        assert_eq!(specs[0].sources.len(), 1);
         for bad in [
             json!({"features": [{"id": "a", "title": "A", "status": "live"}]}),
             json!({"features": [{"id": "a", "title": "A", "sources": [

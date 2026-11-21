@@ -67,10 +67,12 @@ A mission names its mapping with an absolute file path:
 spawn mission configure --id 4 --features /path/to/features.json
 ```
 
-`spawn mission add` takes the same `--features` beside `--backlog` and
-`--resident`. The path is checked when it is configured: it must be a file and
-parse as a map. `--no-features` clears it. The setting is a normal mission
-setting: it is recorded in the control stream as `mission.configured`.
+`spawn mission add` takes the same `--features` beside `--backlog`,
+`--resident` and `--gate`; without `--gate` it refuses them (objectives could
+never land), rather than accepting the flags and dropping them. The path is
+checked when it is configured: it must be a file and parse as a map.
+`--no-features` clears it. The setting is a normal mission setting: it is
+recorded in the control stream as `mission.configured`.
 
 The file holds identities and links, never a status:
 
@@ -197,8 +199,10 @@ objective supports; it does not rewrite the others. `deploy` is the newest
 deploy of any outcome (read within a bounded window for display);
 `live_anchor` is the newest successful deploy over the whole log, so a run of
 failures never hides the one that shipped the source. `backlog_error` names a
-backlog that could not be read: the mission then has no capabilities to show,
-and the page says why rather than rendering four empty columns.
+backlog that could not be read — a directory that was moved or deleted is an
+error, not an empty backlog: the mission has no backlog objectives then, a
+readable mapping may still supply its capabilities, and the page says why
+rather than rendering four empty columns.
 
 ## 6. The page
 
@@ -215,7 +219,12 @@ one), four columns, and a card per capability:
 - an "unowned" badge when no task is in flight and the capability is not live.
 
 A warning banner names a mapping file or a backlog that could not be read: the
-page never shows empty columns without saying why.
+page never shows empty columns without saying why. A backlog banner says the
+mission's objectives are unknown and, when a readable mapping still supplies
+the cards, that they come from the mapping; it does not claim the map is
+empty. The `deployed` row is the evidence's anchor and only that: a Planned
+card says nothing has landed, and an unshipped mission says live is not
+observable, instead of printing the newest Spawn deploy of another source.
 
 The view only lays out the server's answer. It does not recompute a state, so
 the API and the page can never disagree about what is implemented, verified or
@@ -227,12 +236,15 @@ live.
 | --- | --- |
 | The four states never collapse; an accepted task is not implemented; a pass is not live; a live capability may be unverified; a deploy before the landing is not live | `crates/spawn-cli/src/serve/feature_map.rs` tests |
 | A capability is only as far as its least advanced objective (a never-landed one holds it at planned); a pre-landing pass verifies nothing; the newest verification decides | same |
-| The live anchor is the newest success in the whole log, not the display window; a backlog that cannot be read is named in the answer | same |
-| A mission no deploy ships is not live (the gap says so) and its evidence has no deploy | same |
-| `mission add --features` accepts a mapping that names its own (not yet known) mission | `crates/spawn-cli/src/missions.rs` tests |
+| The live anchor is the newest success in the whole log, through the route's own store read (one success, then sixty failures); a backlog that cannot be read is named in the answer | same |
+| A mission no deploy ships is not live (the gap says so) and its evidence has no deploy; only `/missions/spawn.git` counts as shipped; a capability with no objective is planned | same |
+| The boundaries are strict: a deploy or a verification at exactly the landing's millisecond is not after it; the later event decides within one millisecond | same |
+| The same objective named twice in one capability is one source, not a conflict | same |
+| A backlog directory that is gone is an error, not an empty backlog (`load_backlog`, `with_objectives`) | `crates/spawn-cli/src/objectives.rs`, `.../serve.rs` tests |
+| `mission add --features` accepts a mapping that names its own (not yet known) mission; refuses objectives without `--gate`; stores `--features` through a real store | `crates/spawn-cli/src/missions.rs` tests |
 | `/api/features` is a route and its clock stays out of the ETag | `crates/spawn-cli/src/serve.rs`, `.../serve/answers.rs` tests |
 | Blocked and unowned come from the records; a revision is in flight, a cancellation is blocked | same |
 | The mapping is checked (unknown fields, duplicate ids/objectives, external URLs), and native provenance is added and deduplicated | same |
 | Deploys newest first and bounded; the live anchor found outside the newest 50; halt/pause/red main blockers; `objectives.features` is an absolute path that clears | `crates/spawn-postgres/tests/features.rs` |
-| Normalization, four columns, live-without-verified, an Implemented card never says "verified by", gaps, source labels and a backlog error | `web/test/features.test.ts` |
+| Normalization, four columns, live-without-verified, an Implemented card never says "verified by", a Planned card says another objective has not landed, the deploy row shows only the evidence's anchor, the backlog banner's wording, gaps, source labels and a backlog error | `web/test/features.test.ts` |
 | The web build serves the view | `rsi/scenarios/check-web.sh` (as for every view) |

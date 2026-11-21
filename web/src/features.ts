@@ -590,23 +590,55 @@ export function verificationNote(feature: Feature): string {
   if (newest.result !== "pass") {
     return `verification ${newest.result} by ${newest.by ?? "someone"}`;
   }
-  // The newest pass is across all objectives; on a multi-objective
-  // capability another landed objective may still hold it back, so an
-  // Implemented card never claims "verified by".
+  // The newest pass is across all objectives, and only landed objectives
+  // get checks. A capability that has not landed has no verification of its
+  // own: the pass is a landed sibling's, while a never-landed objective
+  // holds the capability at planned.
+  if (!feature.implemented) {
+    return `latest pass by ${newest.by ?? "someone"}; another objective has not landed`;
+  }
+  // On an Implemented card another landed objective may still hold it back,
+  // so it never claims "verified by".
   if (!feature.verified) {
     return `latest pass by ${newest.by ?? "someone"}; another landed objective is not verified`;
   }
   return `verified by ${newest.by ?? "someone"}`;
 }
 
-/** The deploy a live claim stands on, or the newest deploy of any outcome. */
+/** The deploy a live claim stands on, and only that. Without an anchor in
+ * the evidence (an unshipped mission, or a capability that never landed)
+ * `last_deploy` is the newest Spawn deploy of any source, not this
+ * capability's: say what the records do support instead of "deployed". */
 export function deployNote(feature: Feature): string {
-  const deploy = feature.evidence.deploy ?? feature.evidence.last_deploy;
-  if (deploy === null) return "no deploy record";
-  const head = deploy.head ? deploy.head.slice(0, 12) : "unknown";
-  return deploy.ok
-    ? `deployed ${head}`
-    : `deploy ${head} failed${deploy.reason ? `: ${deploy.reason}` : ""}`;
+  const deploy = feature.evidence.deploy;
+  if (deploy !== null) {
+    const head = deploy.head ? deploy.head.slice(0, 12) : "unknown";
+    return deploy.ok
+      ? `deployed ${head}`
+      : `deploy ${head} failed${deploy.reason ? `: ${deploy.reason}` : ""}`;
+  }
+  if (!feature.implemented) return "not deployed: nothing has landed";
+  const gaps = new Set(feature.gaps.map((gap) => gap.kind));
+  if (gaps.has("live_not_observable")) {
+    return "no deploy ships this source: live is not observable";
+  }
+  if (gaps.has("not_deployed")) {
+    return "not deployed: landed after the newest successful deploy";
+  }
+  if (gaps.has("no_deploy_record")) return "no deploy record";
+  return "not deployed yet";
+}
+
+/** Why the map has no backlog objectives, and whether a mapping still
+ * supplies capabilities: a readable mapping keeps its capabilities when the
+ * backlog directory moves, so the banner must not claim the map is empty. */
+export function backlogExplanation(mission: FeatureMission): string {
+  const backlog = mission.backlog ?? "path";
+  const capabilities =
+    mission.mapping.kind === "file" && mission.features.length > 0
+      ? "the capabilities below come from its mapping"
+      : "so the map has no capabilities to show";
+  return `The mission's backlog ${backlog} could not be read: its objectives are unknown, ${capabilities}`;
 }
 
 /** The blocker in one line. */

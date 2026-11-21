@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  backlogExplanation,
   blockerText,
   deployNote,
   gapText,
@@ -252,6 +253,11 @@ test("a deploy note distinguishes a failure from a live ship", () => {
           id: 4,
           features: [
             feature({
+              state: "live",
+              planned: false,
+              implemented: true,
+              verified: true,
+              live: true,
               evidence: { tasks: [], landings: [], verifications: [], deploy },
             }),
           ],
@@ -266,7 +272,93 @@ test("a deploy note distinguishes a failure from a live ship", () => {
     deployNote(featureWith({ ok: false, head: "b".repeat(40), reason: "the build failed" })),
     `deploy ${"b".repeat(12)} failed: the build failed`,
   );
-  assert.equal(deployNote(featureWith(null)), "no deploy record");
+  // No anchor in the evidence: the note is not a deploy claim.
+  assert.equal(deployNote(featureWith(null)), "not deployed yet");
+});
+
+test("an unshipped mission and a Planned card never say deployed", () => {
+  const read = (value: Record<string, unknown>) =>
+    normalizeFeatureMap({ missions: [{ id: 4, features: [feature(value)] }] })
+      .missions[0].features[0];
+  // The newest Spawn deploy is another source's: it is not this card's.
+  const last = { ok: true, head: "d".repeat(40), event: 205313, at_ms: 10 };
+  const unshipped = read({
+    state: "verified",
+    planned: false,
+    implemented: true,
+    verified: true,
+    live: false,
+    gaps: [{ kind: "live_not_observable", objectives: [], detail: null }],
+    evidence: { tasks: [], landings: [], verifications: [], deploy: null, last_deploy: last },
+  });
+  assert.equal(
+    deployNote(unshipped),
+    "no deploy ships this source: live is not observable",
+  );
+  const planned = read({
+    state: "planned",
+    gaps: [{ kind: "not_landed", objectives: [2], detail: null }],
+    evidence: { tasks: [], landings: [], verifications: [], deploy: null, last_deploy: last },
+  });
+  assert.equal(deployNote(planned), "not deployed: nothing has landed");
+  const waiting = read({
+    state: "implemented",
+    planned: false,
+    implemented: true,
+    gaps: [{ kind: "not_deployed", objectives: [2], detail: null }],
+    evidence: { tasks: [], landings: [], verifications: [], deploy: null, last_deploy: last },
+  });
+  assert.equal(deployNote(waiting), "not deployed: landed after the newest successful deploy");
+});
+
+test("a Planned card does not claim another landed objective is unverified", () => {
+  const planned = normalizeFeatureMap({
+    missions: [
+      {
+        id: 4,
+        features: [
+          feature({
+            state: "planned",
+            implemented: false,
+            verified: false,
+            gaps: [{ kind: "not_landed", objectives: [2], detail: null }],
+            evidence: {
+              tasks: [],
+              landings: [{ objective: 1, kind: "landed", at_ms: 100 }],
+              verifications: [{ objective: 1, result: "pass", by: "lead", at_ms: 150 }],
+            },
+          }),
+        ],
+      },
+    ],
+  }).missions[0].features[0];
+  assert.equal(
+    verificationNote(planned),
+    "latest pass by lead; another objective has not landed",
+  );
+});
+
+test("the backlog banner names unknown objectives and a mapping that still supplies capabilities", () => {
+  const read = (mapping: Record<string, unknown>, features: unknown[]) =>
+    normalizeFeatureMap({
+      missions: [
+        {
+          id: 4,
+          backlog: "/m/backlog",
+          backlog_error: "read /m/backlog: No such file or directory",
+          mapping,
+          features,
+        },
+      ],
+    }).missions[0];
+  const withMapping = read({ kind: "file", path: "/m/map.json", error: null }, [
+    feature({ id: "from-mapping" }),
+  ]);
+  assert.match(backlogExplanation(withMapping), /\/m\/backlog/);
+  assert.match(backlogExplanation(withMapping), /come from its mapping/);
+  assert.doesNotMatch(backlogExplanation(withMapping), /no capabilities to show/);
+  const fallback = read({ kind: "objectives", path: null, error: null }, []);
+  assert.match(backlogExplanation(fallback), /no capabilities to show/);
 });
 
 test("blockers and owners read as words", () => {

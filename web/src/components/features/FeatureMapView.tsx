@@ -18,6 +18,7 @@ import type {
   FeatureTask,
 } from "../../features";
 import {
+  backlogExplanation,
   blockerText,
   deployNote,
   gapText,
@@ -172,8 +173,8 @@ function BacklogError({ mission }: { mission: FeatureMission }) {
     <div className="flex items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2.5">
       <OctagonAlert size={16} className="mt-0.5 shrink-0 text-warning" />
       <div className="min-w-0 text-label text-foreground">
-        The mission&rsquo;s backlog {mission.backlog ?? "path"} could not be read, so the map has no
-        capabilities to show: <span className="font-mono text-caption">{mission.backlog_error}</span>
+        {backlogExplanation(mission)}:{" "}
+        <span className="font-mono text-caption">{mission.backlog_error}</span>
       </div>
     </div>
   );
@@ -345,7 +346,10 @@ function FeatureCard({
           ) : null}
         </dd>
         <dt className="text-faint-foreground">deployed</dt>
-        <dd className="min-w-0 truncate text-foreground" title={deployTitle(feature.evidence.deploy ?? feature.evidence.last_deploy)}>
+        <dd
+          className="min-w-0 truncate text-foreground"
+          title={deployTitle(feature.evidence.deploy)}
+        >
           {deployNote(feature)}
         </dd>
         {newest && (

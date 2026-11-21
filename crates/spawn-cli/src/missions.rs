@@ -29,8 +29,10 @@ const USAGE: &str = "usage:
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
                 [--daily-usd <US dollars above 0>]
                 [--backlog <dir> --resident <name> [--workers N] [--features <file>]]
-                (with add, all of them at once; with configure, any of them alone, and
-                --backlog with --resident for a mission without objectives)
+                (with add, all of them at once, and --backlog, --resident, --workers and
+                --features need --gate: an objective lands only through a gate;
+                with configure, any of them alone, and --backlog with --resident for a
+                mission without objectives)
                 (--features: the mission's feature map, a JSON file of capabilities and
                 their provenance sources; identities and links only, never a status)
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
@@ -357,11 +359,15 @@ fn directory(flags: &Flags, name: &str) -> Result<Option<String>, String> {
 }
 
 /// A mission's landing settings (docs/fleet-architecture.md §10.3-10.4).
+#[derive(Debug)]
 struct Settings {
     gate: Option<String>,
     accept: String,
     budget: Option<Value>,
     objectives: Option<Value>,
+    /// Whether any setting flag was given: `mission add` applies the
+    /// settings it is given, and records nothing when it is given none.
+    given: bool,
 }
 
 impl Settings {
@@ -387,8 +393,19 @@ impl Settings {
         }
         let workers = number("workers")?;
         let features = features_file(flags, "features", 0)?;
+        let gate = directory(flags, "gate")?;
         let objectives = match (directory(flags, "backlog")?, flags.get("resident")) {
             (Some(backlog), Some(resident)) => {
+                // `spawn_mission_configure` refuses objectives without a
+                // gate, and objectives without a gate never land: refuse it
+                // here, where `mission add` can say so instead of dropping
+                // the settings the command line named.
+                if gate.is_none() {
+                    return Err(format!(
+                        "add with --backlog, --resident, --workers or --features needs \
+                         --gate: an objective lands only through a gate\n{USAGE}"
+                    ));
+                }
                 let mut objectives = json!({"backlog": backlog, "resident": resident});
                 // Absent means 1, the default: a mission configured without
                 // it stores exactly what it did before.
@@ -408,11 +425,25 @@ impl Settings {
             }
             _ => return Err(format!("--backlog and --resident go together\n{USAGE}")),
         };
+        let given = [
+            "gate",
+            "accept",
+            "minutes",
+            "tool-calls",
+            "daily-usd",
+            "backlog",
+            "resident",
+            "workers",
+            "features",
+        ]
+        .iter()
+        .any(|name| flags.get(name).is_some());
         Ok(Self {
-            gate: directory(flags, "gate")?,
+            gate,
             accept: flags.get("accept").unwrap_or_else(|| "review".to_string()),
             budget: (!budget.is_empty()).then_some(Value::Object(budget)),
             objectives,
+            given,
         })
     }
 
@@ -640,36 +671,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let store = open_store()?;
     let err = |error: spawn_core::port::StoreError| error.to_string();
     match verb {
-        "add" => {
-            // Checked here for a clear error; spawn_mission_add holds the
-            // same rule for every caller.
-            let sources = match flags.get("source") {
-                Some(source) => json!([crate::sources::MissionSource::parse(&source)?.as_str()]),
-                None => json!([]),
-            };
-            let settings = Settings::from(&flags)?;
-            // spawn_mission_configure refuses it too, but only once the
-            // mission exists.
-            if settings.gate.is_some()
-                && sources
-                    .get(0)
-                    .and_then(Value::as_str)
-                    .is_some_and(|source| !source.starts_with('/'))
-            {
-                return Err(
-                    "a gate lands only on a source that is a directory on this host; agents' \
-                     branches never reach a remote one"
-                        .to_string(),
-                );
-            }
-            let id = store
-                .mission_add(&text(&flags, "text")?, &sources, "human")
-                .map_err(err)?;
-            if settings.gate.is_some() {
-                settings.apply(&store, id)?;
-            }
-            print(&json!({ "mission": id }));
-        }
+        "add" => print(&json!({ "mission": add(&store, &flags)? })),
         "configure" => {
             let mission = id(&flags, "id")?;
             let change = change(&flags)?;
@@ -714,6 +716,41 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// `spawn mission add`: the mission, then every setting the command line
+/// gave it. A setting is never dropped: `Settings::from` refuses objectives
+/// without a gate (they could never land), and `given` is true for any
+/// other setting so `--accept` or a budget is stored too.
+fn add(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i64, String> {
+    // Checked here for a clear error; spawn_mission_add holds the same rule
+    // for every caller.
+    let sources = match flags.get("source") {
+        Some(source) => json!([crate::sources::MissionSource::parse(&source)?.as_str()]),
+        None => json!([]),
+    };
+    let settings = Settings::from(flags)?;
+    // spawn_mission_configure refuses it too, but only once the mission
+    // exists.
+    if settings.gate.is_some()
+        && sources
+            .get(0)
+            .and_then(Value::as_str)
+            .is_some_and(|source| !source.starts_with('/'))
+    {
+        return Err(
+            "a gate lands only on a source that is a directory on this host; agents' \
+             branches never reach a remote one"
+                .to_string(),
+        );
+    }
+    let id = store
+        .mission_add(&text(flags, "text")?, &sources, "human")
+        .map_err(|error| error.to_string())?;
+    if settings.given {
+        settings.apply(store, id)?;
+    }
+    Ok(id)
 }
 
 /// `spawn mission moved --source <dir> --from <commit> --to <commit>`: a
@@ -1212,10 +1249,13 @@ mod tests {
         .expect("a mapping");
         let backlog = dir.join("backlog").display().to_string();
         let path = dir.join("map.json").display().to_string();
+        let gate = dir.display().to_string();
         let words: Vec<String> = [
             "add",
             "--text",
             "Spawn RSI",
+            "--gate",
+            &gate,
             "--backlog",
             &backlog,
             "--resident",
@@ -1238,6 +1278,192 @@ mod tests {
         let refused = crate::serve::feature_map::validate_file(std::path::Path::new(&path), 4)
             .expect_err("a foreign mission");
         assert!(refused.contains("names mission 7"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mission add` never silently drops the settings it is given:
+    /// objectives without a gate are refused (they could never land), and
+    /// any setting that is given — a budget or `--accept` alone too — is
+    /// carried to be applied.
+    #[test]
+    fn add_refuses_objective_settings_without_a_gate() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-add-settings-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(dir.join("backlog")).expect("temp backlog");
+        std::fs::write(
+            dir.join("map.json"),
+            r#"{"features":[{"id":"x","title":"X","sources":[{"kind":"objective","objective":1}]}]}"#,
+        )
+        .expect("a mapping");
+        let gate = dir.display().to_string();
+        let backlog = dir.join("backlog").display().to_string();
+        let path = dir.join("map.json").display().to_string();
+        let settings_of = |words: &[&str]| {
+            let words: Vec<String> = ["add", "--text", "Spawn RSI"]
+                .iter()
+                .chain(words.iter())
+                .map(ToString::to_string)
+                .collect();
+            let (_, flags) = split_mission(&words).expect("flags");
+            super::Settings::from(&flags)
+        };
+        let refused = settings_of(&[
+            "--backlog",
+            &backlog,
+            "--resident",
+            "rsi",
+            "--features",
+            &path,
+        ])
+        .expect_err("objectives without a gate");
+        assert!(refused.contains("--gate"), "{refused}");
+        // With the gate, every one of them is carried: none is dropped.
+        let settings = settings_of(&[
+            "--gate",
+            &gate,
+            "--backlog",
+            &backlog,
+            "--resident",
+            "rsi",
+            "--workers",
+            "2",
+            "--features",
+            &path,
+        ])
+        .expect("all of them with a gate");
+        assert!(settings.given);
+        let objectives = settings.objectives.expect("the objectives");
+        assert_eq!(objectives["backlog"], backlog);
+        assert_eq!(objectives["resident"], "rsi");
+        assert_eq!(objectives["workers"], 2);
+        assert_eq!(objectives["features"], path);
+        // No setting at all means no configure record.
+        let bare = settings_of(&[]).expect("a bare add");
+        assert!(!bare.given);
+        assert!(bare.objectives.is_none());
+        // A budget or `--accept` alone is a setting, and is applied.
+        let budget = settings_of(&["--minutes", "45"]).expect("a budget");
+        assert!(budget.given);
+        assert_eq!(budget.budget, Some(json!({"minutes": 45})));
+        let accept = settings_of(&["--accept", "gate"]).expect("an accept rule");
+        assert!(accept.given);
+        assert_eq!(accept.accept, "gate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through a real store, the command's own path: `mission add` with a
+    /// gate, a backlog and `--features` stores the mapping path, and the
+    /// feature map's mission row reads it back as `features_file`. Without a
+    /// gate nothing is added (the refusal leaves no half-configured
+    /// mission).
+    #[test]
+    #[allow(clippy::too_many_lines)] // one store, the add, the budget and the refusal
+    fn add_stores_the_features_it_is_given() {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("mission_add_features");
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("a schema of its own, migrated");
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-roundtrip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("backlog")).expect("temp backlog");
+        std::fs::write(
+            dir.join("map.json"),
+            r#"{"features":[{"id":"x","title":"X","sources":[{"kind":"objective","objective":1}]}]}"#,
+        )
+        .expect("a mapping");
+        std::fs::write(
+            dir.join("backlog/001.json"),
+            r#"{"id": 1, "title": "One", "prompt": "Do it."}"#,
+        )
+        .expect("an objective");
+        let gate = dir.display().to_string();
+        let backlog = dir.join("backlog").display().to_string();
+        let path = dir.join("map.json").display().to_string();
+        let flags_of = |words: &[&str]| {
+            let words: Vec<String> = ["add", "--text", "Spawn RSI"]
+                .iter()
+                .chain(words.iter())
+                .map(ToString::to_string)
+                .collect();
+            let (_, flags) = split_mission(&words).expect("flags");
+            flags
+        };
+        let id = super::add(
+            &store,
+            &flags_of(&[
+                "--gate",
+                &gate,
+                "--backlog",
+                &backlog,
+                "--resident",
+                "rsi",
+                "--workers",
+                "2",
+                "--features",
+                &path,
+            ]),
+        )
+        .expect("added with every setting");
+        let missions = store.objective_missions().expect("the missions");
+        let mission = missions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mission| mission["id"].as_i64() == Some(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("mission {id} in {missions}"));
+        assert_eq!(mission["gate"], gate);
+        assert_eq!(mission["objectives"]["backlog"], backlog);
+        assert_eq!(mission["objectives"]["workers"], 2);
+        assert_eq!(mission["objectives"]["features"], path);
+        let board = crate::serve::with_objectives(mission);
+        assert_eq!(board["features_file"], path);
+        // A budget with no gate is a setting too: it is applied, not dropped.
+        let budgeted = super::add(
+            &store,
+            &flags_of(&["--text", "a budgeted mission", "--minutes", "45"]),
+        )
+        .expect("added with a budget");
+        let budget = store.objective_missions().expect("the missions");
+        let budgeted = budget
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mission| mission["id"].as_i64() == Some(budgeted))
+            .cloned()
+            .unwrap_or_else(|| panic!("mission {budgeted} in {budget}"));
+        assert_eq!(budgeted["budget"]["minutes"], 45);
+        assert_eq!(budgeted["gate"], serde_json::Value::Null);
+        // Without a gate the add is refused before it records anything.
+        let before = budget.as_array().unwrap().len();
+        let refused = super::add(
+            &store,
+            &flags_of(&[
+                "--backlog",
+                &backlog,
+                "--resident",
+                "rsi",
+                "--features",
+                &path,
+            ]),
+        )
+        .expect_err("no gate");
+        assert!(refused.contains("--gate"), "{refused}");
+        let after = store
+            .objective_missions()
+            .expect("the missions")
+            .as_array()
+            .map_or(0, Vec::len);
+        assert_eq!(after, before, "the refusal added no mission");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

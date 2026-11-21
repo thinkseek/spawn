@@ -4475,6 +4475,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A backlog directory that has been moved or deleted is named, not
+    /// silently read as an empty backlog: the feature map must not render
+    /// four empty columns as "no capabilities" without saying why.
+    #[test]
+    fn a_backlog_directory_that_is_gone_is_named_on_the_board() {
+        let missing = std::env::temp_dir().join(format!(
+            "spawn-board-gone-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let board = with_objectives(json!({
+            "id": 4,
+            "gate": "/g",
+            "objectives": {"backlog": missing.display().to_string()},
+            "tasks": [],
+        }));
+        let error = board["backlog_error"].as_str().expect("named");
+        assert!(
+            error.starts_with(&format!("read {}: ", missing.display())),
+            "{error}"
+        );
+        assert_eq!(board["objectives"], json!([]));
+    }
+
     #[test]
     fn a_recurring_objective_above_its_target_stays_open() {
         let tasks = [task(

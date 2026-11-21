@@ -215,13 +215,13 @@ pub(crate) fn candidate_value(line: &str, name: &str) -> Option<f64> {
         .candidate
 }
 
-/// Every task in the controller's backlog directory, by id.
+/// Every task in the controller's backlog directory, by id. A directory that
+/// does not exist is an error, not an empty backlog: a moved or renamed
+/// backlog is what `backlog_error` names, instead of the page showing four
+/// empty columns as "no capabilities".
 pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("read {}: {error}", directory.display())),
-    };
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?;
     let mut tasks = Vec::new();
     for entry in entries {
         let path = entry
@@ -1558,6 +1558,24 @@ mod tests {
         write(r#"{"id": 1, "prompt": "go faster", "recurring": true, "metric": "ns"}"#);
         assert!(load_backlog(&dir).is_err(), "never met");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that is gone (moved, renamed, deleted) is an error, not an
+    /// empty backlog: the feature map carries it as `backlog_error` instead
+    /// of rendering four empty columns as "no capabilities".
+    #[test]
+    fn a_backlog_directory_that_is_gone_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-backlog-gone-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = load_backlog(&dir).expect_err("a moved backlog is not empty");
+        assert!(
+            error.starts_with(&format!("read {}: ", dir.display())),
+            "{error}"
+        );
     }
 
     /// An outcome as the store gives it. A conflict's `merge` (how main went
