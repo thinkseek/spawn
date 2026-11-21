@@ -178,6 +178,7 @@ fn only_the_owner_records_verifications() {
 /// paragraph's line, not the quote) or null, every verification oldest
 /// first, and the newest deploy.
 #[test]
+#[allow(clippy::too_many_lines)] // one read: landings, verifications, deploy
 fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_the_deploy() {
     let (store, schema) = store("verification_read");
     let mut client = admin(&schema);
