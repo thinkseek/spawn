@@ -184,7 +184,7 @@ Command: `sh rsi/gate-impact/replay.sh` (raw output in
 | 243 | proposed (historical nightly, unsolved carried) | 5 | 229.8 s ¹ | OVER |
 | 243 | cache-only + carry (no check retired) | 5 | 229.8 s ¹ | OVER |
 | 243 | strict cache, unsolved not carried | 6 | 349.2 s ¹ | OVER |
-| nightly-only (unit fixture) | proposed, carried | 4 | **131.0 s** ¹ | WITHIN |
+| nightly-only (unit fixture) | proposed (historical nightly) | 4 | **131.0 s** ¹ | WITHIN |
 | 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 510.5 s | OVER |
 | 485 | today's checks + cache | 187 | 1277.1 s | OVER |
 | web-only (unit fixture) | conservative journey keys | 14 | 330.9 s | OVER |
