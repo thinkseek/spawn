@@ -1268,7 +1268,7 @@ fn sources_json(
     let mut out: Vec<Value> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for source in &spec.sources {
-        let linked = source_linked(source, mission_id, rows, tasks, facts);
+        let linked = source_linked(source, mission, rows, facts);
         let title = source
             .title
             .clone()
@@ -1339,20 +1339,18 @@ fn push_source(out: &mut Vec<Value>, seen: &mut BTreeSet<String>, source: Value)
     }
 }
 
-fn source_linked(
-    source: &Source,
-    mission_id: i64,
-    rows: &[&Value],
-    tasks: &[&Value],
-    facts: &Facts,
-) -> bool {
+fn source_linked(source: &Source, mission: &Value, rows: &[&Value], facts: &Facts) -> bool {
     match &source.native {
         None => false,
         Some(Native::Objective { objective, .. }) => rows
             .iter()
             .any(|row| row["id"].as_u64() == Some(u64::from(*objective))),
-        Some(Native::Mission(mission)) => *mission == mission_id,
-        Some(Native::Task(task)) => tasks.iter().any(|row| row["id"].as_i64() == Some(*task)),
+        Some(Native::Mission(id)) => mission["id"].as_i64() == Some(*id),
+        Some(Native::Task(task)) => mission["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| row["id"].as_i64() == Some(*task)),
         Some(Native::Verification { mission, objective }) => facts.verifications.iter().any(|seen| {
             seen["mission"].as_i64() == Some(*mission)
                 && seen["objective"].as_u64() == Some(u64::from(*objective))
@@ -1382,8 +1380,10 @@ fn native_title(
             Some(first_line(text(&mission["text"])))
         }
         Native::Mission(id) => Some(format!("mission {id}")),
-        Native::Task(task) => tasks
-            .iter()
+        Native::Task(task) => mission["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
             .find(|row| row["id"].as_i64() == Some(*task))
             .map(|row| first_line(text(&row["brief"]))),
         Native::Verification { objective, .. } => checks
