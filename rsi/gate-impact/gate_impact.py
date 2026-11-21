@@ -222,6 +222,8 @@ def validate_policy(policy, path):
         need(isinstance(job.get("kind"), str), "job %r has no kind" % job.get("id"))
         need(isinstance(job.get("timing"), str), "job %r has no timing" % job.get("id"))
         need(isinstance(job.get("key", []), list), "job %r has a bad key" % job["id"])
+        need(job.get("journey") is None or isinstance(job.get("journey"), str),
+             "job %r has a bad journey" % job["id"])
     need(isinstance(policy.get("core"), dict) and isinstance(policy["core"].get("id"), str),
          "core must be an object with an id")
     need(isinstance(policy.get("historical"), dict), "historical must be an object")
