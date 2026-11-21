@@ -331,24 +331,40 @@ its landing. That is the accepted trade-off, and it is not hidden: the
 selector prints every such skip with `nightly-scope` and the install is
 pending.
 
+The reviews of the first draft also found the opposite error in this
+section: three keys were unproven *downward* and one record rule failed
+open. They are fixed here and each has a test: scenario 008's key now names
+`README.md`, `check-tests.sh` names `rsi/backlog/` and the web tree, the
+base record must name exactly the base commit, `--repo` may be a worktree
+subdirectory without losing the scenario list, serial scenarios run alone,
+and the mode defaults are the policy's. What remains unproven is what the
+C14 proof must decide: that no *other* job reads a path its key excludes.
+The design no longer claims the selector over-selects in every class; it
+over-selects in the journey keys and it under-selected in these three,
+which was the bug.
+
 ## 8. Approvals and work before a live switch
 
 1. **Owner: ratify the class split** in section 2.3 (`rsi/backlog/` and
-   `rsi/scenarios/nightly/` are protected but not judge inputs).
+   `rsi/scenarios/nightly/` are protected, but the backlog is a named input
+   of `check-tests.sh`, not a reason to escalate the whole gate).
 2. **Owner: approve the landing-key fix** that excludes
    `rsi/scenarios/nightly/` from the base-key material, with a test. This is
    a change to `scripts/rsi/gate.sh` (protected).
 3. **Owner: decide the unsolved result.** Either install the approved
-   design-gate-v2 Decision 1 retirement (row 1), or extend the accepting
-   gate's seed to carry an `unsolved` result whose declared inputs are
-   identical in base and candidate. The gate's existing reuse rule already
-   refuses a scenario that declares nothing (`# reads:`), so 241 would need
-   that declaration and its proof. Row 3 is the cost of doing neither.
+   design-gate-v2 Decision 1 retirement, or extend the accepting gate's seed
+   to carry an `unsolved` result whose declared inputs are identical in base
+   and candidate. The gate's existing reuse rule already refuses a scenario
+   that declares nothing (`# reads:`), so 241 would need that declaration and
+   its proof. The strict-cache rows are the cost of doing neither.
 4. **Two independent reviews** of the selector, the class split and every
-   protected-file diff, then the owner's protected landing path.
-5. **C14 proof per job key**, especially the journeys and the non-journey
-   checks: run the job with the excluded paths removed and show the result
-   does not change. Until then the selector over-selects.
+   protected-file diff, then the owner's protected landing path. The first
+   pair returned FIX; this revision answers both, and a fresh pair is
+   required.
+5. **C14 proof per job key**, everywhere: run each job with the excluded
+   paths removed and show the result does not change. The three holes the
+   reviews found (README, backlog, `web/src`) are closed; the rest of the
+   map is still the prototype's word, in both directions.
 6. **C15/C16/C19 wiring**: the base test list, the accepting gate's seed of
    the new main's journey passes, and a named key for every fact the
    integrator reads.
