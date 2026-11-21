@@ -239,6 +239,10 @@ def validate_policy(policy, path):
     need(isinstance(policy.get("serial_list"), str), "serial_list must be a string")
     need(isinstance(policy.get("scenario_inputs", {}), dict),
          "scenario_inputs must be an object")
+    for name, inputs in (policy.get("scenario_inputs") or {}).items():
+        need(isinstance(name, str) and isinstance(inputs, list)
+             and all(isinstance(item, str) for item in inputs),
+             "scenario_inputs[%r] must be a list of key names" % (name,))
     need(isinstance(policy.get("slots"), int) and policy["slots"] >= 1,
          "slots must be a positive integer")
     need(isinstance(policy.get("budget_seconds"), (int, float))
