@@ -610,13 +610,19 @@ def select(opts):
             result.skipped.append({
                 "id": ("historical:" if historical_pattern.match(name) else "check:") + name,
                 "why": "task-only (the gate runs it only as its own task's scenario)",
-                "key": job_key("scenario", name, cand_tree_keys, scenario_keys.get(name))})
+                "key": job_key("scenario", name,
+                               {k: cand_tree_keys[k] for k in scenario_key_names(name)},
+                               scenario_keys.get(name))})
             continue
         is_historical = bool(historical_pattern.match(name))
         is_nightly_hold = name in nightly_holds
         job_id = ("historical:" if is_historical else "check:") + name
-        ckey = job_key("scenario", name, cand_tree_keys, scenario_keys.get(name))
-        bkey = job_key("scenario", name, base_tree_keys, base_scenario_keys.get(name))
+        ckey = job_key("scenario", name,
+                       {k: cand_tree_keys[k] for k in scenario_key_names(name)},
+                       scenario_keys.get(name))
+        bkey = job_key("scenario", name,
+                       {k: base_tree_keys[k] for k in scenario_key_names(name)},
+                       base_scenario_keys.get(name))
         if decision == "narrow":
             if (historical_mode == "nightly") and (is_historical or is_nightly_hold):
                 result.skipped.append({
