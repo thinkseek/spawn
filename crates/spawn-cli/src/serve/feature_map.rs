@@ -1441,7 +1441,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Facts, Spec, build, derive, fallback_specs, parse_mapping, read_mapping, shipped_by_deploy,
+        Facts, Native, Source, Spec, build, derive, fallback_specs, parse_mapping, read_mapping,
+        shipped_by_deploy,
     };
 
     fn spec(id: &str, objectives: &[u32]) -> Spec {
@@ -1450,8 +1451,19 @@ mod tests {
             title: format!("Feature {id}"),
             summary: None,
             objectives: objectives.to_vec(),
-            issues: Vec::new(),
-            prs: Vec::new(),
+            sources: objectives
+                .iter()
+                .map(|objective| Source {
+                    kind: "objective".to_string(),
+                    reference: format!("objective:4/{objective:03}"),
+                    url: None,
+                    title: None,
+                    native: Some(Native::Objective {
+                        mission: 4,
+                        objective: *objective,
+                    }),
+                })
+                .collect(),
         }
     }
 
@@ -1663,37 +1675,71 @@ mod tests {
         assert_eq!(feature["unowned"], false);
     }
 
-    /// A mapping is identities and links only; a typo, a duplicate or a
-    /// non-http link is refused rather than silently dropped.
+    /// A mapping is identities and links only, native or external; a typo,
+    /// a duplicate objective or a non-http link is refused rather than
+    /// silently dropped.
     #[test]
     fn a_mapping_is_checked_and_holds_no_status() {
         let good = json!({"features": [
             {"id": "feature-map", "title": "Feature map",
-             "summary": "capabilities", "objectives": [488, 489],
-             "issues": [{"url": "https://github.com/o/r/issues/63", "title": "map", "number": 63}],
-             "prs": [{"url": "https://github.com/o/r/pull/69"}]},
-            {"id": "other", "title": "Other", "objectives": [490]}
+             "summary": "capabilities",
+             "sources": [
+                {"kind": "objective", "objective": 488},
+                {"kind": "objective", "mission": 4, "objective": 489},
+                {"kind": "issue", "ref": "63", "title": "map",
+                 "url": "https://github.com/thinkseek/spawn/issues/63"},
+                {"kind": "pr", "ref": "69", "url": "https://github.com/thinkseek/spawn/pull/69"},
+                {"kind": "mission", "mission": 7},
+                {"kind": "task", "task": 544},
+                {"kind": "verification", "objective": 488},
+                {"kind": "deploy", "event": 123},
+                {"kind": "request", "ref": "owner-2026-11-21", "title": "make a feature map"}
+             ]},
+            {"id": "other", "title": "Other",
+             "sources": [{"kind": "objective", "objective": 490}]}
         ]});
-        let specs = parse_mapping(&good).expect("a good mapping");
+        let specs = parse_mapping(&good, 4).expect("a good mapping");
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].objectives, vec![488, 489]);
-        assert_eq!(specs[0].issues[0].number, Some(63));
-        assert_eq!(specs[1].prs.len(), 0);
+        assert_eq!(specs[0].sources[2].reference, "issue:63");
+        assert_eq!(specs[0].sources[4].reference, "mission:7");
+        assert_eq!(specs[0].sources[7].reference, "deploy:123");
+        assert_eq!(specs[1].sources.len(), 1);
+        // One source twice is one source, not an error.
+        let deduped = json!({"features": [{"id": "a", "title": "A", "sources": [
+            {"kind": "issue", "ref": "1", "title": "one"},
+            {"kind": "issue", "ref": "1", "url": "https://github.com/o/r/issues/1"}
+        ]}]});
+        let specs = parse_mapping(&deduped, 4).expect("deduplicated");
+        assert_eq!(specs[0].sources.len(), 1);
+        assert_eq!(specs[0].sources[0].title.as_deref(), Some("one"));
+        assert_eq!(specs[0].sources[0].url.as_deref(), Some("https://github.com/o/r/issues/1"));
         for bad in [
             json!({"features": [{"id": "a", "title": "A", "status": "live"}]}),
-            json!({"features": [{"id": "a", "title": "A", "objectives": [1]},
-                                {"id": "a", "title": "B", "objectives": [2]}]}),
-            json!({"features": [{"id": "a", "title": "A", "objectives": [1]},
-                                {"id": "b", "title": "B", "objectives": [1]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "objective", "objective": 1}]},
+                                {"id": "a", "title": "B", "sources": [
+                {"kind": "objective", "objective": 2}]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "objective", "objective": 1}]},
+                                {"id": "b", "title": "B", "sources": [
+                {"kind": "objective", "objective": 1}]}]}),
             json!({"features": [{"id": "A", "title": "A"}]}),
-            json!({"features": [{"id": "a", "title": "A", "issues": [{"url": "file:///x"}]}]}),
-            json!({"features": [{"id": "a", "title": "A", "objectives": ["1"]}]}),
-            json!({"features": [{"id": "a", "title": "A", "objectives": [1, 1]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "issue", "ref": "1", "url": "file:///x"}]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "objective", "objective": "1"}]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "objective", "mission": 9, "objective": 1}]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "deploy", "event": 0}]}]}),
+            json!({"features": [{"id": "a", "title": "A", "sources": [
+                {"kind": "issue", "ref": "1", "number": 1}]}]}),
             json!({"features": [{"id": "a", "title": ""}]}),
             json!({"features": "none"}),
             json!({"features": [], "extra": true}),
         ] {
-            assert!(parse_mapping(&bad).is_err(), "refused: {bad}");
+            assert!(parse_mapping(&bad, 4).is_err(), "refused: {bad}");
         }
     }
 
@@ -1714,7 +1760,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("backlog")).expect("temp backlog");
         std::fs::write(
             dir.join("backlog/map.json"),
-            r#"{"features":[{"id":"x","title":"X","objectives":[1]}]}"#,
+            r#"{"features":[{"id":"x","title":"X","sources":[{"kind":"objective","objective":1}]}]}"#,
         )
         .expect("a mapping");
         let mut row = mission();
@@ -1729,7 +1775,7 @@ mod tests {
         assert_eq!(specs.len(), 5, "the fallback keeps the page useful");
         assert!(mapping["error"].as_str().unwrap().contains("missing.json"));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = read_mapping(Path::new("/definitely/not/here"));
+        let _ = read_mapping(Path::new("/definitely/not/here"), 4);
     }
 
     /// The whole answer carries the seconds and the deploy it stands on.
