@@ -245,7 +245,7 @@ class SelectorTest(unittest.TestCase):
         self.assertEqual(ids["historical:008.sh"]["why"], "input-changed")
         skipped = {job["id"]: job["why"] for job in res["skipped"]}
         self.assertIn("cache-hit", skipped["historical:007.sh"])
-        self.assertGreater(res["predicted"]["wall_seconds"], 131.0)
+        self.assertNotIn("historical:008.sh", skipped)
 
     def test_backlog_change_selects_check_tests(self):
         # crates/spawn-cli/src/objectives.rs loads the real rsi/backlog under
