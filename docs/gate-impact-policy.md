@@ -131,7 +131,7 @@ split, every 243-type change pays the full gate.
   the base's accepting gate recorded the result **for exactly this base
   commit**. The accepting gate's own candidate runs are meant to seed the
   new main (C16; the gate does this today only for solved objectives,
-  `scripts/rsi/gate.sh:4814`), so a check, journey or CI hit depends on the
+  `scripts/rsi/gate.sh:4839`), so a check, journey or CI hit depends on the
   pending C15/C16/C19 wiring and is not available on a live landing yet.
 - **Candidate runs never certify a later candidate.** The selector reads
   results; it never writes a cache entry. A new candidate, a changed input, a
@@ -174,14 +174,23 @@ The target covers selection, the necessary build/listing, and every check the
 policy requires for that change class. It does not apply to the full or
 escalated gate and it does not apply to nightly. There is no universal
 3-minute SLA: under the policy's **own default** (cache-only, unsolved run)
-the numbers in section 4 show five named classes that cannot meet it — the
-nightly-only change (286.9 s; its two 131.0 s rows need the retirement or the
-carry), the measured 243-type change once check-tests is keyed on the backlog
-(349.2 s), web-only (1101.4 s), Rust (510.5 s) and shared/runtime (1973.8 s)
-— and the fail-closed unknown class pays the same full 1973.8 s. On this
-base every narrow class also pays the unsolved 241 under the default, so no
-class is WITHIN it: the 131.0 s rows are WITHIN only under the retirement or
-the carry, and neither is installed.
+no narrow class meets it. Section 4's rows give the nightly-only change
+(286.9 s; its two 131.0 s rows need the retirement or the carry), the
+measured 243-type change once check-tests is keyed on the backlog (349.2 s),
+web-only (1101.4 s) and Rust (1277.1 s under the default; 510.5 s even with
+the nightly retirement); the docs class has the nightly-only shape, because
+a docs change alters no key, and measures the same 286.9 s. The
+shared/runtime change (1973.8 s) and the fail-closed unknown class (the same
+full 1973.8 s) are outside the target by construction — it does not apply to
+the escalated gate — so their 1973.8 s is a cost, not a budget verdict. On
+this base the unsolved objective 241 is charged to every narrow class under
+the default, but differently: a class that leaves its inputs unchanged
+(nightly-only, docs, and the 243-type backlog change) pays its two agreeing
+base runs (119.4 s) and its candidate run (59.2 s); a web change alters
+241's key, so 241 runs on the candidate only (59.2 s); on the Rust change
+241 is the task scenario, one candidate run (39.9 s). No class is WITHIN
+it: the 131.0 s rows are WITHIN only under the retirement or the carry, and
+neither is installed.
 
 ## 3. Change classes
 
@@ -194,11 +203,16 @@ the carry, and neither is installed.
 | judge / shared | `scripts/`, `deploy/`, `rsi/` (except the two data paths), `web/` config, toolchain | today's full gate (186 candidate jobs + base phase) |
 | unknown | anything else | full gate, `fail_closed: true` |
 
-The job lists above are each class's shape; under the policy's default
-(unsolved run) every narrow class also charges the one unsolved objective on
-this base (241): its two agreeing base runs (119.4 s) and its candidate run
-(59.2 s, packed into the C1 slots). That is why no narrow class is WITHIN
-180 s under the defaults (section 2.6).
+The job lists above are each class's shape. Under the policy's default
+(unsolved run) the one unsolved objective on this base (241) is charged
+differently: a class that leaves its inputs unchanged (nightly-only, docs,
+and the 243-type backlog change) pays its two agreeing base runs (119.4 s)
+and its candidate run (59.2 s, packed into the C1 slots); a web change
+alters 241's key, so 241 runs on the candidate only (59.2 s); on the Rust
+change 241 is the task scenario, one candidate run (39.9 s). That charge is
+not what keeps every narrow class over 180 s — check-tests alone is 184.8 s
+for the 243-type change — but no narrow class is WITHIN under the defaults
+(section 2.6).
 
 Protected paths are reported separately (`owner_review_required: true`). The
 selector does not decide the protected-path rule; `gate.sh` still refuses a
@@ -385,17 +399,17 @@ It runs no check, builds nothing, writes no cache, and is not wired into
 
 Confirmed:
 
-- A change that touches only a nightly data file predicts **131.0 s**: four
-  C1 journeys and 186 skipped jobs. That number is the retirement/carry
-  figure only: under the policy's **own default** (cache-only, unsolved run)
-  the same change is **286.9 s and OVER** — the base re-judges the unsolved
-  241 (two agreeing runs, 119.4 s) and 241 runs on the candidate (59.2 s,
-  122.5 s parallel with the C1 journeys). 131.0 s is the same under the
-  nightly retirement (approved, not installed) and under cache-only + carry
-  (carry unratified). Either way it is a prediction, not an achieved landing:
-  the seed wiring in the footnote is not installed. The nightly row depends
-  on the retirement (the 159 historical objectives are skipped, not carried),
-  and the carry row on the carried `unsolved` rule.
+- A change that touches only a nightly data file predicts **286.9 s and
+  OVER** under the policy's **own default** (cache-only, unsolved run): the
+  base re-judges the unsolved 241 (two agreeing runs, 119.4 s) and 241 runs
+  on the candidate (59.2 s, 122.5 s parallel with the C1 journeys). It is
+  **131.0 s** — four C1 journeys and 186 skipped jobs — only under the
+  nightly retirement (approved, not installed) or under cache-only + carry
+  (carry unratified); that is the retirement/carry figure only. Either way
+  it is a prediction, not an achieved landing: the seed wiring in the
+  footnote is not installed. The nightly row depends on the retirement (the
+  159 historical objectives are skipped, not carried), and the carry row on
+  the carried `unsolved` rule.
 - The specific cause of the 1973 s 243 landing is the nightly file in the
   landing cache key, not the number of scenarios.
 - Unknown impact and a missing dependency fail closed: full gate or no
@@ -460,9 +474,12 @@ which was the bug.
    that declaration and its proof. The strict-cache rows are the cost of
    doing neither.
 4. **Two independent reviews** of the selector, the class split and every
-   protected-file diff, then the owner's protected landing path. The first
-   pair returned FIX; this revision answers both, and a fresh pair is
-   required.
+   protected-file diff, then the owner's protected landing path. Four rounds
+   so far: the first pair returned FIX from both reviewers; the second, PASS
+   and FIX; the third, PASS with nits and FIX; the fourth, FIX from both
+   (the Rust default-mode mislabel in section 2.6 and section 3's
+   unsolved-241 overgeneralisation). This revision answers the fourth pair,
+   and a fresh pair is required.
 5. **C14 proof per job key**, everywhere: run each job with the excluded
    paths removed and show the result does not change. The three holes the
    reviews found (README, backlog, `web/src`) are closed; the rest of the
@@ -510,4 +527,4 @@ which was the bug.
 - the gate that accepted the 243 base: `ws/gate-logs/01a1f56e8ddb9e523d04842fc720/spawn-gate-3706967-18e98b3e7b4f564c-0`
 - `sync/design-gate-v2.md` (approved 2026-11-10, conditions C1-C19)
 - `scripts/rsi/gate.sh:3150` (the base cache), `:3211` (`scenarios_key`),
-  `:4814` (seeds from the accepting gate), `:4839` (only `solved` is seeded)
+  `:4813` (seeds from the accepting gate), `:4839` (only `solved` is seeded)
