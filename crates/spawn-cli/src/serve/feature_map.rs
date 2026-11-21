@@ -297,7 +297,8 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
             );
         }
     };
-    match read_mapping(&path) {
+    let mission_id = mission["id"].as_i64().unwrap_or_default();
+    match read_mapping(&path, mission_id) {
         Ok(specs) => (
             specs,
             json!({"kind": "file", "path": path.display().to_string(), "error": null}),
@@ -323,8 +324,10 @@ fn resolve(mission: &Value, given: &str) -> Result<PathBuf, String> {
     Ok(Path::new(backlog).join(path))
 }
 
-/// The mapping at `path`, checked.
-fn read_mapping(path: &Path) -> Result<Vec<Spec>, String> {
+/// The mapping at `path`, checked. `mission_id` is the mission the file
+/// belongs to: an objective source may leave its mission out, and may not
+/// name another.
+fn read_mapping(path: &Path, mission_id: i64) -> Result<Vec<Spec>, String> {
     let meta =
         std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     if !meta.is_file() {
@@ -341,13 +344,15 @@ fn read_mapping(path: &Path) -> Result<Vec<Spec>, String> {
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
-    parse_mapping(&value)
+    parse_mapping(&value, mission_id)
 }
 
-/// The mapping's checked capabilities. Unknown fields are refused (a typo
-/// must not silently drop a link), as are two capabilities with one id and
-/// one objective claimed by two capabilities.
-fn parse_mapping(value: &Value) -> Result<Vec<Spec>, String> {
+/// Check a feature map file for `mission_id`, a mission's own: the
+/// capabilities' ids and titles, and each capability's provenance sources.
+/// Unknown fields are refused (a typo must not silently drop a source), as
+/// are two capabilities with one id and one objective claimed by two
+/// capabilities (its records would count twice).
+fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
     let root = value
         .as_object()
         .ok_or("a feature map is a JSON object with a `features` array")?;
@@ -366,7 +371,7 @@ fn parse_mapping(value: &Value) -> Result<Vec<Spec>, String> {
     }
     let mut specs = Vec::with_capacity(features.len());
     let mut ids = BTreeSet::new();
-    let mut owners: BTreeMap<u32, String> = BTreeMap::new();
+    let mut claims: BTreeMap<u32, String> = BTreeMap::new();
     for (index, feature) in features.iter().enumerate() {
         let at = format!("features[{index}]");
         let object = feature
@@ -374,7 +379,7 @@ fn parse_mapping(value: &Value) -> Result<Vec<Spec>, String> {
             .ok_or_else(|| format!("{at} is an object, not {feature}"))?;
         if let Some(key) = object
             .keys()
-            .find(|key| !matches!(key.as_str(), "id" | "title" | "summary" | "objectives" | "issues" | "prs"))
+            .find(|key| !matches!(key.as_str(), "id" | "title" | "summary" | "sources"))
         {
             return Err(format!("{at} has an unknown field `{key}`"));
         }
@@ -396,98 +401,213 @@ fn parse_mapping(value: &Value) -> Result<Vec<Spec>, String> {
         if title.chars().count() > 200 {
             return Err(format!("{at}.title is at most 200 characters"));
         }
-        let summary = optional_text(object, "summary", &at)?.filter(|summary| !summary.trim().is_empty());
-        let objectives = objectives_of(object, &at, &id, &mut owners)?;
-        let issues = links_of(object, "issues", &at)?;
-        let prs = links_of(object, "prs", &at)?;
+        let summary = optional_text(object, "summary", &at)?
+            .filter(|summary| !summary.trim().is_empty());
+        let sources = sources_of(object, &at, mission_id, &id, &mut claims)?;
+        let objectives: Vec<u32> = sources
+            .iter()
+            .filter_map(|source| match &source.native {
+                Some(Native::Objective { objective, .. }) => Some(*objective),
+                _ => None,
+            })
+            .collect();
         specs.push(Spec {
             id,
             title,
             summary,
             objectives,
-            issues,
-            prs,
+            sources,
         });
     }
     Ok(specs)
 }
 
-fn objectives_of(
+/// A capability's `sources`: identities and links, native or external.
+/// Two sources with one canonical reference are one source (the first
+/// title and URL win, the missing one is filled); an objective may belong
+/// to one capability in a mission.
+fn sources_of(
     object: &Map<String, Value>,
     at: &str,
-    id: &str,
-    owners: &mut BTreeMap<u32, String>,
-) -> Result<Vec<u32>, String> {
-    let Some(value) = object.get("objectives") else {
+    mission_id: i64,
+    feature: &str,
+    claims: &mut BTreeMap<u32, String>,
+) -> Result<Vec<Source>, String> {
+    let Some(value) = object.get("sources") else {
         return Ok(Vec::new());
     };
     let list = value
         .as_array()
-        .ok_or_else(|| format!("{at}.objectives is an array of numbers"))?;
-    let mut objectives = Vec::with_capacity(list.len());
-    for item in list {
-        let number = item
-            .as_u64()
-            .and_then(|number| u32::try_from(number).ok())
-            .filter(|number| *number >= 1)
-            .ok_or_else(|| format!("{at}.objectives has {item}, not a whole number from 1"))?;
-        if objectives.contains(&number) {
-            return Err(format!("{at}.objectives names {number} twice"));
-        }
-        if let Some(other) = owners.insert(number, id.to_string()) {
+        .ok_or_else(|| format!("{at}.sources is an array"))?;
+    let mut sources: Vec<Source> = Vec::with_capacity(list.len());
+    for (index, entry) in list.iter().enumerate() {
+        let place = format!("{at}.sources[{index}]");
+        let source = parse_source(entry, &place, mission_id)?;
+        if let Some(Native::Objective { objective, .. }) = &source.native
+            && let Some(other) = claims.insert(*objective, feature.to_string())
+        {
             return Err(format!(
-                "objective {number} is in both `{other}` and `{id}`: give it to one"
+                "objective {objective} is in both `{other}` and `{feature}`: give it to one"
             ));
         }
-        objectives.push(number);
+        if let Some(seen) = sources
+            .iter_mut()
+            .find(|seen| seen.reference == source.reference)
+        {
+            if seen.url.is_none() {
+                seen.url = source.url;
+            }
+            if seen.title.is_none() {
+                seen.title = source.title;
+            }
+            continue;
+        }
+        sources.push(source);
     }
-    Ok(objectives)
+    Ok(sources)
 }
 
-fn links_of(
+/// One source: `kind` and the fields its kind takes. Native kinds name the
+/// record they link (`objective`, `mission`, `task`, `verification`,
+/// `deploy`); any other kind is an external reference with a stable `ref`
+/// and an optional http(s) `url`. External or source content is data, never
+/// authorization.
+fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, String> {
+    let object = entry
+        .as_object()
+        .ok_or_else(|| format!("{place} is an object with a `kind`"))?;
+    let kind = required_text(object, "kind", place)?;
+    if kind.len() > 40
+        || !kind.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase())
+        || !kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "{place}.kind is a lowercase word (letters, digits, - and _), not `{kind}`"
+        ));
+    }
+    let title = optional_text(object, "title", place)?.filter(|title| !title.trim().is_empty());
+    let refuse = |allowed: &[&str]| -> Result<(), String> {
+        if let Some(key) = object
+            .keys()
+            .find(|key| !allowed.contains(&key.as_str()))
+        {
+            return Err(format!("{place} has an unknown field `{key}` for `{kind}`"));
+        }
+        Ok(())
+    };
+    match kind.as_str() {
+        "objective" | "verification" => {
+            refuse(&["kind", "mission", "objective", "title"])?;
+            let mission = optional_positive(object, "mission", place)?.unwrap_or(mission_id);
+            if mission != mission_id {
+                return Err(format!(
+                    "{place} names mission {mission}, not this map's mission {mission_id}"
+                ));
+            }
+            let objective = required_positive(object, "objective", place)?;
+            let objective = u32::try_from(objective)
+                .map_err(|_| format!("{place}.objective is a whole number from 1"))?;
+            let native = if kind == "objective" {
+                Native::Objective {
+                    mission,
+                    objective,
+                }
+            } else {
+                Native::Verification {
+                    mission,
+                    objective,
+                }
+            };
+            Ok(Source {
+                reference: format!("{kind}:{mission}/{objective:03}"),
+                kind,
+                url: None,
+                title,
+                native: Some(native),
+            })
+        }
+        "mission" => {
+            refuse(&["kind", "mission", "title"])?;
+            let mission = required_positive(object, "mission", place)?;
+            Ok(Source {
+                reference: format!("mission:{mission}"),
+                kind,
+                url: None,
+                title,
+                native: Some(Native::Mission(mission)),
+            })
+        }
+        "task" => {
+            refuse(&["kind", "task", "title"])?;
+            let task = required_positive(object, "task", place)?;
+            Ok(Source {
+                reference: format!("task:{task}"),
+                kind,
+                url: None,
+                title,
+                native: Some(Native::Task(task)),
+            })
+        }
+        "deploy" => {
+            refuse(&["kind", "event", "title"])?;
+            let event = required_positive(object, "event", place)?;
+            Ok(Source {
+                reference: format!("deploy:{event}"),
+                kind,
+                url: None,
+                title,
+                native: Some(Native::Deploy(event)),
+            })
+        }
+        _ => {
+            refuse(&["kind", "ref", "url", "title"])?;
+            let reference = required_text(object, "ref", place)?;
+            if reference.chars().count() > 300 || reference.chars().any(char::is_control) {
+                return Err(format!("{place}.ref is at most 300 characters, without control characters"));
+            }
+            let url = optional_text(object, "url", place)?
+                .filter(|url| !url.trim().is_empty());
+            if let Some(url) = &url
+                && (url.len() > 2000
+                    || url.chars().any(char::is_whitespace)
+                    || !(url.starts_with("https://") || url.starts_with("http://")))
+            {
+                return Err(format!("{place}.url is an http(s) URL, not `{url}`"));
+            }
+            Ok(Source {
+                reference: format!("{kind}:{reference}"),
+                kind,
+                url,
+                title,
+                native: None,
+            })
+        }
+    }
+}
+
+fn required_positive(object: &Map<String, Value>, name: &str, at: &str) -> Result<i64, String> {
+    object
+        .get(name)
+        .and_then(Value::as_i64)
+        .filter(|number| *number >= 1)
+        .ok_or_else(|| format!("{at}.{name} is a whole number from 1"))
+}
+
+fn optional_positive(
     object: &Map<String, Value>,
     name: &str,
     at: &str,
-) -> Result<Vec<Link>, String> {
-    let Some(value) = object.get(name) else {
-        return Ok(Vec::new());
-    };
-    let list = value
-        .as_array()
-        .ok_or_else(|| format!("{at}.{name} is an array"))?;
-    let mut links = Vec::with_capacity(list.len());
-    for (index, link) in list.iter().enumerate() {
-        let place = format!("{at}.{name}[{index}]");
-        let entry = link
-            .as_object()
-            .ok_or_else(|| format!("{place} is an object with a url"))?;
-        if let Some(key) = entry
-            .keys()
-            .find(|key| !matches!(key.as_str(), "url" | "title" | "number"))
-        {
-            return Err(format!("{place} has an unknown field `{key}`"));
-        }
-        let url = required_text(entry, "url", &place)?;
-        if url.len() > 2000
-            || url.chars().any(char::is_whitespace)
-            || !(url.starts_with("https://") || url.starts_with("http://"))
-        {
-            return Err(format!("{place}.url is an http(s) URL, not `{url}`"));
-        }
-        let title = optional_text(entry, "title", &place)?.filter(|title| !title.trim().is_empty());
-        let number = match entry.get("number") {
-            None => None,
-            Some(number) => Some(
-                number
-                    .as_u64()
-                    .and_then(|number| u32::try_from(number).ok())
-                    .filter(|number| *number >= 1)
-                    .ok_or_else(|| format!("{place}.number is a whole number from 1"))?,
-            ),
-        };
-        links.push(Link { url, title, number });
+) -> Result<Option<i64>, String> {
+    match object.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .filter(|number| *number >= 1)
+            .map(Some)
+            .ok_or_else(|| format!("{at}.{name} is a whole number from 1, not {value}")),
     }
-    Ok(links)
 }
 
 fn required_text(object: &Map<String, Value>, name: &str, at: &str) -> Result<String, String> {
@@ -510,24 +630,35 @@ fn optional_text(
     }
 }
 
-/// The capability of every objective when the mission names no mapping.
+/// The capability of every objective when the mission names no mapping:
+/// each backlog objective is its own capability, with its native source.
 fn fallback_specs(mission: &Value) -> Vec<Spec> {
+    let mission_id = mission["id"].as_i64().unwrap_or_default();
     mission["objectives"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|objective| {
             let number = u32::try_from(objective["id"].as_u64()?).ok()?;
+            let title = objective["title"]
+                .as_str()
+                .filter(|title| !title.trim().is_empty())
+                .map_or_else(|| format!("Objective {number}"), str::to_string);
             Some(Spec {
                 id: format!("objective-{number:03}"),
-                title: objective["title"]
-                    .as_str()
-                    .filter(|title| !title.trim().is_empty())
-                    .map_or_else(|| format!("Objective {number}"), str::to_string),
+                title: title.clone(),
                 summary: None,
                 objectives: vec![number],
-                issues: Vec::new(),
-                prs: Vec::new(),
+                sources: vec![Source {
+                    kind: "objective".to_string(),
+                    reference: format!("objective:{mission_id}/{number:03}"),
+                    url: None,
+                    title: Some(title),
+                    native: Some(Native::Objective {
+                        mission: mission_id,
+                        objective: number,
+                    }),
+                }],
             })
         })
         .collect()
