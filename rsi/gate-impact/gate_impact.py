@@ -271,8 +271,15 @@ def load_base_record(path, base):
             record = json.load(f)
     except (OSError, ValueError) as exc:
         raise NoVerdict("base record %s is unreadable: %s" % (path, exc))
-    recorded = record.get("commit", "")
-    if not (recorded.startswith(base) or base.startswith(recorded)):
+    recorded = record.get("commit") if isinstance(record, dict) else None
+    if not isinstance(recorded, str):
+        raise NoVerdict("base record %s has no commit field; it must name the "
+                        "exact 40-character base commit" % path)
+    if not re.fullmatch(r"[0-9a-f]{40}", recorded):
+        raise NoVerdict("base record %s names commit %r, which is not a full "
+                        "40-character commit; a short or empty commit binds to "
+                        "no base" % (path, recorded))
+    if recorded != base:
         raise NoVerdict("base record is for %s, not base %s" % (recorded, base))
     return record
 
