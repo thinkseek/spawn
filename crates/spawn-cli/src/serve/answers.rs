@@ -516,6 +516,20 @@ mod tests {
             "",
         );
         assert_ne!(early.etag, changed.etag);
+        // The feature map's clock is its own too: deleting the `/api/features`
+        // row of CLOCKS makes the page poll a fresh tag every four seconds.
+        let features = |at: i64, missions: serde_json::Value| {
+            answer(
+                "/api/features",
+                Ok(json!({"generated_at_ms": at, "missions": missions})),
+                "",
+            )
+        };
+        let first = features(1, json!([]));
+        let later = features(2, json!([]));
+        assert_eq!(first.etag, later.etag, "the map, read later");
+        assert!(later.body.contains("\"generated_at_ms\":2"));
+        assert_ne!(first.etag, features(2, json!([1])).etag);
         // A pane's capture time likewise; the fleet's clock is part of it.
         let pane = |at: i64| {
             answer(

@@ -15,8 +15,8 @@ capability identities to provenance sources, and it holds no status.
 | --- | --- | --- |
 | API | `crates/spawn-cli/src/serve/feature_map.rs`, `GET /api/features` | Derives the map from the records below |
 | UI | `web/src/components/features/FeatureMapView.tsx`, `#/features` | Four columns, evidence and gaps |
-| Read model | `web/src/features.ts`, `web/tests/features.test.ts` | Normalization and words only; never derives a state |
-| Store reads | `crates/spawn-postgres/src/features.rs` | `deploy_facts`, `mission_blockers` |
+| Read model | `web/src/features.ts`, `web/test/features.test.ts` | Normalization and words only; never derives a state |
+| Store reads | `crates/spawn-postgres/src/features.rs` | `deploy_facts`, `live_deploy_fact`, `mission_blockers` |
 | Mission setting | `objectives.features` (`spawn mission configure --features <file>`) | The absolute path of a mapping file |
 | Mapping file | any JSON file the owner keeps in the project tree | Capability ids, titles and provenance sources |
 
@@ -28,15 +28,18 @@ there is no stored state, no materialized view and no second tracker.
 
 ## 2. What each state means
 
-A capability's state is the furthest stage for which Spawn has a record. The
-four stages are nested as a ladder (live > verified > implemented > planned),
-but the four booleans in the answer are independent: a capability can be live
-and never verified, and the page says so.
+A capability's state is the furthest stage **every objective it names**
+supports. With one objective that is the furthest stage Spawn has a record
+for; with several, the least advanced objective sets the state, so a live
+sibling never lifts an objective that never landed. The four stages are
+nested as a ladder (live > verified > implemented > planned), but the four
+booleans in the answer are independent: a capability can be live and never
+verified, and the page says so.
 
 | State | Evidence required | Not enough |
 | --- | --- | --- |
 | **planned** | A capability exists in the mapping, or a backlog objective exists, and nothing landed | a task assigned, delivered, reported, accepted or reviewed; a merged PR or issue |
-| **implemented** | A `task.landed` record for a named objective, or an `objective.solved` (its scenario passes at the base) | an accepted task; a branch; a report |
+| **implemented** | For **every** named objective: a `task.landed` record, or an `objective.solved` (its scenario passes at the base) | one named objective without a landing (the capability stays planned); an accepted task; a branch; a report |
 | **verified** | For **every landed** objective: the newest `objective.verified` after that objective's newest landing is `pass` | a verification recorded before the landing; a verification of another objective |
 | **live** | The mission's source is shipped by Spawn's own deploy (a source ending `/missions/spawn.git`) **and** the newest successful `deploy.finished` was recorded after the capability's newest landing | a landing; a failed deploy; a deploy recorded before the landing; a mission no deploy ships |
 
@@ -50,8 +53,11 @@ Two consequences worth stating:
   latency convention for a metric, not evidence that a running system has the
   capability, so the feature map does not borrow it.
 - **A capability with several objectives takes the lowest state among
-  them.** If one named objective is unverified, a live sibling does not make
-  the capability verified. The gaps name the objective that is behind.
+  them.** Every named objective must have landed before the capability is
+  implemented; a never-landed objective holds it at planned even beside a
+  live sibling. If one landed objective is unverified (or failed), a live
+  sibling does not make the capability verified. The gaps name the objective
+  that is behind.
 
 ## 3. The mapping (identity only)
 
@@ -152,7 +158,8 @@ default 10) answers:
   "missions": [{
     "id": 4, "text": "...", "state": "active", "halted": null, "baseline": "...",
     "sources": ["/.../missions/spawn.git"], "gate": "/...", "accept": "gate",
-    "resident": {...} | null, "backlog": "/...", "source": {...},
+    "resident": {...} | null, "backlog": "/...",
+    "backlog_error": "read /...: ..." | null, "source": {...},
     "mapping": {"kind": "file" | "objectives", "path": "...", "error": null},
     "blocker": {"kind": "mission_paused", "reason": "...", "event": 7, "at_ms": ...} | null,
     "shipped_by_deploy": true,
@@ -185,8 +192,13 @@ default 10) answers:
 ```
 
 The four booleans (`implemented`, `verified`, `live`, and `planned` as their
-negation) are separate evidence. `state` is the furthest one; it does not
-rewrite the others.
+negation) are separate evidence. `state` is the furthest one every named
+objective supports; it does not rewrite the others. `deploy` is the newest
+deploy of any outcome (read within a bounded window for display);
+`live_anchor` is the newest successful deploy over the whole log, so a run of
+failures never hides the one that shipped the source. `backlog_error` names a
+backlog that could not be read: the mission then has no capabilities to show,
+and the page says why rather than rendering four empty columns.
 
 ## 6. The page
 
@@ -202,6 +214,9 @@ one), four columns, and a card per capability:
 - gap chips and the blocker, if any;
 - an "unowned" badge when no task is in flight and the capability is not live.
 
+A warning banner names a mapping file or a backlog that could not be read: the
+page never shows empty columns without saying why.
+
 The view only lays out the server's answer. It does not recompute a state, so
 the API and the page can never disagree about what is implemented, verified or
 live.
@@ -211,9 +226,13 @@ live.
 | What | Where |
 | --- | --- |
 | The four states never collapse; an accepted task is not implemented; a pass is not live; a live capability may be unverified; a deploy before the landing is not live | `crates/spawn-cli/src/serve/feature_map.rs` tests |
-| A mission no deploy ships is not live (the gap says so) | same |
+| A capability is only as far as its least advanced objective (a never-landed one holds it at planned); a pre-landing pass verifies nothing; the newest verification decides | same |
+| The live anchor is the newest success in the whole log, not the display window; a backlog that cannot be read is named in the answer | same |
+| A mission no deploy ships is not live (the gap says so) and its evidence has no deploy | same |
+| `mission add --features` accepts a mapping that names its own (not yet known) mission | `crates/spawn-cli/src/missions.rs` tests |
+| `/api/features` is a route and its clock stays out of the ETag | `crates/spawn-cli/src/serve.rs`, `.../serve/answers.rs` tests |
 | Blocked and unowned come from the records; a revision is in flight, a cancellation is blocked | same |
 | The mapping is checked (unknown fields, duplicate ids/objectives, external URLs), and native provenance is added and deduplicated | same |
-| Deploys newest first and bounded; halt/pause/red main blockers; `objectives.features` is an absolute path that clears | `crates/spawn-postgres/tests/features.rs` |
-| Normalization, four columns, live-without-verified, gaps and source labels | `web/test/features.test.ts` |
+| Deploys newest first and bounded; the live anchor found outside the newest 50; halt/pause/red main blockers; `objectives.features` is an absolute path that clears | `crates/spawn-postgres/tests/features.rs` |
+| Normalization, four columns, live-without-verified, an Implemented card never says "verified by", gaps, source labels and a backlog error | `web/test/features.test.ts` |
 | The web build serves the view | `rsi/scenarios/check-web.sh` (as for every view) |

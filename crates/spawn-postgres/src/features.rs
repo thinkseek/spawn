@@ -1,6 +1,7 @@
-//! The feature map's two reads that no other page needs: the newest deploy
-//! records (what has actually been shipped, and when) and every open
-//! mission's current blocker (a halt, the owner's pause, a red main).
+//! The feature map's reads that no other page needs: the newest deploy
+//! records (what has actually been shipped, and when), the newest successful
+//! deploy over the whole log (the live anchor), and every open mission's
+//! current blocker (a halt, the owner's pause, a red main).
 //!
 //! The map itself is derived in `spawn serve` from reads that already
 //! exist: an objective mission's backlog and tasks (`objective_missions`),
@@ -31,6 +32,23 @@ select coalesce(jsonb_agg(jsonb_build_object(
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
            and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'
          order by e.session_seq desc limit $1) e";
+
+/// The newest successful `deploy.finished` over the whole log, or `null`:
+/// `{event, at_ms, ok, head, by, reason}`. The live anchor is not bounded by
+/// the display window [`DEPLOY_RECORDS`] reads: a run of failed deploys must
+/// not hide the success that shipped the source.
+pub(crate) const LIVE_DEPLOY: &str = r"
+select coalesce((select jsonb_build_object(
+         'event', e.id, 'at_ms', e.recorded_at_ms,
+         'ok', e.kind -> 'detail' -> 'record' -> 'ok',
+         'head', e.kind -> 'detail' -> 'record' ->> 'head',
+         'by', e.kind -> 'detail' -> 'record' ->> 'by',
+         'reason', e.kind -> 'detail' -> 'record' ->> 'reason')
+          from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'
+           and e.kind -> 'detail' -> 'record' -> 'ok' = 'true'::jsonb
+         order by e.session_seq desc limit 1), 'null'::jsonb)";
 
 /// Every open or active mission's current blocker, by mission:
 /// `[{id, halt, paused, main_red}]`, each of the three null when absent.
@@ -63,6 +81,12 @@ impl PostgresStore {
     /// ([`DEPLOY_RECORDS`]).
     pub fn deploy_facts(&self, limit: i64) -> Result<Value, StoreError> {
         self.query_json(DEPLOY_RECORDS, &[&limit.clamp(1, 100)])
+    }
+
+    /// The newest successful `deploy.finished` over the whole log, or
+    /// `null` ([`LIVE_DEPLOY`]): `{event, at_ms, ok, head, by, reason}`.
+    pub fn live_deploy_fact(&self) -> Result<Value, StoreError> {
+        self.query_json(LIVE_DEPLOY, &[])
     }
 
     /// Every open or active mission's blocker, by mission

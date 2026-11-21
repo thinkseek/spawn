@@ -93,6 +93,7 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1600px] flex-col gap-3 px-4 py-4 sm:px-5">
             {mission.blocker && <MissionBlocker mission={mission} />}
+            {mission.backlog_error && <BacklogError mission={mission} />}
             {mission.mapping.error && <MappingError mission={mission} />}
             <MissionHead mission={mission} />
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
@@ -162,6 +163,18 @@ function MissionBlocker({ mission }: { mission: FeatureMission }) {
     <div className="flex items-start gap-3 rounded-card border border-destructive/30 bg-fail-tint px-4 py-2.5">
       <OctagonAlert size={16} className="mt-0.5 shrink-0 text-destructive" />
       <div className="min-w-0 text-label text-foreground">{blockerText(blocker)}</div>
+    </div>
+  );
+}
+
+function BacklogError({ mission }: { mission: FeatureMission }) {
+  return (
+    <div className="flex items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2.5">
+      <OctagonAlert size={16} className="mt-0.5 shrink-0 text-warning" />
+      <div className="min-w-0 text-label text-foreground">
+        The mission&rsquo;s backlog {mission.backlog ?? "path"} could not be read, so the map has no
+        capabilities to show: <span className="font-mono text-caption">{mission.backlog_error}</span>
+      </div>
     </div>
   );
 }

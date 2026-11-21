@@ -191,6 +191,8 @@ export interface FeatureMission {
   accept: string;
   resident: { name: string | null; session_id: string | null; state: string | null } | null;
   backlog: string | null;
+  /** Why the backlog could not be read, or null: without it the map is empty. */
+  backlog_error: string | null;
   source: FeatureSource | null;
   mapping: FeatureMapping;
   blocker: FeatureBlocker | null;
@@ -447,6 +449,7 @@ function normalizeMission(value: unknown): FeatureMission {
       state: optionalText(resident.state),
     },
     backlog: optionalText(raw.backlog),
+    backlog_error: optionalText(raw.backlog_error),
     source: raw.source === null || raw.source === undefined ? null : normalizeSource(raw.source),
     mapping: {
       kind: mapping.kind === "file" ? "file" : "objectives",
@@ -586,6 +589,12 @@ export function verificationNote(feature: Feature): string {
   }
   if (newest.result !== "pass") {
     return `verification ${newest.result} by ${newest.by ?? "someone"}`;
+  }
+  // The newest pass is across all objectives; on a multi-objective
+  // capability another landed objective may still hold it back, so an
+  // Implemented card never claims "verified by".
+  if (!feature.verified) {
+    return `latest pass by ${newest.by ?? "someone"}; another landed objective is not verified`;
   }
   return `verified by ${newest.by ?? "someone"}`;
 }

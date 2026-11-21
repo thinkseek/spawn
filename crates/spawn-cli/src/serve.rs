@@ -5236,6 +5236,25 @@ mod tests {
         );
     }
 
+    /// `/api/features` is a route of its own, behind the same read guard: a
+    /// tokenless request naming this server reaches its read (there is no
+    /// SPAWN_DATABASE_URL in the test, so 500 says so) rather than a 404. A
+    /// mistyped path is still 404.
+    #[test]
+    fn the_feature_map_route_reaches_its_read() {
+        let named = "Host: 127.0.0.1:PORT\r\n";
+        let answer = exchange(
+            None,
+            "",
+            None,
+            &format!("GET /api/features HTTP/1.1\r\n{named}Connection: close\r\n\r\n"),
+        );
+        assert_eq!(answer.status, 500, "{answer:?}");
+        assert_eq!(answer.body["error"], "SPAWN_DATABASE_URL is not set");
+        assert_eq!(tokenless_status("/api/feature", named), 404);
+        assert_eq!(tokenless_status("/api/features/", named), 404);
+    }
+
     /// An API answer that failed carries no tag, so it is never "not
     /// modified": a malformed id answers 400 whatever the request names.
     #[test]

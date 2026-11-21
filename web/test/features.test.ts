@@ -143,6 +143,10 @@ test("a verification after a landing is read; a failed one says so", () => {
         id: 4,
         features: [
           feature({
+            state: "verified",
+            planned: false,
+            implemented: true,
+            verified: true,
             evidence: {
               tasks: [],
               landings: [],
@@ -154,6 +158,37 @@ test("a verification after a landing is read; a failed one says so", () => {
     ],
   }).missions[0].features[0];
   assert.equal(verificationNote(passed), "verified by lead");
+  // The newest pass is picked across objectives; when the server does not
+  // call the capability verified (a landed sibling is unverified), an
+  // Implemented card must not say "verified by".
+  const partly = normalizeFeatureMap({
+    missions: [
+      {
+        id: 4,
+        features: [
+          feature({
+            state: "implemented",
+            planned: false,
+            implemented: true,
+            verified: false,
+            evidence: {
+              tasks: [],
+              landings: [],
+              verifications: [
+                { objective: 1, result: "pass", by: "lead", at_ms: 30 },
+                { objective: 2, result: "fail", by: "rev", at_ms: 20 },
+              ],
+            },
+          }),
+        ],
+      },
+    ],
+  }).missions[0].features[0];
+  assert.equal(partly.state, "implemented");
+  assert.equal(
+    verificationNote(partly),
+    "latest pass by lead; another landed objective is not verified",
+  );
 });
 
 test("gaps name the objective that is behind, not a percentage", () => {
@@ -260,8 +295,23 @@ test("blockers and owners read as words", () => {
 test("a partial answer normalizes to empty values instead of crashing", () => {
   const map = normalizeFeatureMap({ missions: [{}, { id: 6, features: [{}] }] });
   assert.equal(map.missions.length, 2);
+  assert.equal(map.missions[0].backlog_error, null);
   assert.equal(map.missions[1].features[0].state, "planned");
   assert.deepEqual(map.missions[1].features[0].sources, []);
   assert.equal(map.missions[1].features[0].evidence.deploy, null);
   assert.equal(normalizeFeatureMap(null).missions.length, 0);
+  // A backlog that could not be read is carried to the page, not hidden by
+  // an empty answer.
+  const unreadable = normalizeFeatureMap({
+    missions: [
+      {
+        id: 4,
+        backlog: "/m/backlog",
+        backlog_error: "read /m/backlog: No such file or directory",
+        features: [],
+      },
+    ],
+  }).missions[0];
+  assert.equal(unreadable.backlog_error, "read /m/backlog: No such file or directory");
+  assert.equal(unreadable.features.length, 0);
 });

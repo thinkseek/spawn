@@ -552,7 +552,10 @@ fn change(flags: &Flags) -> Result<Value, String> {
     if let Some(workers) = number("workers")? {
         part("objectives", Some("workers"), json!(workers));
     }
-    let mission = flags.get("id").and_then(|id| id.parse::<i64>().ok()).unwrap_or(0);
+    let mission = flags
+        .get("id")
+        .and_then(|id| id.parse::<i64>().ok())
+        .unwrap_or(0);
     if let Some(features) = features_file(flags, "features", mission)? {
         part("objectives", Some("features"), json!(features));
     }
@@ -1188,6 +1191,53 @@ mod tests {
         let bad = dir.join("bad.json").display().to_string();
         let refused = configure(&["--id", "4", "--features", &bad]).expect_err("a status");
         assert!(refused.contains("unknown field `status`"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mission add` validates `--features` before the mission has an id, so
+    /// a mapping that names its own mission in an objective source is
+    /// accepted; only a known mission id refuses a foreign one.
+    #[test]
+    fn add_accepts_a_mapping_that_names_its_own_mission() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-add-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(dir.join("backlog")).expect("temp backlog");
+        std::fs::write(
+            dir.join("map.json"),
+            r#"{"features":[{"id":"x","title":"X","sources":[{"kind":"objective","mission":7,"objective":488}]}]}"#,
+        )
+        .expect("a mapping");
+        let backlog = dir.join("backlog").display().to_string();
+        let path = dir.join("map.json").display().to_string();
+        let words: Vec<String> = [
+            "add",
+            "--text",
+            "Spawn RSI",
+            "--backlog",
+            &backlog,
+            "--resident",
+            "rsi",
+            "--features",
+            &path,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let (_, flags) = split_mission(&words).expect("flags");
+        let settings = super::Settings::from(&flags).expect("add knows no mission id yet");
+        assert_eq!(
+            settings.objectives.expect("the objectives")["features"],
+            path
+        );
+        // The same file is fine for its own mission and refused for another
+        // once the id is known.
+        assert!(crate::serve::feature_map::validate_file(std::path::Path::new(&path), 7).is_ok());
+        let refused = crate::serve::feature_map::validate_file(std::path::Path::new(&path), 4)
+            .expect_err("a foreign mission");
+        assert!(refused.contains("names mission 7"), "{refused}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

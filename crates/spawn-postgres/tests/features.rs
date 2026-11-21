@@ -18,8 +18,10 @@ fn mission(client: &mut Client, id: i64, sources: &Value) {
     client
         .query_one(
             "select spawn_control_record($1)",
-            &[&json!({"type": "mission.added", "id": id, "text": format!("mission {id}"),
-                      "origin": "human", "sources": sources})],
+            &[
+                &json!({"type": "mission.added", "id": id, "text": format!("mission {id}"),
+                      "origin": "human", "sources": sources}),
+            ],
         )
         .expect("a mission");
 }
@@ -51,9 +53,42 @@ fn deploy_facts_are_newest_first_and_bounded() {
     assert_eq!(rows[1]["by"], "landing");
     assert!(rows[1]["at_ms"].as_i64().is_some(), "{all}");
     assert_eq!(
-        store.deploy_facts(1).expect("one").as_array().unwrap().len(),
+        store
+            .deploy_facts(1)
+            .expect("one")
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
+}
+
+/// The live anchor is the newest success over the whole log, not the newest
+/// 50: a burst of failures after the last good deploy must not hide it.
+#[test]
+fn the_live_anchor_is_found_outside_the_newest_fifty_deploys() {
+    let (store, _schema) = store("feature_live_anchor");
+    assert_eq!(
+        store.live_deploy_fact().expect("no deploy yet"),
+        Value::Null
+    );
+    let success = deploy(&store, &"a".repeat(40), true);
+    // 60 newer failures: the success falls out of deploy_facts(50).
+    for _ in 0..60 {
+        deploy(&store, &"b".repeat(40), false);
+    }
+    let window = store.deploy_facts(50).expect("the display window");
+    let rows = window.as_array().expect("an array");
+    assert_eq!(rows.len(), 50);
+    assert!(
+        rows.iter().all(|row| row["ok"] == false),
+        "the window holds only failures: {window}"
+    );
+    let anchor = store.live_deploy_fact().expect("the live anchor");
+    assert_eq!(anchor["event"], success);
+    assert_eq!(anchor["ok"], true);
+    assert_eq!(anchor["head"], "a".repeat(40));
+    assert!(anchor["at_ms"].as_i64().is_some(), "{anchor}");
 }
 
 /// A halted mission, a paused one and a red main are named with the record
@@ -130,7 +165,10 @@ fn the_feature_map_path_is_a_mission_setting_an_absolute_file_path() {
     let cleared = store
         .mission_reconfigure(mission, &json!({"objectives": {"features": null}}))
         .expect("a cleared path");
-    assert!(cleared["after"]["objectives"].get("features").is_none(), "{cleared}");
+    assert!(
+        cleared["after"]["objectives"].get("features").is_none(),
+        "{cleared}"
+    );
     let read = store.objective_missions().expect("the mission");
     assert!(read[0]["objectives"].get("features").is_none());
 }

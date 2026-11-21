@@ -23,10 +23,13 @@
 //!   Spawn) is never called live: the map says live is not observable
 //!   instead of guessing.
 //!
-//! The states are nested (live implies verified implies implemented implies
-//! planned) but each is evidence of a different kind: a capability can be
-//! live and never verified (the deploy shipped unverified work), and it is
-//! shown as live with its verification evidence beside it. What the map
+//! `state` is only as far as the least advanced objective the capability
+//! names: every named objective must have landed before the capability is
+//! implemented, and a landed objective without a pass after its newest
+//! landing holds the capability at implemented. Each stage is evidence of a
+//! different kind, and the four booleans are independent: a capability can
+//! be live and never verified (the deploy shipped unverified work), and it
+//! is shown as live with its verification evidence beside it. What the map
 //! never does is call a landing, a merge or a review live.
 //!
 //! The mapping is a mission's `objectives.features`, an absolute path (or
@@ -117,8 +120,12 @@ pub(crate) fn feature_map(query: &str) -> Result<Value, String> {
     let verifications = store
         .verification_facts()
         .map_err(|error| error.to_string())?;
-    let deployments = store
-        .deploy_facts(50)
+    let deployments = store.deploy_facts(50).map_err(|error| error.to_string())?;
+    // The live anchor is the newest success in the whole log: the 50-record
+    // window above is for display, and a burst of failures must not hide the
+    // deploy that shipped the source.
+    let live_anchor = store
+        .live_deploy_fact()
         .map_err(|error| error.to_string())?;
     let blockers = store
         .mission_blockers()
@@ -127,6 +134,7 @@ pub(crate) fn feature_map(query: &str) -> Result<Value, String> {
         &missions,
         &verifications,
         &deployments,
+        &live_anchor,
         &blockers,
         now_ms(),
     ))
@@ -187,7 +195,11 @@ struct Landing {
 struct Facts<'a> {
     landings: &'a [Value],
     verifications: &'a [Value],
+    /// The newest deploys of any outcome, in the display window.
     deployments: &'a [Value],
+    /// The newest successful deploy in the whole log, if any: the live
+    /// anchor, which the display window does not bound.
+    anchor: Option<&'a Value>,
     blockers: &'a [Value],
 }
 
@@ -197,6 +209,7 @@ fn build(
     missions: &[Value],
     verification: &Value,
     deployments: &Value,
+    live_anchor: &Value,
     blockers: &Value,
     now: i64,
 ) -> Value {
@@ -208,6 +221,7 @@ fn build(
             .as_array()
             .map_or(&[], Vec::as_slice),
         deployments: deployments.as_array().map_or(&[], Vec::as_slice),
+        anchor: live_anchor.as_object().map(|_| live_anchor),
         blockers: blockers.as_array().map_or(&[], Vec::as_slice),
     };
     let rows: Vec<Value> = missions
@@ -216,11 +230,11 @@ fn build(
         .collect();
     json!({
         "generated_at_ms": now,
-        // The newest deploy of any outcome, and the newest successful one
-        // (the live anchor), so the page can say what it stands on.
+        // The newest deploy of any outcome (the display window), and the
+        // newest successful one over the whole log (the live anchor), so the
+        // page can say what it stands on.
         "deploy": facts.deployments.first().cloned().unwrap_or(Value::Null),
-        "live_anchor": facts.deployments.iter().find(|deploy| deploy["ok"] == true)
-            .cloned().unwrap_or(Value::Null),
+        "live_anchor": live_anchor.clone(),
         "missions": rows,
     })
 }
@@ -277,6 +291,9 @@ fn mission_row(mission: &Value, facts: &Facts) -> Value {
         "gate_rejections": mission["gate_rejections"],
         "gate_aborts": mission["gate_aborts"],
         "backlog": mission["backlog"],
+        // A backlog that cannot be read leaves the fallback empty: say so
+        // rather than render four empty columns as "no capabilities".
+        "backlog_error": mission["backlog_error"],
         // The mission is a person's request (origin `human`): the owner's
         // provenance for every capability inside it.
         "source": {"kind": "mission", "ref": format!("mission:{id}"),
@@ -419,9 +436,9 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
         let id = required_text(object, "id", &at)?;
         if id.is_empty()
             || id.len() > 80
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))
+            || !id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
         {
             return Err(format!(
                 "{at}.id is lowercase letters, digits, - and _ (at most 80), not `{id}`"
@@ -434,8 +451,8 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
         if title.chars().count() > 200 {
             return Err(format!("{at}.title is at most 200 characters"));
         }
-        let summary = optional_text(object, "summary", &at)?
-            .filter(|summary| !summary.trim().is_empty());
+        let summary =
+            optional_text(object, "summary", &at)?.filter(|summary| !summary.trim().is_empty());
         let sources = sources_of(object, &at, mission_id, &id, &mut claims)?;
         let objectives: Vec<u32> = sources
             .iter()
@@ -512,10 +529,13 @@ fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, S
         .ok_or_else(|| format!("{place} is an object with a `kind`"))?;
     let kind = required_text(object, "kind", place)?;
     if kind.len() > 40
-        || !kind.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase())
         || !kind
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        || !kind.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
     {
         return Err(format!(
             "{place}.kind is a lowercase word (letters, digits, - and _), not `{kind}`"
@@ -523,10 +543,7 @@ fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, S
     }
     let title = optional_text(object, "title", place)?.filter(|title| !title.trim().is_empty());
     let refuse = |allowed: &[&str]| -> Result<(), String> {
-        if let Some(key) = object
-            .keys()
-            .find(|key| !allowed.contains(&key.as_str()))
-        {
+        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
             return Err(format!("{place} has an unknown field `{key}` for `{kind}`"));
         }
         Ok(())
@@ -535,7 +552,10 @@ fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, S
         "objective" | "verification" => {
             refuse(&["kind", "mission", "objective", "title"])?;
             let mission = optional_positive(object, "mission", place)?.unwrap_or(mission_id);
-            if mission != mission_id {
+            // 0 means the caller does not know the mission yet (`mission
+            // add` validates before the mission has an id): any mission the
+            // source names is then the one it will belong to.
+            if mission_id > 0 && mission != mission_id {
                 return Err(format!(
                     "{place} names mission {mission}, not this map's mission {mission_id}"
                 ));
@@ -544,15 +564,9 @@ fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, S
             let objective = u32::try_from(objective)
                 .map_err(|_| format!("{place}.objective is a whole number from 1"))?;
             let native = if kind == "objective" {
-                Native::Objective {
-                    mission,
-                    objective,
-                }
+                Native::Objective { mission, objective }
             } else {
-                Native::Verification {
-                    mission,
-                    objective,
-                }
+                Native::Verification { mission, objective }
             };
             Ok(Source {
                 reference: format!("{kind}:{mission}/{objective:03}"),
@@ -599,10 +613,11 @@ fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, S
             refuse(&["kind", "ref", "url", "title"])?;
             let reference = required_text(object, "ref", place)?;
             if reference.chars().count() > 300 || reference.chars().any(char::is_control) {
-                return Err(format!("{place}.ref is at most 300 characters, without control characters"));
+                return Err(format!(
+                    "{place}.ref is at most 300 characters, without control characters"
+                ));
             }
-            let url = optional_text(object, "url", place)?
-                .filter(|url| !url.trim().is_empty());
+            let url = optional_text(object, "url", place)?.filter(|url| !url.trim().is_empty());
             if let Some(url) = &url
                 && (url.len() > 2000
                     || url.chars().any(char::is_whitespace)
@@ -729,14 +744,23 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
     let landed = landings_of(spec, mission, facts);
     let newest_landing = landed.values().max_by_key(|landing| landing.at_ms);
     let checks = checks_of(&landed, mission_id, facts);
-    let implemented = !landed.is_empty();
+    // The lowest state among the capability's objectives: a capability is
+    // only implemented when every objective it names has landed, so a live
+    // sibling never lifts a never-landed one. Verified and live inherit
+    // this, and a landed objective without a pass holds the capability at
+    // implemented.
+    let implemented = !spec.objectives.is_empty()
+        && spec
+            .objectives
+            .iter()
+            .all(|objective| landed.contains_key(objective));
     let verified = implemented && checks.iter().all(|check| check["result"] == "pass");
     let unverified: Vec<u32> = checks
         .iter()
         .filter(|check| check["result"] != "pass")
         .filter_map(|check| u32::try_from(check["objective"].as_u64()?).ok())
         .collect();
-    let anchor = facts.deployments.iter().find(|deploy| deploy["ok"] == true);
+    let anchor = facts.anchor;
     let shipped = shipped_by_deploy(mission);
     let live = implemented
         && shipped
@@ -776,10 +800,7 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         tasks.is_empty(),
     ));
     gaps.extend(accepted_gaps(spec, mission));
-    let complete = live
-        && verified
-        && missing.is_empty()
-        && landed.len() == spec.objectives.len();
+    let complete = live && verified && missing.is_empty() && landed.len() == spec.objectives.len();
     json!({
         "id": spec.id,
         "title": spec.title,
@@ -803,7 +824,7 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         "blocked": blocker,
         "gaps": gaps,
         "evidence": evidence_of(
-            &landed, &checks, newest_landing, anchor, facts.deployments.first(), &tasks,
+            &landed, &checks, newest_landing, anchor, facts.deployments.first(), &tasks, live,
         ),
     })
 }
@@ -855,7 +876,9 @@ fn landings_of(spec: &Spec, mission: &Value, facts: &Facts) -> BTreeMap<u32, Lan
             at_ms,
             kind,
             event: None,
-            commit: row.and_then(|row| row["candidate"].as_str()).map(str::to_string),
+            commit: row
+                .and_then(|row| row["candidate"].as_str())
+                .map(str::to_string),
             base: row.and_then(|row| row["base"].as_str()).map(str::to_string),
         }
     };
@@ -883,7 +906,10 @@ fn landings_of(spec: &Spec, mission: &Value, facts: &Facts) -> BTreeMap<u32, Lan
         }
         if let Some(solved) = row["solved_on_base"].as_object() {
             let at_ms = solved["at_ms"].as_i64().unwrap_or(i64::MIN);
-            if landed.get(&number).is_none_or(|landing| at_ms > landing.at_ms) {
+            if landed
+                .get(&number)
+                .is_none_or(|landing| at_ms > landing.at_ms)
+            {
                 landed.insert(
                     number,
                     Landing {
@@ -901,7 +927,10 @@ fn landings_of(spec: &Spec, mission: &Value, facts: &Facts) -> BTreeMap<u32, Lan
         if let Some(history) = row["landings"].as_array() {
             for entry in history {
                 let at_ms = entry["at_ms"].as_i64().unwrap_or(i64::MIN);
-                if landed.get(&number).is_none_or(|landing| at_ms > landing.at_ms) {
+                if landed
+                    .get(&number)
+                    .is_none_or(|landing| at_ms > landing.at_ms)
+                {
                     landed.insert(
                         number,
                         evidence(number, entry["task"].as_i64(), at_ms, "landed"),
@@ -1115,9 +1144,9 @@ fn blocked_of(
         .map(str::to_string)
         .or_else(|| {
             task["gates"].as_array().and_then(|gates| {
-                gates.last().and_then(|gate| {
-                    gate["reason"].as_str().map(str::trim).map(str::to_string)
-                })
+                gates
+                    .last()
+                    .and_then(|gate| gate["reason"].as_str().map(str::trim).map(str::to_string))
             })
         });
     json!({
@@ -1160,7 +1189,9 @@ fn blocker_of(blocker: &Value) -> Option<Value> {
 }
 
 /// What the page shows as proof: the tasks, the landings, every decisive
-/// verification, and the deploy the live claim stands on.
+/// verification, and the deploy the live claim stands on. `deploy` is the
+/// anchor only when the capability is actually live: a mission no deploy
+/// ships keeps the newest deploy record as `last_deploy`, never as proof.
 fn evidence_of(
     landed: &BTreeMap<u32, Landing>,
     checks: &[Value],
@@ -1168,6 +1199,7 @@ fn evidence_of(
     anchor: Option<&Value>,
     last_deploy: Option<&Value>,
     tasks: &[&Value],
+    live: bool,
 ) -> Value {
     let mut sorted: Vec<&Value> = tasks.to_vec();
     sorted.sort_by_key(|task| std::cmp::Reverse(task_key(task)));
@@ -1235,12 +1267,9 @@ fn evidence_of(
             "base": landing.base,
         })).collect::<Vec<_>>(),
         "verifications": checks,
-        "deploy": if anchor.is_some() && newest_landing.is_some()
-            && anchor.is_some_and(|anchor| {
-                anchor["at_ms"].as_i64().unwrap_or(i64::MAX)
-                    > newest_landing.map_or(i64::MIN, |landing| landing.at_ms)
-            })
-        {
+        // The deploy the live claim stands on, and only that: an unshipped
+        // mission's newest Spawn deploy is not proof of its capability.
+        "deploy": if live {
             anchor.cloned().unwrap_or(Value::Null)
         } else {
             Value::Null
@@ -1351,10 +1380,12 @@ fn source_linked(source: &Source, mission: &Value, rows: &[&Value], facts: &Fact
             .into_iter()
             .flatten()
             .any(|row| row["id"].as_i64() == Some(*task)),
-        Some(Native::Verification { mission, objective }) => facts.verifications.iter().any(|seen| {
-            seen["mission"].as_i64() == Some(*mission)
-                && seen["objective"].as_u64() == Some(u64::from(*objective))
-        }),
+        Some(Native::Verification { mission, objective }) => {
+            facts.verifications.iter().any(|seen| {
+                seen["mission"].as_i64() == Some(*mission)
+                    && seen["objective"].as_u64() == Some(u64::from(*objective))
+            })
+        }
         Some(Native::Deploy(event)) => facts
             .deployments
             .iter()
@@ -1538,10 +1569,32 @@ mod tests {
         deployments: &'a [serde_json::Value],
         blockers: &'a [serde_json::Value],
     ) -> Facts<'a> {
+        // The anchor is the newest success in the list, unless a test says
+        // otherwise (`facts_anchored`).
+        let anchor = deployments.iter().find(|deploy| deploy["ok"] == true);
         Facts {
             landings,
             verifications,
             deployments,
+            anchor,
+            blockers,
+        }
+    }
+
+    /// [`facts_of`] with a live anchor that the display window does not
+    /// hold: what the store reads over the whole deploy log.
+    fn facts_anchored<'a>(
+        landings: &'a [serde_json::Value],
+        verifications: &'a [serde_json::Value],
+        deployments: &'a [serde_json::Value],
+        anchor: &'a serde_json::Value,
+        blockers: &'a [serde_json::Value],
+    ) -> Facts<'a> {
+        Facts {
+            landings,
+            verifications,
+            deployments,
+            anchor: Some(anchor),
             blockers,
         }
     }
@@ -1589,6 +1642,170 @@ mod tests {
         assert_eq!(live["state"], "live");
         assert_eq!(live["verified"], true);
         assert_eq!(live["evidence"]["deploy"]["event"], 400);
+    }
+
+    /// A capability is only as far as its least advanced objective: one that
+    /// never landed holds the capability at planned (a live sibling does not
+    /// lift it), and one that landed without a pass holds it at implemented.
+    #[test]
+    fn a_capability_is_only_as_far_as_its_least_advanced_objective() {
+        let landings = vec![
+            json!({"mission": 4, "objective": 1, "task": 20, "landed_ms": 100, "event": 102}),
+            json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 300, "event": 302}),
+        ];
+        let verifications = vec![json!({"mission": 4, "objective": 1, "result": "pass",
+                                        "by": "lead", "how": "looked", "at_ms": 150, "event": 152})];
+        let deployments = vec![json!({"event": 400, "at_ms": 400, "ok": true,
+                                      "head": "d".repeat(40), "by": "landing", "reason": ""})];
+        let facts = facts_of(&landings[..1], &verifications, &deployments, &[]);
+        // 1 landed and verified; 2 never landed. The capability is planned,
+        // not live on 1's evidence.
+        let never_landed = derive(&spec("multi", &[1, 2]), &mission(), &facts);
+        assert_eq!(never_landed["state"], "planned", "{never_landed}");
+        assert_eq!(never_landed["implemented"], false);
+        assert_eq!(never_landed["verified"], false);
+        assert!(
+            never_landed["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "not_landed" && gap["objectives"] == json!([2])),
+            "{never_landed}"
+        );
+        // Both landed; only 1 has a pass, and nothing shipped. The lowest
+        // state is implemented: 1's pass does not verify 2.
+        let facts = facts_of(&landings, &verifications, &[], &[]);
+        let unverified = derive(&spec("multi", &[1, 2]), &mission(), &facts);
+        assert_eq!(unverified["state"], "implemented", "{unverified}");
+        assert_eq!(unverified["verified"], false);
+        assert!(
+            unverified["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "unverified" && gap["objectives"] == json!([2])),
+            "{unverified}"
+        );
+    }
+
+    /// A pass recorded before the landing verifies nothing: the newest
+    /// verification after the landing is the one that counts.
+    #[test]
+    fn only_a_verification_after_the_landing_verifies_it() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 300, "event": 302})];
+        let verifications = vec![json!({"mission": 4, "objective": 2, "result": "pass",
+                                        "by": "lead", "how": "looked", "at_ms": 200, "event": 202})];
+        let facts = facts_of(&landings, &verifications, &[], &[]);
+        let feature = derive(&spec("late", &[2]), &mission(), &facts);
+        assert_eq!(feature["state"], "implemented", "{feature}");
+        assert_eq!(feature["verified"], false);
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "unverified"),
+            "{feature}"
+        );
+        assert_eq!(feature["evidence"]["verifications"][0]["result"], "none");
+    }
+
+    /// The newest verification decides: a later fail does not let an older
+    /// pass verify the landing, whatever order the records arrive in.
+    #[test]
+    fn the_newest_verification_decides() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 100, "event": 102})];
+        let verifications = vec![
+            json!({"mission": 4, "objective": 2, "result": "pass", "by": "lead",
+                   "how": "looked", "at_ms": 300, "event": 301}),
+            json!({"mission": 4, "objective": 2, "result": "fail", "by": "lead",
+                   "how": "looked", "at_ms": 400, "event": 402}),
+        ];
+        let facts = facts_of(&landings, &verifications, &[], &[]);
+        let feature = derive(&spec("two", &[2]), &mission(), &facts);
+        assert_eq!(feature["state"], "implemented", "{feature}");
+        assert_eq!(feature["verified"], false);
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "verification_failed" && gap["objectives"] == json!([2])),
+            "{feature}"
+        );
+    }
+
+    /// The live anchor comes from the whole deploy log, not the display
+    /// window: a burst of failures after the last success cannot pull a
+    /// shipped capability back to implemented.
+    #[test]
+    fn a_capability_stays_live_when_the_newest_deploys_fail() {
+        let landings =
+            vec![json!({"mission": 4, "objective": 2, "task": 20, "landed_ms": 100, "event": 102})];
+        let verifications = vec![json!({"mission": 4, "objective": 2, "result": "pass",
+                                        "by": "lead", "how": "looked", "at_ms": 150, "event": 152})];
+        // The display window the store returns: the newest outcome first.
+        let deployments = vec![
+            json!({"event": 900, "at_ms": 900, "ok": false, "head": "f".repeat(40),
+                   "by": "owner", "reason": "the build failed"}),
+            json!({"event": 800, "at_ms": 800, "ok": false, "head": "e".repeat(40),
+                   "by": "owner", "reason": "the build failed"}),
+        ];
+        let anchor = json!({"event": 400, "at_ms": 400, "ok": true, "head": "d".repeat(40),
+                            "by": "landing", "reason": ""});
+        let facts = facts_anchored(&landings, &verifications, &deployments, &anchor, &[]);
+        let feature = derive(&spec("shipped", &[2]), &mission(), &facts);
+        assert_eq!(feature["state"], "live", "{feature}");
+        assert_eq!(feature["evidence"]["deploy"]["event"], 400);
+        assert_eq!(
+            feature["evidence"]["last_deploy"]["event"], 900,
+            "the failure, not the anchor"
+        );
+        // The anchor the card stands on is the whole-log success.
+        let answer = build(
+            &[mission()],
+            &json!({"landings": landings, "verifications": verifications}),
+            &json!(deployments),
+            &anchor,
+            &json!([]),
+            0,
+        );
+        assert_eq!(answer["live_anchor"]["event"], 400);
+        assert_eq!(answer["deploy"]["event"], 900);
+    }
+
+    /// A backlog that could not be read is named in the answer: the page
+    /// must not show empty columns as "no capabilities".
+    #[test]
+    fn a_backlog_that_cannot_be_read_is_named_in_the_answer() {
+        let mut row = mission();
+        row["objectives"] = json!([]);
+        row["backlog_error"] = json!("read /backlog: No such file or directory");
+        let answer = build(
+            &[row],
+            &json!({"landings": [], "verifications": []}),
+            &json!([]),
+            &Value::Null,
+            &json!([]),
+            0,
+        );
+        assert_eq!(
+            answer["missions"][0]["backlog_error"],
+            "read /backlog: No such file or directory"
+        );
+        assert_eq!(answer["missions"][0]["features"], json!([]));
+        let readable = mission();
+        let answer = build(
+            &[readable],
+            &json!({"landings": [], "verifications": []}),
+            &json!([]),
+            &Value::Null,
+            &json!([]),
+            0,
+        );
+        assert_eq!(answer["missions"][0]["backlog_error"], Value::Null);
     }
 
     /// A capability's provenance includes the native records that already
@@ -1707,6 +1924,10 @@ mod tests {
                 .any(|gap| gap["kind"] == "live_not_observable"),
             "{feature}"
         );
+        // The Spawn deploy is not this capability's proof: it ships another
+        // source. It stays the newest deploy record, never `deploy`.
+        assert_eq!(feature["evidence"]["deploy"], Value::Null, "{feature}");
+        assert_eq!(feature["evidence"]["last_deploy"]["event"], 4);
     }
 
     /// A mission's pause, halt or red main blocks its capabilities; a
@@ -1790,6 +2011,17 @@ mod tests {
         assert_eq!(specs[0].sources[4].reference, "mission:7");
         assert_eq!(specs[0].sources[7].reference, "deploy:123");
         assert_eq!(specs[1].sources.len(), 1);
+        // `mission add` validates before the mission has an id (0): a
+        // mapping naming its own mission is accepted then, and still refused
+        // for another mission the moment the id is known.
+        let own = json!({"features": [{"id": "a", "title": "A", "sources": [
+            {"kind": "objective", "mission": 7, "objective": 488}]}]});
+        assert!(
+            parse_mapping(&own, 0).is_ok(),
+            "mission add's unknown mission"
+        );
+        assert!(parse_mapping(&own, 7).is_ok());
+        assert!(parse_mapping(&own, 4).is_err(), "a foreign mission");
         // One source twice is one source, not an error.
         let deduped = json!({"features": [{"id": "a", "title": "A", "sources": [
             {"kind": "issue", "ref": "1", "title": "one"},
@@ -1798,7 +2030,10 @@ mod tests {
         let specs = parse_mapping(&deduped, 4).expect("deduplicated");
         assert_eq!(specs[0].sources.len(), 1);
         assert_eq!(specs[0].sources[0].title.as_deref(), Some("one"));
-        assert_eq!(specs[0].sources[0].url.as_deref(), Some("https://github.com/o/r/issues/1"));
+        assert_eq!(
+            specs[0].sources[0].url.as_deref(),
+            Some("https://github.com/o/r/issues/1")
+        );
         for bad in [
             json!({"features": [{"id": "a", "title": "A", "status": "live"}]}),
             json!({"features": [{"id": "a", "title": "A", "sources": [
@@ -1887,7 +2122,7 @@ mod tests {
                 dir.join(format!("{objective:03}.json")),
                 json!({"id": objective, "title": format!("Capability {objective}"),
                        "prompt": format!("Objective {objective}.")})
-                    .to_string(),
+                .to_string(),
             )
             .expect("an objective");
         }
@@ -1954,6 +2189,7 @@ mod tests {
             &missions,
             &store.verification_facts().expect("the verifications"),
             &store.deploy_facts(50).expect("the deploys"),
+            &store.live_deploy_fact().expect("the live anchor"),
             &store.mission_blockers().expect("the blockers"),
             0,
         );
@@ -1988,24 +2224,39 @@ mod tests {
     fn the_answer_says_which_deploy_it_stands_on() {
         let deployments = vec![json!({"event": 9, "at_ms": 90, "ok": true,
                                       "head": "d".repeat(40), "by": "landing", "reason": ""})];
-        let answer = build(&[mission()], &json!({"landings": [], "verifications": []}),
-                           &json!(deployments), &json!([]), 1000);
+        let anchor = deployments[0].clone();
+        let answer = build(
+            &[mission()],
+            &json!({"landings": [], "verifications": []}),
+            &json!(deployments),
+            &anchor,
+            &json!([]),
+            1000,
+        );
         assert_eq!(answer["generated_at_ms"], 1000);
         assert_eq!(answer["live_anchor"]["event"], 9);
         assert_eq!(answer["missions"][0]["counts"]["features"], 5);
         // The accepted, ungated task test below is a different mission.
         let mut ungated = mission();
         ungated["gate"] = Value::Null;
-        let answer = build(&[ungated], &json!({"landings": [], "verifications": []}),
-                           &json!([]), &json!([]), 1000);
-        assert!(answer["missions"][0]["features"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|feature| feature["gaps"]
+        let answer = build(
+            &[ungated],
+            &json!({"landings": [], "verifications": []}),
+            &json!([]),
+            &Value::Null,
+            &json!([]),
+            1000,
+        );
+        assert!(
+            answer["missions"][0]["features"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|gap| gap["kind"] == "accepted_without_landing")));
+                .any(|feature| feature["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|gap| gap["kind"] == "accepted_without_landing"))
+        );
     }
 }
