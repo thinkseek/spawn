@@ -45,9 +45,10 @@ meet 180 s even with a perfect base: the check alone is 184.8 s.
 ### 2.1 Mandatory core, on every landing
 
 - The static trust checks keep running: protected paths (the controller's
-  `rsi/scenarios/protected`, never the candidate's copy), no build-time code
-  (`build.rs`, `.cargo/`, a `Cargo.toml` with `build =`, a new proc-macro),
-  and the test count from the base's cached `cargo test` list (C15).
+  `rsi/scenarios/protected`, never the candidate's copy, matched by the
+  gate's string-prefix rule), no build-time code (`build.rs`, `.cargo/`, a
+  `Cargo.toml` with `build =`, a new proc-macro), and the test count from
+  the base's cached `cargo test` list (C15).
 - A versioned evidence record is written: policy version and digest, base
   and candidate commits and tree, toolchain and environment probe, the
   selected jobs and the skipped jobs with a deterministic reason.
