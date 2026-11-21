@@ -5,6 +5,7 @@
   "budget_seconds": 180,
   "slots": 4,
   "protected_list": "rsi/scenarios/protected",
+  "serial_list": "rsi/scenarios/serial",
   "nightly_dir": "rsi/scenarios/nightly/",
   "core": {
     "id": "static-core",
@@ -21,21 +22,21 @@
       "impact": "none",
       "protected": true,
       "scope": "nightly",
-      "why": "data the landing judge never reads: the backlog and nightly scenarios. A change needs the owner's review but cannot alter a landing verdict.",
+      "why": "data no landing scenario reads directly: the backlog and the nightly scenarios. The backlog is not inert, though: check-tests.sh runs cargo test, whose objectives.rs loads rsi/backlog, so that job's key names it and a backlog edit selects check-tests. The nightly scenarios are never run by the landing gate. A change needs the owner's review but must not escalate to the full gate.",
       "paths": ["rsi/backlog/", "rsi/scenarios/nightly/"]
     },
     {
       "id": "docs",
       "impact": "none",
       "scope": "landing-static-only",
-      "why": "no job reads it",
+      "why": "no job reads a docs/ file. The root README.md is listed here too, but scenario 008.sh greps it for the git floor ('2.43 or later'), so scenario_inputs puts README.md in 008's key; a README edit selects 008 and nothing else.",
       "paths": ["docs/", "README.md", "README.zh-CN.md"]
     },
     {
       "id": "web-source",
       "impact": "web",
       "scope": "landing",
-      "why": "web tests and build read it",
+      "why": "web tests and build read it; check-tests.sh also runs crates/spawn-cli/tests/cost_page.rs, which executes web/src/cost.ts, so check-tests is keyed on the web tree too",
       "paths": ["web/src/", "web/test/", "web/index.html"]
     },
     {
@@ -54,10 +55,13 @@
       "paths": ["rsi/", "scripts/", "deploy/", "web/", "rust-toolchain", "rust-toolchain.toml", ".cargo/"]
     }
   ],
+  "scenario_inputs": {
+    "008.sh": ["readme"]
+  },
   "jobs": [
     {"id": "rust-build", "kind": "serial", "impact": "rust", "key": ["rust"], "timing": "rust-build"},
     {"id": "test-listing", "kind": "serial", "impact": "rust", "key": ["rust"], "timing": "test-listing"},
-    {"id": "check-tests.sh", "kind": "parallel", "impact": "rust", "key": ["rust"], "timing": "check-tests.sh"},
+    {"id": "check-tests.sh", "kind": "parallel", "impact": "rust", "key": ["rust", "web", "backlog"], "timing": "check-tests.sh"},
     {"id": "check-clippy.sh", "kind": "parallel", "impact": "rust", "key": ["rust"], "timing": "check-clippy.sh"},
     {"id": "check-web.sh", "kind": "parallel", "impact": "web", "key": ["web"], "timing": "check-web.sh"},
     {"id": "journey:check-e2e.sh", "kind": "parallel", "always": true, "c1": true, "journey": "check-e2e.sh", "timing": "check-e2e.sh"},
@@ -79,7 +83,8 @@
     "match": "^[0-9][0-9][0-9]\\.sh$",
     "modes": ["cache-only", "nightly"],
     "default_mode": "cache-only",
-    "why": "cache-only is today's gate plus content-addressed results: a historical scenario runs unless its inputs are unchanged and the base's accepting gate recorded a pass. nightly is the design-gate-v2 Decision 1 retirement; installing it needs the C9 proofs and the owner's switch."
+    "unsolved_default": "run",
+    "why": "cache-only is today's gate plus content-addressed results: a historical scenario runs unless its inputs are unchanged and the base's accepting gate recorded a pass. nightly is the design-gate-v2 Decision 1 retirement; installing it needs the C9 proofs and the owner's switch, so it is never a default. An unsolved base result is not carried by default: carry is a new reuse rule and needs the owner's decision, so the default re-judges it (the fail-closed direction)."
   },
   "nightly_holds": {
     "scenarios": ["192.sh", "209.sh"],
