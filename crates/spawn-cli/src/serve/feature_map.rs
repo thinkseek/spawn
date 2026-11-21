@@ -118,17 +118,38 @@ struct Spec {
     id: String,
     title: String,
     summary: Option<String>,
+    /// The native objectives whose records decide the capability's state.
     objectives: Vec<u32>,
-    issues: Vec<Link>,
-    prs: Vec<Link>,
+    /// Every provenance source the mapping names, native or external.
+    sources: Vec<Source>,
 }
 
-/// An issue or pull request the mapping points at: a link, never a state.
+/// One place the work came from: a native record Spawn holds (an objective,
+/// a mission, a task, a verification, a deploy) or an external reference (an
+/// issue, a pull request, a person's request, a document). A source is an
+/// identity and a link, never a status: the state still comes from the
+/// records the native kinds point at.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Link {
-    url: String,
+struct Source {
+    kind: String,
+    /// The stable reference, canonical per kind: `objective:4/488`,
+    /// `mission:7`, `task:544`, `verification:4/488`, `deploy:1234`, or
+    /// `<kind>:<ref>` for an external source.
+    reference: String,
+    url: Option<String>,
     title: Option<String>,
-    number: Option<u32>,
+    /// The native record this source names, when its kind is one.
+    native: Option<Native>,
+}
+
+/// The native record behind a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Native {
+    Objective { mission: i64, objective: u32 },
+    Mission(i64),
+    Task(i64),
+    Verification { mission: i64, objective: u32 },
+    Deploy(i64),
 }
 
 /// One objective's newest landing evidence.
