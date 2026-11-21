@@ -108,6 +108,7 @@
 mod answers;
 pub(crate) mod attention;
 pub(crate) mod core_lines;
+pub(crate) mod feature_map;
 mod labels;
 mod storage;
 
@@ -879,6 +880,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/cost" => Box::new(move || cost(query)),
         "/api/core-lines" => Box::new(core_lines::core_lines),
         "/api/verifications" => Box::new(verifications),
+        "/api/features" => Box::new(move || feature_map::feature_map(query)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1677,20 +1679,27 @@ fn task_in_flight(task: &Value, gated: bool) -> bool {
     }
 }
 
-/// One mission row with `backlog`, `backlog_error`, `objectives` and
-/// `next_objective` added. A retired objective's row (the row's `retired`,
-/// objective 210) has status `retired` and its `retired` row, and
-/// `next_objective` never names it. The row's `solved_on_base` (the mission's
-/// `objective.solved` records) and `outcomes` (its tasks' outcomes, when
-/// read) are taken out: each objective row names its own record, and
-/// `next_objective` is what [`crate::objectives::choose`] gives one free
-/// slot from the integrator's own inputs (the landings, landed tasks and
-/// `objective.solved` records as `OBJECTIVE_LANDINGS`; the objectives with
-/// a task in flight; the attempts; the held objectives), null when it
-/// would assign nothing.
+/// One mission row with `backlog`, `backlog_error`, `features_file`,
+/// `objectives` and `next_objective` added. A retired objective's row (the
+/// row's `retired`, objective 210) has status `retired` and its `retired`
+/// row, and `next_objective` never names it. The row's `solved_on_base`
+/// (the mission's `objective.solved` records) and `outcomes` (its tasks'
+/// outcomes, when read) are taken out: each objective row names its own
+/// record, and `next_objective` is what [`crate::objectives::choose`] gives
+/// one free slot from the integrator's own inputs (the landings, landed
+/// tasks and `objective.solved` records as `OBJECTIVE_LANDINGS`; the
+/// objectives with a task in flight; the attempts; the held objectives),
+/// null when it would assign nothing. `features_file` is the
+/// `objectives.features` path as configured (the feature map's
+/// identity-only mapping, [`feature_map`]): null when the mission names
+/// none.
 pub(crate) fn with_objectives(mut mission: Value) -> Value {
     let backlog = mission
         .pointer("/objectives/backlog")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let features_file = mission
+        .pointer("/objectives/features")
         .and_then(Value::as_str)
         .map(str::to_string);
     let (objectives, error) = match &backlog {
@@ -1742,6 +1751,7 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
     if let Some(fields) = mission.as_object_mut() {
         fields.insert("backlog".to_string(), json!(backlog));
         fields.insert("backlog_error".to_string(), json!(error));
+        fields.insert("features_file".to_string(), json!(features_file));
         fields.insert("next_objective".to_string(), json!(next));
         fields.insert("objectives".to_string(), Value::Array(rows));
     }
@@ -4465,6 +4475,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A backlog directory that has been moved or deleted is named, not
+    /// silently read as an empty backlog: the feature map must not render
+    /// four empty columns as "no capabilities" without saying why.
+    #[test]
+    fn a_backlog_directory_that_is_gone_is_named_on_the_board() {
+        let missing = std::env::temp_dir().join(format!(
+            "spawn-board-gone-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let board = with_objectives(json!({
+            "id": 4,
+            "gate": "/g",
+            "objectives": {"backlog": missing.display().to_string()},
+            "tasks": [],
+        }));
+        let error = board["backlog_error"].as_str().expect("named");
+        assert!(
+            error.starts_with(&format!("read {}: ", missing.display())),
+            "{error}"
+        );
+        assert_eq!(board["objectives"], json!([]));
+    }
+
     #[test]
     fn a_recurring_objective_above_its_target_stays_open() {
         let tasks = [task(
@@ -5224,6 +5259,25 @@ mod tests {
             raw_header(&asset, "Cache-Control"),
             Some("public, max-age=31536000, immutable")
         );
+    }
+
+    /// `/api/features` is a route of its own, behind the same read guard: a
+    /// tokenless request naming this server reaches its read (there is no
+    /// SPAWN_DATABASE_URL in the test, so 500 says so) rather than a 404. A
+    /// mistyped path is still 404.
+    #[test]
+    fn the_feature_map_route_reaches_its_read() {
+        let named = "Host: 127.0.0.1:PORT\r\n";
+        let answer = exchange(
+            None,
+            "",
+            None,
+            &format!("GET /api/features HTTP/1.1\r\n{named}Connection: close\r\n\r\n"),
+        );
+        assert_eq!(answer.status, 500, "{answer:?}");
+        assert_eq!(answer.body["error"], "SPAWN_DATABASE_URL is not set");
+        assert_eq!(tokenless_status("/api/feature", named), 404);
+        assert_eq!(tokenless_status("/api/features/", named), 404);
     }
 
     /// An API answer that failed carries no tag, so it is never "not

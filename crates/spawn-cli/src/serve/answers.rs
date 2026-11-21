@@ -95,9 +95,10 @@ fn clocks(path: &str) -> &'static [&'static str] {
 }
 
 /// [`clocks`]' table: a path, or a prefix ending in `*`, and its clocks.
-const CLOCKS: [(&str, &[&str]); 4] = [
+const CLOCKS: [(&str, &[&str]); 5] = [
     ("/api/rsi", &["generated_at_ms"]),
     ("/api/attention", &["generated_at_ms"]),
+    ("/api/features", &["generated_at_ms"]),
     ("/api/rsi/pane", &["captured_at_ms"]),
     ("/api/pane/*", &["captured_at_ms"]),
 ];
@@ -180,6 +181,7 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/missions"
             | "/api/rsi"
             | "/api/rsi/pane"
+            | "/api/features"
             | "/api/scorecard"
     ) || path
         .strip_prefix("/api/pane/")
@@ -514,6 +516,20 @@ mod tests {
             "",
         );
         assert_ne!(early.etag, changed.etag);
+        // The feature map's clock is its own too: deleting the `/api/features`
+        // row of CLOCKS makes the page poll a fresh tag every four seconds.
+        let features = |at: i64, missions: serde_json::Value| {
+            answer(
+                "/api/features",
+                Ok(json!({"generated_at_ms": at, "missions": missions})),
+                "",
+            )
+        };
+        let first = features(1, json!([]));
+        let later = features(2, json!([]));
+        assert_eq!(first.etag, later.etag, "the map, read later");
+        assert!(later.body.contains("\"generated_at_ms\":2"));
+        assert_ne!(first.etag, features(2, json!([1])).etag);
         // A pane's capture time likewise; the fleet's clock is part of it.
         let pane = |at: i64| {
             answer(
@@ -561,6 +577,7 @@ mod tests {
             "/api/missions",
             "/api/rsi",
             "/api/rsi/pane",
+            "/api/features",
             "/api/scorecard",
             "/api/pane/session_a",
         ] {

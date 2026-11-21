@@ -4023,6 +4023,15 @@ begin
                                      or coalesce(p_objectives ->> 'resident', '') = '') then
         raise exception 'objectives need an absolute backlog and a resident';
     end if;
+    -- The feature map's mapping is an identity file the page reads
+    -- (crates/spawn-cli/src/serve/feature_map.rs): an absolute path, never
+    -- a status.
+    if p_objectives ? 'features'
+       and (jsonb_typeof(p_objectives -> 'features') is distinct from 'string'
+            or left(p_objectives ->> 'features', 1) <> '/') then
+        raise exception 'a mission''s features is the absolute path of its feature map, not %',
+            p_objectives -> 'features';
+    end if;
     if p_objectives is not null and p_gate is null then
         raise exception 'objectives need a gate to land on';
     end if;
