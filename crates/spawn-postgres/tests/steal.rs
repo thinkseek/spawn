@@ -466,7 +466,8 @@ fn a_delivery_row_carries_its_missions_state_and_halt() {
             row(queued)["mission_state"].as_str(),
             row(queued)["mission_halted"].as_bool()
         ),
-        (Some("open"), Some(false))
+        (Some("active"), Some(false)),
+        "a delivered mission is active, and not halted"
     );
     client
         .batch_execute(&format!(
