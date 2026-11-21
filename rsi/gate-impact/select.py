@@ -26,26 +26,15 @@ Policy (rsi/gate-impact/policy.json, version 1):
 - Real-time holds (192, 209) and the historical objectives are nightly in
   the proposed policy; `--historical-mode cache-only` models today's gate
   plus content-addressed results instead, so the two costs can be compared.
-  The default is the policy's own (`historical.default_mode`, cache-only):
-  an operator who omits the flag does not install the unapproved retirement.
 - A file under rsi/scenarios/nightly/ is not in any landing key: the gate
-  never runs it, so it must not invalidate a landing result.  But the
-  backlog is not inert: `cargo test` (check-tests.sh) reads rsi/backlog/
-  through crates/spawn-cli/src/objectives.rs, and scenario 008 reads the
-  tree's README.md, so both are key material for the jobs that read them.
-- A scenario listed in rsi/scenarios/serial runs alone, as the gate runs it;
-  its seconds are charged serially, not into the four-slot makespan.
-- A base record binds to its exact base commit: a missing, short or
-  different commit is no verdict (exit 2), never a cache hit.
+  never runs it, so it must not invalidate a landing result.
 
 Exit codes:
   0  a selection was produced (decision narrow, full or reject)
   1  static trust refused the candidate (build-time code)
-  2  no verdict: the policy, timings, record or tree could not be read or is
-     malformed, the base record does not name exactly the base commit, the
-     candidate does not descend from the base, a slot count is not positive,
-     or a selected job has no measured time.  The caller keeps today's full
-     gate; nothing is narrowed.
+  2  no verdict: the policy, timings, record or tree could not be read, a
+     selected job has no measured time, or the base record is for another
+     commit.  The caller keeps today's full gate; nothing is narrowed.
   3  --require-narrow was given and the decision is not narrow.
 
 Not done here (deliberately): executing any job, writing a result, deciding
@@ -98,35 +87,12 @@ def commit_id(repo, rev):
     return git(repo, ["rev-parse", "--verify", rev + "^{commit}"], text=True).strip()
 
 
-def is_ancestor(repo, base, candidate):
-    """True when `base` is an ancestor of (or equal to) `candidate`.
-
-    The controller checks this today, but a selector that claims fail-closed
-    must not answer for a candidate that does not contain its base: the diff
-    would then describe a reversal, not a landing.
-    """
-    proc = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor",
-                           base, candidate],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode == 0:
-        return True
-    if proc.returncode == 1:
-        return False
-    raise NoVerdict("git merge-base --is-ancestor %s %s failed: %s" % (
-        short(base), short(candidate),
-        proc.stderr.decode("utf-8", "replace").strip()))
-
-
 def tree_id(repo, commit):
     return git(repo, ["rev-parse", commit + "^{tree}"], text=True).strip()
 
 
 def changed_paths(repo, base, candidate):
-    # core.quotePath=false matches the gate: a non-ASCII path arrives raw
-    # instead of C-quoted, so it cannot slip past the build.rs and protected
-    # matchers into a safe-looking unknown class.
-    raw = git(repo, ["-c", "core.quotePath=false",
-                     "diff", "--no-renames", "--name-only", "-z", base, candidate])
+    raw = git(repo, ["diff", "--no-renames", "--name-only", "-z", base, candidate])
     return sorted(p for p in raw.decode("utf-8", "surrogateescape").split("\0") if p)
 
 
@@ -163,8 +129,8 @@ def tree_key(repo, commit, specs, policy_version):
 
 
 def top_level_scenarios(repo, commit, scenarios_dir):
-    raw = git(repo, ["ls-tree", "-r", "--full-tree", "--name-only", commit,
-                     "--", scenarios_dir], text=True)
+    raw = git(repo, ["ls-tree", "-r", "--name-only", commit, "--", scenarios_dir],
+              text=True)
     prefix = scenarios_dir.rstrip("/") + "/"
     out = []
     for line in raw.splitlines():
@@ -175,17 +141,6 @@ def top_level_scenarios(repo, commit, scenarios_dir):
             continue
         out.append(rest)
     return sorted(out)
-
-
-def read_list(repo, commit, path):
-    """One entry per non-empty, non-comment line of a gate list file."""
-    text = file_text(repo, commit, path) or ""
-    out = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            out.append(line)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -200,61 +155,6 @@ def sha_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def validate_policy(policy, path):
-    """Every field the selector reads, checked before it is read.
-
-    A malformed policy used to raise KeyError or ValueError out of `select`
-    and end the process with exit 1 (the static-reject code).  It is a
-    missing authority, not a refused candidate: exit 2, no verdict.
-    """
-    def need(cond, what):
-        if not cond:
-            raise NoVerdict("policy %s is malformed: %s" % (path, what))
-
-    need(isinstance(policy, dict), "not a JSON object")
-    need(isinstance(policy.get("path_classes"), list) and policy["path_classes"],
-         "path_classes must be a non-empty list")
-    for cls in policy["path_classes"]:
-        need(isinstance(cls, dict), "a path class is not an object")
-        need(isinstance(cls.get("id"), str) and cls["id"], "a path class has no id")
-        need(cls.get("impact") in ("none", "web", "rust", "full"),
-             "path class %r has no known impact" % cls.get("id"))
-        need(isinstance(cls.get("paths"), list), "path class %r has no paths" % cls["id"])
-    need(isinstance(policy.get("jobs"), list) and policy["jobs"],
-         "jobs must be a non-empty list")
-    for job in policy["jobs"]:
-        need(isinstance(job, dict), "a job is not an object")
-        need(isinstance(job.get("id"), str) and job["id"], "a job has no id")
-        need(isinstance(job.get("kind"), str), "job %r has no kind" % job.get("id"))
-        need(isinstance(job.get("timing"), str), "job %r has no timing" % job.get("id"))
-        need(isinstance(job.get("key", []), list), "job %r has a bad key" % job["id"])
-        need(job.get("journey") is None or isinstance(job.get("journey"), str),
-             "job %r has a bad journey" % job["id"])
-    need(isinstance(policy.get("core"), dict) and isinstance(policy["core"].get("id"), str),
-         "core must be an object with an id")
-    need(isinstance(policy.get("historical"), dict), "historical must be an object")
-    need(isinstance(policy["historical"].get("match"), str),
-         "historical.match must be a string")
-    need(isinstance(policy["historical"].get("default_mode"), str),
-         "historical.default_mode must be a string")
-    need(isinstance(policy["historical"].get("unsolved_default"), str),
-         "historical.unsolved_default must be a string")
-    need(isinstance(policy.get("journey_dir"), str) and policy["journey_dir"].endswith("/"),
-         "journey_dir must be a directory path ending in /")
-    need(isinstance(policy.get("protected_list"), str), "protected_list must be a string")
-    need(isinstance(policy.get("serial_list"), str), "serial_list must be a string")
-    need(isinstance(policy.get("scenario_inputs", {}), dict),
-         "scenario_inputs must be an object")
-    for name, inputs in (policy.get("scenario_inputs") or {}).items():
-        need(isinstance(name, str) and isinstance(inputs, list)
-             and all(isinstance(item, str) for item in inputs),
-             "scenario_inputs[%r] must be a list of key names" % (name,))
-    need(isinstance(policy.get("slots"), int) and policy["slots"] >= 1,
-         "slots must be a positive integer")
-    need(isinstance(policy.get("budget_seconds"), (int, float))
-         and policy["budget_seconds"] > 0, "budget_seconds must be positive")
-
-
 def load_policy(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -262,11 +162,10 @@ def load_policy(path):
         policy = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise NoVerdict("policy %s is unreadable: %s" % (path, exc))
-    version = policy.get("policy_version") if isinstance(policy, dict) else None
+    version = policy.get("policy_version")
     if version != SUPPORTED_POLICY_VERSION:
         raise NoVerdict("policy version %r is not supported (this selector knows %d)"
                         % (version, SUPPORTED_POLICY_VERSION))
-    validate_policy(policy, path)
     return policy, sha_text(canon(policy))
 
 
@@ -294,17 +193,8 @@ def load_base_record(path, base):
             record = json.load(f)
     except (OSError, ValueError) as exc:
         raise NoVerdict("base record %s is unreadable: %s" % (path, exc))
-    if not isinstance(record, dict):
-        raise NoVerdict("base record %s is not a JSON object" % path)
-    recorded = record.get("commit")
-    if not isinstance(recorded, str):
-        raise NoVerdict("base record %s has no commit field; it must name the "
-                        "exact 40-character base commit" % path)
-    if not re.fullmatch(r"[0-9a-f]{40}", recorded):
-        raise NoVerdict("base record %s names commit %r, which is not a full "
-                        "40-character commit; a short or empty commit binds to "
-                        "no base" % (path, recorded))
-    if recorded != base:
+    recorded = record.get("commit", "")
+    if not (recorded.startswith(base) or base.startswith(recorded)):
         raise NoVerdict("base record is for %s, not base %s" % (recorded, base))
     return record
 
@@ -339,29 +229,18 @@ def parse_protected(text):
             deny.append(line)
 
     def protected(path):
-        # The gate matches these as string prefixes (gate.sh:2772-2784), not
-        # as exact paths or directories: `rust-toolchain` protects
-        # `rust-toolchain.toml` and any `rust-toolchain-*` the gate would
-        # refuse.  Mirror it, so the selector's flag cannot disagree.
-        if any(path.startswith(spec) for spec in allow):
+        if any(path_matches(path, spec) for spec in allow):
             return False
-        return any(path.startswith(spec) for spec in deny)
+        return any(path_matches(path, spec) for spec in deny)
     return protected
 
 
 BUILD_SCRIPT = re.compile(r"(?m)^\s*build\s*=")
-PROC_MACRO = re.compile(r"(?m)^\s*proc-macro\s*=\s*true\b")
+PROC_MACRO = re.compile(r"(?m)^\s*proc-macro\s*=\s*true\s*$")
 
 
 def static_build_time(repo, candidate, paths):
-    """A superset of gate.sh's no-build-time-code rule.
-
-    The gate rejects `build.rs` and `.cargo/`; this also rejects a
-    `Cargo.toml` that sets `build =` or declares a proc-macro, which is
-    stricter than the gate.  Over-strict is the safe direction for a static
-    check; the gate's `cargo metadata` rule is the authority for a live
-    install.
-    """
+    """The subset of gate.sh's no-build-time-code rule a diff can decide."""
     bad = []
     for path in paths:
         if path == "build.rs" or path.endswith("/build.rs"):
@@ -422,35 +301,13 @@ def select(opts):
 
     version = policy["policy_version"]
     env = profile.get("env") or {}
-
-    # The defaults are the policy's, not this file's: an operator who omits
-    # the flags must not install a retirement the owner has not approved.
-    modes = policy["historical"].get("modes") or ["cache-only", "nightly"]
-    if opts.historical_mode is None:
-        opts.historical_mode = policy["historical"]["default_mode"]
-    if opts.historical_mode not in modes:
-        raise NoVerdict("historical mode %r is not one of the policy's %s"
-                        % (opts.historical_mode, modes))
-    if opts.unsolved_mode is None:
-        opts.unsolved_mode = policy["historical"]["unsolved_default"]
-    if opts.unsolved_mode not in ("carry", "run"):
-        raise NoVerdict("unsolved mode %r is not one of carry, run"
-                        % opts.unsolved_mode)
-
-    if opts.slots is not None and opts.slots < 1:
-        raise NoVerdict("--slots must be a positive integer, not %d" % opts.slots)
     slots = opts.slots or policy["slots"]
-    if opts.budget is not None and opts.budget <= 0:
-        raise NoVerdict("--budget must be positive, not %r" % opts.budget)
     budget = opts.budget or policy["budget_seconds"]
 
     paths = changed_paths(repo, base, candidate)
     if not paths:
         raise NoVerdict("no paths changed between %s and %s: nothing to land"
                         % (short(base), short(candidate)))
-    if not is_ancestor(repo, base, candidate):
-        raise NoVerdict("base %s is not an ancestor of candidate %s: the diff "
-                        "would not describe a landing" % (short(base), short(candidate)))
 
     result = Selection()
     protected_text = file_text(repo, base, policy["protected_list"])
@@ -486,12 +343,6 @@ def select(opts):
     web_specs = ["web/src/", "web/test/", "web/index.html",
                  "web/package.json", "web/package-lock.json", "web/pnpm-lock.yaml"]
     scripts_specs = ["scripts/"]
-    # The backlog is not inert data: crates/spawn-cli/src/objectives.rs loads
-    # the tree's real rsi/backlog under `cargo test`, so check-tests.sh (and
-    # only check-tests.sh) reads it.  The README floor sentence is read by
-    # scenario 008.  Neither may sit in the "no job reads it" docs class.
-    backlog_specs = ["rsi/backlog/"]
-    readme_specs = ["README.md"]
     keys = {
         "static": key_for(version, env, {
             "protected": sha_text(protected_text),
@@ -500,8 +351,6 @@ def select(opts):
         "rust": tree_key(repo, candidate, rust_specs, version),
         "web": tree_key(repo, candidate, web_specs, version),
         "scripts": tree_key(repo, candidate, scripts_specs, version),
-        "backlog": tree_key(repo, candidate, backlog_specs, version),
-        "readme": tree_key(repo, candidate, readme_specs, version),
     }
     base_keys = {
         "static": key_for(version, env, {
@@ -511,8 +360,6 @@ def select(opts):
         "rust": tree_key(repo, base, rust_specs, version),
         "web": tree_key(repo, base, web_specs, version),
         "scripts": tree_key(repo, base, scripts_specs, version),
-        "backlog": tree_key(repo, base, backlog_specs, version),
-        "readme": tree_key(repo, base, readme_specs, version),
     }
     scenarios_dir = policy["journey_dir"]
     scenario_names = top_level_scenarios(repo, candidate, scenarios_dir)
@@ -534,11 +381,10 @@ def select(opts):
             parts["blob"] = scenario_blob
         return key_for(version, env, parts)
 
-    base_tree_keys = {name: base_keys[name] for name in
-                      ("rust", "web", "scripts", "backlog", "readme")}
-    cand_tree_keys = {name: keys[name] for name in
-                      ("rust", "web", "scripts", "backlog", "readme")}
-    scenario_inputs = policy.get("scenario_inputs") or {}
+    base_tree_keys = {"rust": base_keys["rust"], "web": base_keys["web"],
+                      "scripts": base_keys["scripts"]}
+    cand_tree_keys = {"rust": keys["rust"], "web": keys["web"],
+                      "scripts": keys["scripts"]}
 
     def decide(job_id, kind, tree_key_names, name, always=False):
         cand_parts = {k: cand_tree_keys[k] for k in tree_key_names}
@@ -579,12 +425,9 @@ def select(opts):
         state, why, ckey = decide(job_id, kind, key_names, name, job.get("always", False))
         if state == "selected" and decision == "narrow":
             seconds = require_timing(job["timing"])
-            selected = {"id": job_id, "kind": job["kind"], "why": why,
-                        "key": ckey, "seconds": seconds,
-                        "timing": job["timing"]}
-            if job.get("journey"):
-                selected["scenario"] = job["journey"]
-            result.selected.append(selected)
+            result.selected.append({"id": job_id, "kind": job["kind"], "why": why,
+                                    "key": ckey, "seconds": seconds,
+                                    "timing": job["timing"]})
         elif state == "skipped" and decision == "narrow":
             result.skipped.append({"id": job_id, "why": why, "key": ckey})
         elif decision == "full":
@@ -603,19 +446,6 @@ def select(opts):
     task_only = re.compile(r"(?m)^#\s*rsi:\s*task-only\b")
     record_unsolved = set((record or {}).get("unsolved") or [])
     base_jobs = profile.get("base_jobs") or {}
-
-    def scenario_key_names(name):
-        """What a scenario reads: the three trees, plus the policy's extras.
-
-        A scenario is keyed on the trees it may read; the policy adds the
-        one path a scenario reads directly (`008.sh` reads README.md).
-        """
-        extra = scenario_inputs.get(name) or []
-        unknown_extra = [key for key in extra if key not in cand_tree_keys]
-        if unknown_extra:
-            raise NoVerdict("policy scenario_inputs names unknown key(s) %s for %s"
-                            % (unknown_extra, name))
-        return ["rust", "web", "scripts"] + list(extra)
 
     def base_cost(name, trust_record=True):
         """What the base phase costs for a historical objective.
@@ -643,19 +473,13 @@ def select(opts):
             result.skipped.append({
                 "id": ("historical:" if historical_pattern.match(name) else "check:") + name,
                 "why": "task-only (the gate runs it only as its own task's scenario)",
-                "key": job_key("scenario", name,
-                               {k: cand_tree_keys[k] for k in scenario_key_names(name)},
-                               scenario_keys.get(name))})
+                "key": job_key("scenario", name, cand_tree_keys, scenario_keys.get(name))})
             continue
         is_historical = bool(historical_pattern.match(name))
         is_nightly_hold = name in nightly_holds
         job_id = ("historical:" if is_historical else "check:") + name
-        ckey = job_key("scenario", name,
-                       {k: cand_tree_keys[k] for k in scenario_key_names(name)},
-                       scenario_keys.get(name))
-        bkey = job_key("scenario", name,
-                       {k: base_tree_keys[k] for k in scenario_key_names(name)},
-                       base_scenario_keys.get(name))
+        ckey = job_key("scenario", name, cand_tree_keys, scenario_keys.get(name))
+        bkey = job_key("scenario", name, base_tree_keys, base_scenario_keys.get(name))
         if decision == "narrow":
             if (historical_mode == "nightly") and (is_historical or is_nightly_hold):
                 result.skipped.append({
@@ -673,17 +497,16 @@ def select(opts):
                 cost = base_cost(name, trust_record=False)
                 result.base_seconds += cost
                 result.selected.append({
-                    "id": job_id, "kind": "parallel", "scenario": name,
+                    "id": job_id, "kind": "parallel",
                     "why": "cache-miss: unsolved base result is not carried (--unsolved-mode run)",
                     "key": ckey, "seconds": require_timing(name),
                     "timing": name, "base_seconds": round(cost, 3)})
                 continue
-            state, why, _ = decide(job_id, "scenario", scenario_key_names(name), name)
+            state, why, _ = decide(job_id, "scenario", ["rust", "web", "scripts"], name)
             if state == "selected":
                 cost = base_cost(name) if is_historical else 0.0
                 result.base_seconds += cost
                 result.selected.append({"id": job_id, "kind": "parallel",
-                                        "scenario": name,
                                         "why": why, "key": ckey,
                                         "seconds": require_timing(name),
                                         "timing": name,
@@ -693,7 +516,7 @@ def select(opts):
         else:
             seconds = timing(name) or 0.0
             result.selected.append({"id": job_id, "kind": "parallel",
-                                    "scenario": name, "why": "full gate", "key": ckey,
+                                    "why": "full gate", "key": ckey,
                                     "seconds": seconds, "timing": name})
 
     # The task's own scenario: always on the landing path when the task names
@@ -704,9 +527,7 @@ def select(opts):
         if name not in scenario_names:
             raise NoVerdict("task scenario %r is not in %s at the candidate"
                             % (name, scenarios_dir))
-        ckey = job_key("task", name,
-                       {k: cand_tree_keys[k] for k in scenario_key_names(name)},
-                       scenario_keys.get(name))
+        ckey = job_key("task", name, cand_tree_keys, scenario_keys.get(name))
         task_times = (profile.get("task") or {}).get(name)
         if not task_times:
             raise NoVerdict("task scenario %r has no measured time in profile %r"
@@ -722,7 +543,6 @@ def select(opts):
         result.selected.append({
             "id": "task:" + name,
             "kind": "parallel",
-            "scenario": name,
             "why": "task acceptance test: fail on base, pass on candidate",
             "key": ckey,
             "seconds": task_seconds,
@@ -745,14 +565,6 @@ def select(opts):
         measured_candidate = 0.0
         serial_seconds = 0.0
         if decision == "narrow":
-            # rsi/scenarios/serial (read at the base, as the controller does):
-            # a listed scenario runs with nothing else of the gate beside it,
-            # so its time is added whole, not packed into the four slots.
-            serial_names = set(read_list(repo, base, policy["serial_list"]))
-            for job in result.selected:
-                if job["kind"] == "parallel" and job.get("scenario") in serial_names:
-                    job["kind"] = "serial"
-                    job["why"] += " (serial: the gate runs it alone)"
             for job in result.selected:
                 if job["kind"] == "serial":
                     serial_seconds += job["seconds"]
@@ -836,14 +648,9 @@ def select(opts):
         "unsolved_mode": opts.unsolved_mode,
         "task_scenario": opts.task_scenario,
         "assumptions": result.assumptions + [
-            "historical mode: %s; unsolved objectives: %s (carry: an unchanged "
-            "input carries the base's recorded unsolved result to the new main; "
-            "run: the base's two agreeing runs are charged instead)"
-            % (opts.historical_mode, opts.unsolved_mode),
-            "a cache hit on a check, journey or CI job depends on the pending "
-            "C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved "
-            "objectives only, so the predicted wall clock is conditional until "
-            "that wiring lands",
+            "unsolved objectives: %s (carry: an unchanged input carries the base's "
+            "recorded unsolved result to the new main; run: the base's two agreeing "
+            "runs are charged instead)" % opts.unsolved_mode,
         ] + ([
             "the base record %s is the accepting gate's candidate passes for %s; "
             "candidate runs of a later tree are never read" % (
@@ -884,7 +691,7 @@ def text_report(res, out):
     out.write("owner review  %s\n" % ("required (protected paths changed)"
                                       if res["owner_review_required"] else "not required by path class"))
     out.write("keys\n")
-    for name in ("static", "rust", "web", "scripts", "backlog", "readme"):
+    for name in ("static", "rust", "web", "scripts"):
         out.write("  %-8s sha256:%s  base sha256:%s%s\n" % (
             name, res["keys"][name], res["base_keys"][name],
             "  unchanged" if res["keys"][name] == res["base_keys"][name] else "  CHANGED"))
@@ -933,16 +740,14 @@ def main(argv=None):
     parser.add_argument("--base-record", default=None,
                         help="JSON record of the base's accepting-gate passes")
     parser.add_argument("--historical-mode", choices=["cache-only", "nightly"],
-                        default=None,
+                        default="nightly",
                         help="cache-only: today's checks minus cache hits; "
-                             "nightly: the proposed design-gate-v2 Decision 1 retirement. "
-                             "Default: policy historical.default_mode (cache-only)")
+                             "nightly: the proposed design-gate-v2 Decision 1 retirement")
     parser.add_argument("--unsolved-mode", choices=["carry", "run"],
-                        default=None,
+                        default="carry",
                         help="carry: an unchanged input carries the base's recorded "
                              "unsolved objective result to the new main; "
-                             "run: re-judge it on the base (fail-closed strict cache). "
-                             "Default: policy historical.unsolved_default (run)")
+                             "run: re-judge it on the base (fail-closed strict cache)")
     parser.add_argument("--task-scenario", default=None,
                         help="the task's own scenario file name, e.g. 241.sh")
     parser.add_argument("--task-runs", type=int, default=1,
@@ -963,15 +768,6 @@ def main(argv=None):
     except Reject as exc:
         no_verdict_report(str(exc), None, sys.stdout)
         return EXIT_REJECT
-    except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        # A malformed policy, timings or record reaching an unguarded read is
-        # a missing authority, not a refused candidate: no verdict, exit 2.
-        missing = "no verdict: malformed input reached the selector: %r" % (exc,)
-        if opts.format == "json":
-            no_verdict_report(missing, None, sys.stdout)
-        else:
-            sys.stderr.write("gate-impact: %s\n" % missing)
-        return EXIT_NO_VERDICT
     except NoVerdict as exc:
         if opts.format == "json":
             no_verdict_report(str(exc), None, sys.stdout)

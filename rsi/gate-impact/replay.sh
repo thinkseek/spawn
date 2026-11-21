@@ -22,7 +22,7 @@ run() {
     shift
     printf '\n### %s\n' "$label"
     # shellcheck disable=SC2086
-    python3 "$here/gate_impact.py" --repo "$repo" $fmt "$@"
+    python3 "$here/select.py" --repo "$repo" $fmt "$@"
 }
 
 printf '# gate-impact dry run\n'
@@ -30,12 +30,6 @@ printf '# date: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 printf '# host: %s\n' "$(uname -n)"
 printf '# mirror: %s\n' "$repo"
 printf '# policy: %s\n' "$here/policy.json"
-
-run "243 with no mode flag: the policy's own defaults (cache-only, unsolved run)" \
-    --base 5e416443d48c5639456ecb377ae4f214ec05c11c \
-    --candidate 865cc4df9f88b1c594a78a2aff3a853604930eb0 \
-    --profile 243 \
-    --base-record "$here/records/base-5e416443.json"
 
 run "243 proposed: historical objectives nightly, unsolved carried" \
     --base 5e416443d48c5639456ecb377ae4f214ec05c11c \

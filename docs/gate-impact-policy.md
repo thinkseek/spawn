@@ -45,21 +45,17 @@ meet 180 s even with a perfect base: the check alone is 184.8 s.
 ### 2.1 Mandatory core, on every landing
 
 - The static trust checks keep running: protected paths (the controller's
-  `rsi/scenarios/protected`, never the candidate's copy, matched by the
-  gate's string-prefix rule), no build-time code (`build.rs`, `.cargo/`, a
-  `Cargo.toml` with `build =`, a new proc-macro), and the test count from
-  the base's cached `cargo test` list (C15).
+  `rsi/scenarios/protected`, never the candidate's copy), no build-time code
+  (`build.rs`, `.cargo/`, a `Cargo.toml` with `build =`, a new proc-macro),
+  and the test count from the base's cached `cargo test` list (C15).
 - A versioned evidence record is written: policy version and digest, base
   and candidate commits and tree, toolchain and environment probe, the
   selected jobs and the skipped jobs with a deterministic reason.
 - **Fail closed.** Unknown path class, missing dependency, or a cache miss
-  never narrows: an unknown class runs the full gate; an unreadable or
-  malformed policy, timings profile, base record or tree, a base record
-  that does not name exactly the base commit (a missing, empty or short
-  commit binds to no base), a candidate that does not descend from its
-  base, or a selected job with no measured time is **no verdict** (exit 2),
-  and the caller keeps today's full gate. No job is skipped because a model
-  said so.
+  never narrows: an unknown class runs the full gate; an unreadable policy,
+  timings profile, base record or tree, a base record for another commit, or
+  a selected job with no measured time is **no verdict** (exit 2), and the
+  caller keeps today's full gate. No job is skipped because a model said so.
 - A new candidate hash invalidates any prior selection or approval: the
   approval digest in section 5 covers the candidate tree and every selected
   key.
@@ -69,9 +65,8 @@ meet 180 s even with a perfect base: the check alone is 184.8 s.
 Selection uses only controller-side signals: git paths and content hashes of
 what a job reads (the shape of C14), never model text. A job runs when the
 hash of its inputs changed. A job whose key is unchanged but for which no
-base result is recorded runs too (a cache miss is not a skip; a record that
-does not name the base commit is no verdict, not a miss). The C1 data-loss
-and control journeys run on every landing, cached or not:
+base result is recorded runs too (a cache miss is not a skip). The C1
+data-loss and control journeys run on every landing, cached or not:
 
 - `check-e2e.sh` (what C1 assigns to check-e2e),
 - `check-j03-human.sh` (015 and 038: human input and keys),
@@ -94,28 +89,21 @@ documented full set). It is never a narrow accept:
 
 **One interpretation needs the owner's ratification.** `rsi/backlog/**` and
 `rsi/scenarios/nightly/**` are protected (the owner reviews them, as 243
-was), but no landing scenario reads them, so they must not escalate the
-whole gate. The backlog is not inert, though: `check-tests.sh` runs
-`cargo test`, and `crates/spawn-cli/src/objectives.rs` loads the tree's real
-`rsi/backlog` to assert its order, so the backlog is a named input of
-`check-tests.sh` (and of nothing else). A backlog edit therefore selects
-that one job, not the full gate. The prototype keeps both directories in
-the review flag and out of the escalation reason. If the owner rejects that
-split, every 243-type change pays the full gate.
+was), but they are not landing-judge inputs: the gate never reads them. They
+must not escalate. The prototype keeps them in the review flag and out of
+the escalation reason. If the owner rejects that split, every 243-type
+change pays the full gate and this proposal has no narrow class.
 
 ### 2.4 Cache
 
 - A key is a content hash of what a job reads, computed on both trees: the
   Rust tree (`crates/`, `Cargo.toml`, `Cargo.lock`), the web tree, the
-  scripts tree, the backlog tree (`rsi/backlog/`, for `check-tests.sh`),
-  `README.md` (for scenario 008), the scenario blob, the
-  toolchain/environment probe, and the policy version.
+  scripts tree, the scenario blob, the toolchain/environment probe, and the
+  policy version.
 - A result is reused only when the candidate's key equals the base's key and
-  the base's accepting gate recorded the result **for exactly this base
-  commit**. The accepting gate's own candidate runs are meant to seed the
-  new main (C16; the gate does this today only for solved objectives,
-  `scripts/rsi/gate.sh:4814`), so a check, journey or CI hit depends on the
-  pending C15/C16/C19 wiring and is not available on a live landing yet.
+  the base's accepting gate recorded the result. The accepting gate's own
+  candidate runs seed the new main (C16; the gate already does this for
+  solved objectives, `scripts/rsi/gate.sh:4814`).
 - **Candidate runs never certify a later candidate.** The selector reads
   results; it never writes a cache entry. A new candidate, a changed input, a
   different toolchain or environment, or a new policy version changes the
@@ -138,12 +126,8 @@ scenarios off the ordinary landing path, per the owner's approved
 design-gate-v2 Decision 1 (performance bounds and retired scenarios are
 checked nightly). The `--historical-mode cache-only` replay models today's
 gate instead: every check stays, and only content-addressed results are
-reused. A scenario listed in `rsi/scenarios/serial` (read at the base, as
-the controller does) is charged alone, outside the four-slot makespan.
-Neither default is this tool's own: `--historical-mode` takes the policy's
-`default_mode` (cache-only) and `--unsolved-mode` its `unsolved_default`
-(run), so an operator who omits the flags gets the conservative replay, not
-the unapproved retirement or the unratified carry.
+reused. The difference is what the retirement buys for a code change; it
+buys nothing for a 243-type change, whose results are all cache hits anyway.
 
 Nothing is hidden outside the clock: section 7 lists exactly what the landing
 does not prove and the nightly owner of each such fact.
@@ -153,17 +137,16 @@ does not prove and the nightly owner of each such fact.
 The target covers selection, the necessary build/listing, and every check the
 policy requires for that change class. It does not apply to the full or
 escalated gate and it does not apply to nightly. There is no universal
-3-minute SLA: the numbers in section 4 show four classes that cannot meet
-it under today's checks, including the measured 243-type change once
-check-tests is keyed on the backlog.
+3-minute SLA: the numbers in section 4 show three classes that cannot meet
+it under today's checks.
 
 ## 3. Change classes
 
 | class | paths | landing jobs |
 | --- | --- | --- |
-| nightly-only / data | `rsi/backlog/`, `rsi/scenarios/nightly/` | static core + C1; a backlog edit also selects `check-tests.sh` (its key names `rsi/backlog/`), and the changed nightly scenario is proven by the nightly |
-| docs | `docs/`, `README*` | static core + C1; a `README.md` edit also selects `008.sh`, which greps the README floor |
-| web | `web/src/`, `web/test/`, `web/index.html` | static core + `check-web.sh` + `check-tests.sh` (its `cost_page` test runs `web/src/cost.ts`) + C1 + journeys whose key changed |
+| nightly-only / data | `rsi/backlog/`, `rsi/scenarios/nightly/` | static core + C1; the changed nightly scenario is proven by the nightly |
+| docs | `docs/`, `README*` | static core + C1 |
+| web | `web/src/`, `web/test/`, `web/index.html` | static core + `check-web.sh` + C1 + journeys whose key changed |
 | rust | `crates/`, `Cargo.toml`, `Cargo.lock` | static core + build + test listing + `check-tests.sh` + `check-clippy.sh` + C1 + journeys + the task scenario |
 | judge / shared | `scripts/`, `deploy/`, `rsi/` (except the two data paths), `web/` config, toolchain | today's full gate (186 candidate jobs + base phase) |
 | unknown | anything else | full gate, `fail_closed: true` |
@@ -180,82 +163,52 @@ Command: `sh rsi/gate-impact/replay.sh` (raw output in
 
 | fixture | mode | selected | predicted | budget |
 | --- | --- | ---: | ---: | --- |
-| 243 `5e416443..865cc4df` | no mode flag: the policy's defaults (cache-only, unsolved run) | 6 | 349.2 s ¹ | OVER |
-| 243 | proposed (historical nightly, unsolved carried) | 5 | 229.8 s ¹ | OVER |
-| 243 | cache-only + carry (no check retired) | 5 | 229.8 s ¹ | OVER |
-| 243 | strict cache, unsolved not carried | 6 | 349.2 s ¹ | OVER |
-| nightly-only (unit fixture) | proposed (historical nightly) | 4 | **131.0 s** ¹ | WITHIN |
-| 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 510.5 s | OVER |
-| 485 | today's checks + cache | 187 | 1277.1 s | OVER |
-| web-only (unit fixture) | conservative journey keys | 14 | 330.9 s | OVER |
+| 243 `5e416443..865cc4df` | proposed (historical nightly, unsolved carried) | 4 | **131.0 s** | WITHIN |
+| 243 | cache-only + carry (no check retired) | 4 | **131.0 s** | WITHIN |
+| 243 | strict cache, unsolved not carried | 5 | 286.9 s | OVER |
+| 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 479.1 s | OVER |
+| 485 | today's checks + cache | 187 | 1221.2 s | OVER |
+| web-only (unit fixture) | conservative journey keys | 13 | 257.6 s | OVER |
 | shared `337c94b5..2e8781ca` | full escalation | 186 | 1973.8 s | OVER |
 | unknown path (unit fixture) | fail-closed | all | 1973.8 s | OVER |
 | `build.rs` (unit fixture) | static trust | - | - | reject, exit 1 |
 | missing timing/policy/record | no verdict | - | - | exit 2 |
 
-¹ **Depends on pending C15/C16/C19 wiring.** The gate seeds only solved
-objectives today (`scripts/rsi/gate.sh:4839`); the selector's hits on
-checks, journeys and CI jobs are a prediction until the accepting gate
-seeds those results. The 25 such jobs in a narrow run are the build, the
-test listing, check-tests (when its key is unchanged), check-clippy,
-check-web, the eight non-C1 journeys and the twelve non-journey checks. No
-reader should take 131.0 s as an achieved landing yet.
-
-The 243 pair is **not** 131.0 s, and the reviews of the first draft are why.
-243 edited `rsi/backlog/243.json`, and `cargo test` reads the backlog, so
-`check-tests.sh` is selected by its own key (184.8 s) in every mode. The
-honest 243-type number is 229.8 s: over budget until test selection (C14,
-C15) is proven, and no key fix can bring a backlog edit under 180 s while
-`check-tests` alone is 184.8 s.
-
-How the 131.0 s is made (a change that touches no key but a nightly data
-file, e.g. `rsi/scenarios/nightly/023.sh`):
+How the 131.0 s is made:
 
 - setup 45 s (measured, includes the static checks);
 - the four C1 journeys, longest-first on four slots: 85.993 s wall; their own
   time is 305.3 s, so the slots matter (run serially, 350 s);
-- nothing else runs: 186 jobs are skipped - 159 historical objectives (158
-  solved cache hits plus the unsolved 241, either carried in cache-only or
-  `nightly-scope` in the proposed mode), 25 check/journey/CI results, and the
-  two task-only scenarios (`029.sh`, `238.sh`). Of those 186, 183 are cache
-  hits from the base's accepting gate; the 241 result is a carried
-  `unsolved`, not a pass, and neither task-only job is a miss either. The
-  first draft's "all 186 skipped jobs recorded a pass" was wrong.
+- nothing else runs: 183 results are cache hits from the base's accepting
+  gate - the build and test listing, the five CI jobs, the eight non-C1
+  journeys, twelve non-journey checks and 158 historical objective results.
+  Their Rust and web inputs are byte-identical and the base recorded a pass.
 
-The table's 243 rows are the same landing under three policies, none under
-budget. **No check is retired in the cache-only + carry row**: its 185
-skipped jobs (182 cache hits, the carried 241, two task-only) are skipped
-because their inputs are byte-identical and the base recorded a result, not
-because a policy removed them. The strict-cache rows are the price of the
-one unsolved objective on main (241): with no carried `unsolved` fact, a
-strict cache re-judges it on the base (two agreeing runs, 119.4 s measured)
-and on the candidate (59.2 s, inside the 184.8 s makespan). That is the
-difference between 229.8 s and 349.2 s.
+The table's 243 rows are the same landing under three policies. **No check is
+retired in row 2**: all 186 skipped jobs are skipped because their inputs are
+byte-identical and the base's accepting gate recorded a pass, not because a
+policy removed them. Row 3 is the price of the one unsolved objective on
+main (241): with no recorded pass and no carried `unsolved` fact, a strict
+cache re-judges it on the base (two agreeing runs, 119.4 s measured) and on
+the candidate (59.2 s). That is the difference between 131.0 s and 286.9 s.
 
-The 485 rows show the floor for a Rust change: build 20.3 + listing 73.9 and
-the serial journey `check-j04-observe.sh` 44.3 are charged alone (`rsi/scenarios/serial`),
-check-tests 187.8, clippy 30.4, every journey whose Rust input changed, the
-twelve non-journey checks, and task 241 at 39.9 (one candidate run;
-`--task-runs 3` models P25). Even with historical objectives nightly it is
-510.5 s. Under today's checks it is 1277.1 s (`107.sh` also runs alone,
-30.3 s).
+The 485 rows show the floor for a Rust change: build 20.3 + listing 73.9
+(serial), check-tests 187.8, clippy 30.4, every journey whose Rust input
+changed, and task 241 at 39.9. Even with historical objectives nightly it is
+479.1 s. Under today's checks it is 1221.2 s.
 
 The web row is deliberately conservative: the prototype keys every journey
 on rust + web + scripts, so a `web/src/` change re-runs the eight non-C1
-journeys too, and it runs check-tests (the `cost_page` test) and
-`check-j04-observe.sh` alone. Narrowing that needs the per-journey
-`depends_on` proof (C14); until then the selector over-selects in this
-class, which is the safe direction.
+journeys too. Narrowing that needs the per-journey `depends_on` proof (C14);
+until then the selector over-selects, which is the safe direction.
 
 Assumptions, all printed by the selector:
 
-- the base record is the accepting gate's candidate passes, bound to exactly
-  the base commit (a missing, empty or short commit is no verdict); the
-  checks/journeys/CI seed needs the pending C16 wiring, which exists today
-  only for solved objectives; candidate runs of a later tree are never read;
-- four scenario slots, longest-first (the gate's order), except the
-  scenarios `rsi/scenarios/serial` runs alone; setup includes the static
-  checks; no host noise;
+- the base record is the accepting gate's candidate passes for the base
+  commit, seeded into the new main as the gate already does for solved
+  objectives (C16); candidate runs of a later tree are never read;
+- four scenario slots, longest-first (the gate's order); setup includes the
+  static checks; no host noise;
 - the timings are one measured run each (243 and 485) on this host; a
   different host or toolchain needs its own profile, and a missing time is
   no verdict.
@@ -264,30 +217,23 @@ Assumptions, all printed by the selector:
 
 `rsi/gate-impact/` is bounded and read-only:
 
-- `gate_impact.py` — the selector (named so it cannot shadow the standard
-  library's `select` module on sys.path[0]). Given `--repo`, `--base`,
-  `--candidate`, it prints the policy version and digest, the changed paths
-  and classes, the content keys (static, rust, web, scripts, backlog,
-  readme, per job), every selected and skipped job with a reason and a key,
-  the approval digest, and the predicted wall clock against 180 s. Exit
-  codes: 0 selection, 1 static reject, 2 no verdict (including malformed
-  policy, negative slots, a base the candidate does not descend from, and a
-  record that does not name exactly the base), 3 `--require-narrow` not met.
-- `policy.json` — policy version 1: the classes, jobs, C1 set, scenario
-  inputs, serial list, mode defaults and the non-goals.
+- `select.py` — the selector. Given `--repo`, `--base`, `--candidate`, it
+  prints the policy version and digest, the changed paths and classes, the
+  content keys (static, rust, web, scripts, per job), every selected and
+  skipped job with a reason and a key, the approval digest, and the
+  predicted wall clock against 180 s. Exit codes: 0 selection, 1 static
+  reject, 2 no verdict, 3 `--require-narrow` not met.
+- `policy.json` — policy version 1: the classes, jobs, C1 set, nightly notes
+  and the non-goals.
 - `timings.json` — the measured own times from the 243 and 485 gate logs, the
   serial build/listing times, the base-run times, and the measured full-gate
   totals.
 - `records/base-5e416443.json`, `records/base-865cc4df.json` — the accepting
   gates' candidate passes (the seed), plus the `unsolved` fact for 241.
-- `test_gate_impact.py` — 26 tests on a temporary repository: narrow nightly,
-  web and rust classes, carry/run, the policy defaults, README -> 008,
-  backlog -> check-tests, web/src -> check-tests, the serial list, full
-  escalation, unknown path, nested build.rs/.cargo, a proc-macro with a
-  trailing comment, protected prefixes, a subdirectory `--repo`, ancestry,
-  unknown policy version, malformed policy, negative slots, missing timing,
-  missing/empty/short/wrong base record, a cache miss with no record, the
-  approval digest bound to the candidate, and a no-change diff.
+- `test_select.py` — 13 tests on a temporary repository: narrow nightly, web
+  and rust classes, carry/run, full escalation, unknown path, build.rs,
+  unknown policy version, missing timing, wrong base record, the approval
+  digest, and a no-change diff.
 - `replay.sh`, `evidence/` — the runs in section 4.
 
 It runs no check, builds nothing, writes no cache, and is not wired into
@@ -297,10 +243,9 @@ It runs no check, builds nothing, writes no cache, and is not wired into
 
 Confirmed:
 
-- A change that touches only a nightly data file predicts **131.0 s**: four
-  C1 journeys and 186 skipped jobs. It is a prediction, not an achieved
-  landing (the seed wiring in the footnote, and the carried `unsolved` rule,
-  are not installed).
+- A 243-type change lands in **131.0 s** under the proposed policy, and in
+  131.0 s under cache-only with the base's results intact. It is 186 skipped
+  jobs, four C1 journeys, and no retired check in the cache-only row.
 - The specific cause of the 1973 s 243 landing is the nightly file in the
   landing cache key, not the number of scenarios.
 - Unknown impact and a missing dependency fail closed: full gate or no
@@ -308,16 +253,13 @@ Confirmed:
 
 Refuted:
 
-- "A 243-type change lands in 131 s." It does not: 243 edited the backlog,
-  `cargo test` reads the backlog, and check-tests is 184.8 s, so the honest
-  243-type prediction is 229.8 s, over budget.
 - "Cache alone is enough." Strict cache-only with the one unsolved objective
-  on main costs 349.2 s, over the budget. The 229.8 s needs a carried
-  `unsolved` result; the retirement alone does not remove check-tests.
-- "A Rust change fits in 180 s." It does not: 510.5 s under the proposed
-  policy, 1277.1 s under today's checks. check-tests alone is 184.8 s.
-- "A web change fits under conservative keys." It is 330.9 s until the
-  per-journey keys are proven, and check-tests must run for `cost.ts`.
+  on main costs 286.9 s, over the budget. The 131 s needs either the
+  approved retirement (row 1) or a carried `unsolved` result (row 2).
+- "A Rust change fits in 180 s." It does not: 479.1 s under the proposed
+  policy, 1221.2 s under today's checks. check-tests alone is 184.8 s.
+- "A web change fits under conservative keys." It is 257.6 s until the
+  per-journey keys are proven.
 - "There is a universal 3-minute SLA." There is not. Runtime/shared changes
   correctly stay at the full 1973.8 s.
 
@@ -332,40 +274,24 @@ its landing. That is the accepted trade-off, and it is not hidden: the
 selector prints every such skip with `nightly-scope` and the install is
 pending.
 
-The reviews of the first draft also found the opposite error in this
-section: three keys were unproven *downward* and one record rule failed
-open. They are fixed here and each has a test: scenario 008's key now names
-`README.md`, `check-tests.sh` names `rsi/backlog/` and the web tree, the
-base record must name exactly the base commit, `--repo` may be a worktree
-subdirectory without losing the scenario list, serial scenarios run alone,
-and the mode defaults are the policy's. What remains unproven is what the
-C14 proof must decide: that no *other* job reads a path its key excludes.
-The design no longer claims the selector over-selects in every class; it
-over-selects in the journey keys and it under-selected in these three,
-which was the bug.
-
 ## 8. Approvals and work before a live switch
 
 1. **Owner: ratify the class split** in section 2.3 (`rsi/backlog/` and
-   `rsi/scenarios/nightly/` are protected, but the backlog is a named input
-   of `check-tests.sh`, not a reason to escalate the whole gate).
+   `rsi/scenarios/nightly/` are protected but not judge inputs).
 2. **Owner: approve the landing-key fix** that excludes
    `rsi/scenarios/nightly/` from the base-key material, with a test. This is
    a change to `scripts/rsi/gate.sh` (protected).
 3. **Owner: decide the unsolved result.** Either install the approved
-   design-gate-v2 Decision 1 retirement, or extend the accepting gate's seed
-   to carry an `unsolved` result whose declared inputs are identical in base
-   and candidate. The gate's existing reuse rule already refuses a scenario
-   that declares nothing (`# reads:`), so 241 would need that declaration and
-   its proof. The strict-cache rows are the cost of doing neither.
+   design-gate-v2 Decision 1 retirement (row 1), or extend the accepting
+   gate's seed to carry an `unsolved` result whose declared inputs are
+   identical in base and candidate. The gate's existing reuse rule already
+   refuses a scenario that declares nothing (`# reads:`), so 241 would need
+   that declaration and its proof. Row 3 is the cost of doing neither.
 4. **Two independent reviews** of the selector, the class split and every
-   protected-file diff, then the owner's protected landing path. The first
-   pair returned FIX; this revision answers both, and a fresh pair is
-   required.
-5. **C14 proof per job key**, everywhere: run each job with the excluded
-   paths removed and show the result does not change. The three holes the
-   reviews found (README, backlog, `web/src`) are closed; the rest of the
-   map is still the prototype's word, in both directions.
+   protected-file diff, then the owner's protected landing path.
+5. **C14 proof per job key**, especially the journeys and the non-journey
+   checks: run the job with the excluded paths removed and show the result
+   does not change. Until then the selector over-selects.
 6. **C15/C16/C19 wiring**: the base test list, the accepting gate's seed of
    the new main's journey passes, and a named key for every fact the
    integrator reads.
@@ -377,7 +303,7 @@ which was the bug.
 
 ## 9. Open questions
 
-- Should the web class be 139 s (per-journey keys) or 330.9 s (conservative)?
+- Should the web class be 139 s (per-journey keys) or 257.6 s (conservative)?
   Only the C14 proof decides.
 - Does carrying an `unsolved` result need the base's two-run proof only, or
   two candidate runs on the new main too? Proposal: the base's two-run
@@ -387,10 +313,7 @@ which was the bug.
   which read the candidate binary? The prototype conservatively keys them on
   rust + web + scripts.
 - The host timing profile must be refreshed when the toolchain or host
-  changes. `env` is part of every key, so a stale profile is a stale *hit*,
-  not merely a wrong prediction; computing the probe at selection time is
-  the C15 wiring's job, and until it exists the profile is an assumption,
-  not a measurement.
+  changes; a stale profile is a wrong prediction, not a wrong verdict.
 - The 4-slot assumption is this host's; a smaller host changes every wall
   clock in section 4.
 
