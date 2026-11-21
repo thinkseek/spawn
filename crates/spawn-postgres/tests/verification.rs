@@ -253,16 +253,16 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
         landings,
         [
             json!({"mission": 4, "objective": 28, "task": 4, "landed_ms": at("4"),
-                   "verified_by": "Verified by: the second."}),
+                   "event": landed_4, "verified_by": "Verified by: the second."}),
             json!({"mission": 4, "objective": 133, "task": 1, "landed_ms": at("1"),
-                   "verified_by": "Verified by: the gate runs 133.sh on the candidate. After \
-                   the landing, the lead runs `spawn verify list` on the live store and posts \
-                   the unverified objectives since 11-13 beside sync/features.md, records one \
-                   verification (`spawn verify 4/133 --by lead --how … --result pass`, once 133 \
-                   itself has been looked at) and posts that 4/133 leaves the list; rev-g \
-                   reviews."}),
+                   "event": landed_1, "verified_by": "Verified by: the gate runs 133.sh on the \
+                   candidate. After the landing, the lead runs `spawn verify list` on the live \
+                   store and posts the unverified objectives since 11-13 beside \
+                   sync/features.md, records one verification (`spawn verify 4/133 --by lead \
+                   --how … --result pass`, once 133 itself has been looked at) and posts that \
+                   4/133 leaves the list; rev-g reviews."}),
             json!({"mission": 9, "objective": 133, "task": 2, "landed_ms": at("2"),
-                   "verified_by": null}),
+                   "event": landed_2, "verified_by": null}),
         ],
         "{facts}"
     );
@@ -272,9 +272,11 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     assert_eq!(verifications[0]["result"], "fail");
     assert_eq!(verifications[0]["by"], "lead");
     assert_eq!(verifications[0]["how"], "read the running product");
+    assert_eq!(verifications[0]["event"], failed);
     assert_eq!(verifications[1]["mission"], 9);
     assert_eq!(verifications[1]["objective"], 133);
     assert_eq!(verifications[1]["result"], "pass");
+    assert_eq!(verifications[1]["event"], passed);
     assert!(
         verifications[0]["at_ms"].as_i64() <= verifications[1]["at_ms"].as_i64(),
         "{facts}"

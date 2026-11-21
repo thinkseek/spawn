@@ -187,7 +187,8 @@ impl PostgresStore {
 
     /// What `spawn verify list` decides on ([`FACTS`]): each landing with
     /// `verified_by`, its brief's "Verified by:" line or null
-    /// ([`verified_by_line`]), in place of the brief.
+    /// ([`verified_by_line`]), in place of the brief. Each landing and each
+    /// verification also carries the event id of its record.
     pub fn verification_facts(&self) -> Result<Value, StoreError> {
         let mut facts = self.query_json(FACTS, &[])?;
         if let Some(landings) = facts["landings"].as_array_mut() {
