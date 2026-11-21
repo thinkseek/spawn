@@ -271,7 +271,9 @@ def load_base_record(path, base):
             record = json.load(f)
     except (OSError, ValueError) as exc:
         raise NoVerdict("base record %s is unreadable: %s" % (path, exc))
-    recorded = record.get("commit") if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        raise NoVerdict("base record %s is not a JSON object" % path)
+    recorded = record.get("commit")
     if not isinstance(recorded, str):
         raise NoVerdict("base record %s has no commit field; it must name the "
                         "exact 40-character base commit" % path)
