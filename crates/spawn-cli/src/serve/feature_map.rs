@@ -257,6 +257,11 @@ fn mission_row(mission: &Value, facts: &Facts) -> Value {
         "gate_rejections": mission["gate_rejections"],
         "gate_aborts": mission["gate_aborts"],
         "backlog": mission["backlog"],
+        // The mission is a person's request (origin `human`): the owner's
+        // provenance for every capability inside it.
+        "source": {"kind": "mission", "ref": format!("mission:{id}"),
+                   "url": Value::Null, "title": first_line(text(&mission["text"])),
+                   "native": true, "linked": true},
         "mapping": mapping,
         "blocker": blocker,
         "shipped_by_deploy": shipped_by_deploy(mission),
