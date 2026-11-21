@@ -96,6 +96,25 @@ def commit_id(repo, rev):
     return git(repo, ["rev-parse", "--verify", rev + "^{commit}"], text=True).strip()
 
 
+def is_ancestor(repo, base, candidate):
+    """True when `base` is an ancestor of (or equal to) `candidate`.
+
+    The controller checks this today, but a selector that claims fail-closed
+    must not answer for a candidate that does not contain its base: the diff
+    would then describe a reversal, not a landing.
+    """
+    proc = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor",
+                           base, candidate],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise NoVerdict("git merge-base --is-ancestor %s %s failed: %s" % (
+        short(base), short(candidate),
+        proc.stderr.decode("utf-8", "replace").strip()))
+
+
 def tree_id(repo, commit):
     return git(repo, ["rev-parse", commit + "^{tree}"], text=True).strip()
 
