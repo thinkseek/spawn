@@ -94,10 +94,14 @@ documented full set). It is never a narrow accept:
 
 **One interpretation needs the owner's ratification.** `rsi/backlog/**` and
 `rsi/scenarios/nightly/**` are protected (the owner reviews them, as 243
-was), but they are not landing-judge inputs: the gate never reads them. They
-must not escalate. The prototype keeps them in the review flag and out of
-the escalation reason. If the owner rejects that split, every 243-type
-change pays the full gate and this proposal has no narrow class.
+was), but no landing scenario reads them, so they must not escalate the
+whole gate. The backlog is not inert, though: `check-tests.sh` runs
+`cargo test`, and `crates/spawn-cli/src/objectives.rs` loads the tree's real
+`rsi/backlog` to assert its order, so the backlog is a named input of
+`check-tests.sh` (and of nothing else). A backlog edit therefore selects
+that one job, not the full gate. The prototype keeps both directories in
+the review flag and out of the escalation reason. If the owner rejects that
+split, every 243-type change pays the full gate.
 
 ### 2.4 Cache
 
