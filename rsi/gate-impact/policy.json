@@ -1,0 +1,98 @@
+{
+  "policy_version": 1,
+  "name": "impact-based landing slice (prototype, not installed)",
+  "status": "dry-run only: nothing runs this policy on a landing yet",
+  "budget_seconds": 180,
+  "slots": 4,
+  "protected_list": "rsi/scenarios/protected",
+  "nightly_dir": "rsi/scenarios/nightly/",
+  "core": {
+    "id": "static-core",
+    "checks": [
+      "protected-paths (the controller's rsi/scenarios/protected, read at the base)",
+      "no-build-time-code (build.rs, .cargo/, a Cargo.toml build key, a new proc-macro)",
+      "test-count (the base's cargo test list cached by the base Rust tree)"
+    ],
+    "cost": "in setup; the test listing is a serial job only when the Rust tree changed and no base list is cached"
+  },
+  "path_classes": [
+    {
+      "id": "nightly-only",
+      "impact": "none",
+      "protected": true,
+      "scope": "nightly",
+      "why": "data the landing judge never reads: the backlog and nightly scenarios. A change needs the owner's review but cannot alter a landing verdict.",
+      "paths": ["rsi/backlog/", "rsi/scenarios/nightly/"]
+    },
+    {
+      "id": "docs",
+      "impact": "none",
+      "scope": "landing-static-only",
+      "why": "no job reads it",
+      "paths": ["docs/", "README.md", "README.zh-CN.md"]
+    },
+    {
+      "id": "web-source",
+      "impact": "web",
+      "scope": "landing",
+      "why": "web tests and build read it",
+      "paths": ["web/src/", "web/test/", "web/index.html"]
+    },
+    {
+      "id": "rust",
+      "impact": "rust",
+      "scope": "landing",
+      "why": "the build, the test listing and cargo tests read it",
+      "paths": ["crates/", "Cargo.toml", "Cargo.lock"]
+    },
+    {
+      "id": "judge-or-shared",
+      "impact": "full",
+      "protected": true,
+      "scope": "escalate",
+      "why": "it shapes the judge, the toolchain or every job's environment: never accept a selection over it",
+      "paths": ["rsi/", "scripts/", "deploy/", "web/", "rust-toolchain", "rust-toolchain.toml", ".cargo/"]
+    }
+  ],
+  "jobs": [
+    {"id": "rust-build", "kind": "serial", "impact": "rust", "key": ["rust"], "timing": "rust-build"},
+    {"id": "test-listing", "kind": "serial", "impact": "rust", "key": ["rust"], "timing": "test-listing"},
+    {"id": "check-tests.sh", "kind": "parallel", "impact": "rust", "key": ["rust"], "timing": "check-tests.sh"},
+    {"id": "check-clippy.sh", "kind": "parallel", "impact": "rust", "key": ["rust"], "timing": "check-clippy.sh"},
+    {"id": "check-web.sh", "kind": "parallel", "impact": "web", "key": ["web"], "timing": "check-web.sh"},
+    {"id": "journey:check-e2e.sh", "kind": "parallel", "always": true, "c1": true, "journey": "check-e2e.sh", "timing": "check-e2e.sh"},
+    {"id": "journey:check-j03-human.sh", "kind": "parallel", "always": true, "c1": true, "journey": "check-j03-human.sh", "timing": "check-j03-human.sh"},
+    {"id": "journey:check-j06-recover-a.sh", "kind": "parallel", "always": true, "c1": true, "journey": "check-j06-recover-a.sh", "timing": "check-j06-recover-a.sh"},
+    {"id": "journey:check-j07-recover-b.sh", "kind": "parallel", "always": true, "c1": true, "journey": "check-j07-recover-b.sh", "timing": "check-j07-recover-b.sh"},
+    {"id": "journey:check-j02-lands.sh", "kind": "parallel", "journey": "check-j02-lands.sh", "timing": "check-j02-lands.sh"},
+    {"id": "journey:check-j04-observe.sh", "kind": "parallel", "journey": "check-j04-observe.sh", "timing": "check-j04-observe.sh"},
+    {"id": "journey:check-j05-operator.sh", "kind": "parallel", "journey": "check-j05-operator.sh", "timing": "check-j05-operator.sh"},
+    {"id": "journey:check-j08-stuck.sh", "kind": "parallel", "journey": "check-j08-stuck.sh", "timing": "check-j08-stuck.sh"},
+    {"id": "journey:check-j09-stall-cancel.sh", "kind": "parallel", "journey": "check-j09-stall-cancel.sh", "timing": "check-j09-stall-cancel.sh"},
+    {"id": "journey:check-j10-verdicts.sh", "kind": "parallel", "journey": "check-j10-verdicts.sh", "timing": "check-j10-verdicts.sh"},
+    {"id": "journey:check-j11-push-drain.sh", "kind": "parallel", "journey": "check-j11-push-drain.sh", "timing": "check-j11-push-drain.sh"},
+    {"id": "journey:check-j12-hold-told.sh", "kind": "parallel", "journey": "check-j12-hold-told.sh", "timing": "check-j12-hold-told.sh"}
+  ],
+  "journey_dir": "rsi/scenarios/",
+  "historical": {
+    "dir": "rsi/scenarios/",
+    "match": "^[0-9][0-9][0-9]\\.sh$",
+    "modes": ["cache-only", "nightly"],
+    "default_mode": "cache-only",
+    "why": "cache-only is today's gate plus content-addressed results: a historical scenario runs unless its inputs are unchanged and the base's accepting gate recorded a pass. nightly is the design-gate-v2 Decision 1 retirement; installing it needs the C9 proofs and the owner's switch."
+  },
+  "nightly_holds": {
+    "scenarios": ["192.sh", "209.sh"],
+    "why": "the proposed policy keeps real-time guardrail holds off the ordinary landing path (task 490 point 5; design-gate-v2 Decision 1). Until that install they are either cache hits (their inputs did not change) or run on the live path."
+  },
+  "task_scenario": {
+    "required": false,
+    "runs": 1,
+    "why": "the task's own scenario must fail on the base and pass on the candidate (design-gate-v2 section 2). The live gate's 3-of-3 is P25, not part of this policy; --task-runs can model it."
+  },
+  "non_goal": [
+    "This file is not a live gate policy. gate.sh does not read it.",
+    "No check is retired by this file: historical scenarios are cache-only unless the operator selects the approved nightly mode.",
+    "Model text is never authority: selection comes only from git paths and content hashes."
+  ]
+}

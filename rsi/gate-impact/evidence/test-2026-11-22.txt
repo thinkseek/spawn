@@ -1,0 +1,18 @@
+test_approval_is_bound_to_the_candidate (__main__.SelectorTest.test_approval_is_bound_to_the_candidate) ... ok
+test_base_record_for_another_commit_is_no_verdict (__main__.SelectorTest.test_base_record_for_another_commit_is_no_verdict) ... ok
+test_build_time_code_is_refused (__main__.SelectorTest.test_build_time_code_is_refused) ... ok
+test_cache_only_carries_an_unsolved_objective (__main__.SelectorTest.test_cache_only_carries_an_unsolved_objective) ... ok
+test_cache_only_without_carry_pays_the_base_and_misses_budget (__main__.SelectorTest.test_cache_only_without_carry_pays_the_base_and_misses_budget) ... ok
+test_missing_timing_is_no_verdict (__main__.SelectorTest.test_missing_timing_is_no_verdict) ... ok
+test_nightly_change_is_narrow_and_under_budget (__main__.SelectorTest.test_nightly_change_is_narrow_and_under_budget) ... ok
+test_no_change_is_no_verdict (__main__.SelectorTest.test_no_change_is_no_verdict) ... ok
+test_rust_change_runs_tests_and_cannot_meet_the_budget (__main__.SelectorTest.test_rust_change_runs_tests_and_cannot_meet_the_budget) ... ok
+test_shared_change_escalates_to_the_full_gate (__main__.SelectorTest.test_shared_change_escalates_to_the_full_gate) ... ok
+test_unknown_path_fails_closed_to_the_full_gate (__main__.SelectorTest.test_unknown_path_fails_closed_to_the_full_gate) ... ok
+test_unknown_policy_version_is_no_verdict (__main__.SelectorTest.test_unknown_policy_version_is_no_verdict) ... ok
+test_web_change_is_narrow_but_conservative_keys_exceed_budget (__main__.SelectorTest.test_web_change_is_narrow_but_conservative_keys_exceed_budget) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.985s
+
+OK

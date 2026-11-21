@@ -1,0 +1,604 @@
+# gate-impact dry run
+# date: 2026-11-21T16:52:27Z
+# host: spawn
+# mirror: /home/ckl/.local/share/spawn-rsi/missions/spawn.git
+# policy: /home/ckl/.local/share/spawn-rsi/ws/agent_worker_gate_impact_490/rsi/gate-impact/policy.json
+
+
+### 243 proposed: historical objectives nightly, unsolved carried
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+base          5e416443d48c5639456ecb377ae4f214ec05c11c
+candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
+approval      sha256:64c8dc3a217a7382e9bba346abbf4a1a08d1dae3b6b63ff040c11bf712412fab
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       2 path(s)
+  rsi/backlog/243.json                       nightly-only    protected
+  rsi/scenarios/nightly/023.sh               nightly-only    protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+selected      4 job(s)
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
+skipped (186):
+  [25] cache-hit
+  [159] nightly-scope
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
+predicted     131.0 s = setup 45.0 + base 0.0 + serial 0.0 + parallel 86.0  [setup + base + serial + longest-first on 4 slots (profile 243)]
+budget        180 s -> WITHIN
+assumptions
+  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
+
+
+### 243 cache-only plus carry: no check retired, content-addressed results
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+base          5e416443d48c5639456ecb377ae4f214ec05c11c
+candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
+approval      sha256:40da3f276b4b4247496f0b796f7e9638d5d6d8e9014631373728c99630b06ff0
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       2 path(s)
+  rsi/backlog/243.json                       nightly-only    protected
+  rsi/scenarios/nightly/023.sh               nightly-only    protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+selected      4 job(s)
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
+skipped (186):
+  [183] cache-hit
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
+  historical:241.sh                            carried: unsolved on base, inputs unchanged key 4cbb71fe50ba4d87
+predicted     131.0 s = setup 45.0 + base 0.0 + serial 0.0 + parallel 86.0  [setup + base + serial + longest-first on 4 slots (profile 243)]
+budget        180 s -> WITHIN
+assumptions
+  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
+
+
+### 243 strict cache: an uncarried unsolved objective is re-judged
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+base          5e416443d48c5639456ecb377ae4f214ec05c11c
+candidate     865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate tree 025cadf6dcbd1780cc6f12bdc089711851d04707
+approval      sha256:30091b9fc2400ad64957b72d6403a05d87259ff588df06b4d91e3ede91e09147
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       2 path(s)
+  rsi/backlog/243.json                       nightly-only    protected
+  rsi/scenarios/nightly/023.sh               nightly-only    protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+selected      5 job(s)
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   84.257s  key a50d0211cecba12f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   71.708s  key 157752839034bd3d
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   63.329s  key be0fc01c1dbf2700
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   85.993s  key 46b4ee591c1d34bb
+  historical:241.sh                            cache-miss: unsolved base result is not carried (--unsolved-mode run)   59.202s  key 4cbb71fe50ba4d87
+skipped (185):
+  [183] cache-hit
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 3e9ebcbcae2055c6
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 5e4f2fa3ade3bded
+predicted     286.9 s = setup 45.0 + base 119.4 + serial 0.0 + parallel 122.5  [setup + base + serial + longest-first on 4 slots (profile 243)]
+budget        180 s -> OVER
+assumptions
+  - unsolved objectives: run (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - the base record base-5e416443.json is the accepting gate's candidate passes for 5e416443; candidate runs of a later tree are never read
+
+
+### 485 rust change plus its own task scenario 241 (proposed policy)
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+base          865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate     33777df8fe02d26c3e2538ba136983eefffa1b36
+candidate tree 5daa98f9af39a6417a2f2d98febb8b21b32c84df
+approval      sha256:89bbd813d505c0138e709a267190e1b1a41e86822cddc104b67b1f163222c97c
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       1 path(s)
+  crates/spawn-core/src/bridge.rs            rust
+owner review  not required by path class
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:0defe313ee2376ea847cc036afb143a64b31047f8b2f6d7b0216d923a2abba66  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  CHANGED
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+selected      29 job(s)
+  rust-build                                   input-changed        20.335s  key 0c0f743a8f4476b8
+  test-listing                                 input-changed        73.873s  key 6cdfa329dd42acab
+  check-tests.sh                               input-changed       187.781s  key 2f155a5ca3a2e489
+  check-clippy.sh                              input-changed        30.441s  key d408d55fadc161f7
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   82.587s  key bbb8cb8181520a8f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   80.867s  key 1003bf73d4b0fcac
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   62.855s  key 31a4651788816bb2
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   86.962s  key 82a7b000ccd1c89c
+  journey:check-j02-lands.sh                   input-changed        55.401s  key 19cffb3589a1f610
+  journey:check-j04-observe.sh                 input-changed        44.293s  key 9d5c846c38aedfc9
+  journey:check-j05-operator.sh                input-changed         8.536s  key 9b982872697cdc8f
+  journey:check-j08-stuck.sh                   input-changed       109.724s  key c1f9dbbd1d2d1395
+  journey:check-j09-stall-cancel.sh            input-changed       110.907s  key 64009d2b73a6c156
+  journey:check-j10-verdicts.sh                input-changed        64.131s  key dfc1bc701dbb32f2
+  journey:check-j11-push-drain.sh              input-changed        79.992s  key 3a21e683ed188741
+  journey:check-j12-hold-told.sh               input-changed        52.492s  key f78aa54de4ba22db
+  check:check-agent-presence.sh                input-changed        26.990s  key 929350a378d3a4dc
+  check:check-blackbox.sh                      input-changed         6.377s  key d2854728a1697b02
+  check:check-credential-health.sh             input-changed         1.052s  key 029814094afc7f1c
+  check:check-credential-prints.sh             input-changed         6.479s  key b12212637a8a8f7b
+  check:check-maintenance.sh                   input-changed         0.634s  key b6318cca0687d0d2
+  check:check-model-relay.sh                   input-changed         7.728s  key a6af3fffb97cfb74
+  check:check-on-landing.sh                    input-changed        72.847s  key c5433c9b1cd9c34a
+  check:check-presence-upload.sh               input-changed        11.167s  key 2659f4bb52296678
+  check:check-schema-upgrade.sh                input-changed         0.828s  key 7d5b6a0d56744b5a
+  check:check-shadow-observe.sh                input-changed         3.588s  key 5c95897ceebfbf61
+  check:check-storage-extents.sh               input-changed         0.066s  key 5124249e960054ed
+  check:check-test-gate.sh                     input-changed         0.237s  key 4b3df0c317297e67
+  task:241.sh                                  task acceptance test: fail on base, pass on candidate   39.916s  key 90d3b5f3a567df6b
+skipped (161):
+  [1] cache-hit
+  [158] nightly-scope
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 2e6c89e7d3d9864d
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 45568b3359ae6a64
+predicted     479.1 s = setup 74.0 + base 0.0 + serial 94.2 + parallel 310.9  [setup + base + serial + longest-first on 4 slots (profile 485)]
+budget        180 s -> OVER
+assumptions
+  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - the base record base-865cc4df.json is the accepting gate's candidate passes for 865cc4df; candidate runs of a later tree are never read
+
+
+### 485 under today's checks plus cache (no retirement)
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+base          865cc4df9f88b1c594a78a2aff3a853604930eb0
+candidate     33777df8fe02d26c3e2538ba136983eefffa1b36
+candidate tree 5daa98f9af39a6417a2f2d98febb8b21b32c84df
+approval      sha256:36a16e62c485823a3f6d7e19cf54d9a57a2acd27194792dc66c41837cf7e2f3e
+              bind any approval to this digest; a new candidate changes it
+decision      narrow
+changed       1 path(s)
+  crates/spawn-core/src/bridge.rs            rust
+owner review  not required by path class
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:0defe313ee2376ea847cc036afb143a64b31047f8b2f6d7b0216d923a2abba66  base sha256:3a0dc40b93f1050264bd5090f200bd198b6869ea5689661b8fcfb4d1d273b60b  CHANGED
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  unchanged
+selected      187 job(s)
+  rust-build                                   input-changed        20.335s  key 0c0f743a8f4476b8
+  test-listing                                 input-changed        73.873s  key 6cdfa329dd42acab
+  check-tests.sh                               input-changed       187.781s  key 2f155a5ca3a2e489
+  check-clippy.sh                              input-changed        30.441s  key d408d55fadc161f7
+  journey:check-e2e.sh                         always-on (C1 data-loss/control)   82.587s  key bbb8cb8181520a8f
+  journey:check-j03-human.sh                   always-on (C1 data-loss/control)   80.867s  key 1003bf73d4b0fcac
+  journey:check-j06-recover-a.sh               always-on (C1 data-loss/control)   62.855s  key 31a4651788816bb2
+  journey:check-j07-recover-b.sh               always-on (C1 data-loss/control)   86.962s  key 82a7b000ccd1c89c
+  journey:check-j02-lands.sh                   input-changed        55.401s  key 19cffb3589a1f610
+  journey:check-j04-observe.sh                 input-changed        44.293s  key 9d5c846c38aedfc9
+  journey:check-j05-operator.sh                input-changed         8.536s  key 9b982872697cdc8f
+  journey:check-j08-stuck.sh                   input-changed       109.724s  key c1f9dbbd1d2d1395
+  journey:check-j09-stall-cancel.sh            input-changed       110.907s  key 64009d2b73a6c156
+  journey:check-j10-verdicts.sh                input-changed        64.131s  key dfc1bc701dbb32f2
+  journey:check-j11-push-drain.sh              input-changed        79.992s  key 3a21e683ed188741
+  journey:check-j12-hold-told.sh               input-changed        52.492s  key f78aa54de4ba22db
+  historical:007.sh                            input-changed         3.508s  key fae9d7ff9cdebad9
+  historical:008.sh                            input-changed         2.187s  key 0926028c4c5879e2
+  historical:017.sh                            input-changed         2.543s  key 0a3a321cdf25b966
+  historical:034.sh                            input-changed        88.160s  key 1c188a4ea719fb98
+  historical:035.sh                            input-changed        31.077s  key 23b61a897df0119e
+  historical:037.sh                            input-changed        56.002s  key fa429c488e166022
+  historical:039.sh                            input-changed        42.332s  key 8d03f27fee927558
+  historical:040.sh                            input-changed        12.973s  key 7546f26b53551402
+  historical:041.sh                            input-changed        55.506s  key 1fed46df8519f3dc
+  historical:042.sh                            input-changed        17.993s  key 4b022c4219e15579
+  historical:043.sh                            input-changed         2.626s  key 014f8e2a2d197b91
+  historical:044.sh                            input-changed        22.453s  key be1c27c142d00281
+  historical:045.sh                            input-changed        42.522s  key 4c273248b6675c45
+  historical:046.sh                            input-changed        78.899s  key f7591668ae3a82dc
+  historical:047.sh                            input-changed       100.068s  key 785ea07ba4533a18
+  historical:048.sh                            input-changed        30.949s  key b957a49721e64a84
+  historical:049.sh                            input-changed         2.543s  key 31285bad8e050eab
+  historical:050.sh                            input-changed        57.229s  key c6ed813488b3f059
+  historical:051.sh                            input-changed        35.773s  key 99eab6a2d0204b40
+  historical:052.sh                            input-changed         1.254s  key cf67d56618a9838f
+  historical:053.sh                            input-changed        11.738s  key fb0af60bbea9fb0d
+  historical:056.sh                            input-changed         6.179s  key 2d9529c964fc79ad
+  historical:057.sh                            input-changed        13.859s  key 6318d0975469f118
+  historical:058.sh                            input-changed        11.958s  key b95041688e7ad357
+  historical:059.sh                            input-changed         5.144s  key 415add1d7605dd84
+  historical:060.sh                            input-changed         3.216s  key c0e184774d4625c0
+  historical:061.sh                            input-changed         1.332s  key 19096190a2d4648c
+  historical:062.sh                            input-changed         7.504s  key e5869713fe011370
+  historical:063.sh                            input-changed         0.864s  key f1d61022a9d03f2c
+  historical:064.sh                            input-changed        28.391s  key 2edd4d39f939e0bc
+  historical:065.sh                            input-changed         1.871s  key 7ff83da35568d5b5
+  historical:066.sh                            input-changed         1.214s  key 67669971ff7054bf
+  historical:067.sh                            input-changed         1.753s  key afd11e788e88c3f5
+  historical:068.sh                            input-changed         1.353s  key e57ecd7b79146853
+  historical:069.sh                            input-changed         1.115s  key 7fbc9f3f18e48c1b
+  historical:070.sh                            input-changed        19.693s  key e240c896a977354e
+  historical:071.sh                            input-changed         1.108s  key 8711997179176f41
+  historical:072.sh                            input-changed         1.208s  key 2704cdbf1dafb84c
+  historical:073.sh                            input-changed         1.101s  key 540b6f43406c90d1
+  historical:074.sh                            input-changed         4.385s  key 341a0a01a33a1aec
+  historical:075.sh                            input-changed         1.133s  key 1ba9274d8337c12f
+  historical:076.sh                            input-changed         5.873s  key 38ed25061cb943ad
+  historical:077.sh                            input-changed         6.898s  key ba3f22924acc3a85
+  historical:078.sh                            input-changed        23.108s  key d13ff704e9e9392e
+  historical:079.sh                            input-changed         1.353s  key da1bb06eb9505096
+  historical:080.sh                            input-changed         1.242s  key 8d2a4ac699212b5a
+  historical:081.sh                            input-changed         1.170s  key 99180f75c117586e
+  historical:082.sh                            input-changed         1.129s  key 50c29ce7478931a7
+  historical:083.sh                            input-changed         1.086s  key 409a067faa4f112a
+  historical:085.sh                            input-changed         2.743s  key 56189e957798cdc1
+  historical:086.sh                            input-changed         1.280s  key 2138a2c8d72076e8
+  historical:087.sh                            input-changed         0.955s  key 3a1f12ce209bdcd1
+  historical:089.sh                            input-changed        24.398s  key 55601522ccb98944
+  historical:090.sh                            input-changed         2.656s  key 14f1008e539ae818
+  historical:091.sh                            input-changed         0.837s  key 3f32a7b5c2c4157e
+  historical:092.sh                            input-changed        21.356s  key bf9f87ab66440b3e
+  historical:093.sh                            input-changed         1.161s  key 4d53dda3faeaaf16
+  historical:094.sh                            input-changed         1.904s  key 84f5088fac904e8e
+  historical:095.sh                            input-changed         1.186s  key f95b4255dfd94333
+  historical:096.sh                            input-changed        42.221s  key 0e77258091e00f0d
+  historical:097.sh                            input-changed         3.110s  key 03d1fc661c869eea
+  historical:098.sh                            input-changed         1.269s  key 1b8bd4fc32ca21bb
+  historical:099.sh                            input-changed        12.913s  key eed7d2a4bd4c22ce
+  historical:100.sh                            input-changed         1.415s  key a88d9256b165aeea
+  historical:102.sh                            input-changed         1.184s  key 52867e783fa0a0a5
+  historical:103.sh                            input-changed         1.037s  key 28d940c574685abe
+  historical:104.sh                            input-changed         2.998s  key eb933f6fd871155b
+  historical:105.sh                            input-changed         1.235s  key 5a43147bd4759254
+  historical:106.sh                            input-changed        12.268s  key ab9afb5b3987352b
+  historical:107.sh                            input-changed        30.261s  key 54cec2349e83e83e
+  historical:108.sh                            input-changed         2.646s  key 01b85be7723a88b3
+  historical:109.sh                            input-changed         2.502s  key 9e5335629f1f02b5
+  historical:112.sh                            input-changed         1.126s  key f3f7d9b2cdaec234
+  historical:113.sh                            input-changed         1.599s  key 2ec5f4a55918d930
+  historical:114.sh                            input-changed        15.981s  key d195c9565e16e917
+  historical:115.sh                            input-changed         1.138s  key 28e334d2522d7b21
+  historical:116.sh                            input-changed         7.147s  key 8fcfee96e9e104ba
+  historical:117.sh                            input-changed         0.894s  key d65fcfc12d1435c5
+  historical:119.sh                            input-changed         5.896s  key 1e86c32543035fa6
+  historical:120.sh                            input-changed         8.027s  key f7546de41ea3a44b
+  historical:121.sh                            input-changed         9.371s  key 1a65451b23ea3cd6
+  historical:122.sh                            input-changed         3.442s  key 0751c554e4040da9
+  historical:123.sh                            input-changed         1.308s  key 3d36f31db5370895
+  historical:129.sh                            input-changed         1.922s  key 2699f6075d6602f2
+  historical:131.sh                            input-changed         3.131s  key 8f280567c3860787
+  historical:132.sh                            input-changed         1.285s  key 7528436c5e88af55
+  historical:133.sh                            input-changed         1.179s  key e04ad99594efc768
+  historical:135.sh                            input-changed        11.638s  key b734622426a69793
+  historical:136.sh                            input-changed         8.376s  key de52272eb1e09964
+  historical:138.sh                            input-changed        73.570s  key 3959b1029e31a7d5
+  historical:139.sh                            input-changed        33.719s  key 6a9d8d437dff58a0
+  historical:140.sh                            input-changed         1.391s  key 58a7f0f57573ebdb
+  historical:145.sh                            input-changed         1.274s  key 472fc22e3e561a85
+  historical:146.sh                            input-changed        62.703s  key f7a794adb0baffeb
+  historical:148.sh                            input-changed         1.123s  key 61746fbd6d826484
+  historical:149.sh                            input-changed         5.436s  key da54d1bb2df2a350
+  historical:151.sh                            input-changed         1.491s  key 74803f1b3c7fdc67
+  historical:155.sh                            input-changed         2.484s  key e0e5bf1f0765bb91
+  historical:156.sh                            input-changed         0.936s  key 82e3a5f32bad1623
+  historical:158.sh                            input-changed         1.121s  key 768dbb033cad18c3
+  historical:159.sh                            input-changed         1.124s  key 3dfa2ea0327b8fb7
+  historical:166.sh                            input-changed         1.068s  key 24961c278aa795df
+  historical:167.sh                            input-changed         6.191s  key 17b07be149ec6974
+  historical:168.sh                            input-changed         1.042s  key f5f00469c8eba2ff
+  historical:169.sh                            input-changed         2.360s  key f6c49c606101aec2
+  historical:170.sh                            input-changed        17.225s  key a30e6adef01f465b
+  historical:171.sh                            input-changed         4.152s  key 91583504f3df155b
+  historical:172.sh                            input-changed         0.565s  key 00246c6742aeb9af
+  historical:173.sh                            input-changed         2.241s  key 04b1fe8cab88e1f7
+  historical:175.sh                            input-changed       193.291s  key 55245c7f8c3a0a0c
+  historical:176.sh                            input-changed        22.188s  key 7ddf6628befb097e
+  historical:177.sh                            input-changed        32.792s  key 289fcc5630aba635
+  historical:178.sh                            input-changed         3.030s  key 657df090d7299224
+  historical:179.sh                            input-changed        99.356s  key d43cd758f1743ff3
+  historical:180.sh                            input-changed        24.537s  key 3d362f01558a0f18
+  historical:181.sh                            input-changed         1.695s  key 9e846a2a11887cc4
+  historical:182.sh                            input-changed         3.506s  key 761aa55e05c7302c
+  historical:185.sh                            input-changed         1.273s  key 8058883d3f7413c1
+  historical:186.sh                            input-changed         4.530s  key af20f63b0fe17126
+  historical:192.sh                            input-changed       301.131s  key 99564c4431500b26
+  historical:193.sh                            input-changed        88.229s  key 08b0c816f6a94809
+  historical:194.sh                            input-changed        36.231s  key 158ea96ca736369b
+  historical:195.sh                            input-changed         1.222s  key dabd1fa1552faa86
+  historical:198.sh                            input-changed         6.061s  key 5da7cd1abc58b847
+  historical:199.sh                            input-changed         4.144s  key 026107d5e64aadfb
+  historical:200.sh                            input-changed         8.290s  key 5180c94bc8fa3138
+  historical:201.sh                            input-changed         2.230s  key e0572952d98328c7
+  historical:202.sh                            input-changed         1.345s  key b0df43870350027d
+  historical:203.sh                            input-changed        16.349s  key 5c093eb350a5005f
+  historical:204.sh                            input-changed        30.756s  key b53299671d53646f
+  historical:205.sh                            input-changed       108.136s  key 7c1ee4cf29137e0f
+  historical:206.sh                            input-changed         8.249s  key aad1da3d91be0603
+  historical:207.sh                            input-changed         1.866s  key 644cf4cd7a85c1ca
+  historical:209.sh                            input-changed       305.195s  key b8ee1ac4834bcf94
+  historical:210.sh                            input-changed         3.252s  key a8e41a91521d115c
+  historical:211.sh                            input-changed         1.234s  key 378a9bd97ba8ac0c
+  historical:212.sh                            input-changed         2.451s  key 1d1c57e7bcffeb89
+  historical:214.sh                            input-changed        39.100s  key f2e15a65914c27b3
+  historical:215.sh                            input-changed         7.881s  key d6160e938ea8df91
+  historical:216.sh                            input-changed        16.464s  key 7032d45728b5263d
+  historical:217.sh                            input-changed        13.775s  key 78d70fbe73110586
+  historical:219.sh                            input-changed        15.375s  key 59e610c125dc4543
+  historical:220.sh                            input-changed         1.310s  key 8c2abcfde3acbb79
+  historical:221.sh                            input-changed        52.745s  key 693c54d52b1bf67f
+  historical:222.sh                            input-changed         2.123s  key 2712618f814f1003
+  historical:223.sh                            input-changed         5.778s  key 6aa6d6b974e0e79a
+  historical:224.sh                            input-changed         7.725s  key 0a1cacd227dbcdba
+  historical:225.sh                            input-changed         1.765s  key 11d26f8e341640b8
+  historical:227.sh                            input-changed         1.631s  key 4dc0a3944031bee3
+  historical:228.sh                            input-changed         2.067s  key 71693bf009c112ef
+  historical:230.sh                            input-changed         2.751s  key 762e577ef8aa9d18
+  historical:231.sh                            input-changed         1.269s  key 17c52a32d3db2b48
+  historical:232.sh                            input-changed         2.700s  key 1b59880f1269959a
+  historical:233.sh                            input-changed         1.969s  key 2ada8db9df263ec1
+  historical:234.sh                            input-changed        17.197s  key 6ee37fa79837d692
+  historical:236.sh                            input-changed        51.956s  key 07d77590319f8bd5
+  historical:237.sh                            input-changed        61.856s  key 0bfe9a787bcdb169
+  historical:239.sh                            input-changed        23.378s  key 576644b6a47137ed
+  check:check-agent-presence.sh                input-changed        26.990s  key 929350a378d3a4dc
+  check:check-blackbox.sh                      input-changed         6.377s  key d2854728a1697b02
+  check:check-credential-health.sh             input-changed         1.052s  key 029814094afc7f1c
+  check:check-credential-prints.sh             input-changed         6.479s  key b12212637a8a8f7b
+  check:check-maintenance.sh                   input-changed         0.634s  key b6318cca0687d0d2
+  check:check-model-relay.sh                   input-changed         7.728s  key a6af3fffb97cfb74
+  check:check-on-landing.sh                    input-changed        72.847s  key c5433c9b1cd9c34a
+  check:check-presence-upload.sh               input-changed        11.167s  key 2659f4bb52296678
+  check:check-schema-upgrade.sh                input-changed         0.828s  key 7d5b6a0d56744b5a
+  check:check-shadow-observe.sh                input-changed         3.588s  key 5c95897ceebfbf61
+  check:check-storage-extents.sh               input-changed         0.066s  key 5124249e960054ed
+  check:check-test-gate.sh                     input-changed         0.237s  key 4b3df0c317297e67
+  task:241.sh                                  task acceptance test: fail on base, pass on candidate   39.916s  key 90d3b5f3a567df6b
+skipped (3):
+  [1] cache-hit
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 2e6c89e7d3d9864d
+  historical:238.sh                            task-only (the gate runs it only as its own task's scenario) key 45568b3359ae6a64
+predicted     1221.2 s = setup 74.0 + base 0.0 + serial 94.2 + parallel 1053.0  [setup + base + serial + longest-first on 4 slots (profile 485)]
+budget        180 s -> OVER
+assumptions
+  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - the base record base-865cc4df.json is the accepting gate's candidate passes for 865cc4df; candidate runs of a later tree are never read
+
+
+### shared/runtime change: gate helper and a journey file (2e8781ca)
+gate-impact selector: impact-based landing slice (prototype, dry-run only)
+policy        v1  sha256:fc6a533e5d3804626587f334be5a2d18dab013942b73d86a6d069c503bc8fbe7
+base          337c94b52440198d2bb309e6e20f1043e3b2c6d2
+candidate     2e8781ca82ba09240616f412f01adc582144c00a
+candidate tree 6403615eca6f4cb171f5ab04967914cbeebb57fc
+approval      sha256:a9513634e28c7c63ab9bca0a19f84da2b998197d06dea5fbedb913b5d475551d
+              bind any approval to this digest; a new candidate changes it
+decision      full
+              - shared/cross-cutting input changed: rsi/scenarios/237.sh (judge-or-shared)
+              - shared/cross-cutting input changed: rsi/scenarios/check-j02-lands.sh (judge-or-shared)
+              - shared/cross-cutting input changed: scripts/blackbox/scenario-db.sh (judge-or-shared)
+changed       4 path(s)
+  rsi/backlog/237.json                       nightly-only    protected
+  rsi/scenarios/237.sh                       judge-or-shared  protected
+  rsi/scenarios/check-j02-lands.sh           judge-or-shared  protected
+  scripts/blackbox/scenario-db.sh            judge-or-shared  protected
+owner review  required (protected paths changed)
+keys
+  static   sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  base sha256:8e5e1a4b3203f0ebf7482375892a88d705f341b01b8dd9f6d0ec61e41b470253  unchanged
+  rust     sha256:4c83a29b74d5c4ce82d10593a9d89b04eea5926c67b292a0ade9338121f4f925  base sha256:4c83a29b74d5c4ce82d10593a9d89b04eea5926c67b292a0ade9338121f4f925  unchanged
+  web      sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  base sha256:28b0c1cf90aa8a083991be3a89d4436575d6f013bb8b19f6ff800e0627a1b0d9  unchanged
+  scripts  sha256:127a1d6b77bc4e0535e38b7270bc0ab2fd874efc4282ff199c2f98ca6909e04a  base sha256:40ccde3b7e5441155790667b42b7399601562882b7d9e1b3aae3c55dad38c9e9  CHANGED
+selected      186 job(s)
+  rust-build                                   full gate            18.232s  key dde5b20a1ae4e7f6
+  test-listing                                 full gate            61.219s  key ac16a5d73f7aaf24
+  check-tests.sh                               full gate           184.793s  key c36d31b38438f935
+  check-clippy.sh                              full gate            25.463s  key 9c4abc9204e8765c
+  check-web.sh                                 full gate             7.928s  key 4d4759410b45de66
+  journey:check-e2e.sh                         full gate            84.257s  key 979c223b67b8d78f
+  journey:check-j03-human.sh                   full gate            71.708s  key 9a1663f0df68dfdd
+  journey:check-j06-recover-a.sh               full gate            63.329s  key 71b7f9c6974d3909
+  journey:check-j07-recover-b.sh               full gate            85.993s  key 0894d15a09689198
+  journey:check-j02-lands.sh                   full gate            54.875s  key 54e750bab397b0c3
+  journey:check-j04-observe.sh                 full gate            44.406s  key b2d8647cc4a8c201
+  journey:check-j05-operator.sh                full gate             5.818s  key 42142c7053956b55
+  journey:check-j08-stuck.sh                   full gate           108.839s  key 4e5ab834e3be6794
+  journey:check-j09-stall-cancel.sh            full gate           106.218s  key 77da148d2adb22a5
+  journey:check-j10-verdicts.sh                full gate            56.169s  key 0eee0df9b388f616
+  journey:check-j11-push-drain.sh              full gate            73.459s  key 8c24b1b8dc8bda74
+  journey:check-j12-hold-told.sh               full gate            52.386s  key 20efe2e73e11625e
+  historical:007.sh                            full gate             2.288s  key 0dd1bb40b69f6892
+  historical:008.sh                            full gate             2.015s  key 55de70e086496c3d
+  historical:017.sh                            full gate             2.351s  key 83302ffff4a2227c
+  historical:034.sh                            full gate            86.901s  key 2a30cb5ef6b715fe
+  historical:035.sh                            full gate            37.386s  key 4366da279471c0b2
+  historical:037.sh                            full gate            71.517s  key f86ddf2d822357a8
+  historical:039.sh                            full gate            42.106s  key bac2c7013cfeda66
+  historical:040.sh                            full gate            11.573s  key 44d2a5284e5f594f
+  historical:041.sh                            full gate            39.476s  key 1f3a80c5b65c32b0
+  historical:042.sh                            full gate            16.913s  key 39cfe96ea726f273
+  historical:043.sh                            full gate             1.961s  key 58b74ede14a9938b
+  historical:044.sh                            full gate            21.931s  key 84c23d92a3999cc8
+  historical:045.sh                            full gate            42.272s  key ce74cae67f2baaf3
+  historical:046.sh                            full gate            64.251s  key 0a4d580c074d0c9f
+  historical:047.sh                            full gate            91.016s  key 3d6b63de7c7005a0
+  historical:048.sh                            full gate            37.004s  key da29be7fe9e0bae4
+  historical:049.sh                            full gate             1.974s  key 2792b73860153b48
+  historical:050.sh                            full gate            41.825s  key 0a43ad9299c53bb7
+  historical:051.sh                            full gate            35.328s  key 1e80b390a60df394
+  historical:052.sh                            full gate             0.787s  key 66d52b1b20c973df
+  historical:053.sh                            full gate            11.145s  key ef68c6cda766419f
+  historical:056.sh                            full gate             5.459s  key 35ae9155c52368c1
+  historical:057.sh                            full gate            13.489s  key 640a918937a98d1b
+  historical:058.sh                            full gate            11.885s  key 33cb96d6f5554097
+  historical:059.sh                            full gate             3.297s  key dd9713edbf65675f
+  historical:060.sh                            full gate             3.409s  key c1b1d0bee46ce35e
+  historical:061.sh                            full gate             1.209s  key e69118cd182f71cf
+  historical:062.sh                            full gate             7.134s  key 341418145ca89992
+  historical:063.sh                            full gate             1.054s  key 0826200ec5de5246
+  historical:064.sh                            full gate            13.789s  key 03f8f22bc4e332bc
+  historical:065.sh                            full gate             1.653s  key 87c793e118059875
+  historical:066.sh                            full gate             0.882s  key a2773644c2c0ed7d
+  historical:067.sh                            full gate             1.505s  key 01983458dbf9c97b
+  historical:068.sh                            full gate             0.798s  key 11616ea34d16913f
+  historical:069.sh                            full gate             0.950s  key b163649e78c3b4f5
+  historical:070.sh                            full gate            10.888s  key 2b4249a9f5648e6f
+  historical:071.sh                            full gate             1.189s  key d9147b6c46577f24
+  historical:072.sh                            full gate             1.114s  key 49ea8b5c3c6f28b0
+  historical:073.sh                            full gate             0.921s  key 738e1502228ccb03
+  historical:074.sh                            full gate             4.490s  key 6fd0419ec5ab9063
+  historical:075.sh                            full gate             0.988s  key 7c682b92a62bc095
+  historical:076.sh                            full gate             4.747s  key 42f141e0b4c32aa4
+  historical:077.sh                            full gate             7.015s  key 2f448268f11d6e9a
+  historical:078.sh                            full gate            11.553s  key 3c9bb4303596ff03
+  historical:079.sh                            full gate             0.775s  key 955cd0a0f326019d
+  historical:080.sh                            full gate             0.837s  key 5e1b646171259227
+  historical:081.sh                            full gate             1.006s  key d256ef74606ebd89
+  historical:082.sh                            full gate             0.877s  key a4f6349b2a2d6797
+  historical:083.sh                            full gate             1.080s  key 7871de431ae4b197
+  historical:085.sh                            full gate             1.828s  key ce7fc6b3bda730a7
+  historical:086.sh                            full gate             1.080s  key 6b243ce689488aa8
+  historical:087.sh                            full gate             1.052s  key aa7284f3d9d1b552
+  historical:089.sh                            full gate            21.057s  key eaf1beabebf78b64
+  historical:090.sh                            full gate             1.778s  key fb8d55cb956452de
+  historical:091.sh                            full gate             0.986s  key d4ca92deabce7de0
+  historical:092.sh                            full gate            21.416s  key 492642ac451ef633
+  historical:093.sh                            full gate             0.936s  key 521bf33942a98a0c
+  historical:094.sh                            full gate             1.545s  key e8162e1aa4d734d0
+  historical:095.sh                            full gate             0.878s  key 940f654258d20ebb
+  historical:096.sh                            full gate            33.119s  key 24c3ba90333398d5
+  historical:097.sh                            full gate             1.845s  key 2ede25dd4e8aca73
+  historical:098.sh                            full gate             0.861s  key 42d0720d953e4c3f
+  historical:099.sh                            full gate            12.052s  key f7309c5a78c2559d
+  historical:100.sh                            full gate             1.000s  key d19c49fc9ec30167
+  historical:102.sh                            full gate             0.972s  key 0ceabe05ba8642e1
+  historical:103.sh                            full gate             0.876s  key f15467caaff30ce2
+  historical:104.sh                            full gate             3.063s  key 9ead5561388dcf32
+  historical:105.sh                            full gate             0.942s  key 16deba74ce7aa503
+  historical:106.sh                            full gate            10.960s  key cc40b1f62e91a3ad
+  historical:107.sh                            full gate            30.335s  key 2eebdbab9ab0a574
+  historical:108.sh                            full gate             2.056s  key 83e1ff8653618efe
+  historical:109.sh                            full gate             1.725s  key 52ae76365c433d46
+  historical:112.sh                            full gate             1.038s  key 603043f757529c43
+  historical:113.sh                            full gate             1.332s  key ea4d6ee0b90c8f37
+  historical:114.sh                            full gate            13.863s  key 14cd6d63dcd457cd
+  historical:115.sh                            full gate             0.963s  key a6dd232d5fdca19f
+  historical:116.sh                            full gate             6.756s  key 202201d7a6a71105
+  historical:117.sh                            full gate             0.624s  key e0f8311b5feb21b2
+  historical:119.sh                            full gate             6.189s  key 2f1cc433a6e02809
+  historical:120.sh                            full gate             7.941s  key b45a45b7e90e2d5b
+  historical:121.sh                            full gate             7.735s  key 7e718944b4689d39
+  historical:122.sh                            full gate             2.368s  key 73d953fdd642ba00
+  historical:123.sh                            full gate             1.300s  key f652d6504772962c
+  historical:129.sh                            full gate             1.457s  key 9b201e611498bf1d
+  historical:131.sh                            full gate             3.141s  key eaf67d6c9013a60b
+  historical:132.sh                            full gate             1.093s  key 8dc6d60298527dc1
+  historical:133.sh                            full gate             0.891s  key 4e20346dc11ec1fa
+  historical:135.sh                            full gate            10.884s  key 4de64af25a3fdfc8
+  historical:136.sh                            full gate             5.012s  key d342868493d21407
+  historical:138.sh                            full gate            73.255s  key 76eb11ad7bdc0cf0
+  historical:139.sh                            full gate            34.785s  key 0d9e0ec70810d041
+  historical:140.sh                            full gate             1.153s  key cd915d012c34487c
+  historical:145.sh                            full gate             1.420s  key af568c34ed7cc7b0
+  historical:146.sh                            full gate            58.767s  key a1f993b6835314d4
+  historical:148.sh                            full gate             1.170s  key 3b028552b4113b33
+  historical:149.sh                            full gate             3.786s  key a33bb0a0bf07f498
+  historical:151.sh                            full gate             1.263s  key 4d11d765c889ef12
+  historical:155.sh                            full gate             1.906s  key ca70f818d871ce82
+  historical:156.sh                            full gate             1.118s  key 87232a12a023eef5
+  historical:158.sh                            full gate             0.968s  key 84b7e5798240802d
+  historical:159.sh                            full gate             1.053s  key 7bd0c6db0933daa0
+  historical:166.sh                            full gate             1.249s  key b31c3ea30041e6ef
+  historical:167.sh                            full gate             3.996s  key c1d41ef3bbaa8cc3
+  historical:168.sh                            full gate             0.834s  key d5f2d50ac81ce466
+  historical:169.sh                            full gate             2.011s  key a2502cb181dc0776
+  historical:170.sh                            full gate            14.155s  key e5e90d8ff73a7826
+  historical:171.sh                            full gate             2.615s  key 647aad90d1807ed4
+  historical:172.sh                            full gate             0.498s  key a92ccc02473760a8
+  historical:173.sh                            full gate             1.635s  key 071e161b28481715
+  historical:175.sh                            full gate           191.535s  key c2a0b4563bebe556
+  historical:176.sh                            full gate            21.720s  key 308e5f2680db2c9e
+  historical:177.sh                            full gate            25.729s  key bceb19439d5f5263
+  historical:178.sh                            full gate             2.926s  key 61bb9b7f0395e2df
+  historical:179.sh                            full gate            91.774s  key a14428d73babc475
+  historical:180.sh                            full gate            11.979s  key 756ee6e82169a7be
+  historical:181.sh                            full gate             1.051s  key e7ea416d09a4b91e
+  historical:182.sh                            full gate             2.789s  key 3de98fa1e7665cb4
+  historical:185.sh                            full gate             1.370s  key aa8664c725cba1f9
+  historical:186.sh                            full gate             4.872s  key c91491cb345117c6
+  historical:192.sh                            full gate           301.864s  key 6f6a6a3cc02198a2
+  historical:193.sh                            full gate            66.427s  key b6d997480b5de6a8
+  historical:194.sh                            full gate            36.243s  key 9edabc2163dd6246
+  historical:195.sh                            full gate             1.121s  key 18f16430685d96b8
+  historical:198.sh                            full gate             7.340s  key 6bbe27e5933d5c42
+  historical:199.sh                            full gate             4.479s  key 5fc6e1528d3fe355
+  historical:200.sh                            full gate             5.452s  key 22e84b9f76e75c18
+  historical:201.sh                            full gate             2.176s  key b1ecc1194a6defd1
+  historical:202.sh                            full gate             1.062s  key 7a2631741f6dcd57
+  historical:203.sh                            full gate            15.894s  key 756da046f45a4e36
+  historical:204.sh                            full gate            25.494s  key 2d47c7f02a5b6643
+  historical:205.sh                            full gate           107.041s  key d9dcf5e75afca20c
+  historical:206.sh                            full gate             5.774s  key d523ac81f2520711
+  historical:207.sh                            full gate             1.381s  key d55ccecc7f2c2ae4
+  historical:209.sh                            full gate           303.254s  key 41bbed18585269bc
+  historical:210.sh                            full gate             2.772s  key 4c5dd0e207c356f7
+  historical:211.sh                            full gate             0.941s  key 10d1ff0421780dfe
+  historical:212.sh                            full gate             1.631s  key e59b0a1c2547c45c
+  historical:214.sh                            full gate            39.168s  key 90cf67aef6355201
+  historical:215.sh                            full gate             7.705s  key 9aeb7635ddb95aaf
+  historical:216.sh                            full gate            15.593s  key 0178ba60ff652c97
+  historical:217.sh                            full gate            13.855s  key e3a9ea902a883077
+  historical:219.sh                            full gate            15.025s  key 56b2a58dea5f927e
+  historical:220.sh                            full gate             1.065s  key 86737662c0e24d69
+  historical:221.sh                            full gate            71.058s  key 4059e3f883f01d3a
+  historical:222.sh                            full gate             1.778s  key 62c3feafe1e5559f
+  historical:223.sh                            full gate             5.000s  key 98bf75ddba8263dc
+  historical:224.sh                            full gate             7.210s  key 5fb21d9aa9da6c0e
+  historical:225.sh                            full gate             1.338s  key 285651e2030936a8
+  historical:227.sh                            full gate             1.549s  key 69dd22f04ebdda9a
+  historical:228.sh                            full gate             1.948s  key a3ca5586a34dfd0d
+  historical:230.sh                            full gate             1.821s  key 5eff9f186a8dc1be
+  historical:231.sh                            full gate             0.921s  key 0934187146f358d9
+  historical:232.sh                            full gate             2.264s  key 24b3bfc444ce9790
+  historical:233.sh                            full gate             1.732s  key cecb076660715477
+  historical:234.sh                            full gate            16.677s  key 998a560ac28119b4
+  historical:236.sh                            full gate            71.878s  key 6263851c5a3b31f8
+  historical:237.sh                            full gate            63.506s  key 0f82e2a3e9b6c10e
+  historical:239.sh                            full gate            22.890s  key ea6dad12d745e314
+  check:check-agent-presence.sh                full gate            16.133s  key 394a2beb010653e3
+  check:check-blackbox.sh                      full gate             5.282s  key a9fa4278ff584647
+  check:check-credential-health.sh             full gate             0.527s  key d34bc8c118c9ff01
+  check:check-credential-prints.sh             full gate             5.323s  key c83a40d97df3c090
+  check:check-maintenance.sh                   full gate             0.596s  key 3982b6288efb2802
+  check:check-model-relay.sh                   full gate             6.839s  key acb0804d7416f67b
+  check:check-presence-upload.sh               full gate            10.648s  key 4522893f8c9b1ba2
+  check:check-schema-upgrade.sh                full gate             0.640s  key 6c5e5b2ed4a29e1c
+  check:check-shadow-observe.sh                full gate             3.229s  key 783820241eef78ab
+  check:check-storage-extents.sh               full gate             0.048s  key 5aec4e52819da002
+  check:check-test-gate.sh                     full gate             0.029s  key 040cb817d2df8f34
+skipped (1):
+  historical:029.sh                            task-only (the gate runs it only as its own task's scenario) key 83d195fe8d00576a
+predicted     1973.8 s (measured total; setup 45.0, base 778.0, candidate 1149.0)  [measured today's full gate (profile 243)]
+budget        180 s -> OVER
+assumptions
+  - unsolved objectives: carry (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
+  - no base record: every job is a cache miss (fail-closed direction)
