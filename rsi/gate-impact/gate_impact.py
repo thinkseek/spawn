@@ -122,7 +122,11 @@ def tree_id(repo, commit):
 
 
 def changed_paths(repo, base, candidate):
-    raw = git(repo, ["diff", "--no-renames", "--name-only", "-z", base, candidate])
+    # core.quotePath=false matches the gate: a non-ASCII path arrives raw
+    # instead of C-quoted, so it cannot slip past the build.rs and protected
+    # matchers into a safe-looking unknown class.
+    raw = git(repo, ["-c", "core.quotePath=false",
+                     "diff", "--no-renames", "--name-only", "-z", base, candidate])
     return sorted(p for p in raw.decode("utf-8", "surrogateescape").split("\0") if p)
 
 
