@@ -179,44 +179,72 @@ Command: `sh rsi/gate-impact/replay.sh` (raw output in
 
 | fixture | mode | selected | predicted | budget |
 | --- | --- | ---: | ---: | --- |
-| 243 `5e416443..865cc4df` | proposed (historical nightly, unsolved carried) | 4 | **131.0 s** | WITHIN |
-| 243 | cache-only + carry (no check retired) | 4 | **131.0 s** | WITHIN |
-| 243 | strict cache, unsolved not carried | 5 | 286.9 s | OVER |
-| 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 479.1 s | OVER |
-| 485 | today's checks + cache | 187 | 1221.2 s | OVER |
-| web-only (unit fixture) | conservative journey keys | 13 | 257.6 s | OVER |
+| 243 `5e416443..865cc4df` | no mode flag: the policy's defaults (cache-only, unsolved run) | 6 | 349.2 s ¹ | OVER |
+| 243 | proposed (historical nightly, unsolved carried) | 5 | 229.8 s ¹ | OVER |
+| 243 | cache-only + carry (no check retired) | 5 | 229.8 s ¹ | OVER |
+| 243 | strict cache, unsolved not carried | 6 | 349.2 s ¹ | OVER |
+| nightly-only (unit fixture) | proposed, carried | 4 | **131.0 s** ¹ | WITHIN |
+| 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 510.5 s | OVER |
+| 485 | today's checks + cache | 187 | 1277.1 s | OVER |
+| web-only (unit fixture) | conservative journey keys | 14 | 330.9 s | OVER |
 | shared `337c94b5..2e8781ca` | full escalation | 186 | 1973.8 s | OVER |
 | unknown path (unit fixture) | fail-closed | all | 1973.8 s | OVER |
 | `build.rs` (unit fixture) | static trust | - | - | reject, exit 1 |
 | missing timing/policy/record | no verdict | - | - | exit 2 |
 
-How the 131.0 s is made:
+¹ **Depends on pending C15/C16/C19 wiring.** The gate seeds only solved
+objectives today (`scripts/rsi/gate.sh:4839`); the selector's hits on
+checks, journeys and CI jobs are a prediction until the accepting gate
+seeds those results. The 25 such jobs in a narrow run are the build, the
+test listing, check-tests (when its key is unchanged), check-clippy,
+check-web, the eight non-C1 journeys and the twelve non-journey checks. No
+reader should take 131.0 s as an achieved landing yet.
+
+The 243 pair is **not** 131.0 s, and the reviews of the first draft are why.
+243 edited `rsi/backlog/243.json`, and `cargo test` reads the backlog, so
+`check-tests.sh` is selected by its own key (184.8 s) in every mode. The
+honest 243-type number is 229.8 s: over budget until test selection (C14,
+C15) is proven, and no key fix can bring a backlog edit under 180 s while
+`check-tests` alone is 184.8 s.
+
+How the 131.0 s is made (a change that touches no key but a nightly data
+file, e.g. `rsi/scenarios/nightly/023.sh`):
 
 - setup 45 s (measured, includes the static checks);
 - the four C1 journeys, longest-first on four slots: 85.993 s wall; their own
   time is 305.3 s, so the slots matter (run serially, 350 s);
-- nothing else runs: 183 results are cache hits from the base's accepting
-  gate - the build and test listing, the five CI jobs, the eight non-C1
-  journeys, twelve non-journey checks and 158 historical objective results.
-  Their Rust and web inputs are byte-identical and the base recorded a pass.
+- nothing else runs: 186 jobs are skipped - 159 historical objectives (158
+  solved cache hits plus the unsolved 241, either carried in cache-only or
+  `nightly-scope` in the proposed mode), 25 check/journey/CI results, and the
+  two task-only scenarios (`029.sh`, `238.sh`). Of those 186, 183 are cache
+  hits from the base's accepting gate; the 241 result is a carried
+  `unsolved`, not a pass, and neither task-only job is a miss either. The
+  first draft's "all 186 skipped jobs recorded a pass" was wrong.
 
-The table's 243 rows are the same landing under three policies. **No check is
-retired in row 2**: all 186 skipped jobs are skipped because their inputs are
-byte-identical and the base's accepting gate recorded a pass, not because a
-policy removed them. Row 3 is the price of the one unsolved objective on
-main (241): with no recorded pass and no carried `unsolved` fact, a strict
-cache re-judges it on the base (two agreeing runs, 119.4 s measured) and on
-the candidate (59.2 s). That is the difference between 131.0 s and 286.9 s.
+The table's 243 rows are the same landing under three policies, none under
+budget. **No check is retired in the cache-only + carry row**: its 185
+skipped jobs (182 cache hits, the carried 241, two task-only) are skipped
+because their inputs are byte-identical and the base recorded a result, not
+because a policy removed them. The strict-cache rows are the price of the
+one unsolved objective on main (241): with no carried `unsolved` fact, a
+strict cache re-judges it on the base (two agreeing runs, 119.4 s measured)
+and on the candidate (59.2 s, inside the 184.8 s makespan). That is the
+difference between 229.8 s and 349.2 s.
 
-The 485 rows show the floor for a Rust change: build 20.3 + listing 73.9
-(serial), check-tests 187.8, clippy 30.4, every journey whose Rust input
-changed, and task 241 at 39.9. Even with historical objectives nightly it is
-479.1 s. Under today's checks it is 1221.2 s.
+The 485 rows show the floor for a Rust change: build 20.3 + listing 73.9 and
+the serial journey `check-j04-observe.sh` 44.3 are charged alone (`rsi/scenarios/serial`),
+check-tests 187.8, clippy 30.4, every journey whose Rust input changed, the
+twelve non-journey checks, and task 241 at 39.9 (one candidate run;
+`--task-runs 3` models P25). Even with historical objectives nightly it is
+510.5 s. Under today's checks it is 1277.1 s (`107.sh` also runs alone,
+30.3 s).
 
 The web row is deliberately conservative: the prototype keys every journey
 on rust + web + scripts, so a `web/src/` change re-runs the eight non-C1
-journeys too. Narrowing that needs the per-journey `depends_on` proof (C14);
-until then the selector over-selects, which is the safe direction.
+journeys too, and it runs check-tests (the `cost_page` test) and
+`check-j04-observe.sh` alone. Narrowing that needs the per-journey
+`depends_on` proof (C14); until then the selector over-selects in this
+class, which is the safe direction.
 
 Assumptions, all printed by the selector:
 
