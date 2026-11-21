@@ -571,6 +571,19 @@ def select(opts):
     record_unsolved = set((record or {}).get("unsolved") or [])
     base_jobs = profile.get("base_jobs") or {}
 
+    def scenario_key_names(name):
+        """What a scenario reads: the three trees, plus the policy's extras.
+
+        A scenario is keyed on the trees it may read; the policy adds the
+        one path a scenario reads directly (`008.sh` reads README.md).
+        """
+        extra = scenario_inputs.get(name) or []
+        unknown_extra = [key for key in extra if key not in cand_tree_keys]
+        if unknown_extra:
+            raise NoVerdict("policy scenario_inputs names unknown key(s) %s for %s"
+                            % (unknown_extra, name))
+        return ["rust", "web", "scripts"] + list(extra)
+
     def base_cost(name, trust_record=True):
         """What the base phase costs for a historical objective.
 
