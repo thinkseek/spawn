@@ -183,6 +183,55 @@ def sha_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def validate_policy(policy, path):
+    """Every field the selector reads, checked before it is read.
+
+    A malformed policy used to raise KeyError or ValueError out of `select`
+    and end the process with exit 1 (the static-reject code).  It is a
+    missing authority, not a refused candidate: exit 2, no verdict.
+    """
+    def need(cond, what):
+        if not cond:
+            raise NoVerdict("policy %s is malformed: %s" % (path, what))
+
+    need(isinstance(policy, dict), "not a JSON object")
+    need(isinstance(policy.get("path_classes"), list) and policy["path_classes"],
+         "path_classes must be a non-empty list")
+    for cls in policy["path_classes"]:
+        need(isinstance(cls, dict), "a path class is not an object")
+        need(isinstance(cls.get("id"), str) and cls["id"], "a path class has no id")
+        need(cls.get("impact") in ("none", "web", "rust", "full"),
+             "path class %r has no known impact" % cls.get("id"))
+        need(isinstance(cls.get("paths"), list), "path class %r has no paths" % cls["id"])
+    need(isinstance(policy.get("jobs"), list) and policy["jobs"],
+         "jobs must be a non-empty list")
+    for job in policy["jobs"]:
+        need(isinstance(job, dict), "a job is not an object")
+        need(isinstance(job.get("id"), str) and job["id"], "a job has no id")
+        need(isinstance(job.get("kind"), str), "job %r has no kind" % job.get("id"))
+        need(isinstance(job.get("timing"), str), "job %r has no timing" % job.get("id"))
+        need(isinstance(job.get("key", []), list), "job %r has a bad key" % job["id"])
+    need(isinstance(policy.get("core"), dict) and isinstance(policy["core"].get("id"), str),
+         "core must be an object with an id")
+    need(isinstance(policy.get("historical"), dict), "historical must be an object")
+    need(isinstance(policy["historical"].get("match"), str),
+         "historical.match must be a string")
+    need(isinstance(policy["historical"].get("default_mode"), str),
+         "historical.default_mode must be a string")
+    need(isinstance(policy["historical"].get("unsolved_default"), str),
+         "historical.unsolved_default must be a string")
+    need(isinstance(policy.get("journey_dir"), str) and policy["journey_dir"].endswith("/"),
+         "journey_dir must be a directory path ending in /")
+    need(isinstance(policy.get("protected_list"), str), "protected_list must be a string")
+    need(isinstance(policy.get("serial_list"), str), "serial_list must be a string")
+    need(isinstance(policy.get("scenario_inputs", {}), dict),
+         "scenario_inputs must be an object")
+    need(isinstance(policy.get("slots"), int) and policy["slots"] >= 1,
+         "slots must be a positive integer")
+    need(isinstance(policy.get("budget_seconds"), (int, float))
+         and policy["budget_seconds"] > 0, "budget_seconds must be positive")
+
+
 def load_policy(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -190,10 +239,11 @@ def load_policy(path):
         policy = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise NoVerdict("policy %s is unreadable: %s" % (path, exc))
-    version = policy.get("policy_version")
+    version = policy.get("policy_version") if isinstance(policy, dict) else None
     if version != SUPPORTED_POLICY_VERSION:
         raise NoVerdict("policy version %r is not supported (this selector knows %d)"
                         % (version, SUPPORTED_POLICY_VERSION))
+    validate_policy(policy, path)
     return policy, sha_text(canon(policy))
 
 
