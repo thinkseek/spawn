@@ -562,6 +562,7 @@ export function MobileNav({
   | "attention"
   | "onShowFleet"
   | "onShowMissions"
+  | "onShowFeatures"
   | "onShowRsi"
   | "openAlerts"
   | "onShowAlerts"
