@@ -4058,6 +4058,16 @@ impl Judge {
         task: &Task,
         jobs: Option<usize>,
     ) -> Result<bool, String> {
+        if gate::validate_revision("base", main).is_err() {
+            // judge_pushed records the parameter abort before it reads a
+            // branch. Do not let fetch/freshness turn bad trusted input into
+            // an unrecorded retry or a stale verdict.
+            return self
+                .judge_pushed(
+                    store, mirror, source, main, mission, count, task, None, jobs,
+                )
+                .map(|()| false);
+        }
         // An adopted judging's branch was read when its gate started.
         if let Some(adopted) = &self.adopted {
             return self
@@ -4111,7 +4121,7 @@ impl Judge {
 
     /// Judge `branch`, the agent's pushed head already in the mirror (`None`:
     /// the agent has nothing to land).
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn judge_pushed(
         &self,
         store: &Arc<PostgresStore>,
@@ -4123,6 +4133,34 @@ impl Judge {
         task: &Task,
         branch: Option<&str>,
         jobs: Option<usize>,
+    ) -> Result<(), String> {
+        self.judge_pushed_using(
+            store,
+            mirror,
+            source,
+            main,
+            mission,
+            count,
+            task,
+            branch,
+            jobs,
+            landing_candidate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn judge_pushed_using(
+        &self,
+        store: &Arc<PostgresStore>,
+        mirror: &Path,
+        source: &str,
+        main: &str,
+        mission: &Mission,
+        count: u32,
+        task: &Task,
+        branch: Option<&str>,
+        jobs: Option<usize>,
+        landing: impl FnOnce(&str, &str, &str, &str) -> Result<Option<String>, String>,
     ) -> Result<(), String> {
         let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
@@ -4202,16 +4240,18 @@ impl Judge {
             // that is no longer main, so it is `stale`, judged again on the
             // new one, before anything is counted (the cap below, the abort
             // halt). An `accepted` keeps the landing's compare-and-swap as
-            // its guard ([`land`]).
-            let now = if verdict == "accepted" {
-                None
-            } else {
-                main_now().unwrap_or_else(|error| {
-                    eprintln!("integrate: task {}: where main is now: {error}", task.id);
-                    unread = Some(error);
+            // its guard ([`land`]). A parameter error does not depend on main
+            // and must keep its bounded abort classification.
+            let now =
+                if verdict == "accepted" || extra["evidence"].as_str() == Some("parameter_error") {
                     None
-                })
-            };
+                } else {
+                    main_now().unwrap_or_else(|error| {
+                        eprintln!("integrate: task {}: where main is now: {error}", task.id);
+                        unread = Some(error);
+                        None
+                    })
+                };
             if let Some(now) = now {
                 let reason = extra["reason"].as_str().unwrap_or_default();
                 let mut stale = stale_on_main_move(main, &now, verdict, reason);
@@ -4307,6 +4347,11 @@ impl Judge {
         };
         let rejected = |reason: &str, log: &str| gated("rejected", rejected_fields(reason, log));
 
+        // Invalid trusted inputs become bounded aborts before any git work.
+        // Returning an error here would record nothing and retry forever.
+        if let Err(error) = gate::validate_revision("base", main) {
+            return gated("aborted", aborted(&GateFailure::Parameter(error)));
+        }
         let mirror_path = mirror.to_string_lossy().to_string();
         let Some(branch) = branch.map(str::to_string) else {
             return rejected("the worker has no branch to land", "");
@@ -4325,6 +4370,9 @@ impl Judge {
         // a gate were made when it started, and the candidate, a merge made
         // then, would not come out the same.
         let candidate = if let Some(adopted) = &self.adopted {
+            if let Err(error) = gate::validate_revision("candidate", &adopted.candidate) {
+                return gated("aborted", aborted(&GateFailure::Parameter(error)));
+            }
             known.replace(inputs::known(Some(main), Some(&adopted.candidate)));
             adopted.candidate.clone()
         } else {
@@ -4340,7 +4388,7 @@ impl Judge {
                 return gated("conflict", json!({ "note": note, "merge": "pending" }));
             }
             let message = landing_message(task, &branch);
-            let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
+            let Some(candidate) = landing(&mirror_path, main, &branch, &message)? else {
                 // The worker cannot merge main itself: merge it into the
                 // workspace now, while the worker waits for this verdict, so
                 // the note names what it has to resolve.
@@ -4355,6 +4403,9 @@ impl Judge {
                     json!({"note": main_merge::conflict_note(main, &merge), "merge": merge.kind()}),
                 );
             };
+            if let Err(error) = gate::validate_revision("candidate", &candidate) {
+                return gated("aborted", aborted(&GateFailure::Parameter(error)));
+            }
             known.replace(inputs::known(Some(main), Some(&candidate)));
             // A candidate equal to main in an objective mission is not judged
             // here: the gate's base check answers what it means before it builds
@@ -4933,7 +4984,12 @@ fn gate_log(judged: &Result<gate::Verdict, GateFailure>) -> Option<&str> {
         Ok(verdict) => Some(&verdict.output),
         // Reaped (gate v2 step 2): the integrator that started it read it;
         // this judging read nothing.
-        Err(GateFailure::Timeout | GateFailure::Failed(_) | GateFailure::Reaped) => None,
+        Err(
+            GateFailure::Timeout
+            | GateFailure::Failed(_)
+            | GateFailure::Parameter(_)
+            | GateFailure::Reaped,
+        ) => None,
         Err(
             GateFailure::Aborted { log, .. }
             | GateFailure::NoRoom { log, .. }

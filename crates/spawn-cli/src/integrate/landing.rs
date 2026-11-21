@@ -21,6 +21,7 @@ use crate::sources;
 /// error as its `main_read` (main was never checked). A source that cannot
 /// be read leaves no task unrecorded, and is no reason to judge again.
 pub(super) fn main_moved(source: &str, main: &str) -> Result<Option<String>, String> {
+    crate::gate::validate_revision("base", main)?;
     let (_, now) = source_head(source)?;
     Ok((now != main).then_some(now))
 }

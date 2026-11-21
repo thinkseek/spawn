@@ -341,17 +341,27 @@ fn a_taker_holding_any_open_task_or_an_untold_cancel_is_not_idle() {
         "cid",
         "(not idle: a cancel notice is not told)",
     );
-    // Told: idle.
+    // Recording the notice is enough, regardless of its eventual outcome.
     let notice = command(&store, "cid", &format!("cancel-notice-{own}-0"));
-    client
-        .execute(
-            "update spawn_commands set succeeded = true where id = $1",
-            &[&notice],
-        )
-        .expect("told");
+    for succeeded in [None, Some(true), Some(false)] {
+        client
+            .execute(
+                "update spawn_commands set succeeded = $2 where id = $1",
+                &[&notice, &succeeded],
+            )
+            .expect("notice outcome");
+        let untold: bool = client
+            .query_one(
+                "select spawn_cancel_notice_untold('session_resident_cid')",
+                &[],
+            )
+            .expect("notice state")
+            .get(0);
+        assert!(!untold, "recorded notice, succeeded={succeeded:?}");
+    }
     store
         .task_steal(queued, "cid", "human", None)
-        .expect("cid is idle");
+        .expect("a recorded failed notice leaves cid idle");
 }
 
 /// A task that is its worker's next (its worker idle, the task its oldest)

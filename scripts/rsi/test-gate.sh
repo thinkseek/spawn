@@ -230,6 +230,57 @@ expect "a ref is resolved to its commit" \
     "\"candidate\":\"$good\"}"
 expect "a candidate that names no commit is no verdict" \
     "exit=$(sh "$gate" "$repo" "$base" no-such-ref "$scenarios" >/dev/null 2>&1 || echo $?)" 'exit=3'
+empty_revision() {
+    empty_side=$1
+    empty_value=$2
+    empty_base=$base
+    empty_candidate=$good
+    if [ "$empty_side" = base ]; then
+        empty_base=$empty_value
+    else
+        empty_candidate=$empty_value
+    fi
+    empty_status=0
+    empty_output=$(sh "$gate" "$repo" "$empty_base" "$empty_candidate" "$scenarios" 2>&1) || empty_status=$?
+    printf 'exit=%s %s' "$empty_status" "$empty_output"
+}
+# Empty plus Rust char::is_whitespace's 25 code points. The octal bytes keep
+# the cases readable and preserve trailing newlines through command substitution.
+for empty_side in base candidate; do
+    for empty_code in \
+        '' '\011' '\012' '\013' '\014' '\015' '\040' \
+        '\302\205' '\302\240' '\341\232\200' \
+        '\342\200\200' '\342\200\201' '\342\200\202' '\342\200\203' \
+        '\342\200\204' '\342\200\205' '\342\200\206' '\342\200\207' \
+        '\342\200\210' '\342\200\211' '\342\200\212' \
+        '\342\200\250' '\342\200\251' '\342\200\257' \
+        '\342\201\237' '\343\200\200'
+    do
+        empty_value=$(printf "${empty_code}X")
+        empty_value=${empty_value%X}
+        expect "empty $empty_side revision ($empty_code) is a parameter error" \
+            "$(empty_revision "$empty_side" "$empty_value")" \
+            "exit=64 gate: $empty_side revision is empty or whitespace"
+    done
+done
+empty_non_utf8=
+for empty_locale in zh_CN.GB18030 ja_JP.eucJP ja_JP.SJIS ko_KR.eucKR; do
+    if locale -a | grep -Fxi "$empty_locale" >/dev/null 2>&1; then
+        empty_non_utf8=$empty_locale
+        break
+    fi
+done
+if [ -n "$empty_non_utf8" ]; then
+    empty_value=$(printf '\302\240X')
+    empty_value=${empty_value%X}
+    for empty_side in base candidate; do
+        expect "empty $empty_side revision in $empty_non_utf8 is a parameter error" \
+            "$(LC_ALL=$empty_non_utf8 empty_revision "$empty_side" "$empty_value")" \
+            "exit=64 gate: $empty_side revision is empty or whitespace"
+    done
+else
+    echo 'note: no non-UTF-8 locale: the non-UTF-8 revision case is not run'
+fi
 expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
 # The regressions that passed (objective 056): named in the verdict, in
 # the log's order; 007.sh, unsolved on the base, passes here as a

@@ -3637,6 +3637,52 @@ mod tests {
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
     }
 
+    /// Once the notice command is recorded (`told`), its failed outcome or
+    /// a dispatcher restart does not hold back an idle pane. An open command
+    /// still excludes concurrent input, and no pass adds another notice.
+    #[test]
+    fn a_recorded_cancel_notice_does_not_block_an_idle_pane() {
+        for state in [TaskState::Assigned, TaskState::Revise] {
+            for restart in [false, true] {
+                let work = Work {
+                    tasks: vec![task(8, state, "resident")],
+                    cancelled: vec![cancelled(true)],
+                    ..Work::default()
+                };
+                let mut facts = worker(true, true);
+                facts.last_delivery = Some("deliver-7-0".to_string());
+                if !restart {
+                    facts.dispatched.push(sent(
+                        30,
+                        "cancel-notice-7-0",
+                        1_000,
+                        Some("pane not ready"),
+                    ));
+                }
+                let plan = orders(&work, &[facts]);
+                assert_eq!(
+                    plan.len(),
+                    1,
+                    "state={state:?}, restart={restart}: {plan:?}"
+                );
+                assert_eq!(plan[0].task, Some(8), "{plan:?}");
+                assert!(
+                    matches!(plan[0].action, CommandAction::Input { .. }),
+                    "{plan:?}"
+                );
+                assert!(!plan[0].key.starts_with("cancel-"), "{plan:?}");
+            }
+        }
+        let mut open = worker(true, true);
+        open.open_command = true;
+        open.dispatched.push(Sent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..sent(30, "cancel-notice-7-0", 1_000, None)
+        });
+        assert!(orders(&after_cancel(true), &[open]).is_empty());
+    }
+
     /// Every pass after the first sends nothing new: a stop submitted (in
     /// flight, or being pursued), a notice in flight, a worker told.
     #[test]

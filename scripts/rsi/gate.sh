@@ -630,6 +630,23 @@ while [ "${#scenarios}" -gt 1 ] && [ "${scenarios%/}" != "$scenarios" ]; do
 done
 scenario=${5-}
 
+blank_revision() {
+    # Match Rust char::is_whitespace as UTF-8 bytes under C, in every caller locale.
+    # Newlines are removed first because grep matches one line at a time.
+    blank_flat=$(printf '%s' "$1" | LC_ALL=C tr -d '\012')
+    [ -z "$blank_flat" ] && return 0
+    printf '%s' "$blank_flat" |
+        LC_ALL=C grep -Eq '^([[:space:]]|| | | | | | | | | | | | | | | | | |　)+$'
+}
+require_revision() {
+    if blank_revision "$2"; then
+        echo "gate: $1 revision is empty or whitespace" >&2
+        exit 64
+    fi
+}
+require_revision base "$baseline"
+require_revision candidate "$candidate"
+
 if ! command -v bwrap >/dev/null 2>&1; then
     echo "gate: bwrap is required to run candidate code" >&2
     exit 3

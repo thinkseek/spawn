@@ -355,8 +355,8 @@ select coalesce(jsonb_agg(jsonb_build_object(
 ///   start or resume makes); `null` when the agent has none;
 /// - `set_aside`: the commit of the set-aside already recorded for the task
 ///   (`source_event_id` `set-aside:<task>`), if any;
-/// - `told`: a notice of the cancel (`cancel-notice-<task>-<n>`) reached the
-///   worker, however long ago;
+/// - `told`: a notice of the cancel (`cancel-notice-<task>-<n>`) command is
+///   recorded, however long ago; its delivery outcome does not block the session;
 /// - `closed_by` and `reason`: the task's last control record (`task.aborted`
 ///   carries the integrator's reason); `yielded` when that record yielded
 ///   its objective's slot, and `yield_reason`, an abort's reason for it.
@@ -382,8 +382,7 @@ from (
          coalesce(spawn_commit_now(aside.commit), aside.commit) as set_aside,
          exists (select 1 from spawn_commands c
                   where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
-                    and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
-                    and c.succeeded) as told,
+                    and c.idempotency_key like 'cancel-notice-' || k.id || '-%') as told,
          last.type as closed_by, last.reason, last.yield_reason,
          coalesce(last.yielded, false) as yielded,
          (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
