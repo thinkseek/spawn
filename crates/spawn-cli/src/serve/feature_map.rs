@@ -820,7 +820,6 @@ fn landing_gaps(
 fn delivery_gaps(
     state: &str,
     landed: &BTreeMap<u32, Landing>,
-    mission: &Value,
     anchor: Option<&Value>,
     shipped: bool,
     no_task: bool,
@@ -853,7 +852,6 @@ fn delivery_gaps(
         gaps.push(json!({"kind": "not_deployed", "objectives": waiting,
                          "detail": "landed after the newest successful deploy"}));
     }
-    let _ = mission;
     gaps
 }
 
