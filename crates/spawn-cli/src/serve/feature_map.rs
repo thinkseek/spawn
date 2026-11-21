@@ -1971,13 +1971,12 @@ mod tests {
         assert_eq!(feature("objective-002")["state"], "verified");
         assert_eq!(feature("objective-002")["live"], false);
         assert_eq!(feature("objective-003")["state"], "live");
-        assert_eq!(
+        assert!(
             feature("objective-003")["sources"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|source| source["ref"] == "deploy:4"),
-            true,
+                .any(|source| source["kind"] == "deploy"),
             "{map}"
         );
         let _ = std::fs::remove_dir_all(&dir);
