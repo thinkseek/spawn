@@ -69,8 +69,9 @@ meet 180 s even with a perfect base: the check alone is 184.8 s.
 Selection uses only controller-side signals: git paths and content hashes of
 what a job reads (the shape of C14), never model text. A job runs when the
 hash of its inputs changed. A job whose key is unchanged but for which no
-base result is recorded runs too (a cache miss is not a skip). The C1
-data-loss and control journeys run on every landing, cached or not:
+base result is recorded runs too (a cache miss is not a skip; a record that
+does not name the base commit is no verdict, not a miss). The C1 data-loss
+and control journeys run on every landing, cached or not:
 
 - `check-e2e.sh` (what C1 assigns to check-e2e),
 - `check-j03-human.sh` (015 and 038: human input and keys),
