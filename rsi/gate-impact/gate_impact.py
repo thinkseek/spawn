@@ -689,6 +689,7 @@ def select(opts):
         result.selected.append({
             "id": "task:" + name,
             "kind": "parallel",
+            "scenario": name,
             "why": "task acceptance test: fail on base, pass on candidate",
             "key": ckey,
             "seconds": task_seconds,
