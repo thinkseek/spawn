@@ -560,9 +560,12 @@ def select(opts):
         state, why, ckey = decide(job_id, kind, key_names, name, job.get("always", False))
         if state == "selected" and decision == "narrow":
             seconds = require_timing(job["timing"])
-            result.selected.append({"id": job_id, "kind": job["kind"], "why": why,
-                                    "key": ckey, "seconds": seconds,
-                                    "timing": job["timing"]})
+            selected = {"id": job_id, "kind": job["kind"], "why": why,
+                        "key": ckey, "seconds": seconds,
+                        "timing": job["timing"]}
+            if job.get("journey"):
+                selected["scenario"] = job["journey"]
+            result.selected.append(selected)
         elif state == "skipped" and decision == "narrow":
             result.skipped.append({"id": job_id, "why": why, "key": ckey})
         elif decision == "full":
