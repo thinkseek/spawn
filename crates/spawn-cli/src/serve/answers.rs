@@ -181,6 +181,7 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/missions"
             | "/api/rsi"
             | "/api/rsi/pane"
+            | "/api/features"
             | "/api/scorecard"
     ) || path
         .strip_prefix("/api/pane/")
