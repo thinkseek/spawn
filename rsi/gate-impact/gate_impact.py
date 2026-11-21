@@ -911,14 +911,16 @@ def main(argv=None):
     parser.add_argument("--base-record", default=None,
                         help="JSON record of the base's accepting-gate passes")
     parser.add_argument("--historical-mode", choices=["cache-only", "nightly"],
-                        default="nightly",
+                        default=None,
                         help="cache-only: today's checks minus cache hits; "
-                             "nightly: the proposed design-gate-v2 Decision 1 retirement")
+                             "nightly: the proposed design-gate-v2 Decision 1 retirement. "
+                             "Default: policy historical.default_mode (cache-only)")
     parser.add_argument("--unsolved-mode", choices=["carry", "run"],
-                        default="carry",
+                        default=None,
                         help="carry: an unchanged input carries the base's recorded "
                              "unsolved objective result to the new main; "
-                             "run: re-judge it on the base (fail-closed strict cache)")
+                             "run: re-judge it on the base (fail-closed strict cache). "
+                             "Default: policy historical.unsolved_default (run)")
     parser.add_argument("--task-scenario", default=None,
                         help="the task's own scenario file name, e.g. 241.sh")
     parser.add_argument("--task-runs", type=int, default=1,
