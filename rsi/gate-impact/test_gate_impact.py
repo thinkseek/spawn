@@ -411,7 +411,6 @@ class SelectorTest(unittest.TestCase):
 
     def test_base_that_is_not_an_ancestor_is_no_verdict(self):
         code, res, _ = run_selector(self.root, self.nightly_only, self.base,
-                                    "--base-record", self.record,
                                     "--profile", "243")
         self.assertEqual(code, 2)
         self.assertEqual(res["decision"], "no_verdict")
