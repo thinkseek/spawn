@@ -116,6 +116,8 @@ from (
          end as reissued_attempts,
          m.text as mission_text,
          m.gate is not null as gated,
+         m.state as mission_state,
+         m.halted is not null as mission_halted,
          r.charter, r.name as resident
     from mission_tasks k
     join mission_missions m on m.id = k.mission_id

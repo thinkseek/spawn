@@ -27,10 +27,15 @@
 # green), a busy deploy lock and the off switch each make the tick wait,
 # and say so once; the deploy runs main's own deploy.sh --main from the
 # checkout at main while the source is held with this script's reason; a
-# failed deploy of a main is tried again only after the retry bound; a tick
-# killed with its deploy leaves its hold, and the next tick releases it and
-# deploys; a failure before deploy.sh runs is recorded as deploy.sh records
-# its own (deploy.finished, by landing).
+# failed deploy of a main is tried again only after the retry bound, 1800 s
+# by default (a failure 1790 s old waits, one 1810 s old is tried again); a
+# tick killed with its deploy leaves its hold, bounded at 3600 s by default
+# (a bound set, 120 s, is the one a deploy holds with),
+# and the next tick releases it and deploys; a tick while another holds
+# on-landing.lock ends at once, saying and deploying nothing; a failure
+# before deploy.sh runs is recorded as deploy.sh records its own
+# (deploy.finished, by landing). The defaults are cases of their own (235,
+# 242): no tick inherits the caller's setting of a bound.
 set -euo pipefail
 
 repo=$(git rev-parse --show-toplevel)
@@ -187,9 +192,12 @@ judging() { spawn_live mission landing --source "$missions" | jq -r '.judging'; 
 
 export FAKE_LOG=$scratch/deploys.log
 : >"$FAKE_LOG"
-# The default quiet spell is a case of its own (235): a tick given no
-# SPAWN_DEPLOY_QUIET_SECS uses on-landing.sh's, never the caller's.
-unset SPAWN_DEPLOY_QUIET_SECS
+# The defaults are cases of their own (235, 242): a tick given no bound uses
+# on-landing.sh's, never the caller's. SPAWN_SOURCE_HOLD_SECS too: the tick
+# must pass its own hold bound to `spawn mission hold`, whose default is the
+# owner's 3 h.
+unset SPAWN_DEPLOY_QUIET_SECS SPAWN_DEPLOY_MAX_WAIT_SECS SPAWN_DEPLOY_RETRY_SECS \
+  SPAWN_DEPLOY_HOLD_SECS SPAWN_SOURCE_HOLD_SECS
 # tick [ENV=VALUE...]: one tick, as the timer runs it; output in $out.
 tick() {
   guard_home
@@ -361,9 +369,33 @@ tick SPAWN_DEPLOY_QUIET_SECS=x
 check "a bad bound is refused (status $status)" [ "$status" -ne 0 ]
 check "naming it" grep -qF "SPAWN_DEPLOY_QUIET_SECS must be a whole number of seconds" "$out"
 
+echo "== one tick at a time: a tick while another holds on-landing.lock ends at once (242)"
+flock -o "$live/on-landing.lock" sleep 30 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  flock -n "$live/on-landing.lock" true || break
+  sleep 0.2
+done
+# The case needs the holder to have taken the lock; a holder that never
+# did is the test's own failure, not the tick's (rev-b's 242 n3).
+if flock -n "$live/on-landing.lock" true; then
+  echo "test-on-landing: harness: the lock holder (pid $holder) did not take $live/on-landing.lock within 2 s" >&2
+  exit 2
+fi
+tick SPAWN_DEPLOY_QUIET_SECS=1
+lock_tick_status=$status
+lock_tick_out=$(cat "$out")
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+check "it ends with status 0 (status $lock_tick_status)" [ "$lock_tick_status" -eq 0 ]
+check "deploys nothing, though main is due" [ "$(deploys)" -eq 0 ]
+check "and says nothing" [ -z "$lock_tick_out" ]
+check "takes no hold" [ "$(holds)" = null ]
+
 echo "== after the quiet spell: main's own deploy.sh --main, with the source held"
 tick SPAWN_DEPLOY_QUIET_SECS=1
 check "deployed (status $status)" [ "$status" -eq 0 ]
+check "the hold's bound is the default 3600 s (242)" grep -qF ", at most 3600 s)" "$out"
 check "once" [ "$(deploys)" -eq 1 ]
 check "main's deploy.sh, --main, in the checkout at main" \
   grep -qF "deploy --main at $c1 in $live/deploy-checkout, hold {" "$FAKE_LOG"
@@ -381,8 +413,9 @@ c3=$(commit_work "second of a burst")
 land "$c3"
 tick SPAWN_DEPLOY_QUIET_SECS=600
 check "inside the quiet spell and the max wait: not deployed" [ "$(deploys)" -eq 1 ]
-tick SPAWN_DEPLOY_QUIET_SECS=600 SPAWN_DEPLOY_MAX_WAIT_SECS=2
+tick SPAWN_DEPLOY_QUIET_SECS=600 SPAWN_DEPLOY_MAX_WAIT_SECS=2 SPAWN_DEPLOY_HOLD_SECS=120
 check "past the max wait since the first landing not live (c2): deployed" [ "$(deploys)" -eq 2 ]
+check "a hold bound set is the one used (242)" grep -qF ", at most 120 s)" "$out"
 check "the burst's last main" [ "$(live_commit)" = "spawn-$c3" ]
 
 echo "== a failed deploy is tried again after the retry bound"
@@ -395,8 +428,22 @@ check "the failure is on the record" [ "$(finished | tail -n 1)" = "false landin
 tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1
 check "not tried again inside the bound" [ "$(deploys)" -eq 3 ]
 check "says so" grep -qF "main $c4 waits: its deploy failed" "$out"
-sleep 1
-tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1 SPAWN_DEPLOY_RETRY_SECS=1
+check "naming the default bound, 1800 s (242)" grep -qF "tried again 1800 s after it (SPAWN_DEPLOY_RETRY_SECS)" "$out"
+tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1 SPAWN_DEPLOY_RETRY_SECS=1234
+check "a bound set is the one used" grep -qF "tried again 1234 s after it (SPAWN_DEPLOY_RETRY_SECS)" "$out"
+# The default against the store's clock (242): the failure's record moved
+# back, 1790 s and then 1810 s before the database's now.
+failure_event=$(spawn_live mission landing --source "$missions" | jq -er '.last_deploy.event')
+failed_ago() {
+  sql "update spawn_events
+          set recorded_at_ms = (extract(epoch from clock_timestamp()) * 1000)::bigint - $1 * 1000
+        where id = $failure_event" >/dev/null
+}
+failed_ago 1790
+tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1
+check "a failure 1790 s old is not tried again by default" [ "$(deploys)" -eq 3 ]
+failed_ago 1810
+tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1
 check "tried again after it, and deployed" bash -c '[ "$(wc -l <"$1")" -eq 4 ] && [ "$(readlink "$2")" = "spawn-$3" ]' _ "$FAKE_LOG" "$live/controllers/spawn" "$c4"
 
 echo "== a tick killed with its deploy leaves its hold; the next tick releases it"
@@ -406,6 +453,8 @@ sleep 1.2
 tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1 FAKE_DEPLOY=kill
 check "killed (status $status)" [ "$status" -eq 137 ]
 check "its hold is left" [ "$(holds | jq -r .reason)" = "deploy-on-landing $c5" ]
+check "bounded at the default 3600 s, not the owner's 3 h (242)" \
+  [ "$(sql "select expires_ms - held_at_ms from mission_source_holds")" = 3600000 ]
 check "and nothing went live" [ "$(live_commit)" = "spawn-$c4" ]
 tick SPAWN_DEPLOY_QUIET_SECS=1 SPAWN_DEPLOY_MAX_WAIT_SECS=1
 check "the next tick releases it" grep -qF "(deploy-on-landing $c5): its tick or deploy was killed before it could" "$out"
