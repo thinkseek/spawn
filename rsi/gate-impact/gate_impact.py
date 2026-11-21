@@ -26,8 +26,17 @@ Policy (rsi/gate-impact/policy.json, version 1):
 - Real-time holds (192, 209) and the historical objectives are nightly in
   the proposed policy; `--historical-mode cache-only` models today's gate
   plus content-addressed results instead, so the two costs can be compared.
+  The default is the policy's own (`historical.default_mode`, cache-only):
+  an operator who omits the flag does not install the unapproved retirement.
 - A file under rsi/scenarios/nightly/ is not in any landing key: the gate
-  never runs it, so it must not invalidate a landing result.
+  never runs it, so it must not invalidate a landing result.  But the
+  backlog is not inert: `cargo test` (check-tests.sh) reads rsi/backlog/
+  through crates/spawn-cli/src/objectives.rs, and scenario 008 reads the
+  tree's README.md, so both are key material for the jobs that read them.
+- A scenario listed in rsi/scenarios/serial runs alone, as the gate runs it;
+  its seconds are charged serially, not into the four-slot makespan.
+- A base record binds to its exact base commit: a missing, short or
+  different commit is no verdict (exit 2), never a cache hit.
 
 Exit codes:
   0  a selection was produced (decision narrow, full or reject)
