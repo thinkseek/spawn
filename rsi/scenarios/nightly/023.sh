@@ -69,26 +69,36 @@
 #         `session_resident_alpha stall-T1-activity-<n>`), no sooner than 20 s
 #         and no later than 20 s + STALL_SLACK_MS (2500) after alpha's last
 #         fact (deliver.rs and dispatch/stall.rs measure it so);
-#       - the minute's scans add up to at most BUSY_MAX (9,100). The minute
-#         makes the same decisions at the same times on every run, so its
-#         cost varies little, though the host adds some (7,771-8,282, 6.5%,
-#         over 6 alternating runs of the same loop code): 7,340-8,282 on 22
-#         runs, 2026-11-08/09 (8 base runs from the gate's warm cache, mains
-#         up to 984d0592; 8 owner-gate runs; 6 runs alternating 984d0592 and
-#         f10c4e98, whose code 023 reaches is the same). 9,100 is the highest
-#         plus 10%, rounded down. It was IDLE_MAX + 150 per half-second
-#         slice holding an event (recorded_at_ms), a full pass (118 scans)
-#         per slice in which something happened; but the slice count moves
-#         with event timing (52-64 on one build) while the scans do not, so
-#         the per-slice figure swung 122.7-151.5 on unchanged code and
-#         rejected batch 12 at 151.5 with nothing in the loop changed. The
-#         slices are still printed.
+#       - the minute's scans add up to at most BUSY_MAX (10,500). The minute
+#         makes the same decisions at the same times on every run, but its
+#         cost moves with event timing and the host. That spread is the
+#         figure BUSY_MAX is derived from, measured on loop code 023 reaches
+#         unchanged (objective 243, 2026-11-20, quiet host): 8,801-9,549
+#         (8.5%) over 23 runs of mains 38c3a263, 84dcd333, 2f0d2198 and
+#         5e416443, whose code 023 reaches is the same apart from 239's
+#         steal step (which moved nothing measurable). The 23 runs are 7
+#         nightly gate runs and 16 private-cluster runs, 12 of them on
+#         5e416443 alone (8,878-9,549). BUSY_MAX is the highest plus 10%,
+#         rounded down to the hundred.
+#         It was 9,100, the highest of 22 runs on 2026-11-08/09 (7,340-8,282)
+#         plus 10%. The cost has since crept up to above that limit with no
+#         one landing behind it: 38c3a263 against 84dcd333, alternating, was
+#         8,805-9,051 against 8,801-9,173. Yet 84dcd333's nightly went red
+#         at 9,132, and the quiet re-run on 5e416443 failed its candidate and
+#         its base (9,034-9,300), with nothing in the loop changed. The limit
+#         is derived again, by the same rule, when unchanged code reaches it.
+#         An event-slice rule was tried before it and dropped: the slice count
+#         moves with event timing (52-64 on one build) while the scans do
+#         not. The slices are still printed.
 #         What it catches: a full pass on every pass where nothing changed
 #         (the live main before objective 023: 14,753), a full pass more per
-#         event (about +118 x 55 = +6,500), or any change adding about 820
-#         scans over the highest run (15 a slice, 7 full passes). What it
-#         does not: one extra watermark read per pass (+120 a minute), which
-#         (2) catches (an idle minute then costs about 260, over IDLE_MAX).
+#         event (about +118 x 55 = +6,500), a step that reads its facts once
+#         more on the passes where something changed (objective 243's
+#         mutants: the dispatcher's load twice 12,940-12,950, its facts read
+#         twice 11,885-11,906), or any change adding about 950 scans over
+#         the highest run (about 17 a slice, 8 full passes). What it does
+#         not: one extra watermark read per pass (+120 a minute), which (2)
+#         catches (an idle minute then costs about 260, over IDLE_MAX).
 #
 # Measured on the live main (49b92be, the deployed binary built from it),
 # this fleet, this host, 2026-11-06 (BB_023_MEASURE=1 prints them):
@@ -137,7 +147,7 @@ done
 
 MEASURE=${BB_023_MEASURE:-}
 IDLE_MAX=150
-BUSY_MAX=9100
+BUSY_MAX=10500
 DELIVER_MAX_MS=4000
 RETRY_SLACK_MS=1500
 STALL_SECS=20
@@ -656,7 +666,7 @@ slices=$(q "select count(distinct (recorded_at_ms - $busy_start) / 500) from spa
 echo "023: busy minute: events in $slices of its 120 half-second slices"
 
 [ "$busy_scans" -le "$BUSY_MAX" ] ||
-    measured_fail "(3) the busy minute cost $busy_scans table scans ($busy_seq sequential, $busy_idx by index; most:$busy_top; events in $slices of its 120 half-second slices), more than $BUSY_MAX (the highest of 22 runs of today's loop, 8,282, plus 10%): its steps ran on passes where nothing had changed"
+    measured_fail "(3) the busy minute cost $busy_scans table scans ($busy_seq sequential, $busy_idx by index; most:$busy_top; events in $slices of its 120 half-second slices), more than $BUSY_MAX (the highest of 23 runs of unchanged loop code in objective 243, 9,549, plus 10%): a step costs more on the passes where something changed, or runs on passes where nothing had"
 
 if [ -n "$MEASURE" ]; then
     echo "023: measured (BB_023_MEASURE=1): idle $idle_scans, busy $busy_scans scans a minute"

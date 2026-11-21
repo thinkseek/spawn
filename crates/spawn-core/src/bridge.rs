@@ -377,7 +377,8 @@ struct Follow {
     /// When its pane was last captured.
     last_capture: Option<i64>,
     /// When to read its files next although nothing was watched: the grace
-    /// after which a transcript that never appeared is reported.
+    /// after which a transcript that never appeared is reported, or the next
+    /// pass after a read that came back full (more waits to be read).
     due_at: Option<i64>,
     /// Bytes of the transcript read so far.
     offset: u64,
@@ -1807,7 +1808,12 @@ impl Bridge {
     /// pass when no watch could be set for the execution
     /// ([`Follow::poll`]). A read that leaves a line half-written, or a
     /// checkpoint uncommitted, keeps the execution due, so the next pass
-    /// reads again: a line is never lost to the moment it was written.
+    /// reads again: a line is never lost to the moment it was written. So
+    /// does a read that came back full (objective 241): a backlog over one
+    /// read ([`READ_LIMIT`]), such as a long transcript read again from its
+    /// execution's start after a restart, is read through in passes, never
+    /// left waiting for the next change of the file (LOOK 4082: an idle
+    /// session's new turn was never reached, its message read as not taken).
     ///
     /// A transcript that shrank below the offset, or was replaced (other
     /// bytes than the ones read just before the offset: a rewrite, a
@@ -1870,13 +1876,15 @@ impl Bridge {
                 return Ok(());
             }
         };
+        // The file is there (no grace to wait for): due next pass only when
+        // this read came back full, so more of it waits to be read.
+        active.follow.due_at = (bytes.len() >= limit).then(|| self.clock.now().0);
         if !bytes.is_empty() {
             // The transcript grew: the archive copies it on this pass.
             active.follow.archiving.due = true;
             // Its screen is looked at once it holds still, not while it is
             // being written.
             active.follow.unread_since = Some(self.clock.now().0);
-            active.follow.due_at = None;
         }
         let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
             // A full read without a newline is one line longer than the
@@ -6123,6 +6131,67 @@ mod tests {
             world.engine_events(),
             vec!["tool.started", "turn.stopped"],
             "the rest of the line is read at the next pass"
+        );
+    }
+
+    /// `mib` MiB of lines that carry no event (the engine's queue: no line
+    /// id), then `last`: one write, as a long-idle transcript holds them.
+    fn backlog(mib: usize, last: &str) -> String {
+        let line = format!(
+            "{{\"type\":\"queue-operation\",\"pad\":\"{}\"}}\n",
+            "x".repeat(1000)
+        );
+        let mut text = line.repeat((mib << 20) / line.len() + 1);
+        text.push_str(last);
+        text
+    }
+
+    /// A backlog over one read is read through in passes (objective 241): a
+    /// full read leaves the execution due, so the next pass reads again with
+    /// no further change of the file; nothing is read twice.
+    #[test]
+    fn a_backlog_over_one_read_is_read_through_without_another_change() {
+        let mut world = World::new();
+        world.engine_writes(&backlog(20, TOOL_LINE));
+        let mut passes = 0;
+        while !world.engine_events().contains(&"tool.started") {
+            passes += 1;
+            assert!(passes <= 4, "20 MiB not read through in 4 passes");
+            world.tick();
+        }
+        for _ in 0..3 {
+            world.advance(500);
+            world.tick();
+        }
+        assert_eq!(
+            world.engine_events(),
+            vec!["tool.started"],
+            "nothing read twice"
+        );
+    }
+
+    /// After a restart the follow starts again from the execution's start: a
+    /// transcript longer than one read is read through to the line the
+    /// engine writes next, whose event is logged; the old one not twice.
+    #[test]
+    fn after_a_restart_a_long_transcript_is_read_through_to_its_new_lines() {
+        let mut world = World::new();
+        world.engine_writes(&backlog(20, TOOL_LINE));
+        for _ in 0..4 {
+            world.tick();
+        }
+        assert_eq!(world.engine_events(), vec!["tool.started"]);
+        world.restart();
+        world.tick();
+        world.engine_writes(TURN_LINE);
+        for _ in 0..5 {
+            world.advance(500);
+            world.tick();
+        }
+        assert_eq!(
+            world.engine_events(),
+            vec!["tool.started", "turn.stopped"],
+            "the new line is read, the old one not twice"
         );
     }
 
