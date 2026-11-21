@@ -7,10 +7,11 @@ import {
 import { useState } from "react";
 
 import { usePoll } from "../../api";
-import { absoluteTitle, clockTime, relativeTime } from "../../format";
+import { clockTime, relativeTime } from "../../format";
 import { freshAt } from "../../validated";
 import type {
   Feature,
+  FeatureDeploy,
   FeatureLanding,
   FeatureMission,
   FeatureSource,
@@ -19,7 +20,6 @@ import type {
 import {
   blockerText,
   deployNote,
-  fetchFeatureMap,
   gapText,
   groupByState,
   isExternal,
@@ -29,6 +29,7 @@ import {
   sourceLabel,
   verificationNote,
 } from "../../features";
+import { fetchFeatureMap } from "../../featuresApi";
 import { Card, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
 
 interface FeatureMapViewProps {
