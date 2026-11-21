@@ -849,7 +849,8 @@ def select(opts):
             "candidate runs of a later tree are never read" % (
                 os.path.basename(opts.base_record), short(base))
         ] if opts.base_record else [
-            "no base record: every job is a cache miss (fail-closed direction)"
+            "no base record: every job that runs is a cache miss "
+            "(fail-closed direction)"
         ]),
         "cache": {
             "base_record": opts.base_record,

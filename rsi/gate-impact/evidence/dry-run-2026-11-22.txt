@@ -1,8 +1,8 @@
 # gate-impact dry run
-# date: 2026-11-21T20:22:32Z
+# date: 2026-11-21T21:14:27Z
 # host: spawn
 # mirror: /home/ckl/.local/share/spawn-rsi/missions/spawn.git
-# policy: /home/ckl/.local/share/spawn-rsi/ws/agent_worker_gate_impact_fix_493/rsi/gate-impact/policy.json
+# policy: /home/ckl/.local/share/spawn-rsi/ws/agent_worker_gate_impact_docs_495/rsi/gate-impact/policy.json
 
 ### 243 with no mode flag: the policy's own defaults (cache-only, unsolved run)
 gate-impact selector: impact-based landing slice (prototype, dry-run only)
@@ -1535,4 +1535,4 @@ budget        180 s -> OVER
 assumptions
   - historical mode: cache-only; unsolved objectives: run (carry: an unchanged input carries the base's recorded unsolved result to the new main; run: the base's two agreeing runs are charged instead)
   - a cache hit on a check, journey or CI job depends on the pending C15/C16/C19 seed wiring: today scripts/rsi/gate.sh seeds solved objectives only, so the predicted wall clock is conditional until that wiring lands
-  - no base record: every job is a cache miss (fail-closed direction)
+  - no base record: every job that runs is a cache miss (fail-closed direction)

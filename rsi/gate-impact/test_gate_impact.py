@@ -379,6 +379,19 @@ class SelectorTest(unittest.TestCase):
         self.assertIn("check-tests.sh", {job["id"] for job in res["selected"]})
         self.assertGreater(res["predicted"]["wall_seconds"], 180)
         self.assertFalse(res["predicted"]["within_budget"])
+        # Under the nightly retirement 159 objectives are skipped because the
+        # policy retired them, not because they are misses; the printed
+        # assumption must not count them as cache misses.
+        code, res, err = run_selector(self.root, self.base, self.nightly_only,
+                                      "--profile", "243",
+                                      "--historical-mode", "nightly",
+                                      "--unsolved-mode", "carry")
+        self.assertEqual(code, 0, err)
+        assumptions = " ".join(res["assumptions"])
+        self.assertIn("every job that runs is a cache miss", assumptions)
+        self.assertNotIn("every job is a cache miss", assumptions)
+        self.assertTrue([job for job in res["skipped"]
+                         if job["why"].startswith("nightly-scope")])
 
     def test_missing_record_file_is_no_verdict(self):
         code, res, _ = run_selector(self.root, self.base, self.nightly_only,

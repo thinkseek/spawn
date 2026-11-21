@@ -49,6 +49,10 @@ Useful switches:
   needs the owner's decision.
 - `--task-scenario 241.sh --task-base-cached [--task-runs 3]`: the task's own
   scenario, its cached base result, and the live P25 run count.
+  `--task-base-cached` is the caller's word, not a verified fact: it drops
+  the task's base run from the prediction and the selector does not check
+  that the base recorded a cached result, so a base with no cached run is
+  understated by one task run (39.9 s for 241).
 
 ## Files
 
@@ -96,5 +100,7 @@ a prediction, not an achieved landing: the gate seeds only solved objectives
 today, so hits on checks, journeys and CI jobs depend on the pending
 C15/C16/C19 wiring. The measured 243 change also edited `rsi/backlog/243.json`,
 and `cargo test` reads the backlog, so `check-tests.sh` (184.8 s) runs and
-the honest 243-type number is 229.8 s, over budget. `docs/gate-impact-policy.md`
-section 4 carries the full table.
+the honest 243-type number is 349.2 s under the policy's own default
+(cache-only, unsolved run), or 229.8 s only with the unapproved nightly
+retirement or the unratified carried `unsolved`; both are over budget.
+`docs/gate-impact-policy.md` section 4 carries the full table.

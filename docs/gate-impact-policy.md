@@ -40,6 +40,11 @@ candidate 1232, check-tests 187.8, build 20.3, listing 73.9, task scenario
 241 39.9 s a run. A Rust change that runs today's whole check-tests cannot
 meet 180 s even with a perfect base: the check alone is 184.8 s.
 
+The part rows above are rounded phase boundaries, not an exhaustive
+decomposition: 45 + 778 + 1149 = 1972 s against the measured 1973.790 s
+total (1.79 s unassigned), and 74 + 0 + 1232 = 1306 s against 1309.4 s
+(3.4 s unassigned). The measured totals are the authoritative ones.
+
 ## 2. The policy
 
 ### 2.1 Mandatory core, on every landing
@@ -48,10 +53,16 @@ meet 180 s even with a perfect base: the check alone is 184.8 s.
   `rsi/scenarios/protected`, never the candidate's copy, matched by the
   gate's string-prefix rule), no build-time code (`build.rs`, `.cargo/`, a
   `Cargo.toml` with `build =`, a new proc-macro), and the test count from
-  the base's cached `cargo test` list (C15).
+  the base's cached `cargo test` list (C15). **The prototype does not
+  implement that count as an always-on check.** It computes a static key
+  from the protected list and the core id, but no job compares a test
+  listing, and the listing itself is a cache-skippable job keyed on the
+  Rust tree; until C15's wiring exists the ratchet is `gate.sh`'s job
+  (`scripts/rsi/gate.sh:3830-3925`), not a core check this selector models.
 - A versioned evidence record is written: policy version and digest, base
-  and candidate commits and tree, toolchain and environment probe, the
-  selected jobs and the skipped jobs with a deterministic reason.
+  and candidate commits and tree, the environment key (today the constant
+  recorded in `timings.json`, not a live probe: section 9), the selected
+  jobs and the skipped jobs with a deterministic reason.
 - **Fail closed.** Unknown path class, missing dependency, or a cache miss
   never narrows: an unknown class runs the full gate; an unreadable or
   malformed policy, timings profile, base record or tree, a base record
@@ -108,8 +119,9 @@ split, every 243-type change pays the full gate.
 - A key is a content hash of what a job reads, computed on both trees: the
   Rust tree (`crates/`, `Cargo.toml`, `Cargo.lock`), the web tree, the
   scripts tree, the backlog tree (`rsi/backlog/`, for `check-tests.sh`),
-  `README.md` (for scenario 008), the scenario blob, the
-  toolchain/environment probe, and the policy version.
+  `README.md` (for scenario 008), the scenario blob, the environment key
+  (`env`, today the constant recorded in `timings.json`, not a live probe;
+  section 9), and the policy version.
 - A result is reused only when the candidate's key equals the base's key and
   the base's accepting gate recorded the result **for exactly this base
   commit**. The accepting gate's own candidate runs are meant to seed the
@@ -185,13 +197,22 @@ Command: `sh rsi/gate-impact/replay.sh` (raw output in
 | 243 | cache-only + carry (no check retired) | 5 | 229.8 s ¹ | OVER |
 | 243 | strict cache, unsolved not carried | 6 | 349.2 s ¹ | OVER |
 | nightly-only (unit fixture) | proposed (historical nightly) | 4 | **131.0 s** ¹ | WITHIN |
+| nightly-only (unit fixture) | cache-only + carry (no check retired) | 4 | **131.0 s** ¹ | WITHIN |
 | 485 `865cc4df..33777df8` | proposed + task 241 | 29 | 510.5 s | OVER |
 | 485 | today's checks + cache | 187 | 1277.1 s | OVER |
+| web-only (`web/src/cost.ts` on 865cc4df, real tree, profile 243) | no mode flag: the policy's defaults (cache-only, unsolved run) | 185 | 1101.4 s | OVER |
+| web-only (same real-tree change) | proposed (historical nightly) | 26 | 380.3 s | OVER |
 | web-only (unit fixture) | conservative journey keys | 14 | 330.9 s | OVER |
 | shared `337c94b5..2e8781ca` | full escalation | 186 | 1973.8 s | OVER |
 | unknown path (unit fixture) | fail-closed | all | 1973.8 s | OVER |
 | `build.rs` (unit fixture) | static trust | - | - | reject, exit 1 |
 | missing timing/policy/record | no verdict | - | - | exit 2 |
+
+The two real-tree web rows are a probe, not a `replay.sh` row: the selector
+was run against a throwaway clone of the mission history at 865cc4df with a
+`web/src/cost.ts` edit (profile 243), because the replay repository holds no
+such commit. The unit-fixture rows, including the 14-job web fixture, are the
+tests' temporary repository.
 
 ¹ **Depends on pending C15/C16/C19 wiring.** The gate seeds only solved
 objectives today (`scripts/rsi/gate.sh:4839`); the selector's hits on
@@ -204,9 +225,11 @@ reader should take 131.0 s as an achieved landing yet.
 The 243 pair is **not** 131.0 s, and the reviews of the first draft are why.
 243 edited `rsi/backlog/243.json`, and `cargo test` reads the backlog, so
 `check-tests.sh` is selected by its own key (184.8 s) in every mode. The
-honest 243-type number is 229.8 s: over budget until test selection (C14,
-C15) is proven, and no key fix can bring a backlog edit under 180 s while
-`check-tests` alone is 184.8 s.
+honest 243-type number under the policy's own default (cache-only, unsolved
+run) is 349.2 s; the 229.8 s row needs either the proposed nightly retirement
+or the unratified carried `unsolved` result, and neither is installed. Both
+are over budget until test selection (C14, C15) is proven, and no key fix can
+bring a backlog edit under 180 s while `check-tests` alone is 184.8 s.
 
 How the 131.0 s is made (a change that touches no key but a nightly data
 file, e.g. `rsi/scenarios/nightly/023.sh`):
@@ -214,13 +237,17 @@ file, e.g. `rsi/scenarios/nightly/023.sh`):
 - setup 45 s (measured, includes the static checks);
 - the four C1 journeys, longest-first on four slots: 85.993 s wall; their own
   time is 305.3 s, so the slots matter (run serially, 350 s);
-- nothing else runs: 186 jobs are skipped - 159 historical objectives (158
-  solved cache hits plus the unsolved 241, either carried in cache-only or
-  `nightly-scope` in the proposed mode), 25 check/journey/CI results, and the
-  two task-only scenarios (`029.sh`, `238.sh`). Of those 186, 183 are cache
-  hits from the base's accepting gate; the 241 result is a carried
-  `unsolved`, not a pass, and neither task-only job is a miss either. The
-  first draft's "all 186 skipped jobs recorded a pass" was wrong.
+- nothing else runs: 186 jobs are skipped, with two different accounts that
+  give the same 4 selected and 131.0 s. Under the proposed retirement: 25
+  cache hits on check, journey and CI results, 159 historical objectives
+  skipped as `nightly-scope` (158 solved ones plus the unsolved 241, which
+  the retirement does not read), and the two task-only scenarios (`029.sh`,
+  `238.sh`). Under cache-only + carry, where no check is retired: 183 cache
+  hits from the base's accepting gate (the 158 solved objectives and the 25
+  check/journey/CI results), the 241 result carried as `unsolved` (not a
+  pass), and the same two task-only jobs. Neither account is a claim that
+  every skipped job recorded a pass; the first draft's "all 186 skipped jobs
+  recorded a pass" was wrong.
 
 The table's 243 rows are the same landing under three policies, none under
 budget. **No check is retired in the cache-only + carry row**: its 185
@@ -240,12 +267,18 @@ twelve non-journey checks, and task 241 at 39.9 (one candidate run;
 510.5 s. Under today's checks it is 1277.1 s (`107.sh` also runs alone,
 30.3 s).
 
-The web row is deliberately conservative: the prototype keys every journey
+The web class is deliberately conservative: the prototype keys every journey
 on rust + web + scripts, so a `web/src/` change re-runs the eight non-C1
 journeys too, and it runs check-tests (the `cost_page` test) and
-`check-j04-observe.sh` alone. Narrowing that needs the per-journey
-`depends_on` proof (C14); until then the selector over-selects in this
-class, which is the safe direction.
+`check-j04-observe.sh` alone. On the real tree the class also runs the twelve
+non-journey `check-*` scenarios and, under the policy default, the 159
+historical objectives, because every scenario's key includes the web tree:
+26 jobs and 380.3 s under the nightly retirement, 185 jobs and 1101.4 s under
+the default (profile 243). The 14-job unit fixture's 330.9 s is the same
+policy shape over the test repository (12 journeys, check-web, check-tests),
+not the class's cost. Narrowing
+that needs the per-journey `depends_on` proof (C14); until then the selector
+over-selects in this class, which is the safe direction.
 
 Assumptions, all printed by the selector:
 
@@ -258,7 +291,14 @@ Assumptions, all printed by the selector:
   checks; no host noise;
 - the timings are one measured run each (243 and 485) on this host; a
   different host or toolchain needs its own profile, and a missing time is
-  no verdict.
+  no verdict;
+- `--task-base-cached` is the caller's word, not a verified fact: it drops
+  the task's base run from the prediction and the selector does not check
+  that the base recorded a cached result, so a base with no cached run is
+  understated by one task run (39.9 s for 241);
+- with no `--base-record`, every job that runs is a cache miss (the
+  fail-closed direction); a job skipped by the nightly retirement is neither
+  a hit nor a miss.
 
 ## 5. The prototype
 
@@ -299,8 +339,11 @@ Confirmed:
 
 - A change that touches only a nightly data file predicts **131.0 s**: four
   C1 journeys and 186 skipped jobs. It is a prediction, not an achieved
-  landing (the seed wiring in the footnote, and the carried `unsolved` rule,
-  are not installed).
+  landing: the seed wiring in the footnote is not installed, and the 131.0 s
+  figure is the same under the proposed nightly retirement and under
+  cache-only + carry. The nightly row therefore depends on the retirement
+  (the 159 historical objectives are skipped, not carried), and the carry
+  row on the carried `unsolved` rule; neither is installed.
 - The specific cause of the 1973 s 243 landing is the nightly file in the
   landing cache key, not the number of scenarios.
 - Unknown impact and a missing dependency fail closed: full gate or no
@@ -310,14 +353,16 @@ Refuted:
 
 - "A 243-type change lands in 131 s." It does not: 243 edited the backlog,
   `cargo test` reads the backlog, and check-tests is 184.8 s, so the honest
-  243-type prediction is 229.8 s, over budget.
+  243-type prediction is 349.2 s under the policy's own default (229.8 s only
+  with the nightly retirement or the carried `unsolved`), over budget.
 - "Cache alone is enough." Strict cache-only with the one unsolved objective
   on main costs 349.2 s, over the budget. The 229.8 s needs a carried
   `unsolved` result; the retirement alone does not remove check-tests.
 - "A Rust change fits in 180 s." It does not: 510.5 s under the proposed
   policy, 1277.1 s under today's checks. check-tests alone is 184.8 s.
-- "A web change fits under conservative keys." It is 330.9 s until the
-  per-journey keys are proven, and check-tests must run for `cost.ts`.
+- "A web change fits under conservative keys." On the real tree it is
+  380.3 s under the retirement and 1101.4 s under the policy default, not the
+  14-job unit fixture's 330.9 s, and check-tests must run for `cost.ts`.
 - "There is a universal 3-minute SLA." There is not. Runtime/shared changes
   correctly stay at the full 1973.8 s.
 
@@ -377,8 +422,12 @@ which was the bug.
 
 ## 9. Open questions
 
-- Should the web class be 139 s (per-journey keys) or 330.9 s (conservative)?
-  Only the C14 proof decides.
+- Should the web class be the conservative journey keys or something narrower?
+  The 139 s once quoted is not an option: it is setup 45.0 + C1 85.993 +
+  check-web 7.928 = 138.9 s and leaves out check-tests (184.8 s), which the
+  `cost_page` test requires for `cost.ts`. The conservative real-tree cost is
+  380.3 s under the retirement and 1101.4 s under the default; how far below
+  that the class can go is the C14 proof's decision.
 - Does carrying an `unsolved` result need the base's two-run proof only, or
   two candidate runs on the new main too? Proposal: the base's two-run
   `unsolved` plus identical declared inputs is enough; a changed input
