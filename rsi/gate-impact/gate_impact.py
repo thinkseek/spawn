@@ -645,7 +645,7 @@ def select(opts):
                     "key": ckey, "seconds": require_timing(name),
                     "timing": name, "base_seconds": round(cost, 3)})
                 continue
-            state, why, _ = decide(job_id, "scenario", ["rust", "web", "scripts"], name)
+            state, why, _ = decide(job_id, "scenario", scenario_key_names(name), name)
             if state == "selected":
                 cost = base_cost(name) if is_historical else 0.0
                 result.base_seconds += cost
