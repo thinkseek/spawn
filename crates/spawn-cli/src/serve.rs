@@ -1677,20 +1677,27 @@ fn task_in_flight(task: &Value, gated: bool) -> bool {
     }
 }
 
-/// One mission row with `backlog`, `backlog_error`, `objectives` and
-/// `next_objective` added. A retired objective's row (the row's `retired`,
-/// objective 210) has status `retired` and its `retired` row, and
-/// `next_objective` never names it. The row's `solved_on_base` (the mission's
-/// `objective.solved` records) and `outcomes` (its tasks' outcomes, when
-/// read) are taken out: each objective row names its own record, and
-/// `next_objective` is what [`crate::objectives::choose`] gives one free
-/// slot from the integrator's own inputs (the landings, landed tasks and
-/// `objective.solved` records as `OBJECTIVE_LANDINGS`; the objectives with
-/// a task in flight; the attempts; the held objectives), null when it
-/// would assign nothing.
+/// One mission row with `backlog`, `backlog_error`, `features_file`,
+/// `objectives` and `next_objective` added. A retired objective's row (the
+/// row's `retired`, objective 210) has status `retired` and its `retired`
+/// row, and `next_objective` never names it. The row's `solved_on_base`
+/// (the mission's `objective.solved` records) and `outcomes` (its tasks'
+/// outcomes, when read) are taken out: each objective row names its own
+/// record, and `next_objective` is what [`crate::objectives::choose`] gives
+/// one free slot from the integrator's own inputs (the landings, landed
+/// tasks and `objective.solved` records as `OBJECTIVE_LANDINGS`; the
+/// objectives with a task in flight; the attempts; the held objectives),
+/// null when it would assign nothing. `features_file` is the
+/// `objectives.features` path as configured (the feature map's
+/// identity-only mapping, [`feature_map`]): null when the mission names
+/// none.
 pub(crate) fn with_objectives(mut mission: Value) -> Value {
     let backlog = mission
         .pointer("/objectives/backlog")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let features_file = mission
+        .pointer("/objectives/features")
         .and_then(Value::as_str)
         .map(str::to_string);
     let (objectives, error) = match &backlog {
@@ -1742,6 +1749,7 @@ pub(crate) fn with_objectives(mut mission: Value) -> Value {
     if let Some(fields) = mission.as_object_mut() {
         fields.insert("backlog".to_string(), json!(backlog));
         fields.insert("backlog_error".to_string(), json!(error));
+        fields.insert("features_file".to_string(), json!(features_file));
         fields.insert("next_objective".to_string(), json!(next));
         fields.insert("objectives".to_string(), Value::Array(rows));
     }
