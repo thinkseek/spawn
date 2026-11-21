@@ -22,7 +22,7 @@ run() {
     shift
     printf '\n### %s\n' "$label"
     # shellcheck disable=SC2086
-    python3 "$here/select.py" --repo "$repo" $fmt "$@"
+    python3 "$here/gate_impact.py" --repo "$repo" $fmt "$@"
 }
 
 printf '# gate-impact dry run\n'
