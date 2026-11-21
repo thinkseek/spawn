@@ -434,3 +434,51 @@ fn a_delivery_into_a_session_that_is_not_the_tasks_is_refused() {
     let new = command(&store, "ann", &format!("deliver-{queued}-1"));
     assert!(delivered(&mut client, queued, new));
 }
+
+/// A delivery row carries its mission's state and halt (objective 239 fix
+/// F1), so the dispatcher's stealing pass skips a halted or closed
+/// mission's task without another read.
+#[test]
+fn a_delivery_row_carries_its_missions_state_and_halt() {
+    let (store, schema) = store("steal_row_state");
+    let mut client = admin(&schema);
+    let mission = world(&store);
+    let running = assign(&store, mission, "ben", false);
+    deliver(&store, running, "ben");
+    let queued = assign(&store, mission, "ben", false);
+    let other = store
+        .mission_add("Other work", &json!([]), "human")
+        .expect("mission");
+    let elsewhere = assign(&store, other, "ann", false);
+    let row = |task: i64| -> serde_json::Value {
+        store
+            .delivery_rows()
+            .expect("rows")
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["id"].as_i64() == Some(task))
+            .cloned()
+            .expect("the row")
+    };
+    assert_eq!(
+        (
+            row(queued)["mission_state"].as_str(),
+            row(queued)["mission_halted"].as_bool()
+        ),
+        (Some("active"), Some(false)),
+        "a delivered mission is active, and not halted"
+    );
+    client
+        .batch_execute(&format!(
+            "update mission_missions set halted = 'red' where id = {mission}"
+        ))
+        .expect("halt");
+    assert_eq!(row(queued)["mission_halted"].as_bool(), Some(true));
+    client
+        .batch_execute(&format!(
+            "update mission_missions set state = 'done' where id = {other}"
+        ))
+        .expect("close");
+    assert_eq!(row(elsewhere)["mission_state"].as_str(), Some("done"));
+}

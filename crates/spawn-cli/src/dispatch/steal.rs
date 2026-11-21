@@ -67,13 +67,29 @@ fn queued(work: &Work, task: &TaskRow) -> bool {
         })
 }
 
-/// This pass's moves, `(task, taker's name)`: for each pool, its idle
-/// approved residents in name order each take the pool's oldest stealable
-/// task not taken yet. Stealable: a resident task, assigned, never revised,
-/// not pinned, of a mission not paused, of a worker in the pool, waiting in
-/// that worker's queue. The store checks every rule again (a delivery
-/// command, a halted or closed mission among them).
-pub(crate) fn choices(work: &Work) -> Vec<(i64, String)> {
+/// Whether `task` may move at all: a resident task, assigned, never
+/// revised, not pinned, of a mission open, not paused, not halted, waiting
+/// in its worker's queue. The store's mission rule, read from this pass's
+/// own work, so a halted or closed mission's task is never picked: it is
+/// skipped and the pool's next stealable task goes instead.
+fn stealable(work: &Work, task: &TaskRow) -> bool {
+    task.kind == "resident"
+        && task.state == TaskState::Assigned
+        && task.revisions == 0
+        && !task.pinned
+        && matches!(task.mission_state.as_str(), "open" | "active")
+        && !task.mission_halted
+        && !work.paused(task.mission_id)
+        && queued(work, task)
+}
+
+/// This pass's tries, `(taker's name, the tasks it may try in order)`: for
+/// each pool, its idle approved residents in name order, each with the
+/// pool's stealable queued tasks not its own, lowest id first. The store
+/// checks every rule again (a delivery command, a move that just happened
+/// among them); a refusal lets the taker try its next one in the same pass,
+/// and a task another taker already moved is skipped ([`attempt`]).
+pub(crate) fn choices(work: &Work) -> Vec<(String, Vec<i64>)> {
     let pool_of: BTreeMap<&str, &str> = work
         .residents
         .iter()
@@ -87,61 +103,86 @@ pub(crate) fn choices(work: &Work) -> Vec<(i64, String)> {
             members.entry(pool).or_default().push(resident);
         }
     }
-    let mut moves = Vec::new();
+    let mut tries = Vec::new();
     for (pool, residents) in members {
         let mut candidates: Vec<&TaskRow> = work
             .tasks
             .iter()
             .filter(|task| {
-                task.kind == "resident"
-                    && task.state == TaskState::Assigned
-                    && task.revisions == 0
-                    && !task.pinned
-                    && !work.paused(task.mission_id)
-                    && pool_of.get(task.agent_id.as_str()) == Some(&pool)
-                    && queued(work, task)
+                pool_of.get(task.agent_id.as_str()) == Some(&pool) && stealable(work, task)
             })
             .collect();
         candidates.sort_by_key(|task| task.id);
-        let mut taken: BTreeSet<i64> = BTreeSet::new();
         let mut sorted = residents;
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         for resident in sorted.into_iter().filter(|resident| idle(work, resident)) {
-            if let Some(task) = candidates
-                .iter()
-                .find(|task| !taken.contains(&task.id) && task.session_id != resident.session_id)
-            {
-                taken.insert(task.id);
-                moves.push((task.id, resident.name.clone()));
+            tries.push((
+                resident.name.clone(),
+                candidates
+                    .iter()
+                    .filter(|task| task.session_id != resident.session_id)
+                    .map(|task| task.id)
+                    .collect(),
+            ));
+        }
+    }
+    tries
+}
+
+/// The moves of one pass's tries ([`choices`]), each tried in order through
+/// `steal`: the first of a taker's tasks it wins is its one move for the
+/// pass; a refusal is a line in `lines` and its next task is tried, and a
+/// task another taker already moved is skipped. The store's answer names
+/// from and to whose session.
+fn attempt(
+    tries: &[(String, Vec<i64>)],
+    lines: &mut Vec<String>,
+    mut steal: impl FnMut(i64, &str) -> Result<String, String>,
+) -> Vec<(i64, String)> {
+    let mut moved: BTreeSet<i64> = BTreeSet::new();
+    let mut won = Vec::new();
+    for (to, tasks) in tries {
+        for task in tasks {
+            if moved.contains(task) {
+                continue;
+            }
+            match steal(*task, to) {
+                Ok(where_) => {
+                    lines.push(format!("dispatch: task #{task} stolen {where_}"));
+                    moved.insert(*task);
+                    won.push((*task, to.clone()));
+                    break;
+                }
+                Err(error) => lines.push(format!(
+                    "dispatch: task #{task} not stolen by {to}: {error}"
+                )),
             }
         }
     }
-    moves
+    won
 }
 
-/// Make this pass's moves ([`choices`]) through the store, each said in
-/// `lines`, a refusal too. Returns whether any was tried, so the pass reads
-/// its work again before it plans deliveries.
+/// Make this pass's tries ([`choices`]) through the store, each said in
+/// `lines`, a refusal too. Returns whether any move was made, so the pass
+/// reads its work again before it plans deliveries; a pass whose tries were
+/// all refused changed nothing and needs no reload.
 pub(crate) fn run(store: &PostgresStore, work: &Work, lines: &mut Vec<String>) -> bool {
-    let moves = choices(work);
-    for (task, to) in &moves {
-        match store.task_steal(*task, to, BY, Some(REASON)) {
-            Ok(answer) => lines.push(format!(
-                "dispatch: task #{task} stolen from {} to {}",
-                answer["from_session"].as_str().unwrap_or("?"),
-                answer["to_session"].as_str().unwrap_or("?")
-            )),
-            Err(error) => lines.push(format!(
-                "dispatch: task #{task} not stolen by {to}: {error}"
-            )),
-        }
-    }
+    let moves = attempt(&choices(work), lines, |task, to| {
+        let answer = store
+            .task_steal(task, to, BY, Some(REASON))
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "from {} to {}",
+            answer["from_session"].as_str().unwrap_or("?"),
+            answer["to_session"].as_str().unwrap_or("?")
+        ))
+    });
     !moves.is_empty()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{choices, enabled};
+    use super::{attempt, choices, enabled};
     use crate::deliver::{Cancelled, Resident, TaskRow, Work};
     use spawn_core::mission::TaskState;
 
@@ -170,6 +211,8 @@ mod tests {
             charter: None,
             resident: Some(worker.to_string()),
             gated: false,
+            mission_state: "open".to_string(),
+            mission_halted: false,
             model: spawn_core::event::ModelProfile::default(),
             reissue_of: None,
             reissued_attempts: None,
@@ -180,6 +223,13 @@ mod tests {
             restart: None,
             pinned: false,
         }
+    }
+
+    /// The moves a pass makes when every try wins.
+    fn moves(work: &Work) -> Vec<(i64, String)> {
+        attempt(&choices(work), &mut Vec::new(), |task, _| {
+            Ok(format!("task {task}"))
+        })
     }
 
     /// ben runs task 1 and queues 2, 3 and 4; ann, cid and dee are idle,
@@ -209,7 +259,7 @@ mod tests {
         let mut work = pool();
         work.residents.reverse();
         assert_eq!(
-            choices(&work),
+            moves(&work),
             [
                 (2, "ann".to_string()),
                 (3, "cid".to_string()),
@@ -219,7 +269,7 @@ mod tests {
         // One idle resident: one task, the oldest.
         work.residents
             .retain(|resident| ["ben", "dee"].contains(&resident.name.as_str()));
-        assert_eq!(choices(&work), [(2, "dee".to_string())]);
+        assert_eq!(moves(&work), [(2, "dee".to_string())]);
     }
 
     /// A running, pinned, revised, paused-mission or ephemeral task never
@@ -241,11 +291,11 @@ mod tests {
         work.tasks[3].kind = "ephemeral".to_string();
         // cid holds a task of its own, assigned: not idle.
         work.tasks.push(task(9, "cid", TaskState::Assigned));
-        assert_eq!(choices(&work), []);
+        assert_eq!(moves(&work), []);
         // cid's task 9 is its next (cid is idle otherwise): never taken.
         work.residents
             .push(resident("dee", Some("logs"), "approved"));
-        assert_eq!(choices(&work), []);
+        assert_eq!(moves(&work), []);
         // A paused mission's task waits for its mission.
         let mut paused = pool();
         paused
@@ -259,14 +309,14 @@ mod tests {
             pause_event: Some(1),
             ..Default::default()
         }];
-        assert_eq!(choices(&paused), []);
+        assert_eq!(moves(&paused), []);
         // A worker not yet told of a cancel is held: its tasks are queued,
         // and it takes none.
         let mut told = pool();
         told.tasks = vec![task(2, "ben", TaskState::Assigned)];
         told.residents
             .retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
-        assert_eq!(choices(&told), [], "ben is idle: task 2 is its next");
+        assert_eq!(moves(&told), [], "ben is idle: task 2 is its next");
         told.cancelled = vec![Cancelled {
             id: 1,
             mission_id: 1,
@@ -282,7 +332,70 @@ mod tests {
             reassigned_as: None,
             reassigned_to_session: None,
         }];
-        assert_eq!(choices(&told), [(2, "ann".to_string())]);
+        assert_eq!(moves(&told), [(2, "ann".to_string())]);
+    }
+
+    /// One halt does not stop its pool's stealing: a halted or closed
+    /// mission's queued task stays its worker's, and the pool's next
+    /// stealable task goes instead.
+    #[test]
+    fn a_halted_or_closed_missions_task_is_skipped_and_the_next_one_moves() {
+        for (state, halted) in [("open", true), ("closed", false)] {
+            let mut work = pool();
+            work.residents
+                .retain(|resident| ["ann", "ben"].contains(&resident.name.as_str()));
+            work.tasks[1].mission_state = state.to_string();
+            work.tasks[1].mission_halted = halted;
+            assert_eq!(
+                moves(&work),
+                [(3, "ann".to_string())],
+                "task 2 ({state}, halted {halted}) stays ben's; ann takes 3"
+            );
+            assert!(
+                !choices(&work).iter().any(|(_, tasks)| tasks.contains(&2)),
+                "task 2 is in no one's tries"
+            );
+        }
+        // All of a pool's queued tasks halted: nothing moves, nothing tried.
+        let mut all = pool();
+        for task in &mut all.tasks[1..] {
+            task.mission_halted = true;
+        }
+        assert_eq!(moves(&all), []);
+    }
+
+    /// A refused first candidate (a lost race, a delivery command that
+    /// appeared) lets the taker try its next one in the same pass, one move
+    /// per taker.
+    #[test]
+    fn a_refused_first_candidate_lets_the_taker_try_the_next() {
+        let work = pool();
+        let tries = choices(&work);
+        let mut lines = Vec::new();
+        let mut asked = Vec::new();
+        let moved = attempt(&tries, &mut lines, |task, to| {
+            asked.push((task, to.to_string()));
+            if task == 2 {
+                Err("task 2 is not queued (a delivery command exists)".to_string())
+            } else {
+                Ok(format!("task {task}"))
+            }
+        });
+        assert_eq!(
+            moved,
+            [(3, "ann".to_string()), (4, "cid".to_string())],
+            "ann's next after 2, then cid's oldest untaken: one move each"
+        );
+        assert_eq!(asked[..2], [(2, "ann".to_string()), (3, "ann".to_string())]);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("task #2 not stolen by ann")),
+            "the refusal is said"
+        );
+        // Every try refused: no move, so the pass does not reload its work.
+        let refused = attempt(&tries, &mut Vec::new(), |task, _| Err(format!("no {task}")));
+        assert_eq!(refused, []);
     }
 
     #[test]
