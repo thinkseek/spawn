@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use spawn_postgres::PostgresStore;
 
 mod common;
-use common::{admin, schema_url, store};
+use common::{admin, store};
 
 fn mission(client: &mut Client, id: i64, sources: &Value) {
     client
@@ -133,5 +133,4 @@ fn the_feature_map_path_is_a_mission_setting_an_absolute_file_path() {
     assert!(cleared["after"]["objectives"].get("features").is_none(), "{cleared}");
     let read = store.objective_missions().expect("the mission");
     assert!(read[0]["objectives"].get("features").is_none());
-    let _ = schema_url; // the module's other helpers are for logins
 }
