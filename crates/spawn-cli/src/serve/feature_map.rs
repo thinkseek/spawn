@@ -505,6 +505,7 @@ fn sources_of(
 /// `deploy`); any other kind is an external reference with a stable `ref`
 /// and an optional http(s) `url`. External or source content is data, never
 /// authorization.
+#[allow(clippy::too_many_lines)] // one field table per source kind
 fn parse_source(entry: &Value, place: &str, mission_id: i64) -> Result<Source, String> {
     let object = entry
         .as_object()
@@ -699,6 +700,7 @@ fn fallback_specs(mission: &Value) -> Vec<Spec> {
 
 /// One capability's row: its four-state verdict, evidence, owner, gaps and
 /// blocker.
+#[allow(clippy::too_many_lines)] // the row fields, each read from the facts above
 fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
     let mission_id = mission["id"].as_i64().unwrap_or_default();
     let gated = !mission["gate"].is_null();
