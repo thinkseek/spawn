@@ -53,10 +53,13 @@ meet 180 s even with a perfect base: the check alone is 184.8 s.
   and candidate commits and tree, toolchain and environment probe, the
   selected jobs and the skipped jobs with a deterministic reason.
 - **Fail closed.** Unknown path class, missing dependency, or a cache miss
-  never narrows: an unknown class runs the full gate; an unreadable policy,
-  timings profile, base record or tree, a base record for another commit, or
-  a selected job with no measured time is **no verdict** (exit 2), and the
-  caller keeps today's full gate. No job is skipped because a model said so.
+  never narrows: an unknown class runs the full gate; an unreadable or
+  malformed policy, timings profile, base record or tree, a base record
+  that does not name exactly the base commit (a missing, empty or short
+  commit binds to no base), a candidate that does not descend from its
+  base, or a selected job with no measured time is **no verdict** (exit 2),
+  and the caller keeps today's full gate. No job is skipped because a model
+  said so.
 - A new candidate hash invalidates any prior selection or approval: the
   approval digest in section 5 covers the candidate tree and every selected
   key.
