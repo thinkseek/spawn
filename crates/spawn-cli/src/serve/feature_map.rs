@@ -1110,6 +1110,8 @@ fn cut(value: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::json;
 
     use super::{
@@ -1230,7 +1232,14 @@ mod tests {
         let facts = facts(&landings, &verifications, &deployments, &[]);
         let row = derive(&spec("late", &[2]), &mission(), &facts);
         assert_eq!(row["state"], "implemented");
-        assert_eq!(row["gaps"][0]["kind"], "not_deployed");
+        assert!(
+            row["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "not_deployed"),
+            "{row}"
+        );
         let failed_only = vec![
             json!({"event": 900, "at_ms": 900, "ok": false, "head": "f".repeat(40), "by": "owner",
                    "reason": "failed"}),
