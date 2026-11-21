@@ -364,9 +364,11 @@ itself has no hold to take (the live binary predates it): stop
 `~/.local/share/spawn-rsi/controllers/<name>` is a symlink to
 `<name>-<commit>`, that commit's `git archive`, read-only, with what the gate
 needs from a controller that git does not hold (for Spawn, `web/node_modules`,
-which `check-web.sh` builds the UI with: a reflink copy of the deploying
-checkout's, a few MB of metadata on btrfs; refused unless it was installed from
-the commit's lockfile). `deploy/controller.sh` builds one and switches the
+which `check-web.sh` builds the UI with: a copy of the deploying
+checkout's set — a reflink on btrfs, a few MB of metadata, and a full copy
+where the filesystem makes no reflinks (never a hardlink); refused unless it
+was installed from the commit's lockfile). `deploy/controller.sh` builds one
+and switches the
 symlink atomically (rename over it); the one it replaces stays as
 `<name>.prev`, and older ones are removed once no process uses them. The
 integrator resolves the symlink once per step (gate and scenarios), so a gate

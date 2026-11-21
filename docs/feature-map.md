@@ -155,9 +155,9 @@
 
 - 能力：验证 accepted verdict，构建和安装 artifact，迁移 schema，切换 controller，移动 main，重启 loop/integrate/serve/relay。
 - 入口：`deploy/deploy.sh`、`deploy/controller.sh`、`deploy/cutover-controller.sh`、`deploy/systemd/*.service`。
-- 代码：`deploy/deploy.sh:543-652`、`deploy/deploy.sh:654-776`、`deploy/controller.sh:200-268`、`deploy/systemd/spawn-loop.service:1-30`、`deploy/systemd/spawn-integrate.service:1-26`。
-- 实现状态：`已实现`。部署脚本有恢复记录和 fake-live 测试；实际部署仍必须独立记录 commit、环境和 unit 健康。
-- 测试证据：`deploy/test-deploy.sh:348-414` 覆盖 pending 恢复；`deploy/test-deploy.sh:596-789` 覆盖 drain/timeout；`deploy/test-controller.sh:70-181` 覆盖原子切换和保留。
+- 代码：`deploy/deploy.sh:544-653`、`deploy/deploy.sh:655-777`、`deploy/controller.sh:179-196`、`deploy/controller.sh:208-273`、`deploy/controller.sh:329-373`、`deploy/controller.sh:377-404`、`deploy/systemd/spawn-loop.service:1-30`、`deploy/systemd/spawn-integrate.service:1-26`。
+- 实现状态：`已实现`。部署脚本有恢复记录和 fake-live 测试；实际部署仍必须独立记录 commit、环境和 unit 健康。controller 的 `web/node_modules` 复制在文件系统支持时走 reflink，不支持时走真实全量复制，两条路径都产生独立 inode；硬链接回退已移除，因为共享 inode 会让源目录的写入到达只读 controller。同一语义在 `crates/spawn-cli/src/integrate/owner.rs:877-895` 的候选树复制中保持一致。
+- 测试证据：`deploy/test-deploy.sh:348-414` 覆盖 pending 恢复；`deploy/test-deploy.sh:596-789` 覆盖 drain/timeout；`deploy/test-controller.sh:72-113` 覆盖构建副本、inode 独立性和强制无 reflink 的全量复制回退；`deploy/test-controller.sh:125-267` 覆盖原子切换和保留；`crates/spawn-cli/src/integrate/owner.rs:2132-2180` 断言候选树复制得到独立 inode 且对副本的写不触及 controller。Linux/x86_64、Debian 12、ext4（`cp --reflink=always` 返回 Operation not supported）、Rust 1.95.0、git 2.43.0、bash 5.2.15、mawk 1.3.4（在 `unshare -rm` 命名空间内绑定为 awk）、一次性 PostgreSQL 16.4 集群（独立 socket 与 data 目录，trust 认证）、独立临时 checkout/target/logs，于 2026-11-21 运行：`cargo test -p spawn-cli` 三个测试二进制共 1236 通过、0 失败、3 忽略（1234+1+1，含新增的 inode 独立性测试）；`cargo test -p spawn-host` 共 151 通过、0 失败、1 忽略；`bash deploy/test-controller.sh` 为 79 ok、0 失败；`bash deploy/test-session-backup.sh` 为 124 ok、0 失败；`python3 -I scripts/check-feature-map.py` 为 19 条目 177 引用 OK，`--self-test` 7 个负例 OK，`git diff --check` 无输出，公司标记/`.internal`/私有网段 IP/个人标识扫描全部 none。这些是隔离临时目录的结果，不连接任何现有服务。
 - 部署状态：`部署未验证`。本次只读脚本，没有运行 deploy、systemctl 或健康检查。
 - 已知缺口：写入新事件后的旧二进制回滚受版本兼容约束；cutover 含主机特定配置和无界 gate 等待。既有 engine 在 restart/resume 前保留旧环境。
 - 下一步：在 GNU/Linux 隔离环境运行 fake-live deploy/controller 测试；真实部署后记录 installed commit、unit 状态、HTTP/DB 检查和新 engine 环境。

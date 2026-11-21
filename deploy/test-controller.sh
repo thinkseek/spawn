@@ -77,11 +77,41 @@ check "names its commit" [ "$(cat "$dir/spawn-$A/.controller")" = "$A" ]
 check "web/node_modules is copied in" [ "$(cat "$dir/spawn-$A/web/node_modules/.bin/tool")" = "tool v1" ]
 check "the copy is not the source's inodes (reflink or copy here)" \
   [ "$(stat -c %i "$modules/.bin/tool")" != "$(stat -c %i "$dir/spawn-$A/web/node_modules/.bin/tool")" ]
+
+echo "== a filesystem without reflinks: the fallback is a full copy, not hardlinks"
+# A PATH shim whose cp fails every --reflink=always attempt, as GNU cp does
+# on ext4 ("Operation not supported"), passing other arguments through. The
+# fallback must still give the controller its own inodes.
+shim=$scratch/cp-shim
+mkdir -p "$shim"
+real_cp=$(command -v cp)
+cat >"$shim/cp" <<SH
+#!/bin/sh
+for arg in "\$@"; do
+  if [ "\$arg" = "--reflink=always" ]; then
+    echo "cp: failed to clone: Operation not supported" >&2
+    exit 1
+  fi
+done
+exec "$real_cp" "\$@"
+SH
+chmod +x "$shim/cp"
+out=$(PATH="$shim:$PATH" ctl build spawn "$git_dir" "$B" "$modules" 2>"$scratch/err-noreflink")
+check "builds when the filesystem makes no reflinks" [ "$out" = "$dir/spawn-$B" ]
+check "the fallback copy has its own inodes, not the source's" \
+  [ "$(stat -c %i "$modules/.bin/tool")" != "$(stat -c %i "$dir/spawn-$B/web/node_modules/.bin/tool")" ]
+check "the fallback copy holds the bytes" \
+  [ "$(cat "$dir/spawn-$B/web/node_modules/.bin/tool")" = "tool v1" ]
+check "it warns the set is a full copy" grep -q "full copy" "$scratch/err-noreflink"
+chmod -R u+w "$dir/spawn-$B"
+rm -rf "$dir/spawn-$B"
+
 echo "tool v2" >"$modules/.bin/tool.new" && mv "$modules/.bin/tool.new" "$modules/.bin/tool"
 check "a reinstall in the source does not reach it" [ "$(cat "$dir/spawn-$A/web/node_modules/.bin/tool")" = "tool v1" ]
 check "a file of the tree is read-only" bash -c '! echo x 2>/dev/null >"$1"' _ "$dir/spawn-$A/rsi/scenarios/which"
 check "no file can be added to the tree" bash -c '! touch "$1" 2>/dev/null' _ "$dir/spawn-$A/rsi/scenarios/new.sh"
 check "nothing is current before a switch" [ ! -e "$dir/spawn" ]
+
 echo "lockfile v2" >"$modules/.pnpm/lock.yaml"
 set +e
 ctl build spawn "$git_dir" "$B" "$modules" >/dev/null 2>"$scratch/err"
@@ -261,8 +291,10 @@ check "spawn is untouched" [ "$(readlink "$dir/spawn")" = "spawn-$C" ]
 
 echo "== a deps store (a commit with a pnpm-lock.yaml at its root)"
 # A stub pnpm: `install` writes the installed lockfile where pnpm keeps it,
-# and a tool a tree runs. SPAWN_PNPM_STUB_HARDLINK=1 makes it import as
-# hardlinks, as pnpm's default import method may.
+# and a tool a tree runs. A tree holding .pnpm-stub-hardlink makes it import
+# as hardlinks, as pnpm's default import method may: the marker is a file of
+# the commit, so it survives web-install.sh's `env -i`, which keeps only
+# PATH, HOME and LC_ALL (an exported variable would not reach the stub).
 pnpm_dir=$scratch/bin
 mkdir -p "$pnpm_dir"
 cat >"$pnpm_dir/pnpm" <<'SH'
@@ -281,7 +313,7 @@ esac
 mkdir -p node_modules/.pnpm node_modules/.bin
 cp pnpm-lock.yaml node_modules/.pnpm/lock.yaml
 printf 'tool: %s\n' "$(cat pnpm-lock.yaml)" >node_modules/.bin/tool
-[ "${SPAWN_PNPM_STUB_HARDLINK-}" = 1 ] && ln pnpm-lock.yaml node_modules/.pnpm/hardlinked
+[ -f .pnpm-stub-hardlink ] && ln pnpm-lock.yaml node_modules/.pnpm/hardlinked
 exit 0
 SH
 chmod +x "$pnpm_dir/pnpm"
@@ -289,11 +321,18 @@ export SPAWN_PNPM=$pnpm_dir/pnpm
 deps_dir=$SPAWN_LIVE/deps
 lock_sha() { sha256sum | cut -d' ' -f1; }
 sha_of() { printf '%s\n' "$1" | lock_sha; }
-commit_root() { # commit_root <label> <lockfile>
+commit_root() { # commit_root <label> <lockfile> [<hardlink-marker>]
   mkdir -p "$src/rsi/scenarios" "$src/scripts" "$src/web"
   echo "$1" >"$src/rsi/scenarios/which"
   printf '#!/bin/sh\nexec cat "$(dirname "$0")/../rsi/scenarios/which"\n' >"$src/scripts/gate.sh"
   printf '%s\n' "$2" >"$src/pnpm-lock.yaml"
+  # web-install.sh --strict=supply requires a real pnpm-workspace.yaml and
+  # package.json at the root; the packages glob points at a directory the
+  # fixture never creates, which the validator skips.
+  printf 'packages:\n  - apps/*\n' >"$src/pnpm-workspace.yaml"
+  printf '{}\n' >"$src/package.json"
+  # A third argument plants the stub-hardlink marker in the commit's tree.
+  [ -z "${3-}" ] || printf '%s\n' "$3" >"$src/.pnpm-stub-hardlink"
   git -C "$src" add -A
   git -C "$src" -c user.name=t -c user.email=t@t commit -q -m "$1"
   git -C "$src" rev-parse HEAD
@@ -301,7 +340,7 @@ commit_root() { # commit_root <label> <lockfile>
 E=$(commit_root E "lockfile v1")
 F=$(commit_root F "lockfile v2")
 G=$(commit_root G "lockfile v3")
-H=$(commit_root H "lockfile v4")
+H=$(commit_root H "lockfile v4" hardlink)
 one=$(sha_of "lockfile v1")
 two=$(sha_of "lockfile v2")
 three=$(sha_of "lockfile v3")
@@ -344,7 +383,7 @@ ctl deps-prune supply-pa >/dev/null 2>"$scratch/err"
 check "once the workspace is gone, deps-prune removes it" [ ! -e "$deps_dir/supply-pa/$one" ]
 check "and keeps the current one" [ -d "$deps_dir/supply-pa/$three" ]
 set +e
-SPAWN_PNPM_STUB_HARDLINK=1 ctl deps supply-pa "$git_dir" "$H" >/dev/null 2>"$scratch/err"
+ctl deps supply-pa "$git_dir" "$H" >/dev/null 2>"$scratch/err"
 status=$?
 set -e
 four=$(sha_of "lockfile v4")

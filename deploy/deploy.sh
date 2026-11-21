@@ -77,10 +77,11 @@
 #      password reaches pg_dump through PGPASSWORD, never argv);
 #   5. HEAD is exported (`git archive`, so nothing untracked or ignored in
 #      the checkout is built) to $TMPDIR/spawn-deploy-export-<uid>, with the
-#      checkout's web/node_modules linked in; the controller for HEAD is
+#      checkout's web/node_modules copied in; the controller for HEAD is
 #      built beside the current one ($live/controllers/spawn-<head>, its
-#      web/node_modules a reflink copy of the checkout's, which must be
-#      installed from HEAD's lockfile); a release build without the
+#      web/node_modules a reflink copy of the checkout's where the filesystem
+#      supports reflinks, otherwise a full copy, never a hardlink, and it must
+#      be installed from HEAD's lockfile); a release build without the
 #      compiler cache into the persistent SPAWN_DEPLOY_TARGET (default
 #      ~/.cache/spawn/deploy-target) and the UI build (only
 #      web/vite.config.ts, named with --config; postcss configured inline)
