@@ -354,7 +354,14 @@ PROC_MACRO = re.compile(r"(?m)^\s*proc-macro\s*=\s*true\b")
 
 
 def static_build_time(repo, candidate, paths):
-    """The subset of gate.sh's no-build-time-code rule a diff can decide."""
+    """A superset of gate.sh's no-build-time-code rule.
+
+    The gate rejects `build.rs` and `.cargo/`; this also rejects a
+    `Cargo.toml` that sets `build =` or declares a proc-macro, which is
+    stricter than the gate.  Over-strict is the safe direction for a static
+    check; the gate's `cargo metadata` rule is the authority for a live
+    install.
+    """
     bad = []
     for path in paths:
         if path == "build.rs" or path.endswith("/build.rs"):
