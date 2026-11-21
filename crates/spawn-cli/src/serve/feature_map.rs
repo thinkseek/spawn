@@ -572,7 +572,14 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         .filter(|task| task_in_flight(task, gated))
         .max_by_key(|task| task_key(task));
     let newest_task = tasks.iter().copied().max_by_key(|task| task_key(task));
-    let blocker = blocked_of(state, mission_id, newest_in_flight, newest_task, facts);
+    let blocker = blocked_of(
+        state,
+        mission_id,
+        gated,
+        newest_in_flight,
+        newest_task,
+        facts,
+    );
     let mut gaps = landing_gaps(spec, &present, &landed, &unverified, &checks);
     gaps.extend(delivery_gaps(
         state,
@@ -582,19 +589,21 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         tasks.is_empty(),
     ));
     gaps.extend(accepted_gaps(spec, mission));
-    let complete = state == "live"
+    let complete = live
+        && verified
         && missing.is_empty()
-        && landed.len() == spec.objectives.len()
-        && unverified.is_empty();
+        && landed.len() == spec.objectives.len();
     json!({
         "id": spec.id,
         "title": spec.title,
         "summary": spec.summary,
         "state": state,
-        "planned": state == "planned",
-        "implemented": state != "planned",
-        "verified": state == "verified" || state == "live",
-        "live": state == "live",
+        // Four separate pieces of evidence, not synonyms: a live
+        // capability can be unverified, and says so.
+        "planned": !implemented,
+        "implemented": implemented,
+        "verified": verified,
+        "live": live,
         "complete": complete,
         "objectives": spec.objectives,
         "objective_rows": rows.iter().map(|row| json!({
@@ -885,6 +894,7 @@ fn unmatched_accepted(spec: &Spec, task: &Value) -> bool {
 fn blocked_of(
     state: &str,
     mission_id: i64,
+    gated: bool,
     newest_in_flight: Option<&Value>,
     newest_task: Option<&Value>,
     facts: &Facts,
@@ -907,8 +917,8 @@ fn blocked_of(
         return Value::Null;
     };
     let kind = match task["state"].as_str() {
-        Some("revise") => "sent_back",
         Some("cancelled") => "cancelled",
+        Some("accepted") if !gated => "accepted_without_landing",
         _ => return Value::Null,
     };
     let reason = task["review_note"]
