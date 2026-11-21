@@ -30,21 +30,41 @@
 //! never does is call a landing, a merge or a review live.
 //!
 //! The mapping is a mission's `objectives.features`, an absolute path (or
-//! one relative to the mission's backlog) to a JSON file:
+//! one relative to the mission's backlog) to a JSON file. A capability
+//! names provenance sources, native or external; an `objective` source is
+//! what decides its state:
 //!
 //! ```json
 //! {"features": [
 //!   {"id": "feature-map", "title": "Feature map",
 //!    "summary": "planned, implemented, verified and live capabilities",
-//!    "objectives": [488],
-//!    "issues": [{"url": "https://github.com/acupof-ai/Spawn/issues/63",
-//!                "title": "a feature map", "number": 63}],
-//!    "prs": [{"url": "https://github.com/acupof-ai/Spawn/pull/69"}]}
+//!    "sources": [
+//!      {"kind": "objective", "objective": 488},
+//!      {"kind": "issue", "ref": "63", "title": "a feature map",
+//!       "url": "https://github.com/thinkseek/spawn/issues/63"},
+//!      {"kind": "pr", "ref": "69",
+//!       "url": "https://github.com/thinkseek/spawn/pull/69"},
+//!      {"kind": "mission", "mission": 7},
+//!      {"kind": "task", "task": 544},
+//!      {"kind": "request", "ref": "owner-2026-11-21"}
+//!    ]}
 //! ]}
 //! ```
 //!
-//! Without one, each backlog objective is a capability of its own. A
-//! mapping that cannot be read falls back to the objectives and names the
+//! The native kinds (`objective`, `mission`, `task`, `verification`,
+//! `deploy`) link the records Spawn already holds, by a stable reference
+//! (`objective:4/488`, `mission:7`, `task:544`, `verification:4/488`,
+//! `deploy:1234`); every other kind is an external reference with a stable
+//! `ref` and an optional http(s) `url`. The page also adds the native
+//! sources that exist whether or not the file names them: each objective,
+//! each task a person assigned, each verification and the deploy that made
+//! the capability live. Two sources with one reference are one source; an
+//! objective belongs to one capability. A source is never a state: external
+//! content, a merged PR or a person's request does not change what the
+//! records prove.
+//!
+//! Without a mapping, each backlog objective is a capability of its own.
+//! A mapping that cannot be read falls back to the objectives and names the
 //! error: the page stays useful, and the gap is visible.
 //!
 //! `GET /api/features[?mission=<id>][&limit=<missions>]` answers the map;
