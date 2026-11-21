@@ -320,6 +320,11 @@ pub(crate) struct Reissue {
     pub(crate) attempts: Vec<Attempt>,
 }
 
+/// A task row's mission state when its row names none (every row does).
+fn open_state() -> String {
+    "open".to_string()
+}
+
 /// One task row from `delivery_rows`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TaskRow {
@@ -343,6 +348,14 @@ pub(crate) struct TaskRow {
     /// The mission has a gate: its accepted work still has to land.
     #[serde(default)]
     pub(crate) gated: bool,
+    /// Its mission's state (`open`, `active`, `closed`, ...): work stealing
+    /// only takes a task of an open mission, as the store's rule says.
+    #[serde(default = "open_state")]
+    pub(crate) mission_state: String,
+    /// Its mission is halted (`spawn mission halt`): work stealing leaves its
+    /// tasks where they are, as the store does.
+    #[serde(default)]
+    pub(crate) mission_halted: bool,
     /// The models the task's worker runs on.
     #[serde(default)]
     pub(crate) model: ModelProfile,
