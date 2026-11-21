@@ -563,6 +563,7 @@ mod tests {
             "/api/missions",
             "/api/rsi",
             "/api/rsi/pane",
+            "/api/features",
             "/api/scorecard",
             "/api/pane/session_a",
         ] {
