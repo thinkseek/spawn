@@ -573,10 +573,16 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         .max_by_key(task_key);
     let newest_task = tasks.iter().copied().max_by_key(task_key);
     let blocker = blocked_of(state, mission_id, newest_in_flight, newest_task, facts);
-    let gaps = gaps_of(
-        spec, &present, &landed, &unverified, &checks, mission, anchor, shipped, state,
+    let mut gaps = landing_gaps(spec, &present, &landed, &unverified, &checks);
+    gaps.extend(delivery_gaps(
+        state,
+        &landed,
+        mission,
+        anchor,
+        shipped,
         tasks.is_empty(),
-    );
+    ));
+    gaps.extend(accepted_gaps(spec, mission));
     let complete = state == "live"
         && missing.is_empty()
         && landed.len() == spec.objectives.len()
