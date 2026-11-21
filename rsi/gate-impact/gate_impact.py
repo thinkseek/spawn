@@ -456,6 +456,12 @@ def select(opts):
     web_specs = ["web/src/", "web/test/", "web/index.html",
                  "web/package.json", "web/package-lock.json", "web/pnpm-lock.yaml"]
     scripts_specs = ["scripts/"]
+    # The backlog is not inert data: crates/spawn-cli/src/objectives.rs loads
+    # the tree's real rsi/backlog under `cargo test`, so check-tests.sh (and
+    # only check-tests.sh) reads it.  The README floor sentence is read by
+    # scenario 008.  Neither may sit in the "no job reads it" docs class.
+    backlog_specs = ["rsi/backlog/"]
+    readme_specs = ["README.md"]
     keys = {
         "static": key_for(version, env, {
             "protected": sha_text(protected_text),
@@ -464,6 +470,8 @@ def select(opts):
         "rust": tree_key(repo, candidate, rust_specs, version),
         "web": tree_key(repo, candidate, web_specs, version),
         "scripts": tree_key(repo, candidate, scripts_specs, version),
+        "backlog": tree_key(repo, candidate, backlog_specs, version),
+        "readme": tree_key(repo, candidate, readme_specs, version),
     }
     base_keys = {
         "static": key_for(version, env, {
@@ -473,6 +481,8 @@ def select(opts):
         "rust": tree_key(repo, base, rust_specs, version),
         "web": tree_key(repo, base, web_specs, version),
         "scripts": tree_key(repo, base, scripts_specs, version),
+        "backlog": tree_key(repo, base, backlog_specs, version),
+        "readme": tree_key(repo, base, readme_specs, version),
     }
     scenarios_dir = policy["journey_dir"]
     scenario_names = top_level_scenarios(repo, candidate, scenarios_dir)
