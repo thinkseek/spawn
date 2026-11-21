@@ -22,14 +22,17 @@ const USAGE: &str = "usage:
       the database merges them under its lock, checks the result and records it whole.
       A setting is cleared only by its own switch, which takes no value: --no-gate,
       --no-budget (every field), --no-minutes, --no-tool-calls, --no-daily-usd, --no-objectives,
-      --no-workers (back to the default 1); a switch and a value for the same setting
-      are refused. Prints {mission, before, after}; with nothing given it changes nothing.
+      --no-workers (back to the default 1), --no-features; a switch and a value for the
+      same setting are refused. Prints {mission, before, after}; with nothing given it
+      changes nothing.
       Clearing the gate, or moving accept away from gate, waits while a task is landing.
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
                 [--daily-usd <US dollars above 0>]
-                [--backlog <dir> --resident <name> [--workers N]]
+                [--backlog <dir> --resident <name> [--workers N] [--features <file>]]
                 (with add, all of them at once; with configure, any of them alone, and
                 --backlog with --resident for a mission without objectives)
+                (--features: the mission's feature map, a JSON file of capabilities and
+                their provenance sources; identities and links only, never a status)
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
                 (--daily-usd: what the mission's model calls may cost in a UTC day; the
@@ -383,6 +386,7 @@ impl Settings {
             budget.insert("daily_usd".to_string(), json!(usd));
         }
         let workers = number("workers")?;
+        let features = features_file(flags, "features", 0)?;
         let objectives = match (directory(flags, "backlog")?, flags.get("resident")) {
             (Some(backlog), Some(resident)) => {
                 let mut objectives = json!({"backlog": backlog, "resident": resident});
@@ -391,12 +395,15 @@ impl Settings {
                 if let (Some(workers), Some(map)) = (workers, objectives.as_object_mut()) {
                     map.insert("workers".to_string(), json!(workers));
                 }
+                if let (Some(features), Some(map)) = (features, objectives.as_object_mut()) {
+                    map.insert("features".to_string(), json!(features));
+                }
                 Some(objectives)
             }
-            (None, None) if workers.is_none() => None,
+            (None, None) if workers.is_none() && features.is_none() => None,
             (None, None) => {
                 return Err(format!(
-                    "--workers goes with --backlog and --resident\n{USAGE}"
+                    "--workers and --features go with --backlog and --resident\n{USAGE}"
                 ));
             }
             _ => return Err(format!("--backlog and --resident go together\n{USAGE}")),
@@ -442,9 +449,27 @@ fn dollars(flags: &Flags) -> Result<Option<f64>, String> {
     }
 }
 
+/// A mission's feature map: an absolute path to a JSON file, resolved
+/// against the working directory and checked now, so a typo or an invalid
+/// map is refused when it is configured rather than silently ignored by the
+/// page. `mission_id` is 0 when the mission has no id yet (`mission add`):
+/// the map may still name its own mission's objectives.
+fn features_file(flags: &Flags, name: &str, mission_id: i64) -> Result<Option<String>, String> {
+    let Some(text) = flags.get(name) else {
+        return Ok(None);
+    };
+    let path = std::path::absolute(&text).map_err(|error| format!("--{name}: {error}"))?;
+    if !path.is_file() {
+        return Err(format!("--{name} {} is not a file", path.display()));
+    }
+    crate::serve::feature_map::validate_file(&path, mission_id)
+        .map_err(|error| format!("--{name} {}: {error}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 /// `configure`'s clearing switches (they take no value), and the setting
 /// (and key in it) each clears.
-const CLEARING: [(&str, &str, Option<&str>); 7] = [
+const CLEARING: [(&str, &str, Option<&str>); 8] = [
     ("no-gate", "gate", None),
     ("no-budget", "budget", None),
     ("no-minutes", "budget", Some("minutes")),
@@ -452,6 +477,7 @@ const CLEARING: [(&str, &str, Option<&str>); 7] = [
     ("no-daily-usd", "budget", Some("daily_usd")),
     ("no-objectives", "objectives", None),
     ("no-workers", "objectives", Some("workers")),
+    ("no-features", "objectives", Some("features")),
 ];
 
 /// The change `spawn mission configure` asks for (objective 027): only the
@@ -461,7 +487,7 @@ const CLEARING: [(&str, &str, Option<&str>); 7] = [
 /// cleared, or a flag configure does not know, is refused. No flag at all is
 /// an empty change, which changes and records nothing.
 fn change(flags: &Flags) -> Result<Value, String> {
-    const KNOWN: [&str; 9] = [
+    const KNOWN: [&str; 10] = [
         "id",
         "gate",
         "accept",
@@ -471,6 +497,7 @@ fn change(flags: &Flags) -> Result<Value, String> {
         "backlog",
         "resident",
         "workers",
+        "features",
     ];
     if let Some(unknown) = flags.names().find(|name| !KNOWN.contains(name)) {
         return Err(format!(
@@ -525,6 +552,10 @@ fn change(flags: &Flags) -> Result<Value, String> {
     if let Some(workers) = number("workers")? {
         part("objectives", Some("workers"), json!(workers));
     }
+    let mission = flags.get("id").and_then(|id| id.parse::<i64>().ok()).unwrap_or(0);
+    if let Some(features) = features_file(flags, "features", mission)? {
+        part("objectives", Some("features"), json!(features));
+    }
     // Every value flag and the setting (and key) it writes.
     let written = [
         ("gate", "gate", None),
@@ -535,6 +566,7 @@ fn change(flags: &Flags) -> Result<Value, String> {
         ("backlog", "objectives", Some("backlog")),
         ("resident", "objectives", Some("resident")),
         ("workers", "objectives", Some("workers")),
+        ("features", "objectives", Some("features")),
     ];
     for (switch, setting, key) in CLEARING {
         if !flags.switch(switch) {
