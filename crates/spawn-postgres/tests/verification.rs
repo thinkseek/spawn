@@ -190,9 +190,9 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     mission(&mut client, 4);
     mission(&mut client, 9);
     assigned(&mut client, 1, 4, 133, BRIEF_133);
-    landed(&mut client, 1);
+    let landed_1 = landed(&mut client, 1);
     assigned(&mut client, 2, 9, 133, "Objective 133 of another mission.");
-    landed(&mut client, 2);
+    let landed_2 = landed(&mut client, 2);
     assigned(
         &mut client,
         3,
@@ -210,13 +210,13 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
         28,
         "Objective 28 again.\nVerified by: the first.\n\n  Verified by: the second.  \nrev-g reviews.",
     );
-    landed(&mut client, 4);
+    let landed_4 = landed(&mut client, 4);
     // Assigned, never landed: no landing.
     assigned(&mut client, 5, 4, 29, "Objective 29.\nVerified by: never.");
-    store
+    let failed = store
         .verification_record(&verification(4, 133, "fail"))
         .expect("a fail");
-    store
+    let passed = store
         .verification_record(&verification(9, 133, "pass"))
         .expect("a pass");
     store
