@@ -577,7 +577,6 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
     gaps.extend(delivery_gaps(
         state,
         &landed,
-        mission,
         anchor,
         shipped,
         tasks.is_empty(),
@@ -762,19 +761,16 @@ fn checks_of(landed: &BTreeMap<u32, Landing>, mission_id: i64, facts: &Facts) ->
         .collect()
 }
 
-/// The gaps a capability's evidence leaves, each a fact and the objectives
-/// it is about. No percentages: a gap names what is missing.
-fn gaps_of(
+/// The gaps between a capability and its objectives: one it names but the
+/// backlog does not hold, one never landed, one landed but never verified,
+/// one whose verification failed. No percentages: a gap names what is
+/// missing.
+fn landing_gaps(
     spec: &Spec,
     present: &BTreeSet<u32>,
     landed: &BTreeMap<u32, Landing>,
     unverified: &[u32],
     checks: &[Value],
-    mission: &Value,
-    anchor: Option<&Value>,
-    shipped: bool,
-    state: &str,
-    no_task: bool,
 ) -> Vec<Value> {
     let mut gaps = Vec::new();
     if spec.objectives.is_empty() {
@@ -799,62 +795,85 @@ fn gaps_of(
     if !unlanded.is_empty() {
         gaps.push(json!({"kind": "not_landed", "objectives": unlanded}));
     }
-    if !unverified.is_empty() {
-        let failed: Vec<u32> = checks
-            .iter()
-            .filter(|check| check["result"] == "fail")
-            .filter_map(|check| u32::try_from(check["objective"].as_u64()?).ok())
-            .collect();
-        if !failed.is_empty() {
-            gaps.push(json!({"kind": "verification_failed", "objectives": failed}));
-        }
-        let open: Vec<u32> = unverified
-            .iter()
-            .copied()
-            .filter(|number| !failed.contains(number))
-            .collect();
-        if !open.is_empty() {
-            gaps.push(json!({"kind": "unverified", "objectives": open}));
-        }
+    let failed: Vec<u32> = checks
+        .iter()
+        .filter(|check| check["result"] == "fail")
+        .filter_map(|check| u32::try_from(check["objective"].as_u64()?).ok())
+        .collect();
+    if !failed.is_empty() {
+        gaps.push(json!({"kind": "verification_failed", "objectives": failed}));
     }
+    let open: Vec<u32> = unverified
+        .iter()
+        .copied()
+        .filter(|number| !failed.contains(number))
+        .collect();
+    if !open.is_empty() {
+        gaps.push(json!({"kind": "unverified", "objectives": open}));
+    }
+    gaps
+}
+
+/// The gaps between a landing and a running product: a mission Spawn's own
+/// deploy does not ship (live is not observable), or one it does and the
+/// landing is not in a successful deploy yet.
+fn delivery_gaps(
+    state: &str,
+    landed: &BTreeMap<u32, Landing>,
+    mission: &Value,
+    anchor: Option<&Value>,
+    shipped: bool,
+    no_task: bool,
+) -> Vec<Value> {
+    let mut gaps = Vec::new();
     if state == "planned" && no_task {
         gaps.push(json!({"kind": "no_task",
                          "detail": "no task has ever been assigned for it"}));
     }
-    if state != "planned" && shipped {
-        match anchor {
-            None => gaps.push(json!({"kind": "no_deploy_record",
-                                     "detail": "no deploy.finished has been recorded"})),
-            Some(anchor) => {
-                let at = anchor["at_ms"].as_i64().unwrap_or(i64::MAX);
-                let waiting: Vec<u32> = landed
-                    .values()
-                    .filter(|landing| landing.at_ms >= at)
-                    .map(|landing| landing.objective)
-                    .collect();
-                if !waiting.is_empty() {
-                    gaps.push(json!({"kind": "not_deployed", "objectives": waiting,
-                                     "detail": "landed after the newest successful deploy"}));
-                }
-            }
-        }
+    if state == "planned" {
+        return gaps;
     }
-    if state != "planned" && !shipped {
+    if !shipped {
         gaps.push(json!({"kind": "live_not_observable",
                          "detail": "no deploy ships this mission's source"}));
+        return gaps;
     }
-    let ungated = mission["gate"].is_null();
-    if ungated
-        && mission["tasks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|task| unmatched_accepted(spec, task))
-    {
-        gaps.push(json!({"kind": "accepted_without_landing",
-                         "detail": "the mission has no gate: an accepted task never lands"}));
+    let Some(anchor) = anchor else {
+        gaps.push(json!({"kind": "no_deploy_record",
+                         "detail": "no deploy.finished has been recorded"}));
+        return gaps;
+    };
+    let at = anchor["at_ms"].as_i64().unwrap_or(i64::MAX);
+    let waiting: Vec<u32> = landed
+        .values()
+        .filter(|landing| landing.at_ms >= at)
+        .map(|landing| landing.objective)
+        .collect();
+    if !waiting.is_empty() {
+        gaps.push(json!({"kind": "not_deployed", "objectives": waiting,
+                         "detail": "landed after the newest successful deploy"}));
     }
+    let _ = mission;
     gaps
+}
+
+/// An accepted task of a mission without a gate never lands: its work is
+/// closed, and the map says so rather than counting it implemented.
+fn accepted_gaps(spec: &Spec, mission: &Value) -> Vec<Value> {
+    if !mission["gate"].is_null() {
+        return Vec::new();
+    }
+    let accepted = mission["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|task| unmatched_accepted(spec, task));
+    if accepted {
+        vec![json!({"kind": "accepted_without_landing",
+                    "detail": "the mission has no gate: an accepted task never lands"})]
+    } else {
+        Vec::new()
+    }
 }
 
 /// An accepted task of a mission without a gate: its work is closed, not
