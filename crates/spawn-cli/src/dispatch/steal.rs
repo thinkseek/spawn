@@ -85,10 +85,10 @@ fn stealable(work: &Work, task: &TaskRow) -> bool {
 
 /// This pass's tries, `(taker's name, the tasks it may try in order)`: for
 /// each pool, its idle approved residents in name order, each with the
-/// pool's stealable queued tasks of other members, lowest id first, not
-/// already planned to another resident. The store checks every rule again
-/// (a delivery command, a move that just happened among them); a refusal
-/// lets the taker try its next one in the same pass ([`run`]).
+/// pool's stealable queued tasks not its own, lowest id first. The store
+/// checks every rule again (a delivery command, a move that just happened
+/// among them); a refusal lets the taker try its next one in the same pass,
+/// and a task another taker already moved is skipped ([`attempt`]).
 pub(crate) fn choices(work: &Work) -> Vec<(String, Vec<i64>)> {
     let pool_of: BTreeMap<&str, &str> = work
         .residents
@@ -116,45 +116,41 @@ pub(crate) fn choices(work: &Work) -> Vec<(String, Vec<i64>)> {
         let mut sorted = residents;
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         for resident in sorted.into_iter().filter(|resident| idle(work, resident)) {
-            let mut mine: Vec<i64> = candidates
-                .iter()
-                .filter(|task| {
-                    task.session_id != resident.session_id
-                        && !tries.iter().any(|(_, planned): &(String, Vec<i64>)| {
-                            planned.contains(&task.id)
-                        })
-                })
-                .map(|task| task.id)
-                .collect();
-            mine.shrink_to_fit();
-            tries.push((resident.name.clone(), mine));
+            tries.push((
+                resident.name.clone(),
+                candidates
+                    .iter()
+                    .filter(|task| task.session_id != resident.session_id)
+                    .map(|task| task.id)
+                    .collect(),
+            ));
         }
     }
     tries
 }
 
-/// The first of a taker's `tasks` it wins, trying each in order through
-/// `steal`: the first success is its move for the pass and no other is
-/// tried; a refusal is a line in `lines` and the next one is tried. A task
-/// another taker already moved this pass is skipped. Returns whether any
-/// move was made.
-fn attempt<T>(
+/// The moves of one pass's tries ([`choices`]), each tried in order through
+/// `steal`: the first of a taker's tasks it wins is its one move for the
+/// pass; a refusal is a line in `lines` and its next task is tried, and a
+/// task another taker already moved is skipped. The store's answer names
+/// from and to whose session.
+fn attempt(
     tries: &[(String, Vec<i64>)],
     lines: &mut Vec<String>,
-    mut steal: impl FnMut(i64, &str) -> Result<T, String>,
-) -> bool {
-    let mut moved = BTreeSet::new();
-    let mut any = false;
+    mut steal: impl FnMut(i64, &str) -> Result<String, String>,
+) -> Vec<(i64, String)> {
+    let mut moved: BTreeSet<i64> = BTreeSet::new();
+    let mut moves = Vec::new();
     for (to, tasks) in tries {
         for task in tasks {
             if moved.contains(task) {
                 continue;
             }
             match steal(*task, to) {
-                Ok(_) => {
-                    lines.push(format!("dispatch: task #{task} stolen to {to}"));
+                Ok(where_) => {
+                    lines.push(format!("dispatch: task #{task} stolen {where_}"));
                     moved.insert(*task);
-                    any = true;
+                    moves.push((*task, to.clone()));
                     break;
                 }
                 Err(error) => lines.push(format!(
@@ -163,27 +159,25 @@ fn attempt<T>(
             }
         }
     }
-    any
+    moves
 }
 
 /// Make this pass's tries ([`choices`]) through the store, each said in
 /// `lines`, a refusal too. Returns whether any move was made, so the pass
 /// reads its work again before it plans deliveries; a pass whose tries were
-/// all refused changes nothing and needs no reload.
+/// all refused changed nothing and needs no reload.
 pub(crate) fn run(store: &PostgresStore, work: &Work, lines: &mut Vec<String>) -> bool {
-    let tries = choices(work);
-    attempt(&tries, lines, |task, to| {
-        store
+    let moves = attempt(&choices(work), lines, |task, to| {
+        let answer = store
             .task_steal(task, to, BY, Some(REASON))
-            .map(|answer| {
-                lines.push(format!(
-                    "dispatch: task #{task} stolen from {} to {}",
-                    answer["from_session"].as_str().unwrap_or("?"),
-                    answer["to_session"].as_str().unwrap_or("?")
-                ));
-            })
-            .map_err(|error| error.to_string())
-    })
+            .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "from {} to {}",
+            answer["from_session"].as_str().unwrap_or("?"),
+            answer["to_session"].as_str().unwrap_or("?")
+        ))
+    });
+    !moves.is_empty()
 }
 
 #[cfg(test)]
