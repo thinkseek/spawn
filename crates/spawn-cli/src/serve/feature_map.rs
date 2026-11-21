@@ -570,8 +570,8 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         .iter()
         .copied()
         .filter(|task| task_in_flight(task, gated))
-        .max_by_key(task_key);
-    let newest_task = tasks.iter().copied().max_by_key(task_key);
+        .max_by_key(|task| task_key(task));
+    let newest_task = tasks.iter().copied().max_by_key(|task| task_key(task));
     let blocker = blocked_of(state, mission_id, newest_in_flight, newest_task, facts);
     let mut gaps = landing_gaps(spec, &present, &landed, &unverified, &checks);
     gaps.extend(delivery_gaps(
@@ -1112,7 +1112,7 @@ fn cut(value: &Value) -> Value {
 mod tests {
     use std::path::Path;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         Facts, Spec, build, derive, fallback_specs, parse_mapping, read_mapping, shipped_by_deploy,
@@ -1161,7 +1161,7 @@ mod tests {
         })
     }
 
-    fn facts<'a>(
+    fn facts_of<'a>(
         landings: &'a [serde_json::Value],
         verifications: &'a [serde_json::Value],
         deployments: &'a [serde_json::Value],
@@ -1195,7 +1195,7 @@ mod tests {
             json!({"event": 400, "at_ms": 400, "ok": true, "head": "d".repeat(40), "by": "landing",
                    "reason": ""}),
         ];
-        let facts = facts(&landings, &verifications, &deployments, &[]);
+        let facts = facts_of(&landings, &verifications, &deployments, &[]);
         let planned = derive(&spec("p", &[1]), &mission(), &facts);
         assert_eq!(planned["state"], "planned");
         assert_eq!(planned["implemented"], false);
@@ -1229,7 +1229,7 @@ mod tests {
             json!({"event": 400, "at_ms": 400, "ok": true, "head": "d".repeat(40), "by": "landing",
                    "reason": ""}),
         ];
-        let facts = facts(&landings, &verifications, &deployments, &[]);
+        let facts = facts_of(&landings, &verifications, &deployments, &[]);
         let row = derive(&spec("late", &[2]), &mission(), &facts);
         assert_eq!(row["state"], "implemented");
         assert!(
@@ -1244,7 +1244,7 @@ mod tests {
             json!({"event": 900, "at_ms": 900, "ok": false, "head": "f".repeat(40), "by": "owner",
                    "reason": "failed"}),
         ];
-        let facts = facts(&landings, &verifications, &failed_only, &[]);
+        let facts = facts_of(&landings, &verifications, &failed_only, &[]);
         let row = derive(&spec("late", &[2]), &mission(), &facts);
         assert_eq!(row["state"], "implemented", "a failed deploy is no anchor");
     }
@@ -1259,7 +1259,7 @@ mod tests {
                                         "by": "lead", "how": "seen", "at_ms": 200, "event": 3})];
         let deployments = vec![json!({"event": 4, "at_ms": 400, "ok": true,
                                       "head": "d".repeat(40), "by": "landing", "reason": ""})];
-        let facts = facts(&landings, &verifications, &deployments, &[]);
+        let facts = facts_of(&landings, &verifications, &deployments, &[]);
         let mut row = mission();
         row["id"] = json!(6);
         row["sources"] = json!(["/m/missions/supply-pa.git"]);
@@ -1289,7 +1289,7 @@ mod tests {
         let blockers = vec![json!({"id": 4, "halt": null,
                                    "paused": {"reason": "owner hold", "event": 7, "at_ms": 70},
                                    "main_red": null})];
-        let facts = facts(&[], &[], &[], &blockers);
+        let facts = facts_of(&[], &[], &[], &blockers);
         let mut row = mission();
         row["tasks"] = json!([
             {"id": 60, "state": "delivered", "kind": "ephemeral", "agent_id": "a60",
@@ -1316,7 +1316,7 @@ mod tests {
              "session_id": "s70", "objective": 1, "revisions": 1, "candidate": null,
              "base": null, "updated_at_ms": 700, "review_note": "add the test", "gates": []}
         ]);
-        let facts = facts(&[], &[], &[], &[]);
+        let facts = facts_of(&[], &[], &[], &[]);
         let feature = derive(&spec("one", &[1]), &row, &facts);
         assert_eq!(feature["state"], "planned");
         assert_eq!(feature["blocked"]["kind"], "sent_back");
