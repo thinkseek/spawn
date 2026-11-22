@@ -316,7 +316,10 @@ export default function App() {
       ) : view === "missions" ? (
         <MissionsView missions={missions} />
       ) : view === "features" ? (
-        <FeatureMapView onOpenSession={openTimeline} />
+        <FeatureMapView
+          onOpenSession={openTimeline}
+          onOpenCoverage={() => setView("coverage")}
+        />
       ) : view === "coverage" ? (
         <CoveragePage />
       ) : view === "rsi" ? (

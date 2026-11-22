@@ -1,6 +1,7 @@
 import {
   ArrowUpRight,
   ExternalLink,
+  FileSearch,
   LayoutGrid,
   Network,
   OctagonAlert,
@@ -49,6 +50,8 @@ type ViewMode = "mindmap" | "columns";
 interface FeatureMapViewProps {
   /** Open a task's session timeline: the evidence behind a capability. */
   onOpenSession: (sessionId: string) => void;
+  /** Jump to the File coverage & one-click unassociated-file (wild file) scan page. */
+  onOpenCoverage?: () => void;
 }
 
 /** The Feature map: a mission's capabilities, planned, implemented,
@@ -56,7 +59,7 @@ interface FeatureMapViewProps {
  * interactive navigable Mind Map view, with a secondary State Columns audit
  * view. The states are the server's, derived from Spawn's log; this page
  * only lays them out. */
-export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
+export function FeatureMapView({ onOpenSession, onOpenCoverage }: FeatureMapViewProps) {
   const poll = usePoll("features", fetchFeatureMap, 4_000, { checked: true });
   const [chosen, setChosen] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("mindmap");
@@ -138,6 +141,17 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
             <LayoutGrid size={13} />
             State columns
           </button>
+          {onOpenCoverage && (
+            <button
+              type="button"
+              onClick={onOpenCoverage}
+              title="Open file coverage & one-click unassociated-file (野文件) scan"
+              className={cx(chip(false), FOCUS_RING)}
+            >
+              <FileSearch size={13} />
+              Wild-file scan
+            </button>
+          )}
         </div>
 
         {data && data.missions.length > 1 && (

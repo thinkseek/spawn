@@ -70,3 +70,20 @@ Do **not** split out an external repository or publish a standalone crate until 
 3. The query/graph/coverage/storage-key traits have proven stable under at least two distinct IO adapters (e.g., local working tree + git bare repo tree / CAS manifest reader).
 
 At that point, extracting `spawn_core::feature_coverage` + Slice C's `fm-cas/v1` types into a standalone workspace crate (`crates/feature-map-core`) and later an external repository will require zero rewrites to CLI, HTTP, or UI consumers.
+
+## 6. Integration Confirmation (`t586u` / `t587u` on `t559u-fm-integrate`)
+
+Integrating all three parallel slices onto `t559u-fm-integrate` (from live `main` `6c5d22782`) empirically confirms **Option B (Internal Pure Core Seam inside Spawn's workspace)** over premature external extraction:
+
+1. **Zero merge conflicts & zero dependency churn**: Slices A (`25d294eeb`), B (`f4ac04887`), and C (`2104c1bf1`) merged cleanly (`ort`) across 30 files with **zero** edits to `Cargo.toml`, `Cargo.lock`, `web/package.json`, `web/pnpm-lock.yaml`, or protected paths (`rsi/`, `scripts/`, `deploy/`).
+2. **Clean acyclic module seams verified by `cargo clippy --all-targets -- -D warnings`**:
+   - Pure domain coverage core (`spawn_core::feature_coverage`): zero IO, zero PostgreSQL, zero HTTP, zero `unsafe`.
+   - Mind-map schema & read endpoint (`spawn_cli::serve::feature_map`) + coverage CLI/HTTP adapter (`spawn_cli::feature_inventory`, `serve.rs`, `main.rs`).
+   - Content-addressed recoverable storage engine (`spawn_cli::backup::recoverable`, `fm-cas/v1`) exposed additively under `spawn backup cas`, ready to consume `FeatureRegistry` / `FmGraphSnapshot` and `InventoryEntry` hashes without introducing crate cycles.
+   - Pure TypeScript read/graph models (`web/src/features.ts`, `web/src/featuresGraph.ts`, `web/src/featureCoverage.ts`) decoupled from API adapters (`featuresApi.ts`, `featureCoverageApi.ts`) and React UI views (`#/features` Mind Map linked directly to `#/coverage` Wild-File Scan).
+3. **Real drift detection across slices**: Running `spawn features scan` and `cargo test -p spawn-core --test feature_coverage` on the combined `t559u-fm-integrate` tree immediately caught the 8 newly-added Slice A + Slice C files (`docs/feature-map-mindmap.md`, `web/src/featuresGraph.ts`, `web/src/components/features/FeatureMindMap.tsx`, `web/src/components/features/FeatureInspector.tsx`, `web/test/featuresGraph.test.ts`, `crates/spawn-cli/src/backup/recoverable.rs`, `crates/spawn-cli/tests/recoverable_storage.rs`, `docs/recoverable-storage-keys.md`) as unassociated ("wild") files relative to Slice B's isolated `registry.json` — validating the scanner's end-to-end drift contract and establishing the exact handoff to `t559u-coverage` (`t559u-fm-audit-coverage`).
+4. **Local initiative linkage record (no live API writes, no invented live IDs)**:
+   - `t559u` (Mind map, coverage & storage keys): local slices `t559u-fm-mindmap` (`25d294eeb`), `t559u-fm-coverage` (`f4ac04887`), `t559u-fm-storage-keys` (`2104c1bf1`); integration branch `t559u-fm-integrate`; audit branches `t559u-fm-audit-coverage` and `t559u-fm-audit-storage`.
+   - `t565u` (One-click unassociated-file / "野文件" scan): tracked under `t559u` in `docs/feature-map/registry.json` (`t565u-wild-file-scan`) and linked 1-click from `#/features` to `#/coverage`.
+   - `t567u` / `t568u` (Multi-machine distributed compute & storage): remains a **separate staged research/design initiative** (`t567u-multi-machine-distributed`, `kind: "research-initiative"`), linked to `t559u`, Slice B's library/CLI/API seam, and Slice C's `fm-cas/v1` keys — not a production build, not a cluster conversion, and permanently excluding sold `mac16`.
+   - Live `/api/features` remains untouched until ordinary dual independent review, full serial gate, and owner deploy approval succeed.
