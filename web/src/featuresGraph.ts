@@ -1152,3 +1152,63 @@ function buildRelationCurve(
   const labelY = 0.125 * y1 + 0.375 * c1y + 0.375 * c2y + 0.125 * y2;
   return { path, labelX, labelY, maxX: Math.max(x1, x2, c1x, c2x) };
 }
+
+/** Stable identity of a mind-map graph: changes only when the user switches
+ * mission, changes grouping mode, or the mission's mapping source changes —
+ * NOT on live poll/data refreshes of the same mission. */
+export function mindMapGraphIdentity(
+  mission: FeatureMission,
+  tree: FeatureMindMapTree,
+): string {
+  return `${mission.id}:${tree.effectiveGrouping}:${mission.mapping.kind}:${mission.mapping.path ?? ""}`;
+}
+
+/** Reconcile expanded branch IDs when `tree` rebuilds:
+ * - On a real graph-identity change (new mission, grouping, or mapping),
+ *   reset to `defaultExpandedIds(nextTree)`.
+ * - On a same-graph poll/data refresh, preserve every expanded ID that still
+ *   exists in `nextTree.nodes` (returning `prevExpanded` unchanged when all
+ *   IDs survive, so React avoids unnecessary state churn). */
+export function reconcileExpandedIds(
+  prevExpanded: ReadonlySet<string>,
+  nextTree: FeatureMindMapTree,
+  prevGraphIdentity: string | null,
+  nextGraphIdentity: string,
+): Set<string> {
+  if (prevGraphIdentity !== nextGraphIdentity) {
+    return defaultExpandedIds(nextTree);
+  }
+  let allExist = true;
+  for (const id of prevExpanded) {
+    if (!nextTree.nodes[id]) {
+      allExist = false;
+      break;
+    }
+  }
+  if (allExist) {
+    return prevExpanded instanceof Set ? prevExpanded : new Set(prevExpanded);
+  }
+  const kept = new Set<string>();
+  for (const id of prevExpanded) {
+    if (nextTree.nodes[id]) kept.add(id);
+  }
+  if (kept.size === 0 && prevExpanded.size > 0) {
+    return defaultExpandedIds(nextTree);
+  }
+  return kept;
+}
+
+/** Whether a tree rebuild should automatically re-fit zoom/pan. Only true when
+ * the graph identity genuinely changed, never on a same-graph poll refresh. */
+export function shouldAutoFitOnRefresh(
+  prevGraphIdentity: string | null,
+  nextGraphIdentity: string,
+): boolean {
+  return prevGraphIdentity !== nextGraphIdentity;
+}
+
+/** Whether opening/closing the inspector drawer should auto-fit the canvas:
+ * skip once the user has manually zoomed or panned the viewport. */
+export function shouldAutoFitOnInspectorToggle(userTransformed: boolean): boolean {
+  return !userTransformed;
+}

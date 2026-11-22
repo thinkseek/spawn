@@ -52,6 +52,7 @@ To obtain the architectural benefits of a reusable library *without* the tax of 
 
 - Slice C defines deterministic, content-derived storage keys and verifiable manifests (`fm-cas/v1`) for feature snapshots and artifacts.
 - Notice `InventoryEntry` already carries `sha256: Option<String>` and `FeatureRegistry` is deterministically serialized JSON (`schema_version: 1`): Slice B's scan inputs/outputs compose cleanly with Slice C's content-addressed key/manifest format without circular dependencies.
+- **Explicit current scope note**: `spawn backup cas snapshot` currently consumes an explicit `--fm-graph <file>` JSON input (`FmGraphSnapshot`); an automatic `docs/feature-map/registry.json -> FmGraphSnapshot` adapter is a clean follow-up consumer task once Slices A–C stabilize on `main`, and the per-mission `/api/features` mapping and static project `registry.json` remain distinct ID spaces by design.
 
 ### 3.4 Pure Frontend Read Model (`web/src/featureCoverage.ts` vs `featureCoverageApi.ts`)
 

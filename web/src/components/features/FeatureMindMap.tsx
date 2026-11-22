@@ -29,6 +29,10 @@ import {
   ancestorsOf,
   defaultExpandedIds,
   layoutMindMap,
+  mindMapGraphIdentity,
+  reconcileExpandedIds,
+  shouldAutoFitOnInspectorToggle,
+  shouldAutoFitOnRefresh,
 } from "../../featuresGraph";
 import { FOCUS_RING, chip, cx } from "../ui";
 
@@ -82,19 +86,40 @@ export function FeatureMindMap({
     startY: number;
   } | null>(null);
 
+  const graphIdentity = mindMapGraphIdentity(mission, tree);
+  const prevGraphIdentityRef = useRef<string | null>(graphIdentity);
+  const userTransformedRef = useRef(false);
   const [fitRequest, setFitRequest] = useState(1);
 
-  // Reset expanded state and schedule auto-fit when mission or grouping changes.
+  // Preserve expansion, search, and zoom/pan across live poll/data refreshes of
+  // the same graph; reset only when graph identity genuinely changes (mission,
+  // grouping mode, or mapping source/path).
   useEffect(() => {
-    setExpandedIds(defaultExpandedIds(tree));
-    setSearchQuery("");
-    setFitRequest((n) => n + 1);
-  }, [tree]);
+    const prevId = prevGraphIdentityRef.current;
+    if (shouldAutoFitOnRefresh(prevId, graphIdentity)) {
+      prevGraphIdentityRef.current = graphIdentity;
+      userTransformedRef.current = false;
+      setExpandedIds(defaultExpandedIds(tree));
+      setSearchQuery("");
+      setFitRequest((n) => n + 1);
+      return;
+    }
+    setExpandedIds((prev) => {
+      const next = reconcileExpandedIds(prev, tree, prevId, graphIdentity);
+      return next === prev ? prev : next;
+    });
+  }, [graphIdentity, tree]);
 
-  // Refit gently when the inspector drawer opens/closes so nodes never clip off-canvas.
+  // Refit gently when the inspector drawer opens/closes ONLY if the user has
+  // not manually zoomed or panned the canvas.
   const inspectorOpen = selectedNodeId !== null;
+  const prevInspectorOpenRef = useRef(inspectorOpen);
   useEffect(() => {
-    setFitRequest((n) => n + 1);
+    if (prevInspectorOpenRef.current === inspectorOpen) return;
+    prevInspectorOpenRef.current = inspectorOpen;
+    if (shouldAutoFitOnInspectorToggle(userTransformedRef.current)) {
+      setFitRequest((n) => n + 1);
+    }
   }, [inspectorOpen]);
 
   // Whenever a node is selected (e.g., jumped to from Inspector), ensure all
@@ -122,21 +147,34 @@ export function FeatureMindMap({
     [tree, expandedIds, searchQuery, activeRelations, relationIndex],
   );
 
+  // Keep latest layout dimensions in a ref so `fitToView` has a stable identity
+  // and does NOT re-run on single-branch expand/collapse, search, or live polls.
+  const layoutSizeRef = useRef({ width: layout.width, height: layout.height });
+  layoutSizeRef.current = { width: layout.width, height: layout.height };
+
   const fitToView = useCallback(() => {
     const el = viewportRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
+    const { width, height } = layoutSizeRef.current;
     const pad = 28;
-    const scaleX = (rect.width - pad * 2) / Math.max(layout.width, 1);
-    const scaleY = (rect.height - pad * 2) / Math.max(layout.height, 1);
+    const scaleX = (rect.width - pad * 2) / Math.max(width, 1);
+    const scaleY = (rect.height - pad * 2) / Math.max(height, 1);
     const scale = Math.min(1, Math.max(MIN_ZOOM, Math.min(scaleX, scaleY)));
-    const x = Math.max(pad, (rect.width - layout.width * scale) / 2);
-    const y = Math.max(pad, (rect.height - layout.height * scale) / 2);
+    const x = Math.max(pad, (rect.width - width * scale) / 2);
+    const y = Math.max(pad, (rect.height - height * scale) / 2);
     setTransform({ x, y, scale });
-  }, [layout.width, layout.height]);
+  }, []);
 
-  // Run auto-fit after layout & viewport size settle.
+  const handleFitClick = useCallback(() => {
+    userTransformedRef.current = false;
+    fitToView();
+  }, [fitToView]);
+
+  // Run auto-fit ONLY when `fitRequest` is explicitly incremented (initial
+  // mount, real graph identity change, Expand all / Collapse to branches, or
+  // inspector toggle before manual pan/zoom).
   useEffect(() => {
     if (fitRequest === 0) return;
     const raf = window.requestAnimationFrame(() => fitToView());
@@ -193,15 +231,18 @@ export function FeatureMindMap({
 
   const handleExpandAll = useCallback(() => {
     setExpandedIds(allBranchIds(tree));
+    userTransformedRef.current = false;
     setFitRequest((n) => n + 1);
   }, [tree]);
 
   const handleCollapseToBranches = useCallback(() => {
     setExpandedIds(new Set([tree.rootId]));
+    userTransformedRef.current = false;
     setFitRequest((n) => n + 1);
   }, [tree.rootId]);
 
   const zoomBy = useCallback((factor: number) => {
+    userTransformedRef.current = true;
     const el = viewportRef.current;
     setTransform((prev) => {
       const nextScale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev.scale * factor));
@@ -219,26 +260,34 @@ export function FeatureMindMap({
   }, []);
 
   const handleReset = useCallback(() => {
+    userTransformedRef.current = true;
     setTransform({ x: 24, y: 24, scale: 1 });
   }, []);
 
-  const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
-    event.preventDefault();
+  // Attach a non-passive wheel listener so preventDefault reliably suppresses
+  // parent scrolling while zooming the mind map.
+  useEffect(() => {
     const el = viewportRef.current;
     if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const pointerX = event.clientX - rect.left;
-    const pointerY = event.clientY - rect.top;
-    const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
-    setTransform((prev) => {
-      const nextScale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev.scale * factor));
-      const ratio = nextScale / prev.scale;
-      return {
-        scale: nextScale,
-        x: pointerX - (pointerX - prev.x) * ratio,
-        y: pointerY - (pointerY - prev.y) * ratio,
-      };
-    });
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      userTransformedRef.current = true;
+      const rect = el.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      const factor = event.deltaY < 0 ? 1.1 : 1 / 1.1;
+      setTransform((prev) => {
+        const nextScale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prev.scale * factor));
+        const ratio = nextScale / prev.scale;
+        return {
+          scale: nextScale,
+          x: pointerX - (pointerX - prev.x) * ratio,
+          y: pointerY - (pointerY - prev.y) * ratio,
+        };
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
   const handlePointerDown = useCallback(
@@ -263,6 +312,9 @@ export function FeatureMindMap({
     if (!origin) return;
     const dx = event.clientX - origin.clientX;
     const dy = event.clientY - origin.clientY;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+      userTransformedRef.current = true;
+    }
     setTransform((prev) => ({
       ...prev,
       x: origin.startX + dx,
@@ -410,7 +462,7 @@ export function FeatureMindMap({
           </button>
           <button
             type="button"
-            onClick={fitToView}
+            onClick={handleFitClick}
             title="Fit map to viewport"
             className={cx(
               "inline-flex h-7 items-center gap-1 rounded-control bg-surface px-2 text-caption text-muted-foreground shadow-hairline hover:bg-surface-hover hover:text-foreground",
@@ -486,7 +538,6 @@ export function FeatureMindMap({
       {/* Interactive pan/zoom canvas */}
       <div
         ref={viewportRef}
-        onWheel={handleWheel}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}

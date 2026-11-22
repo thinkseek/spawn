@@ -12,7 +12,11 @@ import {
   defaultExpandedIds,
   getSharedCoOwners,
   layoutMindMap,
+  mindMapGraphIdentity,
+  reconcileExpandedIds,
   searchMindMap,
+  shouldAutoFitOnInspectorToggle,
+  shouldAutoFitOnRefresh,
   validateFeatureGraph,
 } from "../src/featuresGraph.ts";
 
@@ -304,4 +308,87 @@ test("validateFeatureGraph detects self-links, dangling targets, and hierarchy/d
   // Ensure Feature type check stays clean
   const sample: Feature | undefined = broken.features[0];
   assert.equal(sample?.id, "self");
+});
+
+test("mindMapGraphIdentity and reconcileExpandedIds preserve user expansion and zoom across poll refreshes (Review A F2)", () => {
+  const initialMission = makeMission(
+    [
+      { id: "domain-a", title: "Domain A", kind: "domain", state: "implemented", planned: false, implemented: true },
+      { id: "feat-1", title: "Feature 1", parent: "domain-a", state: "implemented", planned: false, implemented: true },
+      { id: "feat-2", title: "Feature 2", parent: "domain-a", state: "planned" },
+      { id: "domain-b", title: "Domain B", kind: "domain", state: "planned" },
+    ],
+    4,
+  );
+  const tree1 = buildFeatureMindMapTree(initialMission);
+  const id1 = mindMapGraphIdentity(initialMission, tree1);
+
+  // User expands domain-a manually and zooms in.
+  const userExpanded = new Set<string>([tree1.rootId, "domain-a"]);
+
+  // Live 4s poll returns a brand-new mission object where feat-1 moved to live and feat-3 was added.
+  const refreshedMission = makeMission(
+    [
+      { id: "domain-a", title: "Domain A", kind: "domain", state: "live", planned: false, implemented: true, verified: true, live: true },
+      { id: "feat-1", title: "Feature 1", parent: "domain-a", state: "live", planned: false, implemented: true, verified: true, live: true },
+      { id: "feat-2", title: "Feature 2", parent: "domain-a", state: "verified", planned: false, implemented: true, verified: true },
+      { id: "feat-3", title: "Feature 3", parent: "domain-a", state: "planned" },
+      { id: "domain-b", title: "Domain B", kind: "domain", state: "planned" },
+    ],
+    4,
+  );
+  const tree2 = buildFeatureMindMapTree(refreshedMission);
+  const id2 = mindMapGraphIdentity(refreshedMission, tree2);
+
+  assert.equal(id2, id1, "poll data refresh on same mission/grouping keeps identical graph identity");
+  assert.equal(shouldAutoFitOnRefresh(id1, id2), false, "poll refresh must NOT auto-fit or reset zoom/pan");
+
+  const reconciled = reconcileExpandedIds(userExpanded, tree2, id1, id2);
+  assert.equal(reconciled, userExpanded, "same-graph refresh with all expanded IDs intact returns the exact same Set");
+  assert.equal(reconciled.has("domain-a"), true);
+
+  // If a previously expanded branch disappears on refresh, drop only the removed ID and keep surviving ones.
+  const prunedMission = makeMission(
+    [
+      { id: "domain-a", title: "Domain A", kind: "domain" },
+      { id: "feat-1", title: "Feature 1", parent: "domain-a" },
+    ],
+    4,
+  );
+  const tree3 = buildFeatureMindMapTree(prunedMission);
+  const id3 = mindMapGraphIdentity(prunedMission, tree3);
+  const withDeleted = new Set<string>([tree1.rootId, "domain-a", "domain-b"]);
+  const reconciledAfterDelete = reconcileExpandedIds(withDeleted, tree3, id1, id3);
+  assert.equal(reconciledAfterDelete.has("domain-a"), true);
+  assert.equal(reconciledAfterDelete.has("domain-b"), false);
+
+  // Switching to a different mission OR changing grouping mode changes graph identity and resets cleanly.
+  const otherMission = makeMission([{ id: "m6-a", title: "Other" }], 6);
+  const otherTree = buildFeatureMindMapTree(otherMission);
+  const otherId = mindMapGraphIdentity(otherMission, otherTree);
+  assert.notEqual(otherId, id1);
+  assert.equal(shouldAutoFitOnRefresh(id1, otherId), true);
+  assert.deepEqual(
+    reconcileExpandedIds(userExpanded, otherTree, id1, otherId),
+    defaultExpandedIds(otherTree),
+  );
+
+  // Changing flat grouping mode ("auto" -> "state") also changes graph identity.
+  const flatMission = makeMission(
+    [
+      { id: "obj-1", title: "Serve: one", state: "live", planned: false, implemented: true, verified: true, live: true },
+      { id: "obj-2", title: "Web: two", state: "planned" },
+    ],
+    4,
+  );
+  const topicTree = buildFeatureMindMapTree(flatMission, { groupingMode: "auto" });
+  const stateTree = buildFeatureMindMapTree(flatMission, { groupingMode: "state" });
+  assert.notEqual(
+    mindMapGraphIdentity(flatMission, topicTree),
+    mindMapGraphIdentity(flatMission, stateTree),
+  );
+
+  // Inspector open/close auto-fits only before the user manually pans or zooms.
+  assert.equal(shouldAutoFitOnInspectorToggle(false), true);
+  assert.equal(shouldAutoFitOnInspectorToggle(true), false);
 });
