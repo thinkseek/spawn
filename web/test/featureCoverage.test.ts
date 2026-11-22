@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  accountingIdentitiesHold,
   consistencyIssueCount,
   featureAssociatedFiles,
   fileAssociatedFeatures,
@@ -255,4 +259,236 @@ test("initiatives, research-initiative badging, and empty-payload resilience", (
   assert.equal(fallback.features.length, 0);
   assert.equal(fallback.report.counts.in_scope, 0);
   assert.equal(fallback.update, null);
+});
+
+test("accountingIdentitiesHold validates exact counts and catches excluded-file leakage", () => {
+  const clean = normalizeFeatureCoverage(basePayload());
+  assert.equal(accountingIdentitiesHold(clean.report), true);
+
+  // Break covered + wild == in_scope
+  const badCoverage = normalizeFeatureCoverage(
+    basePayload({
+      report: {
+        counts: {
+          total_seen: 3,
+          in_scope: 2,
+          covered: 2,
+          unassociated_wild: 1,
+          stale_references: 0,
+          explicit_exclusions: 1,
+          multi_feature_files: 0,
+          orphan_features: 0,
+          invalid_relations: 0,
+        },
+      },
+    }),
+  );
+  assert.equal(accountingIdentitiesHold(badCoverage.report), false);
+
+  // Excluded file leaked into bidirectional covered index
+  const leakedCovered = normalizeFeatureCoverage(
+    basePayload({
+      report: {
+        counts: {
+          total_seen: 3,
+          in_scope: 2,
+          covered: 2,
+          unassociated_wild: 0,
+          stale_references: 0,
+          explicit_exclusions: 1,
+          multi_feature_files: 0,
+          orphan_features: 0,
+          invalid_relations: 0,
+        },
+        unassociated_files: [],
+        bidirectional_index: {
+          feature_to_files: {
+            "t559u-slice-b-coverage": ["crates/spawn-core/src/feature_coverage.rs", ".env"],
+          },
+          file_to_features: {
+            "crates/spawn-core/src/feature_coverage.rs": ["t559u-slice-b-coverage"],
+            ".env": ["t559u-slice-b-coverage"],
+          },
+        },
+      },
+    }),
+  );
+  assert.equal(accountingIdentitiesHold(leakedCovered.report), false);
+});
+
+test("orphan features and every consistency failure class mark scan not clean", () => {
+  const fields = [
+    "orphan_features",
+    "dangling_relations",
+    "self_links",
+    "cycle_errors",
+    "duplicate_feature_ids",
+    "invalid_paths",
+  ] as const;
+
+  for (const field of fields) {
+    const data = normalizeFeatureCoverage(
+      basePayload({
+        report: {
+          counts: {
+            total_seen: 2,
+            in_scope: 1,
+            covered: 1,
+            unassociated_wild: 0,
+            stale_references: 0,
+            explicit_exclusions: 1,
+            multi_feature_files: 0,
+            orphan_features: field === "orphan_features" ? 1 : 0,
+            invalid_relations:
+              field === "dangling_relations" || field === "self_links" || field === "cycle_errors"
+                ? 1
+                : 0,
+          },
+          unassociated_files: [],
+          consistency: {
+            orphan_features: [],
+            dangling_relations: [],
+            self_links: [],
+            cycle_errors: [],
+            duplicate_feature_ids: [],
+            invalid_paths: [],
+            [field]: [`fixture-${field}`],
+          },
+        },
+      }),
+    );
+    assert.equal(consistencyIssueCount(data.report.consistency), 1, `expected 1 issue for ${field}`);
+    assert.equal(isScanClean(data.report), false, `expected scan not clean for ${field}`);
+    assert.equal(accountingIdentitiesHold(data.report), true);
+  }
+});
+
+test("mixed wild, stale, multi-feature, and excluded fixture stays strictly separated", () => {
+  const data = normalizeFeatureCoverage(
+    basePayload({
+      report: {
+        counts: {
+          total_seen: 6,
+          in_scope: 4,
+          covered: 2,
+          unassociated_wild: 2,
+          stale_references: 1,
+          explicit_exclusions: 2,
+          multi_feature_files: 1,
+          orphan_features: 0,
+          invalid_relations: 0,
+        },
+        unassociated_files: [
+          {
+            path: "crates/spawn-core/src/unmapped_tracked.rs",
+            tracked: true,
+            size_bytes: 300,
+            reason: "In-scope git-tracked file has no feature association in the registry",
+            evidence: ["git_tracked=true", "matched_exclusion=none"],
+            suggested_features: ["t559u-slice-b-coverage"],
+          },
+          {
+            path: "docs/untracked_note.md",
+            tracked: false,
+            size_bytes: 120,
+            reason: "In-scope untracked file exists on disk with no feature association in the registry",
+            evidence: ["git_tracked=false", "matched_exclusion=none"],
+            suggested_features: [],
+          },
+        ],
+        stale_references: [
+          {
+            path: "crates/spawn-core/src/removed.rs",
+            referencing_features: ["t559u-slice-b-coverage"],
+            rename_candidates: ["crates/spawn-core/src/unmapped_tracked.rs"],
+          },
+        ],
+        excluded_files: [
+          {
+            path: ".env",
+            rule_id: "secrets-env-dotfile",
+            category: "secrets",
+            reason: "Secret files are excluded.",
+          },
+          {
+            path: "secrets/",
+            rule_id: "secrets-directory",
+            category: "secrets",
+            reason: "Dedicated secrets directories are never crawled or indexed.",
+          },
+        ],
+        bidirectional_index: {
+          feature_to_files: {
+            "t559u-slice-b-coverage": [
+              "crates/spawn-core/src/feature_coverage.rs",
+              "crates/spawn-core/src/lib.rs",
+            ],
+            "t565u-wild-file-scan": ["crates/spawn-core/src/feature_coverage.rs"],
+          },
+          file_to_features: {
+            "crates/spawn-core/src/feature_coverage.rs": [
+              "t559u-slice-b-coverage",
+              "t565u-wild-file-scan",
+            ],
+            "crates/spawn-core/src/lib.rs": ["t559u-slice-b-coverage"],
+          },
+        },
+      },
+    }),
+  );
+
+  assert.equal(accountingIdentitiesHold(data.report), true);
+  assert.equal(isScanClean(data.report), false);
+  assert.equal(data.report.counts.unassociated_wild, 2);
+  assert.equal(data.report.counts.stale_references, 1);
+  assert.equal(data.report.counts.explicit_exclusions, 2);
+  assert.equal(data.report.counts.multi_feature_files, 1);
+  assert.equal(fileAssociatedFeatures(data.report, "secrets/").length, 0);
+});
+
+test("real docs/feature-map/registry.json satisfies semantic non-catchall invariants", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const registryPath = path.resolve(here, "../../docs/feature-map/registry.json");
+  const raw = JSON.parse(fs.readFileSync(registryPath, "utf8")) as {
+    schema_version: number;
+    initiative_id: string;
+    boundary: { exclusions: Array<{ id: string; pattern: string }> };
+    features: Array<{
+      id: string;
+      kind: string;
+      parent: string | null;
+      files: string[];
+    }>;
+  };
+
+  assert.equal(raw.schema_version, 1);
+  assert.equal(raw.initiative_id, "t559u");
+  assert.equal(raw.boundary.exclusions.length, 26);
+
+  const ids = new Set(raw.features.map((f) => f.id));
+  for (const catchAll of [
+    "domain-workspace-docs",
+    "cap-rsi-backlog-specs",
+    "cap-rsi-gate-scenarios",
+    "cap-web-fleet-home-views",
+    "cap-web-missions-rsi-trace-views",
+  ]) {
+    assert.equal(ids.has(catchAll), false, `catch-all ${catchAll} must not exist`);
+  }
+
+  for (const feat of raw.features) {
+    if (feat.kind === "domain") {
+      assert.equal(feat.files.length, 0, `domain ${feat.id} must not hold stray files`);
+    }
+  }
+
+  const sliceA = raw.features.find((f) => f.id === "t559u-slice-a-mindmap");
+  assert.ok(sliceA);
+  assert.deepEqual(sliceA.files, []);
+
+  const t567u = raw.features.find((f) => f.id === "t567u-multi-machine-distributed");
+  assert.ok(t567u);
+  assert.equal(t567u.kind, "research-initiative");
+  assert.equal(t567u.parent, null);
+  assert.equal(t567u.files.includes("docs/storage.md"), false);
 });
