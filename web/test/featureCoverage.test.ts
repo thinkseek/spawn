@@ -6,15 +6,20 @@ import { fileURLToPath } from "node:url";
 
 import {
   accountingIdentitiesHold,
+  canSubmitWildFileAssociation,
   consistencyIssueCount,
   featureAssociatedFiles,
   fileAssociatedFeatures,
   formatBytes,
+  initialWildFileSelection,
   initiativesAndSlices,
   isResearchInitiative,
   isScanClean,
   kindLabel,
   normalizeFeatureCoverage,
+  parseCoverageHttpResponse,
+  parseFeatureCoverageResponse,
+  toggleWildFileSelection,
 } from "../src/featureCoverage.ts";
 
 function basePayload(overrides: Record<string, unknown> = {}) {
@@ -512,4 +517,136 @@ test("real docs/feature-map/registry.json satisfies semantic non-catchall invari
   assert.equal(t567u.kind, "research-initiative");
   assert.equal(t567u.parent, null);
   assert.equal(t567u.files.includes("docs/storage.md"), false);
+
+  // Every provenance.artifacts & provenance.tests entry must resolve to a real file.
+  const repoRoot = path.resolve(here, "../..");
+  const rawFull = JSON.parse(fs.readFileSync(registryPath, "utf8")) as {
+    features: Array<{
+      id: string;
+      provenance?: { artifacts?: string[]; tests?: string[] };
+    }>;
+  };
+  for (const feat of rawFull.features) {
+    for (const p of [
+      ...(feat.provenance?.artifacts ?? []),
+      ...(feat.provenance?.tests ?? []),
+    ]) {
+      assert.equal(
+        fs.existsSync(path.join(repoRoot, p)),
+        true,
+        `provenance path ${p} on ${feat.id} does not exist on disk`,
+      );
+    }
+  }
+});
+
+test("Review A F1 / B F4: wild-file selection starts empty even with suggestions and requires explicit selection", () => {
+  const data = normalizeFeatureCoverage(basePayload());
+  const finding = data.report.unassociated_files[0];
+  assert.ok(finding.suggested_features.length > 0);
+
+  const initial = initialWildFileSelection(finding);
+  assert.deepEqual(initial, []);
+  assert.equal(canSubmitWildFileAssociation(initial, false), false);
+
+  // Explicit user selection enables submission and supports many-to-many toggles.
+  const once = toggleWildFileSelection(initial, finding.suggested_features[0]);
+  assert.deepEqual(once, ["t559u-slice-b-coverage"]);
+  assert.equal(canSubmitWildFileAssociation(once, false), true);
+  assert.equal(canSubmitWildFileAssociation(once, true), false);
+
+  const twice = toggleWildFileSelection(once, "t565u-wild-file-scan");
+  assert.deepEqual(twice, ["t559u-slice-b-coverage", "t565u-wild-file-scan"]);
+  const cleared = toggleWildFileSelection(
+    toggleWildFileSelection(twice, "t559u-slice-b-coverage"),
+    "t565u-wild-file-scan",
+  );
+  assert.deepEqual(cleared, []);
+  assert.equal(canSubmitWildFileAssociation(cleared, false), false);
+
+  // Guard WildFileScanPanel.tsx against regressing back to pre-selecting suggested_features.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const panelSource = fs.readFileSync(
+    path.resolve(here, "../src/components/features/WildFileScanPanel.tsx"),
+    "utf8",
+  );
+  assert.equal(panelSource.includes("initialWildFileSelection("), true);
+  assert.equal(panelSource.includes("suggested_features.slice("), false);
+});
+
+test("Review A F4: non-JSON 200 and malformed coverage payloads fail visibly instead of rendering zero drift", async () => {
+  const makeError = (status: number, detail: string) =>
+    new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
+
+  // 1. Non-JSON 200 (e.g., HTML proxy error page or index.html fallback) must reject.
+  await assert.rejects(
+    () =>
+      parseCoverageHttpResponse(
+        {
+          ok: true,
+          status: 200,
+          json: () => Promise.reject(new SyntaxError("Unexpected token '<'")),
+        },
+        makeError,
+      ),
+    /non-JSON body/i,
+  );
+
+  // 2. Malformed / empty JSON 200 payloads must reject rather than returning a fake clean scan.
+  for (const malformed of [null, {}, { ok: true }, { report: {}, features: [] }]) {
+    assert.throws(
+      () => parseFeatureCoverageResponse(malformed),
+      /Invalid coverage response/i,
+    );
+    await assert.rejects(
+      () =>
+        parseCoverageHttpResponse(
+          {
+            ok: true,
+            status: 200,
+            json: () => Promise.resolve(malformed),
+          },
+          makeError,
+        ),
+      /Invalid coverage response/i,
+    );
+  }
+
+  // 3. HTTP error responses preserve status and optional JSON error detail.
+  await assert.rejects(
+    () =>
+      parseCoverageHttpResponse(
+        {
+          ok: false,
+          status: 500,
+          json: () => Promise.resolve({ error: "registry unreadable" }),
+        },
+        makeError,
+      ),
+    /HTTP 500: registry unreadable/,
+  );
+  await assert.rejects(
+    () =>
+      parseCoverageHttpResponse(
+        {
+          ok: false,
+          status: 502,
+          json: () => Promise.reject(new SyntaxError("bad gateway html")),
+        },
+        makeError,
+      ),
+    /HTTP 502/,
+  );
+
+  // 4. Valid 200 JSON coverage payload succeeds cleanly.
+  const valid = await parseCoverageHttpResponse(
+    {
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(basePayload()),
+    },
+    makeError,
+  );
+  assert.equal(valid.report.counts.in_scope, 2);
+  assert.equal(valid.report.counts.unassociated_wild, 1);
 });

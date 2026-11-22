@@ -358,6 +358,114 @@ export function normalizeFeatureCoverage(value: unknown): FeatureCoverageRespons
   };
 }
 
+function isPlainObject(value: unknown): value is JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Strict validator for HTTP coverage responses. Rejects non-object payloads
+ * or missing required report/count/collection fields so a malformed or non-JSON
+ * 200 response can NEVER render as a false "Zero drift" clean bill. */
+export function parseFeatureCoverageResponse(value: unknown): FeatureCoverageResponse {
+  if (!isPlainObject(value)) {
+    throw new Error("Invalid coverage response: expected a JSON object");
+  }
+  if (!isPlainObject(value.report)) {
+    throw new Error("Invalid coverage response: missing report object");
+  }
+  if (!Array.isArray(value.features)) {
+    throw new Error("Invalid coverage response: missing features array");
+  }
+  const report = value.report;
+  if (!isPlainObject(report.counts)) {
+    throw new Error("Invalid coverage response: missing report.counts");
+  }
+  for (const key of [
+    "total_seen",
+    "in_scope",
+    "covered",
+    "unassociated_wild",
+    "stale_references",
+    "explicit_exclusions",
+  ]) {
+    const metric = report.counts[key];
+    if (typeof metric !== "number" || !Number.isFinite(metric)) {
+      throw new Error(`Invalid coverage response: missing numeric report.counts.${key}`);
+    }
+  }
+  if (
+    !isPlainObject(report.boundary) ||
+    !isPlainObject(report.consistency) ||
+    !isPlainObject(report.bidirectional_index) ||
+    !Array.isArray(report.unassociated_files) ||
+    !Array.isArray(report.stale_references) ||
+    !Array.isArray(report.excluded_files)
+  ) {
+    throw new Error("Invalid coverage response: incomplete report payload");
+  }
+  return normalizeFeatureCoverage(value);
+}
+
+export interface HttpJsonResponseLike {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}
+
+/** Parse and validate an HTTP response from `/api/features/{scan,associate}`.
+ * Never swallows JSON parse failures on HTTP 200 responses. */
+export async function parseCoverageHttpResponse(
+  response: HttpJsonResponseLike,
+  makeError: (status: number, detail: string) => Error,
+): Promise<FeatureCoverageResponse> {
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = await response.json();
+      if (isPlainObject(payload) && typeof payload.error === "string") {
+        detail = payload.error;
+      }
+    } catch {
+      // Non-JSON error body: HTTP status carries the failure.
+    }
+    throw makeError(response.status, detail);
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw makeError(
+      response.status,
+      "server returned a non-JSON body where a coverage scan JSON payload was expected",
+    );
+  }
+  return parseFeatureCoverageResponse(payload);
+}
+
+/** Initial feature selection for a wild-file row: ALWAYS empty so suggested
+ * heuristics are never pre-checked or silently submitted without explicit
+ * user selection. */
+export function initialWildFileSelection(_finding?: WildFileFinding): string[] {
+  return [];
+}
+
+/** Toggle one feature ID in a wild-file row's explicit user selection. */
+export function toggleWildFileSelection(
+  selected: readonly string[],
+  featureId: string,
+): string[] {
+  return selected.includes(featureId)
+    ? selected.filter((item) => item !== featureId)
+    : [...selected, featureId];
+}
+
+/** Linking requires at least one explicitly selected feature and no in-flight save. */
+export function canSubmitWildFileAssociation(
+  selected: readonly string[],
+  saving = false,
+): boolean {
+  return selected.length > 0 && !saving;
+}
+
 export function consistencyIssueCount(consistency: ConsistencyReport): number {
   return (
     consistency.orphan_features.length +

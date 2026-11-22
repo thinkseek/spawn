@@ -1002,3 +1002,98 @@ fn match_directory_exclusion_collapses_subtree_rules_only() {
         );
     }
 }
+
+#[test]
+fn provenance_artifacts_and_tests_paths_are_stale_checked_while_commit_shas_are_not() {
+    let mut registry = fixture_registry();
+    // Replicate the exact Review A F3 / Review B F2 typo alongside valid commits,
+    // a missing test path, and an existing file mentioned ONLY in provenance.
+    registry.features[0].provenance.commits = vec![
+        "6c5d22782".to_string(),
+        "e55c51819".to_string(),
+        "57dfd77849afe1dc792b3dbf9b38756afd8f22d5".to_string(),
+    ];
+    registry.features[0].provenance.artifacts = vec![
+        "docs/landing-notes/2026-11-22-pr82-feature-map.md".to_string(), // missing typo!
+        "docs/unlinked_artifact.md".to_string(),                         // exists, NOT in files
+    ];
+    registry.features[1].provenance.tests = vec![
+        "crates/spawn-core/tests/nonexistent_test.rs".to_string(), // missing test path!
+        "cargo test -p spawn-core".to_string(),                    // command, not a repo path
+    ];
+
+    let inventory = vec![
+        entry("crates/spawn-core/src/lib.rs", true, 400),
+        entry("crates/spawn-core/src/feature_coverage.rs", true, 8000),
+        entry("docs/landing-notes/2026-11-22-pr82.md", true, 1200),
+        entry("docs/unlinked_artifact.md", false, 128),
+    ];
+
+    let report = scan_coverage(&registry, &inventory, 1200);
+    assert_accounting_identities(&report);
+    assert!(!report.is_clean());
+
+    // Exact typo in provenance.artifacts must be flagged as stale (with real file as candidate).
+    let typo_stale = report
+        .stale_references
+        .iter()
+        .find(|s| s.path == "docs/landing-notes/2026-11-22-pr82-feature-map.md")
+        .expect("missing provenance.artifacts path must appear in stale_references");
+    assert_eq!(
+        typo_stale.referencing_features,
+        vec!["domain-core".to_string()]
+    );
+    assert!(
+        typo_stale
+            .rename_candidates
+            .contains(&"docs/landing-notes/2026-11-22-pr82.md".to_string()),
+        "expected real landing note in rename candidates: {:?}",
+        typo_stale.rename_candidates
+    );
+
+    // Missing provenance.tests path must also be flagged as stale.
+    assert!(
+        report
+            .stale_references
+            .iter()
+            .any(|s| s.path == "crates/spawn-core/tests/nonexistent_test.rs"),
+        "missing provenance.tests path must appear in stale_references"
+    );
+
+    // Git commit SHAs and free-form test commands must NEVER be flagged as stale or invalid.
+    assert_eq!(report.stale_references.len(), 2);
+    assert!(report.consistency.is_clean(), "{:?}", report.consistency);
+
+    // Provenance alone must NEVER count an unassociated file as covered.
+    assert!(
+        report
+            .unassociated_files
+            .iter()
+            .any(|w| w.path == "docs/unlinked_artifact.md"),
+        "file referenced only in provenance.artifacts must still be detected as wild"
+    );
+
+    // Excluded or traversal paths inside provenance.artifacts / provenance.tests fail validation.
+    registry.features[0]
+        .provenance
+        .artifacts
+        .push(".env".to_string());
+    registry.features[1]
+        .provenance
+        .tests
+        .push("../outside_test.rs".to_string());
+    let consistency = validate_registry(&registry);
+    assert!(!consistency.is_clean());
+    assert!(
+        consistency
+            .invalid_paths
+            .iter()
+            .any(|m| m.contains("provenance.artifacts") && m.contains(".env"))
+    );
+    assert!(
+        consistency
+            .invalid_paths
+            .iter()
+            .any(|m| m.contains("provenance.tests") && m.contains("../outside_test.rs"))
+    );
+}

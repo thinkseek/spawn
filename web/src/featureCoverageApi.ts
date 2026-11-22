@@ -4,7 +4,8 @@
 
 import { apiError, apiHeaders, readApi } from "./api";
 import {
-  normalizeFeatureCoverage,
+  parseCoverageHttpResponse,
+  parseFeatureCoverageResponse,
   type FeatureCoverageResponse,
 } from "./featureCoverage.ts";
 
@@ -12,7 +13,7 @@ import {
 export async function fetchFeatureCoverage(
   signal: AbortSignal,
 ): Promise<FeatureCoverageResponse> {
-  return readApi("/api/features/coverage", signal, normalizeFeatureCoverage);
+  return readApi("/api/features/coverage", signal, parseFeatureCoverageResponse);
 }
 
 /** POST /api/features/scan: trigger a fresh one-click unassociated-file scan. */
@@ -26,11 +27,7 @@ export async function runWildFileScan(
     headers: { ...apiHeaders(), "Content-Type": "application/json" },
     body: "{}",
   });
-  const payload = await readJson(response);
-  if (!response.ok) {
-    throw apiError(response.status, errorDetail(payload));
-  }
-  return normalizeFeatureCoverage(payload);
+  return parseCoverageHttpResponse(response, apiError);
 }
 
 /** POST /api/features/associate: associate one in-scope file with one or more
@@ -47,29 +44,5 @@ export async function associateWildFile(
     headers: { ...apiHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify({ path, features }),
   });
-  const payload = await readJson(response);
-  if (!response.ok) {
-    throw apiError(response.status, errorDetail(payload));
-  }
-  return normalizeFeatureCoverage(payload);
-}
-
-async function readJson(response: Response): Promise<unknown> {
-  try {
-    return await response.json();
-  } catch {
-    return null;
-  }
-}
-
-function errorDetail(payload: unknown): string {
-  if (
-    payload !== null &&
-    typeof payload === "object" &&
-    "error" in payload &&
-    typeof (payload as { error?: unknown }).error === "string"
-  ) {
-    return (payload as { error: string }).error;
-  }
-  return "";
+  return parseCoverageHttpResponse(response, apiError);
 }

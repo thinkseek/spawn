@@ -2125,7 +2125,7 @@
         ],
         "artifacts": [
           "docs/feature-map.md",
-          "docs/landing-notes/2026-11-22-pr82-feature-map.md"
+          "docs/landing-notes/2026-11-22-pr82.md"
         ],
         "discussions": []
       }
@@ -2794,11 +2794,13 @@
           "6c5d22782",
           "25d294eeb"
         ],
-        "tests": [],
+        "tests": [
+          "web/test/featuresGraph.test.ts",
+          "web/test/features.test.ts"
+        ],
         "deploys": [],
         "artifacts": [
-          "docs/feature-map/registry.json",
-          "docs/feature-map.md"
+          "docs/feature-map-mindmap.md"
         ],
         "discussions": []
       }
@@ -2959,10 +2961,12 @@
           "2104c1bf1",
           "8bf2127b3"
         ],
-        "tests": [],
+        "tests": [
+          "crates/spawn-cli/tests/recoverable_storage.rs"
+        ],
         "deploys": [],
         "artifacts": [
-          "docs/storage.md",
+          "docs/recoverable-storage-keys.md",
           "docs/feature-map/library-extraction-analysis.md"
         ],
         "discussions": []
