@@ -768,6 +768,7 @@
       "parent": "domain-storage-postgres",
       "summary": "Disk budget enforcement, btrfs extent inspection, commit-map provenance, schema vacuum/sweep, Core-lines storage metrics, and leased scratch directory cleanup.",
       "files": [
+        "crates/spawn-cli/src/backup/recoverable.rs",
         "crates/spawn-cli/src/commit_map.rs",
         "crates/spawn-cli/src/disk.rs",
         "crates/spawn-cli/src/scratch_owner.rs",
@@ -788,6 +789,7 @@
         "crates/spawn-postgres/tests/commit_map.rs",
         "crates/spawn-postgres/tests/commit_map_checkpoints.rs",
         "crates/spawn-postgres/tests/storage.rs",
+        "docs/recoverable-storage-keys.md",
         "docs/storage.md",
         "rsi/backlog/054.json",
         "rsi/backlog/055.json",
@@ -1729,6 +1731,7 @@
       "summary": "Off-host dump/bundle/verify backups, session block archival, systemd backup timers, Core-lines recoverability drills, and automated restore drills.",
       "files": [
         "crates/spawn-cli/src/backup.rs",
+        "crates/spawn-cli/src/backup/recoverable.rs",
         "crates/spawn-cli/src/backup/restore_drill.rs",
         "crates/spawn-cli/src/backup/restore_drill/controllers.rs",
         "crates/spawn-cli/src/backup/restore_drill/sync.rs",
@@ -1737,6 +1740,7 @@
         "crates/spawn-cli/src/backup/sync_dir.rs",
         "crates/spawn-cli/src/serve/core_lines/drills.rs",
         "crates/spawn-cli/src/serve/core_lines/recoverability.rs",
+        "crates/spawn-cli/tests/recoverable_storage.rs",
         "crates/spawn-postgres/tests/backup.rs",
         "deploy/backup/README.md",
         "deploy/backup/lib.sh",
@@ -1770,6 +1774,7 @@
         "deploy/systemd/system/spawn-session-backup.service",
         "deploy/systemd/system/spawn-session-backup.timer",
         "deploy/test-session-backup.sh",
+        "docs/recoverable-storage-keys.md",
         "rsi/backlog/031.json",
         "rsi/backlog/082.json",
         "rsi/backlog/087.json",
@@ -2071,12 +2076,17 @@
         "crates/spawn-cli/src/serve/feature_map.rs",
         "crates/spawn-postgres/src/features.rs",
         "crates/spawn-postgres/tests/features.rs",
+        "docs/feature-map-mindmap.md",
         "docs/feature-map.md",
         "docs/landing-notes/2026-11-22-pr82.md",
+        "web/src/components/features/FeatureInspector.tsx",
         "web/src/components/features/FeatureMapView.tsx",
+        "web/src/components/features/FeatureMindMap.tsx",
         "web/src/features.ts",
         "web/src/featuresApi.ts",
-        "web/test/features.test.ts"
+        "web/src/featuresGraph.ts",
+        "web/test/features.test.ts",
+        "web/test/featuresGraph.test.ts"
       ],
       "relations": [
         {
@@ -2677,9 +2687,11 @@
       "summary": "Owner initiative t559u expanding Spawn's feature map with interactive mindmap visualization (Slice A), semantic file coverage & one-click wild-file scan (Slice B / t565u), and content-derived storage keys (Slice C).",
       "status_note": "Active multi-slice initiative branched from main 6c5d22782.",
       "files": [
+        "docs/feature-map-mindmap.md",
         "docs/feature-map/coverage-spec.md",
         "docs/feature-map/library-extraction-analysis.md",
-        "docs/feature-map/registry.json"
+        "docs/feature-map/registry.json",
+        "docs/recoverable-storage-keys.md"
       ],
       "relations": [
         {
@@ -2748,8 +2760,18 @@
       "kind": "slice",
       "parent": "t559u-feature-map-initiative",
       "summary": "Interactive mindmap / node-edge exploration UI slice (parallel branch `t559u-fm-mindmap`) consuming feature registry topology and capability status.",
-      "status_note": "Parallel slice on branch t559u-fm-mindmap (9 files, not yet merged into this branch's working tree); zero files claimed here to avoid fabricated placeholder links until integration.",
-      "files": [],
+      "status_note": "Implemented on branch t559u-fm-mindmap (25d294eeb) and integrated via t559u-fm-integrate; all 9 Slice A mindmap/graph files are genuinely associated here and shared with cap-feature-map-status.",
+      "files": [
+        "crates/spawn-cli/src/serve/feature_map.rs",
+        "docs/feature-map-mindmap.md",
+        "web/src/components/features/FeatureInspector.tsx",
+        "web/src/components/features/FeatureMapView.tsx",
+        "web/src/components/features/FeatureMindMap.tsx",
+        "web/src/features.ts",
+        "web/src/featuresGraph.ts",
+        "web/test/features.test.ts",
+        "web/test/featuresGraph.test.ts"
+      ],
       "relations": [
         {
           "kind": "depends_on",
@@ -2769,7 +2791,8 @@
         ],
         "agents": [],
         "commits": [
-          "6c5d22782"
+          "6c5d22782",
+          "25d294eeb"
         ],
         "tests": [],
         "deploys": [],
@@ -2831,7 +2854,9 @@
           "slice-b-coverage-agent"
         ],
         "commits": [
-          "6c5d22782"
+          "6c5d22782",
+          "f4ac04887",
+          "57dfd7784"
         ],
         "tests": [
           "crates/spawn-core/tests/feature_coverage.rs",
@@ -2903,9 +2928,13 @@
       "kind": "slice",
       "parent": "t559u-feature-map-initiative",
       "summary": "Deterministic content-derived storage keys and verifiable snapshot manifests (`fm-cas/v1`) developed on parallel branch `t559u-fm-storage-keys`.",
-      "status_note": "Parallel slice on branch t559u-fm-storage-keys (implementation files not yet merged into this branch); only the shared library-extraction seam doc on this branch is linked here.",
+      "status_note": "Implemented on branch t559u-fm-storage-keys (2104c1bf1), hardened on t559u-fm-audit-storage (8bf2127b3), and integrated via t559u-fm-integrate; all 4 fm-cas/v1 files plus the library-extraction seam doc are genuinely associated.",
       "files": [
-        "docs/feature-map/library-extraction-analysis.md"
+        "crates/spawn-cli/src/backup.rs",
+        "crates/spawn-cli/src/backup/recoverable.rs",
+        "crates/spawn-cli/tests/recoverable_storage.rs",
+        "docs/feature-map/library-extraction-analysis.md",
+        "docs/recoverable-storage-keys.md"
       ],
       "relations": [
         {
@@ -2926,7 +2955,9 @@
         ],
         "agents": [],
         "commits": [
-          "6c5d22782"
+          "6c5d22782",
+          "2104c1bf1",
+          "8bf2127b3"
         ],
         "tests": [],
         "deploys": [],
@@ -2946,7 +2977,8 @@
       "status_note": "Staged research/design only \u2014 NOT a production implementation and NOT a 4th slice of t559u. Permanently excludes sold mac16.",
       "files": [
         "docs/feature-map/library-extraction-analysis.md",
-        "docs/feature-map/t567u-t568u-distributed-research.md"
+        "docs/feature-map/t567u-t568u-distributed-research.md",
+        "docs/recoverable-storage-keys.md"
       ],
       "relations": [
         {
