@@ -3697,6 +3697,7 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
+            make_tree_writable_best_effort(&self.path);
             let _ = fs::remove_dir_all(&self.path);
         }
     }
@@ -3917,7 +3918,8 @@ mod tests {
         let src = TempDir::new("rt-src");
         let store_dir = TempDir::new("rt-store");
         let restore_dir = TempDir::new("rt-out");
-        let restored_fm = TempDir::new("rt-fm").path().join("restored-fm.json");
+        let fm_dir = TempDir::new("rt-fm");
+        let restored_fm = fm_dir.path().join("restored-fm.json");
 
         // Use a small chunk size (1024 bytes) to exercise multi-chunk storage
         // and reassembly without allocating huge files.
@@ -4739,7 +4741,8 @@ mod tests {
         // Single-snapshot verify & restore in store2 succeed without snap1 present!
         cas2.verify_snapshot(&snap2.snapshot_key)
             .expect("independent delta snapshot verifies without parent");
-        let restore_out = TempDir::new("sock-restore").path().join("tree");
+        let restore_dir = TempDir::new("sock-restore");
+        let restore_out = restore_dir.path().join("tree");
         cas2.restore_snapshot(&snap2.snapshot_key, &restore_out, None)
             .expect("independent delta snapshot restores");
         assert_eq!(
