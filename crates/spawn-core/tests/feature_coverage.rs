@@ -372,25 +372,38 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn collect_repo_inventory(root: &Path, boundary: &BoundaryPolicy) -> Vec<InventoryEntry> {
-    let git_out = Command::new("git")
+fn git_tracked_files_if_repo(root: &Path) -> Option<BTreeSet<String>> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["ls-files", "-z"])
         .env("LC_ALL", "C")
         .output()
-        .expect("git ls-files");
-    assert!(git_out.status.success(), "git ls-files failed");
-    let tracked: BTreeSet<String> = git_out
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| std::str::from_utf8(s).ok())
-        .map(str::to_string)
-        .collect();
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .map(str::to_string)
+            .collect(),
+    )
+}
 
+fn collect_repo_inventory(root: &Path, boundary: &BoundaryPolicy) -> Vec<InventoryEntry> {
+    // In a git worktree, `git ls-files` identifies tracked vs untracked files.
+    // In a git-archive export (no `.git`, as run by the official gate), the
+    // exported tree itself is the tracked file set.
+    let tracked = git_tracked_files_if_repo(root);
     let mut entries = Vec::new();
-    walk_repo(root, "", boundary, &tracked, &mut entries);
+    walk_repo(root, "", boundary, tracked.as_ref(), &mut entries);
     entries
 }
 
@@ -398,7 +411,7 @@ fn walk_repo(
     dir: &Path,
     rel_prefix: &str,
     boundary: &BoundaryPolicy,
-    tracked: &BTreeSet<String>,
+    tracked: Option<&BTreeSet<String>>,
     out: &mut Vec<InventoryEntry>,
 ) {
     let mut children: Vec<PathBuf> = fs::read_dir(dir)
@@ -422,19 +435,7 @@ fn walk_repo(
             continue;
         }
         if meta.file_type().is_dir() {
-            if matches!(
-                name,
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "dist"
-                    | ".cache"
-                    | "__pycache__"
-                    | ".spawn"
-                    | ".claude"
-            ) && spawn_core::feature_coverage::match_exclusion(boundary, &format!("{rel}/"))
-                .is_some()
-            {
+            if match_directory_exclusion(boundary, &rel).is_some() {
                 out.push(InventoryEntry {
                     path: format!("{rel}/"),
                     tracked: false,
@@ -445,10 +446,13 @@ fn walk_repo(
             }
             walk_repo(&path, &rel, boundary, tracked, out);
         } else if meta.file_type().is_file() {
+            let is_excluded =
+                spawn_core::feature_coverage::match_exclusion(boundary, &rel).is_some();
+            let is_tracked = !is_excluded && tracked.is_none_or(|set| set.contains(&rel));
             out.push(InventoryEntry {
-                path: rel.clone(),
-                tracked: tracked.contains(&rel),
-                size_bytes: meta.len(),
+                path: rel,
+                tracked: is_tracked,
+                size_bytes: if is_excluded { 0 } else { meta.len() },
                 sha256: None,
             });
         }
@@ -1096,4 +1100,72 @@ fn provenance_artifacts_and_tests_paths_are_stale_checked_while_commit_shas_are_
             .iter()
             .any(|m| m.contains("provenance.tests") && m.contains("../outside_test.rs"))
     );
+}
+
+#[test]
+fn collect_repo_inventory_works_on_git_archive_export_without_dot_git() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let export_dir = std::env::temp_dir().join(format!(
+        "spawn-core-archive-export-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(export_dir.join("crates/spawn-core/src")).expect("src dir");
+    fs::create_dir_all(export_dir.join("target/debug")).expect("target dir");
+    fs::write(export_dir.join("crates/spawn-core/src/lib.rs"), "// lib\n").expect("lib.rs");
+    fs::write(
+        export_dir.join("crates/spawn-core/src/feature_coverage.rs"),
+        "// coverage\n",
+    )
+    .expect("feature_coverage.rs");
+    fs::write(
+        export_dir.join("crates/spawn-core/src/wild_export.rs"),
+        "// wild\n",
+    )
+    .expect("wild_export.rs");
+    fs::write(export_dir.join("target/debug/bin"), "derived").expect("target bin");
+    fs::write(export_dir.join(".env"), "SECRET=1").expect(".env");
+
+    // Ensure no `.git` exists in the simulated git-archive export.
+    assert!(!export_dir.join(".git").exists());
+
+    let mut registry = fixture_registry();
+    let inventory = collect_repo_inventory(&export_dir, &registry.boundary);
+    let report = scan_coverage(&registry, &inventory, 1300);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_accounting_identities(&report);
+        assert_eq!(report.counts.in_scope, 3);
+        assert_eq!(report.counts.covered, 2);
+        assert_eq!(report.counts.unassociated_wild, 1);
+        assert_eq!(report.counts.explicit_exclusions, 2);
+        assert_eq!(
+            report.unassociated_files[0].path,
+            "crates/spawn-core/src/wild_export.rs"
+        );
+        assert!(
+            report.unassociated_files[0].tracked,
+            "git-archive exported in-scope files are treated as tracked"
+        );
+
+        associate_file(
+            &mut registry,
+            "crates/spawn-core/src/wild_export.rs",
+            &["cap-coverage".to_string()],
+            &inventory,
+        )
+        .expect("associate exported wild file");
+        let after = scan_coverage(&registry, &inventory, 1400);
+        assert!(after.is_clean());
+        assert_accounting_identities(&after);
+        assert_eq!(after.counts.covered, 3);
+        assert_eq!(after.counts.in_scope, 3);
+    }));
+    let _ = fs::remove_dir_all(&export_dir);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
