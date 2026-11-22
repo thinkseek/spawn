@@ -459,7 +459,16 @@ fn walk_repo(
     }
 }
 
-fn assert_real_registry_semantic_invariants(registry: &FeatureRegistry, report: &ScanReport) {
+fn assert_real_registry_semantic_invariants(
+    root: &Path,
+    registry: &FeatureRegistry,
+    report: &ScanReport,
+) {
+    assert_eq!(
+        registry.boundary.exclusions.len(),
+        26,
+        "expected 26 explicit exclusion rules in docs/feature-map/registry.json"
+    );
     let ids: BTreeSet<&str> = registry.features.iter().map(|f| f.id.as_str()).collect();
     for forbidden_catchall in [
         "domain-workspace-docs",
@@ -480,6 +489,18 @@ fn assert_real_registry_semantic_invariants(registry: &FeatureRegistry, report: 
                 "root domain {} must organize child capabilities rather than holding stray files: {:?}",
                 feat.id,
                 feat.files
+            );
+        }
+        for prov_path in feat
+            .provenance
+            .artifacts
+            .iter()
+            .chain(feat.provenance.tests.iter())
+        {
+            assert!(
+                root.join(prov_path).is_file(),
+                "provenance path {prov_path:?} on {} does not exist on disk",
+                feat.id
             );
         }
     }
@@ -688,7 +709,7 @@ fn real_project_registry_covers_every_in_scope_file_with_zero_drift() {
     assert_eq!(report.counts.covered, report.counts.in_scope);
     assert!(report.counts.multi_feature_files >= 100);
 
-    assert_real_registry_semantic_invariants(&registry, &report);
+    assert_real_registry_semantic_invariants(&root, &registry, &report);
 }
 
 fn simple_node(id: &str, kind: FeatureKind, parent: Option<&str>) -> FeatureNode {

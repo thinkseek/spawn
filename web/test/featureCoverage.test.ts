@@ -451,93 +451,168 @@ test("mixed wild, stale, multi-feature, and excluded fixture stays strictly sepa
   assert.equal(fileAssociatedFeatures(data.report, "secrets/").length, 0);
 });
 
-test("real docs/feature-map/registry.json satisfies semantic non-catchall invariants", () => {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const registryPath = path.resolve(here, "../../docs/feature-map/registry.json");
-  const raw = JSON.parse(fs.readFileSync(registryPath, "utf8")) as {
-    schema_version: number;
-    initiative_id: string;
-    boundary: { exclusions: Array<{ id: string; pattern: string }> };
-    features: Array<{
-      id: string;
-      kind: string;
-      parent: string | null;
-      files: string[];
-    }>;
+test("multi-slice initiative coverage fixture normalizes domain hierarchy, cross-slice links, and research badge without reading outside web/", () => {
+  const payload = {
+    ...basePayload({
+      report: {
+        counts: {
+          total_seen: 12,
+          in_scope: 10,
+          covered: 10,
+          unassociated_wild: 0,
+          stale_references: 0,
+          explicit_exclusions: 2,
+          multi_feature_files: 4,
+          orphan_features: 0,
+          invalid_relations: 0,
+        },
+        unassociated_files: [],
+        excluded_files: [
+          {
+            path: "target/",
+            rule_id: "rust-build-output",
+            category: "build-cache",
+            reason: "Cargo build outputs are derived.",
+          },
+          {
+            path: ".env",
+            rule_id: "secrets-env-dotfile",
+            category: "secrets",
+            reason: "Secret files are excluded.",
+          },
+        ],
+        bidirectional_index: {
+          feature_to_files: {
+            "t559u-slice-a-mindmap": [
+              "docs/feature-map-mindmap.md",
+              "web/src/featuresGraph.ts",
+              "web/src/components/features/FeatureMindMap.tsx",
+              "web/src/components/features/FeatureInspector.tsx",
+              "web/test/featuresGraph.test.ts",
+            ],
+            "t559u-slice-b-coverage": [
+              "crates/spawn-core/src/feature_coverage.rs",
+              "docs/feature-map/registry.json",
+            ],
+            "t559u-slice-c-storage-keys": [
+              "crates/spawn-cli/src/backup/recoverable.rs",
+              "crates/spawn-cli/tests/recoverable_storage.rs",
+              "docs/recoverable-storage-keys.md",
+            ],
+            "t567u-multi-machine-distributed": [
+              "docs/recoverable-storage-keys.md",
+              "docs/feature-map/t567u-t568u-distributed-research.md",
+            ],
+          },
+          file_to_features: {
+            "docs/feature-map-mindmap.md": [
+              "cap-feature-map-status",
+              "t559u-feature-map-initiative",
+              "t559u-slice-a-mindmap",
+            ],
+            "web/src/featuresGraph.ts": ["cap-feature-map-status", "t559u-slice-a-mindmap"],
+            "web/src/components/features/FeatureMindMap.tsx": ["t559u-slice-a-mindmap"],
+            "web/src/components/features/FeatureInspector.tsx": ["t559u-slice-a-mindmap"],
+            "web/test/featuresGraph.test.ts": ["t559u-slice-a-mindmap"],
+            "crates/spawn-core/src/feature_coverage.rs": [
+              "t559u-slice-b-coverage",
+              "t565u-wild-file-scan",
+            ],
+            "docs/feature-map/registry.json": ["t559u-slice-b-coverage"],
+            "crates/spawn-cli/src/backup/recoverable.rs": ["t559u-slice-c-storage-keys"],
+            "crates/spawn-cli/tests/recoverable_storage.rs": ["t559u-slice-c-storage-keys"],
+            "docs/recoverable-storage-keys.md": [
+              "t559u-slice-c-storage-keys",
+              "t567u-multi-machine-distributed",
+            ],
+          },
+        },
+      },
+    }),
+    features: [
+      {
+        id: "domain-dashboard-web",
+        title: "Observer HTTP API & Web Dashboard",
+        kind: "domain",
+        parent: null,
+        summary: "Organizational root domain.",
+        status_note: null,
+        file_count: 0,
+        relations: [{ kind: "contains", target: "cap-feature-map-status" }],
+        provenance: {},
+      },
+      {
+        id: "t559u-feature-map-initiative",
+        title: "Full-Project Feature Map Initiative (t559u)",
+        kind: "initiative",
+        parent: null,
+        summary: "Multi-slice initiative.",
+        status_note: "Active",
+        file_count: 3,
+        relations: [{ kind: "contains", target: "t559u-slice-a-mindmap" }],
+        provenance: {},
+      },
+      {
+        id: "t559u-slice-a-mindmap",
+        title: "Slice A: Interactive Feature Mindmap",
+        kind: "slice",
+        parent: "t559u-feature-map-initiative",
+        summary: "Mindmap graph view.",
+        status_note: null,
+        file_count: 5,
+        relations: [{ kind: "depends_on", target: "cap-feature-map-status" }],
+        provenance: {},
+      },
+      {
+        id: "t559u-slice-b-coverage",
+        title: "Slice B: File Coverage & Wild-File Scan",
+        kind: "slice",
+        parent: "t559u-feature-map-initiative",
+        summary: "Coverage core & UI.",
+        status_note: null,
+        file_count: 2,
+        relations: [],
+        provenance: {},
+      },
+      {
+        id: "t559u-slice-c-storage-keys",
+        title: "Slice C: Content-Derived Storage Keys",
+        kind: "slice",
+        parent: "t559u-feature-map-initiative",
+        summary: "Deterministic fm-cas/v1 storage keys.",
+        status_note: null,
+        file_count: 3,
+        relations: [],
+        provenance: {},
+      },
+      {
+        id: "t567u-multi-machine-distributed",
+        title: "Multi-Machine Distributed Research (t567u/t568u)",
+        kind: "research-initiative",
+        parent: null,
+        summary: "Staged research/design only.",
+        status_note: "Not production",
+        file_count: 2,
+        relations: [{ kind: "relates_to", target: "t559u-feature-map-initiative" }],
+        provenance: {},
+      },
+    ],
   };
 
-  assert.equal(raw.schema_version, 1);
-  assert.equal(raw.initiative_id, "t559u");
-  assert.equal(raw.boundary.exclusions.length, 26);
-
-  const ids = new Set(raw.features.map((f) => f.id));
-  for (const catchAll of [
-    "domain-workspace-docs",
-    "cap-rsi-backlog-specs",
-    "cap-rsi-gate-scenarios",
-    "cap-web-fleet-home-views",
-    "cap-web-missions-rsi-trace-views",
-  ]) {
-    assert.equal(ids.has(catchAll), false, `catch-all ${catchAll} must not exist`);
-  }
-
-  for (const feat of raw.features) {
-    if (feat.kind === "domain") {
-      assert.equal(feat.files.length, 0, `domain ${feat.id} must not hold stray files`);
-    }
-  }
-
-  const sliceA = raw.features.find((f) => f.id === "t559u-slice-a-mindmap");
-  assert.ok(sliceA);
-  for (const expected of [
-    "docs/feature-map-mindmap.md",
-    "web/src/featuresGraph.ts",
-    "web/src/components/features/FeatureMindMap.tsx",
-    "web/src/components/features/FeatureInspector.tsx",
-    "web/test/featuresGraph.test.ts",
-  ]) {
-    assert.equal(sliceA.files.includes(expected), true, `sliceA missing ${expected}`);
-  }
-  assert.equal(sliceA.files.includes("web/src/App.tsx"), false);
-  assert.equal(sliceA.files.includes("web/src/components/Sidebar.tsx"), false);
-
-  const sliceC = raw.features.find((f) => f.id === "t559u-slice-c-storage-keys");
-  assert.ok(sliceC);
-  for (const expected of [
-    "crates/spawn-cli/src/backup/recoverable.rs",
-    "crates/spawn-cli/tests/recoverable_storage.rs",
-    "docs/recoverable-storage-keys.md",
-  ]) {
-    assert.equal(sliceC.files.includes(expected), true, `sliceC missing ${expected}`);
-  }
-  assert.equal(sliceC.files.includes("docs/storage.md"), false);
-
-  const t567u = raw.features.find((f) => f.id === "t567u-multi-machine-distributed");
-  assert.ok(t567u);
-  assert.equal(t567u.kind, "research-initiative");
-  assert.equal(t567u.parent, null);
-  assert.equal(t567u.files.includes("docs/storage.md"), false);
-
-  // Every provenance.artifacts & provenance.tests entry must resolve to a real file.
-  const repoRoot = path.resolve(here, "../..");
-  const rawFull = JSON.parse(fs.readFileSync(registryPath, "utf8")) as {
-    features: Array<{
-      id: string;
-      provenance?: { artifacts?: string[]; tests?: string[] };
-    }>;
-  };
-  for (const feat of rawFull.features) {
-    for (const p of [
-      ...(feat.provenance?.artifacts ?? []),
-      ...(feat.provenance?.tests ?? []),
-    ]) {
-      assert.equal(
-        fs.existsSync(path.join(repoRoot, p)),
-        true,
-        `provenance path ${p} on ${feat.id} does not exist on disk`,
-      );
-    }
-  }
+  const parsed = parseFeatureCoverageResponse(payload);
+  assert.equal(isScanClean(parsed.report), true);
+  assert.equal(accountingIdentitiesHold(parsed.report), true);
+  assert.equal(parsed.features.find((f) => f.id === "domain-dashboard-web")?.file_count, 0);
+  const tracked = initiativesAndSlices(parsed.features);
+  assert.equal(tracked.length, 5);
+  const research = tracked.find((f) => f.id === "t567u-multi-machine-distributed");
+  assert.ok(research);
+  assert.equal(isResearchInitiative(research), true);
+  assert.equal(research.parent, null);
+  assert.deepEqual(fileAssociatedFeatures(parsed.report, "docs/recoverable-storage-keys.md"), [
+    "t559u-slice-c-storage-keys",
+    "t567u-multi-machine-distributed",
+  ]);
 });
 
 test("Review A F1 / B F4: wild-file selection starts empty even with suggestions and requires explicit selection", () => {
