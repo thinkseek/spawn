@@ -236,16 +236,21 @@ Supported relation kinds: `parent_of`, `depends_on`, `implements`, `verifies`,
 
 - Repo-relative canonical POSIX paths (`path`)
 - Entry kinds: `regular`, `directory` (including nested empty directories), `symlink`
-- POSIX permission mode bits (`mode & 0o777`, preserving `0o755`/`0o644` while
-  stripping setuid/setgid/sticky bits `0o7000` for restore safety; applied to
-  directories in reverse depth order so restrictive modes like `0o555` do not
-  block child creation)
-- Nanosecond modification timestamps (`mtime_ns`, restored on regular files via
-  `File::set_modified`)
+- POSIX permission mode bits (`mode & 0o777`, preserving `0o755`/`0o644`/`0o444`/`0o555`
+  while stripping setuid/setgid/sticky bits `0o7000` for restore safety; applied
+  to regular files after setting `mtime_ns` and to directories in reverse depth
+  order after setting directory `mtime_ns` so restrictive modes like `0o444` and
+  `0o555` do not block child creation or timestamp restoration)
+- Nanosecond modification timestamps (`mtime_ns`, including pre-1970 negative
+  timestamps, restored on regular files via `File::set_modified` and on
+  directories and symlinks via `utimensat(..., AT_SYMLINK_NOFOLLOW)` so
+  `snapshot -> restore -> re-snapshot` reproduces the identical `snapshot_key`
+  on nanosecond-resolution POSIX filesystems)
 - Exact raw bytes for empty files, binary files (`0x00..=0xFF`), and multi-chunk
-  files
+  files (captured via `O_NOFOLLOW` + single-fd `fstat` with size-drift checks)
 - Exact UTF-8 symlink target strings (never followed during snapshot; verified
-  against `symlink_blob_key` and validated against root escape before restore)
+  against `symlink_blob_key` and validated against single-hop and multi-hop
+  symlink-chain root escapes and symlink loops before restore)
 - Complete `FmGraphSnapshot` object and bidirectional `entry.feature_ids`
 
 ### Explicitly Unsupported (Encoded in `unsupported_semantics`)
@@ -264,14 +269,22 @@ Supported relation kinds: `parent_of`, `depends_on`, `implements`, `verifies`,
 
 ### Corruption & Missing Object Detection
 
-- Every `verify` and `restore` operation performs **full pre-flight verification**
-  before writing any restored output:
-  1. Recomputes and verifies `snapshot_key` over canonical `SnapshotManifestBody`.
-  2. Recomputes and verifies `fm_graph_key` over canonical `FmGraphSnapshot`
-     bytes (when present).
-  3. Verifies FM graph structural & bidirectional consistency:
+- Every `verify` and `restore` operation opens the store **strictly read-only**
+  (`CasStore::open_read_only`, never creating directories or mutating `--store`,
+  safe on read-only disaster-recovery mounts) and performs **full pre-flight
+  verification** before writing any restored output:
+  1. Recomputes and verifies `snapshot_key` over canonical `SnapshotManifestBody`,
+     enforces strict schema parsing (`deny_unknown_fields`, `chunk_size > 0`),
+     and verifies exact canonical byte equality of the manifest on disk (catching
+     trailing whitespace, unknown fields, unsorted entries, and duplicate tags).
+  2. Validates `parent_snapshot_key` syntax (when present) and rejects
+     self-parenting; intentionally does not require the parent snapshot object
+     to exist locally so single-snapshot delta restores remain independent.
+  3. Recomputes and verifies `fm_graph_key` and exact canonical bytes of
+     `FmGraphSnapshot` (when present).
+  4. Verifies FM graph structural & bidirectional consistency:
      - Unique non-empty feature IDs; no self-loops; no dangling `parent_id` or
-       relation endpoints.
+       relation endpoints; no conflicting `FileAssocStatus` on the same path.
      - Acyclic parent hierarchy (`parent_id` + `parent_of`) and acyclic
        `depends_on` graph.
      - Every `entry.feature_ids` element exists in the FM graph and references
@@ -279,9 +292,13 @@ Supported relation kinds: `parent_of`, `depends_on`, `implements`, `verifies`,
      - Every feature file with `status == present` exists in `entries[]` and
        lists the feature ID back (`external` and `missing` entries may be absent
        from `entries[]`).
-  4. Verifies every regular blob, chunk (size + `chunk_key` + whole-file
-     reassembled `blob_key`), and symlink blob (`symlink_blob_key` + UTF-8
-     target equality).
+  5. Verifies per-entry invariants (mode mask `<= 0o777`, no path hierarchy
+     collisions such as a file at `a` alongside `a/b`, valid `renamed_from`,
+     strict per-kind payload fields, and consistent `entry.size` across all
+     entries deduplicating the same `blob_key`).
+  6. Verifies every regular blob, chunk (`0 < chunk.length <= chunk_size`,
+     `chunk_key`, and whole-file reassembled `blob_key`), and symlink blob
+     (`symlink_blob_key`, exact `entry.size`, and UTF-8 target equality).
 - Any 1-bit flip, truncation, tampering, or missing object returns a structured
   `CasError` naming the exact key and all affected logical paths.
 
@@ -290,26 +307,84 @@ Supported relation kinds: `parent_of`, `depends_on`, `implements`, `verifies`,
 - Every immutable object (`blob`, `symlink`, `chunk`, `fm-graph`, `snapshot`)
   is written to a unique staging path `fm-cas/v1/staging/.tmp-<pid>-<seq>`,
   flushed with `sync_all()`, and committed with write-once hard-link semantics
-  (falling back to atomic `rename` if hard links are unsupported).
+  followed by a parent-directory `fsync` (falling back to atomic `rename` only
+  when hard links are unsupported on the filesystem, after verifying no corrupt
+  destination object exists).
 - When a target object already exists (deduplication or concurrent writer
-  race), the writer **re-reads and verifies the on-disk object's hash** rather
-  than blindly trusting it, surfacing pre-existing disk corruption immediately.
+  race), the writer **re-reads and verifies the on-disk object's hash** (and
+  exact canonical manifest bytes) rather than blindly trusting it, surfacing
+  pre-existing disk corruption immediately.
 - `fm-cas/v1/snapshots.json` is updated under an exclusive advisory lock
-  (`fm-cas/v1/.cas.lock`) via `staging/.tmp-* -> sync_all -> rename`.
+  (`fm-cas/v1/.cas.lock`) via `staging/.tmp-* -> sync_all -> rename -> dir fsync`,
+  and `read_index` validates `schema_version == "fm-cas/v1"`.
 - Stray `.tmp-*` files left by killed/interrupted runs live exclusively under
-  `fm-cas/v1/staging/`, are ignored by all readers and verifiers, and can be
-  safely swept without touching committed objects.
+  `fm-cas/v1/staging/`, are ignored by all readers and verifiers, and
+  `sweep_staging` checks `file_type().is_file()` (never following symlinks) and
+  skips `.tmp-<pid>-<seq>` files owned by a currently live PID on this host.
 
-### Restore Target Safety
+### Restore Target Safety & Rollback
 
-- Refuses to restore into a non-empty directory or non-directory path.
+- Validates `--restore-fm` (presence of `fm_graph`, non-existence via `lstat`
+  including dangling symlinks, and non-overlap with `--into`) in pre-flight
+  before creating `--into`.
+- Refuses to restore into a non-empty directory, a non-directory path, or any
+  symlink (including dangling symlinks or symlinks to empty directories).
 - Refuses any path traversal (`..`, absolute paths, `.git` components) and
-  refuses absolute or root-escaping symlink targets.
+  symbolically resolves all manifest symlinks (up to 40 hops) to refuse
+  absolute targets, single-hop or multi-hop symlink-chain root escapes, `.git`
+  targets, and symlink loops.
 - Restores directories first, regular files second (checking no parent
-  component is a symlink), symlinks third, and directory permissions last in
-  reverse depth order.
+  component is a symlink, setting `mtime_ns` before `chmod`), symlinks third
+  (with `utimensat(..., AT_SYMLINK_NOFOLLOW)`), and directory `mtime_ns` +
+  modes last in explicit reverse depth order.
+- Wraps the write phase in a rollback guard: if any mid-restore I/O or
+  integrity error occurs, partial restored files/directories (including any
+  already-restricted `0o555` directories) are cleaned up cleanly.
 
-## 8. CLI Reference
+## 8. Known & Remaining Limitations (Honest Scope of `fm-cas/v1`)
+
+1. **Fixed-size chunking (not content-defined chunking / FastCDC)**: files
+   `> 4 MiB` are split at fixed `chunk_size` offsets. Inserting or deleting
+   bytes near the beginning of a large file shifts subsequent chunk boundaries
+   and causes later chunks to hash differently.
+2. **Metadata-sensitive `snapshot_key` & cross-OS / cross-FS drift**:
+   `snapshot_key` hashes `mtime_ns` and `mode` for files, directories, and
+   symlinks. Restoring onto a coarser-timestamp filesystem (e.g. HFS+ 1 s,
+   FAT32 2 s) or moving across OSes with different symlink mode semantics
+   (Linux always reports `0o777` for symlinks; macOS reflects `umask`) changes
+   `snapshot_key` upon re-snapshot, even though all `blob_key`, `chunk_key`,
+   `symlink_blob_key`, and `fm_graph_key` values remain 100% identical.
+3. **Case-insensitive or Unicode-normalizing filesystems**: snapshots captured
+   on case-sensitive Linux containing paths differing only by case (e.g.
+   `Foo.rs` and `foo.rs`) or NFC/NFD form cannot both materialize on a
+   case-insensitive restore target; `create_new` refuses silent overwrite and
+   rolls back cleanly.
+4. **Single-host POSIX locking & PID-namespace scope**: `.cas.lock` advisory
+   locks and `sweep_staging` PID-liveness checks assume a single local POSIX
+   host/PID namespace. Do not point multiple hosts or containers in distinct
+   PID namespaces at one mutable local store over NFS/SMB; use remote
+   content-addressed replication (`t567u`/`t568u`) instead.
+5. **Content-only `--parent` rename heuristic**: rename detection matches
+   disappeared content keys to newly appeared paths in lexicographical order.
+   Deleting one empty (or duplicate-content) file while adding another
+   unrelated file with identical bytes is recorded as a rename, and a file that
+   is simultaneously renamed and edited is recorded as a delete + add.
+6. **Parent snapshot not required locally for single-snapshot `verify`/`restore`**:
+   `verify` checks `parent_snapshot_key` format and rejects self-parenting, but
+   intentionally allows verifying/restoring a snapshot without fetching its
+   parent lineage.
+7. **No local garbage collection or local encryption-at-rest**: local
+   `fm-cas/v1` stores are append-only plaintext-addressed caches; pruning
+   unreferenced blobs and remote sealing (`transport_key` + AEAD/GPG) are
+   separate lifecycle/transport layers.
+8. **Absolute / root-escaping symlinks**: `snapshot` faithfully records any
+   UTF-8 symlink target and `verify` validates its content hash, while
+   `restore` strictly refuses absolute, escaping, `.git`-targeting, or looping
+   symlinks with no unsafe override flag in v1.
+9. **Non-UTF-8 paths & symlink targets**: rejected at snapshot time rather than
+   lossily transcoded, ensuring unambiguous canonical JSON and POSIX paths.
+
+## 9. CLI Reference
 
 ```bash
 # Capture a snapshot (with optional FM graph and parent snapshot for rename tracking)
@@ -341,7 +416,7 @@ spawn backup cas key-of \
   [--json]
 ```
 
-## 9. Legacy Coexistence & Multi-Machine Replication (`t567u` / `t568u`)
+## 10. Legacy Coexistence & Multi-Machine Replication (`t567u` / `t568u`)
 
 ### Non-Destructive Coexistence
 
