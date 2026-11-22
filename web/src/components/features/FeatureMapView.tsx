@@ -1,10 +1,12 @@
 import {
   ArrowUpRight,
   ExternalLink,
+  LayoutGrid,
+  Network,
   OctagonAlert,
   UserRoundX,
 } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { usePoll } from "../../api";
 import { clockTime, relativeTime } from "../../format";
@@ -31,7 +33,18 @@ import {
   verificationNote,
 } from "../../features";
 import { fetchFeatureMap } from "../../featuresApi";
+import type { GraphGroupingMode } from "../../featuresGraph";
+import {
+  buildFeatureMindMapTree,
+  buildFileIndex,
+  buildRelationIndex,
+  validateFeatureGraph,
+} from "../../featuresGraph";
 import { Card, FOCUS_RING, LiveStatus, PageHeader, chip, cx } from "../ui";
+import { FeatureInspector } from "./FeatureInspector";
+import { FeatureMindMap } from "./FeatureMindMap";
+
+type ViewMode = "mindmap" | "columns";
 
 interface FeatureMapViewProps {
   /** Open a task's session timeline: the evidence behind a capability. */
@@ -39,14 +52,58 @@ interface FeatureMapViewProps {
 }
 
 /** The Feature map: a mission's capabilities, planned, implemented,
- * verified and live, each with the records that say so. The states are the
- * server's, derived from Spawn's log; this page only lays them out. */
+ * verified and live, each with the records that say so. Defaults to the
+ * interactive navigable Mind Map view, with a secondary State Columns audit
+ * view. The states are the server's, derived from Spawn's log; this page
+ * only lays them out. */
 export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
   const poll = usePoll("features", fetchFeatureMap, 4_000, { checked: true });
   const [chosen, setChosen] = useState<number | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("mindmap");
+  const [groupingMode, setGroupingMode] = useState<GraphGroupingMode>("auto");
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [focusTrigger, setFocusTrigger] = useState(0);
+
   const data = poll.data;
   const mission =
     data?.missions.find((entry) => entry.id === chosen) ?? data?.missions[0] ?? null;
+
+  const tree = useMemo(
+    () => (mission ? buildFeatureMindMapTree(mission, { groupingMode }) : null),
+    [mission, groupingMode],
+  );
+  const fileIndex = useMemo(
+    () => buildFileIndex(mission?.features ?? []),
+    [mission?.features],
+  );
+  const relationIndex = useMemo(
+    () => buildRelationIndex(mission?.features ?? []),
+    [mission?.features],
+  );
+  const graphIssues = useMemo(
+    () => validateFeatureGraph(mission?.features ?? []),
+    [mission?.features],
+  );
+
+  // Clear selection if the selected node no longer exists in the active mission tree.
+  useEffect(() => {
+    if (selectedNodeId && tree && !tree.nodes[selectedNodeId]) {
+      setSelectedNodeId(null);
+    }
+  }, [selectedNodeId, tree]);
+
+  const handleJumpToNode = useCallback((nodeId: string) => {
+    setSelectedNodeId(nodeId);
+    setFocusTrigger((n) => n + 1);
+  }, []);
+
+  const handleInspectInMap = useCallback((featureId: string) => {
+    setViewMode("mindmap");
+    setSelectedNodeId(featureId);
+    setFocusTrigger((n) => n + 1);
+  }, []);
+
+  const selectedNode = selectedNodeId && tree ? (tree.nodes[selectedNodeId] ?? null) : null;
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -57,13 +114,42 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
           </h1>
         }
       >
+        {/* View mode toggle: Mind Map (default) vs State Columns */}
+        <div
+          className="flex items-center gap-1"
+          role="group"
+          aria-label="Feature map view mode"
+        >
+          <button
+            type="button"
+            onClick={() => setViewMode("mindmap")}
+            aria-pressed={viewMode === "mindmap"}
+            className={cx(chip(viewMode === "mindmap"), FOCUS_RING)}
+          >
+            <Network size={13} />
+            Mind map
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("columns")}
+            aria-pressed={viewMode === "columns"}
+            className={cx(chip(viewMode === "columns"), FOCUS_RING)}
+          >
+            <LayoutGrid size={13} />
+            State columns
+          </button>
+        </div>
+
         {data && data.missions.length > 1 && (
           <div className="flex gap-1.5">
             {data.missions.map((entry) => (
               <button
                 key={entry.id}
                 type="button"
-                onClick={() => setChosen(entry.id)}
+                onClick={() => {
+                  setChosen(entry.id);
+                  setSelectedNodeId(null);
+                }}
                 aria-current={entry.id === mission?.id ? "true" : undefined}
                 className={cx("tnum", chip(entry.id === mission?.id), FOCUS_RING)}
               >
@@ -86,9 +172,59 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
         <div className="grid flex-1 place-items-center text-label text-muted-foreground">
           {poll.error ? `The feature map could not be read: ${poll.error}` : "Reading the map…"}
         </div>
-      ) : !mission ? (
+      ) : !mission || !tree ? (
         <div className="grid flex-1 place-items-center px-6 text-center text-label text-muted-foreground">
           No open objective mission has a capability map.
+        </div>
+      ) : viewMode === "mindmap" ? (
+        <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 py-3 sm:px-5">
+          {mission.blocker && <MissionBlocker mission={mission} />}
+          {mission.backlog_error && <BacklogError mission={mission} />}
+          {mission.mapping.error && <MappingError mission={mission} />}
+          {graphIssues.length > 0 && <GraphIssuesBanner count={graphIssues.length} firstMessage={graphIssues[0].message} />}
+          <MissionHead
+            mission={mission}
+            relationsTotal={relationIndex.total}
+            sharedFilesCount={Object.keys(fileIndex.sharedFiles).length}
+          />
+          <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
+            <FeatureMindMap
+              mission={mission}
+              tree={tree}
+              fileIndex={fileIndex}
+              relationIndex={relationIndex}
+              groupingMode={groupingMode}
+              onGroupingModeChange={setGroupingMode}
+              selectedNodeId={selectedNodeId}
+              onSelectNode={setSelectedNodeId}
+              focusTrigger={focusTrigger}
+            />
+            {selectedNode && (
+              <div className="flex min-h-[320px] max-h-[55vh] flex-col overflow-hidden rounded-card border border-surface-border shadow-card lg:min-h-0 lg:max-h-none">
+                <FeatureInspector
+                  mission={mission}
+                  node={selectedNode}
+                  tree={tree}
+                  fileIndex={fileIndex}
+                  relationIndex={relationIndex}
+                  onSelectNode={handleJumpToNode}
+                  onOpenSession={onOpenSession}
+                  onClose={() => setSelectedNodeId(null)}
+                />
+              </div>
+            )}
+          </div>
+          {mission.unmapped.length > 0 && (
+            <p className="shrink-0 rounded-card border border-surface-border bg-surface px-3 py-2 text-caption text-muted-foreground">
+              <span className="font-medium text-foreground">
+                {mission.unmapped.length} objective
+                {mission.unmapped.length === 1 ? "" : "s"} not in the mapping:
+              </span>{" "}
+              {mission.unmapped
+                .map((objective) => objectiveName(mission.id, objective.id))
+                .join(", ")}
+            </p>
+          )}
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -96,7 +232,12 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
             {mission.blocker && <MissionBlocker mission={mission} />}
             {mission.backlog_error && <BacklogError mission={mission} />}
             {mission.mapping.error && <MappingError mission={mission} />}
-            <MissionHead mission={mission} />
+            {graphIssues.length > 0 && <GraphIssuesBanner count={graphIssues.length} firstMessage={graphIssues[0].message} />}
+            <MissionHead
+              mission={mission}
+              relationsTotal={relationIndex.total}
+              sharedFilesCount={Object.keys(fileIndex.sharedFiles).length}
+            />
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
               {groupByState(mission.features).map((column) => (
                 <section
@@ -127,6 +268,7 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
                         feature={feature}
                         mission={mission}
                         onOpenSession={onOpenSession}
+                        onInspectInMap={() => handleInspectInMap(feature.id)}
                       />
                     ))
                   )}
@@ -157,11 +299,23 @@ export function FeatureMapView({ onOpenSession }: FeatureMapViewProps) {
   );
 }
 
+function GraphIssuesBanner({ count, firstMessage }: { count: number; firstMessage: string }) {
+  return (
+    <div className="flex shrink-0 items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2">
+      <OctagonAlert size={16} className="mt-0.5 shrink-0 text-warning" />
+      <div className="min-w-0 text-caption text-foreground">
+        {count} feature graph link warning{count === 1 ? "" : "s"}:{" "}
+        <span className="font-mono">{firstMessage}</span>
+      </div>
+    </div>
+  );
+}
+
 function MissionBlocker({ mission }: { mission: FeatureMission }) {
   const blocker = mission.blocker;
   if (!blocker) return null;
   return (
-    <div className="flex items-start gap-3 rounded-card border border-destructive/30 bg-fail-tint px-4 py-2.5">
+    <div className="flex shrink-0 items-start gap-3 rounded-card border border-destructive/30 bg-fail-tint px-4 py-2.5">
       <OctagonAlert size={16} className="mt-0.5 shrink-0 text-destructive" />
       <div className="min-w-0 text-label text-foreground">{blockerText(blocker)}</div>
     </div>
@@ -170,7 +324,7 @@ function MissionBlocker({ mission }: { mission: FeatureMission }) {
 
 function BacklogError({ mission }: { mission: FeatureMission }) {
   return (
-    <div className="flex items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2.5">
+    <div className="flex shrink-0 items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2.5">
       <OctagonAlert size={16} className="mt-0.5 shrink-0 text-warning" />
       <div className="min-w-0 text-label text-foreground">
         {backlogExplanation(mission)}:{" "}
@@ -182,7 +336,7 @@ function BacklogError({ mission }: { mission: FeatureMission }) {
 
 function MappingError({ mission }: { mission: FeatureMission }) {
   return (
-    <div className="flex items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2.5">
+    <div className="flex shrink-0 items-start gap-3 rounded-card border border-warning/30 bg-wait-tint px-4 py-2.5">
       <OctagonAlert size={16} className="mt-0.5 shrink-0 text-warning" />
       <div className="min-w-0 text-label text-foreground">
         The mapping {mission.mapping.path} could not be read, so each backlog objective is shown
@@ -192,10 +346,18 @@ function MappingError({ mission }: { mission: FeatureMission }) {
   );
 }
 
-function MissionHead({ mission }: { mission: FeatureMission }) {
+function MissionHead({
+  mission,
+  relationsTotal,
+  sharedFilesCount,
+}: {
+  mission: FeatureMission;
+  relationsTotal: number;
+  sharedFilesCount: number;
+}) {
   const counts = mission.counts;
   return (
-    <Card className="px-4 py-3">
+    <Card className="shrink-0 px-4 py-2.5">
       <div className="flex flex-wrap items-start gap-x-4 gap-y-2">
         <div className="min-w-0 flex-1">
           <p className="text-label text-foreground">{mission.text}</p>
@@ -222,13 +384,18 @@ function MissionHead({ mission }: { mission: FeatureMission }) {
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <Count label="capabilities" value={counts.features} />
+          <Count label="planned" value={counts.planned} />
+          <Count label="implemented" value={counts.implemented} tone="info" />
+          <Count label="verified" value={counts.verified} tone="success" />
+          <Count label="live" value={counts.live} tone="success" />
+          {relationsTotal > 0 && <Count label="links" value={relationsTotal} tone="info" />}
+          {sharedFilesCount > 0 && <Count label="shared files" value={sharedFilesCount} tone="info" />}
           <Count label="unowned" value={counts.unowned} tone="warning" />
           <Count label="blocked" value={counts.blocked} tone="danger" />
-          <Count label="complete" value={counts.complete} tone="success" />
         </div>
       </div>
       {mission.source && (
-        <p className="mt-2 text-micro text-faint-foreground">
+        <p className="mt-1.5 text-micro text-faint-foreground">
           Provenance: {sourceLabel(mission.source)}
           {mission.source.title ? ` — ${mission.source.title}` : ""}
         </p>
@@ -244,7 +411,7 @@ function Count({
 }: {
   label: string;
   value: number;
-  tone?: "muted" | "warning" | "danger" | "success";
+  tone?: "muted" | "info" | "warning" | "danger" | "success";
 }) {
   const style =
     value === 0
@@ -255,7 +422,9 @@ function Count({
           ? "bg-wait-tint text-warning"
           : tone === "success"
             ? "bg-ok-tint text-success"
-            : "bg-surface-selected text-foreground";
+            : tone === "info"
+              ? "bg-info-tint text-info"
+              : "bg-surface-selected text-foreground";
   return (
     <span className={cx("tnum rounded-chip px-1.5 py-px text-caption", style)} title={label}>
       {value} {label}
@@ -267,10 +436,12 @@ function FeatureCard({
   feature,
   mission,
   onOpenSession,
+  onInspectInMap,
 }: {
   feature: Feature;
   mission: FeatureMission;
   onOpenSession: (sessionId: string) => void;
+  onInspectInMap: () => void;
 }) {
   const newest = newestTask(feature);
   return (
@@ -293,7 +464,19 @@ function FeatureCard({
           </span>
         )}
       </div>
-      <p className="truncate font-mono text-micro text-faint-foreground">{feature.id}</p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="truncate font-mono text-micro text-faint-foreground">{feature.id}</p>
+        <button
+          type="button"
+          onClick={onInspectInMap}
+          className={cx(
+            "inline-flex shrink-0 items-center gap-0.5 rounded-chip px-1 text-micro text-info hover:underline",
+            FOCUS_RING,
+          )}
+        >
+          <Network size={10} /> map
+        </button>
+      </div>
       {feature.summary && (
         <p className="text-caption text-muted-foreground">{feature.summary}</p>
       )}
