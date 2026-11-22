@@ -1,4 +1,4 @@
-import { Activity, BellRing, Boxes, CircleDollarSign, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -42,6 +42,7 @@ interface SidebarProps {
   onShowFleet: () => void;
   onShowMissions: () => void;
   onShowFeatures: () => void;
+  onShowCoverage: () => void;
   onShowRsi: () => void;
   onShowAlerts: () => void;
   onShowScorecard: () => void;
@@ -77,6 +78,7 @@ export function Sidebar({
   onShowFleet,
   onShowMissions,
   onShowFeatures,
+  onShowCoverage,
   onShowRsi,
   onShowAlerts,
   onShowScorecard,
@@ -127,6 +129,12 @@ export function Sidebar({
           onClick={onShowFeatures}
           icon={<Boxes size={15} />}
           label="Feature map"
+        />
+        <NavItem
+          active={view === "coverage"}
+          onClick={onShowCoverage}
+          icon={<FolderSearch size={15} />}
+          label="File coverage"
         />
         <NavItem
           active={view === "rsi"}
@@ -550,6 +558,7 @@ export function MobileNav({
   onShowFleet,
   onShowMissions,
   onShowFeatures,
+  onShowCoverage,
   onShowRsi,
   onShowAlerts,
   onShowScorecard,
@@ -563,6 +572,7 @@ export function MobileNav({
   | "onShowFleet"
   | "onShowMissions"
   | "onShowFeatures"
+  | "onShowCoverage"
   | "onShowRsi"
   | "openAlerts"
   | "onShowAlerts"
@@ -580,6 +590,7 @@ export function MobileNav({
             ["fleet", "Home", <House key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["features", "Map", <Boxes key="f" size={13} />, onShowFeatures],
+            ["coverage", "Coverage", <FolderSearch key="cov" size={13} />, onShowCoverage],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
             ["alerts", "Alerts", <BellRing key="b" size={13} />, onShowAlerts],
             ["scorecard", "Score", <Gauge key="g" size={13} />, onShowScorecard],

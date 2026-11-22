@@ -1,0 +1,2534 @@
+{
+  "schema_version": 1,
+  "initiative_id": "t559u",
+  "boundary": {
+    "project_name": "Spawn",
+    "description": "All tracked project source, tests, docs, configuration, scripts, deploy specs, web assets, and RSI backlogs/scenarios inside the repository root, plus any newly created untracked in-scope files. Derived build caches, VCS internals, third-party installed dependencies, ephemeral agent runtime files, local editor swap files, and secrets/credentials are explicitly excluded and never counted as covered.",
+    "included_categories": [
+      "tracked-source",
+      "tests",
+      "docs",
+      "config",
+      "assets",
+      "deploy-and-scripts",
+      "rsi-scenarios-and-backlogs",
+      "untracked-in-scope-artifacts"
+    ],
+    "exclusions": [
+      {
+        "id": "vcs-metadata",
+        "pattern": ".git/**",
+        "category": "vcs",
+        "reason": "Git internal object store and repository metadata are never feature artifacts."
+      },
+      {
+        "id": "rust-build-output",
+        "pattern": "target/**",
+        "category": "build-cache",
+        "reason": "Cargo build outputs are derived and rebuildable from source."
+      },
+      {
+        "id": "node-dependencies",
+        "pattern": "**/node_modules/**",
+        "category": "dependency-cache",
+        "reason": "Installed third-party frontend packages are external dependencies, not authored project files."
+      },
+      {
+        "id": "web-build-output",
+        "pattern": "web/dist/**",
+        "category": "build-cache",
+        "reason": "Compiled frontend bundle is derived build output."
+      },
+      {
+        "id": "spawn-runtime-state",
+        "pattern": ".spawn/**",
+        "category": "runtime-state",
+        "reason": "Ephemeral agent execution markers and exit files are runtime state, not project deliverables."
+      },
+      {
+        "id": "engine-runtime-state",
+        "pattern": ".claude/**",
+        "category": "runtime-state",
+        "reason": "Local coding-engine runtime state and worktrees are excluded from project coverage."
+      },
+      {
+        "id": "secrets-env-dotfile",
+        "pattern": "**/.env",
+        "category": "secrets",
+        "reason": "Environment secret files are never indexed or associated in the feature registry."
+      },
+      {
+        "id": "secrets-env-variants",
+        "pattern": "**/.env.*",
+        "category": "secrets",
+        "reason": "Environment secret variants are never indexed or associated in the feature registry."
+      },
+      {
+        "id": "secrets-env-suffix",
+        "pattern": "**/*.env",
+        "category": "secrets",
+        "reason": "Host environment files (such as spawn.env) hold secrets and are excluded."
+      },
+      {
+        "id": "secrets-private-keys",
+        "pattern": "**/*.key",
+        "category": "secrets",
+        "reason": "Private key material is never indexed in feature coverage."
+      },
+      {
+        "id": "secrets-pem-certs",
+        "pattern": "**/*.pem",
+        "category": "secrets",
+        "reason": "PEM key/certificate files are excluded from feature coverage."
+      },
+      {
+        "id": "secrets-directory",
+        "pattern": "**/secrets/**",
+        "category": "secrets",
+        "reason": "Dedicated secrets directories are never crawled or indexed."
+      },
+      {
+        "id": "os-ds-store",
+        "pattern": "**/.DS_Store",
+        "category": "editor-temp",
+        "reason": "macOS Finder metadata files are transient local artifacts."
+      },
+      {
+        "id": "editor-swap-files",
+        "pattern": "**/*.swp",
+        "category": "editor-temp",
+        "reason": "Editor swap files are transient local artifacts."
+      },
+      {
+        "id": "transient-logs",
+        "pattern": "**/*.log",
+        "category": "transient",
+        "reason": "Runtime log files are transient diagnostic outputs."
+      },
+      {
+        "id": "transient-tmp",
+        "pattern": "**/*.tmp",
+        "category": "transient",
+        "reason": "Temporary scratch files are outside durable project coverage."
+      },
+      {
+        "id": "tool-caches",
+        "pattern": "**/.cache/**",
+        "category": "build-cache",
+        "reason": "Tool caches are derived and rebuildable."
+      },
+      {
+        "id": "python-bytecode-cache",
+        "pattern": "**/__pycache__/**",
+        "category": "build-cache",
+        "reason": "Python bytecode caches are derived build artifacts."
+      }
+    ]
+  },
+  "features": [
+    {
+      "id": "domain-core-runtime",
+      "title": "Core Domain, Bridge & Event Engine",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Pure domain types, event normalization, Bridge orchestration, CLI entrypoint, and synchronous runtime loop.",
+      "files": [
+        "docs/architecture.md"
+      ],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-bridge-events"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-cli-entrypoint"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/001",
+          "4/004"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [
+          "crates/spawn-core/tests/api.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/architecture.md",
+          "docs/design.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-storage-postgres",
+      "title": "PostgreSQL Event Store, KDF & Storage Lifecycle",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Append-only PostgreSQL event log, command queue, role KDF, disk/extent accounting, and scratch lease lifecycle.",
+      "files": [],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-storage-lifecycle"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/015",
+          "4/145"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [
+          "crates/spawn-postgres/tests/api.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md",
+          "crates/spawn-postgres/sql/schema.sql"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-host-execution",
+      "title": "Host Execution, Git Workspaces, tmux & Transcripts",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Host-level git workspace branching/merging/set-aside, tmux terminal lifecycle, and durable transcript archiving.",
+      "files": [],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-tmux-runner"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-transcript-archive"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/015",
+          "4/028"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "52bf19cd3"
+        ],
+        "tests": [
+          "crates/spawn-host/tests/branches.rs",
+          "crates/spawn-host/tests/runner.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-observer-jev",
+      "title": "Semantic Observer, Screen Parser & Jev Judge Relay",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Tail-screen state parser, tiered semantic observation rules, shadow observer, and Jev/model HTTP judge relays.",
+      "files": [],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-semantic-observer"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-jev-judge-relay"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/004",
+          "4/241"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "5e416443d"
+        ],
+        "tests": [
+          "crates/spawn-core/tests/observe_tiers.rs",
+          "crates/spawn-jev/tests/api.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/shadow-context.md",
+          "docs/observe3-agent-presence.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-missions-fleet",
+      "title": "Missions, Fleet Dispatch, Verification & RSI Gate",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Mission/task/resident lifecycle, supervisor & stall escalation, verification records, RSI backlog, and black-box integration gate.",
+      "files": [],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-rsi-integration-gate"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-rsi-backlog-specs"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-rsi-gate-scenarios"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/208",
+          "4/239",
+          "4/243"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6544fe424",
+          "865cc4df9",
+          "e9177b496"
+        ],
+        "tests": [
+          "scripts/rsi/test-gate.sh"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/fleet-architecture.md",
+          "docs/rsi.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-observability-ops",
+      "title": "Scorecard, Cost, Alerts, Security, Backup & Deployment",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Fleet scorecard, token cost accounting, alerts/acks, secret masking, backup/restore drills, systemd units, and host maintenance.",
+      "files": [],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-scorecard-and-cost"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-alerts-and-acks"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-secrets-and-masking"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-backup-and-drills"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-deploy-and-systemd"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/048",
+          "4/092",
+          "4/123"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6cdb60b05"
+        ],
+        "tests": [
+          "crates/spawn-cli/tests/cost_page.rs",
+          "crates/spawn-postgres/tests/backup.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/upgrading.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-dashboard-web",
+      "title": "Observer HTTP API & Web Dashboard",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Authenticated HTTP/ETag server (`spawn serve`), capability feature map, design system, and all web dashboard views.",
+      "files": [],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "cap-serve-http-api"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-feature-map-status"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-web-shell-design-system"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-web-fleet-home-views"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-web-missions-rsi-trace-views"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/488",
+          "t559u"
+        ],
+        "tasks": [
+          "492",
+          "494"
+        ],
+        "agents": [],
+        "commits": [
+          "6c5d22782",
+          "e55c51819",
+          "6a89585d3"
+        ],
+        "tests": [
+          "web/test/features.test.ts",
+          "web/test/featureCoverage.test.ts"
+        ],
+        "deploys": [
+          "2026-11-22-pr82-feature-map"
+        ],
+        "artifacts": [
+          "docs/view-architecture.md",
+          "docs/feature-map.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "domain-workspace-docs",
+      "title": "Workspace Manifests, Toolchain & Architecture Docs",
+      "kind": "domain",
+      "parent": null,
+      "summary": "Top-level Rust workspace manifests, pinned toolchain/formatter settings, bilingual READMEs, and architectural specifications.",
+      "files": [
+        ".gitignore",
+        "Cargo.lock",
+        "Cargo.toml",
+        "README.md",
+        "README.zh-CN.md",
+        "docs/architecture.md",
+        "docs/design.md",
+        "docs/feature-map.md",
+        "docs/fleet-architecture.md",
+        "docs/landing-notes/2026-11-22-pr82.md",
+        "docs/observe3-agent-presence.md",
+        "docs/observe3-presence-upload.md",
+        "docs/rsi.md",
+        "docs/shadow-context.md",
+        "docs/storage.md",
+        "docs/upgrading.md",
+        "docs/view-architecture.md",
+        "rust-toolchain.toml",
+        "rustfmt.toml"
+      ],
+      "relations": [],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "Cargo.toml",
+          "README.md",
+          "docs/architecture.md",
+          "docs/design.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-bridge-events",
+      "title": "Bridge, Event Normalization & Sync Runtime",
+      "kind": "capability",
+      "parent": "domain-core-runtime",
+      "summary": "Pure domain events, commands, idempotency keys, ingest, Bridge state machine, in-memory conformance suite, and CLI loop/queue commands.",
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/spawn-cli/src/commands/inspect.rs",
+        "crates/spawn-cli/src/commands/loops.rs",
+        "crates/spawn-cli/src/commands/mod.rs",
+        "crates/spawn-cli/src/commands/queue.rs",
+        "crates/spawn-cli/src/config.rs",
+        "crates/spawn-cli/src/context.rs",
+        "crates/spawn-cli/src/memory.rs",
+        "crates/spawn-cli/src/runtime.rs",
+        "crates/spawn-cli/src/sources.rs",
+        "crates/spawn-core/Cargo.toml",
+        "crates/spawn-core/src/bridge.rs",
+        "crates/spawn-core/src/command.rs",
+        "crates/spawn-core/src/contract.rs",
+        "crates/spawn-core/src/event.rs",
+        "crates/spawn-core/src/id.rs",
+        "crates/spawn-core/src/ingest.rs",
+        "crates/spawn-core/src/lib.rs",
+        "crates/spawn-core/src/memory.rs",
+        "crates/spawn-core/src/message.rs",
+        "crates/spawn-core/src/port.rs",
+        "crates/spawn-core/src/time.rs",
+        "crates/spawn-core/tests/api.rs",
+        "crates/spawn-core/tests/audit_lifecycle.rs",
+        "crates/spawn-core/tests/background_jobs.rs",
+        "crates/spawn-core/tests/waiting_inputs.rs",
+        "docs/design.md"
+      ],
+      "relations": [],
+      "provenance": {
+        "objectives": [
+          "4/001",
+          "4/004"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-core/tests/api.rs",
+          "crates/spawn-core/tests/audit_lifecycle.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-cli-entrypoint",
+      "title": "Spawn CLI Binary Entrypoint & Dispatch",
+      "kind": "subsystem",
+      "parent": "domain-core-runtime",
+      "summary": "Top-level `spawn` CLI command parser, usage contract, undumpable hardening, and crate wiring.",
+      "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/spawn-cli/Cargo.toml",
+        "crates/spawn-cli/src/main.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [
+          "crates/spawn-cli/src/main.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-postgres-event-log",
+      "title": "PostgreSQL Schema, EventLog, CommandQueue & Role KDF",
+      "kind": "capability",
+      "parent": "domain-storage-postgres",
+      "summary": "PostgreSQL 16 schema, SQL functions, RBAC roles (`spawn_reader`, `spawn_human`), PBKDF2-HMAC-SHA256 role password KDF, and integration suite.",
+      "files": [
+        "crates/spawn-kdf/Cargo.toml",
+        "crates/spawn-kdf/src/lib.rs",
+        "crates/spawn-postgres/Cargo.toml",
+        "crates/spawn-postgres/sql/schema.sql",
+        "crates/spawn-postgres/src/command_queue.rs",
+        "crates/spawn-postgres/src/event_log.rs",
+        "crates/spawn-postgres/src/features.rs",
+        "crates/spawn-postgres/src/gateway.rs",
+        "crates/spawn-postgres/src/host.rs",
+        "crates/spawn-postgres/src/lib.rs",
+        "crates/spawn-postgres/src/passfile.rs",
+        "crates/spawn-postgres/src/row.rs",
+        "crates/spawn-postgres/src/testing.rs",
+        "crates/spawn-postgres/src/wake.rs",
+        "crates/spawn-postgres/tests/api.rs",
+        "crates/spawn-postgres/tests/common/mod.rs",
+        "crates/spawn-postgres/tests/dashboard.rs",
+        "crates/spawn-postgres/tests/duplicates.rs",
+        "crates/spawn-postgres/tests/features.rs",
+        "crates/spawn-postgres/tests/first-shapes.sql",
+        "crates/spawn-postgres/tests/human_input.rs",
+        "crates/spawn-postgres/tests/human_key.rs",
+        "crates/spawn-postgres/tests/human_resume.rs",
+        "crates/spawn-postgres/tests/identity.rs",
+        "crates/spawn-postgres/tests/probe.rs",
+        "crates/spawn-postgres/tests/roles.rs",
+        "crates/spawn-postgres/tests/schema_guard.rs",
+        "crates/spawn-postgres/tests/scorecard.rs",
+        "crates/spawn-postgres/tests/sources.rs",
+        "crates/spawn-postgres/tests/stalls.rs",
+        "crates/spawn-postgres/tests/steal.rs",
+        "crates/spawn-postgres/tests/storage.rs",
+        "crates/spawn-postgres/tests/text_masked.rs",
+        "crates/spawn-postgres/tests/upgrade.rs",
+        "crates/spawn-postgres/tests/verification-133-brief.txt",
+        "crates/spawn-postgres/tests/verification.rs",
+        "crates/spawn-postgres/tests/waiting.rs",
+        "crates/spawn-postgres/tests/wake.rs",
+        "crates/spawn-postgres/tests/zombie.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-postgres/tests/api.rs",
+          "crates/spawn-postgres/tests/roles.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "crates/spawn-postgres/sql/schema.sql"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-storage-lifecycle",
+      "title": "Storage Accounting, Commit Map & Scratch Governance",
+      "kind": "capability",
+      "parent": "domain-storage-postgres",
+      "summary": "Disk budget enforcement, btrfs extent inspection, commit-map provenance, schema vacuum/sweep, and leased scratch directory cleanup.",
+      "files": [
+        "crates/spawn-cli/src/commit_map.rs",
+        "crates/spawn-cli/src/disk.rs",
+        "crates/spawn-cli/src/scratch_owner.rs",
+        "crates/spawn-cli/src/scratch_owner/tests.rs",
+        "crates/spawn-cli/src/scratch_sweep.rs",
+        "crates/spawn-cli/src/scratch_sweep/tests.rs",
+        "crates/spawn-cli/src/storage.rs",
+        "crates/spawn-cli/src/storage_bytes.rs",
+        "crates/spawn-cli/src/storage_bytes/tests.rs",
+        "crates/spawn-host/src/scratch.rs",
+        "crates/spawn-postgres/src/commit_map.rs",
+        "crates/spawn-postgres/tests/commit_map.rs",
+        "crates/spawn-postgres/tests/commit_map_checkpoints.rs",
+        "docs/storage.md",
+        "scripts/check-test-schemas.sh",
+        "scripts/disk.sh",
+        "scripts/storage-extents.py",
+        "scripts/sweep-test-schemas.sh",
+        "scripts/test-storage-extents.py",
+        "scripts/test-sweep-test-schemas.sh",
+        "scripts/test-vacuum-catalogs.sh",
+        "scripts/vacuum-catalogs.sh"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/145"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-cli/src/scratch_sweep/tests.rs",
+          "scripts/test-storage-extents.py"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-git-workspaces",
+      "title": "Git Workspaces, Branch Checkpoints, Merge & Set-Aside",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "Canonical workspace root resolution, descriptor-safe agent file access, git checkpointing, main-branch merge, background push, and set-aside commits.",
+      "files": [
+        "crates/spawn-cli/src/commit_now.rs",
+        "crates/spawn-cli/src/main_merge.rs",
+        "crates/spawn-cli/src/push.rs",
+        "crates/spawn-cli/src/recover.rs",
+        "crates/spawn-cli/src/rewrite_guard.rs",
+        "crates/spawn-cli/src/set_aside.rs",
+        "crates/spawn-core/tests/branches.rs",
+        "crates/spawn-host/Cargo.toml",
+        "crates/spawn-host/src/agent_files.rs",
+        "crates/spawn-host/src/beneath.rs",
+        "crates/spawn-host/src/beneath/tests.rs",
+        "crates/spawn-host/src/git.rs",
+        "crates/spawn-host/src/home.rs",
+        "crates/spawn-host/src/lib.rs",
+        "crates/spawn-host/src/root.rs",
+        "crates/spawn-host/src/tree_path.rs",
+        "crates/spawn-host/tests/branches.rs",
+        "crates/spawn-host/tests/identity.rs",
+        "crates/spawn-host/tests/runtime_files.rs",
+        "docs/storage.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/015",
+          "4/028"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-host/tests/branches.rs",
+          "crates/spawn-host/tests/identity.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-tmux-runner",
+      "title": "tmux Terminal Adapter, Runner & Process Lifecycle",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "tmux session management, `spawn run` wrapper, off-loop process-tree termination, filesystem watcher, and host audit.",
+      "files": [
+        "crates/spawn-cli/src/commands/engine.rs",
+        "crates/spawn-core/src/shell.rs",
+        "crates/spawn-core/tests/terminal_server.rs",
+        "crates/spawn-core/tests/terminate_off_loop.rs",
+        "crates/spawn-core/tests/transient_terminal.rs",
+        "crates/spawn-core/tests/zombie.rs",
+        "crates/spawn-host/src/audit.rs",
+        "crates/spawn-host/src/process.rs",
+        "crates/spawn-host/src/tmux.rs",
+        "crates/spawn-host/src/watch.rs",
+        "crates/spawn-host/tests/api.rs",
+        "crates/spawn-host/tests/runner.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-host/tests/runner.rs",
+          "crates/spawn-core/tests/terminate_off_loop.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-transcript-archive",
+      "title": "Durable Transcript Archive & Resume Restoration",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "Append-only host transcript archival, progress tracking, masking on archive, and safe restore-on-resume.",
+      "files": [
+        "crates/spawn-core/src/transcripts.rs",
+        "crates/spawn-host/src/archive_mask.rs",
+        "crates/spawn-host/src/archive_mask/tests.rs",
+        "crates/spawn-host/src/transcripts.rs",
+        "crates/spawn-host/tests/resume_copies.rs",
+        "docs/storage.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-host/tests/resume_copies.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-semantic-observer",
+      "title": "Semantic Observer, Tail-Screen Parser & Shadow Context",
+      "kind": "capability",
+      "parent": "domain-observer-jev",
+      "summary": "Strict tail-window screen state parser, deterministic classification tiers, semantic Observer loop, and shadow-context tooling.",
+      "files": [
+        "crates/spawn-core/src/observation.rs",
+        "crates/spawn-core/src/observe/classify.rs",
+        "crates/spawn-core/src/observe/judge.rs",
+        "crates/spawn-core/src/observe/mod.rs",
+        "crates/spawn-core/src/observe/observer.rs",
+        "crates/spawn-core/src/observe/reply.rs",
+        "crates/spawn-core/src/observe/snapshot.rs",
+        "crates/spawn-core/src/screen.rs",
+        "crates/spawn-core/tests/models.rs",
+        "crates/spawn-core/tests/observe_tiers.rs",
+        "crates/spawn-core/tests/reply.rs",
+        "crates/spawn-core/tests/screen_audit.rs",
+        "docs/shadow-context.md",
+        "scripts/shadow/shadow_observe.py",
+        "scripts/shadow/test_shadow_observe.py"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-core/tests/observe_tiers.rs",
+          "crates/spawn-core/tests/screen_audit.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/shadow-context.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-jev-judge-relay",
+      "title": "Jev Judge Client, Model Relay & Agent Presence",
+      "kind": "capability",
+      "parent": "domain-observer-jev",
+      "summary": "Zero-dependency HTTP/1.1 Jev judge client (`spawn-jev`), credential-isolated model/Jev relays, judge health watch, and observe3 presence tools.",
+      "files": [
+        "crates/spawn-cli/src/judge_watch.rs",
+        "crates/spawn-cli/tests/model_relay.rs",
+        "crates/spawn-jev/Cargo.toml",
+        "crates/spawn-jev/src/lib.rs",
+        "crates/spawn-jev/tests/api.rs",
+        "crates/spawn-jev/tests/relay.rs",
+        "docs/observe3-agent-presence.md",
+        "docs/observe3-presence-upload.md",
+        "scripts/jev-relay-test.py",
+        "scripts/jev-relay.py",
+        "scripts/model-relay-test.py",
+        "scripts/model-relay.py",
+        "scripts/observe3/agent_presence.py",
+        "scripts/observe3/presence_upload.py",
+        "scripts/observe3/test_agent_presence.py",
+        "scripts/observe3/test_presence_upload.py"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-semantic-observer"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-jev/tests/api.rs",
+          "crates/spawn-cli/tests/model_relay.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/observe3-agent-presence.md",
+          "docs/observe3-presence-upload.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-mission-dispatch",
+      "title": "Missions, Task Dispatch, Supervision & Verifications",
+      "kind": "capability",
+      "parent": "domain-missions-fleet",
+      "summary": "Mission/task/resident CLI & PG views, charter & digest dispatch, delivery retry/reissue, stall detection, work-stealing, supervisor, and `spawn verify`.",
+      "files": [
+        "crates/spawn-cli/src/deliver.rs",
+        "crates/spawn-cli/src/deliver/unfinished.rs",
+        "crates/spawn-cli/src/dispatch.rs",
+        "crates/spawn-cli/src/dispatch/charter.rs",
+        "crates/spawn-cli/src/dispatch/digest.rs",
+        "crates/spawn-cli/src/dispatch/jobs.rs",
+        "crates/spawn-cli/src/dispatch/resume_replay.rs",
+        "crates/spawn-cli/src/dispatch/stall.rs",
+        "crates/spawn-cli/src/dispatch/stall/tests.rs",
+        "crates/spawn-cli/src/dispatch/steal.rs",
+        "crates/spawn-cli/src/dispatch/stops.rs",
+        "crates/spawn-cli/src/dispatch/worker.rs",
+        "crates/spawn-cli/src/missions.rs",
+        "crates/spawn-cli/src/objectives.rs",
+        "crates/spawn-cli/src/supervise.rs",
+        "crates/spawn-cli/src/verify.rs",
+        "crates/spawn-core/src/mission.rs",
+        "crates/spawn-postgres/sql/schema.sql",
+        "crates/spawn-postgres/src/activity.rs",
+        "crates/spawn-postgres/src/experience.rs",
+        "crates/spawn-postgres/src/fleet.rs",
+        "crates/spawn-postgres/src/missions.rs",
+        "crates/spawn-postgres/src/recovery.rs",
+        "crates/spawn-postgres/src/sessions.rs",
+        "crates/spawn-postgres/src/verifications.rs",
+        "crates/spawn-postgres/tests/activity.rs",
+        "crates/spawn-postgres/tests/cancelled.rs",
+        "crates/spawn-postgres/tests/control.rs",
+        "crates/spawn-postgres/tests/deploy.rs",
+        "crates/spawn-postgres/tests/experience.rs",
+        "crates/spawn-postgres/tests/holds.rs",
+        "crates/spawn-postgres/tests/intents.rs",
+        "crates/spawn-postgres/tests/jobs.rs",
+        "crates/spawn-postgres/tests/judgings.rs",
+        "crates/spawn-postgres/tests/merges.rs",
+        "crates/spawn-postgres/tests/message_due.rs",
+        "crates/spawn-postgres/tests/pause.rs",
+        "crates/spawn-postgres/tests/recovery.rs",
+        "crates/spawn-postgres/tests/reissue.rs",
+        "crates/spawn-postgres/tests/restart.rs",
+        "crates/spawn-postgres/tests/retire.rs",
+        "docs/fleet-architecture.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/211",
+          "4/239"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6544fe424"
+        ],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "docs/fleet-architecture.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-rsi-integration-gate",
+      "title": "RSI Integrator, Black-Box Gate Runner & Timing Harness",
+      "kind": "capability",
+      "parent": "domain-missions-fleet",
+      "summary": "Autonomous `spawn integrate` loop, host-slot gated candidate judging, CAS main landing, e2e & blackbox contract suites, and timing shims.",
+      "files": [
+        "crates/spawn-cli/src/gate.rs",
+        "crates/spawn-cli/src/integrate.rs",
+        "crates/spawn-cli/src/integrate/base_disagrees_tests.rs",
+        "crates/spawn-cli/src/integrate/cannot_judge_tests.rs",
+        "crates/spawn-cli/src/integrate/database_tests.rs",
+        "crates/spawn-cli/src/integrate/host.rs",
+        "crates/spawn-cli/src/integrate/host_fault_tests.rs",
+        "crates/spawn-cli/src/integrate/inputs.rs",
+        "crates/spawn-cli/src/integrate/judging.rs",
+        "crates/spawn-cli/src/integrate/landing.rs",
+        "crates/spawn-cli/src/integrate/main_red_tests.rs",
+        "crates/spawn-cli/src/integrate/owner.rs",
+        "crates/spawn-cli/src/integrate/retained.rs",
+        "crates/spawn-cli/src/integrate/shadow.rs",
+        "crates/spawn-cli/src/integrate/tests.rs",
+        "crates/spawn-cli/src/integrate/verdicts.rs",
+        "crates/spawn-cli/src/integrate/warm.rs",
+        "docs/fleet-architecture.md",
+        "docs/rsi.md",
+        "scripts/blackbox/assertions.sh",
+        "scripts/blackbox/drop-logins.sql",
+        "scripts/blackbox/phase.sh",
+        "scripts/blackbox/run-scenarios.sh",
+        "scripts/blackbox/scenario-db.sh",
+        "scripts/blackbox/scenarios/040-queue.sh",
+        "scripts/blackbox/scenarios/070-views.sh",
+        "scripts/blackbox/test-engine-read.sh",
+        "scripts/blackbox/test-serve-accept.sh",
+        "scripts/blackbox/test-serve-log-restart.sh",
+        "scripts/e2e.sh",
+        "scripts/rsi/check-credential-prints.py",
+        "scripts/rsi/failed-tests.awk",
+        "scripts/rsi/gate-pg.sh",
+        "scripts/rsi/gate.sh",
+        "scripts/rsi/nightly.sh",
+        "scripts/rsi/test-check-credential-prints.sh",
+        "scripts/rsi/test-gate.sh",
+        "scripts/rsi/test-nightly.sh",
+        "scripts/test-e2e-waits.sh",
+        "scripts/timing/lib.sh",
+        "scripts/timing/minimize.sh",
+        "scripts/timing/mirror.py",
+        "scripts/timing/relay.py",
+        "scripts/timing/run.sh",
+        "scripts/timing/shim-engine-proxy.bash",
+        "scripts/timing/shim-git.bash",
+        "scripts/timing/shim-spawn.bash",
+        "scripts/timing/shim-tmux.bash",
+        "scripts/timing/timing.sh",
+        "scripts/timing/with.sh"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/208",
+          "4/243"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "865cc4df9",
+          "e9177b496"
+        ],
+        "tests": [
+          "scripts/rsi/test-gate.sh"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/rsi.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-rsi-backlog-specs",
+      "title": "RSI Objective Backlog Specifications",
+      "kind": "subsystem",
+      "parent": "domain-missions-fleet",
+      "summary": "Structured JSON objective backlog (`rsi/backlog/*.json`) defining autonomous improvement goals, metrics, and owner-judged specs.",
+      "files": [
+        "rsi/backlog/001.json",
+        "rsi/backlog/003.json",
+        "rsi/backlog/004.json",
+        "rsi/backlog/007.json",
+        "rsi/backlog/008.json",
+        "rsi/backlog/009.json",
+        "rsi/backlog/010.json",
+        "rsi/backlog/011.json",
+        "rsi/backlog/012.json",
+        "rsi/backlog/013.json",
+        "rsi/backlog/014.json",
+        "rsi/backlog/015.json",
+        "rsi/backlog/016.json",
+        "rsi/backlog/017.json",
+        "rsi/backlog/018.json",
+        "rsi/backlog/019.json",
+        "rsi/backlog/020.json",
+        "rsi/backlog/021.json",
+        "rsi/backlog/023.json",
+        "rsi/backlog/025.json",
+        "rsi/backlog/026.json",
+        "rsi/backlog/028.json",
+        "rsi/backlog/029.json",
+        "rsi/backlog/030.json",
+        "rsi/backlog/031.json",
+        "rsi/backlog/032.json",
+        "rsi/backlog/033.json",
+        "rsi/backlog/034.json",
+        "rsi/backlog/035.json",
+        "rsi/backlog/036.json",
+        "rsi/backlog/037.json",
+        "rsi/backlog/039.json",
+        "rsi/backlog/040.json",
+        "rsi/backlog/041.json",
+        "rsi/backlog/042.json",
+        "rsi/backlog/043.json",
+        "rsi/backlog/044.json",
+        "rsi/backlog/045.json",
+        "rsi/backlog/046.json",
+        "rsi/backlog/047.json",
+        "rsi/backlog/048.json",
+        "rsi/backlog/049.json",
+        "rsi/backlog/050.json",
+        "rsi/backlog/051.json",
+        "rsi/backlog/052.json",
+        "rsi/backlog/053.json",
+        "rsi/backlog/054.json",
+        "rsi/backlog/055.json",
+        "rsi/backlog/056.json",
+        "rsi/backlog/057.json",
+        "rsi/backlog/058.json",
+        "rsi/backlog/059.json",
+        "rsi/backlog/060.json",
+        "rsi/backlog/061.json",
+        "rsi/backlog/062.json",
+        "rsi/backlog/063.json",
+        "rsi/backlog/064.json",
+        "rsi/backlog/065.json",
+        "rsi/backlog/066.json",
+        "rsi/backlog/067.json",
+        "rsi/backlog/068.json",
+        "rsi/backlog/069.json",
+        "rsi/backlog/070.json",
+        "rsi/backlog/071.json",
+        "rsi/backlog/072.json",
+        "rsi/backlog/073.json",
+        "rsi/backlog/074.json",
+        "rsi/backlog/075.json",
+        "rsi/backlog/076.json",
+        "rsi/backlog/077.json",
+        "rsi/backlog/078.json",
+        "rsi/backlog/079.json",
+        "rsi/backlog/080.json",
+        "rsi/backlog/081.json",
+        "rsi/backlog/082.json",
+        "rsi/backlog/083.json",
+        "rsi/backlog/084.json",
+        "rsi/backlog/085.json",
+        "rsi/backlog/086.json",
+        "rsi/backlog/087.json",
+        "rsi/backlog/088.json",
+        "rsi/backlog/089.json",
+        "rsi/backlog/090.json",
+        "rsi/backlog/091.json",
+        "rsi/backlog/092.json",
+        "rsi/backlog/093.json",
+        "rsi/backlog/094.json",
+        "rsi/backlog/095.json",
+        "rsi/backlog/096.json",
+        "rsi/backlog/097.json",
+        "rsi/backlog/098.json",
+        "rsi/backlog/099.json",
+        "rsi/backlog/100.json",
+        "rsi/backlog/102.json",
+        "rsi/backlog/103.json",
+        "rsi/backlog/104.json",
+        "rsi/backlog/105.json",
+        "rsi/backlog/106.json",
+        "rsi/backlog/107.json",
+        "rsi/backlog/108.json",
+        "rsi/backlog/109.json",
+        "rsi/backlog/112.json",
+        "rsi/backlog/113.json",
+        "rsi/backlog/114.json",
+        "rsi/backlog/115.json",
+        "rsi/backlog/116.json",
+        "rsi/backlog/117.json",
+        "rsi/backlog/119.json",
+        "rsi/backlog/120.json",
+        "rsi/backlog/121.json",
+        "rsi/backlog/122.json",
+        "rsi/backlog/123.json",
+        "rsi/backlog/129.json",
+        "rsi/backlog/131.json",
+        "rsi/backlog/132.json",
+        "rsi/backlog/133.json",
+        "rsi/backlog/135.json",
+        "rsi/backlog/136.json",
+        "rsi/backlog/138.json",
+        "rsi/backlog/139.json",
+        "rsi/backlog/140.json",
+        "rsi/backlog/141.json",
+        "rsi/backlog/145.json",
+        "rsi/backlog/148.json",
+        "rsi/backlog/149.json",
+        "rsi/backlog/151.json",
+        "rsi/backlog/155.json",
+        "rsi/backlog/156.json",
+        "rsi/backlog/158.json",
+        "rsi/backlog/159.json",
+        "rsi/backlog/166.json",
+        "rsi/backlog/167.json",
+        "rsi/backlog/168.json",
+        "rsi/backlog/169.json",
+        "rsi/backlog/170.json",
+        "rsi/backlog/171.json",
+        "rsi/backlog/172.json",
+        "rsi/backlog/173.json",
+        "rsi/backlog/175.json",
+        "rsi/backlog/176.json",
+        "rsi/backlog/177.json",
+        "rsi/backlog/178.json",
+        "rsi/backlog/179.json",
+        "rsi/backlog/180.json",
+        "rsi/backlog/181.json",
+        "rsi/backlog/182.json",
+        "rsi/backlog/185.json",
+        "rsi/backlog/186.json",
+        "rsi/backlog/192.json",
+        "rsi/backlog/193.json",
+        "rsi/backlog/194.json",
+        "rsi/backlog/195.json",
+        "rsi/backlog/198.json",
+        "rsi/backlog/199.json",
+        "rsi/backlog/200.json",
+        "rsi/backlog/202.json",
+        "rsi/backlog/203.json",
+        "rsi/backlog/204.json",
+        "rsi/backlog/205.json",
+        "rsi/backlog/206.json",
+        "rsi/backlog/207.json",
+        "rsi/backlog/208.json",
+        "rsi/backlog/209.json",
+        "rsi/backlog/210.json",
+        "rsi/backlog/211.json",
+        "rsi/backlog/212.json",
+        "rsi/backlog/214.json",
+        "rsi/backlog/215.json",
+        "rsi/backlog/216.json",
+        "rsi/backlog/217.json",
+        "rsi/backlog/219.json",
+        "rsi/backlog/220.json",
+        "rsi/backlog/221.json",
+        "rsi/backlog/222.json",
+        "rsi/backlog/223.json",
+        "rsi/backlog/224.json",
+        "rsi/backlog/225.json",
+        "rsi/backlog/227.json",
+        "rsi/backlog/228.json",
+        "rsi/backlog/230.json",
+        "rsi/backlog/231.json",
+        "rsi/backlog/232.json",
+        "rsi/backlog/233.json",
+        "rsi/backlog/234.json",
+        "rsi/backlog/236.json",
+        "rsi/backlog/237.json",
+        "rsi/backlog/239.json",
+        "rsi/backlog/241.json",
+        "rsi/backlog/243.json"
+      ],
+      "relations": [
+        {
+          "kind": "relates_to",
+          "target": "cap-rsi-integration-gate"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "rsi/backlog/"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-rsi-gate-scenarios",
+      "title": "RSI Verification & Nightly Gate Scenarios",
+      "kind": "subsystem",
+      "parent": "domain-missions-fleet",
+      "summary": "Executable acceptance, regression, and nightly soak scenarios (`rsi/scenarios/**`) enforced by the integration gate.",
+      "files": [
+        "rsi/scenarios/007.sh",
+        "rsi/scenarios/008.sh",
+        "rsi/scenarios/017.sh",
+        "rsi/scenarios/029.sh",
+        "rsi/scenarios/034.sh",
+        "rsi/scenarios/035.sh",
+        "rsi/scenarios/037.sh",
+        "rsi/scenarios/039.sh",
+        "rsi/scenarios/040.sh",
+        "rsi/scenarios/041.sh",
+        "rsi/scenarios/042.sh",
+        "rsi/scenarios/043.sh",
+        "rsi/scenarios/044.sh",
+        "rsi/scenarios/045.sh",
+        "rsi/scenarios/046.sh",
+        "rsi/scenarios/047.sh",
+        "rsi/scenarios/048.sh",
+        "rsi/scenarios/049.sh",
+        "rsi/scenarios/050.sh",
+        "rsi/scenarios/051.sh",
+        "rsi/scenarios/052.sh",
+        "rsi/scenarios/053.sh",
+        "rsi/scenarios/056.sh",
+        "rsi/scenarios/057.sh",
+        "rsi/scenarios/058.sh",
+        "rsi/scenarios/059.sh",
+        "rsi/scenarios/060.sh",
+        "rsi/scenarios/061.sh",
+        "rsi/scenarios/062.sh",
+        "rsi/scenarios/063.sh",
+        "rsi/scenarios/064.sh",
+        "rsi/scenarios/065.sh",
+        "rsi/scenarios/066.sh",
+        "rsi/scenarios/067.sh",
+        "rsi/scenarios/068.sh",
+        "rsi/scenarios/069.sh",
+        "rsi/scenarios/070.sh",
+        "rsi/scenarios/071.sh",
+        "rsi/scenarios/072.sh",
+        "rsi/scenarios/073.sh",
+        "rsi/scenarios/074.sh",
+        "rsi/scenarios/075.sh",
+        "rsi/scenarios/076.sh",
+        "rsi/scenarios/077.sh",
+        "rsi/scenarios/078.sh",
+        "rsi/scenarios/079.sh",
+        "rsi/scenarios/080.sh",
+        "rsi/scenarios/081.sh",
+        "rsi/scenarios/082.sh",
+        "rsi/scenarios/083.sh",
+        "rsi/scenarios/085.sh",
+        "rsi/scenarios/086.sh",
+        "rsi/scenarios/087.sh",
+        "rsi/scenarios/089.sh",
+        "rsi/scenarios/090.sh",
+        "rsi/scenarios/091.sh",
+        "rsi/scenarios/092.sh",
+        "rsi/scenarios/093.sh",
+        "rsi/scenarios/094.sh",
+        "rsi/scenarios/095.sh",
+        "rsi/scenarios/096.sh",
+        "rsi/scenarios/097.sh",
+        "rsi/scenarios/098.sh",
+        "rsi/scenarios/099.sh",
+        "rsi/scenarios/100.sh",
+        "rsi/scenarios/102.sh",
+        "rsi/scenarios/103.sh",
+        "rsi/scenarios/104.sh",
+        "rsi/scenarios/105.sh",
+        "rsi/scenarios/106.sh",
+        "rsi/scenarios/107.sh",
+        "rsi/scenarios/108.sh",
+        "rsi/scenarios/109.sh",
+        "rsi/scenarios/112.sh",
+        "rsi/scenarios/113.sh",
+        "rsi/scenarios/114.sh",
+        "rsi/scenarios/115.sh",
+        "rsi/scenarios/116.sh",
+        "rsi/scenarios/117.sh",
+        "rsi/scenarios/119.sh",
+        "rsi/scenarios/120.sh",
+        "rsi/scenarios/121.sh",
+        "rsi/scenarios/122.sh",
+        "rsi/scenarios/123.sh",
+        "rsi/scenarios/129.sh",
+        "rsi/scenarios/131.sh",
+        "rsi/scenarios/132.sh",
+        "rsi/scenarios/133.sh",
+        "rsi/scenarios/135.sh",
+        "rsi/scenarios/136.sh",
+        "rsi/scenarios/138.sh",
+        "rsi/scenarios/139.sh",
+        "rsi/scenarios/140.sh",
+        "rsi/scenarios/145.sh",
+        "rsi/scenarios/146.sh",
+        "rsi/scenarios/148.sh",
+        "rsi/scenarios/149.sh",
+        "rsi/scenarios/151.sh",
+        "rsi/scenarios/155.sh",
+        "rsi/scenarios/156.sh",
+        "rsi/scenarios/158.sh",
+        "rsi/scenarios/159.sh",
+        "rsi/scenarios/166.sh",
+        "rsi/scenarios/167.sh",
+        "rsi/scenarios/168.sh",
+        "rsi/scenarios/169.sh",
+        "rsi/scenarios/170.sh",
+        "rsi/scenarios/171.sh",
+        "rsi/scenarios/172.sh",
+        "rsi/scenarios/173.sh",
+        "rsi/scenarios/175.sh",
+        "rsi/scenarios/176.sh",
+        "rsi/scenarios/177.sh",
+        "rsi/scenarios/178.sh",
+        "rsi/scenarios/179.sh",
+        "rsi/scenarios/180.sh",
+        "rsi/scenarios/181.sh",
+        "rsi/scenarios/182.sh",
+        "rsi/scenarios/185.sh",
+        "rsi/scenarios/186.sh",
+        "rsi/scenarios/192.sh",
+        "rsi/scenarios/193.sh",
+        "rsi/scenarios/194.sh",
+        "rsi/scenarios/195.sh",
+        "rsi/scenarios/198.sh",
+        "rsi/scenarios/199.sh",
+        "rsi/scenarios/200.sh",
+        "rsi/scenarios/201.sh",
+        "rsi/scenarios/202.sh",
+        "rsi/scenarios/203.sh",
+        "rsi/scenarios/204.sh",
+        "rsi/scenarios/205.sh",
+        "rsi/scenarios/206.sh",
+        "rsi/scenarios/207.sh",
+        "rsi/scenarios/209.sh",
+        "rsi/scenarios/210.sh",
+        "rsi/scenarios/211.sh",
+        "rsi/scenarios/212.sh",
+        "rsi/scenarios/214.sh",
+        "rsi/scenarios/215.sh",
+        "rsi/scenarios/216.sh",
+        "rsi/scenarios/217.sh",
+        "rsi/scenarios/219.sh",
+        "rsi/scenarios/220.sh",
+        "rsi/scenarios/221.sh",
+        "rsi/scenarios/222.sh",
+        "rsi/scenarios/223.sh",
+        "rsi/scenarios/224.sh",
+        "rsi/scenarios/225.sh",
+        "rsi/scenarios/227.sh",
+        "rsi/scenarios/228.sh",
+        "rsi/scenarios/230.sh",
+        "rsi/scenarios/231.sh",
+        "rsi/scenarios/232.sh",
+        "rsi/scenarios/233.sh",
+        "rsi/scenarios/234.sh",
+        "rsi/scenarios/236.sh",
+        "rsi/scenarios/237.sh",
+        "rsi/scenarios/238.sh",
+        "rsi/scenarios/239.sh",
+        "rsi/scenarios/241.sh",
+        "rsi/scenarios/build",
+        "rsi/scenarios/check-agent-presence.sh",
+        "rsi/scenarios/check-blackbox.sh",
+        "rsi/scenarios/check-clippy.sh",
+        "rsi/scenarios/check-credential-health.sh",
+        "rsi/scenarios/check-credential-prints.sh",
+        "rsi/scenarios/check-e2e.sh",
+        "rsi/scenarios/check-j02-lands.sh",
+        "rsi/scenarios/check-j03-human.sh",
+        "rsi/scenarios/check-j04-observe.sh",
+        "rsi/scenarios/check-j05-operator.sh",
+        "rsi/scenarios/check-j06-recover-a.sh",
+        "rsi/scenarios/check-j07-recover-b.sh",
+        "rsi/scenarios/check-j08-stuck.sh",
+        "rsi/scenarios/check-j09-stall-cancel.sh",
+        "rsi/scenarios/check-j10-verdicts.sh",
+        "rsi/scenarios/check-j11-push-drain.sh",
+        "rsi/scenarios/check-j12-hold-told.sh",
+        "rsi/scenarios/check-maintenance.sh",
+        "rsi/scenarios/check-model-relay.sh",
+        "rsi/scenarios/check-on-landing.sh",
+        "rsi/scenarios/check-presence-upload.sh",
+        "rsi/scenarios/check-schema-upgrade.sh",
+        "rsi/scenarios/check-shadow-observe.sh",
+        "rsi/scenarios/check-storage-extents.sh",
+        "rsi/scenarios/check-test-gate.sh",
+        "rsi/scenarios/check-tests.sh",
+        "rsi/scenarios/check-web.sh",
+        "rsi/scenarios/nightly/013.sh",
+        "rsi/scenarios/nightly/023.sh",
+        "rsi/scenarios/nightly/025.sh",
+        "rsi/scenarios/nightly/032.sh",
+        "rsi/scenarios/nightly/036.sh",
+        "rsi/scenarios/protected",
+        "rsi/scenarios/retired-tests",
+        "rsi/scenarios/serial",
+        "rsi/scenarios/web-dependencies-reviewed"
+      ],
+      "relations": [
+        {
+          "kind": "verifies",
+          "target": "cap-rsi-integration-gate"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "rsi/scenarios/"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-scorecard-and-cost",
+      "title": "Fleet Scorecard, Core Lines & Cost Accounting",
+      "kind": "capability",
+      "parent": "domain-observability-ops",
+      "summary": "Eight-dimension fleet scorecard, token pricing and session/archive cost accounting, and core-lines health sampling.",
+      "files": [
+        "crates/spawn-cli/src/core_lines_sample.rs",
+        "crates/spawn-cli/src/cost.rs",
+        "crates/spawn-cli/src/cost/archive.rs",
+        "crates/spawn-cli/src/cost/sessions.rs",
+        "crates/spawn-cli/src/scorecard.rs",
+        "crates/spawn-cli/src/scorecard/fleet.rs",
+        "crates/spawn-cli/src/scorecard/history.rs",
+        "crates/spawn-cli/src/scorecard/interventions.rs",
+        "crates/spawn-cli/src/scorecard/measure.rs",
+        "crates/spawn-cli/src/scorecard/queue_posts.rs",
+        "crates/spawn-cli/src/scorecard/tests.rs",
+        "crates/spawn-cli/src/scorecard/time.rs",
+        "crates/spawn-cli/src/scorecard/transcripts.rs",
+        "crates/spawn-cli/tests/cost_page.rs",
+        "crates/spawn-cli/tests/data/mission-4-outcomes-2026-11-07T23-05-46.json",
+        "crates/spawn-cli/tests/data/mission-4-outcomes-2026-11-08T04-47-05.json",
+        "crates/spawn-postgres/src/cost.rs",
+        "crates/spawn-postgres/src/scorecard.rs",
+        "crates/spawn-postgres/tests/cost.rs",
+        "docs/design.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-transcript-archive"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/048",
+          "4/159"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-cli/tests/cost_page.rs",
+          "crates/spawn-cli/src/scorecard/tests.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-alerts-and-acks",
+      "title": "Fleet Alerts, Guardrails & Operator Acknowledgements",
+      "kind": "capability",
+      "parent": "domain-observability-ops",
+      "summary": "Alert derivation, archival/notice folding, operator verdicts (`right|false|stale|duplicate`), and command acknowledgement.",
+      "files": [
+        "crates/spawn-cli/src/ack.rs",
+        "crates/spawn-cli/src/alerts.rs",
+        "crates/spawn-cli/src/alerts/archives.rs",
+        "crates/spawn-cli/src/alerts/guardrails.rs",
+        "crates/spawn-cli/src/alerts/notices.rs",
+        "crates/spawn-postgres/src/acks.rs",
+        "crates/spawn-postgres/src/alerts.rs",
+        "crates/spawn-postgres/tests/acks.rs",
+        "crates/spawn-postgres/tests/alerts.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/092",
+          "4/151"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-postgres/tests/alerts.rs",
+          "crates/spawn-postgres/tests/acks.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-secrets-and-masking",
+      "title": "Secrets Management, Output Masking & Redaction",
+      "kind": "capability",
+      "parent": "domain-observability-ops",
+      "summary": "Secret generation/rotation, HMAC fingerprints, transcript/control-stream redaction, and output masking hooks.",
+      "files": [
+        "crates/spawn-cli/src/mask.rs",
+        "crates/spawn-cli/src/secret.rs",
+        "crates/spawn-core/src/mask.rs",
+        "crates/spawn-core/src/redact.rs",
+        "crates/spawn-kdf/Cargo.toml",
+        "crates/spawn-kdf/src/lib.rs",
+        "crates/spawn-postgres/src/control_mask.rs",
+        "crates/spawn-postgres/tests/control_mask.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-bridge-events"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/123"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-postgres/tests/control_mask.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-backup-and-drills",
+      "title": "Fleet Backup Bundles, Block Store & Restore Drills",
+      "kind": "capability",
+      "parent": "domain-observability-ops",
+      "summary": "Off-host dump/bundle/verify backups, session block archival, and automated restore drills across missions, controllers, and transcripts.",
+      "files": [
+        "crates/spawn-cli/src/backup.rs",
+        "crates/spawn-cli/src/backup/restore_drill.rs",
+        "crates/spawn-cli/src/backup/restore_drill/controllers.rs",
+        "crates/spawn-cli/src/backup/restore_drill/sync.rs",
+        "crates/spawn-cli/src/backup/store.rs",
+        "crates/spawn-cli/src/backup/store/tests.rs",
+        "crates/spawn-cli/src/backup/sync_dir.rs",
+        "crates/spawn-postgres/tests/backup.rs",
+        "deploy/backup/README.md",
+        "deploy/backup/lib.sh",
+        "deploy/backup/pg-backup.sh",
+        "deploy/backup/pg-restore-drill.sh",
+        "deploy/backup/r2-lifecycle-rules.json",
+        "deploy/backup/r2-lock-rules.json",
+        "deploy/backup/test-pg-backup-key.sh",
+        "deploy/backup/test-pg-restore-drill.sh",
+        "deploy/backup/test-restore-drill.sh",
+        "deploy/session-backup.sh",
+        "deploy/session-blocks.py",
+        "deploy/test-session-backup.sh"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-postgres/tests/backup.rs",
+          "deploy/test-session-backup.sh"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-deploy-and-systemd",
+      "title": "Host Deployment, systemd Units & Operational Scripts",
+      "kind": "capability",
+      "parent": "domain-observability-ops",
+      "summary": "Controller deployment, on-landing rollout, systemd user services/timers, gate-runner sandboxing, web-install strict verifier, and maintenance scripts.",
+      "files": [
+        "deploy/controller.sh",
+        "deploy/cutover-controller.sh",
+        "deploy/deploy.sh",
+        "deploy/detach.sh",
+        "deploy/fleet-test-db.sh",
+        "deploy/gate-env.sh",
+        "deploy/gate-runner.sh",
+        "deploy/gate-runner/README.md",
+        "deploy/gate-runner/remote.sh",
+        "deploy/gate-runner/setup.sh",
+        "deploy/hold.sh",
+        "deploy/on-landing.sh",
+        "deploy/systemd/README.md",
+        "deploy/systemd/spawn-agent-presence-upload.service",
+        "deploy/systemd/spawn-agent-presence-upload.timer",
+        "deploy/systemd/spawn-agent-presence.service",
+        "deploy/systemd/spawn-agent-presence.timer",
+        "deploy/systemd/spawn-backup-bundle.service",
+        "deploy/systemd/spawn-backup-bundle.timer",
+        "deploy/systemd/spawn-backup-restore-drill-controllers.service",
+        "deploy/systemd/spawn-backup-restore-drill-controllers.timer",
+        "deploy/systemd/spawn-backup-restore-drill-missions.service",
+        "deploy/systemd/spawn-backup-restore-drill-missions.timer",
+        "deploy/systemd/spawn-backup-restore-drill-sync.service",
+        "deploy/systemd/spawn-backup-restore-drill-sync.timer",
+        "deploy/systemd/spawn-backup-restore-drill-transcripts.service",
+        "deploy/systemd/spawn-backup-restore-drill-transcripts.timer",
+        "deploy/systemd/spawn-backup-restore-drill.service",
+        "deploy/systemd/spawn-backup-restore-drill.timer",
+        "deploy/systemd/spawn-backup-verify.service",
+        "deploy/systemd/spawn-backup-verify.timer",
+        "deploy/systemd/spawn-backup.service",
+        "deploy/systemd/spawn-backup.timer",
+        "deploy/systemd/spawn-credential-health.service",
+        "deploy/systemd/spawn-credential-health.timer",
+        "deploy/systemd/spawn-deploy-on-landing.service",
+        "deploy/systemd/spawn-deploy-on-landing.timer",
+        "deploy/systemd/spawn-fleet-test-db.service",
+        "deploy/systemd/spawn-integrate.service",
+        "deploy/systemd/spawn-jev-relay.path",
+        "deploy/systemd/spawn-jev-relay.service",
+        "deploy/systemd/spawn-loop.service",
+        "deploy/systemd/spawn-maintenance.service",
+        "deploy/systemd/spawn-maintenance.timer",
+        "deploy/systemd/spawn-model-relay.service",
+        "deploy/systemd/spawn-nightly-stale@.service",
+        "deploy/systemd/spawn-nightly-stale@.timer",
+        "deploy/systemd/spawn-nightly@.service",
+        "deploy/systemd/spawn-nightly@.timer",
+        "deploy/systemd/spawn-serve.service",
+        "deploy/systemd/spawn-shadow-observe.service",
+        "deploy/systemd/spawn-shadow-observe.timer",
+        "deploy/systemd/system/spawn-session-backup-drill.service",
+        "deploy/systemd/system/spawn-session-backup-drill.timer",
+        "deploy/systemd/system/spawn-session-backup.service",
+        "deploy/systemd/system/spawn-session-backup.timer",
+        "deploy/test-controller.sh",
+        "deploy/test-deploy.sh",
+        "deploy/test-gate-runner.sh",
+        "deploy/test-on-landing.sh",
+        "docs/upgrading.md",
+        "scripts/check-runtime-dir.sh",
+        "scripts/keep/credential-health.sh",
+        "scripts/keep/test-credential-health.sh",
+        "scripts/maintenance.sh",
+        "scripts/move-check-test.py",
+        "scripts/move-check.py",
+        "scripts/pg-url.sh",
+        "scripts/sandbox.sh",
+        "scripts/stage.sh",
+        "scripts/test-maintenance.sh",
+        "scripts/test-pg-url.sh",
+        "scripts/test-web-install.sh",
+        "scripts/web-install.sh"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-cli-entrypoint"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6c5d22782",
+          "6cdb60b05"
+        ],
+        "tests": [
+          "deploy/test-deploy.sh",
+          "deploy/test-on-landing.sh",
+          "scripts/test-web-install.sh"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/upgrading.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-serve-http-api",
+      "title": "Observer HTTP Server (`spawn serve`) & Auth Guards",
+      "kind": "capability",
+      "parent": "domain-dashboard-web",
+      "summary": "Read-only observer API, weak ETag/304 validation, shared board caching, bearer/local-open/CIDR guards, and human action endpoints.",
+      "files": [
+        "crates/spawn-cli/src/serve.rs",
+        "crates/spawn-cli/src/serve/answers.rs",
+        "crates/spawn-cli/src/serve/attention.rs",
+        "crates/spawn-cli/src/serve/core_lines.rs",
+        "crates/spawn-cli/src/serve/core_lines/disk.rs",
+        "crates/spawn-cli/src/serve/core_lines/drills.rs",
+        "crates/spawn-cli/src/serve/core_lines/kept.rs",
+        "crates/spawn-cli/src/serve/core_lines/observability.rs",
+        "crates/spawn-cli/src/serve/core_lines/performance.rs",
+        "crates/spawn-cli/src/serve/core_lines/quiet.rs",
+        "crates/spawn-cli/src/serve/core_lines/recoverability.rs",
+        "crates/spawn-cli/src/serve/core_lines/schemas.rs",
+        "crates/spawn-cli/src/serve/core_lines/scratch.rs",
+        "crates/spawn-cli/src/serve/core_lines/storage.rs",
+        "crates/spawn-cli/src/serve/core_lines/trends.rs",
+        "crates/spawn-cli/src/serve/core_lines/unowned.rs",
+        "crates/spawn-cli/src/serve/feature_map.rs",
+        "crates/spawn-cli/src/serve/labels.rs",
+        "crates/spawn-cli/src/serve/storage.rs",
+        "crates/spawn-postgres/sql/schema.sql",
+        "crates/spawn-postgres/tests/dashboard.rs",
+        "crates/spawn-postgres/tests/human_input.rs",
+        "crates/spawn-postgres/tests/human_key.rs",
+        "crates/spawn-postgres/tests/human_resume.rs",
+        "docs/architecture.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/040",
+          "4/051"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [
+          "crates/spawn-cli/src/serve.rs"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-feature-map-status",
+      "title": "Capability Status Feature Map (`/api/features`, `#/features`)",
+      "kind": "capability",
+      "parent": "domain-dashboard-web",
+      "summary": "Evidence-derived four-state capability map (planned, implemented, verified, live) with provenance, gaps, blockers, and deploy anchor.",
+      "files": [
+        "crates/spawn-cli/src/serve/feature_map.rs",
+        "crates/spawn-postgres/src/features.rs",
+        "crates/spawn-postgres/tests/features.rs",
+        "docs/feature-map.md",
+        "docs/landing-notes/2026-11-22-pr82.md",
+        "web/src/components/features/FeatureMapView.tsx",
+        "web/src/features.ts",
+        "web/src/featuresApi.ts",
+        "web/test/features.test.ts"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-serve-http-api"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/488"
+        ],
+        "tasks": [
+          "488",
+          "492",
+          "494"
+        ],
+        "agents": [
+          "agent_worker_feature_map_488"
+        ],
+        "commits": [
+          "6c5d22782",
+          "e55c51819",
+          "6a89585d3",
+          "7079ec4e5"
+        ],
+        "tests": [
+          "crates/spawn-postgres/tests/features.rs",
+          "web/test/features.test.ts"
+        ],
+        "deploys": [
+          "2026-11-22-pr82-feature-map"
+        ],
+        "artifacts": [
+          "docs/feature-map.md",
+          "docs/landing-notes/2026-11-22-pr82-feature-map.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-web-shell-design-system",
+      "title": "Web Shell, Routing, Auth Token & Design System",
+      "kind": "capability",
+      "parent": "domain-dashboard-web",
+      "summary": "React/Vite/Tailwind app shell, sidebar & mobile nav, design tokens, reusable UI primitives, ETag fetch client, and contrast verification.",
+      "files": [
+        "docs/view-architecture.md",
+        "web/.gitignore",
+        "web/LICENSE-MULTICA",
+        "web/NOTICE",
+        "web/THIRD_PARTY_NOTICES.md",
+        "web/index.html",
+        "web/package.json",
+        "web/pnpm-lock.yaml",
+        "web/pnpm-workspace.yaml",
+        "web/scripts/contrast.mjs",
+        "web/src/App.tsx",
+        "web/src/api.ts",
+        "web/src/components/Diff.tsx",
+        "web/src/components/Sidebar.tsx",
+        "web/src/components/StateDot.tsx",
+        "web/src/components/ViewToggle.tsx",
+        "web/src/components/aui/HomeCard.tsx",
+        "web/src/components/aui/NorthStarChart.tsx",
+        "web/src/components/aui/kit.ts",
+        "web/src/components/ui.tsx",
+        "web/src/components/ui/affectui.sha256",
+        "web/src/components/ui/badge.tsx",
+        "web/src/components/ui/button.tsx",
+        "web/src/components/ui/card.tsx",
+        "web/src/components/ui/code-block.tsx",
+        "web/src/components/ui/dialog.tsx",
+        "web/src/components/ui/empty-state.tsx",
+        "web/src/components/ui/kbd.tsx",
+        "web/src/components/ui/kpi-chart.tsx",
+        "web/src/components/ui/notification-stack.tsx",
+        "web/src/components/ui/number-ticker.tsx",
+        "web/src/components/ui/pagination.tsx",
+        "web/src/components/ui/popover.tsx",
+        "web/src/components/ui/progress-tracker.tsx",
+        "web/src/components/ui/segmented-control.tsx",
+        "web/src/components/ui/select.tsx",
+        "web/src/components/ui/separator.tsx",
+        "web/src/components/ui/skeleton.tsx",
+        "web/src/components/ui/spinner.tsx",
+        "web/src/components/ui/toggle-group.tsx",
+        "web/src/components/ui/tool-call-card.tsx",
+        "web/src/components/ui/tooltip.tsx",
+        "web/src/format.ts",
+        "web/src/index.css",
+        "web/src/keys.ts",
+        "web/src/label.ts",
+        "web/src/main.tsx",
+        "web/src/styles/aui.css",
+        "web/src/styles/base.css",
+        "web/src/styles/spawn.css",
+        "web/src/styles/tokens.css",
+        "web/src/theme.ts",
+        "web/src/token.ts",
+        "web/src/validated.ts",
+        "web/test/keys.test.ts",
+        "web/test/label.test.ts",
+        "web/test/theme.test.ts",
+        "web/test/token.test.ts",
+        "web/test/validated.test.ts",
+        "web/tsconfig.json",
+        "web/vite.config.ts"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-serve-http-api"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "web/test/token.test.ts",
+          "web/test/theme.test.ts",
+          "web/test/validated.test.ts"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/view-architecture.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-web-fleet-home-views",
+      "title": "Web Home, Fleet, Alerts, Scorecard, Cost & Show Views",
+      "kind": "capability",
+      "parent": "domain-dashboard-web",
+      "summary": "Home 'Needs you' triage, fleet agent board & input/key actions, alerts panel, scorecard, cost dashboard, and Show wall-screen view.",
+      "files": [
+        "web/src/agentPage.ts",
+        "web/src/attention.ts",
+        "web/src/commands.ts",
+        "web/src/components/alerts/AlertsView.tsx",
+        "web/src/components/cost/CostDashboard.tsx",
+        "web/src/components/cost/CostView.tsx",
+        "web/src/components/fleet/AgentDetail.tsx",
+        "web/src/components/fleet/AlwaysOnAgents.tsx",
+        "web/src/components/fleet/AttentionQueue.tsx",
+        "web/src/components/fleet/FleetBoard.tsx",
+        "web/src/components/fleet/FleetView.tsx",
+        "web/src/components/fleet/HealthStrip.tsx",
+        "web/src/components/fleet/InputBox.tsx",
+        "web/src/components/fleet/Interventions.tsx",
+        "web/src/components/fleet/bits.tsx",
+        "web/src/components/home/CoreLines.tsx",
+        "web/src/components/home/Home.tsx",
+        "web/src/components/home/HomeView.tsx",
+        "web/src/components/scorecard/FleetDecisions.tsx",
+        "web/src/components/scorecard/ScorecardView.tsx",
+        "web/src/components/show/Scene.tsx",
+        "web/src/components/show/ShowView.tsx",
+        "web/src/components/show/layout.ts",
+        "web/src/components/show/useShowFeed.ts",
+        "web/src/coreLines.ts",
+        "web/src/cost.ts",
+        "web/src/fleet.ts",
+        "web/src/fleetDecisions.ts",
+        "web/src/home.ts",
+        "web/src/input.ts",
+        "web/src/interventions.ts",
+        "web/src/keptAnswer.ts",
+        "web/src/notices.ts",
+        "web/src/ordering.ts",
+        "web/src/recordedState.ts",
+        "web/src/resources.ts",
+        "web/src/scorecard.ts",
+        "web/src/scorecardFormat.ts",
+        "web/src/settling.ts",
+        "web/src/show.ts",
+        "web/src/tokenReach.ts",
+        "web/test/agentPage.test.ts",
+        "web/test/attention.test.ts",
+        "web/test/commands.test.ts",
+        "web/test/coreLines.test.ts",
+        "web/test/costDashboard.test.ts",
+        "web/test/costFold.test.ts",
+        "web/test/costNames.test.ts",
+        "web/test/fleetDecisions.test.ts",
+        "web/test/home.test.ts",
+        "web/test/input.test.ts",
+        "web/test/interventions.test.ts",
+        "web/test/keptAnswer.test.ts",
+        "web/test/notices.test.ts",
+        "web/test/ordering.test.ts",
+        "web/test/recordedState.test.ts",
+        "web/test/resources.test.ts",
+        "web/test/scorecardFormat.test.ts",
+        "web/test/show.test.ts",
+        "web/test/tokenReach.test.ts",
+        "web/test/tokenUnits.test.ts"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "web/test/home.test.ts",
+          "web/test/costDashboard.test.ts",
+          "web/test/show.test.ts"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-web-missions-rsi-trace-views",
+      "title": "Web Missions, RSI, Session Timeline & Trace Views",
+      "kind": "capability",
+      "parent": "domain-dashboard-web",
+      "summary": "Missions board & markdown task drawer, RSI progress/metric charts & live pane, session event timeline, time-axis scrubber, and trace spans.",
+      "files": [
+        "web/src/components/DetailsRail.tsx",
+        "web/src/components/Terminal.tsx",
+        "web/src/components/Timeline.tsx",
+        "web/src/components/missions/HeldSources.tsx",
+        "web/src/components/missions/Markdown.tsx",
+        "web/src/components/missions/MissionTimeline.tsx",
+        "web/src/components/missions/MissionsView.tsx",
+        "web/src/components/missions/TaskActivity.tsx",
+        "web/src/components/missions/TaskPanel.tsx",
+        "web/src/components/missions/TaskTexts.tsx",
+        "web/src/components/missions/parts.tsx",
+        "web/src/components/missions/timelineStyle.ts",
+        "web/src/components/rsi/AgentPane.tsx",
+        "web/src/components/rsi/GateLog.tsx",
+        "web/src/components/rsi/GateVerdicts.tsx",
+        "web/src/components/rsi/MetricChart.tsx",
+        "web/src/components/rsi/ObjectiveName.tsx",
+        "web/src/components/rsi/Phase.tsx",
+        "web/src/components/rsi/ProgressChart.tsx",
+        "web/src/components/rsi/RsiView.tsx",
+        "web/src/components/rsi/Verdicts.tsx",
+        "web/src/components/rsi/metric.ts",
+        "web/src/components/timeaxis/Overview.tsx",
+        "web/src/components/timeaxis/TimeAxis.tsx",
+        "web/src/components/timeaxis/useTimeWindow.ts",
+        "web/src/components/trace/SpanDetail.tsx",
+        "web/src/components/trace/TraceView.tsx",
+        "web/src/components/trace/style.ts",
+        "web/src/eventFormat.ts",
+        "web/src/events.ts",
+        "web/src/executionFacts.ts",
+        "web/src/messages.ts",
+        "web/src/missionTimeline.ts",
+        "web/src/missions.ts",
+        "web/src/rsi.ts",
+        "web/src/rsiProgress.ts",
+        "web/src/sessionWindow.ts",
+        "web/src/taskActivity.ts",
+        "web/src/timeFold.ts",
+        "web/src/timeWindow.ts",
+        "web/src/trace.ts",
+        "web/src/traceWindow.ts",
+        "web/test/executionFacts.test.ts",
+        "web/test/missionTimeline.test.ts",
+        "web/test/missionsWindow.test.ts",
+        "web/test/rsiProgress.test.ts",
+        "web/test/sessionWindow.test.ts",
+        "web/test/taskActivity.test.ts",
+        "web/test/timeFold.test.ts",
+        "web/test/timeWindow.test.ts",
+        "web/test/trace.test.ts",
+        "web/test/traceWindow.test.ts"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-web-shell-design-system"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "web/test/missionTimeline.test.ts",
+          "web/test/rsiProgress.test.ts",
+          "web/test/trace.test.ts"
+        ],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "t559u-feature-map-initiative",
+      "title": "Full-Project Feature Map Initiative (t559u)",
+      "kind": "initiative",
+      "parent": null,
+      "summary": "Owner initiative t559u expanding Spawn's feature map with interactive mindmap visualization (Slice A), 100% file coverage & one-click wild-file scan (Slice B / t565u), and content-derived storage keys (Slice C).",
+      "status_note": "Active multi-slice initiative branched from main 6c5d22782.",
+      "files": [
+        "docs/feature-map.md",
+        "docs/feature-map/coverage-spec.md",
+        "docs/feature-map/library-extraction-analysis.md",
+        "docs/feature-map/registry.json",
+        "docs/landing-notes/2026-11-22-pr82.md"
+      ],
+      "relations": [
+        {
+          "kind": "contains",
+          "target": "t559u-slice-a-mindmap"
+        },
+        {
+          "kind": "contains",
+          "target": "t559u-slice-b-coverage"
+        },
+        {
+          "kind": "contains",
+          "target": "t559u-slice-c-storage-keys"
+        },
+        {
+          "kind": "contains",
+          "target": "t565u-wild-file-scan"
+        },
+        {
+          "kind": "extends",
+          "target": "cap-feature-map-status",
+          "note": "Builds on PR #82 four-state capability map"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "t559u",
+          "t565u",
+          "4/488"
+        ],
+        "tasks": [
+          "494",
+          "slice-a",
+          "slice-b",
+          "slice-c"
+        ],
+        "agents": [
+          "lead-mac",
+          "slice-b-coverage-agent"
+        ],
+        "commits": [
+          "6c5d22782",
+          "e55c51819",
+          "6a89585d3"
+        ],
+        "tests": [
+          "crates/spawn-core/tests/feature_coverage.rs",
+          "web/test/featureCoverage.test.ts"
+        ],
+        "deploys": [
+          "2026-11-22-pr82-feature-map"
+        ],
+        "artifacts": [
+          "docs/feature-map/registry.json",
+          "docs/feature-map/coverage-spec.md",
+          "docs/feature-map/library-extraction-analysis.md"
+        ],
+        "discussions": [
+          "owner-t559u-feature-map-initiative",
+          "owner-t565u-wild-file-scan"
+        ]
+      }
+    },
+    {
+      "id": "t559u-slice-a-mindmap",
+      "title": "Slice A: Interactive Feature Mindmap & Graph View",
+      "kind": "slice",
+      "parent": "t559u-feature-map-initiative",
+      "summary": "Interactive mindmap / node-edge exploration UI slice (parallel branch `t559u-fm-mindmap`) consuming feature registry topology and capability status.",
+      "status_note": "Parallel slice on branch t559u-fm-mindmap; shares registry schema and web shell routing.",
+      "files": [
+        "docs/feature-map.md",
+        "docs/feature-map/registry.json",
+        "web/src/App.tsx",
+        "web/src/components/Sidebar.tsx"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-feature-map-status"
+        },
+        {
+          "kind": "relates_to",
+          "target": "t559u-slice-b-coverage",
+          "note": "Shares registry.json schema and feature graph relations"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "t559u"
+        ],
+        "tasks": [
+          "slice-a"
+        ],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "docs/feature-map/registry.json",
+          "docs/feature-map.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "t559u-slice-b-coverage",
+      "title": "Slice B: Pure Coverage Core, Registry, CLI/API & Wild-File UI",
+      "kind": "slice",
+      "parent": "t559u-feature-map-initiative",
+      "summary": "Reusable pure-Rust coverage/consistency core (`spawn-core::feature_coverage`), IO/CLI/HTTP adapter, complete 100%-coverage repo registry, library extraction analysis, and `#/coverage` UI.",
+      "status_note": "Implemented on branch t559u-fm-coverage with 0 wild files, 0 stale refs, and 0 consistency errors.",
+      "files": [
+        "crates/spawn-cli/src/feature_inventory.rs",
+        "crates/spawn-cli/src/main.rs",
+        "crates/spawn-cli/src/serve.rs",
+        "crates/spawn-core/src/feature_coverage.rs",
+        "crates/spawn-core/src/lib.rs",
+        "crates/spawn-core/tests/feature_coverage.rs",
+        "docs/feature-map/coverage-spec.md",
+        "docs/feature-map/library-extraction-analysis.md",
+        "docs/feature-map/registry.json",
+        "web/src/App.tsx",
+        "web/src/components/Sidebar.tsx",
+        "web/src/components/features/CoveragePage.tsx",
+        "web/src/components/features/WildFileScanPanel.tsx",
+        "web/src/featureCoverage.ts",
+        "web/src/featureCoverageApi.ts",
+        "web/test/featureCoverage.test.ts"
+      ],
+      "relations": [
+        {
+          "kind": "implements",
+          "target": "t565u-wild-file-scan"
+        },
+        {
+          "kind": "extends",
+          "target": "cap-feature-map-status"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-serve-http-api"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "t559u",
+          "t565u"
+        ],
+        "tasks": [
+          "slice-b"
+        ],
+        "agents": [
+          "slice-b-coverage-agent"
+        ],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [
+          "crates/spawn-core/tests/feature_coverage.rs",
+          "crates/spawn-cli/src/feature_inventory.rs",
+          "web/test/featureCoverage.test.ts"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/feature-map/registry.json",
+          "docs/feature-map/coverage-spec.md",
+          "docs/feature-map/library-extraction-analysis.md"
+        ],
+        "discussions": [
+          "owner-t565u-wild-file-scan"
+        ]
+      }
+    },
+    {
+      "id": "t565u-wild-file-scan",
+      "title": "One-Click Unassociated-File ('\u91ce\u6587\u4ef6') Scan (t565u)",
+      "kind": "capability",
+      "parent": "t559u-feature-map-initiative",
+      "summary": "Owner capability t565u: one-click scan surfacing unassociated in-scope files with evidence and feature suggestions, strictly separating stale references and explicit exclusions, supporting non-destructive many-to-many linking.",
+      "status_note": "All 5 t565u acceptance criteria verified by Rust and Web fixture suites.",
+      "files": [
+        "crates/spawn-cli/src/feature_inventory.rs",
+        "crates/spawn-cli/src/serve.rs",
+        "crates/spawn-core/src/feature_coverage.rs",
+        "crates/spawn-core/tests/feature_coverage.rs",
+        "docs/feature-map/coverage-spec.md",
+        "web/src/components/features/CoveragePage.tsx",
+        "web/src/components/features/WildFileScanPanel.tsx",
+        "web/src/featureCoverage.ts",
+        "web/src/featureCoverageApi.ts",
+        "web/test/featureCoverage.test.ts"
+      ],
+      "relations": [
+        {
+          "kind": "verifies",
+          "target": "t559u-slice-b-coverage"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "t565u",
+          "t559u"
+        ],
+        "tasks": [
+          "slice-b"
+        ],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-core/tests/feature_coverage.rs",
+          "web/test/featureCoverage.test.ts"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/feature-map/coverage-spec.md"
+        ],
+        "discussions": [
+          "owner-t565u-wild-file-scan"
+        ]
+      }
+    },
+    {
+      "id": "t559u-slice-c-storage-keys",
+      "title": "Slice C: Content-Derived Storage Keys & Manifests (`fm-cas/v1`)",
+      "kind": "slice",
+      "parent": "t559u-feature-map-initiative",
+      "summary": "Deterministic content-derived storage keys and verifiable snapshot manifests (`fm-cas/v1`) developed on parallel branch `t559u-fm-storage-keys`.",
+      "status_note": "Parallel slice on branch t559u-fm-storage-keys; integrates cleanly with Slice B's InventoryEntry and library seam.",
+      "files": [
+        "docs/feature-map/library-extraction-analysis.md",
+        "docs/feature-map/registry.json",
+        "docs/storage.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-storage-lifecycle"
+        },
+        {
+          "kind": "relates_to",
+          "target": "t559u-slice-b-coverage",
+          "note": "InventoryEntry sha256 and registry schema compose with fm-cas/v1 manifests"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "t559u"
+        ],
+        "tasks": [
+          "slice-c"
+        ],
+        "agents": [],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md",
+          "docs/feature-map/library-extraction-analysis.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "t567u-multi-machine-distributed",
+      "title": "Multi-Machine Distributed Compute & Storage Research (t567u/t568u)",
+      "kind": "research-initiative",
+      "parent": null,
+      "summary": "Distinct staged research & design initiative (Stages 1-4: failure model, mature consensus evaluation, isolated PoCs, discarded alternatives & owner decisions). Explicitly NOT a production implementation and NOT a 4th slice of t559u; permanently excludes sold machine mac16.",
+      "status_note": "Staged research/design only \u2014 NOT a production implementation and NOT a 4th slice of t559u. Permanently excludes sold mac16.",
+      "files": [
+        "docs/feature-map/library-extraction-analysis.md",
+        "docs/feature-map/t567u-t568u-distributed-research.md",
+        "docs/storage.md"
+      ],
+      "relations": [
+        {
+          "kind": "relates_to",
+          "target": "t559u-feature-map-initiative",
+          "note": "Distinct research initiative tracked in feature map; explicitly NOT a 4th slice of t559u"
+        },
+        {
+          "kind": "depends_on",
+          "target": "t559u-slice-b-coverage",
+          "note": "Consumes pure core/CLI/API library extraction seam"
+        },
+        {
+          "kind": "depends_on",
+          "target": "t559u-slice-c-storage-keys",
+          "note": "Builds cross-machine data plane on fm-cas/v1 content-derived storage keys and manifests"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-storage-lifecycle",
+          "note": "Consensus is strictly for control-plane metadata, never bulk file replication or job execution"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "t567u",
+          "t568u"
+        ],
+        "tasks": [],
+        "agents": [
+          "lead-mac",
+          "slice-b-coverage-agent"
+        ],
+        "commits": [
+          "6c5d22782"
+        ],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [
+          "docs/feature-map/t567u-t568u-distributed-research.md",
+          "docs/feature-map/library-extraction-analysis.md"
+        ],
+        "discussions": [
+          "owner-t567u-t568u-distributed-research"
+        ]
+      }
+    }
+  ]
+}
