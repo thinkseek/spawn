@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Validate docs/feature-map.md against the current checkout."""
+"""Validate the hand-maintained static map docs/feature-map-static.md.
+
+docs/feature-map.md is the derived, record-driven map shipped by PR #82
+(GET /api/features); it holds no hand-written status and is not checked here.
+The static FM-01..FM-19 capability audit moved to feature-map-static.md when
+the two add/add histories merged.
+"""
 
 import re
 import sys
@@ -7,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DOC = ROOT / "docs/feature-map.md"
+DOC = ROOT / "docs/feature-map-static.md"
 FIELDS = ("能力", "入口", "代码", "实现状态", "测试证据", "部署状态", "已知缺口", "下一步")
 IMPLEMENTATION = ("已实现", "部分实现", "未实现", "已知缺陷")
 DEPLOYMENT = ("部署未验证", "部署已验证", "未部署", "不适用")

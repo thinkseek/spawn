@@ -89,6 +89,7 @@ pub mod control_mask;
 mod cost;
 mod event_log;
 mod experience;
+mod features;
 mod fleet;
 mod gateway;
 mod host;

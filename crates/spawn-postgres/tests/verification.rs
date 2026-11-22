@@ -178,6 +178,7 @@ fn only_the_owner_records_verifications() {
 /// paragraph's line, not the quote) or null, every verification oldest
 /// first, and the newest deploy.
 #[test]
+#[allow(clippy::too_many_lines)] // one read: landings, verifications, deploy
 fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_the_deploy() {
     let (store, schema) = store("verification_read");
     let mut client = admin(&schema);
@@ -190,9 +191,9 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     mission(&mut client, 4);
     mission(&mut client, 9);
     assigned(&mut client, 1, 4, 133, BRIEF_133);
-    landed(&mut client, 1);
+    let landed_1 = landed(&mut client, 1);
     assigned(&mut client, 2, 9, 133, "Objective 133 of another mission.");
-    landed(&mut client, 2);
+    let landed_2 = landed(&mut client, 2);
     assigned(
         &mut client,
         3,
@@ -210,13 +211,13 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
         28,
         "Objective 28 again.\nVerified by: the first.\n\n  Verified by: the second.  \nrev-g reviews.",
     );
-    landed(&mut client, 4);
+    let landed_4 = landed(&mut client, 4);
     // Assigned, never landed: no landing.
     assigned(&mut client, 5, 4, 29, "Objective 29.\nVerified by: never.");
-    store
+    let failed = store
         .verification_record(&verification(4, 133, "fail"))
         .expect("a fail");
-    store
+    let passed = store
         .verification_record(&verification(9, 133, "pass"))
         .expect("a pass");
     store
@@ -253,16 +254,16 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
         landings,
         [
             json!({"mission": 4, "objective": 28, "task": 4, "landed_ms": at("4"),
-                   "verified_by": "Verified by: the second."}),
+                   "event": landed_4, "verified_by": "Verified by: the second."}),
             json!({"mission": 4, "objective": 133, "task": 1, "landed_ms": at("1"),
-                   "verified_by": "Verified by: the gate runs 133.sh on the candidate. After \
-                   the landing, the lead runs `spawn verify list` on the live store and posts \
-                   the unverified objectives since 11-13 beside sync/features.md, records one \
-                   verification (`spawn verify 4/133 --by lead --how … --result pass`, once 133 \
-                   itself has been looked at) and posts that 4/133 leaves the list; rev-g \
-                   reviews."}),
+                   "event": landed_1, "verified_by": "Verified by: the gate runs 133.sh on the \
+                   candidate. After the landing, the lead runs `spawn verify list` on the live \
+                   store and posts the unverified objectives since 11-13 beside \
+                   sync/features.md, records one verification (`spawn verify 4/133 --by lead \
+                   --how … --result pass`, once 133 itself has been looked at) and posts that \
+                   4/133 leaves the list; rev-g reviews."}),
             json!({"mission": 9, "objective": 133, "task": 2, "landed_ms": at("2"),
-                   "verified_by": null}),
+                   "event": landed_2, "verified_by": null}),
         ],
         "{facts}"
     );
@@ -272,9 +273,11 @@ fn the_read_has_each_objectives_newest_landing_its_line_the_verifications_and_th
     assert_eq!(verifications[0]["result"], "fail");
     assert_eq!(verifications[0]["by"], "lead");
     assert_eq!(verifications[0]["how"], "read the running product");
+    assert_eq!(verifications[0]["event"], failed);
     assert_eq!(verifications[1]["mission"], 9);
     assert_eq!(verifications[1]["objective"], 133);
     assert_eq!(verifications[1]["result"], "pass");
+    assert_eq!(verifications[1]["event"], passed);
     assert!(
         verifications[0]["at_ms"].as_i64() <= verifications[1]["at_ms"].as_i64(),
         "{facts}"
