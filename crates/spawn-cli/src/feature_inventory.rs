@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -110,13 +109,13 @@ pub fn save_registry_atomic(path: &Path, registry: &FeatureRegistry) -> Result<(
 }
 
 /// Query git-tracked files inside `root`, if `root` is inside a git working
-/// tree. Non-git fixture directories return an empty tracked set.
+/// tree. Non-git fixture directories (and git-archive exports) return an empty
+/// tracked set without panicking.
 fn git_tracked_files(root: &Path) -> BTreeSet<String> {
-    let output = Command::new("git")
+    let output = crate::sources::controller_git()
         .arg("-C")
         .arg(root)
         .args(["ls-files", "-z"])
-        .env("LC_ALL", "C")
         .output();
     let Ok(output) = output else {
         return BTreeSet::new();
