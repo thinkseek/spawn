@@ -377,6 +377,29 @@ export function isScanClean(report: ScanReport): boolean {
   );
 }
 
+/** Verify the strict coverage accounting identities hold on a scan report:
+ * - covered + unassociated_wild === in_scope
+ * - in_scope + explicit_exclusions === total_seen
+ * - array lengths match counters
+ * - no excluded path appears in covered or wild collections. */
+export function accountingIdentitiesHold(report: ScanReport): boolean {
+  const c = report.counts;
+  if (c.covered + c.unassociated_wild !== c.in_scope) return false;
+  if (c.in_scope + c.explicit_exclusions !== c.total_seen) return false;
+  if (report.unassociated_files.length !== c.unassociated_wild) return false;
+  if (report.stale_references.length !== c.stale_references) return false;
+  if (report.excluded_files.length !== c.explicit_exclusions) return false;
+  if (Object.keys(report.bidirectional_index.file_to_features).length !== c.covered) {
+    return false;
+  }
+  const wildSet = new Set(report.unassociated_files.map((item) => item.path));
+  for (const excluded of report.excluded_files) {
+    if (wildSet.has(excluded.path)) return false;
+    if (excluded.path in report.bidirectional_index.file_to_features) return false;
+  }
+  return true;
+}
+
 export function fileAssociatedFeatures(report: ScanReport, path: string): string[] {
   return report.bidirectional_index.file_to_features[path] ?? [];
 }

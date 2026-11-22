@@ -179,8 +179,9 @@ export function WildFileScanPanel({
           <div className="flex items-center gap-2 px-4 py-4 text-caption text-success">
             <CheckCircle2 size={15} />
             <span>
-              All {counts.in_scope} in-scope project files are associated with at least one
-              genuine feature node.
+              {counts.in_scope === 0
+                ? "No in-scope project files were observed in this scan."
+                : `All ${counts.in_scope} in-scope project files are associated with at least one genuine feature node.`}
             </span>
           </div>
         ) : (

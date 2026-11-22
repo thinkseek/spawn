@@ -33,20 +33,28 @@ Every excluded path must match a named `ExclusionRule { id, pattern, category, r
 
 | Category | Rule IDs / Patterns | Reason |
 | --- | --- | --- |
-| `vcs` | `.git/**` | Git internal object store and repository metadata |
+| `vcs` | `.git/**` | Git internal object store, worktree `.git` pointers, and repository metadata |
 | `build-cache` | `target/**`, `web/dist/**`, `**/.cache/**`, `**/__pycache__/**` | Derived, rebuildable build and tool caches |
-| `dependency-cache` | `**/node_modules/**` | Third-party installed packages, not authored project files |
-| `runtime-state` | `.spawn/**`, `.claude/**` | Ephemeral agent/engine execution markers and local worktrees |
-| `secrets` | `**/.env`, `**/.env.*`, `**/*.env`, `**/*.key`, `**/*.pem`, `**/secrets/**` | Credentials and private keys are never crawled, hashed, or indexed |
-| `editor-temp` | `**/.DS_Store`, `**/*.swp` | OS metadata and transient editor swap files |
-| `transient` | `**/*.log`, `**/*.tmp` | Transient diagnostic logs and scratch files |
+| `dependency-cache` | `**/node_modules/**`, `**/.pnpm-store/**` | Third-party installed packages and local pnpm store, not authored project files |
+| `runtime-state` | `.spawn/**`, `.claude/**`, `rsi/.gate-owner/**` | Ephemeral agent/engine execution markers, local worktrees, and gitignored gate-owner leases |
+| `secrets` | `**/.env`, `**/.env.*`, `**/*.env`, `**/*.key`, `**/*.pem`, `**/*.gpg`, `**/secrets/**` | Credentials, private keys, and encrypted secrets are never crawled, hashed, or indexed |
+| `editor-temp` | `**/.DS_Store`, `**/*.swp`, `**/*.swo`, `**/*~`, `**/*.rs.bk`, `Cargo.lock.bak` | OS metadata and transient editor/formatter backup files |
+| `transient` | `**/*.log`, `**/*.tmp`, `**/*.part` | Transient diagnostic logs, scratch files, and partial downloads |
 
 **Hard invariants on exclusions**:
 - Excluded paths are reported in `excluded_files` with their `rule_id`, `category`, and `reason`.
 - Excluded paths are **NEVER** counted in `counts.in_scope` or `counts.covered`.
 - Excluded paths are **NEVER** listed in `unassociated_files`.
-- Attempting to associate an excluded or secret path via CLI or API is rejected with an error.
-- The filesystem walker refuses symlinks escaping the project root and never crawls `$HOME` or reads secret file contents.
+- Any directory matching a whole-subtree (`/**`) exclusion rule — including `secrets/`, `rsi/.gate-owner/`, `.git/`, `target/`, `node_modules/`, `.pnpm-store/`, `web/dist/`, `.spawn/`, `.claude/`, `.cache/`, and `__pycache__/` — is collapsed immediately via `match_directory_exclusion` without calling `read_dir` inside it.
+- Attempting to associate an excluded or secret path via CLI or API is rejected with an error; listing an excluded path in `registry.json` fails `validate_registry` (`consistency.invalid_paths`) and is never counted as covered or stale.
+- The filesystem walker refuses symlinks escaping the project root, never traverses symlinked directories, and never crawls `$HOME` or reads secret file contents.
+
+### 2.3 Semantic Association Rules (No Catch-All Buckets, No Fabricated Links)
+
+A green `covered == in_scope` counter is **not** sufficient on its own. Associations in `docs/feature-map/registry.json` must satisfy these semantic rules:
+1. **No directory-glob catch-all buckets**: Every capability/subsystem node must represent a genuine functional capability. In particular, RSI objective backlogs (`rsi/backlog/*.json`) and verification scenarios (`rsi/scenarios/**`) are mapped to the specific Spawn capabilities they specify or verify rather than dumped wholesale into generic directory buckets; feature-specific documentation and systemd units are linked to their owning capabilities rather than a generic docs/deploy catch-all.
+2. **Organizational `domain` roots own zero direct files**: Top-level `domain` nodes organize child capabilities/subsystems via `contains` / `parent` links; concrete files live on genuine capability/subsystem/initiative/slice nodes.
+3. **No fabricated placeholder links on unmerged parallel slices**: If a parallel initiative slice (such as `t559u-slice-a-mindmap` on branch `t559u-fm-mindmap` or `t559u-slice-c-storage-keys` on `t559u-fm-storage-keys`) has not yet merged its implementation files into the current branch, its `files` list contains only files genuinely present and authored for that seam on this branch (or `[]` with an explicit `status_note`), never unrelated placeholder files.
 
 ## 3. Data Model & Invariants
 
@@ -77,8 +85,8 @@ Exact accounting identities that hold on every scan:
 - `dangling_relations`: `parent` or `relations[].target` naming a non-existent feature ID.
 - `self_links`: a feature whose `parent` or relation targets itself.
 - `cycle_errors`: directed cycles in `parent`, `depends_on`, or `contains`.
-- `orphan_features`: non-root feature kinds (`capability`, `slice`, `subsystem`) with neither a `parent` nor an incoming `contains` relation. Top-level `domain`, `initiative`, and `research-initiative` nodes are valid roots.
-- `invalid_paths`: malformed, absolute, traversal (`..`), or excluded file paths listed inside `feature.files`.
+- `orphan_features`: non-root feature kinds (`capability`, `slice`, `subsystem`) that are not reachable from any valid root (`domain`, `initiative`, `research-initiative`) via valid `parent` or `contains` hierarchy edges (catching direct orphans, children of orphans, dangling/self-parent orphans, and isolated cycles).
+- `invalid_paths`: malformed, absolute, traversal (`..`), duplicate-within-feature, or excluded file paths listed inside `feature.files`.
 
 ### 3.4 Non-Destructive Safety Guarantee
 

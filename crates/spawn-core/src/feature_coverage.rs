@@ -71,6 +71,12 @@ impl BoundaryPolicy {
                     reason: "Installed third-party frontend packages are external dependencies, not authored project files.".to_string(),
                 },
                 ExclusionRule {
+                    id: "pnpm-store".to_string(),
+                    pattern: "**/.pnpm-store/**".to_string(),
+                    category: "dependency-cache".to_string(),
+                    reason: "pnpm content-addressable package store is a local dependency cache.".to_string(),
+                },
+                ExclusionRule {
                     id: "web-build-output".to_string(),
                     pattern: "web/dist/**".to_string(),
                     category: "build-cache".to_string(),
@@ -87,6 +93,12 @@ impl BoundaryPolicy {
                     pattern: ".claude/**".to_string(),
                     category: "runtime-state".to_string(),
                     reason: "Local coding-engine runtime state and worktrees are excluded from project coverage.".to_string(),
+                },
+                ExclusionRule {
+                    id: "rsi-gate-owner-state".to_string(),
+                    pattern: "rsi/.gate-owner/**".to_string(),
+                    category: "runtime-state".to_string(),
+                    reason: "Ephemeral RSI gate owner lease and runtime state (gitignored) are not authored project artifacts.".to_string(),
                 },
                 ExclusionRule {
                     id: "secrets-env-dotfile".to_string(),
@@ -119,6 +131,12 @@ impl BoundaryPolicy {
                     reason: "PEM key/certificate files are excluded from feature coverage.".to_string(),
                 },
                 ExclusionRule {
+                    id: "secrets-gpg-encrypted".to_string(),
+                    pattern: "**/*.gpg".to_string(),
+                    category: "secrets".to_string(),
+                    reason: "GPG-encrypted secrets and backup artifacts are excluded from feature coverage.".to_string(),
+                },
+                ExclusionRule {
                     id: "secrets-directory".to_string(),
                     pattern: "**/secrets/**".to_string(),
                     category: "secrets".to_string(),
@@ -137,6 +155,30 @@ impl BoundaryPolicy {
                     reason: "Editor swap files are transient local artifacts.".to_string(),
                 },
                 ExclusionRule {
+                    id: "editor-swo-files".to_string(),
+                    pattern: "**/*.swo".to_string(),
+                    category: "editor-temp".to_string(),
+                    reason: "Secondary editor swap files are transient local artifacts.".to_string(),
+                },
+                ExclusionRule {
+                    id: "editor-backup-tilde".to_string(),
+                    pattern: "**/*~".to_string(),
+                    category: "editor-temp".to_string(),
+                    reason: "Editor tilde backup files are transient local artifacts.".to_string(),
+                },
+                ExclusionRule {
+                    id: "rust-backup-files".to_string(),
+                    pattern: "**/*.rs.bk".to_string(),
+                    category: "editor-temp".to_string(),
+                    reason: "Rust formatter backup files (gitignored) are transient local artifacts.".to_string(),
+                },
+                ExclusionRule {
+                    id: "cargo-lock-backup".to_string(),
+                    pattern: "Cargo.lock.bak".to_string(),
+                    category: "editor-temp".to_string(),
+                    reason: "Transient Cargo.lock backup file (gitignored) is outside project coverage.".to_string(),
+                },
+                ExclusionRule {
                     id: "transient-logs".to_string(),
                     pattern: "**/*.log".to_string(),
                     category: "transient".to_string(),
@@ -147,6 +189,12 @@ impl BoundaryPolicy {
                     pattern: "**/*.tmp".to_string(),
                     category: "transient".to_string(),
                     reason: "Temporary scratch files are outside durable project coverage.".to_string(),
+                },
+                ExclusionRule {
+                    id: "transient-part".to_string(),
+                    pattern: "**/*.part".to_string(),
+                    category: "transient".to_string(),
+                    reason: "Partial transfer/download files are transient artifacts.".to_string(),
                 },
                 ExclusionRule {
                     id: "tool-caches".to_string(),
@@ -393,10 +441,14 @@ pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
     }
     let replaced = raw.replace('\\', "/");
     if replaced.starts_with('/') {
-        return Err(format!("path {raw:?} must be repository-relative, not absolute"));
+        return Err(format!(
+            "path {raw:?} must be repository-relative, not absolute"
+        ));
     }
     if replaced.ends_with('/') {
-        return Err(format!("path {raw:?} must name a file, not a trailing slash"));
+        return Err(format!(
+            "path {raw:?} must name a file, not a trailing slash"
+        ));
     }
     if replaced.as_bytes().get(1) == Some(&b':')
         && replaced
@@ -412,7 +464,9 @@ pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
             return Err(format!("path {raw:?} contains an empty path segment"));
         }
         if segment == "." || segment == ".." {
-            return Err(format!("path {raw:?} contains traversal segment {segment:?}"));
+            return Err(format!(
+                "path {raw:?} contains traversal segment {segment:?}"
+            ));
         }
         parts.push(segment);
     }
@@ -439,6 +493,24 @@ pub fn match_exclusion<'a>(policy: &'a BoundaryPolicy, path: &str) -> Option<&'a
         .find(|rule| glob_matches(&rule.pattern, trimmed) || glob_matches(&rule.pattern, path))
 }
 
+/// Return the first explicit whole-subtree directory [`ExclusionRule`]
+/// (a rule whose pattern ends with `/**`) matching `dir_rel`, if any.
+///
+/// Filesystem walkers use this to collapse excluded subtrees (such as `.git/`,
+/// `target/`, `node_modules/`, `secrets/`, or `rsi/.gate-owner/`) without ever
+/// calling `read_dir` inside them.
+pub fn match_directory_exclusion<'a>(
+    policy: &'a BoundaryPolicy,
+    dir_rel: &str,
+) -> Option<&'a ExclusionRule> {
+    let trimmed = dir_rel.trim_end_matches('/');
+    let probe = format!("{trimmed}/__probe__");
+    policy.exclusions.iter().find(|rule| {
+        rule.pattern.ends_with("/**")
+            && (glob_matches(&rule.pattern, trimmed) || glob_matches(&rule.pattern, &probe))
+    })
+}
+
 /// Pure glob matcher over `/`-separated relative paths supporting `*`, `?`,
 /// and `**` (zero or more segments).
 ///
@@ -462,8 +534,7 @@ fn match_segments(pat: &[&str], path: &[&str]) -> bool {
         (None, None) => true,
         (Some(&"**"), _) => {
             // `**` matches zero segments or consumes one path segment.
-            match_segments(&pat[1..], path)
-                || (!path.is_empty() && match_segments(pat, &path[1..]))
+            match_segments(&pat[1..], path) || (!path.is_empty() && match_segments(pat, &path[1..]))
         }
         (None, Some(_)) | (Some(_), None) => false,
         (Some(p), Some(s)) => segment_matches(p, s) && match_segments(&pat[1..], &path[1..]),
@@ -506,17 +577,17 @@ pub fn validate_registry(registry: &FeatureRegistry) -> ConsistencyReport {
     let mut report = ConsistencyReport::default();
     let known_ids = collect_feature_ids(registry, &mut report);
 
-    let mut contained_targets: BTreeSet<String> = BTreeSet::new();
     let mut parent_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut depends_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut contains_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut hierarchy_children: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for feature in &registry.features {
         validate_feature_files(feature, &registry.boundary, &mut report);
         validate_feature_links(
             feature,
             &known_ids,
-            &mut contained_targets,
+            &mut hierarchy_children,
             &mut parent_edges,
             &mut depends_edges,
             &mut contains_edges,
@@ -524,16 +595,45 @@ pub fn validate_registry(registry: &FeatureRegistry) -> ConsistencyReport {
         );
     }
 
+    // Root-reachability orphan check: a non-root feature (capability, slice,
+    // subsystem) is an orphan unless it is reachable from at least one valid
+    // root node (`domain`, `initiative`, `research-initiative`) via valid
+    // `parent` or `contains` hierarchy edges. This catches direct orphans,
+    // children of orphans, dangling/self-parent orphans, and isolated cycles.
+    let mut root_anchored: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = Vec::new();
     for feature in &registry.features {
-        if feature.parent.is_none()
-            && !contained_targets.contains(&feature.id)
+        if !feature.id.trim().is_empty()
+            && feature.kind.may_be_root()
+            && root_anchored.insert(feature.id.clone())
+        {
+            queue.push(feature.id.clone());
+        }
+    }
+    while let Some(curr) = queue.pop() {
+        if let Some(children) = hierarchy_children.get(&curr) {
+            for child in children {
+                if root_anchored.insert(child.clone()) {
+                    queue.push(child.clone());
+                }
+            }
+        }
+    }
+    for feature in &registry.features {
+        if !feature.id.trim().is_empty()
             && !feature.kind.may_be_root()
+            && !root_anchored.contains(&feature.id)
         {
             report.orphan_features.push(feature.id.clone());
         }
     }
 
-    detect_cycles("parent", &known_ids, &parent_edges, &mut report.cycle_errors);
+    detect_cycles(
+        "parent",
+        &known_ids,
+        &parent_edges,
+        &mut report.cycle_errors,
+    );
     detect_cycles(
         "depends_on",
         &known_ids,
@@ -587,9 +687,15 @@ fn validate_feature_files(
     boundary: &BoundaryPolicy,
     report: &mut ConsistencyReport,
 ) {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for raw_path in &feature.files {
         match normalize_repo_path(raw_path) {
             Ok(norm) => {
+                if !seen.insert(norm.clone()) {
+                    report
+                        .invalid_paths
+                        .push(format!("{}: duplicate file path {norm:?}", feature.id));
+                }
                 if let Some(rule) = match_exclusion(boundary, &norm) {
                     report.invalid_paths.push(format!(
                         "{}: file {norm:?} matches exclusion rule {:?} ({})",
@@ -610,7 +716,7 @@ fn validate_feature_files(
 fn validate_feature_links(
     feature: &FeatureNode,
     known_ids: &BTreeSet<String>,
-    contained_targets: &mut BTreeSet<String>,
+    hierarchy_children: &mut BTreeMap<String, Vec<String>>,
     parent_edges: &mut BTreeMap<String, Vec<String>>,
     depends_edges: &mut BTreeMap<String, Vec<String>>,
     contains_edges: &mut BTreeMap<String, Vec<String>>,
@@ -622,15 +728,18 @@ fn validate_feature_links(
                 .self_links
                 .push(format!("{}: parent points to itself", feature.id));
         } else if !known_ids.contains(parent) {
-            report.dangling_relations.push(format!(
-                "{}: parent {parent:?} does not exist",
-                feature.id
-            ));
+            report
+                .dangling_relations
+                .push(format!("{}: parent {parent:?} does not exist", feature.id));
         } else {
             parent_edges
                 .entry(feature.id.clone())
                 .or_default()
                 .push(parent.clone());
+            hierarchy_children
+                .entry(parent.clone())
+                .or_default()
+                .push(feature.id.clone());
         }
     }
 
@@ -657,7 +766,10 @@ fn validate_feature_links(
                     .push(rel.target.clone());
             }
             RelationKind::Contains => {
-                contained_targets.insert(rel.target.clone());
+                hierarchy_children
+                    .entry(feature.id.clone())
+                    .or_default()
+                    .push(rel.target.clone());
                 contains_edges
                     .entry(feature.id.clone())
                     .or_default()
@@ -744,10 +856,8 @@ pub fn scan_coverage(
 
     let unassociated_files =
         collect_wild_files(&in_scope_map, &file_to_features, &feature_to_files);
-    let unassociated_paths: BTreeSet<&str> = unassociated_files
-        .iter()
-        .map(|f| f.path.as_str())
-        .collect();
+    let unassociated_paths: BTreeSet<&str> =
+        unassociated_files.iter().map(|f| f.path.as_str()).collect();
     let stale_references: Vec<StaleFileReference> = stale_map
         .into_iter()
         .map(|(stale_path, referencing)| StaleFileReference {
@@ -952,9 +1062,9 @@ pub fn associate_file(
         ));
     }
 
-    let exists_in_inventory = inventory.iter().any(|entry| {
-        normalize_repo_path(&entry.path).is_ok_and(|candidate| candidate == norm)
-    });
+    let exists_in_inventory = inventory
+        .iter()
+        .any(|entry| normalize_repo_path(&entry.path).is_ok_and(|candidate| candidate == norm));
     if !exists_in_inventory {
         return Err(format!(
             "file {norm:?} does not exist in the current project inventory"
@@ -975,10 +1085,19 @@ pub fn associate_file(
         return Err("at least one genuine feature id is required".to_string());
     }
 
-    let known: BTreeSet<&str> = registry.features.iter().map(|f| f.id.as_str()).collect();
+    let mut id_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for feature in &registry.features {
+        *id_counts.entry(feature.id.as_str()).or_insert(0) += 1;
+    }
     for fid in &requested {
-        if !known.contains(fid.as_str()) {
-            return Err(format!("unknown feature id {fid:?}"));
+        match id_counts.get(fid.as_str()).copied().unwrap_or(0) {
+            0 => return Err(format!("unknown feature id {fid:?}")),
+            1 => {}
+            _ => {
+                return Err(format!(
+                    "ambiguous duplicate feature id {fid:?} in registry"
+                ));
+            }
         }
     }
 
@@ -1065,7 +1184,11 @@ fn suggest_features_for_path(
         }
     }
 
-    scores.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(b.2)));
+    scores.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
     scores
         .into_iter()
         .take(5)
