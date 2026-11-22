@@ -23,10 +23,8 @@ struct ScratchDir {
 impl ScratchDir {
     fn new(name: &str) -> Self {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "spawn-cas-it-{name}-{}-{seq}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("spawn-cas-it-{name}-{}-{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create scratch dir");
         Self { path }
@@ -209,18 +207,44 @@ fn deterministic_keys_and_full_round_trip_restore_with_large_multichunk() {
     let expected_mtime_ns = u128::from(secs) * 1_000_000_000 + u128::from(nanos);
 
     // Regular text file (0o644)
-    write_file(&src.join("src/lib.rs"), b"pub fn answer() -> u32 { 42 }\n", 0o644, secs, nanos);
+    write_file(
+        &src.join("src/lib.rs"),
+        b"pub fn answer() -> u32 { 42 }\n",
+        0o644,
+        secs,
+        nanos,
+    );
     // Executable script (0o755)
-    write_file(&src.join("bin/tool.sh"), b"#!/bin/sh\nexit 0\n", 0o755, secs, nanos);
+    write_file(
+        &src.join("bin/tool.sh"),
+        b"#!/bin/sh\nexit 0\n",
+        0o755,
+        secs,
+        nanos,
+    );
     // Empty file
     write_file(&src.join("data/empty.dat"), b"", 0o644, secs, nanos);
     // Arbitrary binary file containing every byte 0x00..=0xFF
     let all_bytes: Vec<u8> = (0u8..=255).collect();
-    write_file(&src.join("data/all_bytes.bin"), &all_bytes, 0o644, secs, nanos);
+    write_file(
+        &src.join("data/all_bytes.bin"),
+        &all_bytes,
+        0o644,
+        secs,
+        nanos,
+    );
     // Large multi-chunk file: 4 MiB + 128 KiB -> 2 deterministic chunks
     let large_len = 4 * 1024 * 1024 + 128 * 1024;
-    let large_payload: Vec<u8> = (0..large_len).map(|i| u8::try_from((i * 31) % 256).unwrap()).collect();
-    write_file(&src.join("data/large_multi_chunk.bin"), &large_payload, 0o644, secs, nanos);
+    let large_payload: Vec<u8> = (0..large_len)
+        .map(|i| u8::try_from((i * 31) % 256).unwrap())
+        .collect();
+    write_file(
+        &src.join("data/large_multi_chunk.bin"),
+        &large_payload,
+        0o644,
+        secs,
+        nanos,
+    );
     // Nested empty directory
     fs::create_dir_all(src.join("empty_dirs/nested/leaf")).expect("create empty dirs");
     // Relative symlink (never followed during snapshot)
@@ -343,8 +367,14 @@ fn deterministic_keys_and_full_round_trip_restore_with_large_multichunk() {
     // Modes & mtimes preserved
     assert_eq!(read_mode(&restored.join("src/lib.rs")), 0o644);
     assert_eq!(read_mode(&restored.join("bin/tool.sh")), 0o755);
-    assert_eq!(read_mtime_ns(&restored.join("src/lib.rs")), expected_mtime_ns);
-    assert_eq!(read_mtime_ns(&restored.join("bin/tool.sh")), expected_mtime_ns);
+    assert_eq!(
+        read_mtime_ns(&restored.join("src/lib.rs")),
+        expected_mtime_ns
+    );
+    assert_eq!(
+        read_mtime_ns(&restored.join("bin/tool.sh")),
+        expected_mtime_ns
+    );
 
     #[cfg(unix)]
     assert_eq!(
@@ -397,9 +427,27 @@ fn duplicates_and_renames_via_parent_snapshot() {
     let src = scratch.path().join("src");
     let store = scratch.path().join("store");
 
-    write_file(&src.join("copy_one.txt"), b"shared content bytes", 0o644, 1_750_000_010, 0);
-    write_file(&src.join("copy_two.txt"), b"shared content bytes", 0o644, 1_750_000_010, 0);
-    write_file(&src.join("before.txt"), b"unique file for rename", 0o644, 1_750_000_010, 0);
+    write_file(
+        &src.join("copy_one.txt"),
+        b"shared content bytes",
+        0o644,
+        1_750_000_010,
+        0,
+    );
+    write_file(
+        &src.join("copy_two.txt"),
+        b"shared content bytes",
+        0o644,
+        1_750_000_010,
+        0,
+    );
+    write_file(
+        &src.join("before.txt"),
+        b"unique file for rename",
+        0o644,
+        1_750_000_010,
+        0,
+    );
 
     let snap1 = run_spawn_json(&[
         "backup",
@@ -465,12 +513,36 @@ fn detects_bit_flip_corruption_tampering_and_missing_blobs() {
     let store = scratch.path().join("store");
     let fm_file = scratch.path().join("fm.json");
 
-    write_file(&src.join("src/lib.rs"), b"pub fn check() {}\n", 0o644, 1_750_000_020, 0);
-    write_file(&src.join("bin/tool.sh"), b"#!/bin/sh\n", 0o755, 1_750_000_020, 0);
+    write_file(
+        &src.join("src/lib.rs"),
+        b"pub fn check() {}\n",
+        0o644,
+        1_750_000_020,
+        0,
+    );
+    write_file(
+        &src.join("bin/tool.sh"),
+        b"#!/bin/sh\n",
+        0o755,
+        1_750_000_020,
+        0,
+    );
     write_file(&src.join("data/empty.dat"), b"", 0o644, 1_750_000_020, 0);
-    write_file(&src.join("data/all_bytes.bin"), &[1, 2, 3, 4], 0o644, 1_750_000_020, 0);
+    write_file(
+        &src.join("data/all_bytes.bin"),
+        &[1, 2, 3, 4],
+        0o644,
+        1_750_000_020,
+        0,
+    );
     let large_payload = vec![0x42u8; 4 * 1024 * 1024 + 64];
-    write_file(&src.join("data/large_multi_chunk.bin"), &large_payload, 0o644, 1_750_000_020, 0);
+    write_file(
+        &src.join("data/large_multi_chunk.bin"),
+        &large_payload,
+        0o644,
+        1_750_000_020,
+        0,
+    );
     write_sample_fm(&fm_file);
 
     let snap = run_spawn_json(&[
@@ -562,7 +634,10 @@ fn detects_bit_flip_corruption_tampering_and_missing_blobs() {
     ]);
     assert!(!missing_out.status.success());
     let missing_err = String::from_utf8_lossy(&missing_out.stderr);
-    assert!(missing_err.contains("missing object"), "stderr: {missing_err}");
+    assert!(
+        missing_err.contains("missing object"),
+        "stderr: {missing_err}"
+    );
     assert!(missing_err.contains(&lib_blob_key), "stderr: {missing_err}");
     assert!(missing_err.contains("src/lib.rs"), "stderr: {missing_err}");
     fs::write(&lib_blob_path, &orig_blob).unwrap();
@@ -585,7 +660,10 @@ fn detects_bit_flip_corruption_tampering_and_missing_blobs() {
     assert!(!chunk_fail.status.success());
     let chunk_err = String::from_utf8_lossy(&chunk_fail.stderr);
     assert!(chunk_err.contains(&chunk0_key), "stderr: {chunk_err}");
-    assert!(chunk_err.contains("data/large_multi_chunk.bin"), "stderr: {chunk_err}");
+    assert!(
+        chunk_err.contains("data/large_multi_chunk.bin"),
+        "stderr: {chunk_err}"
+    );
     fs::write(&c_path, &orig_chunk).unwrap();
 
     // 4. Tampered FM graph JSON -> detected
@@ -645,15 +723,36 @@ fn rejects_inconsistent_fm_graphs_and_preserves_legacy_backup_layout() {
     let src = scratch.path().join("src");
     let store = scratch.path().join("store");
 
-    write_file(&src.join("app.rs"), b"fn main() {}\n", 0o644, 1_750_000_030, 0);
+    write_file(
+        &src.join("app.rs"),
+        b"fn main() {}\n",
+        0o644,
+        1_750_000_030,
+        0,
+    );
 
     // Plant simulated legacy spawn backup / store directories & manifest
     let legacy_files = [
-        ("postgres/hourly/spawn-20261122-000000.dump.gpg", b"legacy-pg-dump".as_slice()),
-        ("bundles/full-20261122.tar.zst.gpg", b"legacy-bundle".as_slice()),
-        ("transcripts/manifests/host/acct/000000000001.json.gpg", b"legacy-tr".as_slice()),
-        ("sessions/manifests/host/acct/000000000001.json.gpg", b"legacy-sess".as_slice()),
-        (".backup-sync-manifest.json", b"{\"legacy\":true}".as_slice()),
+        (
+            "postgres/hourly/spawn-20261122-000000.dump.gpg",
+            b"legacy-pg-dump".as_slice(),
+        ),
+        (
+            "bundles/full-20261122.tar.zst.gpg",
+            b"legacy-bundle".as_slice(),
+        ),
+        (
+            "transcripts/manifests/host/acct/000000000001.json.gpg",
+            b"legacy-tr".as_slice(),
+        ),
+        (
+            "sessions/manifests/host/acct/000000000001.json.gpg",
+            b"legacy-sess".as_slice(),
+        ),
+        (
+            ".backup-sync-manifest.json",
+            b"{\"legacy\":true}".as_slice(),
+        ),
     ];
     for (rel, content) in &legacy_files {
         let p = store.join(rel);
@@ -711,7 +810,13 @@ fn rejects_inconsistent_fm_graphs_and_preserves_legacy_backup_layout() {
     for worker in 0..4u32 {
         let store_clone = store.clone();
         let worker_src = scratch.path().join(format!("worker_src_{worker}"));
-        write_file(&worker_src.join("common.txt"), b"shared across procs", 0o644, 1_750_000_040, 0);
+        write_file(
+            &worker_src.join("common.txt"),
+            b"shared across procs",
+            0o644,
+            1_750_000_040,
+            0,
+        );
         write_file(
             &worker_src.join(format!("only_{worker}.txt")),
             format!("worker {worker} bytes").as_bytes(),
@@ -772,4 +877,262 @@ fn rejects_inconsistent_fm_graphs_and_preserves_legacy_backup_layout() {
             "legacy file {rel} was modified"
         );
     }
+}
+
+#[cfg(unix)]
+fn chmod_tree(path: &Path, dir_mode: u32, file_mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(path).unwrap();
+    if meta.file_type().is_dir() {
+        // Ensure readable/traversable before descending when restoring permissions.
+        if dir_mode & 0o200 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(dir_mode)).unwrap();
+        }
+        for entry in fs::read_dir(path).unwrap() {
+            chmod_tree(&entry.unwrap().path(), dir_mode, file_mode);
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(dir_mode)).unwrap();
+    } else if meta.file_type().is_file() {
+        fs::set_permissions(path, fs::Permissions::from_mode(file_mode)).unwrap();
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_read_only_store_and_round_trip_resnapshot_determinism() {
+    let scratch = ScratchDir::new("ro-det");
+    let src = scratch.path().join("src");
+    let store = scratch.path().join("store");
+    let store_re = scratch.path().join("store_re");
+    let fm_file = scratch.path().join("fm.json");
+    let restored = scratch.path().join("restored");
+    let restored_fm = scratch.path().join("restored_fm.json");
+
+    let secs = 1_750_000_050u64;
+    let nanos = 987_654_321u32;
+    write_file(
+        &src.join("src/lib.rs"),
+        b"pub fn answer() -> u32 { 42 }\n",
+        0o644,
+        secs,
+        nanos,
+    );
+    write_file(
+        &src.join("bin/tool.sh"),
+        b"#!/bin/sh\nexit 0\n",
+        0o755,
+        secs,
+        nanos,
+    );
+    write_file(&src.join("data/empty.dat"), b"", 0o644, secs, nanos);
+    write_file(
+        &src.join("data/all_bytes.bin"),
+        &(0u8..=255).collect::<Vec<_>>(),
+        0o444,
+        secs,
+        nanos,
+    );
+    let large_len = 4 * 1024 * 1024 + 4096;
+    let large_payload: Vec<u8> = (0..large_len)
+        .map(|i| u8::try_from((i * 17) % 256).unwrap())
+        .collect();
+    write_file(
+        &src.join("data/large_multi_chunk.bin"),
+        &large_payload,
+        0o644,
+        secs,
+        nanos,
+    );
+    fs::create_dir_all(src.join("empty/nested")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../src/lib.rs", src.join("bin/lib_link")).unwrap();
+    write_sample_fm(&fm_file);
+
+    let snap1 = run_spawn_json(&[
+        "backup",
+        "cas",
+        "snapshot",
+        "--source",
+        src.to_str().unwrap(),
+        "--store",
+        store.to_str().unwrap(),
+        "--fm-graph",
+        fm_file.to_str().unwrap(),
+        "--json",
+    ]);
+    let snap1_key = snap1["snapshot_key"].as_str().unwrap().to_string();
+
+    // Freeze the entire store read-only (`0o555` dirs, `0o444` files).
+    #[cfg(unix)]
+    chmod_tree(&store, 0o555, 0o444);
+
+    // `verify` and `restore` MUST succeed against a strictly read-only store!
+    let verify_ro = run_spawn_json(&[
+        "backup",
+        "cas",
+        "verify",
+        "--store",
+        store.to_str().unwrap(),
+        "--snapshot",
+        &snap1_key,
+        "--json",
+    ]);
+    assert_eq!(verify_ro["verified"], true);
+
+    let restore_ro = run_spawn_json(&[
+        "backup",
+        "cas",
+        "restore",
+        "--store",
+        store.to_str().unwrap(),
+        "--snapshot",
+        &snap1_key,
+        "--into",
+        restored.to_str().unwrap(),
+        "--restore-fm",
+        restored_fm.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(restore_ro["snapshot_key"], snap1_key);
+
+    // Unfreeze store so ScratchDir cleanup succeeds.
+    #[cfg(unix)]
+    chmod_tree(&store, 0o755, 0o644);
+
+    // Re-snapshotting the restored tree + restored FM graph yields the EXACT same snapshot_key!
+    let snap2 = run_spawn_json(&[
+        "backup",
+        "cas",
+        "snapshot",
+        "--source",
+        restored.to_str().unwrap(),
+        "--store",
+        store_re.to_str().unwrap(),
+        "--fm-graph",
+        restored_fm.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(snap2["snapshot_key"], snap1["snapshot_key"]);
+    assert_eq!(snap2["fm_graph_key"], snap1["fm_graph_key"]);
+
+    // Verifying against a fresh empty directory must NOT create `fm-cas/`!
+    let empty_store = scratch.path().join("empty_store");
+    fs::create_dir_all(&empty_store).unwrap();
+    let miss = run_spawn(&[
+        "backup",
+        "cas",
+        "verify",
+        "--store",
+        empty_store.to_str().unwrap(),
+        "--snapshot",
+        &snap1_key,
+    ]);
+    assert!(!miss.status.success());
+    assert!(
+        !empty_store.join("fm-cas").exists(),
+        "read-only verify must not create fm-cas directory in store"
+    );
+}
+
+#[test]
+fn cli_rejects_symlink_chain_escape_manifest_whitespace_tampering_and_bad_restore_fm() {
+    let scratch = ScratchDir::new("sec-checks");
+    let src = scratch.path().join("src");
+    let store = scratch.path().join("store");
+
+    fs::create_dir_all(src.join("a/b")).unwrap();
+    write_file(&src.join("ok.txt"), b"ok\n", 0o644, 1_750_000_060, 0);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../..", src.join("a/b/jump")).unwrap();
+        std::os::unix::fs::symlink("jump/../../etc/passwd", src.join("a/b/escape")).unwrap();
+    }
+
+    let snap = run_spawn_json(&[
+        "backup",
+        "cas",
+        "snapshot",
+        "--source",
+        src.to_str().unwrap(),
+        "--store",
+        store.to_str().unwrap(),
+        "--json",
+    ]);
+    let snap_key = snap["snapshot_key"].as_str().unwrap().to_string();
+
+    // 1. Symlink chain escape refused on restore without creating target dir.
+    #[cfg(unix)]
+    {
+        let escape_target = scratch.path().join("escape_out");
+        let out = run_spawn(&[
+            "backup",
+            "cas",
+            "restore",
+            "--store",
+            store.to_str().unwrap(),
+            "--snapshot",
+            &snap_key,
+            "--into",
+            escape_target.to_str().unwrap(),
+        ]);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("escapes restore root"),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!escape_target.exists());
+    }
+
+    // 2. Trailing whitespace / extra field tampering in manifest rejected by verify.
+    let manifest_path = snapshot_disk_path(&store, &snap_key);
+    let orig = fs::read(&manifest_path).unwrap();
+    let mut padded = orig.clone();
+    padded.push(b' ');
+    fs::write(&manifest_path, &padded).unwrap();
+    let ws_fail = run_spawn(&[
+        "backup",
+        "cas",
+        "verify",
+        "--store",
+        store.to_str().unwrap(),
+        "--snapshot",
+        &snap_key,
+    ]);
+    assert!(!ws_fail.status.success());
+    fs::write(&manifest_path, &orig).unwrap();
+
+    // 3. `--restore-fm` requested on snapshot without FM graph fails pre-flight without creating `--into`.
+    let clean_src = scratch.path().join("clean_src");
+    write_file(&clean_src.join("hi.txt"), b"hi", 0o644, 1_750_000_070, 0);
+    let clean_snap = run_spawn_json(&[
+        "backup",
+        "cas",
+        "snapshot",
+        "--source",
+        clean_src.to_str().unwrap(),
+        "--store",
+        store.to_str().unwrap(),
+        "--json",
+    ]);
+    let clean_key = clean_snap["snapshot_key"].as_str().unwrap().to_string();
+    let no_fm_target = scratch.path().join("no_fm_out");
+    let no_fm_fail = run_spawn(&[
+        "backup",
+        "cas",
+        "restore",
+        "--store",
+        store.to_str().unwrap(),
+        "--snapshot",
+        &clean_key,
+        "--into",
+        no_fm_target.to_str().unwrap(),
+        "--restore-fm",
+        scratch.path().join("fm_out.json").to_str().unwrap(),
+    ]);
+    assert!(!no_fm_fail.status.success());
+    assert!(
+        !no_fm_target.exists(),
+        "failed --restore-fm pre-flight must not create --into directory"
+    );
 }

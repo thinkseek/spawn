@@ -394,6 +394,7 @@ pub(crate) enum EntryKind {
 
 /// Ordered fixed-size chunk reference for files exceeding `chunk_size`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChunkRef {
     pub(crate) index: u32,
     pub(crate) offset: u64,
@@ -404,6 +405,7 @@ pub(crate) struct ChunkRef {
 /// Canonical entry record binding logical identity, content identity, restore
 /// metadata, rename lineage, and feature-map associations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotEntry {
     pub(crate) path: String,
     pub(crate) logical_file_id: String,
@@ -427,6 +429,7 @@ pub(crate) struct SnapshotEntry {
 
 /// Special filesystem entry explicitly skipped during snapshot capture.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SkippedSpecial {
     pub(crate) path: String,
     pub(crate) kind: String,
@@ -435,6 +438,7 @@ pub(crate) struct SkippedSpecial {
 /// Explicitly declared unsupported POSIX/filesystem semantics recorded in
 /// every snapshot manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UnsupportedSemantics {
     pub(crate) posix_acls: String,
     pub(crate) extended_attributes: String,
@@ -460,6 +464,7 @@ impl UnsupportedSemantics {
 /// Compatibility declaration binding `fm-cas/v1` as strictly additive alongside
 /// legacy backup/store areas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CompatibilityMetadata {
     pub(crate) namespace: String,
     pub(crate) legacy_areas_untouched: Vec<String>,
@@ -499,6 +504,7 @@ fn default_file_assoc_status() -> FileAssocStatus {
 
 /// Bidirectional file-to-feature association entry inside `FmFeature`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FmFileAssoc {
     pub(crate) path: String,
     #[serde(default = "default_file_assoc_status")]
@@ -517,6 +523,7 @@ pub(crate) enum RelationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FmRelation {
     pub(crate) from: String,
     pub(crate) to: String,
@@ -525,6 +532,7 @@ pub(crate) struct FmRelation {
 
 /// Boundary / exclusion rules captured alongside the FM graph.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FmBoundaries {
     #[serde(default)]
     pub(crate) include_roots: Vec<String>,
@@ -534,6 +542,7 @@ pub(crate) struct FmBoundaries {
 
 /// Provenance reference linking a feature to objectives, PRs, issues, or requests.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FmProvenanceRef {
     pub(crate) kind: String,
     pub(crate) reference: String,
@@ -545,6 +554,7 @@ pub(crate) struct FmProvenanceRef {
 
 /// Single feature node in the content-addressed FM graph snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FmFeature {
     pub(crate) id: String,
     pub(crate) title: String,
@@ -560,6 +570,7 @@ pub(crate) struct FmFeature {
 
 /// Content-addressed Feature-Map graph snapshot object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FmGraphSnapshot {
     #[serde(default = "default_schema_version")]
     pub(crate) schema_version: String,
@@ -585,8 +596,19 @@ impl FmGraphSnapshot {
         }
         for feature in &mut graph.features {
             for assoc in &mut feature.files {
-                if assoc.status == FileAssocStatus::Present {
-                    assoc.path = canonicalize_posix_path(&assoc.path)?;
+                match assoc.status {
+                    FileAssocStatus::Present => {
+                        assoc.path = canonicalize_posix_path(&assoc.path)?;
+                    }
+                    FileAssocStatus::External | FileAssocStatus::Missing => {
+                        if assoc.path.is_empty() || assoc.path.contains('\0') {
+                            return Err(CasError::InvalidPath {
+                                path: assoc.path.clone(),
+                                reason: "file association path must not be empty or contain NUL"
+                                    .to_string(),
+                            });
+                        }
+                    }
                 }
             }
             feature.files.sort();
@@ -605,7 +627,8 @@ impl FmGraphSnapshot {
     }
 
     /// Validate structural invariants of the FM graph (unique ids, no dangling
-    /// relations, no self-loops, no parent/`depends_on` cycles).
+    /// relations, no self-loops, no parent/`depends_on` cycles, and no
+    /// conflicting file association statuses).
     pub(crate) fn validate_structure(&self) -> Result<(), CasError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(CasError::FmGraphConsistency {
@@ -627,6 +650,7 @@ impl FmGraphSnapshot {
                     reason: format!("duplicate feature id {:?}", feature.id),
                 });
             }
+            validate_feature_files(feature)?;
         }
 
         let mut parent_edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -702,6 +726,45 @@ impl FmGraphSnapshot {
     }
 }
 
+fn validate_feature_files(feature: &FmFeature) -> Result<(), CasError> {
+    let mut seen_file_statuses: BTreeMap<&str, FileAssocStatus> = BTreeMap::new();
+    for assoc in &feature.files {
+        match assoc.status {
+            FileAssocStatus::Present => {
+                let canonical = canonicalize_posix_path(&assoc.path)?;
+                if canonical != assoc.path {
+                    return Err(CasError::FmGraphConsistency {
+                        reason: format!(
+                            "feature {:?} has non-canonical present path {:?}",
+                            feature.id, assoc.path
+                        ),
+                    });
+                }
+            }
+            FileAssocStatus::External | FileAssocStatus::Missing => {
+                if assoc.path.is_empty() || assoc.path.contains('\0') {
+                    return Err(CasError::InvalidPath {
+                        path: assoc.path.clone(),
+                        reason: "file association path must not be empty or contain NUL"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(prev_status) = seen_file_statuses.insert(assoc.path.as_str(), assoc.status)
+            && prev_status != assoc.status
+        {
+            return Err(CasError::FmGraphConsistency {
+                reason: format!(
+                    "feature {:?} lists path {:?} with conflicting statuses ({prev_status:?} vs {:?})",
+                    feature.id, assoc.path, assoc.status
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn check_acyclic(
     label: &str,
     nodes: &BTreeSet<String>,
@@ -730,7 +793,9 @@ fn dfs_cycle<'a>(
             match state.get(next).copied().unwrap_or(0) {
                 1 => {
                     return Err(CasError::FmGraphConsistency {
-                        reason: format!("cycle detected in {label} edges involving {node:?} -> {next:?}"),
+                        reason: format!(
+                            "cycle detected in {label} edges involving {node:?} -> {next:?}"
+                        ),
                     });
                 }
                 0 => dfs_cycle(label, next, edges, state)?,
@@ -757,6 +822,7 @@ pub(crate) fn fm_graph_key(graph: &FmGraphSnapshot) -> Result<String, CasError> 
 /// Intentionally excludes wall-clock timestamps so identical source trees,
 /// metadata, parent, and FM graphs always hash to the exact same `snapshot_key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotManifestBody {
     pub(crate) schema_version: String,
     pub(crate) chunk_size: u64,
@@ -802,6 +868,7 @@ pub(crate) fn snapshot_key(body: &SnapshotManifestBody) -> Result<String, CasErr
 /// Uses explicit fields (rather than `#[serde(flatten)]`) so `i128`
 /// nanosecond timestamps round-trip directly through `serde_json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotManifest {
     pub(crate) snapshot_key: String,
     pub(crate) schema_version: String,
@@ -848,6 +915,7 @@ impl SnapshotManifest {
 
 /// Mutable index entry stored in `<store>/fm-cas/v1/snapshots.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotIndexEntry {
     pub(crate) snapshot_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -860,6 +928,7 @@ pub(crate) struct SnapshotIndexEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotIndex {
     pub(crate) schema_version: String,
     pub(crate) snapshots: Vec<SnapshotIndexEntry>,
@@ -1005,6 +1074,18 @@ impl CasStore {
         Self::open_with_chunk_size(store_root, DEFAULT_CHUNK_SIZE)
     }
 
+    /// Open an existing `fm-cas/v1` store in strictly read-only mode without
+    /// creating any directories or mutating `store_root`.
+    ///
+    /// Suitable for `verify` and `restore` against read-only backup mounts or
+    /// immutable storage directories.
+    pub(crate) fn open_read_only(store_root: &Path) -> Self {
+        Self {
+            cas_root: store_root.join("fm-cas").join("v1"),
+            chunk_size: DEFAULT_CHUNK_SIZE,
+        }
+    }
+
     /// Open or initialize a `fm-cas/v1` store with a custom chunk size (useful
     /// in tests to exercise multi-chunk logic cleanly on small payloads).
     pub(crate) fn open_with_chunk_size(
@@ -1046,11 +1127,7 @@ impl CasStore {
 
     pub(crate) fn chunk_path(&self, key: &str) -> Result<PathBuf, CasError> {
         let digest = parse_key_digest(key, PREFIX_CHUNK)?;
-        Ok(self
-            .cas_root
-            .join("chunks")
-            .join(&digest[..2])
-            .join(digest))
+        Ok(self.cas_root.join("chunks").join(&digest[..2]).join(digest))
     }
 
     pub(crate) fn fm_graph_path(&self, key: &str) -> Result<PathBuf, CasError> {
@@ -1080,24 +1157,55 @@ impl CasStore {
     }
 
     /// Safely sweep stray `.tmp-*` files only inside `fm-cas/v1/staging/`.
+    ///
+    /// Never follows symlinks and skips staging files whose owning `<pid>`
+    /// is still running on this host so concurrent active writers are never
+    /// disturbed.
     #[allow(dead_code)]
     pub(crate) fn sweep_staging(&self) -> Result<usize, CasError> {
         let staging = self.staging_dir();
-        if !staging.exists() {
-            return Ok(0);
+        match fs::symlink_metadata(&staging) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(io_err(format!("lstat {}", staging.display()), &error)),
         }
         let mut removed = 0usize;
         let entries = fs::read_dir(&staging)
             .map_err(|error| io_err(format!("read_dir {}", staging.display()), &error))?;
         for entry in entries {
-            let entry =
-                entry.map_err(|error| io_err(format!("dir entry {}", staging.display()), &error))?;
+            let entry = entry
+                .map_err(|error| io_err(format!("dir entry {}", staging.display()), &error))?;
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(io_err(
+                        format!("file_type {}", entry.path().display()),
+                        &error,
+                    ));
+                }
+            };
+            if !file_type.is_file() {
+                continue;
+            }
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
-            if name.starts_with(".tmp-") && entry.path().is_file() {
-                fs::remove_file(entry.path())
-                    .map_err(|error| io_err(format!("remove {}", entry.path().display()), &error))?;
-                removed += 1;
+            let Some(rest) = name.strip_prefix(".tmp-") else {
+                continue;
+            };
+            if let Some((pid_str, _seq)) = rest.split_once('-')
+                && let Ok(pid) = pid_str.parse::<u32>()
+                && is_process_alive(pid)
+            {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_err(format!("remove {}", entry.path().display()), &error));
+                }
             }
         }
         Ok(removed)
@@ -1212,20 +1320,13 @@ impl CasStore {
         let manifest = SnapshotManifest::from_body(key.clone(), body);
         let manifest_bytes = canonical_json_bytes(&manifest)?;
         let manifest_dest = self.snapshot_path(&key)?;
-        let expected_digest = parse_key_digest(&key, PREFIX_SNAPSHOT)?;
+        let expected_manifest_bytes_digest = sha256_domain(DOMAIN_SNAPSHOT, &manifest_bytes);
         self.write_object_once(
             &manifest_dest,
             &manifest_bytes,
             &key,
-            expected_digest,
-            |disk_bytes| {
-                serde_json::from_slice::<SnapshotManifest>(disk_bytes)
-                    .ok()
-                    .and_then(|parsed| canonical_json_bytes(&parsed.body().canonicalized()).ok())
-                    .map_or_else(String::new, |body_bytes| {
-                        sha256_domain(DOMAIN_SNAPSHOT, &body_bytes)
-                    })
-            },
+            &expected_manifest_bytes_digest,
+            |disk_bytes| sha256_domain(DOMAIN_SNAPSHOT, disk_bytes),
         )?;
 
         let total_bytes: u64 = manifest
@@ -1271,8 +1372,10 @@ impl CasStore {
     /// Restore a verified snapshot into an isolated empty directory `into_dir`.
     ///
     /// Performs full pre-flight verification (manifest, FM graph, every blob
-    /// and chunk, and every path / symlink safety rule) before writing any
-    /// output files.
+    /// and chunk, every path / symlink-chain safety rule, and `--restore-fm`
+    /// target checks) before writing any output files. If any mid-restore
+    /// error occurs, rolls back partial output so no half-restored tree is
+    /// left behind.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn restore_snapshot(
         &self,
@@ -1282,24 +1385,47 @@ impl CasStore {
     ) -> Result<RestoreSummary, CasError> {
         let (manifest, fm_graph, _verify_summary) = self.verify_snapshot_internal(snap_key)?;
 
-        // Pre-flight safety validation of every entry path and symlink target.
+        // Pre-flight safety validation of every entry path and symlink chain.
         for entry in &manifest.entries {
             let _ = canonicalize_posix_path(&entry.path)?;
-            if entry.kind == EntryKind::Symlink {
-                let target =
-                    entry
-                        .symlink_target
-                        .as_deref()
-                        .ok_or_else(|| CasError::ManifestIntegrity {
-                            snapshot_key: snap_key.to_string(),
-                            reason: format!("symlink entry {:?} missing target", entry.path),
-                        })?;
-                validate_symlink_target(&entry.path, target)?;
+        }
+        validate_all_symlink_targets(&manifest.entries)?;
+
+        // Pre-flight validation of optional `--restore-fm` output path BEFORE
+        // creating `into_dir` or writing any files.
+        if let Some(fm_out) = restore_fm_path {
+            if fm_graph.is_none() {
+                return Err(CasError::FmGraphConsistency {
+                    reason: format!(
+                        "--restore-fm requested ({}) but snapshot {snap_key} has no fm_graph_key",
+                        fm_out.display()
+                    ),
+                });
+            }
+            match fs::symlink_metadata(fm_out) {
+                Ok(_) => {
+                    return Err(CasError::UnsafeRestoreTarget {
+                        path: fm_out.display().to_string(),
+                        reason: "refusing to overwrite existing FM graph output file".to_string(),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_err(format!("lstat {}", fm_out.display()), &error));
+                }
+            }
+            if paths_overlap(into_dir, fm_out) {
+                return Err(CasError::UnsafeRestoreTarget {
+                    path: fm_out.display().to_string(),
+                    reason: "refusing to place --restore-fm output inside --into restore directory"
+                        .to_string(),
+                });
             }
         }
 
         // Prepare and verify isolated empty destination directory.
-        prepare_empty_restore_dir(into_dir)?;
+        let created_root = prepare_empty_restore_dir(into_dir)?;
+        let mut rollback = RestoreRollbackGuard::new(into_dir.to_path_buf(), created_root);
 
         // 1. Create all directories (sorted shallow-to-deep).
         let mut dirs: Vec<&SnapshotEntry> = manifest
@@ -1307,7 +1433,13 @@ impl CasStore {
             .iter()
             .filter(|entry| entry.kind == EntryKind::Directory)
             .collect();
-        dirs.sort_by(|a, b| a.path.cmp(&b.path));
+        dirs.sort_by(|a, b| {
+            a.path
+                .matches('/')
+                .count()
+                .cmp(&b.path.matches('/').count())
+                .then_with(|| a.path.cmp(&b.path))
+        });
         for dir_entry in &dirs {
             let dest = safe_join(into_dir, &dir_entry.path)?;
             fs::create_dir_all(&dest)
@@ -1333,14 +1465,13 @@ impl CasStore {
                 .map_err(|error| io_err(format!("create {}", dest.display()), &error))?;
 
             if entry.chunks.is_empty() {
-                let key =
-                    entry
-                        .blob_key
-                        .as_deref()
-                        .ok_or_else(|| CasError::ManifestIntegrity {
-                            snapshot_key: snap_key.to_string(),
-                            reason: format!("regular entry {:?} missing blob_key", entry.path),
-                        })?;
+                let key = entry
+                    .blob_key
+                    .as_deref()
+                    .ok_or_else(|| CasError::ManifestIntegrity {
+                        snapshot_key: snap_key.to_string(),
+                        reason: format!("regular entry {:?} missing blob_key", entry.path),
+                    })?;
                 let bytes =
                     self.read_verified_blob(key, entry.size, std::slice::from_ref(&entry.path))?;
                 out_file
@@ -1394,8 +1525,9 @@ impl CasStore {
             out_file
                 .sync_all()
                 .map_err(|error| io_err(format!("sync {}", dest.display()), &error))?;
-            set_file_mode(&dest, entry.mode)?;
+            // Set mtime before restricting permissions (e.g. 0o444).
             set_file_mtime(&out_file, entry.mtime_ns, &dest)?;
+            set_file_mode(&dest, entry.mode)?;
         }
 
         // 3. Restore symlinks after regular files so no file write can ever
@@ -1420,13 +1552,22 @@ impl CasStore {
                         reason: format!("symlink entry {:?} missing target", entry.path),
                     })?;
             create_symlink(target, &dest)?;
+            set_path_mtime_nofollow(&dest, entry.mtime_ns)?;
         }
 
-        // 4. Apply directory modes in reverse depth order so restrictive modes
-        // (e.g. 0o555) do not block creating children inside them.
-        dirs.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then(b.path.cmp(&a.path)));
+        // 4. Apply directory mtimes and modes in reverse depth order so child
+        // creation does not clobber mtimes and restrictive modes (e.g. 0o555)
+        // do not block creating children or updating timestamps.
+        dirs.sort_by(|a, b| {
+            b.path
+                .matches('/')
+                .count()
+                .cmp(&a.path.matches('/').count())
+                .then_with(|| b.path.cmp(&a.path))
+        });
         for dir_entry in &dirs {
             let dest = safe_join(into_dir, &dir_entry.path)?;
+            set_path_mtime_nofollow(&dest, dir_entry.mtime_ns)?;
             set_file_mode(&dest, dir_entry.mode)?;
         }
 
@@ -1440,12 +1581,6 @@ impl CasStore {
                     ),
                 });
             };
-            if fm_out.exists() {
-                return Err(CasError::UnsafeRestoreTarget {
-                    path: fm_out.display().to_string(),
-                    reason: "refusing to overwrite existing FM graph output file".to_string(),
-                });
-            }
             if let Some(parent) = fm_out.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -1458,6 +1593,7 @@ impl CasStore {
                 .create_new(true)
                 .open(fm_out)
                 .map_err(|error| io_err(format!("create {}", fm_out.display()), &error))?;
+            rollback.track_fm_file(fm_out.to_path_buf());
             file.write_all(&bytes)
                 .map_err(|error| io_err(format!("write {}", fm_out.display()), &error))?;
             file.sync_all()
@@ -1466,6 +1602,8 @@ impl CasStore {
         } else {
             None
         };
+
+        rollback.disarm();
 
         Ok(RestoreSummary {
             schema_version: SCHEMA_VERSION.to_string(),
@@ -1480,29 +1618,61 @@ impl CasStore {
     /// Read the snapshot index (`fm-cas/v1/snapshots.json`).
     pub(crate) fn read_index(&self) -> Result<SnapshotIndex, CasError> {
         let path = self.index_path();
-        if !path.exists() {
-            return Ok(SnapshotIndex::default());
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(CasError::ManifestIntegrity {
+                    snapshot_key: "snapshots.json".to_string(),
+                    reason: format!("index path {} is not a regular file", path.display()),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SnapshotIndex::default());
+            }
+            Err(error) => return Err(io_err(format!("lstat {}", path.display()), &error)),
         }
         let bytes =
             fs::read(&path).map_err(|error| io_err(format!("read {}", path.display()), &error))?;
-        serde_json::from_slice(&bytes).map_err(|error| CasError::Json {
-            context: format!("parse {}", path.display()),
-            message: error.to_string(),
-        })
+        let index: SnapshotIndex =
+            serde_json::from_slice(&bytes).map_err(|error| CasError::Json {
+                context: format!("parse {}", path.display()),
+                message: error.to_string(),
+            })?;
+        if index.schema_version != SCHEMA_VERSION {
+            return Err(CasError::ManifestIntegrity {
+                snapshot_key: "snapshots.json".to_string(),
+                reason: format!(
+                    "unexpected index schema_version {:?} (expected {SCHEMA_VERSION:?})",
+                    index.schema_version
+                ),
+            });
+        }
+        Ok(index)
     }
 
-    /// Load a manifest and verify its self-hash against `snap_key`.
+    /// Load a manifest and verify its self-hash and exact canonical bytes
+    /// against `snap_key`.
     pub(crate) fn load_and_verify_manifest(
         &self,
         snap_key: &str,
     ) -> Result<SnapshotManifest, CasError> {
         let expected_digest = parse_key_digest(snap_key, PREFIX_SNAPSHOT)?;
         let path = self.snapshot_path(snap_key)?;
-        if !path.exists() {
-            return Err(CasError::MissingObject {
-                key: snap_key.to_string(),
-                affected_paths: Vec::new(),
-            });
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(CasError::ManifestIntegrity {
+                    snapshot_key: snap_key.to_string(),
+                    reason: format!("manifest path {} is not a regular file", path.display()),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(CasError::MissingObject {
+                    key: snap_key.to_string(),
+                    affected_paths: Vec::new(),
+                });
+            }
+            Err(error) => return Err(io_err(format!("lstat {}", path.display()), &error)),
         }
         let bytes =
             fs::read(&path).map_err(|error| io_err(format!("read {}", path.display()), &error))?;
@@ -1517,6 +1687,12 @@ impl CasStore {
                 reason: format!("unexpected schema_version {:?}", manifest.schema_version),
             });
         }
+        if manifest.chunk_size == 0 {
+            return Err(CasError::ManifestIntegrity {
+                snapshot_key: snap_key.to_string(),
+                reason: "manifest chunk_size must be greater than zero".to_string(),
+            });
+        }
         if manifest.snapshot_key != snap_key {
             return Err(CasError::ManifestIntegrity {
                 snapshot_key: snap_key.to_string(),
@@ -1526,7 +1702,8 @@ impl CasStore {
                 ),
             });
         }
-        let recomputed = snapshot_key(&manifest.body())?;
+        let canonical_body = manifest.body().canonicalized();
+        let recomputed = snapshot_key(&canonical_body)?;
         let actual_digest = parse_key_digest(&recomputed, PREFIX_SNAPSHOT)?;
         if actual_digest != expected_digest {
             return Err(CasError::CorruptedObject {
@@ -1536,21 +1713,40 @@ impl CasStore {
                 affected_paths: Vec::new(),
             });
         }
+        let canonical_manifest = SnapshotManifest::from_body(snap_key.to_string(), canonical_body);
+        let expected_canonical_bytes = canonical_json_bytes(&canonical_manifest)?;
+        if bytes != expected_canonical_bytes {
+            return Err(CasError::ManifestIntegrity {
+                snapshot_key: snap_key.to_string(),
+                reason: "manifest bytes on disk are not canonical (tampered formatting, unsorted collections, or duplicate entries)".to_string(),
+            });
+        }
         Ok(manifest)
     }
 
-    /// Load an FM graph snapshot and verify its self-hash against `graph_key`.
+    /// Load an FM graph snapshot and verify its self-hash and exact canonical
+    /// bytes against `graph_key`.
     pub(crate) fn load_and_verify_fm_graph(
         &self,
         graph_key: &str,
     ) -> Result<FmGraphSnapshot, CasError> {
         let expected_digest = parse_key_digest(graph_key, PREFIX_FM_GRAPH)?;
         let path = self.fm_graph_path(graph_key)?;
-        if !path.exists() {
-            return Err(CasError::MissingObject {
-                key: graph_key.to_string(),
-                affected_paths: Vec::new(),
-            });
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(CasError::FmGraphIntegrity {
+                    fm_graph_key: graph_key.to_string(),
+                    reason: format!("fm-graph path {} is not a regular file", path.display()),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(CasError::MissingObject {
+                    key: graph_key.to_string(),
+                    affected_paths: Vec::new(),
+                });
+            }
+            Err(error) => return Err(io_err(format!("lstat {}", path.display()), &error)),
         }
         let bytes =
             fs::read(&path).map_err(|error| io_err(format!("read {}", path.display()), &error))?;
@@ -1568,15 +1764,23 @@ impl CasStore {
                 fm_graph_key: graph_key.to_string(),
                 reason: format!("invalid fm-graph json: {error}"),
             })?;
-        let recomputed = fm_graph_key(&graph)?;
+        let canonical = graph.canonicalized()?;
+        let expected_canonical_bytes = canonical_json_bytes(&canonical)?;
+        if bytes != expected_canonical_bytes {
+            return Err(CasError::FmGraphIntegrity {
+                fm_graph_key: graph_key.to_string(),
+                reason: "fm-graph bytes on disk are not canonical".to_string(),
+            });
+        }
+        let recomputed = fm_graph_key(&canonical)?;
         if recomputed != graph_key {
             return Err(CasError::FmGraphIntegrity {
                 fm_graph_key: graph_key.to_string(),
                 reason: format!("recomputed canonical key {recomputed} differs from {graph_key}"),
             });
         }
-        graph.validate_structure()?;
-        Ok(graph)
+        canonical.validate_structure()?;
+        Ok(canonical)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1585,6 +1789,15 @@ impl CasStore {
         snap_key: &str,
     ) -> Result<(SnapshotManifest, Option<FmGraphSnapshot>, VerifySummary), CasError> {
         let manifest = self.load_and_verify_manifest(snap_key)?;
+        if let Some(parent_key) = &manifest.parent_snapshot_key {
+            let _ = parse_key_digest(parent_key, PREFIX_SNAPSHOT)?;
+            if parent_key == snap_key {
+                return Err(CasError::ManifestIntegrity {
+                    snapshot_key: snap_key.to_string(),
+                    reason: "snapshot cannot declare itself as parent_snapshot_key".to_string(),
+                });
+            }
+        }
         let fm_graph = match &manifest.fm_graph_key {
             Some(graph_key) => Some(self.load_and_verify_fm_graph(graph_key)?),
             None => None,
@@ -1609,7 +1822,7 @@ impl CasStore {
         // or corrupted object error names every affected logical path.
         let mut blob_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut chunk_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut seen_paths = BTreeSet::new();
+        let mut entry_kinds: BTreeMap<&str, EntryKind> = BTreeMap::new();
 
         for entry in &manifest.entries {
             let canonical = canonicalize_posix_path(&entry.path)?;
@@ -1619,10 +1832,22 @@ impl CasStore {
                     reason: format!("non-canonical path {:?}", entry.path),
                 });
             }
-            if !seen_paths.insert(entry.path.clone()) {
+            if entry_kinds
+                .insert(entry.path.as_str(), entry.kind)
+                .is_some()
+            {
                 return Err(CasError::ManifestIntegrity {
                     snapshot_key: snap_key.to_string(),
                     reason: format!("duplicate entry path {:?}", entry.path),
+                });
+            }
+            if entry.mode & !0o777 != 0 {
+                return Err(CasError::ManifestIntegrity {
+                    snapshot_key: snap_key.to_string(),
+                    reason: format!(
+                        "entry {:?} has mode {:#o} outside allowed 0o777 mask",
+                        entry.path, entry.mode
+                    ),
                 });
             }
             let expected_logical = logical_file_id(&entry.path)?;
@@ -1634,6 +1859,27 @@ impl CasStore {
                         entry.path, entry.logical_file_id
                     ),
                 });
+            }
+            if let Some(renamed_from) = &entry.renamed_from {
+                if entry.kind == EntryKind::Directory {
+                    return Err(CasError::ManifestIntegrity {
+                        snapshot_key: snap_key.to_string(),
+                        reason: format!(
+                            "directory entry {:?} must not carry renamed_from",
+                            entry.path
+                        ),
+                    });
+                }
+                let canonical_old = canonicalize_posix_path(renamed_from)?;
+                if canonical_old != *renamed_from || renamed_from == &entry.path {
+                    return Err(CasError::ManifestIntegrity {
+                        snapshot_key: snap_key.to_string(),
+                        reason: format!(
+                            "invalid renamed_from {:?} for entry {:?}",
+                            renamed_from, entry.path
+                        ),
+                    });
+                }
             }
             if entry.kind == EntryKind::Regular {
                 if let Some(key) = &entry.blob_key {
@@ -1651,14 +1897,60 @@ impl CasStore {
             }
         }
 
-        let mut verified_blobs = BTreeSet::new();
+        // Reject path hierarchy collisions (e.g. regular file or symlink at "a"
+        // alongside a descendant entry at "a/b").
+        for entry in &manifest.entries {
+            let mut prefix_end = 0usize;
+            while let Some(rel_slash) = entry.path[prefix_end..].find('/') {
+                let slash_idx = prefix_end + rel_slash;
+                let ancestor = &entry.path[..slash_idx];
+                if let Some(kind) = entry_kinds.get(ancestor)
+                    && *kind != EntryKind::Directory
+                {
+                    return Err(CasError::ManifestIntegrity {
+                        snapshot_key: snap_key.to_string(),
+                        reason: format!(
+                            "path hierarchy conflict: {:?} has non-directory ancestor {:?} ({kind:?})",
+                            entry.path, ancestor
+                        ),
+                    });
+                }
+                prefix_end = slash_idx + 1;
+            }
+        }
+
+        let mut verified_blobs: BTreeMap<String, u64> = BTreeMap::new();
         let mut verified_chunks = BTreeSet::new();
         let mut symlinks_verified = 0usize;
 
         for entry in &manifest.entries {
             match entry.kind {
-                EntryKind::Directory => {}
+                EntryKind::Directory => {
+                    if entry.size != 0
+                        || entry.blob_key.is_some()
+                        || !entry.chunks.is_empty()
+                        || entry.symlink_blob_key.is_some()
+                        || entry.symlink_target.is_some()
+                    {
+                        return Err(CasError::ManifestIntegrity {
+                            snapshot_key: snap_key.to_string(),
+                            reason: format!(
+                                "directory entry {:?} has unexpected payload fields",
+                                entry.path
+                            ),
+                        });
+                    }
+                }
                 EntryKind::Symlink => {
+                    if entry.blob_key.is_some() || !entry.chunks.is_empty() {
+                        return Err(CasError::ManifestIntegrity {
+                            snapshot_key: snap_key.to_string(),
+                            reason: format!(
+                                "symlink entry {:?} must not carry blob_key or chunks",
+                                entry.path
+                            ),
+                        });
+                    }
                     let sym_key = entry.symlink_blob_key.as_deref().ok_or_else(|| {
                         CasError::ManifestIntegrity {
                             snapshot_key: snap_key.to_string(),
@@ -1677,9 +1969,18 @@ impl CasStore {
                             ),
                         }
                     })?;
+                    let target_len = u64::try_from(target.len()).unwrap_or(u64::MAX);
+                    if entry.size != target_len {
+                        return Err(CasError::SizeMismatch {
+                            key: sym_key.to_string(),
+                            expected: entry.size,
+                            actual: target_len,
+                            affected_paths: vec![entry.path.clone()],
+                        });
+                    }
                     let raw = self.read_verified_symlink_blob(
                         sym_key,
-                        u64::try_from(target.len()).unwrap_or(u64::MAX),
+                        entry.size,
                         std::slice::from_ref(&entry.path),
                     )?;
                     let disk_target =
@@ -1699,6 +2000,15 @@ impl CasStore {
                     symlinks_verified += 1;
                 }
                 EntryKind::Regular => {
+                    if entry.symlink_blob_key.is_some() || entry.symlink_target.is_some() {
+                        return Err(CasError::ManifestIntegrity {
+                            snapshot_key: snap_key.to_string(),
+                            reason: format!(
+                                "regular entry {:?} must not carry symlink fields",
+                                entry.path
+                            ),
+                        });
+                    }
                     let whole_key =
                         entry
                             .blob_key
@@ -1712,10 +2022,38 @@ impl CasStore {
                         .cloned()
                         .unwrap_or_else(|| vec![entry.path.clone()]);
                     if entry.chunks.is_empty() {
-                        if verified_blobs.insert(whole_key.to_string()) {
+                        if entry.size > manifest.chunk_size {
+                            return Err(CasError::ManifestIntegrity {
+                                snapshot_key: snap_key.to_string(),
+                                reason: format!(
+                                    "regular entry {:?} exceeds manifest chunk_size ({}) without chunks",
+                                    entry.path, manifest.chunk_size
+                                ),
+                            });
+                        }
+                        if let Some(&verified_size) = verified_blobs.get(whole_key) {
+                            if verified_size != entry.size {
+                                return Err(CasError::SizeMismatch {
+                                    key: whole_key.to_string(),
+                                    expected: entry.size,
+                                    actual: verified_size,
+                                    affected_paths: affected,
+                                });
+                            }
+                        } else {
                             let _ = self.read_verified_blob(whole_key, entry.size, &affected)?;
+                            verified_blobs.insert(whole_key.to_string(), entry.size);
                         }
                     } else {
+                        if entry.size == 0 {
+                            return Err(CasError::ManifestIntegrity {
+                                snapshot_key: snap_key.to_string(),
+                                reason: format!(
+                                    "zero-byte entry {:?} must not carry chunks",
+                                    entry.path
+                                ),
+                            });
+                        }
                         let expected_whole_digest = parse_key_digest(whole_key, PREFIX_BLOB)?;
                         let mut whole_hasher = Sha256::new();
                         whole_hasher.update(DOMAIN_BLOB);
@@ -1729,6 +2067,15 @@ impl CasStore {
                                     reason: format!(
                                         "non-contiguous chunk sequence for {:?} at index {}",
                                         entry.path, chunk.index
+                                    ),
+                                });
+                            }
+                            if chunk.length == 0 || chunk.length > manifest.chunk_size {
+                                return Err(CasError::ManifestIntegrity {
+                                    snapshot_key: snap_key.to_string(),
+                                    reason: format!(
+                                        "invalid chunk length {} for {:?} at index {} (chunk_size {})",
+                                        chunk.length, entry.path, chunk.index, manifest.chunk_size
                                     ),
                                 });
                             }
@@ -1894,16 +2241,16 @@ impl CasStore {
                     stats,
                 )?;
             } else if file_type.is_file() {
-                let (whole_key, size, chunks) = self.store_regular_file(&child, stats)?;
+                let stored = self.store_regular_file(&child, stats)?;
                 entries.push(SnapshotEntry {
                     path: rel_posix,
                     logical_file_id: logical_id,
                     kind: EntryKind::Regular,
-                    mode,
-                    mtime_ns,
-                    size,
-                    blob_key: Some(whole_key),
-                    chunks,
+                    mode: stored.mode,
+                    mtime_ns: stored.mtime_ns,
+                    size: stored.size,
+                    blob_key: Some(stored.whole_key),
+                    chunks: stored.chunks,
                     symlink_blob_key: None,
                     symlink_target: None,
                     renamed_from: None,
@@ -1923,33 +2270,55 @@ impl CasStore {
         &self,
         path: &Path,
         stats: &mut SnapshotWriteStats,
-    ) -> Result<(String, u64, Vec<ChunkRef>), CasError> {
-        let meta = fs::symlink_metadata(path)
-            .map_err(|error| io_err(format!("lstat {}", path.display()), &error))?;
+    ) -> Result<StoredRegularFile, CasError> {
+        let mut file = open_regular_nofollow(path)?;
+        let meta = file
+            .metadata()
+            .map_err(|error| io_err(format!("fstat {}", path.display()), &error))?;
+        if !meta.file_type().is_file() {
+            return Err(CasError::InvalidPath {
+                path: path.display().to_string(),
+                reason: "path changed to non-regular file during snapshot".to_string(),
+            });
+        }
         let expected_size = meta.len();
+        let mode = extract_mode(&meta);
+        let mtime_ns = extract_mtime_ns(&meta)?;
         let chunk_limit = u64::try_from(self.chunk_size).unwrap_or(u64::MAX);
 
         if expected_size <= chunk_limit {
-            let bytes = fs::read(path)
+            let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
+            file.read_to_end(&mut bytes)
                 .map_err(|error| io_err(format!("read {}", path.display()), &error))?;
             let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if actual_size != expected_size {
+                return Err(CasError::SizeMismatch {
+                    key: path.display().to_string(),
+                    expected: expected_size,
+                    actual: actual_size,
+                    affected_paths: vec![path.display().to_string()],
+                });
+            }
             let key = blob_key(&bytes);
             let digest = parse_key_digest(&key, PREFIX_BLOB)?;
             let dest = self.blob_path(&key)?;
-            let outcome =
-                self.write_object_once(&dest, &bytes, &key, digest, |disk_bytes| {
-                    sha256_len_prefixed(DOMAIN_BLOB, disk_bytes)
-                })?;
+            let outcome = self.write_object_once(&dest, &bytes, &key, digest, |disk_bytes| {
+                sha256_len_prefixed(DOMAIN_BLOB, disk_bytes)
+            })?;
             match outcome {
                 WriteOutcome::Written => stats.blobs_written += 1,
                 WriteOutcome::Deduplicated => stats.blobs_deduplicated += 1,
             }
-            return Ok((key, actual_size, Vec::new()));
+            return Ok(StoredRegularFile {
+                whole_key: key,
+                size: actual_size,
+                mode,
+                mtime_ns,
+                chunks: Vec::new(),
+            });
         }
 
         // Multi-chunk deterministic streaming path for files > chunk_size.
-        let mut file = File::open(path)
-            .map_err(|error| io_err(format!("open {}", path.display()), &error))?;
         let mut whole_hasher = Sha256::new();
         whole_hasher.update(DOMAIN_BLOB);
         whole_hasher.update(expected_size.to_be_bytes());
@@ -1998,7 +2367,13 @@ impl CasStore {
         }
 
         let whole_key = format!("{PREFIX_BLOB}{}", encode_hex(&whole_hasher.finalize()));
-        Ok((whole_key, offset, chunks))
+        Ok(StoredRegularFile {
+            whole_key,
+            size: offset,
+            mode,
+            mtime_ns,
+            chunks,
+        })
     }
 
     fn read_verified_blob(
@@ -2058,9 +2433,9 @@ impl CasStore {
     /// Atomic, idempotent write-once commit for immutable CAS objects.
     ///
     /// Writes to `<store>/fm-cas/v1/staging/.tmp-<pid>-<seq>`, fsyncs, and
-    /// commits with hard-link write-once semantics. If the destination already
-    /// exists, verifies the on-disk object's recomputed hash rather than
-    /// blindly trusting it.
+    /// commits with hard-link write-once semantics followed by a parent
+    /// directory fsync. If the destination already exists, verifies the
+    /// on-disk object's recomputed hash rather than blindly trusting it.
     fn write_object_once<F>(
         &self,
         dest: &Path,
@@ -2072,9 +2447,21 @@ impl CasStore {
     where
         F: Fn(&[u8]) -> String,
     {
-        if dest.exists() {
-            verify_existing_on_disk(dest, object_key, expected_digest, &digest_fn)?;
-            return Ok(WriteOutcome::Deduplicated);
+        match fs::symlink_metadata(dest) {
+            Ok(meta) if meta.file_type().is_file() => {
+                verify_existing_on_disk(dest, object_key, expected_digest, &digest_fn)?;
+                return Ok(WriteOutcome::Deduplicated);
+            }
+            Ok(_) => {
+                return Err(CasError::CorruptedObject {
+                    key: object_key.to_string(),
+                    expected_digest: expected_digest.to_string(),
+                    actual_digest: "<non-regular-file>".to_string(),
+                    affected_paths: Vec::new(),
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(format!("lstat {}", dest.display()), &error)),
         }
 
         if let Some(parent) = dest.parent() {
@@ -2094,6 +2481,7 @@ impl CasStore {
 
         match fs::hard_link(&tmp_path, dest) {
             Ok(()) => {
+                sync_parent_dir(dest)?;
                 // Keep guard armed so the staging hard-link is removed cleanly.
                 Ok(WriteOutcome::Written)
             }
@@ -2101,17 +2489,36 @@ impl CasStore {
                 verify_existing_on_disk(dest, object_key, expected_digest, &digest_fn)?;
                 Ok(WriteOutcome::Deduplicated)
             }
-            Err(_) => {
-                // Fallback for filesystems without hard links: atomic rename.
-                fs::rename(&tmp_path, dest).map_err(|error| {
+            Err(error) if is_hardlink_unsupported(&error) => {
+                // Fallback for filesystems without hard links: re-check for
+                // existing object before atomic rename so we never silently
+                // overwrite corrupt on-disk data.
+                if let Ok(meta) = fs::symlink_metadata(dest) {
+                    if !meta.file_type().is_file() {
+                        return Err(CasError::CorruptedObject {
+                            key: object_key.to_string(),
+                            expected_digest: expected_digest.to_string(),
+                            actual_digest: "<non-regular-file>".to_string(),
+                            affected_paths: Vec::new(),
+                        });
+                    }
+                    verify_existing_on_disk(dest, object_key, expected_digest, &digest_fn)?;
+                    return Ok(WriteOutcome::Deduplicated);
+                }
+                fs::rename(&tmp_path, dest).map_err(|rename_err| {
                     io_err(
                         format!("rename {} -> {}", tmp_path.display(), dest.display()),
-                        &error,
+                        &rename_err,
                     )
                 })?;
                 guard.disarm();
+                sync_parent_dir(dest)?;
                 Ok(WriteOutcome::Written)
             }
+            Err(error) => Err(io_err(
+                format!("hard_link {} -> {}", tmp_path.display(), dest.display()),
+                &error,
+            )),
         }
     }
 
@@ -2172,8 +2579,17 @@ impl CasStore {
             )
         })?;
         guard.disarm();
+        sync_parent_dir(&dest)?;
         Ok(())
     }
+}
+
+struct StoredRegularFile {
+    whole_key: String,
+    size: u64,
+    mode: u32,
+    mtime_ns: i128,
+    chunks: Vec<ChunkRef>,
 }
 
 #[derive(Default)]
@@ -2218,11 +2634,23 @@ fn read_and_verify_object<F>(
 where
     F: Fn(&[u8]) -> String,
 {
-    if !path.exists() {
-        return Err(CasError::MissingObject {
-            key: key.to_string(),
-            affected_paths: affected_paths.to_vec(),
-        });
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(CasError::CorruptedObject {
+                key: key.to_string(),
+                expected_digest: expected_digest.to_string(),
+                actual_digest: "<non-regular-file>".to_string(),
+                affected_paths: affected_paths.to_vec(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(CasError::MissingObject {
+                key: key.to_string(),
+                affected_paths: affected_paths.to_vec(),
+            });
+        }
+        Err(error) => return Err(io_err(format!("lstat {}", path.display()), &error)),
     }
     let bytes =
         fs::read(path).map_err(|error| io_err(format!("read {}", path.display()), &error))?;
@@ -2408,6 +2836,8 @@ fn safe_join(root: &Path, canonical_rel: &str) -> Result<PathBuf, CasError> {
     Ok(out)
 }
 
+const MAX_SYMLINK_HOPS: usize = 40;
+
 fn validate_symlink_target(entry_path: &str, target: &str) -> Result<(), CasError> {
     if target.is_empty() {
         return Err(CasError::UnsafeRestoreTarget {
@@ -2429,7 +2859,8 @@ fn validate_symlink_target(entry_path: &str, target: &str) -> Result<(), CasErro
     }
     // Simulate resolving `target` relative to `entry_path`'s parent directory
     // and ensure depth never drops below the restore root (0).
-    let mut depth: i64 = i64::try_from(entry_path.split('/').count().saturating_sub(1)).unwrap_or(0);
+    let mut depth: i64 =
+        i64::try_from(entry_path.split('/').count().saturating_sub(1)).unwrap_or(0);
     for part in target.split('/') {
         match part {
             "" | "." => {}
@@ -2438,9 +2869,7 @@ fn validate_symlink_target(entry_path: &str, target: &str) -> Result<(), CasErro
                 if depth < 0 {
                     return Err(CasError::UnsafeRestoreTarget {
                         path: entry_path.to_string(),
-                        reason: format!(
-                            "symlink target {target:?} escapes restore root via '..'"
-                        ),
+                        reason: format!("symlink target {target:?} escapes restore root via '..'"),
                     });
                 }
             }
@@ -2456,29 +2885,223 @@ fn validate_symlink_target(entry_path: &str, target: &str) -> Result<(), CasErro
     Ok(())
 }
 
-fn prepare_empty_restore_dir(into_dir: &Path) -> Result<(), CasError> {
-    if into_dir.exists() {
-        let meta = fs::symlink_metadata(into_dir)
-            .map_err(|error| io_err(format!("lstat {}", into_dir.display()), &error))?;
-        if !meta.is_dir() {
-            return Err(CasError::UnsafeRestoreTarget {
-                path: into_dir.display().to_string(),
-                reason: "restore destination exists and is not a directory".to_string(),
-            });
+/// Validate all symlinks in a manifest, including multi-hop symlink chains
+/// (e.g. `a/b/jump -> ../..` followed by `a/b/escape -> jump/../../etc/passwd`)
+/// and symlink loops (> `MAX_SYMLINK_HOPS`).
+fn validate_all_symlink_targets(entries: &[SnapshotEntry]) -> Result<(), CasError> {
+    let mut symlinks: BTreeMap<&str, &str> = BTreeMap::new();
+    for entry in entries {
+        if entry.kind == EntryKind::Symlink {
+            let target =
+                entry
+                    .symlink_target
+                    .as_deref()
+                    .ok_or_else(|| CasError::UnsafeRestoreTarget {
+                        path: entry.path.clone(),
+                        reason: "symlink entry missing target".to_string(),
+                    })?;
+            validate_symlink_target(&entry.path, target)?;
+            symlinks.insert(entry.path.as_str(), target);
         }
-        let mut iter = fs::read_dir(into_dir)
-            .map_err(|error| io_err(format!("read_dir {}", into_dir.display()), &error))?;
-        if iter.next().is_some() {
-            return Err(CasError::UnsafeRestoreTarget {
-                path: into_dir.display().to_string(),
-                reason: "refusing to restore into non-empty directory".to_string(),
-            });
+    }
+
+    for (&sym_path, &target) in &symlinks {
+        let mut cwd: Vec<String> = sym_path.split('/').map(str::to_string).collect();
+        let _ = cwd.pop(); // parent directory of `sym_path`
+        let mut queue: Vec<String> = target
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_string)
+            .rev()
+            .collect();
+        let mut hops = 0usize;
+
+        while let Some(part) = queue.pop() {
+            if part == ".." {
+                if cwd.pop().is_none() {
+                    return Err(CasError::UnsafeRestoreTarget {
+                        path: sym_path.to_string(),
+                        reason: format!(
+                            "symlink chain from {target:?} escapes restore root via '..'"
+                        ),
+                    });
+                }
+                continue;
+            }
+            if part == ".git" {
+                return Err(CasError::UnsafeRestoreTarget {
+                    path: sym_path.to_string(),
+                    reason: format!("symlink chain from {target:?} references '.git'"),
+                });
+            }
+            cwd.push(part);
+            let candidate = cwd.join("/");
+            if let Some(&next_target) = symlinks.get(candidate.as_str()) {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(CasError::UnsafeRestoreTarget {
+                        path: sym_path.to_string(),
+                        reason: format!(
+                            "symlink chain from {target:?} exceeds maximum hop depth ({MAX_SYMLINK_HOPS}; possible symlink loop)"
+                        ),
+                    });
+                }
+                // Resolve `next_target` relative to `candidate`'s parent directory.
+                let _ = cwd.pop();
+                let next_parts: Vec<String> = next_target
+                    .split('/')
+                    .filter(|seg| !seg.is_empty() && *seg != ".")
+                    .map(str::to_string)
+                    .collect();
+                for seg in next_parts.into_iter().rev() {
+                    queue.push(seg);
+                }
+            }
         }
-    } else {
-        fs::create_dir_all(into_dir)
-            .map_err(|error| io_err(format!("create {}", into_dir.display()), &error))?;
     }
     Ok(())
+}
+
+/// Returns `true` if `candidate` equals or lies inside `root` (comparing
+/// lexically normalized paths and, where parents exist, canonicalized paths).
+fn paths_overlap(root: &Path, candidate: &Path) -> bool {
+    let norm_root = normalize_lexical_path(root);
+    let norm_cand = normalize_lexical_path(candidate);
+    if norm_cand == norm_root || norm_cand.starts_with(&norm_root) {
+        return true;
+    }
+    if let (Ok(can_root), Some(cand_parent)) = (fs::canonicalize(root), candidate.parent())
+        && let Ok(can_parent) = fs::canonicalize(cand_parent)
+    {
+        let can_cand = match candidate.file_name() {
+            Some(name) => can_parent.join(name),
+            None => can_parent,
+        };
+        if can_cand == can_root || can_cand.starts_with(&can_root) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Prepares an empty restore directory and returns `true` if this call created
+/// `into_dir` (so rollback knows whether to remove the root directory itself or
+/// only its contents).
+fn prepare_empty_restore_dir(into_dir: &Path) -> Result<bool, CasError> {
+    match fs::symlink_metadata(into_dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return Err(CasError::UnsafeRestoreTarget {
+                    path: into_dir.display().to_string(),
+                    reason: "restore destination exists and is not a directory".to_string(),
+                });
+            }
+            let mut iter = fs::read_dir(into_dir)
+                .map_err(|error| io_err(format!("read_dir {}", into_dir.display()), &error))?;
+            if iter.next().is_some() {
+                return Err(CasError::UnsafeRestoreTarget {
+                    path: into_dir.display().to_string(),
+                    reason: "refusing to restore into non-empty directory".to_string(),
+                });
+            }
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(into_dir).map_err(|create_err| {
+                io_err(format!("create {}", into_dir.display()), &create_err)
+            })?;
+            Ok(true)
+        }
+        Err(error) => Err(io_err(format!("lstat {}", into_dir.display()), &error)),
+    }
+}
+
+/// Cleans up partial restore output if `restore_snapshot` fails mid-flight.
+struct RestoreRollbackGuard {
+    into_dir: PathBuf,
+    created_root: bool,
+    fm_file: Option<PathBuf>,
+    armed: bool,
+}
+
+impl RestoreRollbackGuard {
+    fn new(into_dir: PathBuf, created_root: bool) -> Self {
+        Self {
+            into_dir,
+            created_root,
+            fm_file: None,
+            armed: true,
+        }
+    }
+
+    fn track_fm_file(&mut self, path: PathBuf) {
+        self.fm_file = Some(path);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestoreRollbackGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(fm) = &self.fm_file {
+            let _ = fs::remove_file(fm);
+        }
+        make_tree_writable_best_effort(&self.into_dir);
+        if self.created_root {
+            let _ = fs::remove_dir_all(&self.into_dir);
+        } else if let Ok(entries) = fs::read_dir(&self.into_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
+fn make_tree_writable_best_effort(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::symlink_metadata(dir)
+            && meta.file_type().is_dir()
+        {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                        make_tree_writable_best_effort(&entry.path());
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
 }
 
 fn ensure_no_symlink_components(root: &Path, candidate: &Path) -> Result<(), CasError> {
@@ -2491,19 +3114,103 @@ fn ensure_no_symlink_components(root: &Path, candidate: &Path) -> Result<(), Cas
     let mut current = root.to_path_buf();
     for component in rel.components() {
         current.push(component);
-        if current.exists() {
-            let meta = fs::symlink_metadata(&current)
-                .map_err(|error| io_err(format!("lstat {}", current.display()), &error))?;
-            if meta.file_type().is_symlink() {
-                return Err(CasError::UnsafeRestoreTarget {
-                    path: current.display().to_string(),
-                    reason: "refusing to traverse symlink component inside restore target"
-                        .to_string(),
-                });
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CasError::UnsafeRestoreTarget {
+                        path: current.display().to_string(),
+                        reason: "refusing to traverse symlink component inside restore target"
+                            .to_string(),
+                    });
+                }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(format!("lstat {}", current.display()), &error)),
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_regular_nofollow(path: &Path) -> Result<File, CasError> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()).map_err(
+        |errno| {
+            io_err(
+                format!("open(O_NOFOLLOW) {}", path.display()),
+                &errno.into(),
+            )
+        },
+    )?;
+    Ok(File::from(fd))
+}
+
+#[cfg(not(unix))]
+fn open_regular_nofollow(path: &Path) -> Result<File, CasError> {
+    File::open(path).map_err(|error| io_err(format!("open {}", path.display()), &error))
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), CasError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let dir = File::open(parent)
+        .map_err(|error| io_err(format!("open dir {}", parent.display()), &error))?;
+    dir.sync_all()
+        .map_err(|error| io_err(format!("sync dir {}", parent.display()), &error))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), CasError> {
+    Ok(())
+}
+
+fn is_hardlink_unsupported(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error().is_some_and(|code| {
+            matches!(
+                rustix::io::Errno::from_raw_os_error(code),
+                rustix::io::Errno::OPNOTSUPP
+                    | rustix::io::Errno::NOSYS
+                    | rustix::io::Errno::XDEV
+                    | rustix::io::Errno::PERM
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(typed_pid) = rustix::process::Pid::from_raw(raw_pid) else {
+        return false;
+    };
+    match rustix::process::test_kill_process(typed_pid) {
+        Ok(()) => true,
+        Err(errno) => errno == rustix::io::Errno::PERM,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -2603,6 +3310,38 @@ fn set_file_mtime(file: &File, mtime_ns: i128, path: &Path) -> Result<(), CasErr
         .map_err(|error| io_err(format!("set_modified {}", path.display()), &error))
 }
 
+#[cfg(unix)]
+fn set_path_mtime_nofollow(path: &Path, mtime_ns: i128) -> Result<(), CasError> {
+    use rustix::fs::{AtFlags, CWD, Nsecs, Secs, Timespec, Timestamps, UTIME_OMIT, utimensat};
+    let secs =
+        Secs::try_from(mtime_ns.div_euclid(1_000_000_000)).map_err(|_| CasError::InvalidKey {
+            key: mtime_ns.to_string(),
+            reason: "mtime seconds out of POSIX timespec range".to_string(),
+        })?;
+    let nsecs =
+        Nsecs::try_from(mtime_ns.rem_euclid(1_000_000_000)).map_err(|_| CasError::InvalidKey {
+            key: mtime_ns.to_string(),
+            reason: "mtime nanoseconds out of POSIX timespec range".to_string(),
+        })?;
+    let times = Timestamps {
+        last_access: Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        last_modification: Timespec {
+            tv_sec: secs,
+            tv_nsec: nsecs,
+        },
+    };
+    utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|errno| io_err(format!("utimensat {}", path.display()), &errno.into()))
+}
+
+#[cfg(not(unix))]
+fn set_path_mtime_nofollow(_path: &Path, _mtime_ns: i128) -> Result<(), CasError> {
+    Ok(())
+}
+
 fn now_unix_ms() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2616,6 +3355,12 @@ pub(crate) fn inspect_key_of(
     logical_path: Option<&str>,
     chunk_size: usize,
 ) -> Result<KeyOfReport, CasError> {
+    if chunk_size == 0 {
+        return Err(CasError::InvalidKey {
+            key: "chunk_size".to_string(),
+            reason: "chunk_size must be greater than zero".to_string(),
+        });
+    }
     let meta = fs::symlink_metadata(path)
         .map_err(|error| io_err(format!("lstat {}", path.display()), &error))?;
     let (canonical_logical, logical_id) = match logical_path {
@@ -2658,16 +3403,45 @@ pub(crate) fn inspect_key_of(
         });
     }
 
-    let expected_size = meta.len();
+    inspect_regular_file_keys(path, chunk_size, canonical_logical, logical_id)
+}
+
+fn inspect_regular_file_keys(
+    path: &Path,
+    chunk_size: usize,
+    canonical_logical: Option<String>,
+    logical_id: Option<String>,
+) -> Result<KeyOfReport, CasError> {
+    let mut file = open_regular_nofollow(path)?;
+    let fd_meta = file
+        .metadata()
+        .map_err(|error| io_err(format!("fstat {}", path.display()), &error))?;
+    if !fd_meta.file_type().is_file() {
+        return Err(CasError::InvalidPath {
+            path: path.display().to_string(),
+            reason: "key-of requires a regular file or symlink".to_string(),
+        });
+    }
+    let expected_size = fd_meta.len();
     let chunk_limit = u64::try_from(chunk_size).unwrap_or(u64::MAX);
     if expected_size <= chunk_limit {
-        let bytes =
-            fs::read(path).map_err(|error| io_err(format!("read {}", path.display()), &error))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
+        file.read_to_end(&mut bytes)
+            .map_err(|error| io_err(format!("read {}", path.display()), &error))?;
+        let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if actual_size != expected_size {
+            return Err(CasError::SizeMismatch {
+                key: path.display().to_string(),
+                expected: expected_size,
+                actual: actual_size,
+                affected_paths: vec![path.display().to_string()],
+            });
+        }
         let key = blob_key(&bytes);
         return Ok(KeyOfReport {
             schema_version: SCHEMA_VERSION.to_string(),
             kind: EntryKind::Regular,
-            size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            size: actual_size,
             blob_key: Some(key),
             symlink_blob_key: None,
             symlink_target: None,
@@ -2677,8 +3451,6 @@ pub(crate) fn inspect_key_of(
         });
     }
 
-    let mut file =
-        File::open(path).map_err(|error| io_err(format!("open {}", path.display()), &error))?;
     let mut whole_hasher = Sha256::new();
     whole_hasher.update(DOMAIN_BLOB);
     whole_hasher.update(expected_size.to_be_bytes());
@@ -2704,6 +3476,15 @@ pub(crate) fn inspect_key_of(
         });
         offset = offset.saturating_add(len_u64);
         index = index.saturating_add(1);
+    }
+
+    if offset != expected_size {
+        return Err(CasError::SizeMismatch {
+            key: path.display().to_string(),
+            expected: expected_size,
+            actual: offset,
+            affected_paths: vec![path.display().to_string()],
+        });
     }
 
     let whole_key = format!("{PREFIX_BLOB}{}", encode_hex(&whole_hasher.finalize()));
@@ -2797,7 +3578,7 @@ fn cmd_restore(flags: &Flags) -> Result<i32, String> {
     let into_dir = PathBuf::from(flags.required("into")?);
     let restore_fm = flags.get("restore-fm").map(PathBuf::from);
 
-    let store = CasStore::open(&store_root).map_err(|error| error.to_string())?;
+    let store = CasStore::open_read_only(&store_root);
     let summary = store
         .restore_snapshot(&snap_key, &into_dir, restore_fm.as_deref())
         .map_err(|error| error.to_string())?;
@@ -2824,7 +3605,7 @@ fn cmd_verify(flags: &Flags) -> Result<i32, String> {
     let store_root = PathBuf::from(flags.required("store")?);
     let snap_key = flags.required("snapshot")?;
 
-    let store = CasStore::open(&store_root).map_err(|error| error.to_string())?;
+    let store = CasStore::open_read_only(&store_root);
     let summary = store
         .verify_snapshot(&snap_key)
         .map_err(|error| error.to_string())?;
@@ -3025,8 +3806,18 @@ mod tests {
         let store_b = TempDir::new("det-store-b");
 
         let fixed_mtime = 1_750_000_000_123_456_789_i128;
-        write_file_with_meta(&src.path().join("src/lib.rs"), b"pub fn a() {}", 0o644, fixed_mtime);
-        write_file_with_meta(&src.path().join("bin/run.sh"), b"#!/bin/sh\necho hi\n", 0o755, fixed_mtime);
+        write_file_with_meta(
+            &src.path().join("src/lib.rs"),
+            b"pub fn a() {}",
+            0o644,
+            fixed_mtime,
+        );
+        write_file_with_meta(
+            &src.path().join("bin/run.sh"),
+            b"#!/bin/sh\necho hi\n",
+            0o755,
+            fixed_mtime,
+        );
         let graph = sample_fm_graph();
 
         let cas_a = CasStore::open(store_a.path()).expect("open a");
@@ -3058,9 +3849,24 @@ mod tests {
         let cas = CasStore::open(store_dir.path()).expect("open");
 
         let mtime = 1_750_000_100_000_000_000_i128;
-        write_file_with_meta(&src.path().join("dup_a.txt"), b"identical payload", 0o644, mtime);
-        write_file_with_meta(&src.path().join("dup_b.txt"), b"identical payload", 0o644, mtime);
-        write_file_with_meta(&src.path().join("original.txt"), b"will be renamed", 0o644, mtime);
+        write_file_with_meta(
+            &src.path().join("dup_a.txt"),
+            b"identical payload",
+            0o644,
+            mtime,
+        );
+        write_file_with_meta(
+            &src.path().join("dup_b.txt"),
+            b"identical payload",
+            0o644,
+            mtime,
+        );
+        write_file_with_meta(
+            &src.path().join("original.txt"),
+            b"will be renamed",
+            0o644,
+            mtime,
+        );
 
         let snap1 = cas.create_snapshot(src.path(), None, None).expect("snap1");
         assert_eq!(snap1.blobs_written, 2);
@@ -3180,7 +3986,12 @@ mod tests {
         let cas = CasStore::open_with_chunk_size(store_dir.path(), 512).expect("open");
 
         let mtime = 1_750_000_300_000_000_000_i128;
-        write_file_with_meta(&src.path().join("small.txt"), b"integrity test", 0o644, mtime);
+        write_file_with_meta(
+            &src.path().join("small.txt"),
+            b"integrity test",
+            0o644,
+            mtime,
+        );
         let big = vec![0x5Au8; 1200];
         write_file_with_meta(&src.path().join("big.bin"), &big, 0o644, mtime);
 
@@ -3259,7 +4070,12 @@ mod tests {
         let src = TempDir::new("fmc-src");
         let store_dir = TempDir::new("fmc-store");
         let cas = CasStore::open(store_dir.path()).expect("open");
-        write_file_with_meta(&src.path().join("a.rs"), b"fn a(){}", 0o644, 1_750_000_000_000_000_000);
+        write_file_with_meta(
+            &src.path().join("a.rs"),
+            b"fn a(){}",
+            0o644,
+            1_750_000_000_000_000_000,
+        );
 
         // Dangling relation
         let dangling = FmGraphSnapshot {
@@ -3366,7 +4182,12 @@ mod tests {
                 let src = TempDir::new(&format!("conc-src-{worker}"));
                 let mtime = 1_750_000_500_000_000_000_i128;
                 // Shared content across all threads (exercises concurrent dedup race)
-                write_file_with_meta(&src.path().join("shared.txt"), b"shared across workers", 0o644, mtime);
+                write_file_with_meta(
+                    &src.path().join("shared.txt"),
+                    b"shared across workers",
+                    0o644,
+                    mtime,
+                );
                 // Unique content per thread
                 write_file_with_meta(
                     &src.path().join(format!("worker_{worker}.txt")),
@@ -3388,7 +4209,10 @@ mod tests {
         let index = cas.read_index().expect("read index");
         for key in &keys {
             assert!(
-                index.snapshots.iter().any(|entry| &entry.snapshot_key == key),
+                index
+                    .snapshots
+                    .iter()
+                    .any(|entry| &entry.snapshot_key == key),
                 "missing {key} in snapshot index"
             );
         }
@@ -3414,5 +4238,538 @@ mod tests {
         assert!(validate_symlink_target("bin/link", "../../escape").is_err());
         assert!(validate_symlink_target("bin/link", "/etc/passwd").is_err());
         assert!(validate_symlink_target("bin/link", "../.git/HEAD").is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn round_trip_restore_preserves_dir_and_symlink_mtimes_and_snapshot_key_determinism() {
+        let src = TempDir::new("det-rt-src");
+        let store1 = TempDir::new("det-rt-store1");
+        let store2 = TempDir::new("det-rt-store2");
+        let restore_parent = TempDir::new("det-rt-out");
+        let restored_tree = restore_parent.path().join("tree");
+
+        let cas1 = CasStore::open_with_chunk_size(store1.path(), 512).expect("open 1");
+        let cas2 = CasStore::open_with_chunk_size(store2.path(), 512).expect("open 2");
+
+        let file_mtime = 1_750_000_111_222_333_444_i128;
+        let pre_epoch_mtime = -86_400_500_000_000_i128; // 1969-12-30T23:59:59.500Z
+        let sym_mtime = 1_750_000_222_111_000_999_i128;
+        let dir_mtime = 1_750_000_333_444_555_666_i128;
+
+        write_file_with_meta(
+            &src.path().join("src/lib.rs"),
+            b"pub fn ro() {}\n",
+            0o644,
+            file_mtime,
+        );
+        write_file_with_meta(
+            &src.path().join("bin/run.sh"),
+            b"#!/bin/sh\nexit 0\n",
+            0o755,
+            pre_epoch_mtime,
+        );
+        write_file_with_meta(
+            &src.path().join("ro_dir/secret.txt"),
+            b"readonly data",
+            0o444,
+            file_mtime,
+        );
+        let big = vec![0x33u8; 1300];
+        write_file_with_meta(
+            &src.path().join("data/chunked.bin"),
+            &big,
+            0o644,
+            file_mtime,
+        );
+        fs::create_dir_all(src.path().join("empty/deep")).expect("empty dir");
+        create_symlink("../src/lib.rs", &src.path().join("bin/lib_link")).expect("symlink");
+        set_path_mtime_nofollow(&src.path().join("bin/lib_link"), sym_mtime).expect("sym mtime");
+
+        // Set explicit deterministic mtimes on all directories in reverse depth order,
+        // and apply restrictive 0o555 mode on `ro_dir`.
+        for rel in ["empty/deep", "empty", "src", "bin", "data", "ro_dir"] {
+            set_path_mtime_nofollow(&src.path().join(rel), dir_mtime).expect("dir mtime");
+        }
+        set_file_mode(&src.path().join("ro_dir"), 0o555).expect("chmod ro_dir");
+
+        let graph = sample_fm_graph();
+        let snap1 = cas1
+            .create_snapshot(src.path(), Some(&graph), None)
+            .expect("snap1");
+
+        // Make source writable again before TempDir drop can remove it.
+        set_file_mode(&src.path().join("ro_dir"), 0o755).expect("restore ro_dir mode");
+
+        cas1.restore_snapshot(&snap1.snapshot_key, &restored_tree, None)
+            .expect("restore");
+
+        // Verify restored modes & mtimes including pre-1970, symlink, and dirs.
+        assert_eq!(
+            extract_mode(&fs::symlink_metadata(restored_tree.join("ro_dir")).unwrap()),
+            0o555
+        );
+        assert_eq!(
+            extract_mode(&fs::symlink_metadata(restored_tree.join("ro_dir/secret.txt")).unwrap()),
+            0o444
+        );
+        assert_eq!(
+            extract_mtime_ns(&fs::symlink_metadata(restored_tree.join("bin/run.sh")).unwrap())
+                .unwrap(),
+            pre_epoch_mtime
+        );
+        assert_eq!(
+            extract_mtime_ns(&fs::symlink_metadata(restored_tree.join("bin/lib_link")).unwrap())
+                .unwrap(),
+            sym_mtime
+        );
+        for rel in ["empty/deep", "empty", "src", "bin", "data", "ro_dir"] {
+            assert_eq!(
+                extract_mtime_ns(&fs::symlink_metadata(restored_tree.join(rel)).unwrap()).unwrap(),
+                dir_mtime,
+                "directory mtime mismatch for {rel}"
+            );
+        }
+
+        // Re-snapshotting the restored tree yields the EXACT same snapshot_key!
+        let snap2 = cas2
+            .create_snapshot(&restored_tree, Some(&graph), None)
+            .expect("snap2");
+        // Restore writable mode so TempDir drops cleanly.
+        set_file_mode(&restored_tree.join("ro_dir"), 0o755).expect("cleanup chmod");
+        assert_eq!(snap1.snapshot_key, snap2.snapshot_key);
+        assert_eq!(snap1.fm_graph_key, snap2.fm_graph_key);
+    }
+
+    #[test]
+    fn detects_manifest_raw_byte_tampering_and_unknown_fields() {
+        let src = TempDir::new("tamper-src");
+        let store_dir = TempDir::new("tamper-store");
+        let cas = CasStore::open(store_dir.path()).expect("open");
+        let mtime = 1_750_000_000_000_000_000_i128;
+        write_file_with_meta(&src.path().join("a.txt"), b"alpha", 0o644, mtime);
+        write_file_with_meta(&src.path().join("b.txt"), b"beta", 0o644, mtime);
+
+        let snap = cas.create_snapshot(src.path(), None, None).expect("snap");
+        let manifest_path = cas.snapshot_path(&snap.snapshot_key).unwrap();
+        let orig = fs::read(&manifest_path).unwrap();
+
+        // 1. Trailing whitespace tampering -> rejected on verify AND re-snapshot!
+        let mut with_ws = orig.clone();
+        with_ws.push(b'\n');
+        fs::write(&manifest_path, &with_ws).unwrap();
+        assert!(matches!(
+            cas.verify_snapshot(&snap.snapshot_key),
+            Err(CasError::ManifestIntegrity { .. })
+        ));
+        assert!(matches!(
+            cas.create_snapshot(src.path(), None, None),
+            Err(CasError::CorruptedObject { .. })
+        ));
+
+        // 2. Unknown injected JSON field -> rejected via deny_unknown_fields!
+        let mut val: Value = serde_json::from_slice(&orig).unwrap();
+        val.as_object_mut()
+            .unwrap()
+            .insert("injected_field".to_string(), json!("evil"));
+        fs::write(&manifest_path, serde_json::to_vec(&val).unwrap()).unwrap();
+        assert!(matches!(
+            cas.verify_snapshot(&snap.snapshot_key),
+            Err(CasError::ManifestIntegrity { .. })
+        ));
+
+        // 3. Reordered entries array (non-canonical on disk) -> rejected!
+        let mut reordered: Value = serde_json::from_slice(&orig).unwrap();
+        reordered["entries"].as_array_mut().unwrap().reverse();
+        fs::write(&manifest_path, serde_json::to_vec(&reordered).unwrap()).unwrap();
+        assert!(matches!(
+            cas.verify_snapshot(&snap.snapshot_key),
+            Err(CasError::ManifestIntegrity { .. })
+        ));
+
+        // Restore original bytes -> verifies cleanly again.
+        fs::write(&manifest_path, &orig).unwrap();
+        cas.verify_snapshot(&snap.snapshot_key).expect("clean");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rejects_crafted_manifest_prefix_collision_dup_size_mismatch_and_bad_parent() {
+        let store_dir = TempDir::new("crafted-store");
+        let cas = CasStore::open(store_dir.path()).expect("open");
+
+        // Store one valid 5-byte blob ("hello")
+        let hello = b"hello";
+        let hello_key = blob_key(hello);
+        let hello_digest = parse_key_digest(&hello_key, PREFIX_BLOB).unwrap();
+        let hello_dest = cas.blob_path(&hello_key).unwrap();
+        cas.write_object_once(&hello_dest, hello, &hello_key, hello_digest, |b| {
+            sha256_len_prefixed(DOMAIN_BLOB, b)
+        })
+        .unwrap();
+
+        let write_crafted_manifest = |body: SnapshotManifestBody| -> String {
+            let canonical = body.canonicalized();
+            let key = snapshot_key(&canonical).unwrap();
+            let manifest = SnapshotManifest::from_body(key.clone(), canonical);
+            let bytes = canonical_json_bytes(&manifest).unwrap();
+            let dest = cas.snapshot_path(&key).unwrap();
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(&dest, &bytes).unwrap();
+            key
+        };
+
+        let make_reg = |path: &str, size: u64| SnapshotEntry {
+            path: path.to_string(),
+            logical_file_id: logical_file_id(path).unwrap(),
+            kind: EntryKind::Regular,
+            mode: 0o644,
+            mtime_ns: 1_750_000_000_000_000_000,
+            size,
+            blob_key: Some(hello_key.clone()),
+            chunks: Vec::new(),
+            symlink_blob_key: None,
+            symlink_target: None,
+            renamed_from: None,
+            feature_ids: Vec::new(),
+        };
+
+        // 1. Path hierarchy collision: regular file at "a" AND regular file at "a/b"
+        let collision_key = write_crafted_manifest(SnapshotManifestBody {
+            schema_version: SCHEMA_VERSION.to_string(),
+            chunk_size: DEFAULT_CHUNK_SIZE as u64,
+            parent_snapshot_key: None,
+            fm_graph_key: None,
+            entries: vec![make_reg("a", 5), make_reg("a/b", 5)],
+            skipped_specials: Vec::new(),
+            unsupported_semantics: UnsupportedSemantics::v1_defaults(),
+            compatibility: CompatibilityMetadata::v1_defaults(),
+        });
+        assert!(matches!(
+            cas.verify_snapshot(&collision_key),
+            Err(CasError::ManifestIntegrity { ref reason, .. }) if reason.contains("hierarchy conflict")
+        ));
+
+        // 2. Duplicate blob_key where 2nd entry lies about entry.size
+        let dup_size_key = write_crafted_manifest(SnapshotManifestBody {
+            schema_version: SCHEMA_VERSION.to_string(),
+            chunk_size: DEFAULT_CHUNK_SIZE as u64,
+            parent_snapshot_key: None,
+            fm_graph_key: None,
+            entries: vec![make_reg("first.txt", 5), make_reg("second.txt", 999)],
+            skipped_specials: Vec::new(),
+            unsupported_semantics: UnsupportedSemantics::v1_defaults(),
+            compatibility: CompatibilityMetadata::v1_defaults(),
+        });
+        assert!(matches!(
+            cas.verify_snapshot(&dup_size_key),
+            Err(CasError::SizeMismatch {
+                expected: 999,
+                actual: 5,
+                ..
+            })
+        ));
+
+        // 3. Invalid parent_snapshot_key syntax
+        let bad_parent_key = write_crafted_manifest(SnapshotManifestBody {
+            schema_version: SCHEMA_VERSION.to_string(),
+            chunk_size: DEFAULT_CHUNK_SIZE as u64,
+            parent_snapshot_key: Some("not-a-snapshot-key".to_string()),
+            fm_graph_key: None,
+            entries: vec![make_reg("ok.txt", 5)],
+            skipped_specials: Vec::new(),
+            unsupported_semantics: UnsupportedSemantics::v1_defaults(),
+            compatibility: CompatibilityMetadata::v1_defaults(),
+        });
+        assert!(matches!(
+            cas.verify_snapshot(&bad_parent_key),
+            Err(CasError::InvalidKey { .. })
+        ));
+
+        // 4. Conflicting file statuses in FM graph
+        let conflicting_fm = FmGraphSnapshot {
+            schema_version: SCHEMA_VERSION.to_string(),
+            features: vec![FmFeature {
+                id: "f1".to_string(),
+                title: "F1".to_string(),
+                summary: None,
+                parent_id: None,
+                files: vec![
+                    FmFileAssoc {
+                        path: "ok.txt".to_string(),
+                        status: FileAssocStatus::Present,
+                    },
+                    FmFileAssoc {
+                        path: "ok.txt".to_string(),
+                        status: FileAssocStatus::Missing,
+                    },
+                ],
+                provenance: Vec::new(),
+            }],
+            relations: Vec::new(),
+            boundaries: FmBoundaries::default(),
+        };
+        assert!(matches!(
+            conflicting_fm.validate_structure(),
+            Err(CasError::FmGraphConsistency { ref reason }) if reason.contains("conflicting statuses")
+        ));
+
+        // 5. Incompatible index schema_version rejected
+        fs::write(
+            cas.index_path(),
+            br#"{"schema_version":"fm-cas/v99","snapshots":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            cas.read_index(),
+            Err(CasError::ManifestIntegrity { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_symlink_chain_root_escape_and_loops_on_restore() {
+        let src = TempDir::new("symchain-src");
+        let store_dir = TempDir::new("symchain-store");
+        let cas = CasStore::open(store_dir.path()).expect("open");
+
+        // 2-hop escape: a/b/jump -> ../.. (resolves to root), a/b/escape -> jump/../../etc/passwd
+        fs::create_dir_all(src.path().join("a/b")).unwrap();
+        create_symlink("../..", &src.path().join("a/b/jump")).unwrap();
+        create_symlink("jump/../../etc/passwd", &src.path().join("a/b/escape")).unwrap();
+
+        let snap = cas.create_snapshot(src.path(), None, None).expect("snap");
+        cas.verify_snapshot(&snap.snapshot_key)
+            .expect("verify validates content integrity");
+
+        let out_parent = TempDir::new("symchain-out");
+        let out_dir = out_parent.path().join("target");
+        let err = cas
+            .restore_snapshot(&snap.snapshot_key, &out_dir, None)
+            .expect_err("must refuse symlink chain escape");
+        assert!(matches!(err, CasError::UnsafeRestoreTarget { .. }));
+        assert!(
+            !out_dir.exists(),
+            "must not create restore dir on pre-flight failure"
+        );
+
+        // Symlink loop: loop/x -> y, loop/y -> x
+        let loop_src = TempDir::new("symloop-src");
+        fs::create_dir_all(loop_src.path().join("loop")).unwrap();
+        create_symlink("y", &loop_src.path().join("loop/x")).unwrap();
+        create_symlink("x", &loop_src.path().join("loop/y")).unwrap();
+
+        let loop_snap = cas
+            .create_snapshot(loop_src.path(), None, None)
+            .expect("loop snap");
+        let loop_out = out_parent.path().join("loop_target");
+        let loop_err = cas
+            .restore_snapshot(&loop_snap.snapshot_key, &loop_out, None)
+            .expect_err("must refuse symlink loop");
+        assert!(matches!(loop_err, CasError::UnsafeRestoreTarget { .. }));
+        assert!(!loop_out.exists());
+    }
+
+    #[test]
+    fn preflight_restore_fm_and_dangling_symlink_target_checks_leave_no_output() {
+        let src = TempDir::new("pf-src");
+        let store_dir = TempDir::new("pf-store");
+        let cas = CasStore::open(store_dir.path()).expect("open");
+        let mtime = 1_750_000_000_000_000_000_i128;
+        write_file_with_meta(&src.path().join("src/lib.rs"), b"fn x() {}", 0o644, mtime);
+        write_file_with_meta(&src.path().join("bin/run.sh"), b"#!/bin/sh\n", 0o755, mtime);
+
+        let snap_no_fm = cas.create_snapshot(src.path(), None, None).expect("no fm");
+        let snap_with_fm = cas
+            .create_snapshot(src.path(), Some(&sample_fm_graph()), None)
+            .expect("with fm");
+
+        let scratch = TempDir::new("pf-out");
+
+        // 1. --restore-fm when snapshot has no fm_graph_key -> fails BEFORE creating into_dir
+        let target1 = scratch.path().join("t1");
+        let err1 = cas
+            .restore_snapshot(
+                &snap_no_fm.snapshot_key,
+                &target1,
+                Some(&scratch.path().join("fm1.json")),
+            )
+            .expect_err("must refuse missing fm_graph");
+        assert!(matches!(err1, CasError::FmGraphConsistency { .. }));
+        assert!(
+            !target1.exists(),
+            "into_dir must not be created when --restore-fm fails pre-flight"
+        );
+
+        // 2. --restore-fm pointing to a dangling symlink -> fails BEFORE creating into_dir
+        let dangling_fm = scratch.path().join("dangling_fm.json");
+        create_symlink("does-not-exist", &dangling_fm).unwrap();
+        let target2 = scratch.path().join("t2");
+        let err2 = cas
+            .restore_snapshot(&snap_with_fm.snapshot_key, &target2, Some(&dangling_fm))
+            .expect_err("must refuse dangling symlink fm_out");
+        assert!(matches!(err2, CasError::UnsafeRestoreTarget { .. }));
+        assert!(!target2.exists());
+
+        // 3. --restore-fm inside into_dir -> fails BEFORE creating into_dir
+        let target3 = scratch.path().join("t3");
+        let err3 = cas
+            .restore_snapshot(
+                &snap_with_fm.snapshot_key,
+                &target3,
+                Some(&target3.join("fm.json")),
+            )
+            .expect_err("must refuse fm_out inside into_dir");
+        assert!(matches!(err3, CasError::UnsafeRestoreTarget { .. }));
+        assert!(!target3.exists());
+
+        // 4. --into pointing to a dangling symlink -> refused cleanly
+        let dangling_into = scratch.path().join("dangling_into");
+        create_symlink("nowhere", &dangling_into).unwrap();
+        let err4 = cas
+            .restore_snapshot(&snap_no_fm.snapshot_key, &dangling_into, None)
+            .expect_err("must refuse dangling symlink into_dir");
+        assert!(matches!(err4, CasError::UnsafeRestoreTarget { .. }));
+    }
+
+    #[test]
+    fn sweep_staging_preserves_live_pid_and_symlinks_and_read_only_store_works() {
+        let src = TempDir::new("ro-src");
+        let store_dir = TempDir::new("ro-store");
+        let cas = CasStore::open(store_dir.path()).expect("open");
+        let mtime = 1_750_000_000_000_000_000_i128;
+        write_file_with_meta(
+            &src.path().join("hello.txt"),
+            b"readonly store test",
+            0o644,
+            mtime,
+        );
+        let snap = cas.create_snapshot(src.path(), None, None).expect("snap");
+
+        // Plant live-PID temp file, dead-PID temp file, and symlink inside staging.
+        let live_tmp = cas
+            .staging_dir()
+            .join(format!(".tmp-{}-9999", std::process::id()));
+        let dead_tmp = cas.staging_dir().join(".tmp-999999-1");
+        let sym_tmp = cas.staging_dir().join(".tmp-999999-sym");
+        fs::write(&live_tmp, b"active writer").unwrap();
+        fs::write(&dead_tmp, b"crashed writer").unwrap();
+        create_symlink("hello", &sym_tmp).unwrap();
+
+        let swept = cas.sweep_staging().expect("sweep");
+        assert_eq!(swept, 1, "only dead-PID regular temp file should be swept");
+        assert!(live_tmp.exists(), "live writer temp file must be preserved");
+        assert!(!dead_tmp.exists(), "dead PID temp file should be removed");
+        assert!(
+            fs::symlink_metadata(&sym_tmp).is_ok(),
+            "symlink in staging must not be followed/removed"
+        );
+        fs::remove_file(&live_tmp).unwrap();
+        fs::remove_file(&sym_tmp).unwrap();
+
+        // Read-only open on an empty/missing dir MUST NOT create fm-cas/v1/
+        let untouched_dir = TempDir::new("untouched-store");
+        let ro_empty = CasStore::open_read_only(untouched_dir.path());
+        assert!(matches!(
+            ro_empty.verify_snapshot(&snap.snapshot_key),
+            Err(CasError::MissingObject { .. })
+        ));
+        assert!(
+            !untouched_dir.path().join("fm-cas").exists(),
+            "open_read_only must not mutate store directory"
+        );
+
+        // inspect_key_of rejects zero chunk size
+        assert!(matches!(
+            inspect_key_of(&src.path().join("hello.txt"), None, 0),
+            Err(CasError::InvalidKey { .. })
+        ));
+    }
+
+    #[test]
+    fn skips_unix_socket_special_file_supports_parentless_delta_restore_and_rolls_back_cleanly() {
+        let src = TempDir::new("sock-src");
+        let store1_dir = TempDir::new("sock-store1");
+        let store2_dir = TempDir::new("sock-store2");
+        let cas1 = CasStore::open(store1_dir.path()).expect("open 1");
+        let cas2 = CasStore::open(store2_dir.path()).expect("open 2");
+
+        let mtime = 1_750_000_000_000_000_000_i128;
+        write_file_with_meta(
+            &src.path().join("before.txt"),
+            b"socket test payload",
+            0o644,
+            mtime,
+        );
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(src.path().join("ctrl.sock"))
+            .expect("bind unix socket");
+
+        let snap1 = cas1.create_snapshot(src.path(), None, None).expect("snap1");
+        #[cfg(unix)]
+        assert_eq!(
+            snap1.skipped_specials,
+            vec![SkippedSpecial {
+                path: "ctrl.sock".to_string(),
+                kind: "socket".to_string()
+            }]
+        );
+
+        // Rename file and create snap2 with snap1 as parent.
+        fs::rename(src.path().join("before.txt"), src.path().join("after.txt")).unwrap();
+        let snap2 = cas1
+            .create_snapshot(src.path(), None, Some(&snap1.snapshot_key))
+            .expect("snap2");
+        assert_eq!(snap2.renamed_count, 1);
+
+        // Delta-replicate ONLY snap2's manifest and its blob into store2 (WITHOUT snap1!).
+        let m2 = cas1.load_and_verify_manifest(&snap2.snapshot_key).unwrap();
+        let m2_src = cas1.snapshot_path(&snap2.snapshot_key).unwrap();
+        let m2_dst = cas2.snapshot_path(&snap2.snapshot_key).unwrap();
+        fs::create_dir_all(m2_dst.parent().unwrap()).unwrap();
+        fs::copy(&m2_src, &m2_dst).unwrap();
+        for entry in &m2.entries {
+            if let Some(bk) = &entry.blob_key {
+                let b_src = cas1.blob_path(bk).unwrap();
+                let b_dst = cas2.blob_path(bk).unwrap();
+                fs::create_dir_all(b_dst.parent().unwrap()).unwrap();
+                fs::copy(&b_src, &b_dst).unwrap();
+            }
+        }
+
+        // Single-snapshot verify & restore in store2 succeed without snap1 present!
+        cas2.verify_snapshot(&snap2.snapshot_key)
+            .expect("independent delta snapshot verifies without parent");
+        let restore_out = TempDir::new("sock-restore").path().join("tree");
+        cas2.restore_snapshot(&snap2.snapshot_key, &restore_out, None)
+            .expect("independent delta snapshot restores");
+        assert_eq!(
+            fs::read(restore_out.join("after.txt")).unwrap(),
+            b"socket test payload"
+        );
+        assert!(!restore_out.join("ctrl.sock").exists());
+
+        // Rollback guard cleans up partial files & 0o555 dirs for both created_root=true and false.
+        let rb_scratch = TempDir::new("rb-test");
+        let created_dir = rb_scratch.path().join("created");
+        fs::create_dir_all(created_dir.join("ro")).unwrap();
+        fs::write(created_dir.join("ro/part.txt"), b"partial").unwrap();
+        set_file_mode(&created_dir.join("ro"), 0o555).unwrap();
+        {
+            let _guard = RestoreRollbackGuard::new(created_dir.clone(), true);
+        }
+        assert!(!created_dir.exists(), "created_root rollback removes dir");
+
+        let pre_empty = rb_scratch.path().join("pre_empty");
+        fs::create_dir_all(pre_empty.join("ro")).unwrap();
+        fs::write(pre_empty.join("ro/part.txt"), b"partial").unwrap();
+        set_file_mode(&pre_empty.join("ro"), 0o555).unwrap();
+        {
+            let _guard = RestoreRollbackGuard::new(pre_empty.clone(), false);
+        }
+        assert!(pre_empty.is_dir(), "pre-existing empty dir itself remains");
+        assert!(
+            fs::read_dir(&pre_empty).unwrap().next().is_none(),
+            "pre-existing dir contents are cleaned on rollback"
+        );
     }
 }
