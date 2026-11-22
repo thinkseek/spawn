@@ -682,6 +682,30 @@ fn collect_feature_ids(
     known_ids
 }
 
+/// Returns true when a `provenance.artifacts` or `provenance.tests` entry looks
+/// like a repository-relative file path (rather than a URL, free-form command,
+/// or non-path identifier).
+///
+/// `provenance.commits` (git SHAs) and other non-path provenance fields are
+/// never passed to this check.
+pub fn looks_like_repo_path(raw: &str) -> bool {
+    const PATH_EXTS: &[&str] = &[
+        ".md", ".rs", ".ts", ".tsx", ".js", ".mjs", ".json", ".toml", ".yaml", ".yml", ".sh",
+        ".py", ".sql", ".txt", ".css", ".html", ".env", ".key", ".pem", ".gpg",
+    ];
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) || trimmed.contains("://") {
+        return false;
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || (trimmed.starts_with('.') && trimmed.len() > 1)
+    {
+        return true;
+    }
+    PATH_EXTS.iter().any(|ext| trimmed.ends_with(ext))
+}
+
 fn validate_feature_files(
     feature: &FeatureNode,
     boundary: &BoundaryPolicy,
@@ -708,6 +732,33 @@ fn validate_feature_files(
                     "{}: invalid file path {raw_path:?}: {err}",
                     feature.id
                 ));
+            }
+        }
+    }
+
+    for (field, entries) in [
+        ("artifacts", &feature.provenance.artifacts),
+        ("tests", &feature.provenance.tests),
+    ] {
+        for raw_path in entries {
+            if !looks_like_repo_path(raw_path) {
+                continue;
+            }
+            match normalize_repo_path(raw_path) {
+                Ok(norm) => {
+                    if let Some(rule) = match_exclusion(boundary, &norm) {
+                        report.invalid_paths.push(format!(
+                            "{}: provenance.{field} path {norm:?} matches exclusion rule {:?} ({})",
+                            feature.id, rule.id, rule.reason
+                        ));
+                    }
+                }
+                Err(err) => {
+                    report.invalid_paths.push(format!(
+                        "{}: invalid provenance.{field} path {raw_path:?}: {err}",
+                        feature.id
+                    ));
+                }
             }
         }
     }
@@ -992,6 +1043,33 @@ fn index_registry_files(
                     .or_default()
                     .insert(feature.id.clone());
             } else {
+                stale_map
+                    .entry(norm)
+                    .or_default()
+                    .insert(feature.id.clone());
+            }
+        }
+
+        // Stale-check repo-relative path entries in `provenance.artifacts` and
+        // `provenance.tests` without ever counting provenance links as file
+        // coverage in `bidirectional_index` (and never treating `provenance.commits`
+        // SHAs as file paths).
+        for raw_path in feature
+            .provenance
+            .artifacts
+            .iter()
+            .chain(feature.provenance.tests.iter())
+        {
+            if !looks_like_repo_path(raw_path) {
+                continue;
+            }
+            let Ok(norm) = normalize_repo_path(raw_path) else {
+                continue;
+            };
+            if match_exclusion(&registry.boundary, &norm).is_some() {
+                continue;
+            }
+            if !in_scope_map.contains_key(&norm) {
                 stale_map
                     .entry(norm)
                     .or_default()

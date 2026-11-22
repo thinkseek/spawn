@@ -86,7 +86,8 @@ Exact accounting identities that hold on every scan:
 - `self_links`: a feature whose `parent` or relation targets itself.
 - `cycle_errors`: directed cycles in `parent`, `depends_on`, or `contains`.
 - `orphan_features`: non-root feature kinds (`capability`, `slice`, `subsystem`) that are not reachable from any valid root (`domain`, `initiative`, `research-initiative`) via valid `parent` or `contains` hierarchy edges (catching direct orphans, children of orphans, dangling/self-parent orphans, and isolated cycles).
-- `invalid_paths`: malformed, absolute, traversal (`..`), duplicate-within-feature, or excluded file paths listed inside `feature.files`.
+- `invalid_paths`: malformed, absolute, traversal (`..`), duplicate-within-feature, or excluded file paths listed inside `feature.files` or path-like entries in `feature.provenance.artifacts` / `feature.provenance.tests`.
+- `stale_references` (during `scan_coverage`): missing in-scope paths referenced in `feature.files` **or** path-like entries in `feature.provenance.artifacts` / `feature.provenance.tests` (while never treating `provenance.commits` SHAs as file paths and never counting provenance references toward `covered` files).
 
 ### 3.4 Non-Destructive Safety Guarantee
 

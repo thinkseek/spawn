@@ -13,12 +13,15 @@ import {
 import { useMemo, useState } from "react";
 
 import {
+  canSubmitWildFileAssociation,
   consistencyIssueCount,
   formatBytes,
+  initialWildFileSelection,
   initiativesAndSlices,
   isResearchInitiative,
   isScanClean,
   kindLabel,
+  toggleWildFileSelection,
   type CoverageFeatureSummary,
   type FeatureCoverageResponse,
   type WildFileFinding,
@@ -496,15 +499,13 @@ function WildFileRow({
   onAssociate: (path: string, featureIds: string[]) => Promise<void>;
 }) {
   const [selected, setSelected] = useState<string[]>(() =>
-    finding.suggested_features.slice(0, 1),
+    initialWildFileSelection(finding),
   );
   const [filter, setFilter] = useState("");
   const [saving, setSaving] = useState(false);
 
   const toggle = (fid: string) => {
-    setSelected((prev) =>
-      prev.includes(fid) ? prev.filter((item) => item !== fid) : [...prev, fid],
-    );
+    setSelected((prev) => toggleWildFileSelection(prev, fid));
   };
 
   const filteredFeatures = useMemo(() => {
@@ -518,8 +519,10 @@ function WildFileRow({
     );
   }, [features, filter]);
 
+  const canSubmit = canSubmitWildFileAssociation(selected, saving);
+
   const submit = async () => {
-    if (selected.length === 0 || saving) return;
+    if (!canSubmit) return;
     setSaving(true);
     try {
       await onAssociate(finding.path, selected);
@@ -555,7 +558,9 @@ function WildFileRow({
 
       {finding.suggested_features.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5 text-micro">
-          <span className="text-faint-foreground">Suggested features:</span>
+          <span className="text-faint-foreground">
+            Suggested features (click to select — not pre-selected):
+          </span>
           {finding.suggested_features.map((fid) => {
             const active = selected.includes(fid);
             return (
@@ -594,7 +599,7 @@ function WildFileRow({
           />
           <button
             type="button"
-            disabled={selected.length === 0 || saving}
+            disabled={!canSubmit}
             onClick={() => void submit()}
             className={cx(
               "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-control bg-foreground px-2.5 text-caption font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-40",
