@@ -82,11 +82,20 @@ export function FeatureMindMap({
     startY: number;
   } | null>(null);
 
-  // Reset expanded state when mission or grouping changes.
+  const [fitRequest, setFitRequest] = useState(1);
+
+  // Reset expanded state and schedule auto-fit when mission or grouping changes.
   useEffect(() => {
     setExpandedIds(defaultExpandedIds(tree));
     setSearchQuery("");
+    setFitRequest((n) => n + 1);
   }, [tree]);
+
+  // Refit gently when the inspector drawer opens/closes so nodes never clip off-canvas.
+  const inspectorOpen = selectedNodeId !== null;
+  useEffect(() => {
+    setFitRequest((n) => n + 1);
+  }, [inspectorOpen]);
 
   // Whenever a node is selected (e.g., jumped to from Inspector), ensure all
   // ancestors are expanded so the target node is guaranteed visible.
@@ -127,12 +136,12 @@ export function FeatureMindMap({
     setTransform({ x, y, scale });
   }, [layout.width, layout.height]);
 
-  // Fit on mission/tree change.
+  // Run auto-fit after layout & viewport size settle.
   useEffect(() => {
+    if (fitRequest === 0) return;
     const raf = window.requestAnimationFrame(() => fitToView());
     return () => window.cancelAnimationFrame(raf);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mission.id, tree.effectiveGrouping]);
+  }, [fitRequest, fitToView]);
 
   // Center on focused node when triggered explicitly (e.g. clicking a link in Inspector).
   useEffect(() => {
@@ -184,10 +193,12 @@ export function FeatureMindMap({
 
   const handleExpandAll = useCallback(() => {
     setExpandedIds(allBranchIds(tree));
+    setFitRequest((n) => n + 1);
   }, [tree]);
 
   const handleCollapseToBranches = useCallback(() => {
     setExpandedIds(new Set([tree.rootId]));
+    setFitRequest((n) => n + 1);
   }, [tree.rootId]);
 
   const zoomBy = useCallback((factor: number) => {
