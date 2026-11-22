@@ -407,3 +407,75 @@ test("a partial answer normalizes to empty values instead of crashing", () => {
   assert.equal(unreadable.backlog_error, "read /m/backlog: No such file or directory");
   assert.equal(unreadable.features.length, 0);
 });
+
+test("hierarchy, kind, tags, files, relations, and mission graph normalize cleanly", () => {
+  const map = normalizeFeatureMap({
+    generated_at_ms: 2000,
+    missions: [
+      {
+        id: 4,
+        text: "Spawn RSI",
+        graph: {
+          relations_total: 2,
+          files_indexed: 3,
+          shared_files: {
+            "web/src/features.ts": ["feature-api", "feature-mindmap"],
+          },
+          hierarchy_roots: ["ui-domain", "feature-api"],
+        },
+        features: [
+          feature({
+            id: "ui-domain",
+            title: "UI Domain",
+            kind: "domain",
+            tags: ["web", "ui"],
+            files: ["web/src/App.tsx"],
+          }),
+          feature({
+            id: "feature-mindmap",
+            title: "Feature Mind Map",
+            parent: "ui-domain",
+            kind: "initiative",
+            tags: ["web", "graph"],
+            files: ["web/src/features.ts", "web/src/featuresGraph.ts"],
+            relations: [
+              { kind: "depends_on", target: "feature-api", label: "reads API" },
+              { kind: "invalid_kind", target: "feature-api" },
+              { kind: "blocks", target: "" },
+            ],
+          }),
+          feature({
+            id: "feature-api",
+            title: "Feature API",
+            kind: "unknown-kind",
+            files: ["web/src/features.ts"],
+          }),
+        ],
+      },
+    ],
+  });
+
+  const m = map.missions[0];
+  assert.equal(m.graph.relations_total, 2);
+  assert.equal(m.graph.files_indexed, 3);
+  assert.deepEqual(m.graph.shared_files, {
+    "web/src/features.ts": ["feature-api", "feature-mindmap"],
+  });
+  assert.deepEqual(m.graph.hierarchy_roots, ["ui-domain", "feature-api"]);
+
+  const mindmap = m.features[1];
+  assert.equal(mindmap.parent, "ui-domain");
+  assert.equal(mindmap.kind, "initiative");
+  assert.deepEqual(mindmap.tags, ["web", "graph"]);
+  assert.deepEqual(mindmap.files, ["web/src/features.ts", "web/src/featuresGraph.ts"]);
+  assert.deepEqual(mindmap.relations, [
+    { kind: "depends_on", target: "feature-api", label: "reads API" },
+  ]);
+
+  // Unknown kind falls back to "capability"; omitted fields normalize safely.
+  const api = m.features[2];
+  assert.equal(api.parent, null);
+  assert.equal(api.kind, "capability");
+  assert.deepEqual(api.tags, []);
+  assert.deepEqual(api.relations, []);
+});
