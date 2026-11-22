@@ -832,6 +832,12 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
                 return moved(request, id, action, access, shared);
             }
         }
+        if path == "/api/features/scan" {
+            return feature_scan_post(request, access, shared);
+        }
+        if path == "/api/features/associate" {
+            return feature_associate_post(request, access, shared);
+        }
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
@@ -881,6 +887,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/core-lines" => Box::new(core_lines::core_lines),
         "/api/verifications" => Box::new(verifications),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
+        "/api/features/coverage" => Box::new(feature_coverage_get),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1319,6 +1326,102 @@ fn resumed(
         Ok(spawn_postgres::HumanResume::Refused(why)) => Err((409, why)),
         Err(error) => Err((500, error.to_string())),
     }
+}
+
+/// `GET /api/features/coverage`: current feature-map file coverage report,
+/// boundary policy, exclusions, wild files, stale references, and features.
+fn feature_coverage_get() -> Result<Value, String> {
+    let root = crate::feature_inventory::default_root();
+    let registry = crate::feature_inventory::default_registry_path(&root);
+    crate::feature_inventory::api_coverage_payload(&root, &registry)
+}
+
+/// `POST /api/features/scan`: one-click unassociated-file ("野文件") scan.
+/// Performs a fresh read-only project inventory scan; never modifies or
+/// deletes any file on disk.
+fn feature_scan_post(
+    mut request: Request,
+    access: Access,
+    _shared: &Shared,
+) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    if !access.token && !same_origin(header(&request, "Host"), header(&request, "Origin")) {
+        return request
+            .respond(json_response(
+                403,
+                &json!({ "error": "forbidden: a scan without the token needs this page's own Origin" }),
+            ))
+            .map_err(|error| error.to_string());
+    }
+    let _ = read_body(&mut request);
+    let root = crate::feature_inventory::default_root();
+    let registry = crate::feature_inventory::default_registry_path(&root);
+    let (status, body) = match crate::feature_inventory::api_coverage_payload(&root, &registry) {
+        Ok(payload) => (200, payload),
+        Err(error) => (500, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// Body of `POST /api/features/associate`: one repo-relative file path and
+/// one or more genuine feature IDs to associate it with (many-to-many).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeatureAssociateBody {
+    path: String,
+    features: Vec<String>,
+}
+
+/// `POST /api/features/associate`: validate and atomically persist a
+/// many-to-many file-to-feature association, returning the refreshed scan
+/// report and association update summary.
+fn feature_associate_post(
+    mut request: Request,
+    access: Access,
+    shared: &Shared,
+) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match feature_associate_checked(&mut request, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+fn feature_associate_checked(
+    request: &mut Request,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
+    let body: FeatureAssociateBody = serde_json::from_slice(&raw_body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}the body must be {{\"path\": ..., \"features\": [...]}}: {error}"),
+        )
+    })?;
+    let root = crate::feature_inventory::default_root();
+    let registry = crate::feature_inventory::default_registry_path(&root);
+    let payload = crate::feature_inventory::api_associate_payload(
+        &root,
+        &registry,
+        &body.path,
+        &body.features,
+    )
+    .map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
+    Ok((200, payload))
 }
 
 /// Whether `origin` is this page's own: present, and the same host over
@@ -5278,6 +5381,40 @@ mod tests {
         assert_eq!(answer.body["error"], "SPAWN_DATABASE_URL is not set");
         assert_eq!(tokenless_status("/api/feature", named), 404);
         assert_eq!(tokenless_status("/api/features/", named), 404);
+    }
+
+    #[test]
+    fn the_feature_coverage_and_scan_routes_enforce_methods_and_guards() {
+        let named = "Host: 127.0.0.1:PORT\r\n";
+        // GET on POST-only endpoints answers 405.
+        assert_eq!(tokenless_status("/api/features/scan", named), 405);
+        assert_eq!(tokenless_status("/api/features/associate", named), 405);
+        // POST on GET-only coverage endpoint answers 405.
+        let post_cov = exchange(
+            None,
+            "",
+            None,
+            &format!("POST /api/features/coverage HTTP/1.1\r\n{named}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(post_cov.status, 405, "{post_cov:?}");
+        // POST /api/features/scan without Origin and without token answers 403.
+        let scan_no_origin = exchange(
+            None,
+            "",
+            None,
+            &format!("POST /api/features/scan HTTP/1.1\r\n{named}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"),
+        );
+        assert_eq!(scan_no_origin.status, 403, "{scan_no_origin:?}");
+        // POST /api/features/associate with invalid JSON body under token answers 400.
+        let bad_assoc = exchange(
+            Some("secret-token"),
+            "",
+            None,
+            &format!(
+                "POST /api/features/associate HTTP/1.1\r\n{named}Authorization: Bearer secret-token\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        );
+        assert_eq!(bad_assoc.status, 400, "{bad_assoc:?}");
     }
 
     /// An API answer that failed carries no tag, so it is never "not
