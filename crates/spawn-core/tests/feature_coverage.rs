@@ -480,31 +480,7 @@ fn assert_real_registry_semantic_invariants(registry: &FeatureRegistry, report: 
         }
     }
 
-    let find_node = |id: &str| {
-        registry
-            .features
-            .iter()
-            .find(|f| f.id == id)
-            .unwrap_or_else(|| panic!("missing feature {id}"))
-    };
-    assert!(
-        find_node("t559u-slice-a-mindmap").files.is_empty(),
-        "unmerged parallel slice t559u-slice-a-mindmap must not claim fabricated placeholder files"
-    );
-    assert!(
-        !find_node("t559u-slice-c-storage-keys")
-            .files
-            .iter()
-            .any(|p| p == "docs/storage.md"),
-        "t559u-slice-c-storage-keys must not claim unrelated docs/storage.md"
-    );
-    assert!(
-        !find_node("t567u-multi-machine-distributed")
-            .files
-            .iter()
-            .any(|p| p == "docs/storage.md"),
-        "t567u-multi-machine-distributed must not claim unrelated docs/storage.md"
-    );
+    assert_integrated_slice_associations(registry, report);
 
     let f2f = &report.bidirectional_index.file_to_features;
     for (path, expected_feat) in [
@@ -544,6 +520,92 @@ fn assert_real_registry_semantic_invariants(registry: &FeatureRegistry, report: 
             f2f.get(path)
                 .is_some_and(|feats| feats.iter().any(|id| id == expected_feat)),
             "expected {path} to be associated with {expected_feat}, got {:?}",
+            f2f.get(path)
+        );
+    }
+}
+
+fn assert_integrated_slice_associations(registry: &FeatureRegistry, report: &ScanReport) {
+    let find_node = |id: &str| {
+        registry
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap_or_else(|| panic!("missing feature {id}"))
+    };
+    let slice_a = find_node("t559u-slice-a-mindmap");
+    for expected in [
+        "docs/feature-map-mindmap.md",
+        "web/src/featuresGraph.ts",
+        "web/src/components/features/FeatureMindMap.tsx",
+        "web/src/components/features/FeatureInspector.tsx",
+        "web/test/featuresGraph.test.ts",
+    ] {
+        assert!(
+            slice_a.files.iter().any(|p| p == expected),
+            "t559u-slice-a-mindmap must associate real Slice A file {expected}"
+        );
+    }
+    assert!(
+        !slice_a
+            .files
+            .iter()
+            .any(|p| p == "web/src/App.tsx" || p == "web/src/components/Sidebar.tsx"),
+        "t559u-slice-a-mindmap must not claim unrelated App.tsx or Sidebar.tsx"
+    );
+
+    let slice_c = find_node("t559u-slice-c-storage-keys");
+    for expected in [
+        "crates/spawn-cli/src/backup/recoverable.rs",
+        "crates/spawn-cli/tests/recoverable_storage.rs",
+        "docs/recoverable-storage-keys.md",
+    ] {
+        assert!(
+            slice_c.files.iter().any(|p| p == expected),
+            "t559u-slice-c-storage-keys must associate real Slice C file {expected}"
+        );
+    }
+    assert!(
+        !slice_c.files.iter().any(|p| p == "docs/storage.md"),
+        "t559u-slice-c-storage-keys must not claim unrelated docs/storage.md"
+    );
+    assert!(
+        !find_node("t567u-multi-machine-distributed")
+            .files
+            .iter()
+            .any(|p| p == "docs/storage.md"),
+        "t567u-multi-machine-distributed must not claim unrelated docs/storage.md"
+    );
+
+    let f2f = &report.bidirectional_index.file_to_features;
+    for (path, expected_feat) in [
+        ("docs/feature-map-mindmap.md", "cap-feature-map-status"),
+        (
+            "docs/feature-map-mindmap.md",
+            "t559u-feature-map-initiative",
+        ),
+        ("web/src/featuresGraph.ts", "cap-feature-map-status"),
+        (
+            "crates/spawn-cli/src/backup/recoverable.rs",
+            "cap-backup-and-drills",
+        ),
+        (
+            "crates/spawn-cli/src/backup/recoverable.rs",
+            "cap-storage-lifecycle",
+        ),
+        (
+            "crates/spawn-cli/tests/recoverable_storage.rs",
+            "cap-backup-and-drills",
+        ),
+        (
+            "docs/recoverable-storage-keys.md",
+            "t567u-multi-machine-distributed",
+        ),
+    ] {
+        assert!(
+            f2f.get(path)
+                .is_some_and(|feats| feats.iter().any(|id| id == expected_feat)),
+            "expected cross-link {path} -> {expected_feat}, got {:?}",
             f2f.get(path)
         );
     }
@@ -618,7 +680,7 @@ fn real_project_registry_covers_every_in_scope_file_with_zero_drift() {
         report.stale_references
     );
     assert!(report.consistency.is_clean(), "{:?}", report.consistency);
-    assert_eq!(report.counts.in_scope, 980);
+    assert_eq!(report.counts.in_scope, 988);
     assert_eq!(report.counts.covered, report.counts.in_scope);
     assert!(report.counts.multi_feature_files >= 100);
 

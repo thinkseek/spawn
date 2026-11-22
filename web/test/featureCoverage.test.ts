@@ -484,7 +484,28 @@ test("real docs/feature-map/registry.json satisfies semantic non-catchall invari
 
   const sliceA = raw.features.find((f) => f.id === "t559u-slice-a-mindmap");
   assert.ok(sliceA);
-  assert.deepEqual(sliceA.files, []);
+  for (const expected of [
+    "docs/feature-map-mindmap.md",
+    "web/src/featuresGraph.ts",
+    "web/src/components/features/FeatureMindMap.tsx",
+    "web/src/components/features/FeatureInspector.tsx",
+    "web/test/featuresGraph.test.ts",
+  ]) {
+    assert.equal(sliceA.files.includes(expected), true, `sliceA missing ${expected}`);
+  }
+  assert.equal(sliceA.files.includes("web/src/App.tsx"), false);
+  assert.equal(sliceA.files.includes("web/src/components/Sidebar.tsx"), false);
+
+  const sliceC = raw.features.find((f) => f.id === "t559u-slice-c-storage-keys");
+  assert.ok(sliceC);
+  for (const expected of [
+    "crates/spawn-cli/src/backup/recoverable.rs",
+    "crates/spawn-cli/tests/recoverable_storage.rs",
+    "docs/recoverable-storage-keys.md",
+  ]) {
+    assert.equal(sliceC.files.includes(expected), true, `sliceC missing ${expected}`);
+  }
+  assert.equal(sliceC.files.includes("docs/storage.md"), false);
 
   const t567u = raw.features.find((f) => f.id === "t567u-multi-machine-distributed");
   assert.ok(t567u);
