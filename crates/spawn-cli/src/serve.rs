@@ -843,7 +843,7 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
                 .respond(not_allowed("GET"))
                 .map_err(|error| error.to_string());
         }
-        if path == "/api/features/coverage" && parameter(query, "mission").is_some() {
+        if path == "/api/features/coverage" && mission_query(query).is_some() {
             return feature_coverage_mission_get(request, query);
         }
     }
@@ -1362,7 +1362,7 @@ fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), Str
 /// the open objective mission's `--features` file and the project root it
 /// belongs to ([`mission_feature_paths`]).
 fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
-    let Some(text) = parameter(query, "mission") else {
+    let Some(text) = mission_query(query) else {
         let root = crate::feature_inventory::default_root();
         let registry = crate::feature_inventory::default_registry_path(&root);
         return Ok((root, registry));
@@ -1376,7 +1376,43 @@ fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
     let missions = open_store()
         .and_then(|store| store.objective_missions().map_err(err))
         .map_err(|error| (500, json!({ "error": error })))?;
-    mission_feature_paths(&missions, id)
+    let (root, registry) = mission_feature_paths(&missions, id)?;
+    coverage_registry_checked(&registry, id)?;
+    Ok((root, registry))
+}
+
+/// The `mission` of a coverage request's query as given: `None` when the
+/// query names none, `Some("")` for a bare `mission` or an empty
+/// `mission=` (refused as a bad mission, never read as the default
+/// project).
+fn mission_query(query: &str) -> Option<&str> {
+    query
+        .split('&')
+        .find_map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key == "mission").then_some(value),
+            None => (pair == "mission").then_some(""),
+        })
+}
+
+/// 400 `not_a_coverage_registry` when mission `id`'s `--features` file is
+/// not a coverage registry [`crate::feature_inventory::load_registry`]
+/// takes (missing, unreadable, or a legacy identity-only feature map).
+fn coverage_registry_checked(registry: &Path, id: i64) -> Result<(), (u16, Value)> {
+    crate::feature_inventory::load_registry(registry)
+        .map(|_| ())
+        .map_err(|error| {
+            (
+                400,
+                json!({
+                    "error": format!(
+                        "{BAD_REQUEST}mission {id}'s --features file is not a coverage \
+                         registry: {error}"
+                    ),
+                    "code": "not_a_coverage_registry",
+                    "mission": id,
+                }),
+            )
+        })
 }
 
 /// Mission `id`'s registry (its `objectives.features`, a relative path
@@ -1418,6 +1454,7 @@ fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf)
     let backlog = json!({ "backlog": mission.pointer("/objectives/backlog") });
     let registry = feature_map::resolve(&backlog, given)
         .map_err(|error| refused(400, "no_features_registry", format!("{BAD_REQUEST}{error}")))?;
+    let registry = crate::feature_inventory::normalize_lexically(&registry);
     let root = crate::feature_inventory::project_root_for_registry(&registry);
     Ok((root, registry))
 }
@@ -2865,7 +2902,7 @@ mod tests {
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_INPUT_BODY,
         MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
-        feature_associate_at, feature_paths, handle, is_json, is_loopback, keep_listening,
+        coverage_registry_checked, feature_associate_at, feature_paths, handle, is_json, is_loopback, keep_listening,
         listen_again_pause, local_exemption, log_window, mission_feature_paths, objective_json,
         objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
         rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
