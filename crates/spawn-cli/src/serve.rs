@@ -1385,7 +1385,10 @@ fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
 /// `--features` registry.
 fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
     let refused = |status: u16, code: &str, error: String| {
-        (status, json!({ "error": error, "code": code, "mission": id }))
+        (
+            status,
+            json!({ "error": error, "code": code, "mission": id }),
+        )
     };
     let mission = missions
         .as_array()
@@ -5825,7 +5828,10 @@ mod tests {
         assert_eq!(status, 400);
         assert_eq!(body["code"], "no_features_registry");
         assert_eq!(body["mission"], 11);
-        assert!(body["error"].as_str().unwrap().starts_with(BAD_REQUEST), "{body}");
+        assert!(
+            body["error"].as_str().unwrap().starts_with(BAD_REQUEST),
+            "{body}"
+        );
 
         let (status, body) = mission_feature_paths(&missions, 12).expect_err("no mission");
         assert_eq!(status, 404);

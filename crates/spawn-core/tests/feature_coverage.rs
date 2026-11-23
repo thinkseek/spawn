@@ -1319,13 +1319,23 @@ fn default_generic_boundary_serves_any_project_and_spawn_builds_on_it() {
     let spawn = BoundaryPolicy::default_spawn_boundary();
     assert_eq!(spawn.project_name, "Spawn");
     assert_eq!(spawn.exclusions.len(), 27);
-    for path in [".spawn/report.md", ".claude/x", ".controller", "rsi/.gate-owner/lease", "web/dist/a.js"] {
+    for path in [
+        ".spawn/report.md",
+        ".claude/x",
+        ".controller",
+        "rsi/.gate-owner/lease",
+        "web/dist/a.js",
+    ] {
         assert!(match_exclusion(&spawn, path).is_some(), "{path}");
     }
     for path in ["dist/app.js", "build/out.o"] {
         assert!(match_exclusion(&spawn, path).is_none(), "{path}");
     }
-    let generic_ids: BTreeSet<&str> = generic.exclusions.iter().map(|rule| rule.id.as_str()).collect();
+    let generic_ids: BTreeSet<&str> = generic
+        .exclusions
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect();
     let shared = spawn
         .exclusions
         .iter()
