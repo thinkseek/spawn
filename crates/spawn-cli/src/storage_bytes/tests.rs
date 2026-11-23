@@ -1,7 +1,7 @@
 use super::{
-    BOUND_SECS, DAY_MS, Flight, RETRY_MS, Sampler, Source, WHY_MAX_CHARS, World, live_database,
-    quiet_hold, run_script, script_input, script_sources, session_backups, source_hold, sources,
-    test_databases,
+    BOUND_SECS, DAY_MS, Flight, RETRY_MS, Sampler, Source, WHY_MAX_CHARS, World, build_cache_roots,
+    live_database, quiet_hold, run_script, script_input, script_sources, session_backups,
+    source_hold, sources, test_databases,
 };
 use crate::core_lines_sample::Reading;
 use crate::serve::core_lines::StorageBytesSettings;
@@ -248,14 +248,18 @@ fn the_scripts_input_lists_the_sources_in_their_counting_order() {
     let all = sources(
         Some(Path::new("/ws")),
         PathBuf::from("/home/a/.claude/projects"),
-        Some(PathBuf::from("/home/a/.cache")),
+        vec![
+            PathBuf::from("/home/a/.cache"),
+            PathBuf::from("/home/a/.bun/install/cache"),
+        ],
         &settings,
     );
     assert_eq!(
         script_input(&all, BOUND_SECS),
         json!({"bound_secs": 1200, "sources": [
             {"name": "transcripts", "roots": ["/ws/.transcripts", "/home/a/.claude/projects"], "exclude": []},
-            {"name": "build_cache", "roots": ["/home/a/.cache"], "exclude": []},
+            {"name": "build_cache", "roots": ["/home/a/.cache", "/home/a/.bun/install/cache"],
+             "exclude": []},
             {"name": "scratch", "roots": ["/data/tmp"], "exclude": ["/data/tmp/ccd-pg"]},
         ]})
     );
@@ -263,7 +267,7 @@ fn the_scripts_input_lists_the_sources_in_their_counting_order() {
     let some = sources(
         None,
         PathBuf::from("/p"),
-        None,
+        Vec::new(),
         &StorageBytesSettings::default(),
     );
     assert_eq!(
@@ -764,4 +768,130 @@ fn a_store_that_cannot_be_read_is_said_once_per_retry() {
     assert_eq!(sampler.check_with(3 * RETRY_MS - 1, &mut world), Ok(None));
     assert_eq!(world.holds_read, 1);
     assert_eq!(world.started, 0);
+}
+
+/// The environment `vars` names, as `crate::env_value` reads it: an unset
+/// or empty variable is none.
+fn env_of(vars: &[(&str, PathBuf)]) -> impl Fn(&str) -> Option<String> {
+    let vars: Vec<(String, String)> = vars
+        .iter()
+        .map(|(name, path)| ((*name).to_string(), path.display().to_string()))
+        .collect();
+    move |name: &str| {
+        vars.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[test]
+fn the_build_cache_counts_the_xdg_cache_and_bun_and_pnpm_when_present() {
+    let home = Scratch(scratch("cache-home"));
+    // Nothing there yet: the XDG cache alone, as before (its root counted
+    // whether or not it is there); neither Bun's nor pnpm's.
+    assert_eq!(
+        build_cache_roots(env_of(&[("HOME", home.to_path_buf())])),
+        [home.join(".cache")]
+    );
+    file(&home.join(".cache/pip/a"), 1);
+    file(&home.join(".bun/install/cache/react@19/index.js"), 1);
+    file(&home.join(".local/share/pnpm/store/v10/files/00/a"), 1);
+    assert_eq!(
+        build_cache_roots(env_of(&[("HOME", home.to_path_buf())])),
+        [
+            home.join(".cache"),
+            home.join(".bun/install/cache"),
+            home.join(".local/share/pnpm/store"),
+        ]
+    );
+    // The variables win over the places under HOME.
+    let elsewhere = Scratch(scratch("cache-elsewhere"));
+    std::fs::create_dir_all(elsewhere.join("xdg")).expect("xdg");
+    std::fs::create_dir_all(elsewhere.join("bun")).expect("bun");
+    std::fs::create_dir_all(elsewhere.join("pnpm/store")).expect("pnpm");
+    assert_eq!(
+        build_cache_roots(env_of(&[
+            ("HOME", home.to_path_buf()),
+            ("XDG_CACHE_HOME", elsewhere.join("xdg")),
+            ("BUN_INSTALL_CACHE_DIR", elsewhere.join("bun")),
+            ("PNPM_HOME", elsewhere.join("pnpm")),
+        ])),
+        [
+            elsewhere.join("xdg"),
+            elsewhere.join("bun"),
+            elsewhere.join("pnpm/store"),
+        ]
+    );
+    // A named Bun or pnpm cache that is not there is not counted; an empty
+    // variable is no variable.
+    assert_eq!(
+        build_cache_roots(env_of(&[
+            ("HOME", home.to_path_buf()),
+            ("XDG_CACHE_HOME", PathBuf::new()),
+            ("BUN_INSTALL_CACHE_DIR", elsewhere.join("no-bun")),
+            ("PNPM_HOME", elsewhere.join("no-pnpm")),
+        ])),
+        [home.join(".cache")]
+    );
+    // No HOME and no variables: no root, so the source is not measured.
+    assert!(build_cache_roots(env_of(&[])).is_empty());
+}
+
+#[test]
+fn a_build_cache_reached_two_ways_is_counted_once() {
+    let home = Scratch(scratch("cache-twice"));
+    file(&home.join(".cache/bun/react@19/index.js"), 1);
+    file(&home.join(".local/share/pnpm/store/v10/a"), 1);
+    // Bun's cache named as the XDG cache itself, and pnpm's store through a
+    // symlink to it: each counted once, the first way it is reached kept.
+    std::fs::create_dir_all(home.join(".bun/install")).expect("bun parent");
+    std::os::unix::fs::symlink(home.join(".cache"), home.join(".bun/install/cache"))
+        .expect("symlink");
+    std::fs::create_dir_all(home.join("pnpm")).expect("pnpm home");
+    std::os::unix::fs::symlink(
+        home.join(".local/share/pnpm/store"),
+        home.join("pnpm/store"),
+    )
+    .expect("symlink");
+    assert_eq!(
+        build_cache_roots(env_of(&[
+            ("HOME", home.to_path_buf()),
+            ("PNPM_HOME", home.join("pnpm")),
+        ])),
+        [home.join(".cache"), home.join("pnpm/store")]
+    );
+    assert_eq!(
+        build_cache_roots(env_of(&[
+            ("HOME", home.to_path_buf()),
+            ("XDG_CACHE_HOME", home.join(".cache")),
+            ("BUN_INSTALL_CACHE_DIR", home.join(".cache/")),
+        ])),
+        [home.join(".cache"), home.join(".local/share/pnpm/store")]
+    );
+    // pnpm's store reached as Bun's cache is (through a symlink) and as the
+    // XDG cache itself (a variable): pnpm's way is the one dropped.
+    std::fs::create_dir_all(home.join("bun-cache")).expect("bun cache");
+    std::fs::create_dir_all(home.join("pnpm-to-bun")).expect("pnpm home");
+    std::os::unix::fs::symlink(home.join("bun-cache"), home.join("pnpm-to-bun/store"))
+        .expect("symlink");
+    assert_eq!(
+        build_cache_roots(env_of(&[
+            ("HOME", home.to_path_buf()),
+            ("BUN_INSTALL_CACHE_DIR", home.join("bun-cache")),
+            ("PNPM_HOME", home.join("pnpm-to-bun")),
+        ])),
+        [home.join(".cache"), home.join("bun-cache")]
+    );
+    std::fs::create_dir_all(home.join("pnpm-to-xdg")).expect("pnpm home");
+    std::os::unix::fs::symlink(home.join(".cache"), home.join("pnpm-to-xdg/store"))
+        .expect("symlink");
+    assert_eq!(
+        build_cache_roots(env_of(&[
+            ("HOME", home.to_path_buf()),
+            ("BUN_INSTALL_CACHE_DIR", home.join("bun-cache")),
+            ("PNPM_HOME", home.join("pnpm-to-xdg")),
+        ])),
+        [home.join(".cache"), home.join("bun-cache")]
+    );
 }

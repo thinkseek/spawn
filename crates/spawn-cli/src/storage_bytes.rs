@@ -10,9 +10,10 @@
 //!
 //! - `transcripts`, `build_cache` and `scratch`, through the script, their
 //!   extents counted in that order: the transcript archive and Claude Code's
-//!   projects; `$XDG_CACHE_HOME`, else `$HOME/.cache`; the Core lines file's
-//!   `storage.scratch_roots` less its `storage.scratch_exclude`. A source
-//!   with no root is not measured, and says so;
+//!   projects; `$XDG_CACHE_HOME`, else `$HOME/.cache`, with Bun's install
+//!   cache and pnpm's store when present (`build_cache_roots`); the Core
+//!   lines file's `storage.scratch_roots` less its `storage.scratch_exclude`.
+//!   A source with no root is not measured, and says so;
 //! - `session_backups`: the status file's `estimated_bytes` (objective 097);
 //! - `test_databases`: each configured test database's size, each database
 //!   once by name;
@@ -94,16 +95,44 @@ pub(crate) struct Plan {
     pub(crate) script: PathBuf,
 }
 
-/// The build cache: `$XDG_CACHE_HOME`, else `$HOME/.cache`.
-fn build_cache() -> Option<PathBuf> {
-    crate::env_value("XDG_CACHE_HOME")
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            crate::env_value("HOME")
-                .filter(|path| !path.trim().is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
+/// The build caches' roots, from the environment `env` gives: the XDG
+/// cache (`$XDG_CACHE_HOME`, else `$HOME/.cache`, counted whether or not it
+/// is there yet), Bun's install cache (`$BUN_INSTALL_CACHE_DIR`, else
+/// `$HOME/.bun/install/cache`) and pnpm's store (`$PNPM_HOME/store`, else
+/// `$HOME/.local/share/pnpm/store`), each of those two only when it is a
+/// directory. Each root once, by its canonical path (a cache reached two
+/// ways, through a symlink or a variable naming another's root, is counted
+/// once), in that order.
+pub(crate) fn build_cache_roots(env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let var = |name: &str| {
+        env(name)
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+    };
+    let home = var("HOME");
+    let under_home = |rest: &str| home.as_ref().map(|home| home.join(rest));
+    let xdg = var("XDG_CACHE_HOME").or_else(|| under_home(".cache"));
+    let bun = var("BUN_INSTALL_CACHE_DIR").or_else(|| under_home(".bun/install/cache"));
+    let pnpm = var("PNPM_HOME")
+        .map(|pnpm| pnpm.join("store"))
+        .or_else(|| under_home(".local/share/pnpm/store"));
+    let present = |path: Option<PathBuf>| path.filter(|path| path.is_dir());
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for root in [xdg, present(bun), present(pnpm)].into_iter().flatten() {
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if seen.contains(&canonical) {
+            continue;
+        }
+        seen.push(canonical);
+        roots.push(root);
+    }
+    roots
+}
+
+/// The build caches' roots now ([`build_cache_roots`]).
+fn build_cache() -> Vec<PathBuf> {
+    build_cache_roots(crate::env_value)
 }
 
 /// The script `SPAWN_STORAGE_EXTENTS` names, else the one beside the binary.
@@ -121,11 +150,12 @@ pub(crate) fn script_path() -> PathBuf {
 
 /// The script's three sources, in their counting order: the transcripts
 /// (the archive under `root`, and Claude Code's `projects`), the build
-/// cache `cache`, and the scratch roots `settings` names.
+/// caches' roots `cache` ([`build_cache_roots`]), and the scratch roots
+/// `settings` names.
 pub(crate) fn sources(
     root: Option<&Path>,
     projects: PathBuf,
-    cache: Option<PathBuf>,
+    cache: Vec<PathBuf>,
     settings: &StorageBytesSettings,
 ) -> Vec<Source> {
     let mut transcripts: Vec<PathBuf> =
@@ -139,7 +169,7 @@ pub(crate) fn sources(
         },
         Source {
             name: BUILD_CACHE,
-            roots: cache.into_iter().collect(),
+            roots: cache,
             exclude: Vec::new(),
         },
         Source {

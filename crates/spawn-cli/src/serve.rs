@@ -3911,6 +3911,37 @@ mod tests {
         });
     }
 
+    /// Task 545 (reviews 532/533 of 515): a reading through the real store
+    /// in a test (the serve and Core lines readings reach
+    /// [`super::storage::report`], as does the alerts monitor's guardrail
+    /// reading) looks for build directories under the tests' path, never
+    /// under the host's `/tmp` or `SPAWN_ALERT_TMPFS_PATH`. A look there
+    /// stops the test itself (`storage::tmpfs_build_targets`); this one
+    /// fails when a reading's look holds a watched host path.
+    #[test]
+    fn a_reading_in_a_test_never_looks_at_the_hosts_tmpfs() {
+        in_test_schema(|_owner, store| {
+            let storage = super::storage::report(store, super::now_ms()).expect("the figures");
+            let looked = storage["tmpfs_build_targets"]["root"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .expect("the tmpfs looked under");
+            assert_eq!(looked, std::path::Path::new(super::storage::TESTS_TMPFS));
+            for watched in super::storage::watched_host_paths() {
+                assert!(
+                    !watched.starts_with(&looked),
+                    "a test's reading looked under {}, which holds the host's {}",
+                    looked.display(),
+                    watched.display()
+                );
+            }
+            assert_eq!(
+                storage["tmpfs_build_targets"]["targets"],
+                serde_json::json!([])
+            );
+        });
+    }
+
     /// Objective 064, through the real store: each line for the owner
     /// carries the tasks it names with their states now, and only a review
     /// ask whose tasks have all ended is settled.

@@ -7,6 +7,14 @@
 //! most every [`READ_EVERY_MS`] and kept between: the page polls
 //! `/api/fleet` every 3 s in every tab, and a walk of the live root takes
 //! about 0.3 s. `read_at_ms` says when they were read.
+//!
+//! `tmpfs_build_targets` lists the Cargo build directories (a directory
+//! holding a CACHEDIR.TAG with the standard's signature) found under the
+//! tmpfs (`SPAWN_ALERT_TMPFS_PATH`, else `/tmp`), at most
+//! [`TMPFS_DEPTH`] levels down: there a build target holds RAM, not disk.
+//! Read only; nothing there is ever removed from here. The look and the
+//! measuring of what it finds read at most [`TMPFS_BOUND`] together. A test
+//! run never looks at the host's tmpfs ([`tmpfs_root`], [`TESTS_TMPFS`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -29,6 +37,249 @@ const GROWTH_MIN_MS: i64 = DAY_MS;
 
 /// `before` is the count of the newest sample at least this old.
 const BEFORE_MS: i64 = 3_600_000;
+
+/// How deep under the tmpfs a build directory is looked for: `/tmp/<a>`,
+/// `/tmp/<a>/<b>` (`/tmp/x/target`), `/tmp/<a>/<b>/<c>`.
+pub(crate) const TMPFS_DEPTH: usize = 3;
+
+/// How many directories the look for build directories and the measuring
+/// of those it finds read at most, together: a /tmp of many folders, or a
+/// build directory of many, is read in part, and says so (`partial`).
+pub(crate) const TMPFS_DIRS_MAX: usize = 4096;
+
+/// How many directory entries the look and the measuring take at most,
+/// together: a build directory of many files is measured in part, and says
+/// so (`partial`).
+pub(crate) const TMPFS_ENTRIES_MAX: usize = 100_000;
+
+/// The cache directory tagging standard's signature, Cargo's tag's start.
+const TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// The tmpfs a test run looks under instead of the host's: a path that is
+/// not there, so no test reads the host's `/tmp` (or
+/// `SPAWN_ALERT_TMPFS_PATH`) through [`report`]; a test that wants build
+/// directories passes a sandbox of its own to [`tmpfs_build_targets`].
+#[cfg(test)]
+pub(crate) const TESTS_TMPFS: &str = "/nonexistent/spawn-tests-tmpfs";
+
+/// The host's tmpfs: `SPAWN_ALERT_TMPFS_PATH` (the tmpfs alert's), else
+/// `/tmp`.
+fn host_tmpfs_root() -> PathBuf {
+    crate::env_value("SPAWN_ALERT_TMPFS_PATH").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+}
+
+/// The tmpfs looked under: the host's ([`host_tmpfs_root`]); in a test run
+/// [`TESTS_TMPFS`], whichever test reaches [`report`] (the serve and Core
+/// lines readings, the alerts monitor's guardrails).
+pub(crate) fn tmpfs_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        PathBuf::from(TESTS_TMPFS)
+    }
+    #[cfg(not(test))]
+    {
+        host_tmpfs_root()
+    }
+}
+
+/// The host paths no test may walk: `/tmp` and the host's tmpfs
+/// ([`host_tmpfs_root`]).
+#[cfg(test)]
+pub(crate) fn watched_host_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from("/tmp"), host_tmpfs_root()]
+}
+
+/// In a test run, a look under `root` that would read a watched host path
+/// ([`watched_host_paths`]: `root` is one, or holds one) stops the test
+/// before anything is read.
+#[cfg(test)]
+fn refuse_a_watched_host_path(root: &Path) {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let looked = resolved(root);
+    for watched in watched_host_paths() {
+        assert!(
+            !resolved(&watched).starts_with(&looked),
+            "a test looked for build directories under {}, which reads the host's {}: pass \
+             a sandbox of the test's own",
+            root.display(),
+            watched.display()
+        );
+    }
+}
+
+/// Whether `dir` holds a CACHEDIR.TAG: a regular file (not a symlink)
+/// starting with the standard's signature. The tag is opened without
+/// following a symlink and without blocking (a FIFO swapped in never holds
+/// the read), and is read only when the opened file is a regular one.
+fn cachedir_tagged(dir: &Path) -> bool {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let Ok(tag) = rustix::fs::open(
+        dir.join("CACHEDIR.TAG"),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    if !rustix::fs::fstat(&tag)
+        .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile)
+    {
+        return false;
+    }
+    let mut head = [0_u8; TAG_SIGNATURE.len()];
+    let mut got = 0;
+    while got < head.len() {
+        match rustix::io::read(&tag, &mut head[got..]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => got += read,
+        }
+    }
+    head[..got] == *TAG_SIGNATURE
+}
+
+/// What the look for build directories may read: directories and entries,
+/// for the look and the measuring together.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bound {
+    pub(crate) dirs: usize,
+    pub(crate) entries: usize,
+}
+
+/// The bound the live look reads within.
+pub(crate) const TMPFS_BOUND: Bound = Bound {
+    dirs: TMPFS_DIRS_MAX,
+    entries: TMPFS_ENTRIES_MAX,
+};
+
+/// What is left of a [`Bound`]; `spent` once anything was left unread for
+/// it.
+struct Budget {
+    left: Bound,
+    spent: bool,
+}
+
+impl Budget {
+    /// Take one directory read; false (and spent) when none is left.
+    fn dir(&mut self) -> bool {
+        Self::take(&mut self.left.dirs, &mut self.spent)
+    }
+
+    /// Take one entry; false (and spent) when none is left.
+    fn entry(&mut self) -> bool {
+        Self::take(&mut self.left.entries, &mut self.spent)
+    }
+
+    fn take(left: &mut usize, spent: &mut bool) -> bool {
+        if *left == 0 {
+            *spent = true;
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+}
+
+/// The regular files under the build directory `dir`, no symlink followed,
+/// within `budget`: their sizes, and whether all of it was read.
+fn measure(dir: &Path, budget: &mut Budget) -> (Sizes, bool) {
+    let mut sizes = Sizes::default();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        if !budget.dir() {
+            return (sizes, false);
+        }
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !budget.entry() {
+                return (sizes, false);
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file()
+                && let Ok(metadata) = entry.metadata()
+            {
+                sizes.bytes = sizes.bytes.saturating_add(metadata.len());
+                sizes.files += 1;
+            }
+        }
+    }
+    (sizes, true)
+}
+
+/// The Cargo build directories under `root` (the tmpfs), read only:
+/// `{root, bytes, files, partial, targets: [{path, bytes, files, partial}]}`,
+/// the targets largest first. A tagged directory is not entered further; no
+/// symlink is followed; at most [`TMPFS_DEPTH`] levels are looked through,
+/// and the look and the measuring together read at most [`TMPFS_BOUND`]
+/// (`partial` when anything was left unread; a target's own `partial` when
+/// it was measured in part). A `root` that cannot be read has no targets.
+pub(crate) fn tmpfs_build_targets(root: &Path) -> Value {
+    tmpfs_build_targets_within(root, TMPFS_BOUND)
+}
+
+/// [`tmpfs_build_targets`] within `bound`.
+pub(crate) fn tmpfs_build_targets_within(root: &Path, bound: Bound) -> Value {
+    #[cfg(test)]
+    refuse_a_watched_host_path(root);
+    let mut budget = Budget {
+        left: bound,
+        spent: false,
+    };
+    let mut found: Vec<(PathBuf, Sizes, bool)> = Vec::new();
+    let mut pending: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    'look: while let Some((dir, depth)) = pending.pop() {
+        if !budget.dir() {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !budget.entry() {
+                break 'look;
+            }
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let child = entry.path();
+            if cachedir_tagged(&child) {
+                let (sizes, whole) = measure(&child, &mut budget);
+                found.push((child, sizes, !whole));
+                if !whole {
+                    break 'look;
+                }
+            } else if depth + 1 < TMPFS_DEPTH {
+                pending.push((child, depth + 1));
+            }
+        }
+    }
+    found.sort_by(|(a_path, a, _), (b_path, b, _)| b.bytes.cmp(&a.bytes).then(a_path.cmp(b_path)));
+    let bytes = found
+        .iter()
+        .fold(0_u64, |sum, (_, sizes, _)| sum.saturating_add(sizes.bytes));
+    let files = found
+        .iter()
+        .fold(0_u64, |sum, (_, sizes, _)| sum.saturating_add(sizes.files));
+    json!({
+        "root": root.display().to_string(),
+        "bytes": bytes,
+        "files": files,
+        "partial": budget.spent,
+        "targets": found
+            .iter()
+            .map(|(path, sizes, partial)| json!({
+                "path": path.display().to_string(),
+                "bytes": sizes.bytes,
+                "files": sizes.files,
+                "partial": partial,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
 
 /// The sizes of the last read, and when.
 pub(crate) struct Kept {
@@ -74,12 +325,17 @@ pub(crate) struct Walked {
     /// The session backups' `estimated_bytes` (objective 097); `None`
     /// without a status file that reads with that number.
     pub(crate) session_backups: Option<u64>,
+    /// The Cargo build directories on the tmpfs
+    /// ([`tmpfs_build_targets`]).
+    pub(crate) tmpfs_build_targets: Value,
 }
 
 impl Walked {
     /// Walk the archive and the workspaces of `root` (when there is one)
-    /// and Claude Code's projects directory.
-    pub(crate) fn read(root: Option<&Path>, projects_path: PathBuf) -> Self {
+    /// and Claude Code's projects directory, and look for build directories
+    /// on the tmpfs at `tmpfs_root` (the live callers pass [`tmpfs_root`];
+    /// the tests a sandbox of their own, never the host's `/tmp`).
+    pub(crate) fn read(root: Option<&Path>, projects_path: PathBuf, tmpfs_root: &Path) -> Self {
         Self {
             root: root.map(Path::to_path_buf),
             archive: root.map(archive).unwrap_or_default(),
@@ -89,6 +345,7 @@ impl Walked {
             session_backups: crate::storage::session_backup_bytes(
                 crate::storage::session_backup_status().as_deref(),
             ),
+            tmpfs_build_targets: tmpfs_build_targets(tmpfs_root),
         }
     }
 }
@@ -301,6 +558,7 @@ pub(crate) fn sizes(
         "growth_parts": parts,
         "growth_from_parts": growth_from_parts(&samples["carrying"], root.is_some()),
         "growth_excluded": excluded,
+        "tmpfs_build_targets": walked.tmpfs_build_targets.clone(),
     })
 }
 
@@ -318,7 +576,7 @@ pub(crate) fn with_free(mut sizes: Value, free: Option<u64>) -> Value {
 pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String> {
     let root = crate::env_value("SPAWN_WORKSPACE_ROOT").map(PathBuf::from);
     let sizes = kept_or_read(&KEPT, now_ms, |read_at_ms| {
-        let walked = Walked::read(root.as_deref(), projects_path());
+        let walked = Walked::read(root.as_deref(), projects_path(), &tmpfs_root());
         let samples = store
             .host_storage(
                 read_at_ms.saturating_sub(GROWTH_WINDOW_MS),
@@ -351,9 +609,10 @@ pub(crate) fn report(store: &PostgresStore, now_ms: i64) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::{
-        DAY_MS, Kept, READ_EVERY_MS, Walked, days_left, growth_excluded, growth_from,
-        growth_from_parts, growth_of, growth_parts, kept_or_read, persistent_from,
-        persistent_growth, session_backups_part, sizes, test_databases, with_free,
+        Bound, DAY_MS, Kept, READ_EVERY_MS, TESTS_TMPFS, Walked, days_left, growth_excluded,
+        growth_from, growth_from_parts, growth_of, growth_parts, kept_or_read, persistent_from,
+        persistent_growth, session_backups_part, sizes, test_databases, tmpfs_build_targets,
+        tmpfs_build_targets_within, tmpfs_root, watched_host_paths, with_free,
     };
     use crate::storage::tests::{file, scratch};
     use serde_json::{Value, json};
@@ -423,15 +682,27 @@ mod tests {
     fn the_figures_carry_the_growth_and_the_count_before_from_the_samples() {
         let root = scratch("figures");
         let projects = scratch("figures_projects");
+        let tmpfs = scratch("figures_tmpfs");
         file(&root.join(".transcripts/agent_a/a1.jsonl"), 3000);
         file(&root.join(".transcripts/agent_a/a2.jsonl"), 9000);
         file(&root.join(".transcripts-progress/agent_a/a1.json"), 10);
         file(&root.join("agent_c/big.bin"), 2000);
         file(&projects.join("-one/s1.jsonl"), 100);
         file(&projects.join("-two/s2.jsonl"), 200);
-        let walked = Walked::read(Some(&root), projects.clone());
+        let mut walked = Walked::read(Some(&root), projects.clone(), &tmpfs);
+        // The walk looked in the sandbox, never at the host's own /tmp.
+        assert_eq!(
+            walked.tmpfs_build_targets["root"],
+            json!(tmpfs.display().to_string())
+        );
+        assert_eq!(walked.tmpfs_build_targets["targets"], json!([]));
+        let targets = json!({"root": "/sandbox/tmp", "bytes": 7, "files": 1, "partial": false,
+                             "targets": [{"path": "/sandbox/tmp/x/target", "bytes": 7,
+                                          "files": 1}]});
+        walked.tmpfs_build_targets = targets.clone();
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&projects).expect("clean up");
+        std::fs::remove_dir_all(&tmpfs).expect("clean up");
         let now = 50 * DAY_MS;
         let oldest = json!({"at_ms": now - 2 * DAY_MS, "archive_bytes": 2000,
                             "projects_bytes": 100, "projects_files": 40});
@@ -468,6 +739,7 @@ mod tests {
                 "growth_excluded": ["session_backups"],
                 "persistent_growth_bytes_per_day": 8100,
                 "persistent_from_ms": now,
+                "tmpfs_build_targets": targets,
                 "free_bytes": 100_000,
                 "days_left": 12,
             })
@@ -570,6 +842,7 @@ mod tests {
         );
         let root = scratch("session_backups");
         let projects = scratch("session_backups_projects");
+        let tmpfs = scratch("session_backups_tmpfs");
         file(
             &root.join(".transcripts/agent_a/a1.jsonl"),
             usize::try_from(12 * MIB).expect("fits"),
@@ -584,7 +857,7 @@ mod tests {
         std::fs::write(&without, r#"{"at": 1, "accounts": []}"#).expect("status");
         let read = |path: Option<&std::path::Path>| Walked {
             session_backups: crate::storage::session_backup_bytes(path),
-            ..Walked::read(Some(&root), projects.clone())
+            ..Walked::read(Some(&root), projects.clone(), &tmpfs)
         };
         let counted = read(Some(&status));
         let none = read(None);
@@ -592,6 +865,7 @@ mod tests {
         let unnumbered = read(Some(&without));
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&projects).expect("clean up");
+        std::fs::remove_dir_all(&tmpfs).expect("clean up");
         let database = json!({"bytes": 108 * MIB});
 
         let figures = with_free(
@@ -690,11 +964,13 @@ mod tests {
         // without.
         let root = scratch("growth_from_parts");
         let projects = scratch("growth_from_parts_projects");
+        let tmpfs = scratch("growth_from_parts_tmpfs");
         file(&root.join(".transcripts/agent_a/a1.jsonl"), 3000);
-        let walked = Walked::read(Some(&root), projects.clone());
-        let rootless = Walked::read(None, projects.clone());
+        let walked = Walked::read(Some(&root), projects.clone(), &tmpfs);
+        let rootless = Walked::read(None, projects.clone(), &tmpfs);
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&projects).expect("clean up");
+        std::fs::remove_dir_all(&tmpfs).expect("clean up");
         let samples = json!({"oldest": old_shape, "carrying": carrying, "before": null});
         for walked in [&walked, &rootless] {
             let figures = sizes(now, walked, &samples, &json!({"bytes": 400}), &json!([]));
@@ -716,11 +992,13 @@ mod tests {
     fn the_figures_say_from_when_the_growth_is_measured() {
         let root = scratch("growth_from");
         let projects = scratch("growth_from_projects");
+        let tmpfs = scratch("growth_from_tmpfs");
         file(&root.join(".transcripts/agent_a/a1.jsonl"), 3000);
-        let walked = Walked::read(Some(&root), projects.clone());
-        let rootless = Walked::read(None, projects.clone());
+        let walked = Walked::read(Some(&root), projects.clone(), &tmpfs);
+        let rootless = Walked::read(None, projects.clone(), &tmpfs);
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&projects).expect("clean up");
+        std::fs::remove_dir_all(&tmpfs).expect("clean up");
         let now = 50 * DAY_MS;
         let ten_hours = 36_000_000;
         let oldest = json!({"at_ms": now - ten_hours, "archive_bytes": 1000,
@@ -749,11 +1027,13 @@ mod tests {
     fn the_figures_say_from_when_the_persistent_growth_is_measured() {
         let root = scratch("persistent_from");
         let projects = scratch("persistent_from_projects");
+        let tmpfs = scratch("persistent_from_tmpfs");
         file(&root.join(".transcripts/agent_a/a1.jsonl"), 3000);
-        let walked = Walked::read(Some(&root), projects.clone());
-        let rootless = Walked::read(None, projects.clone());
+        let walked = Walked::read(Some(&root), projects.clone(), &tmpfs);
+        let rootless = Walked::read(None, projects.clone(), &tmpfs);
         std::fs::remove_dir_all(&root).expect("clean up");
         std::fs::remove_dir_all(&projects).expect("clean up");
+        std::fs::remove_dir_all(&tmpfs).expect("clean up");
         let now = 50 * DAY_MS;
         let old = json!({"at_ms": now - 30 * 3_600_000, "archive_bytes": 1000,
                          "projects_bytes": 0, "projects_files": 0});
@@ -827,5 +1107,194 @@ mod tests {
             "error connecting to server: Connection refused"
         );
         assert_eq!(test_databases(Vec::new()), json!([]));
+    }
+
+    /// The tag a Cargo build directory holds.
+    const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+                             # This file is a cache directory tag created by cargo.\n";
+
+    #[test]
+    fn the_cargo_build_directories_on_the_tmpfs_are_listed_largest_first() {
+        let tmp = scratch("tmpfs");
+        let tag = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir).expect("dir");
+            std::fs::write(dir.join("CACHEDIR.TAG"), CARGO_TAG).expect("tag");
+        };
+        // A worker's target one level down, a CARGO_TARGET_DIR at the top,
+        // and one three levels down.
+        tag(&tmp.join("agent_x/target"));
+        file(&tmp.join("agent_x/target/debug/deps/libbig.rlib"), 5000);
+        file(&tmp.join("agent_x/target/debug/.fingerprint/a"), 10);
+        tag(&tmp.join("cargo-target-1"));
+        file(&tmp.join("cargo-target-1/release/spawn"), 9000);
+        tag(&tmp.join("a/b/c"));
+        file(&tmp.join("a/b/c/debug/x"), 30);
+        // Too deep, a tag of another signature, a tag that is a symlink, a
+        // symlink to a build directory, and plain folders: none counted.
+        tag(&tmp.join("a/b/c2/d"));
+        file(&tmp.join("a/b/c2/d/x"), 70);
+        file(&tmp.join("other/CACHEDIR.TAG"), 43);
+        file(&tmp.join("plain/target/debug/x"), 80);
+        std::fs::create_dir_all(tmp.join("linked-tag")).expect("dir");
+        std::os::unix::fs::symlink(
+            tmp.join("cargo-target-1/CACHEDIR.TAG"),
+            tmp.join("linked-tag/CACHEDIR.TAG"),
+        )
+        .expect("symlink");
+        std::os::unix::fs::symlink(tmp.join("cargo-target-1"), tmp.join("link")).expect("link");
+        let read = tmpfs_build_targets(&tmp);
+        // Read only: everything is still there.
+        assert!(tmp.join("agent_x/target/debug/deps/libbig.rlib").is_file());
+        assert!(tmp.join("cargo-target-1/release/spawn").is_file());
+        let shown = |rest: &str| tmp.join(rest).display().to_string();
+        assert_eq!(
+            read,
+            json!({
+                "root": tmp.display().to_string(),
+                "bytes": 9000 + 5010 + 30 + 3 * CARGO_TAG.len(),
+                "files": 2 + 3 + 2,
+                "partial": false,
+                "targets": [
+                    {"path": shown("cargo-target-1"),
+                     "bytes": 9000 + CARGO_TAG.len(), "files": 2, "partial": false},
+                    {"path": shown("agent_x/target"),
+                     "bytes": 5010 + CARGO_TAG.len(), "files": 3, "partial": false},
+                    {"path": shown("a/b/c"), "bytes": 30 + CARGO_TAG.len(), "files": 2,
+                     "partial": false},
+                ],
+            })
+        );
+        std::fs::remove_dir_all(&tmp).expect("clean up");
+        // A tmpfs that cannot be read has no targets.
+        let gone = tmpfs_build_targets(&tmp);
+        assert_eq!(gone["targets"], json!([]));
+        assert_eq!(gone["bytes"], 0);
+    }
+
+    /// A tag that is a FIFO (or any file not regular) is no tag, and the
+    /// look does not wait on it.
+    #[test]
+    fn a_tag_that_is_no_regular_file_is_no_tag_and_never_blocks() {
+        let tmp = scratch("tmpfs-fifo");
+        std::fs::create_dir_all(tmp.join("x/target")).expect("dir");
+        let fifo = tmp.join("x/target/CACHEDIR.TAG");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "a FIFO made");
+        let read = tmpfs_build_targets(&tmp);
+        assert_eq!(read["targets"], json!([]), "{read}");
+        std::fs::remove_dir_all(&tmp).expect("clean up");
+    }
+
+    /// A tagged directory `dir` holding a chain of `depth` directories,
+    /// one file of `bytes` in each.
+    fn chain(dir: &std::path::Path, depth: usize, bytes: usize) {
+        std::fs::create_dir_all(dir).expect("dir");
+        std::fs::write(dir.join("CACHEDIR.TAG"), CARGO_TAG).expect("tag");
+        let mut at = dir.to_path_buf();
+        for level in 0..depth {
+            at.push(format!("d{level}"));
+            file(&at.join("f"), bytes);
+        }
+    }
+
+    /// The bound holds for the look and for the measuring alike: a small
+    /// one reads only so many directories and entries, and says `partial`
+    /// (on the whole, and on a target measured in part); a large one reads
+    /// it all.
+    #[test]
+    fn the_look_and_the_measuring_read_within_the_bound() {
+        let tmp = scratch("tmpfs-bound");
+        let wide = Bound {
+            dirs: 10_000,
+            entries: 10_000,
+        };
+        // The look alone: a target two levels down, behind plain folders.
+        for name in ["p1", "p2", "p3", "p4"] {
+            std::fs::create_dir_all(tmp.join(name)).expect("dir");
+        }
+        chain(&tmp.join("p5/target"), 0, 0);
+        file(&tmp.join("p5/target/x"), 10);
+        let all = tmpfs_build_targets_within(&tmp, wide);
+        assert_eq!(all["partial"], false, "{all}");
+        assert_eq!(all["targets"].as_array().map(Vec::len), Some(1), "{all}");
+        // One directory: the root only; the target below is never reached.
+        let root_only = tmpfs_build_targets_within(
+            &tmp,
+            Bound {
+                dirs: 1,
+                entries: 10_000,
+            },
+        );
+        assert_eq!(root_only["partial"], true, "{root_only}");
+        assert_eq!(root_only["targets"], json!([]), "{root_only}");
+        // Too few entries for the root's five folders.
+        let few = tmpfs_build_targets_within(
+            &tmp,
+            Bound {
+                dirs: 10_000,
+                entries: 3,
+            },
+        );
+        assert_eq!(few["partial"], true, "{few}");
+        assert_eq!(few["targets"], json!([]), "{few}");
+        std::fs::remove_dir_all(&tmp).expect("clean up");
+
+        // The measuring: one target of 50 nested directories, a file in
+        // each.
+        let tmp = scratch("tmpfs-bound-deep");
+        chain(&tmp.join("target"), 50, 1);
+        let whole = tmpfs_build_targets_within(&tmp, wide);
+        assert_eq!(whole["partial"], false, "{whole}");
+        assert_eq!(whole["targets"][0]["partial"], false, "{whole}");
+        assert_eq!(whole["files"], 51, "{whole}");
+        // Ten directories in all: the root's read and nine of the target's.
+        let shallow = tmpfs_build_targets_within(
+            &tmp,
+            Bound {
+                dirs: 10,
+                entries: 10_000,
+            },
+        );
+        assert_eq!(shallow["partial"], true, "{shallow}");
+        assert_eq!(shallow["targets"][0]["partial"], true, "{shallow}");
+        assert!(
+            shallow["files"].as_u64().is_some_and(|files| files <= 9),
+            "{shallow}"
+        );
+        // Twenty entries in all: the root's one, nineteen of the target's.
+        let counted = tmpfs_build_targets_within(
+            &tmp,
+            Bound {
+                dirs: 10_000,
+                entries: 20,
+            },
+        );
+        assert_eq!(counted["partial"], true, "{counted}");
+        assert_eq!(counted["targets"][0]["partial"], true, "{counted}");
+        assert!(
+            counted["files"].as_u64().is_some_and(|files| files <= 19),
+            "{counted}"
+        );
+        std::fs::remove_dir_all(&tmp).expect("clean up");
+    }
+
+    /// A test run looks under a path that is not there and holds no host
+    /// path ([`TESTS_TMPFS`]), and a look at a watched host path (`/tmp`,
+    /// the host's tmpfs, or a directory above one) stops the test before
+    /// anything is read.
+    #[test]
+    fn a_test_run_never_looks_at_the_hosts_tmpfs() {
+        assert_eq!(tmpfs_root(), std::path::PathBuf::from(TESTS_TMPFS));
+        assert!(!tmpfs_root().exists());
+        for watched in watched_host_paths() {
+            assert!(!watched.starts_with(tmpfs_root()), "{}", watched.display());
+            for looked in [watched.clone(), std::path::PathBuf::from("/")] {
+                let refused = std::panic::catch_unwind(|| tmpfs_build_targets(&looked));
+                assert!(refused.is_err(), "{} was looked under", looked.display());
+            }
+        }
     }
 }
