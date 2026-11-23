@@ -2944,7 +2944,7 @@ mod tests {
         MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
         coverage_registry_checked, feature_associate_at, feature_paths, handle, is_json,
         is_loopback, keep_listening, listen_again_pause, local_exemption, log_window,
-        mission_feature_paths, mission_query, objective_json, objective_prompt,
+        coverage_projects, mission_feature_paths, mission_query, objective_json, objective_prompt,
         open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective,
         rsi_summary, same_origin, same_secret, serve_requests, server_hosts, tokenless_request,
         typed_text, with_activity, with_last_gates, with_objectives,
@@ -5635,6 +5635,11 @@ mod tests {
         assert_eq!(answer.body["error"], "SPAWN_DATABASE_URL is not set");
         assert_eq!(tokenless_status("/api/feature", named), 404);
         assert_eq!(tokenless_status("/api/features/", named), 404);
+        // The coverage page's project list is a read of its own too.
+        assert_eq!(
+            tokenless_status("/api/features/coverage/projects", named),
+            500
+        );
     }
 
     #[test]
@@ -5897,9 +5902,10 @@ mod tests {
             PathBuf::from("/srv/spawn/docs/feature-map/registry.json")
         );
         let (root, registry) = mission_feature_paths(&missions, 9).expect("acme");
+        // The registry is the path as configured; the root is where it is.
         assert_eq!(
             registry,
-            PathBuf::from("/srv/acme/docs/feature-map/registry.json")
+            PathBuf::from("/srv/acme/backlog/../docs/feature-map/registry.json")
         );
         assert_eq!(root, PathBuf::from("/srv/acme"));
 
@@ -5981,15 +5987,74 @@ mod tests {
     }
 
     /// A relative registry that walks out of the backlog's repository
-    /// (`../../../acme/meta/features.json` from Spawn's backlog) is
-    /// normalized, so it names Acme's file, not a path through Spawn.
+    /// (`../../../acme/meta/features.json` from Spawn's backlog) keeps its
+    /// configured path (opened and saved as the OS resolves it), and its
+    /// root is Acme's directory, not a path through Spawn.
     #[test]
     fn a_relative_registry_is_normalized_out_of_the_backlog() {
         let missions = json!([
             {"id": 9, "objectives": {"backlog": "/srv/spawn/rsi/backlog",
                                      "features": "../../../acme/meta/features.json"}},
         ]);
-        let (_, registry) = mission_feature_paths(&missions, 9).expect("acme");
-        assert_eq!(registry, PathBuf::from("/srv/acme/meta/features.json"));
+        let (root, registry) = mission_feature_paths(&missions, 9).expect("acme");
+        assert_eq!(
+            registry,
+            PathBuf::from("/srv/spawn/rsi/backlog/../../../acme/meta/features.json")
+        );
+        assert_eq!(root, PathBuf::from("/srv/acme/meta"));
+    }
+
+    /// The coverage page's projects are every open objective mission with a
+    /// coverage registry, however many missions there are: one past
+    /// `/api/features`' 50-mission cap is listed; a mission without a
+    /// registry, with a legacy map, or with a missing file is not.
+    #[test]
+    fn coverage_projects_list_every_eligible_mission_past_the_feature_map_cap() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-serve-coverage-projects-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("backlog")).expect("backlog");
+        let registry = r#"{"schema_version": 1, "initiative_id": "x", "features": [],
+            "boundary": {"project_name": "P", "description": "d",
+                         "included_categories": [], "exclusions": []}}"#;
+        std::fs::write(dir.join("backlog/registry.json"), registry).expect("registry");
+        std::fs::write(
+            dir.join("backlog/legacy.json"),
+            r#"{"features": [{"id": "a", "title": "A", "objectives": [1]}]}"#,
+        )
+        .expect("legacy");
+        let backlog = dir.join("backlog").display().to_string();
+        let missions: Vec<serde_json::Value> = (1..=60)
+            .map(|id| {
+                let features = match id {
+                    3 | 57 => json!("registry.json"),
+                    58 => json!("legacy.json"),
+                    59 => json!("missing.json"),
+                    _ => serde_json::Value::Null,
+                };
+                json!({"id": id, "text": format!("Mission {id}"),
+                       "objectives": {"backlog": backlog, "features": features}})
+            })
+            .collect();
+        let answer = coverage_projects(&serde_json::Value::Array(missions));
+        let projects = answer["projects"].as_array().expect("projects");
+        let ids: Vec<i64> = projects
+            .iter()
+            .filter_map(|project| project["mission"].as_i64())
+            .collect();
+        assert_eq!(ids, [3, 57]);
+        assert_eq!(projects[1]["text"], "Mission 57");
+        assert_eq!(
+            projects[1]["registry_path"],
+            dir.join("backlog/registry.json").display().to_string()
+        );
+        assert!(coverage_projects(&json!([]))["projects"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
