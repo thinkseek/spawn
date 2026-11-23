@@ -2904,10 +2904,10 @@ mod tests {
         MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
         coverage_registry_checked, feature_associate_at, feature_paths, handle, is_json,
         is_loopback, keep_listening, listen_again_pause, local_exemption, log_window,
-        mission_feature_paths, mission_query, objective_json, objective_prompt, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
-        same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_activity,
-        with_last_gates, with_objectives,
+        mission_feature_paths, mission_query, objective_json, objective_prompt,
+        open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective,
+        rsi_summary, same_origin, same_secret, serve_requests, server_hosts, tokenless_request,
+        typed_text, with_activity, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -5859,9 +5859,9 @@ mod tests {
         let (root, registry) = mission_feature_paths(&missions, 9).expect("acme");
         assert_eq!(
             registry,
-            PathBuf::from("/srv/acme/backlog/../docs/feature-map/registry.json")
+            PathBuf::from("/srv/acme/docs/feature-map/registry.json")
         );
-        assert_eq!(root, PathBuf::from("/srv/acme/backlog/.."));
+        assert_eq!(root, PathBuf::from("/srv/acme"));
 
         let (status, body) = mission_feature_paths(&missions, 11).expect_err("no registry");
         assert_eq!(status, 400);
@@ -5886,5 +5886,70 @@ mod tests {
         let (status, body) = feature_paths("mission=abc").expect_err("bad id");
         assert_eq!(status, 400);
         assert_eq!(body["code"], "bad_mission");
+    }
+
+    /// A bare `?mission` or an empty `?mission=` is a bad mission (400),
+    /// never the default project; a query without it is the default.
+    #[test]
+    fn a_bare_or_empty_mission_is_a_bad_mission() {
+        assert_eq!(mission_query(""), None);
+        assert_eq!(mission_query("limit=3&missions=4"), None);
+        assert_eq!(mission_query("mission"), Some(""));
+        assert_eq!(mission_query("token=x&mission="), Some(""));
+        assert_eq!(mission_query("mission=4&limit=3"), Some("4"));
+        for query in ["mission", "mission=", "token=x&mission"] {
+            let (status, body) = feature_paths(query).expect_err(query);
+            assert_eq!(status, 400, "{query}");
+            assert_eq!(body["code"], "bad_mission", "{query}");
+        }
+    }
+
+    /// A mission's `--features` file must be a coverage registry: a legacy
+    /// identity-only feature map or a missing file is a structured 400.
+    #[test]
+    fn a_legacy_feature_map_is_not_a_coverage_registry() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-serve-coverage-registry-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let legacy = dir.join("legacy.json");
+        std::fs::write(
+            &legacy,
+            r#"{"features": [{"id": "a", "title": "A", "objectives": [1]}]}"#,
+        )
+        .expect("legacy");
+        let registry = dir.join("registry.json");
+        std::fs::write(
+            &registry,
+            r#"{"schema_version": 1, "initiative_id": "x", "features": [],
+                "boundary": {"project_name": "Acme", "description": "d",
+                             "included_categories": [], "exclusions": []}}"#,
+        )
+        .expect("registry");
+        assert!(coverage_registry_checked(&registry, 9).is_ok());
+        for refused in [legacy, dir.join("missing.json")] {
+            let (status, body) = coverage_registry_checked(&refused, 9).expect_err("refused");
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], "not_a_coverage_registry");
+            assert_eq!(body["mission"], 9);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative registry that walks out of the backlog's repository
+    /// (`../../../acme/meta/features.json` from Spawn's backlog) is
+    /// normalized, so it names Acme's file, not a path through Spawn.
+    #[test]
+    fn a_relative_registry_is_normalized_out_of_the_backlog() {
+        let missions = json!([
+            {"id": 9, "objectives": {"backlog": "/srv/spawn/rsi/backlog",
+                                     "features": "../../../acme/meta/features.json"}},
+        ]);
+        let (_, registry) = mission_feature_paths(&missions, 9).expect("acme");
+        assert_eq!(registry, PathBuf::from("/srv/acme/meta/features.json"));
     }
 }
