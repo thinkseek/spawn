@@ -2158,7 +2158,7 @@ mod tests {
 
     use super::{
         Facts, Native, Source, Spec, build, derive, fallback_specs, parse_mapping, read_map,
-        read_mapping, shipped_by_deploy,
+        read_mapping, shipped_by_deploy, with_deployed,
     };
 
     fn spec(id: &str, objectives: &[u32]) -> Spec {
@@ -2400,6 +2400,32 @@ mod tests {
         assert!(shipped_by_deploy(
             &json!({"sources": ["/m/missions/flake-doctor.git", "/m/missions/spawn.git"]})
         ));
+    }
+
+    /// The store's deployed-missions fact decides when a row carries it
+    /// (any project's deploy source, not one path): Spawn RSI shipped,
+    /// Supply PA and Flake Doctor not, a sourceless mission never; a row
+    /// without it falls back to the source predicate with the same truth.
+    #[test]
+    fn the_stores_deployed_missions_decide_shipped() {
+        let mut missions = vec![
+            json!({"id": 4, "sources": ["/m/missions/spawn.git"]}),
+            json!({"id": 5, "sources": ["/m/missions/supply-pa.git"]}),
+            json!({"id": 6, "sources": ["/m/missions/flake-doctor.git"]}),
+            json!({"id": 7, "sources": []}),
+            json!({"id": 8, "sources": ["/srv/other/acme.git"]}),
+        ];
+        let fallback: Vec<bool> = missions.iter().map(shipped_by_deploy).collect();
+        assert_eq!(fallback, [true, false, false, false, false]);
+        // The store says Supply PA and Flake Doctor are undeployed; Acme's
+        // source is deployed by a deploy of its own.
+        with_deployed(&mut missions, &json!([5, 6]));
+        let shipped: Vec<bool> = missions.iter().map(shipped_by_deploy).collect();
+        assert_eq!(shipped, [true, false, false, false, true]);
+        // An undeployed answer overrides a source the fallback would ship.
+        with_deployed(&mut missions, &json!([4, 5, 6, 8]));
+        assert!(!shipped_by_deploy(&missions[0]));
+        assert!(!shipped_by_deploy(&missions[4]));
     }
 
     /// The landing's time is not a deploy's: a deploy at exactly the
