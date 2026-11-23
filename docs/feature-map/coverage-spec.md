@@ -119,3 +119,9 @@ Configured via optional `SPAWN_FEATURE_ROOT` (default: working directory) and `S
 
 - Accessible from the sidebar ("File coverage") and mobile nav ("Coverage").
 - Provides a one-click **"Scan unassociated files (野文件)"** button, disclosed boundary & exclusion policy viewer, six strictly separated metric tiles, per-wild-file multi-select feature linker (many-to-many), stale-reference table with rename candidates, and initiative/consistency overview displaying `t559u` slices and `t567u/t568u` (badged *"Staged research/design — not production"*).
+
+## 5. Landing Note: `t559u` (`0cb7eece3`), 2026-11-23
+
+The `t559u` feature-map work (Slices A/B/C: navigable mind map, 100% file-coverage registry and wild-file scanner, and `fm-cas/v1` recoverable storage) reached `main` at 04:04 +08 via ungated owner push (request `209140`, `source.moved` event `209141`, moving `6c5d2278` -> `0cb7eece`). Because an ungated push records no gate verdict in the store, `deploy/on-landing.sh` held live on `spawn-6c5d2278`.
+
+This doc-only addendum exists solely to record a gate-accepted landing on top of `0cb7eece` through `spawn mission push --gated` without rewriting `main`, touching protected paths, or adding a new file that would shift the `in_scope` count (`988`) in `crates/spawn-core/tests/feature_coverage.rs`.
