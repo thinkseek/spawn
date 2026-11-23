@@ -297,6 +297,27 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
        order by e.id
        limit $2) x";
 
+/// The deploys' `deploy.finished` records after the event `$1` and up to
+/// `$2`, recorded since `$3`, oldest first, at most `$4`: what a restarted
+/// loop replays for `deploy_failed`. [`HISTORY`] does not list them: the
+/// step reads them from the last deploy record its `deploy_failed` alerts
+/// name (`$1`), not from a time, so a failure that fired nothing while one
+/// was open is not a new occurrence at every restart. A deploy restarts the
+/// loop and only then records how it ended (deploy/deploy.sh), so its record
+/// is often at or below the new loop's watermark, where no check feeds it.
+pub(crate) const DEPLOYS: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object(
+      'event_id', x.id, 'at_ms', x.recorded_at_ms, 'record', x.record)
+    order by x.id), '[]'::jsonb)
+from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
+        from spawn_events e
+       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.id > $1 and e.id <= $2
+         and e.recorded_at_ms >= $3
+         and e.kind -> 'detail' -> 'record' ->> 'type' = 'deploy.finished'
+       order by e.id
+       limit $4) x";
+
 /// Every session's latest judgement, with its execution's end when the
 /// session's current execution has ended (an end clears a stuck alert,
 /// whatever its cause). The Observer keeps the latest judgement covering
@@ -536,6 +557,18 @@ impl PostgresStore {
     /// The alert-family records since `since_ms` ([`HISTORY`]).
     pub fn alert_history(&self, since_ms: i64, limit: i64) -> Result<Value, StoreError> {
         self.query_json(HISTORY, &[&since_ms, &limit])
+    }
+
+    /// The `deploy.finished` records after the event `after` and up to
+    /// `upto`, recorded since `since_ms` ([`DEPLOYS`]).
+    pub fn alert_deploys(
+        &self,
+        after: i64,
+        upto: i64,
+        since_ms: i64,
+        limit: i64,
+    ) -> Result<Value, StoreError> {
+        self.query_json(DEPLOYS, &[&after, &upto, &since_ms, &limit])
     }
 
     /// The transcript archive's events after the event id `after`, oldest

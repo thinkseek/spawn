@@ -64,6 +64,12 @@
         "reason": "Ephemeral RSI gate owner lease and runtime state (gitignored) are not authored project artifacts."
       },
       {
+        "id": "deployed-controller-marker",
+        "pattern": ".controller",
+        "category": "runtime-state",
+        "reason": "Root deploy marker (the 41-byte commit id written by deploy/controller.sh into a deployed controller tree) is runtime state, not an authored project artifact."
+      },
+      {
         "id": "secrets-env-dotfile",
         "pattern": "**/.env",
         "category": "secrets",

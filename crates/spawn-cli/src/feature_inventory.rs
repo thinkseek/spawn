@@ -7,7 +7,7 @@
 //! walking, git index querying, and atomic registry persistence.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,6 +106,84 @@ pub fn save_registry_atomic(path: &Path, registry: &FeatureRegistry) -> Result<(
         let _ = fs::remove_file(&tmp_path);
     }
     write_res
+}
+
+/// Whether the feature registry can be saved in place by
+/// [`save_registry_atomic`], probed against the real filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryWritability {
+    /// `true` when both the registry file (if present) and the directory that
+    /// holds it accept writes.
+    pub writable: bool,
+    /// Human-readable explanation when `writable` is `false`.
+    pub read_only_reason: Option<String>,
+}
+
+/// Probe whether `registry_path` can be atomically rewritten.
+///
+/// An atomic save creates a sibling temp file and renames it over the
+/// registry, so the parent directory must accept new files; the registry
+/// file itself must also be writable (a deployed controller tree is made
+/// read-only with `chmod a-w` on every file and directory). The probe opens
+/// the registry for writing without truncating it and creates then removes a
+/// uniquely named probe file beside it: it never changes the registry.
+pub fn probe_registry_writable(registry_path: &Path) -> RegistryWritability {
+    let read_only = |reason: String| RegistryWritability {
+        writable: false,
+        read_only_reason: Some(reason),
+    };
+    if registry_path.exists()
+        && let Err(error) = OpenOptions::new().write(true).open(registry_path)
+    {
+        return read_only(format!(
+            "the feature registry {} is read-only ({}); this looks like a deployed controller \
+             tree, so associations cannot be saved here: associate files in a writable \
+             checkout and deploy again",
+            registry_path.display(),
+            error.kind()
+        ));
+    }
+    // The nearest existing directory that will hold the registry (a save
+    // creates missing parents first).
+    let mut dir = match registry_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    while !dir.is_dir() {
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => dir = parent.to_path_buf(),
+            _ => {
+                dir = PathBuf::from(".");
+                break;
+            }
+        }
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let probe = dir.join(format!(
+        // `.tmp` keeps a concurrent scan from ever listing it as a wild file.
+        ".registry-write-probe.{}.{nanos}.tmp",
+        std::process::id()
+    ));
+    match OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            RegistryWritability {
+                writable: true,
+                read_only_reason: None,
+            }
+        }
+        Err(error) => read_only(format!(
+            "the directory {} holding the feature registry is read-only ({}), and an atomic \
+             save needs to create a temp file beside the registry; this looks like a deployed \
+             controller tree, so associations cannot be saved here: associate files in a \
+             writable checkout and deploy again",
+            dir.display(),
+            error.kind()
+        )),
+    }
 }
 
 /// Query git-tracked files inside `root`, if `root` is inside a git working
@@ -335,9 +413,12 @@ fn build_api_payload(
             })
         })
         .collect();
+    let writability = probe_registry_writable(registry_path);
     json!({
         "root": root.display().to_string(),
         "registry_path": registry_path.display().to_string(),
+        "registry_writable": writability.writable,
+        "read_only_reason": writability.read_only_reason,
         "report": report,
         "features": features,
     })
@@ -665,6 +746,84 @@ mod tests {
         assert!(err.contains("excluded"), "{err}");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coverage_payload_reports_a_writable_registry() {
+        let root = temp_fixture("payload-writable");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+        let registry_path = root.join("docs/feature-map/registry.json");
+        save_registry_atomic(&registry_path, &minimal_registry(vec!["src/lib.rs"])).expect("save");
+        let payload = api_coverage_payload(&root, &registry_path).expect("payload");
+        let leftovers: Vec<_> = fs::read_dir(root.join("docs/feature-map"))
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(payload["registry_writable"], json!(true));
+        assert_eq!(payload["read_only_reason"], Value::Null);
+        assert_eq!(
+            leftovers,
+            vec!["registry.json".to_string()],
+            "probe leaves nothing"
+        );
+    }
+
+    /// A deployed controller tree is `chmod a-w`: the payload says the
+    /// registry is read-only (with a reason) instead of failing later.
+    #[cfg(unix)]
+    #[test]
+    fn coverage_payload_reports_a_read_only_registry_and_its_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_fixture("payload-read-only");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+        let dir = root.join("docs/feature-map");
+        let registry_path = dir.join("registry.json");
+        save_registry_atomic(&registry_path, &minimal_registry(vec!["src/lib.rs"])).expect("save");
+
+        // Only the directory read-only: the temp-file rename is what fails.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("chmod dir");
+        let dir_only = probe_registry_writable(&registry_path);
+        // Registry file read-only as well, as deploy/controller.sh leaves it.
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o444)).expect("chmod file");
+        let payload = api_coverage_payload(&root, &registry_path);
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o644)).expect("restore");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore dir");
+        // Directory writable again but the file not: still read-only.
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o444)).expect("chmod file");
+        let file_only = probe_registry_writable(&registry_path);
+        fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o644)).expect("restore");
+        let _ = fs::remove_dir_all(&root);
+
+        if dir_only.writable {
+            // Running as root ignores permission bits: nothing to observe.
+            eprintln!("skipping: permission bits are not enforced for this user");
+            return;
+        }
+        let dir_reason = dir_only.read_only_reason.expect("dir reason");
+        assert!(
+            dir_reason.contains("temp file beside the registry"),
+            "{dir_reason}"
+        );
+        assert!(dir_reason.contains("deployed controller"), "{dir_reason}");
+        assert!(
+            !dir_reason.contains("os error"),
+            "no raw OS error: {dir_reason}"
+        );
+
+        let payload = payload.expect("a read-only registry still scans");
+        assert_eq!(payload["registry_writable"], json!(false));
+        let reason = payload["read_only_reason"].as_str().expect("reason string");
+        assert!(reason.contains("read-only"), "{reason}");
+        assert!(payload["report"]["counts"]["covered"].as_u64() == Some(1));
+
+        assert!(!file_only.writable);
+        let file_reason = file_only.read_only_reason.expect("file reason");
+        assert!(file_reason.contains("registry.json"), "{file_reason}");
     }
 
     #[cfg(unix)]

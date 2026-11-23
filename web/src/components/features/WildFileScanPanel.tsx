@@ -6,6 +6,7 @@ import {
   FileWarning,
   GitBranch,
   Link2,
+  Lock,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
@@ -21,6 +22,7 @@ import {
   isResearchInitiative,
   isScanClean,
   kindLabel,
+  registryReadOnlyNotice,
   toggleWildFileSelection,
   type CoverageFeatureSummary,
   type FeatureCoverageResponse,
@@ -54,6 +56,8 @@ export function WildFileScanPanel({
   const consistencyIssues = consistencyIssueCount(report.consistency);
   const trackedInitiatives = useMemo(() => initiativesAndSlices(features), [features]);
   const [showExclusionRules, setShowExclusionRules] = useState(false);
+  const readOnlyNotice = registryReadOnlyNotice(data);
+  const registryWritable = readOnlyNotice === null;
 
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-4 px-4 py-4 sm:px-5">
@@ -114,6 +118,25 @@ export function WildFileScanPanel({
           </span>
         </div>
 
+        {readOnlyNotice && (
+          <div
+            role="status"
+            data-testid="registry-read-only-banner"
+            className="mt-2.5 flex items-start gap-2 rounded-control border border-warning/30 bg-wait-tint px-3 py-2 text-caption text-warning"
+          >
+            <Lock size={14} className="mt-0.5 shrink-0" />
+            <div className="min-w-0">
+              <p className="font-medium">
+                Read-only deployment: associations are disabled on this server.
+              </p>
+              <p className="mt-0.5 text-micro">{readOnlyNotice}</p>
+              <p className="mt-0.5 text-micro">
+                Scanning still works. Link files in a writable checkout of the repository and
+                deploy again.
+              </p>
+            </div>
+          </div>
+        )}
         {actionError && (
           <div className="mt-2.5 flex items-start gap-2 rounded-control border border-destructive/30 bg-fail-tint px-3 py-2 text-caption text-destructive">
             <ShieldAlert size={14} className="mt-0.5 shrink-0" />
@@ -194,6 +217,7 @@ export function WildFileScanPanel({
                 key={finding.path}
                 finding={finding}
                 features={features}
+                registryWritable={registryWritable}
                 onAssociate={onAssociate}
               />
             ))}
@@ -492,10 +516,12 @@ function ConsistencyBadge({ label, count }: { label: string; count: number }) {
 function WildFileRow({
   finding,
   features,
+  registryWritable,
   onAssociate,
 }: {
   finding: WildFileFinding;
   features: CoverageFeatureSummary[];
+  registryWritable: boolean;
   onAssociate: (path: string, featureIds: string[]) => Promise<void>;
 }) {
   const [selected, setSelected] = useState<string[]>(() =>
@@ -505,6 +531,7 @@ function WildFileRow({
   const [saving, setSaving] = useState(false);
 
   const toggle = (fid: string) => {
+    if (!registryWritable) return;
     setSelected((prev) => toggleWildFileSelection(prev, fid));
   };
 
@@ -519,7 +546,7 @@ function WildFileRow({
     );
   }, [features, filter]);
 
-  const canSubmit = canSubmitWildFileAssociation(selected, saving);
+  const canSubmit = canSubmitWildFileAssociation(selected, saving, registryWritable);
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -567,9 +594,10 @@ function WildFileRow({
               <button
                 key={fid}
                 type="button"
+                disabled={!registryWritable}
                 onClick={() => toggle(fid)}
                 className={cx(
-                  "rounded-chip px-2 py-0.5 font-mono transition-colors",
+                  "rounded-chip px-2 py-0.5 font-mono transition-colors disabled:cursor-not-allowed disabled:opacity-50",
                   FOCUS_RING,
                   active
                     ? "bg-surface-selected font-medium text-foreground ring-1 ring-foreground/25"
@@ -590,26 +618,34 @@ function WildFileRow({
             type="search"
             value={filter}
             onChange={(event) => setFilter(event.target.value)}
-            placeholder="Filter features to associate (supports many-to-many)…"
+            disabled={!registryWritable}
+            placeholder={
+              registryWritable
+                ? "Filter features to associate (supports many-to-many)…"
+                : "Read-only deployment: associations are disabled"
+            }
             aria-label={`Filter features for ${finding.path}`}
             className={cx(
-              "h-7 min-w-[220px] flex-1 rounded-control border border-surface-border bg-surface px-2.5 text-caption text-foreground placeholder:text-faint-foreground",
+              "h-7 min-w-[220px] flex-1 rounded-control border border-surface-border bg-surface px-2.5 text-caption text-foreground placeholder:text-faint-foreground disabled:cursor-not-allowed disabled:opacity-60",
               FOCUS_RING,
             )}
           />
           <button
             type="button"
             disabled={!canSubmit}
+            title={registryWritable ? undefined : "The registry on this server is read-only"}
             onClick={() => void submit()}
             className={cx(
               "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-control bg-foreground px-2.5 text-caption font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-40",
               FOCUS_RING,
             )}
           >
-            <Link2 size={12} />
-            {saving
-              ? "Linking…"
-              : `Link to selected features (${selected.length})`}
+            {registryWritable ? <Link2 size={12} /> : <Lock size={12} />}
+            {!registryWritable
+              ? "Linking disabled (read-only registry)"
+              : saving
+                ? "Linking…"
+                : `Link to selected features (${selected.length})`}
           </button>
         </div>
 
@@ -620,10 +656,11 @@ function WildFileRow({
               <button
                 key={feature.id}
                 type="button"
+                disabled={!registryWritable}
                 onClick={() => toggle(feature.id)}
                 title={`${feature.title} — ${feature.summary}`}
                 className={cx(
-                  "inline-flex items-center gap-1 rounded-chip px-2 py-0.5 text-micro transition-colors",
+                  "inline-flex items-center gap-1 rounded-chip px-2 py-0.5 text-micro transition-colors disabled:cursor-not-allowed disabled:opacity-50",
                   FOCUS_RING,
                   checked
                     ? "bg-ok-tint font-medium text-success ring-1 ring-success/30"

@@ -1598,6 +1598,74 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
     );
 }
 
+/// A cancel notice stays among the dispatcher's facts however old: a failed
+/// one goes again under the next number (`cancel-notice-<task>-<n>`), and a
+/// notice older than the day the facts keep for other commands, read as
+/// never sent, made the retry reuse a key already used. A submit under an
+/// existing key makes no new command, so nothing was sent and the resident
+/// stayed blocked.
+#[test]
+fn a_dispatchers_cancel_notices_stay_among_its_facts_however_old() {
+    let (store, schema) = store("facts_cancel_notice");
+    let worker = AgentId::new("agent_resident_core").expect("valid agent");
+    let session = SessionId::new("session_resident_core").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    let submit = |key: &str| {
+        store
+            .submit(
+                &Principal::new("spawn-dispatch").expect("valid principal"),
+                &Submission {
+                    agent_id: worker.clone(),
+                    idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+                    action: CommandAction::Input {
+                        text: key.to_string(),
+                        tags: Vec::new(),
+                    },
+                    ..start(session.clone(), key)
+                },
+            )
+            .expect("submit succeeds")
+    };
+    let notice = submit("cancel-notice-4-0");
+    let claimed = store
+        .claim("w1", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("a command waits");
+    store
+        .finish(&claimed, &Outcome::Failed("pane not ready".to_string()))
+        .expect("finish succeeds");
+    submit("cancel-stop-4-exec_1");
+    admin(&schema)
+        .execute(
+            "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000",
+            &[],
+        )
+        .expect("age the commands");
+    let facts = store.dispatch_facts().expect("facts")[0].clone();
+    let kept: Vec<(&str, Option<bool>)> = facts["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .filter_map(|sent| Some((sent["key"].as_str()?, sent["succeeded"].as_bool())))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![("cancel-notice-4-0", Some(false))],
+        "the failed notice stays, two days old; an old stop does not"
+    );
+    assert_eq!(
+        submit("cancel-notice-4-0"),
+        notice,
+        "a key already used makes no new command"
+    );
+}
+
 /// A delivery refused before anything was typed (a pane not ready) is not
 /// the worker's last delivery, nor an episode: it told the worker nothing.
 /// One that may have typed is, and so is one not finished yet.

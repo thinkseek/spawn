@@ -66,6 +66,14 @@
 //! content, a merged PR or a person's request does not change what the
 //! records prove.
 //!
+//! The mapping may also be the project's curated feature registry
+//! (`docs/feature-map/registry.json`, `"schema_version": 1`): its nodes'
+//! `parent`, `kind`, `files` and `relations` draw the hierarchy, and each
+//! node's `provenance` lists become its sources. `"<mission>/<number>"`
+//! objectives of this mission are native `objective` sources (a parent and
+//! its child may share one); other objective names, non-numeric tasks and
+//! deploys, agents, commits, tests, artifacts and discussions are links.
+//!
 //! Without a mapping, each backlog objective is a capability of its own.
 //! A mapping that cannot be read falls back to the objectives and names the
 //! error: the page stays useful, and the gap is visible.
@@ -190,6 +198,49 @@ const FEATURE_KINDS: &[&str] = &[
     "research-initiative",
     "subsystem",
 ];
+
+/// The fields a capability of a plain `{"features": [...]}` mapping takes.
+const MAPPING_FEATURE_FIELDS: &[&str] = &[
+    "id",
+    "title",
+    "summary",
+    "sources",
+    "parent",
+    "kind",
+    "tags",
+    "files",
+    "relations",
+];
+
+/// The fields a node of a `schema_version: 1` feature registry takes.
+const REGISTRY_FEATURE_FIELDS: &[&str] = &[
+    "id",
+    "title",
+    "summary",
+    "kind",
+    "parent",
+    "tags",
+    "files",
+    "relations",
+    "provenance",
+    "status_note",
+];
+
+/// A registry node's `provenance` lists, in the order their sources are
+/// listed, and the source kind each non-native entry becomes.
+const PROVENANCE_FIELDS: &[(&str, &str)] = &[
+    ("objectives", "external-objective"),
+    ("tasks", "external-task"),
+    ("agents", "agent"),
+    ("commits", "commit"),
+    ("tests", "test"),
+    ("deploys", "external-deploy"),
+    ("artifacts", "artifact"),
+    ("discussions", "discussion"),
+];
+
+/// The most entries one `provenance` list holds.
+const MAX_PROVENANCE_ENTRIES: usize = 500;
 
 /// Allowed values for a relation's `kind` field.
 const RELATION_KINDS: &[&str] = &[
@@ -495,13 +546,17 @@ fn read_mapping(path: &Path, mission_id: i64) -> Result<Vec<Spec>, String> {
 /// Unknown fields are refused (a typo must not silently drop a source), as
 /// are two capabilities with one id and one objective claimed by two
 /// capabilities (its records would count twice).
+///
+/// A root with `"schema_version": 1` is the project's curated
+/// `FeatureRegistry` (`docs/feature-map/registry.json`): its nodes carry
+/// `provenance` instead of `sources` (see `provenance_of`), and one
+/// objective may sit on a parent and its children, since the hierarchy
+/// shows the same work at two depths rather than claiming it twice.
 fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
     let root = value
         .as_object()
         .ok_or("a feature map is a JSON object with a `features` array")?;
-    if let Some(key) = root.keys().find(|key| key.as_str() != "features") {
-        return Err(format!("a feature map has only `features`, not `{key}`"));
-    }
+    let registry = registry_format(root)?;
     let features = root
         .get("features")
         .and_then(Value::as_array)
@@ -520,19 +575,12 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
         let object = feature
             .as_object()
             .ok_or_else(|| format!("{at} is an object, not {feature}"))?;
-        if let Some(key) = object.keys().find(|key| {
-            !matches!(
-                key.as_str(),
-                "id" | "title"
-                    | "summary"
-                    | "sources"
-                    | "parent"
-                    | "kind"
-                    | "tags"
-                    | "files"
-                    | "relations"
-            )
-        }) {
+        let allowed: &[&str] = if registry {
+            REGISTRY_FEATURE_FIELDS
+        } else {
+            MAPPING_FEATURE_FIELDS
+        };
+        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
             return Err(format!("{at} has an unknown field `{key}`"));
         }
         let id = required_text(object, "id", &at)?;
@@ -568,7 +616,14 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
         let tags = tags_of(object, &at)?;
         let files = files_of(object, &at)?;
         let relations = relations_of(object, &at)?;
-        let sources = sources_of(object, &at, mission_id, &id, &mut claims)?;
+        if registry {
+            optional_text(object, "status_note", &at)?;
+        }
+        let sources = if registry {
+            provenance_of(object, &at, mission_id)?
+        } else {
+            sources_of(object, &at, mission_id, &id, &mut claims)?
+        };
         let objectives: Vec<u32> = sources
             .iter()
             .filter_map(|source| match &source.native {
@@ -591,6 +646,36 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
     }
     validate_graph(&specs, &ids)?;
     Ok(specs)
+}
+
+/// Whether `root` is a `schema_version: 1` feature registry (else a plain
+/// `{"features": [...]}` map), with only the top-level keys its format takes.
+fn registry_format(root: &Map<String, Value>) -> Result<bool, String> {
+    let registry = match root.get("schema_version") {
+        None => false,
+        Some(version) if version.as_u64() == Some(1) => true,
+        Some(other) => {
+            return Err(format!(
+                "a feature registry's `schema_version` is 1, not {other}"
+            ));
+        }
+    };
+    if registry {
+        if let Some(key) = root.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "schema_version" | "initiative_id" | "boundary" | "features"
+            )
+        }) {
+            return Err(format!(
+                "a feature registry has only `schema_version`, `initiative_id`, \
+                 `boundary` and `features`, not `{key}`"
+            ));
+        }
+    } else if let Some(key) = root.keys().find(|key| key.as_str() != "features") {
+        return Err(format!("a feature map has only `features`, not `{key}`"));
+    }
+    Ok(registry)
 }
 
 fn validate_feature_id(id: &str, place: &str) -> Result<(), String> {
@@ -688,7 +773,9 @@ fn normalize_repo_path(raw: &str, place: &str) -> Result<String, String> {
         ));
     }
     if raw.contains('\\') {
-        return Err(format!("{place} must use POSIX `/` separators, not `{raw}`"));
+        return Err(format!(
+            "{place} must use POSIX `/` separators, not `{raw}`"
+        ));
     }
     let mut parts: Vec<&str> = Vec::new();
     for segment in raw.split('/') {
@@ -916,6 +1003,119 @@ fn sources_of(
         sources.push(source);
     }
     Ok(sources)
+}
+
+/// A registry node's `provenance`, as sources. Every list is strings:
+///
+/// - `objectives`: `"<mission>/<number>"` naming this map's mission (or any
+///   mission while it is not known yet, 0) is a native `objective` source,
+///   the one that decides the state; anything else (another mission, an
+///   initiative id such as `t559u`) is an `external-objective` link;
+/// - `tasks`: a whole number is a native `task`, any other name an
+///   `external-task` link;
+/// - `deploys`: a whole number is a native `deploy` event, any other name an
+///   `external-deploy` link;
+/// - `agents`, `commits`, `tests`, `artifacts` and `discussions` are
+///   external `agent`, `commit`, `test`, `artifact` and `discussion` links.
+///
+/// One reference twice in a node is one source; unknown lists are refused.
+fn provenance_of(
+    object: &Map<String, Value>,
+    at: &str,
+    mission_id: i64,
+) -> Result<Vec<Source>, String> {
+    let Some(value) = object.get("provenance") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let place = format!("{at}.provenance");
+    let provenance = value
+        .as_object()
+        .ok_or_else(|| format!("{place} is an object"))?;
+    if let Some(key) = provenance
+        .keys()
+        .find(|key| !PROVENANCE_FIELDS.iter().any(|(name, _)| name == key))
+    {
+        return Err(format!("{place} has an unknown field `{key}`"));
+    }
+    let mut sources: Vec<Source> = Vec::new();
+    for (field, external) in PROVENANCE_FIELDS {
+        let Some(list) = provenance.get(*field) else {
+            continue;
+        };
+        if list.is_null() {
+            continue;
+        }
+        let list = list
+            .as_array()
+            .ok_or_else(|| format!("{place}.{field} is an array of strings"))?;
+        if list.len() > MAX_PROVENANCE_ENTRIES {
+            return Err(format!(
+                "{place}.{field} has at most {MAX_PROVENANCE_ENTRIES} entries"
+            ));
+        }
+        for (index, entry) in list.iter().enumerate() {
+            let at = format!("{place}.{field}[{index}]");
+            let raw = entry
+                .as_str()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .ok_or_else(|| format!("{at} is a non-empty string, not {entry}"))?;
+            if raw.chars().count() > 300 || raw.chars().any(char::is_control) {
+                return Err(format!(
+                    "{at} is at most 300 characters, without control characters"
+                ));
+            }
+            let source = provenance_source(field, external, raw, mission_id);
+            if !sources
+                .iter()
+                .any(|seen| seen.reference == source.reference)
+            {
+                sources.push(source);
+            }
+        }
+    }
+    Ok(sources)
+}
+
+/// One `provenance` entry as a source: native when it names a record this
+/// map's mission holds, an external link otherwise.
+fn provenance_source(field: &str, external: &str, raw: &str, mission_id: i64) -> Source {
+    let whole = |text: &str| -> Option<i64> {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<i64>().ok().filter(|number| *number >= 1)
+    };
+    let native = match field {
+        "objectives" => raw.split_once('/').and_then(|(mission, objective)| {
+            let mission = whole(mission)?;
+            let objective = u32::try_from(whole(objective)?).ok()?;
+            (mission_id <= 0 || mission == mission_id)
+                .then_some(Native::Objective { mission, objective })
+        }),
+        "tasks" => whole(raw).map(Native::Task),
+        "deploys" => whole(raw).map(Native::Deploy),
+        _ => None,
+    };
+    let (kind, reference) = match &native {
+        Some(Native::Objective { mission, objective }) => (
+            "objective".to_string(),
+            format!("objective:{mission}/{objective:03}"),
+        ),
+        Some(Native::Task(task)) => ("task".to_string(), format!("task:{task}")),
+        Some(Native::Deploy(event)) => ("deploy".to_string(), format!("deploy:{event}")),
+        _ => (external.to_string(), format!("{external}:{raw}")),
+    };
+    Source {
+        kind,
+        reference,
+        url: None,
+        title: None,
+        native,
+    }
 }
 
 /// One source: `kind` and the fields its kind takes. Native kinds name the
@@ -2973,7 +3173,11 @@ mod tests {
         assert_eq!(specs[0].kind, "domain");
         assert_eq!(specs[0].tags, vec!["web", "ui"]);
         assert_eq!(specs[0].files, vec!["web/src/shared.ts", "web/src/App.tsx"]);
-        assert_eq!(specs[0].relations.len(), 1, "duplicate (kind, target) merged");
+        assert_eq!(
+            specs[0].relations.len(),
+            1,
+            "duplicate (kind, target) merged"
+        );
         assert_eq!(specs[0].relations[0].label.as_deref(), Some("owns view"));
         assert_eq!(specs[1].parent.as_deref(), Some("ui-domain"));
         assert_eq!(specs[3].kind, "slice");
@@ -3157,5 +3361,226 @@ mod tests {
         assert_eq!(row["tags"], json!([]));
         assert_eq!(row["files"], json!([]));
         assert_eq!(row["relations"], json!([]));
+    }
+
+    /// A `schema_version: 1` registry: nodes carry `provenance`, a parent and
+    /// its child may share an objective, and every provenance list becomes a
+    /// source (native when it names this mission's record, a link otherwise).
+    #[test]
+    #[allow(clippy::too_many_lines)] // one registry, then each refusal
+    fn a_registry_maps_provenance_into_sources_and_shares_objectives() {
+        let registry = json!({
+            "schema_version": 1,
+            "initiative_id": "t559u",
+            "boundary": {"project_name": "Spawn", "exclusions": []},
+            "features": [
+                {"id": "domain-a", "title": "Domain A", "kind": "domain", "parent": null,
+                 "summary": "a domain", "files": [],
+                 "relations": [{"kind": "contains", "target": "cap-a"}],
+                 "provenance": {"objectives": ["4/001", "4/002"], "tasks": [],
+                                "agents": [], "commits": [], "tests": [], "deploys": [],
+                                "artifacts": ["docs/a.md"], "discussions": []}},
+                {"id": "cap-a", "title": "Cap A", "kind": "capability", "parent": "domain-a",
+                 "summary": "a capability", "status_note": "half done",
+                 "files": ["crates/a/src/lib.rs"],
+                 "relations": [{"kind": "depends_on", "target": "domain-a"}],
+                 "provenance": {
+                    "objectives": ["4/001", "4/1", "t559u", "5/003"],
+                    "tasks": ["488", "slice-a"],
+                    "agents": ["lead-mac"],
+                    "commits": ["6544fe424"],
+                    "tests": ["crates/a/tests/a.rs"],
+                    "deploys": ["2026-11-22-pr82", "77"],
+                    "artifacts": ["docs/a.md"],
+                    "discussions": ["owner-t559u"]}}
+            ]
+        });
+        let specs = parse_mapping(&registry, 4).expect("a registry");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].kind, "domain");
+        assert_eq!(specs[0].objectives, vec![1, 2]);
+        assert_eq!(specs[1].parent.as_deref(), Some("domain-a"));
+        assert_eq!(specs[1].files, vec!["crates/a/src/lib.rs".to_string()]);
+        // `4/001` and `4/1` are one objective, shared with the parent.
+        assert_eq!(specs[1].objectives, vec![1]);
+        let refs: Vec<(&str, &str, bool)> = specs[1]
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.kind.as_str(),
+                    source.reference.as_str(),
+                    source.native.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                ("objective", "objective:4/001", true),
+                ("external-objective", "external-objective:t559u", false),
+                ("external-objective", "external-objective:5/003", false),
+                ("task", "task:488", true),
+                ("external-task", "external-task:slice-a", false),
+                ("agent", "agent:lead-mac", false),
+                ("commit", "commit:6544fe424", false),
+                ("test", "test:crates/a/tests/a.rs", false),
+                ("external-deploy", "external-deploy:2026-11-22-pr82", false),
+                ("deploy", "deploy:77", true),
+                ("artifact", "artifact:docs/a.md", false),
+                ("discussion", "discussion:owner-t559u", false),
+            ]
+        );
+        // The Inspector receives every provenance link.
+        let facts = facts_of(&[], &[], &[], &[]);
+        let row = derive(&specs[1], &mission(), &facts);
+        let shown: Vec<&str> = row["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["ref"].as_str().unwrap())
+            .collect();
+        for wanted in [
+            "objective:4/001",
+            "external-objective:t559u",
+            "commit:6544fe424",
+            "test:crates/a/tests/a.rs",
+            "external-deploy:2026-11-22-pr82",
+            "artifact:docs/a.md",
+            "discussion:owner-t559u",
+        ] {
+            assert!(shown.contains(&wanted), "{wanted} in {shown:?}");
+        }
+        // While the mission is unknown (0) any mission's objective is native.
+        let unknown = parse_mapping(&registry, 0).expect("mission add's unknown mission");
+        assert!(unknown[1].objectives.contains(&3));
+
+        // The legacy format still refuses one objective in two capabilities.
+        let shared_legacy = json!({"features": [
+            {"id": "a", "title": "A", "sources": [{"kind": "objective", "objective": 1}]},
+            {"id": "b", "title": "B", "parent": "a",
+             "sources": [{"kind": "objective", "objective": 1}]}
+        ]});
+        assert!(parse_mapping(&shared_legacy, 4).is_err());
+
+        let node = |extra: serde_json::Value| {
+            let mut node = json!({"id": "a", "title": "A"});
+            for (key, value) in extra.as_object().unwrap() {
+                node[key] = value.clone();
+            }
+            node
+        };
+        for bad in [
+            // Registry fields without `schema_version` are a legacy typo.
+            json!({"features": [node(json!({"provenance": {}}))]}),
+            json!({"features": [node(json!({"status_note": "x"}))]}),
+            json!({"initiative_id": "t559u", "features": []}),
+            // Only version 1 is known.
+            json!({"schema_version": 2, "features": []}),
+            json!({"schema_version": "1", "features": []}),
+            json!({"schema_version": 1, "features": [], "extra": true}),
+            json!({"schema_version": 1, "features": [node(json!({"status": "live"}))]}),
+            json!({"schema_version": 1, "features": [node(json!({"sources": []}))]}),
+            json!({"schema_version": 1, "features": [
+                node(json!({"provenance": {"objective": ["4/001"]}}))]}),
+            json!({"schema_version": 1, "features": [
+                node(json!({"provenance": {"objectives": "4/001"}}))]}),
+            json!({"schema_version": 1, "features": [
+                node(json!({"provenance": {"commits": [1]}}))]}),
+            json!({"schema_version": 1, "features": [
+                node(json!({"provenance": {"tests": [" "]}}))]}),
+            json!({"schema_version": 1, "features": [node(json!({"status_note": 3}))]}),
+        ] {
+            assert!(parse_mapping(&bad, 4).is_err(), "refused: {bad}");
+        }
+    }
+
+    /// The repository's own curated registry reads directly as mission 4's
+    /// map: every node, with its hierarchy, files, relations and native
+    /// objectives, instead of the flat objective fallback.
+    #[test]
+    fn the_repository_registry_reads_as_a_feature_map() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/feature-map/registry.json");
+        let specs = read_mapping(&path, 4).expect("docs/feature-map/registry.json reads");
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the registry"))
+                .expect("JSON");
+        let nodes = raw["features"].as_array().expect("features");
+        assert_eq!(specs.len(), nodes.len());
+        assert!(specs.len() >= 40, "the curated hierarchy, not a stub");
+        let mut shared = std::collections::BTreeMap::<u32, usize>::new();
+        for (spec, node) in specs.iter().zip(nodes) {
+            assert_eq!(spec.id, node["id"].as_str().unwrap());
+            assert_eq!(spec.kind, node["kind"].as_str().unwrap(), "{}", spec.id);
+            assert_eq!(
+                spec.parent.as_deref(),
+                node["parent"].as_str(),
+                "{}",
+                spec.id
+            );
+            let files: Vec<&str> = node["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file.as_str().unwrap())
+                .collect();
+            assert_eq!(spec.files, files, "{}", spec.id);
+            let relations: Vec<(&str, &str)> = node["relations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|relation| {
+                    (
+                        relation["kind"].as_str().unwrap(),
+                        relation["target"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            let parsed: Vec<(&str, &str)> = spec
+                .relations
+                .iter()
+                .map(|relation| (relation.kind.as_str(), relation.target.as_str()))
+                .collect();
+            assert_eq!(parsed, relations, "{}", spec.id);
+            let mut native: Vec<u32> = node["provenance"]["objectives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.as_str()?.strip_prefix("4/")?.parse().ok())
+                .collect();
+            let mut seen = std::collections::BTreeSet::new();
+            native.retain(|objective| seen.insert(*objective));
+            assert_eq!(spec.objectives, native, "{}", spec.id);
+            for objective in &spec.objectives {
+                *shared.entry(*objective).or_default() += 1;
+            }
+            // Every provenance entry is a source; nothing is dropped.
+            let entries: usize = node["provenance"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|list| list.as_array().map_or(0, Vec::len))
+                .sum();
+            assert!(spec.sources.len() <= entries, "{}", spec.id);
+            assert_eq!(spec.sources.is_empty(), entries == 0, "{}", spec.id);
+        }
+        assert!(
+            shared.values().any(|count| *count > 1),
+            "parent and child nodes share objectives"
+        );
+        assert!(
+            specs
+                .iter()
+                .flat_map(|spec| &spec.sources)
+                .any(|source| source.reference == "external-objective:t559u"),
+            "the initiative id is an external link, not a parse failure"
+        );
+        let summary = super::graph_summary(&specs);
+        assert!(
+            summary["hierarchy_roots"]
+                .as_array()
+                .is_some_and(|roots| !roots.is_empty())
+        );
     }
 }

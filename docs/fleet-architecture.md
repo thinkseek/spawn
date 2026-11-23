@@ -909,7 +909,10 @@ turns into a cancel, or a mission closed or a resident retired under it
   none of it, so nothing rides into another objective's landing.
 - *Told.* The resident is then resumed with a notice that names the task,
   says it is cancelled, and says where its work is (the commit that holds
-  it). Its next task waits until the notice reached it.
+  it). Its next task waits until the notice reached it. A notice that
+  failed goes again, after a wait that doubles, under the next number
+  after every `cancel-notice-<task>-<n>` already sent, however long ago
+  (a reused key would be taken as already sent, and nothing would go).
 - *Never collected.* A cancelled task's report is not collected, recorded
   or judged; a report file it leaves is not the next task's (the delivery
   mark rule).
@@ -1326,7 +1329,18 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   of a store the step meets for the first time) finds the alert the earlier
   one fired and clears it, naming itself. The judge's exception stands: an
   `up` whose `down` is older than the history clears its open alert (the
-  `up` is the later record).
+  `up` is the later record). The deploys' records are read apart from that
+  history: a deploy restarts the loop and only then records its
+  `deploy.finished` (deploy/deploy.sh), so the record is often at or below
+  the new step's watermark, where no check feeds it. A restarted step
+  therefore replays, one at a time, the `deploy.finished` records after the
+  last one its `deploy_failed` alerts name (the newest failure one fired on
+  or success one was cleared by; the owner's judgement, for one it cleared)
+  up to its watermark, whatever their age: the first success after an open
+  alert's failure clears it, a success older than the failure is not read,
+  a failure recorded while the loop was down fires once, and one that fired
+  nothing while an alert was open is no new occurrence at a restart. A
+  store with no `deploy_failed` alert yet reads the last 7 days.
 - **When.** A record-borne alert is recorded within one pass of its record; a
   host reading or a log line within `SPAWN_ALERT_CHECK_SECS` (default 30)
   and one pass; a bound within one pass of falling due, never before,
@@ -3230,7 +3244,9 @@ are per-agent uids or a mount per engine.
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a
-  bug. One that returns an error records nothing: the error is shown to
+  bug. So is a base or a candidate that is empty or whitespace (evidence
+  `parameter_error`), before any git work or gate run, and never turned
+  `stale` by a main that moved. One that returns an error records nothing: the error is shown to
   the operator and a later pass judges again (a git that cannot run a
   merge is the host's problem, not the work's: objective 008).
   TERM kills the gate with the process (no record), and the next
