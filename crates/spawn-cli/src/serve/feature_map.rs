@@ -525,10 +525,16 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
         }
     };
     let mission_id = mission["id"].as_i64().unwrap_or_default();
-    match read_mapping(&path, mission_id) {
-        Ok(specs) => (
+    let read = read_mapping_value(&path)
+        .and_then(|value| Ok((parse_mapping(&value, mission_id)?, value)));
+    match read {
+        // `registry`: whether the file is a coverage registry the coverage
+        // page (`/api/features/coverage?mission=`) can scan, not a legacy
+        // identity-only map.
+        Ok((specs, value)) => (
             specs,
-            json!({"kind": "file", "path": path.display().to_string(), "error": null}),
+            json!({"kind": "file", "path": path.display().to_string(), "error": null,
+                   "registry": crate::feature_inventory::is_coverage_registry(&value)}),
         ),
         Err(error) => (
             fallback,
@@ -563,6 +569,11 @@ pub(crate) fn validate_file(path: &Path, mission_id: i64) -> Result<(), String> 
 /// belongs to: an objective source may leave its mission out, and may not
 /// name another.
 fn read_mapping(path: &Path, mission_id: i64) -> Result<Vec<Spec>, String> {
+    parse_mapping(&read_mapping_value(path)?, mission_id)
+}
+
+/// The JSON of the mapping file at `path`, at most [`MAX_MAPPING_BYTES`].
+fn read_mapping_value(path: &Path) -> Result<Value, String> {
     let meta =
         std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     if !meta.is_file() {
@@ -577,9 +588,7 @@ fn read_mapping(path: &Path, mission_id: i64) -> Result<Vec<Spec>, String> {
     }
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("parse {}: {error}", path.display()))?;
-    parse_mapping(&value, mission_id)
+    serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
 /// Check a feature map file for `mission_id`, a mission's own: the
