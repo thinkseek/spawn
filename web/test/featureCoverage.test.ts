@@ -29,6 +29,7 @@ import {
   registryReadOnlyNotice,
   toggleWildFileSelection,
 } from "../src/featureCoverage.ts";
+import { normalizeFeatureMap } from "../src/features.ts";
 
 function basePayload(overrides: Record<string, unknown> = {}) {
   return {
@@ -858,6 +859,16 @@ test("any project: coverage routes carry ?mission=<id>, the default project stay
   assert.equal(projects[1].label, "Mission #9");
   assert.equal(projects[2].label, `Mission #10 — ${"x".repeat(47)}…`);
   assert.deepEqual(coverageProjects([]), []);
+  // `/api/features` says which file is a coverage registry; an older server
+  // that does not say offers none.
+  const map = normalizeFeatureMap({
+    missions: [
+      { id: 4, text: "Spawn", mapping: { kind: "file", path: "/r.json", error: null, registry: true } },
+      { id: 6, text: "Old", mapping: { kind: "file", path: "/m.json", error: null } },
+    ],
+  });
+  assert.deepEqual(map.missions.map((mission) => mission.mapping.registry), [true, false]);
+  assert.deepEqual(coverageProjects(map.missions).map((project) => project.mission), [4]);
 
   // The page and its client pass the selected mission to all three routes.
   const here = path.dirname(fileURLToPath(import.meta.url));
