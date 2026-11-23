@@ -41,9 +41,10 @@ pub fn default_registry_path(root: &Path) -> PathBuf {
 
 /// `path` with its `.` and `..` segments resolved lexically (a `..` drops
 /// the segment before it; one past the root stays at the root; a relative
-/// path keeps its leading `..`), so a path's ancestors are the directories
-/// it really sits in. An empty result is `.`.
-pub fn normalize_lexically(path: &Path) -> PathBuf {
+/// path keeps its leading `..`). An empty result is `.`. Only for a path
+/// nothing of which exists ([`real_registry_path`]): on disk a `..` after a
+/// symlink leaves the link's target, not the link's directory.
+fn normalize_lexically(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for component in path.components() {
         match component {
@@ -65,22 +66,35 @@ pub fn normalize_lexically(path: &Path) -> PathBuf {
     }
 }
 
-/// Whether `value` is a coverage [`FeatureRegistry`] [`load_registry`]
-/// would take (`schema_version` 1 with the registry's fields), not a
-/// legacy identity-only feature map.
-pub fn is_coverage_registry(value: &Value) -> bool {
-    use serde::Deserialize;
-    FeatureRegistry::deserialize(value)
-        .is_ok_and(|registry| registry.schema_version == SCHEMA_VERSION)
+/// Where `registry` really is: the filesystem's canonical path when it
+/// exists, else its canonical parent joined with its file name, else (when
+/// neither exists) its lexical normalization. Only for finding the project
+/// root: the registry itself is always opened and saved at the path as
+/// configured.
+fn real_registry_path(registry: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(registry) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (registry.parent(), registry.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(real) = fs::canonicalize(parent) {
+            return real.join(name);
+        }
+    }
+    normalize_lexically(registry)
 }
 
 /// The project root a mission's `--features` registry file belongs to,
-/// once the path is normalized ([`normalize_lexically`]): the directory
+/// from where the file really is ([`real_registry_path`]): the directory
 /// holding `docs/feature-map/registry.json` when the file sits at that
 /// conventional place, else the nearest ancestor that is a repository root
 /// (holds `.git`), else the registry's own directory.
 pub fn project_root_for_registry(registry: &Path) -> PathBuf {
-    let registry = normalize_lexically(registry);
+    let registry = real_registry_path(registry);
     let registry = registry.as_path();
     let conventional: PathBuf = DEFAULT_REGISTRY_REL.split('/').collect();
     if registry.ends_with(&conventional) {
@@ -1150,20 +1164,5 @@ mod tests {
         assert_eq!(normalize_lexically(Path::new("a/..")), PathBuf::from("."));
 
         let _ = fs::remove_dir_all(&base);
-    }
-
-    /// Only a schema-1 coverage registry is one; a legacy feature map (the
-    /// identity-only `{"features": [...]}`) is not.
-    #[test]
-    fn is_coverage_registry_refuses_legacy_feature_maps() {
-        let registry =
-            serde_json::to_value(minimal_registry(vec!["src/lib.rs"])).expect("registry json");
-        assert!(is_coverage_registry(&registry));
-        assert!(!is_coverage_registry(
-            &json!({"features": [{"id": "a", "title": "A", "objectives": [1]}]})
-        ));
-        let mut other = registry;
-        other["schema_version"] = json!(2);
-        assert!(!is_coverage_registry(&other));
     }
 }
