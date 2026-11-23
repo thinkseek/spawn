@@ -2904,7 +2904,7 @@ mod tests {
         MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
         coverage_registry_checked, feature_associate_at, feature_paths, handle, is_json,
         is_loopback, keep_listening, listen_again_pause, local_exemption, log_window,
-        mission_feature_paths, objective_json, objective_prompt, open_network_request,
+        mission_feature_paths, mission_query, objective_json, objective_prompt, open_network_request,
         open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
         same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_activity,
         with_last_gates, with_objectives,
