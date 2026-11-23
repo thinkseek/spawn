@@ -10,6 +10,9 @@ import {
   consistencyIssueCount,
   coverageProjects,
   coverageUrl,
+  INITIAL_COVERAGE_SCOPE,
+  isCurrentCoverageScope,
+  nextCoverageScope,
   featureAssociatedFiles,
   fileAssociatedFeatures,
   formatBytes,
@@ -835,11 +838,16 @@ test("any project: coverage routes carry ?mission=<id>, the default project stay
   assert.equal(coverageUrl("/api/features/scan", 9), "/api/features/scan?mission=9");
   assert.equal(coverageUrl("/api/features/associate", 4), "/api/features/associate?mission=4");
 
+  const file = (path: string, registry = true) => ({ kind: "file", path, registry });
   const projects = coverageProjects([
-    { id: 4, text: "Spawn RSI\nmore", mapping: { path: "/srv/spawn/docs/feature-map/registry.json" } },
-    { id: 5, text: "Supply PA", mapping: { path: null } },
-    { id: 9, text: "", mapping: { path: "/srv/acme/docs/feature-map/registry.json" } },
-    { id: 10, text: "x".repeat(60), mapping: { path: "/srv/long/map.json" } },
+    { id: 4, text: "Spawn RSI\nmore", mapping: file("/srv/spawn/docs/feature-map/registry.json") },
+    { id: 5, text: "Supply PA", mapping: { kind: "objectives", path: null, registry: false } },
+    { id: 9, text: "", mapping: file("/srv/acme/docs/feature-map/registry.json") },
+    { id: 10, text: "x".repeat(60), mapping: file("/srv/long/map.json") },
+    // A legacy identity-only map the coverage parser refuses is not offered.
+    { id: 11, text: "Flake Doctor", mapping: file("/srv/flake/map.json", false) },
+    // A configured path that failed to read falls back to objectives.
+    { id: 12, text: "Broken", mapping: { kind: "objectives", path: "/srv/gone.json", registry: false } },
   ]);
   assert.deepEqual(
     projects.map((project) => project.mission),
@@ -861,8 +869,44 @@ test("any project: coverage routes carry ?mission=<id>, the default project stay
     path.resolve(here, "../src/components/features/CoveragePage.tsx"),
     "utf8",
   );
-  assert.ok(page.includes("fetchFeatureCoverage(controller.signal, mission)"));
-  assert.ok(page.includes("runWildFileScan(undefined, mission)"));
-  assert.ok(page.includes("associateWildFile(path, featureIds, undefined, mission)"));
+  assert.ok(page.includes("fetchFeatureCoverage(controller.signal, started.mission)"));
+  assert.ok(page.includes("runWildFileScan(undefined, started.mission)"));
+  assert.ok(page.includes("associateWildFile(path, featureIds, undefined, started.mission)"));
   assert.ok(page.includes('data-testid="coverage-project-select"'));
+  // The picker reads past /api/features' default of 10 missions.
+  assert.ok(page.includes("fetchFeatureMap(controller.signal, FEATURE_MAP_MAX_MISSIONS)"));
+  const featuresApi = fs.readFileSync(path.resolve(here, "../src/featuresApi.ts"), "utf8");
+  assert.ok(featuresApi.includes("FEATURE_MAP_MAX_MISSIONS = 50"));
+  assert.ok(featuresApi.includes("`/api/features?limit=${limit}`"));
+});
+
+test("any project: a late load, scan or association from an earlier project selection is discarded (A -> B -> A)", () => {
+  const a1 = nextCoverageScope(INITIAL_COVERAGE_SCOPE, 4);
+  assert.deepEqual(a1, { mission: 4, epoch: 1 });
+  assert.equal(isCurrentCoverageScope(a1, a1), true);
+  const b = nextCoverageScope(a1, 9);
+  // A's scan finishing while B is selected must not land.
+  assert.equal(isCurrentCoverageScope(a1, b), false);
+  const a2 = nextCoverageScope(b, 4);
+  // Back on A: the first visit's completion is still stale.
+  assert.equal(isCurrentCoverageScope(a1, a2), false);
+  assert.equal(isCurrentCoverageScope(b, a2), false);
+  assert.equal(isCurrentCoverageScope(a2, a2), true);
+  // The default project is a scope of its own.
+  const home = nextCoverageScope(a2, null);
+  assert.equal(home.mission, null);
+  assert.equal(isCurrentCoverageScope(INITIAL_COVERAGE_SCOPE, home), false);
+
+  // Every completion in the page checks its scope before it lands, only the
+  // current scope's report is drawn, and the panel remounts per scope.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const page = fs.readFileSync(
+    path.resolve(here, "../src/components/features/CoveragePage.tsx"),
+    "utf8",
+  );
+  const guards = page.split("if (!isCurrentCoverageScope(started, scopeRef.current)) return;").length - 1;
+  assert.ok(guards >= 6, `each success and failure path is guarded (${guards})`);
+  assert.ok(page.includes("shown && isCurrentCoverageScope(shown.scope, scope) ? shown.data : null"));
+  assert.ok(page.includes("key={scope.epoch}"));
+  assert.equal(page.includes("runWildFileScan(undefined, mission)"), false);
 });
