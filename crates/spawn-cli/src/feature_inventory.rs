@@ -1113,8 +1113,10 @@ mod tests {
             PathBuf::from("/srv/acme")
         );
         assert_eq!(
-            project_root_for_registry(Path::new("docs/feature-map/registry.json")),
-            PathBuf::from(".")
+            project_root_for_registry(Path::new(
+                "no-such-project-554/docs/feature-map/registry.json"
+            )),
+            PathBuf::from("no-such-project-554")
         );
 
         let repo = temp_fixture("project-root");
@@ -1122,13 +1124,14 @@ mod tests {
         fs::create_dir_all(repo.join("meta/maps")).expect("maps");
         assert_eq!(
             project_root_for_registry(&repo.join("meta/maps/features.json")),
-            repo
+            fs::canonicalize(&repo).expect("repo")
         );
         let loose = temp_fixture("project-root-loose");
         fs::create_dir_all(loose.join("maps")).expect("maps");
         let derived = project_root_for_registry(&loose.join("maps/features.json"));
-        if !loose.ancestors().any(|dir| dir.join(".git").exists()) {
-            assert_eq!(derived, loose.join("maps"));
+        let real_loose = fs::canonicalize(&loose).expect("loose");
+        if !real_loose.ancestors().any(|dir| dir.join(".git").exists()) {
+            assert_eq!(derived, real_loose.join("maps"));
         }
 
         let _ = fs::remove_dir_all(&repo);
@@ -1136,9 +1139,9 @@ mod tests {
     }
 
     /// A relative registry reached from another repository's backlog
-    /// (`../../../acme/meta/features.json` from Spawn's) is normalized
-    /// before the `.git` walk: it never lands on the repository the `..`
-    /// segments only pass through.
+    /// (`../../../acme/meta/features.json` from Spawn's) resolves its `..`
+    /// segments before the `.git` walk: it never lands on the repository
+    /// they only pass through.
     #[test]
     fn project_root_for_registry_normalizes_dot_dot_before_the_git_walk() {
         let base = temp_fixture("project-root-dotdot");
@@ -1146,11 +1149,13 @@ mod tests {
         fs::create_dir_all(base.join("spawn/rsi/backlog")).expect("backlog");
         fs::create_dir_all(base.join("acme/.git")).expect("acme .git");
         fs::create_dir_all(base.join("acme/meta")).expect("meta");
+        fs::create_dir_all(base.join("acme/docs/feature-map")).expect("feature-map");
+        let acme = fs::canonicalize(base.join("acme")).expect("acme");
         let through = base.join("spawn/rsi/backlog/../../../acme/meta/features.json");
-        assert_eq!(project_root_for_registry(&through), base.join("acme"));
+        assert_eq!(project_root_for_registry(&through), acme);
         let conventional =
             base.join("spawn/rsi/backlog/../../../acme/docs/feature-map/registry.json");
-        assert_eq!(project_root_for_registry(&conventional), base.join("acme"));
+        assert_eq!(project_root_for_registry(&conventional), acme);
 
         assert_eq!(
             normalize_lexically(Path::new("/srv/spawn/rsi/backlog/../../../acme/./x.json")),
@@ -1162,6 +1167,38 @@ mod tests {
             PathBuf::from("../../b")
         );
         assert_eq!(normalize_lexically(Path::new("a/..")), PathBuf::from("."));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A `..` after a symlink leaves the link's target, as the OS resolves
+    /// it (`/var/run/..` is `/`, not `/var`): the root is found from the
+    /// file the path really names, and the path itself, which is what the
+    /// registry is opened and saved by, names that file.
+    #[test]
+    fn project_root_for_registry_follows_symlinks_before_dot_dot() {
+        let base = temp_fixture("project-root-symlink");
+        // The real file: <base>/real/acme/meta/features.json, Acme a repo.
+        fs::create_dir_all(base.join("real/acme/.git")).expect("acme .git");
+        fs::create_dir_all(base.join("real/acme/meta/run")).expect("run");
+        // <base>/spawn is another repo holding `run`, a link into Acme.
+        fs::create_dir_all(base.join("spawn/.git")).expect("spawn .git");
+        std::os::unix::fs::symlink(base.join("real/acme/meta/run"), base.join("spawn/run"))
+            .expect("symlink");
+        let registry = base.join("spawn/run/../features.json");
+        fs::write(base.join("real/acme/meta/features.json"), "{}").expect("real file");
+        // Lexically this would be <base>/spawn/features.json (no such file)
+        // under the Spawn repo; on disk it is Acme's file.
+        assert_eq!(
+            fs::read_to_string(&registry).expect("the path names the real file"),
+            "{}"
+        );
+        assert!(!base.join("spawn/features.json").exists());
+        let acme = fs::canonicalize(base.join("real/acme")).expect("acme");
+        assert_eq!(project_root_for_registry(&registry), acme);
+        // Not created yet: its parent's real place decides the same way.
+        let fresh = base.join("spawn/run/../fresh.json");
+        assert_eq!(project_root_for_registry(&fresh), acme);
 
         let _ = fs::remove_dir_all(&base);
     }
