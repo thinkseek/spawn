@@ -2865,14 +2865,15 @@ mod tests {
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_INPUT_BODY,
         MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
-        feature_associate_at, handle, is_json, is_loopback, keep_listening, listen_again_pause,
-        local_exemption, log_window, objective_json, objective_prompt, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
-        same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_activity,
-        with_last_gates, with_objectives,
+        feature_associate_at, feature_paths, handle, is_json, is_loopback, keep_listening,
+        listen_again_pause, local_exemption, log_window, mission_feature_paths, objective_json,
+        objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
+        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
+        tokenless_request, typed_text, with_activity, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
+    use std::path::PathBuf;
 
     fn address(text: &str) -> SocketAddr {
         text.parse().expect("a socket address")
