@@ -156,11 +156,53 @@ struct Spec {
     id: String,
     title: String,
     summary: Option<String>,
+    /// Optional parent feature id defining explicit hierarchy.
+    parent: Option<String>,
+    /// Capability classification (`domain`, `capability`, `initiative`,
+    /// `slice`, `research-initiative`, `subsystem`).
+    kind: String,
+    /// Optional lowercase tags for grouping and discovery.
+    tags: Vec<String>,
+    /// Repo-relative normalized POSIX file paths (many-to-many across features).
+    files: Vec<String>,
+    /// Typed feature-to-feature relations.
+    relations: Vec<Relation>,
     /// The native objectives whose records decide the capability's state.
     objectives: Vec<u32>,
     /// Every provenance source the mapping names, native or external.
     sources: Vec<Source>,
 }
+
+/// One typed link from a capability to another capability in the same mission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Relation {
+    kind: String,
+    target: String,
+    label: Option<String>,
+}
+
+/// Allowed values for a feature's `kind` field.
+const FEATURE_KINDS: &[&str] = &[
+    "domain",
+    "capability",
+    "initiative",
+    "slice",
+    "research-initiative",
+    "subsystem",
+];
+
+/// Allowed values for a relation's `kind` field.
+const RELATION_KINDS: &[&str] = &[
+    "depends_on",
+    "blocks",
+    "implements",
+    "extends",
+    "relates_to",
+    "supersedes",
+    "verifies",
+    "documented_by",
+    "contains",
+];
 
 /// One place the work came from: a native record Spawn holds (an objective,
 /// a mission, a task, a verification, a deploy) or an external reference (an
@@ -313,8 +355,49 @@ fn mission_row(mission: &Value, facts: &Facts) -> Value {
         "blocker": blocker,
         "shipped_by_deploy": shipped_by_deploy(mission),
         "counts": counts(&features),
+        "graph": graph_summary(&specs),
         "features": features,
         "unmapped": unmapped,
+    })
+}
+
+/// Mission-level graph summary over the capabilities' hierarchy, typed links,
+/// and indexed repo files (highlighting files shared by more than one feature).
+fn graph_summary(specs: &[Spec]) -> Value {
+    let mut relations_total: usize = 0;
+    let mut file_owners: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut hierarchy_roots: Vec<&str> = Vec::new();
+    for spec in specs {
+        relations_total += spec.relations.len();
+        if spec.parent.is_none() {
+            hierarchy_roots.push(&spec.id);
+        }
+        for file in &spec.files {
+            file_owners.entry(file.as_str()).or_default().push(&spec.id);
+        }
+    }
+    let files_indexed = file_owners.len();
+    let mut shared_files = Map::new();
+    for (file, mut owners) in file_owners {
+        if owners.len() > 1 {
+            owners.sort_unstable();
+            owners.dedup();
+            shared_files.insert(
+                file.to_string(),
+                Value::Array(
+                    owners
+                        .into_iter()
+                        .map(|owner| Value::String(owner.to_string()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    json!({
+        "relations_total": relations_total,
+        "files_indexed": files_indexed,
+        "shared_files": shared_files,
+        "hierarchy_roots": hierarchy_roots,
     })
 }
 
@@ -437,23 +520,23 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
         let object = feature
             .as_object()
             .ok_or_else(|| format!("{at} is an object, not {feature}"))?;
-        if let Some(key) = object
-            .keys()
-            .find(|key| !matches!(key.as_str(), "id" | "title" | "summary" | "sources"))
-        {
+        if let Some(key) = object.keys().find(|key| {
+            !matches!(
+                key.as_str(),
+                "id" | "title"
+                    | "summary"
+                    | "sources"
+                    | "parent"
+                    | "kind"
+                    | "tags"
+                    | "files"
+                    | "relations"
+            )
+        }) {
             return Err(format!("{at} has an unknown field `{key}`"));
         }
         let id = required_text(object, "id", &at)?;
-        if id.is_empty()
-            || id.len() > 80
-            || !id.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-            })
-        {
-            return Err(format!(
-                "{at}.id is lowercase letters, digits, - and _ (at most 80), not `{id}`"
-            ));
-        }
+        validate_feature_id(&id, &format!("{at}.id"))?;
         if !ids.insert(id.clone()) {
             return Err(format!("two features have the id `{id}`"));
         }
@@ -463,6 +546,28 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
         }
         let summary =
             optional_text(object, "summary", &at)?.filter(|summary| !summary.trim().is_empty());
+        let parent = optional_text(object, "parent", &at)?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(parent_id) = &parent {
+            validate_feature_id(parent_id, &format!("{at}.parent"))?;
+        }
+        let kind = match optional_text(object, "kind", &at)?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) if FEATURE_KINDS.contains(&value.as_str()) => value,
+            Some(other) => {
+                return Err(format!(
+                    "{at}.kind must be one of {}, not `{other}`",
+                    FEATURE_KINDS.join(", ")
+                ));
+            }
+            None => "capability".to_string(),
+        };
+        let tags = tags_of(object, &at)?;
+        let files = files_of(object, &at)?;
+        let relations = relations_of(object, &at)?;
         let sources = sources_of(object, &at, mission_id, &id, &mut claims)?;
         let objectives: Vec<u32> = sources
             .iter()
@@ -475,11 +580,291 @@ fn parse_mapping(value: &Value, mission_id: i64) -> Result<Vec<Spec>, String> {
             id,
             title,
             summary,
+            parent,
+            kind,
+            tags,
+            files,
+            relations,
             objectives,
             sources,
         });
     }
+    validate_graph(&specs, &ids)?;
     Ok(specs)
+}
+
+fn validate_feature_id(id: &str, place: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 80
+        || !id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+    {
+        return Err(format!(
+            "{place} is lowercase letters, digits, - and _ (at most 80), not `{id}`"
+        ));
+    }
+    Ok(())
+}
+
+fn tags_of(object: &Map<String, Value>, at: &str) -> Result<Vec<String>, String> {
+    let Some(value) = object.get("tags") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = value
+        .as_array()
+        .ok_or_else(|| format!("{at}.tags is an array"))?;
+    if list.len() > 50 {
+        return Err(format!("{at}.tags has at most 50 entries"));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    let mut seen = BTreeSet::new();
+    for (index, entry) in list.iter().enumerate() {
+        let place = format!("{at}.tags[{index}]");
+        let raw = entry
+            .as_str()
+            .ok_or_else(|| format!("{place} is a string, not {entry}"))?;
+        let tag = raw.trim();
+        if tag.is_empty()
+            || tag.len() > 40
+            || !tag.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+        {
+            return Err(format!(
+                "{place} is a lowercase tag (letters, digits, - and _, at most 40), not `{raw}`"
+            ));
+        }
+        if seen.insert(tag.to_string()) {
+            out.push(tag.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn files_of(object: &Map<String, Value>, at: &str) -> Result<Vec<String>, String> {
+    let Some(value) = object.get("files") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = value
+        .as_array()
+        .ok_or_else(|| format!("{at}.files is an array"))?;
+    if list.len() > 500 {
+        return Err(format!("{at}.files has at most 500 entries"));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    let mut seen = BTreeSet::new();
+    for (index, entry) in list.iter().enumerate() {
+        let place = format!("{at}.files[{index}]");
+        let raw = entry
+            .as_str()
+            .ok_or_else(|| format!("{place} is a string, not {entry}"))?;
+        let normalized = normalize_repo_path(raw, &place)?;
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_repo_path(raw: &str, place: &str) -> Result<String, String> {
+    if raw.is_empty() || raw.len() > 400 {
+        return Err(format!(
+            "{place} is a non-empty repo-relative path (at most 400 bytes)"
+        ));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(format!("{place} must not contain control characters"));
+    }
+    if raw.starts_with('/') {
+        return Err(format!(
+            "{place} must be repo-relative without a leading `/`, not `{raw}`"
+        ));
+    }
+    if raw.contains('\\') {
+        return Err(format!("{place} must use POSIX `/` separators, not `{raw}`"));
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in raw.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err(format!("{place} must not contain `..`, not `{raw}`"));
+        }
+        parts.push(segment);
+    }
+    if parts.is_empty() {
+        return Err(format!("{place} is an empty path, not `{raw}`"));
+    }
+    Ok(parts.join("/"))
+}
+
+fn relations_of(object: &Map<String, Value>, at: &str) -> Result<Vec<Relation>, String> {
+    let Some(value) = object.get("relations") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = value
+        .as_array()
+        .ok_or_else(|| format!("{at}.relations is an array"))?;
+    if list.len() > 200 {
+        return Err(format!("{at}.relations has at most 200 entries"));
+    }
+    let mut out: Vec<Relation> = Vec::with_capacity(list.len());
+    for (index, entry) in list.iter().enumerate() {
+        let place = format!("{at}.relations[{index}]");
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("{place} is an object"))?;
+        if let Some(key) = obj
+            .keys()
+            .find(|key| !matches!(key.as_str(), "kind" | "target" | "label"))
+        {
+            return Err(format!("{place} has an unknown field `{key}`"));
+        }
+        let kind = required_text(obj, "kind", &place)?;
+        if !RELATION_KINDS.contains(&kind.as_str()) {
+            return Err(format!(
+                "{place}.kind must be one of {}, not `{kind}`",
+                RELATION_KINDS.join(", ")
+            ));
+        }
+        let target = required_text(obj, "target", &place)?;
+        validate_feature_id(&target, &format!("{place}.target"))?;
+        let label = optional_text(obj, "label", &place)?
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        if let Some(label_text) = &label
+            && (label_text.chars().count() > 120 || label_text.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "{place}.label is at most 120 characters without control characters"
+            ));
+        }
+        if let Some(existing) = out
+            .iter_mut()
+            .find(|existing| existing.kind == kind && existing.target == target)
+        {
+            if existing.label.is_none() {
+                existing.label = label;
+            }
+            continue;
+        }
+        out.push(Relation {
+            kind,
+            target,
+            label,
+        });
+    }
+    Ok(out)
+}
+
+/// Cross-feature structural validation:
+/// - Refuse self-links (`parent == id` or `relation.target == id`).
+/// - Refuse dangling `parent` and `relation.target` references.
+/// - Refuse cycles in `parent`, `depends_on`, and `contains` edges.
+fn validate_graph(specs: &[Spec], ids: &BTreeSet<String>) -> Result<(), String> {
+    let mut parent_edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut depends_edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut contains_edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for spec in specs {
+        if let Some(parent) = &spec.parent {
+            if parent == &spec.id {
+                return Err(format!("feature `{}` cannot be its own parent", spec.id));
+            }
+            if !ids.contains(parent) {
+                return Err(format!(
+                    "feature `{}` names unknown parent `{parent}`",
+                    spec.id
+                ));
+            }
+            parent_edges
+                .entry(spec.id.as_str())
+                .or_default()
+                .push(parent.as_str());
+        }
+        for relation in &spec.relations {
+            if relation.target == spec.id {
+                return Err(format!(
+                    "feature `{}` cannot link `{}` to itself",
+                    spec.id, relation.kind
+                ));
+            }
+            if !ids.contains(&relation.target) {
+                return Err(format!(
+                    "feature `{}` relation `{}` names unknown target `{}`",
+                    spec.id, relation.kind, relation.target
+                ));
+            }
+            match relation.kind.as_str() {
+                "depends_on" => depends_edges
+                    .entry(spec.id.as_str())
+                    .or_default()
+                    .push(relation.target.as_str()),
+                "contains" => contains_edges
+                    .entry(spec.id.as_str())
+                    .or_default()
+                    .push(relation.target.as_str()),
+                _ => {}
+            }
+        }
+    }
+
+    detect_cycle(&parent_edges, "parent")?;
+    detect_cycle(&depends_edges, "depends_on")?;
+    detect_cycle(&contains_edges, "contains")?;
+    Ok(())
+}
+
+/// Three-color DFS cycle detector over directed feature edges.
+fn detect_cycle(edges: &BTreeMap<&str, Vec<&str>>, edge_kind: &str) -> Result<(), String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        Visiting,
+        Visited,
+    }
+
+    fn visit<'a>(
+        node: &'a str,
+        edges: &BTreeMap<&'a str, Vec<&'a str>>,
+        marks: &mut BTreeMap<&'a str, Mark>,
+        edge_kind: &str,
+    ) -> Result<(), String> {
+        marks.insert(node, Mark::Visiting);
+        if let Some(neighbors) = edges.get(node) {
+            for &next in neighbors {
+                match marks.get(next) {
+                    Some(Mark::Visiting) => {
+                        return Err(format!(
+                            "`{edge_kind}` cycle detected between `{node}` and `{next}`"
+                        ));
+                    }
+                    Some(Mark::Visited) => {}
+                    None => visit(next, edges, marks, edge_kind)?,
+                }
+            }
+        }
+        marks.insert(node, Mark::Visited);
+        Ok(())
+    }
+
+    let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
+    for &node in edges.keys() {
+        if !marks.contains_key(node) {
+            visit(node, edges, &mut marks, edge_kind)?;
+        }
+    }
+    Ok(())
 }
 
 /// A capability's `sources`: identities and links, native or external.
@@ -713,6 +1098,11 @@ fn fallback_specs(mission: &Value) -> Vec<Spec> {
                 id: format!("objective-{number:03}"),
                 title: title.clone(),
                 summary: None,
+                parent: None,
+                kind: "capability".to_string(),
+                tags: Vec::new(),
+                files: Vec::new(),
+                relations: Vec::new(),
                 objectives: vec![number],
                 sources: vec![Source {
                     kind: "objective".to_string(),
@@ -821,6 +1211,15 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         "id": spec.id,
         "title": spec.title,
         "summary": spec.summary,
+        "parent": spec.parent,
+        "kind": spec.kind,
+        "tags": spec.tags,
+        "files": spec.files,
+        "relations": spec.relations.iter().map(|rel| json!({
+            "kind": rel.kind,
+            "target": rel.target,
+            "label": rel.label,
+        })).collect::<Vec<_>>(),
         "state": state,
         // Four separate pieces of evidence, not synonyms: a live
         // capability can be unverified, and says so.
@@ -1526,6 +1925,11 @@ mod tests {
             id: id.to_string(),
             title: format!("Feature {id}"),
             summary: None,
+            parent: None,
+            kind: "capability".to_string(),
+            tags: Vec::new(),
+            files: Vec::new(),
+            relations: Vec::new(),
             objectives: objectives.to_vec(),
             sources: objectives
                 .iter()
@@ -2511,5 +2915,247 @@ mod tests {
                     .iter()
                     .any(|gap| gap["kind"] == "accepted_without_landing"))
         );
+    }
+
+    /// Extended schema: explicit parent hierarchy, kind, tags, normalized
+    /// many-to-many files, and typed relations (with deduplication) flow into
+    /// both per-feature rows and mission-level `graph` summary.
+    #[test]
+    #[allow(clippy::too_many_lines)] // full end-to-end schema + graph summary fixture
+    fn extended_hierarchy_relations_and_shared_files_flow_into_graph_summary() {
+        let map_json = json!({
+            "features": [
+                {
+                    "id": "ui-domain",
+                    "title": "Dashboard UI",
+                    "kind": "domain",
+                    "tags": ["web", "ui", "web"],
+                    "files": ["./web/src//shared.ts", "web/src/App.tsx"],
+                    "relations": [
+                        {"kind": "contains", "target": "feature-mindmap"},
+                        {"kind": "contains", "target": "feature-mindmap", "label": "owns view"}
+                    ]
+                },
+                {
+                    "id": "feature-mindmap",
+                    "title": "Feature Mind Map",
+                    "parent": "ui-domain",
+                    "kind": "initiative",
+                    "tags": ["web", "graph"],
+                    "files": ["web/src/shared.ts", "web/src/featuresGraph.ts"],
+                    "relations": [
+                        {"kind": "depends_on", "target": "feature-api", "label": "reads /api/features"},
+                        {"kind": "documented_by", "target": "mindmap-docs"}
+                    ],
+                    "sources": [{"kind": "objective", "objective": 2}]
+                },
+                {
+                    "id": "feature-api",
+                    "title": "Feature Map API",
+                    "kind": "subsystem",
+                    "files": ["crates/spawn-cli/src/serve/feature_map.rs", "web/src/shared.ts"],
+                    "relations": [
+                        {"kind": "implements", "target": "ui-domain"}
+                    ],
+                    "sources": [{"kind": "objective", "objective": 3}]
+                },
+                {
+                    "id": "mindmap-docs",
+                    "title": "Mind Map Docs",
+                    "parent": "feature-mindmap",
+                    "kind": "slice",
+                    "files": ["docs/feature-map-mindmap.md"]
+                }
+            ]
+        });
+        let specs = parse_mapping(&map_json, 4).expect("valid hierarchical mapping");
+        assert_eq!(specs.len(), 4);
+        assert_eq!(specs[0].kind, "domain");
+        assert_eq!(specs[0].tags, vec!["web", "ui"]);
+        assert_eq!(specs[0].files, vec!["web/src/shared.ts", "web/src/App.tsx"]);
+        assert_eq!(specs[0].relations.len(), 1, "duplicate (kind, target) merged");
+        assert_eq!(specs[0].relations[0].label.as_deref(), Some("owns view"));
+        assert_eq!(specs[1].parent.as_deref(), Some("ui-domain"));
+        assert_eq!(specs[3].kind, "slice");
+
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-graph-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let map_path = dir.join("features.json");
+        std::fs::write(&map_path, map_json.to_string()).expect("write map");
+
+        let mut row = mission();
+        row["features_file"] = json!(map_path.display().to_string());
+        let answer = build(
+            &[row],
+            &json!({"landings": [], "verifications": []}),
+            &json!([]),
+            &Value::Null,
+            &json!([]),
+            42,
+        );
+        let m = &answer["missions"][0];
+        assert_eq!(m["mapping"]["kind"], "file");
+        assert_eq!(m["mapping"]["error"], Value::Null);
+        assert_eq!(m["graph"]["relations_total"], 4);
+        assert_eq!(m["graph"]["files_indexed"], 5);
+        assert_eq!(
+            m["graph"]["shared_files"],
+            json!({"web/src/shared.ts": ["feature-api", "feature-mindmap", "ui-domain"]})
+        );
+        assert_eq!(
+            m["graph"]["hierarchy_roots"],
+            json!(["ui-domain", "feature-api"])
+        );
+
+        let mindmap_row = m["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == "feature-mindmap")
+            .expect("feature-mindmap row");
+        assert_eq!(mindmap_row["parent"], "ui-domain");
+        assert_eq!(mindmap_row["kind"], "initiative");
+        assert_eq!(mindmap_row["tags"], json!(["web", "graph"]));
+        assert_eq!(
+            mindmap_row["files"],
+            json!(["web/src/shared.ts", "web/src/featuresGraph.ts"])
+        );
+        assert_eq!(mindmap_row["relations"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Strict graph validation refuses self-links, dangling references,
+    /// parent cycles, depends_on cycles, contains cycles, bad paths, and
+    /// unknown fields, while allowing associative `relates_to` pairs.
+    #[test]
+    fn graph_validation_rejects_self_links_dangling_targets_cycles_and_bad_paths() {
+        // Associative mutual `relates_to` is valid (not a hierarchy/dependency cycle).
+        let mutual = json!({"features": [
+            {"id": "a", "title": "A", "relations": [{"kind": "relates_to", "target": "b"}]},
+            {"id": "b", "title": "B", "relations": [{"kind": "relates_to", "target": "a"}]}
+        ]});
+        assert!(parse_mapping(&mutual, 4).is_ok());
+
+        for (label, bad) in [
+            (
+                "parent self-link",
+                json!({"features": [{"id": "a", "title": "A", "parent": "a"}]}),
+            ),
+            (
+                "relation self-link",
+                json!({"features": [{"id": "a", "title": "A",
+                    "relations": [{"kind": "depends_on", "target": "a"}]}]}),
+            ),
+            (
+                "dangling parent",
+                json!({"features": [{"id": "a", "title": "A", "parent": "ghost"}]}),
+            ),
+            (
+                "dangling relation target",
+                json!({"features": [{"id": "a", "title": "A",
+                    "relations": [{"kind": "blocks", "target": "ghost"}]}]}),
+            ),
+            (
+                "2-node parent cycle",
+                json!({"features": [
+                    {"id": "a", "title": "A", "parent": "b"},
+                    {"id": "b", "title": "B", "parent": "a"}
+                ]}),
+            ),
+            (
+                "3-node parent cycle",
+                json!({"features": [
+                    {"id": "a", "title": "A", "parent": "b"},
+                    {"id": "b", "title": "B", "parent": "c"},
+                    {"id": "c", "title": "C", "parent": "a"}
+                ]}),
+            ),
+            (
+                "depends_on cycle",
+                json!({"features": [
+                    {"id": "a", "title": "A", "relations": [{"kind": "depends_on", "target": "b"}]},
+                    {"id": "b", "title": "B", "relations": [{"kind": "depends_on", "target": "c"}]},
+                    {"id": "c", "title": "C", "relations": [{"kind": "depends_on", "target": "a"}]}
+                ]}),
+            ),
+            (
+                "contains cycle",
+                json!({"features": [
+                    {"id": "a", "title": "A", "relations": [{"kind": "contains", "target": "b"}]},
+                    {"id": "b", "title": "B", "relations": [{"kind": "contains", "target": "a"}]}
+                ]}),
+            ),
+            (
+                "unknown feature kind",
+                json!({"features": [{"id": "a", "title": "A", "kind": "epic"}]}),
+            ),
+            (
+                "unknown relation kind",
+                json!({"features": [
+                    {"id": "a", "title": "A", "relations": [{"kind": "owns", "target": "b"}]},
+                    {"id": "b", "title": "B"}
+                ]}),
+            ),
+            (
+                "unknown relation field",
+                json!({"features": [
+                    {"id": "a", "title": "A", "relations": [{"kind": "blocks", "target": "b", "weight": 2}]},
+                    {"id": "b", "title": "B"}
+                ]}),
+            ),
+            (
+                "file path traversal",
+                json!({"features": [{"id": "a", "title": "A", "files": ["src/../secret.rs"]}]}),
+            ),
+            (
+                "absolute file path",
+                json!({"features": [{"id": "a", "title": "A", "files": ["/etc/passwd"]}]}),
+            ),
+            (
+                "file path with NUL",
+                json!({"features": [{"id": "a", "title": "A", "files": ["src/a\0b.rs"]}]}),
+            ),
+            (
+                "file path with backslash",
+                json!({"features": [{"id": "a", "title": "A", "files": ["src\\lib.rs"]}]}),
+            ),
+            (
+                "uppercase tag",
+                json!({"features": [{"id": "a", "title": "A", "tags": ["Web"]}]}),
+            ),
+        ] {
+            assert!(
+                parse_mapping(&bad, 4).is_err(),
+                "{label} should be rejected: {bad}"
+            );
+        }
+    }
+
+    /// Minimal legacy mappings without hierarchy/relations/files remain 100%
+    /// backward-compatible with default values on derived rows and graph summary.
+    #[test]
+    fn legacy_mapping_defaults_remain_backward_compatible() {
+        let legacy = json!({"features": [
+            {"id": "core", "title": "Core", "sources": [{"kind": "objective", "objective": 1}]}
+        ]});
+        let specs = parse_mapping(&legacy, 4).expect("legacy mapping");
+        assert_eq!(specs[0].parent, None);
+        assert_eq!(specs[0].kind, "capability");
+        assert_eq!(specs[0].tags, Vec::<String>::new());
+        assert_eq!(specs[0].files, Vec::<String>::new());
+        assert_eq!(specs[0].relations, Vec::new());
+
+        let facts = facts_of(&[], &[], &[], &[]);
+        let row = derive(&specs[0], &mission(), &facts);
+        assert_eq!(row["parent"], Value::Null);
+        assert_eq!(row["kind"], "capability");
+        assert_eq!(row["tags"], json!([]));
+        assert_eq!(row["files"], json!([]));
+        assert_eq!(row["relations"], json!([]));
     }
 }

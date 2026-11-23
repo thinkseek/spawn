@@ -11,6 +11,42 @@
 export const STATES = ["planned", "implemented", "verified", "live"] as const;
 export type FeatureState = (typeof STATES)[number];
 
+export const FEATURE_KINDS = [
+  "domain",
+  "capability",
+  "initiative",
+  "slice",
+  "research-initiative",
+  "subsystem",
+] as const;
+export type FeatureKind = (typeof FEATURE_KINDS)[number];
+
+export const RELATION_KINDS = [
+  "depends_on",
+  "blocks",
+  "implements",
+  "extends",
+  "relates_to",
+  "supersedes",
+  "verifies",
+  "documented_by",
+  "contains",
+] as const;
+export type RelationKind = (typeof RELATION_KINDS)[number];
+
+export interface FeatureRelation {
+  kind: RelationKind;
+  target: string;
+  label: string | null;
+}
+
+export interface FeatureMissionGraph {
+  relations_total: number;
+  files_indexed: number;
+  shared_files: Record<string, string[]>;
+  hierarchy_roots: string[];
+}
+
 export interface StateInfo {
   label: string;
   /** What the state proves, in one line. */
@@ -157,6 +193,11 @@ export interface Feature {
   id: string;
   title: string;
   summary: string | null;
+  parent: string | null;
+  kind: FeatureKind;
+  tags: string[];
+  files: string[];
+  relations: FeatureRelation[];
   state: FeatureState;
   planned: boolean;
   implemented: boolean;
@@ -207,6 +248,7 @@ export interface FeatureMission {
     unowned: number;
     complete: number;
   };
+  graph: FeatureMissionGraph;
   features: Feature[];
   unmapped: FeatureObjective[];
 }
@@ -252,6 +294,46 @@ function bool(value: unknown): boolean {
 
 function stateOf(value: unknown): FeatureState {
   return STATES.includes(value as FeatureState) ? (value as FeatureState) : "planned";
+}
+
+function featureKindOf(value: unknown): FeatureKind {
+  return FEATURE_KINDS.includes(value as FeatureKind) ? (value as FeatureKind) : "capability";
+}
+
+function strings(value: unknown): string[] {
+  return list(value)
+    .filter((item): item is string => typeof item === "string" && item.trim() !== "")
+    .map((item) => item.trim());
+}
+
+function normalizeRelation(value: unknown): FeatureRelation | null {
+  const raw = object(value);
+  const kind = raw.kind;
+  const target = optionalText(raw.target);
+  if (!RELATION_KINDS.includes(kind as RelationKind) || target === null) return null;
+  return {
+    kind: kind as RelationKind,
+    target,
+    label: optionalText(raw.label),
+  };
+}
+
+function normalizeMissionGraph(value: unknown): FeatureMissionGraph {
+  const raw = object(value);
+  const sharedRaw = object(raw.shared_files);
+  const shared_files: Record<string, string[]> = {};
+  for (const [file, owners] of Object.entries(sharedRaw)) {
+    const ownerIds = strings(owners);
+    if (file !== "" && ownerIds.length > 0) {
+      shared_files[file] = ownerIds;
+    }
+  }
+  return {
+    relations_total: number(raw.relations_total),
+    files_indexed: number(raw.files_indexed),
+    shared_files,
+    hierarchy_roots: strings(raw.hierarchy_roots),
+  };
 }
 
 function numbers(value: unknown): number[] {
@@ -402,6 +484,13 @@ function normalizeFeature(value: unknown): Feature {
     id: text(raw.id),
     title: text(raw.title, "Untitled capability"),
     summary: optionalText(raw.summary),
+    parent: optionalText(raw.parent),
+    kind: featureKindOf(raw.kind),
+    tags: strings(raw.tags),
+    files: strings(raw.files),
+    relations: list(raw.relations)
+      .map(normalizeRelation)
+      .filter((rel): rel is FeatureRelation => rel !== null),
     state,
     // The server's booleans, not the state's: live does not imply verified.
     planned: bool(raw.planned),
@@ -468,6 +557,7 @@ function normalizeMission(value: unknown): FeatureMission {
       unowned: number(counts.unowned),
       complete: number(counts.complete),
     },
+    graph: normalizeMissionGraph(raw.graph),
     features: list(raw.features).map(normalizeFeature),
     unmapped: list(raw.unmapped).map(normalizeObjective),
   };

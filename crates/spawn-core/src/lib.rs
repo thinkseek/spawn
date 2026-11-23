@@ -6,6 +6,7 @@ pub mod command;
 #[cfg(feature = "testing")]
 pub mod contract;
 pub mod event;
+pub mod feature_coverage;
 pub mod id;
 pub mod ingest;
 pub mod mask;
