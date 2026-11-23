@@ -891,6 +891,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/verifications" => Box::new(verifications),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
+        "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1415,29 +1416,36 @@ fn coverage_registry_checked(registry: &Path, id: i64) -> Result<(), (u16, Value
         })
 }
 
-/// Mission `id`'s registry (its `objectives.features`, a relative path
-/// beside its backlog) and project root, from the open objective missions
-/// `missions`: 404 when there is no such mission, 400 when it names no
-/// `--features` registry.
+/// Mission `id`'s registry and project root ([`mission_paths`]), from the
+/// open objective missions `missions`: 404 when there is no such mission.
 fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
-    let refused = |status: u16, code: &str, error: String| {
-        (
-            status,
-            json!({ "error": error, "code": code, "mission": id }),
-        )
-    };
     let mission = missions
         .as_array()
         .into_iter()
         .flatten()
         .find(|mission| mission["id"].as_i64() == Some(id))
         .ok_or_else(|| {
-            refused(
+            (
                 404,
-                "mission_not_found",
-                format!("no open objective mission {id}"),
+                json!({ "error": format!("no open objective mission {id}"),
+                        "code": "mission_not_found", "mission": id }),
             )
         })?;
+    mission_paths(mission, id)
+}
+
+/// Mission row `mission`'s (id `id`) registry, its `objectives.features` as
+/// configured (a relative path beside its backlog; never rewritten, so it
+/// is opened and saved as the OS resolves it, symlinks and `..` included),
+/// and the project root it belongs to; 400 when it names no `--features`
+/// registry.
+fn mission_paths(mission: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let refused = |status: u16, code: &str, error: String| {
+        (
+            status,
+            json!({ "error": error, "code": code, "mission": id }),
+        )
+    };
     let given = mission
         .pointer("/objectives/features")
         .and_then(Value::as_str)
@@ -1454,9 +1462,41 @@ fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf)
     let backlog = json!({ "backlog": mission.pointer("/objectives/backlog") });
     let registry = feature_map::resolve(&backlog, given)
         .map_err(|error| refused(400, "no_features_registry", format!("{BAD_REQUEST}{error}")))?;
-    let registry = crate::feature_inventory::normalize_lexically(&registry);
     let root = crate::feature_inventory::project_root_for_registry(&registry);
     Ok((root, registry))
+}
+
+/// `GET /api/features/coverage/projects`: every project the coverage page
+/// can read ([`coverage_projects`]), over all open objective missions (no
+/// `/api/features` mission limit).
+fn feature_coverage_projects() -> Result<Value, String> {
+    let store = open_store()?;
+    let missions = store.objective_missions().map_err(err)?;
+    Ok(coverage_projects(&missions))
+}
+
+/// `{"projects": [{mission, text, registry_path, root}]}`: each mission of
+/// `missions` whose `--features` file is a coverage registry
+/// ([`coverage_registry_checked`]), in mission order; a mission without
+/// one, or with a legacy identity-only map, is left out.
+fn coverage_projects(missions: &Value) -> Value {
+    let projects: Vec<Value> = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|mission| {
+            let id = mission["id"].as_i64()?;
+            let (root, registry) = mission_paths(mission, id).ok()?;
+            coverage_registry_checked(&registry, id).ok()?;
+            Some(json!({
+                "mission": id,
+                "text": mission["text"],
+                "registry_path": registry.display().to_string(),
+                "root": root.display().to_string(),
+            }))
+        })
+        .collect();
+    json!({ "projects": projects })
 }
 
 /// `POST /api/features/scan`: one-click unassociated-file ("野文件") scan.
