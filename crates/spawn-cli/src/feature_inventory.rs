@@ -1159,7 +1159,7 @@ mod tests {
     /// identity-only `{"features": [...]}`) is not.
     #[test]
     fn is_coverage_registry_refuses_legacy_feature_maps() {
-        let registry = serde_json::to_value(fixture_registry()).expect("registry json");
+        let registry = serde_json::to_value(minimal_registry(vec!["src/lib.rs"])).expect("registry json");
         assert!(is_coverage_registry(&registry));
         assert!(!is_coverage_registry(
             &json!({"features": [{"id": "a", "title": "A", "objectives": [1]}]})
