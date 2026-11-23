@@ -5794,4 +5794,52 @@ mod tests {
         let summary = rsi_summary(&mission(json!("/srv/rsi/scenarios"), "cancelled"));
         assert!(summary["open_task"].is_null());
     }
+
+    /// `?mission=<id>` reads that open objective mission's `--features`
+    /// registry (relative beside its backlog) and the project root it
+    /// belongs to; no such mission is a structured 404, a mission without
+    /// a registry a structured 400.
+    #[test]
+    fn mission_feature_paths_find_any_projects_registry() {
+        let missions = json!([
+            {"id": 4, "objectives": {"backlog": "/srv/spawn/rsi/backlog",
+                                     "features": "/srv/spawn/docs/feature-map/registry.json"}},
+            {"id": 9, "objectives": {"backlog": "/srv/acme/backlog",
+                                     "features": "../docs/feature-map/registry.json"}},
+            {"id": 11, "objectives": {"backlog": "/srv/flake/backlog"}},
+        ]);
+        let (root, registry) = mission_feature_paths(&missions, 4).expect("spawn");
+        assert_eq!(root, PathBuf::from("/srv/spawn"));
+        assert_eq!(
+            registry,
+            PathBuf::from("/srv/spawn/docs/feature-map/registry.json")
+        );
+        let (root, registry) = mission_feature_paths(&missions, 9).expect("acme");
+        assert_eq!(
+            registry,
+            PathBuf::from("/srv/acme/backlog/../docs/feature-map/registry.json")
+        );
+        assert_eq!(root, PathBuf::from("/srv/acme/backlog/.."));
+
+        let (status, body) = mission_feature_paths(&missions, 11).expect_err("no registry");
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "no_features_registry");
+        assert_eq!(body["mission"], 11);
+        assert!(body["error"].as_str().unwrap().starts_with(BAD_REQUEST), "{body}");
+
+        let (status, body) = mission_feature_paths(&missions, 12).expect_err("no mission");
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], "mission_not_found");
+
+        // Without `?mission` the server's own root stays the default.
+        let (root, registry) = feature_paths("").expect("default");
+        assert_eq!(root, crate::feature_inventory::default_root());
+        assert_eq!(
+            registry,
+            crate::feature_inventory::default_registry_path(&root)
+        );
+        let (status, body) = feature_paths("mission=abc").expect_err("bad id");
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "bad_mission");
+    }
 }
