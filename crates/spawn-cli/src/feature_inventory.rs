@@ -1142,10 +1142,7 @@ mod tests {
             normalize_lexically(Path::new("/srv/spawn/rsi/backlog/../../../acme/./x.json")),
             PathBuf::from("/srv/acme/x.json")
         );
-        assert_eq!(
-            normalize_lexically(Path::new("/../a")),
-            PathBuf::from("/a")
-        );
+        assert_eq!(normalize_lexically(Path::new("/../a")), PathBuf::from("/a"));
         assert_eq!(
             normalize_lexically(Path::new("../a/../../b")),
             PathBuf::from("../../b")
@@ -1159,7 +1156,8 @@ mod tests {
     /// identity-only `{"features": [...]}`) is not.
     #[test]
     fn is_coverage_registry_refuses_legacy_feature_maps() {
-        let registry = serde_json::to_value(minimal_registry(vec!["src/lib.rs"])).expect("registry json");
+        let registry =
+            serde_json::to_value(minimal_registry(vec!["src/lib.rs"])).expect("registry json");
         assert!(is_coverage_registry(&registry));
         assert!(!is_coverage_registry(
             &json!({"features": [{"id": "a", "title": "A", "objectives": [1]}]})
