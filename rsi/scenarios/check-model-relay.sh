@@ -31,6 +31,29 @@
 # missing or wrong); 2 a harness failure (no python3, the relay did not
 # start). Any unexpected error exits 2, never 1.
 set -eu
+# Only when the tree differs from the base (SPAWN_BASELINE_TREE) in what this
+# check runs or reads: scripts/model-relay.py, scripts/model-relay-test.py and
+# its systemd unit. Otherwise it passes at once, as check-test-gate.sh does, so
+# a tree that leaves them alone pays nothing (it never caught a regression in
+# the gate ROI audit of 2026-11-24). Its own file is on the list, so a change to
+# the check runs it.
+base=${SPAWN_BASELINE_TREE-}
+if [ -n "$base" ] && [ -d "$base" ]; then
+    same=1
+    for path in scripts/model-relay.py scripts/model-relay-test.py deploy/systemd/spawn-model-relay.service \
+        rsi/scenarios/check-model-relay.sh; do
+        if [ -e "$path" ] || [ -e "$base/$path" ]; then
+            diff -rq -- "$base/$path" "$path" >/dev/null 2>&1 || {
+                same=""
+                echo "changed against the base: $path"
+            }
+        fi
+    done
+    if [ -n "$same" ]; then
+        echo "check-model-relay: the relay and its unit are the base's: not run"
+        exit 0
+    fi
+fi
 relay=$PWD/scripts/model-relay.py
 [ -f "$relay" ] || { echo "check-model-relay: harness: no $relay" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "check-model-relay: harness: python3 is not installed" >&2; exit 2; }

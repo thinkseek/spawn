@@ -140,9 +140,25 @@ done
 exec "$REAL_PSQL_237" "$@"
 SHIM
 chmod +x "$WORK/bin/psql" || harness "cannot make the psql shim executable"
+# check-j02-lands.sh: the controller's gate copy or, since it left the gate, the nightly's
+# (the controller's rsi/scenarios/nightly/, or the tree's: the nightly copies only the
+# scenario it runs). j02 takes its controller two levels above itself, so a nightly copy
+# runs from $WORK/cj02/rsi/scenarios/ beside a link to this controller's scripts/.
+j02=$controller/rsi/scenarios/check-j02-lands.sh
+if [ ! -f "$j02" ]; then
+    j02_src=""
+    for j02_try in "$controller/rsi/scenarios/nightly/check-j02-lands.sh" "$PWD/rsi/scenarios/nightly/check-j02-lands.sh"; do
+        [ -f "$j02_try" ] && { j02_src=$j02_try; break; }
+    done
+    [ -n "$j02_src" ] ||
+        harness "no check-j02-lands.sh in $controller/rsi/scenarios, its nightly/ or $PWD/rsi/scenarios/nightly"
+    mkdir -p "$WORK/cj02/rsi/scenarios" && cp "$j02_src" "$WORK/cj02/rsi/scenarios/check-j02-lands.sh" &&
+        ln -s "$controller/scripts" "$WORK/cj02/scripts" || harness "cannot stage $j02_src under $WORK/cj02"
+    j02=$WORK/cj02/rsi/scenarios/check-j02-lands.sh
+fi
 code=0
 env PATH="$WORK/bin:$PATH" REAL_PSQL_237="$real_psql" DROPS_237="$WORK/drops.log" \
-    sh "$controller/rsi/scenarios/check-j02-lands.sh" >"$WORK/j02.out" 2>&1 </dev/null || code=$?
+    sh "$j02" >"$WORK/j02.out" 2>&1 </dev/null || code=$?
 case "$code" in
 0) ;;
 1) check_failed "(1) check-j02-lands.sh failed (exit 1): $(grep -m 3 'blackbox:' "$WORK/j02.out" | tr '\n' ' ')" ;;
