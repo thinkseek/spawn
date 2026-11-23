@@ -833,15 +833,18 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
             }
         }
         if path == "/api/features/scan" {
-            return feature_scan_post(request, access, shared);
+            return feature_scan_post(request, query, access, shared);
         }
         if path == "/api/features/associate" {
-            return feature_associate_post(request, access, shared);
+            return feature_associate_post(request, query, access, shared);
         }
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
                 .map_err(|error| error.to_string());
+        }
+        if path == "/api/features/coverage" && parameter(query, "mission").is_some() {
+            return feature_coverage_mission_get(request, query);
         }
     }
     let Some(read) = reader(path, query) else {
@@ -1336,10 +1339,95 @@ fn feature_coverage_get() -> Result<Value, String> {
     crate::feature_inventory::api_coverage_payload(&root, &registry)
 }
 
+/// `GET /api/features/coverage?mission=<id>`: [`feature_coverage_get`] for
+/// that mission's project ([`feature_paths`]), its refusals structured.
+fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), String> {
+    let (status, body) = match feature_paths(query) {
+        Ok((root, registry)) => {
+            match crate::feature_inventory::api_coverage_payload(&root, &registry) {
+                Ok(payload) => (200, payload),
+                Err(error) => (500, json!({ "error": error })),
+            }
+        }
+        Err(refusal) => refusal,
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The project root and feature registry a coverage request reads: without
+/// `?mission` the server's own (`SPAWN_FEATURE_ROOT`, else the working
+/// directory; `SPAWN_FEATURE_REGISTRY`, else the root's registry); with it,
+/// the open objective mission's `--features` file and the project root it
+/// belongs to ([`mission_feature_paths`]).
+fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let Some(text) = parameter(query, "mission") else {
+        let root = crate::feature_inventory::default_root();
+        let registry = crate::feature_inventory::default_registry_path(&root);
+        return Ok((root, registry));
+    };
+    let Ok(id) = text.parse::<i64>() else {
+        return Err((
+            400,
+            json!({ "error": format!("{BAD_REQUEST}bad mission {text}"), "code": "bad_mission" }),
+        ));
+    };
+    let missions = open_store()
+        .and_then(|store| store.objective_missions().map_err(err))
+        .map_err(|error| (500, json!({ "error": error })))?;
+    mission_feature_paths(&missions, id)
+}
+
+/// Mission `id`'s registry (its `objectives.features`, a relative path
+/// beside its backlog) and project root, from the open objective missions
+/// `missions`: 404 when there is no such mission, 400 when it names no
+/// `--features` registry.
+fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let refused = |status: u16, code: &str, error: String| {
+        (status, json!({ "error": error, "code": code, "mission": id }))
+    };
+    let mission = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|mission| mission["id"].as_i64() == Some(id))
+        .ok_or_else(|| {
+            refused(
+                404,
+                "mission_not_found",
+                format!("no open objective mission {id}"),
+            )
+        })?;
+    let given = mission
+        .pointer("/objectives/features")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refused(
+                400,
+                "no_features_registry",
+                format!(
+                    "{BAD_REQUEST}mission {id} has no --features registry configured \
+                     (spawn mission configure {id} --features <registry.json>)"
+                ),
+            )
+        })?;
+    let backlog = json!({ "backlog": mission.pointer("/objectives/backlog") });
+    let registry = feature_map::resolve(&backlog, given)
+        .map_err(|error| refused(400, "no_features_registry", format!("{BAD_REQUEST}{error}")))?;
+    let root = crate::feature_inventory::project_root_for_registry(&registry);
+    Ok((root, registry))
+}
+
 /// `POST /api/features/scan`: one-click unassociated-file ("野文件") scan.
 /// Performs a fresh read-only project inventory scan; never modifies or
 /// deletes any file on disk.
-fn feature_scan_post(mut request: Request, access: Access, _shared: &Shared) -> Result<(), String> {
+fn feature_scan_post(
+    mut request: Request,
+    query: &str,
+    access: Access,
+    _shared: &Shared,
+) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -1354,11 +1442,14 @@ fn feature_scan_post(mut request: Request, access: Access, _shared: &Shared) -> 
             .map_err(|error| error.to_string());
     }
     let _ = read_body(&mut request);
-    let root = crate::feature_inventory::default_root();
-    let registry = crate::feature_inventory::default_registry_path(&root);
-    let (status, body) = match crate::feature_inventory::api_coverage_payload(&root, &registry) {
-        Ok(payload) => (200, payload),
-        Err(error) => (500, json!({ "error": error })),
+    let (status, body) = match feature_paths(query) {
+        Ok((root, registry)) => {
+            match crate::feature_inventory::api_coverage_payload(&root, &registry) {
+                Ok(payload) => (200, payload),
+                Err(error) => (500, json!({ "error": error })),
+            }
+        }
+        Err(refusal) => refusal,
     };
     request
         .respond(json_response(status, &body))
@@ -1379,6 +1470,7 @@ struct FeatureAssociateBody {
 /// report and association update summary.
 fn feature_associate_post(
     mut request: Request,
+    query: &str,
     access: Access,
     shared: &Shared,
 ) -> Result<(), String> {
@@ -1387,7 +1479,7 @@ fn feature_associate_post(
             .respond(not_allowed("POST"))
             .map_err(|error| error.to_string());
     }
-    let (status, body) = match feature_associate_checked(&mut request, access, shared) {
+    let (status, body) = match feature_associate_checked(&mut request, query, access, shared) {
         Ok(answer) | Err(FeatureAssociateRefusal::Structured(answer)) => answer,
         Err(FeatureAssociateRefusal::Plain((status, error))) => (status, json!({ "error": error })),
     };
@@ -1413,12 +1505,12 @@ impl From<(u16, String)> for FeatureAssociateRefusal {
 
 fn feature_associate_checked(
     request: &mut Request,
+    query: &str,
     access: Access,
     shared: &Shared,
 ) -> Result<(u16, Value), FeatureAssociateRefusal> {
     let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
-    let root = crate::feature_inventory::default_root();
-    let registry = crate::feature_inventory::default_registry_path(&root);
+    let (root, registry) = feature_paths(query).map_err(FeatureAssociateRefusal::Structured)?;
     feature_associate_at(&root, &registry, &raw_body)
 }
 
