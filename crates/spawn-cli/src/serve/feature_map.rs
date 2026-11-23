@@ -138,6 +138,10 @@ fn read_map(
         missions.retain(|mission| mission["id"].as_i64() == Some(wanted));
     }
     missions.truncate(limit);
+    let undeployed = store
+        .scorecard_undeployed_missions()
+        .map_err(|error| error.to_string())?;
+    with_deployed(&mut missions, &undeployed);
     let verifications = store
         .verification_facts()
         .map_err(|error| error.to_string())?;
@@ -452,16 +456,53 @@ fn graph_summary(specs: &[Spec]) -> Value {
     })
 }
 
-/// Whether Spawn's own deploy ships the mission's source: the scorecard's
-/// own predicate (`UNDEPLOYED_MISSIONS`), so a mission is never "deployed"
-/// here that the scorecard counts as undeployed.
+/// The source path ending a deploy ships when the deployed missions are
+/// not read (a mission row without `shipped_by_deploy`): the one
+/// deploy/on-landing.sh deploys, as the store's `UNDEPLOYED_MISSIONS` names
+/// it. Anything else (a broader suffix, `.../spawn.git.bak`, a bare
+/// `spawn.git`) is another source.
+const DEPLOYED_SOURCE_SUFFIX: &str = "/missions/spawn.git";
+
+/// Whether a deploy ships the mission's source. The store's own answer
+/// when the row carries it ([`with_deployed`], from the scorecard's
+/// `UNDEPLOYED_MISSIONS` predicate, so a mission is never "deployed" here
+/// that the scorecard counts as undeployed); else the same predicate over
+/// the row's `sources` ([`DEPLOYED_SOURCE_SUFFIX`]).
 fn shipped_by_deploy(mission: &Value) -> bool {
+    if let Some(known) = mission["shipped_by_deploy"].as_bool() {
+        return known;
+    }
     mission["sources"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|source| source.ends_with("/missions/spawn.git"))
+        .any(|source| source.ends_with(DEPLOYED_SOURCE_SUFFIX))
+}
+
+/// Mark each mission row with `shipped_by_deploy` from the store's
+/// undeployed missions (`undeployed`, a JSON array of ids): a mission with
+/// at least one source that is not among them is shipped by a deploy; one
+/// with no source ships nothing known.
+fn with_deployed(missions: &mut [Value], undeployed: &Value) {
+    let undeployed: BTreeSet<i64> = undeployed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect();
+    for mission in missions {
+        let sourced = mission["sources"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty());
+        let shipped = sourced
+            && mission["id"]
+                .as_i64()
+                .is_some_and(|id| !undeployed.contains(&id));
+        if let Some(fields) = mission.as_object_mut() {
+            fields.insert("shipped_by_deploy".to_string(), json!(shipped));
+        }
+    }
 }
 
 /// The mission's capabilities: a readable mapping file, or one capability
@@ -499,7 +540,7 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
 
 /// `given` against the mission's backlog: an absolute path as it is, a
 /// relative one beside the backlog the mission names.
-fn resolve(mission: &Value, given: &str) -> Result<PathBuf, String> {
+pub(super) fn resolve(mission: &Value, given: &str) -> Result<PathBuf, String> {
     let path = Path::new(given);
     if path.is_absolute() {
         return Ok(path.to_path_buf());
