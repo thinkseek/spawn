@@ -443,19 +443,22 @@ impl GitWorkspace {
         command
     }
 
-    fn git_output(&self, arguments: &[&str]) -> Result<String, WorkspaceError> {
+    pub(crate) fn git_output(&self, arguments: &[&str]) -> Result<String, WorkspaceError> {
         let output = self.command().args(arguments).stdin(Stdio::null()).output();
         report(output, &arguments.join(" "))
     }
 
     /// Stdout of a `-z` listing of paths, untrimmed bytes
     /// ([`report_listing`]).
-    fn git_listing<S: AsRef<OsStr>>(&self, arguments: &[S]) -> Result<Vec<u8>, WorkspaceError> {
+    pub(crate) fn git_listing<S: AsRef<OsStr>>(
+        &self,
+        arguments: &[S],
+    ) -> Result<Vec<u8>, WorkspaceError> {
         let output = self.command().args(arguments).stdin(Stdio::null()).output();
         report_listing(output, &shown_arguments(arguments))
     }
 
-    fn output_in<S: AsRef<OsStr>>(
+    pub(crate) fn output_in<S: AsRef<OsStr>>(
         &self,
         directory: &Path,
         index: &Path,
@@ -497,7 +500,7 @@ impl GitWorkspace {
 
     /// [`Self::listing_in`] for a command that reads `input` on standard
     /// input.
-    fn listing_in_with_input<S: AsRef<OsStr>>(
+    pub(crate) fn listing_in_with_input<S: AsRef<OsStr>>(
         &self,
         directory: &Path,
         index: &Path,
@@ -951,6 +954,94 @@ impl GitWorkspace {
         Ok((oversized, special))
     }
 
+    /// The paths a checkpoint of the work tree in `directory`, whose parent
+    /// is `head`, takes by this store's rules, for a store that builds the
+    /// tree itself (the copy-on-write store, [`crate::cow`]); and the files
+    /// over the size cap it leaves out, with their sizes.
+    ///
+    /// The rules are [`Self::tree_of`]'s: what `git ls-files --cached
+    /// --others --exclude-standard` lists against `head` (tracked files,
+    /// and untracked ones no `.gitignore`, `info/exclude` or build-output
+    /// rule ignores), never an engine runtime file ([`ENGINE_RUNTIME_FILES`])
+    /// unless both `head` and `main` track it, and no file over the cap
+    /// ([`max_file_bytes`]) unless `main` holds it as a blob. A tracked path
+    /// is listed even when it is gone from `directory` or ignored: the
+    /// caller reads the work tree for it. `index` names a file that does not
+    /// exist (nothing is written to it): the listing is against `head`
+    /// alone, never a kept index.
+    pub(crate) fn checkpoint_paths(
+        &self,
+        directory: &Path,
+        index: &Path,
+        head: &str,
+    ) -> Result<CheckpointPaths, WorkspaceError> {
+        self.exclude_build_output()?;
+        let with_tree = OsString::from(format!("--with-tree={head}"));
+        let mut listing: Vec<OsString> = ["ls-files", "-z", "--cached", "--others"]
+            .map(OsString::from)
+            .into();
+        listing.extend([
+            OsString::from("--exclude-standard"),
+            with_tree.clone(),
+            OsString::from("--"),
+            OsString::from("."),
+        ]);
+        listing.extend(runtime_pathspecs("exclude"));
+        let mut paths = listed_paths(&self.listing_in(directory, index, &listing)?);
+        // The runtime files the project tracks: in `head` and in `main`.
+        let mut runtime: Vec<OsString> = ["ls-files", "-z", "--cached"].map(OsString::from).into();
+        runtime.extend([with_tree, OsString::from("--")]);
+        runtime.extend(runtime_pathspecs(""));
+        let tracked: Vec<(TreePath, u64)> =
+            listed_paths(&self.listing_in(directory, index, &runtime)?)
+                .into_iter()
+                .map(|path| (path, 0))
+                .collect();
+        if !tracked.is_empty()
+            && let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}"))
+        {
+            let in_main = self.blobs_in(&[main], &tracked)?;
+            paths.extend(
+                tracked
+                    .into_iter()
+                    .map(|(path, _)| path)
+                    .filter(|path| in_main.contains(path)),
+            );
+        }
+        paths.sort();
+        paths.dedup();
+        let mut oversized = Vec::new();
+        for path in &paths {
+            match std::fs::symlink_metadata(directory.join(path.as_path())) {
+                Ok(meta) if meta.is_file() && meta.len() > self.max_file_bytes => {
+                    oversized.push((path.clone(), meta.len()));
+                }
+                Ok(_) => {}
+                // Gone, or a leading directory is a file now: a deletion.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => {
+                    return Err(WorkspaceError::Unavailable(format!(
+                        "stat {}: {error}",
+                        directory.join(path.as_path()).display()
+                    )));
+                }
+            }
+        }
+        let kept = self.blobs_in(&self.source_commits(None), &oversized)?;
+        oversized.retain(|(path, _)| !kept.contains(path));
+        let left_out: HashSet<&TreePath> = oversized.iter().map(|(path, _)| path).collect();
+        let paths = paths
+            .iter()
+            .filter(|path| !left_out.contains(path))
+            .cloned()
+            .collect();
+        Ok((paths, oversized))
+    }
+
     /// Where the files over the cap that checkpoints of a branch left out are
     /// recorded, NUL-separated, three fields each: `told` or `untold`, the
     /// size in bytes, the path.
@@ -1008,7 +1099,7 @@ impl GitWorkspace {
     /// one already told of stays told; one no longer left out is forgotten,
     /// so it is told of again if it grows past the cap again. The caller
     /// holds the branch's lock.
-    fn record_oversized(&self, branch: &str, oversized: &[(TreePath, u64)]) {
+    pub(crate) fn record_oversized(&self, branch: &str, oversized: &[(TreePath, u64)]) {
         let before = self.read_oversized(branch);
         let record: BTreeMap<TreePath, (u64, bool)> = oversized
             .iter()
@@ -2568,19 +2659,7 @@ impl GitWorkspace {
     /// Hold the branch's `<index>.spawn-lock`, as a checkpoint does, until
     /// the returned file is dropped.
     fn lock_branch(&self, branch: &str) -> Result<std::fs::File, WorkspaceError> {
-        let lock_path = self.index(branch).with_extension("spawn-lock");
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
-            })?;
-        }
-        let lock = std::fs::File::create(&lock_path).map_err(|error| {
-            WorkspaceError::Unavailable(format!("create {}: {error}", lock_path.display()))
-        })?;
-        lock.lock().map_err(|error| {
-            WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
-        })?;
-        Ok(lock)
+        lock_file(&self.index(branch).with_extension("spawn-lock"))
     }
 
     /// Whether a merge of `main` into `branch` waits for its conflict
@@ -2647,6 +2726,29 @@ impl GitWorkspace {
         }
         Ok(marked)
     }
+}
+
+/// What [`GitWorkspace::checkpoint_paths`] answers: the paths a checkpoint
+/// takes, and the files over the size cap it leaves out, with their sizes.
+pub(crate) type CheckpointPaths = (Vec<TreePath>, Vec<(TreePath, u64)>);
+
+/// Hold the exclusive `flock` of `lock_path` (made, with its directory,
+/// when missing) until the returned file is dropped: the lock every
+/// checkpoint, mount and unmount of one branch takes, in this store and in
+/// the copy-on-write one ([`crate::cow`]).
+pub(crate) fn lock_file(lock_path: &Path) -> Result<std::fs::File, WorkspaceError> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+        })?;
+    }
+    let lock = std::fs::File::create(lock_path).map_err(|error| {
+        WorkspaceError::Unavailable(format!("create {}: {error}", lock_path.display()))
+    })?;
+    lock.lock().map_err(|error| {
+        WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
+    })?;
+    Ok(lock)
 }
 
 /// `<meta>\t<path>`, an entry of a `-z` tree listing: the meta fields

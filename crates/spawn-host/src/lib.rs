@@ -1,4 +1,5 @@
-//! Host adapters: tmux terminals, the git workspace store and the local
+//! Host adapters: tmux terminals, the git workspace store, the opt-in
+//! copy-on-write workspace store and artifact deduplicator, and the local
 //! transcript archive.
 //!
 //! The tmux and git adapters call an external program and read its exit
@@ -13,6 +14,8 @@
 pub mod agent_files;
 pub mod archive_mask;
 pub mod beneath;
+pub mod cas_dedup;
+pub mod cow;
 pub mod git;
 pub mod home;
 #[cfg(target_os = "linux")]
@@ -29,6 +32,13 @@ pub mod watch;
 #[cfg(test)]
 mod audit;
 
+pub use cas_dedup::{
+    ArtifactRoot, DedupConfig, DedupError, DedupReport, PruneReport, dedup_dirs, prune_unused,
+};
+pub use cow::{
+    CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
+    cow_clone_supported, directory_occupancy, live_users, reflink_file,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
 pub use git::{
