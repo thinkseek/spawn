@@ -909,7 +909,10 @@ turns into a cancel, or a mission closed or a resident retired under it
   none of it, so nothing rides into another objective's landing.
 - *Told.* The resident is then resumed with a notice that names the task,
   says it is cancelled, and says where its work is (the commit that holds
-  it). Its next task waits until the notice reached it.
+  it). Its next task waits until the notice reached it. A notice that
+  failed goes again, after a wait that doubles, under the next number
+  after every `cancel-notice-<task>-<n>` already sent, however long ago
+  (a reused key would be taken as already sent, and nothing would go).
 - *Never collected.* A cancelled task's report is not collected, recorded
   or judged; a report file it leaves is not the next task's (the delivery
   mark rule).
@@ -3230,7 +3233,9 @@ are per-agent uids or a mount per engine.
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a
-  bug. One that returns an error records nothing: the error is shown to
+  bug. So is a base or a candidate that is empty or whitespace (evidence
+  `parameter_error`), before any git work or gate run, and never turned
+  `stale` by a main that moved. One that returns an error records nothing: the error is shown to
   the operator and a later pass judges again (a git that cannot run a
   merge is the host's problem, not the work's: objective 008).
   TERM kills the gate with the process (no record), and the next

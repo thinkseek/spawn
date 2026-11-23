@@ -1813,7 +1813,10 @@ pub(super) fn repeats(failure: &crate::gate::GateFailure) -> bool {
     use crate::gate::GateFailure;
     !matches!(
         failure,
-        GateFailure::NoRoom { .. } | GateFailure::Failed(_) | GateFailure::Reaped
+        GateFailure::NoRoom { .. }
+            | GateFailure::Failed(_)
+            | GateFailure::Parameter(_)
+            | GateFailure::Reaped
     )
 }
 
@@ -1830,7 +1833,10 @@ fn failure_log(failure: &crate::gate::GateFailure) -> Option<&str> {
         | GateFailure::MainRed { log, .. }
         | GateFailure::CannotJudge { log, .. }
         | GateFailure::BaseDisagrees { log, .. } => Some(log),
-        GateFailure::Timeout | GateFailure::Reaped | GateFailure::Failed(_) => None,
+        GateFailure::Timeout
+        | GateFailure::Reaped
+        | GateFailure::Failed(_)
+        | GateFailure::Parameter(_) => None,
     }
 }
 
@@ -1848,6 +1854,7 @@ fn no_verdict(failure: crate::gate::GateFailure) -> String {
         GateFailure::Timeout => "the gate ran past its wall clock".to_string(),
         GateFailure::Reaped => "the integrator that started the gate reaped it".to_string(),
         GateFailure::Failed(error) => format!("the gate could not start: {error}"),
+        GateFailure::Parameter(error) => format!("invalid gate parameters: {error}"),
         GateFailure::NoRoom { short, .. } => format!("no room to judge ({})", short.check()),
         GateFailure::HostFault {
             scenario, reason, ..

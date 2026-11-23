@@ -206,7 +206,9 @@ select jsonb_build_object(
 /// model profile of its latest execution, what the dispatcher already sent
 /// there in the last day, and however old what a decision still rests on:
 /// its deliveries (a delivery is confirmed from its command), its restarts'
-/// Stops and resumes (`restart-<task>-<n>[-stop]`, each sent once), the nudges of
+/// Stops and resumes (`restart-<task>-<n>[-stop]`, each sent once), its
+/// cancel notices (`cancel-notice-<task>-<n>`: a failed one goes again under
+/// the next number, which must not be one already used), the nudges of
 /// the current episode and the resume of the current execution (an old one
 /// is not "not sent"); the tags of every input it delivered there
 /// (`told`: the escalations its digests carried, however long ago);
@@ -290,6 +292,7 @@ from (
         and (c.created_at_ms > spawn_now_ms() - 86400000
              or c.idempotency_key like 'deliver-%'
              or starts_with(c.idempotency_key, 'restart-')
+             or starts_with(c.idempotency_key, 'cancel-notice-')
              or c.idempotency_key = 'dispatch-resume-' || coalesce(s.execution_id, 'none')
              or c.idempotency_key = 'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
              or starts_with(c.idempotency_key,

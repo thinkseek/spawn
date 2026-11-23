@@ -1217,6 +1217,25 @@ fn unresolved_markers_send_work_back_before_the_gate() {
 }
 
 #[test]
+fn an_empty_gate_base_is_a_parameter_error_not_a_stale_retry() {
+    let root = std::env::temp_dir().join(format!("spawn-empty-base-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).expect("seed directory");
+    let path = seed.to_string_lossy().to_string();
+    crate::sources::test_git(&["init", "-q", "--initial-branch=main", &path]).expect("init");
+    std::fs::write(seed.join("README.md"), "base\n").expect("write");
+    commit_in(&path, "base");
+    for base in ["", " ", "\t", "\n"] {
+        let error = super::main_moved(&path, base)
+            .expect_err("an empty base must not be compared with a source head");
+        assert!(error.contains("base revision"), "base={base:?}: {error}");
+        assert!(error.contains("empty"), "base={base:?}: {error}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_gate_without_a_believable_verdict_is_recorded_as_an_abort_with_its_log() {
     let record = aborted(&GateFailure::Aborted {
         reason: "the gate ended with signal: 9 (SIGKILL)".to_string(),
@@ -1241,6 +1260,15 @@ fn a_gate_without_a_believable_verdict_is_recorded_as_an_abort_with_its_log() {
             .as_str()
             .is_some_and(|r| r.contains("wall clock"))
     );
+    let empty_candidate = aborted(&GateFailure::Parameter(
+        "gate candidate revision is empty or whitespace".to_string(),
+    ));
+    assert_eq!(
+        empty_candidate["reason"],
+        "the gate failed: gate candidate revision is empty or whitespace"
+    );
+    assert!(empty_candidate.get("log").is_none());
+    assert_eq!(empty_candidate["evidence"], "parameter_error");
 }
 
 fn mission(rejections: u32, aborts: u32, floor: u32) -> Mission {

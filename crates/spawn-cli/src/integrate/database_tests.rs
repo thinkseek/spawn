@@ -3451,6 +3451,162 @@ fn last_verdict(db: &Db) -> (Value, i64, i64) {
     (row.get(0), row.get(1), row.get(2))
 }
 
+#[test]
+fn an_empty_base_is_an_abort_before_pregate_git_work() {
+    let (base, source, scenarios, integrator) = world("empty-base-pregate", "exit 3\n");
+    let db = Db::new("empty_base_pregate");
+    for empty_base in ["", " ", "\u{3000}"] {
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let row = snapshot(&db, mission);
+        let ran = integrator
+            .judge
+            .judge(
+                &db.store,
+                Path::new("/nonexistent/mirror.git"),
+                "/nonexistent/source.git",
+                empty_base,
+                &row,
+                0,
+                &ready_task(&db, task),
+                None,
+            )
+            .expect("an empty base becomes a parameter abort before fetching a candidate");
+        assert!(!ran, "a parameter error runs no gate");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["id"], task, "{record}");
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        assert_eq!(record["evidence"], "parameter_error", "{record}");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("base revision is empty")),
+            "base={empty_base:?}: {record}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 1);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_empty_candidate_is_an_abort_before_pregate_git_work() {
+    let (base, source, scenarios, integrator) = world("empty-candidate-pregate", "exit 3\n");
+    let db = Db::new("empty_candidate_pregate");
+    let mirror = mirror_of(&integrator, &source);
+    let main = source_main(&source);
+    for (index, empty_candidate) in ["", " ", "\u{3000}"].into_iter().enumerate() {
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        let pushed = push_work(&base, &source, &agent, &format!("work-{index}.txt"));
+        git(&[
+            "--git-dir",
+            &mirror,
+            "fetch",
+            "-q",
+            &source,
+            &format!("+refs/heads/spawn/{agent}:refs/spawn-integrate/{agent}"),
+        ])
+        .expect("fetch the candidate");
+        let row = snapshot(&db, mission);
+        integrator
+            .judge
+            .judge_pushed_using(
+                &db.store,
+                Path::new(&mirror),
+                &source,
+                &main,
+                &row,
+                0,
+                &ready_task(&db, task),
+                Some(&pushed),
+                None,
+                |_, _, _, _| {
+                    if index == 2 {
+                        main_moves(&base, &source, "main-moves-empty-candidate.txt");
+                    }
+                    Ok(Some(empty_candidate.to_string()))
+                },
+            )
+            .expect("an empty candidate becomes a parameter abort");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["id"], task, "{record}");
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        assert_eq!(record["evidence"], "parameter_error", "{record}");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("candidate revision is empty")),
+            "candidate={empty_candidate:?}: {record}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 1);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An adopted judging (gate v2 step 2, D5) judges the candidate its
+/// `judging.json` names: one that is empty or whitespace is a parameter
+/// abort before any gate run is bound (no `env`), counted toward the abort
+/// halt, as a candidate the landing merge returned empty is.
+#[test]
+fn an_empty_adopted_candidate_is_an_abort_before_the_gate() {
+    let (base, source, scenarios, integrator) = world("empty-adopted-candidate", "exit 3\n");
+    let db = Db::new("empty_adopted_candidate");
+    let mirror = mirror_of(&integrator, &source);
+    let main = source_main(&source);
+    for (index, empty_candidate) in ["", " ", "\u{3000}"].into_iter().enumerate() {
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = agent_of(&db, mission, task);
+        let pushed = push_work(&base, &source, &agent, &format!("adopted-{index}.txt"));
+        git(&[
+            "--git-dir",
+            &mirror,
+            "fetch",
+            "-q",
+            &source,
+            &format!("+refs/heads/spawn/{agent}:refs/spawn-integrate/{agent}"),
+        ])
+        .expect("fetch the branch");
+        let mut judge = integrator.judge.clone();
+        judge.adopted = Some(super::Adopted {
+            candidate: empty_candidate.to_string(),
+            branch: pushed,
+            started_ms: super::now_ms(),
+        });
+        let row = snapshot(&db, mission);
+        let ran = judge
+            .judge(
+                &db.store,
+                Path::new(&mirror),
+                &source,
+                &main,
+                &row,
+                0,
+                &ready_task(&db, task),
+                None,
+            )
+            .expect("an empty adopted candidate becomes a parameter abort");
+        assert!(ran, "the adopted judging is judged");
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["id"], task, "{record}");
+        assert_eq!(record["verdict"], "aborted", "{record}");
+        assert_eq!(record["evidence"], "parameter_error", "{record}");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("candidate revision is empty")),
+            "candidate={empty_candidate:?}: {record}"
+        );
+        assert!(
+            record["env"].is_null(),
+            "refused before a gate run was bound: {record}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 1);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Objective 20, end to end: a gate that rejects for check-tests.sh
 /// with connection errors only is recorded `host_fault` (by its
 /// failures), the task stays reported and is not judged again before the
@@ -5687,6 +5843,9 @@ fn a_gate_that_never_started_or_was_reaped_twice_stays_pending() {
         "x".to_string()
     )));
     assert!(!super::owner::repeats(&GateFailure::Reaped));
+    assert!(!super::owner::repeats(&GateFailure::Parameter(
+        "gate base revision is empty or whitespace".to_string(),
+    )));
     assert!(super::owner::repeats(&GateFailure::Timeout));
     assert!(super::owner::repeats(&GateFailure::Aborted {
         reason: "r".to_string(),

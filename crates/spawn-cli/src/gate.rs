@@ -778,6 +778,8 @@ pub(crate) enum GateFailure {
     Timeout,
     /// The gate could not start.
     Failed(String),
+    /// A trusted caller supplied an empty or whitespace-only revision.
+    Parameter(String),
     /// The gate ran but gave no verdict to believe: a non-zero or signalled
     /// exit, or no verdict file. `log` is what it printed.
     Aborted { reason: String, log: String },
@@ -1075,6 +1077,16 @@ fn cluster_of(url: &str) -> (String, String) {
     (host, port.to_string())
 }
 
+/// Reject an empty revision at the trusted caller boundary. A nonexistent
+/// non-empty revision still goes through git and keeps its old abort class.
+pub(crate) fn validate_revision(parameter: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("gate {parameter} revision is empty or whitespace"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Judge `candidate` against `base` in `repo` with the scenarios in
 /// `scenarios`, and the task scenario when there is one. `env` is the
 /// gate's whole environment ([`gate_env`]).
@@ -1156,6 +1168,9 @@ fn judge_in(
     limit: Duration,
     seen: &mut Option<String>,
 ) -> Result<Verdict, GateFailure> {
+    for (parameter, value) in [("base", base), ("candidate", candidate)] {
+        validate_revision(parameter, value).map_err(GateFailure::Parameter)?;
+    }
     let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
         .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
     // The gate's own TMPDIR, as gate.sh reads it.
@@ -2916,6 +2931,24 @@ mod tests {
             )
         }
 
+        fn judge_revisions(
+            &self,
+            base: &str,
+            candidate: &str,
+        ) -> Result<super::Verdict, GateFailure> {
+            let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            judge(
+                &path("gate.sh"),
+                Path::new("/nonexistent/repo.git"),
+                base,
+                candidate,
+                &path("scenarios"),
+                None,
+                &path_only(),
+                Duration::from_secs(20),
+            )
+        }
+
         /// [`FakeGate::judge`], and the base check it saw
         /// ([`super::judge_seeing_base_check`]).
         fn judge_seeing(
@@ -2973,6 +3006,44 @@ mod tests {
 
     fn path_only() -> Vec<(String, String)> {
         vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]
+    }
+
+    #[test]
+    fn empty_revisions_are_parameter_errors_before_the_gate_runs() {
+        const RUST_WHITESPACE: [char; 25] = [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}',
+            '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
+            '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ];
+        let gate = FakeGate::new("");
+        let marker = gate.directory.path().join("ran");
+        let script = format!("touch '{}'\nexit 3\n", marker.display());
+        std::fs::write(gate.directory.path().join("gate.sh"), script).expect("gate");
+        for parameter in ["base", "candidate"] {
+            for value in
+                std::iter::once(String::new()).chain(RUST_WHITESPACE.iter().map(char::to_string))
+            {
+                let (base, candidate) = if parameter == "base" {
+                    (value.as_str(), "candidate")
+                } else {
+                    ("base", value.as_str())
+                };
+                let judged = gate.judge_revisions(base, candidate);
+                assert!(
+                    matches!(judged, Err(GateFailure::Parameter(ref reason)) if reason.contains(parameter)),
+                    "{parameter} {value:?}: {judged:?}"
+                );
+            }
+        }
+        assert!(!marker.exists(), "the gate script never ran");
+        assert!(
+            matches!(
+                gate.judge_revisions("base", "no-such-ref"),
+                Err(GateFailure::Aborted { .. })
+            ),
+            "a non-empty unresolved revision keeps its old abort class"
+        );
     }
 
     /// A verdict names the checks that failed once and passed again

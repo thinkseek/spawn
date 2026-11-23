@@ -1728,8 +1728,16 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
         return None;
     }
     facts.execution_id.as_ref()?;
+    // The next number after every one seen, not the count seen: a key
+    // already used would be refused as a duplicate, and nothing sent.
+    let next = attempts
+        .iter()
+        .filter_map(|sent| sent.key.strip_prefix(&prefix)?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |last| last.saturating_add(1))
+        .max(attempts.len());
     Some(cancelled.command(
-        format!("{prefix}{}", attempts.len()),
+        format!("{prefix}{next}"),
         CommandAction::Resume {
             prompt: Some(cancel_notice(cancelled)),
             model: None,
@@ -3644,6 +3652,16 @@ mod tests {
             retry[0].key, "cancel-notice-7-1",
             "a retry under a key of its own"
         );
+        // Only the latest of four failed notices still among the facts: the
+        // retry is numbered after it, not by the count seen (which would
+        // reuse `cancel-notice-7-1`, refused as a duplicate: nothing sent).
+        let mut later = stopped();
+        later
+            .dispatched
+            .push(sent(33, "cancel-notice-7-3", 1_000, Some("pane not ready")));
+        let retry = super::orders(&after_cancel(false), &[later], 1_000 + super::RETRY_MAX_MS);
+        assert_eq!(retry.len(), 1, "{retry:?}");
+        assert_eq!(retry[0].key, "cancel-notice-7-4", "a key never used");
 
         // Told: the waiting task goes to the idle worker.
         let plan = orders(&after_cancel(true), &[worker(true, true)]);

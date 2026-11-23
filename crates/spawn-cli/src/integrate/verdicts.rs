@@ -1008,6 +1008,10 @@ pub(super) fn aborted(failure: &GateFailure) -> Value {
         GateFailure::Timeout => json!({"reason": "the gate exceeded its wall clock"}),
         GateFailure::Reaped => json!({"reason": "the integrator that started the gate reaped it"}),
         GateFailure::Failed(error) => json!({"reason": format!("the gate failed: {error}")}),
+        GateFailure::Parameter(error) => json!({
+            "reason": format!("the gate failed: {error}"),
+            "evidence": "parameter_error",
+        }),
         GateFailure::Aborted { reason, log } => {
             json!({"reason": format!("the gate failed: {reason}"), "log": log})
         }
