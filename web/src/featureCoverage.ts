@@ -641,3 +641,25 @@ export function coverageProjects(
       };
     });
 }
+
+/** What the coverage page shows: one mission's project (null: the server's
+ * default) in one selection `epoch`. Every project switch starts a new
+ * epoch, so A -> B -> A is not the A it left. */
+export interface CoverageScope {
+  mission: number | null;
+  epoch: number;
+}
+
+export const INITIAL_COVERAGE_SCOPE: CoverageScope = { mission: null, epoch: 0 };
+
+/** The scope after selecting `mission`: always a new epoch. */
+export function nextCoverageScope(current: CoverageScope, mission: number | null): CoverageScope {
+  return { mission, epoch: current.epoch + 1 };
+}
+
+/** Whether a load, scan or association started in `started` may still land:
+ * only while the page is in that same scope. A late completion from an
+ * earlier selection is discarded. */
+export function isCurrentCoverageScope(started: CoverageScope, current: CoverageScope): boolean {
+  return started.epoch === current.epoch && started.mission === current.mission;
+}

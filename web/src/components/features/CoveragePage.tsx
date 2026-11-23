@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   coverageProjects,
+  INITIAL_COVERAGE_SCOPE,
+  isCurrentCoverageScope,
+  nextCoverageScope,
   type CoverageProject,
+  type CoverageScope,
   type FeatureCoverageResponse,
 } from "../../featureCoverage";
 import {
@@ -10,82 +14,106 @@ import {
   fetchFeatureCoverage,
   runWildFileScan,
 } from "../../featureCoverageApi";
-import { fetchFeatureMap } from "../../featuresApi";
+import { FEATURE_MAP_MAX_MISSIONS, fetchFeatureMap } from "../../featuresApi";
 import { relativeTime } from "../../format";
 import { LiveStatus, PageHeader } from "../ui";
 import { WildFileScanPanel } from "./WildFileScanPanel";
 
 /** Feature file coverage & one-click unassociated-file ("野文件") scan view
  * (`#/coverage`): the server's default project, or any mission with a
- * configured `--features` registry (`?mission=<id>`). */
+ * configured `--features` coverage registry (`?mission=<id>`). Every result
+ * is scoped to the selection it was asked for: one that completes after the
+ * project changed is discarded. */
 export function CoveragePage() {
-  // null: the server's default project (SPAWN_FEATURE_ROOT).
-  const [mission, setMission] = useState<number | null>(null);
+  // mission null: the server's default project (SPAWN_FEATURE_ROOT).
+  const [scope, setScope] = useState<CoverageScope>(INITIAL_COVERAGE_SCOPE);
+  const scopeRef = useRef<CoverageScope>(INITIAL_COVERAGE_SCOPE);
   const [projects, setProjects] = useState<CoverageProject[]>([]);
-  const [data, setData] = useState<FeatureCoverageResponse | null>(null);
+  const [shown, setShown] = useState<{ scope: CoverageScope; data: FeatureCoverageResponse } | null>(
+    null,
+  );
   const [loadError, setLoadError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const mission = scope.mission;
+  // Only the current scope's report is ever drawn (or associated against).
+  const data = shown && isCurrentCoverageScope(shown.scope, scope) ? shown.data : null;
 
   // The project list is a convenience: without it the default project still reads.
   useEffect(() => {
     const controller = new AbortController();
-    void fetchFeatureMap(controller.signal)
+    void fetchFeatureMap(controller.signal, FEATURE_MAP_MAX_MISSIONS)
       .then((map) => setProjects(coverageProjects(map.missions)))
       .catch(() => setProjects([]));
     return () => controller.abort();
   }, []);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    setData(null);
+  const selectMission = useCallback((next: number | null) => {
+    const nextScope = nextCoverageScope(scopeRef.current, next);
+    scopeRef.current = nextScope;
+    setScope(nextScope);
+    setShown(null);
+    setScanning(false);
     setLoadError(null);
     setActionError(null);
     setActionNotice(null);
-    void fetchFeatureCoverage(controller.signal, mission)
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const started = scope;
+    void fetchFeatureCoverage(controller.signal, started.mission)
       .then((next) => {
-        setData(next);
+        if (!isCurrentCoverageScope(started, scopeRef.current)) return;
+        setShown({ scope: started, data: next });
         setLoadError(null);
       })
       .catch((cause) => {
         if (cause instanceof DOMException && cause.name === "AbortError") return;
+        if (!isCurrentCoverageScope(started, scopeRef.current)) return;
         setLoadError(cause instanceof Error ? cause.message : "Failed to load coverage");
       });
     return () => controller.abort();
-  }, [mission]);
+  }, [scope]);
 
   const handleScan = useCallback(async () => {
+    const started = scopeRef.current;
     setScanning(true);
     setActionError(null);
     setActionNotice(null);
     try {
-      const next = await runWildFileScan(undefined, mission);
-      setData(next);
+      const next = await runWildFileScan(undefined, started.mission);
+      if (!isCurrentCoverageScope(started, scopeRef.current)) return;
+      setShown({ scope: started, data: next });
       setLoadError(null);
       setActionNotice(
         `Scan complete: ${next.report.counts.in_scope} in-scope, ${next.report.counts.covered} covered, ${next.report.counts.unassociated_wild} wild, ${next.report.counts.stale_references} stale.`,
       );
     } catch (cause) {
+      if (!isCurrentCoverageScope(started, scopeRef.current)) return;
       setActionError(cause instanceof Error ? cause.message : "Scan failed");
     } finally {
-      setScanning(false);
+      if (isCurrentCoverageScope(started, scopeRef.current)) setScanning(false);
     }
-  }, [mission]);
+  }, []);
 
   const handleAssociate = useCallback(async (path: string, featureIds: string[]) => {
+    const started = scopeRef.current;
     setActionError(null);
     setActionNotice(null);
     try {
-      const next = await associateWildFile(path, featureIds, undefined, mission);
-      setData(next);
+      const next = await associateWildFile(path, featureIds, undefined, started.mission);
+      if (!isCurrentCoverageScope(started, scopeRef.current)) return;
+      setShown({ scope: started, data: next });
       setActionNotice(
         `Associated ${path} with ${featureIds.join(", ")} (remaining wild files: ${next.report.counts.unassociated_wild}).`,
       );
     } catch (cause) {
+      if (!isCurrentCoverageScope(started, scopeRef.current)) return;
       setActionError(cause instanceof Error ? cause.message : "Association failed");
     }
-  }, [mission]);
+  }, []);
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-page-canvas">
@@ -103,7 +131,7 @@ export function CoveragePage() {
             value={mission === null ? "" : String(mission)}
             onChange={(event) => {
               const next = event.target.value;
-              setMission(next === "" ? null : Number(next));
+              selectMission(next === "" ? null : Number(next));
             }}
             className="max-w-xs truncate rounded-md border border-surface-border bg-surface px-2 text-caption font-medium text-foreground transition-colors hover:border-border-strong focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
           >
@@ -133,7 +161,9 @@ export function CoveragePage() {
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* A new scope remounts the panel: no selection from another project survives. */}
           <WildFileScanPanel
+            key={scope.epoch}
             data={data}
             scanning={scanning}
             actionError={actionError}
