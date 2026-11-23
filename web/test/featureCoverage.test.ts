@@ -14,11 +14,14 @@ import {
   initialWildFileSelection,
   initiativesAndSlices,
   isResearchInitiative,
+  isRegistryReadOnlyRefusal,
   isScanClean,
   kindLabel,
   normalizeFeatureCoverage,
   parseCoverageHttpResponse,
   parseFeatureCoverageResponse,
+  REGISTRY_READ_ONLY_CODE,
+  registryReadOnlyNotice,
   toggleWildFileSelection,
 } from "../src/featureCoverage.ts";
 
@@ -724,4 +727,103 @@ test("Review A F4: non-JSON 200 and malformed coverage payloads fail visibly ins
   );
   assert.equal(valid.report.counts.in_scope, 2);
   assert.equal(valid.report.counts.unassociated_wild, 1);
+});
+
+test("read-only deployed registry: payload fields normalize, banner text, and Associate is disabled", () => {
+  // A server that predates the fields still accepts associations.
+  const legacy = normalizeFeatureCoverage(basePayload());
+  assert.equal(legacy.registry_writable, true);
+  assert.equal(legacy.read_only_reason, null);
+  assert.equal(registryReadOnlyNotice(legacy), null);
+
+  const writable = parseFeatureCoverageResponse(
+    { ...basePayload(), registry_writable: true, read_only_reason: null },
+  );
+  assert.equal(writable.registry_writable, true);
+  assert.equal(registryReadOnlyNotice(writable), null);
+
+  const reason =
+    "the directory /srv/controller/docs/feature-map holding the feature registry is read-only (permission denied)";
+  const readOnly = parseFeatureCoverageResponse(
+    { ...basePayload(), registry_writable: false, read_only_reason: reason },
+  );
+  assert.equal(readOnly.registry_writable, false);
+  assert.equal(readOnly.read_only_reason, reason);
+  assert.equal(registryReadOnlyNotice(readOnly), reason);
+  // A missing or blank reason still yields a clear banner.
+  for (const blank of [null, "", "   ", 7]) {
+    const data = normalizeFeatureCoverage(
+      { ...basePayload(), registry_writable: false, read_only_reason: blank },
+    );
+    assert.equal(data.registry_writable, false);
+    assert.match(registryReadOnlyNotice(data) ?? "", /read-only/);
+  }
+  // Only an explicit `false` is read-only; a reason without it is ignored.
+  const stray = normalizeFeatureCoverage(
+    { ...basePayload(), registry_writable: "no", read_only_reason: reason },
+  );
+  assert.equal(stray.registry_writable, true);
+  assert.equal(stray.read_only_reason, null);
+
+  // Associate stays disabled on a read-only registry whatever is selected.
+  const selected = ["t559u-slice-b-coverage"];
+  assert.equal(canSubmitWildFileAssociation(selected, false, true), true);
+  assert.equal(canSubmitWildFileAssociation(selected, false, false), false);
+  assert.equal(canSubmitWildFileAssociation(selected), true);
+
+  // The panel wires the banner and the disabled controls to these helpers.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const panelSource = fs.readFileSync(
+    path.resolve(here, "../src/components/features/WildFileScanPanel.tsx"),
+    "utf8",
+  );
+  assert.ok(panelSource.includes("registryReadOnlyNotice(data)"));
+  assert.ok(panelSource.includes('data-testid="registry-read-only-banner"'));
+  assert.ok(
+    panelSource.includes("canSubmitWildFileAssociation(selected, saving, registryWritable)"),
+  );
+  assert.ok(panelSource.includes("disabled={!registryWritable}"));
+});
+
+test("read-only deployed registry: the associate route's structured 409 surfaces its clear message", async () => {
+  const makeError = (status: number, detail: string) =>
+    new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
+  const refusal = {
+    error:
+      "the feature registry on this deployment is read-only, so the association was not saved: the directory /srv/c holding the feature registry is read-only (permission denied)",
+    code: REGISTRY_READ_ONLY_CODE,
+    registry_writable: false,
+    read_only_reason: "the directory /srv/c holding the feature registry is read-only (permission denied)",
+    registry_path: "/srv/c/docs/feature-map/registry.json",
+  };
+  assert.equal(isRegistryReadOnlyRefusal(409, refusal), true);
+  assert.equal(isRegistryReadOnlyRefusal(400, refusal), false);
+  assert.equal(isRegistryReadOnlyRefusal(409, { error: "conflict" }), false);
+  assert.equal(isRegistryReadOnlyRefusal(409, null), false);
+
+  await assert.rejects(
+    () =>
+      parseCoverageHttpResponse(
+        { ok: false, status: 409, json: () => Promise.resolve(refusal) },
+        makeError,
+      ),
+    (error: Error) => {
+      assert.match(error.message, /^HTTP 409: the feature registry on this deployment is read-only/);
+      assert.doesNotMatch(error.message, /os error/);
+      return true;
+    },
+  );
+  // Without an `error` string the reason (or a default) still explains it.
+  await assert.rejects(
+    () =>
+      parseCoverageHttpResponse(
+        {
+          ok: false,
+          status: 409,
+          json: () => Promise.resolve({ code: REGISTRY_READ_ONLY_CODE, registry_writable: false }),
+        },
+        makeError,
+      ),
+    /HTTP 409: .*read-only/,
+  );
 });

@@ -135,6 +135,11 @@ export interface AssociationUpdate {
 export interface FeatureCoverageResponse {
   root: string;
   registry_path: string;
+  /** Whether the server can save associations into the registry. `false` on
+   * a deployed controller tree, which is read-only. */
+  registry_writable: boolean;
+  /** Why the registry is read-only, when `registry_writable` is `false`. */
+  read_only_reason: string | null;
   report: ScanReport;
   features: CoverageFeatureSummary[];
   update: AssociationUpdate | null;
@@ -352,6 +357,10 @@ export function normalizeFeatureCoverage(value: unknown): FeatureCoverageRespons
   return {
     root: str(raw.root),
     registry_path: str(raw.registry_path),
+    // Only an explicit `false` means read-only: a server that predates the
+    // field still accepts associations.
+    registry_writable: raw.registry_writable !== false,
+    read_only_reason: raw.registry_writable === false ? optStr(raw.read_only_reason) : null,
     report: normalizeScanReport(raw.report),
     features: arr(raw.features).map(normalizeFeatureSummary),
     update: normalizeUpdate(raw.update),
@@ -421,7 +430,10 @@ export async function parseCoverageHttpResponse(
     let detail = "";
     try {
       const payload = await response.json();
-      if (isPlainObject(payload) && typeof payload.error === "string") {
+      if (isRegistryReadOnlyRefusal(response.status, payload)) {
+        detail =
+          str(payload.error) || str(payload.read_only_reason) || DEFAULT_READ_ONLY_REASON;
+      } else if (isPlainObject(payload) && typeof payload.error === "string") {
         detail = payload.error;
       }
     } catch {
@@ -458,12 +470,42 @@ export function toggleWildFileSelection(
     : [...selected, featureId];
 }
 
-/** Linking requires at least one explicitly selected feature and no in-flight save. */
+/** Linking requires at least one explicitly selected feature, no in-flight
+ * save, and a registry the server can write (never on a read-only deployed
+ * controller). */
 export function canSubmitWildFileAssociation(
   selected: readonly string[],
   saving = false,
+  registryWritable = true,
 ): boolean {
-  return selected.length > 0 && !saving;
+  return registryWritable && selected.length > 0 && !saving;
+}
+
+/** Error code of the structured `409` answer from `POST
+ * /api/features/associate` when the registry is read-only. */
+export const REGISTRY_READ_ONLY_CODE = "registry_read_only";
+
+const DEFAULT_READ_ONLY_REASON =
+  "The feature registry on this server is read-only, so associations cannot be saved here.";
+
+/** Banner text for a read-only registry (a deployed controller tree), or
+ * `null` when associations can be saved. */
+export function registryReadOnlyNotice(
+  data: Pick<FeatureCoverageResponse, "registry_writable" | "read_only_reason">,
+): string | null {
+  if (data.registry_writable) return null;
+  const reason = data.read_only_reason?.trim();
+  return reason ? reason : DEFAULT_READ_ONLY_REASON;
+}
+
+/** Whether an HTTP answer is the associate route's read-only refusal. */
+export function isRegistryReadOnlyRefusal(
+  status: number,
+  payload: unknown,
+): payload is Record<string, unknown> {
+  return (
+    status === 409 && isPlainObject(payload) && payload.code === REGISTRY_READ_ONLY_CODE
+  );
 }
 
 export function consistencyIssueCount(consistency: ConsistencyReport): number {

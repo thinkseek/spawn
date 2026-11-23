@@ -101,6 +101,12 @@ impl BoundaryPolicy {
                     reason: "Ephemeral RSI gate owner lease and runtime state (gitignored) are not authored project artifacts.".to_string(),
                 },
                 ExclusionRule {
+                    id: "deployed-controller-marker".to_string(),
+                    pattern: ".controller".to_string(),
+                    category: "runtime-state".to_string(),
+                    reason: "Root deploy marker (the 41-byte commit id written by deploy/controller.sh into a deployed controller tree) is runtime state, not an authored project artifact.".to_string(),
+                },
+                ExclusionRule {
                     id: "secrets-env-dotfile".to_string(),
                     pattern: "**/.env".to_string(),
                     category: "secrets".to_string(),

@@ -110,7 +110,39 @@ claiming it would count the same records twice, and that is refused. Two
 sources with one reference in one capability are merged. External sources may
 repeat (a shared issue, a person's request), and they never affect the state.
 
-### 3.2 What the page adds
+### 3.2 The curated registry as the mapping
+
+The project's own feature registry, `docs/feature-map/registry.json`
+(`"schema_version": 1`, the file `spawn-core`'s feature coverage reads), is
+also a mapping, so it can be configured directly:
+
+```bash
+spawn mission configure --id 4 --features "$PWD/docs/feature-map/registry.json"
+```
+
+The registry's top level is `schema_version`, `initiative_id`, `boundary` and
+`features`; a node takes `id`, `title`, `summary`, `kind`, `parent`, `tags`,
+`files`, `relations`, `provenance` and `status_note` (anything else is refused,
+as in a plain map; `sources` is the plain map's field, not the registry's).
+`parent`, `kind`, `files` and `relations` draw the Mind Map's hierarchy. Each
+`provenance` list becomes sources:
+
+| `provenance` list | Entry | Source |
+| --- | --- | --- |
+| `objectives` | `"4/001"` (this mission) | native `objective:4/001`: **decides the state** |
+| `objectives` | anything else (`"t559u"`, `"5/003"`) | `external-objective:<entry>` link |
+| `tasks` | a whole number | native `task:<n>` |
+| `tasks` | a name (`"slice-a"`) | `external-task:<entry>` link |
+| `deploys` | a whole number | native `deploy:<event>` |
+| `deploys` | a name | `external-deploy:<entry>` link |
+| `agents`, `commits`, `tests`, `artifacts`, `discussions` | any | `agent:`, `commit:`, `test:`, `artifact:`, `discussion:` links |
+
+Unlike a plain map, a registry may name one objective on a parent and on its
+children: the hierarchy shows the same work at two depths, it does not claim
+it twice. Within one node an entry named twice is one source. A plain map
+(no `schema_version`) keeps its rules: one objective, one capability.
+
+### 3.3 What the page adds
 
 Whether or not the file names them, the map adds the native sources that
 exist: the capability's objectives, each task a person assigned

@@ -1339,11 +1339,7 @@ fn feature_coverage_get() -> Result<Value, String> {
 /// `POST /api/features/scan`: one-click unassociated-file ("野文件") scan.
 /// Performs a fresh read-only project inventory scan; never modifies or
 /// deletes any file on disk.
-fn feature_scan_post(
-    mut request: Request,
-    access: Access,
-    _shared: &Shared,
-) -> Result<(), String> {
+fn feature_scan_post(mut request: Request, access: Access, _shared: &Shared) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -1392,36 +1388,88 @@ fn feature_associate_post(
             .map_err(|error| error.to_string());
     }
     let (status, body) = match feature_associate_checked(&mut request, access, shared) {
-        Ok(answer) => answer,
-        Err((status, error)) => (status, json!({ "error": error })),
+        Ok(answer) | Err(FeatureAssociateRefusal::Structured(answer)) => answer,
+        Err(FeatureAssociateRefusal::Plain((status, error))) => (status, json!({ "error": error })),
     };
     request
         .respond(json_response(status, &body))
         .map_err(|error| error.to_string())
 }
 
+/// Why `POST /api/features/associate` did not save: a plain `(status,
+/// message)` answered as `{"error": message}`, or a complete JSON body (the
+/// read-only registry refusal carries its own fields).
+#[derive(Debug)]
+enum FeatureAssociateRefusal {
+    Plain((u16, String)),
+    Structured((u16, Value)),
+}
+
+impl From<(u16, String)> for FeatureAssociateRefusal {
+    fn from(plain: (u16, String)) -> Self {
+        Self::Plain(plain)
+    }
+}
+
 fn feature_associate_checked(
     request: &mut Request,
     access: Access,
     shared: &Shared,
-) -> Result<(u16, Value), (u16, String)> {
+) -> Result<(u16, Value), FeatureAssociateRefusal> {
     let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
-    let body: FeatureAssociateBody = serde_json::from_slice(&raw_body).map_err(|error| {
-        (
-            400,
-            format!("{BAD_REQUEST}the body must be {{\"path\": ..., \"features\": [...]}}: {error}"),
-        )
-    })?;
     let root = crate::feature_inventory::default_root();
     let registry = crate::feature_inventory::default_registry_path(&root);
-    let payload = crate::feature_inventory::api_associate_payload(
-        &root,
-        &registry,
-        &body.path,
-        &body.features,
-    )
-    .map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    Ok((200, payload))
+    feature_associate_at(&root, &registry, &raw_body)
+}
+
+/// The association itself, against an explicit project root and registry
+/// path: parse the body, refuse a read-only registry with a structured 409
+/// before anything is attempted, then validate and save.
+fn feature_associate_at(
+    root: &std::path::Path,
+    registry: &std::path::Path,
+    raw_body: &[u8],
+) -> Result<(u16, Value), FeatureAssociateRefusal> {
+    let body: FeatureAssociateBody = serde_json::from_slice(raw_body).map_err(|error| {
+        (
+            400,
+            format!(
+                "{BAD_REQUEST}the body must be {{\"path\": ..., \"features\": [...]}}: {error}"
+            ),
+        )
+    })?;
+    let read_only = |reason: Option<String>| {
+        let reason = reason.unwrap_or_else(|| "the feature registry is read-only".to_string());
+        FeatureAssociateRefusal::Structured((
+            409,
+            json!({
+                "error": format!(
+                    "the feature registry on this deployment is read-only, so the association \
+                     was not saved: {reason}"
+                ),
+                "code": "registry_read_only",
+                "registry_writable": false,
+                "read_only_reason": reason,
+                "registry_path": registry.display().to_string(),
+            }),
+        ))
+    };
+    let writability = crate::feature_inventory::probe_registry_writable(registry);
+    if !writability.writable {
+        return Err(read_only(writability.read_only_reason));
+    }
+    crate::feature_inventory::api_associate_payload(root, registry, &body.path, &body.features)
+        .map(|payload| (200, payload))
+        .map_err(|error| {
+            // The registry may have turned read-only between the probe and
+            // the save: answer that the same way, never as a raw OS error.
+            let again = crate::feature_inventory::probe_registry_writable(registry);
+            if again.writable {
+                FeatureAssociateRefusal::Plain((400, format!("{BAD_REQUEST}{error}")))
+            } else {
+                read_only(again.read_only_reason)
+            }
+        })
 }
 
 /// Whether `origin` is this page's own: present, and the same host over
@@ -2720,12 +2768,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
-        ProcSocket, Shared, Slots, access_token, backups, handle, is_json, is_loopback,
-        keep_listening, listen_again_pause, local_exemption, log_window, objective_json,
-        objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
-        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
-        tokenless_request, typed_text, with_activity, with_last_gates, with_objectives,
+        Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_INPUT_BODY,
+        MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
+        feature_associate_at, handle, is_json, is_loopback, keep_listening, listen_again_pause,
+        local_exemption, log_window, objective_json, objective_prompt, open_network_request,
+        open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
+        same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_activity,
+        with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -5394,7 +5443,9 @@ mod tests {
             None,
             "",
             None,
-            &format!("POST /api/features/coverage HTTP/1.1\r\n{named}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+            &format!(
+                "POST /api/features/coverage HTTP/1.1\r\n{named}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
         );
         assert_eq!(post_cov.status, 405, "{post_cov:?}");
         // POST /api/features/scan without Origin and without token answers 403.
@@ -5402,7 +5453,9 @@ mod tests {
             None,
             "",
             None,
-            &format!("POST /api/features/scan HTTP/1.1\r\n{named}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"),
+            &format!(
+                "POST /api/features/scan HTTP/1.1\r\n{named}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
         );
         assert_eq!(scan_no_origin.status, 403, "{scan_no_origin:?}");
         // POST /api/features/associate with invalid JSON body under token answers 400.
@@ -5415,6 +5468,89 @@ mod tests {
             ),
         );
         assert_eq!(bad_assoc.status, 400, "{bad_assoc:?}");
+    }
+
+    /// A deployed controller tree is read-only: an association is refused
+    /// with a structured 409 naming why, before anything is attempted, and
+    /// the registry is left exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_feature_association_against_a_read_only_registry_is_refused_with_409() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "spawn-serve-assoc-read-only-{}-{nanos}",
+            std::process::id()
+        ));
+        let dir = root.join("docs/feature-map");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(&dir).expect("registry dir");
+        std::fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib.rs");
+        std::fs::write(root.join("src/wild.rs"), "pub fn wild() {}\n").expect("wild.rs");
+        let registry = dir.join("registry.json");
+        let boundary = spawn_core::feature_coverage::BoundaryPolicy::default_spawn_boundary();
+        let registry_json = json!({
+            "schema_version": spawn_core::feature_coverage::SCHEMA_VERSION,
+            "initiative_id": "t559u",
+            "boundary": boundary,
+            "features": [{
+                "id": "domain-core",
+                "title": "Core",
+                "kind": "domain",
+                "summary": "Core files",
+                "files": ["src/lib.rs"],
+            }],
+        });
+        let text = serde_json::to_string_pretty(&registry_json).expect("json");
+        std::fs::write(&registry, &text).expect("registry");
+        crate::feature_inventory::load_registry(&registry).expect("fixture registry parses");
+
+        let body = br#"{"path": "src/wild.rs", "features": ["domain-core"]}"#;
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o444))
+            .expect("chmod file");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod dir");
+        let refused = feature_associate_at(&root, &registry, body);
+        let unchanged = std::fs::read_to_string(&registry).expect("read back");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o644))
+            .expect("restore file");
+        // A malformed body is still a 400, read-only or not.
+        let bad = feature_associate_at(&root, &registry, b"{}");
+        // Writable again: the same association saves.
+        let saved = feature_associate_at(&root, &registry, body);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            matches!(bad, Err(FeatureAssociateRefusal::Plain((400, _)))),
+            "{bad:?}"
+        );
+        let (status, payload) = saved.expect("a writable registry saves");
+        assert_eq!(status, 200);
+        assert_eq!(payload["registry_writable"], json!(true));
+        assert_eq!(payload["report"]["counts"]["unassociated_wild"], json!(1));
+        if refused.is_ok() {
+            // Root ignores permission bits: nothing read-only to observe.
+            eprintln!("skipping: permission bits are not enforced for this user");
+            return;
+        }
+        let Err(FeatureAssociateRefusal::Structured((status, refusal))) = refused else {
+            panic!("expected a structured refusal, got {refused:?}");
+        };
+        assert_eq!(status, 409);
+        assert_eq!(refusal["code"], "registry_read_only");
+        assert_eq!(refusal["registry_writable"], json!(false));
+        let error = refusal["error"].as_str().expect("error");
+        assert!(error.contains("read-only"), "{error}");
+        assert!(!error.contains("os error"), "no raw OS error: {error}");
+        assert!(
+            refusal["read_only_reason"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty())
+        );
+        assert_eq!(unchanged, text, "the registry is untouched");
     }
 
     /// An API answer that failed carries no tag, so it is never "not

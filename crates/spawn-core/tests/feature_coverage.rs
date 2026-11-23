@@ -466,8 +466,8 @@ fn assert_real_registry_semantic_invariants(
 ) {
     assert_eq!(
         registry.boundary.exclusions.len(),
-        26,
-        "expected 26 explicit exclusion rules in docs/feature-map/registry.json"
+        27,
+        "expected 27 explicit exclusion rules in docs/feature-map/registry.json"
     );
     let ids: BTreeSet<&str> = registry.features.iter().map(|f| f.id.as_str()).collect();
     for forbidden_catchall in [
@@ -1121,6 +1121,93 @@ fn provenance_artifacts_and_tests_paths_are_stale_checked_while_commit_shas_are_
             .iter()
             .any(|m| m.contains("provenance.tests") && m.contains("../outside_test.rs"))
     );
+}
+
+#[test]
+fn deployed_controller_marker_is_excluded_and_never_unassociated_wild() {
+    let policy = BoundaryPolicy::default_spawn_boundary();
+    let rule = spawn_core::feature_coverage::match_exclusion(&policy, ".controller")
+        .expect("root .controller must match an explicit exclusion rule");
+    assert_eq!(rule.id, "deployed-controller-marker");
+    assert_eq!(rule.category, "runtime-state");
+    // Only the root deploy marker is excluded; a nested file of the same name
+    // stays in scope so a real authored file is never silently hidden.
+    assert!(spawn_core::feature_coverage::match_exclusion(&policy, "web/.controller").is_none());
+
+    // Pure scan over a synthetic inventory carrying the 41-byte marker.
+    let mut registry = fixture_registry();
+    let inventory = vec![
+        entry("crates/spawn-core/src/lib.rs", true, 400),
+        entry("crates/spawn-core/src/feature_coverage.rs", true, 8000),
+        entry(".controller", false, 41),
+    ];
+    let report = scan_coverage(&registry, &inventory, 1250);
+    assert_accounting_identities(&report);
+    assert!(report.is_clean());
+    assert_eq!(report.counts.unassociated_wild, 0);
+    assert_eq!(report.counts.explicit_exclusions, 1);
+    let excluded = report
+        .excluded_files
+        .iter()
+        .find(|e| e.path == ".controller")
+        .expect(".controller listed under excluded_files");
+    assert_eq!(excluded.rule_id, "deployed-controller-marker");
+    assert_eq!(excluded.category, "runtime-state");
+    assert!(
+        !report
+            .unassociated_files
+            .iter()
+            .any(|w| w.path == ".controller")
+    );
+    assert!(
+        associate_file(
+            &mut registry,
+            ".controller",
+            &["cap-coverage".to_string()],
+            &inventory
+        )
+        .is_err(),
+        "the deploy marker must never be associable"
+    );
+
+    // Filesystem walk over a synthetic deployed controller tree (no .git).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tree = std::env::temp_dir().join(format!(
+        "spawn-core-controller-marker-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(tree.join("crates/spawn-core/src")).expect("src dir");
+    fs::write(tree.join("crates/spawn-core/src/lib.rs"), "// lib\n").expect("lib.rs");
+    fs::write(
+        tree.join("crates/spawn-core/src/feature_coverage.rs"),
+        "// coverage\n",
+    )
+    .expect("feature_coverage.rs");
+    fs::write(
+        tree.join(".controller"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .expect(".controller");
+    let registry = fixture_registry();
+    let walked = collect_repo_inventory(&tree, &registry.boundary);
+    let walked_report = scan_coverage(&registry, &walked, 1260);
+    let _ = fs::remove_dir_all(&tree);
+    assert_accounting_identities(&walked_report);
+    assert!(
+        walked_report
+            .excluded_files
+            .iter()
+            .any(|e| e.path == ".controller" && e.rule_id == "deployed-controller-marker")
+    );
+    assert!(
+        !walked_report
+            .unassociated_files
+            .iter()
+            .any(|w| w.path == ".controller")
+    );
+    assert_eq!(walked_report.counts.unassociated_wild, 0);
 }
 
 #[test]
