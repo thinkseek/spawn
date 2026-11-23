@@ -525,8 +525,8 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
         }
     };
     let mission_id = mission["id"].as_i64().unwrap_or_default();
-    let read = read_mapping_value(&path)
-        .and_then(|value| Ok((parse_mapping(&value, mission_id)?, value)));
+    let read =
+        read_mapping_value(&path).and_then(|value| Ok((parse_mapping(&value, mission_id)?, value)));
     match read {
         // `registry`: whether the file is a coverage registry the coverage
         // page (`/api/features/coverage?mission=`) can scan, not a legacy
