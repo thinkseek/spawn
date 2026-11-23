@@ -8,11 +8,11 @@ import {
   accountingIdentitiesHold,
   canSubmitWildFileAssociation,
   consistencyIssueCount,
-  coverageProjects,
   coverageUrl,
   INITIAL_COVERAGE_SCOPE,
   isCurrentCoverageScope,
   nextCoverageScope,
+  normalizeCoverageProjects,
   featureAssociatedFiles,
   fileAssociatedFeatures,
   formatBytes,
@@ -29,7 +29,6 @@ import {
   registryReadOnlyNotice,
   toggleWildFileSelection,
 } from "../src/featureCoverage.ts";
-import { normalizeFeatureMap } from "../src/features.ts";
 
 function basePayload(overrides: Record<string, unknown> = {}) {
   return {
@@ -839,17 +838,31 @@ test("any project: coverage routes carry ?mission=<id>, the default project stay
   assert.equal(coverageUrl("/api/features/scan", 9), "/api/features/scan?mission=9");
   assert.equal(coverageUrl("/api/features/associate", 4), "/api/features/associate?mission=4");
 
-  const file = (path: string, registry = true) => ({ kind: "file", path, registry });
-  const projects = coverageProjects([
-    { id: 4, text: "Spawn RSI\nmore", mapping: file("/srv/spawn/docs/feature-map/registry.json") },
-    { id: 5, text: "Supply PA", mapping: { kind: "objectives", path: null, registry: false } },
-    { id: 9, text: "", mapping: file("/srv/acme/docs/feature-map/registry.json") },
-    { id: 10, text: "x".repeat(60), mapping: file("/srv/long/map.json") },
-    // A legacy identity-only map the coverage parser refuses is not offered.
-    { id: 11, text: "Flake Doctor", mapping: file("/srv/flake/map.json", false) },
-    // A configured path that failed to read falls back to objectives.
-    { id: 12, text: "Broken", mapping: { kind: "objectives", path: "/srv/gone.json", registry: false } },
-  ]);
+  // The server lists every eligible mission, however many: 60 options,
+  // mission #57 among them, all kept in order.
+  const many = normalizeCoverageProjects({
+    projects: Array.from({ length: 60 }, (_, index) => ({
+      mission: index + 1,
+      text: `Mission ${index + 1}`,
+      registry_path: `/srv/p${index + 1}/docs/feature-map/registry.json`,
+    })),
+  });
+  assert.equal(many.length, 60);
+  assert.equal(many[56].mission, 57);
+  assert.equal(many[56].registry, "/srv/p57/docs/feature-map/registry.json");
+
+  const projects = normalizeCoverageProjects({
+    projects: [
+      { mission: 4, text: "Spawn RSI\nmore", registry_path: "/srv/spawn/docs/feature-map/registry.json" },
+      { mission: 9, text: "", registry_path: "/srv/acme/docs/feature-map/registry.json" },
+      { mission: 10, text: "x".repeat(60), registry_path: "/srv/long/map.json" },
+      // Malformed entries are dropped, never offered.
+      { mission: "11", registry_path: "/srv/x.json" },
+      { mission: 12, registry_path: "" },
+      { mission: 1.5, registry_path: "/srv/y.json" },
+      null,
+    ],
+  });
   assert.deepEqual(
     projects.map((project) => project.mission),
     [4, 9, 10],
@@ -858,17 +871,9 @@ test("any project: coverage routes carry ?mission=<id>, the default project stay
   assert.equal(projects[0].registry, "/srv/spawn/docs/feature-map/registry.json");
   assert.equal(projects[1].label, "Mission #9");
   assert.equal(projects[2].label, `Mission #10 — ${"x".repeat(47)}…`);
-  assert.deepEqual(coverageProjects([]), []);
-  // `/api/features` says which file is a coverage registry; an older server
-  // that does not say offers none.
-  const map = normalizeFeatureMap({
-    missions: [
-      { id: 4, text: "Spawn", mapping: { kind: "file", path: "/r.json", error: null, registry: true } },
-      { id: 6, text: "Old", mapping: { kind: "file", path: "/m.json", error: null } },
-    ],
-  });
-  assert.deepEqual(map.missions.map((mission) => mission.mapping.registry), [true, false]);
-  assert.deepEqual(coverageProjects(map.missions).map((project) => project.mission), [4]);
+  for (const empty of [null, {}, { projects: null }, { projects: [] }]) {
+    assert.deepEqual(normalizeCoverageProjects(empty), []);
+  }
 
   // The page and its client pass the selected mission to all three routes.
   const here = path.dirname(fileURLToPath(import.meta.url));
@@ -884,11 +889,9 @@ test("any project: coverage routes carry ?mission=<id>, the default project stay
   assert.ok(page.includes("runWildFileScan(undefined, started.mission)"));
   assert.ok(page.includes("associateWildFile(path, featureIds, undefined, started.mission)"));
   assert.ok(page.includes('data-testid="coverage-project-select"'));
-  // The picker reads past /api/features' default of 10 missions.
-  assert.ok(page.includes("fetchFeatureMap(controller.signal, FEATURE_MAP_MAX_MISSIONS)"));
-  const featuresApi = fs.readFileSync(path.resolve(here, "../src/featuresApi.ts"), "utf8");
-  assert.ok(featuresApi.includes("FEATURE_MAP_MAX_MISSIONS = 50"));
-  assert.ok(featuresApi.includes("`/api/features?limit=${limit}`"));
+  // The picker reads the uncapped project list, not /api/features' missions.
+  assert.ok(page.includes("fetchCoverageProjects(controller.signal)"));
+  assert.ok(api.includes('"/api/features/coverage/projects"'));
 });
 
 test("any project: a late load, scan or association from an earlier project selection is discarded (A -> B -> A)", () => {
