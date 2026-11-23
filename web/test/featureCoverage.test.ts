@@ -8,6 +8,8 @@ import {
   accountingIdentitiesHold,
   canSubmitWildFileAssociation,
   consistencyIssueCount,
+  coverageProjects,
+  coverageUrl,
   featureAssociatedFiles,
   fileAssociatedFeatures,
   formatBytes,
@@ -826,4 +828,41 @@ test("read-only deployed registry: the associate route's structured 409 surfaces
       ),
     /HTTP 409: .*read-only/,
   );
+});
+
+test("any project: coverage routes carry ?mission=<id>, the default project stays unparameterized", () => {
+  assert.equal(coverageUrl("/api/features/coverage", null), "/api/features/coverage");
+  assert.equal(coverageUrl("/api/features/scan", 9), "/api/features/scan?mission=9");
+  assert.equal(coverageUrl("/api/features/associate", 4), "/api/features/associate?mission=4");
+
+  const projects = coverageProjects([
+    { id: 4, text: "Spawn RSI\nmore", mapping: { path: "/srv/spawn/docs/feature-map/registry.json" } },
+    { id: 5, text: "Supply PA", mapping: { path: null } },
+    { id: 9, text: "", mapping: { path: "/srv/acme/docs/feature-map/registry.json" } },
+    { id: 10, text: "x".repeat(60), mapping: { path: "/srv/long/map.json" } },
+  ]);
+  assert.deepEqual(
+    projects.map((project) => project.mission),
+    [4, 9, 10],
+  );
+  assert.equal(projects[0].label, "Mission #4 — Spawn RSI");
+  assert.equal(projects[0].registry, "/srv/spawn/docs/feature-map/registry.json");
+  assert.equal(projects[1].label, "Mission #9");
+  assert.equal(projects[2].label, `Mission #10 — ${"x".repeat(47)}…`);
+  assert.deepEqual(coverageProjects([]), []);
+
+  // The page and its client pass the selected mission to all three routes.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const api = fs.readFileSync(path.resolve(here, "../src/featureCoverageApi.ts"), "utf8");
+  for (const route of ["/api/features/coverage", "/api/features/scan", "/api/features/associate"]) {
+    assert.ok(api.includes(`coverageUrl("${route}", mission)`), route);
+  }
+  const page = fs.readFileSync(
+    path.resolve(here, "../src/components/features/CoveragePage.tsx"),
+    "utf8",
+  );
+  assert.ok(page.includes("fetchFeatureCoverage(controller.signal, mission)"));
+  assert.ok(page.includes("runWildFileScan(undefined, mission)"));
+  assert.ok(page.includes("associateWildFile(path, featureIds, undefined, mission)"));
+  assert.ok(page.includes('data-testid="coverage-project-select"'));
 });
