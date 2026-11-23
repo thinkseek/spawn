@@ -20,6 +20,7 @@ testing = []
 [dev-dependencies]
 spawn-core = { workspace = true, features = ["testing"] }
 spawn-host = { path = ".", features = ["testing"] }
+spawn-postgres.workspace = true
 
 [lints]
 workspace = true

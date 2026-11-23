@@ -637,6 +637,7 @@ dependencies = [
  "serde_json",
  "spawn-core",
  "spawn-host",
+ "spawn-postgres",
 ]
 
 [[package]]
