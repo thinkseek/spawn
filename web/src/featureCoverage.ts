@@ -598,3 +598,35 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
+
+/** A coverage route for one mission's project (`?mission=<id>`), or the
+ * server's default project when `mission` is null. */
+export function coverageUrl(path: string, mission: number | null): string {
+  return mission === null ? path : `${path}?mission=${encodeURIComponent(String(mission))}`;
+}
+
+/** One project the coverage page can read: a mission with a `--features`
+ * registry file configured. */
+export interface CoverageProject {
+  mission: number;
+  label: string;
+  registry: string;
+}
+
+/** The projects of `/api/features`' missions whose map is a configured
+ * file (`mapping.path`), in the order given. */
+export function coverageProjects(
+  missions: ReadonlyArray<{ id: number; text: string; mapping: { path: string | null } }>,
+): CoverageProject[] {
+  return missions
+    .filter((mission) => typeof mission.mapping.path === "string" && mission.mapping.path !== "")
+    .map((mission) => {
+      const title = mission.text.split("\n")[0]?.trim() ?? "";
+      const short = title.length > 48 ? `${title.slice(0, 47)}…` : title;
+      return {
+        mission: mission.id,
+        label: short ? `Mission #${mission.id} — ${short}` : `Mission #${mission.id}`,
+        registry: mission.mapping.path as string,
+      };
+    });
+}
