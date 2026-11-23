@@ -15,6 +15,8 @@ pub mod archive_mask;
 pub mod beneath;
 pub mod git;
 pub mod home;
+#[cfg(target_os = "linux")]
+pub mod overlay;
 pub mod process;
 pub mod root;
 #[cfg(any(test, feature = "testing"))]
@@ -34,6 +36,8 @@ pub use git::{
     SET_ASIDE_FILES, git_command, has_conflict_block, has_conflict_block_sized, max_file_bytes,
     names_files_outside_git,
 };
+#[cfg(target_os = "linux")]
+pub use overlay::{OverlayWorkspace, overlay_supported, overlay_supported_in};
 pub use process::{current_uid, undumpable};
 pub use root::canonical_root;
 #[cfg(any(test, feature = "testing"))]

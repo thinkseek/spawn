@@ -271,7 +271,10 @@ pub fn test_git_command() -> Command {
 /// failure as an error. A `-z` listing is read this way: a path may begin
 /// or end with whitespace, which trimming would cut off the first or the
 /// last path, and its bytes need not be UTF-8 ([`TreePath`]).
-fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<Vec<u8>, WorkspaceError> {
+pub(crate) fn report_listing(
+    output: std::io::Result<Output>,
+    word: &str,
+) -> Result<Vec<u8>, WorkspaceError> {
     let output =
         output.map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
     if !output.status.success() {
@@ -285,7 +288,10 @@ fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<Vec<u8>
 
 /// Trimmed stdout of a git command that prints one value (a commit, a
 /// tree), or the failure as an error. Never for a listing of paths.
-fn report(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
+pub(crate) fn report(
+    output: std::io::Result<Output>,
+    word: &str,
+) -> Result<String, WorkspaceError> {
     report_listing(output, word).map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -305,7 +311,7 @@ const PATHSPEC_BATCH_BYTES: usize = 128 << 10;
 
 /// `specs` in order, cut into runs of at most [`PATHSPEC_BATCH_BYTES`]
 /// (a longer spec gets a run of its own).
-fn pathspec_batches(specs: Vec<OsString>) -> Vec<Vec<OsString>> {
+pub(crate) fn pathspec_batches(specs: Vec<OsString>) -> Vec<Vec<OsString>> {
     let mut batches: Vec<Vec<OsString>> = Vec::new();
     let mut bytes = 0;
     for spec in specs {
@@ -394,8 +400,8 @@ impl GitWorkspace {
     }
 
     /// Every git this store runs: in the C locale ([`git_command`]), on its
-    /// repository.
-    fn command(&self) -> Command {
+    /// repository. The overlay store runs its git here too.
+    pub(crate) fn command(&self) -> Command {
         let mut command = git_command(&self.git);
         command.arg(format!("--git-dir={}", self.repo.display()));
         // commit-tree needs a committer identity. Supplying it here keeps the
