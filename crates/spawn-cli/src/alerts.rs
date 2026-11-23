@@ -58,8 +58,10 @@
 //!   a gate of the mission found main red on the scenario (the record's
 //!   `main_red_scenarios`: solved, as the same scenario, on an ancestor of
 //!   the base, and unsolved on it; scripts/rsi/gate.sh, "Main red on a
-//!   scenario"), where an unsolved objective says nothing. Once per mission
-//!   and scenario while it stays red; clears at the first later `accepted`
+//!   scenario"), where an unsolved objective says nothing. The text names
+//!   the mission, the task whose gate saw it and the base's first 8 hex: an
+//!   observation at the fired time, not a present fact (issue #71). Once
+//!   per mission and scenario while it stays red; clears at the first later `accepted`
 //!   gating of the mission that does not name it (an accepted gate judged
 //!   every scenario on the base; a rejection may come before the base, so
 //!   it clears nothing).
@@ -1994,6 +1996,13 @@ impl Monitor {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect();
+        // The claim is an observation by this gate on this base, not a
+        // present fact about main (issue #71 (B)): the text says whose gate
+        // and which base; the alert's fired time says when.
+        let base = record["base"]
+            .as_str()
+            .map(|base| format!(" (base {})", base.get(..8).unwrap_or(base)))
+            .unwrap_or_default();
         for scenario in &named {
             let at = (mission_id, scenario.clone());
             if self.red.contains_key(&at) {
@@ -2010,8 +2019,8 @@ impl Monitor {
                     "base": record["base"], "event_id": event_id,
                 }),
                 text: format!(
-                    "mission #{mission_id}: main is red on {scenario}: solved on an ancestor of \
-the base, unsolved on it (task #{task}'s gate)"
+                    "mission #{mission_id}: task #{task}'s gate found main red on {scenario}\
+{base}: solved on an ancestor of the base, unsolved on it"
                 ),
                 notice: false,
             });
@@ -5353,7 +5362,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
 /// need, objective 148).
 pub(crate) const VERDICTS: [&str; 4] = ["right", "false", "stale", "duplicate"];
 
-const JUDGE_USAGE: &str = "usage: spawn alert judge <key> right|false|stale|duplicate\n       \
+const JUDGE_USAGE: &str = "usage: spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       \
                            spawn alert record < <one alert.fired or alert.cleared JSON object>";
 
 /// What `spawn alert record` takes, as its refusals name it.
@@ -5374,42 +5383,87 @@ pub(crate) fn record_argument(text: &str) -> Result<Value, String> {
     }
 }
 
-/// The arguments of `spawn alert`: `judge <key> <verdict>`, the key and
-/// the verdict, or why they are not.
-pub(crate) fn judge_arguments(arguments: &[String]) -> Result<(String, String), String> {
-    match arguments {
-        [verb, key, verdict] if verb == "judge" => {
-            if key.trim().is_empty() {
-                return Err(format!("the key is empty\n{JUDGE_USAGE}"));
-            }
-            if !VERDICTS.contains(&verdict.as_str()) {
-                return Err(format!(
-                    "{verdict:?} is not a verdict (right, false, stale or duplicate)\n{JUDGE_USAGE}"
-                ));
-            }
-            Ok((key.clone(), verdict.clone()))
-        }
-        _ => Err(JUDGE_USAGE.to_string()),
+/// The arguments of `spawn alert`: `judge <key> [<key>...] <verdict>`, the
+/// keys and the verdict, or why they are not (issue #71 (A)): the last word
+/// is the verdict, every one before it a key. A key that is itself a
+/// verdict word is refused here, before anything is judged: `judge k false
+/// stale` is a slip, not a key named `false`, and judging `k` stale while
+/// dropping the word would lose it silently.
+pub(crate) fn judge_arguments(arguments: &[String]) -> Result<(Vec<String>, String), String> {
+    let [verb, keys @ .., verdict] = arguments else {
+        return Err(JUDGE_USAGE.to_string());
+    };
+    if verb != "judge" {
+        return Err(JUDGE_USAGE.to_string());
     }
+    if !VERDICTS.contains(&verdict.as_str()) {
+        return Err(format!(
+            "{verdict:?} is not a verdict (right, false, stale or duplicate): the last word is \
+             the verdict\n{JUDGE_USAGE}"
+        ));
+    }
+    if keys.is_empty() {
+        return Err(JUDGE_USAGE.to_string());
+    }
+    for key in keys {
+        if key.trim().is_empty() {
+            return Err(format!("a key is empty\n{JUDGE_USAGE}"));
+        }
+        if VERDICTS.contains(&key.as_str()) {
+            return Err(format!(
+                "{key:?} is a verdict, not a key: only the last word is the verdict; nothing \
+                 was judged\n{JUDGE_USAGE}"
+            ));
+        }
+    }
+    Ok((keys.to_vec(), verdict.clone()))
 }
 
-/// `spawn alert judge <key> right|false|stale|duplicate`: the owner's
-/// judgement of an alert, a real need (`right`, objective 148) or one that
-/// should not have been raised. It records `alert.judged` through
-/// `spawn_alert_record`; an open alert is cleared by any verdict but
-/// `right`. The store refuses a key no alert has, a notice and an alert
-/// judged already.
+/// `spawn alert judge <key> [<key>...] right|false|stale|duplicate`: the
+/// owner's judgement of one alert or several, a real need (`right`,
+/// objective 148) or one that should not have been raised. Each key records
+/// its own `alert.judged` through `spawn_alert_record` and prints its own
+/// line; an open alert is cleared by any verdict but `right`. The store
+/// refuses a key no alert has, a notice and an alert judged already: a
+/// refused key is said on stderr, the keys after it are still judged, and
+/// the status is 1 when any was refused (issue #71 (A)).
 pub(crate) fn alert(arguments: &[String]) -> Result<i32, String> {
     if matches!(arguments, [verb] if verb == "record") {
         return record_from_stdin();
     }
-    let (key, verdict) = judge_arguments(arguments)?;
+    let (keys, verdict) = judge_arguments(arguments)?;
     let store = open_store()?;
-    let id = store
-        .alert_judge(&key, &verdict)
-        .map_err(|error| format!("{key} was not judged: {error}"))?;
-    println!("judged {key} {verdict} (event {id})");
-    Ok(0)
+    Ok(judge_each(
+        &store,
+        &keys,
+        &verdict,
+        &mut |said| match said {
+            Ok(line) => println!("{line}"),
+            Err(line) => eprintln!("spawn: {line}"),
+        },
+    ))
+}
+
+/// Judge each of `keys` `verdict` through the store, in order, saying each
+/// one's line as it is judged (`Err` for a refused key); a refusal does not
+/// stop the keys after it. The status: 1 when any key was refused, else 0.
+fn judge_each(
+    store: &PostgresStore,
+    keys: &[String],
+    verdict: &str,
+    say: &mut dyn FnMut(Result<String, String>),
+) -> i32 {
+    let mut status = 0;
+    for key in keys {
+        match store.alert_judge(key, verdict) {
+            Ok(id) => say(Ok(format!("judged {key} {verdict} (event {id})"))),
+            Err(error) => {
+                say(Err(format!("{key} was not judged: {error}")));
+                status = 1;
+            }
+        }
+    }
+    status
 }
 
 /// `spawn alert record`: one alert.fired or alert.cleared on stdin
@@ -5634,7 +5688,7 @@ mod tests {
 
     /// Objective 092: `spawn alert judge <key> right|false|stale|duplicate`
     /// (`right`, objective 148), its usage and what it refuses before
-    /// reaching the store.
+    /// reaching the store, for one key.
     #[test]
     fn the_judge_verb_takes_a_key_and_one_of_three_verdicts() {
         let words =
@@ -5643,31 +5697,88 @@ mod tests {
         for verdict in super::VERDICTS {
             assert_eq!(
                 super::judge_arguments(&words(&["judge", "bb:a1", verdict])),
-                Ok(("bb:a1".to_string(), verdict.to_string()))
+                Ok((words(&["bb:a1"]), verdict.to_string()))
             );
         }
-        let usage = "usage: spawn alert judge <key> right|false|stale|duplicate\n       \
+        let usage = "usage: spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       \
                      spawn alert record < <one alert.fired or alert.cleared JSON object>";
-        for wrong in [
-            &[][..],
-            &["judge"][..],
-            &["judge", "bb:a1"][..],
-            &["judge", "bb:a1", "false", "more"][..],
-            &["clear", "bb:a1", "false"][..],
-        ] {
+        for wrong in [&[][..], &["judge"][..], &["clear", "bb:a1", "false"][..]] {
             assert_eq!(
                 super::judge_arguments(&words(wrong)),
                 Err(usage.to_string()),
                 "{wrong:?}"
             );
         }
-        let refused = super::judge_arguments(&words(&["judge", "bb:a1", "wrong"]))
-            .expect_err("another verdict");
+        // A key without a verdict, or a word after the verdict: still
+        // refused, now because the last word is no verdict (issue #71 (A)).
+        for wrong in [
+            &["judge", "bb:a1", "wrong"][..],
+            &["judge", "bb:a1"][..],
+            &["judge", "bb:a1", "false", "more"][..],
+        ] {
+            let refused = super::judge_arguments(&words(wrong)).expect_err("another verdict");
+            assert!(
+                refused.contains("not a verdict") && refused.ends_with(usage),
+                "{wrong:?}: {refused}"
+            );
+        }
+        assert!(super::judge_arguments(&words(&["judge", " ", "false"])).is_err());
+    }
+
+    /// Issue #71 (A): `spawn alert judge <key> [<key>...] <verdict>`, several
+    /// keys, the verdict last; what it refuses before reaching the store.
+    #[test]
+    fn the_judge_verb_takes_several_keys_and_the_verdict_last() {
+        let words =
+            |list: &[&str]| -> Vec<String> { list.iter().map(ToString::to_string).collect() };
+        // Three keys: each one, in order, and the last word the verdict.
+        assert_eq!(
+            super::judge_arguments(&words(&[
+                "judge",
+                "scenario_red:5:008.sh:19157",
+                "scenario_red:5:009.sh:19157",
+                "scenario_red:5:018.sh:19157",
+                "stale"
+            ])),
+            Ok((
+                words(&[
+                    "scenario_red:5:008.sh:19157",
+                    "scenario_red:5:009.sh:19157",
+                    "scenario_red:5:018.sh:19157"
+                ]),
+                "stale".to_string()
+            ))
+        );
+        let usage = "usage: spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       \
+                     spawn alert record < <one alert.fired or alert.cleared JSON object>";
+        // A verdict and no key: the usage.
+        assert_eq!(
+            super::judge_arguments(&words(&["judge", "false"])),
+            Err(usage.to_string())
+        );
+        // Several keys and no verdict last: refused, naming it (a forgotten
+        // verdict reads the last key as one).
+        let refused = super::judge_arguments(&words(&["judge", "bb:a1", "bb:a2"]))
+            .expect_err("no verdict last");
         assert!(
-            refused.contains("not a verdict") && refused.ends_with(usage),
+            refused.contains("is not a verdict") && refused.ends_with(usage),
             "{refused}"
         );
-        assert!(super::judge_arguments(&words(&["judge", " ", "false"])).is_err());
+        // A key that is a verdict word is not dropped, nor judged as a key:
+        // the whole command is refused before the store.
+        for wrong in [
+            &["judge", "bb:a1", "false", "stale"][..],
+            &["judge", "stale", "stale"][..],
+            &["judge", "right", "bb:a1", "duplicate"][..],
+        ] {
+            let refused = super::judge_arguments(&words(wrong)).expect_err("a verdict as a key");
+            assert!(
+                refused.contains("is a verdict, not a key") && refused.ends_with(usage),
+                "{wrong:?}: {refused}"
+            );
+        }
+        // An empty key among several.
+        assert!(super::judge_arguments(&words(&["judge", "bb:a1", "", "false"])).is_err());
     }
 
     /// Objective 172: `spawn alert record` takes one alert.fired or
@@ -6439,7 +6550,8 @@ mod tests {
     /// red on.
     fn red_gated(verdict: &str, revision: i64, red: &[&str]) -> Value {
         let mut record = json!({"type": "task.gated", "id": 7, "verdict": verdict,
-                                "revision": revision, "base": "b"});
+                                "revision": revision,
+                                "base": "0123abcd4567ef890123abcd4567ef890123abcd"});
         if !red.is_empty() {
             record["main_red_scenarios"] = json!(red);
         }
@@ -6480,7 +6592,10 @@ mod tests {
         commit(&mut monitor, &first);
         commit(&mut monitor, &second);
         let Event::Fire {
-            evidence, notice, ..
+            evidence,
+            notice,
+            text,
+            ..
         } = first
             .iter()
             .find(|event| event.key() == "scenario_red:4:046.sh:11")
@@ -6489,6 +6604,14 @@ mod tests {
             panic!("a fire")
         };
         assert!(!notice, "a condition, not a notice");
+        // Issue #71 (B): an observation, by which gate on which base.
+        assert_eq!(
+            text,
+            "mission #4: task #7's gate found main red on 046.sh (base 0123abcd): solved on an \
+             ancestor of the base, unsolved on it"
+        );
+        assert_eq!(evidence["task"], 7);
+        assert_eq!(evidence["base"], "0123abcd4567ef890123abcd4567ef890123abcd");
         assert_eq!(evidence["scenario"], "046.sh");
         assert_eq!(evidence["mission"], 4);
         // Another mission's accepted gate is no word on mission 4's main.
@@ -10741,7 +10864,7 @@ execute function alerts_test_deploys_mid_start();
     }
 
     mod through_the_store {
-        use super::super::{Event, Monitor};
+        use super::super::{Event, Monitor, judge_each};
         use super::{commit, decided, fires, monitor};
         use serde_json::{Value, json};
         use spawn_core::command::Outcome;
@@ -10766,6 +10889,97 @@ execute function alerts_test_deploys_mid_start();
             if let Err(panic) = result {
                 std::panic::resume_unwind(panic);
             }
+        }
+
+        /// Issue #71 (A): `spawn alert judge k1 k2 k3 stale` judges each key
+        /// through the store, in order, each its own `alert.judged` and its
+        /// own line; a key the store refuses (none has it, or judged
+        /// already) is said, the keys after it are still judged, and the
+        /// status is 1. All judged: 0.
+        #[test]
+        fn several_keys_are_each_judged_and_a_refused_one_does_not_stop_the_rest() {
+            in_schema("alerts_judge_many", |store| {
+                for key in ["scenario_red:5:008.sh:9", "scenario_red:5:009.sh:9"] {
+                    store
+                        .alert_record(&json!({
+                            "type": "alert.fired", "key": key, "kind": "memory_low",
+                            "subject": "host", "evidence": {}, "text": "t", "notice": false,
+                        }))
+                        .expect("fired");
+                }
+                let keys = |list: &[&str]| -> Vec<String> {
+                    list.iter().map(ToString::to_string).collect()
+                };
+                let mut said = Vec::new();
+                let status = judge_each(
+                    store,
+                    &keys(&[
+                        "scenario_red:5:008.sh:9",
+                        "no:such:key",
+                        "scenario_red:5:009.sh:9",
+                    ]),
+                    "stale",
+                    &mut |line| said.push(line),
+                );
+                assert_eq!(status, 1, "{said:?}");
+                assert_eq!(said.len(), 3, "{said:?}");
+                assert!(
+                    matches!(&said[0], Ok(line) if line.starts_with("judged scenario_red:5:008.sh:9 stale (event ")),
+                    "{said:?}"
+                );
+                assert!(
+                    matches!(&said[1], Err(line) if line.starts_with("no:such:key was not judged: ")),
+                    "{said:?}"
+                );
+                assert!(
+                    matches!(&said[2], Ok(line) if line.starts_with("judged scenario_red:5:009.sh:9 stale (event ")),
+                    "{said:?}"
+                );
+                let rows = store.alert_rows().expect("the rows");
+                let judged: Vec<(&str, &str)> = rows["rows"]
+                    .as_array()
+                    .expect("rows")
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["key"].as_str().unwrap_or_default(),
+                            row["state"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    judged,
+                    [
+                        ("scenario_red:5:008.sh:9", "cleared"),
+                        ("scenario_red:5:009.sh:9", "cleared")
+                    ]
+                );
+                // Judged already: refused again, status 1; nothing new judged.
+                let mut again = Vec::new();
+                assert_eq!(
+                    judge_each(
+                        store,
+                        &keys(&["scenario_red:5:009.sh:9"]),
+                        "false",
+                        &mut |line| again.push(line)
+                    ),
+                    1
+                );
+                assert!(matches!(&again[..], [Err(_)]), "{again:?}");
+                // A fresh one alone: 0, as one key always was.
+                store
+                    .alert_record(&json!({
+                        "type": "alert.fired", "key": "k:1", "kind": "memory_low",
+                        "subject": "host", "evidence": {}, "text": "t", "notice": false,
+                    }))
+                    .expect("fired");
+                let mut one = Vec::new();
+                assert_eq!(
+                    judge_each(store, &keys(&["k:1"]), "right", &mut |line| one.push(line)),
+                    0
+                );
+                assert!(matches!(&one[..], [Ok(_)]), "{one:?}");
+            });
         }
 
         /// One worker session's records, appended in order; each start

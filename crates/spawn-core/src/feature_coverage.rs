@@ -34,189 +34,245 @@ pub struct BoundaryPolicy {
     pub exclusions: Vec<ExclusionRule>,
 }
 
+/// Exclusion rule ids [`BoundaryPolicy::default_generic_boundary`] holds
+/// and [`BoundaryPolicy::default_spawn_boundary`] leaves out: Spawn's own
+/// build outputs are named exactly (`target/**`, `web/dist/**`).
+const GENERIC_ONLY_EXCLUSIONS: [&str; 2] = ["dist-build-output", "build-output"];
+
 impl BoundaryPolicy {
-    /// Default disclosed project file-universe boundary for the Spawn
-    /// repository.
-    pub fn default_spawn_boundary() -> Self {
+    /// Default disclosed file-universe boundary usable by any repository
+    /// (`project_name`): every tracked and untracked in-scope file, less VCS
+    /// internals, build outputs (`target/`, `dist/`, `build/`), installed
+    /// dependencies, secrets (`.env*`, keys, certificates), and OS/editor
+    /// temporary files. Nothing in it names one project's layout.
+    pub fn default_generic_boundary(project_name: &str) -> Self {
         Self {
-            project_name: "Spawn".to_string(),
-            description: "All tracked project source, tests, docs, configuration, scripts, deploy specs, web assets, and RSI backlogs/scenarios inside the repository root, plus any newly created untracked in-scope files. Derived build caches, VCS internals, third-party installed dependencies, ephemeral agent runtime files, local editor swap files, and secrets/credentials are explicitly excluded and never counted as covered.".to_string(),
+            project_name: project_name.to_string(),
+            description: "All tracked project files inside the repository root, plus any newly created untracked in-scope files. Derived build outputs, VCS internals, third-party installed dependencies, local OS/editor temporary files, and secrets/credentials are explicitly excluded and never counted as covered.".to_string(),
             included_categories: vec![
                 "tracked-source".to_string(),
                 "tests".to_string(),
                 "docs".to_string(),
                 "config".to_string(),
                 "assets".to_string(),
-                "deploy-and-scripts".to_string(),
-                "rsi-scenarios-and-backlogs".to_string(),
                 "untracked-in-scope-artifacts".to_string(),
             ],
             exclusions: vec![
-                ExclusionRule {
-                    id: "vcs-metadata".to_string(),
-                    pattern: ".git/**".to_string(),
-                    category: "vcs".to_string(),
-                    reason: "Git internal object store and repository metadata are never feature artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "rust-build-output".to_string(),
-                    pattern: "target/**".to_string(),
-                    category: "build-cache".to_string(),
-                    reason: "Cargo build outputs are derived and rebuildable from source.".to_string(),
-                },
-                ExclusionRule {
-                    id: "node-dependencies".to_string(),
-                    pattern: "**/node_modules/**".to_string(),
-                    category: "dependency-cache".to_string(),
-                    reason: "Installed third-party frontend packages are external dependencies, not authored project files.".to_string(),
-                },
-                ExclusionRule {
-                    id: "pnpm-store".to_string(),
-                    pattern: "**/.pnpm-store/**".to_string(),
-                    category: "dependency-cache".to_string(),
-                    reason: "pnpm content-addressable package store is a local dependency cache.".to_string(),
-                },
-                ExclusionRule {
-                    id: "web-build-output".to_string(),
-                    pattern: "web/dist/**".to_string(),
-                    category: "build-cache".to_string(),
-                    reason: "Compiled frontend bundle is derived build output.".to_string(),
-                },
-                ExclusionRule {
-                    id: "spawn-runtime-state".to_string(),
-                    pattern: ".spawn/**".to_string(),
-                    category: "runtime-state".to_string(),
-                    reason: "Ephemeral agent execution markers and exit files are runtime state, not project deliverables.".to_string(),
-                },
-                ExclusionRule {
-                    id: "engine-runtime-state".to_string(),
-                    pattern: ".claude/**".to_string(),
-                    category: "runtime-state".to_string(),
-                    reason: "Local coding-engine runtime state and worktrees are excluded from project coverage.".to_string(),
-                },
-                ExclusionRule {
-                    id: "rsi-gate-owner-state".to_string(),
-                    pattern: "rsi/.gate-owner/**".to_string(),
-                    category: "runtime-state".to_string(),
-                    reason: "Ephemeral RSI gate owner lease and runtime state (gitignored) are not authored project artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "deployed-controller-marker".to_string(),
-                    pattern: ".controller".to_string(),
-                    category: "runtime-state".to_string(),
-                    reason: "Root deploy marker (the 41-byte commit id written by deploy/controller.sh into a deployed controller tree) is runtime state, not an authored project artifact.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-env-dotfile".to_string(),
-                    pattern: "**/.env".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "Environment secret files are never indexed or associated in the feature registry.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-env-variants".to_string(),
-                    pattern: "**/.env.*".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "Environment secret variants are never indexed or associated in the feature registry.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-env-suffix".to_string(),
-                    pattern: "**/*.env".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "Host environment files (such as spawn.env) hold secrets and are excluded.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-private-keys".to_string(),
-                    pattern: "**/*.key".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "Private key material is never indexed in feature coverage.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-pem-certs".to_string(),
-                    pattern: "**/*.pem".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "PEM key/certificate files are excluded from feature coverage.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-gpg-encrypted".to_string(),
-                    pattern: "**/*.gpg".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "GPG-encrypted secrets and backup artifacts are excluded from feature coverage.".to_string(),
-                },
-                ExclusionRule {
-                    id: "secrets-directory".to_string(),
-                    pattern: "**/secrets/**".to_string(),
-                    category: "secrets".to_string(),
-                    reason: "Dedicated secrets directories are never crawled or indexed.".to_string(),
-                },
-                ExclusionRule {
-                    id: "os-ds-store".to_string(),
-                    pattern: "**/.DS_Store".to_string(),
-                    category: "editor-temp".to_string(),
-                    reason: "macOS Finder metadata files are transient local artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "editor-swap-files".to_string(),
-                    pattern: "**/*.swp".to_string(),
-                    category: "editor-temp".to_string(),
-                    reason: "Editor swap files are transient local artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "editor-swo-files".to_string(),
-                    pattern: "**/*.swo".to_string(),
-                    category: "editor-temp".to_string(),
-                    reason: "Secondary editor swap files are transient local artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "editor-backup-tilde".to_string(),
-                    pattern: "**/*~".to_string(),
-                    category: "editor-temp".to_string(),
-                    reason: "Editor tilde backup files are transient local artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "rust-backup-files".to_string(),
-                    pattern: "**/*.rs.bk".to_string(),
-                    category: "editor-temp".to_string(),
-                    reason: "Rust formatter backup files (gitignored) are transient local artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "cargo-lock-backup".to_string(),
-                    pattern: "Cargo.lock.bak".to_string(),
-                    category: "editor-temp".to_string(),
-                    reason: "Transient Cargo.lock backup file (gitignored) is outside project coverage.".to_string(),
-                },
-                ExclusionRule {
-                    id: "transient-logs".to_string(),
-                    pattern: "**/*.log".to_string(),
-                    category: "transient".to_string(),
-                    reason: "Runtime log files are transient diagnostic outputs.".to_string(),
-                },
-                ExclusionRule {
-                    id: "transient-tmp".to_string(),
-                    pattern: "**/*.tmp".to_string(),
-                    category: "transient".to_string(),
-                    reason: "Temporary scratch files are outside durable project coverage.".to_string(),
-                },
-                ExclusionRule {
-                    id: "transient-part".to_string(),
-                    pattern: "**/*.part".to_string(),
-                    category: "transient".to_string(),
-                    reason: "Partial transfer/download files are transient artifacts.".to_string(),
-                },
-                ExclusionRule {
-                    id: "tool-caches".to_string(),
-                    pattern: "**/.cache/**".to_string(),
-                    category: "build-cache".to_string(),
-                    reason: "Tool caches are derived and rebuildable.".to_string(),
-                },
-                ExclusionRule {
-                    id: "python-bytecode-cache".to_string(),
-                    pattern: "**/__pycache__/**".to_string(),
-                    category: "build-cache".to_string(),
-                    reason: "Python bytecode caches are derived build artifacts.".to_string(),
-                },
+            ExclusionRule {
+                id: "vcs-metadata".to_string(),
+                pattern: ".git/**".to_string(),
+                category: "vcs".to_string(),
+                reason: "Git internal object store and repository metadata are never feature artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "rust-build-output".to_string(),
+                pattern: "target/**".to_string(),
+                category: "build-cache".to_string(),
+                reason: "Cargo build outputs are derived and rebuildable from source.".to_string(),
+            },
+            ExclusionRule {
+                id: "node-dependencies".to_string(),
+                pattern: "**/node_modules/**".to_string(),
+                category: "dependency-cache".to_string(),
+                reason: "Installed third-party frontend packages are external dependencies, not authored project files.".to_string(),
+            },
+            ExclusionRule {
+                id: "pnpm-store".to_string(),
+                pattern: "**/.pnpm-store/**".to_string(),
+                category: "dependency-cache".to_string(),
+                reason: "pnpm content-addressable package store is a local dependency cache.".to_string(),
+            },
+            ExclusionRule {
+                id: "dist-build-output".to_string(),
+                pattern: "dist/**".to_string(),
+                category: "build-cache".to_string(),
+                reason: "A root `dist/` bundle is derived build output.".to_string(),
+            },
+            ExclusionRule {
+                id: "build-output".to_string(),
+                pattern: "build/**".to_string(),
+                category: "build-cache".to_string(),
+                reason: "A root `build/` directory is derived build output.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-env-dotfile".to_string(),
+                pattern: "**/.env".to_string(),
+                category: "secrets".to_string(),
+                reason: "Environment secret files are never indexed or associated in the feature registry.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-env-variants".to_string(),
+                pattern: "**/.env.*".to_string(),
+                category: "secrets".to_string(),
+                reason: "Environment secret variants are never indexed or associated in the feature registry.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-env-suffix".to_string(),
+                pattern: "**/*.env".to_string(),
+                category: "secrets".to_string(),
+                reason: "Host environment files (such as spawn.env) hold secrets and are excluded.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-private-keys".to_string(),
+                pattern: "**/*.key".to_string(),
+                category: "secrets".to_string(),
+                reason: "Private key material is never indexed in feature coverage.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-pem-certs".to_string(),
+                pattern: "**/*.pem".to_string(),
+                category: "secrets".to_string(),
+                reason: "PEM key/certificate files are excluded from feature coverage.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-gpg-encrypted".to_string(),
+                pattern: "**/*.gpg".to_string(),
+                category: "secrets".to_string(),
+                reason: "GPG-encrypted secrets and backup artifacts are excluded from feature coverage.".to_string(),
+            },
+            ExclusionRule {
+                id: "secrets-directory".to_string(),
+                pattern: "**/secrets/**".to_string(),
+                category: "secrets".to_string(),
+                reason: "Dedicated secrets directories are never crawled or indexed.".to_string(),
+            },
+            ExclusionRule {
+                id: "os-ds-store".to_string(),
+                pattern: "**/.DS_Store".to_string(),
+                category: "editor-temp".to_string(),
+                reason: "macOS Finder metadata files are transient local artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "editor-swap-files".to_string(),
+                pattern: "**/*.swp".to_string(),
+                category: "editor-temp".to_string(),
+                reason: "Editor swap files are transient local artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "editor-swo-files".to_string(),
+                pattern: "**/*.swo".to_string(),
+                category: "editor-temp".to_string(),
+                reason: "Secondary editor swap files are transient local artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "editor-backup-tilde".to_string(),
+                pattern: "**/*~".to_string(),
+                category: "editor-temp".to_string(),
+                reason: "Editor tilde backup files are transient local artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "rust-backup-files".to_string(),
+                pattern: "**/*.rs.bk".to_string(),
+                category: "editor-temp".to_string(),
+                reason: "Rust formatter backup files (gitignored) are transient local artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "cargo-lock-backup".to_string(),
+                pattern: "Cargo.lock.bak".to_string(),
+                category: "editor-temp".to_string(),
+                reason: "Transient Cargo.lock backup file (gitignored) is outside project coverage.".to_string(),
+            },
+            ExclusionRule {
+                id: "transient-logs".to_string(),
+                pattern: "**/*.log".to_string(),
+                category: "transient".to_string(),
+                reason: "Runtime log files are transient diagnostic outputs.".to_string(),
+            },
+            ExclusionRule {
+                id: "transient-tmp".to_string(),
+                pattern: "**/*.tmp".to_string(),
+                category: "transient".to_string(),
+                reason: "Temporary scratch files are outside durable project coverage.".to_string(),
+            },
+            ExclusionRule {
+                id: "transient-part".to_string(),
+                pattern: "**/*.part".to_string(),
+                category: "transient".to_string(),
+                reason: "Partial transfer/download files are transient artifacts.".to_string(),
+            },
+            ExclusionRule {
+                id: "tool-caches".to_string(),
+                pattern: "**/.cache/**".to_string(),
+                category: "build-cache".to_string(),
+                reason: "Tool caches are derived and rebuildable.".to_string(),
+            },
+            ExclusionRule {
+                id: "python-bytecode-cache".to_string(),
+                pattern: "**/__pycache__/**".to_string(),
+                category: "build-cache".to_string(),
+                reason: "Python bytecode caches are derived build artifacts.".to_string(),
+            },
             ],
         }
     }
+
+    /// Default disclosed project file-universe boundary for the Spawn
+    /// repository: [`Self::default_generic_boundary`] with Spawn's own
+    /// build output (`web/dist/**` for the generic `dist/`/`build/`) and its
+    /// runtime state (`.spawn/**`, `.claude/**`, `rsi/.gate-owner/**`, the
+    /// deployed `.controller` marker), in the order the checked-in registry
+    /// discloses them.
+    pub fn default_spawn_boundary() -> Self {
+        let mut policy = Self::default_generic_boundary("Spawn");
+        policy.description = "All tracked project source, tests, docs, configuration, scripts, deploy specs, web assets, and RSI backlogs/scenarios inside the repository root, plus any newly created untracked in-scope files. Derived build caches, VCS internals, third-party installed dependencies, ephemeral agent runtime files, local editor swap files, and secrets/credentials are explicitly excluded and never counted as covered.".to_string();
+        policy.included_categories = vec![
+            "tracked-source".to_string(),
+            "tests".to_string(),
+            "docs".to_string(),
+            "config".to_string(),
+            "assets".to_string(),
+            "deploy-and-scripts".to_string(),
+            "rsi-scenarios-and-backlogs".to_string(),
+            "untracked-in-scope-artifacts".to_string(),
+        ];
+        policy
+            .exclusions
+            .retain(|rule| !GENERIC_ONLY_EXCLUSIONS.contains(&rule.id.as_str()));
+        let at = policy
+            .exclusions
+            .iter()
+            .position(|rule| rule.id == "pnpm-store")
+            .map_or(0, |index| index + 1);
+        policy.exclusions.splice(at..at, spawn_exclusions());
+        policy
+    }
+}
+
+/// Spawn-specific exclusion rules [`BoundaryPolicy::default_spawn_boundary`]
+/// adds to the generic boundary.
+fn spawn_exclusions() -> Vec<ExclusionRule> {
+    vec![
+        ExclusionRule {
+            id: "web-build-output".to_string(),
+            pattern: "web/dist/**".to_string(),
+            category: "build-cache".to_string(),
+            reason: "Compiled frontend bundle is derived build output.".to_string(),
+        },
+        ExclusionRule {
+            id: "spawn-runtime-state".to_string(),
+            pattern: ".spawn/**".to_string(),
+            category: "runtime-state".to_string(),
+            reason: "Ephemeral agent execution markers and exit files are runtime state, not project deliverables.".to_string(),
+        },
+        ExclusionRule {
+            id: "engine-runtime-state".to_string(),
+            pattern: ".claude/**".to_string(),
+            category: "runtime-state".to_string(),
+            reason: "Local coding-engine runtime state and worktrees are excluded from project coverage.".to_string(),
+        },
+        ExclusionRule {
+            id: "rsi-gate-owner-state".to_string(),
+            pattern: "rsi/.gate-owner/**".to_string(),
+            category: "runtime-state".to_string(),
+            reason: "Ephemeral RSI gate owner lease and runtime state (gitignored) are not authored project artifacts.".to_string(),
+        },
+        ExclusionRule {
+            id: "deployed-controller-marker".to_string(),
+            pattern: ".controller".to_string(),
+            category: "runtime-state".to_string(),
+            reason: "Root deploy marker (the 41-byte commit id written by deploy/controller.sh into a deployed controller tree) is runtime state, not an authored project artifact.".to_string(),
+        },
+    ]
 }
 
 /// Kind of feature node in the registry graph.

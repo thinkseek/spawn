@@ -34,6 +34,21 @@
 //! judged, from file descriptors ([`remove`]): no name is resolved again,
 //! no symlink followed, nothing renamed and no working directory changed.
 //!
+//! It also reclaims the build output of finished ephemeral workers: a
+//! workspace `<root>/agent_worker_*` (`SPAWN_WORKSPACE_ROOT`, its folder
+//! name the worker's agent id) whose `target` goes only when:
+//! - the store knows the agent's tasks, each ephemeral and each in a
+//!   terminal state ([`TERMINAL`]: `accepted`, `landed` or `cancelled`);
+//! - no execution of any of their sessions is still running;
+//! - every rule above from "every component" on holds (the same device, no
+//!   symlink, the CACHEDIR.TAG signature, no transcript, nothing in use),
+//!   and nothing under it is a git repository or worktree (a `.git`).
+//!
+//! Only `target` is ever removed: never the workspace, its sources, a git
+//! worktree or branch, nor anything under the transcript archive
+//! (`<root>/.transcripts`, no worker's workspace). `--apply` reads the
+//! worker's tasks again just before removal; changed, it stays.
+//!
 //! What it relies on: a claim's lease is no lock. The sweep relies on the
 //! lease having ended and on no process using the path when it is judged
 //! again; a process that writes into the judged directory after that, against
@@ -58,6 +73,16 @@ pub(crate) const EXCUSED: [&str; 1] = ["(sd-pam)"];
 
 /// The cache directory tagging standard's signature.
 const TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// The task states a worker's workspace may be reclaimed in: its work is
+/// done with, whether it landed or not.
+pub(crate) const TERMINAL: [&str; 3] = ["accepted", "landed", "cancelled"];
+
+/// An ephemeral worker's workspace name starts so (its agent id).
+pub(crate) const WORKER_PREFIX: &str = "agent_worker_";
+
+/// The one build path of a worker's workspace.
+const WORKER_BUILD: &str = "target";
 
 /// Clock ticks per second of /proc's start times.
 const USER_HZ: u64 = 100;
@@ -144,28 +169,254 @@ pub(crate) fn command(words: &[String]) -> Result<i32, String> {
     let args = args(words)?;
     let read = crate::serve::core_lines::claimed_scratch(crate::verify::now_ms())
         .map_err(|why| format!("{why}; nothing removed"))?;
+    let root = crate::env_value("SPAWN_WORKSPACE_ROOT")
+        .map(|root| spawn_host::canonical_root(Path::new(&root)));
+    let found = root.as_deref().map(worker_folders).unwrap_or_default();
+    let store = if found.is_empty() {
+        None
+    } else {
+        Some(crate::open_store().map_err(|why| {
+            format!(
+                "the store cannot be opened: {}; nothing removed",
+                crate::alerts::scrub(&why)
+            )
+        })?)
+    };
+    let reread = |agent: &str| -> Result<Worker, String> {
+        let store = store
+            .as_ref()
+            .ok_or_else(|| "the store is not open".to_string())?;
+        worker_of(&label_facts(store)?, agent, |session| {
+            session_runs(store, session)
+        })
+    };
+    let mut workers = Vec::new();
+    if let Some(store) = &store {
+        let facts = label_facts(store).map_err(|why| format!("{why}; nothing removed"))?;
+        for folder in found {
+            let agent = folder_agent(&folder).unwrap_or_default().to_string();
+            let worker = worker_of(&facts, &agent, |session| session_runs(store, session))
+                .map_err(|why| format!("{why}; nothing removed"))?;
+            workers.push((folder, worker));
+        }
+    }
     let inputs = Inputs {
         folders: &read.folders,
         landed: &read.landed,
+        workers: &workers,
+        reread: &reread,
         proc_root: Path::new("/proc"),
         uid: spawn_host::process::current_uid(),
     };
+    if root.is_none() {
+        println!("workers\tnot read: SPAWN_WORKSPACE_ROOT is not set");
+    }
     sweep(&inputs, &args, &|_, _| {}, &mut |line| println!("{line}"))
 }
 
-/// What a sweep decides from: the claimed folders, their landed pairs,
-/// where /proc is and the user running it.
+/// The agent id a worker's workspace `folder` is named for, when it is one.
+fn folder_agent(folder: &Path) -> Option<&str> {
+    folder
+        .file_name()?
+        .to_str()
+        .filter(|name| name.starts_with(WORKER_PREFIX) && name.len() > WORKER_PREFIX.len())
+}
+
+/// The ephemeral workers' workspaces under `root` that hold a `target`
+/// (whatever it is: a rule says why one stays): each a real directory, not
+/// a symlink, named `agent_worker_*`, sorted. The transcript archive is
+/// never one.
+pub(crate) fn worker_folders(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| folder_agent(path).is_some())
+        .filter(|path| path.as_path() != crate::storage::archive_path(root))
+        .filter(|path| {
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        })
+        .filter(|path| std::fs::symlink_metadata(path.join(WORKER_BUILD)).is_ok())
+        .collect();
+    found.sort();
+    found
+}
+
+/// One task of a worker, as the store has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerTask {
+    pub(crate) id: i64,
+    pub(crate) kind: String,
+    pub(crate) state: String,
+    pub(crate) session: String,
+    pub(crate) created_ms: i64,
+}
+
+/// An ephemeral worker as the store has it: its tasks, and the sessions of
+/// theirs with an execution still running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Worker {
+    pub(crate) agent: String,
+    pub(crate) tasks: Vec<WorkerTask>,
+    pub(crate) live: Vec<String>,
+}
+
+impl Worker {
+    /// What the digest holds of it: every fact it is judged on.
+    fn line(&self) -> String {
+        let tasks: Vec<serde_json::Value> = self
+            .tasks
+            .iter()
+            .map(|task| {
+                serde_json::json!({
+                    "id": task.id, "kind": task.kind, "state": task.state,
+                    "session": task.session, "created_ms": task.created_ms,
+                })
+            })
+            .collect();
+        serde_json::json!({"agent": self.agent, "tasks": tasks, "live": self.live}).to_string()
+    }
+
+    /// The earliest of its tasks' creation: what an unreadable process
+    /// excused by name must have started before.
+    fn created_ms(&self) -> i64 {
+        self.tasks
+            .iter()
+            .map(|task| task.created_ms)
+            .min()
+            .unwrap_or(i64::MIN)
+    }
+
+    /// Why its workspace's build output stays, if it does: no task known,
+    /// a task not ephemeral or not in a terminal state, or an execution
+    /// still running.
+    fn stays(&self) -> Option<String> {
+        if self.tasks.is_empty() {
+            return Some("the store knows no task of it".to_string());
+        }
+        if let Some(task) = self.tasks.iter().find(|task| task.kind != "ephemeral") {
+            return Some(format!("task {} is {}, not ephemeral", task.id, task.kind));
+        }
+        if let Some(task) = self
+            .tasks
+            .iter()
+            .find(|task| !TERMINAL.contains(&task.state.as_str()))
+        {
+            return Some(format!("task {} is {}", task.id, task.state));
+        }
+        self.live
+            .first()
+            .map(|session| format!("an execution of {session} still runs"))
+    }
+}
+
+/// The worker `agent` from the dashboard's label facts (`facts`, as
+/// `PostgresStore::label_facts` reads them: every session's latest task and
+/// every task not yet terminal), each session's running executions told by
+/// `runs`.
+pub(crate) fn worker_of(
+    facts: &serde_json::Value,
+    agent: &str,
+    runs: impl Fn(&str) -> Result<bool, String>,
+) -> Result<Worker, String> {
+    let missions = facts["missions"]
+        .as_array()
+        .ok_or_else(|| "the store's label facts have no missions".to_string())?;
+    let mut tasks: Vec<WorkerTask> = Vec::new();
+    for task in missions
+        .iter()
+        .filter_map(|mission| mission["tasks"].as_array())
+        .flatten()
+        .filter(|task| task["agent_id"] == agent)
+    {
+        let Some(id) = task["id"].as_i64() else {
+            return Err(format!("a task of {agent} has no id"));
+        };
+        if tasks.iter().any(|known| known.id == id) {
+            continue;
+        }
+        let text = |field: &str| task[field].as_str().unwrap_or_default().to_string();
+        tasks.push(WorkerTask {
+            id,
+            kind: text("kind"),
+            state: text("state"),
+            session: text("session_id"),
+            created_ms: task["created_at_ms"].as_i64().unwrap_or(i64::MIN),
+        });
+    }
+    tasks.sort_by_key(|task| task.id);
+    let mut live: Vec<String> = Vec::new();
+    let mut asked: Vec<&str> = Vec::new();
+    for task in &tasks {
+        if task.session.is_empty() || asked.contains(&task.session.as_str()) {
+            continue;
+        }
+        asked.push(&task.session);
+        if runs(&task.session)? {
+            live.push(task.session.clone());
+        }
+    }
+    Ok(Worker {
+        agent: agent.to_string(),
+        tasks,
+        live,
+    })
+}
+
+/// The store's label facts ([`worker_of`]).
+fn label_facts(store: &spawn_postgres::PostgresStore) -> Result<serde_json::Value, String> {
+    store.label_facts().map_err(|error| {
+        format!(
+            "the store's tasks cannot be read: {}",
+            crate::alerts::scrub(&error.to_string())
+        )
+    })
+}
+
+/// Whether an execution of `session` still runs, by the store.
+fn session_runs(store: &spawn_postgres::PostgresStore, session: &str) -> Result<bool, String> {
+    let id = spawn_core::id::SessionId::new(session.to_string())
+        .map_err(|error| format!("session {session}: {error}"))?;
+    let executions = store.executions(&id).map_err(|error| {
+        format!(
+            "the executions of {session} cannot be read: {}",
+            crate::alerts::scrub(&error.to_string())
+        )
+    })?;
+    Ok(executions
+        .iter()
+        .any(|execution| execution.ended_at.is_none()))
+}
+
+/// What a sweep decides from: the claimed folders, their landed pairs, the
+/// workers' workspaces, where /proc is and the user running it.
 pub(crate) struct Inputs<'a> {
     pub(crate) folders: &'a [(PathBuf, Claim)],
     pub(crate) landed: &'a [(i64, i64)],
+    /// The ephemeral workers' workspaces holding a `target`, each with its
+    /// worker as the store had it when listed.
+    pub(crate) workers: &'a [(PathBuf, Worker)],
+    /// The worker of an agent as the store has it now: read again just
+    /// before its build output goes.
+    pub(crate) reread: &'a dyn Fn(&str) -> Result<Worker, String>,
     pub(crate) proc_root: &'a Path,
     pub(crate) uid: u32,
 }
 
-/// One build path of one claimed folder.
+/// Whose a build path is: a claimed folder's, or a worker's workspace's.
+#[derive(Debug, Clone, Copy)]
+enum Owner<'a> {
+    Claim(&'a Claim),
+    Worker(&'a Worker),
+}
+
+/// One build path of one claimed folder or worker's workspace.
 struct Row<'a> {
     folder: &'a Path,
-    claim: &'a Claim,
+    owner: Owner<'a>,
     path: PathBuf,
     parts: Vec<&'a OsStr>,
     build: &'a str,
@@ -173,7 +424,43 @@ struct Row<'a> {
 
 impl Row<'_> {
     fn who(&self) -> String {
-        format!("{} {}", self.claim.agent, self.claim.objective)
+        match self.owner {
+            Owner::Claim(claim) => format!("{} {}", claim.agent, claim.objective),
+            Owner::Worker(worker) => {
+                let tasks: Vec<String> = worker
+                    .tasks
+                    .iter()
+                    .map(|task| format!("task {} {}", task.id, task.state))
+                    .collect();
+                if tasks.is_empty() {
+                    worker.agent.clone()
+                } else {
+                    format!("{} {}", worker.agent, tasks.join(", "))
+                }
+            }
+        }
+    }
+
+    /// The digest's word for its owner: the sha256 of the claim's line, or
+    /// of the worker's facts.
+    fn owned(&self) -> String {
+        match self.owner {
+            Owner::Claim(claim) => {
+                format!("claim {}", hex(&Sha256::digest(claim.line().as_bytes())))
+            }
+            Owner::Worker(worker) => {
+                format!("worker {}", hex(&Sha256::digest(worker.line().as_bytes())))
+            }
+        }
+    }
+
+    /// When its owner began: what an unreadable process excused by name must
+    /// have started before.
+    fn created_ms(&self) -> i64 {
+        match self.owner {
+            Owner::Claim(claim) => claim.created_ms,
+            Owner::Worker(worker) => worker.created_ms(),
+        }
     }
 
     fn stays(&self, why: &str) -> String {
@@ -196,13 +483,13 @@ fn would_remove(row: &Row, judged: &Judged) -> String {
         .iter()
         .map(|(dev, ino)| format!("{dev}:{ino}"))
         .collect();
-    let claim = hex(&Sha256::digest(row.claim.line().as_bytes()));
     format!(
-        "would-remove\t{}\t{}\t{}\tids {}\tclaim {claim}",
+        "would-remove\t{}\t{}\t{}\tids {}\t{}",
         row.path.display(),
         judged.bytes,
         row.who(),
-        ids.join(",")
+        ids.join(","),
+        row.owned()
     )
 }
 
@@ -212,8 +499,12 @@ fn excused_lines(row: &Row, judged: &Judged) -> Vec<String> {
         .iter()
         .map(|(pid, comm)| {
             format!(
-                "excused\t{}\tprocess {pid} {comm}: cannot be read, started before the claim",
-                row.path.display()
+                "excused\t{}\tprocess {pid} {comm}: cannot be read, started before the {}",
+                row.path.display(),
+                match row.owner {
+                    Owner::Claim(_) => "claim",
+                    Owner::Worker(_) => "task",
+                }
             )
         })
         .collect()
@@ -286,19 +577,13 @@ fn sweep(
         .collect();
     // The excused set first, beside the list.
     first.sort_by_key(|line| !line.starts_with("excuse\t"));
-    let rows = rows(inputs.folders);
+    let rows = rows(inputs.folders, inputs.workers);
     let now = crate::verify::now_ms();
     let listed: Vec<Result<Judged, String>> = rows
         .iter()
         .map(|row| {
             let (judged, owner) = examine(row, inputs.landed, now)?;
-            match in_use(
-                &row.path,
-                owner,
-                row.claim.created_ms,
-                &procs,
-                &args.excuses,
-            ) {
+            match in_use(&row.path, owner, row.created_ms(), &procs, &args.excuses) {
                 Proof::Used(why) => Err(why),
                 Proof::Free(by_name) => Ok(Judged {
                     excused: by_name,
@@ -400,8 +685,10 @@ fn apply(
     i32::from(failed)
 }
 
-/// Each build path of each folder, once per folder, in order.
-fn rows(folders: &[(PathBuf, Claim)]) -> Vec<Row<'_>> {
+/// Each build path of each folder, once per folder, in order; then each
+/// worker's workspace's `target`, unless a claimed folder's row is that
+/// very path.
+fn rows<'a>(folders: &'a [(PathBuf, Claim)], workers: &'a [(PathBuf, Worker)]) -> Vec<Row<'a>> {
     let mut rows = Vec::new();
     for (folder, claim) in folders {
         let mut seen: Vec<&str> = Vec::new();
@@ -412,7 +699,7 @@ fn rows(folders: &[(PathBuf, Claim)]) -> Vec<Row<'_>> {
             seen.push(build);
             rows.push(Row {
                 folder,
-                claim,
+                owner: Owner::Claim(claim),
                 path: folder.join(build),
                 parts: Path::new(build)
                     .components()
@@ -421,6 +708,19 @@ fn rows(folders: &[(PathBuf, Claim)]) -> Vec<Row<'_>> {
                 build,
             });
         }
+    }
+    for (folder, worker) in workers {
+        let path = folder.join(WORKER_BUILD);
+        if rows.iter().any(|row| row.path == path) {
+            continue;
+        }
+        rows.push(Row {
+            folder,
+            owner: Owner::Worker(worker),
+            path,
+            parts: vec![OsStr::new(WORKER_BUILD)],
+            build: WORKER_BUILD,
+        });
     }
     rows
 }
@@ -434,13 +734,22 @@ fn rejudge(
     excuses: &[(u32, u64)],
     hook: &dyn Fn(Stage, &Path),
 ) -> Result<Judged, String> {
-    if claim_in(row.folder).as_ref() != Some(row.claim) {
-        return Err("its claim changed".to_string());
+    match row.owner {
+        Owner::Claim(claim) => {
+            if claim_in(row.folder).as_ref() != Some(claim) {
+                return Err("its claim changed".to_string());
+            }
+        }
+        Owner::Worker(worker) => match (inputs.reread)(&worker.agent) {
+            Ok(now) if now == *worker => {}
+            Ok(_) => return Err("its tasks changed".to_string()),
+            Err(why) => return Err(format!("its tasks cannot be read again: {why}")),
+        },
     }
     let (judged, owner) = examine(row, inputs.landed, crate::verify::now_ms())?;
     hook(Stage::InUse, &row.path);
     let procs = snapshot(inputs.proc_root).map_err(|why| format!("in use unknown: {why}"))?;
-    match in_use(&row.path, owner, row.claim.created_ms, &procs, excuses) {
+    match in_use(&row.path, owner, row.created_ms(), &procs, excuses) {
         Proof::Used(why) => Err(why),
         Proof::Free(by_name) => Ok(Judged {
             excused: by_name,
@@ -452,11 +761,27 @@ fn rejudge(
 /// Every rule but the in-use proof, at `now`: the judged path's bytes and
 /// ids, and its owner's uid; else why it stays.
 fn examine(row: &Row, landed: &[(i64, i64)], now: i64) -> Result<(Judged, u32), String> {
-    if row.claim.lease_until_ms > now {
-        return Err("lease runs".to_string());
-    }
-    if !row.claim.pair().is_some_and(|pair| landed.contains(&pair)) {
-        return Err("not landed".to_string());
+    match row.owner {
+        Owner::Claim(claim) => {
+            if claim.lease_until_ms > now {
+                return Err("lease runs".to_string());
+            }
+            if !claim.pair().is_some_and(|pair| landed.contains(&pair)) {
+                return Err("not landed".to_string());
+            }
+        }
+        Owner::Worker(worker) => {
+            if let Some(why) = worker.stays() {
+                return Err(why);
+            }
+            if row
+                .path
+                .components()
+                .any(|part| part.as_os_str() == OsStr::new(crate::storage::ARCHIVE))
+            {
+                return Err("under the transcript archive".to_string());
+            }
+        }
     }
     if !build_path_ok(row.build) {
         return Err("not a build path".to_string());
@@ -519,7 +844,8 @@ fn tagged(dir: &Path) -> bool {
 }
 
 /// The regular files' bytes under `dir`, no symlink followed; why it stays
-/// when anything there is a transcript or on another device than `dev`.
+/// when anything there is a transcript, a git repository's or worktree's
+/// `.git`, or on another device than `dev`.
 fn size(dir: &Path, dev: u64) -> Result<u64, String> {
     let mut bytes = 0_u64;
     let mut pending = vec![dir.to_path_buf()];
@@ -532,6 +858,9 @@ fn size(dir: &Path, dev: u64) -> Result<u64, String> {
                 .path();
             if path.extension().is_some_and(|ext| ext == "jsonl") {
                 return Err(format!("{} is a transcript", path.display()));
+            }
+            if path.file_name().is_some_and(|name| name == ".git") {
+                return Err(format!("{} is a git repository's", path.display()));
             }
             let metadata = std::fs::symlink_metadata(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -861,6 +1190,12 @@ fn empty(dir: &OwnedFd, dev: u64, shown: &Path) -> Result<(), String> {
         {
             return Err(format!(
                 "{} is a transcript: it is never removed",
+                path.display()
+            ));
+        }
+        if name.as_bytes() == b".git" {
+            return Err(format!(
+                "{} is a git repository's: it is never removed",
                 path.display()
             ));
         }

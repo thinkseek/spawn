@@ -10,7 +10,7 @@ use std::process::Command;
 use spawn_core::feature_coverage::{
     BoundaryPolicy, FeatureKind, FeatureNode, FeatureProvenance, FeatureRegistry, FeatureRelation,
     InventoryEntry, RelationKind, SCHEMA_VERSION, ScanReport, associate_file,
-    match_directory_exclusion, scan_coverage, validate_registry,
+    match_directory_exclusion, match_exclusion, scan_coverage, validate_registry,
 };
 
 fn assert_accounting_identities(report: &ScanReport) {
@@ -1276,4 +1276,70 @@ fn collect_repo_inventory_works_on_git_archive_export_without_dot_git() {
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+}
+
+/// The generic boundary works for any repository: it names none of Spawn's
+/// own paths, excludes VCS internals, build outputs, dependencies, secrets
+/// and OS/editor temp files, and Spawn's boundary is it plus Spawn's own
+/// rules (the same 27 rules, in the registry's order).
+#[test]
+fn default_generic_boundary_serves_any_project_and_spawn_builds_on_it() {
+    let generic = BoundaryPolicy::default_generic_boundary("Acme");
+    assert_eq!(generic.project_name, "Acme");
+    for path in [
+        ".git/HEAD",
+        "target/debug/acme",
+        "node_modules/react/index.js",
+        "app/node_modules/x.js",
+        "dist/app.js",
+        "build/out.o",
+        ".env",
+        ".env.local",
+        "config/prod.env",
+        "certs/server.pem",
+        "id.key",
+        ".DS_Store",
+        "src/main.rs.swp",
+        "notes.txt~",
+    ] {
+        assert!(match_exclusion(&generic, path).is_some(), "{path}");
+    }
+    for path in [
+        "src/main.rs",
+        "README.md",
+        "src/build/mod.rs",
+        ".spawn/report.md",
+        ".claude/settings.json",
+        ".controller",
+        "rsi/.gate-owner/lease",
+    ] {
+        assert!(match_exclusion(&generic, path).is_none(), "{path}");
+    }
+
+    let spawn = BoundaryPolicy::default_spawn_boundary();
+    assert_eq!(spawn.project_name, "Spawn");
+    assert_eq!(spawn.exclusions.len(), 27);
+    for path in [
+        ".spawn/report.md",
+        ".claude/x",
+        ".controller",
+        "rsi/.gate-owner/lease",
+        "web/dist/a.js",
+    ] {
+        assert!(match_exclusion(&spawn, path).is_some(), "{path}");
+    }
+    for path in ["dist/app.js", "build/out.o"] {
+        assert!(match_exclusion(&spawn, path).is_none(), "{path}");
+    }
+    let generic_ids: BTreeSet<&str> = generic
+        .exclusions
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect();
+    let shared = spawn
+        .exclusions
+        .iter()
+        .filter(|rule| generic_ids.contains(rule.id.as_str()))
+        .count();
+    assert_eq!(shared, generic.exclusions.len() - 2);
 }

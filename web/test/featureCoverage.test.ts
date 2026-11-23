@@ -8,6 +8,11 @@ import {
   accountingIdentitiesHold,
   canSubmitWildFileAssociation,
   consistencyIssueCount,
+  coverageUrl,
+  INITIAL_COVERAGE_SCOPE,
+  isCurrentCoverageScope,
+  nextCoverageScope,
+  normalizeCoverageProjects,
   featureAssociatedFiles,
   fileAssociatedFeatures,
   formatBytes,
@@ -826,4 +831,96 @@ test("read-only deployed registry: the associate route's structured 409 surfaces
       ),
     /HTTP 409: .*read-only/,
   );
+});
+
+test("any project: coverage routes carry ?mission=<id>, the default project stays unparameterized", () => {
+  assert.equal(coverageUrl("/api/features/coverage", null), "/api/features/coverage");
+  assert.equal(coverageUrl("/api/features/scan", 9), "/api/features/scan?mission=9");
+  assert.equal(coverageUrl("/api/features/associate", 4), "/api/features/associate?mission=4");
+
+  // The server lists every eligible mission, however many: 60 options,
+  // mission #57 among them, all kept in order.
+  const many = normalizeCoverageProjects({
+    projects: Array.from({ length: 60 }, (_, index) => ({
+      mission: index + 1,
+      text: `Mission ${index + 1}`,
+      registry_path: `/srv/p${index + 1}/docs/feature-map/registry.json`,
+    })),
+  });
+  assert.equal(many.length, 60);
+  assert.equal(many[56].mission, 57);
+  assert.equal(many[56].registry, "/srv/p57/docs/feature-map/registry.json");
+
+  const projects = normalizeCoverageProjects({
+    projects: [
+      { mission: 4, text: "Spawn RSI\nmore", registry_path: "/srv/spawn/docs/feature-map/registry.json" },
+      { mission: 9, text: "", registry_path: "/srv/acme/docs/feature-map/registry.json" },
+      { mission: 10, text: "x".repeat(60), registry_path: "/srv/long/map.json" },
+      // Malformed entries are dropped, never offered.
+      { mission: "11", registry_path: "/srv/x.json" },
+      { mission: 12, registry_path: "" },
+      { mission: 1.5, registry_path: "/srv/y.json" },
+      null,
+    ],
+  });
+  assert.deepEqual(
+    projects.map((project) => project.mission),
+    [4, 9, 10],
+  );
+  assert.equal(projects[0].label, "Mission #4 — Spawn RSI");
+  assert.equal(projects[0].registry, "/srv/spawn/docs/feature-map/registry.json");
+  assert.equal(projects[1].label, "Mission #9");
+  assert.equal(projects[2].label, `Mission #10 — ${"x".repeat(47)}…`);
+  for (const empty of [null, {}, { projects: null }, { projects: [] }]) {
+    assert.deepEqual(normalizeCoverageProjects(empty), []);
+  }
+
+  // The page and its client pass the selected mission to all three routes.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const api = fs.readFileSync(path.resolve(here, "../src/featureCoverageApi.ts"), "utf8");
+  for (const route of ["/api/features/coverage", "/api/features/scan", "/api/features/associate"]) {
+    assert.ok(api.includes(`coverageUrl("${route}", mission)`), route);
+  }
+  const page = fs.readFileSync(
+    path.resolve(here, "../src/components/features/CoveragePage.tsx"),
+    "utf8",
+  );
+  assert.ok(page.includes("fetchFeatureCoverage(controller.signal, started.mission)"));
+  assert.ok(page.includes("runWildFileScan(undefined, started.mission)"));
+  assert.ok(page.includes("associateWildFile(path, featureIds, undefined, started.mission)"));
+  assert.ok(page.includes('data-testid="coverage-project-select"'));
+  // The picker reads the uncapped project list, not /api/features' missions.
+  assert.ok(page.includes("fetchCoverageProjects(controller.signal)"));
+  assert.ok(api.includes('"/api/features/coverage/projects"'));
+});
+
+test("any project: a late load, scan or association from an earlier project selection is discarded (A -> B -> A)", () => {
+  const a1 = nextCoverageScope(INITIAL_COVERAGE_SCOPE, 4);
+  assert.deepEqual(a1, { mission: 4, epoch: 1 });
+  assert.equal(isCurrentCoverageScope(a1, a1), true);
+  const b = nextCoverageScope(a1, 9);
+  // A's scan finishing while B is selected must not land.
+  assert.equal(isCurrentCoverageScope(a1, b), false);
+  const a2 = nextCoverageScope(b, 4);
+  // Back on A: the first visit's completion is still stale.
+  assert.equal(isCurrentCoverageScope(a1, a2), false);
+  assert.equal(isCurrentCoverageScope(b, a2), false);
+  assert.equal(isCurrentCoverageScope(a2, a2), true);
+  // The default project is a scope of its own.
+  const home = nextCoverageScope(a2, null);
+  assert.equal(home.mission, null);
+  assert.equal(isCurrentCoverageScope(INITIAL_COVERAGE_SCOPE, home), false);
+
+  // Every completion in the page checks its scope before it lands, only the
+  // current scope's report is drawn, and the panel remounts per scope.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const page = fs.readFileSync(
+    path.resolve(here, "../src/components/features/CoveragePage.tsx"),
+    "utf8",
+  );
+  const guards = page.split("if (!isCurrentCoverageScope(started, scopeRef.current)) return;").length - 1;
+  assert.ok(guards >= 6, `each success and failure path is guarded (${guards})`);
+  assert.ok(page.includes("shown && isCurrentCoverageScope(shown.scope, scope) ? shown.data : null"));
+  assert.ok(page.includes("key={scope.epoch}"));
+  assert.equal(page.includes("runWildFileScan(undefined, mission)"), false);
 });

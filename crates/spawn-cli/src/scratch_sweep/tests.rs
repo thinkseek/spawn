@@ -2,7 +2,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Args, EXCUSED, Inputs, Proof, Stage, args, digest, in_use, mapped, snapshot, sweep, under,
+    Args, EXCUSED, Inputs, Proof, Stage, TERMINAL, Worker, WorkerTask, args, digest, in_use,
+    mapped, session_runs, snapshot, sweep, under, worker_folders, worker_of,
 };
 use crate::scratch_owner::{Claim, OWNER_FILE};
 use sha2::Digest as _;
@@ -168,12 +169,34 @@ fn run(
     words: &[&str],
     hook: &dyn Fn(Stage, &Path),
 ) -> (Result<i32, String>, Vec<String>) {
+    run_with(
+        scratch,
+        folders,
+        &[],
+        &|_| Err("no store".to_string()),
+        words,
+        hook,
+    )
+}
+
+/// One sweep's exit (or refusal) and its lines, with workers' workspaces
+/// and the store's worker as `reread` gives it again.
+fn run_with(
+    scratch: &Scratch,
+    folders: &[(PathBuf, Claim)],
+    workers: &[(PathBuf, Worker)],
+    reread: &dyn Fn(&str) -> Result<Worker, String>,
+    words: &[&str],
+    hook: &dyn Fn(Stage, &Path),
+) -> (Result<i32, String>, Vec<String>) {
     let words: Vec<String> = words.iter().map(ToString::to_string).collect();
     let args = args(&words).expect("arguments");
     let proc = scratch.proc();
     let inputs = Inputs {
         folders,
         landed: &[(1, 7), (1, 9)],
+        workers,
+        reread,
         proc_root: &proc,
         uid: uid(),
     };
@@ -1038,4 +1061,582 @@ fn the_arguments() {
     assert!(parse(&["--excuse"]).is_err());
     assert!(parse(&["--apply", "--apply", "--expect-digest", "ab"]).is_err());
     assert!(parse(&["--whatever"]).is_err());
+}
+
+/// A worker `agent` with one ephemeral task `id` in `state`, made an hour
+/// ago, its execution ended (unless `live`).
+fn worker(agent: &str, id: i64, state: &str, live: bool) -> Worker {
+    let session = format!("session_{}", agent.trim_start_matches("agent_"));
+    Worker {
+        agent: agent.to_string(),
+        tasks: vec![WorkerTask {
+            id,
+            kind: "ephemeral".to_string(),
+            state: state.to_string(),
+            session: session.clone(),
+            created_ms: now() - HOUR_MS,
+        }],
+        live: if live { vec![session] } else { Vec::new() },
+    }
+}
+
+/// A synthetic workspace root `ws` with the transcript archive, and a
+/// worker's workspace `agent` with sources and a tagged, filled `target`.
+fn worker_workspace(ws: &Path, agent: &str) -> PathBuf {
+    let folder = ws.join(agent);
+    folder_with(&folder, "target");
+    fill(&ws.join(".transcripts").join(agent).join("s1.jsonl"), 500);
+    folder
+}
+
+/// How a test's store gives a worker again.
+type Reread = dyn Fn(&str) -> Result<Worker, String>;
+
+/// The workers as listed, read again unchanged.
+fn same(workers: &[(PathBuf, Worker)]) -> impl Fn(&str) -> Result<Worker, String> + '_ {
+    move |agent| {
+        workers
+            .iter()
+            .find(|(_, worker)| worker.agent == agent)
+            .map(|(_, worker)| worker.clone())
+            .ok_or_else(|| format!("no worker {agent}"))
+    }
+}
+
+/// The print-only list of `workers`, then `--apply` with its digest.
+fn workers_listed_then_applied(
+    scratch: &Scratch,
+    workers: &[(PathBuf, Worker)],
+    reread: &dyn Fn(&str) -> Result<Worker, String>,
+    hook: &dyn Fn(Stage, &Path),
+) -> (Vec<String>, Result<i32, String>, Vec<String>) {
+    let (result, listed) = run_with(scratch, &[], workers, reread, &[], &none);
+    assert_eq!(result, Ok(0), "{listed:?}");
+    let digest = digest_of(&listed);
+    let (result, applied) = run_with(
+        scratch,
+        &[],
+        workers,
+        reread,
+        &["--apply", "--expect-digest", &digest],
+        hook,
+    );
+    (listed, result, applied)
+}
+
+#[test]
+fn a_terminal_workers_target_goes_and_nothing_else() {
+    let scratch = Scratch::new("sweep-workers");
+    let ws = scratch.0.join("ws");
+    let mut workers = Vec::new();
+    for (n, state) in TERMINAL.iter().enumerate() {
+        let agent = format!("agent_worker_done_{n}");
+        let folder = worker_workspace(&ws, &agent);
+        let id = 500 + i64::try_from(n).expect("small");
+        workers.push((folder, worker(&agent, id, state, false)));
+    }
+    let bytes = 3000 + SIGNATURE.len();
+    // Print only: the list, nothing removed.
+    let (result, listed) = run_with(&scratch, &[], &workers, &same(&workers), &[], &none);
+    assert_eq!(result, Ok(0), "{listed:?}");
+    for (folder, worker) in &workers {
+        let line = line_for(&listed, &folder.join("target"));
+        assert!(line.starts_with("would-remove\t"), "{line}");
+        let task = &worker.tasks[0];
+        assert!(
+            line.contains(&format!(
+                "\t{bytes}\t{} task {} {}\t",
+                worker.agent, task.id, task.state
+            )),
+            "{line}"
+        );
+        assert!(line.contains("\tworker "), "{line}");
+        assert!(folder.join("target/debug/x").exists());
+    }
+    assert!(listed.contains(&format!(
+        "would remove (print only; nothing removed) 3 build path(s), {} bytes",
+        3 * bytes
+    )));
+    let (_, result, applied) =
+        workers_listed_then_applied(&scratch, &workers, &same(&workers), &none);
+    assert_eq!(result, Ok(0), "{applied:?}");
+    assert_eq!(
+        applied.last().cloned(),
+        Some(format!("removed 3 build path(s), {} bytes", 3 * bytes))
+    );
+    for (folder, worker) in &workers {
+        assert!(line_for(&applied, &folder.join("target")).starts_with("removed\t"));
+        assert!(!folder.join("target").exists());
+        // The workspace, its sources and the transcripts stay.
+        assert!(folder.join("src/main.rs").is_file());
+        assert!(
+            ws.join(".transcripts")
+                .join(&worker.agent)
+                .join("s1.jsonl")
+                .is_file()
+        );
+    }
+}
+
+/// Only stays lines, the summary and the digest: nothing listed to go.
+fn all_stay(lines: &[String]) {
+    assert!(
+        lines.iter().all(|line| line.starts_with("stays\t")
+            || !line.contains('\t')
+            || line.starts_with("digest\t")),
+        "{lines:?}"
+    );
+}
+
+const OPEN: [&str; 5] = ["assigned", "delivered", "reported", "revise", "landing"];
+
+#[test]
+fn a_worker_not_done_by_the_store_keeps_its_target() {
+    let scratch = Scratch::new("sweep-worker-store");
+    let ws = scratch.0.join("ws");
+    let mut workers = Vec::new();
+    let mut add = |agent: &str, facts: Worker| {
+        let folder = worker_workspace(&ws, agent);
+        workers.push((folder, facts));
+    };
+    // Tasks not terminal.
+    for (n, state) in OPEN.iter().enumerate() {
+        let agent = format!("agent_worker_open_{n}");
+        add(&agent, worker(&agent, 600, state, false));
+    }
+    // A terminal task with an execution still running.
+    add(
+        "agent_worker_live",
+        worker("agent_worker_live", 601, "accepted", true),
+    );
+    // No task known.
+    let mut unknown = worker("agent_worker_unknown", 602, "landed", false);
+    unknown.tasks.clear();
+    add("agent_worker_unknown", unknown);
+    // A task that is not ephemeral.
+    let mut resident = worker("agent_worker_resident", 603, "landed", false);
+    resident.tasks[0].kind = "resident".to_string();
+    add("agent_worker_resident", resident);
+    // Two tasks, one still open.
+    let mut two = worker("agent_worker_two", 604, "cancelled", false);
+    let mut open = two.tasks[0].clone();
+    open.id = 605;
+    open.state = "delivered".to_string();
+    two.tasks.push(open);
+    add("agent_worker_two", two);
+
+    let (listed, result, applied) =
+        workers_listed_then_applied(&scratch, &workers, &same(&workers), &none);
+    assert_eq!(result, Ok(0), "{applied:?}");
+    for lines in [&listed, &applied] {
+        let why = |agent: &str| line_for(lines, &ws.join(agent).join("target")).to_string();
+        for (n, state) in OPEN.iter().enumerate() {
+            let line = why(&format!("agent_worker_open_{n}"));
+            assert!(line.ends_with(&format!(": task 600 is {state}")), "{line}");
+        }
+        assert!(
+            why("agent_worker_live").ends_with(": an execution of session_worker_live still runs")
+        );
+        assert!(why("agent_worker_unknown").ends_with(": the store knows no task of it"));
+        assert!(why("agent_worker_resident").ends_with(": task 603 is resident, not ephemeral"));
+        assert!(why("agent_worker_two").ends_with(": task 605 is delivered"));
+        all_stay(lines);
+    }
+    assert_eq!(
+        applied.last().map(String::as_str),
+        Some("removed 0 build path(s), 0 bytes")
+    );
+    for (folder, _) in &workers {
+        assert!(
+            folder.join("target/debug/x").is_file(),
+            "{}",
+            folder.display()
+        );
+    }
+}
+
+#[test]
+fn each_file_system_rule_alone_keeps_a_done_workers_target() {
+    let scratch = Scratch::new("sweep-worker-fs");
+    let ws = scratch.0.join("ws");
+    let outside = scratch.0.join("outside");
+    fill(&outside.join("target/secret"), 9000);
+    tag(&outside.join("target"));
+    let done = |agent: &str| worker(agent, 700, "landed", false);
+    let mut workers = Vec::new();
+    for agent in [
+        "agent_worker_jsonl",
+        "agent_worker_git",
+        "agent_worker_notag",
+        "agent_worker_badtag",
+        "agent_worker_used",
+    ] {
+        workers.push((worker_workspace(&ws, agent), done(agent)));
+    }
+    // A transcript under it; a git repository or worktree under it.
+    fill(&ws.join("agent_worker_jsonl/target/debug/s.jsonl"), 10);
+    fill(&ws.join("agent_worker_git/target/vendor/.git"), 40);
+    // No tag; a tag of another signature.
+    std::fs::remove_file(ws.join("agent_worker_notag/target/CACHEDIR.TAG")).expect("untag");
+    std::fs::write(
+        ws.join("agent_worker_badtag/target/CACHEDIR.TAG"),
+        "Signature: 0000\n",
+    )
+    .expect("bad tag");
+    // In use.
+    let used = ws.join("agent_worker_used/target/debug");
+    Fake::readable(4343, &used).make(&scratch.proc());
+    // A target that is a symlink to a tagged directory elsewhere.
+    std::fs::create_dir_all(ws.join("agent_worker_link")).expect("mkdir");
+    std::os::unix::fs::symlink(outside.join("target"), ws.join("agent_worker_link/target"))
+        .expect("symlink");
+    workers.push((ws.join("agent_worker_link"), done("agent_worker_link")));
+
+    let (listed, result, applied) =
+        workers_listed_then_applied(&scratch, &workers, &same(&workers), &none);
+    assert_eq!(result, Ok(0), "{applied:?}");
+    for lines in [&listed, &applied] {
+        let why = |agent: &str| line_for(lines, &ws.join(agent).join("target")).to_string();
+        assert!(why("agent_worker_jsonl").ends_with(&format!(
+            ": {} is a transcript",
+            ws.join("agent_worker_jsonl/target/debug/s.jsonl").display()
+        )));
+        assert!(why("agent_worker_git").ends_with(&format!(
+            ": {} is a git repository's",
+            ws.join("agent_worker_git/target/vendor/.git").display()
+        )));
+        assert!(why("agent_worker_notag").ends_with(": no CACHEDIR.TAG"));
+        assert!(why("agent_worker_badtag").ends_with(": no CACHEDIR.TAG"));
+        assert!(why("agent_worker_link").ends_with(&format!(
+            ": {} is a symlink",
+            ws.join("agent_worker_link/target").display()
+        )));
+        assert!(why("agent_worker_used").ends_with(": in use: process 4343's cwd"));
+        all_stay(lines);
+    }
+    assert_eq!(
+        applied.last().map(String::as_str),
+        Some("removed 0 build path(s), 0 bytes")
+    );
+    assert!(outside.join("target/secret").is_file());
+    assert!(ws.join("agent_worker_link/target").is_symlink());
+    for (folder, _) in workers
+        .iter()
+        .filter(|(f, _)| !f.ends_with("agent_worker_link"))
+    {
+        assert!(
+            folder.join("target/debug/x").is_file(),
+            "{}",
+            folder.display()
+        );
+    }
+    assert!(ws.join("agent_worker_jsonl/target/debug/s.jsonl").is_file());
+    assert!(ws.join("agent_worker_git/target/vendor/.git").is_file());
+}
+
+#[test]
+fn a_worker_whose_tasks_changed_since_the_list_keeps_its_target() {
+    let scratch = Scratch::new("sweep-worker-changed");
+    let ws = scratch.0.join("ws");
+    let folder = worker_workspace(&ws, "agent_worker_x");
+    let workers = vec![(
+        folder.clone(),
+        worker("agent_worker_x", 9, "accepted", false),
+    )];
+    // Between the list and the removal, an execution starts again; or the
+    // store cannot be read.
+    let restarted = |_: &str| Ok(worker("agent_worker_x", 9, "accepted", true));
+    let unreadable = |_: &str| Err("the store is down".to_string());
+    let rereads: [(&Reread, &str); 2] = [
+        (&restarted, ": its tasks changed"),
+        (
+            &unreadable,
+            ": its tasks cannot be read again: the store is down",
+        ),
+    ];
+    for (reread, why) in rereads {
+        let (listed, result, applied) =
+            workers_listed_then_applied(&scratch, &workers, reread, &none);
+        assert!(line_for(&listed, &folder.join("target")).starts_with("would-remove\t"));
+        assert_eq!(result, Ok(0), "{applied:?}");
+        let line = line_for(&applied, &folder.join("target"));
+        assert!(line.starts_with("stays\t") && line.ends_with(why), "{line}");
+        assert!(folder.join("target/debug/x").is_file());
+    }
+    // Other facts, another digest: a list read before is not acted on.
+    let (_, before) = run_with(&scratch, &[], &workers, &same(&workers), &[], &none);
+    let landed = vec![(folder.clone(), worker("agent_worker_x", 9, "landed", false))];
+    let (result, _) = run_with(
+        &scratch,
+        &[],
+        &landed,
+        &same(&landed),
+        &["--apply", "--expect-digest", &digest_of(&before)],
+        &none,
+    );
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|why| why.contains("nothing removed")),
+        "{result:?}"
+    );
+    assert!(folder.join("target/debug/x").is_file());
+}
+
+#[test]
+fn a_transcript_put_in_a_workers_target_during_removal_is_never_removed() {
+    let scratch = Scratch::new("sweep-worker-transcript");
+    let ws = scratch.0.join("ws");
+    let folder = worker_workspace(&ws, "agent_worker_t");
+    let workers = vec![(
+        folder.clone(),
+        worker("agent_worker_t", 3, "cancelled", false),
+    )];
+    let late = folder.join("target/debug/late.jsonl");
+    let put = |stage: Stage, _: &Path| {
+        if stage == Stage::Opened {
+            fill(&late, 7);
+        }
+    };
+    let (_, result, applied) =
+        workers_listed_then_applied(&scratch, &workers, &same(&workers), &put);
+    assert_eq!(result, Ok(1), "{applied:?}");
+    assert!(line_for(&applied, &folder.join("target")).starts_with("failed\t"));
+    assert!(late.is_file(), "the transcript stays");
+    assert!(folder.join("src/main.rs").is_file());
+}
+
+#[test]
+fn only_workers_workspaces_with_a_target_are_found() {
+    let scratch = Scratch::new("sweep-worker-find");
+    let ws = scratch.0.join("ws");
+    worker_workspace(&ws, "agent_worker_a");
+    worker_workspace(&ws, "agent_worker_b");
+    // No target; not a worker; a resident; a bare prefix; a symlink to a
+    // worker's workspace; a file so named; the archive with a target.
+    fill(&ws.join("agent_worker_bare/src/main.rs"), 1);
+    folder_with(&ws.join("agent_resident_r"), "target");
+    folder_with(&ws.join("other"), "target");
+    folder_with(&ws.join("agent_worker_"), "target");
+    std::os::unix::fs::symlink(ws.join("agent_worker_a"), ws.join("agent_worker_link"))
+        .expect("symlink");
+    fill(&ws.join("agent_worker_file"), 1);
+    tag(&ws.join(".transcripts/target"));
+    assert_eq!(
+        worker_folders(&ws),
+        [ws.join("agent_worker_a"), ws.join("agent_worker_b")]
+    );
+    assert!(worker_folders(&scratch.0.join("no-such-root")).is_empty());
+}
+
+#[test]
+fn a_worker_is_read_from_the_label_facts() {
+    let facts = serde_json::json!({"missions": [
+        {"id": 7, "tasks": [
+            {"id": 507, "kind": "ephemeral", "agent_id": "agent_worker_x",
+             "session_id": "session_worker_x", "state": "accepted", "created_at_ms": 10},
+            {"id": 508, "kind": "ephemeral", "agent_id": "agent_worker_y",
+             "session_id": "session_worker_y", "state": "delivered", "created_at_ms": 11},
+        ]},
+        {"id": 6, "tasks": [
+            {"id": 400, "kind": "ephemeral", "agent_id": "agent_worker_x",
+             "session_id": "session_worker_x", "state": "landed", "created_at_ms": 5},
+        ]},
+    ]});
+    let asked = std::cell::RefCell::new(Vec::new());
+    let runs = |session: &str| {
+        asked.borrow_mut().push(session.to_string());
+        Ok(false)
+    };
+    let x = worker_of(&facts, "agent_worker_x", runs).expect("read");
+    assert_eq!(
+        x.tasks
+            .iter()
+            .map(|task| (task.id, task.state.as_str()))
+            .collect::<Vec<_>>(),
+        [(400, "landed"), (507, "accepted")]
+    );
+    assert_eq!(x.created_ms(), 5);
+    assert_eq!(x.stays(), None);
+    assert_eq!(
+        *asked.borrow(),
+        ["session_worker_x"],
+        "each session asked once"
+    );
+    let live = worker_of(&facts, "agent_worker_x", |_| Ok(true)).expect("read");
+    assert_eq!(live.live, ["session_worker_x"]);
+    assert!(live.stays().is_some());
+    let y = worker_of(&facts, "agent_worker_y", |_| Ok(false)).expect("read");
+    assert_eq!(y.stays().as_deref(), Some("task 508 is delivered"));
+    let none = worker_of(&facts, "agent_worker_z", |_| Ok(false)).expect("read");
+    assert_eq!(
+        none.stays().as_deref(),
+        Some("the store knows no task of it")
+    );
+    // A session whose executions cannot be read, or facts with no missions:
+    // no worker, so the sweep refuses.
+    assert!(worker_of(&facts, "agent_worker_x", |_| Err("down".to_string())).is_err());
+    assert!(worker_of(&serde_json::json!({}), "agent_worker_x", |_| Ok(false)).is_err());
+}
+
+/// A `.git` put in a worker's target once the removal has opened it (after
+/// every check by name) stops the removal there: the fd-based emptying
+/// refuses it too, and it stays.
+#[test]
+fn a_git_put_in_a_workers_target_during_removal_is_never_removed() {
+    let scratch = Scratch::new("sweep-worker-late-git");
+    let ws = scratch.0.join("ws");
+    let folder = worker_workspace(&ws, "agent_worker_g");
+    let workers = vec![(folder.clone(), worker("agent_worker_g", 4, "landed", false))];
+    let late = folder.join("target/debug/vendor/.git");
+    let put = |stage: Stage, _: &Path| {
+        if stage == Stage::Opened {
+            fill(&late.join("HEAD"), 7);
+        }
+    };
+    let (_, result, applied) =
+        workers_listed_then_applied(&scratch, &workers, &same(&workers), &put);
+    assert_eq!(result, Ok(1), "{applied:?}");
+    let line = line_for(&applied, &folder.join("target"));
+    assert!(line.starts_with("failed\t"), "{line}");
+    assert!(
+        line.ends_with(&format!(
+            ": {} is a git repository's: it is never removed",
+            late.display()
+        )),
+        "{line}"
+    );
+    assert!(late.join("HEAD").is_file(), "the repository stays");
+    assert!(folder.join("src/main.rs").is_file());
+}
+
+/// The digest holds every fact a worker is judged on, those its line does
+/// not print too (a task's session, kind, creation): a list read with
+/// other facts is not acted on.
+#[test]
+fn a_workers_facts_not_printed_still_change_the_digest() {
+    let scratch = Scratch::new("sweep-worker-facts");
+    let ws = scratch.0.join("ws");
+    let folder = worker_workspace(&ws, "agent_worker_f");
+    let listed = vec![(
+        folder.clone(),
+        worker("agent_worker_f", 11, "landed", false),
+    )];
+    let (result, before) = run_with(&scratch, &[], &listed, &same(&listed), &[], &none);
+    assert_eq!(result, Ok(0), "{before:?}");
+    let printed = line_for(&before, &folder.join("target")).to_string();
+    let mut other_session = listed[0].1.clone();
+    other_session.tasks[0].session = "session_other".to_string();
+    let mut later = listed[0].1.clone();
+    later.tasks[0].created_ms += 1;
+    for changed in [other_session, later] {
+        let now = vec![(folder.clone(), changed)];
+        let (result, again) = run_with(&scratch, &[], &now, &same(&now), &[], &none);
+        assert_eq!(result, Ok(0), "{again:?}");
+        let line = line_for(&again, &folder.join("target"));
+        // The same printed facts, another digest.
+        let shown = |line: &str| {
+            line.rsplit_once("\tworker ")
+                .map(|(head, _)| head.to_string())
+        };
+        assert_eq!(shown(line), shown(&printed), "{line}");
+        assert_ne!(digest_of(&again), digest_of(&before));
+        let (result, _) = run_with(
+            &scratch,
+            &[],
+            &now,
+            &same(&now),
+            &["--apply", "--expect-digest", &digest_of(&before)],
+            &none,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|why| why.contains("nothing removed")),
+            "{result:?}"
+        );
+        assert!(folder.join("target/debug/x").is_file());
+    }
+}
+
+/// A worker's target that a claimed folder's row already names is listed
+/// once, as the claim's.
+#[test]
+fn a_target_both_claimed_and_a_workers_is_one_row() {
+    let scratch = Scratch::new("sweep-claim-and-worker");
+    let ws = scratch.0.join("ws");
+    let folder = worker_workspace(&ws, "agent_worker_c");
+    let folders = vec![(folder.clone(), claim(&folder, "1/007", &["target"], None))];
+    let workers = vec![(
+        folder.clone(),
+        worker("agent_worker_c", 12, "landed", false),
+    )];
+    let (result, listed) = run_with(&scratch, &folders, &workers, &same(&workers), &[], &none);
+    assert_eq!(result, Ok(0), "{listed:?}");
+    let field = format!("\t{}\t", folder.join("target").display());
+    let rows: Vec<&String> = listed.iter().filter(|line| line.contains(&field)).collect();
+    assert_eq!(rows.len(), 1, "{listed:?}");
+    assert!(rows[0].starts_with("would-remove\t"), "{rows:?}");
+    assert!(rows[0].contains("\trev-g 1/007\t"), "{rows:?}");
+    assert!(rows[0].contains("\tclaim "), "{rows:?}");
+}
+
+/// Whether a session's execution still runs is read from the store: a
+/// started execution runs until its end is recorded; a session with no
+/// execution runs none; a session id the store cannot take refuses.
+#[test]
+fn a_running_execution_is_read_from_the_store() {
+    use spawn_core::event::{ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
+    use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+    use spawn_core::port::EventLog;
+    let url = std::env::var("SPAWN_TEST_DATABASE_URL")
+        .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip");
+    let schema = spawn_postgres::testing::TestSchema::new("sweep_runs");
+    let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+        .expect("a schema of its own, migrated");
+    let mut next = 0;
+    let mut append = |kind: EventKind| {
+        next += 1;
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new("agent_worker_r").expect("valid"),
+                session_id: SessionId::new("session_worker_r").expect("valid"),
+                execution_id: Some(ExecutionId::new("exec_worker_r_1").expect("valid")),
+                source: Source::Bridge,
+                source_event_id: Some(format!("sweep-runs:{next}")),
+                kind,
+            })
+            .expect("append");
+    };
+    assert_eq!(session_runs(&store, "session_worker_r"), Ok(false));
+    append(EventKind::ExecutionStarted {
+        engine: ENGINE.to_string(),
+        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+        command_id: CommandId(1),
+        fork: None,
+        model: ModelProfile::Default,
+        transcript_from: None,
+    });
+    assert_eq!(session_runs(&store, "session_worker_r"), Ok(true));
+    // A worker read through the store with that session stays.
+    let facts = serde_json::json!({"missions": [{"id": 1, "tasks": [
+        {"id": 1, "kind": "ephemeral", "agent_id": "agent_worker_r",
+         "session_id": "session_worker_r", "state": "landed", "created_at_ms": 1},
+    ]}]});
+    let read = worker_of(&facts, "agent_worker_r", |session| {
+        session_runs(&store, session)
+    })
+    .expect("read");
+    assert_eq!(
+        read.stays().as_deref(),
+        Some("an execution of session_worker_r still runs")
+    );
+    append(EventKind::ExecutionEnded {
+        cause: EndCause::Stopped,
+        exit_code: None,
+        signal: None,
+        evidence: None,
+    });
+    assert_eq!(session_runs(&store, "session_worker_r"), Ok(false));
+    assert!(session_runs(&store, "").is_err());
 }

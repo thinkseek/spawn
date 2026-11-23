@@ -834,7 +834,9 @@ is a control record in the stream, in the same shape as everything else:
 - `alert.cleared {key, kind, subject, evidence}` — what cleared it, with the
   clearing record's `event_id` (or the log line, or the reading).
 - `alert.judged {key, verdict}` (objective 092) — the owner's judgement of an
-  alert, `spawn alert judge <key> right|false|stale|duplicate`: `right`
+  alert, `spawn alert judge <key> [<key>...] right|false|stale|duplicate`
+  (several keys, the verdict last, each its own record; a refused key is
+  said, the others are still judged, and the status is 1; issue #71): `right`
   (objective 148) a real need, the others one that should not have been
   raised. `right` changes nothing else: an open alert stays open (its
   condition clears it later, and it keeps its verdict) and a cleared one

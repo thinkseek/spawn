@@ -833,15 +833,18 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
             }
         }
         if path == "/api/features/scan" {
-            return feature_scan_post(request, access, shared);
+            return feature_scan_post(request, query, access, shared);
         }
         if path == "/api/features/associate" {
-            return feature_associate_post(request, access, shared);
+            return feature_associate_post(request, query, access, shared);
         }
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
                 .map_err(|error| error.to_string());
+        }
+        if path == "/api/features/coverage" && mission_query(query).is_some() {
+            return feature_coverage_mission_get(request, query);
         }
     }
     let Some(read) = reader(path, query) else {
@@ -888,6 +891,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/verifications" => Box::new(verifications),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
+        "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 Box::new(move || session(id, query))
@@ -1336,10 +1340,174 @@ fn feature_coverage_get() -> Result<Value, String> {
     crate::feature_inventory::api_coverage_payload(&root, &registry)
 }
 
+/// `GET /api/features/coverage?mission=<id>`: [`feature_coverage_get`] for
+/// that mission's project ([`feature_paths`]), its refusals structured.
+fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), String> {
+    let (status, body) = match feature_paths(query) {
+        Ok((root, registry)) => {
+            match crate::feature_inventory::api_coverage_payload(&root, &registry) {
+                Ok(payload) => (200, payload),
+                Err(error) => (500, json!({ "error": error })),
+            }
+        }
+        Err(refusal) => refusal,
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The project root and feature registry a coverage request reads: without
+/// `?mission` the server's own (`SPAWN_FEATURE_ROOT`, else the working
+/// directory; `SPAWN_FEATURE_REGISTRY`, else the root's registry); with it,
+/// the open objective mission's `--features` file and the project root it
+/// belongs to ([`mission_feature_paths`]).
+fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let Some(text) = mission_query(query) else {
+        let root = crate::feature_inventory::default_root();
+        let registry = crate::feature_inventory::default_registry_path(&root);
+        return Ok((root, registry));
+    };
+    let Ok(id) = text.parse::<i64>() else {
+        return Err((
+            400,
+            json!({ "error": format!("{BAD_REQUEST}bad mission {text}"), "code": "bad_mission" }),
+        ));
+    };
+    let missions = open_store()
+        .and_then(|store| store.objective_missions().map_err(err))
+        .map_err(|error| (500, json!({ "error": error })))?;
+    let (root, registry) = mission_feature_paths(&missions, id)?;
+    coverage_registry_checked(&registry, id)?;
+    Ok((root, registry))
+}
+
+/// The `mission` of a coverage request's query as given: `None` when the
+/// query names none, `Some("")` for a bare `mission` or an empty
+/// `mission=` (refused as a bad mission, never read as the default
+/// project).
+fn mission_query(query: &str) -> Option<&str> {
+    query
+        .split('&')
+        .find_map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key == "mission").then_some(value),
+            None => (pair == "mission").then_some(""),
+        })
+}
+
+/// 400 `not_a_coverage_registry` when mission `id`'s `--features` file is
+/// not a coverage registry [`crate::feature_inventory::load_registry`]
+/// takes (missing, unreadable, or a legacy identity-only feature map).
+fn coverage_registry_checked(registry: &Path, id: i64) -> Result<(), (u16, Value)> {
+    crate::feature_inventory::load_registry(registry)
+        .map(|_| ())
+        .map_err(|error| {
+            (
+                400,
+                json!({
+                    "error": format!(
+                        "{BAD_REQUEST}mission {id}'s --features file is not a coverage \
+                         registry: {error}"
+                    ),
+                    "code": "not_a_coverage_registry",
+                    "mission": id,
+                }),
+            )
+        })
+}
+
+/// Mission `id`'s registry and project root ([`mission_paths`]), from the
+/// open objective missions `missions`: 404 when there is no such mission.
+fn mission_feature_paths(missions: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let mission = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|mission| mission["id"].as_i64() == Some(id))
+        .ok_or_else(|| {
+            (
+                404,
+                json!({ "error": format!("no open objective mission {id}"),
+                        "code": "mission_not_found", "mission": id }),
+            )
+        })?;
+    mission_paths(mission, id)
+}
+
+/// Mission row `mission`'s (id `id`) registry, its `objectives.features` as
+/// configured (a relative path beside its backlog; never rewritten, so it
+/// is opened and saved as the OS resolves it, symlinks and `..` included),
+/// and the project root it belongs to; 400 when it names no `--features`
+/// registry.
+fn mission_paths(mission: &Value, id: i64) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+    let refused = |status: u16, code: &str, error: String| {
+        (
+            status,
+            json!({ "error": error, "code": code, "mission": id }),
+        )
+    };
+    let given = mission
+        .pointer("/objectives/features")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refused(
+                400,
+                "no_features_registry",
+                format!(
+                    "{BAD_REQUEST}mission {id} has no --features registry configured \
+                     (spawn mission configure {id} --features <registry.json>)"
+                ),
+            )
+        })?;
+    let backlog = json!({ "backlog": mission.pointer("/objectives/backlog") });
+    let registry = feature_map::resolve(&backlog, given)
+        .map_err(|error| refused(400, "no_features_registry", format!("{BAD_REQUEST}{error}")))?;
+    let root = crate::feature_inventory::project_root_for_registry(&registry);
+    Ok((root, registry))
+}
+
+/// `GET /api/features/coverage/projects`: every project the coverage page
+/// can read ([`coverage_projects`]), over all open objective missions (no
+/// `/api/features` mission limit).
+fn feature_coverage_projects() -> Result<Value, String> {
+    let store = open_store()?;
+    let missions = store.objective_missions().map_err(err)?;
+    Ok(coverage_projects(&missions))
+}
+
+/// `{"projects": [{mission, text, registry_path, root}]}`: each mission of
+/// `missions` whose `--features` file is a coverage registry
+/// ([`coverage_registry_checked`]), in mission order; a mission without
+/// one, or with a legacy identity-only map, is left out.
+fn coverage_projects(missions: &Value) -> Value {
+    let projects: Vec<Value> = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|mission| {
+            let id = mission["id"].as_i64()?;
+            let (root, registry) = mission_paths(mission, id).ok()?;
+            coverage_registry_checked(&registry, id).ok()?;
+            Some(json!({
+                "mission": id,
+                "text": mission["text"],
+                "registry_path": registry.display().to_string(),
+                "root": root.display().to_string(),
+            }))
+        })
+        .collect();
+    json!({ "projects": projects })
+}
+
 /// `POST /api/features/scan`: one-click unassociated-file ("野文件") scan.
 /// Performs a fresh read-only project inventory scan; never modifies or
 /// deletes any file on disk.
-fn feature_scan_post(mut request: Request, access: Access, _shared: &Shared) -> Result<(), String> {
+fn feature_scan_post(
+    mut request: Request,
+    query: &str,
+    access: Access,
+    _shared: &Shared,
+) -> Result<(), String> {
     if *request.method() != Method::Post {
         return request
             .respond(not_allowed("POST"))
@@ -1354,11 +1522,14 @@ fn feature_scan_post(mut request: Request, access: Access, _shared: &Shared) -> 
             .map_err(|error| error.to_string());
     }
     let _ = read_body(&mut request);
-    let root = crate::feature_inventory::default_root();
-    let registry = crate::feature_inventory::default_registry_path(&root);
-    let (status, body) = match crate::feature_inventory::api_coverage_payload(&root, &registry) {
-        Ok(payload) => (200, payload),
-        Err(error) => (500, json!({ "error": error })),
+    let (status, body) = match feature_paths(query) {
+        Ok((root, registry)) => {
+            match crate::feature_inventory::api_coverage_payload(&root, &registry) {
+                Ok(payload) => (200, payload),
+                Err(error) => (500, json!({ "error": error })),
+            }
+        }
+        Err(refusal) => refusal,
     };
     request
         .respond(json_response(status, &body))
@@ -1379,6 +1550,7 @@ struct FeatureAssociateBody {
 /// report and association update summary.
 fn feature_associate_post(
     mut request: Request,
+    query: &str,
     access: Access,
     shared: &Shared,
 ) -> Result<(), String> {
@@ -1387,7 +1559,7 @@ fn feature_associate_post(
             .respond(not_allowed("POST"))
             .map_err(|error| error.to_string());
     }
-    let (status, body) = match feature_associate_checked(&mut request, access, shared) {
+    let (status, body) = match feature_associate_checked(&mut request, query, access, shared) {
         Ok(answer) | Err(FeatureAssociateRefusal::Structured(answer)) => answer,
         Err(FeatureAssociateRefusal::Plain((status, error))) => (status, json!({ "error": error })),
     };
@@ -1413,12 +1585,12 @@ impl From<(u16, String)> for FeatureAssociateRefusal {
 
 fn feature_associate_checked(
     request: &mut Request,
+    query: &str,
     access: Access,
     shared: &Shared,
 ) -> Result<(u16, Value), FeatureAssociateRefusal> {
     let (raw_body, _) = write_body(request, access, shared, "a feature association")?;
-    let root = crate::feature_inventory::default_root();
-    let registry = crate::feature_inventory::default_registry_path(&root);
+    let (root, registry) = feature_paths(query).map_err(FeatureAssociateRefusal::Structured)?;
     feature_associate_at(&root, &registry, &raw_body)
 }
 
@@ -2770,14 +2942,16 @@ mod tests {
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_INPUT_BODY,
         MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
-        feature_associate_at, handle, is_json, is_loopback, keep_listening, listen_again_pause,
-        local_exemption, log_window, objective_json, objective_prompt, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin,
-        same_secret, serve_requests, server_hosts, tokenless_request, typed_text, with_activity,
-        with_last_gates, with_objectives,
+        coverage_projects, coverage_registry_checked, feature_associate_at, feature_paths, handle,
+        is_json, is_loopback, keep_listening, listen_again_pause, local_exemption, log_window,
+        mission_feature_paths, mission_query, objective_json, objective_prompt,
+        open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective,
+        rsi_summary, same_origin, same_secret, serve_requests, server_hosts, tokenless_request,
+        typed_text, with_activity, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
+    use std::path::PathBuf;
 
     fn address(text: &str) -> SocketAddr {
         text.parse().expect("a socket address")
@@ -3903,6 +4077,37 @@ mod tests {
                 Value::Null
             );
             let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// Task 545 (reviews 532/533 of 515): a reading through the real store
+    /// in a test (the serve and Core lines readings reach
+    /// [`super::storage::report`], as does the alerts monitor's guardrail
+    /// reading) looks for build directories under the tests' path, never
+    /// under the host's `/tmp` or `SPAWN_ALERT_TMPFS_PATH`. A look there
+    /// stops the test itself (`storage::tmpfs_build_targets`); this one
+    /// fails when a reading's look holds a watched host path.
+    #[test]
+    fn a_reading_in_a_test_never_looks_at_the_hosts_tmpfs() {
+        in_test_schema(|_owner, store| {
+            let storage = super::storage::report(store, super::now_ms()).expect("the figures");
+            let looked = storage["tmpfs_build_targets"]["root"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .expect("the tmpfs looked under");
+            assert_eq!(looked, std::path::Path::new(super::storage::TESTS_TMPFS));
+            for watched in super::storage::watched_host_paths() {
+                assert!(
+                    !watched.starts_with(&looked),
+                    "a test's reading looked under {}, which holds the host's {}",
+                    looked.display(),
+                    watched.display()
+                );
+            }
+            assert_eq!(
+                storage["tmpfs_build_targets"]["targets"],
+                serde_json::json!([])
+            );
         });
     }
 
@@ -5425,6 +5630,11 @@ mod tests {
         assert_eq!(answer.body["error"], "SPAWN_DATABASE_URL is not set");
         assert_eq!(tokenless_status("/api/feature", named), 404);
         assert_eq!(tokenless_status("/api/features/", named), 404);
+        // The coverage page's project list is a read of its own too.
+        assert_eq!(
+            tokenless_status("/api/features/coverage/projects", named),
+            500
+        );
     }
 
     #[test]
@@ -5665,5 +5875,183 @@ mod tests {
         assert!(summary["open_task"].is_null());
         let summary = rsi_summary(&mission(json!("/srv/rsi/scenarios"), "cancelled"));
         assert!(summary["open_task"].is_null());
+    }
+
+    /// `?mission=<id>` reads that open objective mission's `--features`
+    /// registry (relative beside its backlog) and the project root it
+    /// belongs to; no such mission is a structured 404, a mission without
+    /// a registry a structured 400.
+    #[test]
+    fn mission_feature_paths_find_any_projects_registry() {
+        let missions = json!([
+            {"id": 4, "objectives": {"backlog": "/srv/spawn/rsi/backlog",
+                                     "features": "/srv/spawn/docs/feature-map/registry.json"}},
+            {"id": 9, "objectives": {"backlog": "/srv/acme/backlog",
+                                     "features": "../docs/feature-map/registry.json"}},
+            {"id": 11, "objectives": {"backlog": "/srv/flake/backlog"}},
+        ]);
+        let (root, registry) = mission_feature_paths(&missions, 4).expect("spawn");
+        assert_eq!(root, PathBuf::from("/srv/spawn"));
+        assert_eq!(
+            registry,
+            PathBuf::from("/srv/spawn/docs/feature-map/registry.json")
+        );
+        let (root, registry) = mission_feature_paths(&missions, 9).expect("acme");
+        // The registry is the path as configured; the root is where it is.
+        assert_eq!(
+            registry,
+            PathBuf::from("/srv/acme/backlog/../docs/feature-map/registry.json")
+        );
+        assert_eq!(root, PathBuf::from("/srv/acme"));
+
+        let (status, body) = mission_feature_paths(&missions, 11).expect_err("no registry");
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "no_features_registry");
+        assert_eq!(body["mission"], 11);
+        assert!(
+            body["error"].as_str().unwrap().starts_with(BAD_REQUEST),
+            "{body}"
+        );
+
+        let (status, body) = mission_feature_paths(&missions, 12).expect_err("no mission");
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], "mission_not_found");
+
+        // Without `?mission` the server's own root stays the default.
+        let (root, registry) = feature_paths("").expect("default");
+        assert_eq!(root, crate::feature_inventory::default_root());
+        assert_eq!(
+            registry,
+            crate::feature_inventory::default_registry_path(&root)
+        );
+        let (status, body) = feature_paths("mission=abc").expect_err("bad id");
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "bad_mission");
+    }
+
+    /// A bare `?mission` or an empty `?mission=` is a bad mission (400),
+    /// never the default project; a query without it is the default.
+    #[test]
+    fn a_bare_or_empty_mission_is_a_bad_mission() {
+        assert_eq!(mission_query(""), None);
+        assert_eq!(mission_query("limit=3&missions=4"), None);
+        assert_eq!(mission_query("mission"), Some(""));
+        assert_eq!(mission_query("token=x&mission="), Some(""));
+        assert_eq!(mission_query("mission=4&limit=3"), Some("4"));
+        for query in ["mission", "mission=", "token=x&mission"] {
+            let (status, body) = feature_paths(query).expect_err(query);
+            assert_eq!(status, 400, "{query}");
+            assert_eq!(body["code"], "bad_mission", "{query}");
+        }
+    }
+
+    /// A mission's `--features` file must be a coverage registry: a legacy
+    /// identity-only feature map or a missing file is a structured 400.
+    #[test]
+    fn a_legacy_feature_map_is_not_a_coverage_registry() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-serve-coverage-registry-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let legacy = dir.join("legacy.json");
+        std::fs::write(
+            &legacy,
+            r#"{"features": [{"id": "a", "title": "A", "objectives": [1]}]}"#,
+        )
+        .expect("legacy");
+        let registry = dir.join("registry.json");
+        std::fs::write(
+            &registry,
+            r#"{"schema_version": 1, "initiative_id": "x", "features": [],
+                "boundary": {"project_name": "Acme", "description": "d",
+                             "included_categories": [], "exclusions": []}}"#,
+        )
+        .expect("registry");
+        assert!(coverage_registry_checked(&registry, 9).is_ok());
+        for refused in [legacy, dir.join("missing.json")] {
+            let (status, body) = coverage_registry_checked(&refused, 9).expect_err("refused");
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], "not_a_coverage_registry");
+            assert_eq!(body["mission"], 9);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative registry that walks out of the backlog's repository
+    /// (`../../../acme/meta/features.json` from Spawn's backlog) keeps its
+    /// configured path (opened and saved as the OS resolves it), and its
+    /// root is Acme's directory, not a path through Spawn.
+    #[test]
+    fn a_relative_registry_is_normalized_out_of_the_backlog() {
+        let missions = json!([
+            {"id": 9, "objectives": {"backlog": "/srv/spawn/rsi/backlog",
+                                     "features": "../../../acme/meta/features.json"}},
+        ]);
+        let (root, registry) = mission_feature_paths(&missions, 9).expect("acme");
+        assert_eq!(
+            registry,
+            PathBuf::from("/srv/spawn/rsi/backlog/../../../acme/meta/features.json")
+        );
+        assert_eq!(root, PathBuf::from("/srv/acme/meta"));
+    }
+
+    /// The coverage page's projects are every open objective mission with a
+    /// coverage registry, however many missions there are: one past
+    /// `/api/features`' 50-mission cap is listed; a mission without a
+    /// registry, with a legacy map, or with a missing file is not.
+    #[test]
+    fn coverage_projects_list_every_eligible_mission_past_the_feature_map_cap() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-serve-coverage-projects-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("backlog")).expect("backlog");
+        let registry = r#"{"schema_version": 1, "initiative_id": "x", "features": [],
+            "boundary": {"project_name": "P", "description": "d",
+                         "included_categories": [], "exclusions": []}}"#;
+        std::fs::write(dir.join("backlog/registry.json"), registry).expect("registry");
+        std::fs::write(
+            dir.join("backlog/legacy.json"),
+            r#"{"features": [{"id": "a", "title": "A", "objectives": [1]}]}"#,
+        )
+        .expect("legacy");
+        let backlog = dir.join("backlog").display().to_string();
+        let missions: Vec<serde_json::Value> = (1..=60)
+            .map(|id| {
+                let features = match id {
+                    3 | 57 => json!("registry.json"),
+                    58 => json!("legacy.json"),
+                    59 => json!("missing.json"),
+                    _ => serde_json::Value::Null,
+                };
+                json!({"id": id, "text": format!("Mission {id}"),
+                       "objectives": {"backlog": backlog, "features": features}})
+            })
+            .collect();
+        let answer = coverage_projects(&serde_json::Value::Array(missions));
+        let projects = answer["projects"].as_array().expect("projects");
+        let ids: Vec<i64> = projects
+            .iter()
+            .filter_map(|project| project["mission"].as_i64())
+            .collect();
+        assert_eq!(ids, [3, 57]);
+        assert_eq!(projects[1]["text"], "Mission 57");
+        assert_eq!(
+            projects[1]["registry_path"],
+            dir.join("backlog/registry.json").display().to_string()
+        );
+        assert!(
+            coverage_projects(&json!([]))["projects"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

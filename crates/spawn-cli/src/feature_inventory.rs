@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -37,6 +37,85 @@ pub fn default_registry_path(root: &Path) -> PathBuf {
         return PathBuf::from(registry);
     }
     root.join(DEFAULT_REGISTRY_REL)
+}
+
+/// `path` with its `.` and `..` segments resolved lexically (a `..` drops
+/// the segment before it; one past the root stays at the root; a relative
+/// path keeps its leading `..`). An empty result is `.`. Only for a path
+/// nothing of which exists ([`real_registry_path`]): on disk a `..` after a
+/// symlink leaves the link's target, not the link's directory.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normal.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normal.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normal.push(".."),
+            },
+            other => normal.push(other),
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normal
+    }
+}
+
+/// Where `registry` really is: the filesystem's canonical path when it
+/// exists, else its canonical parent joined with its file name, else (when
+/// neither exists) its lexical normalization. Only for finding the project
+/// root: the registry itself is always opened and saved at the path as
+/// configured.
+fn real_registry_path(registry: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(registry) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (registry.parent(), registry.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(real) = fs::canonicalize(parent) {
+            return real.join(name);
+        }
+    }
+    normalize_lexically(registry)
+}
+
+/// The project root a mission's `--features` registry file belongs to,
+/// from where the file really is ([`real_registry_path`]): the directory
+/// holding `docs/feature-map/registry.json` when the file sits at that
+/// conventional place, else the nearest ancestor that is a repository root
+/// (holds `.git`), else the registry's own directory.
+pub fn project_root_for_registry(registry: &Path) -> PathBuf {
+    let registry = real_registry_path(registry);
+    let registry = registry.as_path();
+    let conventional: PathBuf = DEFAULT_REGISTRY_REL.split('/').collect();
+    if registry.ends_with(&conventional) {
+        let depth = conventional.components().count();
+        if let Some(root) = registry.ancestors().nth(depth) {
+            return if root.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                root.to_path_buf()
+            };
+        }
+    }
+    let parent = registry
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(parent)
+        .to_path_buf()
 }
 
 /// Current epoch timestamp in milliseconds.
@@ -1022,5 +1101,105 @@ mod tests {
         assert_eq!(code, 1);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A mission's `--features` registry names its project root: the
+    /// conventional `docs/feature-map/registry.json` place, else the
+    /// repository holding it, else its own directory.
+    #[test]
+    fn project_root_for_registry_derives_the_missions_project() {
+        assert_eq!(
+            project_root_for_registry(Path::new("/srv/acme/docs/feature-map/registry.json")),
+            PathBuf::from("/srv/acme")
+        );
+        assert_eq!(
+            project_root_for_registry(Path::new(
+                "no-such-project-554/docs/feature-map/registry.json"
+            )),
+            PathBuf::from("no-such-project-554")
+        );
+
+        let repo = temp_fixture("project-root");
+        fs::create_dir_all(repo.join(".git")).expect(".git");
+        fs::create_dir_all(repo.join("meta/maps")).expect("maps");
+        assert_eq!(
+            project_root_for_registry(&repo.join("meta/maps/features.json")),
+            fs::canonicalize(&repo).expect("repo")
+        );
+        let loose = temp_fixture("project-root-loose");
+        fs::create_dir_all(loose.join("maps")).expect("maps");
+        let derived = project_root_for_registry(&loose.join("maps/features.json"));
+        let real_loose = fs::canonicalize(&loose).expect("loose");
+        if !real_loose.ancestors().any(|dir| dir.join(".git").exists()) {
+            assert_eq!(derived, real_loose.join("maps"));
+        }
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&loose);
+    }
+
+    /// A relative registry reached from another repository's backlog
+    /// (`../../../acme/meta/features.json` from Spawn's) resolves its `..`
+    /// segments before the `.git` walk: it never lands on the repository
+    /// they only pass through.
+    #[test]
+    fn project_root_for_registry_normalizes_dot_dot_before_the_git_walk() {
+        let base = temp_fixture("project-root-dotdot");
+        fs::create_dir_all(base.join("spawn/.git")).expect("spawn .git");
+        fs::create_dir_all(base.join("spawn/rsi/backlog")).expect("backlog");
+        fs::create_dir_all(base.join("acme/.git")).expect("acme .git");
+        fs::create_dir_all(base.join("acme/meta")).expect("meta");
+        fs::create_dir_all(base.join("acme/docs/feature-map")).expect("feature-map");
+        let acme = fs::canonicalize(base.join("acme")).expect("acme");
+        let through = base.join("spawn/rsi/backlog/../../../acme/meta/features.json");
+        assert_eq!(project_root_for_registry(&through), acme);
+        let conventional =
+            base.join("spawn/rsi/backlog/../../../acme/docs/feature-map/registry.json");
+        assert_eq!(project_root_for_registry(&conventional), acme);
+
+        assert_eq!(
+            normalize_lexically(Path::new("/srv/spawn/rsi/backlog/../../../acme/./x.json")),
+            PathBuf::from("/srv/acme/x.json")
+        );
+        assert_eq!(normalize_lexically(Path::new("/../a")), PathBuf::from("/a"));
+        assert_eq!(
+            normalize_lexically(Path::new("../a/../../b")),
+            PathBuf::from("../../b")
+        );
+        assert_eq!(normalize_lexically(Path::new("a/..")), PathBuf::from("."));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A `..` after a symlink leaves the link's target, as the OS resolves
+    /// it (`/var/run/..` is `/`, not `/var`): the root is found from the
+    /// file the path really names, and the path itself, which is what the
+    /// registry is opened and saved by, names that file.
+    #[test]
+    fn project_root_for_registry_follows_symlinks_before_dot_dot() {
+        let base = temp_fixture("project-root-symlink");
+        // The real file: <base>/real/acme/meta/features.json, Acme a repo.
+        fs::create_dir_all(base.join("real/acme/.git")).expect("acme .git");
+        fs::create_dir_all(base.join("real/acme/meta/run")).expect("run");
+        // <base>/spawn is another repo holding `run`, a link into Acme.
+        fs::create_dir_all(base.join("spawn/.git")).expect("spawn .git");
+        std::os::unix::fs::symlink(base.join("real/acme/meta/run"), base.join("spawn/run"))
+            .expect("symlink");
+        let registry = base.join("spawn/run/../features.json");
+        fs::write(base.join("real/acme/meta/features.json"), "{}").expect("real file");
+        // Lexically this would be <base>/spawn/features.json (no such file)
+        // under the Spawn repo; on disk it is Acme's file.
+        assert_eq!(
+            fs::read_to_string(&registry).expect("the path names the real file"),
+            "{}"
+        );
+        assert!(!base.join("spawn/features.json").exists());
+        let acme = fs::canonicalize(base.join("real/acme")).expect("acme");
+        assert_eq!(project_root_for_registry(&registry), acme);
+        // Not created yet: its parent's real place decides the same way.
+        let fresh = base.join("spawn/run/../fresh.json");
+        assert_eq!(project_root_for_registry(&fresh), acme);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

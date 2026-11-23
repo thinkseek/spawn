@@ -598,3 +598,66 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
+
+/** A coverage route for one mission's project (`?mission=<id>`), or the
+ * server's default project when `mission` is null. */
+export function coverageUrl(path: string, mission: number | null): string {
+  return mission === null ? path : `${path}?mission=${encodeURIComponent(String(mission))}`;
+}
+
+/** One project the coverage page can read: an open objective mission with
+ * a coverage registry as its `--features` file. */
+export interface CoverageProject {
+  mission: number;
+  label: string;
+  registry: string;
+}
+
+/** `GET /api/features/coverage/projects`' answer, `{projects: [{mission,
+ * text, registry_path}]}`, as the picker's options in the order given: the
+ * server lists every eligible mission (no mission limit). An entry without a
+ * numeric mission or a registry path is dropped. */
+export function normalizeCoverageProjects(value: unknown): CoverageProject[] {
+  const raw = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const projects = Array.isArray(raw.projects) ? raw.projects : [];
+  return projects.flatMap((entry): CoverageProject[] => {
+    const project =
+      entry !== null && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    const mission = project.mission;
+    const registry = project.registry_path;
+    if (typeof mission !== "number" || !Number.isInteger(mission)) return [];
+    if (typeof registry !== "string" || registry === "") return [];
+    const text = typeof project.text === "string" ? project.text : "";
+    const title = text.split("\n")[0]?.trim() ?? "";
+    const short = title.length > 48 ? `${title.slice(0, 47)}…` : title;
+    return [
+      {
+        mission,
+        label: short ? `Mission #${mission} — ${short}` : `Mission #${mission}`,
+        registry,
+      },
+    ];
+  });
+}
+
+/** What the coverage page shows: one mission's project (null: the server's
+ * default) in one selection `epoch`. Every project switch starts a new
+ * epoch, so A -> B -> A is not the A it left. */
+export interface CoverageScope {
+  mission: number | null;
+  epoch: number;
+}
+
+export const INITIAL_COVERAGE_SCOPE: CoverageScope = { mission: null, epoch: 0 };
+
+/** The scope after selecting `mission`: always a new epoch. */
+export function nextCoverageScope(current: CoverageScope, mission: number | null): CoverageScope {
+  return { mission, epoch: current.epoch + 1 };
+}
+
+/** Whether a load, scan or association started in `started` may still land:
+ * only while the page is in that same scope. A late completion from an
+ * earlier selection is discarded. */
+export function isCurrentCoverageScope(started: CoverageScope, current: CoverageScope): boolean {
+  return started.epoch === current.epoch && started.mission === current.mission;
+}
