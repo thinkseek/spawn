@@ -39,6 +39,33 @@ pub fn default_registry_path(root: &Path) -> PathBuf {
     root.join(DEFAULT_REGISTRY_REL)
 }
 
+/// The project root a mission's `--features` registry file belongs to: the
+/// directory holding `docs/feature-map/registry.json` when the file sits at
+/// that conventional place, else the nearest ancestor that is a repository
+/// root (holds `.git`), else the registry's own directory.
+pub fn project_root_for_registry(registry: &Path) -> PathBuf {
+    let conventional: PathBuf = DEFAULT_REGISTRY_REL.split('/').collect();
+    if registry.ends_with(&conventional) {
+        let depth = conventional.components().count();
+        if let Some(root) = registry.ancestors().nth(depth) {
+            return if root.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                root.to_path_buf()
+            };
+        }
+    }
+    let parent = registry
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(parent)
+        .to_path_buf()
+}
+
 /// Current epoch timestamp in milliseconds.
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -1022,5 +1049,37 @@ mod tests {
         assert_eq!(code, 1);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A mission's `--features` registry names its project root: the
+    /// conventional `docs/feature-map/registry.json` place, else the
+    /// repository holding it, else its own directory.
+    #[test]
+    fn project_root_for_registry_derives_the_missions_project() {
+        assert_eq!(
+            project_root_for_registry(Path::new("/srv/acme/docs/feature-map/registry.json")),
+            PathBuf::from("/srv/acme")
+        );
+        assert_eq!(
+            project_root_for_registry(Path::new("docs/feature-map/registry.json")),
+            PathBuf::from(".")
+        );
+
+        let repo = temp_fixture("project-root");
+        fs::create_dir_all(repo.join(".git")).expect(".git");
+        fs::create_dir_all(repo.join("meta/maps")).expect("maps");
+        assert_eq!(
+            project_root_for_registry(&repo.join("meta/maps/features.json")),
+            repo
+        );
+        let loose = temp_fixture("project-root-loose");
+        fs::create_dir_all(loose.join("maps")).expect("maps");
+        let derived = project_root_for_registry(&loose.join("maps/features.json"));
+        if !loose.ancestors().any(|dir| dir.join(".git").exists()) {
+            assert_eq!(derived, loose.join("maps"));
+        }
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&loose);
     }
 }
