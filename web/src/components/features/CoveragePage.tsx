@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-  coverageProjects,
   INITIAL_COVERAGE_SCOPE,
   isCurrentCoverageScope,
   nextCoverageScope,
@@ -11,10 +10,10 @@ import {
 } from "../../featureCoverage";
 import {
   associateWildFile,
+  fetchCoverageProjects,
   fetchFeatureCoverage,
   runWildFileScan,
 } from "../../featureCoverageApi";
-import { FEATURE_MAP_MAX_MISSIONS, fetchFeatureMap } from "../../featuresApi";
 import { relativeTime } from "../../format";
 import { LiveStatus, PageHeader } from "../ui";
 import { WildFileScanPanel } from "./WildFileScanPanel";
@@ -43,8 +42,8 @@ export function CoveragePage() {
   // The project list is a convenience: without it the default project still reads.
   useEffect(() => {
     const controller = new AbortController();
-    void fetchFeatureMap(controller.signal, FEATURE_MAP_MAX_MISSIONS)
-      .then((map) => setProjects(coverageProjects(map.missions)))
+    void fetchCoverageProjects(controller.signal)
+      .then(setProjects)
       .catch(() => setProjects([]));
     return () => controller.abort();
   }, []);

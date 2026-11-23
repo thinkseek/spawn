@@ -6,10 +6,18 @@
 import { apiError, apiHeaders, readApi } from "./api";
 import {
   coverageUrl,
+  normalizeCoverageProjects,
   parseCoverageHttpResponse,
   parseFeatureCoverageResponse,
+  type CoverageProject,
   type FeatureCoverageResponse,
 } from "./featureCoverage.ts";
+
+/** GET /api/features/coverage/projects: every open objective mission whose
+ * `--features` file is a coverage registry (the project picker). */
+export async function fetchCoverageProjects(signal: AbortSignal): Promise<CoverageProject[]> {
+  return readApi("/api/features/coverage/projects", signal, normalizeCoverageProjects);
+}
 
 /** GET /api/features/coverage: current coverage report and registered features. */
 export async function fetchFeatureCoverage(

@@ -605,41 +605,39 @@ export function coverageUrl(path: string, mission: number | null): string {
   return mission === null ? path : `${path}?mission=${encodeURIComponent(String(mission))}`;
 }
 
-/** One project the coverage page can read: a mission with a `--features`
- * registry file configured. */
+/** One project the coverage page can read: an open objective mission with
+ * a coverage registry as its `--features` file. */
 export interface CoverageProject {
   mission: number;
   label: string;
   registry: string;
 }
 
-/** The projects of `/api/features`' missions whose map is a readable
- * coverage registry file (`mapping.kind` "file" with `mapping.registry`; a
- * legacy identity-only map is left out), in the order given. */
-export function coverageProjects(
-  missions: ReadonlyArray<{
-    id: number;
-    text: string;
-    mapping: { kind: string; path: string | null; registry: boolean };
-  }>,
-): CoverageProject[] {
-  return missions
-    .filter(
-      (mission) =>
-        mission.mapping.kind === "file" &&
-        mission.mapping.registry === true &&
-        typeof mission.mapping.path === "string" &&
-        mission.mapping.path !== "",
-    )
-    .map((mission) => {
-      const title = mission.text.split("\n")[0]?.trim() ?? "";
-      const short = title.length > 48 ? `${title.slice(0, 47)}…` : title;
-      return {
-        mission: mission.id,
-        label: short ? `Mission #${mission.id} — ${short}` : `Mission #${mission.id}`,
-        registry: mission.mapping.path as string,
-      };
-    });
+/** `GET /api/features/coverage/projects`' answer, `{projects: [{mission,
+ * text, registry_path}]}`, as the picker's options in the order given: the
+ * server lists every eligible mission (no mission limit). An entry without a
+ * numeric mission or a registry path is dropped. */
+export function normalizeCoverageProjects(value: unknown): CoverageProject[] {
+  const raw = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const projects = Array.isArray(raw.projects) ? raw.projects : [];
+  return projects.flatMap((entry): CoverageProject[] => {
+    const project =
+      entry !== null && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    const mission = project.mission;
+    const registry = project.registry_path;
+    if (typeof mission !== "number" || !Number.isInteger(mission)) return [];
+    if (typeof registry !== "string" || registry === "") return [];
+    const text = typeof project.text === "string" ? project.text : "";
+    const title = text.split("\n")[0]?.trim() ?? "";
+    const short = title.length > 48 ? `${title.slice(0, 47)}…` : title;
+    return [
+      {
+        mission,
+        label: short ? `Mission #${mission} — ${short}` : `Mission #${mission}`,
+        registry,
+      },
+    ];
+  });
 }
 
 /** What the coverage page shows: one mission's project (null: the server's
