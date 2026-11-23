@@ -455,7 +455,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         storage_bytes: crate::storage_bytes::Sampler::default(),
         core_lines,
         nodes,
-        terminals: crate::config::terminal_host(),
+        terminals: crate::config::terminal_host()?,
         config,
         recovery: crate::recover::Recovery::new(),
         pace: Pace::default(),
@@ -513,7 +513,7 @@ struct Fleet<'a> {
     /// The terminal host the recovery asks whether a native session's
     /// terminal server lives on (an end found with it gone is a host
     /// restart).
-    terminals: spawn_host::TmuxHost,
+    terminals: spawn_host::LocalTerminalHost,
     /// The recovery's settings (`SPAWN_RECOVER_*`).
     config: crate::recover::Config,
     /// The recovery's own state: this loop's start, and the database outage

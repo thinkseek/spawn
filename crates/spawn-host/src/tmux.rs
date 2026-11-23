@@ -24,7 +24,7 @@ const SCRUBBED: [&str; 2] = ["PGPASSWORD", "TYPESAFE_API_KEY"];
 /// repository and workspace root) and the secrets in [`SCRUBBED`]. A pane
 /// gets only what its launch passes explicitly; an agent that runs the
 /// black-box or e2e scripts in its pane must not reach the live fleet.
-fn scrub(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn scrub(name: &std::ffi::OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| name.starts_with("SPAWN_") || SCRUBBED.contains(&name))
 }
@@ -37,8 +37,8 @@ const HEIGHT: &str = "50";
 /// How long [`TerminalHost::terminate`] waits for a killed terminal's
 /// processes to exit after `kill-session` hangs their terminal up, and again
 /// after it sends the survivors SIGKILL.
-const HANGUP_WAIT: Duration = Duration::from_secs(5);
-const KILL_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const HANGUP_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const KILL_WAIT: Duration = Duration::from_secs(2);
 
 /// How often that wait looks.
 const GONE_POLL: Duration = Duration::from_millis(20);
@@ -165,23 +165,7 @@ impl TmuxHost {
     /// the hang-up wait, then SIGKILL to what is left and the kill wait. An
     /// error names what outlived both.
     fn wait_gone(&self, terminal: &TerminalName, leaders: &[u32]) -> Result<(), TerminalError> {
-        let (hangup, kill) = self.waits;
-        if until_gone(leaders, hangup).is_empty() {
-            return Ok(());
-        }
-        for pid in session_members(leaders) {
-            if let Some(pid) = rustix::process::Pid::from_raw(pid.cast_signed()) {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-            }
-        }
-        let left = until_gone(leaders, kill);
-        if left.is_empty() {
-            return Ok(());
-        }
-        Err(TerminalError(format!(
-            "{} process(es) of {terminal}'s runner outlived kill-session and SIGKILL: {left:?}",
-            left.len()
-        )))
+        wait_sessions_gone(terminal, leaders, self.waits, "kill-session")
     }
 
     /// Where this host records its terminals' pane leaders: a private
@@ -310,6 +294,35 @@ impl TmuxHost {
     }
 }
 
+/// Wait until no process is left in the sessions `leaders` lead: within
+/// `waits.0` (the hang-up wait), then SIGKILL to what is left and `waits.1`
+/// (the kill wait). An error names what outlived both. Shared by every local
+/// terminal host whose panes each lead a session of their own.
+pub(crate) fn wait_sessions_gone(
+    terminal: &TerminalName,
+    leaders: &[u32],
+    waits: (Duration, Duration),
+    closed_by: &str,
+) -> Result<(), TerminalError> {
+    let (hangup, kill) = waits;
+    if until_gone(leaders, hangup).is_empty() {
+        return Ok(());
+    }
+    for pid in session_members(leaders) {
+        if let Some(pid) = rustix::process::Pid::from_raw(pid.cast_signed()) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+    let left = until_gone(leaders, kill);
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(TerminalError(format!(
+        "{} process(es) of {terminal}'s runner outlived {closed_by} and SIGKILL: {left:?}",
+        left.len()
+    )))
+}
+
 /// The processes still in the sessions `leaders` lead once none is left or
 /// `limit` passes.
 fn until_gone(leaders: &[u32], limit: Duration) -> Vec<u32> {
@@ -383,7 +396,7 @@ const PANE_STATE: &str =
 
 /// The command that runs `words` (the program, then its arguments), with
 /// the controller's settings kept out of its environment.
-fn command_of(words: &[String]) -> Command {
+pub(crate) fn command_of(words: &[String]) -> Command {
     let mut command = Command::new(&words[0]);
     command.args(&words[1..]);
     // The first command starts the tmux server, whose global environment
@@ -475,6 +488,13 @@ fn write_environment(
     terminal: &TerminalName,
     environment: &[(String, String)],
 ) -> Result<std::path::PathBuf, TerminalError> {
+    let text = environment_text(environment)?;
+    write_private(directory, terminal, LAUNCH, "env", "the environment", &text)
+}
+
+/// `environment` as `NAME='value'` lines for a shell to source, every name
+/// checked to be one ([`write_environment`]).
+pub(crate) fn environment_text(environment: &[(String, String)]) -> Result<String, TerminalError> {
     let mut text = String::new();
     for (key, value) in environment {
         let name_ok = key
@@ -492,12 +512,12 @@ fn write_environment(
         text.push_str(&spawn_core::shell::shell_quote(value));
         text.push('\n');
     }
-    write_private(directory, terminal, LAUNCH, "env", "the environment", &text)
+    Ok(text)
 }
 
 /// The kind of [`write_private`] file a launch's environment goes through
 /// ([`write_environment`]).
-const LAUNCH: &str = "launch";
+pub(crate) const LAUNCH: &str = "launch";
 
 /// What the start command of a pane this host launched as `terminal` holds,
 /// and nothing else's does: the name of its environment file
@@ -543,7 +563,7 @@ fn runner_of(terminal: &TerminalName, line: &str) -> Runner {
 /// the temporary directory): what must reach tmux but never a command line,
 /// which every local user reads in /proc and tmux caps in size. The caller
 /// removes it.
-fn write_private(
+pub(crate) fn write_private(
     directory: &std::path::Path,
     terminal: &TerminalName,
     kind: &str,
@@ -986,25 +1006,7 @@ impl TerminalHost for TmuxHost {
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError> {
-        // Below the pinned projects root first, whatever other root also
-        // holds the path: never through a link, never a second hard link.
-        if let Some(beneath) = &self.beneath
-            && let Some(relative) = beneath.relative(std::path::Path::new(path))
-        {
-            return read_beneath(beneath, relative, offset);
-        }
-        // A file in the workspace (the engine's exit status) is the agent's:
-        // opened the safe way, from the workspace through held directories.
-        let top = workspace.path().trim_end_matches('/');
-        match path
-            .strip_prefix(top)
-            .and_then(|rest| rest.strip_prefix('/'))
-        {
-            Some(relative) if !top.is_empty() => {
-                read_in_workspace(std::path::Path::new(top), relative, offset)
-            }
-            _ => read_local(path, offset),
-        }
+        read_from_files(self.beneath.as_ref(), workspace, path, offset)
     }
 
     fn write_new(
@@ -1013,12 +1015,7 @@ impl TerminalHost for TmuxHost {
         path: &str,
         bytes: &[u8],
     ) -> Result<bool, TerminalError> {
-        if let Some(beneath) = &self.beneath
-            && let Some(relative) = beneath.relative(std::path::Path::new(path))
-        {
-            return beneath.write_new(relative, bytes).map_err(TerminalError);
-        }
-        write_local(path, bytes)
+        write_new_file(self.beneath.as_ref(), path, bytes)
     }
 
     fn replace_grown(
@@ -1028,15 +1025,72 @@ impl TerminalHost for TmuxHost {
         bytes: &[u8],
         current: &[u8],
     ) -> Result<bool, TerminalError> {
-        if let Some(beneath) = &self.beneath
-            && let Some(relative) = beneath.relative(std::path::Path::new(path))
-        {
-            return beneath
-                .replace_grown(relative, bytes, current)
-                .map_err(TerminalError);
-        }
-        replace_local(path, bytes, current)
+        replace_grown_file(self.beneath.as_ref(), path, bytes, current)
     }
+}
+
+/// [`TerminalHost::read_from`] for a host whose terminals share this
+/// machine's files with Spawn (tmux, Herdr): below the pinned projects root
+/// `beneath` first, whatever other root also holds the path, never through a
+/// link, never a second hard link; then a workspace file through held
+/// directories; then any other local file, never through a symlink and
+/// never blocking.
+pub(crate) fn read_from_files(
+    beneath: Option<&crate::beneath::Beneath>,
+    workspace: &WorkspaceId,
+    path: &str,
+    offset: u64,
+) -> Result<Option<Vec<u8>>, TerminalError> {
+    if let Some(beneath) = beneath
+        && let Some(relative) = beneath.relative(std::path::Path::new(path))
+    {
+        return read_beneath(beneath, relative, offset);
+    }
+    // A file in the workspace (the engine's exit status) is the agent's:
+    // opened the safe way, from the workspace through held directories.
+    let top = workspace.path().trim_end_matches('/');
+    match path
+        .strip_prefix(top)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        Some(relative) if !top.is_empty() => {
+            read_in_workspace(std::path::Path::new(top), relative, offset)
+        }
+        _ => read_local(path, offset),
+    }
+}
+
+/// [`TerminalHost::write_new`] on this machine's files, below `beneath`
+/// through it ([`read_from_files`]).
+pub(crate) fn write_new_file(
+    beneath: Option<&crate::beneath::Beneath>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<bool, TerminalError> {
+    if let Some(beneath) = beneath
+        && let Some(relative) = beneath.relative(std::path::Path::new(path))
+    {
+        return beneath.write_new(relative, bytes).map_err(TerminalError);
+    }
+    write_local(path, bytes)
+}
+
+/// [`TerminalHost::replace_grown`] on this machine's files, below
+/// `beneath` through it ([`read_from_files`]).
+pub(crate) fn replace_grown_file(
+    beneath: Option<&crate::beneath::Beneath>,
+    path: &str,
+    bytes: &[u8],
+    current: &[u8],
+) -> Result<bool, TerminalError> {
+    if let Some(beneath) = beneath
+        && let Some(relative) = beneath.relative(std::path::Path::new(path))
+    {
+        return beneath
+            .replace_grown(relative, bytes, current)
+            .map_err(TerminalError);
+    }
+    replace_local(path, bytes, current)
 }
 
 /// Replace the regular file `path` with `bytes` if it holds exactly

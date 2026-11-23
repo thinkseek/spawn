@@ -2520,7 +2520,7 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let terminal = TerminalName::for_execution(&execution.execution_id);
     let root = env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
     let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
-    let host = crate::config::terminal_host();
+    let host = crate::config::terminal_host()?;
     let text = if live {
         host.capture_tail(&terminal, &workspace, PANE_LINES)
             .unwrap_or_default()

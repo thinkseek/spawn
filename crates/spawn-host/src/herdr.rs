@@ -1,0 +1,1298 @@
+//! Herdr adapter: an opt-in alternative to tmux (`SPAWN_TERMINAL_BACKEND=herdr`).
+//!
+//! Herdr (<https://herdr.dev>) is a terminal workspace manager whose server
+//! holds workspaces, tabs and panes, and answers a JSON API on a Unix socket
+//! (one request per line, one answer per line). Each terminal is a Herdr
+//! workspace of its own, labelled with the terminal's name, whose one pane
+//! runs the launch.
+//!
+//! The host runs on a named Herdr session of its own (`--session`, Spawn's
+//! `SPAWN_HERDR_SESSION`, `spawn` by default), never the user's default or
+//! interactive one, and starts that session's headless server
+//! (`herdr --session <name> server`) when a terminal starts and none
+//! answers. The `herdr` program is asked where the session's socket is
+//! (`status`) and starts the server; every other call goes to the socket:
+//! a prompt typed into a pane is never on a command line, which every local
+//! user reads in /proc and the kernel caps in size.
+//!
+//! A Herdr pane starts a shell and takes no command, so the launch reaches it
+//! as a script: a private file (mode 600) holding the launch's environment and
+//! `exec` of its program, which the pane's shell is told to `exec`. The
+//! script removes itself before the program runs. The pane's shell leads a
+//! session of its own (Herdr starts it with `setsid`), and `exec` keeps its
+//! pid: the leader recorded at start is the runner's.
+//!
+//! Herdr names a pane `w1:p1`, not by the terminal's name: which pane a
+//! terminal is, which server it is on and which process leads it are
+//! recorded at start in a private directory under `$XDG_RUNTIME_DIR`
+//! ([`HerdrHost::with_runtime_under`] in a test), so every later call, from
+//! any process, finds them there.
+
+use std::collections::HashSet;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use spawn_core::id::{TerminalName, WorkspaceId};
+use spawn_core::port::{Launch, Runner, ServerSeen, TerminalError, TerminalHost, TerminalServer};
+
+use crate::process::ProcessId;
+use crate::tmux::{HANGUP_WAIT, KILL_WAIT};
+
+/// The Herdr session the host runs on when none is named.
+pub const DEFAULT_SESSION: &str = "spawn";
+
+/// How long one API call may take before it is failed: a server that
+/// stopped answering must not hold the caller's tick.
+const CALL_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long a screen read may take (tmux's `capture-pane` limit).
+const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long a server this host started has to answer.
+const SERVER_START_LIMIT: Duration = Duration::from_secs(10);
+
+/// The most bytes of staged text one `pane.send_text` carries: a long prompt
+/// goes in pieces, each a whole number of characters.
+const TEXT_CHUNK: usize = 16 * 1024;
+
+/// The pause after each key [`TerminalHost::send_keys`] presses: a dialog
+/// reads the first key and redraws, and keys sent in one burst can arrive
+/// before it listens again (as tmux's).
+const KEY_PAUSE: Duration = Duration::from_millis(200);
+
+/// What the session's server reads as its configuration when this host
+/// starts it: a plain `/bin/sh` that reads no profile in each pane (the
+/// launch script is all a pane runs), and no agent resumed by Herdr itself
+/// after a restart (a terminal of Spawn's is Spawn's to resume).
+const SERVER_CONFIG: &str = "[terminal]\n\
+default_shell = \"/bin/sh\"\n\
+shell_mode = \"non_login\"\n\
+\n\
+[session]\n\
+resume_agents_on_restore = false\n";
+
+/// Herdr host.
+pub struct HerdrHost {
+    program: String,
+    session: String,
+    /// [`HANGUP_WAIT`] and [`KILL_WAIT`], shorter in a test.
+    waits: (Duration, Duration),
+    /// What this host keeps in `$XDG_RUNTIME_DIR` goes here instead
+    /// ([`HerdrHost::with_runtime_under`]): a test's own.
+    runtime_base: Option<PathBuf>,
+    /// The engines' projects root, pinned ([`HerdrHost::with_files_beneath`]).
+    beneath: Option<crate::beneath::Beneath>,
+    /// The session's API socket, once `status` said where it is.
+    socket: OnceLock<PathBuf>,
+}
+
+/// What [`HerdrHost::start`] recorded of a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Record {
+    /// The pane that runs the launch (`w1:p1`).
+    pane: String,
+    /// The workspace that holds it (`w1`).
+    workspace: String,
+    /// The pane's shell, which became the runner (`exec`).
+    leader: ProcessId,
+    /// The server the pane is on: a pane id is that server's only.
+    server: TerminalServer,
+}
+
+impl Record {
+    fn to_text(&self) -> String {
+        json!({
+            "pane": self.pane,
+            "workspace": self.workspace,
+            "leader": self.leader.record(),
+            "server": self.server,
+        })
+        .to_string()
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        Some(Self {
+            pane: value["pane"].as_str()?.to_string(),
+            workspace: value["workspace"].as_str()?.to_string(),
+            leader: ProcessId::parse(value["leader"].as_str()?)?,
+            server: serde_json::from_value(value["server"].clone()).ok()?,
+        })
+    }
+}
+
+/// How one API call failed.
+#[derive(Debug)]
+enum Call {
+    /// No server listens on the session's socket.
+    NoServer,
+    /// The server answered with an error (`pane_not_found`, ...).
+    Refused { code: String, message: String },
+    /// Anything else: says nothing about the terminals.
+    Failed(String),
+}
+
+impl Call {
+    fn into_error(self, what: &str) -> TerminalError {
+        match self {
+            Self::NoServer => TerminalError(format!("{what}: no herdr server is running")),
+            Self::Refused { code, message } => {
+                TerminalError(format!("{what}: herdr refused ({code}): {message}"))
+            }
+            Self::Failed(why) => TerminalError(format!("{what}: {why}")),
+        }
+    }
+
+    fn gone(&self) -> bool {
+        match self {
+            Self::NoServer => true,
+            Self::Refused { code, .. } => code.ends_with("_not_found"),
+            Self::Failed(_) => false,
+        }
+    }
+}
+
+/// A key as Herdr takes it: a logical key name (`enter`, `ctrl+c`), or a
+/// character typed as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Press {
+    Key(String),
+    Text(String),
+}
+
+/// One of Spawn's tmux key names (`Enter`, `Escape`, `C-c`, `BTab`, `y`) as
+/// Herdr presses it, or why it has none. Every key of a call is translated
+/// before the first is pressed, so an unknown one presses nothing. Herdr
+/// 0.9.5 has no Home, End, page, Delete or Insert key: those are refused.
+pub(crate) fn herdr_key(key: &str) -> Result<Press, TerminalError> {
+    let named = match key {
+        "Enter" | "KPEnter" => Some("enter"),
+        "Escape" => Some("esc"),
+        "Tab" => Some("tab"),
+        "BTab" => Some("shift+tab"),
+        "BSpace" => Some("backspace"),
+        "Space" => Some("space"),
+        "Up" => Some("up"),
+        "Down" => Some("down"),
+        "Left" => Some("left"),
+        "Right" => Some("right"),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Ok(Press::Key(named.to_string()));
+    }
+    let unknown = || TerminalError(format!("herdr has no key for the tmux key {key:?}"));
+    if let Some(rest) = key.strip_prefix('F')
+        && let Ok(number) = rest.parse::<u8>()
+        && (1..=12).contains(&number)
+    {
+        return Ok(Press::Key(format!("f{number}")));
+    }
+    for (prefix, modifier) in [("C-", "ctrl"), ("M-", "alt")] {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            let mut characters = rest.chars();
+            return match (characters.next(), characters.next()) {
+                (Some(character), None) if character.is_ascii_graphic() => Ok(Press::Key(format!(
+                    "{modifier}+{}",
+                    character.to_ascii_lowercase()
+                ))),
+                _ => Err(unknown()),
+            };
+        }
+    }
+    let mut characters = key.chars();
+    match (characters.next(), characters.next()) {
+        (Some(character), None) if !character.is_control() => Ok(Press::Text(key.to_string())),
+        _ => Err(unknown()),
+    }
+}
+
+/// Whether a variable of the caller's stays out of every `herdr` call (and
+/// so out of the server it starts, whose environment each pane inherits):
+/// the controller's settings and secrets, as for tmux ([`crate::tmux::scrub`]),
+/// and every `HERDR_*` one. Spawn run inside a Herdr pane has that pane's
+/// `HERDR_SOCKET_PATH`, which would aim a call at the user's own session.
+pub(crate) fn scrub(name: &std::ffi::OsStr) -> bool {
+    crate::tmux::scrub(name) || name.to_str().is_some_and(|name| name.starts_with("HERDR_"))
+}
+
+/// Whether `name` may name the host's Herdr session: a plain word that is
+/// not Herdr's default session's.
+pub(crate) fn valid_session(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "default"
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+impl HerdrHost {
+    /// Host on the Herdr session `session` of the `herdr` at `program`.
+    ///
+    /// # Errors
+    ///
+    /// When `session` is no plain word (letters, digits, `_`, `-`), or is
+    /// `default`: the host never runs on the user's own session.
+    pub fn on_session(program: &str, session: &str) -> Result<Self, TerminalError> {
+        if !valid_session(session) {
+            return Err(TerminalError(format!(
+                "{session:?} cannot name Spawn's herdr session: use letters, digits, `_` and `-`, \
+                 and not `default` (the user's own session)"
+            )));
+        }
+        Ok(Self {
+            program: program.to_string(),
+            session: session.to_string(),
+            waits: (HANGUP_WAIT, KILL_WAIT),
+            runtime_base: None,
+            beneath: None,
+            socket: OnceLock::new(),
+        })
+    }
+
+    /// The same host, reading, restoring and replacing every file below
+    /// `projects` through it, as [`crate::TmuxHost::with_files_beneath`].
+    #[must_use]
+    pub fn with_files_beneath(mut self, projects: crate::beneath::Beneath) -> Self {
+        self.beneath = Some(projects);
+        self
+    }
+
+    /// The same host, waiting `hangup` for a closed terminal's processes to
+    /// exit and `kill` after SIGKILL ([`TerminalHost::terminate`]).
+    #[must_use]
+    pub fn with_terminate_waits(mut self, hangup: Duration, kill: Duration) -> Self {
+        self.waits = (hangup, kill);
+        self
+    }
+
+    /// The same host, keeping under `base` what it would keep in
+    /// `$XDG_RUNTIME_DIR` (its records, staged texts, launch scripts and the
+    /// server's configuration): a test's own directory.
+    #[must_use]
+    pub fn with_runtime_under(mut self, base: PathBuf) -> Self {
+        self.runtime_base = Some(base);
+        self
+    }
+
+    /// The Herdr session the host runs on.
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Where this host keeps its files: a private directory per Herdr this
+    /// host runs (its program and session) under the runtime directory, so
+    /// a host on another session never reads a record of a terminal of the
+    /// same name. Only while the base and both levels below it are this
+    /// user's alone ([`crate::process::private_to_us`]): a record names a
+    /// session that terminate SIGKILLs. `create` makes the two levels
+    /// (0700) when missing.
+    fn state_directory(&self, create: bool) -> Result<PathBuf, TerminalError> {
+        let (base, user, directory) = self.state_levels()?;
+        private(&base)?;
+        for level in [&user, &directory] {
+            if create {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new().mode(0o700).create(level);
+            }
+            private(level)?;
+        }
+        Ok(directory)
+    }
+
+    /// The state directory for a reader: `None` only when a level below the
+    /// base is missing (nothing was ever recorded). An unset or shared base,
+    /// a level that is there but not this user's alone, or any other stat
+    /// error is an error: it must not read as "every terminal is gone".
+    fn state(&self) -> Result<Option<PathBuf>, TerminalError> {
+        let (base, user, directory) = self.state_levels()?;
+        private(&base)?;
+        for level in [&user, &directory] {
+            match std::fs::symlink_metadata(level) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(TerminalError(format!("read {}: {error}", level.display())));
+                }
+                Ok(_) => private(level)?,
+            }
+        }
+        Ok(Some(directory))
+    }
+
+    /// The runtime base, and the user and host levels below it.
+    fn state_levels(&self) -> Result<(PathBuf, PathBuf, PathBuf), TerminalError> {
+        let base = self
+            .runtime_base
+            .clone()
+            .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+            .ok_or_else(|| {
+                TerminalError(
+                    "the herdr host keeps its terminals in $XDG_RUNTIME_DIR, which is not set"
+                        .to_string(),
+                )
+            })?;
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for word in [self.program.as_str(), self.session.as_str()] {
+            for byte in word.bytes().chain([0]) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let user = base.join(format!("spawn-herdr-{}", crate::process::current_uid()));
+        let directory = user.join(format!("{hash:016x}"));
+        Ok((base, user, directory))
+    }
+
+    /// The `herdr` command on this host's session, with the caller's
+    /// settings kept out of it ([`scrub`]).
+    fn herdr(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.program);
+        command.arg("--session").arg(&self.session).args(arguments);
+        for (name, _) in std::env::vars_os() {
+            if scrub(&name) {
+                command.env_remove(name);
+            }
+        }
+        command
+    }
+
+    /// The session's API socket, as `herdr status` names it (once).
+    fn socket(&self) -> Result<PathBuf, TerminalError> {
+        if let Some(socket) = self.socket.get() {
+            return Ok(socket.clone());
+        }
+        let output = self
+            .herdr(&["status"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| TerminalError(format!("run {} status: {error}", self.program)))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let socket = socket_of_status(&text).ok_or_else(|| {
+            TerminalError(format!(
+                "{} --session {} status named no socket: {}",
+                self.program,
+                self.session,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        })?;
+        Ok(self.socket.get_or_init(|| socket).clone())
+    }
+
+    /// One API call: `method` with `params`, the result, within `limit`.
+    fn call(&self, method: &str, params: &Value, limit: Duration) -> Result<Value, Call> {
+        let socket = self.socket().map_err(|error| Call::Failed(error.0))?;
+        let stream = match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => stream,
+            Err(error) if no_listener(&error) => return Err(Call::NoServer),
+            Err(error) => {
+                return Err(Call::Failed(format!(
+                    "connect to {}: {error}",
+                    socket.display()
+                )));
+            }
+        };
+        let failed = |error: std::io::Error| Call::Failed(format!("herdr {method}: {error}"));
+        stream.set_read_timeout(Some(limit)).map_err(failed)?;
+        stream.set_write_timeout(Some(limit)).map_err(failed)?;
+        let request =
+            json!({ "id": format!("spawn:{method}"), "method": method, "params": params });
+        let mut line = request.to_string();
+        line.push('\n');
+        (&stream).write_all(line.as_bytes()).map_err(failed)?;
+        let mut answer = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut answer)
+            .map_err(failed)?;
+        let answer: Value = serde_json::from_str(&answer)
+            .map_err(|error| Call::Failed(format!("herdr {method} answered no JSON: {error}")))?;
+        if let Some(error) = answer.get("error") {
+            return Err(Call::Refused {
+                code: error["code"].as_str().unwrap_or("unknown").to_string(),
+                message: error["message"].as_str().unwrap_or_default().to_string(),
+            });
+        }
+        Ok(answer["result"].clone())
+    }
+
+    /// The server that answers on the session's socket now: its pid (the
+    /// socket's peer, `SO_PEERCRED`) and when it started. Never starts one.
+    fn identity(&self) -> ServerSeen {
+        let Ok(socket) = self.socket() else {
+            return ServerSeen::Answers(None);
+        };
+        match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => ServerSeen::Answers(peer_server(&stream)),
+            Err(error) if no_listener(&error) => ServerSeen::Gone,
+            Err(_) => ServerSeen::Answers(None),
+        }
+    }
+
+    /// The server, started (headless, detached, on this host's
+    /// configuration) when none answers.
+    fn ensure_server(&self, state: &Path) -> Result<TerminalServer, TerminalError> {
+        match self.identity() {
+            ServerSeen::Answers(Some(server)) => return Ok(server),
+            ServerSeen::Answers(None) => {
+                return Err(TerminalError(format!(
+                    "herdr session {} answers, but not as a server of this user's",
+                    self.session
+                )));
+            }
+            ServerSeen::Gone => {}
+        }
+        crate::process::write_private(state, "config.toml", SERVER_CONFIG)
+            .map_err(|error| TerminalError(format!("write the herdr configuration: {error}")))?;
+        let mut command = self.herdr(&["server"]);
+        command
+            .env("HERDR_CONFIG_PATH", state.join("config.toml"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Its own process group: a signal to the caller's group (Ctrl-C in
+        // the terminal that ran a command) does not reach it.
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().map_err(|error| {
+            TerminalError(format!(
+                "start {} --session {} server: {error}",
+                self.program, self.session
+            ))
+        })?;
+        let deadline = Instant::now() + SERVER_START_LIMIT;
+        loop {
+            if let ServerSeen::Answers(Some(server)) = self.identity() {
+                // Reaped when it exits, for as long as this process lives.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(server);
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                // Another process's server may have won the socket.
+                if let ServerSeen::Answers(Some(server)) = self.identity() {
+                    return Ok(server);
+                }
+                return Err(TerminalError(format!(
+                    "herdr server for session {} exited with {status}",
+                    self.session
+                )));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TerminalError(format!(
+                    "herdr server for session {} did not answer within {} s",
+                    self.session,
+                    SERVER_START_LIMIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn record_path(state: &Path, terminal: &TerminalName) -> PathBuf {
+        state.join("terminals").join(terminal.as_str())
+    }
+
+    fn staged_path(state: &Path, terminal: &TerminalName) -> PathBuf {
+        state.join("staged").join(terminal.as_str())
+    }
+
+    /// What [`TerminalHost::start`] recorded of `terminal`, if anything.
+    /// Only a missing state directory or record file is "nothing recorded";
+    /// a state or record that cannot be read is an error.
+    fn record(&self, terminal: &TerminalName) -> Result<Option<Record>, TerminalError> {
+        match self.state()? {
+            None => Ok(None),
+            Some(state) => Self::record_in(&state, terminal),
+        }
+    }
+
+    /// The record of `terminal` in the state directory `state`.
+    fn record_in(state: &Path, terminal: &TerminalName) -> Result<Option<Record>, TerminalError> {
+        let path = Self::record_path(state, terminal);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Record::parse(&text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(TerminalError(format!("read {}: {error}", path.display()))),
+        }
+    }
+
+    /// Remove what this host keeps of `terminal`.
+    fn forget(&self, terminal: &TerminalName) {
+        if let Ok(state) = self.state_directory(false) {
+            let _ = std::fs::remove_file(Self::record_path(&state, terminal));
+            let _ = std::fs::remove_file(Self::staged_path(&state, terminal));
+        }
+    }
+
+    /// The pane that is `terminal`: recorded, on the server that answers
+    /// now. `None` when it is gone (or never was).
+    fn pane(&self, terminal: &TerminalName) -> Result<Option<Record>, TerminalError> {
+        let Some(record) = self.record(terminal)? else {
+            return Ok(None);
+        };
+        match self.identity() {
+            ServerSeen::Gone => return Ok(None),
+            ServerSeen::Answers(Some(server)) if server != record.server => return Ok(None),
+            ServerSeen::Answers(Some(_)) => {}
+            ServerSeen::Answers(None) => {
+                return Err(TerminalError(format!(
+                    "cannot tell which herdr server holds {terminal}"
+                )));
+            }
+        }
+        match self.call("pane.get", &json!({ "pane_id": record.pane }), CALL_LIMIT) {
+            Ok(_) => Ok(Some(record)),
+            Err(call) if call.gone() => Ok(None),
+            Err(call) => Err(call.into_error("pane.get")),
+        }
+    }
+
+    /// The pane that is `terminal`, or an error that says it is gone.
+    fn live_pane(&self, terminal: &TerminalName) -> Result<Record, TerminalError> {
+        self.pane(terminal)?
+            .ok_or_else(|| TerminalError(format!("{terminal} does not exist")))
+    }
+
+    /// Type `text` into `pane`, literally, in pieces of whole characters.
+    fn send_text(&self, pane: &str, text: &str) -> Result<(), TerminalError> {
+        for piece in chunks(text, TEXT_CHUNK) {
+            self.call(
+                "pane.send_text",
+                &json!({ "pane_id": pane, "text": piece }),
+                CALL_LIMIT,
+            )
+            .map_err(|call| call.into_error("pane.send_text"))?;
+        }
+        Ok(())
+    }
+
+    fn press(&self, pane: &str, press: &Press) -> Result<(), TerminalError> {
+        match press {
+            Press::Key(key) => self
+                .call(
+                    "pane.send_keys",
+                    &json!({ "pane_id": pane, "keys": [key] }),
+                    CALL_LIMIT,
+                )
+                .map(|_| ())
+                .map_err(|call| call.into_error(&format!("pane.send_keys {key}"))),
+            Press::Text(text) => self.send_text(pane, text),
+        }
+    }
+
+    /// The pane's new workspace for `launch`, its shell told to run the
+    /// launch script, and the record of it: what [`TerminalHost::start`]
+    /// does once the server answers.
+    fn launch(
+        &self,
+        state: &Path,
+        launch: &Launch,
+        server: TerminalServer,
+        script: &Path,
+    ) -> Result<Record, TerminalError> {
+        let created = self
+            .call(
+                "workspace.create",
+                &json!({ "cwd": launch.cwd, "label": launch.terminal.as_str(), "focus": false }),
+                CALL_LIMIT,
+            )
+            .map_err(|call| call.into_error("workspace.create"))?;
+        let pane = created["root_pane"]["pane_id"].as_str().map(str::to_string);
+        let workspace = created["workspace"]["workspace_id"]
+            .as_str()
+            .map(str::to_string);
+        let (Some(pane), Some(workspace)) = (pane, workspace) else {
+            return Err(TerminalError(format!(
+                "workspace.create named no pane: {created}"
+            )));
+        };
+        let launched = (|| {
+            let info = self
+                .call("pane.process_info", &json!({ "pane_id": pane }), CALL_LIMIT)
+                .map_err(|call| call.into_error("pane.process_info"))?;
+            let shell = info["process_info"]["shell_pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .ok_or_else(|| TerminalError(format!("pane {pane} has no shell: {info}")))?;
+            let record = Record {
+                pane: pane.clone(),
+                workspace: workspace.clone(),
+                leader: ProcessId::of(shell),
+                server,
+            };
+            crate::process::write_private(
+                &state.join("terminals"),
+                launch.terminal.as_str(),
+                &record.to_text(),
+            )
+            .map_err(|error| TerminalError(format!("record {}: {error}", launch.terminal)))?;
+            let line = format!(
+                "exec /bin/sh {}",
+                spawn_core::shell::shell_quote(&script.to_string_lossy())
+            );
+            self.send_text(&pane, &line)?;
+            self.press(&pane, &Press::Key("enter".to_string()))?;
+            Ok(record)
+        })();
+        if launched.is_err() {
+            let _ = self.call("pane.close", &json!({ "pane_id": pane }), CALL_LIMIT);
+            let _ = std::fs::remove_file(Self::record_path(state, &launch.terminal));
+        }
+        launched
+    }
+}
+
+/// `text` in pieces of at most `limit` bytes, each whole characters.
+pub(crate) fn chunks(text: &str, limit: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(limit.max(4));
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (piece, after) = rest.split_at(end);
+        pieces.push(piece);
+        rest = after;
+    }
+    pieces
+}
+
+/// The launch as a script for `/bin/sh`: the environment exported, the
+/// script removed, then the program `exec`ed with its arguments, none of
+/// them read by a shell.
+pub(crate) fn launch_script(launch: &Launch) -> Result<String, TerminalError> {
+    let mut script = String::from("set -a\n");
+    script.push_str(&crate::tmux::environment_text(&launch.environment)?);
+    script.push_str("set +a\nrm -f -- \"$0\"\nexec ");
+    let mut words = vec![launch.program.clone()];
+    words.extend(launch.arguments.iter().cloned());
+    script.push_str(&spawn_core::shell::shell_join(&words));
+    script.push('\n');
+    Ok(script)
+}
+
+/// The socket a `herdr status` answer names for the server.
+fn socket_of_status(status: &str) -> Option<PathBuf> {
+    let mut in_server = false;
+    for line in status.lines() {
+        if !line.starts_with(' ') {
+            in_server = line.trim_end() == "server:";
+            continue;
+        }
+        if in_server && let Some(path) = line.trim().strip_prefix("socket:") {
+            let path = path.trim();
+            return (!path.is_empty()).then(|| PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// Whether a failed connect says nothing listens there.
+fn no_listener(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// `path` is a directory only this user may enter, or the error that says
+/// it is not ([`crate::process::private_to_us`]).
+fn private(path: &Path) -> Result<(), TerminalError> {
+    if crate::process::private_to_us(path) {
+        Ok(())
+    } else {
+        Err(TerminalError(format!(
+            "{} is not a directory only this user may enter",
+            path.display()
+        )))
+    }
+}
+
+/// The server at the other end of `stream`, when it is this user's: its pid
+/// and its start time, wall clock.
+#[cfg(target_os = "linux")]
+fn peer_server(stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer> {
+    let peer = rustix::net::sockopt::socket_peercred(stream).ok()?;
+    if peer.uid.as_raw() != crate::process::current_uid() {
+        return None;
+    }
+    let pid = u32::try_from(peer.pid.as_raw_nonzero().get()).ok()?;
+    Some(TerminalServer {
+        pid,
+        started_at_ms: started_at_ms(crate::process::start_time(pid)?)?,
+    })
+}
+
+/// No `SO_PEERCRED` (nor `/proc`) off Linux: the peer cannot be told to be
+/// this user's server, so it never is, and every caller refuses it.
+#[cfg(not(target_os = "linux"))]
+fn peer_server(_stream: &std::os::unix::net::UnixStream) -> Option<TerminalServer> {
+    None
+}
+
+/// A process start time (clock ticks after boot) as ms since the epoch.
+#[cfg(target_os = "linux")]
+fn started_at_ms(ticks: u64) -> Option<i64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let boot: i64 = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    let hertz = rustix::param::clock_ticks_per_second().max(1);
+    let after = i64::try_from(ticks.saturating_mul(1000) / hertz).ok()?;
+    boot.checked_mul(1000)?.checked_add(after)
+}
+
+impl TerminalHost for HerdrHost {
+    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+        let state = self.state_directory(true)?;
+        if self.pane(&launch.terminal)?.is_some() {
+            return Err(TerminalError(format!("{} already exists", launch.terminal)));
+        }
+        self.forget(&launch.terminal);
+        let server = self.ensure_server(&state)?;
+        // The environment (a database login among it) never goes on a
+        // command line, nor through the pane's screen: it is in the script,
+        // which only this uid reads and which removes itself.
+        let script = crate::tmux::write_private(
+            &state,
+            &launch.terminal,
+            crate::tmux::LAUNCH,
+            "sh",
+            "the launch",
+            &launch_script(launch)?,
+        )?;
+        let launched = self.launch(&state, launch, server, &script);
+        if launched.is_err() {
+            let _ = std::fs::remove_file(&script);
+        }
+        launched.map(|_| ())
+    }
+
+    /// The text goes to a private file of this host's: nothing reaches the
+    /// pane, nor Herdr.
+    fn stage_text(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
+        let state = self.state_directory(true)?;
+        crate::process::write_private(&state.join("staged"), terminal.as_str(), text)
+            .map_err(|error| TerminalError(format!("stage the text for {terminal}: {error}")))
+    }
+
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        let state = self.state_directory(false)?;
+        let staged = Self::staged_path(&state, terminal);
+        let text = std::fs::read_to_string(&staged)
+            .map_err(|error| TerminalError(format!("nothing staged for {terminal}: {error}")))?;
+        let record = self.live_pane(terminal)?;
+        // Typed as it is, then one Enter: a newline in the text is a line
+        // feed, which an engine's prompt box reads as a new line, not as
+        // its submission.
+        let typed = self.send_text(&record.pane, &text);
+        let _ = std::fs::remove_file(&staged);
+        typed?;
+        self.press(&record.pane, &Press::Key("enter".to_string()))
+    }
+
+    fn send_keys(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        keys: &[&str],
+    ) -> Result<(), TerminalError> {
+        let presses = keys
+            .iter()
+            .map(|key| herdr_key(key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let record = self.live_pane(terminal)?;
+        for press in &presses {
+            self.press(&record.pane, press)?;
+            std::thread::sleep(KEY_PAUSE);
+        }
+        Ok(())
+    }
+
+    fn is_alive(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<bool, TerminalError> {
+        Ok(self.pane(terminal)?.is_some())
+    }
+
+    /// The server on the session's socket, by its pid and start time. Only
+    /// asks: never starts one.
+    fn server(&self) -> ServerSeen {
+        self.identity()
+    }
+
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        Ok(match self.pane(terminal)? {
+            None => Runner::Gone,
+            Some(record) => runner_of(terminal, &record),
+        })
+    }
+
+    /// One `pane.list` for the whole fleet, not one call per terminal.
+    fn runners(
+        &self,
+        terminals: &[(TerminalName, WorkspaceId)],
+    ) -> Result<Vec<(TerminalName, Runner)>, TerminalError> {
+        // Resolved once, before anything else: a state that cannot be read
+        // is an error, never every terminal gone.
+        let state = self.state()?;
+        let gone = || {
+            terminals
+                .iter()
+                .map(|(terminal, _)| (terminal.clone(), Runner::Gone))
+                .collect()
+        };
+        let server = match self.identity() {
+            ServerSeen::Gone => return Ok(gone()),
+            ServerSeen::Answers(Some(server)) => server,
+            ServerSeen::Answers(None) => {
+                return Err(TerminalError(
+                    "cannot tell which herdr server answers".to_string(),
+                ));
+            }
+        };
+        let listed = match self.call("pane.list", &json!({}), CALL_LIMIT) {
+            Ok(listed) => listed,
+            Err(Call::NoServer) => return Ok(gone()),
+            Err(call) => return Err(call.into_error("pane.list")),
+        };
+        let panes: HashSet<&str> = listed["panes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pane| pane["pane_id"].as_str())
+            .collect();
+        let Some(state) = state else {
+            return Ok(gone());
+        };
+        terminals
+            .iter()
+            .map(|(terminal, _)| {
+                let runner = match Self::record_in(&state, terminal)? {
+                    Some(record)
+                        if record.server == server && panes.contains(record.pane.as_str()) =>
+                    {
+                        runner_of(terminal, &record)
+                    }
+                    _ => Runner::Gone,
+                };
+                Ok((terminal.clone(), runner))
+            })
+            .collect()
+    }
+
+    fn capture_tail(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        lines: usize,
+    ) -> Result<String, TerminalError> {
+        let record = self.live_pane(terminal)?;
+        let read = self
+            .call(
+                "pane.read",
+                &json!({
+                    "pane_id": record.pane,
+                    "source": "recent",
+                    "lines": u32::try_from(lines).unwrap_or(u32::MAX),
+                    "format": "text",
+                }),
+                CAPTURE_LIMIT,
+            )
+            .map_err(|call| call.into_error("pane.read"))?;
+        read["read"]["text"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| TerminalError(format!("pane.read returned no text: {read}")))
+    }
+
+    /// `pane.close` (Herdr hangs up and kills what runs in the pane), then
+    /// the wait until every process of the runner's session has exited, as
+    /// tmux's terminate waits: the caller's final checkpoint comes next.
+    fn terminate(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        let Some(record) = self.record(terminal)? else {
+            return Ok(());
+        };
+        let leaders: Vec<u32> = if record.leader.leads_its_session() {
+            vec![record.leader.pid]
+        } else {
+            Vec::new()
+        };
+        if matches!(self.identity(), ServerSeen::Answers(Some(server)) if server == record.server) {
+            match self.call("pane.close", &json!({ "pane_id": record.pane }), CALL_LIMIT) {
+                Ok(_) => {}
+                Err(call) if call.gone() => {}
+                Err(call) => return Err(call.into_error("pane.close")),
+            }
+            // Closing its last pane closes the workspace; one left is closed.
+            let _ = self.call(
+                "workspace.close",
+                &json!({ "workspace_id": record.workspace }),
+                CALL_LIMIT,
+            );
+        }
+        crate::tmux::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
+        self.forget(terminal);
+        Ok(())
+    }
+
+    fn terminate_waits(&self) -> bool {
+        true
+    }
+
+    fn read_from(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>, TerminalError> {
+        crate::tmux::read_from_files(self.beneath.as_ref(), workspace, path, offset)
+    }
+
+    fn write_new(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError> {
+        crate::tmux::write_new_file(self.beneath.as_ref(), path, bytes)
+    }
+
+    fn replace_grown(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+        current: &[u8],
+    ) -> Result<bool, TerminalError> {
+        crate::tmux::replace_grown_file(self.beneath.as_ref(), path, bytes, current)
+    }
+}
+
+/// What a pane recorded as `terminal`'s, on its server, hosts: the runner
+/// while the leader recorded at start lives (`exec` kept its pid), else
+/// something that is not Spawn's.
+fn runner_of(terminal: &TerminalName, record: &Record) -> Runner {
+    if record.leader.alive() {
+        Runner::Running
+    } else {
+        Runner::Untracked(format!(
+            "the pane {} of {terminal} no longer runs the runner Spawn started there \
+             (pid {} is gone)",
+            record.pane, record.leader.pid
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Press, Record, chunks, herdr_key, launch_script, socket_of_status};
+    use spawn_core::id::{TerminalName, WorkspaceId};
+    use spawn_core::port::{Launch, Runner, TerminalHost, TerminalServer};
+
+    #[test]
+    fn spawn_s_tmux_keys_become_herdr_keys() {
+        let key = |name: &str| Press::Key(name.to_string());
+        for (tmux, herdr) in [
+            ("Enter", "enter"),
+            ("Escape", "esc"),
+            ("C-c", "ctrl+c"),
+            ("C-d", "ctrl+d"),
+            ("C-C", "ctrl+c"),
+            ("M-x", "alt+x"),
+            ("Up", "up"),
+            ("Down", "down"),
+            ("Left", "left"),
+            ("Right", "right"),
+            ("Tab", "tab"),
+            ("BTab", "shift+tab"),
+            ("BSpace", "backspace"),
+            ("Space", "space"),
+            ("F1", "f1"),
+            ("F12", "f12"),
+        ] {
+            assert_eq!(herdr_key(tmux).expect(tmux), key(herdr), "{tmux}");
+        }
+        for character in ["y", "n", "1", "/", "é"] {
+            assert_eq!(
+                herdr_key(character).expect(character),
+                Press::Text(character.to_string())
+            );
+        }
+        for unknown in [
+            "", "Return", "C-", "C-ab", "F13", "F0", "\u{1b}", "yes", "Home", "End", "PPage",
+            "NPage", "DC", "IC",
+        ] {
+            assert!(herdr_key(unknown).is_err(), "{unknown:?}");
+        }
+    }
+
+    /// An unknown key among several presses nothing: every key is
+    /// translated before the host looks for the pane.
+    #[test]
+    fn an_unknown_key_presses_nothing() {
+        let base = crate::Scratch::new("spawn-herdr-keys");
+        let host = super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
+            .expect("valid session")
+            .with_runtime_under(base.to_path_buf());
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
+        let error = host
+            .send_keys(&terminal, &workspace, &["Enter", "Nope"])
+            .expect_err("refused");
+        assert!(error.0.contains("Nope"), "{error}");
+    }
+
+    #[test]
+    fn the_controllers_settings_and_herdr_s_own_stay_out_of_herdr() {
+        use std::ffi::OsStr;
+        for name in [
+            "SPAWN_DATABASE_URL",
+            "SPAWN_SERVE_TOKEN",
+            "SPAWN_TMUX_SOCKET",
+            "SPAWN_HERDR_SESSION",
+            "SPAWN_HERDR_PROGRAM",
+            "PGPASSWORD",
+            "TYPESAFE_API_KEY",
+            "HERDR_SOCKET_PATH",
+            "HERDR_SESSION",
+            "HERDR_PANE_ID",
+        ] {
+            assert!(super::scrub(OsStr::new(name)), "{name}");
+        }
+        for name in ["PATH", "HOME", "LANG", "XDG_RUNTIME_DIR", "TERM"] {
+            assert!(!super::scrub(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_session_of_spawn_s_own_is_taken() {
+        for good in ["spawn", "spawn-test_1", "S2"] {
+            assert!(
+                super::HerdrHost::on_session("herdr", good).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in ["", "default", "a b", "../x", "x/y", &"x".repeat(65)] {
+            assert!(
+                super::HerdrHost::on_session("herdr", bad).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Staging writes a private file and nothing else: a host whose herdr
+    /// does not even exist stages, and a stage that cannot be written (its
+    /// runtime directory open to others) fails before anything is typed.
+    #[test]
+    fn staging_reaches_no_pane_and_replaces_what_was_held() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::Scratch::new("spawn-herdr-stage");
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("0700");
+        let host = super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
+            .expect("valid session")
+            .with_runtime_under(base.to_path_buf());
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
+        host.stage_text(&terminal, &workspace, "first")
+            .expect("staged");
+        host.stage_text(&terminal, &workspace, "second\nline")
+            .expect("staged again");
+        let state = host.state_directory(false).expect("state");
+        let staged = super::HerdrHost::staged_path(&state, &terminal);
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "second\nline");
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // No pane to type into: the submit fails, the text stays held.
+        assert!(host.submit_staged(&terminal, &workspace).is_err());
+        assert!(staged.exists());
+
+        let open = crate::Scratch::new("spawn-herdr-open");
+        std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("0777");
+        let exposed = super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
+            .expect("valid session")
+            .with_runtime_under(open.to_path_buf());
+        assert!(exposed.stage_text(&terminal, &workspace, "secret").is_err());
+        assert_eq!(std::fs::read_dir(open.path()).unwrap().count(), 0);
+    }
+
+    /// A host over a private scratch runtime base, its herdr absent.
+    fn host_under(base: &crate::Scratch) -> super::HerdrHost {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("0700");
+        super::HerdrHost::on_session("/nonexistent/herdr", "spawn-unit")
+            .expect("valid session")
+            .with_runtime_under(base.to_path_buf())
+    }
+
+    /// Review #558 P2 #3: only a missing state directory means nothing was
+    /// recorded. A fresh runtime base (no levels below it) reads as gone.
+    #[test]
+    fn a_runtime_base_with_nothing_recorded_reads_as_gone() {
+        let base = crate::Scratch::new("spawn-herdr-fresh");
+        let host = host_under(&base);
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
+        assert!(matches!(
+            host.runner(&terminal, &workspace).expect("runner"),
+            Runner::Gone
+        ));
+        assert!(!host.is_alive(&terminal, &workspace).expect("alive"));
+        host.terminate(&terminal, &workspace)
+            .expect("nothing to end");
+    }
+
+    /// Review #558 P2 #3: a state directory no longer private to this user
+    /// (after a record was written) is an error, never every terminal gone
+    /// nor a terminate that "succeeded".
+    #[test]
+    fn a_state_that_cannot_be_trusted_is_an_error_not_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::Scratch::new("spawn-herdr-shared");
+        let host = host_under(&base);
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
+        let state = host.state_directory(true).expect("state");
+        let record = Record {
+            pane: "w1:p1".to_string(),
+            workspace: "w1".to_string(),
+            leader: crate::process::ProcessId { pid: 42, start: 7 },
+            server: TerminalServer {
+                pid: 9,
+                started_at_ms: 1_794_330_336_000,
+            },
+        };
+        crate::process::write_private(
+            &state.join("terminals"),
+            terminal.as_str(),
+            &record.to_text(),
+        )
+        .expect("recorded");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o750)).expect("0750");
+        assert!(host.runner(&terminal, &workspace).is_err());
+        assert!(host.is_alive(&terminal, &workspace).is_err());
+        assert!(
+            host.runners(&[(terminal.clone(), workspace.clone())])
+                .is_err()
+        );
+        assert!(host.terminate(&terminal, &workspace).is_err());
+        // The record is kept for when the state is private again.
+        assert!(super::HerdrHost::record_path(&state, &terminal).exists());
+    }
+
+    /// Review #558 P2 #3: a record file that is there but cannot be read is
+    /// an error.
+    #[test]
+    fn a_record_that_cannot_be_read_is_an_error() {
+        let base = crate::Scratch::new("spawn-herdr-unreadable");
+        let host = host_under(&base);
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        let workspace = WorkspaceId::new("a:/tmp/a").expect("workspace");
+        let state = host.state_directory(true).expect("state");
+        // A directory where the record file belongs: reading it fails
+        // whoever runs the test (root reads a 0000 file).
+        std::fs::create_dir_all(super::HerdrHost::record_path(&state, &terminal)).expect("mkdir");
+        assert!(host.runner(&terminal, &workspace).is_err());
+        assert!(
+            host.runners(&[(terminal.clone(), workspace.clone())])
+                .is_err()
+        );
+        assert!(host.terminate(&terminal, &workspace).is_err());
+    }
+
+    #[test]
+    fn a_launch_script_exports_its_environment_and_execs_its_words_unread() {
+        let launch = Launch {
+            terminal: TerminalName::new("spawn-exec_1").expect("terminal"),
+            workspace: WorkspaceId::new("a:/tmp/a").expect("workspace"),
+            cwd: "/tmp/a".to_string(),
+            program: "/bin/spawn".to_string(),
+            arguments: vec!["run".into(), "--".into(), "it's $HOME".into()],
+            environment: vec![("SPAWN_AGENT".into(), "a'b".into())],
+        };
+        let script = launch_script(&launch).expect("script");
+        assert_eq!(
+            script,
+            "set -a\nSPAWN_AGENT='a'\\''b'\nset +a\nrm -f -- \"$0\"\n\
+             exec '/bin/spawn' 'run' '--' 'it'\\''s $HOME'\n"
+        );
+        let bad = Launch {
+            environment: vec![("A B".into(), "x".into())],
+            ..launch
+        };
+        assert!(launch_script(&bad).is_err());
+    }
+
+    #[test]
+    fn long_text_goes_in_pieces_of_whole_characters() {
+        let text = "aé".repeat(10);
+        let pieces = chunks(&text, 4);
+        assert!(pieces.iter().all(|piece| piece.len() <= 4));
+        assert_eq!(pieces.concat(), text);
+        assert!(chunks("", 4).is_empty());
+    }
+
+    #[test]
+    fn status_names_the_server_s_socket() {
+        let status = "client:\n  version: 0.9.5\n\nserver:\n  status: not running\n  \
+                      socket: /home/u/.config/herdr/sessions/spawn/herdr.sock\n\nupdate:\n  \
+                      restart_needed: no\n";
+        assert_eq!(
+            socket_of_status(status),
+            Some("/home/u/.config/herdr/sessions/spawn/herdr.sock".into())
+        );
+        assert_eq!(socket_of_status("client:\n  socket: /x\n"), None);
+        assert_eq!(socket_of_status(""), None);
+    }
+
+    #[test]
+    fn a_record_reads_back_as_written() {
+        let record = Record {
+            pane: "w1:p1".to_string(),
+            workspace: "w1".to_string(),
+            leader: crate::process::ProcessId { pid: 42, start: 7 },
+            server: TerminalServer {
+                pid: 9,
+                started_at_ms: 1_794_330_336_000,
+            },
+        };
+        assert_eq!(Record::parse(&record.to_text()), Some(record));
+        assert_eq!(Record::parse("{}"), None);
+        assert_eq!(Record::parse("not json"), None);
+    }
+}
