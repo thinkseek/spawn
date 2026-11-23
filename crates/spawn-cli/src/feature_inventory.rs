@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -39,11 +39,49 @@ pub fn default_registry_path(root: &Path) -> PathBuf {
     root.join(DEFAULT_REGISTRY_REL)
 }
 
-/// The project root a mission's `--features` registry file belongs to: the
-/// directory holding `docs/feature-map/registry.json` when the file sits at
-/// that conventional place, else the nearest ancestor that is a repository
-/// root (holds `.git`), else the registry's own directory.
+/// `path` with its `.` and `..` segments resolved lexically (a `..` drops
+/// the segment before it; one past the root stays at the root; a relative
+/// path keeps its leading `..`), so a path's ancestors are the directories
+/// it really sits in. An empty result is `.`.
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normal.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normal.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normal.push(".."),
+            },
+            other => normal.push(other),
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normal
+    }
+}
+
+/// Whether `value` is a coverage [`FeatureRegistry`] [`load_registry`]
+/// would take (`schema_version` 1 with the registry's fields), not a
+/// legacy identity-only feature map.
+pub fn is_coverage_registry(value: &Value) -> bool {
+    use serde::Deserialize;
+    FeatureRegistry::deserialize(value)
+        .is_ok_and(|registry| registry.schema_version == SCHEMA_VERSION)
+}
+
+/// The project root a mission's `--features` registry file belongs to,
+/// once the path is normalized ([`normalize_lexically`]): the directory
+/// holding `docs/feature-map/registry.json` when the file sits at that
+/// conventional place, else the nearest ancestor that is a repository root
+/// (holds `.git`), else the registry's own directory.
 pub fn project_root_for_registry(registry: &Path) -> PathBuf {
+    let registry = normalize_lexically(registry);
+    let registry = registry.as_path();
     let conventional: PathBuf = DEFAULT_REGISTRY_REL.split('/').collect();
     if registry.ends_with(&conventional) {
         let depth = conventional.components().count();
@@ -1081,5 +1119,53 @@ mod tests {
 
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&loose);
+    }
+
+    /// A relative registry reached from another repository's backlog
+    /// (`../../../acme/meta/features.json` from Spawn's) is normalized
+    /// before the `.git` walk: it never lands on the repository the `..`
+    /// segments only pass through.
+    #[test]
+    fn project_root_for_registry_normalizes_dot_dot_before_the_git_walk() {
+        let base = temp_fixture("project-root-dotdot");
+        fs::create_dir_all(base.join("spawn/.git")).expect("spawn .git");
+        fs::create_dir_all(base.join("spawn/rsi/backlog")).expect("backlog");
+        fs::create_dir_all(base.join("acme/.git")).expect("acme .git");
+        fs::create_dir_all(base.join("acme/meta")).expect("meta");
+        let through = base.join("spawn/rsi/backlog/../../../acme/meta/features.json");
+        assert_eq!(project_root_for_registry(&through), base.join("acme"));
+        let conventional =
+            base.join("spawn/rsi/backlog/../../../acme/docs/feature-map/registry.json");
+        assert_eq!(project_root_for_registry(&conventional), base.join("acme"));
+
+        assert_eq!(
+            normalize_lexically(Path::new("/srv/spawn/rsi/backlog/../../../acme/./x.json")),
+            PathBuf::from("/srv/acme/x.json")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("/../a")),
+            PathBuf::from("/a")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("../a/../../b")),
+            PathBuf::from("../../b")
+        );
+        assert_eq!(normalize_lexically(Path::new("a/..")), PathBuf::from("."));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Only a schema-1 coverage registry is one; a legacy feature map (the
+    /// identity-only `{"features": [...]}`) is not.
+    #[test]
+    fn is_coverage_registry_refuses_legacy_feature_maps() {
+        let registry = serde_json::to_value(fixture_registry()).expect("registry json");
+        assert!(is_coverage_registry(&registry));
+        assert!(!is_coverage_registry(
+            &json!({"features": [{"id": "a", "title": "A", "objectives": [1]}]})
+        ));
+        let mut other = registry;
+        other["schema_version"] = json!(2);
+        assert!(!is_coverage_registry(&other));
     }
 }
