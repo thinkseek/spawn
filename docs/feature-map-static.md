@@ -4,7 +4,7 @@
 
 本文件是手工维护的能力审计图，由 `scripts/check-feature-map.py` 校验。PR #82 另交付记录派生的运行时能力图（planned / implemented / verified / live 四态，`GET /api/features`、`#/features`），文档在 [feature-map.md](./feature-map.md)。两者用途不同：本图按固定 FM ID 做代码导航和缺陷证据留痕，派生图从任务、落地、验证和部署记录实时计算，不保存任何手工状态。
 
-代码与行号基线为提交 `6728527e6deb4bade6ef9eeda20e23141a061064`（把 PR #82 的 `e55c5181` 合入任务分支后的 merge 提交，即 r9 验收的代码树；r9 之上的提交只改本文档）。旧基线 `c17110c5f7d94edf6bb1a50c5643d9a167527ea2` 及其验证目录补丁 SHA-256 `4afdb198826733dde90bce7176ea635c2de8ec7e3f15caa12943a3940d620815` 只对应个别条目（如 FM-10）中明确标注提交号的历史测试运行，不覆盖当前行号，也不覆盖 r9 证据。后续文档提交只更新本图与校验脚本。后续代码修改必须同步更新引用。
+代码与行号基线为提交 `32e5f971e1b36316283d0248777c471dd4a6a379`（把 `origin/main` 的 `0cb7eece` 普通 merge 进任务分支后的 r10 代码树；feature_coverage、feature_inventory、recoverable storage、Web FeatureMap/Coverage 在本次合入）。上一基线 `6728527e6deb4bade6ef9eeda20e23141a061064`（r9 验收树，合入 PR #82 的 `e55c5181`）的行号只对应条目中标注 r9 的历史测试运行，不覆盖当前行号。旧基线 `c17110c5f7d94edf6bb1a50c5643d9a167527ea2` 及其验证目录补丁 SHA-256 `4afdb198826733dde90bce7176ea635c2de8ec7e3f15caa12943a3940d620815` 只对应个别条目（如 FM-10）中明确标注提交号的历史测试运行，不覆盖当前行号，也不覆盖 r9/r10 证据。后续文档提交只更新本图与校验脚本。后续代码修改必须同步更新引用。
 
 - 实现状态只使用 `已实现`、`部分实现`、`未实现`、`已知缺陷`。
 - 部署状态只使用 `部署未验证`、`部署已验证`、`未部署`、`不适用`。本次没有执行部署，也没有读取目标运行环境中的进程、数据库或日志，因此没有把源码存在写成线上已部署。
@@ -19,7 +19,7 @@
 
 - 能力：创建和配置 mission，记录 owner push、hold/release，驱动 task 状态及 gate verdict 折叠。
 - 入口：`spawn mission ...`、`spawn task ...`、SQL control-record 写入与 refold。
-- 代码：`crates/spawn-cli/src/main.rs:135-137`、`crates/spawn-cli/src/missions.rs:669-719`、`crates/spawn-core/src/mission.rs:14`、`crates/spawn-postgres/sql/schema.sql:2553`、`crates/spawn-postgres/sql/schema.sql:2631`。
+- 代码：`crates/spawn-cli/src/main.rs:136-138`、`crates/spawn-cli/src/missions.rs:669-719`、`crates/spawn-core/src/mission.rs:14`、`crates/spawn-postgres/sql/schema.sql:2553`、`crates/spawn-postgres/sql/schema.sql:2631`。
 - 实现状态：`已实现`。配置和任务变化先成为记录，SQL 再折叠为读模型；`aborted` 本身不把 task 推进到完成态。
 - 测试证据：`crates/spawn-core/src/mission.rs:87-125` 固定状态值和未知值错误；`crates/spawn-postgres/tests/control.rs:51-135` 覆盖 mission/resident 控制记录折叠。本次在 Darwin/aarch64 运行 `cargo test -p spawn-core mission::tests`，2 个测试通过。
 - 部署状态：`部署未验证`。需要同一套 CLI、schema 和 loop；本次未执行端到端 mission 生命周期。
@@ -63,7 +63,7 @@
 
 - 能力：显式 `init-db` 原地迁移，回填 projection，提供 per-database 受限登录和持久化 recovery facts。
 - 入口：`spawn init-db`、`PostgresStore::migrate`、`role_url`、`spawn_host_record`。
-- 代码：`crates/spawn-cli/src/main.rs:115-118`、`crates/spawn-postgres/src/lib.rs:285-349`、`crates/spawn-postgres/sql/schema.sql:129-200`、`crates/spawn-postgres/src/gateway.rs:178-313`、`crates/spawn-postgres/src/lib.rs:488-520`、`crates/spawn-postgres/src/recovery.rs:27-106`、`crates/spawn-postgres/sql/schema.sql:5332-5375`。
+- 代码：`crates/spawn-cli/src/main.rs:116-119`、`crates/spawn-postgres/src/lib.rs:285-349`、`crates/spawn-postgres/sql/schema.sql:129-200`、`crates/spawn-postgres/src/gateway.rs:178-313`、`crates/spawn-postgres/src/lib.rs:488-520`、`crates/spawn-postgres/src/recovery.rs:27-106`、`crates/spawn-postgres/sql/schema.sql:5332-5375`。
 - 实现状态：`已实现`。普通 `open_store` 只连接；迁移是独立部署步骤。受限登录由 owner 密码派生，recovery writer 只接受 owner。
 - 测试证据：`crates/spawn-postgres/tests/upgrade.rs:91` 覆盖旧表升级；`crates/spawn-postgres/tests/api.rs:2975-3025` 覆盖迁移竞争；`crates/spawn-postgres/tests/roles.rs:108-149` 覆盖数据库间角色隔离；`crates/spawn-postgres/tests/recovery.rs:56`、`crates/spawn-postgres/tests/recovery.rs:117` 覆盖 recovery writer。
 - 部署状态：`部署未验证`。本次未执行 init-db、角色连接或数据库重启。
@@ -144,9 +144,9 @@
 
 - 能力：SQL fleet/tail 读模型、alert fire/clear/notice、attention 计划、dashboard reader，以及受限 human input/key 写入。
 - 入口：`spawn fleet|tail|alerts`、`spawn serve`、`/api/attention`、SQL gateway。
-- 代码：`crates/spawn-postgres/src/fleet.rs:12-109`、`crates/spawn-cli/src/alerts.rs:988-1081`、`crates/spawn-cli/src/serve/attention.rs:157-244`、`crates/spawn-postgres/src/gateway.rs:60-169`。PR #82 的记录派生能力图（planned / implemented / verified / live 四态）：`crates/spawn-cli/src/serve/feature_map.rs:99`（`GET /api/features` 处理函数，整文件 1-2515 行）、`crates/spawn-postgres/src/features.rs:82-97`（`deploy_facts`、`live_deploy_fact`、`mission_blockers`）、`web/src/components/features/FeatureMapView.tsx:1-495`（`#/features` 四列视图）、`web/src/features.ts:1-669`（只做归一化和措辞，不派生状态）。派生图的机制文档是 [feature-map.md](./feature-map.md)，与本静态图并存。
+- 代码：`crates/spawn-postgres/src/fleet.rs:12-109`、`crates/spawn-cli/src/alerts.rs:988-1081`、`crates/spawn-cli/src/serve/attention.rs:157-244`、`crates/spawn-postgres/src/gateway.rs:60-169`。PR #82 的记录派生能力图（planned / implemented / verified / live 四态）：`crates/spawn-cli/src/serve/feature_map.rs:99`（`GET /api/features` 处理函数，整文件 1-3161 行）、`crates/spawn-postgres/src/features.rs:82-97`（`deploy_facts`、`live_deploy_fact`、`mission_blockers`）、`web/src/components/features/FeatureMapView.tsx:1-692`（`#/features` 四列视图）、`web/src/features.ts:1-759`（只做归一化和措辞，不派生状态）。派生图的机制文档是 [feature-map.md](./feature-map.md)，与本静态图并存。
 - 实现状态：`已实现`。reader 与 human-write 使用不同权限路径；attention 是瞬时 dispatcher plan，不提交命令。派生能力图在页面读取时由 backlog、task、landing、verification、deploy 记录实时计算，无存储状态、无物化视图、无第二份跟踪表；mapping 文件只保存能力 id 与 provenance source，不保存状态。
-- 测试证据：`crates/spawn-postgres/tests/dashboard.rs:73-179` 覆盖 board；`crates/spawn-postgres/tests/alerts.rs:60-128` 覆盖 alert 生命周期；`crates/spawn-cli/src/serve/attention.rs:1049-1088` 覆盖 attention parity；`crates/spawn-postgres/tests/human_input.rs:137-228`、`crates/spawn-postgres/tests/human_input.rs:394-455` 覆盖人工输入与角色限制；`crates/spawn-postgres/tests/human_key.rs:117-187`、`crates/spawn-postgres/tests/human_key.rs:230-293` 覆盖 key 命令与权限。派生能力图的证据：`crates/spawn-cli/src/serve/feature_map.rs:1623-2477` 的 21 个单元测试覆盖四态不塌缩、最低 objective 定态、landing 时刻的 deploy/verification 不算数、live anchor 全量 deploy 日志、backlog 不可读具名、mapping 校验；`crates/spawn-postgres/tests/features.rs:39-174` 的 4 个测试覆盖 deploy facts 顺序与边界、50 条之外的 live anchor、mission blocker、mapping 绝对路径设置；`crates/spawn-postgres/tests/verification.rs` 5 个测试；`web/test/features.test.ts:1-409` 的 11 个 node:test 用例覆盖四列归一化、gap 措辞、source 标签和 deploy 注释。
+- 测试证据：`crates/spawn-postgres/tests/dashboard.rs:73-179` 覆盖 board；`crates/spawn-postgres/tests/alerts.rs:60-128` 覆盖 alert 生命周期；`crates/spawn-cli/src/serve/attention.rs:1049-1088` 覆盖 attention parity；`crates/spawn-postgres/tests/human_input.rs:137-228`、`crates/spawn-postgres/tests/human_input.rs:394-455` 覆盖人工输入与角色限制；`crates/spawn-postgres/tests/human_key.rs:117-187`、`crates/spawn-postgres/tests/human_key.rs:230-293` 覆盖 key 命令与权限。派生能力图的证据：`crates/spawn-cli/src/serve/feature_map.rs:2026-3160` 的 24 个单元测试覆盖四态不塌缩、最低 objective 定态、landing 时刻的 deploy/verification 不算数、live anchor 全量 deploy 日志、backlog 不可读具名、mapping 校验；`crates/spawn-postgres/tests/features.rs:39-174` 的 4 个测试覆盖 deploy facts 顺序与边界、50 条之外的 live anchor、mission blocker、mapping 绝对路径设置；`crates/spawn-postgres/tests/verification.rs` 5 个测试；`web/test/features.test.ts:1-481` 的 12 个 node:test 用例覆盖四列归一化、gap 措辞、source 标签和 deploy 注释。
 - 部署状态：`部署未验证`。本次未启动 HTTP 服务、查询 live fleet 或验证 token/Origin/network ACL。
 - 已知缺口：fleet board 不是进程健康证明；没有 backup record 本身不会触发 backup-age alert；采样和投影延迟会影响新鲜度。
 - 下一步：运行 dashboard、alerts、attention 和 HTTP guard 测试，并用一次性数据验证 reader 不能写、human role 只能输入。
@@ -190,9 +190,9 @@
 
 - 能力：加密 PostgreSQL dump、source/transcript bundle，执行上传预算检查，提供 R2 lock/lifecycle 保留配置，并在独立数据库验证恢复。
 - 入口：`spawn backup dump|bundle|verify`、backup systemd timers；旧 shell 工具只作手工 legacy 路径。
-- 代码：`crates/spawn-cli/src/backup.rs:1157-1359`、`crates/spawn-cli/src/backup.rs:1456-1569`、`crates/spawn-cli/src/backup.rs:2703-2848`、`deploy/systemd/spawn-backup-verify.service:5-24`。
+- 代码：`crates/spawn-cli/src/backup.rs:1158-1363`、`crates/spawn-cli/src/backup.rs:1459-1573`、`crates/spawn-cli/src/backup.rs:2707-2852`、`deploy/systemd/spawn-backup-verify.service:5-24`。
 - 实现状态：`已实现`。verify 对比事件数和 high-watermark，并清理独立 drill database；R2 lock/lifecycle 文件只是配置输入。
-- 测试证据：`crates/spawn-cli/src/backup.rs:3861-3978` 覆盖 tiers、limits、bundle 和 suspect dump；`crates/spawn-postgres/tests/backup.rs:152-168` 覆盖记录权限；`deploy/backup/test-pg-restore-drill.sh:72-146` 只覆盖 legacy Docker drill。
+- 测试证据：`crates/spawn-cli/src/backup.rs:3865-3982` 覆盖 tiers、limits、bundle 和 suspect dump；`crates/spawn-postgres/tests/backup.rs:152-168` 覆盖记录权限；`deploy/backup/test-pg-restore-drill.sh:72-146` 只覆盖 legacy Docker drill。
 - 部署状态：`部署未验证`。本次未访问 R2、密钥、真实备份或 drill server。
 - 已知缺口：本地 stand-in 不证明 Cloudflare 权限或 object lock；verify 需要独立 CREATEDB 能力，密钥托管需要单独核验。
 - 下一步：在一次性环境运行 backup tests 和真实恢复，独立读回 R2 规则，并记录 dump/bundle/verified 事实及恢复结果。
@@ -201,7 +201,7 @@
 
 - 能力：提供 SQL operational views、scorecard JSON、原始 transcript 归档、加密 bundle、objective METRIC，以及 Supply PA 依赖 store 和可选测试数据库输入。
 - 入口：`spawn scorecard --json`、`spawn backup bundle`、`SUPPLY_PA_DEPS`、gate `METRIC`、`no-test-database`。
-- 代码：`crates/spawn-postgres/sql/schema.sql:611-921`、`crates/spawn-cli/src/scorecard.rs:132-204`、`crates/spawn-host/src/transcripts.rs:128-224`、`crates/spawn-cli/src/backup.rs:2186-2586`、`crates/spawn-cli/src/runtime.rs:136-176`、`crates/spawn-cli/src/objectives.rs:171-216`、`crates/spawn-cli/src/gate.rs:96-132`。
+- 代码：`crates/spawn-postgres/sql/schema.sql:611-921`、`crates/spawn-cli/src/scorecard.rs:132-204`、`crates/spawn-host/src/transcripts.rs:128-224`、`crates/spawn-cli/src/backup.rs:2190-2590`、`crates/spawn-cli/src/runtime.rs:136-176`、`crates/spawn-cli/src/objectives.rs:171-216`、`crates/spawn-cli/src/gate.rs:96-132`。
 - 实现状态：`部分实现`。运行数据采集、分析、备份和外部项目依赖输入已存在；未找到直接的 post-training、dataset export 或标注平台连接器。
 - 测试证据：`crates/spawn-cli/src/scorecard/tests.rs:878-997` 覆盖 token 去重和 mission 归属；`crates/spawn-cli/src/runtime.rs:401-416` 覆盖依赖路径注入；`crates/spawn-host/src/transcripts.rs:325-346` 覆盖本地归档契约。
 - 部署状态：`部署未验证`。本次未连接外部数据工程系统、Supply PA controller、在线 relay 或后训练平台。
