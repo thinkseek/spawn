@@ -889,6 +889,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/cost" => Box::new(move || cost(query)),
         "/api/core-lines" => Box::new(core_lines::core_lines),
         "/api/verifications" => Box::new(verifications),
+        "/api/nodes" => Box::new(nodes),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
@@ -1812,6 +1813,21 @@ fn verifications() -> Result<Value, String> {
     let store = open_store()?;
     let facts = store.verification_facts().map_err(err)?;
     Ok(crate::verify::list(&facts, now_ms()))
+}
+
+/// `/api/nodes`: every node joined and not removed (multi-host P1, crate
+/// nodes.rs), `{nodes: [...]}`, each as the store lists it without its ssh
+/// destination and note, read through the reader login like every other
+/// read. No clock in it, so an unchanged list keeps its ETag.
+fn nodes() -> Result<Value, String> {
+    let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+    for node in nodes.as_array_mut().into_iter().flatten() {
+        if let Some(node) = node.as_object_mut() {
+            node.remove("ssh");
+            node.remove("note");
+        }
+    }
+    Ok(json!({ "nodes": nodes }))
 }
 
 /// `/api/missions/task/<id>`: one task's brief, report and review note in

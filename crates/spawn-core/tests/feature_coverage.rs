@@ -705,7 +705,7 @@ fn real_project_registry_covers_every_in_scope_file_with_zero_drift() {
         report.stale_references
     );
     assert!(report.consistency.is_clean(), "{:?}", report.consistency);
-    assert_eq!(report.counts.in_scope, 990);
+    assert_eq!(report.counts.in_scope, 997);
     assert_eq!(report.counts.covered, report.counts.in_scope);
     assert!(report.counts.multi_feature_files >= 100);
 
