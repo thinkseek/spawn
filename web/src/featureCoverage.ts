@@ -613,13 +613,24 @@ export interface CoverageProject {
   registry: string;
 }
 
-/** The projects of `/api/features`' missions whose map is a configured
- * file (`mapping.path`), in the order given. */
+/** The projects of `/api/features`' missions whose map is a readable
+ * coverage registry file (`mapping.kind` "file" with `mapping.registry`; a
+ * legacy identity-only map is left out), in the order given. */
 export function coverageProjects(
-  missions: ReadonlyArray<{ id: number; text: string; mapping: { path: string | null } }>,
+  missions: ReadonlyArray<{
+    id: number;
+    text: string;
+    mapping: { kind: string; path: string | null; registry: boolean };
+  }>,
 ): CoverageProject[] {
   return missions
-    .filter((mission) => typeof mission.mapping.path === "string" && mission.mapping.path !== "")
+    .filter(
+      (mission) =>
+        mission.mapping.kind === "file" &&
+        mission.mapping.registry === true &&
+        typeof mission.mapping.path === "string" &&
+        mission.mapping.path !== "",
+    )
     .map((mission) => {
       const title = mission.text.split("\n")[0]?.trim() ?? "";
       const short = title.length > 48 ? `${title.slice(0, 47)}…` : title;
