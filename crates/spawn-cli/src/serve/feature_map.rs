@@ -525,16 +525,10 @@ fn specs_for(mission: &Value) -> (Vec<Spec>, Value) {
         }
     };
     let mission_id = mission["id"].as_i64().unwrap_or_default();
-    let read =
-        read_mapping_value(&path).and_then(|value| Ok((parse_mapping(&value, mission_id)?, value)));
-    match read {
-        // `registry`: whether the file is a coverage registry the coverage
-        // page (`/api/features/coverage?mission=`) can scan, not a legacy
-        // identity-only map.
-        Ok((specs, value)) => (
+    match read_mapping(&path, mission_id) {
+        Ok(specs) => (
             specs,
-            json!({"kind": "file", "path": path.display().to_string(), "error": null,
-                   "registry": crate::feature_inventory::is_coverage_registry(&value)}),
+            json!({"kind": "file", "path": path.display().to_string(), "error": null}),
         ),
         Err(error) => (
             fallback,
@@ -569,11 +563,6 @@ pub(crate) fn validate_file(path: &Path, mission_id: i64) -> Result<(), String> 
 /// belongs to: an objective source may leave its mission out, and may not
 /// name another.
 fn read_mapping(path: &Path, mission_id: i64) -> Result<Vec<Spec>, String> {
-    parse_mapping(&read_mapping_value(path)?, mission_id)
-}
-
-/// The JSON of the mapping file at `path`, at most [`MAX_MAPPING_BYTES`].
-fn read_mapping_value(path: &Path) -> Result<Value, String> {
     let meta =
         std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     if !meta.is_file() {
@@ -588,7 +577,9 @@ fn read_mapping_value(path: &Path) -> Result<Value, String> {
     }
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
-    serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    parse_mapping(&value, mission_id)
 }
 
 /// Check a feature map file for `mission_id`, a mission's own: the
@@ -3023,8 +3014,6 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(mapping["kind"], "file");
         assert_eq!(mapping["error"], Value::Null);
-        // A legacy identity-only map is no coverage registry.
-        assert_eq!(mapping["registry"], false);
         row["features_file"] = json!("missing.json");
         let (specs, mapping) = super::specs_for(&row);
         assert_eq!(specs.len(), 5, "the fallback keeps the page useful");
@@ -3580,12 +3569,6 @@ mod tests {
     fn the_repository_registry_reads_as_a_feature_map() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/feature-map/registry.json");
-        // The coverage page may offer it: a coverage registry.
-        let mut row = json!({"id": 4, "objectives": [], "tasks": []});
-        row["features_file"] = json!(path.display().to_string());
-        let (_, mapping) = super::specs_for(&row);
-        assert_eq!(mapping["kind"], "file", "{mapping}");
-        assert_eq!(mapping["registry"], true, "{mapping}");
         let specs = read_mapping(&path, 4).expect("docs/feature-map/registry.json reads");
         let raw: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("the registry"))
