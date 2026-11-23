@@ -225,7 +225,10 @@
 //!   `backup.verified` with `ok` false; clears at the next with `ok` true.
 //! - `deploy_failed`, `deploy`, key `deploy_failed:<its record>`: a
 //!   `deploy.finished` with `ok` false (deploy/deploy.sh, #54), while none
-//!   is open; clears at the next with `ok` true, from any deploy.
+//!   is open; clears at the next with `ok` true, from any deploy. A deploy
+//!   restarts the loop before it records how it ended, so a restarted step
+//!   replays the `deploy.finished` records after the last one its
+//!   `deploy_failed` alerts name, up to its watermark.
 //! - `integrator_down`, `spawn-integrate`, key `integrator_down:<the first
 //!   reading's ms>`: no backend holds the integrator's lock on this store
 //!   (`pg_locks`, the lock `integrator_try_lock` takes) at every reading for
@@ -1138,6 +1141,29 @@ impl Monitor {
             let at = entry["at_ms"].as_i64().unwrap_or(now);
             let mut fed = Vec::new();
             self.feed(id, at, &entry["record"], &mut fed);
+            self.flush(store, now, &fed, lines);
+        }
+        // The deploys' records are no part of the history: a deploy restarts
+        // the loop and only then records how it ended (deploy/deploy.sh), so
+        // its record is often at or below this start's watermark, where no
+        // check feeds it. They are replayed from the last deploy record the
+        // `deploy_failed` alerts name ([`deploy_cursor`]), one at a time as
+        // above: the first success after an open alert's failure clears it,
+        // and a failure recorded while the loop was down fires once. With no
+        // such alert yet, the history's span bounds the read.
+        let cursor = deploy_cursor(&rows["rows"]);
+        let since = if cursor == 0 {
+            now.saturating_sub(HISTORY_MS)
+        } else {
+            0
+        };
+        let deploys = store
+            .alert_deploys(cursor, watermark, since, HISTORY_LIMIT)
+            .map_err(|error| error.to_string())?;
+        for entry in deploys.as_array().into_iter().flatten() {
+            let id = entry["event_id"].as_i64().unwrap_or_default();
+            let mut fed = Vec::new();
+            self.deploy_record(id, &entry["record"], &mut fed);
             self.flush(store, now, &fed, lines);
         }
         let mut events = Vec::new();
@@ -4392,6 +4418,31 @@ fn size_text(bytes: u64) -> String {
     format!("{}.{} {unit}", tenths / 10, tenths % 10)
 }
 
+/// The last `deploy.finished` record the store's `deploy_failed` alerts
+/// (`rows`, as [`spawn_postgres`]'s alert rows) account for: the newest
+/// failure one fired on, success one was cleared by, or, for one the owner's
+/// judgement cleared, that judgement (a failure before it fired nothing
+/// while the alert was open, and is no new occurrence after it). A restarted
+/// step replays the deploys' records after it; 0 when there is no such
+/// alert.
+fn deploy_cursor(rows: &Value) -> i64 {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["kind"] == "deploy_failed")
+        .flat_map(|row| {
+            [
+                row["evidence"]["event_id"].as_i64(),
+                row["cleared_evidence"]["event_id"]
+                    .as_i64()
+                    .or_else(|| row["cleared_event_id"].as_i64()),
+            ]
+        })
+        .flatten()
+        .max()
+        .unwrap_or(0)
+}
+
 /// Whether a clear's `evidence` comes after what the alert `row` fired on,
 /// read from the alert's own evidence (what the store holds, never the
 /// step's memory, which a restart empties): a record-borne clear names a
@@ -7251,6 +7302,39 @@ mod tests {
         );
     }
 
+    /// Where a restarted step replays the deploys' records from (#498): the
+    /// newest deploy record a `deploy_failed` alert names, the failure it
+    /// fired on or the success that cleared it; for one the owner's
+    /// judgement cleared, the judgement; nothing of another kind.
+    #[test]
+    fn the_deploy_cursor_is_the_last_deploy_record_its_alerts_name() {
+        assert_eq!(super::deploy_cursor(&json!([])), 0);
+        assert_eq!(super::deploy_cursor(&Value::Null), 0);
+        let open = json!({"kind": "deploy_failed", "state": "open",
+                          "evidence": {"event_id": 40}, "fired_event_id": 41,
+                          "cleared_event_id": null, "cleared_evidence": null});
+        let cleared = json!({"kind": "deploy_failed", "state": "cleared",
+                             "evidence": {"event_id": 20}, "fired_event_id": 21,
+                             "cleared_event_id": 31, "cleared_evidence": {"event_id": 30}});
+        let judged = json!({"kind": "deploy_failed", "state": "cleared",
+                            "evidence": {"event_id": 50}, "fired_event_id": 51,
+                            "cleared_event_id": 60, "cleared_evidence": {"judged": "false"}});
+        let other = json!({"kind": "drill_failed", "state": "cleared",
+                           "evidence": {"event_id": 90}, "fired_event_id": 91,
+                           "cleared_event_id": 99, "cleared_evidence": {"event_id": 98}});
+        assert_eq!(
+            super::deploy_cursor(&json!([cleared])),
+            30,
+            "the success, not the alert.cleared record after it"
+        );
+        assert_eq!(
+            super::deploy_cursor(&json!([cleared, open, other])),
+            40,
+            "the failure, not the alert.fired record after it"
+        );
+        assert_eq!(super::deploy_cursor(&json!([open, judged, other])), 60);
+    }
+
     /// A mission whose controller lacks the owner's latest landing (P22) fires one
     /// `controller_behind` once it has been behind for the bound, from the
     /// first reading that found it so; nothing more while it stays behind;
@@ -9150,6 +9234,550 @@ connections\n";
                     .expect("count")
                     .get(0);
                 assert_eq!(fired, 2, "once per request, whatever restarts");
+            });
+        }
+
+        /// `deploy_failed` across restarts (#498). A deploy restarts the loop
+        /// and only then records its `deploy.finished` (deploy/deploy.sh),
+        /// so the record is at or below the new step's watermark: a success
+        /// recorded before the step starts clears the open alert at that
+        /// start, naming itself. A success older than the failure clears
+        /// nothing; a failure recorded while the loop was down fires once;
+        /// and a failure that fired nothing while one was open is no new
+        /// occurrence at a later start.
+        #[test]
+        fn a_started_step_clears_a_failed_deploy_at_a_success_recorded_before_it_started() {
+            in_schema("alerts_deploy_restart", |store, client| {
+                let finished = |client: &mut postgres::Client, ok: bool, digit: char| {
+                    let head = digit.to_string().repeat(40);
+                    record(
+                        client,
+                        0,
+                        &format!(
+                            r#"{{"type":"deploy.finished","ok":{ok},"head":"{head}",
+                                "by":"owner","reason":"no web/node_modules"}}"#
+                        ),
+                    )
+                };
+                let deploy_alerts = |client: &mut postgres::Client| -> i64 {
+                    client
+                        .query_one(
+                            "select count(*) from spawn_alerts where kind = 'deploy_failed'",
+                            &[],
+                        )
+                        .expect("count")
+                        .get(0)
+                };
+                // A success, then a failure the running step fires on: the
+                // older success is nothing to it, at a restart too.
+                finished(client, true, 'a');
+                let mut monitor = started(store);
+                let failed = finished(client, false, 'b');
+                monitor.check(store).expect("the step checks");
+                let key = format!("deploy_failed:{failed}");
+                assert_eq!(alert(client, &key), ("open".to_string(), None));
+                drop(monitor);
+                let _again = started(store);
+                assert_eq!(
+                    alert(client, &key),
+                    ("open".to_string(), None),
+                    "a success older than the failure clears nothing"
+                );
+
+                // The deploy that succeeds restarts the loop, then records:
+                // the record is at or below the new step's watermark.
+                let fixed = finished(client, true, 'c');
+                let mut monitor = started(store);
+                assert!(monitor.watermark >= fixed, "the record is not the checks'");
+                assert_eq!(
+                    alert(client, &key),
+                    ("cleared".to_string(), Some(fixed)),
+                    "the start clears it, naming the success"
+                );
+                assert_eq!(deploy_alerts(client), 1);
+
+                // A failure the step sees fires; one more while it is open
+                // fires nothing; the success that clears it and a failure
+                // after that are recorded while the loop is down.
+                let second = finished(client, false, 'd');
+                monitor.check(store).expect("the step checks");
+                let second_key = format!("deploy_failed:{second}");
+                assert_eq!(alert(client, &second_key).0, "open");
+                let unsaid = finished(client, false, 'd');
+                monitor.check(store).expect("the step checks");
+                assert_eq!(deploy_alerts(client), 2, "one alert while it is open");
+                drop(monitor);
+                let good = finished(client, true, 'e');
+                let down = finished(client, false, 'f');
+                let monitor = started(store);
+                assert_eq!(
+                    alert(client, &second_key),
+                    ("cleared".to_string(), Some(good)),
+                    "the first success after it"
+                );
+                let down_key = format!("deploy_failed:{down}");
+                assert_eq!(
+                    alert(client, &down_key),
+                    ("open".to_string(), None),
+                    "a failure recorded while the loop was down fires"
+                );
+                drop(monitor);
+                let _last = started(store);
+                assert_eq!(alert(client, &down_key).0, "open");
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{unsaid}")).0,
+                    "none",
+                    "the failure that fired nothing while one was open"
+                );
+                assert_eq!(deploy_alerts(client), 3, "once each, whatever restarts");
+            });
+        }
+
+        /// The other side of the watermark, as it was before #498: a success
+        /// recorded after the step started is the checks' and clears the
+        /// alert at the next one.
+        #[test]
+        fn a_running_step_clears_a_failed_deploy_at_the_next_success() {
+            in_schema("alerts_deploy_running", |store, client| {
+                let mut monitor = started(store);
+                let failed = record(
+                    client,
+                    0,
+                    r#"{"type":"deploy.finished","ok":false,"head":"b","by":"owner","reason":"r"}"#,
+                );
+                monitor.check(store).expect("the step checks");
+                let key = format!("deploy_failed:{failed}");
+                assert_eq!(alert(client, &key).0, "open");
+                let fixed = record(
+                    client,
+                    0,
+                    r#"{"type":"deploy.finished","ok":true,"head":"c","by":"owner","reason":""}"#,
+                );
+                assert!(monitor.watermark < fixed, "the record is the checks'");
+                monitor.check(store).expect("the step checks");
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(fixed)));
+            });
+        }
+
+        /// A `deploy.finished` record `hours` before now (#498, #500).
+        fn finished(client: &mut postgres::Client, hours: i64, ok: bool) -> i64 {
+            record(
+                client,
+                hours,
+                &format!(
+                    r#"{{"type":"deploy.finished","ok":{ok},"head":"b","by":"owner","reason":"r"}}"#
+                ),
+            )
+        }
+
+        fn deploy_alerts(client: &mut postgres::Client) -> i64 {
+            client
+                .query_one(
+                    "select count(*) from spawn_alerts where kind = 'deploy_failed'",
+                    &[],
+                )
+                .expect("count")
+                .get(0)
+        }
+
+        /// No phantom at a restart with every `deploy_failed` alert cleared
+        /// (#500, rev-k P1): a failure that fired nothing while the first
+        /// was open is no new occurrence when the replay, which starts at
+        /// the success that cleared the first, meets nothing open. A replay
+        /// of the last 7 days from nothing would fire it, and clear it at
+        /// the success, at every start.
+        #[test]
+        fn a_restart_with_every_deploy_alert_cleared_fires_no_phantom() {
+            in_schema("alerts_deploy_all_cleared", |store, client| {
+                let mut monitor = started(store);
+                let first = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let unsaid = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let good = finished(client, 0, true);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{first}")),
+                    ("cleared".to_string(), Some(good))
+                );
+                assert_eq!(deploy_alerts(client), 1);
+                drop(monitor);
+                let again = started(store);
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{unsaid}")).0,
+                    "none",
+                    "no phantom at a restart"
+                );
+                assert_eq!(deploy_alerts(client), 1, "one alert after a restart");
+                drop(again);
+                let _third = started(store);
+                assert_eq!(deploy_alerts(client), 1, "one alert after two restarts");
+            });
+        }
+
+        /// No phantom after the owner's judgement (#500, rev-k P2 and
+        /// rev-j): the open alert judged false through the real writer is
+        /// cleared at the judgement, so a failure before it that fired
+        /// nothing is no alert at a restart; a success and a failure
+        /// recorded after it while the loop is down: the failure fires
+        /// once, whatever restarts follow.
+        #[test]
+        fn a_restart_after_a_judged_deploy_alert_fires_no_phantom() {
+            in_schema("alerts_deploy_judged", |store, client| {
+                let mut monitor = started(store);
+                let first = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let key = format!("deploy_failed:{first}");
+                assert_eq!(alert(client, &key).0, "open");
+                let unsaid = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(deploy_alerts(client), 1);
+                store.alert_judge(&key, "false").expect("judged");
+                assert_eq!(alert(client, &key).0, "cleared");
+                monitor.check(store).expect("the step checks");
+                drop(monitor);
+                let again = started(store);
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{unsaid}")).0,
+                    "none",
+                    "no phantom after a judgement"
+                );
+                assert_eq!(deploy_alerts(client), 1, "one alert");
+                drop(again);
+                let _success = finished(client, 0, true);
+                let down = finished(client, 0, false);
+                let third = started(store);
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{down}")),
+                    ("open".to_string(), None),
+                    "the failure recorded while the loop was down fires"
+                );
+                assert_eq!(deploy_alerts(client), 2, "two alerts");
+                drop(third);
+                let _fourth = started(store);
+                assert_eq!(deploy_alerts(client), 2, "two alerts after another restart");
+            });
+        }
+
+        /// An open alert judged `right` stays open and clears at a success
+        /// recorded before the next start, naming it (#500, rev-j).
+        #[test]
+        fn a_deploy_alert_judged_right_clears_at_a_start() {
+            in_schema("alerts_deploy_right", |store, client| {
+                let mut monitor = started(store);
+                let failed = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let key = format!("deploy_failed:{failed}");
+                store.alert_judge(&key, "right").expect("judged");
+                assert_eq!(alert(client, &key), ("open".to_string(), None));
+                drop(monitor);
+                let fixed = finished(client, 0, true);
+                let _monitor = started(store);
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(fixed)));
+            });
+        }
+
+        /// With a cursor the replay has no age bound (#500, rev-j): a
+        /// success whose time is 8 days old, its id later than the
+        /// failure's, still clears the open alert at a start.
+        #[test]
+        fn with_a_deploy_cursor_a_success_of_any_age_clears() {
+            in_schema("alerts_deploy_old", |store, client| {
+                let mut monitor = started(store);
+                let failed = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let key = format!("deploy_failed:{failed}");
+                drop(monitor);
+                let fixed = finished(client, 8 * 24, true);
+                let _monitor = started(store);
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(fixed)));
+            });
+        }
+
+        /// With no `deploy_failed` alert yet, a start reads the last 7 days
+        /// (#500, rev-j): a failure 8 days old fires nothing, one a day old
+        /// fires once, and a second start adds none.
+        #[test]
+        fn with_no_deploy_alert_a_start_reads_seven_days() {
+            in_schema("alerts_deploy_fresh", |store, client| {
+                let _old = finished(client, 8 * 24, false);
+                let monitor = started(store);
+                assert_eq!(deploy_alerts(client), 0, "older than 7 days");
+                drop(monitor);
+                let recent = finished(client, 24, false);
+                let monitor = started(store);
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{recent}")),
+                    ("open".to_string(), None)
+                );
+                assert_eq!(deploy_alerts(client), 1);
+                drop(monitor);
+                let _again = started(store);
+                assert_eq!(deploy_alerts(client), 1);
+            });
+        }
+
+        /// A failure below the watermark fires at the start's replay, and a
+        /// success above it is the checks' and clears it, once (#500,
+        /// rev-j): the replay stops at the watermark.
+        #[test]
+        fn a_failed_deploy_below_the_watermark_clears_at_a_success_above_it() {
+            in_schema("alerts_deploy_split", |store, client| {
+                let failed = finished(client, 0, false);
+                let mut monitor = started(store);
+                let key = format!("deploy_failed:{failed}");
+                assert_eq!(
+                    alert(client, &key).0,
+                    "open",
+                    "a failure below the watermark fires"
+                );
+                let fixed = finished(client, 0, true);
+                assert!(monitor.watermark < fixed, "the record is the checks'");
+                monitor.check(store).expect("the step checks");
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(fixed)));
+                assert_eq!(deploy_alerts(client), 1);
+            });
+        }
+
+        /// The deploy cursor on each row shape the store writes (#500), read
+        /// back through `alert_rows` as a start reads it: an open alert, its
+        /// failure; one a success cleared, the success (not the later
+        /// `alert.cleared` event); one judged `right` while open, still its
+        /// failure; one cleared by a success and judged after, still the
+        /// success; one judged `false` while open, the judgement.
+        #[test]
+        fn the_deploy_cursor_on_each_row_shape_the_store_writes() {
+            in_schema("alerts_deploy_shapes", |store, client| {
+                let cursor = |store: &PostgresStore| {
+                    let rows = store.alert_rows().expect("the rows read");
+                    super::super::deploy_cursor(&rows["rows"])
+                };
+                let cleared_event = |client: &mut postgres::Client, key: &str| -> Option<i64> {
+                    client
+                        .query_one(
+                            "select cleared_event_id from spawn_alerts where key = $1",
+                            &[&key],
+                        )
+                        .expect("the row reads")
+                        .get(0)
+                };
+                let mut monitor = started(store);
+                assert_eq!(cursor(store), 0, "no deploy_failed alert");
+
+                let f1 = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(cursor(store), f1, "open: its failure");
+                let s1 = finished(client, 0, true);
+                monitor.check(store).expect("the step checks");
+                let k1 = format!("deploy_failed:{f1}");
+                assert_eq!(alert(client, &k1), ("cleared".to_string(), Some(s1)));
+                assert!(cleared_event(client, &k1) > Some(s1));
+                assert_eq!(cursor(store), s1, "cleared by a success: the success");
+
+                let f2 = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let k2 = format!("deploy_failed:{f2}");
+                store.alert_judge(&k2, "right").expect("judged");
+                assert_eq!(alert(client, &k2).0, "open");
+                assert_eq!(cursor(store), f2, "judged right while open: its failure");
+                let s2 = finished(client, 0, true);
+                monitor.check(store).expect("the step checks");
+                assert_eq!(alert(client, &k2), ("cleared".to_string(), Some(s2)));
+                assert_eq!(cursor(store), s2, "judged right, then cleared: the success");
+
+                let f3 = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let s3 = finished(client, 0, true);
+                monitor.check(store).expect("the step checks");
+                let k3 = format!("deploy_failed:{f3}");
+                store.alert_judge(&k3, "false").expect("judged");
+                assert_eq!(alert(client, &k3), ("cleared".to_string(), Some(s3)));
+                assert!(cleared_event(client, &k3) > Some(s3));
+                assert_eq!(cursor(store), s3, "cleared, then judged: still the success");
+
+                let f4 = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let unsaid = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let k4 = format!("deploy_failed:{f4}");
+                store.alert_judge(&k4, "false").expect("judged");
+                assert_eq!(alert(client, &k4), ("cleared".to_string(), None));
+                let judgement = cleared_event(client, &k4).expect("the judgement");
+                assert!(judgement > unsaid);
+                assert_eq!(
+                    cursor(store),
+                    judgement,
+                    "judged false while open: the judgement"
+                );
+                assert_eq!(deploy_alerts(client), 4);
+            });
+        }
+
+        /// The ids of a read of `alert_deploys`, in its order.
+        fn deploy_ids(deploys: &Value) -> Vec<i64> {
+            deploys
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| entry["event_id"].as_i64().expect("an event id"))
+                .collect()
+        }
+
+        /// The store's read of the deploys' records (#504, rev-500-b F1 and
+        /// F2): after `after`, up to and including `upto`, `deploy.finished`
+        /// records only, oldest first. A `backup.verified` carries an `ok`
+        /// too, and is no deploy.
+        #[test]
+        fn the_deploys_read_is_bounded_and_reads_deploys_only() {
+            in_schema("alerts_deploys_read", |store, client| {
+                let d1 = finished(client, 0, false);
+                let verified = record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":false,"key":"v1","reason":"bad"}"#,
+                );
+                let d2 = finished(client, 0, true);
+                let d3 = finished(client, 0, false);
+                assert!(d1 < verified && verified < d2 && d2 < d3);
+                let read = |after: i64, upto: i64| {
+                    deploy_ids(
+                        &store
+                            .alert_deploys(after, upto, 0, 100)
+                            .expect("the deploys read"),
+                    )
+                };
+                assert_eq!(read(0, d3), vec![d1, d2, d3], "deploy.finished only");
+                assert_eq!(read(0, d2), vec![d1, d2], "up to and including upto");
+                assert_eq!(read(d1, d2), vec![d2], "after `after`");
+                assert_eq!(read(0, verified), vec![d1]);
+                assert_eq!(read(d3, i64::MAX), Vec::<i64>::new());
+            });
+        }
+
+        /// A start replays no deploy record past its own watermark (#504,
+        /// rev-500-b F1): one committed after the mirror read, while the
+        /// start runs, is the checks', and fed by the start too it would
+        /// fold twice. Here the start's history replay fires a
+        /// `drill_failed`, and a trigger of this test's schema appends a
+        /// failure F1, a failure F2 and a success S in the same statement,
+        /// so they are committed before the start reads the deploys. The
+        /// start fires nothing for them; the next check fires F1 once, F2
+        /// fires nothing while F1 is open, and S clears F1. Fed by the start
+        /// as well, the check would find F1 cleared and fire F2, a phantom.
+        #[test]
+        fn a_start_replays_no_deploy_record_past_its_watermark() {
+            in_schema("alerts_deploy_watermark", |store, client| {
+                client
+                    .batch_execute(
+                        r"
+create function alerts_test_deploys_mid_start() returns trigger
+language plpgsql security definer set search_path from current as $$
+declare
+    v_ok boolean;
+begin
+    foreach v_ok in array array[false, false, true] loop
+        insert into spawn_events (agent_id, session_id, execution_id, source,
+                                  source_event_id, kind, session_seq, recorded_at_ms)
+        select 'agent_control', 'session_control', null, 'control', null,
+               jsonb_build_object('name', 'control.recorded',
+                 'detail', jsonb_build_object('record', jsonb_build_object(
+                   'type', 'deploy.finished', 'ok', v_ok, 'head', 'b',
+                   'by', 'owner', 'reason', 'r'))),
+               coalesce((select max(session_seq) from spawn_events
+                          where session_id = 'session_control'), 0) + 1,
+               spawn_now_ms();
+    end loop;
+    return null;
+end $$;
+create trigger alerts_test_deploys_mid_start after insert on spawn_events
+for each row
+when (new.event_name = 'control.recorded'
+      and new.kind -> 'detail' -> 'record' ->> 'type' = 'alert.fired'
+      and new.kind -> 'detail' -> 'record' ->> 'kind' = 'drill_failed')
+execute function alerts_test_deploys_mid_start();
+",
+                    )
+                    .expect("the test's trigger");
+                let verified = record(
+                    client,
+                    1,
+                    r#"{"type":"backup.verified","ok":false,"key":"v1","reason":"bad"}"#,
+                );
+                let mut monitor = Monitor::with(settings());
+                let mut lines = Vec::new();
+                monitor.start(store, &mut lines).expect("the step starts");
+                assert_eq!(
+                    alert(client, &format!("drill_failed:{verified}")).0,
+                    "open",
+                    "the history replay fired, so the trigger ran"
+                );
+                let deploys = deploy_ids(
+                    &store
+                        .alert_deploys(0, i64::MAX, 0, 100)
+                        .expect("the deploys read"),
+                );
+                let [f1, f2, s] = deploys[..] else {
+                    panic!("three deploy records: {deploys:?}");
+                };
+                assert!(
+                    monitor.watermark < f1,
+                    "committed after the mirror read, before the deploys read"
+                );
+                assert_eq!(
+                    deploy_alerts(client),
+                    0,
+                    "the start feeds nothing past its watermark"
+                );
+                monitor.check(store).expect("the step checks");
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{f1}")),
+                    ("cleared".to_string(), Some(s))
+                );
+                assert_eq!(
+                    alert(client, &format!("deploy_failed:{f2}")).0,
+                    "none",
+                    "no phantom: F2 came while F1 was open"
+                );
+                assert_eq!(deploy_alerts(client), 1);
+            });
+        }
+
+        /// A start replays deploy records only (#504, rev-500-b F2): a
+        /// `backup.verified` carries an `ok` too. One failed before a first
+        /// start fires no `deploy_failed`; a good one recorded while the
+        /// loop is down clears no open `deploy_failed` at the next start,
+        /// and the deploy's own success still does.
+        #[test]
+        fn a_start_replays_no_other_record_as_a_deploy() {
+            in_schema("alerts_deploy_only", |store, client| {
+                record(
+                    client,
+                    1,
+                    r#"{"type":"backup.verified","ok":false,"key":"v1","reason":"bad"}"#,
+                );
+                let mut monitor = started(store);
+                assert_eq!(deploy_alerts(client), 0, "a failed drill is no deploy");
+                let failed = finished(client, 0, false);
+                monitor.check(store).expect("the step checks");
+                let key = format!("deploy_failed:{failed}");
+                assert_eq!(alert(client, &key), ("open".to_string(), None));
+                drop(monitor);
+                record(
+                    client,
+                    0,
+                    r#"{"type":"backup.verified","ok":true,"key":"v2"}"#,
+                );
+                let monitor = started(store);
+                assert_eq!(
+                    alert(client, &key),
+                    ("open".to_string(), None),
+                    "a good drill is no deploy"
+                );
+                drop(monitor);
+                let fixed = finished(client, 0, true);
+                let _monitor = started(store);
+                assert_eq!(alert(client, &key), ("cleared".to_string(), Some(fixed)));
+                assert_eq!(deploy_alerts(client), 1);
             });
         }
 

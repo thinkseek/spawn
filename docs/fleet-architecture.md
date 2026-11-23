@@ -1329,7 +1329,18 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   of a store the step meets for the first time) finds the alert the earlier
   one fired and clears it, naming itself. The judge's exception stands: an
   `up` whose `down` is older than the history clears its open alert (the
-  `up` is the later record).
+  `up` is the later record). The deploys' records are read apart from that
+  history: a deploy restarts the loop and only then records its
+  `deploy.finished` (deploy/deploy.sh), so the record is often at or below
+  the new step's watermark, where no check feeds it. A restarted step
+  therefore replays, one at a time, the `deploy.finished` records after the
+  last one its `deploy_failed` alerts name (the newest failure one fired on
+  or success one was cleared by; the owner's judgement, for one it cleared)
+  up to its watermark, whatever their age: the first success after an open
+  alert's failure clears it, a success older than the failure is not read,
+  a failure recorded while the loop was down fires once, and one that fired
+  nothing while an alert was open is no new occurrence at a restart. A
+  store with no `deploy_failed` alert yet reads the last 7 days.
 - **When.** A record-borne alert is recorded within one pass of its record; a
   host reading or a log line within `SPAWN_ALERT_CHECK_SECS` (default 30)
   and one pass; a bound within one pass of falling due, never before,
