@@ -333,6 +333,12 @@ from (select e.id, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as record
 /// of an older execution, after the resume's start, would otherwise read a
 /// live session as ended.
 ///
+/// `execution_event` is the current execution's start (its
+/// `execution.started` id) while it has not ended: a judged `agent_stuck`
+/// holds its session for that execution only (issue #80), so a fresh
+/// execution (a restart) is a new stretch even when no pass read the end
+/// between them.
+///
 /// Two reads of the log whatever the number of sessions: the judgements,
 /// and each session's latest start or end, joined once. (The live log's ten
 /// judgements cost 21 scans a pass read as correlated subqueries, one per
@@ -355,15 +361,37 @@ current as (
 select coalesce(jsonb_agg(jsonb_build_object(
       'session_id', o.session_id, 'agent_id', o.agent_id, 'event_id', o.id,
       'at_ms', o.recorded_at_ms, 'observation', o.observation,
-      'ended_event', o.ended_event, 'ended_cause', o.ended_cause)
+      'ended_event', o.ended_event, 'ended_cause', o.ended_cause,
+      'execution_event', o.execution_event)
     order by o.session_id), '[]'::jsonb)
 from (select l.session_id, l.agent_id, l.id, l.recorded_at_ms, l.observation,
              case when x.event_name = 'execution.ended' then x.id end as ended_event,
              case when x.event_name = 'execution.ended'
-                  then x.kind -> 'detail' ->> 'cause' end as ended_cause
+                  then x.kind -> 'detail' ->> 'cause' end as ended_cause,
+             case when x.event_name = 'execution.started' then x.id end as execution_event
         from latest l
         left join current x using (session_id)
        order by l.session_id) o";
+
+/// Which of the sessions `$1` recorded, after the event `$2` (the same
+/// position in its array: the judgement its judged `agent_stuck` fired
+/// on), a judgement that ended its stuck stretch: a score under `$3`, or a
+/// rules judgement with no score (issue #80, review 519-a F1). Read once
+/// when the loop starts, for the stretches it rebuilds from the alert rows:
+/// a hold that ended is not written anywhere, so a judged row stays its
+/// session's newest after its stretch ended, while the loop ran or not.
+/// The index on `(session_id, event_name, id)` finds each session's
+/// judgements after its alert's.
+pub(crate) const STUCK_ENDED: &str = r"
+select coalesce(jsonb_agg(h.session_id order by h.session_id), '[]'::jsonb)
+from unnest($1::text[], $2::bigint[]) h(session_id, after)
+where exists (
+  select 1 from spawn_events e
+   where e.session_id = h.session_id and e.event_name = 'observation.recorded'
+     and e.id > h.after
+     and case when jsonb_typeof(e.kind -> 'detail' -> 'observation' -> 'stuck') = 'number'
+              then (e.kind -> 'detail' -> 'observation' ->> 'stuck')::float8 < $3
+              else e.kind -> 'detail' -> 'observation' ->> 'judge' = 'rules' end)";
 
 /// Commands that finished failed after `$1`, oldest first: a notice each,
 /// an owner's note excepted (the alert step skips those).
@@ -580,6 +608,17 @@ impl PostgresStore {
     /// Every session's latest judgement ([`OBSERVATIONS`]).
     pub fn alert_observations(&self) -> Result<Value, StoreError> {
         self.query_json(OBSERVATIONS, &[])
+    }
+
+    /// Which of `sessions` ended their stuck stretch after the judgement
+    /// `after` names for each ([`STUCK_ENDED`]), a score under `likely`.
+    pub fn alert_stuck_ended(
+        &self,
+        sessions: &[String],
+        after: &[i64],
+        likely: f64,
+    ) -> Result<Value, StoreError> {
+        self.query_json(STUCK_ENDED, &[&sessions, &after, &likely])
     }
 
     /// The messages the `message_not_taken` alert's start reads
