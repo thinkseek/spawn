@@ -1158,7 +1158,9 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   the same scenario, on an ancestor of the base and unsolved on it, which
   scripts/rsi/gate.sh reads from the solved index beside its base cache; one
   per mission and scenario while red, cleared at the first later `accepted`
-  gating of the mission that does not name it), `validator_defect` (a
+  gating of the mission that does not name it; its text names the task
+  whose gate saw it and the base's first 8 hex, an observation, not a
+  present fact, issue #71), `validator_defect` (a
   regression that fails on the base too, run again in the gate: from a
   task's `host_fault` with evidence `validator_defect`, one per mission and
   scenario, also cleared at the mission's next `accepted` or `rejected`
