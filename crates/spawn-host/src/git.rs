@@ -83,6 +83,42 @@ pub const ENGINE_RUNTIME_FILES: [&str; 11] = [
     ".claude/assistant-daemon-state.json",
 ];
 
+/// How many more times a checkpoint's `add` runs when a file vanished from
+/// the work tree while git staged it ([`GitWorkspace::stage_all_but`]).
+const VANISHED_RETRIES: usize = 3;
+
+/// The path a failed `git add` named that is gone from the work tree in
+/// `directory` now. git lists the untracked files of a directory, then
+/// reads each one, and a file another process removed in between ends the
+/// whole `add`: `fatal: unable to stat '<path>': No such file or
+/// directory`, or, removed after the stat, `error: unable to index file
+/// '<path>'` (messages in the C locale, [`git_command`]). `None` for any
+/// other failure, and for a path that is still there (or cannot be looked
+/// at): that is a real error, never a race.
+fn vanished_path(error: &WorkspaceError, directory: &Path) -> Option<String> {
+    let WorkspaceError::Unavailable(text) = error else {
+        return None;
+    };
+    ["unable to stat '", "unable to index file '"]
+        .iter()
+        .filter_map(|marker| {
+            let (_, rest) = text.split_once(marker)?;
+            let (path, _) = rest.split_once('\'')?;
+            Some(path)
+        })
+        .find(|path| {
+            !path.is_empty()
+                && matches!(
+                    std::fs::symlink_metadata(directory.join(path)),
+                    Err(error) if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    )
+                )
+        })
+        .map(str::to_string)
+}
+
 /// Pathspecs that match the engine's runtime files
 /// ([`ENGINE_RUNTIME_FILES`]) at any depth, each with `glob` magic and
 /// `magic` before it (`exclude`, or nothing). A glob pathspec never matches
@@ -622,6 +658,14 @@ impl GitWorkspace {
     /// never hashed: an exclude pathspec, so no ignore rule of the project
     /// (a `.gitignore` that re-includes one) brings one in. The paths go to
     /// git on standard input, so any number of them fits.
+    ///
+    /// The work tree is live while it is staged: a file another process
+    /// removes between git's listing of its directory and its read of the
+    /// file (a test's or a build's scratch under `.tmp/`) fails the whole
+    /// `add`. Such an `add` is run again, up to [`VANISHED_RETRIES`] more
+    /// times, only when the path git names is gone from the work tree now
+    /// ([`vanished_path`]): the next listing no longer has it. Any other
+    /// failure, or one that names a path still there, is the checkpoint's.
     fn stage_all_but(
         &self,
         directory: &Path,
@@ -635,8 +679,19 @@ impl GitWorkspace {
                 .map(|(path, _)| path.pathspec("exclude,literal")),
         );
         add.extend(runtime_pathspecs("exclude"));
-        self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add)
-            .map(|_| ())
+        let mut retries = 0;
+        loop {
+            match self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add) {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if retries < VANISHED_RETRIES && vanished_path(&error, directory).is_some() =>
+                {
+                    retries += 1;
+                    clear_dead_lock(index);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Make the index's entries for the engine's runtime files
@@ -3103,6 +3158,112 @@ mod tests {
         store.unmount(&workspace).expect("kept, then removed");
         assert!(!directory.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A git whose first `add -A` finds `vanishing` (a path under the work
+    /// tree `directory`) gone between its listing and its read: it removes
+    /// the file and fails as git does (`fatal: unable to stat ...`), the
+    /// live `spawn-loop` failure of 2026-11-23 on a `.tmp/` scratch file.
+    /// With `always`, every `add -A` fails so, naming `vanishing`. Every
+    /// other call is git's.
+    fn vanishing_git(base: &Path, directory: &Path, vanishing: &str, always: bool) -> String {
+        let script = base.join("vanishing-git");
+        let marker = base.join("vanished-once");
+        let once = if always {
+            String::new()
+        } else {
+            format!(
+                "    if [ ! -e '{marker}' ]; then\n      : > '{marker}'\n",
+                marker = marker.display()
+            )
+        };
+        let end = if always { "" } else { "    fi\n" };
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\" add -A \"*)\n{once}      rm -f '{path}'\n      \
+                 echo \"fatal: unable to stat '{vanishing}': No such file or directory\" >&2\n      \
+                 exit 128\n{end}    ;;\nesac\nexec git \"$@\"\n",
+                path = directory.join(vanishing).display()
+            ),
+        )
+        .expect("write the vanishing git");
+        assert!(
+            Command::new("chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod")
+                .success()
+        );
+        script.to_string_lossy().to_string()
+    }
+
+    /// A scratch file that vanishes while a checkpoint stages the work tree
+    /// fails no checkpoint: the `add` runs again, the vanished file is in
+    /// no commit, and the rest of the work is.
+    #[test]
+    fn an_untracked_file_that_vanishes_during_the_add_fails_no_checkpoint() {
+        let (checkout, store, workspace, base) = capped("vanish");
+        let directory = PathBuf::from(workspace.path());
+        let vanishing = ".tmp/spawn-feature-anchor-1234";
+        std::fs::create_dir_all(directory.join(".tmp")).expect("create .tmp");
+        std::fs::write(directory.join(vanishing), "scratch\n").expect("write");
+        std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
+        let racing = GitWorkspace {
+            git: vanishing_git(&base, &directory, vanishing, false),
+            ..store.clone()
+        };
+        let Commit::Created(commit) = racing.commit(&workspace, "one").expect("checkpoint") else {
+            panic!("the work is committed");
+        };
+        assert!(base.join("vanished-once").exists(), "the add raced once");
+        let files = git(
+            &checkout,
+            &["ls-tree", "-r", "--name-only", commit.as_str()],
+        );
+        assert!(files.lines().any(|file| file == "work.txt"), "{files}");
+        assert!(!files.contains("spawn-feature-anchor"), "{files}");
+    }
+
+    /// The retry masks nothing: a failure that names a path still there
+    /// is the checkpoint's at once, and a path that keeps vanishing ends
+    /// the checkpoint after a bounded number of runs.
+    #[test]
+    fn a_stat_failure_on_a_present_path_or_one_that_keeps_vanishing_is_an_error() {
+        let (_checkout, store, workspace, base) = capped("vanish-real");
+        let directory = PathBuf::from(workspace.path());
+        let present = WorkspaceError::Unavailable(
+            "git add -A: fatal: unable to stat 'README.md': Permission denied".to_string(),
+        );
+        assert_eq!(super::vanished_path(&present, &directory), None);
+        let gone = WorkspaceError::Unavailable(
+            "git add -A: error: open(\"a/b\"): No such file or directory\nerror: unable to \
+             index file 'a/b'\nfatal: adding files failed"
+                .to_string(),
+        );
+        assert_eq!(
+            super::vanished_path(&gone, &directory).as_deref(),
+            Some("a/b")
+        );
+        let other = WorkspaceError::Unavailable("git add -A: fatal: index.lock exists".to_string());
+        assert_eq!(super::vanished_path(&other, &directory), None);
+
+        std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
+        let failing = GitWorkspace {
+            git: vanishing_git(&base, &directory, ".tmp/always-gone", true),
+            ..store.clone()
+        };
+        let failed = failing.commit(&workspace, "never");
+        assert!(
+            matches!(&failed, Err(WorkspaceError::Unavailable(text)) if text.contains("unable to stat")),
+            "{failed:?}"
+        );
+        // The real git commits it.
+        assert!(matches!(
+            store.commit(&workspace, "after").expect("checkpoint"),
+            Commit::Created(_)
+        ));
     }
 
     /// A repository with `main`, and `agent_a` mounted under `<base>/work`
