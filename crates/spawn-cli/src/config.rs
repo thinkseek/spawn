@@ -59,8 +59,25 @@ pub(crate) fn env_or(name: &str, fallback: &str) -> String {
     env_value(name).unwrap_or_else(|| fallback.to_string())
 }
 
+/// Where `SPAWN_DATABASE_URL` comes from, as the usage and the error of a
+/// command run without it say (GitHub #63, part 3): spawn reads it from its
+/// environment only, and a fleet host keeps it in the loop's `spawn.env`.
+pub(crate) const DATABASE_URL_SOURCE: &str = "spawn reads SPAWN_DATABASE_URL from its \
+     environment only: on a fleet host it is in the loop's spawn.env (source that file \
+     first); elsewhere export SPAWN_DATABASE_URL as a postgres:// connection string";
+
 pub(crate) fn required_env(name: &str) -> Result<String, String> {
-    env_value(name).ok_or_else(|| format!("{name} is not set"))
+    env_value(name).ok_or_else(|| not_set(name))
+}
+
+/// The error of a required variable that is not set; the database's says
+/// where it comes from ([`DATABASE_URL_SOURCE`]).
+fn not_set(name: &str) -> String {
+    if name == "SPAWN_DATABASE_URL" {
+        format!("{name} is not set; {DATABASE_URL_SOURCE}")
+    } else {
+        format!("{name} is not set")
+    }
 }
 
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
@@ -272,6 +289,18 @@ mod tests {
             Some(real.display().to_string().as_str())
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_database_url_says_where_it_comes_from() {
+        let error = not_set("SPAWN_DATABASE_URL");
+        assert!(
+            error.starts_with("SPAWN_DATABASE_URL is not set; "),
+            "{error}"
+        );
+        assert!(error.contains("spawn.env"), "{error}");
+        assert!(error.contains("environment"), "{error}");
+        assert_eq!(not_set("SPAWN_OTHER"), "SPAWN_OTHER is not set");
     }
 
     #[test]

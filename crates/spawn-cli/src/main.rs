@@ -106,12 +106,45 @@ fn long_lived() {
     }
 }
 
+/// The whole usage: the contract's line, the other commands, and where the
+/// database setting comes from (GitHub #63, part 3).
+fn full_usage() -> String {
+    format!(
+        "{USAGE}\n{MORE_USAGE}\n\nMost commands need SPAWN_DATABASE_URL; {}.",
+        config::DATABASE_URL_SOURCE
+    )
+}
+
+/// Whether the words ask for the usage: `spawn --help`, `spawn -h`, `spawn
+/// help`, or `spawn <command> ... --help` (before a `--`, past which the
+/// words are a program's). `spawn run` hands its words to the program it
+/// starts, and `spawn ack` joins the words after its outcome into a free
+/// why (`spawn ack 7 declined see --help`), so only their first word asks:
+/// `spawn run --help`, `spawn ack --help`. Every other free text (a brief,
+/// a reason, a note) is one flag value, a single word.
+fn help_requested(command: &str, rest: &[String]) -> bool {
+    if matches!(command, "--help" | "-h" | "help") {
+        return true;
+    }
+    if matches!(command, "run" | "ack") {
+        return rest.first().is_some_and(|word| word == "--help");
+    }
+    rest.iter()
+        .take_while(|word| word.as_str() != "--")
+        .any(|word| word == "--help")
+}
+
 pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
-        return Err(format!("{USAGE}\n{MORE_USAGE}"));
+        return Err(full_usage());
     };
     let rest: Vec<String> = arguments.collect();
+    // The usage asked for is printed whole, opening no store.
+    if help_requested(&command, &rest) {
+        println!("{}", full_usage());
+        return Ok(0);
+    }
     match command.as_str() {
         "init-db" => {
             open_store()?.migrate().map_err(|error| error.to_string())?;
@@ -165,7 +198,42 @@ pub(crate) fn dispatch() -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MORE_USAGE, USAGE};
+    use super::{MORE_USAGE, USAGE, full_usage, help_requested};
+
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn help_is_asked_at_the_top_and_after_a_command_but_not_of_a_program() {
+        for command in ["--help", "-h", "help"] {
+            assert!(help_requested(command, &[]), "{command}");
+        }
+        assert!(help_requested("task", &words("--help")));
+        assert!(help_requested("task", &words("assign --help")));
+        assert!(help_requested("fleet", &words("--help")));
+        assert!(help_requested("run", &words("--help")));
+        assert!(help_requested("ack", &words("--help")));
+        assert!(!help_requested("ack", &words("12 declined see --help")));
+        assert!(!help_requested("ack", &words("12 done --help works now")));
+        assert!(!help_requested("task", &words("accept --id 3")));
+        assert!(!help_requested("run", &words("claude --help")));
+        assert!(!help_requested("run", &words("-- claude --help")));
+        assert!(!help_requested(
+            "mask-hook",
+            &words("--values f -- x --help")
+        ));
+        assert!(!help_requested("nonsense", &[]));
+    }
+
+    #[test]
+    fn the_whole_usage_says_where_the_database_setting_comes_from() {
+        let usage = full_usage();
+        assert!(usage.starts_with(USAGE), "{usage}");
+        assert!(usage.contains(MORE_USAGE), "{usage}");
+        assert!(usage.contains("SPAWN_DATABASE_URL"), "{usage}");
+        assert!(usage.contains("spawn.env"), "{usage}");
+    }
 
     #[test]
     fn the_usage_names_the_backup_command() {

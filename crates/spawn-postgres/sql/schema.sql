@@ -3500,6 +3500,7 @@ create or replace function spawn_task_review(p_task bigint, p_accept boolean, p_
 returns void language plpgsql security definer as $$
 declare
     v_revision integer;
+    v_state text;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -3509,9 +3510,18 @@ begin
     if not p_accept and coalesce(trim(p_note), '') = '' then
         raise exception 'sending a task back needs a note';
     end if;
-    select revisions into v_revision from mission_tasks where id = p_task and state = 'reported';
-    if v_revision is null then
-        raise exception 'task % has no report to review', p_task;
+    -- A task that is not `reported` is refused naming its state (an
+    -- accept on a task its gate already accepted reads "task N is
+    -- accepted", one sent back "task N is sent back for revision"), and a
+    -- task that does not exist says so (GitHub #63, part 3).
+    select state, revisions into v_state, v_revision from mission_tasks where id = p_task;
+    if v_state is null then
+        raise exception 'task % does not exist: it has no report to review', p_task;
+    end if;
+    if v_state <> 'reported' then
+        raise exception 'task % is %: it has no report to review', p_task,
+                        case v_state when 'revise' then 'sent back for revision'
+                                     else v_state end;
     end if;
     if p_revision is not null and p_revision <> v_revision then
         raise exception 'task % is at revision %, not %: read its report again', p_task,

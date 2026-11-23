@@ -250,8 +250,13 @@ pub(super) fn attention() -> Result<Value, String> {
 /// `told` escalations, each `{tag, session_id, agent_id, why, judgement}`,
 /// `judgement` true for one that is a worker's own judgement (attention,
 /// stopped at its prompt, a nudge that did not help): the alert step decides
-/// which of them are the supervisor's to act on. `lines` are the plan's log
-/// lines, for the loop's log.
+/// which of them are the supervisor's to act on. A report item or a review
+/// stall of a task that waits on a reviewer who may be the owner (reported
+/// in a mission with no gate, `accept` = `review`: owner work, protected
+/// files included) is left out of `items` and listed by tag in
+/// `owner_review` ([`dispatch_items`]): the supervisor that leaves it to the
+/// owner is not stuck on it. `lines` are the plan's log lines, for the
+/// loop's log.
 pub(crate) fn supervisor_dispatch(store: &spawn_postgres::PostgresStore) -> Result<Value, String> {
     let disk = store.host_disk().map_err(super::err)?;
     let (bounds, _) = dispatch::Bounds::from_env();
@@ -281,32 +286,83 @@ pub(crate) fn supervisor_dispatch(store: &spawn_postgres::PostgresStore) -> Resu
             asks(facts, said.as_ref()).is_some()
         }
     });
-    let agents: BTreeMap<&str, &str> = reading
-        .rows
+    let (items, owner_review) = dispatch_items(
+        &reading.rows,
+        &reading.work,
+        reading.plan.pending.iter().chain(&reading.plan.told),
+    );
+    // The plan's once-said log lines (an order no task can meet) are said
+    // by whoever reads the plan first in this process: the loop logs them.
+    Ok(json!({
+        "question": question, "items": items, "owner_review": owner_review,
+        "lines": reading.lines,
+    }))
+}
+
+/// [`supervisor_dispatch`]'s `items` and `owner_review` from the plan's
+/// pending and told `escalations`: every escalation is an item, each
+/// `{tag, session_id, agent_id, why, judgement}`, but one that waits on the
+/// owner's review ([`waits_on_owner_review`]), which is listed by its tag
+/// in `owner_review` instead.
+fn dispatch_items<'a>(
+    rows: &[Facts],
+    work: &crate::deliver::Work,
+    escalations: impl Iterator<Item = &'a Escalation>,
+) -> (Vec<Value>, Vec<String>) {
+    let agents: BTreeMap<&str, &str> = rows
         .iter()
         .map(|facts| (facts.session_id.as_str(), facts.agent_id.as_str()))
         .collect();
-    let items: Vec<Value> = reading
-        .plan
-        .pending
-        .iter()
-        .chain(&reading.plan.told)
-        .map(|escalation| {
-            json!({
-                "tag": escalation.tag(),
-                "session_id": escalation.session_id,
-                "agent_id": agents.get(escalation.session_id.as_str()),
-                "why": dispatch::heading(escalation.why),
-                "judgement": matches!(
-                    escalation.why,
-                    dispatch::Why::Attention | dispatch::Why::Idle | dispatch::Why::NudgeFailed
-                ),
-            })
-        })
-        .collect();
-    // The plan's once-said log lines (an order no task can meet) are said
-    // by whoever reads the plan first in this process: the loop logs them.
-    Ok(json!({ "question": question, "items": items, "lines": reading.lines }))
+    let mut items = Vec::new();
+    let mut owner_review = Vec::new();
+    for escalation in escalations {
+        if waits_on_owner_review(escalation, work) {
+            owner_review.push(escalation.tag());
+            continue;
+        }
+        items.push(json!({
+            "tag": escalation.tag(),
+            "session_id": escalation.session_id,
+            "agent_id": agents.get(escalation.session_id.as_str()),
+            "why": dispatch::heading(escalation.why),
+            "judgement": matches!(
+                escalation.why,
+                dispatch::Why::Attention | dispatch::Why::Idle | dispatch::Why::NudgeFailed
+            ),
+        }));
+    }
+    (items, owner_review)
+}
+
+/// Whether `escalation` is a task's report item (`report-<task>-<revision>`)
+/// or its review stall (`stall-<task>-judgement-<n>`) while the task is
+/// reported in a mission with no gate (its `accept` is `review`): such a
+/// task waits on its review, which in an owner's mission (owner work,
+/// protected files included) is the owner's `spawn task accept`, outside
+/// the supervisor's grants. The digest still tells the supervisor; what it
+/// does not do is pin the supervisor as having work to dispatch, so a
+/// supervisor that left it to the owner raises no `agent_stuck` on it. A
+/// gated mission's report stays the supervisor's (it reviews before the
+/// gate judges), as does every other escalation.
+fn waits_on_owner_review(escalation: &Escalation, work: &crate::deliver::Work) -> bool {
+    let task = match escalation.why {
+        dispatch::Why::Report => escalation
+            .id
+            .strip_prefix("report-")
+            .and_then(|rest| rest.split('-').next()),
+        dispatch::Why::Stalled => escalation
+            .id
+            .strip_prefix("stall-")
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(task, step)| step.starts_with("judgement-").then_some(task)),
+        _ => None,
+    };
+    let Some(task) = task.and_then(|task| task.parse::<i64>().ok()) else {
+        return false;
+    };
+    work.tasks.iter().any(|row| {
+        row.id == task && row.state == spawn_core::mission::TaskState::Reported && !row.gated
+    })
 }
 
 /// The owner's holds of `holds` (`PostgresStore::source_holds`: `{now_ms,
@@ -1944,5 +2000,99 @@ mod tests {
                 json!({"tasks": [{"id": 271, "state": "delivered"}], "settled": false}),
             ]
         );
+    }
+
+    /// The live friction of 2026-11-23: mission 7 (owner work, `accept` =
+    /// `review`, no gate) has task 510 reported, waiting on the owner's
+    /// `spawn task accept`. Its report item and its review stall went to
+    /// the supervisor, which leaves owner work to the owner, and each pass
+    /// counted them as its work to dispatch: `agent_stuck` on
+    /// `session_supervisor` fired and stood. They are the owner's review
+    /// now, not the supervisor's dispatch; a gated mission's report, a
+    /// delivered task's stall and a worker's unfinished report stay its.
+    #[test]
+    fn an_ungated_review_missions_report_waits_on_the_owner_not_the_supervisor() {
+        let task = |id: i64, mission: i64, state: &str, gated: bool| {
+            json!({
+                "id": id, "mission_id": mission, "kind": "ephemeral",
+                "agent_id": format!("agent_worker_t{id}"),
+                "session_id": format!("session_worker_t{id}"),
+                "brief": "b", "state": state, "revisions": 0, "mission_text": "m",
+                "gated": gated,
+            })
+        };
+        let work = Work {
+            tasks: serde_json::from_value(json!([
+                task(510, 7, "reported", false),
+                task(511, 4, "reported", true),
+                task(512, 7, "delivered", false),
+            ]))
+            .expect("task rows"),
+            ..Work::default()
+        };
+        let rows = vec![facts(&row(
+            "session_worker_t510",
+            "agent_worker_t510",
+            &judged("COMPLETED", 0.1, false, 9),
+            NOW,
+        ))];
+        let item = |session: &str, id: &str, why: Why| Escalation {
+            session_id: session.to_string(),
+            id: id.to_string(),
+            why,
+            line: "l".to_string(),
+            since_ms: None,
+        };
+        let escalations = [
+            item("session_worker_t510", "report-510-0", Why::Report),
+            item(
+                "session_worker_t510",
+                "stall-510-judgement-4410",
+                Why::Stalled,
+            ),
+            item("session_worker_t511", "report-511-0", Why::Report),
+            item(
+                "session_worker_t511",
+                "stall-511-judgement-4411",
+                Why::Stalled,
+            ),
+            item("session_worker_t512", "stall-512-activity-77", Why::Stalled),
+            item(
+                "session_worker_t510",
+                "report-unfinished-510-0-00000000000000ab",
+                Why::Report,
+            ),
+            // A report of a task no row names (gone from the rows) is kept.
+            item("session_worker_t999", "report-999-0", Why::Report),
+        ];
+        let (items, owner_review) = super::dispatch_items(&rows, &work, escalations.iter());
+        assert_eq!(
+            owner_review,
+            [
+                "session_worker_t510 report-510-0",
+                "session_worker_t510 stall-510-judgement-4410",
+            ]
+        );
+        let tags: Vec<&str> = items
+            .iter()
+            .filter_map(|item| item["tag"].as_str())
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "session_worker_t511 report-511-0",
+                "session_worker_t511 stall-511-judgement-4411",
+                "session_worker_t512 stall-512-activity-77",
+                "session_worker_t510 report-unfinished-510-0-00000000000000ab",
+                "session_worker_t999 report-999-0",
+            ]
+        );
+        // The alert step reads exactly these items as the supervisor's
+        // dispatch: with the owner's review alone, it has nothing to do.
+        let (items, _) = super::dispatch_items(&rows, &work, escalations[..2].iter());
+        let dispatch = crate::alerts::Dispatch::from_value(
+            &json!({"question": false, "items": items, "owner_review": []}),
+        );
+        assert!(dispatch.items.is_empty(), "{dispatch:?}");
     }
 }

@@ -194,7 +194,15 @@
 //!   task, no mission of its own waiting for its first task), its open one
 //!   clearing at the first pass that finds so. A worker's alert names its
 //!   `task` and `command`, the one command that acts on it: `spawn task
-//!   restart --id <task>` (a delivered task's).
+//!   restart --id <task>` (a delivered task's). Its evidence and text also
+//!   carry the observation's `ambiguity` (why the rules asked the model)
+//!   and `progress_secs` (how long before it the engine last moved), when
+//!   the observation records them, and its execution (`execution_event`).
+//!   One the owner judged `false`, `stale` or `duplicate` holds its session
+//!   (issue #80): no `agent_stuck` fires for it until its stuck stretch
+//!   ends (a latest judgement under 0.5, a rules one with no `stuck`, the
+//!   end of its execution or another execution current); rebuilt from the
+//!   alert rows at start, so a restart does not fire it again.
 //! - `judge_down`, the judge's name (`jev`), key `judge_down:<its
 //!   host.judge down event>`: the model judge's watcher recorded `down` (two
 //!   calls in a row failed after its last answer, crate judge_watch.rs) and
@@ -851,6 +859,14 @@ pub(crate) struct Monitor {
     /// judgement read after it of an alert out since before it keeps no
     /// stretch (objective 209 (1)).
     guardrail_in: BTreeMap<String, i64>,
+    /// Each session whose `agent_stuck` the owner judged `false`, `stale`
+    /// or `duplicate` while open (issue #80), with the execution that alert
+    /// was of (its evidence's `execution_event`; `None` for an alert fired
+    /// before it was recorded), from the alert rows the loop starts with
+    /// ([`Monitor::seed_stuck_judged`]) or an `alert.judged` record it reads
+    /// while it runs: no `agent_stuck` fires for the session until its stuck
+    /// stretch ends ([`Monitor::observe`]).
+    stuck_judged: BTreeMap<String, Option<i64>>,
     /// The last archive event the step read (`archive_failed`, objective
     /// 193): the next read is of the ones after it. `0` at start, so the
     /// first read rebuilds every occurrence.
@@ -929,6 +945,37 @@ fn ephemeral(agent: &str) -> bool {
     agent.starts_with("agent_worker_")
 }
 
+/// What a stuck `observation` adds to its alert (issue #80): the
+/// execution it is of (`execution_event`, which a judgement of the alert
+/// holds the session for), and why the model was asked: its `ambiguity`
+/// and how long before it the engine last moved (its evidence's
+/// `progress_ms`, as `progress_secs`), in the `evidence` and the `text`
+/// when the observation records them.
+fn stuck_context(observation: &Value, evidence: &mut Value, text: String) -> String {
+    if let Some(execution) = observation["execution_event"].as_i64() {
+        evidence["execution_event"] = json!(execution);
+    }
+    let judgement = &observation["observation"];
+    let ambiguity = judgement["ambiguity"].as_str();
+    let progress_secs = judgement["evidence"]["progress_ms"]
+        .as_u64()
+        .map(|ms| ms / 1000);
+    if let Some(ambiguity) = ambiguity {
+        evidence["ambiguity"] = json!(ambiguity);
+    }
+    if let Some(secs) = progress_secs {
+        evidence["progress_secs"] = json!(secs);
+    }
+    match (ambiguity, progress_secs) {
+        (Some(ambiguity), Some(secs)) => {
+            format!("{text} ({ambiguity}, last progress {secs} s before)")
+        }
+        (Some(ambiguity), None) => format!("{text} ({ambiguity})"),
+        (None, Some(secs)) => format!("{text} (last progress {secs} s before)"),
+        (None, None) => text,
+    }
+}
+
 /// The one command that acts on a worker stuck in its task.
 fn restart_command(task: i64) -> String {
     format!("spawn task restart --id {task}")
@@ -982,6 +1029,7 @@ impl Monitor {
             guardrail_seeded: false,
             guardrail_judged: BTreeMap::new(),
             guardrail_in: BTreeMap::new(),
+            stuck_judged: BTreeMap::new(),
             archives_after: 0,
             archives_due: true,
             archive_occurrences: BTreeMap::new(),
@@ -1114,15 +1162,8 @@ impl Monitor {
             .unwrap_or_else(|| store.now_ms().unwrap_or_default());
         self.seed_mirror(&mirror);
         let rows = store.alert_rows().map_err(|error| error.to_string())?;
-        for row in rows["rows"].as_array().into_iter().flatten() {
-            if let Some((key, row)) = Row::from_value(row) {
-                self.known.insert(key, row);
-            }
-        }
-        self.seed_judged(&rows["rows"]);
-        self.seed_red();
-        self.seed_defects();
-        self.seed_parked();
+        self.seed_rows(&rows["rows"]);
+        self.seed_stuck_ended(store)?;
         let history = store
             .alert_history(now.saturating_sub(HISTORY_MS), HISTORY_LIMIT)
             .map_err(|error| error.to_string())?;
@@ -1216,6 +1257,90 @@ impl Monitor {
         Ok(())
     }
 
+    /// The alert `rows` the store holds (oldest first), as the start reads
+    /// them back: the keys known, and what each kind keeps from them.
+    fn seed_rows(&mut self, rows: &Value) {
+        for row in rows.as_array().into_iter().flatten() {
+            if let Some((key, row)) = Row::from_value(row) {
+                self.known.insert(key, row);
+            }
+        }
+        self.seed_judged(rows);
+        self.seed_stuck_judged(rows);
+        self.seed_red();
+        self.seed_defects();
+        self.seed_parked();
+    }
+
+    /// The judged stuck stretches in the alert `rows` the loop starts with
+    /// (oldest first, issue #80): each session whose newest `agent_stuck`
+    /// was cleared by a judgement (its cleared evidence `{judged}`; only a
+    /// verdict other than `right` clears), with that alert's execution. A
+    /// newer alert of the session means its stretch had ended: none kept.
+    /// [`Monitor::seed_stuck_ended`] then drops the ones whose stretch ended
+    /// after their alert, while the loop ran or was down; the start's first
+    /// pass, the ones whose execution ended or is no longer current.
+    fn seed_stuck_judged(&mut self, rows: &Value) {
+        let mut newest: BTreeMap<String, (i64, Option<Option<i64>>)> = BTreeMap::new();
+        for row in rows.as_array().into_iter().flatten() {
+            if row["kind"] != "agent_stuck" {
+                continue;
+            }
+            let Some(session) = row["subject"].as_str() else {
+                continue;
+            };
+            let fired = row["fired_at_ms"].as_i64().unwrap_or(0);
+            let judged = row["cleared_evidence"]["judged"]
+                .is_string()
+                .then(|| row["evidence"]["execution_event"].as_i64());
+            if newest.get(session).is_none_or(|(at, _)| fired >= *at) {
+                newest.insert(session.to_string(), (fired, judged));
+            }
+        }
+        for (session, (_, judged)) in newest {
+            if let Some(execution) = judged {
+                self.stuck_judged.insert(session, execution);
+            }
+        }
+    }
+
+    /// The judged stuck stretches the start rebuilt that have ended
+    /// (issue #80, review 519-a F1): a session that recorded, after the
+    /// judgement its judged alert fired on, one under 0.5 or a rules one
+    /// with no `stuck` holds nothing. A hold ends unwritten, so its judged
+    /// row stays the session's newest; without this a stretch that ended
+    /// while the loop ran would be held again at a restart, and a new one
+    /// begun while the loop was down would fire none. An alert with no
+    /// judgement in its evidence is read from the session's first.
+    fn seed_stuck_ended(&mut self, store: &PostgresStore) -> Result<(), String> {
+        if self.stuck_judged.is_empty() {
+            return Ok(());
+        }
+        let (sessions, after): (Vec<String>, Vec<i64>) = self
+            .stuck_judged
+            .keys()
+            .map(|session| {
+                let after = self
+                    .known
+                    .values()
+                    .filter(|row| row.kind == "agent_stuck" && row.subject == *session)
+                    .filter_map(|row| row.evidence["event_id"].as_i64())
+                    .max()
+                    .unwrap_or(0);
+                (session.clone(), after)
+            })
+            .unzip();
+        let ended = store
+            .alert_stuck_ended(&sessions, &after, LIKELY)
+            .map_err(|error| error.to_string())?;
+        for session in ended.as_array().into_iter().flatten() {
+            if let Some(session) = session.as_str() {
+                self.stuck_judged.remove(session);
+            }
+        }
+        Ok(())
+    }
+
     /// The missions and tasks as the start's mirror read them.
     fn seed_mirror(&mut self, mirror: &Value) {
         for mission in mirror["missions"].as_array().into_iter().flatten() {
@@ -1303,7 +1428,12 @@ impl Monitor {
     /// occurrence of its kind and subject fires anew. Judged `right`
     /// (objective 148) it stays open: its condition still clears it.
     /// A `guardrail_out_of_range` alert judged so keeps its stretch
-    /// (objective 209): [`Monitor::judged_stretch`].
+    /// (objective 209): [`Monitor::judged_stretch`]. So does an
+    /// `agent_stuck` (issue #80): its session fires none until its stuck
+    /// stretch ends ([`Monitor::observe`]). Open, the alert's stretch had
+    /// not ended by any judgement the step read under 0.5 or by an end:
+    /// either would have cleared it. A rules judgement clears no open
+    /// alert, so one judged after it holds the stretch current then.
     fn judged_record(&mut self, record: &Value) {
         if record["verdict"] == "right" {
             return;
@@ -1315,12 +1445,17 @@ impl Monitor {
             && row.open()
         {
             row.state = "cleared".to_string();
-            if row.kind == guardrails::KIND {
-                stretch = Some((row.subject.clone(), row.evidence.clone()));
+            if row.kind == guardrails::KIND || row.kind == "agent_stuck" {
+                stretch = Some((row.kind.clone(), row.subject.clone(), row.evidence.clone()));
             }
         }
-        if let Some((subject, evidence)) = stretch {
-            self.judged_stretch(&subject, &evidence);
+        match stretch {
+            Some((kind, subject, evidence)) if kind == "agent_stuck" => {
+                self.stuck_judged
+                    .insert(subject, evidence["execution_event"].as_i64());
+            }
+            Some((_, subject, evidence)) => self.judged_stretch(&subject, &evidence),
+            None => {}
         }
     }
 
@@ -2386,6 +2521,17 @@ times in a row)",
     /// its open alert clears then). A worker's alert names its task and the
     /// one command that acts on it, `spawn task restart --id <task>` (a
     /// delivered task: the only one a restart takes).
+    ///
+    /// A session whose `agent_stuck` the owner judged `false`, `stale` or
+    /// `duplicate` fires none until its stuck stretch ends (issue #80: each
+    /// judgement opened the same claim again under the next observation's
+    /// key within seconds): a latest judgement under 0.5, a rules one with
+    /// no `stuck`, the end of its execution, or a current execution other
+    /// than the judged alert's. A judge that gave no score ends nothing.
+    /// The alert says which ambiguity sent the session to the model judge
+    /// and how long before that judgement the engine last moved, as the
+    /// observation records them (`ambiguity`, its evidence's
+    /// `progress_ms`).
     fn observe(&mut self, observations: &Value, out: &mut Vec<Event>) {
         for observation in observations.as_array().into_iter().flatten() {
             let session = observation["session_id"]
@@ -2397,6 +2543,7 @@ times in a row)",
             let stuck = judgement["stuck"].as_f64();
             let open = self.open_keys("agent_stuck", &session);
             let ended = observation["ended_event"].as_i64();
+            let judged = self.stuck_held(&session, observation);
             let is_supervisor = session == crate::supervise::SUPERVISOR_SESSION;
             let held = if is_supervisor {
                 None
@@ -2454,7 +2601,7 @@ times in a row)",
                         }),
                     });
                 }
-            } else if open.is_empty() && stuck.is_some_and(|stuck| stuck >= LIKELY) {
+            } else if open.is_empty() && !judged && stuck.is_some_and(|stuck| stuck >= LIKELY) {
                 let mut evidence = json!({
                     "agent_id": observation["agent_id"], "stuck": stuck,
                     "state": judgement["state"], "judge": judgement["judge"],
@@ -2465,6 +2612,7 @@ times in a row)",
                     stuck.unwrap_or_default(),
                     judgement["state"].as_str().unwrap_or("unknown")
                 );
+                text = stuck_context(observation, &mut evidence, text);
                 if let Some((task, state)) = &held {
                     let command = (state == "delivered").then(|| restart_command(*task));
                     evidence["task"] = json!(task);
@@ -2489,6 +2637,28 @@ times in a row)",
                 });
             }
         }
+    }
+
+    /// Whether `session`'s judged stuck stretch (issue #80) still holds at
+    /// its latest `observation`: ended by a judgement under 0.5, a rules
+    /// judgement with no `stuck`, the end of its execution, or a current
+    /// execution other than the judged alert's; a judge that gave no score
+    /// ends nothing.
+    fn stuck_held(&mut self, session: &str, observation: &Value) -> bool {
+        let judgement = &observation["observation"];
+        let stuck = judgement["stuck"].as_f64();
+        let execution = observation["execution_event"].as_i64();
+        let over = observation["ended_event"].is_i64()
+            || stuck.is_some_and(|stuck| stuck < LIKELY)
+            || (stuck.is_none() && judgement["judge"] == "rules")
+            || self.stuck_judged.get(session).is_some_and(|held| {
+                held.zip(execution)
+                    .is_some_and(|(held, current)| held != current)
+            });
+        if over {
+            self.stuck_judged.remove(session);
+        }
+        self.stuck_judged.contains_key(session)
     }
 
     /// The task `agent` holds: its latest delivered or later ([`HELD`]),
@@ -8312,6 +8482,298 @@ connections\n";
             if evidence["stuck"] == 0.05 && evidence["event_id"] == 62));
     }
 
+    /// A latest judgement of `session_resident_r1` at `event_id`: scored
+    /// `stuck` by `judge`, of the execution started at `execution`, ended
+    /// at `ended`.
+    fn judgement_of(
+        event_id: i64,
+        stuck: Option<f64>,
+        judge: &str,
+        execution: Option<i64>,
+        ended: Option<i64>,
+    ) -> Value {
+        let mut observation = json!({"state": "WAITING", "judge": judge});
+        if let Some(stuck) = stuck {
+            observation["stuck"] = json!(stuck);
+        }
+        json!([{"session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
+                "event_id": event_id, "at_ms": 0, "observation": observation,
+                "ended_event": ended, "ended_cause": ended.map(|_| "stopped"),
+                "execution_event": execution}])
+    }
+
+    /// The owner judges `key` `verdict` (`spawn alert judge`), read as the
+    /// next pass reads the control stream.
+    fn judge(monitor: &mut Monitor, key: &str, verdict: &str) {
+        let events = feed(
+            monitor,
+            500,
+            0,
+            json!({"type": "alert.judged", "key": key, "verdict": verdict}),
+        );
+        assert!(
+            events.is_empty(),
+            "a judgement decides no event: {events:?}"
+        );
+        assert!(!monitor.is_open(key), "judged {verdict}: cleared");
+    }
+
+    /// Issue #80 defect 2: an `agent_stuck` judged `false`, `stale` or
+    /// `duplicate` does not come back under the next observation's key.
+    /// Three more stuck judgements (new event ids) fire nothing; one under
+    /// 0.5 ends the stretch, and the next stuck one fires, once.
+    #[test]
+    fn a_judged_stuck_alert_holds_its_session_until_its_stretch_ends() {
+        for verdict in ["false", "stale", "duplicate"] {
+            let mut monitor = monitor();
+            let stuck = |id| judgement_of(id, Some(0.9), "jev", Some(40), None);
+            let fired = observed(&mut monitor, &stuck(100));
+            assert_eq!(fires(&fired), ["agent_stuck:session_resident_r1:100"]);
+            commit(&mut monitor, &fired);
+            judge(&mut monitor, "agent_stuck:session_resident_r1:100", verdict);
+            for id in 101..=103 {
+                let again = observed(&mut monitor, &stuck(id));
+                assert!(again.is_empty(), "{verdict}, judgement {id}: {again:?}");
+            }
+            let calm = observed(
+                &mut monitor,
+                &judgement_of(104, Some(0.2), "jev", Some(40), None),
+            );
+            assert!(calm.is_empty(), "{verdict}: nothing open: {calm:?}");
+            let next = observed(&mut monitor, &stuck(105));
+            assert_eq!(
+                fires(&next),
+                ["agent_stuck:session_resident_r1:105"],
+                "{verdict}: a new stretch"
+            );
+            commit(&mut monitor, &next);
+            assert!(
+                observed(&mut monitor, &stuck(106)).is_empty(),
+                "{verdict}: once"
+            );
+        }
+    }
+
+    /// Issue #80 (review 519-a F3): only an alert judged while open holds
+    /// its session. One its stretch's end cleared first (a score under
+    /// 0.5), judged after, holds nothing: the next stuck judgement fires.
+    #[test]
+    fn a_stuck_alert_judged_after_its_stretch_ended_holds_nothing() {
+        for verdict in ["false", "stale", "duplicate"] {
+            let mut monitor = monitor();
+            let fired = observed(
+                &mut monitor,
+                &judgement_of(100, Some(0.9), "jev", Some(40), None),
+            );
+            commit(&mut monitor, &fired);
+            let calm = observed(
+                &mut monitor,
+                &judgement_of(101, Some(0.2), "jev", Some(40), None),
+            );
+            assert!(
+                matches!(calm.as_slice(), [Event::Clear { .. }]),
+                "{verdict}: {calm:?}"
+            );
+            commit(&mut monitor, &calm);
+            judge(&mut monitor, "agent_stuck:session_resident_r1:100", verdict);
+            assert_eq!(
+                fires(&observed(
+                    &mut monitor,
+                    &judgement_of(102, Some(0.9), "jev", Some(40), None)
+                )),
+                ["agent_stuck:session_resident_r1:102"],
+                "{verdict}: a new stretch"
+            );
+        }
+    }
+
+    /// Issue #80: what ends a judged stretch besides a score under 0.5: a
+    /// rules judgement with no `stuck`, the end of its execution, another
+    /// execution current (a restart no pass saw end). A model judgement
+    /// with no score (a judge that failed) ends nothing.
+    #[test]
+    fn a_judged_stuck_stretch_ends_at_a_rules_judgement_an_end_or_a_new_execution() {
+        // (what, the fired alert's execution, the judgement after the
+        // verdict, the next stuck judgement's execution, it fires)
+        let cases = [
+            (
+                "a rules judgement",
+                Some(40),
+                judgement_of(101, None, "rules", Some(40), None),
+                Some(40),
+                true,
+            ),
+            (
+                "its execution's end",
+                None,
+                judgement_of(101, Some(0.9), "jev", None, Some(90)),
+                None,
+                true,
+            ),
+            (
+                "another execution",
+                Some(40),
+                judgement_of(101, None, "jev", Some(50), None),
+                Some(50),
+                true,
+            ),
+            (
+                "a judge with no score",
+                Some(40),
+                judgement_of(101, None, "jev", Some(40), None),
+                Some(40),
+                false,
+            ),
+        ];
+        for (what, execution, ending, next_execution, fires_again) in cases {
+            let mut monitor = monitor();
+            let fired = observed(
+                &mut monitor,
+                &judgement_of(100, Some(0.9), "jev", execution, None),
+            );
+            assert_eq!(
+                fires(&fired),
+                ["agent_stuck:session_resident_r1:100"],
+                "{what}"
+            );
+            assert_eq!(fired_evidence(&fired)["execution_event"], json!(execution));
+            commit(&mut monitor, &fired);
+            judge(&mut monitor, "agent_stuck:session_resident_r1:100", "stale");
+            let between = observed(&mut monitor, &ending);
+            assert!(between.is_empty(), "{what}: {between:?}");
+            let next = observed(
+                &mut monitor,
+                &judgement_of(102, Some(0.9), "jev", next_execution, None),
+            );
+            if fires_again {
+                assert_eq!(
+                    fires(&next),
+                    ["agent_stuck:session_resident_r1:102"],
+                    "{what}"
+                );
+            } else {
+                assert!(next.is_empty(), "{what}: {next:?}");
+            }
+        }
+    }
+
+    fn fired_evidence(events: &[Event]) -> Value {
+        match events {
+            [Event::Fire { evidence, .. }] => evidence.clone(),
+            _ => panic!("one fire: {events:?}"),
+        }
+    }
+
+    /// The alert row the store holds for a fire, cleared with
+    /// `cleared_evidence`, fired at `fired_at_ms`.
+    fn stored_row(events: &[Event], fired_at_ms: i64, cleared_evidence: &Value) -> Value {
+        let [
+            Event::Fire {
+                key,
+                kind,
+                subject,
+                evidence,
+                text,
+                ..
+            },
+        ] = events
+        else {
+            panic!("one fire: {events:?}");
+        };
+        json!({"key": key, "kind": kind, "subject": subject, "state": "cleared",
+               "notice": false, "text": text, "evidence": evidence,
+               "fired_event_id": 1, "fired_at_ms": fired_at_ms,
+               "cleared_event_id": 2, "cleared_at_ms": fired_at_ms + 1,
+               "cleared_evidence": cleared_evidence})
+    }
+
+    /// Issue #80: the judged stretch is rebuilt from the alert rows a
+    /// restarted step starts with: its session's newest `agent_stuck`,
+    /// cleared by a judgement, holds it until its stretch ends. A newer
+    /// alert of the session (its stretch had ended), or another execution
+    /// current, holds nothing.
+    #[test]
+    fn a_judged_stuck_stretch_survives_a_restart_of_the_step() {
+        let stuck = |id, execution| judgement_of(id, Some(0.9), "jev", Some(execution), None);
+        let mut before = monitor();
+        let first = observed(&mut before, &stuck(100, 40));
+        let judged = stored_row(&first, 1000, &json!({"judged": "stale"}));
+
+        let mut restarted = monitor();
+        restarted.seed_rows(&json!([judged.clone()]));
+        for id in 101..=103 {
+            let again = observed(&mut restarted, &stuck(id, 40));
+            assert!(
+                again.is_empty(),
+                "judgement {id} after a restart: {again:?}"
+            );
+        }
+        assert!(
+            observed(
+                &mut restarted,
+                &judgement_of(104, Some(0.2), "jev", Some(40), None)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            fires(&observed(&mut restarted, &stuck(105, 40))),
+            ["agent_stuck:session_resident_r1:105"]
+        );
+
+        // A newer alert of the session, cleared by its condition: the
+        // judged stretch had ended before it.
+        let mut later = monitor();
+        let second = observed(&mut later, &stuck(200, 40));
+        let newer = stored_row(&second, 2000, &json!({"stuck": 0.1, "event_id": 201}));
+        let mut restarted = monitor();
+        restarted.seed_rows(&json!([judged.clone(), newer]));
+        assert_eq!(
+            fires(&observed(&mut restarted, &stuck(202, 40))),
+            ["agent_stuck:session_resident_r1:202"]
+        );
+
+        // Restarted with another execution current.
+        let mut restarted = monitor();
+        restarted.seed_rows(&json!([judged]));
+        assert_eq!(
+            fires(&observed(&mut restarted, &stuck(300, 50))),
+            ["agent_stuck:session_resident_r1:300"]
+        );
+    }
+
+    /// Issue #80: the alert says why the rules asked the model and how long
+    /// before that judgement the engine last moved, as the observation
+    /// records them; an observation without them says neither.
+    #[test]
+    fn a_stuck_alert_carries_its_ambiguity_and_its_last_progress() {
+        let mut step = monitor();
+        let observation = json!([{"session_id": "session_resident_r1",
+            "agent_id": "agent_resident_r1", "event_id": 60, "at_ms": 0,
+            "observation": {"stuck": 0.9, "state": "WAITING", "judge": "jev",
+                            "ambiguity": "turn_stopped_idle",
+                            "evidence": {"progress_ms": 8_400, "quiet_ms": 1_000}}}]);
+        let fired = observed(&mut step, &observation);
+        let evidence = fired_evidence(&fired);
+        assert_eq!(evidence["ambiguity"], "turn_stopped_idle");
+        assert_eq!(evidence["progress_secs"], 8);
+        let Event::Fire { text, .. } = &fired[0] else {
+            panic!("a fire");
+        };
+        assert!(
+            text.ends_with("WAITING (turn_stopped_idle, last progress 8 s before)"),
+            "{text}"
+        );
+
+        let mut plain = monitor();
+        let fired = observed(&mut plain, &judgement_of(61, Some(0.9), "jev", None, None));
+        let evidence = fired_evidence(&fired);
+        assert!(evidence.get("ambiguity").is_none() && evidence.get("progress_secs").is_none());
+        let Event::Fire { text, .. } = &fired[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(text, "session_resident_r1 is stuck (0.90): WAITING");
+    }
+
     /// One mission (`accept`: `gate` or `review`) and its task #7 with
     /// `agent_worker_w`, moved by `records` (each a control record, its
     /// event id 10, 11, ...).
@@ -10852,6 +11314,155 @@ execute function alerts_test_deploys_mid_start();
                     cleared_by(&observe(&mut monitor, store)),
                     [(key, json!({"event_id": end, "cause": "exited"}))]
                 );
+            });
+        }
+
+        /// Issue #80 defect 2 on a store, through the loop's own checks: a
+        /// stuck alert judged stale through the real writer is the only
+        /// `agent_stuck` of its session while its stretch lasts, whatever
+        /// new judgements and restarts of the step follow; a score under
+        /// 0.5 ends the stretch and the next stuck one fires; judged false,
+        /// a restart of the execution (no pass between its end and the new
+        /// start) is a new stretch too.
+        #[test]
+        fn a_judged_stuck_alert_fires_no_more_in_its_stretch_across_a_restart() {
+            in_schema("stuck_judged_hold", |store| {
+                let alerts = || -> Vec<String> {
+                    let rows = store.alert_rows().expect("the rows");
+                    rows["rows"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|row| row["kind"] == "agent_stuck")
+                        .filter_map(|row| row["key"].as_str().map(str::to_string))
+                        .collect()
+                };
+                let check = |monitor: &mut Monitor| {
+                    monitor.check(store).expect("the step checks");
+                };
+                let mut session = Session::new("worker_held");
+                session.started(store);
+                let first = session.judged(store, Some(0.9));
+                let mut step = monitor();
+                check(&mut step);
+                let key = format!("agent_stuck:session_worker_held:{first}");
+                assert_eq!(alerts(), [key.as_str()]);
+                store.alert_judge(&key, "stale").expect("judged");
+                check(&mut step);
+                for _ in 0..3 {
+                    session.judged(store, Some(0.9));
+                    check(&mut step);
+                }
+                assert_eq!(alerts(), [key.as_str()], "held while it runs");
+
+                drop(step);
+                let mut step = monitor();
+                check(&mut step);
+                session.judged(store, Some(0.9));
+                check(&mut step);
+                assert_eq!(alerts(), [key.as_str()], "held across a restart");
+
+                session.judged(store, Some(0.2));
+                check(&mut step);
+                let second = session.judged(store, Some(0.9));
+                check(&mut step);
+                let again = format!("agent_stuck:session_worker_held:{second}");
+                assert_eq!(alerts(), [key.clone(), again.clone()], "a new stretch");
+
+                store.alert_judge(&again, "false").expect("judged");
+                check(&mut step);
+                session.judged(store, Some(0.9));
+                check(&mut step);
+                assert_eq!(alerts().len(), 2, "held");
+                session.ended(store, EndCause::Stopped);
+                session.started(store);
+                let third = session.judged(store, Some(0.9));
+                check(&mut step);
+                assert_eq!(
+                    alerts(),
+                    [
+                        key,
+                        again,
+                        format!("agent_stuck:session_worker_held:{third}")
+                    ],
+                    "a fresh execution is a new stretch"
+                );
+            });
+        }
+
+        /// Review 519-a F1 on a store: a judged stretch that ended while the
+        /// loop ran (a score under 0.5, or a rules judgement with no
+        /// `stuck`, read by the running step) is not held again when the
+        /// loop restarts from the judged row, so a new stuck stretch begun
+        /// while the loop was down fires once at the restart. One that
+        /// ended while the loop was down too, and one still stuck since
+        /// its alert (a calm before it), are covered as well: the first
+        /// fires, the second stays held.
+        #[test]
+        fn a_stuck_stretch_ended_while_the_loop_ran_is_not_held_again_at_a_restart() {
+            in_schema("stuck_judged_ended", |store| {
+                let alerts = |session: &str| -> usize {
+                    let rows = store.alert_rows().expect("the rows");
+                    rows["rows"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|row| row["kind"] == "agent_stuck" && row["subject"] == session)
+                        .count()
+                };
+                let check = |monitor: &mut Monitor| {
+                    monitor.check(store).expect("the step checks");
+                };
+                // Calm, rules, both seen by the running step; quiet, the
+                // calm while the loop is down; held, stuck throughout.
+                let mut calm = Session::new("worker_calm");
+                let mut rules = Session::new("worker_rules");
+                let mut quiet = Session::new("worker_quiet");
+                let mut held = Session::new("worker_still");
+                let mut step = monitor();
+                for session in [&mut calm, &mut rules, &mut quiet, &mut held] {
+                    session.started(store);
+                    // A calm before the alert's judgement ends nothing it
+                    // holds.
+                    session.judged(store, Some(0.1));
+                    let first = session.judged(store, Some(0.9));
+                    check(&mut step);
+                    let key = format!("agent_stuck:session_{}:{first}", session.name);
+                    store.alert_judge(&key, "false").expect("judged");
+                }
+                check(&mut step);
+                calm.judged(store, Some(0.1));
+                rules.judged(store, None);
+                check(&mut step);
+                for session in [&calm, &rules, &quiet, &held] {
+                    assert_eq!(alerts(&format!("session_{}", session.name)), 1);
+                }
+                drop(step);
+
+                quiet.judged(store, Some(0.1));
+                for session in [&mut calm, &mut rules, &mut quiet, &mut held] {
+                    session.judged(store, Some(0.9));
+                }
+                let mut step = monitor();
+                check(&mut step);
+                for _ in 0..3 {
+                    for session in [&mut calm, &mut rules, &mut quiet, &mut held] {
+                        session.judged(store, Some(0.9));
+                    }
+                    check(&mut step);
+                }
+                assert_eq!(alerts("session_worker_calm"), 2, "a calm the step read");
+                assert_eq!(
+                    alerts("session_worker_rules"),
+                    2,
+                    "a rules judgement it read"
+                );
+                assert_eq!(
+                    alerts("session_worker_quiet"),
+                    2,
+                    "a calm while it was down"
+                );
+                assert_eq!(alerts("session_worker_still"), 1, "a stretch with no end");
             });
         }
 

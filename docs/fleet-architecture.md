@@ -1239,7 +1239,15 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   worker's task past its part (its `task.reported`, `task.gated` and so on,
   that record's id its `event_id`), or, for the supervisor, at the first
   pass that finds it with nothing to dispatch (the latest record read its
-  `event_id`); a session whose current execution has ended fires none),
+  `event_id`); a session whose current execution has ended fires none; its
+  evidence and text carry the observation's `ambiguity` and
+  `progress_secs` when it records them; once the owner judges one
+  `false`, `stale` or `duplicate`, the session fires none again until its
+  stuck stretch ends: a latest judgement under 0.5, a rules judgement with
+  no `stuck`, the end of its execution or another execution current, the
+  hold rebuilt from the alert rows when the loop starts unless the
+  session recorded one under 0.5 or a rules one with no `stuck` after the
+  judgement the alert fired on (issue #80)),
   `judge_down` (the model judge's watcher recorded `host.judge` `down`, two
   calls in a row failed after its last answer, and no `up` after it,
   `SPAWN_ALERT_JUDGE_DOWN_SECS` after the first failed (default 900): no

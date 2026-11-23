@@ -673,6 +673,7 @@
         "Cargo.toml",
         "crates/spawn-cli/Cargo.toml",
         "crates/spawn-cli/src/main.rs",
+        "crates/spawn-cli/tests/help.rs",
         "rsi/backlog/001.json"
       ],
       "relations": [
@@ -689,7 +690,8 @@
           "6c5d22782"
         ],
         "tests": [
-          "crates/spawn-cli/src/main.rs"
+          "crates/spawn-cli/src/main.rs",
+          "crates/spawn-cli/tests/help.rs"
         ],
         "deploys": [],
         "artifacts": [],
@@ -1224,6 +1226,7 @@
         "crates/spawn-postgres/tests/reissue.rs",
         "crates/spawn-postgres/tests/restart.rs",
         "crates/spawn-postgres/tests/retire.rs",
+        "crates/spawn-postgres/tests/review_state.rs",
         "crates/spawn-postgres/tests/stalls.rs",
         "crates/spawn-postgres/tests/steal.rs",
         "crates/spawn-postgres/tests/verification-133-brief.txt",
