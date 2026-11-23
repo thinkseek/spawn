@@ -219,9 +219,6 @@ export interface FeatureMapping {
   kind: "objectives" | "file";
   path: string | null;
   error: string | null;
-  /** Whether the file is a coverage registry (`#/coverage` can scan it), not
-   * a legacy identity-only map; false when the server does not say. */
-  registry: boolean;
 }
 
 export interface FeatureMission {
@@ -547,7 +544,6 @@ function normalizeMission(value: unknown): FeatureMission {
       kind: mapping.kind === "file" ? "file" : "objectives",
       path: optionalText(mapping.path),
       error: optionalText(mapping.error),
-      registry: mapping.registry === true,
     },
     blocker: normalizeBlocker(raw.blocker),
     shipped_by_deploy: bool(raw.shipped_by_deploy),
