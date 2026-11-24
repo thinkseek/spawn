@@ -382,6 +382,24 @@ impl MissionWorkspaces {
         one_shot
     }
 
+    /// [`WorkspaceStore::set_aside`] through the routed store, only while
+    /// `ready` says the agent is idle, asked under the branch's lock
+    /// ([`GitWorkspace::set_aside_when`]).
+    pub(crate) fn set_aside_when(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<SetAside, WorkspaceError> {
+        let routed = self.route(branch.as_str())?;
+        let set_aside = routed.store.set_aside_when(branch, start, message, ready)?;
+        if let (SetAside::Created { .. }, Some((repo, source))) = (&set_aside, &routed.mirror) {
+            self.mark(repo, source, branch.as_str());
+        }
+        Ok(set_aside)
+    }
+
     /// Queue a push of an agent's branch, to a source that receives them
     /// (a one-shot store's caller publishes instead).
     fn mark(&self, mirror: &Path, source: &str, agent: &str) {
@@ -979,12 +997,7 @@ impl WorkspaceStore for MissionWorkspaces {
         start: Option<&str>,
         message: &str,
     ) -> Result<SetAside, WorkspaceError> {
-        let routed = self.route(branch.as_str())?;
-        let set_aside = routed.store.set_aside(branch, start, message)?;
-        if let (SetAside::Created { .. }, Some((repo, source))) = (&set_aside, &routed.mirror) {
-            self.mark(repo, source, branch.as_str());
-        }
-        Ok(set_aside)
+        self.set_aside_when(branch, start, message, &|| Ok(()))
     }
 
     fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {

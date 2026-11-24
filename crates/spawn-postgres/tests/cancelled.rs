@@ -92,7 +92,7 @@ fn rows(store: &PostgresStore) -> Vec<Value> {
 /// the main merge typed just before it included, not the task's own work; a
 /// merge of main recorded between the acceptance and `task.delivered` (a
 /// start's) counts too. The row says whether a set-aside is recorded and
-/// whether the notice reached the worker.
+/// whether a cancel notice command is recorded.
 #[test]
 fn a_residents_cancelled_latest_delivery_comes_with_the_checkpoint_it_started_from() {
     let (store, schema) = store("cancelled_start");
@@ -137,7 +137,8 @@ fn a_residents_cancelled_latest_delivery_comes_with_the_checkpoint_it_started_fr
     assert_eq!(found[0]["set_aside"], commit(5));
     assert_eq!(found[0]["start"], commit(2));
 
-    // The notice reached the worker.
+    // Recording the notice is enough: its later outcome must not block the
+    // session, and a successful legacy notice has the same meaning.
     let notice = command(
         &store,
         &format!("cancel-notice-{task}-0"),
@@ -146,7 +147,7 @@ fn a_residents_cancelled_latest_delivery_comes_with_the_checkpoint_it_started_fr
             model: None,
         },
     );
-    assert_eq!(rows(&store)[0]["told"], false, "submitted is not told");
+    assert_eq!(rows(&store)[0]["told"], true, "the notice is recorded");
     admin(&schema)
         .execute(
             "update spawn_commands set state = 'finished', succeeded = true where id = $1",
@@ -154,6 +155,17 @@ fn a_residents_cancelled_latest_delivery_comes_with_the_checkpoint_it_started_fr
         )
         .expect("finish the notice");
     assert_eq!(rows(&store)[0]["told"], true);
+    admin(&schema)
+        .execute(
+            "update spawn_commands set state = 'finished', succeeded = false where id = $1",
+            &[&notice],
+        )
+        .expect("fail the notice");
+    assert_eq!(
+        rows(&store)[0]["told"],
+        true,
+        "a failed notice is still recorded"
+    );
 }
 
 /// Only the latest delivery counts: a cancelled task delivered before

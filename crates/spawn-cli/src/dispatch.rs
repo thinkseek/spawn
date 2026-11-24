@@ -1061,10 +1061,20 @@ pub(crate) fn step(
 }
 
 /// Set aside the work of the cancelled task `task` before `order`, its
-/// notice, is sent, and add to the notice where the work went. Without a
-/// workspace root there is no branch here to set aside: the notice goes as
-/// it is. Returns a log line when the set-aside did something.
-fn set_aside_before(
+/// notice, is sent, and add to the notice where the work went, whether the
+/// notice resumes the resident or is typed into it. Without a workspace
+/// root there is no branch here to set aside: the notice goes as it is.
+/// Returns a log line when the set-aside did something.
+///
+/// A notice typed into a resident whose engine runs (GitHub #76) goes only
+/// while the resident is idle, asked again on the facts read now
+/// ([`crate::main_merge::ready_to_merge`], what a merge of main before a
+/// typed delivery waits for), under the branch's lock before its work is
+/// set aside ([`crate::set_aside::set_aside_when`]). A resident found busy
+/// keeps its workspace as it is and gets nothing this pass: the error holds
+/// the notice for a later one, so a notice a busy pane would refuse is
+/// never recorded, which would count as told.
+pub(crate) fn set_aside_before(
     store: &std::sync::Arc<PostgresStore>,
     root: Option<&Path>,
     work: &Work,
@@ -1076,14 +1086,25 @@ fn set_aside_before(
             "task #{task}'s cancel notice: the task is not a cancelled delivery"
         ));
     };
+    let typed = matches!(order.action, CommandAction::Input { .. });
+    let session = order.session_id.clone();
+    let ready = || {
+        if typed {
+            crate::main_merge::ready_to_merge(store, &session)
+        } else {
+            Ok(())
+        }
+    };
     let Some(root) = root else {
+        ready().map_err(|why| crate::set_aside::waits(task, &why))?;
         return Ok(None);
     };
-    let done = crate::set_aside::set_aside(store, root, cancelled)?;
+    let done = crate::set_aside::set_aside_when(store, root, cancelled, &ready)?;
     let note = crate::set_aside::note(task, &done);
     if let CommandAction::Resume {
         prompt: Some(text), ..
-    } = &mut order.action
+    }
+    | CommandAction::Input { text, .. } = &mut order.action
         && !note.is_empty()
     {
         text.push_str("\n\n");

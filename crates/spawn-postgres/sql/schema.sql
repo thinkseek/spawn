@@ -4294,8 +4294,8 @@ $$;
 -- A resident starts only after a human approves it.
 -- Whether `p_session`'s resident has a cancel notice not yet told: its
 -- latest delivered task is cancelled, and no `cancel-notice-<task>-<n>`
--- command of the dispatcher's reached it (deliver::Work::blocked, as
--- CANCELLED_DELIVERIES reads it).
+-- command of the dispatcher is recorded (deliver::Work::blocked, as
+-- CANCELLED_DELIVERIES reads it). The command's outcome does not block it.
 create or replace function spawn_cancel_notice_untold(p_session text)
 returns boolean language sql stable as $$
     select exists (
@@ -4310,8 +4310,7 @@ returns boolean language sql stable as $$
                               and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
            and not exists (select 1 from spawn_commands c
                             where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
-                              and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
-                              and c.succeeded))
+                              and c.idempotency_key like 'cancel-notice-' || k.id || '-%'))
 $$;
 
 -- Work stealing (objective 239, docs/fleet-architecture.md §3.2 "Work

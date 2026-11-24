@@ -826,8 +826,9 @@ const NOT_INSTALLED: &str = "the candidate's web dependencies could not be insta
 ///   `web/pnpm-lock.yaml` (its `.pnpm/lock.yaml` is that file): copied, as
 ///   deploy/controller.sh copies it into a controller: a real directory,
 ///   never a symlink (a gate's tree must not reach the controller's files),
-///   a reflink where the filesystem has them, else hardlinks, else a full
-///   copy;
+///   a reflink where the filesystem has them, else a full copy, never a
+///   hardlink (a hardlinked file keeps the controller's inode, so a write
+///   in the gate's tree would change the controller);
 /// - otherwise the candidate's own set is installed into the tree's `web/`
 ///   from the host's pnpm store, offline ([`install_modules`], with `env`,
 ///   the gate's environment, for PATH and HOME): a failure is a
@@ -873,7 +874,10 @@ pub(super) fn controller_modules(
     }
     let temporary = web.join(".node_modules.copy");
     let _ = std::fs::remove_dir_all(&temporary);
-    let copied = [&["-a", "--reflink=always"][..], &["-al"][..], &["-a"][..]]
+    // Reflink where the filesystem has them, else a full copy: either way the
+    // tree's files get their own inodes. Never a hardlink (`cp -al`): the
+    // gate's tree would then share the controller's inodes.
+    let copied = [&["-a", "--reflink=always"][..], &["-a"][..]]
         .iter()
         .any(|flags| {
             let done = std::process::Command::new("cp")
@@ -1924,7 +1928,7 @@ pub(super) fn judged(
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_refusal, package_refusal, workspace_refusal};
+    use super::{Modules, controller_modules, lock_refusal, package_refusal, workspace_refusal};
 
     /// Main's web/ files, as an owner judging reads them.
     const MAIN_WORKSPACE: &str = include_str!("../../../../web/pnpm-workspace.yaml");
@@ -2118,5 +2122,60 @@ mod tests {
         ] {
             assert_eq!(lock_refusal(text).as_deref(), Some(found), "{text}");
         }
+    }
+
+    /// `controller_modules` copies the controller's set into the candidate's
+    /// tree: the copy must hold its own inodes, so a write inside the gate's
+    /// tree can never change the controller it was copied from. On a
+    /// filesystem without reflinks this fails for a hardlink copy (`cp -al`),
+    /// which is why the production path never hardlinks.
+    #[test]
+    fn a_copied_set_holds_its_own_inodes() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static DIRS: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "spawn-controller-modules-{}-{}",
+            std::process::id(),
+            DIRS.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let controller = root.join("controller");
+        let source_file = controller.join("web/node_modules/.pnpm/pkg/tool");
+        std::fs::create_dir_all(source_file.parent().unwrap()).expect("source dir");
+        std::fs::write(&source_file, b"tool v1").expect("source file");
+        std::fs::write(
+            controller.join("web/node_modules/.pnpm/lock.yaml"),
+            b"lock v1",
+        )
+        .expect("installed lockfile");
+
+        let tree = root.join("tree");
+        let tree_web = tree.join("web");
+        std::fs::create_dir_all(&tree_web).expect("tree web");
+        std::fs::write(tree_web.join("package.json"), b"{}").expect("package.json");
+        std::fs::write(tree_web.join("pnpm-lock.yaml"), b"lock v1").expect("lockfile");
+
+        let modules = controller_modules(&controller, &tree, &[]).expect("the copy runs");
+        assert_eq!(modules, Modules::Copied);
+
+        let copied = tree_web.join("node_modules/.pnpm/pkg/tool");
+        assert_eq!(std::fs::read(&copied).expect("copied bytes"), b"tool v1");
+        let same_inode = std::fs::metadata(&source_file)
+            .expect("source metadata")
+            .ino()
+            == std::fs::metadata(&copied).expect("copy metadata").ino();
+        assert!(!same_inode, "the copy shares the controller's inode");
+
+        // The gate writes into its own tree; the controller is untouched.
+        std::fs::write(&copied, b"tool v2").expect("the gate rewrites its copy");
+        assert_eq!(
+            std::fs::read(&source_file).expect("controller bytes"),
+            b"tool v1",
+            "a write in the tree reached the controller"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

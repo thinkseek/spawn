@@ -534,15 +534,17 @@ impl Observer {
             return (observation, true);
         };
         // The raw answer is stored; the folded one is what counts. A session
-        // that never ends is never COMPLETED. Where the facts allow WAITING
-        // (at its prompt) its COMPLETED mass is folded into WAITING before
-        // the narrowing. Where they do not (an exit), folding first would
-        // drop that mass and let a sliver of BLOCKED win (GitHub PR #69,
-        // 061b2c4d), so the narrowed answer is folded instead. That covers
-        // a lost terminal too (UNKNOWN, BLOCKED, COMPLETED): a supervisor the
-        // model calls mostly COMPLETED there reads WAITING, and draws
+        // that never ends is never COMPLETED at its prompt: where the facts
+        // allow WAITING its COMPLETED mass is folded into WAITING before the
+        // narrowing. A lost terminal (UNKNOWN, BLOCKED, COMPLETED) folds the
+        // narrowed answer instead, as folding first would drop that mass and
+        // let a sliver of BLOCKED win (GitHub PR #69, 061b2c4d): a supervisor
+        // the model calls mostly COMPLETED there reads WAITING, and draws
         // attention only by needs_human, stuck or a disagreement; its
-        // recovery runs on its end cause, not on this judgement.
+        // recovery runs on its end cause, not on this judgement. An exit on
+        // its own is not folded at all (GitHub PR #72): the execution ended,
+        // and WAITING is the state of a live idle prompt, so a perpetual
+        // session that exits cleanly stays COMPLETED.
         let fold_first = input.perpetual && ambiguity.allowed().contains(&SemanticState::Waiting);
         let judgement = if fold_first {
             fold_completed(&raw)
@@ -550,7 +552,10 @@ impl Observer {
             raw
         };
         let (state, confidence) = narrow(ambiguity, guess, &judgement);
-        let state = if input.perpetual && state == SemanticState::Completed {
+        let state = if input.perpetual
+            && ambiguity != Ambiguity::ExitedOnItsOwn
+            && state == SemanticState::Completed
+        {
             SemanticState::Waiting
         } else {
             state
@@ -610,7 +615,8 @@ pub trait ObservationContext: Send + Sync {
     }
 
     /// Whether the session is meant never to end (the supervisor). Its
-    /// COMPLETED is read as WAITING.
+    /// COMPLETED at its prompt or on a lost terminal is read as WAITING; a
+    /// clean exit stays COMPLETED.
     fn perpetual(&self, _session: &SessionId) -> bool {
         false
     }
@@ -640,15 +646,15 @@ fn attach_context(
 }
 
 /// The question for a person in the model's latest reply, without the tag:
-/// its last line that starts with `HUMAN:`. The reply is what the model
-/// wrote since the last prompt, so a question someone answered is no longer
-/// in it.
+/// the reply's last non-empty line, when it starts with `HUMAN:`. An earlier
+/// or quoted `HUMAN:` line followed by later work is not a question (GitHub
+/// PR #72). The reply is what the model wrote since the last prompt, so a
+/// question someone answered is no longer in it.
 fn human_question(reply: &str) -> Option<String> {
-    reply.lines().rev().find_map(|line| {
-        line.trim_start()
-            .strip_prefix("HUMAN:")
-            .map(|question| head_chars(question.trim(), QUESTION_CHARS))
-    })
+    let last = reply.lines().rev().find(|line| !line.trim().is_empty())?;
+    last.trim_start()
+        .strip_prefix("HUMAN:")
+        .map(|question| head_chars(question.trim(), QUESTION_CHARS))
 }
 
 /// Stable digest of what the model is shown (FNV-1a over its JSON), so a
@@ -729,5 +735,7 @@ mod tests {
         assert!(asks_human("Done with the build.\nHUMAN: which region?"));
         assert!(asks_human("The key is missing.\n  HUMAN: please add it"));
         assert!(!asks_human("a human should look at the HUMAN: tag docs"));
+        assert!(asks_human("Done.\nHUMAN: which region?\n\n  "));
+        assert!(!asks_human("HUMAN: which region?\nI will use us-east."));
     }
 }

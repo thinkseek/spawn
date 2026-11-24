@@ -207,7 +207,10 @@ commit with a key no agent holds cannot hang or fail a test.
   start's or resume's `base_merged`, recorded before `task.delivered`). It
   runs only while nothing of the agent writes the branch, after the
   dispatcher's Stop took the final checkpoint, under the branch's lock
-  (`set_aside`, routed like `merge_base`): a mounted directory holding
+  (`set_aside`, routed like `merge_base`; a resident revived since, whose
+  notice is typed in, is asked again under the lock whether it is idle at
+  its prompt, `set_aside_when`, and one found busy keeps its workspace as
+  it is): a mounted directory holding
   what no checkpoint took is committed first, the directory moves to the
   start's tree the two-tree way, then the branch moves by compare-and-swap.
   Nothing is rewound (pushes are never forced, and the integrator requires

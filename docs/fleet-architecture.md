@@ -960,20 +960,37 @@ turns into a cancel, or a mission closed or a resident retired under it
 
 - *Stopped.* When a delivered task is cancelled and it was its worker's
   latest delivery, the dispatcher stops the worker at once, in the middle of
-  a turn or idle (a Stop takes a final checkpoint, which keeps what it did;
-  its turn for the task is never left to finish). An ephemeral worker is
-  stopped and nothing more; a retired resident is stopped and not told.
+  a turn or idle (a Stop takes a final checkpoint, which keeps what it did).
+  A resident is stopped once for the task, not once per execution: a
+  cancel's stop (`cancel-stop-<task>-<execution>`) or a reassign's
+  (`reassign-<task>-stop`) that did not fail counts, so a resident revived
+  since is not stopped again (GitHub #76). A stop that failed stopped
+  nothing and is pursued (`stop-<execution>-retry-<n>`). An ephemeral
+  worker is stopped and nothing more; a retired resident is stopped and not
+  told. The recovery takes a cancel's stop, the first or only its retry, as
+  an interrupt, not an end: the resident is revived (resumed, or handed off
+  to a new native session when there is none to resume or after three
+  failed resumes) and told not to continue the cancelled task and to wait
+  for the notice.
 - *Set aside.* Before a resident gets anything else, the task's work leaves
   its branch's tree: a new commit on top of the branch head, whose tree is
   the checkpoint the task started from ([storage.md](storage.md), "Work set
   aside"). Nothing is rewound or lost, and the next task's candidate holds
-  none of it, so nothing rides into another objective's landing.
-- *Told.* The resident is then resumed with a notice that names the task,
-  says it is cancelled, and says where its work is (the commit that holds
-  it). Its next task waits until the notice reached it. A notice that
-  failed goes again, after a wait that doubles, under the next number
-  after every `cancel-notice-<task>-<n>` already sent, however long ago
-  (a reused key would be taken as already sent, and nothing would go).
+  none of it, so nothing rides into another objective's landing. For a
+  resident whose engine runs, this happens only while it is idle at its
+  prompt, asked again on the facts read now, under the branch's lock, as
+  main is merged before a typed delivery: one found busy keeps its
+  workspace as it is, and its notice waits for a later pass.
+- *Told.* The notice names the task, says it is cancelled, and says where
+  its work is (the commit that holds it). A resident whose engine no longer
+  runs is resumed with it. One that runs again since its stop gets it typed
+  in at its prompt, only when its turn stopped idle on its latest fact,
+  never into a busy pane. Its next task waits until a notice is recorded:
+  any recorded `cancel-notice-<task>-<n>` command counts as told, whatever
+  its outcome (FM-18), so a notice is not sent again once one is recorded.
+  A notice's key is the next number after every one already sent, however
+  long ago (a reused key would be taken as already sent, and nothing would
+  go).
 - *Never collected.* A cancelled task's report is not collected, recorded
   or judged; a report file it leaves is not the next task's (the delivery
   mark rule).
@@ -981,7 +998,8 @@ turns into a cancel, or a mission closed or a resident retired under it
 A task never delivered changes nothing for its worker, and a resident whose
 cancelled task is not its latest delivery is left alone. The dispatcher
 keeps no state for this either: `spawn_events`, `spawn_commands` and their
-keys (`cancel-stop-<task>-<execution>`, `cancel-notice-<task>-<n>`,
+keys (`cancel-stop-<task>-<execution>`, `reassign-<task>-stop`,
+`stop-<execution>-retry-<n>`, `cancel-notice-<task>-<n>`,
 `set-aside:<task>`) say what was done.
 
 **Restart and reassign.** A worker that stalls (busy, no fact for

@@ -32,14 +32,22 @@
 //! A file the checkpoints leave out (over the size cap, a special file) is
 //! in no commit: the set-aside leaves it in the workspace, and the notice
 //! says so ([`note`]).
+//!
+//! A resident stopped once for the task and revived since (GitHub #76) gets
+//! its notice typed in while its engine runs, its turn stopped at its
+//! prompt. Its work is then set aside only while it is still idle, asked
+//! again under the branch's lock right before anything is written
+//! ([`set_aside_when`]), the way main is merged before a typed delivery
+//! ([`crate::main_merge::ready_to_merge`]): a resident that went busy keeps
+//! its workspace as it is, and the notice waits for a later pass.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
-use spawn_core::port::{EventLog, SetAside, WorkspaceStore};
-use spawn_host::{GitWorkspace, SET_ASIDE_FILES};
+use spawn_core::port::{EventLog, SetAside, WorkspaceError, WorkspaceStore};
+use spawn_host::{GitWorkspace, SET_ASIDE_FILES, SET_ASIDE_WAITS};
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::Cancelled;
@@ -74,23 +82,50 @@ pub(crate) fn note(task: i64, done: &Done) -> String {
     }
 }
 
+/// Why task `task`'s cancel notice is held this pass: `why`, the reason its
+/// resident is not idle ([`set_aside_when`]).
+pub(crate) fn waits(task: i64, why: &str) -> String {
+    format!("task #{task}'s cancel notice waits while {why}; tried again next pass")
+}
+
 /// Set the work of `cancelled`'s task aside on its agent's branch under
 /// `root` (once: a set-aside already recorded is only read back), record it
 /// in the agent's session and push it before this returns.
+#[cfg(test)]
 pub(crate) fn set_aside(
     store: &Arc<PostgresStore>,
     root: &Path,
     cancelled: &Cancelled,
 ) -> Result<Done, String> {
+    set_aside_when(store, root, cancelled, &|| Ok(()))
+}
+
+/// Set the work of `cancelled`'s task aside as `set_aside` does, only while
+/// `ready` says the resident is idle: asked under the branch's lock right
+/// before the set-aside would write
+/// ([`GitWorkspace::set_aside_when`]), and, where nothing is to be written
+/// (no branch here, or the set-aside already recorded), before this
+/// returns. When `ready` refuses, nothing changes and the error says the
+/// notice waits ([`waits`]).
+pub(crate) fn set_aside_when(
+    store: &Arc<PostgresStore>,
+    root: &Path,
+    cancelled: &Cancelled,
+    ready: &dyn Fn() -> Result<(), String>,
+) -> Result<Done, String> {
     let agent = cancelled.agent_id.as_str();
     let source = match store.agent_source(agent) {
         Ok(Some(source)) => source,
-        Ok(None) => return Ok(Done::NoBranch),
+        Ok(None) => {
+            ready().map_err(|why| waits(cancelled.id, &why))?;
+            return Ok(Done::NoBranch);
+        }
         Err(error) => return Err(format!("mission source of {agent}: {error}")),
     };
     let mirror =
         sources::ensure_mirror(root, source.as_deref()).map_err(|error| error.to_string())?;
     if let Some(commit) = &cancelled.set_aside {
+        ready().map_err(|why| waits(cancelled.id, &why))?;
         let path = mirror.to_string_lossy();
         let kept = sources::git(&["--git-dir", &path, "rev-parse", &format!("{commit}^1")])
             .map_err(|error| format!("the work under set-aside {commit}: {error}"))?;
@@ -117,9 +152,13 @@ pub(crate) fn set_aside(
         cancelled.id
     );
     let done = match workspaces
-        .set_aside(&branch, start.as_deref(), &message)
-        .map_err(|error| format!("set aside the work of task #{}: {error}", cancelled.id))?
-    {
+        .set_aside_when(&branch, start.as_deref(), &message, ready)
+        .map_err(|error| match error {
+            WorkspaceError::Refused { code, message } if code == SET_ASIDE_WAITS => {
+                waits(cancelled.id, &message)
+            }
+            error => format!("set aside the work of task #{}: {error}", cancelled.id),
+        })? {
         SetAside::Unchanged => Done::Nothing,
         // Made now, or by a pass whose record failed.
         SetAside::Created {
