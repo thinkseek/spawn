@@ -1522,9 +1522,12 @@ A message's id is its command's id, carried end to end:
   Without it, every input to a busy worker raised `message_not_taken`
   and kept it open until the session ended. A `queued_command` of any
   other mode (a background job's notification) is the engine's own text:
-  it ends its jobs and takes nothing, whatever it quotes. The clear rule
-  stays the marker, never transcript lines after the typing, which can be
-  the agent's own output.
+  it ends its jobs and takes nothing, whatever it quotes. The marker remains
+  the positive taken signal. Separately, a transcript line recorded after the
+  typing advances `read_since_typed` and suppresses or clears
+  `message_not_taken` (below, issue #66 Part 1), even when the line is the
+  agent's own output; that movement alone does not mark the message taken or
+  answered.
 - **The lifecycle, from records only.** `GET /api/fleet/<session>/commands`
   gives each command a `message` (`spawn_command_message` in the schema),
   null for a command that types nothing: `{state, typed_at_ms, taken_at_ms,
@@ -1568,24 +1571,28 @@ A message's id is its command's id, carried end to end:
   session, key `message_not_taken:<command id>`, evidence the command, the
   agent, the session, whether it was typed and, typed, how many transcript
   lines the Bridge recorded since the typing, `read_since_typed`, at most
-  100 counted) once per message when it
-  becomes not taken while its session has not ended with it; it clears when
-  the message is taken, or when the session ends with it untaken (the
+  100 counted) once per message when it becomes not taken while its session
+  has not ended with it and, if typed, its transcript has not moved since the
+  typing. A typed message with a positive `read_since_typed` neither fires nor
+  remains pending (issue #66 Part 1). An open alert clears, in precedence
+  order, when the message is taken, when a later message of its session is
+  taken (evidence `later_taken`), when the session ends with it untaken (the
   execution it was typed into, or its own start's, ended; a never-typed one
-  finished while no live execution ran). On start the step reads every
-  message that can be one (each live session's commands from its
-  execution's own start on, and every unfinished command) and its open
+  finished while no live execution ran), or when its transcript moved after
+  the typing (evidence `read_since_typed`, the positive count). On start the
+  step reads every message that can be one (each live session's commands from
+  its execution's own start on, and every unfinished command) and its open
   alerts back from the store, so a restart fires none again and loses none;
-  then, when the log moved, only the commands new since, the pending
-  messages that fell due, and the open alerts whose session took a message
-  or ended an execution since (an idle pass reads next to nothing, objective
-  023). An open one reaches
-  `/api/alerts` and Home's Needs you, which names the agent and the message.
-  A typed one with no line read since (S17) is not said as not taken:
-  its text and Home's title ("Spawn has read nothing of a transcript since
-  a message was typed") say whether the agent took it is unknown, since
-  either Spawn is not reading the transcript or the engine wrote nothing.
-  Out of scope: what a reply says, and retrying a message not taken.
+  then, when the log moved, only the commands new since, the pending messages
+  that fell due, and the open alerts whose session took a message, ended an
+  execution or recorded a transcript event since (an idle pass reads next to
+  nothing, objective 023). An open one reaches `/api/alerts` and Home's Needs
+  you, which names the agent and the message. A typed one with no line read
+  since (S17) is not said as not taken: its text and Home's title ("Spawn has
+  read nothing of a transcript since a message was typed") say whether the
+  agent took it is unknown, since either Spawn is not reading the transcript
+  or the engine wrote nothing. Out of scope: what a reply says, retrying a
+  message not taken, and Part 2's Bridge typing/idle wait changes.
 - **Acted: the agent's own answer (objective 046).** Answered says the turn
   a message started ended, not that the agent did what it asked. The agent
   says which: `spawn ack <command id> done|declined [<why>]`, run in its
