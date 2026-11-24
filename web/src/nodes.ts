@@ -5,6 +5,11 @@
 // Pure (no imports), tested in web/test/nodes.test.ts.
 
 export type NodeState = "live" | "lost" | "drained";
+/** How the primary reaches a node (issue #85): ssh, or the node's own
+ * `spawn node serve` over tcp or udp. */
+export type NodeTransport = "ssh" | "tcp" | "udp";
+/** How that path was made: straight, through relays, or a hole the node punched. */
+export type NodeMode = "direct" | "relay" | "hole_punch";
 
 export interface NodeRow {
   name: string;
@@ -23,6 +28,12 @@ export interface NodeRow {
   sampled_ms: number | null;
   /** When it was recorded lost; null unless it is. */
   lost_since_ms: number | null;
+  /** ssh for a join that says none (every join before issue #85). */
+  transport: NodeTransport;
+  /** relay with hops, direct without, when the join says none. */
+  mode: NodeMode;
+  /** The hops from the primary to the node, in order; [] for none. */
+  via: string[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -36,6 +47,13 @@ const number = (value: unknown): number | null =>
 const text = (value: unknown): string | null => (typeof value === "string" && value !== "" ? value : null);
 
 const STATES: readonly string[] = ["live", "lost", "drained"];
+const TRANSPORTS: readonly string[] = ["ssh", "tcp", "udp"];
+const MODES: readonly string[] = ["direct", "relay", "hole_punch"];
+
+/** A node's hops: the names of a list, anything else dropped. */
+function hops(via: unknown): string[] {
+  return Array.isArray(via) ? via.filter((hop): hop is string => text(hop) !== null) : [];
+}
 
 /** `cpu.max` (`<quota> <period>` or `max <period>`) as cores; null for no limit. */
 export function cpuLimit(cpuMax: unknown): number | null {
@@ -78,9 +96,31 @@ export function normalizeNodes(raw: unknown): NodeRow[] {
         gpu: gpuText(node.gpu),
         sampled_ms: number(beat?.at_ms),
         lost_since_ms: number(node.lost_since_ms),
+        ...reach(node),
       };
     })
     .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** How a node is reached, from its join; an old join's (or an unknown
+ * value's) as ssh, direct, without hops, and a mode left out read from the hops. */
+function reach(node: JsonObject): Pick<NodeRow, "transport" | "mode" | "via"> {
+  const transport = TRANSPORTS.includes(node.transport as string) ? (node.transport as NodeTransport) : "ssh";
+  const via = hops(node.via);
+  const mode = MODES.includes(node.mode as string) ? (node.mode as NodeMode) : via.length ? "relay" : "direct";
+  return { transport, mode, via };
+}
+
+/** The transport badge, as `spawn node list` says it: "ssh" for a direct ssh
+ * node, else "tcp/relay", "udp/hole_punch". */
+export function reachText(row: Pick<NodeRow, "transport" | "mode">): string {
+  if (row.transport === "ssh" && row.mode === "direct") return "ssh";
+  return `${row.transport}/${row.mode}`;
+}
+
+/** The hops as a row says them, "via relay-hk → edge-gw"; null without. */
+export function viaText(row: Pick<NodeRow, "via">): string | null {
+  return row.via.length ? `via ${row.via.join(" → ")}` : null;
 }
 
 /** Bytes as GiB, one decimal under 10 G: "12G", "7.5G"; "—" unread. */

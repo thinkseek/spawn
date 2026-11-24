@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { coresText, cpuLimit, gibText, normalizeNodes } from "../src/nodes.ts";
+import { coresText, cpuLimit, gibText, normalizeNodes, reachText, viaText } from "../src/nodes.ts";
 
 const GIB = 1024 ** 3;
 
@@ -53,6 +53,9 @@ test("the server's nodes become rows by name, each with its state and sample as 
       gpu: "RTX 4070 Ti SUPER 16G",
       sampled_ms: null,
       lost_since_ms: null,
+      transport: "ssh",
+      mode: "direct",
+      via: [],
     },
     {
       name: "runner",
@@ -65,6 +68,9 @@ test("the server's nodes become rows by name, each with its state and sample as 
       gpu: null,
       sampled_ms: 800_000,
       lost_since_ms: 900_000,
+      transport: "ssh",
+      mode: "direct",
+      via: [],
     },
   ]);
   assert.deepEqual(normalizeNodes({ nodes: [] }), []);
@@ -85,4 +91,41 @@ test("cores, limits and sizes read as the row says them", () => {
   assert.equal(gibText(7.5 * GIB), "7.5G");
   assert.equal(gibText(200 * GIB), "200G");
   assert.equal(gibText(null), "—");
+});
+
+/** Issue #85: nodes reached over tcp or udp, directly or through hops, as
+ * `/api/nodes` sends them: where each is reached (ssh destination, endpoint)
+ * withheld by the server; one that slips through is never read. */
+const REACHED = {
+  nodes: [
+    { name: "gw", state: "live", transport: "tcp", via: [], mode: "direct" },
+    { name: "edge", state: "live", transport: "udp", via: ["gw", "relay-hk"], mode: "hole_punch" },
+    { name: "inner", state: "drained", transport: "tcp", via: ["gw"] },
+    { name: "jumped", state: "live", transport: "ssh", endpoint: "leak", via: ["bastion"] },
+    { name: "odd", state: "live", transport: "quic", via: "gw", mode: "mesh" },
+  ],
+};
+
+test("each node says how it is reached: transport, mode and hops, defaults read from the hops", () => {
+  const rows = Object.fromEntries(normalizeNodes(REACHED).map((row) => [row.name, row]));
+  const reach = (name: string) => {
+    const { transport, mode, via } = rows[name]!;
+    return { transport, mode, via };
+  };
+  assert.deepEqual(reach("gw"), { transport: "tcp", mode: "direct", via: [] });
+  assert.deepEqual(reach("edge"), { transport: "udp", mode: "hole_punch", via: ["gw", "relay-hk"] });
+  assert.deepEqual(reach("inner"), { transport: "tcp", mode: "relay", via: ["gw"] });
+  assert.deepEqual(reach("jumped"), { transport: "ssh", mode: "relay", via: ["bastion"] });
+  assert.ok(!("endpoint" in rows.jumped!), "no endpoint is kept");
+  // Values it does not know read as an old join's.
+  assert.deepEqual(reach("odd"), { transport: "ssh", mode: "direct", via: [] });
+});
+
+test("the badge and the hops read as the row says them, as the CLI says them", () => {
+  assert.equal(reachText({ transport: "ssh", mode: "direct" }), "ssh");
+  assert.equal(reachText({ transport: "ssh", mode: "relay" }), "ssh/relay");
+  assert.equal(reachText({ transport: "tcp", mode: "direct" }), "tcp/direct");
+  assert.equal(reachText({ transport: "udp", mode: "hole_punch" }), "udp/hole_punch");
+  assert.equal(viaText({ via: [] }), null);
+  assert.equal(viaText({ via: ["relay-hk", "edge-gw"] }), "via relay-hk → edge-gw");
 });

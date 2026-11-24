@@ -1,6 +1,6 @@
 import { readApi, usePoll } from "../../api";
 import type { NodeRow } from "../../nodes";
-import { coresText, gibText, normalizeNodes } from "../../nodes";
+import { coresText, gibText, normalizeNodes, reachText, viaText } from "../../nodes";
 import { absoluteTitle, relativeTime } from "../../format";
 import { cx } from "../ui";
 
@@ -45,6 +45,17 @@ export function NodeRows() {
               {node.state}
               {node.lost_since_ms !== null && ` ${relativeTime(node.lost_since_ms)}`}
             </span>
+            <span
+              className="rounded-sm bg-muted px-1 text-micro font-medium uppercase tracking-[0.04em]"
+              title="how the primary reaches it (transport/mode)"
+            >
+              {reachText(node)}
+            </span>
+            {viaText(node) && (
+              <span className="truncate" title="the hops from the primary to the node, in order">
+                {viaText(node)}
+              </span>
+            )}
             <span>{node.arch ?? "—"}</span>
             <span title="cores (the cgroup's limit)">{coresText(node)} cores</span>
             <span title="memory">{gibText(node.mem_bytes)} mem</span>

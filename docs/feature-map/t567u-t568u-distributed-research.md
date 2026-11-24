@@ -118,6 +118,18 @@ Each PoC answers **one concrete question**, runs strictly in an **isolated sandb
 
 ---
 
+### Built: Multi-Hop Interconnection over TCP / UDP (issue #85, `cap-node-registry`)
+
+The node registry (multi-host P1) no longer assumes one ssh hop. What is built, and what it leaves to the PoCs above:
+
+- **Transports**: `ssh` (as before; `--via` becomes jump hosts through a nested `ProxyCommand`, every jump with the same nine hardening `-o` options, since `-J` gives jump hosts none), `tcp` and `udp` to a node's own `spawn node serve` (`std::net` only, no new crate). Modes: `direct`, `relay` (through hops), `hole_punch` (a label for a path the node opened by speaking first).
+- **Multi-hop**: `via` is the ordered chain of joined nodes from the coordinator (at most 8). A `forward` envelope carries the remaining hops; each relay pops the next, speaks its scheme (TCP↔UDP mixed chains work), passes on less time and a nonce of its own, and checks the relayed reply names the inner request. `spawn_node_record` refuses a hop not joined, a self-loop, a duplicate and any transitive loop through the hops' own `via`, under the append lock.
+- **Upward registration**: `spawn node register` sends a node's own inventory up to a coordinator's `spawn node serve --register-store`, directly or through relays, with retry and one nonce (recorded once); every field is checked as the writer checks it.
+- **Probing**: the heartbeat resolves each node's route from the membership on every read and probes ssh, tcp, udp and relayed nodes alike; spoofed or stale replies (another nonce) are never taken; every exchange is bounded in time, frame size and hops.
+- **Authentication**: with `SPAWN_NODE_TOKEN` set, every request carries `auth`, HMAC-SHA256 keyed by the token over its op, nonce, time and the fields it acts on (the token itself never on the wire), refused outside 120 s of the receiver's clock; a `register` always needs it, and `spawn node serve --register-store` refuses to start without a token.
+- **Bounds against abuse**: each nonce runs once (udp resends dropped while in flight, answered from a 125 s cache after, before any worker slot is taken), so a probe through udp relays to a dead hop costs one resend loop, not a multiplying fan-out; a relay rebuilds the inner request from allowed fields only, never connects to loopback, link-local, unspecified, broadcast or multicast addresses (IPv4-mapped included) unless `--allow-loopback-forward`, and says every failure to reach a hop in the same words (no port-scan oracle); 64 requests per listener, 16 per peer address, 2 s for a tcp request line. `/api/nodes` withholds `ssh`, `endpoint` and `note`.
+- **Not built (still PoC 1)**: encryption of the tcp/udp wire and per-machine identities (one shared fleet token; no single machine can be revoked); the transport belongs on a trusted overlay (open owner decision 2 below). No node runs work yet (P1).
+
 ## Stage 4: Discarded Alternatives, Evidence & Unresolved Owner Decisions
 
 ### 4.1 Discarded Alternatives (and Why)
