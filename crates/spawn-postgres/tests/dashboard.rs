@@ -8,8 +8,8 @@
 
 use serde_json::{Value, json};
 use spawn_core::event::{
-    ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, ModelProfile, NewEvent, SessionSeq,
-    Source,
+    ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, LaunchSummary, ModelProfile,
+    NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, WorkspaceId,
@@ -118,6 +118,7 @@ fn the_board_dates_the_current_state_from_its_first_judgement_and_names_the_open
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         ))
         .expect("append succeeds");
@@ -187,6 +188,7 @@ fn started() -> EventKind {
         fork: None,
         model: ModelProfile::Default,
         transcript_from: None,
+        launch: None,
     }
 }
 
@@ -455,4 +457,101 @@ fn the_label_facts_carry_each_sessions_latest_task_and_the_open_ones() {
     let residents = facts["residents"].as_array().expect("residents");
     assert!(residents.iter().any(|resident| resident["name"] == "core"));
     assert!(facts["inputs"].is_array(), "the latest inputs");
+}
+
+/// Issue #79: the board (`/api/fleet`) and `spawn fleet` show what the
+/// latest execution was launched with, its relay's address, models and
+/// Claude Code directory, and nothing else a record may hold. A start
+/// recorded before the summary was kept reads null.
+#[test]
+fn the_fleet_shows_each_sessions_launch_without_secrets() {
+    let (store, schema) = store("board_launch");
+    let fleet_row =
+        |store: &spawn_postgres::PostgresStore| row(&store.fleet_json().expect("the fleet reads"));
+    let first = ExecutionId::new("exec_launch_1").expect("valid execution");
+    store
+        .append(event(Some(&first), Source::Bridge, Some("s1"), started()))
+        .expect("append succeeds");
+    assert_eq!(
+        row(&store.fleet_board().expect("board"))["launch"],
+        Value::Null
+    );
+    assert_eq!(fleet_row(&store)["launch"], Value::Null);
+    store
+        .append(event(
+            Some(&first),
+            Source::Bridge,
+            Some("e1"),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Exited,
+                exit_code: Some(0),
+                signal: None,
+                evidence: None,
+            },
+        ))
+        .expect("append succeeds");
+
+    let second = ExecutionId::new("exec_launch_2").expect("valid execution");
+    let EventKind::ExecutionStarted {
+        engine,
+        workspace,
+        fork,
+        model,
+        transcript_from,
+        ..
+    } = started()
+    else {
+        unreachable!()
+    };
+    store
+        .append(event(
+            Some(&second),
+            Source::Bridge,
+            Some("s2"),
+            EventKind::ExecutionStarted {
+                engine,
+                workspace,
+                command_id: CommandId(2),
+                fork,
+                model,
+                transcript_from,
+                launch: Some(LaunchSummary {
+                    relay_url: Some("http://127.0.0.1:8791".to_string()),
+                    model: Some("claude-opus-5-5".to_string()),
+                    small_model: Some("deepseek-flash".to_string()),
+                    config_dir: Some("/data/fleet-claude".to_string()),
+                }),
+            },
+        ))
+        .expect("append succeeds");
+    let expected = json!({
+        "relay_url": "http://127.0.0.1:8791",
+        "model": "claude-opus-5-5",
+        "small_model": "deepseek-flash",
+        "config_dir": "/data/fleet-claude",
+    });
+    let board = row(&store.fleet_board().expect("board"));
+    assert_eq!(board["launch"], expected, "{board}");
+    assert_eq!(board["execution_id"], "exec_launch_2");
+    assert_eq!(fleet_row(&store)["launch"], expected);
+
+    // A key the summary does not have is never shown, whatever a record
+    // holds.
+    admin(&schema)
+        .batch_execute(
+            "alter table spawn_events disable trigger user;
+             update spawn_events
+                set kind = jsonb_set(kind, '{detail,launch,token}', '\"sk-made-up\"')
+              where event_name = 'execution.started' and execution_id = 'exec_launch_2';
+             alter table spawn_events enable trigger user;",
+        )
+        .expect("plant a key");
+    let board = store.fleet_board().expect("board").to_string();
+    assert!(!board.contains("sk-made-up"), "{board}");
+    let fleet = store.fleet_json().expect("fleet").to_string();
+    assert!(!fleet.contains("sk-made-up"), "{fleet}");
+    assert_eq!(
+        row(&store.fleet_board().expect("board"))["launch"],
+        expected
+    );
 }

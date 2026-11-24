@@ -1165,9 +1165,32 @@ How the profile travels:
   `assigned` and is never marked delivered by it.
 - The Bridge passes the relay and the slots in the inline `--settings`
   `env` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,
-  `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`). Claude Code merges inline
-  settings over the user's files, `env` name by name (checked with 2.1.318),
-  so the gateway token still comes from the user's own settings.
+  `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL`). Claude Code merges inline settings over the
+  user's files, `env` name by name (checked with 2.1.318), so the gateway
+  token still comes from the user's own settings: no token is ever set
+  inline.
+- `cheap` pins every slot (issue #79): the top-level `model`, the main,
+  sonnet, opus and subagent slots to `SPAWN_CHEAP_MODEL`, the haiku and
+  small-fast slots to `SPAWN_SMALL_MODEL`, so no model the user's own
+  settings name takes a slot back to the gateway. `default` pins only what
+  the loop names, each optional: `SPAWN_DEFAULT_MODEL` (the top-level
+  `model` and `ANTHROPIC_MODEL`, and the fallback of the three below),
+  `SPAWN_SONNET_MODEL`, `SPAWN_OPUS_MODEL`, `SPAWN_SUBAGENT_MODEL`. With
+  none set it is as before: Claude Code's own main model.
+- `SPAWN_CLAUDE_CONFIG_DIR` (opt-in, an absolute path) runs the engines
+  on a Claude Code directory of their own (the login wait and the
+  `sessions` backup read it too): they get it as `CLAUDE_CONFIG_DIR`, its
+  sensitive files are denied as `~/.claude`'s are, and the Bridge reads the
+  transcripts from its `projects` (unless `SPAWN_CLAUDE_PROJECTS` names
+  another). Its `settings.json` must then give the gateway's token, since
+  the relay holds none. Unset, nothing changes.
+- Each `execution.started` records what its engine was launched with, no
+  secret in it (`launch`: the relay's scheme, host and port, the pinned
+  main and small models, the Claude Code directory), left out for an engine
+  on Claude Code's own settings in `~/.claude` (no relay, or `default`'s
+  fallback when the relay is down). `spawn fleet` and `/api/fleet` show it
+  for each session's latest execution.
 
 **When the relay is down.** The Bridge connects to the relay before every
 Claude start. Unreachable: a `default` engine starts on Claude Code's own

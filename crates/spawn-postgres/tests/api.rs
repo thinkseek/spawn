@@ -456,6 +456,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         ))
         .expect("append succeeds");
@@ -511,6 +512,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         )
     };
@@ -740,6 +742,7 @@ fn a_task_lists_its_command_and_execution_events() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         ))
         .expect("append succeeds");
@@ -1198,6 +1201,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         ))
         .expect("append succeeds");
@@ -1449,7 +1453,7 @@ fn view_columns_match_the_snapshot() {
     let expected = [
         "agent_artifacts: session_id text, agent_id text, execution_id text, project text, branch text, commit_id text, reason text, session_seq bigint, recorded_at_ms bigint",
         "agent_commands: id bigint, agent_id text, session_id text, idempotency_key text, action jsonb, created_at_ms bigint",
-        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint, signal integer, evidence text",
+        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint, signal integer, evidence text, launch jsonb",
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
@@ -1457,7 +1461,7 @@ fn view_columns_match_the_snapshot() {
         "agent_open_tools: session_id text, agent_id text, execution_id text, tool_use_id text, tool_name text, session_seq bigint, started_at_ms bigint",
         "agent_relations: session_id text, agent_id text, parent_session_id text, recorded_at_ms bigint",
         "agent_state: session_id text, agent_id text, state text, reason text, confidence double precision, based_on_seq bigint, judge text, session_seq bigint, recorded_at_ms bigint, event_id bigint, observation jsonb",
-        "agent_status: session_id text, agent_id text, state text, reason text, observation_seq bigint, last_session_seq bigint, last_event_at_ms bigint, execution_id text, engine text, started_at_ms bigint, ended_at_ms bigint, exit_reported boolean, live boolean",
+        "agent_status: session_id text, agent_id text, state text, reason text, observation_seq bigint, last_session_seq bigint, last_event_at_ms bigint, execution_id text, engine text, started_at_ms bigint, ended_at_ms bigint, exit_reported boolean, live boolean, launch jsonb",
         "agent_task_events: command_id bigint, session_id text, agent_id text, session_seq bigint, event_id bigint, execution_id text, event_name text, recorded_at_ms bigint",
         "agent_tasks: command_id bigint, agent_id text, session_id text, action text, state text, lease_worker text, lease_attempt integer, succeeded boolean, error text, created_at_ms bigint, finished_at_ms bigint, prompt text, principal text",
         "agent_timeline: session_id text, session_seq bigint, id bigint, agent_id text, execution_id text, source text, event_name text, detail jsonb, recorded_at_ms bigint",
@@ -1829,6 +1833,7 @@ impl Worker<'_> {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         );
     }
@@ -2212,6 +2217,7 @@ fn the_facts_place_the_latest_turn_so_an_earlier_turns_judgement_is_told_apart()
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         )))
         .expect("an execution starts");
@@ -2518,6 +2524,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                         fork: None,
                         model: profile,
                         transcript_from: None,
+                        launch: None,
                     },
                 )
             })
@@ -3131,6 +3138,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                     fork: None,
                     model: ModelProfile::Default,
                     transcript_from: None,
+                    launch: None,
                 },
             ))
             .expect("started");
@@ -3216,6 +3224,19 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
 /// command succeeded and its engine worked. The liveness rule counts none
 /// of them, so it revives at once instead of backing off; revivals that
 /// never got to work are still failures.
+/// An execution's start on the default profile, from `command`.
+fn started_by(command: CommandId) -> EventKind {
+    EventKind::ExecutionStarted {
+        engine: ENGINE.to_string(),
+        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+        command_id: command,
+        fork: None,
+        model: ModelProfile::Default,
+        transcript_from: None,
+        launch: None,
+    }
+}
+
 #[test]
 fn a_revival_that_worked_before_it_was_lost_is_not_a_failure() {
     let (store, _schema) = store("revival_progress");
@@ -3227,14 +3248,7 @@ fn a_revival_that_worked_before_it_was_lost_is_not_a_failure() {
                 &execution,
                 Source::Bridge,
                 &format!("exec_{number}:started"),
-                EventKind::ExecutionStarted {
-                    engine: ENGINE.to_string(),
-                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
-                    command_id: command,
-                    fork: None,
-                    model: ModelProfile::Default,
-                    transcript_from: None,
-                },
+                started_by(command),
             ))
             .expect("started");
         if worked {
@@ -3382,6 +3396,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                     fork: None,
                     model: ModelProfile::Default,
                     transcript_from: None,
+                    launch: None,
                 },
             ),
             (
@@ -3509,6 +3524,7 @@ fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         );
         match became {

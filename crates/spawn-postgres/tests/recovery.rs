@@ -269,6 +269,7 @@ fn the_facts_name_the_terminal_server_the_execution_started_on() {
         fork: None,
         model: ModelProfile::Default,
         transcript_from: None,
+        launch: None,
     };
     let server = TerminalServer {
         pid: 812,

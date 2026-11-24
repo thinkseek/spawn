@@ -2119,6 +2119,7 @@ mod tests {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         );
         let judged = resident_event(

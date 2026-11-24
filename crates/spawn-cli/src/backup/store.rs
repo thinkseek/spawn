@@ -1440,12 +1440,26 @@ fn put_verb(
 }
 
 /// The area's files' directory: `--from`, else the transcript archive
-/// under the root, or the account's `.claude`.
+/// under the root, or the engines' Claude Code directory
+/// ([`claude_dir`]).
 fn from_dir(settings: &Settings, flags: &Flags, area: &str) -> PathBuf {
     match flags.get("from") {
         Some(from) => PathBuf::from(from),
         None if area == "transcripts" => settings.root.join(spawn_host::TRANSCRIPT_DIRECTORY),
-        None => super::home().join(".claude"),
+        None => claude_dir(crate::config::env_value, &super::home()),
+    }
+}
+
+/// The engines' Claude Code directory (issue #79): `SPAWN_CLAUDE_CONFIG_DIR`
+/// when `spawn loop` runs them on one of their own, else the account's
+/// `~/.claude` under `home`.
+pub(super) fn claude_dir(
+    lookup: impl Fn(&str) -> Option<String>,
+    home: &std::path::Path,
+) -> PathBuf {
+    match crate::runtime::claude_config_dir(lookup) {
+        Ok(Some(dir)) => PathBuf::from(dir),
+        _ => home.join(".claude"),
     }
 }
 

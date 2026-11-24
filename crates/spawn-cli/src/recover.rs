@@ -796,13 +796,24 @@ pub(crate) fn auth_retry_due(config: &Config, at_ms: i64, last_attempt_ms: Optio
     }
 }
 
-/// The credentials file as the loop's own environment names it:
-/// `$CLAUDE_CONFIG_DIR/.credentials.json`, else `$HOME/.claude/.credentials.json`.
+/// The engines' credentials file, as the loop's own environment names it.
 pub(crate) fn credentials_path() -> Option<String> {
-    if let Some(dir) = crate::config::env_value("CLAUDE_CONFIG_DIR") {
+    resolve_credentials_path(crate::config::env_value)
+}
+
+/// [`credentials_path`] over the environment `lookup` reads, in the order
+/// the engines' directory is chosen (`runtime`): the engines' own
+/// (`$SPAWN_CLAUDE_CONFIG_DIR`, absolute), else `$CLAUDE_CONFIG_DIR`, else
+/// `$HOME/.claude`; `.credentials.json` in it.
+fn resolve_credentials_path(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let nonempty = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    if let Ok(Some(dir)) = crate::runtime::claude_config_dir(nonempty) {
         return Some(format!("{dir}/.credentials.json"));
     }
-    crate::config::env_value("HOME").map(|home| format!("{home}/.claude/.credentials.json"))
+    if let Some(dir) = nonempty("CLAUDE_CONFIG_DIR") {
+        return Some(format!("{dir}/.credentials.json"));
+    }
+    nonempty("HOME").map(|home| format!("{home}/.claude/.credentials.json"))
 }
 
 /// What the credentials file looked like: its path, modification time and
@@ -2686,6 +2697,50 @@ impl Cause {
         ]
         .into_iter()
         .find(|cause| cause.name() == name)
+    }
+}
+
+#[cfg(test)]
+mod credentials_tests {
+    use super::resolve_credentials_path;
+
+    fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    /// Issue #79's review (F5): the login an expired-login wait watches is
+    /// the engines' own, in the order `spawn loop` gives them a directory.
+    #[test]
+    fn the_credentials_are_the_engines_own_directorys() {
+        let all = lookup(&[
+            ("HOME", "/home/o"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", "/data/fleet-claude/"),
+        ]);
+        assert_eq!(
+            resolve_credentials_path(all).as_deref(),
+            Some("/data/fleet-claude/.credentials.json")
+        );
+        let claude = lookup(&[
+            ("HOME", "/home/o"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", ""),
+        ]);
+        assert_eq!(
+            resolve_credentials_path(claude).as_deref(),
+            Some("/cc/.credentials.json")
+        );
+        let relative = lookup(&[("HOME", "/home/o"), ("SPAWN_CLAUDE_CONFIG_DIR", "fleet")]);
+        assert_eq!(
+            resolve_credentials_path(relative).as_deref(),
+            Some("/home/o/.claude/.credentials.json")
+        );
+        assert_eq!(resolve_credentials_path(lookup(&[])), None);
     }
 }
 

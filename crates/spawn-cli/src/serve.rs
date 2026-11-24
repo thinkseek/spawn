@@ -4324,6 +4324,7 @@ mod tests {
                     fork: None,
                     model: ModelProfile::Default,
                     transcript_from: None,
+                    launch: None,
                 },
             })
             .expect("started");
@@ -4511,6 +4512,7 @@ mod tests {
                     fork: None,
                     model: spawn_core::event::ModelProfile::Default,
                     transcript_from: None,
+                    launch: None,
                 },
             },
         )
