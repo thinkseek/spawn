@@ -2,7 +2,14 @@
 //! machines Spawn may use, and whether they answer. A node does no work yet.
 //!
 //! - `spawn node add|list|drain|undrain|remove` ([`command`]): `add` runs
-//!   the read-only [`INVENTORY`] over ssh once and records `node.joined`.
+//!   the read-only [`INVENTORY`] once over the node's transport and records
+//!   `node.joined`: over ssh (through jump hosts with `--via`), or over tcp
+//!   or udp to the node's `spawn node serve`, directly or relayed by the
+//!   nodes `--via` names, tcp and udp mixed (issue #85, [`transport`]).
+//! - `spawn node serve` is a node's own end of tcp and udp: it answers the
+//!   probes, relays `forward`s, and with `--register-store` takes the
+//!   `register` of a node that joins itself (`spawn node register`, from
+//!   behind a NAT or a firewall, directly or relayed) ([`relay`]).
 //! - `spawn loop` keeps a [`Heartbeat`]: a worker thread with a database
 //!   connection of its own (every statement bounded), so a pass never
 //!   waits on a node, its records or its alerts. Every [`PROBE_EVERY_MS`]
@@ -17,7 +24,8 @@
 //!   latest `node.lost` asks ([`alert_plan`]).
 //!
 //! The trust boundary: the primary sends a node nothing but [`INVENTORY`]
-//! or [`BEAT`], fixed texts of read-only commands. ssh runs with an
+//! or [`BEAT`], fixed texts of read-only commands (over tcp and udp, only
+//! their names: the node runs its own copy). ssh runs with an
 //! environment of `PATH`, `HOME`, `USER`, `LOGNAME` and `SSH_AUTH_SOCK`
 //! alone (no `SendEnv` can carry the database URL or a token), in batch
 //! mode against an already trusted host key, without a shared connection,
@@ -36,6 +44,13 @@ use spawn_postgres::{PostgresStore, StoreConnector};
 use crate::verify::now_ms;
 use crate::{Flags, open_store};
 
+mod auth;
+mod commands;
+mod relay;
+mod transport;
+
+use transport::{Op, Route};
+
 /// What `spawn node add` runs on a node: read-only commands only. Each
 /// section starts with a line `@<name>`; `@end` says the output is whole.
 pub(crate) const INVENTORY: &str = "echo @arch; uname -m; echo @os; uname -o; \
@@ -52,8 +67,8 @@ echo @meminfo; grep '^MemAvailable:' /proc/meminfo; echo @df; df -Pk \"$HOME\"; 
 /// Between two heartbeat probes of a node.
 pub(crate) const PROBE_EVERY_MS: i64 = 15_000;
 /// One heartbeat probe's bound, and `spawn node add`'s.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a node that answers has its heartbeat recorded.
 pub(crate) const RECORD_EVERY_MS: i64 = 600_000;
 /// `SPAWN_NODE_LOST_SECS`: its default and range (at least a probe
@@ -73,7 +88,7 @@ const OUTPUT_LIMIT: u64 = 256 * 1024;
 /// The longest text of a node (an arch, a GPU's name, an error) kept.
 const TEXT_CHARS: usize = 200;
 
-pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)";
+pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node add <name> --ssh <dest>|--tcp <[tcp://]host:port>|--udp <[udp://]host:port> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward]\n       spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]";
 
 /// One line of text from a node, kept only when printable, and short.
 fn clean_text(text: &str) -> Option<String> {
@@ -269,8 +284,60 @@ pub(crate) fn valid_ssh(destination: &str) -> bool {
     }
 }
 
-/// The ssh that runs `script` on `destination` (module doc).
-pub(crate) fn ssh_command(destination: &str, script: &str) -> Command {
+/// The options every ssh of a probe runs with, each jump host's too
+/// (module doc).
+pub(crate) const SSH_OPTIONS: [&str; 9] = [
+    "BatchMode=yes",
+    "ConnectTimeout=10",
+    "StrictHostKeyChecking=yes",
+    "UpdateHostKeys=no",
+    "ControlMaster=no",
+    "ControlPath=none",
+    "ClearAllForwardings=yes",
+    "ForwardAgent=no",
+    "ForwardX11=no",
+];
+
+/// `text` as one POSIX shell word.
+pub(crate) fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The `ProxyCommand` that reaches the host after `jumps` through them, in
+/// order: an ssh to the last jump with every one of [`SSH_OPTIONS`] and
+/// `-W [%h]:%p`, itself reaching that jump through a `ProxyCommand` of the
+/// jumps before it, each word shell-quoted, the nested command's `%`
+/// doubled (each ssh expands its own `%h` and `%p` once). Not `-J`:
+/// OpenSSH gives a jump host none of the command line's `-o` options.
+pub(crate) fn proxy_command(jumps: &[String]) -> Option<String> {
+    let (last, before) = jumps.split_last()?;
+    let mut words = vec!["ssh".to_string()];
+    for option in SSH_OPTIONS {
+        words.push("-o".to_string());
+        words.push(shell_quote(option));
+    }
+    if let Some(inner) = proxy_command(before) {
+        words.push("-o".to_string());
+        words.push(shell_quote(&format!(
+            "ProxyCommand={}",
+            inner.replace('%', "%%")
+        )));
+    }
+    words.extend([
+        "-T".to_string(),
+        "-W".to_string(),
+        shell_quote("[%h]:%p"),
+        "--".to_string(),
+        shell_quote(last),
+    ]);
+    Some(words.join(" "))
+}
+
+/// The ssh that runs `script` on `destination` (module doc) through the
+/// jump hosts `jumps` in order ([`proxy_command`]; each a destination
+/// [`valid_ssh`] takes, checked by the caller, so none is read as an
+/// option), its options before the destination.
+pub(crate) fn ssh_command_via(destination: &str, jumps: &[String], script: &str) -> Command {
     let mut command = Command::new("ssh");
     command.env_clear();
     for name in ["PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK"] {
@@ -278,29 +345,14 @@ pub(crate) fn ssh_command(destination: &str, script: &str) -> Command {
             command.env(name, value);
         }
     }
-    for option in [
-        "BatchMode=yes",
-        "ConnectTimeout=10",
-        "StrictHostKeyChecking=yes",
-        "UpdateHostKeys=no",
-        "ControlMaster=no",
-        "ControlPath=none",
-        "ClearAllForwardings=yes",
-        "ForwardAgent=no",
-        "ForwardX11=no",
-    ] {
+    for option in SSH_OPTIONS {
         command.args(["-o", option]);
+    }
+    if let Some(proxy) = proxy_command(jumps) {
+        command.args(["-o", &format!("ProxyCommand={proxy}")]);
     }
     command.args(["-T", "-a", "-x", "--", destination, script]);
     command
-}
-
-/// Run `script` on `destination` over ssh, bounded by `timeout`.
-pub(crate) fn probe(destination: &str, script: &str, timeout: Duration) -> Result<String, String> {
-    if !valid_ssh(destination) {
-        return Err("not an ssh destination".to_string());
-    }
-    bounded(ssh_command(destination, script), timeout)
 }
 
 /// Everything of `stream` up to [`OUTPUT_LIMIT`], the rest read and
@@ -391,20 +443,54 @@ fn gib(bytes: Option<u64>) -> String {
     )
 }
 
+/// How a node is reached, as `spawn node list` says it: `ssh` (an ssh
+/// node, direct), else `<transport>/<mode>` (`tcp/direct`, `udp/relay`,
+/// `ssh/relay`, `tcp/hole_punch`); an old join's, ssh and direct.
+fn reach(node: &Value) -> String {
+    let transport = node["transport"].as_str().unwrap_or("ssh");
+    let hops = node["via"].as_array().map_or(0, Vec::len);
+    let mode = node["mode"]
+        .as_str()
+        .unwrap_or(if hops > 0 { "relay" } else { "direct" });
+    if transport == "ssh" && mode == "direct" {
+        transport.to_string()
+    } else {
+        format!("{transport}/{mode}")
+    }
+}
+
+/// A node's hops as `spawn node list` says them, `via a->b`, or nothing.
+fn hops_text(node: &Value) -> Option<String> {
+    let hops: Vec<&str> = node["via"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    (!hops.is_empty()).then(|| format!("via {}", hops.join("->")))
+}
+
 /// One line per node for `spawn node list`, from the store's list.
 fn lines(nodes: &Value, now: i64) -> Vec<String> {
     let nodes = nodes.as_array().map_or(&[][..], Vec::as_slice);
     if nodes.is_empty() {
         return vec!["no node joined (spawn node add <name> --ssh <destination>)".to_string()];
     }
-    let row = |cells: [&str; 7]| {
+    let row = |cells: [&str; 8]| {
         format!(
-            "{:<16} {:<8} {:<8} {:>5} {:>8} {:>8} {}",
-            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
+            "{:<16} {:<8} {:<14} {:<8} {:>5} {:>8} {:>8} {}",
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7]
         )
     };
     let mut out = vec![row([
-        "NAME", "STATE", "ARCH", "CORES", "MEMORY", "DISK", "SAMPLED",
+        "NAME",
+        "STATE",
+        "TRANSPORT",
+        "ARCH",
+        "CORES",
+        "MEMORY",
+        "DISK",
+        "SAMPLED",
     ])];
     for node in nodes {
         let beat = &node["heartbeat"];
@@ -419,9 +505,14 @@ fn lines(nodes: &Value, now: i64) -> Vec<String> {
                 )
             },
         );
+        let sampled = match hops_text(node) {
+            Some(hops) => format!("{sampled}  {hops}"),
+            None => sampled,
+        };
         out.push(row([
             node["name"].as_str().unwrap_or("?"),
             node["state"].as_str().unwrap_or("?"),
+            &reach(node),
             node["arch"].as_str().unwrap_or("?"),
             &node["cores"].to_string(),
             &gib(node["mem_total"].as_u64()),
@@ -452,47 +543,9 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         return Err(USAGE.to_string());
     };
     match verb.as_str() {
-        "add" => {
-            let (name, flags) = name_word(words)?;
-            let flags = Flags::parse(flags)?;
-            if let Some(unknown) = flags.names().find(|flag| !matches!(*flag, "ssh" | "note")) {
-                return Err(format!("spawn node add has no --{unknown}\n{USAGE}"));
-            }
-            let ssh = flags.required("ssh")?;
-            if !valid_ssh(&ssh) {
-                return Err(
-                    "--ssh is [user@]host or ssh://[user@]host[:port], the port 1 to 65535"
-                        .to_string(),
-                );
-            }
-            let store = open_store()?;
-            // Refused before the preflight, so a second add reaches no node.
-            let members = store.node_members().map_err(|error| error.to_string())?;
-            if members
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|node| node["name"] == name)
-            {
-                return Err(format!(
-                    "node {name} is joined already (spawn node remove {name} first)"
-                ));
-            }
-            let output = probe(&ssh, INVENTORY, JOIN_TIMEOUT)
-                .map_err(|error| format!("the preflight of {name} over ssh failed: {error}"))?;
-            let mut record = inventory(&output)
-                .map_err(|error| format!("the preflight of {name} over ssh failed: {error}"))?;
-            record["type"] = json!("node.joined");
-            record["name"] = json!(name);
-            record["ssh"] = json!(ssh);
-            record["note"] = json!(flags.get("note"));
-            record["exit_country"] = Value::Null;
-            let event = store
-                .node_record(&record)
-                .map_err(|error| error.to_string())?;
-            println!("node {name} joined (event {event})");
-            Ok(0)
-        }
+        "add" => commands::add(words),
+        "serve" => commands::serve(words),
+        "register" => commands::register(words),
         "list" => {
             let json = match words {
                 [] => false,
@@ -582,7 +635,9 @@ impl ProbeClock {
 pub(crate) struct ProbeJob {
     pub(crate) name: String,
     pub(crate) join: i64,
-    pub(crate) ssh: String,
+    /// Its way (ssh, ssh through jump hosts, tcp or udp through relays),
+    /// or why the membership gives none (a hop not joined): a failed probe.
+    pub(crate) route: Result<Route, String>,
 }
 
 /// A probe's end, stamped on its own thread when it ended.
@@ -614,7 +669,7 @@ pub(crate) struct NodeRecordIntent {
 
 /// One node as the worker keeps it: one join of it.
 struct Node {
-    ssh: String,
+    route: Result<Route, String>,
     join: i64,
     lost: bool,
     /// Its last answer known: one this worker took, or one the store holds
@@ -676,13 +731,17 @@ impl HeartbeatScheduler {
     pub(crate) fn sync(&mut self, members: &Value, now: ProbeClock) {
         let mut nodes = BTreeMap::new();
         for member in members.as_array().into_iter().flatten() {
-            let (Some(name), Some(ssh), Some(join)) = (
+            let (Some(name), Some(reached), Some(join)) = (
                 member["name"].as_str(),
-                member["ssh"].as_str(),
+                transport::Member::of(member),
                 member["join"].as_i64(),
             ) else {
                 continue;
             };
+            // Resolved again at each read: a hop removed, or joined again
+            // elsewhere, changes the way, never the join.
+            let route =
+                transport::route(reached.transport, reached.endpoint, &reached.via, members);
             let open = member["lost"]["open"] == true;
             let last_seen = member["lost"]["last_seen_ms"]
                 .as_i64()
@@ -693,7 +752,7 @@ impl HeartbeatScheduler {
                 .into_iter()
                 .flatten()
                 .max_by_key(|at| at.wall);
-            let node = match self.nodes.remove(name) {
+            let mut node = match self.nodes.remove(name) {
                 Some(node) if node.join == join && !self.resync => node,
                 Some(mut node) if node.join == join => {
                     node.lost = open;
@@ -707,7 +766,7 @@ impl HeartbeatScheduler {
                     node
                 }
                 _ => Node {
-                    ssh: ssh.to_string(),
+                    route: Err(String::new()),
                     join,
                     lost: open,
                     seen: evidence,
@@ -719,6 +778,7 @@ impl HeartbeatScheduler {
                     failing: None,
                 },
             };
+            node.route = route;
             nodes.insert(name.to_string(), node);
         }
         self.nodes = nodes;
@@ -807,7 +867,7 @@ impl HeartbeatScheduler {
                 work.push(ProbeJob {
                     name: name.clone(),
                     join: node.join,
-                    ssh: node.ssh.clone(),
+                    route: node.route.clone(),
                 });
             }
         }
@@ -945,7 +1005,13 @@ fn start(item: ProbeJob, done: &Sender<ProbeOutcome>, origin: Instant) {
     let spawned = std::thread::Builder::new()
         .name("node-probe".to_string())
         .spawn(move || {
-            let answer = probe(&item.ssh, BEAT, PROBE_TIMEOUT).and_then(|output| beat(&output));
+            let answer = item
+                .route
+                .and_then(|route| {
+                    let token = crate::config::env_value("SPAWN_NODE_TOKEN");
+                    transport::probe_route(&route, Op::Beat, PROBE_TIMEOUT, token.as_deref())
+                })
+                .and_then(|output| beat(&output));
             let _ = send.send(ProbeOutcome {
                 name: item.name,
                 join: item.join,

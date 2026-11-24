@@ -1816,18 +1816,26 @@ fn verifications() -> Result<Value, String> {
 }
 
 /// `/api/nodes`: every node joined and not removed (multi-host P1, crate
-/// nodes.rs), `{nodes: [...]}`, each as the store lists it without its ssh
-/// destination and note, read through the reader login like every other
-/// read. No clock in it, so an unchanged list keeps its ETag.
+/// nodes.rs), `{nodes: [...]}`, each as the store lists it ([`public_nodes`]),
+/// read through the reader login like every other read. No clock in it, so
+/// an unchanged list keeps its ETag.
 fn nodes() -> Result<Value, String> {
-    let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+    let nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+    Ok(json!({ "nodes": public_nodes(nodes) }))
+}
+
+/// The store's nodes as the web reads them: without where each is reached
+/// (its ssh destination, its tcp or udp endpoint) nor its note; how it is
+/// reached (`transport`, `mode`, its hops' names in `via`) stays.
+fn public_nodes(mut nodes: Value) -> Value {
     for node in nodes.as_array_mut().into_iter().flatten() {
         if let Some(node) = node.as_object_mut() {
             node.remove("ssh");
+            node.remove("endpoint");
             node.remove("note");
         }
     }
-    Ok(json!({ "nodes": nodes }))
+    nodes
 }
 
 /// `/api/missions/task/<id>`: one task's brief, report and review note in
@@ -2961,9 +2969,9 @@ mod tests {
         coverage_projects, coverage_registry_checked, feature_associate_at, feature_paths, handle,
         is_json, is_loopback, keep_listening, listen_again_pause, local_exemption, log_window,
         mission_feature_paths, mission_query, objective_json, objective_prompt,
-        open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective,
-        rsi_summary, same_origin, same_secret, serve_requests, server_hosts, tokenless_request,
-        typed_text, with_activity, with_last_gates, with_objectives,
+        open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, public_nodes,
+        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
+        tokenless_request, typed_text, with_activity, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -6076,5 +6084,32 @@ mod tests {
                 .is_some_and(Vec::is_empty)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/api/nodes` says how each node is reached, never where.
+    #[test]
+    fn the_nodes_read_withholds_destinations_endpoints_and_notes() {
+        let nodes = public_nodes(json!([
+            {"name": "legacy", "ssh": "ckl@legacy", "note": "rack 4", "transport": "ssh",
+             "endpoint": null, "via": [], "mode": "direct", "state": "live"},
+            {"name": "edge", "ssh": null, "note": null, "transport": "udp",
+             "endpoint": "udp://203.0.113.9:7001", "via": ["gw"], "mode": "hole_punch",
+             "state": "lost"},
+        ]));
+        for node in nodes.as_array().expect("a list") {
+            for key in ["ssh", "endpoint", "note"] {
+                assert!(node.get(key).is_none(), "{key}: {node}");
+            }
+        }
+        assert_eq!(
+            json!([
+                nodes[1]["transport"],
+                nodes[1]["mode"],
+                nodes[1]["via"],
+                nodes[1]["state"]
+            ]),
+            json!(["udp", "hole_punch", ["gw"], "lost"])
+        );
+        assert_eq!(nodes[0]["transport"], "ssh");
     }
 }

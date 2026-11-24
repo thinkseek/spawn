@@ -305,7 +305,8 @@ fn a_probe_of_a_removed_join_records_nothing_for_the_next_one() {
     let members = store.node_members().expect("members");
     assert_eq!(
         members,
-        json!([{"name": "runner", "ssh": "new-host", "join": new, "lost": null, "beat_ms": null}]),
+        json!([{"name": "runner", "ssh": "new-host", "transport": "ssh", "endpoint": "new-host",
+                "via": [], "mode": "direct", "join": new, "lost": null, "beat_ms": null}]),
         "the old join's loss is not the new one's"
     );
     store
@@ -510,4 +511,210 @@ fn the_node_index_is_built_after_the_schema_and_again_when_invalid() {
         .expect("dropped");
     store.migrate().expect("migrated again");
     assert_eq!(valid(&mut client), Some(true));
+}
+
+/// A join reached over tcp or udp: `endpoint` instead of `ssh`.
+fn reached(name: &str, transport: &str, endpoint: &str) -> Value {
+    let mut record = joined(name, "unused");
+    record["ssh"] = Value::Null;
+    record["transport"] = json!(transport);
+    record["endpoint"] = json!(endpoint);
+    record
+}
+
+/// `name`'s entry of a list the store read.
+fn named(list: &Value, name: &str) -> Value {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .find(|node| node["name"] == name)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Issue #85: a join over tcp or udp names its endpoint, scheme matching
+/// its transport; hops are joined nodes, at most 8, none twice, never the
+/// node itself; a mode is one of three. Each refused with nothing recorded.
+#[test]
+fn a_tcp_or_udp_join_names_an_endpoint_and_its_hops_are_joined_nodes() {
+    let (store, schema) = store("nodes_transport_checks");
+    let mut client = admin(&schema);
+    store
+        .node_record(&reached("gw", "tcp", "tcp://gw.example:7000"))
+        .expect("a tcp join");
+    store
+        .node_record(&joined("jump", "ckl@jump"))
+        .expect("an ssh join");
+    let before = counts(&mut client);
+    let tcp = || reached("x", "tcp", "x:1");
+    let nine = json!(["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+    for (record, why) in [
+        (reached("x", "quic", "x:1"), "transport is ssh, tcp or udp"),
+        (reached("x", "tcp", "x"), "endpoint is [tcp://]host:port"),
+        (
+            reached("x", "tcp", "udp://x:1"),
+            "endpoint is [tcp://]host:port",
+        ),
+        (reached("x", "udp", "x:0"), "endpoint is [udp://]host:port"),
+        (reached("x", "udp", "x:65536"), "endpoint"),
+        (reached("x", "tcp", "user@x:22"), "endpoint"),
+        (reached("x", "tcp", "-oProxy:22"), "endpoint"),
+        (reached("x", "tcp", "x y:22"), "endpoint"),
+        (reached("x", "tcp", "[::1:22"), "endpoint"),
+        (with(tcp(), "endpoint", Value::Null), "endpoint"),
+        (with(tcp(), "ssh", json!("-oX")), "ssh destination"),
+        (
+            with(joined("x", "x"), "endpoint", json!("x:1")),
+            "endpoint is null",
+        ),
+        (
+            with(joined("x", "-x"), "transport", json!("ssh")),
+            "ssh destination",
+        ),
+        (
+            with(tcp(), "mode", json!("mesh")),
+            "mode is direct, relay or hole_punch",
+        ),
+        (with(tcp(), "via", json!("gw")), "via is a list"),
+        (with(tcp(), "via", json!(["-gw"])), "via is a list"),
+        (with(tcp(), "via", nine), "via is a list of at most 8"),
+        (with(tcp(), "via", json!(["x"])), "its own via"),
+        (with(tcp(), "via", json!(["gw", "gw"])), "twice"),
+        (with(tcp(), "via", json!(["gw", "nowhere"])), "hop nowhere"),
+        (
+            with(tcp(), "via", json!(["gw", "jump"])),
+            "hop jump is reached over another transport",
+        ),
+        (
+            with(joined("x", "x"), "via", json!(["gw"])),
+            "hop gw is reached over another transport",
+        ),
+        (
+            with(with(tcp(), "via", json!(["gw"])), "mode", json!("direct")),
+            "direct node has no via",
+        ),
+    ] {
+        let error = store.node_record(&record).expect_err(why);
+        assert!(error.to_string().contains(why), "{why}: {error}");
+    }
+    assert_eq!(counts(&mut client), before, "nothing recorded");
+}
+
+/// No loop through the hops' own `via`: `a` joins via `b`; `b`, removed,
+/// may not join again via `a`; a chain without a loop joins however deep.
+#[test]
+fn a_join_whose_hops_lead_back_to_it_is_refused() {
+    let (store, _schema) = store("nodes_transport_loops");
+    store.node_record(&reached("b", "tcp", "b:1")).expect("b");
+    store
+        .node_record(&with(reached("a", "tcp", "a:1"), "via", json!(["b"])))
+        .expect("a via b");
+    store
+        .node_record(&json!({"type": "node.removed", "name": "b"}))
+        .expect("b removed");
+    let error = store
+        .node_record(&with(reached("b", "tcp", "b:1"), "via", json!(["a"])))
+        .expect_err("a loop");
+    assert!(error.to_string().contains("makes a loop"), "{error}");
+    let error = store
+        .node_record(&with(reached("c", "tcp", "c:1"), "via", json!(["a", "b"])))
+        .expect_err("b is not joined");
+    assert!(error.to_string().contains("hop b"), "{error}");
+    store
+        .node_record(&reached("b", "tcp", "b:1"))
+        .expect("b again");
+    store
+        .node_record(&with(reached("c", "udp", "c:2"), "via", json!(["a"])))
+        .expect("c via a via b");
+    store
+        .node_record(&with(
+            reached("d", "udp", "d:2"),
+            "via",
+            json!(["c", "a", "b"]),
+        ))
+        .expect("d via c, a and b");
+    store
+        .node_record(&json!({"type": "node.removed", "name": "b"}))
+        .expect("b removed again");
+    let error = store
+        .node_record(&with(reached("b", "tcp", "b:1"), "via", json!(["d"])))
+        .expect_err("a longer loop");
+    assert!(error.to_string().contains("makes a loop"), "{error}");
+}
+
+/// The readers say each join's transport, endpoint, hops and mode, an old
+/// join's as ssh, its destination, none and direct; the reader login reads
+/// the same; the loop's records take a tcp node as they take an ssh one.
+#[test]
+fn the_reads_say_how_each_node_is_reached_and_default_an_old_join() {
+    let (store, schema) = store("nodes_transport_reads");
+    let gw = store
+        .node_record(&reached("gw", "tcp", "tcp://gw.example:7000"))
+        .expect("a tcp join");
+    store
+        .node_record(&reached("relay-hk", "udp", "[2001:db8::7]:7001"))
+        .expect("a udp join on a bracketed IPv6 address");
+    store
+        .node_record(&joined("legacy", "ckl@legacy"))
+        .expect("an ssh join as before");
+    let edge = with(
+        reached("edge", "udp", "udp://10.0.0.9:9"),
+        "via",
+        json!(["gw", "relay-hk"]),
+    );
+    store
+        .node_record(&with(edge, "mode", json!("hole_punch")))
+        .expect("a udp join through two hops");
+    store
+        .node_record(&with(reached("c", "tcp", "c:2"), "via", json!(["gw"])))
+        .expect("a relayed join");
+
+    let nodes = store.nodes().expect("the nodes");
+    let shape = |name: &str| {
+        let node = named(&nodes, name);
+        json!([
+            node["transport"],
+            node["endpoint"],
+            node["via"],
+            node["mode"]
+        ])
+    };
+    assert_eq!(shape("legacy"), json!(["ssh", null, [], "direct"]));
+    assert_eq!(named(&nodes, "legacy")["ssh"], "ckl@legacy");
+    assert_eq!(
+        shape("gw"),
+        json!(["tcp", "tcp://gw.example:7000", [], "direct"])
+    );
+    assert_eq!(
+        shape("edge"),
+        json!(["udp", "udp://10.0.0.9:9", ["gw", "relay-hk"], "hole_punch"])
+    );
+    assert_eq!(shape("c"), json!(["tcp", "c:2", ["gw"], "relay"]));
+
+    let members = store.node_members().expect("members");
+    let legacy = named(&members, "legacy");
+    assert_eq!(
+        json!([
+            legacy["transport"],
+            legacy["endpoint"],
+            legacy["via"],
+            legacy["mode"]
+        ]),
+        json!(["ssh", "ckl@legacy", [], "direct"])
+    );
+    let member = named(&members, "gw");
+    assert_eq!(
+        (&member["join"], &member["endpoint"], &member["ssh"]),
+        (&json!(gw), &json!("tcp://gw.example:7000"), &Value::Null)
+    );
+    store
+        .node_record(
+            &json!({"type": "node.heartbeat", "name": "gw", "join": gw, "load1": 0.1,
+                              "mem_available": 1, "disk_free": 1}),
+        )
+        .expect("a heartbeat over tcp");
+    let url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
+        .expect("the reader's URL");
+    let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
+    assert_eq!(reader.nodes().expect("read"), store.nodes().expect("read"));
 }

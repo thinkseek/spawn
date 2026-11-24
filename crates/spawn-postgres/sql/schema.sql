@@ -6051,7 +6051,16 @@ create index if not exists spawn_events_host_storage_bytes
 -- spawn_control_refold, this schema's or an older one's, reads them, so a
 -- schema rolled back still refolds a log that holds them.
 --   node.joined {name, ssh, note, arch, os, kernel, cores, cpu_max,
---     mem_total, mem_max, disk_free, gpu, exit_country} (`spawn node add`);
+--     mem_total, mem_max, disk_free, gpu, exit_country, transport, endpoint,
+--     via, mode} (`spawn node add`, or a node's own `spawn node register`
+--     taken by `spawn node serve --register-store`). `transport` is ssh
+--     (absent: every join before it), tcp or udp; `endpoint` is null for
+--     ssh (the destination is `ssh`) and `[tcp://|udp://]host:port` for
+--     the others; `via`, absent or a list of at most 8 joined nodes, the
+--     hops from the primary to this node in order, none the node itself,
+--     none twice, no loop through the hops' own `via`; `mode`, absent or
+--     direct, relay or hole_punch (absent reads as relay with hops and
+--     direct without);
 --   node.drained, node.undrained, node.removed {name};
 --   node.heartbeat {name, join, load1, mem_available, disk_free},
 --   node.lost {name, join, last_seen_ms, silent_ms, error},
@@ -6109,6 +6118,10 @@ returns bigint language plpgsql security definer as $$
 declare
     v_type text := p_record ->> 'type';
     v_name text := p_record ->> 'name';
+    v_transport text := coalesce(p_record ->> 'transport', 'ssh');
+    v_via jsonb := coalesce(p_record -> 'via', 'null'::jsonb);
+    v_seen text[];
+    v_front text[];
     v_bad text;
     v_join bigint;
     v_seq bigint;
@@ -6131,7 +6144,12 @@ begin
         raise exception 'a node''s name is 1 to 63 letters, digits, dots, dashes or underscores, first a letter or digit'
             using errcode = '22023';
     end if;
+    if v_type = 'node.joined' and v_transport not in ('ssh', 'tcp', 'udp') then
+        raise exception 'a node''s transport is ssh, tcp or udp'
+            using errcode = '22023';
+    end if;
     if v_type = 'node.joined'
+       and (v_transport = 'ssh' or p_record ->> 'ssh' is not null)
        and (p_record ->> 'ssh' is null or length(p_record ->> 'ssh') > 255
             or p_record ->> 'ssh' !~ ('^(([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*'
                                       '|ssh://([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?)$')
@@ -6139,6 +6157,89 @@ begin
                         between 1 and 65535, true) is not true) then
         raise exception 'a node''s ssh destination is [user@]host or ssh://[user@]host[:port], the port 1 to 65535'
             using errcode = '22023';
+    end if;
+    -- An ssh node's destination is `ssh`, no endpoint; a tcp or udp
+    -- node's is `endpoint`, `host:port` with no user, password, option or
+    -- space, the scheme (when there) its transport's.
+    if v_type = 'node.joined' and v_transport = 'ssh'
+       and coalesce(jsonb_typeof(p_record -> 'endpoint'), 'null') <> 'null' then
+        raise exception 'an ssh node''s endpoint is null: its destination is ssh'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined' and v_transport in ('tcp', 'udp')
+       and (jsonb_typeof(p_record -> 'endpoint') is distinct from 'string'
+            or length(p_record ->> 'endpoint') > 255
+            or p_record ->> 'endpoint' !~ ('^(' || v_transport || '://)?'
+                                           '([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\])'
+                                           ':[0-9]{1,5}$')
+            or substring(p_record ->> 'endpoint' from ':([0-9]{1,5})$')::integer
+               not between 1 and 65535) then
+        raise exception 'a % node''s endpoint is [%://]host:port (a name, an IPv4 or a bracketed IPv6 address), the port 1 to 65535',
+            v_transport, v_transport using errcode = '22023';
+    end if;
+    if v_type = 'node.joined'
+       and coalesce(jsonb_typeof(p_record -> 'mode'), 'null') <> 'null'
+       and (jsonb_typeof(p_record -> 'mode') <> 'string'
+            or p_record ->> 'mode' not in ('direct', 'relay', 'hole_punch')) then
+        raise exception 'a node''s mode is direct, relay or hole_punch'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined' and jsonb_typeof(v_via) <> 'null' then
+        if jsonb_typeof(v_via) <> 'array' or jsonb_array_length(v_via) > 8
+           or exists (select 1 from jsonb_array_elements(v_via) h
+                       where jsonb_typeof(h) <> 'string'
+                          or h #>> '{}' !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') then
+            raise exception 'a node''s via is a list of at most 8 node names'
+                using errcode = '22023';
+        end if;
+        if exists (select 1 from jsonb_array_elements_text(v_via) h where h = v_name) then
+            raise exception 'node % cannot be a hop of its own via', v_name using errcode = '22023';
+        end if;
+        if (select count(distinct h) <> count(*) from jsonb_array_elements_text(v_via) h) then
+            raise exception 'a node''s via names a hop twice' using errcode = '22023';
+        end if;
+        select h into v_bad from jsonb_array_elements_text(v_via) with ordinality v(h, o)
+         where not exists (select 1 from spawn_node_latest('node.joined', v.h, 0) j
+                            where not exists (select 1 from spawn_node_latest('node.removed', v.h, j.seq)))
+         order by o limit 1;
+        if v_bad is not null then
+            raise exception 'hop % of the via is not joined', v_bad using errcode = 'P0002';
+        end if;
+        -- An ssh node's hops are its jump hosts, ssh nodes; a tcp or udp
+        -- node's are relays, tcp or udp nodes.
+        select h into v_bad from jsonb_array_elements_text(v_via) with ordinality v(h, o)
+         cross join lateral spawn_node_latest('node.joined', v.h, 0) j
+         where (coalesce(j.record ->> 'transport', 'ssh') = 'ssh') <> (v_transport = 'ssh')
+         order by o limit 1;
+        if v_bad is not null then
+            raise exception 'hop % is reached over another transport: an ssh node''s hops are ssh nodes, a tcp or udp node''s are tcp or udp nodes',
+                v_bad using errcode = '22023';
+        end if;
+        if p_record ->> 'mode' = 'direct' and jsonb_array_length(v_via) > 0 then
+            raise exception 'a direct node has no via (its mode is relay or hole_punch)'
+                using errcode = '22023';
+        end if;
+        -- No loop: walk the hops' own `via` (their current joins), each
+        -- name once, and never reach this node.
+        v_seen := array(select jsonb_array_elements_text(v_via));
+        v_front := v_seen;
+        while cardinality(v_front) > 0 loop
+            v_front := array(
+                select distinct n.hop
+                  from unnest(v_front) f(name)
+                 cross join lateral spawn_node_latest('node.joined', f.name, 0) j
+                 cross join lateral jsonb_array_elements_text(
+                     case when jsonb_typeof(j.record -> 'via') = 'array'
+                          then j.record -> 'via' else '[]'::jsonb end) n(hop)
+                 where not exists (select 1 from spawn_node_latest('node.removed', f.name, j.seq))
+                   and n.hop <> all(v_seen));
+            if v_name = any(v_front) then
+                raise exception 'node % via % makes a loop: a hop is reached through %',
+                    v_name, v_via, v_name using errcode = '22023';
+            end if;
+            v_seen := v_seen || v_front;
+        end loop;
+        v_bad := null;
     end if;
     -- Each field this record type holds, named when it is wrong; the
     -- record itself is never said back.

@@ -186,6 +186,111 @@ runs no job yet, and a drain changes no scheduling.
   its latest heartbeat sample. The Fleet details show one row per node and
   say when the read failed.
 
+#### Transports and hops (issue #85)
+
+A node is reached over ssh (as above), or over tcp or udp to its own
+`spawn node serve`, directly or through up to 8 other joined nodes, so a
+node behind a NAT, a firewall or another network still joins.
+
+- `spawn node add <name> --ssh <dest> | --tcp <[tcp://]host:port> |
+  --udp <[udp://]host:port> [--via <hop>[,<hop>...]]
+  [--mode direct|relay|hole_punch]` (exactly one transport). `--via` names
+  joined nodes, the hops from the primary in order. For ssh they are jump
+  hosts, reached through a nested `ProxyCommand` rather than `-J` (whose
+  jump hosts get none of the command line's `-o` options): each jump is an
+  `ssh` with all nine hardening options of the destination's (`BatchMode`,
+  `ConnectTimeout`, `StrictHostKeyChecking=yes`, `UpdateHostKeys=no`,
+  `ControlMaster=no`, `ControlPath=none`, `ClearAllForwardings`,
+  `ForwardAgent=no`, `ForwardX11=no`) and `-T -W [%h]:%p -- <jump>`, every
+  word POSIX single-quoted and each nested command's `%` doubled; a jump
+  is an ssh node whose destination passes the same check. For tcp and udp
+  the hops are relays (tcp or udp nodes, mixed as each hop's scheme says);
+  the writer refuses a hop of the other kind for either. `--mode` defaults to
+  `relay` with hops and `direct` without; `direct` with hops is refused;
+  `hole_punch` labels a path the node opened by speaking first (the probe
+  goes the same way: the label is the record's, not a different protocol).
+- `node.joined` gains `transport` (`ssh`, `tcp`, `udp`; absent means ssh,
+  every earlier join), `endpoint` (null for ssh, whose destination stays in
+  `ssh`; `[scheme://]host:port` for tcp and udp: a name, an IPv4 or a
+  bracketed IPv6 address, port 1 to 65535, no `@`, no leading `-`, no
+  space, at most 255 characters), `via` (at most 8 joined names, never the
+  node itself, none twice) and `mode`. `spawn_node_record` checks them under
+  the append lock, the ssh check and its words unchanged, and walks the
+  hops' own `via` (current joins only, each name once) to refuse a loop.
+  The readers default an old join to `ssh`, `[]`, `direct`; `node_members`
+  (the heartbeat's) gives the ssh destination as `endpoint`, `NODES` does
+  not, and `/api/nodes` withholds `ssh`, `endpoint` and `note` alike: the
+  web learns how a node is reached (`transport`, `mode`, its hops' names),
+  never where.
+- The wire: one JSON object a message, a line on tcp (one exchange a
+  connection), a datagram on udp, each `{nonce, op, at_ms, auth?, ...}`
+  answered `{nonce, ok, ...}`. Every nonce is 16 bytes of `/dev/urandom` and a
+  counter; a reply naming another nonce is refused on tcp and dropped on
+  udp (the wait goes on, sent again with backoff until the deadline), so a
+  spoofed or stale reply is never taken. Ops: `inventory` and `beat` (the
+  node runs its own copy of the fixed read-only scripts, `{output}`, at
+  most 256 KiB, masked on arrival); `forward` `{ttl, hops, timeout_ms,
+  inner}` (at most 8 hops within the ttl, each a tcp or udp endpoint, none
+  twice, at most 60 s, the inner op a probe or `register` only; each relay
+  passes on 400 ms less time and a nonce of its own, and checks that the
+  reply it relays names the inner request); `register`. Frames are bounded
+  (320 KiB on tcp, 65 000 bytes on udp).
+- Authentication: with `SPAWN_NODE_TOKEN` set, `spawn node add`, `spawn
+  node register`, the heartbeat and every relay sign each request with
+  `auth`, HMAC-SHA256 keyed by the token over a domain-separated list of
+  its `op`, `nonce`, `at_ms` and what it acts on (`register`: `name,
+  transport, endpoint, via, mode, note, inventory`; `forward`: `hops, ttl,
+  timeout_ms` and the inner request's `op` and `nonce`). The token itself
+  never goes on the wire. A node with the token refuses any request
+  without a valid `auth`, or more than 120 s from its clock; a `register`
+  always needs one, so `spawn node serve --register-store` refuses to start
+  without `SPAWN_NODE_TOKEN` (fail closed), and `spawn node register` does
+  not send without it.
+- Each nonce runs once. Before a request takes any slot, the node looks
+  its nonce up (at most 1024 kept): one answered in the last 125 s is
+  answered from that cache, one in flight is dropped (a udp resend; a tcp
+  peer is told so), and the mark of a request that never finished (an
+  error, a panic, no slot) is cleared, so its next send runs. A udp probe
+  through relays to a dead hop costs that hop one resend loop, not one per
+  resend of every hop before it, and a `register` sent again while the
+  store records it is recorded once and answered.
+- A relay sends on only an inner request it rebuilt from the allowed
+  fields of a probe (`op, nonce, at_ms, auth`) or a `register` (those and
+  `name, transport, endpoint, via, mode, note, inventory`), each of its
+  type; any other op or key, in the inner request or the envelope, is
+  refused. It resolves its next hop itself and connects only to the
+  addresses it checked: never a loopback, unspecified, link-local,
+  broadcast or multicast one, IPv4-mapped ones included, unless it runs
+  with `--allow-loopback-forward`. Every failure to reach the next hop
+  (refused, silent, not a node, another nonce) is said in the same words,
+  "the next hop gave no valid answer", so a forward is no port scanner.
+- A listener handles at most 64 requests at once, 16 of them from one
+  address, and a tcp peer has 2 s to send its request line, so a peer
+  holding idle connections starves neither the others nor the heartbeat.
+- `spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> |
+  --udp <bind> [--register-store] [--allow-loopback-forward]` answers those
+  ops; with `--register-store` (the owner's login, on the primary or a host
+  with its database) it records the `node.joined` a signed `register` asks
+  for, each field checked as the writer checks it, the note masked.
+- `spawn node register --to <[tcp://|udp://]host:port> --name <name>
+  --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>],...]
+  [--mode ...] [--note ...]` runs the inventory on the node itself and
+  sends it up, signed (up to five tries within 30 s, one nonce, one auth):
+  directly, or, when the
+  hops name endpoints, through them nearest first. `--listen` is the
+  endpoint the primary will probe (the node's `spawn node serve`), never
+  0.0.0.0 or [::].
+- The heartbeat resolves each node's route from the membership at every
+  read (a hop removed makes its probes fail, so the node is lost), and
+  `spawn node list` shows `TRANSPORT` (`ssh`, `tcp/direct`, `udp/relay`,
+  `ssh/relay`, `tcp/hole_punch`) and `via a->b`; the Fleet row shows the
+  same badge, in the same words, and `via a → b`.
+
+The tcp and udp transports are authenticated but not encrypted: a reader
+on the path sees the probes' outputs and the registrations, and one token
+is shared by the fleet. Run them over a network already trusted (a VPN, a
+LAN), as §4.2 of the distributed research leaves the overlay to the owner.
+
 The records are `node.recorded` events of the control session, outside the
 control fold: a refold of this schema, or of one rolled back to before P1,
 reads none of them. The owner-only writer `spawn_node_record` checks each
@@ -197,9 +302,13 @@ not wait for it (it waits for transactions already open, such as a running
 `pg_dump`); a build cut short is dropped and made again at the next
 `init-db`.
 
-The trust boundary is the one panes have: a node writes nothing to the
-log. The primary sends it nothing but two fixed texts of read-only
-commands; ssh runs in batch mode against an already trusted host key,
+The trust boundary is the one panes have: a node writes to the log only
+what an owner process records for it. The primary sends it nothing but
+two fixed texts of read-only commands (over tcp and udp, only their
+names); a node's own `register` is recorded only by an owner's `spawn
+node serve --register-store`, signed with the fleet's token and checked
+field by field as `spawn node add`'s join is. ssh runs in batch mode
+against an already trusted host key, every jump host's ssh too,
 without a shared connection, forwarding or terminal, with an environment
 of `PATH`, `HOME`, `USER`, `LOGNAME` and `SSH_AUTH_SOCK` alone. The
 destination is checked in the CLI and again in the writer, and every string

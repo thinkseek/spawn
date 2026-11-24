@@ -77,13 +77,26 @@ select coalesce(jsonb_agg(x.node order by x.name), '[]'::jsonb) from (select ",
 }
 
 /// Every node joined and not removed, by name: its join record's fields
-/// with `join` (the event id) and `joined_ms`; `state`, `lost` before
+/// with `join` (the event id) and `joined_ms`; how the primary reaches it,
+/// `transport` (`ssh` for a join that says none), `endpoint` (a tcp or udp
+/// node's; null for ssh, whose destination stays in `ssh`, which the web
+/// read drops), `via` (its hops, `[]` without) and `mode` (relay with hops
+/// and direct without when the join says none); `state`, `lost` before
 /// `drained` before `live`; `lost_since_ms`, the time of its open
 /// `node.lost` (null unless lost); `heartbeat`, its latest sample
 /// `{at_ms, load1, mem_available, disk_free}` or null.
 pub(crate) const NODES: &str = joined!(
     r"j.name, (j.record - 'type') || jsonb_build_object(
       'join', j.id, 'joined_ms', j.at_ms,
+      'transport', coalesce(j.record ->> 'transport', 'ssh'),
+      'endpoint', case when coalesce(j.record ->> 'transport', 'ssh') <> 'ssh'
+                       then j.record ->> 'endpoint' end,
+      'via', case when jsonb_typeof(j.record -> 'via') = 'array'
+                  then j.record -> 'via' else '[]'::jsonb end,
+      'mode', coalesce(j.record ->> 'mode',
+                       case when jsonb_array_length(case when jsonb_typeof(j.record -> 'via') = 'array'
+                                                         then j.record -> 'via' else '[]'::jsonb end) > 0
+                            then 'relay' else 'direct' end),
       'state', case when l.seq > coalesce(b.seq, 0) then 'lost'
                     when d.seq > coalesce(u.seq, 0) then 'drained' else 'live' end,
       'lost_since_ms', case when l.seq > coalesce(b.seq, 0) then l.at_ms end,
@@ -93,14 +106,25 @@ pub(crate) const NODES: &str = joined!(
           'disk_free', h.record -> 'disk_free') end) as node"
 );
 
-/// What the heartbeat worker needs of each node: `{name, ssh, join,
-/// beat_ms, lost}`, `beat_ms` its latest heartbeat's time or null, `lost`
+/// What the heartbeat worker needs of each node: `{name, ssh, transport,
+/// endpoint, via, mode, join, beat_ms, lost}` (`transport` `ssh`,
+/// `endpoint` the ssh destination, `via` `[]` and `mode` as [`NODES`] says
+/// for a join that names none), `beat_ms` its latest heartbeat's time or null, `lost`
 /// its latest `node.lost` since the join (with `event_id`, `at_ms`,
 /// `open`, no `node.back` after it, and `alerted`, its `node_lost` alert
 /// fired) or null.
 pub(crate) const MEMBERS: &str = joined!(
     r"j.name, jsonb_build_object(
-      'name', j.name, 'ssh', j.record ->> 'ssh', 'join', j.id, 'beat_ms', h.at_ms,
+      'name', j.name, 'ssh', j.record ->> 'ssh',
+      'transport', coalesce(j.record ->> 'transport', 'ssh'),
+      'endpoint', coalesce(j.record ->> 'endpoint', j.record ->> 'ssh'),
+      'via', case when jsonb_typeof(j.record -> 'via') = 'array'
+                  then j.record -> 'via' else '[]'::jsonb end,
+      'mode', coalesce(j.record ->> 'mode',
+                       case when jsonb_array_length(case when jsonb_typeof(j.record -> 'via') = 'array'
+                                                         then j.record -> 'via' else '[]'::jsonb end) > 0
+                            then 'relay' else 'direct' end),
+      'join', j.id, 'beat_ms', h.at_ms,
       'lost', case when l.id is not null then l.record || jsonb_build_object(
           'event_id', l.id, 'at_ms', l.at_ms, 'open', l.seq > coalesce(b.seq, 0),
           'alerted', exists (select 1 from spawn_alerts a
