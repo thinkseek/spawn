@@ -12319,7 +12319,7 @@ execute function alerts_test_deploys_mid_start();
         /// text says whether the agent took it is unknown, and why (Spawn not
         /// reading the transcript, or nothing written).
         #[test]
-        fn transcript_movement_suppresses_a_typed_message_but_zero_still_fires() {
+        fn a_typed_message_not_taken_says_whether_spawn_read_the_transcript_since() {
             in_schema("messages_read_since", |store| {
                 let world = messages_world(store);
                 let deaf = world.deaf;
