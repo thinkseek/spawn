@@ -2756,10 +2756,13 @@ impl WorkspaceStore for CowWorkspace {
             return false;
         };
         let branch = workspace.sandbox();
+        if self.swap_path(branch).exists() || self.installing_path(branch).exists() {
+            return false;
+        }
         let Ok(Some(meta)) = present(&directory) else {
             return false;
         };
-        let Ok(Some(state)) = self.settled_state(branch) else {
+        let Ok(Some(state)) = read_state(&self.state_path(branch)) else {
             return false;
         };
         Self::owned(&directory, &meta, &state).is_ok()

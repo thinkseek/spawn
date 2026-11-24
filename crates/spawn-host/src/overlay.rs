@@ -1568,7 +1568,15 @@ impl WorkspaceStore for OverlayWorkspace {
         let Ok(merged) = self.merged_dir(workspace) else {
             return false;
         };
-        state.is_dir() && merged.is_dir()
+        if !state.join("lower").is_file() {
+            return false;
+        }
+        let Some(holder) = self.live_holder(&state) else {
+            return false;
+        };
+        let relative = merged.strip_prefix("/").unwrap_or(&merged);
+        let root = PathBuf::from(format!("/proc/{}/root", holder.pid)).join(relative);
+        on_overlay(&root).unwrap_or(false)
     }
 
     fn notices(&self, _workspace: &WorkspaceId) -> Vec<String> {
