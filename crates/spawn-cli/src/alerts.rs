@@ -4718,7 +4718,12 @@ const TMPFS_MAGIC: u64 = 0x0102_1994;
 fn fs_type(path: &Path) -> Result<u64, String> {
     let stat =
         rustix::fs::statfs(path).map_err(|error| format!("statfs {}: {error}", path.display()))?;
-    // `f_type` is a signed word here; the magic numbers are positive.
+    fs_type_of(path, &stat)
+}
+
+/// Linux's `f_type` is a signed word; the magic numbers are positive.
+#[cfg(target_os = "linux")]
+fn fs_type_of(path: &Path, stat: &rustix::fs::StatFs) -> Result<u64, String> {
     u64::try_from(stat.f_type).map_err(|_| {
         format!(
             "statfs {}: type {} is not a magic number",
@@ -4726,6 +4731,16 @@ fn fs_type(path: &Path) -> Result<u64, String> {
             stat.f_type
         )
     })
+}
+
+/// macOS's `f_type` is a `u32`: every value widens to a type.
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "one signature with the Linux reading"
+)]
+fn fs_type_of(_path: &Path, stat: &rustix::fs::StatFs) -> Result<u64, String> {
+    Ok(u64::from(stat.f_type))
 }
 
 fn crossing(open: bool, measured: u64, turn_on: u64, turn_off: u64, under: bool) -> Crossing {

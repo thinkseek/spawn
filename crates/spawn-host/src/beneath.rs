@@ -25,6 +25,12 @@
 //!
 //! It needs `openat2` (Linux 5.6 or later): an older kernel's `ENOSYS`, or a
 //! seccomp filter's `EPERM`, makes every open fail, loudly.
+//!
+//! macOS has no `openat2`: there the same open is `openat` with
+//! `O_NOFOLLOW_ANY` (no component may be a symlink) of a path of plain
+//! components only, which with no link and no `..` cannot resolve above the
+//! directory it starts from. Its refusals read the same. No other platform
+//! has an open here, so the crate does not build for one.
 //! Not stood against: a bind mount below a root, and privileged tampering.
 
 use std::fs::File;
@@ -33,12 +39,13 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
+use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::home::Home;
 
 /// How often an `EAGAIN` from `openat2` is tried again.
+#[cfg(target_os = "linux")]
 const AGAIN: usize = 32;
 
 /// A root's directory as pinned: its canonical path, device and inode, and
@@ -116,7 +123,9 @@ fn refusal(shown: &Path, what: &str, errno: Errno) -> String {
 }
 
 /// `openat2` below `dir`, never through a link, `EAGAIN` tried again.
+#[cfg(target_os = "linux")]
 fn open_below(dir: &impl AsFd, path: &Path, flags: OFlags, mode: Mode) -> Result<OwnedFd, Errno> {
+    use rustix::fs::ResolveFlags;
     let mut tries = 0;
     loop {
         match rustix::fs::openat2(
@@ -130,6 +139,25 @@ fn open_below(dir: &impl AsFd, path: &Path, flags: OFlags, mode: Mode) -> Result
             other => return other,
         }
     }
+}
+
+/// `openat` below `dir`, never through a link (`O_NOFOLLOW_ANY`): a path of
+/// plain components that meets no link stays below `dir`, and any other
+/// path is refused as leaving it (`EXDEV`, as `openat2` says it).
+#[cfg(target_vendor = "apple")]
+fn open_below(dir: &impl AsFd, path: &Path, flags: OFlags, mode: Mode) -> Result<OwnedFd, Errno> {
+    if !path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(Errno::XDEV);
+    }
+    rustix::fs::openat(
+        dir,
+        path,
+        flags | OFlags::CLOEXEC | OFlags::NOFOLLOW_ANY,
+        mode,
+    )
 }
 
 /// `relative` as plain components: no root, no `.` or `..`.
@@ -274,9 +302,14 @@ impl Beneath {
                             std::io::Error::from(errno)
                         )
                     })?;
-                let stat =
-                    rustix::fs::fstat(&fd).map_err(|errno| refusal(&pin.base, "stat", errno))?;
-                if (stat.st_dev, stat.st_ino) != (pin.device, pin.inode) {
+                // The descriptor's own metadata (`fstat`), device and inode
+                // as wide as the pin's on every platform.
+                let held = File::from(fd);
+                let stat = held
+                    .metadata()
+                    .map_err(|error| format!("stat {}: {error}", pin.base.display()))?;
+                let fd = OwnedFd::from(held);
+                if (stat.dev(), stat.ino()) != (pin.device, pin.inode) {
                     return Err(format!(
                         "{} is no longer the directory pinned for {}: not followed",
                         pin.base.display(),
@@ -503,7 +536,11 @@ impl Beneath {
             &dir.fd,
             Path::new(&temporary),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            Mode::from(mode.unwrap_or(0o666)),
+            // Permission bits only (`& 0o7777` where a mode is given): they
+            // fit the platform's `mode_t`, 16 bits wide on macOS.
+            mode.map_or(Mode::from(0o666), |mode| {
+                rustix::fs::RawMode::try_from(mode).map_or(Mode::empty(), Mode::from_bits_truncate)
+            }),
         )
         .map_err(|errno| refusal(&shown, "create", errno))?;
         let mut file = File::from(fd);

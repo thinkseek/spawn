@@ -15,7 +15,9 @@
 //! watches, and says so once.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use spawn_core::port::{FileWatch, WatchError};
@@ -23,6 +25,7 @@ use spawn_core::port::{FileWatch, WatchError};
 /// Bytes of change events one read takes; the queue is read until it is
 /// empty. The kernel drops an event that does not fit its queue and sets
 /// `IN_Q_OVERFLOW`, which is reported as a change of every key.
+#[cfg(target_os = "linux")]
 const EVENT_BUFFER: usize = 8192;
 
 /// A watch on engine files through the platform's change notifications.
@@ -41,6 +44,7 @@ pub struct InotifyWatch {
 struct State {
     /// Watch descriptor → the directory it watches and the keys served by
     /// it.
+    #[cfg(target_os = "linux")]
     dirs: BTreeMap<i32, Dir>,
     /// Every `(key, path)` and the directory watched for it.
     wanted: BTreeMap<(String, String), PathBuf>,
@@ -52,6 +56,7 @@ struct State {
 }
 
 /// One watched directory.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct Dir {
     path: PathBuf,
@@ -59,6 +64,7 @@ struct Dir {
 }
 
 /// One change event, copied out of the descriptor's buffer.
+#[cfg(target_os = "linux")]
 struct Change {
     descriptor: i32,
     flags: u32,
@@ -303,6 +309,10 @@ impl FileWatch for InotifyWatch {
             .map(|(_, path)| path.clone())
             .collect();
         for path in paths {
+            // Nothing is ever watched where there is no adapter.
+            #[cfg(not(target_os = "linux"))]
+            state.wanted.remove(&(key.to_string(), path));
+            #[cfg(target_os = "linux")]
             if let Some(anchor) = state.wanted.remove(&(key.to_string(), path)) {
                 self.release(&mut state, key, &anchor);
             }
@@ -325,6 +335,7 @@ impl FileWatch for InotifyWatch {
 
 /// The deepest directory above `file` that exists, itself included when it
 /// is one.
+#[cfg(any(target_os = "linux", test))]
 fn anchor(file: &Path) -> Option<PathBuf> {
     let mut candidate = if file.is_dir() {
         file.to_path_buf()
@@ -343,7 +354,10 @@ fn anchor(file: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InotifyWatch, anchor};
+    #[cfg(target_os = "linux")]
+    use super::InotifyWatch;
+    use super::anchor;
+    #[cfg(target_os = "linux")]
     use spawn_core::port::FileWatch;
     use std::path::Path;
 
@@ -376,6 +390,7 @@ mod tests {
     }
 
     /// A change to a watched file is reported for its key, once per drain.
+    #[cfg(target_os = "linux")] // the inotify adapter
     #[test]
     fn a_write_to_a_watched_file_is_reported_once() {
         let scratch = Scratch::new("write");
@@ -394,6 +409,7 @@ mod tests {
 
     /// A file that appears in a directory created after the watch was set is
     /// reported: the watch follows the path down.
+    #[cfg(target_os = "linux")] // the inotify adapter
     #[test]
     fn a_file_whose_directory_appears_later_is_reported() {
         let scratch = Scratch::new("nested");
@@ -415,6 +431,7 @@ mod tests {
 
     /// Every key of a directory hears about the file it asked for, and none
     /// hears about another file of it.
+    #[cfg(target_os = "linux")] // the inotify adapter
     #[test]
     fn only_the_file_a_key_asked_for_is_reported() {
         let scratch = Scratch::new("keys");
@@ -431,6 +448,7 @@ mod tests {
     }
 
     /// A key that stops watching hears nothing more.
+    #[cfg(target_os = "linux")] // the inotify adapter
     #[test]
     fn an_unwatched_key_hears_nothing_more() {
         let scratch = Scratch::new("unwatch");
