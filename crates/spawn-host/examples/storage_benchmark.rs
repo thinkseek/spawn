@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use spawn_core::id::{AgentId, BranchName};
+use spawn_core::id::{AgentId, BranchName, WorkspaceId};
 use spawn_core::port::{Commit, TranscriptArchive, WorkspaceStore};
 use spawn_host::{GitWorkspace, LocalTranscriptArchive, git_command};
 use spawn_postgres::PostgresStore;
@@ -152,10 +152,10 @@ fn config() -> Result<Option<Config>, String> {
                 .to_string(),
         );
     }
-    if let Some(revision) = &config.source_revision {
-        if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("--source-revision must be a full 40-character Git commit id".to_string());
-        }
+    if let Some(revision) = &config.source_revision
+        && (revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err("--source-revision must be a full 40-character Git commit id".to_string());
     }
     let last_cycle = config
         .warmup
@@ -216,32 +216,43 @@ impl Samples {
             .push(elapsed.as_secs_f64() * 1000.0);
     }
 
-    fn report(&self) -> Value {
+    fn report(&self) -> Result<Value, String> {
         self.0
             .iter()
-            .map(|(name, values)| ((*name).to_string(), summary(values)))
+            .map(|(name, values)| Ok(((*name).to_string(), summary(values)?)))
             .collect()
     }
 }
 
-fn percentile(sorted: &[f64], percentile: f64) -> f64 {
-    let rank = (percentile * sorted.len() as f64).ceil() as usize;
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+fn sample_count(count: usize) -> Result<f64, String> {
+    let count = u32::try_from(count)
+        .map_err(|_| "sample count exceeds the exactly representable range".to_string())?;
+    Ok(f64::from(count))
 }
 
-fn summary(values: &[f64]) -> Value {
+fn percentile(sorted: &[f64], percent: u32) -> Result<f64, String> {
+    let len = u128::try_from(sorted.len())
+        .map_err(|_| "sample count does not fit the percentile calculation".to_string())?;
+    let rank = (len * u128::from(percent)).div_ceil(100);
+    let index = usize::try_from(rank.saturating_sub(1).min(len - 1))
+        .map_err(|_| "percentile rank does not fit this platform".to_string())?;
+    Ok(sorted[index])
+}
+
+fn summary(values: &[f64]) -> Result<Value, String> {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let sum: f64 = sorted.iter().sum();
-    json!({
+    let count = sample_count(sorted.len())?;
+    Ok(json!({
         "n": sorted.len(),
         "min_ms": sorted[0],
-        "p50_ms": percentile(&sorted, 0.50),
-        "p95_ms": percentile(&sorted, 0.95),
-        "p99_ms": percentile(&sorted, 0.99),
+        "p50_ms": percentile(&sorted, 50)?,
+        "p95_ms": percentile(&sorted, 95)?,
+        "p99_ms": percentile(&sorted, 99)?,
         "max_ms": sorted[sorted.len() - 1],
-        "mean_ms": sum / sorted.len() as f64,
-    })
+        "mean_ms": sum / count,
+    }))
 }
 
 fn directory_size(root: &Path) -> Result<Value, String> {
@@ -291,7 +302,10 @@ fn edit_workspace(workspace: &Path, config: &Config, cycle: usize) -> Result<(),
     for edit in 0..config.edits {
         let index = (cycle * config.edits + edit) % config.files;
         let path = workspace.join(format!("tree/{:04}/{:06}.txt", index % 32, index));
-        let mut payload = vec![b'a' + (cycle % 26) as u8; config.file_bytes];
+        let fill = b'a'
+            + u8::try_from(cycle % 26)
+                .map_err(|_| "cycle fill byte does not fit u8".to_string())?;
+        let mut payload = vec![fill; config.file_bytes];
         let marker = format!("cycle={cycle} edit={edit}");
         payload[..marker.len()].copy_from_slice(marker.as_bytes());
         fs::write(&path, payload).map_err(|error| format!("edit {}: {error}", path.display()))?;
@@ -305,8 +319,10 @@ fn git_version() -> String {
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .map_or_else(
+            || "unknown".to_string(),
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )
 }
 
 fn binary_sha256() -> Result<String, String> {
@@ -393,56 +409,23 @@ fn drop_branch(repo: &Path, branch: &BranchName) -> Result<(), String> {
     }
 }
 
-fn run(mut config: Config) -> Result<Value, String> {
-    let mut scratch = Scratch::new(config.root.take())?;
-    scratch.keep = config.keep;
-    let repo = scratch.root.join("store.git");
-    let workspaces = scratch.root.join("workspaces");
-    fs::create_dir(&workspaces).map_err(|error| format!("create workspace root: {error}"))?;
+fn initialize_repository(repo: &Path) -> Result<(), String> {
     let initialized = git_command("git")
         .args(["init", "--bare", "--quiet"])
-        .arg(&repo)
+        .arg(repo)
         .output()
         .map_err(|error| format!("run git init: {error}"))?;
-    if !initialized.status.success() {
-        return Err(format!(
+    if initialized.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
             "git init failed: {}",
             String::from_utf8_lossy(&initialized.stderr).trim()
-        ));
+        ))
     }
+}
 
-    let store = GitWorkspace::new(&repo, &workspaces);
-    let store = if config.oversized_file_bytes.is_some() {
-        store.with_max_file_bytes(config.file_bytes as u64)
-    } else {
-        store
-    };
-    let branch = BranchName::new("agent_storage_benchmark").map_err(|error| error.to_string())?;
-    store
-        .ensure_branch(&branch, None)
-        .map_err(|error| error.to_string())?;
-    let mut workspace = store.mount(&branch).map_err(|error| error.to_string())?;
-    seed_workspace(Path::new(workspace.path()), &config)?;
-    if !matches!(
-        store
-            .commit(&workspace, "benchmark: seed")
-            .map_err(|error| error.to_string())?,
-        Commit::Created(_)
-    ) {
-        return Err("the seeded workspace did not produce a commit".to_string());
-    }
-    assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
-
-    let archive = LocalTranscriptArchive::new(scratch.root.join(".transcripts"));
-    let agent = AgentId::new("agent_storage_benchmark").map_err(|error| error.to_string())?;
-    let native = "storage-benchmark";
-    let mut transcript_offset = 0_u64;
-    let transcript_payload = {
-        let mut payload = vec![b't'; config.transcript_bytes];
-        payload[config.transcript_bytes - 1] = b'\n';
-        payload
-    };
-
+fn connect_database() -> Result<Option<PostgresStore>, String> {
     let database_url = env::var("SPAWN_BENCH_DATABASE_URL").ok();
     let schema = format!(
         "spawn_storage_benchmark_{}_{:x}",
@@ -451,30 +434,101 @@ fn run(mut config: Config) -> Result<Value, String> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos())
     );
-    let database = database_url
+    database_url
         .as_deref()
         .map(|url| PostgresStore::connect_in_schema(url, &schema))
         .transpose()
-        .map_err(|error| format!("connect the dedicated benchmark database: {error}"))?;
-    let mut last_database_event = None;
+        .map_err(|error| format!("connect the dedicated benchmark database: {error}"))
+}
 
-    let total_cycles = config.warmup + config.iterations;
-    let progress_every = (config.iterations / 10).max(1);
-    let mut samples = Samples::default();
-    let mut cycle_times = Vec::with_capacity(config.iterations);
-    let wall = Instant::now();
-    for cycle in 0..total_cycles {
-        let measured = cycle >= config.warmup;
-        let cycle_clock = Instant::now();
-        edit_workspace(Path::new(workspace.path()), &config, cycle)?;
-        let recreate = config.recreate_every > 0 && (cycle + 1) % config.recreate_every == 0;
-        if recreate {
-            drop_branch(&repo, &branch)?;
+struct Benchmark {
+    config: Config,
+    scratch: Scratch,
+    repo: PathBuf,
+    store: GitWorkspace,
+    branch: BranchName,
+    workspace: WorkspaceId,
+    archive: LocalTranscriptArchive,
+    agent: AgentId,
+    transcript_offset: u64,
+    transcript_payload: Vec<u8>,
+    database: Option<PostgresStore>,
+    last_database_event: Option<i64>,
+    samples: Samples,
+    cycle_times: Vec<f64>,
+}
+
+impl Benchmark {
+    fn new(mut config: Config) -> Result<Self, String> {
+        let mut scratch = Scratch::new(config.root.take())?;
+        scratch.keep = config.keep;
+        let repo = scratch.root.join("store.git");
+        let workspaces = scratch.root.join("workspaces");
+        fs::create_dir(&workspaces).map_err(|error| format!("create workspace root: {error}"))?;
+        initialize_repository(&repo)?;
+
+        let store = GitWorkspace::new(&repo, &workspaces);
+        let store = if config.oversized_file_bytes.is_some() {
+            store.with_max_file_bytes(u64::try_from(config.file_bytes).map_err(|_| {
+                "the maximum file size does not fit the workspace limit".to_string()
+            })?)
+        } else {
+            store
+        };
+        let branch =
+            BranchName::new("agent_storage_benchmark").map_err(|error| error.to_string())?;
+        store
+            .ensure_branch(&branch, None)
+            .map_err(|error| error.to_string())?;
+        let workspace = store.mount(&branch).map_err(|error| error.to_string())?;
+        seed_workspace(Path::new(workspace.path()), &config)?;
+        if !matches!(
+            store
+                .commit(&workspace, "benchmark: seed")
+                .map_err(|error| error.to_string())?,
+            Commit::Created(_)
+        ) {
+            return Err("the seeded workspace did not produce a commit".to_string());
         }
+        assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
 
+        let archive = LocalTranscriptArchive::new(scratch.root.join(".transcripts"));
+        let agent = AgentId::new("agent_storage_benchmark").map_err(|error| error.to_string())?;
+        let mut transcript_payload = vec![b't'; config.transcript_bytes];
+        transcript_payload[config.transcript_bytes - 1] = b'\n';
+        let database = connect_database()?;
+        let cycle_times = Vec::with_capacity(config.iterations);
+        Ok(Self {
+            config,
+            scratch,
+            repo,
+            store,
+            branch,
+            workspace,
+            archive,
+            agent,
+            transcript_offset: 0,
+            transcript_payload,
+            database,
+            last_database_event: None,
+            samples: Samples::default(),
+            cycle_times,
+        })
+    }
+
+    fn checkpoint_changed(
+        &mut self,
+        cycle: usize,
+        recreate: bool,
+        measured: bool,
+    ) -> Result<(), String> {
+        if recreate {
+            drop_branch(&self.repo, &self.branch)?;
+        }
         let clock = Instant::now();
-        let committed = store
-            .commit(&workspace, &format!("benchmark: cycle {cycle}"))
+        let committed = self
+            .store
+            .commit(&self.workspace, &format!("benchmark: cycle {cycle}"))
             .map_err(|error| error.to_string())?;
         let elapsed = clock.elapsed();
         let valid = if recreate {
@@ -487,160 +541,245 @@ fn run(mut config: Config) -> Result<Value, String> {
                 "cycle {cycle}: checkpoint result did not match recreate={recreate}"
             ));
         }
-        assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
+        self.check_oversized_excluded()?;
         if measured {
-            samples.push("checkpoint_changed", elapsed);
+            self.samples.push("checkpoint_changed", elapsed);
         }
+        Ok(())
+    }
 
+    fn check_oversized_excluded(&self) -> Result<(), String> {
+        assert_oversized_excluded(
+            &self.repo,
+            &self.branch,
+            self.config.oversized_file_bytes.is_some(),
+        )
+    }
+
+    fn checkpoint_noop(&mut self, cycle: usize, measured: bool) -> Result<(), String> {
         let clock = Instant::now();
-        let unchanged = store
-            .commit(&workspace, "benchmark: unchanged")
+        let unchanged = self
+            .store
+            .commit(&self.workspace, "benchmark: unchanged")
             .map_err(|error| error.to_string())?;
         let elapsed = clock.elapsed();
         if !matches!(unchanged, Commit::Unchanged) {
             return Err(format!("cycle {cycle}: the no-op checkpoint made a commit"));
         }
-        assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
+        self.check_oversized_excluded()?;
         if measured {
-            samples.push("checkpoint_noop", elapsed);
+            self.samples.push("checkpoint_noop", elapsed);
+        }
+        Ok(())
+    }
+
+    fn append_transcript(&mut self, measured: bool) -> Result<(), String> {
+        let clock = Instant::now();
+        self.archive
+            .append(
+                &self.agent,
+                "storage-benchmark",
+                0,
+                self.transcript_offset,
+                &self.transcript_payload,
+            )
+            .map_err(|error| error.to_string())?;
+        let elapsed = clock.elapsed();
+        let appended = u64::try_from(self.config.transcript_bytes)
+            .map_err(|_| "transcript append length does not fit u64".to_string())?;
+        self.transcript_offset = self
+            .transcript_offset
+            .checked_add(appended)
+            .ok_or_else(|| "transcript offset overflow".to_string())?;
+        if measured {
+            self.samples.push("transcript_append", elapsed);
+        }
+        Ok(())
+    }
+
+    fn database_cycle(&mut self, cycle: usize, measured: bool) -> Result<(), String> {
+        let Some(database) = &self.database else {
+            return Ok(());
+        };
+        let record = json!({
+            "type": "host.storage",
+            "archive_bytes": self.transcript_offset,
+            "archive_files": 1,
+            "projects_bytes": 0,
+            "projects_files": 0,
+            "benchmark_cycle": cycle,
+        });
+        let clock = Instant::now();
+        let event = database
+            .host_record(&record)
+            .map_err(|error| format!("benchmark database append: {error}"))?;
+        let elapsed = clock.elapsed();
+        if self
+            .last_database_event
+            .is_some_and(|previous| event <= previous)
+        {
+            return Err(format!("cycle {cycle}: database event ids did not advance"));
+        }
+        self.last_database_event = Some(event);
+        if measured {
+            self.samples.push("postgres_append", elapsed);
         }
 
         let clock = Instant::now();
-        archive
-            .append(&agent, native, 0, transcript_offset, &transcript_payload)
+        let reading = database
+            .host_storage(0, i64::MAX)
+            .map_err(|error| format!("benchmark database read: {error}"))?;
+        let elapsed = clock.elapsed();
+        if reading["before"]["archive_bytes"].as_u64() != Some(self.transcript_offset) {
+            return Err(format!(
+                "cycle {cycle}: the database read did not return the latest storage sample"
+            ));
+        }
+        if measured {
+            self.samples.push("postgres_read", elapsed);
+        }
+        Ok(())
+    }
+
+    fn remount(&mut self, measured: bool) -> Result<(), String> {
+        let clock = Instant::now();
+        self.store
+            .unmount(&self.workspace)
             .map_err(|error| error.to_string())?;
         let elapsed = clock.elapsed();
-        transcript_offset += config.transcript_bytes as u64;
         if measured {
-            samples.push("transcript_append", elapsed);
+            self.samples.push("unmount", elapsed);
         }
-
-        if let Some(database) = &database {
-            let record = json!({
-                "type": "host.storage",
-                "archive_bytes": transcript_offset,
-                "archive_files": 1,
-                "projects_bytes": 0,
-                "projects_files": 0,
-                "benchmark_cycle": cycle,
-            });
-            let clock = Instant::now();
-            let event = database
-                .host_record(&record)
-                .map_err(|error| format!("benchmark database append: {error}"))?;
-            let elapsed = clock.elapsed();
-            if last_database_event.is_some_and(|previous| event <= previous) {
-                return Err(format!("cycle {cycle}: database event ids did not advance"));
-            }
-            last_database_event = Some(event);
-            if measured {
-                samples.push("postgres_append", elapsed);
-            }
-
-            let clock = Instant::now();
-            let reading = database
-                .host_storage(0, i64::MAX)
-                .map_err(|error| format!("benchmark database read: {error}"))?;
-            let elapsed = clock.elapsed();
-            if reading["before"]["archive_bytes"].as_u64() != Some(transcript_offset) {
-                return Err(format!(
-                    "cycle {cycle}: the database read did not return the latest storage sample"
-                ));
-            }
-            if measured {
-                samples.push("postgres_read", elapsed);
-            }
-        }
-
-        if config.remount_every > 0 && (cycle + 1) % config.remount_every == 0 {
-            let clock = Instant::now();
-            store
-                .unmount(&workspace)
-                .map_err(|error| error.to_string())?;
-            let elapsed = clock.elapsed();
-            if measured {
-                samples.push("unmount", elapsed);
-            }
-            let clock = Instant::now();
-            workspace = store.mount(&branch).map_err(|error| error.to_string())?;
-            let elapsed = clock.elapsed();
-            if measured {
-                samples.push("mount", elapsed);
-            }
-        }
-
+        let clock = Instant::now();
+        self.workspace = self
+            .store
+            .mount(&self.branch)
+            .map_err(|error| error.to_string())?;
+        let elapsed = clock.elapsed();
         if measured {
-            cycle_times.push(cycle_clock.elapsed().as_secs_f64() * 1000.0);
-            if (cycle - config.warmup + 1) % progress_every == 0 {
-                eprintln!(
-                    "storage benchmark: {}/{} measured cycles",
-                    cycle - config.warmup + 1,
-                    config.iterations
-                );
+            self.samples.push("mount", elapsed);
+        }
+        Ok(())
+    }
+
+    fn run_cycle(&mut self, cycle: usize, measured: bool) -> Result<Duration, String> {
+        let cycle_clock = Instant::now();
+        edit_workspace(Path::new(self.workspace.path()), &self.config, cycle)?;
+        let recreate = self.config.recreate_every > 0
+            && (cycle + 1).is_multiple_of(self.config.recreate_every);
+        self.checkpoint_changed(cycle, recreate, measured)?;
+        self.checkpoint_noop(cycle, measured)?;
+        self.append_transcript(measured)?;
+        self.database_cycle(cycle, measured)?;
+        if self.config.remount_every > 0 && (cycle + 1).is_multiple_of(self.config.remount_every) {
+            self.remount(measured)?;
+        }
+        Ok(cycle_clock.elapsed())
+    }
+
+    fn run_cycles(&mut self) -> Result<f64, String> {
+        let total_cycles = self
+            .config
+            .warmup
+            .checked_add(self.config.iterations)
+            .ok_or_else(|| "warmup plus iterations is too large".to_string())?;
+        let progress_every = (self.config.iterations / 10).max(1);
+        let wall = Instant::now();
+        for cycle in 0..total_cycles {
+            let measured = cycle >= self.config.warmup;
+            let elapsed = self.run_cycle(cycle, measured)?;
+            if measured {
+                self.cycle_times.push(elapsed.as_secs_f64() * 1000.0);
+                let completed = cycle - self.config.warmup + 1;
+                if completed.is_multiple_of(progress_every) {
+                    eprintln!(
+                        "storage benchmark: {completed}/{} measured cycles",
+                        self.config.iterations
+                    );
+                }
             }
         }
+        Ok(wall.elapsed().as_secs_f64() * 1000.0)
     }
-    let wall_ms = wall.elapsed().as_secs_f64() * 1000.0;
 
-    let restored = archive
-        .read(
-            &agent,
-            native,
-            0,
-            0,
-            usize::try_from(transcript_offset).unwrap_or(usize::MAX),
-        )
-        .map_err(|error| error.to_string())?;
-    if restored.len() as u64 != transcript_offset
-        || restored.get(restored.len() - config.transcript_bytes..)
-            != Some(transcript_payload.as_slice())
-    {
-        return Err("the transcript archive failed its final content check".to_string());
+    fn verify(&self) -> Result<(), String> {
+        let restored = self
+            .archive
+            .read(
+                &self.agent,
+                "storage-benchmark",
+                0,
+                0,
+                usize::try_from(self.transcript_offset).unwrap_or(usize::MAX),
+            )
+            .map_err(|error| error.to_string())?;
+        if u64::try_from(restored.len()) != Ok(self.transcript_offset)
+            || restored.get(restored.len() - self.config.transcript_bytes..)
+                != Some(self.transcript_payload.as_slice())
+        {
+            return Err("the transcript archive failed its final content check".to_string());
+        }
+        check_repository(&self.repo)
     }
-    check_repository(&repo)?;
 
-    let cycle_seconds: f64 = cycle_times.iter().sum::<f64>() / 1000.0;
-    let benchmark_binary_sha256 = binary_sha256()?;
-    let mut operations = samples.report();
-    operations["cycle"] = summary(&cycle_times);
-    Ok(json!({
-        "schema_version": 1,
-        "benchmark": "spawn-storage",
-        "created_at_ms": SystemTime::now().duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as u64),
-        "config": {
-            "iterations": config.iterations,
-            "warmup": config.warmup,
-            "files": config.files,
-            "file_bytes": config.file_bytes,
-            "edits": config.edits,
-            "transcript_bytes": config.transcript_bytes,
-            "oversized_file_bytes": config.oversized_file_bytes,
-            "recreate_every": config.recreate_every,
-            "remount_every": config.remount_every,
-            "database": database.is_some(),
-        },
-        "environment": {
-            "git_version": git_version(),
-            "spawn_source_revision": config.source_revision,
-            "benchmark_binary_sha256": benchmark_binary_sha256,
-            "scratch_root": scratch.root,
-        },
-        "operations": operations,
-        "totals": {
-            "wall_ms": wall_ms,
-            "measured_cycles_per_second": config.iterations as f64 / cycle_seconds,
-            "transcript_bytes_verified": transcript_offset,
-            "last_database_event": last_database_event,
-            "git_fsck": "passed",
-        },
-        "disk": {
-            "repository": directory_size(&repo)?,
-            "workspace": directory_size(Path::new(workspace.path()))?,
-            "transcripts": directory_size(&scratch.root.join(".transcripts"))?,
-        },
-        "scratch_kept": config.keep,
-    }))
+    fn report(&self, wall_ms: f64) -> Result<Value, String> {
+        let created_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("read the system clock: {error}"))
+            .and_then(|elapsed| {
+                u64::try_from(elapsed.as_millis())
+                    .map_err(|_| "system clock milliseconds do not fit u64".to_string())
+            })?;
+        let cycle_seconds: f64 = self.cycle_times.iter().sum::<f64>() / 1000.0;
+        let iterations = sample_count(self.config.iterations)?;
+        let benchmark_binary_sha256 = binary_sha256()?;
+        let mut operations = self.samples.report()?;
+        operations["cycle"] = summary(&self.cycle_times)?;
+        Ok(json!({
+            "schema_version": 1,
+            "benchmark": "spawn-storage",
+            "created_at_ms": created_at_ms,
+            "config": {
+                "iterations": self.config.iterations,
+                "warmup": self.config.warmup,
+                "files": self.config.files,
+                "file_bytes": self.config.file_bytes,
+                "edits": self.config.edits,
+                "transcript_bytes": self.config.transcript_bytes,
+                "oversized_file_bytes": self.config.oversized_file_bytes,
+                "recreate_every": self.config.recreate_every,
+                "remount_every": self.config.remount_every,
+                "database": self.database.is_some(),
+            },
+            "environment": {
+                "git_version": git_version(),
+                "spawn_source_revision": self.config.source_revision.as_deref(),
+                "benchmark_binary_sha256": benchmark_binary_sha256,
+                "scratch_root": &self.scratch.root,
+            },
+            "operations": operations,
+            "totals": {
+                "wall_ms": wall_ms,
+                "measured_cycles_per_second": iterations / cycle_seconds,
+                "transcript_bytes_verified": self.transcript_offset,
+                "last_database_event": self.last_database_event,
+                "git_fsck": "passed",
+            },
+            "disk": {
+                "repository": directory_size(&self.repo)?,
+                "workspace": directory_size(Path::new(self.workspace.path()))?,
+                "transcripts": directory_size(&self.scratch.root.join(".transcripts"))?,
+            },
+            "scratch_kept": self.config.keep,
+        }))
+    }
+}
+
+fn run(config: Config) -> Result<Value, String> {
+    let mut benchmark = Benchmark::new(config)?;
+    let wall_ms = benchmark.run_cycles()?;
+    benchmark.verify()?;
+    benchmark.report(wall_ms)
 }
 
 fn main() {
