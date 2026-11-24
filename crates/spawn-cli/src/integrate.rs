@@ -4241,17 +4241,23 @@ impl Judge {
             // new one, before anything is counted (the cap below, the abort
             // halt). An `accepted` keeps the landing's compare-and-swap as
             // its guard ([`land`]). A parameter error does not depend on main
-            // and must keep its bounded abort classification.
-            let now =
-                if verdict == "accepted" || extra["evidence"].as_str() == Some("parameter_error") {
+            // and must keep its bounded abort classification. A reaped adopter
+            // has no outcome of its own to supersede either: its abort must
+            // reach the judging-id dedup even when the first outcome landed main.
+            let reaped =
+                verdict == "aborted" && extra["reason"] == aborted(&GateFailure::Reaped)["reason"];
+            let now = if verdict == "accepted"
+                || reaped
+                || extra["evidence"].as_str() == Some("parameter_error")
+            {
+                None
+            } else {
+                main_now().unwrap_or_else(|error| {
+                    eprintln!("integrate: task {}: where main is now: {error}", task.id);
+                    unread = Some(error);
                     None
-                } else {
-                    main_now().unwrap_or_else(|error| {
-                        eprintln!("integrate: task {}: where main is now: {error}", task.id);
-                        unread = Some(error);
-                        None
-                    })
-                };
+                })
+            };
             if let Some(now) = now {
                 let reason = extra["reason"].as_str().unwrap_or_default();
                 let mut stale = stale_on_main_move(main, &now, verdict, reason);
@@ -4811,15 +4817,11 @@ impl Judge {
                 extra["candidate"] = json!(candidate);
                 gated("host_fault", extra)
             }
-            // An adopted gate the integrator that started it reaped (D4):
-            // its outcome is that one's, recorded once, by it.
-            Err(GateFailure::Reaped) => {
-                println!(
-                    "integrate: task {}: the integrator that started its gate read the gate's \
-                     status and reaped it: nothing more recorded here",
-                    task.id
-                );
-                Ok(())
+            Err(failure @ GateFailure::Reaped) => {
+                // Normally the starting integrator's outcome already exists and the
+                // store returns it without appending. If it left no outcome, this abort
+                // bounds repeated no-record judgings just as Timeout does.
+                gated("aborted", aborted(&failure))
             }
             Err(failure) => gated("aborted", aborted(&failure)),
         }

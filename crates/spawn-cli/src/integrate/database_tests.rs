@@ -2686,11 +2686,24 @@ fn a_gate_left_running_is_adopted_judged_once_and_lands_once() {
     second.settle();
     let after = db.mission(mission);
     assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
-    let gated = control_records(&db, "task.gated");
+    let records = control_records(&db, "task.gated");
     let landed = control_records(&db, "task.landed");
-    assert_eq!((gated.len(), landed.len()), (1, 1), "{gated:?} {landed:?}");
-    assert_eq!(gated[0]["verdict"], "accepted");
-    assert_eq!(landed[0]["judging"], gated[0]["judging"]);
+    assert_eq!(
+        (records.len(), landed.len()),
+        (1, 1),
+        "{records:?} {landed:?}"
+    );
+    assert_eq!(records[0]["verdict"], "accepted");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["verdict"] == "aborted")
+            .count(),
+        0,
+        "the starting integrator's outcome is not duplicated as an abort"
+    );
+    assert_eq!(gated(&db, mission).gate_aborts, 0);
+    assert_eq!(landed[0]["judging"], records[0]["judging"]);
     let judgings = base.join("host").join(super::judging::DIRECTORY);
     assert_eq!(
         std::fs::read_dir(&judgings).expect("judgings").count(),
@@ -2700,6 +2713,112 @@ fn a_gate_left_running_is_adopted_judged_once_and_lands_once() {
     assert_eq!(started(&marks).len(), 1, "the gate ran once");
     // The units go before the scratch their judgings are in.
     drop(units);
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&marks);
+}
+
+/// A reaped adopted gate normally has the starting integrator's outcome, and
+/// the store returns it without appending another. With no original outcome,
+/// the adopter records `aborted` under the same judging id instead. Three such
+/// no-outcome reaps hit the existing abort halt; the next pass starts no gate.
+#[test]
+fn a_reaped_gate_without_an_original_outcome_records_an_abort() {
+    let marks = fresh_marks("spawn-reaped-no-outcome");
+    let gate = format!(
+        "echo started >>'{}/started'\nexit 1\n",
+        marks.to_string_lossy()
+    );
+    let (base, source, scenarios, integrator) = world("reaped-no-outcome", &gate);
+    let db = Db::new("reaped_no_outcome");
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = db.reported_task(mission, "w");
+    let pushed = push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
+    let main = source_main(&source);
+
+    for attempt in 1..=3 {
+        let left = left_judging(
+            &base.join("host"),
+            &db,
+            mission,
+            task,
+            &source,
+            &pushed,
+            true,
+        );
+        let private = left.join(format!("spawn-gate-{}-left-1", std::process::id()));
+        // Keep a real runner alive while the adopter starts waiting, then
+        // remove its directory and end it before wait_unit can finish. No
+        // starting integrator exists to record an outcome.
+        let mut runner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("runner");
+        std::fs::write(
+            private.join("runner.json"),
+            json!({"unit": format!("spawn-gate-{}-left-1.service", std::process::id()),
+                   "runner": spawn_host::process::ProcessId::of(runner.id()).record(),
+                   "started_ms": super::now_ms(), "limit_s": 7200})
+            .to_string(),
+        )
+        .expect("live runner");
+        integrator.pass_on(&db.store).expect("adopt the gate");
+        assert_eq!(
+            integrator.running.borrow().len(),
+            1,
+            "the left gate is adopted"
+        );
+        // The live runner keeps wait_unit waiting once it has read runner.json.
+        // Give that read a moment before taking the directory away.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::fs::remove_dir_all(&left).expect("reap the judging directory");
+        runner.kill().expect("end the runner");
+        runner.wait().expect("reap the runner process");
+        integrator.settle();
+
+        let records = control_records(&db, "task.gated");
+        assert_eq!(records.len(), attempt, "one outcome per reap: {records:?}");
+        let record = &records[attempt - 1];
+        assert_eq!(record["id"], task);
+        assert_eq!(record["verdict"], "aborted");
+        assert!(
+            record["reason"].as_str().is_some_and(
+                |reason| reason.contains("the integrator that started the gate reaped it")
+            ),
+            "the abort names the reaping integrator: {record}"
+        );
+        assert_eq!(
+            record["judging"],
+            json!(
+                left.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("judging id")
+            ),
+            "deduplication keeps the adopted judging's id"
+        );
+        assert_eq!(
+            gated(&db, mission).gate_aborts,
+            u32::try_from(attempt).expect("three attempts")
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
+        assert_eq!(source_main(&source), main, "nothing landed");
+    }
+
+    // The next pass turns the third abort into the halt before ready work can
+    // start another gate. The stub would leave a mark if a fourth gate ran.
+    integrator.pass_on(&db.store).expect("the bounded pass");
+    integrator.settle();
+    let after = gated(&db, mission);
+    assert_eq!(after.gate_aborts, 3);
+    assert!(
+        after
+            .halted
+            .as_deref()
+            .is_some_and(|reason| reason.contains("3 gate aborts")),
+        "the no-outcome reaps are bounded: {:?}",
+        after.halted
+    );
+    assert!(started(&marks).is_empty(), "no fourth gate started");
+    assert_eq!(control_records(&db, "task.gated").len(), 3);
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&marks);
 }
@@ -5404,7 +5523,8 @@ fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
     let names = base.join("pnpm-names");
     let install = bin.join("install.sh");
     // awk, not a shell, reads what pnpm was given: a shell exports PWD of
-    // its own before its first line runs.
+    // its own before its first line runs. gawk also adds AWKPATH and
+    // AWKLIBPATH to ENVIRON; the stub deletes those two interpreter defaults.
     let pnpm = format!(
         "#!/usr/bin/awk -f\n\
          BEGIN {{\n\
@@ -5412,6 +5532,8 @@ fn stub_pnpm(base: &Path, integrator: &mut Integrator) -> StubPnpm {
          for (i = 1; i < ARGC; i++) line = line (i > 1 ? \" \" : \"\") ARGV[i]\n\
          print line >> \"{runs}\"\n\
          sorted = \"sort | tr '\\\\n' ' ' >'{names}'\"\n\
+         delete ENVIRON[\"AWKPATH\"]\n\
+         delete ENVIRON[\"AWKLIBPATH\"]\n\
          for (name in ENVIRON) print name | sorted\n\
          close(sorted)\n\
          exit system(\"sh '{install}'\")\n\

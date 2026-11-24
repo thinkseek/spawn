@@ -20,9 +20,11 @@
 //! then remove the directory: when the judging's thread ends ([`Judging::run`],
 //! which first stops any unit of its gates that wrote no status).
 //! Two reapers of one gate (an adopter beside the integrator that started
-//! it) record it once: an adopter that finds the gate's directory gone
-//! when its runner ends records nothing (`GateFailure::Reaped`), and the
-//! store returns a judging's first verdict to any later one, `abandoned` too.
+//! it) record it once: an adopter that finds the gate's directory gone when
+//! its runner ends gets `GateFailure::Reaped`. Normally the store returns the
+//! starting integrator's outcome without appending another. If that integrator
+//! left no outcome, a task adopter records an abort so no-record judgings stay
+//! bounded; the same judging id still prevents a duplicate outcome.
 //!
 //! A gate in a unit (crate::gate's `run_unit`) outlives the integrator that
 //! started it. The next one finds its judging among the [`left`] ones at
