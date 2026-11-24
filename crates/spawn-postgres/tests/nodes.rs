@@ -190,7 +190,7 @@ fn a_node_joins_once_beats_is_lost_and_back_drains_and_is_removed() {
             .is_err()
     );
     let again = store
-        .node_record(&joined("runner", "ssh://ckl@spawn-runner:22"))
+        .node_record(&joined("runner", "ssh://owner@spawn-runner:22"))
         .expect("joined again");
     let node = only(&store);
     assert_eq!(

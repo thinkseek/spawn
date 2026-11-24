@@ -36,7 +36,7 @@ MemAvailable:   24557592 kB
 21474836480
 @df
 Filesystem     1024-blocks      Used Available Capacity Mounted on
-/dev/nvme0n1p2   976745472 896741388  77481844      93% /home/ckl
+/dev/nvme0n1p2   976745472 896741388  77481844      93% /home/owner
 @gpu
 @end
 ";
@@ -129,15 +129,15 @@ fn names_and_ssh_destinations_are_what_ssh_reads_as_a_destination_only() {
     }
     for ssh in [
         "spawn-runner",
-        "ckl@desktop",
-        "ssh://ckl@10.0.0.7:2222",
+        "owner@desktop",
+        "ssh://owner@192.0.2.7:2222",
         "ssh://host",
     ] {
         assert!(valid_ssh(ssh), "{ssh}");
     }
     for ssh in [
         "-oProxyCommand=sh",
-        "ckl:pw@host",
+        "owner:pw@host",
         "a b",
         "host\n",
         "ssh://host:0",
@@ -537,7 +537,7 @@ fn the_worker_raises_and_clears_node_lost_in_the_store_in_order() {
 
 #[test]
 fn ssh_runs_with_no_environment_shared_connection_or_forwarding() {
-    let command = ssh_command("ckl@desktop", BEAT);
+    let command = ssh_command("owner@desktop", BEAT);
     assert_eq!(command.get_program(), "ssh");
     let args: Vec<String> = command
         .get_args()
@@ -553,7 +553,7 @@ fn ssh_runs_with_no_environment_shared_connection_or_forwarding() {
     ] {
         assert!(args.iter().any(|arg| arg == option), "{option}: {args:?}");
     }
-    assert_eq!(&args[args.len() - 3..], ["--", "ckl@desktop", BEAT]);
+    assert_eq!(&args[args.len() - 3..], ["--", "owner@desktop", BEAT]);
     let kept: Vec<String> = command
         .get_envs()
         .filter(|(_, value)| value.is_some())
