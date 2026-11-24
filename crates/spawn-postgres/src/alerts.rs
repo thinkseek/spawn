@@ -33,24 +33,39 @@ pub(crate) const MISSION_GATES: &str = "select coalesce(jsonb_agg(jsonb_build_ob
 /// an idle pass costs the loop one statement (objective 023).
 pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
 
-/// For a message not taken that was typed (`spawn_command_message`'s
-/// `not_taken` and `typed`): `read_since_typed`, how many transcript lines
-/// of its session the Bridge recorded after it was typed (events of source
-/// `claude`, read only from the transcript; at most 100 counted). None
-/// means Spawn has read nothing of the transcript since, so the missing
-/// marker says nothing of the agent; some means the transcript was read and
-/// holds no marker (S17). An object to `||` onto the message's row (empty
-/// for every other message), as `k` and `m` the queries below name them.
+/// For a typed message (`spawn_command_message`'s `typed`):
+/// `read_since_typed`, how many transcript lines of its session the Bridge
+/// recorded strictly after it was typed (events of source `claude`, read only
+/// from the transcript; at most 100 counted). The event id orders lines that
+/// share the typing's millisecond, through `spawn_events_claude_time`. Zero
+/// means Spawn has read nothing of the transcript since, so the missing marker
+/// says nothing of the agent; a positive count means the transcript moved,
+/// which suppresses a new alert or clears an open one (issue #66 Part 1). The
+/// count is read before the alert's bound too, so an already-moved transcript
+/// suppresses the pending message at its first reading. An object to `||` onto
+/// the message's row (empty for every other message), as `k` and `m` the
+/// queries below name them.
 macro_rules! read_since_typed {
     () => {
         r"
-        || case when (m.message ->> 'not_taken')::boolean and (m.message ->> 'typed')::boolean
+        || case when (m.message ->> 'typed')::boolean
                 then jsonb_build_object('read_since_typed', (
                        select count(*) from (
-                         select 1 from spawn_events e
-                          where e.session_id = k.session_id and e.source = 'claude'
-                            and e.recorded_at_ms > (m.message ->> 'typed_at_ms')::bigint
-                          limit 100) r))
+                         select 1
+                           from (select (m.message ->> 'typed_at_ms')::bigint as typed_at,
+                                        coalesce((select min(t.id) from spawn_events t
+                                                   where t.session_id = k.session_id
+                                                     and t.source = 'bridge'
+                                                     and t.source_event_id = 'cmd_' || k.id || ':typed'),
+                                                 0) as typed_id) typing
+                           cross join lateral (
+                             select 1 from spawn_events e
+                              where e.session_id = k.session_id and e.source = 'claude'
+                                and e.recorded_at_ms >= typing.typed_at
+                                and (e.recorded_at_ms > typing.typed_at
+                                     or (e.recorded_at_ms = typing.typed_at
+                                         and e.id > typing.typed_id))
+                              limit 100) r) counted))
                 else '{}'::jsonb end as row"
     };
 }
@@ -64,8 +79,9 @@ macro_rules! read_since_typed {
 /// milliseconds (SPAWN_MESSAGE_TAKEN_SECS). This one reads what the step
 /// needs when the log moved, a scan or two when nothing is new (objective
 /// 023): the commands after `$2`; the pending messages `$3` that fell due;
-/// and the open alerts' `$4` whose session recorded a `message.taken` or an
-/// `execution.ended` at or after `$5` (what clears one).
+/// and the open alerts' `$4` whose session recorded a `message.taken`, an
+/// `execution.ended` or a transcript event (source `claude`) at or after `$5`
+/// (what clears one).
 pub(crate) const MESSAGES_SINCE: &str = concat!(
     r#"
 with fresh as (select k.* from spawn_commands k where k.id > $2),
@@ -80,9 +96,13 @@ candidates as (
   union
   select k.* from spawn_commands k
    where cardinality($4::bigint[]) > 0 and k.id = any($4)
-     and k.session_id in (select e.session_id from spawn_events e
-                           where e.event_name in ('message.taken', 'execution.ended')
-                             and e.recorded_at_ms >= $5))
+     and (exists (select 1 from spawn_events e
+                   where e.session_id = k.session_id
+                     and e.event_name in ('message.taken', 'execution.ended')
+                     and e.recorded_at_ms >= $5)
+          or exists (select 1 from spawn_events e
+                      where e.session_id = k.session_id and e.source = 'claude'
+                        and e.recorded_at_ms >= $5)))
 select jsonb_build_object(
   'now_ms', spawn_now_ms(),
   'max_id', greatest($2, coalesce((select max(id) from fresh), $2)),
@@ -629,8 +649,9 @@ impl PostgresStore {
     }
 
     /// The messages of the commands after `after`, of the pending `due`
-    /// ones, and of the `open` alerts' whose session took a message or
-    /// ended an execution at or after `since_ms` ([`MESSAGES_SINCE`]).
+    /// ones, and of the `open` alerts' whose session took a message, ended an
+    /// execution or recorded a transcript event at or after `since_ms`
+    /// ([`MESSAGES_SINCE`]).
     pub fn alert_messages_since(
         &self,
         bound_ms: i64,

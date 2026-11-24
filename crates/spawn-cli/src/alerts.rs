@@ -336,21 +336,25 @@
 //!   transcript lines the Bridge recorded since the typing
 //!   (`read_since_typed`, at most 100 counted, S17): with none, its text
 //!   says Spawn has read nothing of the transcript since and cannot tell
-//!   whether the agent took it, rather than that it did not. A command an
-//!   older Spawn typed carries
-//!   no marker (no `message.typed`) and is never one, nor is one sent while
-//!   its session's transcript had held no marker yet. Once per message;
-//!   clears when it is taken; else, typed, when a later message of its
-//!   session is taken (objective 138: the agent went on past it, its marker
+//!   whether the agent took it, rather than that it did not. A typed message
+//!   whose transcript moved after the typing (a positive count) fires nothing
+//!   and leaves no pending bound (issue #66 Part 1). A command an older Spawn
+//!   typed carries no marker (no `message.typed`) and is never one, nor is one
+//!   sent while its session's transcript had held no marker yet. Once per
+//!   message; clears when it is taken; else, typed, when a later message of
+//!   its session is taken (objective 138: the agent went on past it, its marker
 //!   missed; evidence `later_taken`, that command, and its `taken_at_ms`;
 //!   another session's taking counts for nothing, and an untyped message is
 //!   behind nothing the agent took); else when its session ends with it
-//!   untaken (the execution it was typed into, or its own start's, ended).
-//!   A message whose session ended first, or a later message of whose
-//!   session was taken first, fires nothing. Read on start (every message
-//!   that can be one, and the open alerts), then when the log moved (the
-//!   new commands, the pending messages due, the open alerts whose session
-//!   took a message or ended since) and when a pending one falls due.
+//!   untaken (the execution it was typed into, or its own start's, ended);
+//!   else, typed, when its transcript moved after the typing (evidence
+//!   `read_since_typed`, the positive count). A message whose session ended
+//!   first, a later message of whose session was taken first, or whose typed
+//!   transcript moved first, fires nothing. Read on start (every message that
+//!   can be one, and the open alerts), then when the log moved (the new
+//!   commands, the pending messages due, the open alerts whose session took a
+//!   message, ended or recorded a transcript event since) and when a pending
+//!   one falls due.
 //! - `archive_failed`, the agent, key `archive_failed:<agent>:<native>:<the
 //!   occurrence's first archive.failed>` (objective 193, alerts/archives.rs):
 //!   a transcript the archive copies nothing of, from the Bridge's
@@ -824,10 +828,15 @@ pub(crate) struct Monitor {
     /// ended with them when last read, by the time each falls due: read
     /// again then.
     pending: BTreeMap<i64, i64>,
-    /// From when the next reading looks for a `message.taken` or an
-    /// `execution.ended` that may clear an open alert: the last reading's
-    /// time, less a margin for an append that committed late.
+    /// From when the next reading looks for a `message.taken`, an
+    /// `execution.ended` or a `source = 'claude'` transcript event that may
+    /// clear an open alert: the last reading's time, less a margin for an
+    /// append that committed late.
     messages_since: i64,
+    /// `messages_since` before the latest successful message reading. A
+    /// transient failure to record a message alert's clear restores it, so
+    /// the event that justified the clear remains in the retry's window.
+    messages_previous_since: i64,
     /// What the supervisor had to dispatch when last read
     /// ([`crate::serve::attention::supervisor_dispatch`]), read only while
     /// its latest judgement is stuck or its `agent_stuck` is open; `None`
@@ -1025,6 +1034,7 @@ impl Monitor {
             messages_after: 0,
             pending: BTreeMap::new(),
             messages_since: 0,
+            messages_previous_since: 0,
             supervisor: None,
             supervisor_due_ms: 0,
             database_due_ms: 0,
@@ -1101,10 +1111,11 @@ impl Monitor {
             self.commands_after = now.saturating_sub(1000);
         }
         // The messages are read when the log moved (a new command, a taking,
-        // an end all append) and when a pending one falls due: the new
-        // commands, the pending ones due, and the open alerts' whose session
-        // took a message or ended since, so an idle pass reads next to
-        // nothing (objective 023).
+        // an end or a transcript event all append) and when a pending one
+        // falls due: the new commands, the pending ones due, and the open
+        // alerts' whose session took a message, ended or recorded a
+        // `source = 'claude'` transcript event since, so an idle pass reads
+        // next to nothing (objective 023).
         if moved || self.messages_due.is_some_and(|due| now >= due) {
             self.read_messages(store, now, &mut events, &mut lines);
         }
@@ -2847,13 +2858,19 @@ times in a row)",
     }
 
     /// `message_not_taken`: a tracked message no `message.taken` names past
-    /// its bound, its session not ended with it and no later message of its
-    /// session taken, fires once; an open one clears once it is taken, else
-    /// once a later message of its session is taken (`later_taken`), else
-    /// once its session ended with it untaken.
-    /// One not due yet is pending, read again until it is taken, ends or
-    /// fires; the next bound is the earliest pending one's.
+    /// its bound, its session not ended with it, no later message of its
+    /// session taken and, if typed, no transcript line read since its typing,
+    /// fires once. A typed message whose transcript moved is suppressed at its
+    /// first reading, before or at its bound, and leaves no pending bound
+    /// (issue #66 Part 1). One read before its bound with no transcript line
+    /// stays pending until due, then is read again and suppressed if the
+    /// transcript moved meanwhile. An open one clears once it is taken, else
+    /// once a later message of its session is taken (`later_taken`), else once
+    /// its session ended with it untaken, else once its transcript moved after
+    /// the typing (`read_since_typed`). The next bound is the earliest pending
+    /// one's.
     fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
+        self.messages_previous_since = self.messages_since;
         for message in messages["messages"].as_array().into_iter().flatten() {
             let Some(id) = message["command_id"].as_i64() else {
                 continue;
@@ -2861,6 +2878,9 @@ times in a row)",
             let key = format!("message_not_taken:{id}");
             let taken = message["taken"].as_i64().unwrap_or_default();
             let ended = message["ended"].as_bool() != Some(false);
+            let typed = message["typed"].as_bool() == Some(true);
+            let read = message["read_since_typed"].as_i64();
+            let transcript_moved = typed && read.is_some_and(|lines| lines > 0);
             // A later message of its session taken (objective 138): the
             // agent went on past it, its marker missed.
             let later_taken = message["later_taken"].as_i64();
@@ -2870,13 +2890,16 @@ times in a row)",
                     continue;
                 }
                 // Taken; else a later message of its session taken; else
-                // its session ended with it.
+                // its session ended with it; else its transcript moved after
+                // the typing (issue #66 Part 1).
                 let evidence = if taken > 0 {
                     json!({"taken": taken, "taken_at_ms": message["taken_at_ms"]})
                 } else if let Some(later) = later_taken {
                     json!({"later_taken": later, "taken_at_ms": message["later_taken_at_ms"]})
                 } else if ended {
                     json!({"ended": true, "state": message["state"]})
+                } else if transcript_moved {
+                    json!({"read_since_typed": read})
                 } else {
                     continue;
                 };
@@ -2887,6 +2910,7 @@ times in a row)",
                 || taken > 0
                 || later_taken.is_some()
                 || ended
+                || transcript_moved
             {
                 self.pending.remove(&id);
                 continue;
@@ -2900,14 +2924,13 @@ times in a row)",
                 continue;
             }
             self.pending.insert(id, now);
-            let typed = message["typed"].as_bool() == Some(true);
             let agent = message["agent_id"].as_str().unwrap_or_default();
             let action = message["action"].as_str().unwrap_or("input");
             let secs = self.settings.message_taken_ms / 1000;
             // The Bridge's own record (S17): the transcript lines it read
             // after the typing. None read: Spawn cannot tell whether the
             // agent took it, so the alert says that and not that it did not.
-            let read = message["read_since_typed"].as_i64();
+            // A positive count was suppressed above (issue #66 Part 1).
             out.push(Event::Fire {
                 key,
                 kind: "message_not_taken",
@@ -4392,12 +4415,25 @@ times in a row)",
         events: &[Event],
         lines: &mut Vec<String>,
     ) {
+        self.flush_with(now, events, lines, |record| store.alert_record(record));
+    }
+
+    /// The writer is separate so the state after each store outcome can be
+    /// exercised without a database; production always writes through
+    /// [`PostgresStore::alert_record`].
+    fn flush_with(
+        &mut self,
+        now: i64,
+        events: &[Event],
+        lines: &mut Vec<String>,
+        mut write: impl FnMut(&Value) -> Result<i64, StoreError>,
+    ) {
         for event in events {
             let key = event.key().to_string();
             let Some(record) = self.record_of(event, now) else {
                 continue;
             };
-            match store.alert_record(&record) {
+            match write(&record) {
                 Ok(id) => {
                     let kind = record["kind"].as_str().unwrap_or_default().to_string();
                     let subject = record["subject"].as_str().unwrap_or_default().to_string();
@@ -4457,6 +4493,16 @@ times in a row)",
                     lines.push(format!("alerts: {key}: {why}"));
                 }
                 Err(error) => {
+                    // The alert stays open, but its message reading already
+                    // moved the watermark past the clearing event. Put that
+                    // watermark back and make the next pass read the open
+                    // alert again, even after the late-append margin. A
+                    // refusal above is different: the store says the alert
+                    // is no longer open, so there is nothing to retry.
+                    if record["type"] == "alert.cleared" && key.starts_with("message_not_taken:") {
+                        self.messages_since = self.messages_previous_since;
+                        self.messages_due = Some(now);
+                    }
                     lines.push(format!("alerts: {key}: {error}"));
                 }
             }
@@ -7233,6 +7279,194 @@ mod tests {
         assert!(decided(&restarted, out).is_empty(), "each once");
         assert!(restarted.pending.is_empty());
         assert_eq!(restarted.messages_due, None);
+    }
+
+    /// Issue #66 Part 1: transcript movement after typing suppresses a new
+    /// alert and leaves no pending bound. No movement, an unavailable count,
+    /// or an untyped message keeps the old firing behavior.
+    #[test]
+    fn transcript_movement_suppresses_only_a_typed_message_not_taken() {
+        let message = |id: i64, typed: bool, read: Value, not_taken: bool| {
+            json!({"command_id": id, "agent_id": "agent_worker_a",
+                   "session_id": "session_worker_a", "action": "input",
+                   "created_at_ms": 380_000, "due_ms": if not_taken { 500_000 } else { 610_000 },
+                   "tracked": true, "not_taken": not_taken, "typed": typed,
+                   "read_since_typed": read, "taken": 0, "ended": false,
+                   "state": if typed { "typed" } else { "recorded" }})
+        };
+        let mut monitor = monitor();
+        let mut out = Vec::new();
+        monitor.messages(
+            &json!({"now_ms": 500_000, "max_id": 57, "messages": [
+                message(50, true, json!(2), true),
+                message(51, true, json!(0), true),
+                message(52, false, json!(2), true),
+                message(53, true, Value::Null, true),
+                message(54, true, json!(2), false),
+                message(55, true, json!(0), false),
+                message(56, false, Value::Null, true),
+                message(57, false, json!(2), false),
+            ]}),
+            &mut out,
+        );
+        assert_eq!(
+            fires(&out),
+            [
+                "message_not_taken:51",
+                "message_not_taken:52",
+                "message_not_taken:53",
+                "message_not_taken:56",
+            ],
+            "{out:?}"
+        );
+        assert_eq!(
+            monitor.pending.keys().copied().collect::<Vec<_>>(),
+            [51, 52, 53, 55, 56, 57],
+            "moved messages 50 and 54 neither fire nor remain pending"
+        );
+    }
+
+    /// For an open alert, transcript movement is the last clear rule: taken,
+    /// a later taking and the session's end all retain their evidence when
+    /// more than one is present. Zero or an untyped count clears nothing.
+    #[test]
+    fn transcript_movement_clears_an_open_alert_after_the_other_clear_rules() {
+        let message = |id: i64,
+                       taken: i64,
+                       later_taken: Option<i64>,
+                       ended: bool,
+                       typed: bool,
+                       read: Value| {
+            json!({"command_id": id, "agent_id": "agent_worker_a",
+                   "session_id": "session_worker_a", "action": "input",
+                   "created_at_ms": 380_000, "due_ms": 500_000, "tracked": true,
+                   "not_taken": taken == 0, "typed": typed, "read_since_typed": read,
+                   "taken": taken, "taken_at_ms": 500_001,
+                   "later_taken": later_taken, "later_taken_at_ms": 500_002,
+                   "ended": ended, "state": if ended { "ended" } else { "typed" }})
+        };
+        let mut monitor = monitor();
+        for id in 60..=65 {
+            monitor.known.insert(
+                format!("message_not_taken:{id}"),
+                Row {
+                    kind: "message_not_taken".to_string(),
+                    subject: "session_worker_a".to_string(),
+                    state: "open".to_string(),
+                    evidence: json!({"command": id}),
+                    fired_event_id: id,
+                    fired_at_ms: 0,
+                },
+            );
+        }
+        let mut out = Vec::new();
+        monitor.messages(
+            &json!({"now_ms": 500_000, "max_id": 65, "messages": [
+                message(60, 2, Some(70), true, true, json!(2)),
+                message(61, 0, Some(71), true, true, json!(2)),
+                message(62, 0, None, true, true, json!(2)),
+                message(63, 0, None, false, true, json!(2)),
+                message(64, 0, None, false, true, json!(0)),
+                message(65, 0, None, false, false, json!(2)),
+            ]}),
+            &mut out,
+        );
+        let clears = out
+            .iter()
+            .filter_map(|event| match event {
+                Event::Clear { key, evidence } => Some((key.clone(), evidence.clone())),
+                Event::Fire { .. } | Event::Update { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            clears,
+            [
+                (
+                    "message_not_taken:60".to_string(),
+                    json!({"taken": 2, "taken_at_ms": 500_001}),
+                ),
+                (
+                    "message_not_taken:61".to_string(),
+                    json!({"later_taken": 71, "taken_at_ms": 500_002}),
+                ),
+                (
+                    "message_not_taken:62".to_string(),
+                    json!({"ended": true, "state": "ended"}),
+                ),
+                (
+                    "message_not_taken:63".to_string(),
+                    json!({"read_since_typed": 2}),
+                ),
+            ],
+            "{out:?}"
+        );
+    }
+
+    /// A transient store failure leaves a message alert open. Its clear must
+    /// remain discoverable after the reading's watermark would otherwise have
+    /// advanced past the transcript event and its 60-second late-append
+    /// margin; the next pass retries the write and clears it once.
+    #[test]
+    fn a_transient_message_clear_failure_restores_its_reading_for_retry() {
+        let mut monitor = monitor();
+        let id = 66;
+        let key = format!("message_not_taken:{id}");
+        monitor.known.insert(
+            key.clone(),
+            Row {
+                kind: "message_not_taken".to_string(),
+                subject: "session_worker_a".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"command": id}),
+                fired_event_id: 12,
+                fired_at_ms: 0,
+            },
+        );
+        monitor.messages_since = 100_000;
+        let reading = |now| {
+            json!({"now_ms": now, "max_id": id, "messages": [
+                {"command_id": id, "agent_id": "agent_worker_a",
+                 "session_id": "session_worker_a", "action": "input",
+                 "created_at_ms": 380_000, "due_ms": 500_000, "tracked": true,
+                 "not_taken": true, "typed": true, "read_since_typed": 1,
+                 "taken": 0, "ended": false, "state": "typed"}
+            ]})
+        };
+        let mut out = Vec::new();
+        monitor.messages(&reading(500_000), &mut out);
+        assert!(matches!(&out[..], [Event::Clear { key: clear, .. }] if *clear == key));
+        assert_eq!(monitor.messages_since, 440_000);
+        assert_eq!(monitor.messages_due, None);
+
+        let mut lines = Vec::new();
+        monitor.flush_with(500_000, &out, &mut lines, |_record| {
+            Err(spawn_core::port::StoreError::Unreachable(
+                "connection reset".to_string(),
+            ))
+        });
+        assert!(monitor.is_open(&key), "the failed clear stays open");
+        assert_eq!(
+            monitor.messages_since, 100_000,
+            "the clearing event is inside the retry's window"
+        );
+        assert_eq!(monitor.messages_due, Some(500_000), "retry next pass");
+        monitor.plan(500_000);
+        assert_eq!(monitor.next_bound_ms, Some(500_000));
+
+        let later = 500_000 + super::MESSAGES_MARGIN_MS + 1_000;
+        let mut retry = Vec::new();
+        monitor.messages(&reading(later), &mut retry);
+        assert!(matches!(&retry[..], [Event::Clear { key: clear, .. }] if *clear == key));
+        let mut writes = 0;
+        monitor.flush_with(later, &retry, &mut lines, |record| {
+            writes += 1;
+            assert_eq!(record["type"], "alert.cleared");
+            assert_eq!(record["key"], json!(key));
+            Ok(99)
+        });
+        assert_eq!(writes, 1);
+        assert!(!monitor.is_open(&key), "the retry records the clear");
+        assert!(lines.iter().any(|line| line.contains("connection reset")));
     }
 
     /// Objective 056 after a restart: an owner alert read back (per source)
@@ -10941,13 +11175,29 @@ execute function alerts_test_deploys_mid_start();
 
         /// Run `case` on a migrated schema of its own, dropped afterwards.
         fn in_schema(name: &str, case: impl FnOnce(&PostgresStore)) {
+            in_schema_with_client(name, |store, _| case(store));
+        }
+
+        /// [`in_schema`], with an owner connection for a case that must put a
+        /// record at an exact time rather than wait for the database's clock.
+        fn in_schema_with_client(
+            name: &str,
+            case: impl FnOnce(&PostgresStore, &mut postgres::Client),
+        ) {
             let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
                 "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
             );
             let schema = spawn_postgres::testing::TestSchema::new(name);
             let store = PostgresStore::connect_in_schema(&url, &schema)
                 .expect("a schema of its own, migrated");
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(&store)));
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+            let mut client =
+                postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                case(&store, &mut client);
+            }));
+            drop(client);
             drop(store);
             if let Err(panic) = result {
                 std::panic::resume_unwind(panic);
@@ -12063,12 +12313,11 @@ execute function alerts_test_deploys_mid_start();
             });
         }
 
-        /// S17: a typed message's alert says what the Bridge recorded of the
-        /// transcript since the typing. `deaf` has a transcript line read
-        /// after it (a turn's end): the agent has not taken it, and the text
-        /// says so with the count. `silent`, typed after that line, has none
-        /// read since: the text says whether the agent took it is unknown,
-        /// and why (Spawn not reading the transcript, or nothing written).
+        /// S17 and issue #66 Part 1: a transcript line read after `deaf` was
+        /// typed suppresses its alert and leaves no pending bound. `silent`,
+        /// typed after that line, has none read since: it still fires, and its
+        /// text says whether the agent took it is unknown, and why (Spawn not
+        /// reading the transcript, or nothing written).
         #[test]
         fn a_typed_message_not_taken_says_whether_spawn_read_the_transcript_since() {
             in_schema("messages_read_since", |store| {
@@ -12082,33 +12331,30 @@ execute function alerts_test_deploys_mid_start();
                 typed(store, "msg", MSG_EXECUTION, silent, true);
                 let mut monitor = prompt_monitor();
                 let fired = read(&mut monitor, store);
-                let alert = |id: CommandId| {
-                    fired
-                        .iter()
-                        .find_map(|event| match event {
-                            Event::Fire {
-                                key,
-                                evidence,
-                                text,
-                                ..
-                            } if *key == format!("message_not_taken:{}", id.0) => {
-                                Some((evidence.clone(), text.clone()))
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| panic!("an alert for {}: {fired:?}", id.0))
-                };
-                let (heard, heard_text) = alert(deaf);
-                assert_eq!(heard["read_since_typed"], 1);
                 assert!(
-                    heard_text.starts_with(&format!(
-                        "agent_msg has not taken message #{} (its input): typed, and the \
-                         transcript lines Spawn has read since (1) hold no marker of it",
-                        deaf.0
-                    )),
-                    "{heard_text}"
+                    message_alert(&fired, deaf).is_none(),
+                    "the moved transcript suppresses the false positive: {fired:?}"
                 );
-                let (unread, unread_text) = alert(silent);
+                assert!(
+                    !monitor
+                        .pending
+                        .contains_key(&i64::try_from(deaf.0).expect("an id")),
+                    "the suppressed message is not pending"
+                );
+                let (unread, unread_text) = fired
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Fire {
+                            key,
+                            evidence,
+                            text,
+                            ..
+                        } if *key == format!("message_not_taken:{}", silent.0) => {
+                            Some((evidence.clone(), text.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("an alert for {}: {fired:?}", silent.0));
                 assert_eq!(unread["read_since_typed"], 0);
                 assert!(
                     unread_text.contains(
@@ -12119,6 +12365,108 @@ execute function alerts_test_deploys_mid_start();
                     "{unread_text}"
                 );
                 assert!(!unread_text.contains("has not taken"), "{unread_text}");
+            });
+        }
+
+        /// With the real, non-zero bound, transcript movement before the first
+        /// reading suppresses a typed message immediately rather than leaving
+        /// it pending. With no movement at that first pre-due reading it stays
+        /// pending; movement while pending suppresses it when its bound falls
+        /// due and it is read again.
+        #[test]
+        fn typed_messages_are_suppressed_before_due_or_rechecked_at_their_bound() {
+            in_schema_with_client("messages_pre_due", |store, client| {
+                let _early_session = marked_session(store, "early");
+                let early = input(store, "early", "early-message", "a");
+                typed(store, "early", "exec_early_1", early, true);
+                turn_ended(store, "early", "exec_early_1", "early-transcript");
+                let early_id = i64::try_from(early.0).expect("an id");
+                let mut immediate = Monitor::with(super::settings());
+                let events = read(&mut immediate, store);
+                assert!(message_alert(&events, early).is_none(), "{events:?}");
+                assert!(
+                    !immediate.pending.contains_key(&early_id),
+                    "already moved before the first pre-due read: {:?}",
+                    immediate.pending
+                );
+
+                let _pending_session = marked_session(store, "pending");
+                let pending = input(store, "pending", "pending-message", "b");
+                typed(store, "pending", "exec_pending_1", pending, true);
+                let pending_id = i64::try_from(pending.0).expect("an id");
+                let mut waiting = Monitor::with(super::settings());
+                assert!(read(&mut waiting, store).is_empty());
+                let due = waiting.pending.get(&pending_id).copied();
+                assert!(
+                    due.is_some_and(|due| due > store.now_ms().expect("the clock")),
+                    "a real non-zero bound is still pending: {due:?}"
+                );
+
+                // The transcript moves only after that zero-count reading.
+                turn_ended(store, "pending", "exec_pending_1", "pending-transcript");
+                // Age the command past its bound instead of sleeping for it.
+                client
+                    .execute(
+                        "update spawn_commands set created_at_ms = created_at_ms - $2
+                          where id = $1",
+                        &[&pending_id, &(super::settings().message_taken_ms + 1_000)],
+                    )
+                    .expect("put the pending message at its bound");
+                // The clock advancing would wake this cached bound too.
+                waiting.pending.insert(pending_id, 0);
+                waiting.messages_due = Some(0);
+                let events = read(&mut waiting, store);
+                assert!(message_alert(&events, pending).is_none(), "{events:?}");
+                assert!(
+                    !waiting.pending.contains_key(&pending_id),
+                    "the due reading sees the transcript movement: {:?}",
+                    waiting.pending
+                );
+            });
+        }
+
+        /// Issue #66 Part 1: an open alert fires with no line read since its
+        /// typing, then an incremental read that has only a new transcript
+        /// event (no taking or execution end) finds it and clears it with the
+        /// positive count.
+        #[test]
+        fn an_open_message_not_taken_clears_when_only_its_transcript_moves() {
+            in_schema("messages_transcript_clear", |store| {
+                let _session = marked_session(store, "moved");
+                let missed = input(store, "moved", "missed", "a");
+                typed(store, "moved", "exec_moved_1", missed, true);
+                let id = i64::try_from(missed.0).expect("an id");
+                let mut monitor = prompt_monitor();
+                let fired = read(&mut monitor, store);
+                assert_eq!(fires(&fired), [format!("message_not_taken:{id}")]);
+                commit(&mut monitor, &fired);
+                assert!(read(&mut monitor, store).is_empty(), "still open");
+
+                // Make the new event's recorded time unambiguously at or after
+                // this watermark. Nothing else is appended with it.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let since = store.now_ms().expect("the clock");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                turn_ended(store, "moved", "exec_moved_1", "transcript-after-alert");
+                let incremental = store
+                    .alert_messages_since(0, monitor.messages_after, &[], &[id], since)
+                    .expect("the incremental messages");
+                let rows = incremental["messages"].as_array().expect("messages");
+                assert_eq!(rows.len(), 1, "{incremental}");
+                assert_eq!(rows[0]["command_id"], json!(id));
+                assert_eq!(rows[0]["read_since_typed"], json!(1));
+
+                let cleared = read(&mut monitor, store);
+                assert_eq!(
+                    clears_of_messages(&cleared),
+                    [(
+                        format!("message_not_taken:{id}"),
+                        json!({"read_since_typed": 1}),
+                    )],
+                    "{cleared:?}"
+                );
+                commit(&mut monitor, &cleared);
+                assert!(read(&mut monitor, store).is_empty(), "cleared once");
             });
         }
 

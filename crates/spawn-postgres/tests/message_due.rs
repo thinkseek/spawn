@@ -56,19 +56,21 @@ fn event(
     name: &str,
     detail: &Value,
     at: i64,
-) {
+) -> i64 {
     client
-        .execute(
+        .query_one(
             "insert into spawn_events (agent_id, session_id, execution_id, source, source_event_id,
                                        kind, session_seq, recorded_at_ms)
              values ($1, $2, 'exec_1', $3, $4,
                      jsonb_build_object('name', $5::text, 'detail', $6::jsonb),
                      (select coalesce(max(session_seq), 0) + 1 from spawn_events
                        where session_id = $2),
-                     $7)",
+                     $7)
+             returning id",
             &[&AGENT, &SESSION, &source, &key, &name, detail, &at],
         )
-        .expect("an event");
+        .expect("an event")
+        .get(0)
 }
 
 /// The engine's transcript held the marker of an earlier message (its own
@@ -250,4 +252,148 @@ fn a_turn_after_the_typing_does_not_move_the_bound() {
         "a turn after the typing moved the bound of a message already typed: {}",
         message(&mut client, sent, s(140))
     );
+}
+
+/// Every plan node that reads the transcript through its partial index.
+fn claude_index_scans<'a>(plan: &'a Value, found: &mut Vec<&'a Value>) {
+    if plan["Index Name"] == "spawn_events_claude_time" {
+        found.push(plan);
+    }
+    for child in plan["Plans"].as_array().into_iter().flatten() {
+        claude_index_scans(child, found);
+    }
+}
+
+/// The real incremental read plans both transcript lookups (the open-alert
+/// candidate and `read_since_typed`) as per-session time range scans.
+fn assert_claude_plan(client: &mut Client, sent: i64, at: i64) {
+    // Give the planner realistic selectivity: the open-alert lookup must seek
+    // this session, not hash every session's recent transcript, and the count
+    // must prefer the partial transcript index over every event of the
+    // session. These unrelated rows also make a sequential scan unattractive.
+    client
+        .execute(
+            "insert into spawn_events (agent_id, session_id, execution_id, source,
+                                       source_event_id, kind, session_seq, recorded_at_ms)
+             select 'agent_fill', 'session_fill_' || g, 'exec_1',
+                    case when g % 2 = 0 then 'claude' else 'bridge' end, null,
+                    jsonb_build_object('name', 'transcript.line', 'detail', '{}'::jsonb),
+                    n, $1::bigint - 100_000 + n
+               from generate_series(1, 200) g cross join generate_series(1, 50) n",
+            &[&at],
+        )
+        .expect("populate unrelated sessions");
+    client
+        .batch_execute("analyze spawn_events; analyze spawn_commands; set enable_seqscan = off")
+        .expect("prefer an index in the plan");
+    let explain = client
+        .prepare(&format!(
+            "explain (format json) {}",
+            spawn_postgres::testing::ALERT_MESSAGES_SINCE
+        ))
+        .expect("prepare the real read's EXPLAIN");
+    let after_commands = i64::MAX;
+    let due: Vec<i64> = Vec::new();
+    let open = vec![sent];
+    let since = 0_i64;
+    let plan: Value = client
+        .query_one(&explain, &[&BOUND, &after_commands, &due, &open, &since])
+        .expect("EXPLAIN the real read")
+        .get(0);
+    let mut scans = Vec::new();
+    claude_index_scans(&plan[0]["Plan"], &mut scans);
+    assert!(
+        scans.len() >= 2,
+        "the open-alert candidate and read_since_typed both use the partial index: {plan}"
+    );
+    for scan in scans {
+        let condition = scan["Index Cond"].as_str().unwrap_or_default();
+        assert!(
+            condition.contains("session_id") && condition.contains("recorded_at_ms"),
+            "a per-session time range, not a global or whole-session scan: {scan}"
+        );
+    }
+}
+
+/// A transcript event in the typing's own millisecond is ordered by its event
+/// id: one inserted before `:typed` is not read since the typing, while one
+/// inserted after it is. The count is present while the non-zero bound is
+/// still pending, and the real query's plan uses the partial index.
+#[test]
+fn same_millisecond_transcript_events_use_event_id_order_and_the_partial_index() {
+    let (store, schema): (PostgresStore, _) = store("messages_same_ms");
+    let mut client = admin(&schema);
+    let at = store.now_ms().expect("the clock");
+    marker_seen(&mut client, at - 1_000);
+    let sent = input(&mut client, "bb-same-ms", at, Some(at));
+    event(
+        &mut client,
+        "bridge",
+        Some(format!("cmd_{sent}:message").as_str()),
+        "message.typed",
+        &json!({"command_id": sent}),
+        at,
+    );
+    event(
+        &mut client,
+        "bridge",
+        Some(format!("cmd_{sent}:typing").as_str()),
+        "command.step",
+        &json!({"command_id": sent, "step": "typing"}),
+        at,
+    );
+    let before = event(
+        &mut client,
+        "claude",
+        Some("same-ms-before"),
+        "transcript.line",
+        &json!({"text": "before"}),
+        at,
+    );
+    let typed_id = event(
+        &mut client,
+        "bridge",
+        Some(format!("cmd_{sent}:typed").as_str()),
+        "command.step",
+        &json!({"command_id": sent, "step": "typed"}),
+        at,
+    );
+    assert!(before < typed_id);
+
+    let read = |store: &PostgresStore| {
+        let reading = store
+            .alert_messages_since(BOUND, 0, &[], &[sent], 0)
+            .expect("the incremental reading");
+        reading["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["command_id"] == json!(sent))
+            .unwrap_or_else(|| panic!("the command's row: {reading}"))
+            .clone()
+    };
+    let row = read(&store);
+    assert_eq!(row["not_taken"], false, "still inside its bound: {row}");
+    assert_eq!(
+        row["read_since_typed"], 0,
+        "the same-ms event before :typed is not after it: {row}"
+    );
+
+    let after = event(
+        &mut client,
+        "claude",
+        Some("same-ms-after"),
+        "transcript.line",
+        &json!({"text": "after"}),
+        at,
+    );
+    assert!(after > typed_id);
+    let row = read(&store);
+    assert_eq!(row["not_taken"], false, "still inside its bound: {row}");
+    assert!(
+        row["read_since_typed"].as_i64().is_some_and(|n| n >= 1),
+        "the same-ms event after :typed moves the transcript: {row}"
+    );
+
+    assert_claude_plan(&mut client, sent, at);
 }
