@@ -1689,11 +1689,12 @@ of mission #{mission}. When it is done, write `{REPORT}` as the task asked, once
 }
 
 /// The next step for a resident not yet told that its latest task was
-/// cancelled: a live one is stopped (once per execution; a stop that fails is
-/// pursued by [`crate::dispatch`]), one that no longer runs is resumed with
-/// the notice, whose work is set aside first ([`crate::dispatch::step`]). A
-/// notice that failed goes again under a key of its own, after a wait that
-/// doubles ([`retry_wait_ms`]).
+/// cancelled: a live one is stopped once for the task (a stop that fails is
+/// pursued by [`crate::dispatch`]), and once stopped, a live one gets the
+/// notice typed in; one that no longer runs is resumed with the notice,
+/// whose work is set aside first ([`crate::dispatch::step`]). A notice that
+/// failed (a busy pane refuses input) goes again under a key of its own,
+/// after a wait that doubles ([`retry_wait_ms`]), live or not (GitHub #76).
 fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Order> {
     if facts.open_command || facts.stopping() {
         return None;
@@ -1714,20 +1715,6 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
             now_ms >= finished.saturating_add(retry_wait_ms(attempts.len()))
         }
     };
-    if facts.live {
-        let execution = facts.execution_id.as_deref().unwrap_or("none");
-        let key = match cancelled.reassigned_as {
-            Some(_) if facts.sent(&reassign_stop_key(cancelled.id)).is_none() => {
-                reassign_stop_key(cancelled.id)
-            }
-            _ => format!("cancel-stop-{}-{execution}", cancelled.id),
-        };
-        return Some(cancelled.command(key, CommandAction::Stop));
-    }
-    if !due {
-        return None;
-    }
-    facts.execution_id.as_ref()?;
     // The next number after every one seen, not the count seen: a key
     // already used would be refused as a duplicate, and nothing sent.
     let next = attempts
@@ -1736,6 +1723,46 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
         .max()
         .map_or(0, |last| last.saturating_add(1))
         .max(attempts.len());
+    if facts.live {
+        // Its turn was stopped for this task already (a cancel's stop, or a
+        // reassign's) and something resumed it since: typing the notice is
+        // the step after. Stopping again on every revival kept a resident
+        // from ever working (GitHub #76, 2026-11-18: stopped seconds after
+        // each recovery resume, and its notice never came). A notice a busy
+        // pane refused waits its turn like any retry, never once a pass
+        // (#76, 2026-11-20: 129 notices in two minutes).
+        let stop_prefix = format!("cancel-stop-{}-", cancelled.id);
+        let reassign_stop = reassign_stop_key(cancelled.id);
+        let stopped_for_task = facts.dispatched.iter().any(|sent| {
+            (sent.key.starts_with(&stop_prefix) || sent.key == reassign_stop)
+                && sent.succeeded != Some(false)
+        });
+        if stopped_for_task {
+            // Typed only at its prompt: a busy pane refuses input, and a
+            // refused notice is recorded all the same, which counts as told
+            // (`CANCELLED_DELIVERIES`).
+            if !due || !facts.turn_stopped_idle() {
+                return None;
+            }
+            return Some(cancelled.command(
+                format!("{prefix}{next}"),
+                CommandAction::Input {
+                    text: cancel_notice(cancelled),
+                    tags: Vec::new(),
+                },
+            ));
+        }
+        let execution = facts.execution_id.as_deref().unwrap_or("none");
+        let key = match cancelled.reassigned_as {
+            Some(_) if facts.sent(&reassign_stop).is_none() => reassign_stop,
+            _ => format!("{stop_prefix}{execution}"),
+        };
+        return Some(cancelled.command(key, CommandAction::Stop));
+    }
+    if !due {
+        return None;
+    }
+    facts.execution_id.as_ref()?;
     Some(cancelled.command(
         format!("{prefix}{next}"),
         CommandAction::Resume {
@@ -3668,6 +3695,172 @@ mod tests {
         assert_eq!(plan.len(), 1, "{plan:?}");
         assert_eq!(plan[0].task, Some(8));
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+    }
+
+    /// Once the notice command is recorded (`told`), its failed outcome or
+    /// a dispatcher restart does not hold back an idle pane. An open command
+    /// still excludes concurrent input, and no pass adds another notice.
+    #[test]
+    fn a_recorded_cancel_notice_does_not_block_an_idle_pane() {
+        for state in [TaskState::Assigned, TaskState::Revise] {
+            for restart in [false, true] {
+                let work = Work {
+                    tasks: vec![task(8, state, "resident")],
+                    cancelled: vec![cancelled(true)],
+                    ..Work::default()
+                };
+                let mut facts = worker(true, true);
+                facts.last_delivery = Some("deliver-7-0".to_string());
+                if !restart {
+                    facts.dispatched.push(sent(
+                        30,
+                        "cancel-notice-7-0",
+                        1_000,
+                        Some("pane not ready"),
+                    ));
+                }
+                let plan = orders(&work, &[facts]);
+                assert_eq!(
+                    plan.len(),
+                    1,
+                    "state={state:?}, restart={restart}: {plan:?}"
+                );
+                assert_eq!(plan[0].task, Some(8), "{plan:?}");
+                assert!(
+                    matches!(plan[0].action, CommandAction::Input { .. }),
+                    "{plan:?}"
+                );
+                assert!(!plan[0].key.starts_with("cancel-"), "{plan:?}");
+            }
+        }
+        let mut open = worker(true, true);
+        open.open_command = true;
+        open.dispatched.push(Sent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..sent(30, "cancel-notice-7-0", 1_000, None)
+        });
+        assert!(orders(&after_cancel(true), &[open]).is_empty());
+    }
+
+    /// GitHub #76: a resident stopped once for its cancelled task and
+    /// resumed since (by the recovery, which now takes a cancel's stop as an
+    /// interrupt) is not stopped again: the notice is typed into the live
+    /// session, under the first notice key. A stop that failed stopped
+    /// nothing, and is not "stopped for the task". A reassign's stop counts
+    /// as the task's stop too.
+    #[test]
+    fn a_live_resident_already_stopped_for_its_cancelled_task_gets_the_notice_not_another_stop() {
+        let mut busy = working();
+        busy.execution_id = Some("exec_5".to_string());
+        busy.dispatched
+            .push(sent(20, "cancel-stop-7-exec_3", 1_000, None));
+        assert!(
+            orders(&after_cancel(false), &[busy]).is_empty(),
+            "mid-turn: neither stopped again nor typed into, until its prompt"
+        );
+        {
+            let mut resumed = worker(true, true);
+            resumed.execution_id = Some("exec_5".to_string());
+            resumed
+                .dispatched
+                .push(sent(20, "cancel-stop-7-exec_3", 1_000, None));
+            let plan = orders(&after_cancel(false), &[resumed]);
+            assert_eq!(plan.len(), 1, "{plan:?}");
+            assert_eq!(plan[0].key, "cancel-notice-7-0", "{plan:?}");
+            assert_eq!(notice_task(&plan[0].key), Some(7));
+            let CommandAction::Input { text, tags } = &plan[0].action else {
+                panic!("the notice typed in, not a stop: {:?}", plan[0].action);
+            };
+            assert!(tags.is_empty());
+            assert!(
+                text.contains("Task #7 of mission #1 was cancelled"),
+                "{text}"
+            );
+        }
+
+        // Another task's stop, or this task's stop that failed: stopped now.
+        for stop in [
+            sent(20, "cancel-stop-70-exec_3", 1_000, None),
+            sent(
+                20,
+                "cancel-stop-7-exec_2",
+                1_000,
+                Some("kill-session refused"),
+            ),
+        ] {
+            let mut facts = worker(true, true);
+            facts.dispatched.push(stop);
+            let plan = orders(&after_cancel(false), &[facts]);
+            assert_eq!(plan.len(), 1, "{plan:?}");
+            assert_eq!(plan[0].key, "cancel-stop-7-exec_3");
+            assert_eq!(plan[0].action, CommandAction::Stop);
+        }
+
+        // A reassigned task: its reassign stop is the task's stop.
+        let mut moved = cancelled(false);
+        moved.reassigned_as = Some(9);
+        moved.reassigned_to_session = Some("session_other".to_string());
+        let reassigned = Work {
+            cancelled: vec![moved],
+            ..Work::default()
+        };
+        let plan = orders(&reassigned, &[worker(true, true)]);
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert_eq!(plan[0].key, super::reassign_stop_key(7));
+        assert_eq!(plan[0].action, CommandAction::Stop);
+        let mut resumed = worker(true, true);
+        resumed
+            .dispatched
+            .push(sent(20, &super::reassign_stop_key(7), 1_000, None));
+        let plan = orders(&reassigned, &[resumed]);
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert_eq!(plan[0].key, "cancel-notice-7-0");
+        assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+    }
+
+    /// GitHub #76, 2026-11-20: a notice a busy pane refused is retried on
+    /// the doubling wait ([`super::retry_wait_ms`]), never once a pass, and
+    /// under the next unused key.
+    #[test]
+    fn a_notice_a_busy_pane_refused_waits_before_its_next_try() {
+        let busy = "pane state Busy does not accept input: the input typed last has not been \
+                    answered yet";
+        // Judged at its prompt, but the pane was mid-turn when typed into.
+        let mut facts = worker(true, true);
+        facts.last_delivery = Some("deliver-7-0".to_string());
+        facts.execution_id = Some("exec_5".to_string());
+        facts
+            .dispatched
+            .push(sent(20, "cancel-stop-7-exec_3", 500, None));
+        facts
+            .dispatched
+            .push(sent(30, "cancel-notice-7-0", 1_000, Some(busy)));
+        let wait = super::retry_wait_ms(1);
+        assert!(wait > 1, "a wait to obey");
+        for now in [1_000, 1_001, 1_000 + wait - 1] {
+            assert!(
+                super::orders(&after_cancel(false), &[facts.clone()], now).is_empty(),
+                "no notice before its wait has passed, at {now}"
+            );
+        }
+        let retry = super::orders(&after_cancel(false), &[facts.clone()], 1_000 + wait);
+        assert_eq!(retry.len(), 1, "{retry:?}");
+        assert_eq!(retry[0].key, "cancel-notice-7-1");
+        assert!(matches!(retry[0].action, CommandAction::Input { .. }));
+
+        // Its second refusal doubles the wait.
+        facts
+            .dispatched
+            .push(sent(31, "cancel-notice-7-1", 2_000_000, Some(busy)));
+        let wait = super::retry_wait_ms(2);
+        assert!(
+            super::orders(&after_cancel(false), &[facts.clone()], 2_000_000 + wait - 1).is_empty(),
+            "the second wait is longer"
+        );
+        let retry = super::orders(&after_cancel(false), &[facts], 2_000_000 + wait);
+        assert_eq!(retry.len(), 1, "{retry:?}");
+        assert_eq!(retry[0].key, "cancel-notice-7-2");
     }
 
     /// Every pass after the first sends nothing new: a stop submitted (in

@@ -137,6 +137,9 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     // (`gate/scenarios/build`); the pane's engine runs the build, so it gets
     // the path. Unset, the store's default under $HOME stands.
     config.environment.extend(supply_pa_env(env_value));
+    // Engines on a Claude Code directory of their own, when the loop names
+    // one (SPAWN_CLAUDE_CONFIG_DIR, issue #79); else the user's own.
+    config.environment.extend(claude_config_env(env_value)?);
     // A worker's pane gets no database login: the Bridge reads what the
     // engine does from its files and screen. The supervisor's pane gets its
     // own login: it reads the fleet and commands workers through the
@@ -321,17 +324,74 @@ impl LaunchEnvironment for FleetTestDatabase {
 /// their models through: `SPAWN_MODEL_RELAY` (`http://127.0.0.1:8791` on a
 /// host that runs `spawn-model-relay`; unset or `off` for none), with the
 /// cheap profile's main model `SPAWN_CHEAP_MODEL` and every profile's small
-/// model `SPAWN_SMALL_MODEL`. Names only: the relay holds the keys.
+/// model `SPAWN_SMALL_MODEL`. The default profile's main model
+/// `SPAWN_DEFAULT_MODEL` and its slots `SPAWN_SONNET_MODEL`,
+/// `SPAWN_OPUS_MODEL` and `SPAWN_SUBAGENT_MODEL` are each optional: unset
+/// or empty keeps Claude Code's own (issue #79). Names only: the relay
+/// holds the keys.
 ///
 /// Opt-in, so a host or test without a relay never probes one, and a
 /// configured relay that is down is a warning worth reading.
 fn model_relay() -> Option<ModelRelay> {
-    let url = env_value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
+    resolve_model_relay(env_value)
+}
+
+/// [`model_relay`] over the environment `lookup` reads (an empty value
+/// reads as unset).
+fn resolve_model_relay(lookup: impl Fn(&str) -> Option<String>) -> Option<ModelRelay> {
+    let value = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+    let url = value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
+    let or = |name: &str, fallback: &str| value(name).unwrap_or_else(|| fallback.to_string());
     Some(ModelRelay {
         url: url.trim_end_matches('/').to_string(),
-        cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-flash"),
-        small_model: env_or("SPAWN_SMALL_MODEL", "deepseek-flash"),
+        cheap_model: or("SPAWN_CHEAP_MODEL", "deepseek-flash"),
+        small_model: or("SPAWN_SMALL_MODEL", "deepseek-flash"),
+        default_model: value("SPAWN_DEFAULT_MODEL"),
+        sonnet_model: value("SPAWN_SONNET_MODEL"),
+        opus_model: value("SPAWN_OPUS_MODEL"),
+        subagent_model: value("SPAWN_SUBAGENT_MODEL"),
     })
+}
+
+/// The Claude Code directory engines run with instead of the user's own
+/// `~/.claude` (issue #79): `SPAWN_CLAUDE_CONFIG_DIR`, opt-in. Set, the
+/// engines get it as `CLAUDE_CONFIG_DIR`, so their settings, login and
+/// transcripts are that directory's: its `settings.json` must give them
+/// the gateway's token, as `~/.claude/settings.json` does otherwise (the
+/// relay holds none). Unset or empty, nothing changes: the engines inherit
+/// the user's own settings, token included.
+///
+/// An absolute path only: a relative one (or `~/…`, which no shell expands
+/// here) would name another directory in each engine's workspace, and the
+/// engines' deny rules name it by its path. Refused, `spawn loop` does not
+/// start.
+pub(crate) fn claude_config_dir(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(dir) = lookup("SPAWN_CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if !dir.starts_with('/') {
+        return Err(format!(
+            "SPAWN_CLAUDE_CONFIG_DIR must be an absolute path, not {dir:?}"
+        ));
+    }
+    let trimmed = dir.trim_end_matches('/');
+    Ok(Some(if trimmed.is_empty() {
+        dir
+    } else {
+        trimmed.to_string()
+    }))
+}
+
+/// The engine environment [`claude_config_dir`] adds, or why it refuses.
+fn claude_config_env(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    Ok(claude_config_dir(lookup)?
+        .map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir))
+        .into_iter()
+        .collect())
 }
 
 /// Claude Code's transcript directory, which is where the Bridge reads it.
@@ -340,11 +400,17 @@ pub(crate) fn claude_projects() -> String {
 }
 
 /// [`claude_projects`] over the environment `lookup` reads:
-/// `SPAWN_CLAUDE_PROJECTS` always wins; else `$CLAUDE_CONFIG_DIR/projects`,
-/// else `$HOME/.claude/projects`.
+/// `SPAWN_CLAUDE_PROJECTS` always wins; else the engines' own directory's
+/// (`$SPAWN_CLAUDE_CONFIG_DIR/projects`), else
+/// `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`.
 fn resolve_claude_projects(lookup: impl Fn(&str) -> Option<String>) -> String {
     if let Some(projects) = lookup("SPAWN_CLAUDE_PROJECTS") {
         return projects;
+    }
+    // An invalid one stops `spawn loop` (`bridge_config`); a reader here
+    // goes on as without it.
+    if let Ok(Some(dir)) = claude_config_dir(&lookup) {
+        return format!("{}/projects", dir.trim_end_matches('/'));
     }
     lookup("CLAUDE_CONFIG_DIR").map_or_else(
         || {
@@ -371,7 +437,10 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FleetTestDatabase, resolve_claude_projects, supply_pa_env};
+    use super::{
+        FleetTestDatabase, claude_config_env, resolve_claude_projects, resolve_model_relay,
+        supply_pa_env,
+    };
     use spawn_core::bridge::LaunchEnvironment;
 
     fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -423,6 +492,116 @@ mod tests {
             ("SPAWN_CLAUDE_PROJECTS", "/mnt/transcripts"),
         ]);
         assert_eq!(resolve_claude_projects(&explicit), "/mnt/transcripts");
+    }
+
+    #[test]
+    fn the_engines_own_claude_directory_comes_before_claude_s_own() {
+        let dedicated = environment(&[
+            ("HOME", "/home/owner"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", "/data/fleet-claude/"),
+        ]);
+        assert_eq!(
+            resolve_claude_projects(&dedicated),
+            "/data/fleet-claude/projects"
+        );
+        let explicit = environment(&[
+            ("SPAWN_CLAUDE_CONFIG_DIR", "/data/fleet-claude"),
+            ("SPAWN_CLAUDE_PROJECTS", "/mnt/transcripts"),
+        ]);
+        assert_eq!(resolve_claude_projects(&explicit), "/mnt/transcripts");
+        let empty = environment(&[
+            ("HOME", "/home/owner"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", ""),
+        ]);
+        assert_eq!(resolve_claude_projects(&empty), "/cc/projects");
+        let home = environment(&[("HOME", "/home/owner"), ("SPAWN_CLAUDE_CONFIG_DIR", "  ")]);
+        assert_eq!(
+            resolve_claude_projects(&home),
+            "/home/owner/.claude/projects"
+        );
+    }
+
+    /// Opt-in: only a named directory reaches the engines, as
+    /// `CLAUDE_CONFIG_DIR`. Unset, the engines get nothing that would move
+    /// them off the user's own settings, whose token they inherit.
+    #[test]
+    fn engines_get_a_claude_directory_only_when_the_loop_names_one() {
+        assert_eq!(
+            claude_config_env(environment(&[(
+                "SPAWN_CLAUDE_CONFIG_DIR",
+                "/data/fleet-claude/"
+            )])),
+            Ok(vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/data/fleet-claude".to_string()
+            )])
+        );
+        assert_eq!(claude_config_env(environment(&[])), Ok(Vec::new()));
+        assert_eq!(
+            claude_config_env(environment(&[("SPAWN_CLAUDE_CONFIG_DIR", "")])),
+            Ok(Vec::new())
+        );
+        // Claude Code's own variable, set for the loop, is not handed on.
+        assert_eq!(
+            claude_config_env(environment(&[("CLAUDE_CONFIG_DIR", "/cc")])),
+            Ok(Vec::new())
+        );
+    }
+
+    /// Issue #79's review (F4): only an absolute directory is taken; a
+    /// relative one, or one under `~/` (no shell expands it here), stops the
+    /// loop, and the transcripts are read as without it.
+    #[test]
+    fn a_claude_directory_that_is_not_absolute_is_refused() {
+        for dir in ["fleet-claude", "./fleet-claude", "~/.claude-fleet", "~"] {
+            let pairs = [("HOME", "/home/owner"), ("SPAWN_CLAUDE_CONFIG_DIR", dir)];
+            let lookup = environment(&pairs);
+            let refused = claude_config_env(&lookup).expect_err(dir);
+            assert!(refused.contains("absolute"), "{refused}");
+            assert_eq!(
+                resolve_claude_projects(&lookup),
+                "/home/owner/.claude/projects",
+                "{dir}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_relay_reads_its_optional_default_profile_slots() {
+        assert_eq!(resolve_model_relay(environment(&[])), None);
+        assert_eq!(
+            resolve_model_relay(environment(&[("SPAWN_MODEL_RELAY", "off")])),
+            None
+        );
+        let plain = resolve_model_relay(environment(&[(
+            "SPAWN_MODEL_RELAY",
+            "http://127.0.0.1:8791/",
+        )]))
+        .expect("a relay");
+        assert_eq!(plain.url, "http://127.0.0.1:8791");
+        assert_eq!(plain.cheap_model, "deepseek-flash");
+        assert_eq!(plain.small_model, "deepseek-flash");
+        assert_eq!(plain.default_model, None);
+        assert_eq!(plain.sonnet_model, None);
+        assert_eq!(plain.opus_model, None);
+        assert_eq!(plain.subagent_model, None);
+        let slots = resolve_model_relay(environment(&[
+            ("SPAWN_MODEL_RELAY", "http://127.0.0.1:8791"),
+            ("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
+            ("SPAWN_SMALL_MODEL", "deepseek-flash"),
+            ("SPAWN_DEFAULT_MODEL", "claude-opus-5-5"),
+            ("SPAWN_SONNET_MODEL", "claude-sonnet-5-5"),
+            ("SPAWN_OPUS_MODEL", ""),
+            ("SPAWN_SUBAGENT_MODEL", "claude-haiku-5-5"),
+        ]))
+        .expect("a relay");
+        assert_eq!(slots.cheap_model, "deepseek-v4-pro");
+        assert_eq!(slots.default_model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(slots.sonnet_model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(slots.opus_model, None, "empty reads as unset");
+        assert_eq!(slots.subagent_model.as_deref(), Some("claude-haiku-5-5"));
     }
 
     const FLEET: &str = "postgres://fleet:pw@%2Fhome%2Fo%2Ffleet-pg%2Fsock:5442/spawn_fleet_test";

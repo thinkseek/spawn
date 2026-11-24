@@ -26,6 +26,9 @@ from (
     s.execution_id,
     s.started_at_ms,
     s.ended_at_ms,
+    -- What the latest execution was launched with (issue #79): the
+    -- relay's address, its models, its Claude Code directory; no secret.
+    s.launch,
     coalesce(s.state, 'UNKNOWN') as state,
     p.observation as judgement,
     p.observation_at_ms as judged_at_ms,

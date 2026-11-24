@@ -76,6 +76,7 @@ fn start(store: &PostgresStore) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            launch: None,
         },
     );
 }

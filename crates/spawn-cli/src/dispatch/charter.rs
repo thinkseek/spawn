@@ -333,6 +333,7 @@ mod tests {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         );
         append(

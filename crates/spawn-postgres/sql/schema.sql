@@ -751,7 +751,20 @@ select
     (x.kind -> 'detail' ->> 'signal')::integer as signal,
     -- What the Bridge saw when no runner of its own ran the execution any
     -- more; null for an exit or a stop of a running engine.
-    x.kind -> 'detail' ->> 'evidence' as evidence
+    x.kind -> 'detail' ->> 'evidence' as evidence,
+    -- What the engine was launched with, no secret in it (issue #79,
+    -- `LaunchSummary`): the relay's scheme, host and port, the main and
+    -- small models the inline settings pin, the engine's own Claude Code
+    -- directory. Only these keys are read, whatever else a record holds;
+    -- null for a start on Claude Code's own settings in `~/.claude`, and
+    -- for records made before it was kept.
+    case when jsonb_typeof(s.kind -> 'detail' -> 'launch') = 'object' then
+        nullif(jsonb_strip_nulls(jsonb_build_object(
+            'relay_url',   s.kind -> 'detail' -> 'launch' ->> 'relay_url',
+            'model',       s.kind -> 'detail' -> 'launch' ->> 'model',
+            'small_model', s.kind -> 'detail' -> 'launch' ->> 'small_model',
+            'config_dir',  s.kind -> 'detail' -> 'launch' ->> 'config_dir')), '{}'::jsonb)
+    end as launch
 from spawn_events s
 left join lateral (
     select e.kind, e.recorded_at_ms
@@ -910,10 +923,12 @@ select
     x.started_at_ms,
     x.ended_at_ms,
     x.exit_reported,
-    x.execution_id is not null and x.ended_at_ms is null as live
+    x.execution_id is not null and x.ended_at_ms is null as live,
+    -- Appended (42P16): the latest execution's launch summary.
+    x.launch
 from spawn_session_state p
 left join lateral (
-    select a.execution_id, a.engine, a.started_at_ms, a.ended_at_ms, a.exit_reported
+    select a.execution_id, a.engine, a.started_at_ms, a.ended_at_ms, a.exit_reported, a.launch
     from agent_executions a
     where a.session_id = p.session_id
     order by a.started_at_ms desc, a.execution_id desc
@@ -4294,8 +4309,8 @@ $$;
 -- A resident starts only after a human approves it.
 -- Whether `p_session`'s resident has a cancel notice not yet told: its
 -- latest delivered task is cancelled, and no `cancel-notice-<task>-<n>`
--- command of the dispatcher's reached it (deliver::Work::blocked, as
--- CANCELLED_DELIVERIES reads it).
+-- command of the dispatcher is recorded (deliver::Work::blocked, as
+-- CANCELLED_DELIVERIES reads it). The command's outcome does not block it.
 create or replace function spawn_cancel_notice_untold(p_session text)
 returns boolean language sql stable as $$
     select exists (
@@ -4310,8 +4325,7 @@ returns boolean language sql stable as $$
                               and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
            and not exists (select 1 from spawn_commands c
                             where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
-                              and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
-                              and c.succeeded))
+                              and c.idempotency_key like 'cancel-notice-' || k.id || '-%'))
 $$;
 
 -- Work stealing (objective 239, docs/fleet-architecture.md §3.2 "Work

@@ -1530,3 +1530,36 @@ fn the_newest_manifests_key_is_its_headers_and_its_file_must_be_here() {
     fs::remove_dir_all(&work).expect("clean up");
     fs::remove_dir_all(&dir).expect("clean up");
 }
+
+/// Issue #79's review (F5): the `sessions` area backs up the engines'
+/// Claude Code directory, the account's `~/.claude` unless `spawn loop`
+/// runs them on an absolute one of their own.
+#[test]
+fn the_sessions_area_is_the_engines_claude_directory() {
+    let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    };
+    let home = Path::new("/home/o");
+    assert_eq!(
+        super::claude_dir(
+            lookup(&[("SPAWN_CLAUDE_CONFIG_DIR", "/data/fleet-claude/")]),
+            home
+        ),
+        PathBuf::from("/data/fleet-claude")
+    );
+    for unset in [
+        &[][..],
+        &[("SPAWN_CLAUDE_CONFIG_DIR", "")][..],
+        &[("SPAWN_CLAUDE_CONFIG_DIR", "rel")][..],
+    ] {
+        assert_eq!(
+            super::claude_dir(lookup(unset), home),
+            PathBuf::from("/home/o/.claude")
+        );
+    }
+}

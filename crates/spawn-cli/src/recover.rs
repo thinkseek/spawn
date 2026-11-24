@@ -414,6 +414,14 @@ impl Stop {
         self.key.starts_with(KEY_PREFIX)
     }
 
+    /// Whether the dispatcher sent it to stop a cancelled task's turn
+    /// (`cancel-stop-<task>-<execution>`, GitHub #76). It interrupts a turn
+    /// so the notice can be typed; it does not end the session, so the
+    /// recovery must not record it as `final`.
+    pub(crate) fn cancelled_task(&self) -> bool {
+        self.principal == crate::dispatch::DISPATCHER && self.key.starts_with("cancel-stop-")
+    }
+
     /// Whether it may have stopped the engine: one refused before typing
     /// stopped nothing.
     pub(crate) fn reached(&self) -> bool {
@@ -505,6 +513,38 @@ fn moved_evidence(facts: &Facts<'_>, evidence: &mut Map<String, Value>) {
     }
 }
 
+/// The dispatcher's Stop an execution ended on, by its purpose, from its
+/// Stops (`stops`, oldest first): the latest Stop that may have stopped it,
+/// the recovery's own aside, when it is the dispatcher's; a retry of the
+/// dispatcher's Stop (`stop-<execution>-retry-<n>`, [`crate::dispatch`]'s
+/// pursuit of a Stop that failed) stands for the first Stop it retries, the
+/// dispatcher's first that is not a retry. `None` when the latest is anyone
+/// else's.
+fn dispatchers_stop(stops: &[Stop]) -> Option<&Stop> {
+    let dispatcher = crate::dispatch::DISPATCHER;
+    let last = stops
+        .iter()
+        .rev()
+        .find(|stop| !stop.ours() && stop.reached())?;
+    if last.principal != dispatcher {
+        return None;
+    }
+    if last.key.starts_with("stop-") {
+        stops
+            .iter()
+            .find(|stop| stop.principal == dispatcher && !stop.key.starts_with("stop-"))
+    } else {
+        Some(last)
+    }
+}
+
+/// Whether the execution whose Stops are `stops` ended on the dispatcher's
+/// stop of a cancelled task's turn ([`Stop::cancelled_task`]), sent first
+/// or reached only by its retry ([`dispatchers_stop`]).
+pub(crate) fn task_cancelled(stops: &[Stop]) -> bool {
+    dispatchers_stop(stops).is_some_and(Stop::cancelled_task)
+}
+
 /// The restart or reassign that ended an execution of `session`, from its
 /// Stops (`stops`, oldest first) and the mission rows: the latest Stop that
 /// may have stopped it, the recovery's own aside, is the dispatcher's
@@ -514,21 +554,7 @@ fn moved_evidence(facts: &Facts<'_>, evidence: &mut Map<String, Value>) {
 /// purpose of the first Stop it retries. A Stop from anyone else, whatever
 /// its key, is none: that end is `stopped`.
 pub(crate) fn moved(stops: &[Stop], session: &str, work: &Work) -> Option<Moved> {
-    let dispatcher = crate::dispatch::DISPATCHER;
-    let last = stops
-        .iter()
-        .rev()
-        .find(|stop| !stop.ours() && stop.reached())?;
-    if last.principal != dispatcher {
-        return None;
-    }
-    let stop = if last.key.starts_with("stop-") {
-        stops
-            .iter()
-            .find(|stop| stop.principal == dispatcher && !stop.key.starts_with("stop-"))?
-    } else {
-        last
-    };
+    let stop = dispatchers_stop(stops)?;
     if let Some((task, n)) = stop
         .key
         .strip_prefix("restart-")
@@ -770,13 +796,24 @@ pub(crate) fn auth_retry_due(config: &Config, at_ms: i64, last_attempt_ms: Optio
     }
 }
 
-/// The credentials file as the loop's own environment names it:
-/// `$CLAUDE_CONFIG_DIR/.credentials.json`, else `$HOME/.claude/.credentials.json`.
+/// The engines' credentials file, as the loop's own environment names it.
 pub(crate) fn credentials_path() -> Option<String> {
-    if let Some(dir) = crate::config::env_value("CLAUDE_CONFIG_DIR") {
+    resolve_credentials_path(crate::config::env_value)
+}
+
+/// [`credentials_path`] over the environment `lookup` reads, in the order
+/// the engines' directory is chosen (`runtime`): the engines' own
+/// (`$SPAWN_CLAUDE_CONFIG_DIR`, absolute), else `$CLAUDE_CONFIG_DIR`, else
+/// `$HOME/.claude`; `.credentials.json` in it.
+fn resolve_credentials_path(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let nonempty = |name: &str| lookup(name).filter(|value| !value.is_empty());
+    if let Ok(Some(dir)) = crate::runtime::claude_config_dir(nonempty) {
         return Some(format!("{dir}/.credentials.json"));
     }
-    crate::config::env_value("HOME").map(|home| format!("{home}/.claude/.credentials.json"))
+    if let Some(dir) = nonempty("CLAUDE_CONFIG_DIR") {
+        return Some(format!("{dir}/.credentials.json"));
+    }
+    nonempty("HOME").map(|home| format!("{home}/.claude/.credentials.json"))
 }
 
 /// What the credentials file looked like: its path, modification time and
@@ -846,6 +883,75 @@ pub(crate) fn key(execution: &str, attempt: u32) -> String {
     format!("{KEY_PREFIX}{execution}-{attempt}")
 }
 
+/// The way back from an end of `cause`, and what its record's evidence
+/// gains: [`way`]'s, except that a cancelled task's Stop (`task_cancelled`,
+/// [`Stop::cancelled_task`]) interrupts the turn and takes `resume` where
+/// any other Stop is `final` (GitHub #76), under `way`'s bounds: with no
+/// native session to resume, or after [`RESUME_ATTEMPTS`] failed resumes in
+/// a row, it is a handoff, so a resume the Bridge refuses is not retried
+/// without end. `final` left a resident dead for good when the notice's
+/// resume did not follow, while the dispatcher went on assigning it work; a
+/// `wait` would never clear, since a stop leaves nothing to observe.
+pub(crate) fn stopped_path(
+    cause: Cause,
+    task_cancelled: bool,
+    native_bound: bool,
+    failed_resumes: u32,
+) -> (Path, Map<String, Value>) {
+    if cause == Cause::Stopped && task_cancelled {
+        bounded(Path::Resume, native_bound, failed_resumes)
+    } else {
+        way(cause, native_bound, failed_resumes)
+    }
+}
+
+/// The way back the interruption `last` recorded, its cause's own when it
+/// names none: a cancelled task's Stop is recorded as `resume` where its
+/// cause's default is `final` (GitHub #76), and a wait made final (a
+/// transient model error's retries spent) is never revived, whatever its
+/// cause's own path.
+fn recorded_path(last: &Recorded, cause: Cause) -> Path {
+    match last.path() {
+        Some("resume") => Path::Resume,
+        Some("handoff") => Path::Handoff,
+        Some("wait") => Path::Wait,
+        Some("final") => Path::Final,
+        _ => cause.path(),
+    }
+}
+
+/// Whether `last` is a cancelled task's Stop (its evidence says
+/// `task_cancelled`): its revival must not tell the worker to go on with
+/// the cancelled task.
+fn cancelled_stop(last: &Recorded) -> bool {
+    last.cause() == Some(Cause::Stopped.name())
+        && last.record["evidence"]["task_cancelled"].as_bool() == Some(true)
+}
+
+/// What a handoff's new native session is told of the interruption `last`
+/// of `cause`, after its role or brief; `head` names the branch's head. The
+/// handoff after a cancelled task's Stop does not tell it to carry on.
+fn handoff_interruption(last: &Recorded, cause: Cause, head: &str) -> String {
+    let then = if cancelled_stop(last) {
+        "Your last turn was stopped because its task was cancelled. Do not continue that task \
+         and do not write a report for it. Wait at your prompt: Spawn's notice of the cancel \
+         and your next task come next."
+    } else {
+        "The work is in the workspace to continue, not to redo: read what is there and carry on."
+    };
+    format!(
+        "\n\nYour previous native session could not go on: {} ({}). This is a new native \
+         session in the same Spawn session, workspace and branch{head}. {then}",
+        cause.name(),
+        describe(last)
+    )
+}
+
+/// What the revival after a cancelled task's Stop types or resumes with:
+/// the dispatcher's notice names the task; until it comes, nothing is to be
+/// continued.
+const CANCELLED_REVIVAL: &str = "Spawn resumed your engine: your last turn was stopped because its task was cancelled. Do not continue that task and do not write a report for it. Wait at your prompt: Spawn's notice of the cancel and your next task come next.";
+
 /// The way back from `cause`, and what its record's evidence gains: a resume
 /// path becomes a handoff after [`RESUME_ATTEMPTS`] failed resumes in a row,
 /// or when there is no native session to resume. `final` is never revived.
@@ -854,16 +960,22 @@ pub(crate) fn way(
     native_bound: bool,
     failed_resumes: u32,
 ) -> (Path, Map<String, Value>) {
+    bounded(cause.path(), native_bound, failed_resumes)
+}
+
+/// `path`, made a handoff where a resume cannot work ([`way`]'s bounds), and
+/// what the record's evidence gains then.
+fn bounded(path: Path, native_bound: bool, failed_resumes: u32) -> (Path, Map<String, Value>) {
     let mut evidence = Map::new();
-    if cause.path() == Path::Resume && failed_resumes >= RESUME_ATTEMPTS {
+    if path == Path::Resume && failed_resumes >= RESUME_ATTEMPTS {
         evidence.insert("resumes_failed".to_string(), json!(RESUME_ATTEMPTS));
         return (Path::Handoff, evidence);
     }
-    if cause.path() == Path::Resume && !native_bound {
+    if path == Path::Resume && !native_bound {
         evidence.insert("native".to_string(), json!("none"));
         return (Path::Handoff, evidence);
     }
-    (cause.path(), evidence)
+    (path, evidence)
 }
 
 /// Whether a free-space reading clears a disk wait: at the floor or above
@@ -1719,14 +1831,15 @@ impl One<'_> {
             disk: below.as_ref(),
             outage: None,
             retired: self.retired.contains(&self.row.session_id),
-            task_cancelled: false,
+            task_cancelled: task_cancelled(&self.row.stops),
             model_error: self.refused_turn(end),
             moved: moved(&self.row.stops, &self.row.session_id, self.work),
         };
         let cause = classify(&facts);
         let mut evidence = self.end_evidence(cause, end, &facts);
-        let (path, mut gains) = way(
+        let (path, mut gains) = stopped_path(
             cause,
+            facts.task_cancelled,
             self.row.native_session_id.is_some(),
             self.failures_in_a_row(),
         );
@@ -1960,12 +2073,7 @@ impl One<'_> {
         let Some(cause) = Cause::from_name(last.cause().unwrap_or_default()) else {
             return Ok(());
         };
-        // A wait made final (a transient model error's retries spent) is
-        // never revived, whatever its cause's own path.
-        if last.path() == Some(Path::Final.name()) {
-            return Ok(());
-        }
-        match cause.path() {
+        match recorded_path(&last, cause) {
             Path::Final => Ok(()),
             Path::Wait => self.wait_path(&last, cause),
             Path::Resume | Path::Handoff => self.revive(&last, cause, false),
@@ -2386,6 +2494,9 @@ impl One<'_> {
     /// interruption, by its cause and evidence, and that its work is where
     /// it left it.
     fn resume_text(&self, last: &Recorded, cause: Cause) -> String {
+        if cancelled_stop(last) {
+            return CANCELLED_REVIVAL.to_string();
+        }
         format!(
             "Spawn restarted your engine: execution {} {} ({}). Continue your task from where \
              you were; what you did is in your workspace.",
@@ -2396,6 +2507,9 @@ impl One<'_> {
     }
 
     fn input_text(last: &Recorded, cause: Cause) -> String {
+        if cancelled_stop(last) {
+            return CANCELLED_REVIVAL.to_string();
+        }
         format!(
             "Spawn: the {} that stopped your last turn is over ({}). Continue your task from \
              where you were; the work is in your workspace.",
@@ -2413,13 +2527,7 @@ impl One<'_> {
             .head
             .as_ref()
             .map_or_else(String::new, |head| format!(" (its head is {head})"));
-        let interruption = format!(
-            "\n\nYour previous native session could not go on: {} ({}). This is a new native \
-             session in the same Spawn session, workspace and branch{head}. The work is in the \
-             workspace to continue, not to redo: read what is there and carry on.",
-            cause.name(),
-            describe(last)
-        );
+        let interruption = handoff_interruption(last, cause, &head);
         if self.row.session_id == supervise::SUPERVISOR_SESSION {
             let supervise::Charter { text, hash } = supervise::Charter::deployed(self.spawn);
             let summary = supervise::handoff(self.store);
@@ -2593,6 +2701,50 @@ impl Cause {
 }
 
 #[cfg(test)]
+mod credentials_tests {
+    use super::resolve_credentials_path;
+
+    fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    /// Issue #79's review (F5): the login an expired-login wait watches is
+    /// the engines' own, in the order `spawn loop` gives them a directory.
+    #[test]
+    fn the_credentials_are_the_engines_own_directorys() {
+        let all = lookup(&[
+            ("HOME", "/home/o"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", "/data/fleet-claude/"),
+        ]);
+        assert_eq!(
+            resolve_credentials_path(all).as_deref(),
+            Some("/data/fleet-claude/.credentials.json")
+        );
+        let claude = lookup(&[
+            ("HOME", "/home/o"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
+            ("SPAWN_CLAUDE_CONFIG_DIR", ""),
+        ]);
+        assert_eq!(
+            resolve_credentials_path(claude).as_deref(),
+            Some("/cc/.credentials.json")
+        );
+        let relative = lookup(&[("HOME", "/home/o"), ("SPAWN_CLAUDE_CONFIG_DIR", "fleet")]);
+        assert_eq!(
+            resolve_credentials_path(relative).as_deref(),
+            Some("/home/o/.claude/.credentials.json")
+        );
+        assert_eq!(resolve_credentials_path(lookup(&[])), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
@@ -2601,6 +2753,194 @@ mod tests {
         resume_failed, retry_at, server_gone, way,
     };
     use serde_json::json;
+
+    /// A cancelled task's stop is the dispatcher's interrupt: the notice's
+    /// resume follows it, so the recovery must not record it as `final`
+    /// (`interrupt_end`). A person's stop, the supervisor's, the
+    /// dispatcher's other stops and the recovery's own still end it.
+    #[test]
+    fn only_a_dispatchers_cancel_stop_is_an_interrupt() {
+        let stop = |principal: &str, key: &str| Stop {
+            command_id: 1,
+            principal: principal.to_string(),
+            key: key.to_string(),
+            action: "stop".to_string(),
+            created_at_ms: 0,
+            succeeded: Some(true),
+            error: None,
+        };
+        let dispatcher = crate::dispatch::DISPATCHER;
+        assert!(stop(dispatcher, "cancel-stop-63-exec_482").cancelled_task());
+        assert!(!stop(dispatcher, "restart-18-1-stop").cancelled_task());
+        assert!(!stop(dispatcher, "reassign-18-stop").cancelled_task());
+        assert!(!stop(dispatcher, "pause-8-23954-exec_206").cancelled_task());
+        assert!(!stop("bb-person", "cancel-stop-63-exec_482").cancelled_task());
+        assert!(!stop("spawn-supervisor", "cancel-stop-63-exec_482").cancelled_task());
+        assert!(!stop("spawn-liveness", "recover-exec_4-1-stop").cancelled_task());
+
+        // Its end is `stopped`, on the way back of a resume; any other
+        // stop's end stays final.
+        let cancelled = stop(dispatcher, "cancel-stop-63-exec_482");
+        let facts = Facts {
+            stop: Some(&cancelled),
+            task_cancelled: cancelled.cancelled_task(),
+            ..Facts::default()
+        };
+        let cause = classify(&facts);
+        assert_eq!(cause, Cause::Stopped);
+        let (path, evidence) = super::stopped_path(cause, true, true, 0);
+        assert_eq!(path, Path::Resume);
+        assert!(evidence.is_empty());
+        assert_eq!(super::stopped_path(cause, false, true, 0).0, Path::Final);
+        assert_eq!(
+            super::stopped_path(Cause::Restarted, true, true, 0).0,
+            Path::Final
+        );
+
+        // A cancel stop that failed and succeeded only on the dispatcher's
+        // retry (`stop-<execution>-retry-<n>`) is still the cancelled
+        // task's stop: the retry carries its purpose, as for `moved`.
+        let failed = Stop {
+            succeeded: Some(false),
+            error: Some("kill-session refused".to_string()),
+            ..stop(dispatcher, "cancel-stop-63-exec_482")
+        };
+        let retried = [failed.clone(), stop(dispatcher, "stop-exec_482-retry-1")];
+        assert!(
+            !retried[1].cancelled_task(),
+            "the retry's own key says nothing"
+        );
+        assert!(super::task_cancelled(&retried));
+        assert!(super::task_cancelled(std::slice::from_ref(&cancelled)));
+        // A retry of a restart's stop, a person's stop after the cancel
+        // stop, or nothing that reached the engine: not a cancelled task's.
+        assert!(!super::task_cancelled(&[
+            stop(dispatcher, "restart-18-1-stop"),
+            stop(dispatcher, "stop-exec_482-retry-1"),
+        ]));
+        assert!(!super::task_cancelled(&[
+            cancelled.clone(),
+            stop("bb-person", "person-stop-1"),
+        ]));
+        assert!(!super::task_cancelled(&[failed]));
+        assert!(!super::task_cancelled(&[]));
+    }
+
+    /// A cancelled task's stop resumes under `way`'s bounds: with no native
+    /// session to resume (the Bridge would refuse every resume), or after
+    /// three failed resumes in a row, it is a handoff, never a resume
+    /// retried without end. With a native session and fewer failures it is
+    /// a resume.
+    #[test]
+    fn a_cancelled_tasks_stop_with_no_native_session_hands_off() {
+        let (path, evidence) = super::stopped_path(Cause::Stopped, true, false, 0);
+        assert_eq!(path, Path::Handoff);
+        assert_eq!(evidence["native"], json!("none"));
+        for failures in 0..super::RESUME_ATTEMPTS {
+            let (path, evidence) = super::stopped_path(Cause::Stopped, true, true, failures);
+            assert_eq!(path, Path::Resume, "{failures} failed resumes");
+            assert!(evidence.is_empty());
+        }
+        let (path, evidence) =
+            super::stopped_path(Cause::Stopped, true, true, super::RESUME_ATTEMPTS);
+        assert_eq!(path, Path::Handoff);
+        assert_eq!(evidence["resumes_failed"], json!(super::RESUME_ATTEMPTS));
+        // Any other stop stays final, native session or not.
+        assert_eq!(
+            super::stopped_path(Cause::Stopped, false, false, 0).0,
+            Path::Final
+        );
+
+        // The handoff's new native session is not told to carry on.
+        let record = |evidence: serde_json::Value| Recorded {
+            event_id: 1,
+            at_ms: 1_000,
+            record: json!({"type": "execution.interrupted", "cause": "stopped",
+                           "path": "handoff", "attempt": 1, "evidence": evidence}),
+        };
+        let cancelled = record(
+            json!({"principal": "spawn-dispatch", "task_cancelled": true,
+                                      "native": "none"}),
+        );
+        let text = super::handoff_interruption(&cancelled, Cause::Stopped, "");
+        assert!(text.contains("Do not continue that task"), "{text}");
+        assert!(!text.contains("carry on"), "{text}");
+        let other = record(json!({"principal": "spawn-dispatch"}));
+        assert!(super::handoff_interruption(&other, Cause::Stopped, "").contains("carry on"));
+    }
+
+    /// `resume_path` takes the record's own path (GitHub #76): a `stopped`
+    /// recorded as `resume` is revived, a `final` one (a person's stop, or
+    /// a wait made final) never is, and a record that names no path takes
+    /// its cause's own.
+    #[test]
+    fn the_way_back_is_the_recorded_path_and_a_final_one_is_never_revived() {
+        let stopped = |path: Option<&str>| Recorded {
+            event_id: 1,
+            at_ms: 1_000,
+            record: match path {
+                Some(path) => json!({"type": "execution.interrupted", "cause": "stopped",
+                                     "path": path, "attempt": 1}),
+                None => json!({"type": "execution.interrupted", "cause": "stopped",
+                               "attempt": 1}),
+            },
+        };
+        let recorded_path = super::recorded_path;
+        assert_eq!(
+            recorded_path(&stopped(Some("resume")), Cause::Stopped),
+            Path::Resume
+        );
+        assert_eq!(
+            recorded_path(&stopped(Some("final")), Cause::Stopped),
+            Path::Final
+        );
+        assert_eq!(recorded_path(&stopped(None), Cause::Stopped), Path::Final);
+        assert_eq!(
+            recorded_path(&stopped(Some("handoff")), Cause::Stopped),
+            Path::Handoff
+        );
+        assert_eq!(
+            recorded_path(&stopped(Some("wait")), Cause::Stopped),
+            Path::Wait
+        );
+        // A model wait whose retries are spent is recorded final: skipped.
+        assert_eq!(
+            recorded_path(&stopped(Some("final")), Cause::ModelUnavailable),
+            Path::Final
+        );
+        assert_eq!(
+            recorded_path(&stopped(None), Cause::ModelUnavailable),
+            Path::Wait
+        );
+    }
+
+    /// The revival after a cancelled task's stop never tells the worker to
+    /// continue: its task is cancelled. Any other revival still does.
+    #[test]
+    fn the_revival_after_a_cancelled_tasks_stop_does_not_continue_it() {
+        let record = |cause: &str, evidence: serde_json::Value| Recorded {
+            event_id: 1,
+            at_ms: 1_000,
+            record: json!({"type": "execution.interrupted", "cause": cause,
+                           "path": "resume", "attempt": 1, "evidence": evidence}),
+        };
+        let cancelled = record(
+            "stopped",
+            json!({"principal": "spawn-dispatch", "task_cancelled": true}),
+        );
+        assert!(super::cancelled_stop(&cancelled));
+        let text = super::One::input_text(&cancelled, Cause::Stopped);
+        assert_eq!(text, super::CANCELLED_REVIVAL);
+        assert!(text.contains("Do not continue that task"), "{text}");
+        assert!(!text.contains("Continue your task"), "{text}");
+        let crashed = record("crashed", json!({"exit_code": 1}));
+        assert!(!super::cancelled_stop(&crashed));
+        assert!(super::One::input_text(&crashed, Cause::Crashed).contains("Continue your task"));
+        assert!(!super::cancelled_stop(&record(
+            "stopped",
+            json!({"principal": "bb-person"})
+        )));
+    }
     use spawn_core::port::{ServerSeen, TerminalServer};
 
     /// A host restart is the server that ran the execution gone, told by

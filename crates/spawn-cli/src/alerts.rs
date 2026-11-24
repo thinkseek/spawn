@@ -7844,6 +7844,50 @@ mod tests {
         );
     }
 
+    /// A path that cannot be read is inaccessible, not "not a tmpfs" (GitHub
+    /// PR #72): clearing an open tmpfs_high as if the host had no tmpfs
+    /// would hide a real reading error. The failed statfs is a line in the
+    /// loop's log and the alert stays open.
+    #[test]
+    fn a_missing_path_is_not_cleared_as_not_a_tmpfs() {
+        let missing = Path::new("/no/such/path/pr72-missing-tmpfs");
+        assert!(
+            std::fs::symlink_metadata(missing).is_err(),
+            "needs a missing path"
+        );
+        let mut monitor = Monitor::with(Settings {
+            tmpfs_path: missing.to_path_buf(),
+            tmpfs_high_mb: 1,
+            tmpfs_ok_mb: 1,
+            ..settings()
+        });
+        monitor.known.insert(
+            "tmpfs_high:1".to_string(),
+            Row {
+                kind: "tmpfs_high".to_string(),
+                subject: "host".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"reading_ms": 1}),
+                fired_event_id: 1,
+                fired_at_ms: 1,
+            },
+        );
+        let mut out = Vec::new();
+        let mut lines = Vec::new();
+        monitor.read_tmpfs(2, &mut out, &mut lines);
+        let events = decided(&monitor, out);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Clear { .. })),
+            "an inaccessible path must not clear tmpfs_high: {events:?} lines={lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("pr72-missing-tmpfs")),
+            "the failed reading is logged: {lines:?}"
+        );
+    }
+
     #[test]
     fn memory_and_tmpfs_do_not_flap_between_their_thresholds() {
         // MemAvailable: fire under 4096, clear at 8192; 5000 in between is
@@ -11060,6 +11104,7 @@ execute function alerts_test_deploys_mid_start();
                         fork: None,
                         model: ModelProfile::Default,
                         transcript_from: None,
+                        launch: None,
                     },
                 )
             }

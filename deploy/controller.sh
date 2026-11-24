@@ -71,10 +71,11 @@
 # web/node_modules as a reflink (`cp --reflink=always`: on btrfs, as here, the
 # copy shares every data block and costs only metadata, a few MB for ~7500
 # files, while each file is its own inode, so an edit or reinstall in the
-# source never reaches the controller); on a filesystem without reflinks, as
-# hardlinks (the same small cost, but the inodes are shared: pnpm replaces
-# files rather than writing into them, an editor may not); across
-# filesystems, a full copy, with a warning. A source whose installed lockfile
+# source never reaches the controller); on a filesystem without reflinks, as a
+# full copy: every file is its own inode there too, at the cost of the set's
+# bytes, never a hardlink (a hardlinked file keeps the source's inode, so an
+# edit in the owner's checkout would reach the controller). This is also the
+# copy across filesystems. A source whose installed lockfile
 # (.pnpm/lock.yaml) is not the commit's web/pnpm-lock.yaml is refused: the
 # gate would judge with other dependencies than the commit names.
 #
@@ -110,7 +111,8 @@ lock() { # lock <name>: held until this process exits (once per shell)
 }
 
 # writable <tree> u+w|a-w: every directory and file of the git tree, never
-# the node_modules (its inodes may be the source's: hardlinks).
+# the node_modules (a copied set keeps its source's modes; its inodes are the
+# controller's own, never hardlinks into the source).
 set_mode() {
   find "$1" -path "$1/web/node_modules" -prune -o \( -type d -o -type f \) -exec chmod "$2" {} +
 }
@@ -175,19 +177,22 @@ judged() {
 }
 
 copy_modules() { # copy_modules <source> <destination>
+  # A reflink first: free blocks, independent inodes. When the filesystem
+  # cannot reflink, a full copy, never `cp -al`: the controller's files must
+  # not share an inode with the owner's checkout, or an edit there would
+  # change the deployed tree. The cost is the set's bytes on disk.
   if cp -a --reflink=always "$1" "$2" 2>/dev/null; then
     say "web/node_modules: reflinked from $1"
     return
   fi
   rm -rf "$2"
-  if cp -al "$1" "$2" 2>/dev/null; then
-    say "web/node_modules: hardlinked from $1 (no reflinks here)"
+  if cp -a "$1" "$2"; then
+    printf 'controller: warning: web/node_modules is a full copy of %s (%s): the filesystem makes no reflinks\n' \
+      "$1" "$(du -sh "$2" | cut -f1)" >&2
     return
   fi
   rm -rf "$2"
-  cp -a "$1" "$2"
-  printf 'controller: warning: web/node_modules is a full copy of %s (%s): not on the same filesystem\n' \
-    "$1" "$(du -sh "$2" | cut -f1)" >&2
+  die "web/node_modules copy from $1 failed"
 }
 
 # deps_sha <git-dir> <commit>: the sha256 of the commit's root pnpm-lock.yaml,

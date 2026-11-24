@@ -160,6 +160,11 @@ pub const MAIN_COPIES: &str = ".spawn/main";
 /// [`MAIN_COPIES`], under `.spawn/`, which no checkpoint takes.
 pub const SET_ASIDE_FILES: &str = ".spawn/set-aside";
 
+/// The refusal code of a set-aside whose `ready` said the agent is not idle
+/// ([`GitWorkspace::set_aside_when`]): nothing was written, and the caller
+/// asks again later.
+pub const SET_ASIDE_WAITS: &str = "SetAsideWaits";
+
 /// First field of the record of main's copies ([`GitWorkspace::main_copies`]).
 const COPIES_TAG: &str = "main-copies";
 
@@ -1658,7 +1663,7 @@ impl WorkspaceStore for GitWorkspace {
         start: Option<&str>,
         message: &str,
     ) -> Result<SetAside, WorkspaceError> {
-        self.set_aside_since(branch.as_str(), start, message)
+        self.set_aside_since(branch.as_str(), start, message, &|| Ok(()))
     }
 
     /// What checkpoints of the workspace left out and the agent was not
@@ -1873,6 +1878,24 @@ impl GitWorkspace {
         })
     }
 
+    /// [`WorkspaceStore::set_aside`], only while `ready` says the agent is
+    /// idle, asked under the branch's lock before anything is written: the
+    /// Bridge types under the same lock ([`WorkspaceStore::hold`]), so a
+    /// set-aside that found the agent idle cannot reset its workspace under
+    /// a turn typed in meanwhile. For a resident whose engine still runs
+    /// (its turn stopped, the cancel notice about to be typed in). When
+    /// `ready` refuses, nothing changes: the refusal is [`SET_ASIDE_WAITS`]
+    /// with `ready`'s reason.
+    pub fn set_aside_when(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<SetAside, WorkspaceError> {
+        self.set_aside_since(branch.as_str(), start, message, ready)
+    }
+
     /// [`WorkspaceStore::set_aside`]: a new commit on top of `branch` whose
     /// tree is `start`'s, so the work done since `start` leaves the branch's
     /// tree but stays in its history. Under the branch's lock, like a
@@ -1895,13 +1918,21 @@ impl GitWorkspace {
     /// caller whose record failed asks again: a head that is this
     /// set-aside already ([`Self::set_aside_made`]) is answered as when it
     /// was made, and nothing is written.
+    ///
+    /// `ready` is asked under the lock before anything is read or written
+    /// ([`Self::set_aside_when`]).
     fn set_aside_since(
         &self,
         branch: &str,
         start: Option<&str>,
         message: &str,
+        ready: &dyn Fn() -> Result<(), String>,
     ) -> Result<SetAside, WorkspaceError> {
         let _lock = self.lock_branch(branch)?;
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: SET_ASIDE_WAITS.to_string(),
+            message: why,
+        })?;
         self.refuse_stale(branch)?;
         let reference = format!("refs/heads/{branch}");
         let mut head = self.commit_id_of(&reference)?;

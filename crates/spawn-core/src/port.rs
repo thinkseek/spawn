@@ -389,8 +389,11 @@ pub trait WorkspaceStore: Send + Sync {
     /// Set aside the work on `branch` since the commit `start` (a checkpoint
     /// of the branch, so its ancestor; `None`: where the branch forked from
     /// `main`), for a task that was cancelled. Called by the dispatcher
-    /// while nothing of the agent writes the branch (its execution has
-    /// ended), under the branch's lock. Nothing is rewound: a mounted
+    /// while nothing of the agent writes the branch, under the branch's
+    /// lock: its execution has ended, or it runs idle at its prompt with
+    /// nothing in flight, which a store with branches asks again under the
+    /// lock before it writes (the Bridge types under [`Self::hold`]), so a
+    /// workspace is never reset under a turn. Nothing is rewound: a mounted
     /// workspace whose state no checkpoint took is committed first, then a
     /// new commit with `start`'s tree goes on top of the branch head (by
     /// compare-and-swap) and the workspace follows it. The work stays in the

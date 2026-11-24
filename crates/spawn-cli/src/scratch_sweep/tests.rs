@@ -1616,6 +1616,7 @@ fn a_running_execution_is_read_from_the_store() {
         fork: None,
         model: ModelProfile::Default,
         transcript_from: None,
+        launch: None,
     });
     assert_eq!(session_runs(&store, "session_worker_r"), Ok(true));
     // A worker read through the store with that session stays.

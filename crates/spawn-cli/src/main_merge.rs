@@ -193,8 +193,10 @@ pub(crate) fn may_merge(facts: Option<&Facts>) -> Result<(), String> {
 }
 
 /// [`may_merge`] for `session`, on the dispatcher's facts read now, not the
-/// ones a pass started with.
-fn ready_to_merge(store: &PostgresStore, session: &str) -> Result<(), String> {
+/// ones a pass started with. Also what a cancel notice typed into a live
+/// resident waits for before its task's work is set aside
+/// ([`crate::set_aside::set_aside_when`]).
+pub(crate) fn ready_to_merge(store: &PostgresStore, session: &str) -> Result<(), String> {
     let rows: Vec<Facts> = serde_json::from_value(
         store
             .dispatch_facts()
@@ -2082,6 +2084,284 @@ mod tests {
         );
         assert_eq!(head(&mirror, &agent), before, "nothing merged");
         assert!(!root.join(&agent).join("added.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A resident of a mission on `source` whose engine runs: its task's
+    /// work on its branch, its workspace mounted with a file no checkpoint
+    /// took yet (`wip.txt`), its execution started, and a judgement of it
+    /// idle at its prompt. `(agent, session, workspace directory, branch
+    /// head)`.
+    fn live_resident(
+        db: &Db,
+        store: &GitWorkspace,
+        mirror: &Path,
+        source: &str,
+    ) -> (String, String, PathBuf, String) {
+        use spawn_core::event::{ENGINE, EventKind, ModelProfile, Source};
+        use spawn_core::id::CommandId;
+        let (agent, session) = db.task_on(source, "typed-notice");
+        let workspace = agent_with_work(store, &agent, |directory| {
+            std::fs::write(directory.join("work.txt"), "cancelled\n").expect("write");
+        });
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("wip.txt"), "half done\n").expect("write");
+        let work = head(mirror, &agent);
+        resident_event(
+            db,
+            &agent,
+            &session,
+            Source::Bridge,
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace,
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+                launch: None,
+            },
+        );
+        let judged = resident_event(
+            db,
+            &agent,
+            &session,
+            Source::Claude,
+            EventKind::MessageReceived,
+        );
+        resident_event(db, &agent, &session, Source::Observer, idle_at(judged));
+        (agent, session, directory, work)
+    }
+
+    /// Append `kind` to the live resident's execution; its session seq.
+    fn resident_event(
+        db: &Db,
+        agent: &str,
+        session: &str,
+        source: spawn_core::event::Source,
+        kind: spawn_core::event::EventKind,
+    ) -> spawn_core::event::SessionSeq {
+        use spawn_core::event::NewEvent;
+        use spawn_core::id::{AgentId, ExecutionId, SessionId};
+        use spawn_core::port::EventLog;
+        db.store
+            .append(NewEvent {
+                agent_id: AgentId::new(agent).expect("agent"),
+                session_id: SessionId::new(session).expect("session"),
+                execution_id: Some(ExecutionId::new("exec_typed_1").expect("execution")),
+                source,
+                source_event_id: None,
+                kind,
+            })
+            .expect("append")
+            .record
+            .session_seq
+    }
+
+    /// The Observer's judgement: stopped idle at its prompt, on `seq`.
+    fn idle_at(seq: spawn_core::event::SessionSeq) -> spawn_core::event::EventKind {
+        use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
+        let mut observation = Observation::basic(
+            SemanticState::Waiting,
+            None,
+            seq,
+            Confidence::new(0.9).expect("valid"),
+            "jev",
+        );
+        observation.ambiguity = Some(Ambiguity::TurnStoppedIdle);
+        spawn_core::event::EventKind::ObservationRecorded { observation }
+    }
+
+    /// Task 7 of `agent`'s session, cancelled, its notice not sent, with
+    /// the set-aside `set_aside` recorded already.
+    fn cancelled_seven(
+        agent: &str,
+        session: &str,
+        set_aside: Option<String>,
+    ) -> crate::deliver::Work {
+        crate::deliver::Work {
+            cancelled: vec![crate::deliver::Cancelled {
+                id: 7,
+                mission_id: 1,
+                agent_id: agent.to_string(),
+                session_id: session.to_string(),
+                start: None,
+                set_aside,
+                told: false,
+                closed_by: Some("task.cancelled".to_string()),
+                reason: None,
+                yielded: false,
+                yield_reason: None,
+                reassigned_as: None,
+                reassigned_to_session: None,
+            }],
+            ..crate::deliver::Work::default()
+        }
+    }
+
+    /// Task 7's notice `key`, typed into `agent`'s live session.
+    fn typed_notice(agent: &str, session: &str, key: &str) -> crate::dispatch::Order {
+        crate::dispatch::Order {
+            agent_id: agent.to_string(),
+            session_id: session.to_string(),
+            key: key.to_string(),
+            action: spawn_core::command::CommandAction::Input {
+                text: "Task #7 was cancelled.".to_string(),
+                tags: Vec::new(),
+            },
+            task: None,
+        }
+    }
+
+    /// The commands of `session`, and the set-aside records of task 7.
+    fn notice_traces(db: &Db, session: &str) -> (i64, i64) {
+        let mut client = postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
+        client
+            .batch_execute(&format!("set search_path to {}", db.schema))
+            .expect("schema");
+        let count = |client: &mut postgres::Client, sql: &str, session: &str| -> i64 {
+            client.query_one(sql, &[&session]).expect("count").get(0)
+        };
+        (
+            count(
+                &mut client,
+                "select count(*) from spawn_commands where session_id = $1",
+                session,
+            ),
+            count(
+                &mut client,
+                "select count(*) from spawn_events
+                  where source_event_id = 'set-aside:7' and session_id = $1",
+                session,
+            ),
+        )
+    }
+
+    /// Whether `session` is live on the dispatcher's facts read now.
+    fn live_now(db: &Db, session: &str) -> bool {
+        let rows: Vec<crate::dispatch::Facts> =
+            serde_json::from_value(db.store.dispatch_facts().expect("facts")).expect("rows");
+        rows.iter()
+            .any(|facts| facts.session_id == session && facts.live)
+    }
+
+    /// GitHub #76 (F1 of the group-1 review), at the dispatcher: a cancel
+    /// notice typed into a resident whose engine runs sets the task's work
+    /// aside only while the resident is idle, asked again on the facts read
+    /// now under the branch's lock. Busy (a turn started after its last
+    /// judgement), the notice is held: the error says it waits, the branch,
+    /// the workspace's files and the order are as they were, and nothing is
+    /// recorded or submitted, so a refused notice never counts as told. The
+    /// same holds when the set-aside is already recorded.
+    #[test]
+    fn a_typed_cancel_notice_waits_and_touches_nothing_while_its_resident_is_busy() {
+        use spawn_core::event::{EventKind, Source};
+        let db = Db::new("typed_notice_busy");
+        let (base, source, root, mirror, store) = world("typed-notice-busy");
+        let (agent, session, directory, work) = live_resident(&db, &store, &mirror, &source);
+        resident_event(
+            &db,
+            &agent,
+            &session,
+            Source::Claude,
+            EventKind::MessageReceived,
+        );
+        assert!(live_now(&db, &session), "its engine runs");
+        for set_aside in [None, Some("5".repeat(40))] {
+            let mut order = typed_notice(&agent, &session, "cancel-notice-7-0");
+            let held = crate::dispatch::set_aside_before(
+                &db.store,
+                Some(&root),
+                &cancelled_seven(&agent, &session, set_aside.clone()),
+                7,
+                &mut order,
+            )
+            .expect_err("held while a turn runs");
+            assert!(
+                held.contains("task #7's cancel notice waits") && held.contains("not idle"),
+                "{held}"
+            );
+            assert_eq!(
+                order.action,
+                typed_notice(&agent, &session, "cancel-notice-7-0").action
+            );
+            assert_eq!(head(&mirror, &agent), work, "the branch as it was");
+            assert_eq!(
+                std::fs::read_to_string(directory.join("work.txt")).expect("work"),
+                "cancelled\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join("wip.txt")).expect("wip"),
+                "half done\n",
+                "the workspace's files as they were ({set_aside:?})"
+            );
+            assert_eq!(
+                notice_traces(&db, &session),
+                (0, 0),
+                "nothing recorded or submitted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GitHub #76 (F1 of the group-1 review): a resident whose engine runs,
+    /// idle at its prompt on its latest fact, has its cancelled task's work
+    /// set aside, and the typed notice says where the work went, as a
+    /// notice that resumes an ended resident does.
+    #[test]
+    fn a_typed_cancel_notice_to_an_idle_resident_says_where_the_work_went() {
+        use spawn_core::command::CommandAction;
+        let db = Db::new("typed_notice_idle");
+        let (base, source, root, mirror, store) = world("typed-notice-idle");
+        let (agent, session, directory, work) = live_resident(&db, &store, &mirror, &source);
+        assert_eq!(super::ready_to_merge(&db.store, &session), Ok(()));
+        assert!(live_now(&db, &session), "running, at its prompt");
+        let cancelled = cancelled_seven(&agent, &session, None);
+        let mut order = typed_notice(&agent, &session, "cancel-notice-7-0");
+        let line =
+            crate::dispatch::set_aside_before(&db.store, Some(&root), &cancelled, 7, &mut order)
+                .expect("idle: set aside")
+                .expect("said");
+        let aside = head(&mirror, &agent);
+        assert_ne!(aside, work, "set aside");
+        assert!(line.contains(&aside), "{line}");
+        let CommandAction::Input { text, .. } = &order.action else {
+            panic!("still typed in: {:?}", order.action);
+        };
+        assert!(text.starts_with("Task #7 was cancelled.\n\n"), "{text}");
+        assert!(
+            text.contains("Its work was set aside, not lost")
+                && text.contains(&format!("commit {aside} on top of it")),
+            "{text}"
+        );
+        assert!(
+            !directory.join("wip.txt").exists(),
+            "kept in the set-aside's parent"
+        );
+        assert_eq!(
+            notice_traces(&db, &session),
+            (0, 1),
+            "recorded once; the dispatcher submits"
+        );
+
+        // A notice that resumes an ended resident gets the same sentence.
+        let mut resume = crate::dispatch::Order {
+            action: CommandAction::Resume {
+                prompt: Some("Task #7 was cancelled.".to_string()),
+                model: None,
+            },
+            ..typed_notice(&agent, &session, "cancel-notice-7-1")
+        };
+        crate::dispatch::set_aside_before(&db.store, Some(&root), &cancelled, 7, &mut resume)
+            .expect("answered again");
+        let CommandAction::Resume {
+            prompt: Some(text), ..
+        } = &resume.action
+        else {
+            panic!("a resume: {:?}", resume.action);
+        };
+        assert!(text.contains("Its work was set aside, not lost"), "{text}");
+        assert_eq!(head(&mirror, &agent), aside, "no second set-aside");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

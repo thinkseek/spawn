@@ -11,12 +11,14 @@ use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
 
-/// The fleet as one JSON array.
+/// The fleet as one JSON array: each session with its latest execution's
+/// launch summary (`launch`, issue #79; no secret in it).
 pub(crate) const FLEET: &str =
     "select coalesce(jsonb_agg(row_to_json(f) order by f.session_id), '[]'::jsonb) as fleet
                    from (
                      select s.session_id, s.agent_id, s.state, s.live, s.engine,
                             s.execution_id, s.started_at_ms, s.ended_at_ms, s.last_event_at_ms,
+                            s.launch,
                             st.observation ->> 'judge' as judge,
                             (st.observation ->> 'confidence')::float8 as confidence,
                             coalesce((st.observation ->> 'attention')::boolean, false) as attention,

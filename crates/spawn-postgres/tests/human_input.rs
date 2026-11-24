@@ -72,6 +72,7 @@ fn start(store: &PostgresStore) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            launch: None,
         },
     );
 }
@@ -253,6 +254,7 @@ fn a_key_used_for_one_session_is_refused_for_another() {
                 fork: None,
                 model: ModelProfile::Default,
                 transcript_from: None,
+                launch: None,
             },
         })
         .expect("append");

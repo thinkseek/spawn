@@ -103,7 +103,7 @@ use serde_json::json;
 use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
 use crate::event::{
     ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind,
-    EventRecord, Fork, GlobalPosition, ModelProfile, NewEvent, Source,
+    EventRecord, Fork, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
@@ -176,17 +176,37 @@ struct Begin<'a> {
 /// routes `deepseek-*` models to DeepSeek with its own key and everything
 /// else to Claude Code's gateway with the engine's own credentials, so
 /// Spawn holds neither.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelRelay {
     /// Base URL of the relay, `http://127.0.0.1:<port>`.
     pub url: String,
-    /// The cheap profile's main model, also in its sonnet and opus slots.
+    /// The cheap profile's main model, also in its sonnet, opus and
+    /// subagent slots.
     pub cheap_model: String,
     /// The small, fast model (the haiku slot) of every profile.
     pub small_model: String,
+    /// The default profile's main model (`SPAWN_DEFAULT_MODEL`), and the
+    /// sonnet, opus and subagent slots' unless they name their own. Unset
+    /// keeps Claude Code's own main model (issue #79).
+    pub default_model: Option<String>,
+    /// The default profile's sonnet slot (`SPAWN_SONNET_MODEL`).
+    pub sonnet_model: Option<String>,
+    /// The default profile's opus slot (`SPAWN_OPUS_MODEL`).
+    pub opus_model: Option<String>,
+    /// The default profile's subagent model (`SPAWN_SUBAGENT_MODEL`).
+    pub subagent_model: Option<String>,
 }
 
 impl ModelRelay {
+    /// The main model `profile` pins through this relay; `None` keeps
+    /// Claude Code's own.
+    pub fn main_model(&self, profile: ModelProfile) -> Option<&str> {
+        match profile {
+            ModelProfile::Cheap => Some(&self.cheap_model),
+            ModelProfile::Default => self.default_model.as_deref(),
+        }
+    }
+
     /// Whether the relay accepts connections now. Checked at every start,
     /// so a relay that comes back is used again without a restart.
     pub fn reachable(&self) -> bool {
@@ -3106,7 +3126,7 @@ impl Bridge {
                 .get(&claimed.session_id)
                 .map_or(ModelProfile::Default, |view| view.model)
         });
-        let settings = match self.engine_settings(claimed, model, report) {
+        let (settings, launch) = match self.engine_settings(claimed, model, report) {
             Ok(settings) => settings,
             Err(why) => return Ok(Outcome::Failed(why)),
         };
@@ -3174,6 +3194,7 @@ impl Bridge {
                 fork,
                 model,
                 transcript_from,
+                launch: (!launch.is_empty()).then_some(launch),
             },
         );
         match recorded {
@@ -4228,33 +4249,52 @@ impl Bridge {
         }
     }
 
-    /// Claude Code's inline settings for an engine on `model`, or why it
+    /// Claude Code's inline settings for an engine on `model`, with what
+    /// they launch it with for the record ([`LaunchSummary`]), or why it
     /// cannot start. The default profile falls back on Claude Code's own
-    /// settings (the gateway, its own small model) when the relay is down;
-    /// the cheap profile has no fallback, and fails where its sender sees
-    /// it.
+    /// settings (the gateway, its own small model) when the relay is down,
+    /// and its summary names no relay; the cheap profile has no fallback,
+    /// and fails where its sender sees it.
     fn engine_settings(
         &self,
         claimed: &Claimed,
         model: ModelProfile,
         report: &mut TickReport,
-    ) -> Result<String, String> {
+    ) -> Result<(String, LaunchSummary), String> {
         let relay = self.config.model_relay.as_ref();
         let reachable = relay.filter(|relay| relay.reachable());
+        let config_dir = self.claude_config_dir(&claimed.session_id);
+        let settings = |relay: Option<&ModelRelay>| {
+            let summary = LaunchSummary {
+                relay_url: relay.and_then(|relay| LaunchSummary::relay_origin(&relay.url)),
+                model: relay
+                    .and_then(|relay| relay.main_model(model))
+                    .map(str::to_string),
+                small_model: relay.map(|relay| relay.small_model.clone()),
+                config_dir: config_dir.clone(),
+            };
+            (
+                claude_settings_in(relay, model, config_dir.as_deref()),
+                summary,
+            )
+        };
         match (model, relay, reachable) {
-            (_, _, Some(relay)) => Ok(claude_settings(Some(relay), model)),
+            (_, _, Some(relay)) => Ok(settings(Some(relay))),
             (ModelProfile::Default, Some(relay), None) => {
                 report.warnings.push(format!(
                     "{}: model relay {} unreachable; the default profile runs on Claude Code's \
                      own settings",
-                    claimed.session_id, relay.url
+                    claimed.session_id,
+                    LaunchSummary::relay_origin(&relay.url)
+                        .unwrap_or_else(|| "(address withheld)".to_string())
                 ));
-                Ok(claude_settings(None, model))
+                Ok(settings(None))
             }
-            (ModelProfile::Default, None, None) => Ok(claude_settings(None, model)),
+            (ModelProfile::Default, None, None) => Ok(settings(None)),
             (ModelProfile::Cheap, Some(relay), None) => Err(format!(
                 "the cheap profile needs the model relay, and {} is unreachable",
-                relay.url
+                LaunchSummary::relay_origin(&relay.url)
+                    .unwrap_or_else(|| "(address withheld)".to_string())
             )),
             (ModelProfile::Cheap, None, None) => Err(
                 "the cheap profile needs the model relay, and none is configured \
@@ -4378,6 +4418,26 @@ impl Bridge {
         )?;
         self.catch_up()?;
         Ok(Some(id))
+    }
+
+    /// The Claude Code directory the engine of `session` runs with
+    /// (`CLAUDE_CONFIG_DIR` in the environment it gets, issue #79), when it
+    /// is not the user's own `~/.claude`.
+    fn claude_config_dir(&self, session: &SessionId) -> Option<String> {
+        let overrides = self
+            .config
+            .session_environment
+            .iter()
+            .filter(|(known, _)| known == session.as_str())
+            .flat_map(|(_, overrides)| overrides.iter());
+        self.config
+            .environment
+            .iter()
+            .chain(overrides)
+            .filter(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+            .map(|(_, dir)| dir.clone())
+            .next_back()
+            .filter(|dir| !dir.is_empty())
     }
 
     fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
@@ -5003,9 +5063,9 @@ fn files_digest(files: &[String]) -> u64 {
 /// - Files: the loop's environment (`~/.local/share/spawn-rsi/*.env*`,
 ///   `env.sh`) and its backups, the fleet's test cluster's files
 ///   (`fleet-pg`), `~/.config/spawn` (database, R2, backup key, relay and
-///   API keys), `~/.config/cloudflare`, `~/.hermes`, all of `~/.claude`
-///   (Claude Code's settings and login, and the transcripts, which hold
-///   whatever a session ever printed) and `~/.claude.json`, `~/.ssh`,
+///   API keys), `~/.config/cloudflare`, `~/.hermes`, `~/.claude` (to
+///   Bash all of it; to the Read and Edit tools its sensitive part,
+///   [`CLAUDE_DIR_SENSITIVE`]) and `~/.claude.json*`, `~/.ssh`,
 ///   `~/.gnupg`, the ccd sessions' directories and their test cluster
 ///   (`/data/tmp/ccd`, `/data/tmp/ccd-pg`).
 /// - Programs that read them for whoever runs them: the owner's helpers
@@ -5036,9 +5096,19 @@ fn files_digest(files: &[String]) -> u64 {
 ///   The task's prompt says what to do instead (deliver's credentials
 ///   line): a deny rule carries no message of its own.
 ///
+/// The rest of `~/.claude` is open to the Read, Edit, Grep and Glob tools
+/// (issue #78): `memory/`, a project's `memory/` and `workflows/` (workflow
+/// transcripts), `plugins/`, `skills/`, `themes/`, `cache/`,
+/// `statusline.py` and `CLAUDE.md`. Bash stays closed on every path that
+/// names `.claude/`, `/.claude` or `cd .claude`: a glob (`~/.claude/*.json`,
+/// `s?ttings.json`), a quote (`se''ttings.json`), an escape or a `cd` then
+/// `..` spells any file in it, and a narrower Bash rule cannot tell them
+/// apart. Text that names `.claude` with no slash before or after it
+/// (`grep -rn "\.claude" crates/`, `git commit -m "fix .claude"`) runs.
+///
 /// Claude Code's own files under `~/.claude` are its internal writes, not
-/// tool calls: a session, its transcript and a resume work with all of it
-/// denied (checked, below).
+/// tool calls: a session, its transcript and a resume work with the
+/// sensitive part denied (checked, below, with all of it denied).
 ///
 /// Checked with Claude Code 2.1.319 in throwaway interactive sessions
 /// started as the Bridge starts engines (bypass mode, these keys inline),
@@ -5070,7 +5140,29 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Read(~/.config/spawn/**)",
     "Read(~/.config/cloudflare/**)",
     "Read(~/.hermes/**)",
-    "Read(~/.claude/**)",
+    "Read(~/.claude/settings*)",
+    "Read(~/.claude/.credentials*)",
+    "Read(~/.claude/**/*credential*)",
+    "Read(~/.claude/.claude.json*)",
+    "Read(~/.claude/backups/**)",
+    "Read(~/.claude/sessions/**)",
+    "Read(~/.claude/session-env/**)",
+    "Read(~/.claude/ssh/**)",
+    "Read(~/.claude/history.jsonl*)",
+    "Read(~/.claude/mcp-needs-auth-cache.json*)",
+    "Read(~/.claude/ide/**)",
+    "Read(~/.claude/shell-snapshots/**)",
+    "Read(~/.claude/debug/**)",
+    "Read(~/.claude/file-history/**)",
+    "Read(~/.claude/paste-cache/**)",
+    "Read(~/.claude/dev-mods/**)",
+    "Read(~/.claude/seed-admin/**)",
+    "Read(~/.claude/projects/*/*.jsonl)",
+    "Read(~/.claude/projects/*/*/subagents/**)",
+    "Read(~/.claude/projects/*/*/tool-results/**)",
+    "Read(~/.claude/**/*.key)",
+    "Read(~/.claude/**/*.pem)",
+    "Read(~/.claude/**/*.env*)",
     "Read(~/.claude.json*)",
     "Read(~/.ssh/**)",
     "Read(~/.gnupg/**)",
@@ -5085,7 +5177,29 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Edit(~/.config/spawn/**)",
     "Edit(~/.config/cloudflare/**)",
     "Edit(~/.hermes/**)",
-    "Edit(~/.claude/**)",
+    "Edit(~/.claude/settings*)",
+    "Edit(~/.claude/.credentials*)",
+    "Edit(~/.claude/**/*credential*)",
+    "Edit(~/.claude/.claude.json*)",
+    "Edit(~/.claude/backups/**)",
+    "Edit(~/.claude/sessions/**)",
+    "Edit(~/.claude/session-env/**)",
+    "Edit(~/.claude/ssh/**)",
+    "Edit(~/.claude/history.jsonl*)",
+    "Edit(~/.claude/mcp-needs-auth-cache.json*)",
+    "Edit(~/.claude/ide/**)",
+    "Edit(~/.claude/shell-snapshots/**)",
+    "Edit(~/.claude/debug/**)",
+    "Edit(~/.claude/file-history/**)",
+    "Edit(~/.claude/paste-cache/**)",
+    "Edit(~/.claude/dev-mods/**)",
+    "Edit(~/.claude/seed-admin/**)",
+    "Edit(~/.claude/projects/*/*.jsonl)",
+    "Edit(~/.claude/projects/*/*/subagents/**)",
+    "Edit(~/.claude/projects/*/*/tool-results/**)",
+    "Edit(~/.claude/**/*.key)",
+    "Edit(~/.claude/**/*.pem)",
+    "Edit(~/.claude/**/*.env*)",
     "Edit(~/.claude.json*)",
     "Edit(~/.ssh/**)",
     "Edit(~/.gnupg/**)",
@@ -5297,7 +5411,9 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Read(//proc/**)",
     // Claude Code's settings by any path (they hold the gateway key):
     // `cd ~/.claude && grep … settings.json` names no file the rules above
-    // know. A workspace's own .claude is refused too.
+    // know. A workspace's own .claude is refused too. Bash stays closed on
+    // all of `.claude` (issue #78's review): a glob, a quote or an escape
+    // spells any file in it, so only the Read and Edit rules are narrow.
     "Bash(*/.claude*)",
     "Bash(*cd .claude*)",
     "Bash(*settings.local.json*)",
@@ -5329,6 +5445,87 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*xargs * kill*)",
 ];
 
+/// What under a Claude Code directory holds a secret (issue #78), relative
+/// to it, as Read and Edit rules name it: settings (the gateway key), the
+/// login (`.credentials.json`, `.claude.json`), backups, the peer sessions'
+/// records and environments, keys, the prompt history, MCP auth state, the
+/// IDE locks (their auth tokens), the shell snapshots (the environment of
+/// the user's shell), debug logs, the file and paste histories, the owner's
+/// dev mods and admin seed, and the sessions' own transcripts, subagent
+/// transcripts and tool results (whatever a session ever printed). A
+/// project's `memory/` and `workflows/` are not among them.
+pub const CLAUDE_DIR_SENSITIVE: &[&str] = &[
+    "settings*",
+    ".credentials*",
+    "**/*credential*",
+    ".claude.json*",
+    "backups/**",
+    "sessions/**",
+    "session-env/**",
+    "ssh/**",
+    "history.jsonl*",
+    "mcp-needs-auth-cache.json*",
+    "ide/**",
+    "shell-snapshots/**",
+    "debug/**",
+    "file-history/**",
+    "paste-cache/**",
+    "dev-mods/**",
+    "seed-admin/**",
+    "projects/*/*.jsonl",
+    "projects/*/*/subagents/**",
+    "projects/*/*/tool-results/**",
+    "**/*.key",
+    "**/*.pem",
+    "**/*.env*",
+];
+
+/// Deny rules for a Claude Code directory `dir` other than `~/.claude`
+/// (`CLAUDE_CONFIG_DIR`, which `spawn loop` takes only as an absolute
+/// path): its sensitive files ([`CLAUDE_DIR_SENSITIVE`]) to the Read and
+/// Edit tools when `dir` is absolute, and every Bash command that names
+/// it, fail-closed as `.claude`'s: `dir` itself, and its last component
+/// after a `/`, before one, or after `cd ` (`~/.claude-fleet/…`,
+/// `$HOME//.claude-fleet`, `cd .claude-fleet`). `Bash(*CLAUDE_CONFIG_DIR*)`
+/// refuses a command whose text names the variable (`cat
+/// $CLAUDE_CONFIG_DIR/…`); like every Bash rule it matches the command's
+/// text, not what the shell expands. A short last component refuses more
+/// than the directory: a name of its own (`.claude-fleet`) is the one to
+/// choose.
+pub fn claude_dir_deny(dir: &str) -> Vec<String> {
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() {
+        return Vec::new();
+    }
+    let mut rules = if dir.starts_with('/') {
+        claude_dir_rules(&format!("/{dir}"))
+    } else {
+        Vec::new()
+    };
+    rules.push(format!("Bash(*{dir}*)"));
+    let base = dir.rsplit('/').next().unwrap_or_default();
+    if !base.is_empty() && base != dir {
+        rules.push(format!("Bash(*/{base}*)"));
+        rules.push(format!("Bash(*{base}/*)"));
+        rules.push(format!("Bash(*cd {base}*)"));
+    }
+    rules.push("Bash(*CLAUDE_CONFIG_DIR*)".to_string());
+    rules
+}
+
+/// The Read and Edit rules of a Claude Code directory, `path` as the rules
+/// name it (`~/.claude`, `//data/fleet-claude`).
+pub fn claude_dir_rules(path: &str) -> Vec<String> {
+    ["Read", "Edit"]
+        .iter()
+        .flat_map(|tool| {
+            CLAUDE_DIR_SENSITIVE
+                .iter()
+                .map(move |below| format!("{tool}({path}/{below})"))
+        })
+        .collect()
+}
+
 /// Settings passed to Claude Code for an engine on `profile`, through
 /// `relay` when there is one.
 ///
@@ -5345,41 +5542,80 @@ pub const CREDENTIAL_DENY: &[&str] = &[
 /// Bridge reads what the engine does from its transcript and its screen.
 ///
 /// With a relay, the engine calls it instead of the gateway, and the haiku
-/// slot (Claude Code's small model for background work) is the relay's
-/// small model; the cheap profile also puts its main model in the main,
-/// sonnet and opus slots. Without a relay nothing about models is set: the
-/// cheap profile needs one, and the Bridge refuses to start it without.
+/// slot (Claude Code's small model for background work, also
+/// `ANTHROPIC_SMALL_FAST_MODEL`) is the relay's small model. The cheap
+/// profile pins every slot (issue #79): the top-level `model`, the main,
+/// sonnet, opus and subagent slots to its main model, so neither a model
+/// the user's own settings name nor a subagent's leaves the cheap
+/// provider. The default profile pins only what the relay names
+/// ([`ModelRelay::default_model`] and the per-slot overrides): with none,
+/// Claude Code's own main model stands. Without a relay nothing about
+/// models is set: the cheap profile needs one, and the Bridge refuses to
+/// start it without.
+///
+/// No credential is ever set here: `ANTHROPIC_AUTH_TOKEN` stays the one
+/// the user's settings give (the relay forwards it to the gateway and
+/// holds none itself).
 ///
 /// Every engine is denied the host's credential files and the programs
 /// that read them ([`CREDENTIAL_DENY`]): a fleet worker read the loop's
 /// environment file once (2026-11-08). Every engine also refuses
 /// cross-session peer messages ([`CROSS_SESSION_INBOUND`]).
 pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> String {
+    claude_settings_in(relay, profile, None)
+}
+
+/// [`claude_settings`] for an engine whose Claude Code directory is
+/// `config_dir` (`CLAUDE_CONFIG_DIR`, issue #79) rather than `~/.claude`:
+/// its sensitive files are denied as `~/.claude`'s are
+/// ([`claude_dir_deny`]), on top of [`CREDENTIAL_DENY`].
+pub fn claude_settings_in(
+    relay: Option<&ModelRelay>,
+    profile: ModelProfile,
+    config_dir: Option<&str>,
+) -> String {
+    let mut deny: Vec<String> = CREDENTIAL_DENY
+        .iter()
+        .map(|rule| (*rule).to_string())
+        .collect();
+    if let Some(dir) = config_dir {
+        deny.extend(claude_dir_deny(dir));
+    }
     let mut settings = json!({
         "permissions": {
             "defaultMode": "bypassPermissions",
-            "deny": CREDENTIAL_DENY,
+            "deny": deny,
         },
         "skipDangerousModePermissionPrompt": true,
         "crossSessionInbound": CROSS_SESSION_INBOUND,
     });
     if let Some(relay) = relay {
         let mut env = serde_json::Map::new();
-        env.insert("ANTHROPIC_BASE_URL".to_string(), json!(relay.url));
-        if profile == ModelProfile::Cheap {
-            for slot in [
-                "ANTHROPIC_MODEL",
-                "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            ] {
-                env.insert(slot.to_string(), json!(relay.cheap_model));
+        let mut pin = |slot: &str, model: Option<&str>| {
+            if let Some(model) = model {
+                env.insert(slot.to_string(), json!(model));
             }
-        }
-        env.insert(
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-            json!(relay.small_model),
-        );
+        };
+        pin("ANTHROPIC_BASE_URL", Some(&relay.url));
+        let main = relay.main_model(profile);
+        let (sonnet, opus, subagent) = match profile {
+            ModelProfile::Cheap => (main, main, main),
+            ModelProfile::Default => (
+                relay.sonnet_model.as_deref().or(main),
+                relay.opus_model.as_deref().or(main),
+                relay.subagent_model.as_deref().or(main),
+            ),
+        };
+        pin("ANTHROPIC_MODEL", main);
+        pin("ANTHROPIC_DEFAULT_OPUS_MODEL", opus);
+        pin("ANTHROPIC_DEFAULT_SONNET_MODEL", sonnet);
+        pin("CLAUDE_CODE_SUBAGENT_MODEL", subagent);
+        pin("ANTHROPIC_DEFAULT_HAIKU_MODEL", Some(&relay.small_model));
+        pin("ANTHROPIC_SMALL_FAST_MODEL", Some(&relay.small_model));
         settings["env"] = serde_json::Value::Object(env);
+        if let Some(main) = main {
+            settings["model"] = json!(main);
+        }
     }
     settings.to_string()
 }
@@ -5741,6 +5977,262 @@ mod tests {
             }
         }
         assert!(super::CREDENTIAL_DENY.contains(&"Read(//proc/**)"));
+    }
+
+    /// Claude Code's Read and Edit rules (gitignore style): `**/` is any
+    /// number of directories, a trailing `**` anything, `*` anything but a
+    /// `/`.
+    fn path_glob(pattern: &str, path: &str) -> bool {
+        if let Some(rest) = pattern.strip_prefix("**/") {
+            return path_glob(rest, path)
+                || path
+                    .match_indices('/')
+                    .any(|(at, _)| path_glob(rest, &path[at + 1..]));
+        }
+        if pattern == "**" {
+            return true;
+        }
+        match pattern.chars().next() {
+            None => path.is_empty(),
+            Some('*') => {
+                let rest = &pattern[1..];
+                path_glob(rest, path)
+                    || path
+                        .char_indices()
+                        .take_while(|(_, c)| *c != '/')
+                        .any(|(at, c)| path_glob(rest, &path[at + c.len_utf8()..]))
+            }
+            Some(c) => path
+                .strip_prefix(c)
+                .is_some_and(|tail| path_glob(&pattern[c.len_utf8()..], tail)),
+        }
+    }
+
+    fn denied_by(tool: &str, path: &str) -> bool {
+        super::CREDENTIAL_DENY.iter().any(|rule| {
+            rule.strip_prefix(tool)
+                .and_then(|body| body.strip_prefix('('))
+                .and_then(|body| body.strip_suffix(')'))
+                .is_some_and(|pattern| path_glob(pattern, path))
+        })
+    }
+
+    fn bash_refused(command: &str) -> bool {
+        super::CREDENTIAL_DENY.iter().any(|rule| {
+            rule.strip_prefix("Bash(")
+                .and_then(|body| body.strip_suffix(')'))
+                .is_some_and(|body| glob(body, command))
+        })
+    }
+
+    #[test]
+    fn the_path_glob_reads_rules_as_claude_code_does() {
+        assert!(path_glob("~/.claude/**/*.pem", "~/.claude/a.pem"));
+        assert!(path_glob("~/.claude/**/*.pem", "~/.claude/x/y/a.pem"));
+        assert!(!path_glob("~/.claude/*.pem", "~/.claude/x/a.pem"));
+        assert!(path_glob(
+            "~/.claude/sessions/**",
+            "~/.claude/sessions/1.json"
+        ));
+        assert!(!path_glob(
+            "~/.claude/settings*",
+            "~/.claude/projects/settings.json"
+        ));
+    }
+
+    /// Issue #78: Claude Code's sensitive files under `~/.claude` stay
+    /// denied to the Read and Edit tools; its memory, a project's memory
+    /// and workflow transcripts, plugins, skills, themes, cache, status
+    /// line and `CLAUDE.md` are theirs to use. Bash is refused all of
+    /// `~/.claude`, either way.
+    #[test]
+    fn engines_keep_claude_code_s_secrets_and_get_its_working_files() {
+        let sensitive = [
+            "~/.claude/settings.json",
+            "~/.claude/settings.local.json",
+            "~/.claude/settings.json.bak",
+            "~/.claude/settings.json.bak-2026-11-01",
+            "~/.claude/.credentials.json",
+            "~/.claude/.claude.json",
+            "~/.claude/backups/settings.json.1",
+            "~/.claude/backups/a/b/.credentials.json",
+            "~/.claude/sessions/1234.json",
+            "~/.claude/session-env/c",
+            "~/.claude/ssh/id_ed25519",
+            "~/.claude/history.jsonl",
+            "~/.claude/mcp-needs-auth-cache.json",
+            "~/.claude/ide/41234.lock",
+            "~/.claude/shell-snapshots/snapshot-bash-1.sh",
+            "~/.claude/debug/abc.txt",
+            "~/.claude/file-history/a",
+            "~/.claude/paste-cache/b",
+            "~/.claude/dev-mods/m.js",
+            "~/.claude/seed-admin/seed.json",
+            "~/.claude/projects/-proj/abc.jsonl",
+            "~/.claude/projects/-proj/abc/subagents/x.jsonl",
+            "~/.claude/projects/-proj/abc/tool-results/x",
+            "~/.claude/gateway.key",
+            "~/.claude/plugins/x/server.pem",
+            "~/.claude/projects/p/.env",
+            "~/.claude/projects/p/prod.env.local",
+            "~/.claude/plugins/x/credentials.toml",
+            "~/.claude.json",
+            "~/.claude.json.backup",
+        ];
+        for path in sensitive {
+            assert!(denied_by("Read", path), "Read {path}");
+            assert!(denied_by("Edit", path), "Edit {path}");
+        }
+        let working = [
+            "~/.claude/memory/MEMORY.md",
+            "~/.claude/memory/notes/a.md",
+            "~/.claude/projects/-proj/memory/MEMORY.md",
+            "~/.claude/projects/-proj/workflows/w.jsonl",
+            "~/.claude/plugins/p/index.js",
+            "~/.claude/plugins/marketplace/plugin.json",
+            "~/.claude/skills/review/SKILL.md",
+            "~/.claude/themes/dark.json",
+            "~/.claude/cache/changelog.md",
+            "~/.claude/statusline.py",
+            "~/.claude/CLAUDE.md",
+        ];
+        for path in working {
+            assert!(!denied_by("Read", path), "Read {path}");
+            assert!(!denied_by("Edit", path), "Edit {path}");
+        }
+        for path in sensitive.iter().chain(&working) {
+            for command in [
+                format!("cat {path}"),
+                format!("python3 -c \"open('{}')\"", path.replace('~', "/home/bb")),
+                format!("less \"$HOME/{}\"", &path[2..]),
+            ] {
+                assert!(bash_refused(&command), "{command}");
+            }
+        }
+    }
+
+    /// Issue #78's review (F1, F2): Bash stays closed on `~/.claude`,
+    /// since a glob, a quote, an escape or a `cd` then `..` reaches any
+    /// file in it; text that names `.claude` with no slash runs.
+    #[test]
+    fn engines_cannot_spell_their_way_to_claude_code_s_secrets() {
+        for command in [
+            "cd ~/.claude && grep TOKEN settings.json",
+            "cd; cd .claude; less settings.json",
+            "cd .claude && cat settings.json",
+            "cd \"$HOME/.claude\" && cat settings.json",
+            "cd $HOME/.claude; cat settings.json",
+            "pushd ~/.claude >/dev/null; cat settings.json",
+            "ls ~/.claude",
+            "grep -r TOKEN ~/.claude/",
+            "grep -r TOKEN ~/.claude*",
+            "find ~/.claude -name 'settings*'",
+            "cat ~/.claude/*.json",
+            "cat ~/.claude/s*",
+            "cat ~/.claude/set?ings.json",
+            "cat ~/.claude/se''ttings.json",
+            "cat ~/.claude/s\\ettings.json",
+            "tar czf /tmp/x.tgz ~/.claude/*",
+            "cat ~/.claude/./settings.json",
+            "cat ~/.claude/memory/../settings.json",
+            "cd ~/.claude/memory && cat ../settings.json",
+            "cat ~/.claude//settings.json",
+            "cat ~/.claude/{settings,x}.json",
+            "cat \"$HOME/.claude/\"settings.json",
+            "python3 -c \"open('/home/bb/.claude/settings.local.json')\"",
+            "python3 -c \"open('/home/bb/.claude/settings.json')\"",
+            "python3 -c \"import os; os.chdir('/home/bb/.claude'); print(open('settings.json').read())\"",
+            "cat ~/.claude.json",
+            "cat .claude/settings.json",
+        ] {
+            assert!(bash_refused(command), "{command}");
+        }
+        for command in [
+            "grep -rn \"\\.claude\" crates/",
+            "git commit -m \"fix .claude\"",
+            "cargo test -p spawn-core | jq .key",
+            "cd .. && ls",
+        ] {
+            assert!(!bash_refused(command), "{command}");
+        }
+    }
+
+    /// One list of what is sensitive under a Claude Code directory, read in
+    /// two places: the `~/.claude` Read and Edit rules of
+    /// [`super::CREDENTIAL_DENY`] are exactly [`super::claude_dir_rules`]
+    /// of `~/.claude`, both ways.
+    #[test]
+    fn the_claude_directory_rules_are_the_credential_rules_for_claude_s_own() {
+        let listed: std::collections::BTreeSet<String> = super::CREDENTIAL_DENY
+            .iter()
+            .filter(|rule| {
+                rule.starts_with("Read(~/.claude/") || rule.starts_with("Edit(~/.claude/")
+            })
+            .map(|rule| (*rule).to_string())
+            .collect();
+        let generated: std::collections::BTreeSet<String> =
+            super::claude_dir_rules("~/.claude").into_iter().collect();
+        assert_eq!(listed, generated);
+        assert_eq!(generated.len(), 2 * super::CLAUDE_DIR_SENSITIVE.len());
+    }
+
+    /// Issue #79's review (F4): a Claude Code directory of the engine's own
+    /// is denied its secrets to Read and Edit, `.claude.json` included, and
+    /// every Bash command that names it.
+    #[test]
+    fn an_engines_own_claude_directory_is_closed_to_bash() {
+        let rules = super::claude_dir_deny("/home/bb/.claude-fleet/");
+        let denied = |tool: &str, path: &str| {
+            rules.iter().any(|rule| {
+                rule.strip_prefix(tool)
+                    .and_then(|body| body.strip_prefix('('))
+                    .and_then(|body| body.strip_suffix(')'))
+                    .is_some_and(|pattern| path_glob(pattern, path))
+            })
+        };
+        let refused = |command: &str| {
+            rules.iter().any(|rule| {
+                rule.strip_prefix("Bash(")
+                    .and_then(|body| body.strip_suffix(')'))
+                    .is_some_and(|body| glob(body, command))
+            })
+        };
+        for path in [
+            "//home/bb/.claude-fleet/settings.json",
+            "//home/bb/.claude-fleet/.claude.json",
+            "//home/bb/.claude-fleet/.credentials.json",
+            "//home/bb/.claude-fleet/projects/-proj/abc.jsonl",
+        ] {
+            assert!(denied("Read", path), "Read {path}");
+            assert!(denied("Edit", path), "Edit {path}");
+        }
+        for path in [
+            "//home/bb/.claude-fleet/memory/MEMORY.md",
+            "//home/bb/.claude-fleet/projects/-proj/workflows/w.jsonl",
+        ] {
+            assert!(!denied("Read", path), "Read {path}");
+        }
+        for command in [
+            "cat /home/bb/.claude-fleet/*.json",
+            "cat ~/.claude-fleet/settings.json",
+            "cat $HOME/.claude-fleet/settings.json",
+            "cat /home/bb//.claude-fleet/settings.json",
+            "cd ~ && cd .claude-fleet && cat settings.json",
+            "cat .claude-fleet/settings.json",
+            "cat $CLAUDE_CONFIG_DIR/settings.json",
+        ] {
+            assert!(refused(command), "{command}");
+        }
+        assert!(!refused("cargo test -p spawn-core"));
+        assert!(super::claude_dir_deny("").is_empty());
+        assert!(super::claude_dir_deny("/").is_empty());
+        // A relative directory gets no Read or Edit rule: `spawn loop`
+        // refuses one before any engine starts.
+        assert!(
+            super::claude_dir_deny("fleet-claude")
+                .iter()
+                .all(|rule| rule.starts_with("Bash("))
+        );
     }
 
     /// Claude Code's API-key dialog, as a pane shows it: it prints the key

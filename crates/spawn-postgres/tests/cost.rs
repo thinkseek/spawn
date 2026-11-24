@@ -51,6 +51,7 @@ fn started(store: &PostgresStore, worker: &Worker, execution: u64) {
             fork: None,
             model: ModelProfile::Default,
             transcript_from: None,
+            launch: None,
         },
     );
 }

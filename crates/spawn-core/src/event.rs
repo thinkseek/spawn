@@ -197,6 +197,85 @@ pub struct Fork {
     pub commit: CommitId,
 }
 
+/// What an engine was launched with, as far as it is no secret (issue #79):
+/// recorded on [`EventKind::ExecutionStarted`] so `spawn fleet` and
+/// `/api/fleet` show where an engine's models come from. Names and an
+/// address, never a key: the relay's address is its scheme, host and port
+/// only ([`LaunchSummary::relay_origin`]), whatever the configured URL held.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LaunchSummary {
+    /// The model relay the inline settings point the engine at
+    /// (`ANTHROPIC_BASE_URL`): scheme, host and port. Unset when the engine
+    /// runs on Claude Code's own settings: no relay configured, or a
+    /// default-profile start whose relay was unreachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// The main model the inline settings pin; unset for Claude Code's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The small, fast model (the haiku slot) the inline settings pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_model: Option<String>,
+    /// The Claude Code configuration directory the engine runs with
+    /// (`CLAUDE_CONFIG_DIR`, from `SPAWN_CLAUDE_CONFIG_DIR`); unset for the
+    /// user's own `~/.claude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+}
+
+impl LaunchSummary {
+    /// Whether it says nothing: an engine on Claude Code's own settings in
+    /// the user's own directory, which a record leaves out.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `url`'s scheme, host and port, with no path, query or fragment.
+    /// `None` for text with no `scheme://host`, for a URL that holds a user
+    /// or a password anywhere (an `@`: nothing of it is shown, however the
+    /// rest would parse), and for an authority that is not a host and an
+    /// optional all-digit port (a second `:` outside IPv6 brackets, an
+    /// empty or non-digit port).
+    pub fn relay_origin(url: &str) -> Option<String> {
+        let (scheme, rest) = url.split_once("://")?;
+        if rest.contains('@') {
+            return None;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let scheme_ok = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+        let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+            let (address, after) = inside.split_once(']')?;
+            let address_ok = !address.is_empty()
+                && address
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+            if !address_ok {
+                return None;
+            }
+            (&authority[..address.len() + 2], after)
+        } else {
+            let end = authority.find(':').unwrap_or(authority.len());
+            let host = &authority[..end];
+            let host_ok = !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+            if !host_ok {
+                return None;
+            }
+            (host, &authority[end..])
+        };
+        let port_ok = port.is_empty()
+            || port.strip_prefix(':').is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            });
+        (scheme_ok && port_ok).then(|| format!("{scheme}://{host}{port}"))
+    }
+}
+
 /// What runs as a background job of the engine: work the agent started
 /// that goes on after its turn ends, and whose end the engine reports to
 /// the agent by waking it (docs/fleet-architecture.md §2, "Waiting on its
@@ -507,6 +586,11 @@ pub enum EventKind {
         /// was kept (read from the start of the file).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript_from: Option<u64>,
+        /// What the engine was launched with, no secret in it
+        /// ([`LaunchSummary`]). Left out when it says nothing, and by
+        /// records made before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch: Option<LaunchSummary>,
     },
     /// The execution's terminal started, on this terminal server: the
     /// server that ran the execution, by its identity
