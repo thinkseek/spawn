@@ -323,7 +323,14 @@ impl World {
     }
 
     fn tick(&mut self) {
-        self.bridge.tick().expect("the Bridge ticks");
+        for _ in 0..64 {
+            let report = self.bridge.tick().expect("the Bridge ticks");
+            if report.commands == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        panic!("the Bridge commands did not finish in 64 ticks");
     }
 
     fn terminal(command: CommandId) -> TerminalName {

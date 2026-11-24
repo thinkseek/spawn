@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spawn_core::bridge::{
-    Bridge, BridgeConfig, claude_arguments, claude_session_id, claude_settings,
+    Bridge, BridgeConfig, TickReport, claude_arguments, claude_session_id, claude_settings,
 };
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
@@ -17,7 +17,7 @@ use spawn_core::id::{
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{SemanticState, WaitReason};
 use spawn_core::observe::{NO_JUDGE, Observer};
-use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
+use spawn_core::port::{CommandQueue, EventLog, StoreError, TerminalHost, WorkspaceStore};
 use spawn_core::screen::{ScreenState, read_claude_screen};
 use spawn_core::time::{ManualClock, Timestamp};
 
@@ -328,6 +328,24 @@ fn any_workspace() -> spawn_core::id::WorkspaceId {
     spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid workspace")
 }
 
+/// Drive all claims of a pass, including resumable starts, without wall-clock
+/// sleeps. The empty final pass also advances executions as `Bridge::tick` does.
+fn tick(bridge: &mut Bridge, store: &Arc<MemoryStore>) -> Result<TickReport, StoreError> {
+    let mut total = TickReport::default();
+    for _ in 0..64 {
+        let mut report = Bridge::tick(bridge)?;
+        total.commands += report.commands;
+        total.warnings.append(&mut report.warnings);
+        total.notes.append(&mut report.notes);
+        if report.commands == 0 {
+            return Ok(total);
+        }
+        store.expire_leases();
+        std::thread::yield_now();
+    }
+    panic!("the commands did not finish in 64 claims")
+}
+
 /// One `spawn tick` process: a new Bridge that refolds the log first.
 fn tick_fresh(store: &Arc<MemoryStore>) -> spawn_core::bridge::TickReport {
     let mut bridge = Bridge::new(
@@ -338,7 +356,7 @@ fn tick_fresh(store: &Arc<MemoryStore>) -> spawn_core::bridge::TickReport {
         BridgeConfig::new("tester"),
     );
     bridge.recover().expect("recover succeeds");
-    bridge.tick().expect("tick succeeds")
+    tick(&mut bridge, &store).expect("tick succeeds")
 }
 
 fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
@@ -463,7 +481,7 @@ fn a_second_bridge_that_missed_the_start_is_refused_by_the_log() {
         store.clone(),
         BridgeConfig::new("other"),
     );
-    other.tick().expect("tick succeeds");
+    tick(&mut other, &store).expect("tick succeeds");
 
     let failures: Vec<String> = events(&store)
         .into_iter()
@@ -531,8 +549,8 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
     store.set_pane(&terminal, READY);
 
     submit_start(&store, "list the files");
-    let report = bridge.tick().expect("tick succeeds");
-    assert_eq!(report.commands, 1);
+    let report = tick(&mut bridge, &store).expect("tick succeeds");
+    assert!(report.commands >= 1);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 
     assert_eq!(
@@ -586,7 +604,7 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
     let terminal = TerminalName::for_execution(&execution);
     store.set_pane(&terminal, READY);
     submit_start(&store, "list the files");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
 
     // The Bridge named the session, so it knows the transcript.
     let (native, path) = store
@@ -612,8 +630,8 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
              {{\"type\":\"system\",\"subtype\":\"turn_dur"
         ),
     );
-    bridge.tick().expect("tick");
-    bridge.tick().expect("a second read appends nothing twice");
+    tick(&mut bridge, &store).expect("tick");
+    tick(&mut bridge, &store).expect("a second read appends nothing twice");
     let engine_events = |store: &MemoryStore| -> Vec<&'static str> {
         store
             .read_global(GlobalPosition(0), 200)
@@ -629,7 +647,7 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
     );
     // The half-written line is read once it is whole.
     store.append_file(&path, &format!("ation\",\"uuid\":\"s1\",{at}}}\n"));
-    bridge.tick().expect("tick");
+    tick(&mut bridge, &store).expect("tick");
     assert_eq!(
         engine_events(&store),
         vec!["tool.started", "tool.completed", "turn.stopped"]
@@ -656,11 +674,11 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
             })
             .count()
     };
-    bridge.tick().expect("tick");
+    tick(&mut bridge, &store).expect("tick");
     assert_eq!(busy(&store), 0, "one reading is not a fact yet");
-    bridge.tick().expect("tick");
+    tick(&mut bridge, &store).expect("tick");
     assert_eq!(busy(&store), 1);
-    bridge.tick().expect("tick");
+    tick(&mut bridge, &store).expect("tick");
     assert_eq!(busy(&store), 1, "an unchanged screen is not recorded again");
 
     // The runner's exit file ends the execution with its status.
@@ -668,7 +686,7 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
         &format!("{}/.spawn/exit-{execution}", any_workspace().path()),
         "3",
     );
-    bridge.tick().expect("tick");
+    tick(&mut bridge, &store).expect("tick");
     let ended = store
         .read_global(GlobalPosition(0), 200)
         .expect("read")
@@ -776,7 +794,7 @@ fn a_resume_restores_a_deleted_transcript_from_the_archive() {
     }
     let mut bridge = archiving_bridge(&store);
     submit_start(&store, "first");
-    bridge.tick().expect("start");
+    tick(&mut bridge, &store).expect("start");
     let (native, first) = transcript_of_latest(&store);
     let at = r#""timestamp":"2099-01-01T00:00:00.000Z""#;
     store.append_file(
@@ -786,7 +804,7 @@ fn a_resume_restores_a_deleted_transcript_from_the_archive() {
              {{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"s1\",{at}}}\n"
         ),
     );
-    bridge.tick().expect("read the turn");
+    tick(&mut bridge, &store).expect("read the turn");
     bridge
         .tick()
         .expect("checkpoint the turn end, and copy the transcript");
@@ -799,7 +817,7 @@ fn a_resume_restores_a_deleted_transcript_from_the_archive() {
         format!("{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"message\":{{\"content\":\"GO\"}}}}\n");
     store.replace_file(&first, rewritten.as_bytes());
     submit(&store, "key_stop", CommandAction::Stop);
-    bridge.tick().expect("stop");
+    tick(&mut bridge, &store).expect("stop");
     assert_eq!(ended(&store), vec![EndCause::Stopped]);
     assert_eq!(
         store.copies(&agent(), &native).expect("copies"),
@@ -817,7 +835,7 @@ fn a_resume_restores_a_deleted_transcript_from_the_archive() {
             model: None,
         },
     );
-    let report = bridge.tick().expect("resume");
+    let report = tick(&mut bridge, &store).expect("resume");
     assert!(
         report
             .warnings
@@ -859,7 +877,7 @@ fn following() -> (Arc<MemoryStore>, Bridge, String) {
         BridgeConfig::new("tester"),
     );
     submit_start(&store, "work");
-    bridge.tick().expect("start");
+    tick(&mut bridge, &store).expect("start");
     let (_, path) = transcript_of_latest(&store);
     (store, bridge, path)
 }
@@ -900,20 +918,20 @@ fn a_transcript_that_shrank_is_read_again_from_the_start() {
         &path,
         &(tool_line("a1", "toolu_1") + &tool_line("a2", "toolu_2")),
     );
-    assert_eq!(reread(&bridge.tick().expect("read")), 0);
+    assert_eq!(reread(&tick(&mut bridge, &store).expect("read")), 0);
     assert_eq!(tools_started(&store).len(), 2);
 
     // The file is cut to one new line, shorter than what was read.
     store.replace_file(&path, tool_line("b1", "toolu_3").as_bytes());
-    let report = bridge.tick().expect("read the shrunk file");
+    let report = tick(&mut bridge, &store).expect("read the shrunk file");
     assert_eq!(reread(&report), 1, "{:?}", report.warnings);
     assert_eq!(tools_started(&store).len(), 3, "the new line is seen");
 
     // From there it is followed as before: no warning, no line twice.
     store.append_file(&path, &tool_line("b2", "toolu_4"));
-    let report = bridge.tick().expect("read on");
+    let report = tick(&mut bridge, &store).expect("read on");
     assert_eq!(reread(&report), 0, "{:?}", report.warnings);
-    bridge.tick().expect("again");
+    tick(&mut bridge, &store).expect("again");
     assert_eq!(tools_started(&store).len(), 4);
 }
 
@@ -926,14 +944,14 @@ fn a_transcript_replaced_by_a_longer_file_is_read_again_without_repeats() {
     let (store, mut bridge, path) = following();
     let first = tool_line("a1", "toolu_1") + &tool_line("a2", "toolu_2");
     store.append_file(&path, &first);
-    bridge.tick().expect("read");
+    tick(&mut bridge, &store).expect("read");
     assert_eq!(tools_started(&store).len(), 2);
 
     let restored = tool_line("z1", "toolu_0") + &first + &tool_line("a3", "toolu_3");
     store.replace_file(&path, restored.as_bytes());
-    let report = bridge.tick().expect("read the replaced file");
+    let report = tick(&mut bridge, &store).expect("read the replaced file");
     assert_eq!(reread(&report), 1, "{:?}", report.warnings);
-    bridge.tick().expect("again");
+    tick(&mut bridge, &store).expect("again");
     let started = tools_started(&store);
     assert_eq!(
         started.len(),
@@ -952,17 +970,17 @@ fn a_transcript_replaced_by_a_longer_file_is_read_again_without_repeats() {
 fn a_transcript_replaced_by_a_file_of_the_same_length_is_read_again() {
     let (store, mut bridge, path) = following();
     store.append_file(&path, &tool_line("a1", "toolu_1"));
-    bridge.tick().expect("read");
+    tick(&mut bridge, &store).expect("read");
     let other = tool_line("c9", "toolu_9");
     assert_eq!(other.len(), tool_line("a1", "toolu_1").len());
     store.replace_file(&path, other.as_bytes());
-    let report = bridge.tick().expect("read the replaced file");
+    let report = tick(&mut bridge, &store).expect("read the replaced file");
     assert_eq!(reread(&report), 1, "{:?}", report.warnings);
     assert_eq!(tools_started(&store).len(), 2);
 
     // A file that went on, the same bytes and more, is no replacement.
     store.append_file(&path, &tool_line("c8", "toolu_8"));
-    let report = bridge.tick().expect("read on");
+    let report = tick(&mut bridge, &store).expect("read on");
     assert_eq!(reread(&report), 0, "{:?}", report.warnings);
     assert_eq!(tools_started(&store).len(), 3);
 }
@@ -1007,12 +1025,12 @@ fn one_read_checkpoints_once_however_many_turns_it_ends() {
         let (store, mut bridge, path) = following();
         store.append_file(&path, &turns(count));
         let before = commits(&store);
-        bridge.tick().expect("read");
+        tick(&mut bridge, &store).expect("read");
         let first = commits(&store) - before;
         assert_eq!(stopped(&store), count);
         store.replace_file(&path, (turn_end("s0") + &turns(count)).as_bytes());
         let before = commits(&store);
-        let report = bridge.tick().expect("read the replaced file");
+        let report = tick(&mut bridge, &store).expect("read the replaced file");
         assert_eq!(reread(&report), 1, "{:?}", report.warnings);
         assert_eq!(
             stopped(&store),
@@ -1048,15 +1066,15 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
     }
     let mut bridge = archiving_bridge(&store);
     submit_start(&store, "work");
-    bridge.tick().expect("start");
+    tick(&mut bridge, &store).expect("start");
     let (_, path) = transcript_of_latest(&store);
     let long: String = (1..=50)
         .map(|n| tool_line(&format!("a{n:02}"), &format!("toolu_{n:02}")))
         .collect();
     store.append_file(&path, &long);
-    bridge.tick().expect("read");
+    tick(&mut bridge, &store).expect("read");
     submit(&store, "key_stop", CommandAction::Stop);
-    bridge.tick().expect("stop");
+    tick(&mut bridge, &store).expect("stop");
     submit(
         &store,
         "key_resume",
@@ -1065,7 +1083,7 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
             model: None,
         },
     );
-    assert_eq!(reread(&bridge.tick().expect("resume")), 0);
+    assert_eq!(reread(&tick(&mut bridge, &store).expect("resume")), 0);
     let (_, resumed) = transcript_of_latest(&store);
     assert_ne!(
         resumed, path,
@@ -1073,7 +1091,7 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
     );
     store.append_file(&resumed, &tool_line("b1", "toolu_b1"));
     for _ in 0..2 {
-        let report = bridge.tick().expect("read on");
+        let report = tick(&mut bridge, &store).expect("read on");
         assert_eq!(reread(&report), 0, "{:?}", report.warnings);
     }
     assert_eq!(tools_started(&store).len(), 51);
@@ -1083,7 +1101,7 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
     bridge.recover().expect("recover");
     store.append_file(&resumed, &tool_line("b2", "toolu_b2"));
     for _ in 0..2 {
-        let report = bridge.tick().expect("read after the restart");
+        let report = tick(&mut bridge, &store).expect("read after the restart");
         assert_eq!(reread(&report), 0, "{:?}", report.warnings);
     }
     let started = tools_started(&store);
@@ -1094,7 +1112,7 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
     let mut bridge = archiving_bridge(&store);
     bridge.recover().expect("recover");
     store.replace_file(&resumed, tool_line("c1", "toolu_c1").as_bytes());
-    let report = bridge.tick().expect("read the shrunk file");
+    let report = tick(&mut bridge, &store).expect("read the shrunk file");
     assert_eq!(reread(&report), 1, "{:?}", report.warnings);
     assert_eq!(tools_started(&store).len(), 53);
 }
@@ -1115,15 +1133,15 @@ fn a_resume_whose_transcript_is_gone_without_a_copy_fails_and_starts_nothing() {
         BridgeConfig::new("tester"),
     );
     submit_start(&store, "first");
-    bridge.tick().expect("start");
+    tick(&mut bridge, &store).expect("start");
     let (_, first) = transcript_of_latest(&store);
     store.append_file(
         &first,
         "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":\"go\"}}\n",
     );
-    bridge.tick().expect("read the prompt");
+    tick(&mut bridge, &store).expect("read the prompt");
     submit(&store, "key_stop", CommandAction::Stop);
-    bridge.tick().expect("stop");
+    tick(&mut bridge, &store).expect("stop");
     submit(
         &store,
         "key_resume",
@@ -1132,7 +1150,7 @@ fn a_resume_whose_transcript_is_gone_without_a_copy_fails_and_starts_nothing() {
             model: None,
         },
     );
-    bridge.tick().expect("resume");
+    tick(&mut bridge, &store).expect("resume");
     let failure = events(&store)
         .into_iter()
         .find_map(|event| match event.kind {
@@ -1168,7 +1186,7 @@ fn an_engine_that_exits_between_the_two_reads_is_exited_not_lost() {
     let terminal = TerminalName::for_execution(&execution);
     store.set_pane(&terminal, READY);
     submit_start(&store, "list the files");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
     // The exit file is absent when the Bridge reads it, then the engine
     // writes it and its pane closes before the liveness check.
     store.exit_on_next_check(
@@ -1176,7 +1194,7 @@ fn an_engine_that_exits_between_the_two_reads_is_exited_not_lost() {
         &format!("{}/.spawn/exit-{execution}", any_workspace().path()),
         "0",
     );
-    bridge.tick().expect("tick");
+    tick(&mut bridge, &store).expect("tick");
     let ended = store
         .read_global(GlobalPosition(0), 200)
         .expect("read")
@@ -1205,7 +1223,7 @@ fn a_prompt_that_cannot_be_typed_ends_the_execution_as_lost() {
     );
     // The pane never shows a ready input box.
     submit_start(&store, "list the files");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
     let names = names(&store);
     assert!(
         names.ends_with(&["execution.ended", "command.finished"]),
@@ -1252,7 +1270,7 @@ fn a_ready_wait_that_fails_quotes_the_pane_s_redacted_tail() {
          \u{276f} 1. Yes\n  2. No (recommended)\n",
     );
     submit_start(&store, "list the files");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
     let error = last_command_failure_error(&store).expect("the start failed");
     assert!(
         error.starts_with("pane never became ready, last state "),
@@ -1285,7 +1303,7 @@ fn a_ready_wait_over_a_blank_pane_quotes_no_pane() {
     let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
     store.set_pane(&terminal, "\n   \n");
     submit_start(&store, "list the files");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
     let error = last_command_failure_error(&store).expect("the start failed");
     assert!(error.starts_with("pane never became ready"), "{error}");
     assert!(!error.contains("; last pane:"), "{error}");
@@ -1311,7 +1329,7 @@ fn bridge_refuses_input_while_a_turn_runs() {
     store.set_pane(&terminal, BUSY);
 
     submit_start(&store, "first");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
     let last = events(&store).pop().expect("an event");
     assert_eq!(last.kind.name(), "command.finished");
     match last.kind {
@@ -1339,7 +1357,7 @@ fn bridge_checkpoints_and_unmounts_on_stop() {
     let terminal = TerminalName::for_execution(&execution);
     store.set_pane(&terminal, READY);
     submit_start(&store, "change the readme");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
 
     let workspace = events(&store)
         .iter()
@@ -1362,7 +1380,7 @@ fn bridge_checkpoints_and_unmounts_on_stop() {
             },
         )
         .expect("submit succeeds");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
 
     assert!(
         names(&store).contains(&"artifact.committed"),
@@ -1430,7 +1448,7 @@ fn bridge_resumes_the_stored_native_session() {
             },
         )
         .expect("submit succeeds");
-    bridge.tick().expect("tick succeeds");
+    tick(&mut bridge, &store).expect("tick succeeds");
 
     let accepted = events(&store)
         .into_iter()
@@ -1703,7 +1721,7 @@ fn masked_following() -> (Arc<MemoryStore>, Bridge, Arc<Rotating>, String, Strin
     let source = Rotating::new(ROTATED_ONE);
     let mut bridge = archiving_bridge(&store).with_archive_mask(source.clone());
     submit_start(&store, "first");
-    bridge.tick().expect("start");
+    tick(&mut bridge, &store).expect("start");
     let (native, path) = transcript_of_latest(&store);
     (store, bridge, source, native, path)
 }
@@ -1739,8 +1757,8 @@ fn resume(store: &MemoryStore, key: &str) {
 fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
     let (store, mut bridge, source, native, path) = masked_following();
     store.append_file(&path, &said_line("u1", ROTATED_ONE));
-    bridge.tick().expect("copy");
-    bridge.tick().expect("copy");
+    tick(&mut bridge, &store).expect("copy");
+    tick(&mut bridge, &store).expect("copy");
     let first = archived(&store, &native);
     assert!(
         first.contains("[REDACTED:spawn.env:API_TOKEN]") && !first.contains(ROTATED_ONE),
@@ -1748,7 +1766,7 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
     );
     source.had(false);
     store.append_file(&path, &said_line("u2", ROTATED_ONE));
-    let report = bridge.tick().expect("no mask");
+    let report = tick(&mut bridge, &store).expect("no mask");
     assert!(
         report
             .warnings
@@ -1758,10 +1776,10 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
         report.warnings
     );
     submit(&store, "key_stop", CommandAction::Stop);
-    bridge.tick().expect("stop");
+    tick(&mut bridge, &store).expect("stop");
     assert_eq!(ended(&store), vec![EndCause::Stopped]);
     resume(&store, "key_resume");
-    let report = bridge.tick().expect("resume");
+    let report = tick(&mut bridge, &store).expect("resume");
     assert!(
         report
             .warnings
@@ -1773,7 +1791,7 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
     // The resumed engine says the value again, still without the mask.
     let (_, resumed) = transcript_of_latest(&store);
     store.append_file(&resumed, &said_line("u3", ROTATED_ONE));
-    bridge.tick().expect("no mask");
+    tick(&mut bridge, &store).expect("no mask");
     assert_eq!(
         archived(&store, &native),
         first,
@@ -1781,7 +1799,7 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
     );
     source.had(true);
     for _ in 0..3 {
-        bridge.tick().expect("copy");
+        tick(&mut bridge, &store).expect("copy");
     }
     let after = archived(&store, &native);
     assert!(
@@ -1794,17 +1812,17 @@ fn a_mask_that_fails_across_a_stop_and_a_resume_copies_nothing() {
 fn a_rotation_between_a_pass_and_a_resume_is_masked_with_the_new_value() {
     let (store, mut bridge, source, native, path) = masked_following();
     store.append_file(&path, &said_line("u1", ROTATED_ONE));
-    bridge.tick().expect("copy");
+    tick(&mut bridge, &store).expect("copy");
     submit(&store, "key_stop", CommandAction::Stop);
-    bridge.tick().expect("stop");
+    tick(&mut bridge, &store).expect("stop");
     // Rotated while stopped; the resumed engine says the new value.
     source.rotate(ROTATED_TWO);
     resume(&store, "key_resume");
-    bridge.tick().expect("resume");
+    tick(&mut bridge, &store).expect("resume");
     let (_, resumed) = transcript_of_latest(&store);
     store.append_file(&resumed, &said_line("u2", ROTATED_TWO));
-    bridge.tick().expect("copy");
-    bridge.tick().expect("copy");
+    tick(&mut bridge, &store).expect("copy");
+    tick(&mut bridge, &store).expect("copy");
     let after = archived(&store, &native);
     assert!(after.contains("u2"), "{after}");
     assert!(
@@ -1817,11 +1835,11 @@ fn a_rotation_between_a_pass_and_a_resume_is_masked_with_the_new_value() {
 fn a_rotation_between_the_mask_and_the_read_copies_nothing_that_pass() {
     let (store, mut bridge, source, native, path) = masked_following();
     store.append_file(&path, &said_line("u1", ROTATED_ONE));
-    bridge.tick().expect("copy");
+    tick(&mut bridge, &store).expect("copy");
     let before = archived(&store, &native);
     source.rotate_after_next(ROTATED_TWO);
     store.append_file(&path, &said_line("u2", ROTATED_TWO));
-    let report = bridge.tick().expect("stale");
+    let report = tick(&mut bridge, &store).expect("stale");
     assert!(
         report
             .warnings
@@ -1835,7 +1853,7 @@ fn a_rotation_between_the_mask_and_the_read_copies_nothing_that_pass() {
         before,
         "nothing copied that pass"
     );
-    bridge.tick().expect("copy");
+    tick(&mut bridge, &store).expect("copy");
     let after = archived(&store, &native);
     assert!(
         after.contains("u2") && !after.contains(ROTATED_TWO),

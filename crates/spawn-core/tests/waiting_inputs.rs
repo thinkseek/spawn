@@ -168,7 +168,14 @@ impl Rig {
                 charter: None,
             },
         );
-        rig.tick();
+        for _ in 0..16 {
+            rig.tick();
+            if rig.finished(1).is_some() {
+                break;
+            }
+            rig.store.expire_leases();
+            std::thread::yield_now();
+        }
         assert!(rig.finished(1).is_some_and(|(ok, _)| ok), "the start");
         rig
     }

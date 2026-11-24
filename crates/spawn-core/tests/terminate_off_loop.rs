@@ -200,7 +200,14 @@ impl Rig {
                 charter: None,
             },
         );
-        rig.tick();
+        for _ in 0..16 {
+            rig.tick();
+            if rig.finished(1).is_some() {
+                break;
+            }
+            rig.store.expire_leases();
+            std::thread::yield_now();
+        }
         assert!(rig.finished(1).is_some_and(|(ok, _)| ok), "the start");
         rig
     }
@@ -232,6 +239,7 @@ impl Rig {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done(self) {
             assert!(Instant::now() < deadline, "not done within 5 s");
+            self.clock.advance(Duration::from_millis(25));
             self.tick();
             std::thread::sleep(Duration::from_millis(10));
         }

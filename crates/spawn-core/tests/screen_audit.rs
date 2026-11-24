@@ -298,6 +298,29 @@ Enter to confirm · Esc to cancel
         keys.pressed.lock().expect("lock").clone()
     }
 
+    fn settle(store: &Arc<MemoryStore>, bridge: &mut Bridge, id: u64) {
+        for _ in 0..16 {
+            bridge.tick().expect("tick");
+            if store
+                .read_global(GlobalPosition(0), 500)
+                .expect("read")
+                .iter()
+                .any(|record| {
+                    matches!(
+                        record.event.kind,
+                        EventKind::CommandFinished { command_id, .. }
+                            if command_id == CommandId(id)
+                    )
+                })
+            {
+                return;
+            }
+            store.expire_leases();
+            std::thread::yield_now();
+        }
+        panic!("command {id} did not finish");
+    }
+
     /// Start a session whose first pane is `pane`, with a short wait for a
     /// ready prompt: the keys pressed, and whether the start succeeded.
     fn start_on(pane: &str) -> (Vec<String>, bool) {
@@ -305,7 +328,7 @@ Enter to confirm · Esc to cancel
         store.set_pane(&terminal_of(1), pane);
         let (mut bridge, keys) = bridge_over(&store);
         submit(&store, "key_start", start());
-        bridge.tick().expect("tick");
+        settle(&store, &mut bridge, 1);
         (pressed(&keys), succeeded(&store, 1))
     }
 
@@ -320,7 +343,7 @@ Enter to confirm · Esc to cancel
         store.set_pane(&terminal_of(1), READY);
         let (mut bridge, keys) = bridge_over(&store);
         submit(&store, "key_start", start());
-        bridge.tick().expect("tick");
+        settle(&store, &mut bridge, 1);
         assert!(succeeded(&store, 1), "the start succeeded");
         submit(&store, "key_stop", CommandAction::Stop);
         bridge.tick().expect("tick");
@@ -335,7 +358,7 @@ Enter to confirm · Esc to cancel
                 model: None,
             },
         );
-        bridge.tick().expect("tick");
+        settle(&store, &mut bridge, 3);
         let launches = store.launches();
         assert_eq!(launches.len(), 2, "one start, one resume");
         let arguments = launches[1].arguments.clone();

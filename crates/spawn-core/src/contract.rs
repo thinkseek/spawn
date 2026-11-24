@@ -427,7 +427,10 @@ pub fn terminal_files(tag: &str, terminals: &dyn TerminalHost, directory: &str) 
 pub fn transcript_archive(tag: &str, archive: &dyn crate::port::TranscriptArchive) {
     let agent = agent(tag);
     let native = "0b7c1d2e-0000-4000-8000-000000000001";
-    assert!(archive.copies(&agent, native).expect("copies").is_empty());
+    assert_eq!(
+        archive.copies(&agent, native).expect("copies"),
+        Vec::<u64>::new()
+    );
     archive
         .append(&agent, native, 0, 0, b"one\n")
         .expect("a first copy");

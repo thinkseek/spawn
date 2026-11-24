@@ -132,6 +132,18 @@ impl Rig {
             .expect("submit");
     }
 
+    fn settle_start(&self, bridge: &mut Bridge) {
+        for _ in 0..16 {
+            bridge.tick().expect("start");
+            if self.outcome(1).is_some() {
+                return;
+            }
+            self.store.expire_leases();
+            std::thread::yield_now();
+        }
+        panic!("the start did not finish");
+    }
+
     fn start(&self, prompt: &str) {
         self.submit(
             "key_start",
@@ -355,7 +367,16 @@ fn m5_a_store_error_before_the_start_prompt_leaves_a_promptless_engine() {
             .as_deref()
             .is_some_and(|key| key.ends_with(":screen:ready"))
     });
-    assert!(bridge.tick().is_err(), "the database is down");
+    let mut failed = false;
+    for _ in 0..16 {
+        if bridge.tick().is_err() {
+            failed = true;
+            break;
+        }
+        rig.store.expire_leases();
+        std::thread::yield_now();
+    }
+    assert!(failed, "the database is down");
     rig.lease_expires();
     for _ in 0..3 {
         let _ = bridge.tick();
@@ -376,7 +397,7 @@ fn m6_an_input_whose_lease_expires_is_typed_twice() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
-    bridge.tick().expect("start");
+    rig.settle_start(&mut bridge);
     rig.submit(
         "key_input",
         CommandAction::Input {
@@ -407,7 +428,7 @@ fn m7_a_crash_between_unmount_and_ended_wedges_the_execution() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
-    bridge.tick().expect("start");
+    rig.settle_start(&mut bridge);
     rig.submit("key_stop", CommandAction::Stop);
     rig.fail_append_once(|event| matches!(event.kind, EventKind::ExecutionEnded { .. }));
     assert!(
@@ -455,7 +476,7 @@ fn m4_main_merges_under_a_turn_typed_before_a_restart() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
-    bridge.tick().expect("start");
+    rig.settle_start(&mut bridge);
     rig.transcript(&[prompt("1"), turn_end("1")]);
     bridge.tick().expect("read the turn");
     bridge.tick().expect("checkpoint and merge");
@@ -483,7 +504,7 @@ fn m4_main_merges_on_the_first_busy_frame_of_a_turn() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
-    bridge.tick().expect("start");
+    rig.settle_start(&mut bridge);
     rig.transcript(&[prompt("1"), turn_end("1")]);
     bridge.tick().expect("read the turn");
     bridge.tick().expect("checkpoint and merge");
@@ -507,7 +528,7 @@ fn l1_the_same_conflict_is_recorded_again_after_a_restart() {
         marked: true,
     });
     rig.start("");
-    bridge.tick().expect("start");
+    rig.settle_start(&mut bridge);
     rig.transcript(&[prompt("1"), turn_end("1")]);
     bridge.tick().expect("read the turn");
     bridge.tick().expect("checkpoint and conflict");
@@ -536,7 +557,17 @@ fn fail_once(
     if failure.is_none() {
         rig.fail_finish_once();
     }
-    let _ = bridge.tick();
+    for _ in 0..64 {
+        let result = bridge.tick();
+        let targeted = seen
+            .as_ref()
+            .is_some_and(|(n, seen)| seen.load(Ordering::SeqCst) > *n);
+        if targeted || (failure.is_none() && result.is_err()) || rig.outcome(1).is_some() {
+            break;
+        }
+        rig.store.expire_leases();
+        std::thread::yield_now();
+    }
     if let Some((n, seen)) = seen
         && seen.load(Ordering::SeqCst) <= n
     {
@@ -594,7 +625,7 @@ fn every_input_is_typed_at_most_once() {
             let rig = Rig::new();
             let mut bridge = rig.bridge();
             rig.start("");
-            bridge.tick().expect("start");
+            rig.settle_start(&mut bridge);
             rig.submit(
                 "key_input",
                 CommandAction::Input {
@@ -626,7 +657,7 @@ fn every_end_completes() {
             let rig = Rig::new();
             let mut bridge = rig.bridge();
             rig.start("");
-            bridge.tick().expect("start");
+            rig.settle_start(&mut bridge);
             rig.submit("key_stop", CommandAction::Stop);
             if fail_once(&rig, bridge, failure, restart, 25).is_none() {
                 break;
