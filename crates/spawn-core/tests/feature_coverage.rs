@@ -710,6 +710,64 @@ fn real_project_registry_covers_every_in_scope_file_with_zero_drift() {
     assert!(report.counts.multi_feature_files >= 100);
 
     assert_real_registry_semantic_invariants(&root, &registry, &report);
+    assert_registry_objectives_match_the_backlog(&root, &registry);
+}
+
+/// The registry's `"4/<n>"` objectives and the backlog on disk agree both
+/// ways: every objective the registry names is a numeric
+/// `rsi/backlog/<n>.json` file (no dangling `4/488` again), and every such
+/// file is named by at least one non-domain feature's
+/// `provenance.objectives` (no backlog objective left off the map).
+fn assert_registry_objectives_match_the_backlog(root: &Path, registry: &FeatureRegistry) {
+    let backlog: BTreeSet<u32> = fs::read_dir(root.join("rsi/backlog"))
+        .expect("read rsi/backlog")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".json")?;
+            stem.bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| stem.parse::<u32>().ok())
+                .flatten()
+        })
+        .collect();
+    assert!(
+        !backlog.is_empty(),
+        "rsi/backlog must hold numeric objectives"
+    );
+    let numbered = |objective: &str| -> Option<u32> {
+        let number = objective.strip_prefix("4/")?;
+        (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| number.parse::<u32>().ok())
+            .flatten()
+    };
+    let mut dangling: Vec<String> = Vec::new();
+    let mut mapped: BTreeSet<u32> = BTreeSet::new();
+    for feature in &registry.features {
+        for objective in &feature.provenance.objectives {
+            if objective.starts_with("4/") {
+                match numbered(objective) {
+                    Some(number) if backlog.contains(&number) => {
+                        if feature.kind != FeatureKind::Domain {
+                            mapped.insert(number);
+                        }
+                    }
+                    _ => dangling.push(format!("{} on {}", objective, feature.id)),
+                }
+            }
+        }
+    }
+    assert!(
+        dangling.is_empty(),
+        "registry objectives with no rsi/backlog/<n>.json on disk: {dangling:?}"
+    );
+    let unmapped: Vec<String> = backlog
+        .difference(&mapped)
+        .map(|number| format!("rsi/backlog/{number:03}.json"))
+        .collect();
+    assert!(
+        unmapped.is_empty(),
+        "backlog objectives no non-domain feature maps in provenance.objectives: {unmapped:?}"
+    );
 }
 
 fn simple_node(id: &str, kind: FeatureKind, parent: Option<&str>) -> FeatureNode {

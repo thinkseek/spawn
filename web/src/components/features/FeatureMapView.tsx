@@ -27,6 +27,7 @@ import {
   gapText,
   groupByState,
   isExternal,
+  landingLabel,
   newestVerification,
   objectiveName,
   ownerText,
@@ -652,11 +653,7 @@ function newestTask(feature: Feature): FeatureTask | null {
 function landingText(feature: Feature): string {
   const landing = newestLanding(feature);
   if (landing === null) return "not landed";
-  const task = landing.task === null ? "a task" : `task #${landing.task}`;
-  const commit = landing.commit ? ` · ${landing.commit.slice(0, 10)}` : "";
-  const when = landing.at_ms ? ` · ${relativeTime(landing.at_ms)}` : "";
-  const solved = landing.kind === "solved_on_base" ? "solved on the base" : "landed";
-  return `${solved} ${task}${commit}${when}`;
+  return landingLabel(landing, landing.at_ms ? relativeTime(landing.at_ms) : "");
 }
 
 function newestLanding(feature: Feature): FeatureLanding | null {
