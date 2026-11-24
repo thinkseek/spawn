@@ -11,8 +11,10 @@ use sha2::{Digest, Sha256};
 use super::{
     Bucket, Entry, Head, Keys, Listed, Plan, Put, Reader, Source, Store, Verified, create_list,
     group, hmac_sha256, may_write, plan, plan_lines, plan_summary, put_summary, random_hex, ranges,
-    restore, restore_with, sources, store_r2, write_list,
+    sources, store_r2, write_list,
 };
+#[cfg(target_os = "linux")] // a restore needs O_TMPFILE
+use super::{restore, restore_with};
 use crate::backup::{hex, md5_hex};
 
 #[derive(Default)]
