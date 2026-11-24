@@ -19,7 +19,7 @@
 
 - 能力：创建和配置 mission，记录 owner push、hold/release，驱动 task 状态及 gate verdict 折叠。
 - 入口：`spawn mission ...`、`spawn task ...`、SQL control-record 写入与 refold。
-- 代码：`crates/spawn-cli/src/main.rs:169-171`、`crates/spawn-cli/src/missions.rs:669-719`、`crates/spawn-core/src/mission.rs:14`、`crates/spawn-postgres/sql/schema.sql:2553`、`crates/spawn-postgres/sql/schema.sql:2631`。
+- 代码：`crates/spawn-cli/src/main.rs:172-174`、`crates/spawn-cli/src/missions.rs:669-719`、`crates/spawn-core/src/mission.rs:14`、`crates/spawn-postgres/sql/schema.sql:2553`、`crates/spawn-postgres/sql/schema.sql:2631`。
 - 实现状态：`已实现`。配置和任务变化先成为记录，SQL 再折叠为读模型；`aborted` 本身不把 task 推进到完成态。
 - 测试证据：`crates/spawn-core/src/mission.rs:87-125` 固定状态值和未知值错误；`crates/spawn-postgres/tests/control.rs:51-135` 覆盖 mission/resident 控制记录折叠。本次在 Darwin/aarch64 运行 `cargo test -p spawn-core mission::tests`，2 个测试通过。
 - 部署状态：`部署未验证`。需要同一套 CLI、schema 和 loop；本次未执行端到端 mission 生命周期。
@@ -30,7 +30,7 @@
 
 - 能力：从 backlog 分配 objective，处理 attempt/yield、worker slots、continuation，重复生成由记录决定的投递计划，并升级停滞。
 - 入口：`spawn mission objectives ...`、`spawn integrate` 分配 objective；`spawn loop` 运行 dispatcher 和 stall；核心函数为 `objectives::assign_next`、`dispatch::decide_with`。
-- 代码：`crates/spawn-cli/src/objectives.rs:1000-1101`、`crates/spawn-cli/src/integrate.rs:3573-3591`、`crates/spawn-cli/src/dispatch.rs:623-675`、`crates/spawn-cli/src/dispatch.rs:909-921`、`crates/spawn-cli/src/dispatch/steal.rs:75-181`、`crates/spawn-cli/src/commands/loops.rs:415-473`、`crates/spawn-cli/src/dispatch/stall.rs:1-50`。`crates/spawn-cli/src/dispatch/steal.rs:75-84` 的 `stealable` 只放行 open/active、未 halt、未暂停 mission 的排队任务，`crates/spawn-cli/src/dispatch/steal.rs:92-130` 的 `choices` 产出每个空闲成员的尝试列表，`crates/spawn-cli/src/dispatch/steal.rs:137-163` 的 `attempt` 在被拒后继续尝试下一个，`crates/spawn-cli/src/dispatch/steal.rs:169-181` 的 `run` 仅在实际发生移动时要求重读。
+- 代码：`crates/spawn-cli/src/objectives.rs:1000-1101`、`crates/spawn-cli/src/integrate.rs:3573-3591`、`crates/spawn-cli/src/dispatch.rs:623-675`、`crates/spawn-cli/src/dispatch.rs:909-921`、`crates/spawn-cli/src/dispatch/steal.rs:75-181`、`crates/spawn-cli/src/commands/loops.rs:416-477`、`crates/spawn-cli/src/dispatch/stall.rs:1-50`。`crates/spawn-cli/src/dispatch/steal.rs:75-84` 的 `stealable` 只放行 open/active、未 halt、未暂停 mission 的排队任务，`crates/spawn-cli/src/dispatch/steal.rs:92-130` 的 `choices` 产出每个空闲成员的尝试列表，`crates/spawn-cli/src/dispatch/steal.rs:137-163` 的 `attempt` 在被拒后继续尝试下一个，`crates/spawn-cli/src/dispatch/steal.rs:169-181` 的 `run` 仅在实际发生移动时要求重读。
 - 实现状态：`已实现`。dispatcher 由记录和时钟生成计划；stall 生成 supervisor 通知，不直接修复阻塞。
 - 测试证据：`crates/spawn-cli/src/objectives.rs:1690-1810` 覆盖 slot 与 yield；`crates/spawn-cli/src/dispatch.rs:1404-1436` 覆盖同事实重复决策；`crates/spawn-cli/src/dispatch/stall/tests.rs:135-190` 覆盖停滞计时起点；`crates/spawn-cli/src/dispatch/steal.rs:345-381` 覆盖 halted/closed/dropped mission 的任务跳过、active 正常移动；`crates/spawn-postgres/tests/steal.rs:452-494` 覆盖投递行携带 mission state 与 halt。合并 `origin/main` 基线 `6544fe42` 后的 head `1cffa02c`，在 Linux/x86_64、Debian 12、ext4、Rust 1.95.0、一次性 PostgreSQL 16.4 隔离环境（独立 checkout/target/socket/logs），于 2026-11-22 运行：`cargo test -p spawn-cli` 1236 通过、0 失败、3 忽略；具名 `cargo test -p spawn-cli dispatch::steal` 5 通过、0 失败、1234 过滤；`cargo test -p spawn-postgres --test steal` 5 通过、0 失败。结果来自隔离临时目录，不连接任何现有服务。合并 `e55c5181`（PR #82）后的 head `6728527e` 在 r9 同型隔离环境复验（2026-11-22，细节见 FM-13）：`dispatch::steal` 5 通过、0 失败、1264 过滤，`spawn-postgres --test steal` 5 通过、0 失败，`cargo test -p spawn-cli` 整体 1266 通过、0 失败、3 忽略。
 - 部署状态：`部署未验证`。backlog 和 scenarios 是 controller 输入；本次未核对部署副本或真实 worker。
@@ -52,7 +52,7 @@
 
 - 能力：幂等 submit、单 session 串行 lease、waiting-input 让行、release/finish、watermark、LISTEN/NOTIFY 和定时回退。
 - 入口：`CommandQueue::{submit, claim, release, finish}`、`PostgresStore::{watermark, listen, next_lease_ms}`。
-- 代码：`crates/spawn-postgres/src/command_queue.rs:21-67`、`crates/spawn-postgres/sql/schema.sql:396-600`、`crates/spawn-postgres/src/wake.rs:34-86`、`crates/spawn-cli/src/commands/loops.rs:539-595`。
+- 代码：`crates/spawn-postgres/src/command_queue.rs:21-67`、`crates/spawn-postgres/sql/schema.sql:396-600`、`crates/spawn-postgres/src/wake.rs:34-86`、`crates/spawn-cli/src/commands/loops.rs:547-603`。
 - 实现状态：`已实现`。submit 与 `command.accepted` 同事务；finish 与 `command.finished` 同事务；丢失通知由 watermark 和到期时间兜底。
 - 测试证据：`crates/spawn-postgres/tests/api.rs:117-267` 覆盖幂等与串行竞争；`crates/spawn-postgres/tests/waiting.rs:67-129` 覆盖 waiting 与 lease；`crates/spawn-postgres/src/wake.rs:131-211` 覆盖通知和到期调度。
 - 部署状态：`部署未验证`。本次未运行 submit→claim→finish，也未断开 LISTEN 连接。
@@ -63,7 +63,7 @@
 
 - 能力：显式 `init-db` 原地迁移，回填 projection，提供 per-database 受限登录和持久化 recovery facts。
 - 入口：`spawn init-db`、`PostgresStore::migrate`、`role_url`、`spawn_host_record`。
-- 代码：`crates/spawn-cli/src/main.rs:149-152`、`crates/spawn-postgres/src/lib.rs:285-349`、`crates/spawn-postgres/sql/schema.sql:129-200`、`crates/spawn-postgres/src/gateway.rs:178-313`、`crates/spawn-postgres/src/lib.rs:488-520`、`crates/spawn-postgres/src/recovery.rs:27-106`、`crates/spawn-postgres/sql/schema.sql:5342-5385`。
+- 代码：`crates/spawn-cli/src/main.rs:152-155`、`crates/spawn-postgres/src/lib.rs:292-362`、`crates/spawn-postgres/sql/schema.sql:129-200`、`crates/spawn-postgres/src/gateway.rs:178-313`、`crates/spawn-postgres/src/lib.rs:501-533`、`crates/spawn-postgres/src/recovery.rs:27-106`、`crates/spawn-postgres/sql/schema.sql:5342-5385`。
 - 实现状态：`已实现`。普通 `open_store` 只连接；迁移是独立部署步骤。受限登录由 owner 密码派生，recovery writer 只接受 owner。
 - 测试证据：`crates/spawn-postgres/tests/upgrade.rs:91` 覆盖旧表升级；`crates/spawn-postgres/tests/api.rs:3043-3093` 覆盖迁移竞争；`crates/spawn-postgres/tests/roles.rs:108-149` 覆盖数据库间角色隔离；`crates/spawn-postgres/tests/recovery.rs:56`、`crates/spawn-postgres/tests/recovery.rs:117` 覆盖 recovery writer。
 - 部署状态：`部署未验证`。本次未执行 init-db、角色连接或数据库重启。
@@ -76,7 +76,7 @@
 
 - 能力：propose/approve/retire resident，维持已批准 worker，按持久化恢复事实选择 resume、wait、handoff 或 final。
 - 入口：`spawn resident propose|approve|retire`、`supervise::keep_residents`、loop recovery step。
-- 代码：`crates/spawn-cli/src/missions.rs:1109-1130`、`crates/spawn-cli/src/supervise.rs:358-437`、`crates/spawn-cli/src/commands/loops.rs:398-473`、`crates/spawn-cli/src/recover.rs:1169-1248`。
+- 代码：`crates/spawn-cli/src/missions.rs:1109-1130`、`crates/spawn-cli/src/supervise.rs:358-437`、`crates/spawn-cli/src/commands/loops.rs:399-477`、`crates/spawn-cli/src/recover.rs:1169-1248`。
 - 实现状态：`已实现`。retire 会进入 open-task 取消路径；resident 后续投递还受 FM-18 的通知顺序约束。
 - 测试证据：`crates/spawn-postgres/tests/control.rs:51-80` 覆盖 propose/approve/retire；`crates/spawn-cli/src/supervise.rs:630-672` 覆盖 revival backoff 与 handoff；`crates/spawn-cli/src/recover.rs:2933`、`crates/spawn-cli/src/recover.rs:2972` 覆盖恢复退避和 handoff/final。
 - 部署状态：`部署未验证`。本次未进行 owner 审批、退休、进程重启或恢复演练。
@@ -87,9 +87,9 @@
 
 - 能力：从 agent 分支导出无 `.git` 的工作目录，做 checkpoint CAS、main merge、冲突续作和取消工作的 set-aside。
 - 入口：`GitWorkspace`/`WorkspaceStore` 的 branch、mount、checkpoint、merge、set-aside。
-- 代码：`crates/spawn-host/src/git.rs:54-149`、`crates/spawn-host/src/git.rs:1218-1475`、`crates/spawn-cli/src/set_aside.rs:77-154`、`crates/spawn-cli/src/main_merge.rs:1`。
+- 代码：`crates/spawn-host/src/git.rs:54-149`、`crates/spawn-host/src/git.rs:1315-1572`、`crates/spawn-cli/src/set_aside.rs:77-154`、`crates/spawn-cli/src/main_merge.rs:1`。
 - 实现状态：`已实现`。这里的“worktree”是 `git archive` 式 plain export，不是带 `.git` 的常规 `git worktree`；分支头保存快照。
-- 测试证据：`crates/spawn-host/tests/api.rs:123-195` 覆盖真实 git branch/mount/checkpoint；`crates/spawn-host/src/git.rs:3287-3380` 覆盖大文件边界；`crates/spawn-cli/src/set_aside.rs:225-240` 覆盖取消通知内容。
+- 测试证据：`crates/spawn-host/tests/api.rs:123-195` 覆盖真实 git branch/mount/checkpoint；`crates/spawn-host/src/git.rs:3395-3449` 覆盖大文件边界；`crates/spawn-cli/src/set_aside.rs:225-240` 覆盖取消通知内容。
 - 部署状态：`部署未验证`。本次未创建真实 agent workspace 或合并冲突。
 - 已知缺口：默认单文件 100 MiB checkpoint 上限不适合大数据集和模型产物；超限文件需要独立 artifact 存储。
 - 下一步：运行 real-git、main-merge、set-aside 测试，并为大型数据产物定义独立保留与血缘方案。
@@ -98,7 +98,7 @@
 
 - 能力：建立精确 tmux session，启动 Claude Code runner，分段输入长 prompt，处理 trust dialog、exit、lost runner 和终止清理。
 - 入口：`spawn run -- claude ...`、`Bridge::type_prompt`、`TmuxHost::{start, stage_text, runner, terminate}`。
-- 代码：`crates/spawn-core/src/bridge.rs:4440-4540`、`crates/spawn-core/src/bridge.rs:1879-1881`、`crates/spawn-host/src/tmux.rs:590-752`、`crates/spawn-cli/src/commands/engine.rs:24-45`、`crates/spawn-host/src/tmux.rs:831-943`。`bridge.rs:1879-1881` 是长 transcript 重启后连读的规则：读满一个 `READ_LIMIT` 就保持 `due_at`，下一遍继续读，不等文件再变化。
+- 代码：`crates/spawn-core/src/bridge.rs:4440-4540`、`crates/spawn-core/src/bridge.rs:1879-1881`、`crates/spawn-host/src/tmux.rs:610-772`、`crates/spawn-cli/src/commands/engine.rs:24-45`、`crates/spawn-host/src/tmux.rs:851-963`。`bridge.rs:1879-1881` 是长 transcript 重启后连读的规则：读满一个 `READ_LIMIT` 就保持 `due_at`，下一遍继续读，不等文件再变化。
 - 实现状态：`已实现`。runner 写退出状态；Bridge 结合 transcript、pane 和 runner 事实判定 exited/lost/stopped。
 - 测试证据：`crates/spawn-host/tests/api.rs:537-569` 覆盖长文本；`crates/spawn-host/tests/api.rs:571-645` 覆盖环境不入 argv；`crates/spawn-host/tests/runner.rs:183` 覆盖 runner 身份；`crates/spawn-host/tests/runner.rs:415`、`crates/spawn-host/tests/runner.rs:501` 覆盖终止等待；`crates/spawn-core/tests/waiting_inputs.rs:343` 覆盖 ready 后输入；`crates/spawn-core/src/bridge.rs:6153-6171`（`a_backlog_over_one_read_is_read_through_without_another_change`）和 `crates/spawn-core/src/bridge.rs:6177-6196`（`after_a_restart_a_long_transcript_is_read_through_to_its_new_lines`）覆盖长 transcript 重启后连读，两者均为旧行为失败、修复后通过的回归。合并 `origin/main` 基线 `33777df8` 后的 head `d4cab4c4`，在与 FM-13 相同的 Linux/x86_64、Debian 12、ext4、Rust 1.95.0、一次性 PostgreSQL 16.4 隔离环境（独立 checkout/target/socket/logs），于 2026-11-22 运行：`cargo test -p spawn-core` 15 个测试二进制共 289 通过、0 失败；具名 `cargo test -p spawn-core bridge::tests -- a_backlog_over_one_read_is_read_through_without_another_change after_a_restart_a_long_transcript_is_read_through_to_its_new_lines` 为 24 通过、0 失败、87 过滤，两个目标测试均在列且 ok；原八项（spawn-cli 1236 通过/3 忽略、spawn-host 151 通过/1 忽略、test-controller 79 ok、test-session-backup 124 ok、Feature Map 19 条目 177 引用 OK、self-test 7 负例 OK、`git diff --check` 无输出、标识扫描全 none）同环境全部通过。这些是隔离临时目录的结果，不连接任何现有服务。
 - 部署状态：`部署未验证`。本次未启动 tmux 或 Claude Code。
@@ -144,9 +144,9 @@
 
 - 能力：SQL fleet/tail 读模型、alert fire/clear/notice、attention 计划、dashboard reader，以及受限 human input/key 写入。
 - 入口：`spawn fleet|tail|alerts`、`spawn serve`、`/api/attention`、SQL gateway。
-- 代码：`crates/spawn-postgres/src/fleet.rs:12-109`、`crates/spawn-cli/src/alerts.rs:1041-1134`、`crates/spawn-cli/src/serve/attention.rs:157-244`、`crates/spawn-postgres/src/gateway.rs:60-169`。PR #82 的记录派生能力图（planned / implemented / verified / live 四态）：`crates/spawn-cli/src/serve/feature_map.rs:107`（`GET /api/features` 处理函数，整文件 1-3653 行）、`crates/spawn-postgres/src/features.rs:82-97`（`deploy_facts`、`live_deploy_fact`、`mission_blockers`）、`web/src/components/features/FeatureMapView.tsx:1-692`（`#/features` 四列视图）、`web/src/features.ts:1-759`（只做归一化和措辞，不派生状态）。派生图的机制文档是 [feature-map.md](./feature-map.md)，与本静态图并存。
+- 代码：`crates/spawn-postgres/src/fleet.rs:12-109`、`crates/spawn-cli/src/alerts.rs:1045-1138`、`crates/spawn-cli/src/serve/attention.rs:158-244`、`crates/spawn-postgres/src/gateway.rs:60-169`。PR #82 的记录派生能力图（planned / implemented / verified / live 四态）：`crates/spawn-cli/src/serve/feature_map.rs:107`（`GET /api/features` 处理函数，整文件 1-3653 行）、`crates/spawn-postgres/src/features.rs:82-97`（`deploy_facts`、`live_deploy_fact`、`mission_blockers`）、`web/src/components/features/FeatureMapView.tsx:1-692`（`#/features` 四列视图）、`web/src/features.ts:1-759`（只做归一化和措辞，不派生状态）。派生图的机制文档是 [feature-map.md](./feature-map.md)，与本静态图并存。
 - 实现状态：`已实现`。reader 与 human-write 使用不同权限路径；attention 是瞬时 dispatcher plan，不提交命令。派生能力图在页面读取时由 backlog、task、landing、verification、deploy 记录实时计算，无存储状态、无物化视图、无第二份跟踪表；mapping 文件只保存能力 id 与 provenance source，不保存状态。
-- 测试证据：`crates/spawn-postgres/tests/dashboard.rs:73-179` 覆盖 board；`crates/spawn-postgres/tests/alerts.rs:60-128` 覆盖 alert 生命周期；`crates/spawn-cli/src/serve/attention.rs:1106-1144` 覆盖 attention parity；`crates/spawn-postgres/tests/human_input.rs:137-228`、`crates/spawn-postgres/tests/human_input.rs:394-455` 覆盖人工输入与角色限制；`crates/spawn-postgres/tests/human_key.rs:117-187`、`crates/spawn-postgres/tests/human_key.rs:230-293` 覆盖 key 命令与权限。派生能力图的证据：`crates/spawn-cli/src/serve/feature_map.rs:2267-3652` 的 27 个单元测试覆盖四态不塌缩、最低 objective 定态、landing 时刻的 deploy/verification 不算数、live anchor 全量 deploy 日志、backlog 不可读具名、mapping 校验、registry schema 与 provenance；`crates/spawn-postgres/tests/features.rs:39-174` 的 4 个测试覆盖 deploy facts 顺序与边界、50 条之外的 live anchor、mission blocker、mapping 绝对路径设置；`crates/spawn-postgres/tests/verification.rs` 5 个测试；`web/test/features.test.ts:1-481` 的 12 个 node:test 用例覆盖四列归一化、gap 措辞、source 标签和 deploy 注释。
+- 测试证据：`crates/spawn-postgres/tests/dashboard.rs:73-179` 覆盖 board；`crates/spawn-postgres/tests/alerts.rs:60-128` 覆盖 alert 生命周期；`crates/spawn-cli/src/serve/attention.rs:1107-1145` 覆盖 attention parity；`crates/spawn-postgres/tests/human_input.rs:137-228`、`crates/spawn-postgres/tests/human_input.rs:394-455` 覆盖人工输入与角色限制；`crates/spawn-postgres/tests/human_key.rs:117-187`、`crates/spawn-postgres/tests/human_key.rs:230-293` 覆盖 key 命令与权限。派生能力图的证据：`crates/spawn-cli/src/serve/feature_map.rs:2267-3652` 的 27 个单元测试覆盖四态不塌缩、最低 objective 定态、landing 时刻的 deploy/verification 不算数、live anchor 全量 deploy 日志、backlog 不可读具名、mapping 校验、registry schema 与 provenance；`crates/spawn-postgres/tests/features.rs:39-174` 的 4 个测试覆盖 deploy facts 顺序与边界、50 条之外的 live anchor、mission blocker、mapping 绝对路径设置；`crates/spawn-postgres/tests/verification.rs` 5 个测试；`web/test/features.test.ts:1-481` 的 12 个 node:test 用例覆盖四列归一化、gap 措辞、source 标签和 deploy 注释。
 - 部署状态：`部署未验证`。本次未启动 HTTP 服务、查询 live fleet 或验证 token/Origin/network ACL。
 - 已知缺口：fleet board 不是进程健康证明；没有 backup record 本身不会触发 backup-age alert；采样和投影延迟会影响新鲜度。
 - 下一步：运行 dashboard、alerts、attention 和 HTTP guard 测试，并用一次性数据验证 reader 不能写、human role 只能输入。
