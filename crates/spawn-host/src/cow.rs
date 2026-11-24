@@ -450,16 +450,22 @@ fn maps_inside(maps: &[u8], directory: &Path) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
+enum SharedMaps {
+    Unread,
+    Outside,
+    Fallback,
+    Failed,
+}
+
 /// Whether any thread of the process at `/proc/<pid>` works under
-/// `directory`. Threads share their memory map, so read it once per process;
-/// descriptors, working directories and roots are still checked per thread.
+/// `directory`. Every thread's `cwd`, `root` and open descriptors are checked
+/// first so a restricted `/proc/<pid>/maps` cannot bypass `WORKSPACE_BUSY`;
+/// when maps inspection is needed, `/proc/<pid>/maps` is read once per
+/// process and reused across threads, falling back per task only if the
+/// process-level file disappears mid-scan.
 #[cfg(target_os = "linux")]
 fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
-    let shared_maps = match fs::read(base.join("maps")) {
-        Ok(maps) => Some(maps),
-        Err(error) if exited(&error) => None,
-        Err(error) => return Err(error),
-    };
     let inside = |link: &Path| -> io::Result<bool> {
         match fs::read_link(link) {
             Ok(to) => Ok(to.starts_with(directory)),
@@ -467,6 +473,8 @@ fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
             Err(error) => Err(error),
         }
     };
+    let mut shared_maps = SharedMaps::Unread;
+    let mut maps_error = None;
     for task in fs::read_dir(base.join("task"))? {
         let task = match task {
             Ok(task) => task.path(),
@@ -491,19 +499,34 @@ fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
                 return Ok(true);
             }
         }
-        let mapped = if let Some(maps) = shared_maps.as_deref() {
-            maps_inside(maps, directory)
-        } else {
-            let maps = match fs::read(task.join("maps")) {
-                Ok(maps) => maps,
-                Err(error) if exited(&error) => continue,
-                Err(error) => return Err(error),
+        if matches!(shared_maps, SharedMaps::Unread) {
+            shared_maps = match fs::read(base.join("maps")) {
+                Ok(maps) => {
+                    if maps_inside(&maps, directory) {
+                        return Ok(true);
+                    }
+                    SharedMaps::Outside
+                }
+                Err(error) if exited(&error) => SharedMaps::Fallback,
+                Err(error) => {
+                    maps_error.get_or_insert(error);
+                    SharedMaps::Failed
+                }
             };
-            maps_inside(&maps, directory)
-        };
-        if mapped {
-            return Ok(true);
         }
+        if matches!(shared_maps, SharedMaps::Fallback) {
+            match fs::read(task.join("maps")) {
+                Ok(maps) if maps_inside(&maps, directory) => return Ok(true),
+                Ok(_) => {}
+                Err(error) if exited(&error) => {}
+                Err(error) => {
+                    maps_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = maps_error {
+        return Err(error);
     }
     Ok(false)
 }
@@ -2824,6 +2847,44 @@ mod tests {
         // Any other per-task read failure still fails closed.
         fs::create_dir(task.join("maps")).expect("unreadable maps stand-in");
         let error = process_inside(&base, Path::new("/work/a")).expect_err("maps read fails");
+        assert!(!exited(&error));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_process_maps_does_not_mask_task_cwd_or_descriptors() {
+        // Single task whose `cwd` is inside the workspace while process-level
+        // `maps` fails with a non-exited error (`EISDIR`).
+        let scratch = Scratch::new("cow-unreadable-maps");
+        let base = scratch.join("proc/200");
+        let task1 = base.join("task/1");
+        fs::create_dir_all(task1.join("fd")).expect("task1 fd");
+        fs::create_dir(base.join("maps")).expect("unreadable process maps stand-in");
+        std::os::unix::fs::symlink("/work/a", task1.join("cwd")).expect("cwd link");
+        assert!(
+            process_inside(&base, Path::new("/work/a")).expect("cwd must win before maps"),
+            "restricted process maps must not hide a task working inside the workspace"
+        );
+
+        // Multi-task fixture: task1 sits outside the workspace (triggering the
+        // deferred `base/maps` failure) while task2 holds an open descriptor inside it.
+        fs::remove_file(task1.join("cwd")).expect("clear task1 cwd");
+        std::os::unix::fs::symlink("/elsewhere", task1.join("cwd")).expect("outside cwd");
+        let task2 = base.join("task/2");
+        fs::create_dir_all(task2.join("fd")).expect("task2 fd");
+        std::os::unix::fs::symlink("/elsewhere", task2.join("cwd")).expect("task2 cwd");
+        std::os::unix::fs::symlink("/work/a/open.txt", task2.join("fd/0")).expect("task2 fd link");
+        assert!(
+            process_inside(&base, Path::new("/work/a"))
+                .expect("later task descriptor must still be detected"),
+            "an earlier task's maps error must not skip subsequent tasks' fd checks"
+        );
+
+        // When no task holds cwd, root or fd inside the workspace, the maps
+        // failure still propagates so occupancy fails closed as uninspected.
+        fs::remove_file(task2.join("fd/0")).expect("clear task2 fd");
+        let error = process_inside(&base, Path::new("/work/a"))
+            .expect_err("unreadable process maps must fail closed when nothing else matches");
         assert!(!exited(&error));
     }
 
