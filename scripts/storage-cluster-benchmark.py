@@ -317,7 +317,8 @@ class HostMonitor(threading.Thread):
                     with open("/proc/diskstats") as source:
                         for line in source:
                             fields = line.split()
-                            if len(fields) >= 14 and fields[2].startswith(("vda", "nvme", "sda")):
+                            if (len(fields) >= 14 and fields[2].startswith(("vda", "nvme", "sda"))
+                                    and not os.path.exists("/sys/class/block/%s/partition" % fields[2])):
                                 read_sectors += int(fields[5])
                                 write_sectors += int(fields[9])
                                 io_ms += int(fields[12])
@@ -453,36 +454,52 @@ def commit_iteration(source, commit, worker):
     return int(match.group(1)) if match else None
 
 
-def event_iterations(events, worker, source):
+def event_iterations(events, worker, source, strict_turns=False):
     starts = {}
     pending = []
+    completed = []
     rows = {}
+    artifact_counts = collections.Counter()
+    turn = 0
     for event in events:
         name = event.get("event_name")
         detail = event.get("detail") or {}
         at = event.get("recorded_at_ms")
         if name == "tool.started" and detail.get("tool_name") == "Bash":
-            starts[detail.get("tool_use_id")] = at
+            starts[detail.get("tool_use_id")] = (at, turn)
         elif name in ("tool.completed", "tool.failed"):
             tool = detail.get("tool_use_id")
             started = starts.pop(tool, None)
             if started is not None and name == "tool.completed":
-                pending.append({
+                started_at, started_turn = started
+                item = {
                     "tool_use_id": tool,
-                    "tool_started_ms": started,
+                    "tool_started_ms": started_at,
                     "tool_completed_ms": at,
                     "reported_tool_ms": detail.get("duration_ms"),
-                })
-        elif name == "artifact.committed" and pending:
+                    "turn": started_turn,
+                }
+                pending.append(item)
+                completed.append(item)
+        elif name == "artifact.committed" and (completed if strict_turns else pending):
             commit = (detail.get("artifact") or {}).get("commit")
             if not commit:
                 continue
             iteration = commit_iteration(source, commit, worker)
             if iteration is None:
                 continue
-            # The checkpoint belongs to the most recently completed tool. Any
-            # earlier no-op Bash calls did not produce an artifact.
-            tool = pending.pop()
+            if strict_turns:
+                candidates = [item for item in completed if item["turn"] == iteration]
+                if len(candidates) != 1:
+                    raise RuntimeError(
+                        "worker %d iteration %d has %d completed Bash calls in its measured turn; expected one"
+                        % (worker, iteration, len(candidates)))
+                tool = candidates[0]
+                artifact_counts[iteration] += 1
+            else:
+                # Autonomous mode is a throughput/coalescing case, not a strict
+                # per-turn timing claim.
+                tool = pending.pop()
             row = {
                 "worker": worker,
                 "iteration": iteration,
@@ -496,6 +513,15 @@ def event_iterations(events, worker, source):
                 "commit": commit,
             }
             rows[iteration] = row
+        elif name == "turn.stopped":
+            turn += 1
+    if strict_turns:
+        for iteration in rows:
+            calls = sum(item["turn"] == iteration for item in completed)
+            if calls != 1 or artifact_counts[iteration] != 1:
+                raise RuntimeError(
+                    "worker %d iteration %d has %d Bash calls and %d result checkpoints; expected one of each"
+                    % (worker, iteration, calls, artifact_counts[iteration]))
     return rows
 
 
@@ -526,10 +552,21 @@ def run_cluster(args):
     if args.iterations < 1:
         raise ValueError("iterations must be positive")
     output = new_directory(args.output)
-    free = os.statvfs(str(source)).f_bavail * os.statvfs(str(source)).f_frsize
+    workspace_setting = os.environ.get("SPAWN_WORKSPACE_ROOT")
+    if not workspace_setting:
+        raise RuntimeError("SPAWN_WORKSPACE_ROOT must name the live workspace filesystem")
+    workspace_root = pathlib.Path(workspace_setting).absolute()
+    workspace_stat = os.statvfs(str(workspace_root))
+    free = workspace_stat.f_bavail * workspace_stat.f_frsize
     required = int(args.agents * manifest["bytes"] * 1.15 + 20 * 1024 ** 3)
     if free < required:
-        raise RuntimeError("not enough free space: need at least %.1f GiB" % (required / 1024 ** 3))
+        raise RuntimeError("not enough workspace free space at %s: need at least %.1f GiB" % (
+            workspace_root, required / 1024 ** 3))
+    source_stat = os.statvfs(str(source))
+    source_required = int(args.agents * args.iterations * OUTPUT_BYTES * 1.15 + 1024 ** 3)
+    if source_stat.f_bavail * source_stat.f_frsize < source_required:
+        raise RuntimeError("not enough source free space for published artifacts: need at least %.1f GiB" % (
+            source_required / 1024 ** 3))
     config = {
         "schema_version": 1,
         "source": str(source),
@@ -537,11 +574,12 @@ def run_cluster(args):
         "iterations": args.iterations,
         "golden_bytes": manifest["bytes"],
         "golden_sha256": manifest["sha256"],
+        "workspace_root": str(workspace_root),
         "mode": "autonomous-single-turn" if args.autonomous_single_turn else "synchronized-turns",
         "started_at_ms": int(time.time() * 1000),
     }
     (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    monitor = HostMonitor(output / "host.jsonl", source)
+    monitor = HostMonitor(output / "host.jsonl", workspace_root)
     monitor.start()
     tasks = {}
     mission_id = None
@@ -612,11 +650,11 @@ def run_cluster(args):
                         tail = spawn_json([
                             "tail", "--session", task["session_id"], "--events", "200"])
                         events = tail.get("events", [])
-                        turns = sum(event.get("event_name") == "turn.stopped" for event in events)
                         worker = int(re.search(r"storage(\d+)(?:_|$)", task["agent_id"]).group(1))
                         merged = merged_events.setdefault(task_id, {})
                         for event in events:
                             merged[event["session_seq"]] = event
+                        turns = sum(event.get("event_name") == "turn.stopped" for event in merged.values())
                         if turns >= iteration + 1:
                             (output / ("tail-%03d-turn-%03d.json" % (worker, iteration))).write_text(
                                 json.dumps(tail, indent=2) + "\n")
@@ -678,7 +716,9 @@ def run_cluster(args):
                 for key, value in detail.items():
                     token_totals[key] += value
             verified = verify_worker_when_published(source, task["agent_id"], worker, args.iterations, manifest)
-            timed = event_iterations(tail.get("events", []), worker, source)
+            timed = event_iterations(
+                tail.get("events", []), worker, source,
+                strict_turns=not args.autonomous_single_turn)
             missing = sorted(set(range(args.iterations)) - set(timed))
             if missing:
                 raise RuntimeError("worker %d lacks timing events for iterations %s" % (worker, missing))

@@ -49,9 +49,30 @@ def main():
     if any(report["config"] != baseline[0]["config"] for report in baseline + candidate):
         raise ValueError("all baseline and candidate configurations must match")
 
-    operations = sorted(
-        set.intersection(*(set(report["operations"]) for report in baseline + candidate))
+    reports = baseline + candidate
+    operation_sets = [set(report["operations"]) for report in reports]
+    expected_operations = operation_sets[0]
+    for path, operations in zip(args.baseline + args.candidate, operation_sets):
+        if operations != expected_operations:
+            missing = sorted(expected_operations - operations)
+            extra = sorted(operations - expected_operations)
+            raise ValueError("%s has different operations (missing=%s extra=%s)" % (
+                path, missing, extra))
+    git_versions = [report.get("environment", {}).get("git_version") for report in reports]
+    if any(not version for version in git_versions) or len(set(git_versions)) != 1:
+        raise ValueError("all reports must record the same environment.git_version")
+    for group, paths in ((baseline, args.baseline), (candidate, args.candidate)):
+        revisions = {report.get("environment", {}).get("spawn_source_revision") for report in group}
+        binaries = {report.get("environment", {}).get("benchmark_binary_sha256") for report in group}
+        if len(revisions) != 1 or None in revisions or len(binaries) != 1 or None in binaries:
+            raise ValueError("each group must record one Spawn source revision and binary SHA-256: %s" % paths)
+    identity = lambda report: (
+        report["environment"]["spawn_source_revision"],
+        report["environment"]["benchmark_binary_sha256"],
     )
+    if identity(baseline[0]) == identity(candidate[0]):
+        raise ValueError("baseline and candidate reports name the same source and benchmark binary")
+    operations = sorted(expected_operations)
     print("%-24s %12s %12s %10s" % ("operation", "baseline", "candidate", "change"))
     failures = []
     for operation in operations:

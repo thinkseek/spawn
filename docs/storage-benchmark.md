@@ -31,6 +31,7 @@ report. Do not compare reports produced by different Git versions.
 cargo build --release -p spawn-host --example storage_benchmark
 
 target/release/examples/storage_benchmark \
+  --source-revision "$(git rev-parse HEAD)" \
   --iterations 100 --warmup 10 \
   --files 512 --file-bytes 4096 --edits 4 \
   --transcript-bytes 16384 --remount-every 10 \
@@ -60,6 +61,14 @@ target/release/examples/storage_benchmark \
 
 An oversized file is intentionally not preserved by unmount, so the benchmark
 rejects combining those two options rather than silently losing that coverage.
+Every seed, changed and no-op checkpoint also runs `git ls-tree` and fails if
+`oversized.bin` entered the committed tree.
+
+Every report records `environment.spawn_source_revision` from the explicit
+option and a SHA-256 of the running benchmark executable. The comparison tool
+requires one identity per group and rejects comparing a binary/source identity
+with itself. Supply the product revision being measured; keep the benchmark
+harness identical on both sides.
 
 ## Compare repeated runs
 
@@ -73,8 +82,10 @@ python3 -I scripts/storage-benchmark-compare.py \
 ```
 
 The comparison uses the median across runs of each operation's p50 and p95. It
-also compares whole-cycle throughput and exits 1 on a median-p50 or throughput
-regression over 10% (`--max-regression-percent` changes that bound). Latency
+requires identical operation sets, configurations and Git versions across every
+report; a missing candidate operation cannot disappear from the regression
+check. It also compares whole-cycle throughput and exits 1 on a median-p50 or
+throughput regression over 10% (`--max-regression-percent` changes that bound). Latency
 improvements are negative percentages; throughput improvements are positive.
 Small differences in transcript, mount and unmount timings are usually noise:
 the checkpoint optimization does not touch those operations.
@@ -143,12 +154,17 @@ python3 -I scripts/storage-cluster-benchmark.py run \
   --agents 32 --iterations 8
 ```
 
-The environment must already contain the normal Spawn owner configuration. The
-runner refuses to start unless the filesystem can hold every mounted dataset
-plus a 20 GiB reserve. By default the controller drives **synchronized turns**:
+The environment must already contain the normal Spawn owner configuration,
+including `SPAWN_WORKSPACE_ROOT`. The runner checks that workspace filesystem
+(not merely the golden source) for every mounted dataset plus a 20 GiB reserve,
+and separately checks source space for published artifacts. By default the
+controller drives **synchronized turns**:
 the initial prompt runs iteration zero, and it sends the next input only after
-every agent's previous `turn.stopped`. Each measured turn is exactly one
-workload Bash call. An additional finalization turn writes `.spawn/report.md`
+every agent's previous `turn.stopped`, counted across the merged event history
+rather than only the latest tail. Each measured turn must contain exactly one
+workload Bash call and one result checkpoint; the timing analysis rejects extra
+Bash calls instead of attaching the artifact to an unrelated command. An
+additional finalization turn writes `.spawn/report.md`
 only after all measured turns, keeping report generation out of iteration
 latency. This forces a real turn boundary and checkpoint per iteration instead
 of assuming that eight tool calls in one model turn necessarily produce eight
@@ -174,7 +190,9 @@ artifact hash, and checks that `golden/` and `tools/` are unchanged. It reports:
 - cluster wall time and stragglers for each iteration number;
 - whole-run verified read bytes and new artifact bytes;
 - deduplicated model token usage and transcript archive failure events;
-- one-second CPU, load, memory, free-space and block-device I/O samples;
+- one-second CPU, load, memory, workspace-free-space and whole-block-device I/O
+  samples (partition counters are excluded so a disk and its partitions are not
+  added together);
 - source size before cleanup and the number of fully verified agents.
 
 The result directory keeps the configuration, task mapping, per-agent event

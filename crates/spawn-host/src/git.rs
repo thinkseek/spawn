@@ -1362,10 +1362,10 @@ impl GitWorkspace {
             return Err(stale_refusal(&branch, Some(&kept)));
         }
         let reference = format!("refs/heads/{branch}");
-        let mut parent = self.commit_and_tree(&reference);
+        let mut parent = self.commit_and_tree(&reference)?;
         if parent.is_none() {
             take_back()?;
-            parent = self.commit_and_tree(&reference);
+            parent = self.commit_and_tree(&reference)?;
             if parent.is_none() {
                 return self.recreate(&branch, &directory, &index, message);
             }
@@ -1408,23 +1408,39 @@ impl GitWorkspace {
     }
 
     /// The commit `reference` names and that commit's tree, read by one git
-    /// process. `None` is the branch-gone case: the caller takes the branch
-    /// back or recreates it, as the previous existence check did.
-    fn commit_and_tree(&self, reference: &str) -> Option<(String, String)> {
-        let answer = self
-            .git_output(&[
-                "rev-parse",
-                &format!("{reference}^{{commit}}"),
-                &format!("{reference}^{{tree}}"),
-            ])
-            .ok()?;
+    /// process. `None` is the branch-gone case: a commit whose tree cannot be
+    /// read is an error, not permission to recreate the branch.
+    fn commit_and_tree(&self, reference: &str) -> Result<Option<(String, String)>, WorkspaceError> {
+        let answer = match self.git_output(&[
+            "rev-parse",
+            &format!("{reference}^{{commit}}"),
+            &format!("{reference}^{{tree}}"),
+        ]) {
+            Ok(answer) => answer,
+            Err(error) => {
+                if self
+                    .git_output(&[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("{reference}^{{commit}}"),
+                    ])
+                    .is_ok()
+                {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+        };
         let mut lines = answer.lines();
-        let commit = lines.next()?.to_string();
-        let tree = lines.next()?.to_string();
+        let commit = lines.next().unwrap_or_default();
+        let tree = lines.next().unwrap_or_default();
         if commit.is_empty() || tree.is_empty() || lines.next().is_some() {
-            return None;
+            return Err(WorkspaceError::Unavailable(format!(
+                "rev-parse returned an invalid commit/tree pair for {reference}"
+            )));
         }
-        Some((commit, tree))
+        Ok(Some((commit.to_string(), tree.to_string())))
     }
 
     /// Make `branch`, gone from the store, again from the workspace in

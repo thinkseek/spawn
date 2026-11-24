@@ -11,6 +11,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -24,6 +25,7 @@ const USAGE: &str = "spawn storage benchmark\n\
 Usage: cargo run --release -p spawn-host --example storage_benchmark -- [options]\n\
 \n\
   --root <new-directory>     Scratch root (default: a unique temporary path)\n\
+  --source-revision <sha>    Spawn source revision recorded in the report\n\
   --iterations <n>           Measured cycles (default: 40)\n\
   --warmup <n>               Warm-up cycles (default: 5)\n\
   --files <n>                Workspace files (default: 512)\n\
@@ -42,6 +44,7 @@ dedicated benchmark database, never the live store. A unique schema is used.\n";
 #[derive(Debug)]
 struct Config {
     root: Option<PathBuf>,
+    source_revision: Option<String>,
     iterations: usize,
     warmup: usize,
     files: usize,
@@ -58,6 +61,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             root: None,
+            source_revision: None,
             iterations: 40,
             warmup: 5,
             files: 512,
@@ -94,6 +98,12 @@ fn config() -> Result<Option<Config>, String> {
                         .next()
                         .ok_or_else(|| "--root needs a path".to_string())?,
                 ));
+            }
+            "--source-revision" => {
+                config.source_revision =
+                    Some(arguments.next().ok_or_else(|| {
+                        "--source-revision needs a full Git commit id".to_string()
+                    })?);
             }
             "--iterations" => config.iterations = number(&mut arguments, "--iterations")?,
             "--warmup" => config.warmup = number(&mut arguments, "--warmup")?,
@@ -141,6 +151,22 @@ fn config() -> Result<Option<Config>, String> {
             "--oversized-file-bytes cannot be combined with --remount-every: an oversized file is intentionally not preserved by unmount"
                 .to_string(),
         );
+    }
+    if let Some(revision) = &config.source_revision {
+        if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("--source-revision must be a full 40-character Git commit id".to_string());
+        }
+    }
+    let last_cycle = config
+        .warmup
+        .checked_add(config.iterations)
+        .and_then(|cycles| cycles.checked_sub(1))
+        .ok_or_else(|| "warmup plus iterations is too large".to_string())?;
+    let marker_bytes = format!("cycle={last_cycle} edit={}", config.edits - 1).len();
+    if config.file_bytes < marker_bytes {
+        return Err(format!(
+            "--file-bytes must be at least {marker_bytes} to hold the edit marker"
+        ));
     }
     Ok(Some(config))
 }
@@ -283,6 +309,58 @@ fn git_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn binary_sha256() -> Result<String, String> {
+    let executable =
+        env::current_exe().map_err(|error| format!("find the benchmark binary: {error}"))?;
+    let output = Command::new("sha256sum")
+        .arg(&executable)
+        .output()
+        .map_err(|error| format!("hash {}: {error}", executable.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sha256sum failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let answer = String::from_utf8_lossy(&output.stdout);
+    let hash = answer.split_whitespace().next().unwrap_or_default();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("sha256sum returned an invalid binary hash".to_string());
+    }
+    Ok(hash.to_string())
+}
+
+fn assert_oversized_excluded(
+    repo: &Path,
+    branch: &BranchName,
+    required: bool,
+) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    let output = git_command("git")
+        .arg(format!("--git-dir={}", repo.display()))
+        .args([
+            "ls-tree",
+            "--name-only",
+            &format!("refs/heads/{branch}"),
+            "--",
+            "oversized.bin",
+        ])
+        .output()
+        .map_err(|error| format!("inspect the committed oversized path: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-tree failed for oversized.bin: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        return Err("oversized.bin was included in a checkpoint".to_string());
+    }
+    Ok(())
+}
+
 fn check_repository(repo: &Path) -> Result<(), String> {
     let output = git_command("git")
         .arg(format!("--git-dir={}", repo.display()))
@@ -353,6 +431,7 @@ fn run(mut config: Config) -> Result<Value, String> {
     ) {
         return Err("the seeded workspace did not produce a commit".to_string());
     }
+    assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
 
     let archive = LocalTranscriptArchive::new(scratch.root.join(".transcripts"));
     let agent = AgentId::new("agent_storage_benchmark").map_err(|error| error.to_string())?;
@@ -408,6 +487,7 @@ fn run(mut config: Config) -> Result<Value, String> {
                 "cycle {cycle}: checkpoint result did not match recreate={recreate}"
             ));
         }
+        assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
         if measured {
             samples.push("checkpoint_changed", elapsed);
         }
@@ -420,6 +500,7 @@ fn run(mut config: Config) -> Result<Value, String> {
         if !matches!(unchanged, Commit::Unchanged) {
             return Err(format!("cycle {cycle}: the no-op checkpoint made a commit"));
         }
+        assert_oversized_excluded(&repo, &branch, config.oversized_file_bytes.is_some())?;
         if measured {
             samples.push("checkpoint_noop", elapsed);
         }
@@ -519,6 +600,7 @@ fn run(mut config: Config) -> Result<Value, String> {
     check_repository(&repo)?;
 
     let cycle_seconds: f64 = cycle_times.iter().sum::<f64>() / 1000.0;
+    let benchmark_binary_sha256 = binary_sha256()?;
     let mut operations = samples.report();
     operations["cycle"] = summary(&cycle_times);
     Ok(json!({
@@ -540,6 +622,8 @@ fn run(mut config: Config) -> Result<Value, String> {
         },
         "environment": {
             "git_version": git_version(),
+            "spawn_source_revision": config.source_revision,
+            "benchmark_binary_sha256": benchmark_binary_sha256,
             "scratch_root": scratch.root,
         },
         "operations": operations,
