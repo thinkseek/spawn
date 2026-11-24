@@ -343,7 +343,7 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
         terminals.clone(),
         config,
     )
-    .with_clock(clock);
+    .with_clock(clock.clone());
 
     submit(
         &memory,
@@ -358,6 +358,12 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
         },
     );
     bridge.tick().expect("start");
+    let start_deadline = Instant::now() + Duration::from_secs(20);
+    while bridge.starts_pending() && Instant::now() < start_deadline {
+        clock.advance(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(25));
+        bridge.tick().expect("start");
+    }
     let started = events(&memory)
         .into_iter()
         .find_map(|event| match event.kind {

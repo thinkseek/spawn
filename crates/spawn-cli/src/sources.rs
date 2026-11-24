@@ -946,6 +946,14 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(branch.as_str())?.store.mount(branch)
     }
 
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        self.route(branch.as_str())?.store.mount_when(branch, ready)
+    }
+
     /// Every mission's store keeps its workspaces under the one root, so
     /// the default store names any of them; nothing is routed.
     fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
@@ -971,6 +979,23 @@ impl WorkspaceStore for MissionWorkspaces {
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         self.route(workspace.sandbox())?.store.unmount(workspace)
+    }
+
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
+        self.route(workspace.sandbox())?
+            .store
+            .unmount_when(workspace, ready)
+    }
+
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        self.route(workspace.sandbox()).map_or_else(
+            |_| self.default.is_mounted(workspace),
+            |routed| routed.store.is_mounted(workspace),
+        )
     }
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {

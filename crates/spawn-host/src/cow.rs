@@ -86,7 +86,9 @@ use std::time::Duration;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{Branch, Commit, WORKSPACE_STALE, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{
+    Branch, Commit, Hold, MOUNT_CANCELLED, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+};
 
 use crate::git::{GitWorkspace, report};
 
@@ -2723,7 +2725,19 @@ impl WorkspaceStore for CowWorkspace {
     /// is never replaced ([`WORKSPACE_NOT_OWNED`]); a tree that could write
     /// outside its directory is refused ([`UNSAFE_TREE`]).
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
+        self.mount_when(branch, &|| Ok(()))
+    }
+
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
         let _lock = self.lock_branch(branch.as_str())?;
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: MOUNT_CANCELLED.to_string(),
+            message: why,
+        })?;
         self.clear_diagnostics();
         self.mount_locked(branch.as_str())
     }
@@ -2746,9 +2760,41 @@ impl WorkspaceStore for CowWorkspace {
     /// workspaces (`<root>/.transcripts`) is never a workspace and is never
     /// touched.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+        self.unmount_when(workspace, &|| Ok(()))
+    }
+
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
         let _lock = self.lock_branch(workspace.sandbox())?;
+        ready()?;
         self.clear_diagnostics();
         self.unmount_locked(workspace)
+    }
+
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        let Ok(directory) = self.checked_path(workspace) else {
+            return false;
+        };
+        let branch = workspace.sandbox();
+        if self.swap_path(branch).exists() || self.installing_path(branch).exists() {
+            return false;
+        }
+        let Ok(Some(meta)) = present(&directory) else {
+            return false;
+        };
+        let Ok(Some(state)) = read_state(&self.state_path(branch)) else {
+            return false;
+        };
+        Self::owned(&directory, &meta, &state).is_ok()
+    }
+
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        self.lock_branch(workspace.sandbox())
+            .ok()
+            .map(|lock| Box::new(lock) as Hold)
     }
 
     /// The Git store's notices of files over the size cap a checkpoint

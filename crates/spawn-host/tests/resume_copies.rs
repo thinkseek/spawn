@@ -71,6 +71,16 @@ fn events(store: &MemoryStore) -> Vec<NewEvent> {
         .collect()
 }
 
+fn settle_start(bridge: &mut Bridge, clock: &ManualClock, step: &str) {
+    bridge.tick().expect(step);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while bridge.starts_pending() && std::time::Instant::now() < deadline {
+        clock.advance(std::time::Duration::from_millis(25));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        bridge.tick().expect(step);
+    }
+}
+
 #[test]
 fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
     let base = std::env::temp_dir().join(format!("spawn-resume-copies-{}", std::process::id()));
@@ -113,7 +123,7 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
             charter: None,
         },
     );
-    bridge.tick().expect("start");
+    settle_start(&mut bridge, &clock, "start");
     let directory: PathBuf = root.join("agent_one");
     assert!(directory.is_dir(), "mounted: {:?}", events(&memory));
     assert_eq!(memory.submitted_held().len(), 1, "the prompt was typed");
@@ -156,7 +166,7 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
             model: None,
         },
     );
-    bridge.tick().expect("resume");
+    settle_start(&mut bridge, &clock, "resume");
     assert!(directory.is_dir(), "mounted again: {:?}", events(&memory));
     assert!(
         !directory.join("notes.txt").exists(),

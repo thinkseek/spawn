@@ -174,6 +174,16 @@ pub const WORKSPACE_STALE: &str = "WorkspaceStale";
 /// tried again later. The message says why.
 pub const MERGE_WAITS: &str = "MergeWaits";
 
+/// The [`WorkspaceError::Refused`] code of a background mount that was
+/// cancelled before installing or replacing the workspace
+/// ([`WorkspaceStore::mount_when`]).
+pub const MOUNT_CANCELLED: &str = "MountCancelled";
+
+/// The [`WorkspaceError::Refused`] code of a delayed/abandoned unmount that
+/// observed a newer mount or live execution under the branch lock
+/// ([`WorkspaceStore::unmount_when`]).
+pub const UNMOUNT_IN_USE: &str = "UnmountInUse";
+
 /// What [`WorkspaceStore::hold`] returns: the workspace is held until it is
 /// dropped.
 pub type Hold = Box<dyn std::any::Any + Send>;
@@ -306,6 +316,23 @@ pub trait WorkspaceStore: Send + Sync {
     /// under that path.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError>;
 
+    /// Materialize `branch` only while `ready` still wants the mount.
+    ///
+    /// Production stores check `ready` under the branch's lock right before
+    /// creating or replacing any workspace tree; if `ready` returns an error,
+    /// nothing is modified and [`MOUNT_CANCELLED`] is returned.
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: MOUNT_CANCELLED.to_string(),
+            message: why,
+        })?;
+        self.mount(branch)
+    }
+
     /// `workspace` as this store names it now ([`Self::mount`]). An id
     /// recorded under another spelling of the store's root (the root as it
     /// was configured, before a version that resolves it through its
@@ -325,6 +352,30 @@ pub trait WorkspaceStore: Send + Sync {
 
     /// Unmount the workspace. Committed state stays on the branch.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
+
+    /// Unmount `workspace` only while `ready` still allows it.
+    ///
+    /// Production stores check `ready` under the branch's lock before
+    /// removing or stopping the workspace; if `ready` returns an error
+    /// (such as [`UNMOUNT_IN_USE`] or a transient log read error), nothing
+    /// is removed and that error is returned.
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
+        ready()?;
+        self.unmount(workspace)
+    }
+
+    /// Whether `workspace` is currently mounted in this store. Used when a
+    /// reclaimed start considers reusing a recorded `CommandStep::Mounted`
+    /// workspace whose `CommandStep::MountReleased` may have failed to append
+    /// after an unmount succeeded.
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        let _ = workspace;
+        true
+    }
 
     /// Merge `main` into `branch`, which is not mounted, only when the merge
     /// is clean: the branch moves to the merge commit

@@ -214,7 +214,27 @@ impl Rig {
                 charter: None,
             },
         );
-        self.bridge.tick().expect("tick");
+        for attempt in 0..1_024 {
+            self.bridge.tick().expect("tick");
+            if self.events().into_iter().any(|kind| {
+                matches!(
+                    kind,
+                    EventKind::CommandFinished {
+                        command_id: CommandId(1),
+                        ..
+                    }
+                )
+            }) {
+                return;
+            }
+            self.store.expire_leases();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        panic!("the start did not finish");
     }
 
     fn input(&mut self, key: &str, text: &str) {

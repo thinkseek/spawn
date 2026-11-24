@@ -407,6 +407,30 @@ fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
         .expect("submit");
 }
 
+fn settle_start(bridge: &mut Bridge, store: &Arc<MemoryStore>, id: u64) {
+    for attempt in 0..1_024 {
+        bridge.tick().expect("start or resume");
+        if store
+            .read_global(GlobalPosition(0), 1000)
+            .expect("read")
+            .iter()
+            .any(|record| {
+                matches!(record.event.kind, EventKind::CommandFinished { command_id, .. }
+                    if command_id == CommandId(id))
+            })
+        {
+            return;
+        }
+        store.expire_leases();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    panic!("command {id} did not finish");
+}
+
 /// The transcript path the start named.
 fn transcript(store: &MemoryStore) -> String {
     store
@@ -539,7 +563,7 @@ fn the_bridge_records_the_jobs_of_an_execution_from_its_transcript() {
             charter: None,
         },
     );
-    bridge.tick().expect("start");
+    settle_start(&mut bridge, &store, 1);
     let path = transcript(&store);
     store.append_file(&path, GATE_TURN);
     bridge.tick().expect("read the turn");
@@ -574,7 +598,7 @@ fn the_bridge_records_the_jobs_of_an_execution_from_its_transcript() {
             model: None,
         },
     );
-    bridge.tick().expect("resume");
+    settle_start(&mut bridge, &store, 3);
     let path = resumed_transcript(&store);
     store.append_file(&path, RESUMED_TURN);
     bridge.tick().expect("read the resumed turn");

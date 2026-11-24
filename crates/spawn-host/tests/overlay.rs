@@ -460,6 +460,50 @@ fn an_upperdir_outlives_its_holder_and_is_mounted_again() {
     unmounted(&second, &workspace);
 }
 
+#[test]
+fn an_overlay_workspace_is_mounted_only_while_its_holder_serves_overlay() {
+    let Some(scratch) = scratch("overlay-is-mounted") else {
+        return;
+    };
+    let repo = seed(&scratch, SEED);
+    let root = scratch.join("ws");
+    let first = OverlayWorkspace::new(&repo, &root);
+    first.ensure_branch(&branch("agent"), None).unwrap();
+    let workspace = first.mount(&branch("agent")).unwrap();
+    assert!(first.is_mounted(&workspace));
+    drop(first);
+
+    let second = OverlayWorkspace::new(&repo, &root);
+    assert!(second.holder_pid(&workspace).is_none());
+    assert!(!second.is_mounted(&workspace));
+    let again = remounted(&second, "agent");
+    assert_eq!(again, workspace);
+    assert!(second.is_mounted(&workspace));
+    unmounted(&second, &workspace);
+    assert!(!second.is_mounted(&workspace));
+}
+
+#[test]
+fn is_mounted_is_false_for_detached_overlay_directories_without_holder() {
+    let scratch = Scratch::new("overlay-detached-dir");
+    let repo = seed(&scratch, SEED);
+    let root = scratch.join("ws");
+    let store = OverlayWorkspace::new(&repo, &root);
+    let merged = store.root().join("agent");
+    let workspace = WorkspaceId::new(format!("agent:{}", merged.display())).unwrap();
+    let state = store
+        .upper_dir(&workspace)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::create_dir_all(&merged).unwrap();
+    fs::create_dir_all(state.join("upper")).unwrap();
+    fs::create_dir_all(state.join("work")).unwrap();
+    fs::write(state.join("lower"), "deadbeef\n").unwrap();
+    assert!(!store.is_mounted(&workspace));
+}
+
 /// A process entered into the workspace with `sh -c "<script>"`, once it
 /// has printed its first line (`in`): it is inside by then. It lives until
 /// [`release`] closes its stdin, when `script` ends in a `read`.

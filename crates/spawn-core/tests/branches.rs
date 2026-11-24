@@ -49,6 +49,26 @@ fn bridge(store: &Arc<MemoryStore>) -> Bridge {
     .with_transcript_archive(store.clone())
 }
 
+fn start_pass(bridge: &mut Bridge, store: &MemoryStore) -> TickReport {
+    let mut total = TickReport::default();
+    for attempt in 0..1_024 {
+        let mut report = bridge.tick().expect("resumable start");
+        total.commands += report.commands;
+        total.warnings.append(&mut report.warnings);
+        total.notes.append(&mut report.notes);
+        if report.commands == 0 {
+            return total;
+        }
+        store.expire_leases();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    panic!("the start did not finish in 1,024 claims")
+}
+
 fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
     store
         .submit(
@@ -151,7 +171,8 @@ fn a_start_from_another_agent_forks_its_head_and_records_the_fork() {
     let source = BranchName::new("agent_source").expect("valid branch");
     store.ensure_branch(&source, None).expect("source branch");
     start(&store, Some("agent_source"));
-    quiet(&bridge(&store).tick().expect("tick"));
+    let mut bridge = bridge(&store);
+    quiet(&start_pass(&mut bridge, &store));
     assert_eq!(
         store.workspace_calls()[1..4],
         [
@@ -175,7 +196,8 @@ fn an_existing_branch_ignores_from_with_a_warning() {
     let own = BranchName::new("agent_one").expect("valid branch");
     store.ensure_branch(&own, None).expect("own branch");
     start(&store, Some(&"b".repeat(40)));
-    let report = bridge(&store).tick().expect("tick");
+    let mut bridge = bridge(&store);
+    let report = start_pass(&mut bridge, &store);
     assert!(
         report
             .warnings
@@ -220,7 +242,7 @@ fn main_is_merged_cleanly_when_an_execution_starts_and_never_while_it_runs() {
     assert!(checkpoints(&store).is_empty());
     // The waiting record goes in; the start, back after its lease, runs.
     clock.advance(std::time::Duration::from_mins(3));
-    quiet(&bridge.tick().expect("the log is back"));
+    quiet(&start_pass(&mut bridge, &store));
     assert_eq!(
         checkpoints(&store),
         [(CheckpointReason::BaseMerged, merged.as_str().to_string())]
@@ -267,7 +289,7 @@ fn a_conflict_at_a_start_leaves_the_branch_and_is_recorded_once() {
         marked: true,
     });
     start(&store, None);
-    let report = bridge.tick().expect("start");
+    let report = start_pass(&mut bridge, &store);
     assert!(
         report
             .warnings
@@ -308,7 +330,7 @@ fn a_conflict_at_a_start_leaves_the_branch_and_is_recorded_once() {
             model: None,
         },
     );
-    bridge.tick().expect("resume");
+    start_pass(&mut bridge, &store);
     assert_eq!(conflicts(&store).len(), 1);
 }
 
@@ -335,13 +357,13 @@ fn a_failed_final_checkpoint_keeps_the_workspace_and_is_tried_again() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    bridge.tick().expect("start");
+    start_pass(&mut bridge, &store);
     store.fail_commits(true);
     submit(&store, "key_stop", CommandAction::Stop);
     bridge.tick().expect("stop");
     assert_eq!(unmounts(&store), 0, "the workspace stays");
     assert!(ended(&store).is_empty());
-    let report = bridge.tick().expect("again");
+    let report = start_pass(&mut bridge, &store);
     assert!(
         report
             .warnings
@@ -382,7 +404,7 @@ fn stalls(store: &MemoryStore) -> Vec<(EndCause, u32)> {
 fn stalled(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Bridge {
     let mut bridge = bridge(store).with_clock(clock.clone());
     start(store, None);
-    bridge.tick().expect("start");
+    start_pass(&mut bridge, store);
     store.fail_commits(true);
     submit(store, "key_stop", CommandAction::Stop);
     // The stop tries once, and the same tick's pass over executions again.
@@ -519,7 +541,7 @@ fn resumed(clock: &Arc<ManualClock>) -> (Arc<MemoryStore>, Bridge) {
     }
     let mut bridge = bridge(&store).with_clock(clock.clone());
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     transcript(&store, &[prompt("1"), turn_end("1")]);
     quiet(&bridge.tick().expect("read the turn"));
     quiet(&bridge.tick().expect("checkpoint"));
@@ -533,7 +555,7 @@ fn resumed(clock: &Arc<ManualClock>) -> (Arc<MemoryStore>, Bridge) {
             model: None,
         },
     );
-    let report = bridge.tick().expect("resume and type the prompt");
+    let report = start_pass(&mut bridge, &store);
     // Each memory mount is a new directory: the transcript is put back
     // there, and said so.
     assert!(
@@ -671,7 +693,7 @@ fn a_resumed_execution_reads_its_own_lines_by_position_whatever_time_they_claim(
 /// refused: the branch holds it, the log does not.
 fn checkpoint_unrecorded(store: &MemoryStore, bridge: &mut Bridge) {
     start(store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(bridge, store));
     transcript(store, &tool_call("toolu_1"));
     quiet(&bridge.tick().expect("read the tool call"));
     let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid");
@@ -734,7 +756,7 @@ fn a_record_the_log_keeps_refusing_holds_up_only_its_session() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    bridge.tick().expect("start one");
+    start_pass(&mut bridge, &store);
     let two = SessionId::new("session_two").expect("valid session");
     store
         .submit(
@@ -754,7 +776,7 @@ fn a_record_the_log_keeps_refusing_holds_up_only_its_session() {
             },
         )
         .expect("submit succeeds");
-    bridge.tick().expect("start two");
+    start_pass(&mut bridge, &store);
 
     // Session one's checkpoint is taken; the log never takes its record.
     let one = SessionId::new("session_one").expect("valid session");
@@ -801,7 +823,7 @@ fn a_stale_workspace_ends_its_execution_instead_of_retrying_its_checkpoint() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    bridge.tick().expect("start");
+    start_pass(&mut bridge, &store);
     store.make_stale(true);
     transcript(&store, &[prompt("1"), turn_end("1")]);
     let mut warnings = bridge.tick().expect("read the turn").warnings;
@@ -839,7 +861,7 @@ fn a_forged_turn_end_mid_turn_does_not_merge_main() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     let merges = |store: &MemoryStore| {
         store
             .workspace_calls()
@@ -892,6 +914,13 @@ impl WorkspaceStore for Telling {
     ) -> Result<spawn_core::id::WorkspaceId, spawn_core::port::WorkspaceError> {
         self.inner.mount(branch)
     }
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<spawn_core::id::WorkspaceId, spawn_core::port::WorkspaceError> {
+        self.inner.mount_when(branch, ready)
+    }
     fn commit(
         &self,
         workspace: &spawn_core::id::WorkspaceId,
@@ -906,6 +935,16 @@ impl WorkspaceStore for Telling {
         workspace: &spawn_core::id::WorkspaceId,
     ) -> Result<(), spawn_core::port::WorkspaceError> {
         self.inner.unmount(workspace)
+    }
+    fn unmount_when(
+        &self,
+        workspace: &spawn_core::id::WorkspaceId,
+        ready: &dyn Fn() -> Result<(), spawn_core::port::WorkspaceError>,
+    ) -> Result<(), spawn_core::port::WorkspaceError> {
+        self.inner.unmount_when(workspace, ready)
+    }
+    fn is_mounted(&self, workspace: &spawn_core::id::WorkspaceId) -> bool {
+        self.inner.is_mounted(workspace)
     }
     fn merge_base(
         &self,
@@ -987,7 +1026,7 @@ fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once(
     )
     .with_transcript_archive(store.clone());
     start(&store, None);
-    bridge.tick().expect("start");
+    start_pass(&mut bridge, &store);
     transcript(&store, &[prompt("1"), turn_end("1")]);
     let mut warnings = Vec::new();
     for _ in 0..2 {
@@ -1045,7 +1084,7 @@ fn a_notice_not_typed_yet_survives_a_restart_of_the_bridge() {
     };
     let mut bridge = build(&telling);
     start(&store, None);
-    bridge.tick().expect("start");
+    start_pass(&mut bridge, &store);
     transcript(&store, &[prompt("1"), turn_end("1")]);
     for _ in 0..2 {
         bridge.tick().expect("checkpoint");
@@ -1071,7 +1110,7 @@ fn a_checkpoint_whose_commit_failed_stays_due_and_is_committed_next_tick() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     transcript(&store, &[prompt("1"), turn_end("1")]);
     quiet(&bridge.tick().expect("read the turn end"));
     store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
@@ -1109,7 +1148,7 @@ fn a_start_whose_prompt_may_have_been_typed_is_not_discarded() {
     store.fail_next_submit();
     store.fail_commits(true);
     start(&store, None);
-    bridge.tick().expect("the start fails");
+    start_pass(&mut bridge, &store);
     assert_eq!(unmounts(&store), 0, "the workspace and its work stay");
     assert!(ended(&store).is_empty());
     bridge.tick().expect("the end is tried again");
@@ -1130,7 +1169,7 @@ fn a_start_that_typed_nothing_is_discarded() {
     store.set_pane(&TerminalName::for_execution(&execution), "loading…");
     store.fail_commits(true);
     start(&store, None);
-    bridge.tick().expect("the start fails");
+    start_pass(&mut bridge, &store);
     assert_eq!(ended(&store), vec![EndCause::Lost]);
     assert_eq!(unmounts(&store), 1);
 }
@@ -1158,7 +1197,7 @@ fn a_turn_end_is_recorded_after_its_checkpoint() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     transcript(&store, &[prompt("1")]);
     quiet(&bridge.tick().expect("read the prompt"));
     store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
@@ -1188,7 +1227,7 @@ fn an_unchanged_turn_is_checkpointed_before_its_end_is_recorded() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     let before = commits(&store);
     transcript(&store, &[prompt("1"), turn_end("1")]);
     quiet(&bridge.tick().expect("read the turn"));
@@ -1210,7 +1249,7 @@ fn a_turn_end_waits_for_its_checkpoint_when_the_commit_fails() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
     store.fail_commits(true);
     transcript(&store, &[prompt("1"), turn_end("1")]);
@@ -1251,7 +1290,7 @@ fn the_bridge_types_only_while_it_holds_the_workspace() {
     }
     let mut bridge = bridge(&store).with_clock(clock.clone());
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     transcript(&store, &[prompt("1"), turn_end("1")]);
     quiet(&bridge.tick().expect("read the turn"));
     submit(
@@ -1301,7 +1340,7 @@ fn what_an_engine_writes_as_it_dies_is_in_its_final_checkpoint() {
         let store = store();
         let mut bridge = bridge(&store);
         start(&store, None);
-        bridge.tick().expect("start");
+        start_pass(&mut bridge, &store);
         store.write_as_it_dies(&terminal);
         match how {
             "stop" => submit(&store, "key_stop", CommandAction::Stop),
@@ -1341,7 +1380,7 @@ fn a_runner_that_outlives_its_kill_holds_its_workspace_until_it_is_gone() {
     store.set_pane(&terminal, READY);
     let mut bridge = bridge(&store).with_clock(clock.clone());
     start(&store, None);
-    bridge.tick().expect("start");
+    start_pass(&mut bridge, &store);
     store.write_as_it_dies(&terminal);
     store.outlive_kills(&terminal, 20);
     submit(&store, "key_stop", CommandAction::Stop);
@@ -1421,7 +1460,7 @@ fn a_failing_commit_is_reported_once_until_it_gets_through() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     store.fail_commits_saying(Some(spawn_core::port::WorkspaceError::Unavailable(
         "git rev-parse refs/heads/agent_one: fatal: ambiguous argument".to_string(),
     )));
@@ -1472,7 +1511,7 @@ fn a_commit_failure_is_reported_once_per_cause() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     let add = |file: &str| {
         Unavailable(format!(
             "git add -A: error: insufficient permission for adding an object to repository \
@@ -1573,7 +1612,7 @@ fn a_branch_made_again_by_a_checkpoint_is_recorded_before_the_checkpoint() {
     let store = store();
     let mut bridge = bridge(&store);
     start(&store, None);
-    quiet(&bridge.tick().expect("start"));
+    quiet(&start_pass(&mut bridge, &store));
     let branch = BranchName::new("agent_one").expect("valid branch");
     store.lose_branch(&branch);
     transcript(&store, &tool_call("toolu_1"));

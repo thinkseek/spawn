@@ -50,6 +50,7 @@
 //! the same clock, a step run on every pass and a step run on change make
 //! the same orders, deliveries, escalations and digests.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -77,28 +78,58 @@ fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration 
     interval.saturating_mul(failures.clamp(1, MAX_BACKOFF_INTERVALS))
 }
 
-/// How long `spawn tick` goes on ticking for an end whose kill waits off
-/// the Bridge's loop: longer than a host's kill takes at its bound (tmux:
-/// 7 s) plus a waiting command's retry (1 s by default).
+/// Most intervals a execution end waits before its kill finishes.
+/// Longer than a host's kill takes at its bound (tmux: 7 s) plus a
+/// waiting command's retry (1 s by default).
 const TICK_ENDS_LIMIT: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// Most time `spawn tick` goes on ticking for a start or resume whose mount
+/// runs off the Bridge thread or whose engine has not painted its prompt yet:
+/// covers a mount plus two prompt readiness budgets (trust dialog + prompt)
+/// and any abandon kill.
+const TICK_STARTS_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// `spawn tick`: one Bridge and Observer pass. A command whose end waits for
-/// its kill, which runs off the Bridge's loop (backlog P7), would finish
-/// only at a later pass; this one-shot pass ticks the Bridge again, every
-/// 50 ms, until no end waits (at most [`TICK_ENDS_LIMIT`]), so a stop it
-/// claims is finished when it returns, as before the kill left the loop.
-pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
-    let (mut bridge, mut observer) = runtime(flags)?;
+/// its kill, which runs off the Bridge's loop (backlog P7), or a start or
+/// resume waiting on its mount worker or prompt readiness, would finish only
+/// at a later pass; this one-shot pass ticks the Bridge again until neither
+/// waits (within [`TICK_ENDS_LIMIT`] or [`TICK_STARTS_LIMIT`]), so commands it
+/// claims are finished when it returns, as before.
+fn tick_bridge(
+    bridge: &mut spawn_core::bridge::Bridge,
+) -> Result<spawn_core::bridge::TickReport, String> {
     let mut report = bridge.tick().map_err(|error| error.to_string())?;
-    let deadline = std::time::Instant::now() + TICK_ENDS_LIMIT;
-    while bridge.ends_pending() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Its commands are the first pass's claimed again (a waiting stop),
-        // not new ones: `commands=` says what this tick was given.
+    let mut seen: BTreeSet<spawn_core::id::CommandId> =
+        report.command_ids.iter().copied().collect();
+    let start = std::time::Instant::now();
+    let mut had_start = bridge.starts_pending();
+    while (bridge.ends_pending() || bridge.starts_pending())
+        && start.elapsed()
+            < if had_start {
+                TICK_STARTS_LIMIT
+            } else {
+                TICK_ENDS_LIMIT
+            }
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        // Count distinct command ids claimed across all passes of this tick:
+        // a retried pending stop, start, or resume is not double-counted,
+        // while a command queued behind it that unblocks once it finishes
+        // is counted once.
         let more = bridge.tick().map_err(|error| error.to_string())?;
+        seen.extend(more.command_ids.iter().copied());
+        had_start |= bridge.starts_pending();
         report.warnings.extend(more.warnings);
         report.notes.extend(more.notes);
     }
+    report.commands = seen.len();
+    report.command_ids = seen.into_iter().collect();
+    Ok(report)
+}
+
+pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
+    let (mut bridge, mut observer) = runtime(flags)?;
+    let report = tick_bridge(&mut bridge)?;
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
     }
@@ -977,7 +1008,7 @@ mod tests {
 
     use super::{
         MAX_FAILURES, MAX_OUTAGE_INTERVALS, Pace, Schedule, Step, Waited, backoff,
-        pause_unless_stopped, stop_on_signal, wait_unless_stopped,
+        pause_unless_stopped, stop_on_signal, tick_bridge, wait_unless_stopped,
     };
 
     /// A watch a unit test makes ready or permanently failing.
@@ -1436,5 +1467,112 @@ mod tests {
         assert_eq!(backoff(interval, 0), interval);
         assert_eq!(backoff(interval, 3), interval * 3);
         assert_eq!(backoff(interval, 500), interval * 30);
+    }
+
+    #[test]
+    fn tick_bridge_deduplicates_retried_start_and_counts_unblocked_queued_start() {
+        use spawn_core::command::{CommandAction, Submission};
+        use spawn_core::event::{ENGINE, EventKind, GlobalPosition};
+        use spawn_core::id::{
+            AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+        };
+        use spawn_core::port::{CommandQueue, EventLog};
+
+        const READY: &str = "❯ \n  ready";
+
+        fn submit_start(
+            store: &MemoryStore,
+            agent: &AgentId,
+            session: &SessionId,
+            key: &str,
+            prompt: &str,
+        ) -> CommandId {
+            store
+                .submit(
+                    &Principal::new("tester").expect("principal"),
+                    &Submission {
+                        agent_id: agent.clone(),
+                        session_id: session.clone(),
+                        idempotency_key: IdempotencyKey::new(key).expect("key"),
+                        action: CommandAction::Start {
+                            engine: ENGINE.to_string(),
+                            prompt: prompt.to_string(),
+                            parent_session_id: None,
+                            from: None,
+                            model: None,
+                            charter: None,
+                        },
+                    },
+                )
+                .expect("submit")
+        }
+
+        // Case 1: a single start retried across mount/readiness passes counts once.
+        let store1 = Arc::new(MemoryStore::new("tick-single", Arc::new(SystemClock)));
+        let agent1 = AgentId::new("agent_tick_1").expect("agent");
+        let session1 = SessionId::new("session_tick_1").expect("session");
+        let id1 = submit_start(&store1, &agent1, &session1, "start-1", "say hello");
+        store1.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id1)),
+            READY,
+        );
+        let mut bridge1 = Bridge::new(
+            store1.clone(),
+            store1.clone(),
+            store1.clone(),
+            store1.clone(),
+            BridgeConfig::new("tick-test"),
+        );
+        let report1 = tick_bridge(&mut bridge1).expect("tick_bridge single");
+        assert_eq!(report1.commands, 1);
+        assert_eq!(report1.command_ids, vec![id1]);
+        assert!(!bridge1.starts_pending());
+        assert_eq!(bridge1.session_count(), 1);
+
+        // Case 2: two queued starts on one session count as two distinct commands.
+        let store2 = Arc::new(MemoryStore::new("tick-queued", Arc::new(SystemClock)));
+        let agent2 = AgentId::new("agent_tick_2").expect("agent");
+        let session2 = SessionId::new("session_tick_2").expect("session");
+        let start_1 = submit_start(&store2, &agent2, &session2, "start-1", "say hello");
+        let start_2 = submit_start(&store2, &agent2, &session2, "start-2", "never");
+        store2.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(start_1)),
+            READY,
+        );
+        let mut bridge2 = Bridge::new(
+            store2.clone(),
+            store2.clone(),
+            store2.clone(),
+            store2.clone(),
+            BridgeConfig::new("tick-test"),
+        );
+        let report2 = tick_bridge(&mut bridge2).expect("tick_bridge queued");
+        assert_eq!(report2.commands, 2);
+        assert_eq!(report2.command_ids, vec![start_1, start_2]);
+        assert!(!bridge2.starts_pending());
+        assert_eq!(bridge2.session_count(), 1);
+
+        let finished: Vec<(CommandId, bool, Option<String>)> = store2
+            .read_global(GlobalPosition(0), 1_000)
+            .expect("events")
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::CommandFinished {
+                    command_id,
+                    succeeded,
+                    error,
+                    ..
+                } => Some((command_id, succeeded, error)),
+                _ => None,
+            })
+            .collect();
+        assert!(finished.iter().any(|(id, ok, _)| *id == start_1 && *ok));
+        assert!(finished.iter().any(|(id, ok, err)| {
+            *id == start_2
+                && !*ok
+                && err
+                    .as_deref()
+                    .is_some_and(|msg| msg.contains("already runs an execution"))
+        }));
     }
 }

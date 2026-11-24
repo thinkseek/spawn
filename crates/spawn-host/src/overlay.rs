@@ -50,7 +50,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{Branch, Commit, WORKSPACE_STALE, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{
+    Branch, Commit, Hold, MOUNT_CANCELLED, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+};
 
 use crate::git::{GitWorkspace, git_command, pathspec_batches, report, report_listing};
 
@@ -1369,6 +1371,16 @@ impl WorkspaceStore for OverlayWorkspace {
     /// cannot tell). A state that exists without its `lower` is refused
     /// ([`STATE_UNREADABLE`]), never started over.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
+        self.mount_when(branch, &|| Ok(()))
+    }
+
+    /// Mount the branch's workspace only while `ready` still wants it,
+    /// checked under the workspace lock before creating or replacing state.
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
         let reference = format!("refs/heads/{branch}");
         let head = self
             .lookup(&reference)?
@@ -1385,6 +1397,10 @@ impl WorkspaceStore for OverlayWorkspace {
         })?;
         let _store = self.lock_store(false)?;
         let _lock = self.lock_workspace(branch.as_str())?;
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: MOUNT_CANCELLED.to_string(),
+            message: why,
+        })?;
         let lower = match std::fs::read_to_string(state.join("lower")) {
             Ok(lower) => {
                 self.published_head(&state, &reference)?;
@@ -1527,9 +1543,18 @@ impl WorkspaceStore for OverlayWorkspace {
     ///    step and deleted. Only the kernel's own `work/` subdirectories
     ///    get their permissions changed, and a `*.jsonl` is never deleted.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+        self.unmount_when(workspace, &|| Ok(()))
+    }
+
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
         let state = self.state_dir(workspace)?;
         let merged = self.merged_dir(workspace)?;
         let _lock = self.lock_workspace(workspace.sandbox())?;
+        ready()?;
         match std::fs::symlink_metadata(&state) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1559,6 +1584,30 @@ impl WorkspaceStore for OverlayWorkspace {
         remove_state(&trash).map_err(|error| {
             WorkspaceError::Unavailable(format!("remove {}: {error}", trash.display()))
         })
+    }
+
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        let Ok(state) = self.state_dir(workspace) else {
+            return false;
+        };
+        let Ok(merged) = self.merged_dir(workspace) else {
+            return false;
+        };
+        if !state.join("lower").is_file() {
+            return false;
+        }
+        let Some(holder) = self.live_holder(&state) else {
+            return false;
+        };
+        let relative = merged.strip_prefix("/").unwrap_or(&merged);
+        let root = PathBuf::from(format!("/proc/{}/root", holder.pid)).join(relative);
+        on_overlay(&root).unwrap_or(false)
+    }
+
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        self.lock_workspace(workspace.sandbox())
+            .ok()
+            .map(|lock| Box::new(lock) as Hold)
     }
 
     fn notices(&self, _workspace: &WorkspaceId) -> Vec<String> {

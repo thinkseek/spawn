@@ -255,7 +255,26 @@ impl Fleet {
                 },
             )
             .expect("submit succeeds");
-        self.bridge.tick().expect("tick succeeds")
+        let id = CommandId(self.commands);
+        let mut total = TickReport::default();
+        for attempt in 0..1_024 {
+            let mut report = self.bridge.tick().expect("tick succeeds");
+            total.commands += report.commands;
+            total.warnings.append(&mut report.warnings);
+            total.notes.append(&mut report.notes);
+            if self.events().into_iter().any(|event| {
+                matches!(event.kind, EventKind::CommandFinished { command_id, .. } if command_id == id)
+            }) {
+                return total;
+            }
+            self.store.expire_leases();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        panic!("command {id} did not finish in 1,024 claims")
     }
 
     fn start(&mut self, model: Option<ModelProfile>) -> TickReport {

@@ -231,6 +231,19 @@ impl MemoryStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Make every unfinished command immediately claimable. Test helper for
+    /// driving a resumable handler without waiting on its retry delays.
+    pub fn expire_leases(&self) {
+        let mut state = self.lock();
+        for row in &mut state.commands {
+            if !row.finished
+                && let Some(lease) = row.lease.as_mut()
+            {
+                lease.expires = crate::time::Timestamp(0);
+            }
+        }
+    }
+
     /// What the terminal server answers from now on
     /// ([`TerminalHost::server`]). Test helper.
     pub fn set_terminal_server(&self, seen: ServerSeen) {
@@ -766,6 +779,10 @@ impl WorkspaceStore for MemoryStore {
             state.unmounted_dirty.push(workspace.clone());
         }
         Ok(())
+    }
+
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        self.lock().mounts.contains_key(workspace)
     }
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
