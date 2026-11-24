@@ -1561,6 +1561,16 @@ impl WorkspaceStore for OverlayWorkspace {
         })
     }
 
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        let Ok(state) = self.state_dir(workspace) else {
+            return false;
+        };
+        let Ok(merged) = self.merged_dir(workspace) else {
+            return false;
+        };
+        state.is_dir() && merged.is_dir()
+    }
+
     fn notices(&self, _workspace: &WorkspaceId) -> Vec<String> {
         Vec::new()
     }

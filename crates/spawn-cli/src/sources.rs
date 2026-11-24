@@ -960,6 +960,13 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(workspace.sandbox())?.store.unmount(workspace)
     }
 
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        self.route(workspace.sandbox()).map_or_else(
+            |_| self.default.is_mounted(workspace),
+            |routed| routed.store.is_mounted(workspace),
+        )
+    }
+
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         self.merge_base_when(workspace, &|| Ok(()))
     }

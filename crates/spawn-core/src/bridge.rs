@@ -766,6 +766,8 @@ fn after(
 struct Steps {
     /// The start mounted this workspace.
     mounted: Option<WorkspaceId>,
+    /// How many `CommandStep::Mounted` events were recorded for this command.
+    mounts: u32,
     /// That mount went again before an execution used it.
     released: bool,
     /// The command's execution started.
@@ -776,6 +778,22 @@ struct Steps {
     typed: bool,
     /// How far the command's key went (a key command's steps).
     press: Press,
+}
+
+fn mounted_key(command: CommandId, generation: u32) -> String {
+    if generation <= 1 {
+        format!("{command}:mounted")
+    } else {
+        format!("{command}:mounted:{generation}")
+    }
+}
+
+fn mount_released_key(command: CommandId, generation: u32) -> String {
+    if generation <= 1 {
+        format!("{command}:mount_released")
+    } else {
+        format!("{command}:mount_released:{generation}")
+    }
 }
 
 /// How far a key command's key went, by its steps.
@@ -832,8 +850,16 @@ impl SessionView {
             } if event.source == Source::Bridge => {
                 let steps = self.steps.entry(*command_id).or_default();
                 match step {
-                    CommandStep::Mounted => steps.mounted.clone_from(workspace),
-                    CommandStep::MountReleased => steps.released = true,
+                    CommandStep::Mounted => {
+                        steps.mounted.clone_from(workspace);
+                        steps.released = false;
+                        steps.mounts = steps.mounts.saturating_add(1);
+                    }
+                    CommandStep::MountReleased => {
+                        if workspace.is_none() || steps.mounted.as_ref() == workspace.as_ref() {
+                            steps.released = true;
+                        }
+                    }
                     CommandStep::Typing => steps.typing_at = Some(record.position),
                     CommandStep::Typed => {
                         steps.typed = true;
@@ -1067,10 +1093,13 @@ struct AbandonedMount {
     session_id: SessionId,
     command_id: CommandId,
     workspace: WorkspaceId,
-    /// True only when this Bridge inserted `{command_id}:mounted` for this
-    /// workspace, so a later successful retry also records
-    /// `{command_id}:mount_released`.
-    recorded: bool,
+    /// True once `self.workspaces.unmount(&workspace)` succeeded, so a later
+    /// retry only needs to append `{command_id}:mount_released`.
+    unmounted: bool,
+    /// Mount generation (`1` for the first mount, `2+` for remounts) when this
+    /// Bridge inserted `mounted` for this workspace, so a later retry records
+    /// the matching `mount_released`.
+    recorded_generation: Option<u32>,
 }
 
 /// How often an unfinished mount is polled.
@@ -1170,10 +1199,16 @@ const KILL_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Drop for Bridge {
     fn drop(&mut self) {
+        // Retry earlier abandoned cleanups (including pending `mount_released`
+        // appends) before joining current workers.
+        self.retry_abandoned_mounts();
         // No mount worker outlives the store and runtime it borrowed. A mount
         // that never reached a `mounted` record has no owner: release it here
         // on the Bridge thread after joining its worker, and persist any
-        // failed unmount so a restart can recover it as an orphan.
+        // failed unmount so a restart can recover it (or reuse it if the
+        // command itself stays unfinished). Do not retry newly failed mounts
+        // from `self.mounting` here so an unfinished command's freshly
+        // persisted workspace stays mounted on disk for reuse.
         for (command_id, pending) in std::mem::take(&mut self.mounting) {
             if let Ok(Ok(workspace)) = pending.handle.join() {
                 self.release_abandoned_mount(
@@ -1184,10 +1219,16 @@ impl Drop for Bridge {
                 );
             }
         }
-        self.retry_abandoned_mounts();
         for mut abandoned in std::mem::take(&mut self.abandoned_mounts) {
-            if !abandoned.recorded {
-                abandoned.recorded = self.persist_abandoned_mount(
+            if abandoned.unmounted {
+                eprintln!(
+                    "bridge: dropped after unmounting workspace {} for {} without recording mount_released",
+                    abandoned.workspace, abandoned.command_id
+                );
+                continue;
+            }
+            if abandoned.recorded_generation.is_none() {
+                abandoned.recorded_generation = self.persist_abandoned_mount(
                     &abandoned.agent_id,
                     &abandoned.session_id,
                     abandoned.command_id,
@@ -1198,7 +1239,7 @@ impl Drop for Bridge {
                 "bridge: dropped with unmounted workspace {} for {} ({})",
                 abandoned.workspace,
                 abandoned.command_id,
-                if abandoned.recorded {
+                if abandoned.recorded_generation.is_some() {
                     "recorded for orphan recovery"
                 } else {
                     "not recorded for orphan recovery"
@@ -1420,11 +1461,12 @@ impl Bridge {
                         session.clone(),
                         *command,
                         workspace.clone(),
+                        steps.mounts.max(1),
                     ));
                 }
             }
         }
-        for (agent_id, session, command, workspace) in orphans {
+        for (agent_id, session, command, workspace, mounts) in orphans {
             // A mount the log's open execution uses is no orphan, whatever
             // this view missed: unmounting it would take the directory from
             // under its engine. The execution is followed again instead.
@@ -1450,7 +1492,7 @@ impl Bridge {
                 &session,
                 None,
                 Source::Bridge,
-                Some(format!("{command}:mount_released")),
+                Some(mount_released_key(command, mounts)),
                 EventKind::CommandStepped {
                     command_id: command,
                     step: CommandStep::MountReleased,
@@ -3325,15 +3367,7 @@ impl Bridge {
         let branch = BranchName::for_agent(&claimed.agent_id);
         let prepared = match self.prepare_start(claimed, &branch, model, from, report)? {
             Ok(prepared) => prepared,
-            Err(why) => {
-                let steps = self.recorded_steps(claimed);
-                if let Some(workspace) = steps.mounted
-                    && !steps.released
-                {
-                    return finished(self.give_up_mount(claimed, &workspace, why));
-                }
-                return finished(Outcome::Failed(why));
-            }
+            Err(why) => return finished(self.fail_prepared_start(claimed, why)),
         };
         let workspace = match self.mount_for_start(claimed, &branch)? {
             MountProgress::Ready(workspace) => workspace,
@@ -3414,6 +3448,30 @@ impl Bridge {
         self.launch_and_prompt(claimed, &active, native, &prepared.settings, prompt, report)
     }
 
+    fn fail_prepared_start(&self, claimed: &Claimed, why: String) -> Outcome {
+        let steps = self.recorded_steps(claimed);
+        if let Some(workspace) = steps.mounted
+            && !steps.released
+        {
+            if self.workspaces.is_mounted(&workspace) {
+                return self.give_up_mount(claimed, &workspace, why);
+            }
+            let _ = self.append(
+                &claimed.agent_id,
+                &claimed.session_id,
+                None,
+                Source::Bridge,
+                Some(mount_released_key(claimed.command_id, steps.mounts.max(1))),
+                EventKind::CommandStepped {
+                    command_id: claimed.command_id,
+                    step: CommandStep::MountReleased,
+                    workspace: Some(workspace),
+                },
+            );
+        }
+        Outcome::Failed(why)
+    }
+
     /// Choose and retain everything a start decided before its mount. On a
     /// later claim the same model, fork, settings and launch summary are used.
     fn prepare_start(
@@ -3463,11 +3521,26 @@ impl Bridge {
         if let Some(workspace) = steps.mounted
             && !steps.released
         {
-            if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
-                pending.cancelled = true;
+            if self.workspaces.is_mounted(&workspace) {
+                if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
+                    pending.cancelled = true;
+                }
+                self.reap_cancelled_mounts();
+                return Ok(MountProgress::Ready(workspace));
             }
-            self.reap_cancelled_mounts();
-            return Ok(MountProgress::Ready(workspace));
+            self.append(
+                &claimed.agent_id,
+                &claimed.session_id,
+                None,
+                Source::Bridge,
+                Some(mount_released_key(claimed.command_id, steps.mounts.max(1))),
+                EventKind::CommandStepped {
+                    command_id: claimed.command_id,
+                    step: CommandStep::MountReleased,
+                    workspace: Some(workspace),
+                },
+            )?;
+            self.catch_up()?;
         }
         if !self.mounting.contains_key(&claimed.command_id) {
             if self.mounting.len() >= MAX_CONCURRENT_MOUNTS {
@@ -3508,18 +3581,31 @@ impl Bridge {
                 )));
             }
         };
+        let generation = self.recorded_steps(claimed).mounts.saturating_add(1);
         // Recorded, so a restart that finds no execution using it can retain
         // it for this unfinished command or release a genuinely orphaned one
         // ([`Self::release_orphan_mounts`]).
-        if let Err(error) = self.step(claimed, None, CommandStep::Mounted, Some(&workspace)) {
+        if let Err(error) = self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            None,
+            Source::Bridge,
+            Some(mounted_key(claimed.command_id, generation)),
+            EventKind::CommandStepped {
+                command_id: claimed.command_id,
+                step: CommandStep::Mounted,
+                workspace: Some(workspace.clone()),
+            },
+        ) {
             self.give_up_mount(claimed, &workspace, error.to_string());
             return Err(error);
         }
+        self.catch_up()?;
         Ok(MountProgress::Ready(workspace))
     }
 
     /// Join canceled commands' finished mount workers and retry any earlier
-    /// cancelled/dropped mounts whose unmount failed.
+    /// cancelled/dropped mounts whose unmount or release record failed.
     fn reap_cancelled_mounts(&mut self) {
         self.retry_abandoned_mounts();
         let done: Vec<CommandId> = self
@@ -3537,9 +3623,10 @@ impl Bridge {
     }
 
     /// Unmount an unrecorded mount from a cancelled or dropped worker. If
-    /// unmounting fails, persist `{command_id}:mounted` when no mounted record
-    /// exists yet so a restart can clean it up via [`Self::release_orphan_mounts`],
-    /// and retain it for retries on subsequent passes.
+    /// unmounting fails, persist `CommandStep::Mounted` when no mounted record
+    /// exists yet for the current generation so a restart can clean it up via
+    /// [`Self::release_orphan_mounts`], and retain it for retries on later
+    /// passes.
     fn release_abandoned_mount(
         &mut self,
         agent_id: AgentId,
@@ -3550,7 +3637,7 @@ impl Bridge {
         match self.workspaces.unmount(&workspace) {
             Ok(()) => {}
             Err(error) => {
-                let recorded =
+                let recorded_generation =
                     self.persist_abandoned_mount(&agent_id, &session_id, command_id, &workspace);
                 self.stray_notes.push(format!(
                     "unmount {workspace} for cancelled {command_id}: {error}"
@@ -3560,63 +3647,80 @@ impl Bridge {
                     session_id,
                     command_id,
                     workspace,
-                    recorded,
+                    unmounted: false,
+                    recorded_generation,
                 });
             }
         }
     }
 
-    /// Retry unmounting abandoned workspaces retained after transient failures.
-    /// Records `MountReleased` only when this Bridge inserted the matching
-    /// `Mounted` record.
+    /// Retry unmounting abandoned workspaces retained after transient failures,
+    /// and retry recording `MountReleased` if an earlier unmount succeeded but
+    /// appending `MountReleased` failed. Retains entries until both complete.
     fn retry_abandoned_mounts(&mut self) {
-        for abandoned in std::mem::take(&mut self.abandoned_mounts) {
-            if self.workspaces.unmount(&abandoned.workspace).is_ok() {
-                if abandoned.recorded {
-                    let _ = self.append(
+        for mut abandoned in std::mem::take(&mut self.abandoned_mounts) {
+            if !abandoned.unmounted {
+                if self.workspaces.unmount(&abandoned.workspace).is_err() {
+                    self.abandoned_mounts.push(abandoned);
+                    continue;
+                }
+                abandoned.unmounted = true;
+            }
+            if let Some(generation) = abandoned.recorded_generation
+                && self
+                    .append(
                         &abandoned.agent_id,
                         &abandoned.session_id,
                         None,
                         Source::Bridge,
-                        Some(format!("{}:mount_released", abandoned.command_id)),
+                        Some(mount_released_key(abandoned.command_id, generation)),
                         EventKind::CommandStepped {
                             command_id: abandoned.command_id,
                             step: CommandStep::MountReleased,
-                            workspace: Some(abandoned.workspace),
+                            workspace: Some(abandoned.workspace.clone()),
                         },
-                    );
-                }
-            } else {
+                    )
+                    .is_err()
+            {
                 self.abandoned_mounts.push(abandoned);
             }
         }
     }
 
     /// Persist `CommandStep::Mounted` for an abandoned mount that could not yet
-    /// be unmounted. Returns `true` only when this Bridge inserted the record
-    /// for `command_id` (not when a peer Bridge already recorded its own).
+    /// be unmounted. Returns `Some(generation)` only when this Bridge inserted
+    /// the record for `command_id` (not when an unreleased `mounted` step is
+    /// already active or a peer Bridge recorded its own).
     fn persist_abandoned_mount(
         &self,
         agent_id: &AgentId,
         session_id: &SessionId,
         command_id: CommandId,
         workspace: &WorkspaceId,
-    ) -> bool {
-        matches!(
-            self.log.append(NewEvent {
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
-                execution_id: None,
-                source: Source::Bridge,
-                source_event_id: Some(format!("{command_id}:mounted")),
-                kind: EventKind::CommandStepped {
-                    command_id,
-                    step: CommandStep::Mounted,
-                    workspace: Some(workspace.clone()),
-                },
-            }),
-            Ok(appended) if appended.inserted
-        )
+    ) -> Option<u32> {
+        let steps = self
+            .sessions
+            .get(session_id)
+            .and_then(|view| view.steps.get(&command_id));
+        if steps.is_some_and(|steps| steps.mounted.is_some() && !steps.released) {
+            return None;
+        }
+        let generation = steps.map_or(1, |steps| steps.mounts.saturating_add(1));
+        match self.log.append(NewEvent {
+            agent_id: agent_id.clone(),
+            session_id: session_id.clone(),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some(mounted_key(command_id, generation)),
+            kind: EventKind::CommandStepped {
+                command_id,
+                step: CommandStep::Mounted,
+                workspace: Some(workspace.clone()),
+            },
+        }) {
+            Ok(appended) if appended.inserted => Some(generation),
+            _ => None,
+        }
     }
 
     /// A retried Start or Resume whose execution the log already records
@@ -4658,7 +4762,19 @@ impl Bridge {
         if let Err(error) = self.workspaces.unmount(workspace) {
             return Outcome::Failed(format!("{why}; unmount {workspace}: {error}"));
         }
-        match self.step(claimed, None, CommandStep::MountReleased, Some(workspace)) {
+        let generation = self.recorded_steps(claimed).mounts.max(1);
+        match self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            None,
+            Source::Bridge,
+            Some(mount_released_key(claimed.command_id, generation)),
+            EventKind::CommandStepped {
+                command_id: claimed.command_id,
+                step: CommandStep::MountReleased,
+                workspace: Some(workspace.clone()),
+            },
+        ) {
             Ok(()) => Outcome::Failed(why),
             Err(error) => Outcome::Failed(format!("{why}; record the unmount: {error}")),
         }
@@ -7156,6 +7272,10 @@ mod tests {
             self.inner.unmount(workspace)
         }
 
+        fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+            self.inner.is_mounted(workspace)
+        }
+
         fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
             self.inner.notices(workspace)
         }
@@ -8900,7 +9020,7 @@ mod tests {
         );
         assert!(bridge.mounting.is_empty());
         assert_eq!(bridge.abandoned_mounts.len(), 1);
-        assert!(bridge.abandoned_mounts[0].recorded);
+        assert!(bridge.abandoned_mounts[0].recorded_generation.is_some());
         assert!(
             store
                 .read_global(GlobalPosition(0), 1_000)
@@ -9075,7 +9195,7 @@ mod tests {
         bridge.work().expect("work reaps failed unmount");
         assert_eq!(bridge.abandoned_mounts.len(), 1);
         assert!(
-            !bridge.abandoned_mounts[0].recorded,
+            bridge.abandoned_mounts[0].recorded_generation.is_none(),
             "did not claim ownership of peer Bridge's mounted step"
         );
 
@@ -9106,5 +9226,248 @@ mod tests {
             "peer Bridge's mounted step must not be marked released"
         );
         assert_ne!(peer_workspace.as_str(), "1:/workspaces/1");
+    }
+
+    struct FailReleaseLog {
+        inner: Arc<MemoryStore>,
+        fail_release: AtomicBool,
+    }
+
+    impl FailReleaseLog {
+        fn new(inner: Arc<MemoryStore>) -> Self {
+            Self {
+                inner,
+                fail_release: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_release(&self, fail: bool) {
+            self.fail_release.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    impl EventLog for FailReleaseLog {
+        fn append(
+            &self,
+            event: NewEvent,
+        ) -> Result<crate::event::Appended, crate::port::StoreError> {
+            if self.fail_release.load(Ordering::SeqCst)
+                && matches!(
+                    event.kind,
+                    EventKind::CommandStepped {
+                        step: CommandStep::MountReleased,
+                        ..
+                    }
+                )
+            {
+                return Err(crate::port::StoreError::Backend(
+                    "transient mount_released append failure".to_string(),
+                ));
+            }
+            self.inner.append(event)
+        }
+
+        fn read_global(
+            &self,
+            after: GlobalPosition,
+            limit: usize,
+        ) -> Result<Vec<crate::event::EventRecord>, crate::port::StoreError> {
+            self.inner.read_global(after, limit)
+        }
+    }
+
+    fn unmount_calls(store: &MemoryStore) -> usize {
+        store
+            .workspace_calls()
+            .iter()
+            .filter(|call| *call == "unmount")
+            .count()
+    }
+
+    fn has_command_step(
+        records: &[crate::event::EventRecord],
+        id: CommandId,
+        target: CommandStep,
+        workspace: &WorkspaceId,
+    ) -> bool {
+        records.iter().any(|record| {
+            matches!(
+                &record.event.kind,
+                EventKind::CommandStepped {
+                    command_id,
+                    step,
+                    workspace: Some(ws),
+                } if *command_id == id && *step == target && ws == workspace
+            )
+        })
+    }
+
+    #[test]
+    fn failed_mount_released_append_retries_and_remounts_unfinished_start_on_restart() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let log = Arc::new(FailReleaseLog::new(store.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let branch = BranchName::for_agent(&resumable_agent(1));
+        mounts.hold(branch.clone());
+        let mut bridge = Bridge::new(
+            log.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock.clone());
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 1
+        });
+
+        bridge.mounting.get_mut(&id).expect("mounting").cancelled = true;
+        mounts.fail_unmounts(true);
+        mounts.release(&branch);
+        while !bridge
+            .mounting
+            .values()
+            .all(|pending| pending.handle.is_finished())
+        {
+            std::thread::yield_now();
+        }
+        bridge
+            .poll()
+            .expect("poll persists mounted after failed unmount");
+        assert_eq!(bridge.abandoned_mounts.len(), 1);
+        assert!(bridge.abandoned_mounts[0].recorded_generation.is_some());
+        assert!(!bridge.abandoned_mounts[0].unmounted);
+        let ws1 = bridge.abandoned_mounts[0].workspace.clone();
+        assert!(mounts.is_mounted(&ws1));
+
+        mounts.fail_unmounts(false);
+        log.fail_release(true);
+        bridge
+            .poll()
+            .expect("poll unmounts ws1 but retains entry after MountReleased failure");
+        assert_eq!(unmount_calls(&store), 1);
+        assert!(!mounts.is_mounted(&ws1));
+        assert_eq!(bridge.abandoned_mounts.len(), 1);
+        assert!(bridge.abandoned_mounts[0].unmounted);
+
+        bridge
+            .poll()
+            .expect("second poll retries only MountReleased without re-unmounting");
+        assert_eq!(unmount_calls(&store), 1);
+        assert_eq!(bridge.abandoned_mounts.len(), 1);
+
+        drop(bridge);
+        assert!(!mounts.is_mounted(&ws1));
+
+        log.fail_release(false);
+        let mut restarted = Bridge::new(
+            log,
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        restarted.recover().expect("recover");
+        store.expire_leases();
+        drive_work(&mut restarted, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+
+        let records = store.read_global(GlobalPosition(0), 1_000).expect("read");
+        let started_ws = records
+            .iter()
+            .find_map(|record| match &record.event.kind {
+                EventKind::ExecutionStarted {
+                    command_id,
+                    workspace,
+                    ..
+                } if *command_id == id => Some(workspace.clone()),
+                _ => None,
+            })
+            .expect("execution started");
+        assert_ne!(started_ws, ws1, "reclaimed start remounted fresh workspace");
+        assert!(mounts.is_mounted(&started_ws));
+        assert_eq!(mounts.calls.load(Ordering::SeqCst), 2);
+        assert!(has_command_step(
+            &records,
+            id,
+            CommandStep::MountReleased,
+            &ws1
+        ));
+        assert!(has_command_step(
+            &records,
+            id,
+            CommandStep::Mounted,
+            &started_ws
+        ));
+    }
+
+    #[test]
+    fn failed_mount_released_append_recovers_on_next_poll_without_remounting_or_reunmounting() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let log = Arc::new(FailReleaseLog::new(store.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let branch = BranchName::for_agent(&resumable_agent(1));
+        mounts.hold(branch.clone());
+        let mut bridge = Bridge::new(
+            log.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 1
+        });
+
+        let claimed = store
+            .claim("other", Duration::from_mins(1))
+            .expect("claim")
+            .expect("claimed");
+        store
+            .finish(&claimed, &Outcome::Failed("cancelled".to_string()))
+            .expect("finish");
+
+        mounts.fail_unmounts(true);
+        mounts.release(&branch);
+        while !bridge
+            .mounting
+            .values()
+            .all(|pending| pending.handle.is_finished())
+        {
+            std::thread::yield_now();
+        }
+        bridge.work().expect("work retains failed unmount");
+        let ws1 = bridge.abandoned_mounts[0].workspace.clone();
+
+        mounts.fail_unmounts(false);
+        log.fail_release(true);
+        bridge
+            .poll()
+            .expect("poll unmounts but retains failed append");
+        assert_eq!(bridge.abandoned_mounts.len(), 1);
+        assert!(bridge.abandoned_mounts[0].unmounted);
+        assert_eq!(unmount_calls(&store), 1);
+
+        log.fail_release(false);
+        bridge.poll().expect("poll retries MountReleased append");
+        assert!(bridge.abandoned_mounts.is_empty());
+        assert_eq!(unmount_calls(&store), 1);
+        let records = store.read_global(GlobalPosition(0), 1_000).expect("read");
+        assert!(has_command_step(
+            &records,
+            id,
+            CommandStep::MountReleased,
+            &ws1
+        ));
     }
 }

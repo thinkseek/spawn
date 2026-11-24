@@ -781,6 +781,10 @@ impl WorkspaceStore for MemoryStore {
         Ok(())
     }
 
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        self.lock().mounts.contains_key(workspace)
+    }
+
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let mut state = self.lock();
         state.workspace_calls.push("merge_base".to_string());

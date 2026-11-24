@@ -1638,6 +1638,11 @@ impl WorkspaceStore for GitWorkspace {
         }
     }
 
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        self.checked_path(workspace)
+            .is_ok_and(|directory| directory.is_dir())
+    }
+
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         self.merge_main(workspace, &|| Ok(()))
     }

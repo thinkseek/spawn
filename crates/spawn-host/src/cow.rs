@@ -2751,6 +2751,20 @@ impl WorkspaceStore for CowWorkspace {
         self.unmount_locked(workspace)
     }
 
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        let Ok(directory) = self.checked_path(workspace) else {
+            return false;
+        };
+        let branch = workspace.sandbox();
+        let Ok(Some(meta)) = present(&directory) else {
+            return false;
+        };
+        let Ok(Some(state)) = self.settled_state(branch) else {
+            return false;
+        };
+        Self::owned(&directory, &meta, &state).is_ok()
+    }
+
     /// The Git store's notices of files over the size cap a checkpoint
     /// left out.
     fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {

@@ -326,6 +326,15 @@ pub trait WorkspaceStore: Send + Sync {
     /// Unmount the workspace. Committed state stays on the branch.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
 
+    /// Whether `workspace` is currently mounted in this store. Used when a
+    /// reclaimed start considers reusing a recorded `CommandStep::Mounted`
+    /// workspace whose `CommandStep::MountReleased` may have failed to append
+    /// after an unmount succeeded.
+    fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+        let _ = workspace;
+        true
+    }
+
     /// Merge `main` into `branch`, which is not mounted, only when the merge
     /// is clean: the branch moves to the merge commit
     /// ([`BaseMerge::Merged`]). A conflict of any kind changes nothing and

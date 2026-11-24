@@ -929,6 +929,9 @@ impl WorkspaceStore for Telling {
     ) -> Result<(), spawn_core::port::WorkspaceError> {
         self.inner.unmount(workspace)
     }
+    fn is_mounted(&self, workspace: &spawn_core::id::WorkspaceId) -> bool {
+        self.inner.is_mounted(workspace)
+    }
     fn merge_base(
         &self,
         workspace: &spawn_core::id::WorkspaceId,
