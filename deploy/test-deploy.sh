@@ -62,7 +62,13 @@
 # moved; a bad SPAWN_DEPLOY_MIRROR_SECS is refused before anything is done;
 # a mirror that carries a credential (in its URL, in the URL of the remote
 # it names, or after url.*.insteadOf) is refused before anything is done,
-# and the credential reaches neither the output nor any git command line.
+# and the credential reaches neither the output nor any git command line;
+# a spawn.env line that systemd's EnvironmentFile and the deploy's shell may
+# read differently (not blank, a # comment or NAME=value; an `export` line,
+# indented by spaces or a tab too; a line ending in CR; a # comment ending in
+# a backslash; an unquoted value with whitespace or a shell metacharacter; a
+# double-quoted value with $) is refused before anything is done, naming the
+# file and line and none of the line's text.
 #
 # TEST_DEPLOY_SCRIPT=<path> runs that deploy script instead of the
 # checkout's deploy/deploy.sh (to show which checks fail without a fix).
@@ -156,7 +162,13 @@ check "the guard refuses the real home (status $guard_status)" \
   bash -c '[ "$1" -eq 2 ] && grep -q "HOME .* is not inside the scratch" "$2"' _ "$guard_status" "$scratch/guard.err"
 missions=$live/missions/spawn.git
 mkdir -p "$live/bin" "$live/backups" "$scratch/tmp" "$scratch/fakebin"
-printf 'SPAWN_DATABASE_URL=%q\n' "$live_url" >"$live/spawn.env"
+# A comment, a blank line and a plain NAME=value too: what check_env_file
+# accepts, so every deploy below passes it.
+{
+  printf '# the fake live spawn.env\n\n'
+  printf "SPAWN_DATABASE_URL='%s'\\n" "$live_url"
+  printf '  # an indented comment\nSPAWN_DEPLOY_TEST_PLAIN=plain-value\n'
+} >"$live/spawn.env"
 chmod 600 "$live/spawn.env"
 cat >"$live/bin/spawn" <<'EOF'
 #!/bin/sh
@@ -297,6 +309,36 @@ check "refused while another deploy holds the lock" [ "$status" -ne 0 ]
 check "says so" grep -q "another deploy holds $live/deploy.lock" "$out"
 check "before any backup" [ -z "$(ls "$live/backups")" ]
 check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+
+echo "== a spawn.env line systemd's EnvironmentFile reads differently"
+cp -p "$live/spawn.env" "$scratch/spawn.env.before-check"
+env_lines=$(wc -l <"$live/spawn.env")
+bad_lines=(
+  "export|export SECRET_KEY=do_not_leak|begins with 'export '"
+  "space-indented export|  export SECRET_KEY=do_not_leak|begins with 'export '"
+  "tab-indented export|"$'\t'"export SECRET_KEY=do_not_leak|begins with 'export '"
+  "no NAME=|SECRET_KEY do_not_leak|not NAME=value"
+  "CRLF|SECRET_KEY=do_not_leak"$'\r'"|ends in a carriage return"
+  "unquoted space|SECRET_KEY=foo secret_leak_word|an unquoted value with whitespace"
+  "unquoted \$(...)|SECRET_KEY=\$(do_not_leak)|an unquoted value with whitespace"
+  "\$ in double quotes|SECRET_KEY=\"do_not_\$leak\"|opens a double quote"
+  "comment ending in a backslash|# do_not_leak SECRET_KEY \\|ends in a backslash"
+)
+for bad in "${bad_lines[@]}"; do
+  IFS='|' read -r what line words <<<"$bad"
+  cp -p "$scratch/spawn.env.before-check" "$live/spawn.env"
+  printf '%s\n# after\n' "$line" >>"$live/spawn.env"
+  : >"$SYSTEMCTL_LOG"
+  deploy
+  check "$what: refused (status $status)" [ "$status" -ne 0 ]
+  check "$what: names the file and the line" grep -qF "$live/spawn.env:$((env_lines + 1)): " "$out"
+  check "$what: says why" grep -qF -- "$words" "$out"
+  check "$what: not a byte of the name or the value in the output" \
+    bash -c '! grep -qF -e SECRET_KEY -e do_not_leak -e secret_leak_word -e "foo " "$1"' _ "$out"
+  check "$what: before any backup" [ -z "$(ls "$live/backups")" ]
+  check "$what: before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
+done
+cp -p "$scratch/spawn.env.before-check" "$live/spawn.env"
 
 echo "== a HEAD that tracks files under node_modules/"
 planted=$scratch/planted

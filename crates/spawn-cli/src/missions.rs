@@ -981,6 +981,9 @@ fn add(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i64, Stri
         Some(source) => json!([crate::sources::MissionSource::parse(&source)?.as_str()]),
         None => json!([]),
     };
+    if let Some(source) = sources.get(0).and_then(Value::as_str) {
+        refuse_source_with_unresolved_head(source)?;
+    }
     let settings = Settings::from(flags)?;
     // spawn_mission_configure refuses it too, but only once the mission
     // exists.
@@ -1003,6 +1006,62 @@ fn add(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i64, Stri
         settings.apply(store, id)?;
     }
     Ok(id)
+}
+
+/// Refuses a local source (an absolute path) whose `HEAD` names no commit
+/// while it holds branches: a bare repository made with another default
+/// branch (`HEAD` at `refs/heads/master`, only `main` pushed). Every task
+/// would later fail on "`<source>` has no HEAD" ([`crate::integrate::source_head`]),
+/// so `mission add` says it once, with the repair. A source that holds no
+/// branch yet (nothing pushed) is accepted: it is a new project's, and so is
+/// one git cannot read here, or a remote one, as before. The error names
+/// the branch HEAD points at (`ls-remote` does not show an unborn HEAD, so
+/// it is read with `symbolic-ref`) and a repair, `git -C <source>
+/// symbolic-ref HEAD <branch>`, that works on a bare and a non-bare source.
+fn refuse_source_with_unresolved_head(source: &str) -> Result<(), String> {
+    if !source.starts_with('/') {
+        return Ok(());
+    }
+    let Ok(listing) = crate::sources::git(&["ls-remote", "--symref", "--", source]) else {
+        return Ok(());
+    };
+    let mut head_resolves = false;
+    let mut head_names = None;
+    let mut branches = Vec::new();
+    for line in listing.lines() {
+        let Some((left, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(target) = left.strip_prefix("ref: ") {
+            if name == "HEAD" {
+                head_names = Some(target.to_string());
+            }
+        } else if name == "HEAD" {
+            head_resolves = true;
+        } else if name.starts_with("refs/heads/") {
+            branches.push(name.to_string());
+        }
+    }
+    if head_resolves || branches.is_empty() {
+        return Ok(());
+    }
+    let suggested = if branches.iter().any(|branch| branch == "refs/heads/main") {
+        "refs/heads/main".to_string()
+    } else {
+        branches[0].clone()
+    };
+    let head_names = head_names.or_else(|| {
+        crate::sources::git(&["-C", source, "symbolic-ref", "--quiet", "HEAD"])
+            .ok()
+            .filter(|target| !target.is_empty())
+    });
+    let names = head_names.map_or_else(String::new, |target| format!(" ({target})"));
+    Err(format!(
+        "{source}: its HEAD{names} names no commit, though it has branches \
+         ({}), so no task could start from it; point HEAD at an existing branch: \
+         git -C {source} symbolic-ref HEAD {suggested}",
+        branches.join(", ")
+    ))
 }
 
 /// `spawn mission moved --source <dir> --from <commit> --to <commit>`: a
@@ -1898,6 +1957,133 @@ mod tests {
             message,
         ])
         .expect("commit");
+    }
+
+    /// A bare source made with `master` as its default branch, holding
+    /// only `main`: its HEAD names no commit. `(base, source)`.
+    fn source_with_head_at_a_missing_branch(tag: &str) -> (std::path::PathBuf, String) {
+        let git = crate::sources::test_git;
+        let base =
+            std::env::temp_dir().join(format!("spawn-missing-head-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["init", "-q", "--bare", "--initial-branch=master", &source]).expect("bare");
+        git(&["-C", &seed_path, "push", "-q", &source, "main:main"]).expect("push main");
+        (base, source)
+    }
+
+    /// The refusal alone, no store: a source whose HEAD names a branch it
+    /// does not hold is refused, naming that branch, with the repair; after
+    /// the repair, an empty source and a remote one are accepted.
+    #[test]
+    fn a_source_with_unresolved_head_is_refused_with_the_repair() {
+        let git = crate::sources::test_git;
+        let (base, source) = source_with_head_at_a_missing_branch("refusal");
+        let refused =
+            super::refuse_source_with_unresolved_head(&source).expect_err("HEAD names no commit");
+        assert!(refused.contains(&source), "{refused}");
+        assert!(refused.contains("refs/heads/main"), "{refused}");
+        assert!(
+            refused.contains("its HEAD (refs/heads/master) names no commit"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(&format!(
+                "git -C {source} symbolic-ref HEAD refs/heads/main"
+            )),
+            "{refused}"
+        );
+        git(&["-C", &source, "symbolic-ref", "HEAD", "refs/heads/main"]).expect("repair");
+        assert_eq!(super::refuse_source_with_unresolved_head(&source), Ok(()));
+        // A source with nothing pushed yet is a new project's: accepted.
+        let empty = base.join("empty.git").to_string_lossy().to_string();
+        git(&["init", "-q", "--bare", "--initial-branch=main", &empty]).expect("empty");
+        assert_eq!(super::refuse_source_with_unresolved_head(&empty), Ok(()));
+        // A remote source is not read here.
+        assert_eq!(
+            super::refuse_source_with_unresolved_head("https://example.invalid/repo.git"),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A non-bare source, HEAD unborn at `trunk`, its one branch `feature`
+    /// (no `main`): refused, naming `trunk` and suggesting the first
+    /// existing branch; the `git -C` repair it names works on a work tree,
+    /// and the source is then accepted.
+    #[test]
+    fn a_non_bare_source_with_unresolved_head_and_no_main_is_repaired_with_git_c() {
+        let git = crate::sources::test_git;
+        let base = std::env::temp_dir().join(format!(
+            "spawn-mission-head-non-bare-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let source = work.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=feature", &source]).expect("init");
+        std::fs::write(work.join("README.md"), "base\n").expect("write");
+        commit_in(&source, "base");
+        git(&["-C", &source, "symbolic-ref", "HEAD", "refs/heads/trunk"]).expect("unborn HEAD");
+        let refused =
+            super::refuse_source_with_unresolved_head(&source).expect_err("HEAD names no commit");
+        assert!(
+            refused.contains("its HEAD (refs/heads/trunk) names no commit"),
+            "{refused}"
+        );
+        assert!(refused.contains("(refs/heads/feature)"), "{refused}");
+        let repair = format!("git -C {source} symbolic-ref HEAD refs/heads/feature");
+        assert!(refused.contains(&repair), "{refused}");
+        // The repair as the error words it, on a work tree.
+        git(&["-C", &source, "symbolic-ref", "HEAD", "refs/heads/feature"])
+            .expect("the named repair works on a non-bare source");
+        assert_eq!(super::refuse_source_with_unresolved_head(&source), Ok(()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Through a real store, the command's own path: `mission add` refuses a
+    /// bare source whose HEAD names no commit and records nothing; after
+    /// `git symbolic-ref HEAD refs/heads/main` the same add succeeds.
+    #[test]
+    fn mission_add_refuses_a_source_whose_head_names_no_commit_until_repaired() {
+        let git = crate::sources::test_git;
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("mission_add_missing_head");
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("a schema of its own, migrated");
+        let (base, source) = source_with_head_at_a_missing_branch("add");
+        let words: Vec<String> = ["add", "--text", "missing head", "--source", &source]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let (_, flags) = split_mission(&words).expect("flags");
+        let recorded = || {
+            store
+                .mission_sources()
+                .expect("the sources")
+                .to_string()
+                .contains(&source)
+        };
+        let refused = super::add(&store, &flags).expect_err("HEAD names no commit");
+        assert!(
+            refused.contains("symbolic-ref HEAD refs/heads/main"),
+            "{refused}"
+        );
+        assert!(!recorded(), "the refusal added no mission");
+        git(&["-C", &source, "symbolic-ref", "HEAD", "refs/heads/main"]).expect("repair");
+        let id = super::add(&store, &flags).expect("added once HEAD names main");
+        assert!(id > 0);
+        assert!(recorded(), "the mission names its source");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A scratch world: a bare source with one commit on main, and the

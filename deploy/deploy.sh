@@ -58,7 +58,10 @@
 # `by` landing for --main and owner for the others. A failure raises the
 # `deploy_failed` alert, and the next deploy that succeeds clears it. A
 # deploy refused by the lock records nothing: another deploy is running,
-# which records its own. A record that cannot be written (a binary from
+# which records its own. Nor does one refused for its spawn.env
+# (check_env_file): the record is written with spawn.env's database URL, and
+# a shell reading a bad line there could print its name. A record that
+# cannot be written (a binary from
 # before this, a database down) is said on stderr, never the deploy's
 # failure.
 #
@@ -134,7 +137,10 @@
 # the deploy that holds the lock, and so does one refused for its
 # SPAWN_DEPLOY_DRAIN_SECS or SPAWN_DEPLOY_MIRROR_SECS: those checks come
 # before the lock, so the hold may be a running deploy's, and the refusal
-# says the hold stays. A hold left by
+# says the hold stays. So does one refused for its spawn.env
+# (check_env_file): that check runs once the lock is held but before the
+# exit handler is set, so nothing is released, and the refusal says the hold
+# stays. A hold left by
 # a deploy killed outright expires on its own (SPAWN_SOURCE_HOLD_SECS, 3 h by
 # default).
 #
@@ -259,6 +265,61 @@ die() {
   echo "$PROG: error: $*" >&2
   exit 1
 }
+
+# check_env_file <file>: every line of spawn.env is one that systemd's
+# EnvironmentFile (the units) and this deploy's shell (`. spawn.env`) read
+# alike, so the units run with what the deploy saw. Accepted: a blank line;
+# a `#` comment (indented too) that does not end in `\` (systemd continues
+# such a comment onto the next line, the shell does not); and NAME=value at
+# the start of the line, whose value is empty, '...' with no ' inside,
+# "..." with no $, `, " or \ inside, or unquoted with no whitespace and none
+# of $ ` ; & | ( ) < > " ' \ ~ (each of which the shell expands, splits or
+# runs, where systemd takes it as text). Refused besides: a line ending in a
+# CR (systemd drops it, the shell keeps it in the value) and an
+# `export NAME=value` line (systemd does not take it as NAME). A refusal
+# names the file, the line number and why, never a byte of the line: its
+# name or value may be a secret. It comes before the exit handler, so it
+# leaves an owner's hold held, and says so.
+check_env_file() {
+  local file=$1 line number=0 name value why
+  local hold="Nothing was done, and an owner's hold on $missions stays held (deploy again, or: spawn mission release --source $missions)"
+  [ -f "$file" ] || die "no $file; nothing was done, and an owner's hold on $missions stays held (deploy again, or: spawn mission release --source $missions)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    why=
+    if [[ $line == *$'\r' ]]; then
+      why="the line ends in a carriage return (CRLF): systemd's EnvironmentFile drops it, a shell keeps it in the value; save the file with LF line ends"
+    elif [[ $line =~ ^[[:space:]]*$ ]]; then
+      continue
+    elif [[ $line =~ ^[[:space:]]*# ]]; then
+      [[ $line == *\\ ]] || continue
+      why="a # comment that ends in a backslash: systemd's EnvironmentFile continues it onto the next line, a shell does not"
+    elif [[ $line =~ ^[[:space:]]*export[[:space:]] ]]; then
+      why="a line that begins with 'export ': systemd's EnvironmentFile does not read it as an assignment, so the units would not get the variable a shell sets; write it as NAME=value"
+    elif [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      name=${line%%=*}
+      value=${line#"$name="}
+      if [[ -z $value ]]; then
+        continue
+      elif [[ $value == \'* ]]; then
+        [[ $value =~ ^\'[^\']*\'$ ]] && continue
+        why="a value that opens a single quote but is not one '...' with no ' inside"
+      elif [[ $value == \"* ]]; then
+        [[ $value =~ ^\"[^\"\$\`\\]*\"$ ]] && continue
+        why="a value that opens a double quote but is not one \"...\" with no \$, backquote, \" or backslash inside"
+      elif [[ $value == *[[:space:]\$\`\;\&\|\(\)\<\>\"\'\\~]* ]]; then
+        why="an unquoted value with whitespace or one of \$ backquote ; & | ( ) < > \" ' backslash ~, which a shell reads otherwise than systemd's EnvironmentFile; quote the value with '...'"
+      else
+        continue
+      fi
+    else
+      why="not NAME=value, a # comment or a blank line, so systemd's EnvironmentFile and this deploy's shell may read it differently"
+    fi
+    die "$file:$number: $why. $hold"
+  done <"$file"
+  return 0
+}
+check_env_file "$live/spawn.env"
 
 # release_hold: end the owner's hold on the missions repo, if one is active
 # (deploy/hold.sh). Never fails: a release that cannot run is said, and the

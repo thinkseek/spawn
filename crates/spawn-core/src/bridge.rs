@@ -4460,6 +4460,9 @@ impl Bridge {
         let mut dialog: Option<String> = None;
         // The last terminal call that failed on a terminal still there.
         let mut transient: Option<String> = None;
+        // The pane as last captured: a wait that fails quotes its tail, so
+        // the cause (a dialog the wait does not know) reaches the log.
+        let mut last_pane: Option<String> = None;
         // The trust dialog comes before the engine starts up, so answering it
         // restarts the budget instead of spending it. A failed capture, or a
         // staging refused before any key went, spends one attempt: only a
@@ -4475,7 +4478,10 @@ impl Bridge {
                     .terminals
                     .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
                 {
-                    Ok(pane) => pane,
+                    Ok(pane) => {
+                        last_pane = Some(pane.clone());
+                        pane
+                    }
                     Err(error) => {
                         if self.terminal_gone(active) {
                             return Ok(Outcome::Failed(format!("terminal disappeared: {error}")));
@@ -4534,8 +4540,12 @@ impl Bridge {
             }
         }
         let why = transient.map_or_else(String::new, |why| format!("; last failure {why}"));
+        let seen = last_pane
+            .as_deref()
+            .and_then(format_pane_tail_excerpt)
+            .map_or_else(String::new, |excerpt| format!("; last pane: {excerpt}"));
         Ok(Outcome::Failed(format!(
-            "pane never became ready, last state {last:?}{why}"
+            "pane never became ready, last state {last:?}{why}{seen}"
         )))
     }
 
@@ -5515,6 +5525,96 @@ fn signal_file(active: &Active) -> String {
     format!("{}.signal", exit_file(active))
 }
 
+/// How many non-empty lines of the last pane a failed ready wait quotes.
+const PANE_TAIL_EXCERPT_LINES: usize = 6;
+
+/// The longest quote of that pane, in bytes, its `...` included.
+const PANE_TAIL_EXCERPT_MAX_BYTES: usize = 400;
+
+/// What a TUI draws rules and boxes with. A line made only of these (at
+/// least 3, spaces aside) is decoration, not text: a 120-column border of
+/// `─` alone would cost 360 of the excerpt's bytes.
+const PANE_RULE_CHARS: [char; 23] = [
+    '\u{2500}', '\u{2501}', '\u{2550}', '-', '_', '=', '*', '\u{b7}', '\u{2502}', '\u{2503}',
+    '\u{2551}', '\u{256d}', '\u{256e}', '\u{2570}', '\u{256f}', '\u{250c}', '\u{2510}', '\u{2514}',
+    '\u{2518}', '\u{2554}', '\u{2557}', '\u{255a}', '\u{255d}',
+];
+
+/// A box's side borders (`│`, `┃`, `║`), trimmed from both ends of a line.
+const PANE_SIDE_BORDERS: [char; 3] = ['\u{2502}', '\u{2503}', '\u{2551}'];
+
+/// Horizontal box-drawing characters (`─`, `━`, `═`): a run of more than 3
+/// of one inside a line is kept as 3.
+const PANE_RUN_CHARS: [char; 3] = ['\u{2500}', '\u{2501}', '\u{2550}'];
+
+/// The tail of `pane` as one bounded line for a failed ready wait's error,
+/// or `None` when it holds no text. Credentials go first
+/// ([`crate::redact::redact`]: Claude Code's API-key dialog prints part of
+/// the key, and this text reaches the log). Each line then has its control
+/// characters made spaces, its runs of whitespace made one space, its box
+/// side borders trimmed and its runs of `─`, `━` or `═` kept to 3; a line
+/// left empty, or made only of rule characters ([`PANE_RULE_CHARS`]), is
+/// dropped. The last [`PANE_TAIL_EXCERPT_LINES`] lines left are joined with
+/// ` | `. Past [`PANE_TAIL_EXCERPT_MAX_BYTES`] the front is cut, on a
+/// character boundary and marked `...`: the bottom of the pane (a dialog's
+/// question and its choices) is what the reader needs.
+fn format_pane_tail_excerpt(pane: &str) -> Option<String> {
+    let clean = crate::redact::redact(pane);
+    let lines: Vec<String> = clean
+        .lines()
+        .map(clean_pane_line)
+        .filter(|line| !line.is_empty() && !is_pane_rule(line))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let joined = lines[lines.len().saturating_sub(PANE_TAIL_EXCERPT_LINES)..].join(" | ");
+    if joined.len() <= PANE_TAIL_EXCERPT_MAX_BYTES {
+        return Some(joined);
+    }
+    let mut start = joined.len() - (PANE_TAIL_EXCERPT_MAX_BYTES - "...".len());
+    while !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("...{}", &joined[start..]))
+}
+
+/// One pane line for [`format_pane_tail_excerpt`]: control characters
+/// made spaces, runs of whitespace made one space, box side borders trimmed
+/// from both ends, and a run of more than 3 of one of [`PANE_RUN_CHARS`]
+/// kept as 3.
+fn clean_pane_line(line: &str) -> String {
+    let flat: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let words = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = words.trim_matches(|c: char| c.is_whitespace() || PANE_SIDE_BORDERS.contains(&c));
+    let mut out = String::with_capacity(trimmed.len());
+    let mut previous = None;
+    let mut run = 0;
+    for c in trimmed.chars() {
+        run = if previous == Some(c) { run + 1 } else { 1 };
+        previous = Some(c);
+        if run <= 3 || !PANE_RUN_CHARS.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether a cleaned pane line is a rule or a box border: at least 3
+/// characters besides spaces, every one of them in [`PANE_RULE_CHARS`].
+/// `--help`, `-1` or `2. No` hold other characters and stay.
+fn is_pane_rule(line: &str) -> bool {
+    let mut marks = line.chars().filter(|c| !c.is_whitespace());
+    let mut count = 0;
+    marks.all(|c| {
+        count += 1;
+        PANE_RULE_CHARS.contains(&c)
+    }) && count >= 3
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -5641,6 +5741,156 @@ mod tests {
             }
         }
         assert!(super::CREDENTIAL_DENY.contains(&"Read(//proc/**)"));
+    }
+
+    /// Claude Code's API-key dialog, as a pane shows it: it prints the key
+    /// elided, its tail still part of the secret.
+    const API_KEY_DIALOG_PANE: &str = "\
+ Detected a custom API key in your environment\n\
+\n\
+ ANTHROPIC_API_KEY: sk-ant-...Zq9xW3vT0aBcDeFgHiJk\n\
+\n\
+ Do you want to use this API key?\n\
+\n\
+ \u{276f} 1. Yes\n\
+   2. No (recommended)\n\
+\n\
+ Enter to confirm \u{b7} Esc to exit\n";
+
+    #[test]
+    fn a_pane_tail_excerpt_quotes_the_dialog_s_last_lines_with_the_key_redacted() {
+        let excerpt =
+            super::format_pane_tail_excerpt(API_KEY_DIALOG_PANE).expect("the dialog has text");
+        assert!(
+            excerpt.contains("Do you want to use this API key?"),
+            "{excerpt}"
+        );
+        assert!(excerpt.contains("2. No (recommended)"), "{excerpt}");
+        assert!(
+            excerpt.contains(&format!("ANTHROPIC_API_KEY: {}", crate::redact::REDACTED)),
+            "{excerpt}"
+        );
+        assert!(
+            !excerpt.contains("Zq9x"),
+            "the key's tail leaked: {excerpt}"
+        );
+        assert!(!excerpt.contains('\n'), "{excerpt}");
+        // Its six non-empty lines, in order, blank lines dropped.
+        assert!(
+            excerpt.starts_with("Detected a custom API key"),
+            "{excerpt}"
+        );
+        assert_eq!(excerpt.matches(" | ").count(), 5, "{excerpt}");
+        assert!(
+            excerpt.ends_with("Enter to confirm \u{b7} Esc to exit"),
+            "{excerpt}"
+        );
+        // A longer pane: the last six non-empty lines only.
+        let longer = format!("first line\nsecond line\n{API_KEY_DIALOG_PANE}");
+        let excerpt = super::format_pane_tail_excerpt(&longer).expect("text");
+        assert!(!excerpt.contains("first line"), "{excerpt}");
+        assert!(!excerpt.contains("second line"), "{excerpt}");
+        assert!(
+            excerpt.starts_with("Detected a custom API key"),
+            "{excerpt}"
+        );
+    }
+
+    #[test]
+    fn a_pane_tail_excerpt_redacts_other_secrets_and_flattens_control_characters() {
+        let pane = "curl -H 'Authorization: Bearer abcdefghijklmnop0123'\n\
+                    DATABASE_URL=postgres://bb:hunter2secret@db/bb\n\
+                    key sk-0123456789abcdefghij\there\x1b[0m done\n";
+        let excerpt = super::format_pane_tail_excerpt(pane).expect("text");
+        for secret in [
+            "abcdefghijklmnop0123",
+            "hunter2secret",
+            "sk-0123456789abcdefghij",
+        ] {
+            assert!(!excerpt.contains(secret), "{secret} leaked: {excerpt}");
+        }
+        assert!(!excerpt.chars().any(char::is_control), "{excerpt:?}");
+    }
+
+    #[test]
+    fn a_pane_tail_excerpt_of_long_multibyte_text_is_cut_on_a_char_boundary() {
+        let line = "命令失败：没有这个文件 ✽ ".repeat(40);
+        let pane = format!("{line}\n{line}\n{line}\n最后一行：选择 1 或 2\n");
+        let excerpt = super::format_pane_tail_excerpt(&pane).expect("text");
+        assert!(
+            excerpt.len() <= super::PANE_TAIL_EXCERPT_MAX_BYTES,
+            "{}",
+            excerpt.len()
+        );
+        // The front is cut, so the bottom of the pane stays whole.
+        assert!(excerpt.starts_with("..."), "{excerpt}");
+        assert!(
+            excerpt.ends_with("没有这个文件 ✽ | 最后一行：选择 1 或 2"),
+            "{excerpt}"
+        );
+        // A short pane is not cut.
+        assert_eq!(
+            super::format_pane_tail_excerpt(" short \n").as_deref(),
+            Some("short")
+        );
+    }
+
+    #[test]
+    fn a_pane_tail_excerpt_drops_a_wide_tui_border_and_keeps_the_dialog_s_bottom() {
+        const WIDTH: usize = 120;
+        let rule = "\u{2500}".repeat(WIDTH - 2);
+        let mut lines = vec![format!("\u{256d}{rule}\u{256e}")];
+        for text in API_KEY_DIALOG_PANE.lines() {
+            lines.push(format!("\u{2502}{text:<width$}\u{2502}", width = WIDTH - 2));
+            lines.push(format!("\u{2502}{rule}\u{2502}"));
+        }
+        lines.push(format!("\u{2570}{rule}\u{256f}"));
+        lines.push("\u{2501}".repeat(WIDTH));
+        let pane = lines.join("\n");
+        let excerpt = super::format_pane_tail_excerpt(&pane).expect("text");
+        assert!(
+            excerpt.len() <= super::PANE_TAIL_EXCERPT_MAX_BYTES,
+            "{}",
+            excerpt.len()
+        );
+        for text in [
+            "Do you want to use this API key?",
+            "\u{276f} 1. Yes",
+            "2. No (recommended)",
+        ] {
+            assert!(excerpt.contains(text), "{text} missing: {excerpt}");
+        }
+        assert!(
+            excerpt.ends_with("Enter to confirm \u{b7} Esc to exit"),
+            "{excerpt}"
+        );
+        assert!(!excerpt.contains('\u{2500}'), "{excerpt}");
+        assert!(!excerpt.contains('\u{2502}'), "{excerpt}");
+        assert!(
+            !excerpt.contains("Zq9x"),
+            "the key's tail leaked: {excerpt}"
+        );
+        // Short lines of text that start with a rule character stay.
+        let cli = "usage: spawn --help\n--help\n-1\n42\n---\n";
+        assert_eq!(
+            super::format_pane_tail_excerpt(cli).as_deref(),
+            Some("usage: spawn --help | --help | -1 | 42")
+        );
+        // A run of `─` inside a line is kept to 3.
+        assert_eq!(
+            super::format_pane_tail_excerpt(
+                "title \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} end\n"
+            )
+            .as_deref(),
+            Some("title \u{2500}\u{2500}\u{2500} end")
+        );
+    }
+
+    #[test]
+    fn a_blank_pane_has_no_tail_excerpt() {
+        for pane in ["", "\n\n", "   \n\t\n \x1b \n"] {
+            assert_eq!(super::format_pane_tail_excerpt(pane), None, "{pane:?}");
+        }
     }
 
     /// A pane at the input box, as the screen reader draws it.
