@@ -147,3 +147,5 @@ create function spawn_read_artifacts(text) returns void language sql as 'select'
 create function spawn_read_task_events(text) returns void language sql as 'select';
 create function spawn_read_lineage(text) returns void language sql as 'select';
 create function spawn_read_open_tools(text) returns void language sql as 'select';
+create function spawn_task_assign(bigint, text, text, text, text, boolean, boolean) returns bigint
+    language sql as 'select 0::bigint';

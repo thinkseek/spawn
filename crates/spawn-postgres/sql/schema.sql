@@ -1565,6 +1565,34 @@ alter table mission_tasks add column if not exists gate_parked_pushed text;
 -- `task.stolen`), null if never.
 alter table mission_tasks add column if not exists pinned boolean not null default false;
 alter table mission_tasks add column if not exists stolen_at_ms bigint;
+-- Agent grading (docs/agent-grading.md). `difficulty`: the rank the task
+-- was assigned at (1 to 3: `l1` to `l3`, `l2` unless the assigner said).
+-- `preset_id`: the graded preset it runs on (`grading_presets`; null:
+-- assigned without the grading catalog); a `task.rerouted` (rework stepped
+-- up to a stronger preset) moves it and `model`. `first_preset_id`: the
+-- preset it was first assigned to, set once by its `task.assigned` (a
+-- re-issue or reassign carries it) and never moved by a reroute: the
+-- preset calibration counts the task for. `quality_rejections`: how many
+-- times the task was sent back for its quality, a review's `revise` or a
+-- gate's `rejected` (never a gate's `conflict` or `incompatible`, which
+-- `revisions` also counts); a re-issue or reassign carries it. Rework
+-- steps up and calibration scores first pass on it. Added here only, after
+-- every other column, so a migrated table keeps a fresh one's column order.
+alter table mission_tasks add column if not exists difficulty smallint not null default 2
+    check (difficulty in (1, 2, 3));
+alter table mission_tasks add column if not exists preset_id text;
+alter table mission_tasks add column if not exists first_preset_id text;
+alter table mission_tasks add column if not exists quality_rejections integer not null default 0;
+
+-- Agent grading: a grade or difficulty's rank from its wire name (`l1` to
+-- `l3`), or from a bare rank (`1` to `3`) as a record might hold it; null
+-- for anything else.
+create or replace function spawn_grade_rank(p_grade text) returns smallint
+language sql immutable as $$
+    select case p_grade when 'l1' then 1 when 'l2' then 2 when 'l3' then 3
+                        when '1' then 1 when '2' then 2 when '3' then 3 end::smallint
+$$;
+revoke execute on function spawn_grade_rank(text) from public;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1582,6 +1610,41 @@ end
 $$;
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
+
+-- The grading catalog (docs/agent-grading.md): every graded preset a task
+-- may be routed to, its cost rank, state and grades (1 to 3: `l1` to `l3`).
+-- The fold of the `grading.recorded` events of the control session (agent
+-- `agent_control`, source `control`), outside the control fold: written
+-- only by `spawn_grading_apply` in the same transaction as its event
+-- (`spawn_grading_record`), rebuilt from them by `spawn_grading_refold`,
+-- and never read or cleared by `spawn_control_refold`. Not a
+-- `ModelProfile`: `model_profile` is the one it maps to, and in phase 1
+-- the only part of it a worker runs on; `engine_label` and `model_label`
+-- are labels. `window_start_ms`: where its calibration window starts (the
+-- last change of its calibrated or locked grade, or of its state to a
+-- routed one); calibration reads only the tasks assigned since.
+create table if not exists grading_presets (
+    preset_id        text    primary key check (preset_id ~ '^[a-z0-9][a-z0-9_-]{0,63}$'),
+    engine_label     text    not null,
+    model_label      text    not null,
+    model_profile    text    not null check (model_profile in ('default', 'cheap')),
+    cost_rank        integer not null check (cost_rank >= 0),
+    state            text    not null default 'unexamined'
+                     check (state in ('unexamined', 'active', 'demoted', 'disabled')),
+    onboarded_grade  smallint check (onboarded_grade in (1, 2, 3)),
+    calibrated_grade smallint check (calibrated_grade in (1, 2, 3)),
+    locked_grade     smallint check (locked_grade in (1, 2, 3)),
+    window_start_ms  bigint  not null,
+    created_at_ms    bigint  not null,
+    updated_at_ms    bigint  not null,
+    last_event       bigint  not null
+);
+
+-- Calibration's window: the tasks first assigned to a preset, at one
+-- difficulty, newest first (spawn-postgres grading.rs `OUTCOMES`).
+create index if not exists mission_tasks_first_preset
+    on mission_tasks (first_preset_id, difficulty, updated_at_ms)
+    where first_preset_id is not null;
 
 -- The owner's holds on mission sources (docs/fleet-architecture.md §10.3,
 -- "Landing: the owner's hold"): the fold of `source.held` (keyed by source:
@@ -2398,14 +2461,26 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   continues, reassign_of, pinned, created_at_ms, updated_at_ms)
+                                   continues, reassign_of, pinned, difficulty, preset_id,
+                                   first_preset_id, quality_rejections,
+                                   created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
                 (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
                 (p_record ->> 'reassign_of')::bigint,
-                coalesce((p_record ->> 'pinned')::boolean, false), p_at, p_at);
+                coalesce((p_record ->> 'pinned')::boolean, false),
+                -- Agent grading: a record from before it, or assigned
+                -- without the catalog, names none of these (`l2`, no
+                -- preset, no rejection). A re-issue or reassign names
+                -- `first_preset_id` when it is not its `preset_id`, and
+                -- the rejections it carries.
+                coalesce(spawn_grade_rank(p_record ->> 'difficulty'), 2),
+                p_record ->> 'preset_id',
+                coalesce(p_record ->> 'first_preset_id', p_record ->> 'preset_id'),
+                coalesce((p_record ->> 'quality_rejections')::integer, 0),
+                p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -2542,6 +2617,15 @@ begin
     when 'source.main_green' then
         -- The red check passed on main's base (a probe's, or a later main's): green.
         delete from mission_source_reds where source = p_record ->> 'source';
+    when 'task.rerouted' then
+        -- Agent grading's rework step-up (docs/agent-grading.md,
+        -- `spawn_task_reroute`): a task sent back runs its next revision on
+        -- the stronger preset the record names, on that preset's model.
+        -- `first_preset_id` stays: calibration counts the task for the
+        -- preset it was first assigned to.
+        update mission_tasks set preset_id = p_record ->> 'preset_id',
+                                 model = p_record ->> 'model'
+         where id = v_id;
     when 'task.held' then
         -- A landing that pushed nothing: its source is held. It stays
         -- `landing`, waiting behind that hold.
@@ -2584,6 +2668,10 @@ begin
                review_note = case when v_verdict in ('rejected', 'conflict', 'incompatible') then p_record ->> 'note'
                                   else review_note end,
                revisions = revisions + case when v_verdict in ('rejected', 'conflict', 'incompatible') then 1 else 0 end,
+               -- Agent grading: only a quality rejection, never a conflict
+               -- or an incompatible head (docs/agent-grading.md).
+               quality_rejections = quality_rejections
+                                    + case when v_verdict = 'rejected' then 1 else 0 end,
                -- The load-sensitive bound: set by its two evidences, kept
                -- by `no_room` and `stale` (no judging), cleared by every
                -- other verdict on the task (a released task's next gate
@@ -2795,6 +2883,7 @@ begin
            set state = case when v_accepted then 'accepted' else 'revise' end,
                review_note = case when v_accepted then review_note else p_record ->> 'note' end,
                revisions = revisions + case when v_accepted then 0 else 1 end,
+               quality_rejections = quality_rejections + case when v_accepted then 0 else 1 end,
                updated_at_ms = p_at
          where id = v_id
            and (p_record ->> 'revision' is null
@@ -3072,7 +3161,9 @@ begin
         when 'mission_tasks' then
             insert into mission_tasks
             select * from jsonb_populate_record(null::mission_tasks,
-                jsonb_build_object('model', 'default', 'pinned', false) || (p_record -> 'row'));
+                jsonb_build_object('model', 'default', 'pinned', false, 'difficulty', 2,
+                                   'quality_rejections', 0)
+                || (p_record -> 'row'));
         else
             raise exception 'legacy record of unknown table %', p_record ->> 'table';
         end case;
@@ -3276,12 +3367,24 @@ end $$;
 drop function if exists spawn_task_assign(bigint, text, text, text);
 drop function if exists spawn_task_assign(bigint, text, text, text, text);
 drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean);
+drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean, boolean);
 -- `p_pin` (objective 239, `--pin`): the task stays with its worker, never
 -- stolen; the record names `pinned` true, and nothing otherwise.
+-- Agent grading (docs/agent-grading.md): `p_difficulty` (1 to 3, `l1` to
+-- `l3`; 2 by default) and `p_preset`, the graded preset the CLI routed the
+-- task to (`spawn_core::grading::route_preset`), or null. A named preset
+-- must be in the grading catalog, routable (active or demoted), graded at
+-- least `p_difficulty` (its locked grade, else its calibrated one), and
+-- `p_model` its model profile. The record names `difficulty` (`l1` to
+-- `l3`) and `preset_id` only when a preset is named or the difficulty is
+-- not the default, so an assignment without the catalog records what it
+-- did before.
 create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text,
                                              p_brief text, p_model text default 'default',
                                              p_again boolean default false,
-                                             p_pin boolean default false)
+                                             p_pin boolean default false,
+                                             p_difficulty integer default 2,
+                                             p_preset text default null)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3291,6 +3394,7 @@ declare
     v_label text;
     v_duplicate bigint;
     v_duplicate_state text;
+    v_preset grading_presets%rowtype;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -3305,6 +3409,29 @@ begin
     end if;
     if p_model is null or p_model not in ('default', 'cheap') then
         raise exception 'a task runs on the default or cheap model profile, not %', p_model;
+    end if;
+    if p_difficulty is null or p_difficulty not in (1, 2, 3) then
+        raise exception 'a task''s difficulty is 1, 2 or 3 (l1, l2 or l3), not %', p_difficulty;
+    end if;
+    if p_preset is not null then
+        select * into v_preset from grading_presets where preset_id = p_preset;
+        if v_preset.preset_id is null then
+            raise exception 'preset % is not in the grading catalog', p_preset;
+        end if;
+        if v_preset.state not in ('active', 'demoted') then
+            raise exception 'preset % is %: only an active or demoted preset is routed',
+                p_preset, v_preset.state;
+        end if;
+        if coalesce(v_preset.locked_grade, v_preset.calibrated_grade, 0) < p_difficulty then
+            raise exception 'preset % is graded %, below the l% task it is assigned', p_preset,
+                coalesce('l' || coalesce(v_preset.locked_grade, v_preset.calibrated_grade),
+                         'nothing'),
+                p_difficulty;
+        end if;
+        if v_preset.model_profile <> p_model then
+            raise exception 'preset % runs on the % model profile, not %', p_preset,
+                v_preset.model_profile, p_model;
+        end if;
     end if;
     if p_kind = 'resident' then
         select agent_id, session_id into v_agent, v_session
@@ -3342,7 +3469,11 @@ begin
         'created_by', case when v_caller = 'owner' then 'human' else v_caller end)
         || case when v_duplicate is not null
                 then jsonb_build_object('duplicate_of', v_duplicate) else '{}'::jsonb end
-        || case when p_pin then jsonb_build_object('pinned', true) else '{}'::jsonb end);
+        || case when p_pin then jsonb_build_object('pinned', true) else '{}'::jsonb end
+        || case when p_preset is not null or p_difficulty <> 2
+                then jsonb_strip_nulls(jsonb_build_object('difficulty', 'l' || p_difficulty,
+                                                          'preset_id', p_preset))
+                else '{}'::jsonb end);
     return v_id;
 end $$;
 
@@ -3543,6 +3674,359 @@ begin
         'revision', v_revision));
 end $$;
 
+-- A grading record's grade: its rank when it is a wire name (`l1` to
+-- `l3`), else null. The checked writers take nothing else; the folds also
+-- read a bare rank (spawn_grade_rank).
+create or replace function spawn_grade_wire(p_grade jsonb) returns smallint
+language sql immutable as $$
+    select case when jsonb_typeof(p_grade) = 'string'
+                then case p_grade #>> '{}' when 'l1' then 1 when 'l2' then 2 when 'l3' then 3 end
+           end::smallint
+$$;
+revoke execute on function spawn_grade_wire(jsonb) from public;
+
+-- Agent grading's rework step-up (docs/agent-grading.md): a task sent back
+-- for its quality runs its next revision on a stronger graded preset. The
+-- CLI routes it (`route_preset`, at `TaskDifficulty::for_rework` of the
+-- task's quality rejections, the review that sent it back counted) and
+-- names the preset; this checks and records `task.rerouted` {id,
+-- preset_id, model, from_preset_id, revision, routed_difficulty}, the
+-- model the preset's own and the difficulty a wire name (`l1` to `l3`).
+-- Refused, recording nothing, for a task that is not sent back, at another
+-- revision, assigned without the catalog, routed at another difficulty
+-- than its quality rejections step it up to, or to its own preset, or to
+-- a preset not in the catalog, not routable, or graded below it. Returns
+-- the record.
+create or replace function spawn_task_reroute(p_task bigint, p_preset text, p_revision integer,
+                                              p_routed_difficulty integer)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_task mission_tasks%rowtype;
+    v_preset grading_presets%rowtype;
+    v_needed integer;
+    v_record jsonb;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is null then
+        raise exception '% may not reroute tasks', session_user using errcode = '42501';
+    end if;
+    select * into v_task from mission_tasks where id = p_task;
+    if v_task.id is null then
+        raise exception 'task % does not exist: there is nothing to reroute', p_task;
+    end if;
+    if v_task.state <> 'revise' then
+        raise exception 'task % is %, not sent back: only a task sent back is rerouted',
+            p_task, v_task.state;
+    end if;
+    if v_task.revisions is distinct from p_revision then
+        raise exception 'task % is at revision %, not %: route it again', p_task,
+            v_task.revisions, p_revision;
+    end if;
+    if v_task.preset_id is null then
+        raise exception 'task % was assigned without the grading catalog: it is not rerouted',
+            p_task;
+    end if;
+    -- `TaskDifficulty::for_rework`, the same thresholds.
+    v_needed := case when v_task.difficulty = 1 and v_task.quality_rejections >= 3 then 3
+                     when v_task.difficulty = 1 and v_task.quality_rejections >= 1 then 2
+                     when v_task.difficulty = 2 and v_task.quality_rejections >= 2 then 3
+                     else v_task.difficulty end;
+    if p_routed_difficulty is distinct from v_needed then
+        raise exception 'task % of difficulty l% after % quality rejections is routed at l%, not %',
+            p_task, v_task.difficulty, v_task.quality_rejections, v_needed,
+            coalesce('l' || p_routed_difficulty, 'nothing');
+    end if;
+    if p_preset is not distinct from v_task.preset_id then
+        raise exception 'task % runs on preset % already: a reroute names another', p_task,
+            p_preset;
+    end if;
+    select * into v_preset from grading_presets where preset_id = p_preset;
+    if v_preset.preset_id is null then
+        raise exception 'preset % is not in the grading catalog', p_preset;
+    end if;
+    if v_preset.state not in ('active', 'demoted') then
+        raise exception 'preset % is %: only an active or demoted preset is routed',
+            p_preset, v_preset.state;
+    end if;
+    if coalesce(v_preset.locked_grade, v_preset.calibrated_grade, 0) < p_routed_difficulty then
+        raise exception 'preset % is graded below the l% task % is routed at', p_preset,
+            p_routed_difficulty, p_task;
+    end if;
+    v_record := jsonb_build_object(
+        'type', 'task.rerouted', 'id', p_task, 'preset_id', p_preset,
+        'model', v_preset.model_profile, 'from_preset_id', v_task.preset_id,
+        'revision', p_revision, 'routed_difficulty', 'l' || p_routed_difficulty);
+    perform spawn_control_record(v_record);
+    return v_record;
+end $$;
+
+-- The grading catalog's log: every change is one `grading.recorded` event
+-- of the control session (agent `agent_control`, source `control`), as the
+-- nodes' `node.recorded` are, and outside the control fold: no
+-- spawn_control_refold reads them, and `grading_presets` is their fold
+-- alone. Applying a record never validates: the log is the truth, and
+-- replaying it (`spawn_grading_refold`) gives the same table. Grades are
+-- wire names (`l1` to `l3`, null for none). Records:
+--   preset.registered    {preset_id, engine_label, model_label, model_profile, cost_rank}
+--   preset.onboarded     {preset_id, from_state, to_state, to_grade (null: failed l1),
+--                         passed, total, failed_cases, suite}
+--   preset.regraded      {preset_id, decision, from_grade, to_grade, from_state, to_state,
+--                         first_pass, total}                      (calibration)
+--   preset.grade_locked  {preset_id, from_grade, to_grade (null: unlocked), from_state,
+--                         to_state}
+--   preset.state_changed {preset_id, from_state, to_state}
+create or replace function spawn_grading_apply(p_record jsonb, p_at bigint, p_event bigint)
+returns void language plpgsql as $$
+declare
+    v_id text := p_record ->> 'preset_id';
+begin
+    case p_record ->> 'type'
+    when 'preset.registered' then
+        insert into grading_presets (preset_id, engine_label, model_label, model_profile,
+                                     cost_rank, state, window_start_ms, created_at_ms,
+                                     updated_at_ms, last_event)
+        values (v_id, p_record ->> 'engine_label', p_record ->> 'model_label',
+                p_record ->> 'model_profile', (p_record ->> 'cost_rank')::integer,
+                'unexamined', p_at, p_at, p_at, p_event);
+    when 'preset.onboarded' then
+        update grading_presets
+           set onboarded_grade = spawn_grade_rank(p_record ->> 'to_grade'),
+               calibrated_grade = spawn_grade_rank(p_record ->> 'to_grade'),
+               state = p_record ->> 'to_state', window_start_ms = p_at, updated_at_ms = p_at,
+               last_event = p_event
+         where preset_id = v_id;
+    when 'preset.regraded' then
+        update grading_presets
+           set calibrated_grade = spawn_grade_rank(p_record ->> 'to_grade'),
+               state = p_record ->> 'to_state', window_start_ms = p_at, updated_at_ms = p_at,
+               last_event = p_event
+         where preset_id = v_id;
+    when 'preset.grade_locked' then
+        update grading_presets
+           set locked_grade = spawn_grade_rank(p_record ->> 'to_grade'),
+               state = p_record ->> 'to_state', window_start_ms = p_at, updated_at_ms = p_at,
+               last_event = p_event
+         where preset_id = v_id;
+    when 'preset.state_changed' then
+        -- A preset enabled again starts its calibration window afresh.
+        update grading_presets
+           set state = p_record ->> 'to_state',
+               window_start_ms = case when p_record ->> 'to_state' = 'disabled'
+                                      then window_start_ms else p_at end,
+               updated_at_ms = p_at, last_event = p_event
+         where preset_id = v_id;
+    else
+        raise exception 'unknown grading record %', p_record ->> 'type';
+    end case;
+end $$;
+
+-- Check one grading record against the catalog and append it (owner only:
+-- the people and scripts that run `spawn grade`). Refused, recording
+-- nothing, naming the first rule that fails. Every record but a
+-- registration names the state it moves the preset from, which must be its
+-- state now, and the state it moves it to, which must be the one the rule
+-- gives; none moves a preset to the state it is in. Returns its event's id.
+create or replace function spawn_grading_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+    v_id text := p_record ->> 'preset_id';
+    v_preset grading_presets%rowtype;
+    v_keys text[];
+    v_from smallint;
+    v_to smallint;
+    v_state text;
+    v_event bigint;
+    v_at bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record grading', session_user using errcode = '42501';
+    end if;
+    v_keys := case v_type
+        when 'preset.registered' then
+            array['type', 'preset_id', 'engine_label', 'model_label', 'model_profile', 'cost_rank']
+        when 'preset.onboarded' then
+            array['type', 'preset_id', 'from_state', 'to_state', 'to_grade', 'passed', 'total',
+                  'failed_cases', 'suite']
+        when 'preset.regraded' then
+            array['type', 'preset_id', 'decision', 'from_grade', 'to_grade', 'from_state',
+                  'to_state', 'first_pass', 'total']
+        when 'preset.grade_locked' then
+            array['type', 'preset_id', 'from_grade', 'to_grade', 'from_state', 'to_state']
+        when 'preset.state_changed' then array['type', 'preset_id', 'from_state', 'to_state']
+        end;
+    if v_keys is null then
+        raise exception 'not a grading record: %', v_type;
+    end if;
+    if exists (select 1 from jsonb_object_keys(p_record) k where k <> all(v_keys))
+       or exists (select 1 from unnest(v_keys) k where not p_record ? k) then
+        raise exception 'a % record has %, and nothing else', v_type, array_to_string(v_keys, ', ');
+    end if;
+    if jsonb_typeof(p_record -> 'preset_id') is distinct from 'string'
+       or v_id !~ '^[a-z0-9][a-z0-9_-]{0,63}$' then
+        raise exception 'a preset id is [a-z0-9][a-z0-9_-]{0,63}, not %', p_record -> 'preset_id';
+    end if;
+    select * into v_preset from grading_presets where preset_id = v_id;
+    if v_type = 'preset.registered' then
+        if v_preset.preset_id is not null then
+            raise exception 'preset % is already in the grading catalog', v_id;
+        end if;
+        if exists (select 1 from unnest(array['engine_label', 'model_label']) f
+                    where jsonb_typeof(p_record -> f) is distinct from 'string'
+                       or char_length(p_record ->> f) not between 1 and 200
+                       or p_record ->> f ~ '^[[:space:]]*$') then
+            raise exception 'a preset''s engine and model labels are 1 to 200 characters, not blank';
+        end if;
+        if p_record ->> 'model_profile' is null
+           or p_record ->> 'model_profile' not in ('default', 'cheap') then
+            raise exception 'a preset runs on the default or cheap model profile, not %',
+                p_record -> 'model_profile';
+        end if;
+        if (case when jsonb_typeof(p_record -> 'cost_rank') = 'number'
+                 then (p_record ->> 'cost_rank')::numeric
+                          <> trunc((p_record ->> 'cost_rank')::numeric)
+                      or (p_record ->> 'cost_rank')::numeric not between 0 and 1000000
+                 else true end) then
+            raise exception 'a preset''s cost rank is a whole number from 0 to 1000000, not %',
+                p_record -> 'cost_rank';
+        end if;
+    else
+        if v_preset.preset_id is null then
+            raise exception 'preset % is not in the grading catalog', v_id;
+        end if;
+        if p_record ->> 'from_state' is distinct from v_preset.state then
+            raise exception 'preset % is %, not %', v_id, v_preset.state, p_record -> 'from_state';
+        end if;
+        case v_type
+        when 'preset.onboarded' then
+            if not (jsonb_typeof(p_record -> 'to_grade') = 'null'
+                    or spawn_grade_wire(p_record -> 'to_grade') is not null) then
+                raise exception 'an onboarding grade is l1, l2, l3 or null, not %',
+                    p_record -> 'to_grade';
+            end if;
+            -- A person's disable stands until a person enables it: only a
+            -- preset that has never had a grade (it failed l1) is examined
+            -- again while disabled.
+            if v_preset.state = 'disabled'
+               and coalesce(v_preset.onboarded_grade, v_preset.calibrated_grade,
+                            v_preset.locked_grade) is not null then
+                raise exception 'preset % is disabled: enable it (spawn grade enable %) before onboarding it again',
+                    v_id, v_id;
+            end if;
+            v_state := case when p_record ->> 'to_grade' is null then 'disabled' else 'active' end;
+            if p_record ->> 'to_state' is distinct from v_state then
+                raise exception 'an onboarding with grade % leaves the preset %, not %',
+                    coalesce(p_record ->> 'to_grade', 'none'), v_state, p_record -> 'to_state';
+            end if;
+            if jsonb_typeof(p_record -> 'passed') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'total') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'failed_cases') is distinct from 'array'
+               or jsonb_typeof(p_record -> 'suite') is distinct from 'string' then
+                raise exception 'an onboarding names passed and total (numbers), failed_cases (a list) and suite';
+            end if;
+        when 'preset.regraded' then
+            v_from := spawn_grade_wire(p_record -> 'from_grade');
+            v_to := spawn_grade_wire(p_record -> 'to_grade');
+            if v_preset.locked_grade is not null then
+                raise exception 'preset % has a locked grade: calibration leaves it alone', v_id;
+            end if;
+            if v_preset.state not in ('active', 'demoted') then
+                raise exception 'preset % is %: calibration grades only a routed preset', v_id,
+                    v_preset.state;
+            end if;
+            if v_from is null or v_from is distinct from v_preset.calibrated_grade then
+                raise exception 'preset % is graded l%, not %', v_id, v_preset.calibrated_grade,
+                    p_record -> 'from_grade';
+            end if;
+            if not coalesce(case p_record ->> 'decision'
+                   when 'demote' then v_to = v_from - 1 and p_record ->> 'to_state' = 'demoted'
+                   when 'restore' then v_to = v_from + 1 and v_to <= v_preset.onboarded_grade
+                                       and p_record ->> 'to_state'
+                                           = case when v_to = v_preset.onboarded_grade
+                                                  then 'active' else 'demoted' end
+                   when 'disable' then v_from = 1 and v_to = 1
+                                       and p_record ->> 'to_state' = 'disabled'
+                   else false end, false) then
+                raise exception 'a calibration of preset % from % to % as % is not one step it takes',
+                    v_id, p_record -> 'from_grade', p_record -> 'to_grade', p_record -> 'to_state';
+            end if;
+            if jsonb_typeof(p_record -> 'first_pass') is distinct from 'number'
+               or jsonb_typeof(p_record -> 'total') is distinct from 'number' then
+                raise exception 'a calibration names first_pass and total, numbers';
+            end if;
+        when 'preset.grade_locked' then
+            if not (jsonb_typeof(p_record -> 'to_grade') = 'null'
+                    or spawn_grade_wire(p_record -> 'to_grade') is not null) then
+                raise exception 'a locked grade is l1, l2, l3 or null, not %', p_record -> 'to_grade';
+            end if;
+            if spawn_grade_wire(p_record -> 'from_grade') is distinct from v_preset.locked_grade
+               or (jsonb_typeof(p_record -> 'from_grade') <> 'null'
+                   and spawn_grade_wire(p_record -> 'from_grade') is null) then
+                raise exception 'preset % has locked grade %, not %', v_id,
+                    coalesce('l' || v_preset.locked_grade, 'none'), p_record -> 'from_grade';
+            end if;
+            v_to := spawn_grade_wire(p_record -> 'to_grade');
+            if v_to is not distinct from v_preset.locked_grade then
+                raise exception 'preset % has locked grade % already', v_id,
+                    coalesce('l' || v_preset.locked_grade, 'none');
+            end if;
+            -- Unlocking the only grade of a routed preset leaves it
+            -- ungraded: unexamined again, never routed on nothing.
+            v_state := case when v_to is null and v_preset.calibrated_grade is null
+                                 and v_preset.state in ('active', 'demoted')
+                            then 'unexamined' else v_preset.state end;
+            if p_record ->> 'to_state' is distinct from v_state then
+                raise exception 'preset % with locked grade % is %, not %', v_id,
+                    coalesce(p_record ->> 'to_grade', 'none'), v_state, p_record -> 'to_state';
+            end if;
+        when 'preset.state_changed' then
+            if p_record ->> 'to_state' = p_record ->> 'from_state' then
+                raise exception 'preset % is % already', v_id, v_preset.state;
+            end if;
+            if p_record ->> 'to_state' = 'disabled' then
+                null;
+            elsif coalesce(v_preset.locked_grade, v_preset.calibrated_grade) is null then
+                raise exception 'preset % has no grade: onboard it or lock its grade before enabling it',
+                    v_id;
+            else
+                v_state := case when v_preset.calibrated_grade is null
+                                     or v_preset.calibrated_grade = v_preset.onboarded_grade
+                                then 'active' else 'demoted' end;
+                if p_record ->> 'to_state' is distinct from v_state then
+                    raise exception 'preset % enabled is %, not %', v_id, v_state,
+                        p_record -> 'to_state';
+                end if;
+            end if;
+        end case;
+    end if;
+    select a.out_id, a.out_at into v_event, v_at
+      from spawn_append_trusted('agent_control', 'session_control', null, 'control', null,
+                                jsonb_build_object('name', 'grading.recorded',
+                                                   'detail', jsonb_build_object('record', p_record))) a;
+    perform spawn_grading_apply(p_record, v_at, v_event);
+    return v_event;
+end $$;
+
+-- Rebuild the grading catalog from its log. Idempotent: it starts from an
+-- empty table every time.
+create or replace function spawn_grading_refold()
+returns void language plpgsql as $$
+declare
+    v_event record;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    delete from grading_presets;
+    for v_event in
+        select e.id, e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
+          from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'grading.recorded'
+         order by e.session_seq
+    loop
+        perform spawn_grading_apply(v_event.record, v_event.recorded_at_ms, v_event.id);
+    end loop;
+end $$;
+
 create or replace function spawn_task_cancel(p_task bigint)
 returns void language plpgsql security definer as $$
 begin
@@ -3624,7 +4108,11 @@ begin
         'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
         'kind', v_old.kind, 'agent_id', v_agent, 'session_id', v_session,
         'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
-        'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task)));
+        'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task,
+        'difficulty', case when v_old.difficulty <> 2 then 'l' || v_old.difficulty end,
+        'preset_id', v_old.preset_id,
+        'first_preset_id', nullif(v_old.first_preset_id, v_old.preset_id),
+        'quality_rejections', nullif(v_old.quality_rejections, 0))));
     return v_id;
 end $$;
 
@@ -3727,7 +4215,11 @@ begin
         'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
         'kind', 'ephemeral', 'agent_id', v_agent, 'session_id', v_session,
         'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
-        'objective', v_old.objective, 'scenario', v_old.scenario, 'reassign_of', p_task)));
+        'objective', v_old.objective, 'scenario', v_old.scenario, 'reassign_of', p_task,
+        'difficulty', case when v_old.difficulty <> 2 then 'l' || v_old.difficulty end,
+        'preset_id', v_old.preset_id,
+        'first_preset_id', nullif(v_old.first_preset_id, v_old.preset_id),
+        'quality_rejections', nullif(v_old.quality_rejections, 0))));
     return jsonb_build_object('task', v_id, 'session_id', v_session, 'agent_id', v_agent);
 end $$;
 
@@ -5539,6 +6031,173 @@ create index if not exists spawn_events_host_storage_bytes
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes';
 
+-- The nodes (multi-host P1; docs/fleet-architecture.md §1.2): the machines
+-- Spawn may use and whether they answer. Their records are `node.recorded`
+-- events of the control session, outside the fold: no
+-- spawn_control_refold, this schema's or an older one's, reads them, so a
+-- schema rolled back still refolds a log that holds them.
+--   node.joined {name, ssh, note, arch, os, kernel, cores, cpu_max,
+--     mem_total, mem_max, disk_free, gpu, exit_country} (`spawn node add`);
+--   node.drained, node.undrained, node.removed {name};
+--   node.heartbeat {name, join, load1, mem_available, disk_free},
+--   node.lost {name, join, last_seen_ms, silent_ms, error},
+--   node.back {name, join, down_ms} (`spawn loop`'s heartbeat worker).
+-- One index, spawn_events_node on (type, name, session_seq) of these
+-- records, finds a node's latest record of a type in one seek, for the
+-- writer's checks and the readers alike. It is not made here: this file
+-- runs in one transaction under the append lock, and a first build reads
+-- all of spawn_events. `PostgresStore::migrate` builds it after that
+-- transaction commits, concurrently, so appends never wait for it
+-- (spawn-postgres nodes.rs `NODE_INDEX`). Until it is there the node reads
+-- are right, only slower.
+
+-- The latest record of type `p_type` of node `p_name` after `p_after` (a
+-- session_seq), through spawn_events_node.
+create or replace function spawn_node_latest(p_type text, p_name text, p_after bigint)
+returns table (id bigint, seq bigint, at_ms bigint, record jsonb)
+language sql stable as $$
+    select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record'
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'node.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'type' = p_type
+       and e.kind -> 'detail' -> 'record' ->> 'name' = p_name
+       and e.session_seq > p_after
+     order by e.session_seq desc
+     limit 1
+$$;
+
+-- Whether `p_value` is a JSON number at least 0.
+create or replace function spawn_node_count(p_value jsonb)
+returns boolean language sql immutable as $$
+    select case when jsonb_typeof(p_value) = 'number' then p_value::text::numeric >= 0
+                else false end
+$$;
+
+-- The reader login (`/api/nodes`) reads through spawn_node_latest, with its
+-- own rights; nobody else is handed either helper.
+revoke execute on function spawn_node_latest(text, text, bigint) from public;
+revoke execute on function spawn_node_count(jsonb) from public;
+do $$
+begin
+    execute format('grant execute on function spawn_node_latest(text, text, bigint) to %I',
+                   spawn_login_role('spawn_reader'));
+end
+$$;
+
+-- The writer of a node's facts (owner only). Under the append lock: a join
+-- of a name not joined (a removed name joins again); any other record of
+-- a joined name, the loop's heartbeat, lost and back of its current join
+-- (`join`, the node.joined event id), so a probe started for an earlier
+-- join records nothing; no drain, undrain, lost or back recorded twice.
+-- Returns the record's event id.
+create or replace function spawn_node_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+    v_name text := p_record ->> 'name';
+    v_bad text;
+    v_join bigint;
+    v_seq bigint;
+    v_on bigint;
+    v_off bigint;
+    v_id bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner records a node''s facts; % may not', session_user
+            using errcode = '42501';
+    end if;
+    if v_type is null or v_type not in ('node.joined', 'node.drained', 'node.undrained',
+                                        'node.removed', 'node.heartbeat', 'node.lost',
+                                        'node.back') then
+        raise exception 'not a node record: its type is none of node.joined, node.drained, node.undrained, node.removed, node.heartbeat, node.lost, node.back'
+            using errcode = '22023';
+    end if;
+    if v_name is null or v_name !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$' then
+        raise exception 'a node''s name is 1 to 63 letters, digits, dots, dashes or underscores, first a letter or digit'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined'
+       and (p_record ->> 'ssh' is null or length(p_record ->> 'ssh') > 255
+            or p_record ->> 'ssh' !~ ('^(([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*'
+                                      '|ssh://([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?)$')
+            or coalesce(substring(p_record ->> 'ssh' from ':([0-9]{1,5})$')::integer
+                        between 1 and 65535, true) is not true) then
+        raise exception 'a node''s ssh destination is [user@]host or ssh://[user@]host[:port], the port 1 to 65535'
+            using errcode = '22023';
+    end if;
+    -- Each field this record type holds, named when it is wrong; the
+    -- record itself is never said back.
+    select c.field, c.what into v_bad, v_on
+      from (values (1, 'node.joined', 'arch', 0), (2, 'node.joined', 'os', 0),
+                   (3, 'node.joined', 'kernel', 0), (4, 'node.joined', 'cores', 1),
+                   (5, 'node.joined', 'mem_total', 1), (6, 'node.joined', 'disk_free', 1),
+                   (7, 'node.joined', 'cpu_max', 3), (8, 'node.joined', 'mem_max', 3),
+                   (9, 'node.joined', 'gpu', 3), (10, 'node.joined', 'exit_country', 3),
+                   (11, 'node.joined', 'note', 4),
+                   (12, 'node.heartbeat', 'load1', 1), (13, 'node.heartbeat', 'mem_available', 1),
+                   (14, 'node.heartbeat', 'disk_free', 1), (15, 'node.lost', 'silent_ms', 1),
+                   (16, 'node.lost', 'last_seen_ms', 2), (17, 'node.back', 'down_ms', 2))
+           as c(o, type, field, what)
+     where c.type = v_type
+       and not coalesce(case c.what
+               when 0 then jsonb_typeof(p_record -> c.field) = 'string'
+               when 1 then spawn_node_count(p_record -> c.field)
+               when 2 then coalesce(jsonb_typeof(p_record -> c.field), 'null') = 'null'
+                           or spawn_node_count(p_record -> c.field)
+               when 3 then p_record ? c.field
+               else char_length(coalesce(p_record ->> c.field, '')) <= 500 end, false)
+     order by c.o
+     limit 1;
+    if v_bad is not null then
+        raise exception 'a % record''s % is %', v_type, v_bad,
+            case v_on when 0 then 'text' when 1 then 'a number at least 0'
+                      when 2 then 'null or a number at least 0' when 3 then 'there, null or not'
+                      else 'at most 500 characters' end
+            using errcode = '22023';
+    end if;
+    v_on := null;
+    select j.id, j.seq into v_join, v_seq from spawn_node_latest('node.joined', v_name, 0) j;
+    if v_join is not null and exists (select 1 from spawn_node_latest('node.removed', v_name, v_seq)) then
+        v_join := null;
+    end if;
+    if v_type = 'node.joined' then
+        if v_join is not null then
+            raise exception 'node % is joined already (spawn node remove first)', v_name
+                using errcode = '23505';
+        end if;
+    elsif v_join is null then
+        raise exception 'node % is not joined', v_name using errcode = 'P0002';
+    elsif v_type in ('node.heartbeat', 'node.lost', 'node.back')
+          and (p_record -> 'join') is distinct from to_jsonb(v_join) then
+        raise exception 'node % is joined as event %, and this record names another: a stale probe',
+            v_name, v_join using errcode = '55000';
+    elsif v_type in ('node.drained', 'node.undrained') then
+        select d.seq into v_on from spawn_node_latest('node.drained', v_name, v_seq) d;
+        select u.seq into v_off from spawn_node_latest('node.undrained', v_name, v_seq) u;
+        if (coalesce(v_on, 0) > coalesce(v_off, 0)) = (v_type = 'node.drained') then
+            raise exception 'node % is % already', v_name,
+                case when v_type = 'node.drained' then 'drained' else 'not drained' end
+                using errcode = '55000';
+        end if;
+    end if;
+    if v_type in ('node.lost', 'node.back') then
+        select l.seq into v_on from spawn_node_latest('node.lost', v_name, v_seq) l;
+        select b.seq into v_off from spawn_node_latest('node.back', v_name, v_seq) b;
+        if (coalesce(v_on, 0) > coalesce(v_off, 0)) = (v_type = 'node.lost') then
+            raise exception 'node % is % already', v_name,
+                case when v_type = 'node.lost' then 'lost' else 'not lost' end
+                using errcode = '55000';
+        end if;
+    end if;
+    select a.out_id into v_id
+      from spawn_append_trusted('agent_control', 'session_control', null, 'control', null,
+                                jsonb_build_object('name', 'node.recorded',
+                                                   'detail', jsonb_build_object('record', p_record))) a;
+    return v_id;
+end $$;
+
+
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
 -- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
@@ -6958,7 +7617,8 @@ where c.principal = 'spawn-dispatch' and c.session_id = 'session_supervisor'
 order by g.tag, c.id;
 
 revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds,
-               mission_source_reds, spawn_alerts, mission_retired_objectives from public;
+               mission_source_reds, spawn_alerts, mission_retired_objectives,
+               grading_presets from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -6968,7 +7628,7 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
@@ -6987,6 +7647,7 @@ begin
         'spawn_mission_resume(bigint)', 'spawn_mission_pause(bigint, text)',
         'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
+        'spawn_node_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
         'spawn_deploy_record(jsonb)', 'spawn_verification_record(jsonb)',
         'spawn_objective_retire(jsonb)', 'spawn_cost_record(jsonb)',
@@ -6998,24 +7659,27 @@ begin
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
         'spawn_source_push_request(text, text, text, boolean, boolean, text)',
-        'spawn_source_push_hold()'] loop
+        'spawn_source_push_hold()',
+        'spawn_task_reroute(bigint, text, integer, integer)',
+        'spawn_grading_apply(jsonb, bigint, bigint)', 'spawn_grading_record(jsonb)',
+        'spawn_grading_refold()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
         'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text, text)',
         'spawn_resident_retire(text)', 'spawn_task_stages(bigint)',
-        'spawn_objective_retire(jsonb)'] loop
+        'spawn_objective_retire(jsonb)', 'spawn_task_reroute(bigint, text, integer, integer)'] loop
         execute format('grant execute on function %s to %I', v_function,
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
                    'mission_source_holds, mission_source_reds, spawn_alerts, '
-                   'mission_retired_objectives, '
+                   'mission_retired_objectives, grading_presets, '
                    'spawn_alert_scores, spawn_decisions, spawn_interventions, spawn_outcomes, '
                    'spawn_escalations, spawn_human_intents to %I',
                    spawn_login_role('spawn_supervisor'));

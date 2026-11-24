@@ -569,6 +569,7 @@ fn transcript_tail(turn: &Value) -> Option<Vec<u8>> {
         .filter(std::fs::Metadata::is_file)?
         .len();
     crate::config::terminal_host()
+        .ok()?
         .read_from(&workspace, path, length.saturating_sub(TRANSCRIPT_TAIL))
         .ok()?
 }

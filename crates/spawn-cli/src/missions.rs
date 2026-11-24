@@ -12,6 +12,9 @@
 
 use serde_json::{Value, json};
 use spawn_core::event::ModelProfile;
+use spawn_core::grading::{
+    GradedPreset, RoutingDecision, RoutingError, TaskDifficulty, catalog_covers, route_preset,
+};
 
 use crate::{Flags, open_store};
 
@@ -110,13 +113,25 @@ const USAGE: &str = "usage:
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
                     [--model default|cheap] [--again] [--pin]   (cheap: every model on DeepSeek)
+                    [--difficulty l1|l2|l3] [--preset <preset_id>]
       (the supervisor's brief that a task of the mission in flight already has, trimmed of
        space, tab, CR and LF, is refused, naming that task; --again assigns it on purpose.
        Every duplicate assigned names the task it repeats in its record: duplicate_of.
-       --pin keeps the task with its worker: it is never stolen)
+       --pin keeps the task with its worker: it is never stolen.
+       Agent grading (docs/agent-grading.md): --difficulty or --preset routes the task
+       through the grading catalog (spawn grade): to --preset, or to the cheapest routable
+       preset graded for the difficulty (l2 unless given), on that preset's --model profile;
+       no such preset is an error. Without either, an ephemeral task is routed at l2 when
+       some routable preset is graded l2 or above, and otherwise assigned on --model default
+       as before, saying so (routing_fallback); a resident task stays on --model. --model
+       keeps the catalog out, and is refused with --difficulty or --preset)
   spawn task accept --id N [--revision R]
   spawn task reject --id N [--revision R] --note <what to fix>
-      (R: the report's revision as read; refused once the task has moved on)
+      (R: the report's revision as read; refused once the task has moved on. A task routed
+       through the grading catalog whose rework steps up past its preset's grade (an l1 task
+       at its 1st and 3rd quality rejection, an l2 task at its 2nd; a gate's conflict is no
+       quality rejection) is rerouted to the preset graded for it, in the same transaction:
+       task.rerouted. Only a review reroutes; a gate's rejection does not)
   spawn task cancel --id N
       (a delivered task's resident is stopped at once, its work set aside on its branch,
        and it is told before its next task; an ephemeral worker is stopped)
@@ -306,6 +321,243 @@ fn model(flags: &Flags) -> Result<ModelProfile, String> {
     };
     ModelProfile::parse(&text)
         .ok_or_else(|| format!("--model is default or cheap, not {text}\n{USAGE}"))
+}
+
+/// How `spawn task assign` places a task (docs/agent-grading.md,
+/// "Assigning").
+enum Placement {
+    /// As before agent grading: on `--model` (`default` unless given).
+    /// `fallback`: why an unflagged ephemeral assignment did not route
+    /// through a catalog that holds presets.
+    Model { fallback: Option<String> },
+    /// Through the grading catalog.
+    Routed(RoutingDecision),
+}
+
+/// `spawn task assign`: through the grading catalog when [`placement`]
+/// says so, else exactly as before agent grading. Prints the task and its
+/// model (routed: its difficulty, preset and the preset's grade; fallen
+/// back: why, as `routing_fallback`, also said on stderr).
+pub(crate) fn assign(
+    store: &spawn_postgres::PostgresStore,
+    flags: &Flags,
+) -> Result<Value, String> {
+    let err = |error: spawn_core::port::StoreError| error.to_string();
+    let decision = match placement(store, flags)? {
+        Placement::Routed(decision) => decision,
+        Placement::Model { fallback } => {
+            let model = model(flags)?;
+            let task = store
+                .task_assign_with(
+                    id(flags, "mission")?,
+                    &text(flags, "kind")?,
+                    &flags.get("worker").unwrap_or_default(),
+                    &text(flags, "brief")?,
+                    model.as_str(),
+                    flags.switch("again"),
+                    flags.switch("pin"),
+                )
+                .map_err(err)?;
+            let mut answer = json!({ "task": task, "model": model.as_str() });
+            if let Some(why) = fallback {
+                eprintln!("spawn: agent grading: task {task}: {why}");
+                answer["routing_fallback"] = json!(why);
+            }
+            return Ok(answer);
+        }
+    };
+    let task = store
+        .task_assign_routed(
+            id(flags, "mission")?,
+            &text(flags, "kind")?,
+            &flags.get("worker").unwrap_or_default(),
+            &text(flags, "brief")?,
+            decision.model_profile.as_str(),
+            flags.switch("again"),
+            flags.switch("pin"),
+            decision.difficulty,
+            Some(&decision.preset_id),
+        )
+        .map_err(err)?;
+    Ok(
+        json!({ "task": task, "model": decision.model_profile.as_str(),
+               "difficulty": decision.difficulty, "preset_id": decision.preset_id,
+               "preset_grade": decision.preset_grade }),
+    )
+}
+
+/// Where `spawn task assign` places a task (docs/agent-grading.md,
+/// "Assigning"):
+///
+/// - `--model`: on it, as before; refused with `--difficulty` or
+///   `--preset`.
+/// - `--difficulty` or `--preset`: through the catalog, strictly: a catalog
+///   that cannot take the task is an error.
+/// - neither, `--kind resident`: on `--model default`, as before, so the
+///   catalog never moves a resident between model profiles task by task.
+/// - neither, an ephemeral task: through the catalog at `l2` when some
+///   routable preset is graded `l2` or above; otherwise on `--model
+///   default`, as before, and when the catalog holds presets, saying why.
+///   An unflagged assignment (the supervisor's) is never stopped by what
+///   the catalog holds.
+fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Placement, String> {
+    let difficulty = flags
+        .get("difficulty")
+        .map(|text| {
+            TaskDifficulty::parse(&text)
+                .ok_or_else(|| format!("--difficulty is l1, l2 or l3, not {text}\n{USAGE}"))
+        })
+        .transpose()?;
+    let preset = flags.get("preset");
+    if flags.get("model").is_some() {
+        if difficulty.is_some() || preset.is_some() {
+            return Err(
+                "--model keeps the grading catalog out: give it, or --difficulty and --preset, \
+                 not both"
+                    .to_string(),
+            );
+        }
+        return Ok(Placement::Model { fallback: None });
+    }
+    let explicit = difficulty.is_some() || preset.is_some();
+    if !explicit && flags.get("kind").as_deref() == Some("resident") {
+        return Ok(Placement::Model { fallback: None });
+    }
+    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
+    if !explicit {
+        if catalog.is_empty() {
+            return Ok(Placement::Model { fallback: None });
+        }
+        let default = TaskDifficulty::default();
+        if !catalog_covers(&catalog, default) {
+            return Ok(Placement::Model {
+                fallback: Some(format!(
+                    "no routable preset in the grading catalog is graded {} or above: \
+                     assigned on --model default, as without the catalog",
+                    default.required_grade()
+                )),
+            });
+        }
+    }
+    route_preset(
+        difficulty.unwrap_or_default(),
+        0,
+        preset.as_deref(),
+        &catalog,
+    )
+    .map(Placement::Routed)
+    .map_err(|error| format!("agent grading: {error}"))
+}
+
+/// `spawn task reject`: send the task back, rerouting its rework when it
+/// steps up past its preset ([`rework_reroute`]) in the same statement.
+pub(crate) fn reject(
+    store: &spawn_postgres::PostgresStore,
+    flags: &Flags,
+) -> Result<Value, String> {
+    let err = |error: spawn_core::port::StoreError| error.to_string();
+    let task = id(flags, "id")?;
+    let note = text(flags, "note")?;
+    let revision = revision(flags)?;
+    let reroute = rework_reroute(store, task)?;
+    if let Some(ReworkReroute {
+        route: Ok(decision),
+        revision: next,
+        model,
+    }) = &reroute
+    {
+        let rerouted = store
+            .task_reject_rerouted(
+                task,
+                &note,
+                revision,
+                &decision.preset_id,
+                *next,
+                decision.routed_difficulty,
+            )
+            .map_err(err)?;
+        let mut answer = json!({ "task": task, "sent_back": true, "rerouted": rerouted });
+        if decision.model_profile.as_str() == model {
+            // Phase 1 runs a worker on its ModelProfile alone: the record
+            // moves the task's preset, and the worker runs as before.
+            eprintln!(
+                "spawn: agent grading: task {task} rerouted to preset {} on the same model \
+                 profile ({model}): its worker runs as before",
+                decision.preset_id
+            );
+            answer["same_model_profile"] = json!(true);
+        }
+        return Ok(answer);
+    }
+    store
+        .task_review(task, false, &note, revision)
+        .map_err(err)?;
+    let mut answer = json!({ "task": task, "sent_back": true });
+    // Sent back all the same: the reviewer decided that. The catalog's
+    // failure to take the rework is said.
+    if let Some(ReworkReroute {
+        route: Err(error), ..
+    }) = reroute
+    {
+        answer["reroute_error"] = json!(error.to_string());
+    }
+    Ok(answer)
+}
+
+/// A rework reroute for `spawn task reject`: where the task's next
+/// revision goes (or why nowhere), the revision it is at once sent back,
+/// and the model profile it runs on now.
+struct ReworkReroute {
+    route: Result<RoutingDecision, RoutingError>,
+    revision: i32,
+    model: String,
+}
+
+/// The rework reroute of a reported task routed through the catalog
+/// (docs/agent-grading.md): routed at its difficulty stepped up for its
+/// quality rejections, this one counted. None when its preset still takes
+/// that (routable and graded for it), or the task is not routed or not
+/// reported (the review itself refuses that).
+fn rework_reroute(
+    store: &spawn_postgres::PostgresStore,
+    task: i64,
+) -> Result<Option<ReworkReroute>, String> {
+    let Some(routed) = store.routed_task(task).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let Some(current) = routed.preset_id.as_deref() else {
+        return Ok(None);
+    };
+    if routed.state != "reported" {
+        return Ok(None);
+    }
+    let rejections = u32::try_from(routed.quality_rejections.saturating_add(1)).unwrap_or(1);
+    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
+    if preset_holds(current, routed.difficulty, rejections, &catalog) {
+        return Ok(None);
+    }
+    Ok(Some(ReworkReroute {
+        route: route_preset(routed.difficulty, rejections, None, &catalog),
+        revision: routed.revisions.saturating_add(1),
+        model: routed.model,
+    }))
+}
+
+/// Whether the preset `current` still takes a task of `difficulty` after
+/// `quality_rejections`: routable and graded for the stepped-up difficulty.
+fn preset_holds(
+    current: &str,
+    difficulty: TaskDifficulty,
+    quality_rejections: u32,
+    catalog: &[GradedPreset],
+) -> bool {
+    let required = difficulty.for_rework(quality_rejections).required_grade();
+    catalog.iter().any(|preset| {
+        preset.preset_id == current
+            && preset
+                .routing_grade()
+                .is_some_and(|grade| grade >= required)
+    })
 }
 
 fn split(rest: &[String]) -> Result<(&str, Flags), String> {
@@ -1014,21 +1266,7 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
     let store = open_store()?;
     let err = |error: spawn_core::port::StoreError| error.to_string();
     match verb {
-        "assign" => {
-            let model = model(&flags)?;
-            let task = store
-                .task_assign_with(
-                    id(&flags, "mission")?,
-                    &text(&flags, "kind")?,
-                    &flags.get("worker").unwrap_or_default(),
-                    &text(&flags, "brief")?,
-                    model.as_str(),
-                    flags.switch("again"),
-                    flags.switch("pin"),
-                )
-                .map_err(err)?;
-            print(&json!({ "task": task, "model": model.as_str() }));
-        }
+        "assign" => print(&assign(&store, &flags)?),
         "accept" => {
             let task = id(&flags, "id")?;
             store
@@ -1036,13 +1274,7 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
                 .map_err(err)?;
             print(&json!({ "task": task, "accepted": true }));
         }
-        "reject" => {
-            let task = id(&flags, "id")?;
-            store
-                .task_review(task, false, &text(&flags, "note")?, revision(&flags)?)
-                .map_err(err)?;
-            print(&json!({ "task": task, "sent_back": true }));
-        }
+        "reject" => print(&reject(&store, &flags)?),
         "cancel" => {
             let task = id(&flags, "id")?;
             store.task_cancel(task).map_err(err)?;

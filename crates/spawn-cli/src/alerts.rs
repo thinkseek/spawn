@@ -215,6 +215,10 @@
 //!   retry). Clears at the `up` record, the first call answered, with its
 //!   `failed_calls`; an `up` whose `down` is older than the history (a loop
 //!   restarted during a week-long outage) clears the judge's open alert.
+//! - `node_lost`, `node <name>`, key `node_lost:<name>:<its node.lost
+//!   event>` (multi-host P1): raised and cleared by the nodes' heartbeat
+//!   worker on its own connection, never this step (crate nodes.rs,
+//!   [`crate::nodes::alert_plan`]).
 //! - `admission_wait`, an execution's `agent_id` or a gate's `task #<id>`,
 //!   key `admission_wait:<its admission.waiting event>`: an
 //!   `admission.waiting` (029) older than `SPAWN_ALERT_ADMISSION_SECS`

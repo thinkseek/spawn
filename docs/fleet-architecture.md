@@ -83,7 +83,7 @@ No layer calls another layer's process directly; they meet in the log.
 
 | Layer | Parts |
 | --- | --- |
-| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, transcripts and exit files |
+| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, transcripts and exit files; the nodes Spawn may use (§1.2) |
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
@@ -144,6 +144,67 @@ lead's own commits pass the same point: a session other than the lead
 reviews them. Today the lead runs reviews for owner work (missions 7 and 8)
 and for everything it merges, gates or deploys; for the fleet's other
 reports the Review point is not built (§9).
+
+### 1.2 Runtime layer: nodes
+
+Spawn may use machines beside the one it runs on (multi-host phase P1,
+owner decision 2026-11-23; design: sync/design-multi-host-nodes.md). The
+*primary* keeps the control plane; the others are *nodes*, at layer 1 only.
+In P1 Spawn knows which nodes it may use and whether they answer: a node
+runs no job yet, and a drain changes no scheduling.
+
+- `spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]>
+  [--note <text>]` (the owner's login) runs a read-only inventory over ssh
+  once and records `node.joined` (arch, os, kernel, cores, the cgroup's
+  `cpu.max` and `memory.max`, memory, free disk of `$HOME`, GPUs;
+  `exit_country` null until egress is read). A joined name is refused
+  before any ssh. `spawn node drain|undrain|remove <name>` record
+  `node.drained`, `node.undrained`, `node.removed`; a removed name joins
+  again from nothing.
+- `spawn loop`'s heartbeat runs on a worker thread with a database
+  connection of its own (statements bounded at 5 s, a database error
+  paced from 15 s to 5 min), so a pass never waits on a node, its
+  records or its alerts; with no node joined it reads the membership once
+  a minute and does nothing else. Every 15 s (a monotonic clock) it runs a
+  small probe (load, available
+  memory, free disk) on each node, one at a time per node, killed with its
+  whole process group at 15 s. It records `node.heartbeat` every ten
+  minutes while the node answers, `node.lost` after `SPAWN_NODE_LOST_SECS`
+  (default 60, 30 to 86400) without an answer (counted from the worker's
+  start for a node not heard since; `last_seen_ms` is only an answer it
+  knows), and `node.back` at the next answer. Each names its `join`, the
+  current `node.joined` event: the writer refuses one of an earlier join,
+  so a probe still running when a node was removed and joined again
+  records nothing. At each read of the membership it fires `node_lost` for
+  each node's latest `node.lost` that has no alert and clears it once a
+  `node.back`, a removal or a new join followed, so a loss and its
+  recovery between two reads are both told, in order, and a failed alert
+  write is made at the next read.
+- `spawn node list [--json]` and `GET /api/nodes` (the reader login; no
+  ssh destination, no note, no clock) give each joined node with `state`
+  (`lost` before `drained` before `live`), `lost_since_ms` while lost and
+  its latest heartbeat sample. The Fleet details show one row per node and
+  say when the read failed.
+
+The records are `node.recorded` events of the control session, outside the
+control fold: a refold of this schema, or of one rolled back to before P1,
+reads none of them. The owner-only writer `spawn_node_record` checks each
+record's shape and the node's state under the append lock; every check and
+every read is a seek of one partial index (`spawn_events_node`), never a
+scan of a node's heartbeats nor of past joins. `init-db` builds that index
+after the schema's transaction, `CREATE INDEX CONCURRENTLY`, so appends do
+not wait for it (it waits for transactions already open, such as a running
+`pg_dump`); a build cut short is dropped and made again at the next
+`init-db`.
+
+The trust boundary is the one panes have: a node writes nothing to the
+log. The primary sends it nothing but two fixed texts of read-only
+commands; ssh runs in batch mode against an already trusted host key,
+without a shared connection, forwarding or terminal, with an environment
+of `PATH`, `HOME`, `USER`, `LOGNAME` and `SSH_AUTH_SOCK` alone. The
+destination is checked in the CLI and again in the writer, and every string
+of a record is masked. Spawn changes no ssh configuration, key or file on a
+node.
 
 ## 2. Observation: rules first, Jev on ambiguity
 
@@ -1189,7 +1250,9 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   every mission), `task_undelivered` (assigned longer than
   `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
   delivered or reported task), `mission_halted` (cleared at its
-  `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
+  `mission.resumed`), `node_lost` (`node <name>`, key
+  `node_lost:<name>:<its node.lost event>`, raised and cleared by the
+  nodes' heartbeat worker, §1.2, not by this step), `postgres_crash` (a `terminated by signal`, `No space
   left` or `could not resize` line in a database's log, cleared by the
   first `database system is ready to accept connections` line after it or by
   `SPAWN_ALERT_PG_QUIET_SECS` of silence, default 900), `memory_low`

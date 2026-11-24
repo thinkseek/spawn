@@ -92,8 +92,10 @@ mod experience;
 mod features;
 mod fleet;
 mod gateway;
+mod grading;
 mod host;
 mod missions;
+mod nodes;
 mod passfile;
 mod recovery;
 mod row;
@@ -110,8 +112,10 @@ pub use cost::{
     ArchiveCounted, ArchiveFile, ArchivedMessage, SessionCounted, SessionFile, SessionMessage,
 };
 pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
+pub use grading::RoutedTask;
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
+pub use nodes::StoreConnector;
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
@@ -168,6 +172,9 @@ pub struct PostgresStore {
     /// prepared from: the loop's fixed reads are parsed and planned once and
     /// reused, not once per pass ([`PostgresStore::query_prepared`]).
     prepared: Mutex<std::collections::HashMap<&'static str, postgres::Statement>>,
+    /// The schema a test store moved into ([`Self::connect_in_schema`]),
+    /// for a connection of its own made elsewhere (nodes.rs `StoreConnector`).
+    schema: Option<String>,
 }
 
 /// The restricted logins, by their base name; each database has its own
@@ -218,6 +225,7 @@ impl PostgresStore {
             password: url_password(url),
             url: url.to_string(),
             prepared: Mutex::new(std::collections::HashMap::new()),
+            schema: None,
         })
     }
 
@@ -238,7 +246,8 @@ impl PostgresStore {
                 "schema name {schema} is not a plain identifier"
             )));
         }
-        let store = Self::connect(url)?;
+        let mut store = Self::connect(url)?;
+        store.schema = Some(schema.to_string());
         {
             let mut client = store.lock();
             client
@@ -301,7 +310,13 @@ impl PostgresStore {
                     attempt += 1;
                     std::thread::sleep(retry_pause(attempt));
                 }
-                result => return result.map_err(|error| backend(&error)),
+                // The node index after the schema's transaction, built
+                // concurrently: appends never wait for it (nodes.rs).
+                result => {
+                    return result
+                        .and_then(|()| self.node_index())
+                        .map_err(|error| backend(&error));
+                }
             }
         }
     }

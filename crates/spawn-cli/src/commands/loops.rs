@@ -33,8 +33,9 @@
 //!
 //! What does not follow this rule is what no append announces: the Bridge's
 //! reading of each engine's screen and transcript runs every pass (objective
-//! 025 gives that schedule its own bounds), and the disk watch reads free
-//! space on its own clock ([`disk::CHECK_EVERY`]).
+//! 025 gives that schedule its own bounds), the disk watch reads free
+//! space on its own clock ([`disk::CHECK_EVERY`]), and the nodes' heartbeat
+//! runs on a worker thread of its own ([`crate::nodes::Heartbeat`]).
 //!
 //! A pass where nothing moved and nothing is due reads the watermark and
 //! runs no step: on an idle fleet that is the only statement it makes, and
@@ -423,6 +424,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     warnings.extend(more);
     let (core_lines, more) = crate::core_lines_sample::Sampler::from_env();
     warnings.extend(more);
+    let (nodes, more) = crate::nodes::Heartbeat::from_env();
+    warnings.extend(more);
     // A price the loop cannot read would record every cost wrong: it stops
     // here, naming the setting.
     let prices = cost::Prices::from_env()?;
@@ -451,7 +454,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         storage: sampler,
         storage_bytes: crate::storage_bytes::Sampler::default(),
         core_lines,
-        terminals: crate::config::terminal_host(),
+        nodes,
+        terminals: crate::config::terminal_host()?,
         config,
         recovery: crate::recover::Recovery::new(),
         pace: Pace::default(),
@@ -502,10 +506,14 @@ struct Fleet<'a> {
     /// then every `SPAWN_CORE_LINES_SAMPLE_SECS`, read beside the passes
     /// ([`crate::core_lines_sample::Sampler`]).
     core_lines: crate::core_lines_sample::Sampler,
+    /// The nodes' heartbeat (multi-host P1, [`crate::nodes::Heartbeat`]):
+    /// its probes and its records run on a worker thread with a database
+    /// connection of its own; a pass only takes its lines.
+    nodes: crate::nodes::Heartbeat,
     /// The terminal host the recovery asks whether a native session's
     /// terminal server lives on (an end found with it gone is a host
     /// restart).
-    terminals: spawn_host::TmuxHost,
+    terminals: spawn_host::LocalTerminalHost,
     /// The recovery's settings (`SPAWN_RECOVER_*`).
     config: crate::recover::Config,
     /// The recovery's own state: this loop's start, and the database outage
@@ -722,6 +730,9 @@ impl Fleet<'_> {
             Ok(line) => lines.extend(line),
             Err(error) => lines.push(error),
         }
+        // Nor the nodes' heartbeat: its probes and its reads and writes run
+        // on its own worker; a pass takes only the lines it said.
+        lines.extend(self.nodes.check(open));
         // The recovery first of the rules that revive an agent: it records
         // every interruption once, with its cause and its evidence, and
         // takes the one way back that cause has. The dispatcher's

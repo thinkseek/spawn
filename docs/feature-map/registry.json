@@ -352,6 +352,10 @@
         {
           "kind": "contains",
           "target": "cap-rsi-integration-gate"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-agent-grading"
         }
       ],
       "provenance": {
@@ -792,11 +796,15 @@
         "crates/spawn-cli/src/storage.rs",
         "crates/spawn-cli/src/storage_bytes.rs",
         "crates/spawn-cli/src/storage_bytes/tests.rs",
+        "crates/spawn-host/src/cas_dedup.rs",
+        "crates/spawn-host/src/overlay.rs",
         "crates/spawn-host/src/scratch.rs",
         "crates/spawn-postgres/src/commit_map.rs",
         "crates/spawn-postgres/tests/commit_map.rs",
         "crates/spawn-postgres/tests/commit_map_checkpoints.rs",
         "crates/spawn-postgres/tests/storage.rs",
+        "docs/cross-os-cow-storage.md",
+        "docs/layerfs-v2-overlay.md",
         "docs/recoverable-storage-keys.md",
         "docs/storage.md",
         "rsi/backlog/054.json",
@@ -909,15 +917,21 @@
         "crates/spawn-host/src/agent_files.rs",
         "crates/spawn-host/src/beneath.rs",
         "crates/spawn-host/src/beneath/tests.rs",
+        "crates/spawn-host/src/cow.rs",
         "crates/spawn-host/src/git.rs",
         "crates/spawn-host/src/home.rs",
         "crates/spawn-host/src/lib.rs",
+        "crates/spawn-host/src/overlay.rs",
         "crates/spawn-host/src/root.rs",
         "crates/spawn-host/src/tree_path.rs",
         "crates/spawn-host/tests/branches.rs",
+        "crates/spawn-host/tests/cow.rs",
         "crates/spawn-host/tests/identity.rs",
+        "crates/spawn-host/tests/overlay.rs",
         "crates/spawn-host/tests/runtime_files.rs",
         "crates/spawn-postgres/tests/sources.rs",
+        "docs/cross-os-cow-storage.md",
+        "docs/layerfs-v2-overlay.md",
         "docs/storage.md",
         "rsi/backlog/003.json",
         "rsi/backlog/004.json",
@@ -954,7 +968,8 @@
         "commits": [],
         "tests": [
           "crates/spawn-host/tests/branches.rs",
-          "crates/spawn-host/tests/identity.rs"
+          "crates/spawn-host/tests/identity.rs",
+          "crates/spawn-host/tests/overlay.rs"
         ],
         "deploys": [],
         "artifacts": [
@@ -965,10 +980,10 @@
     },
     {
       "id": "cap-tmux-runner",
-      "title": "tmux Terminal Adapter, Runner & Process Lifecycle",
+      "title": "tmux / Herdr Terminal Adapters, Runner & Process Lifecycle",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "tmux session management, `spawn run` wrapper, off-loop process-tree termination, filesystem watcher, zombie detection, and host audit.",
+      "summary": "tmux session management (and the opt-in Herdr backend, SPAWN_TERMINAL_BACKEND=herdr), `spawn run` wrapper, off-loop process-tree termination, filesystem watcher, zombie detection, and host audit.",
       "files": [
         "crates/spawn-cli/src/commands/engine.rs",
         "crates/spawn-core/src/shell.rs",
@@ -977,10 +992,12 @@
         "crates/spawn-core/tests/transient_terminal.rs",
         "crates/spawn-core/tests/zombie.rs",
         "crates/spawn-host/src/audit.rs",
+        "crates/spawn-host/src/herdr.rs",
         "crates/spawn-host/src/process.rs",
         "crates/spawn-host/src/tmux.rs",
         "crates/spawn-host/src/watch.rs",
         "crates/spawn-host/tests/api.rs",
+        "crates/spawn-host/tests/herdr.rs",
         "crates/spawn-host/tests/runner.rs",
         "crates/spawn-postgres/tests/zombie.rs",
         "rsi/backlog/025.json",
@@ -1195,6 +1212,8 @@
         "crates/spawn-cli/src/dispatch/stops.rs",
         "crates/spawn-cli/src/dispatch/worker.rs",
         "crates/spawn-cli/src/missions.rs",
+        "crates/spawn-cli/src/nodes.rs",
+        "crates/spawn-cli/src/nodes/tests.rs",
         "crates/spawn-cli/src/objectives.rs",
         "crates/spawn-cli/src/sources.rs",
         "crates/spawn-cli/src/supervise.rs",
@@ -1207,6 +1226,7 @@
         "crates/spawn-postgres/src/experience.rs",
         "crates/spawn-postgres/src/fleet.rs",
         "crates/spawn-postgres/src/missions.rs",
+        "crates/spawn-postgres/src/nodes.rs",
         "crates/spawn-postgres/src/recovery.rs",
         "crates/spawn-postgres/src/sessions.rs",
         "crates/spawn-postgres/src/verifications.rs",
@@ -1221,6 +1241,7 @@
         "crates/spawn-postgres/tests/judgings.rs",
         "crates/spawn-postgres/tests/merges.rs",
         "crates/spawn-postgres/tests/message_due.rs",
+        "crates/spawn-postgres/tests/nodes.rs",
         "crates/spawn-postgres/tests/pause.rs",
         "crates/spawn-postgres/tests/recovery.rs",
         "crates/spawn-postgres/tests/reissue.rs",
@@ -1449,6 +1470,79 @@
         "deploys": [],
         "artifacts": [
           "docs/rsi.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-agent-grading",
+      "title": "Agent Grading: grading catalog, onboarding exams, routing & calibration",
+      "kind": "capability",
+      "parent": "domain-missions-fleet",
+      "summary": "Graded presets (`grading_presets`, the fold of the control session's `grading.recorded` events, outside the control fold) mapped to a `ModelProfile`, offline onboarding exams (`evals/onboarding/`), minimum-sufficient task routing by `TaskDifficulty` with a quality-rejection rework step-up (`task.rerouted`) and a fallback to `--model default` for unflagged assignments the catalog cannot cover, and integer-only calibration over quality outcomes read from `mission_tasks` (`spawn grade`, `spawn task assign --difficulty/--preset`).",
+      "files": [
+        "crates/spawn-cli/src/grading.rs",
+        "crates/spawn-cli/src/missions.rs",
+        "crates/spawn-core/src/grading.rs",
+        "crates/spawn-postgres/sql/schema.sql",
+        "crates/spawn-postgres/src/grading.rs",
+        "crates/spawn-postgres/tests/first-shapes.sql",
+        "crates/spawn-postgres/tests/grading.rs",
+        "docs/agent-grading.md",
+        "evals/onboarding/README.md",
+        "evals/onboarding/l1-slugify/check.sh",
+        "evals/onboarding/l1-slugify/reference/slugify.sh",
+        "evals/onboarding/l1-slugify/spec.md",
+        "evals/onboarding/l2-semver-sort/check.sh",
+        "evals/onboarding/l2-semver-sort/reference/semver_sort.sh",
+        "evals/onboarding/l2-semver-sort/spec.md",
+        "evals/onboarding/l3-toposort/cases/01.code",
+        "evals/onboarding/l3-toposort/cases/01.in",
+        "evals/onboarding/l3-toposort/cases/01.out",
+        "evals/onboarding/l3-toposort/cases/02.code",
+        "evals/onboarding/l3-toposort/cases/02.in",
+        "evals/onboarding/l3-toposort/cases/02.out",
+        "evals/onboarding/l3-toposort/cases/03.code",
+        "evals/onboarding/l3-toposort/cases/03.in",
+        "evals/onboarding/l3-toposort/cases/03.out",
+        "evals/onboarding/l3-toposort/cases/04.code",
+        "evals/onboarding/l3-toposort/cases/04.in",
+        "evals/onboarding/l3-toposort/cases/04.out",
+        "evals/onboarding/l3-toposort/cases/05.code",
+        "evals/onboarding/l3-toposort/cases/05.in",
+        "evals/onboarding/l3-toposort/cases/05.out",
+        "evals/onboarding/l3-toposort/cases/06.code",
+        "evals/onboarding/l3-toposort/cases/06.in",
+        "evals/onboarding/l3-toposort/cases/06.out",
+        "evals/onboarding/l3-toposort/cases/07.code",
+        "evals/onboarding/l3-toposort/cases/07.in",
+        "evals/onboarding/l3-toposort/cases/07.out",
+        "evals/onboarding/l3-toposort/check.sh",
+        "evals/onboarding/l3-toposort/reference/toposort.sh",
+        "evals/onboarding/l3-toposort/spec.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-postgres/tests/grading.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/agent-grading.md",
+          "evals/onboarding/README.md"
         ],
         "discussions": []
       }
@@ -2377,16 +2471,19 @@
         "web/src/components/fleet/HealthStrip.tsx",
         "web/src/components/fleet/InputBox.tsx",
         "web/src/components/fleet/Interventions.tsx",
+        "web/src/components/fleet/NodeRows.tsx",
         "web/src/components/fleet/bits.tsx",
         "web/src/fleet.ts",
         "web/src/input.ts",
         "web/src/interventions.ts",
+        "web/src/nodes.ts",
         "web/src/ordering.ts",
         "web/test/agentPage.test.ts",
         "web/test/attention.test.ts",
         "web/test/commands.test.ts",
         "web/test/input.test.ts",
         "web/test/interventions.test.ts",
+        "web/test/nodes.test.ts",
         "web/test/ordering.test.ts"
       ],
       "relations": [

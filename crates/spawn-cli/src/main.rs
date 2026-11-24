@@ -14,6 +14,8 @@
 //!   record alone (docs/design.md §15).
 //! - `fleet` prints every session with its judgement; `tail` one session's
 //!   judgement, events, judgements and commands.
+//! - `node` joins, lists, drains and removes the machines Spawn may use
+//!   (docs/fleet-architecture.md, "Runtime layer: nodes").
 //! - `alerts` prints the alerts Spawn raised, once or as they are recorded
 //!   (docs/fleet-architecture.md, "Alerts").
 //! - `backup` dumps, bundles and drills the fleet's record off this host
@@ -46,12 +48,14 @@ mod disk;
 mod dispatch;
 mod feature_inventory;
 mod gate;
+mod grading;
 mod integrate;
 mod judge_watch;
 mod main_merge;
 mod mask;
 mod memory;
 mod missions;
+mod nodes;
 mod objectives;
 mod push;
 mod recover;
@@ -80,7 +84,7 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       spawn alert record < <one alert.fired or alert.cleared JSON object>\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions|controllers|transcripts]\n       spawn store put|get|list|verify --area transcripts|sessions [--from <dir>] [--path <file> --into <dir>] [--root <dir>]\n       spawn ack <command id> done|declined [<why>]\n       spawn mask --values <file>\n       spawn mask-hook --values <file>\n       spawn secret set|generate|rotate|list\n       spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail\n       spawn verify list\n       spawn objective retire --mission <m> --objective <n> --kind on-main|renumbered|obsolete --by <name> --reason <text>\n       spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> [--build <path>]... [--lease-hours <h>]\n       spawn scratch renew <dir> [--lease-hours <h>]\n       spawn scratch release <dir>\n       spawn scratch sweep [--excuse <pid>:<start ticks>]... [--apply --expect-digest <digest>]\n       spawn commit-map load <file> --source <git dir>\n       spawn features scan|associate|check [--root <dir>] [--registry <file>] [--json]";
+const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       spawn alert record < <one alert.fired or alert.cleared JSON object>\n       spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions|controllers|transcripts]\n       spawn store put|get|list|verify --area transcripts|sessions [--from <dir>] [--path <file> --into <dir>] [--root <dir>]\n       spawn ack <command id> done|declined [<why>]\n       spawn mask --values <file>\n       spawn mask-hook --values <file>\n       spawn secret set|generate|rotate|list\n       spawn verify <mission>/<objective> --by <name> --how <text> --result pass|fail\n       spawn verify list\n       spawn objective retire --mission <m> --objective <n> --kind on-main|renumbered|obsolete --by <name> --reason <text>\n       spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> [--build <path>]... [--lease-hours <h>]\n       spawn scratch renew <dir> [--lease-hours <h>]\n       spawn scratch release <dir>\n       spawn scratch sweep [--excuse <pid>:<start ticks>]... [--apply --expect-digest <digest>]\n       spawn commit-map load <file> --source <git dir>\n       spawn features scan|associate|check [--root <dir>] [--registry <file>] [--json]\n       spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate ... (the grading catalog: spawn grade with no verb for its usage)";
 
 fn main() {
     let code = match dispatch() {
@@ -169,6 +173,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "mission" => missions::mission(&rest),
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
+        "node" => nodes::command(&rest),
         "fleet" => inspect::fleet(),
         "alerts" => alerts::command(&rest),
         "alert" => alerts::alert(&rest),
@@ -182,6 +187,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "objective" => objectives::command(&rest),
         "commit-map" => commit_map::command(&rest),
         "features" => feature_inventory::command(&rest),
+        "grade" => grading::command(&rest),
         "scratch" => scratch_owner::command(&rest),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "run" => engine::run(&rest),
@@ -243,6 +249,21 @@ mod tests {
         );
         assert!(
             !USAGE.contains("backup"),
+            "the contract's line stays as it was"
+        );
+    }
+
+    #[test]
+    fn the_usage_names_the_node_command_after_the_contracts_line() {
+        for line in [
+            "spawn node add <name> --ssh",
+            "spawn node list [--json]",
+            "spawn node drain|undrain|remove <name>",
+        ] {
+            assert!(MORE_USAGE.contains(line), "{line}: {MORE_USAGE}");
+        }
+        assert!(
+            !USAGE.contains("node"),
             "the contract's line stays as it was"
         );
     }
