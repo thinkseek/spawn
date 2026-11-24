@@ -40,10 +40,10 @@
 //! A pass where nothing moved and nothing is due reads the watermark and
 //! runs no step: on an idle fleet that is the only statement it makes, and
 //! it costs one scan. Between passes the loop waits on `LISTEN
-//! spawn_events` with a timeout of the earlier of the pass interval and the
-//! next due time, so a change ends the wait at once (a notification is a
-//! hint; the watermark is the record) and a notification lost costs at most
-//! one interval.
+//! spawn_events` and the Bridge's file watch, with a timeout of the earlier of
+//! the pass interval and the next due time, so a change ends the wait at once
+//! (both wakeups are hints; the watermark and drained watch are the records)
+//! and a notification lost costs at most one interval.
 //!
 //! Every wait a step returns is checked by a unit test against the rule it
 //! belongs to, and none of them moves a decision: given the same records and
@@ -147,6 +147,9 @@ enum Waited {
     TimedOut,
     /// A notification, or a burst of them, arrived: one pass acts on all.
     Notified,
+    /// A watched engine file may have changed: the next Bridge pass drains
+    /// the watch and reads the files and watermarks as usual.
+    FilesChanged,
     /// The stop flag is set.
     Stopped,
     /// The listening connection is gone: it proves nothing, and the loop
@@ -154,41 +157,67 @@ enum Waited {
     Lost,
 }
 
-/// Wait for `pause`, or less once `stop` is set, or at once when a
-/// notification arrives on `listener` (the log's change signal: a hint, not
-/// the record — the next pass reads the watermark anyway). Without a
-/// listener it is [`pause_unless_stopped`]: the watermark alone wakes the
-/// loop, one interval late at worst.
+/// Wait for `pause`, or less once `stop` is set, a notification arrives on
+/// `listener`, or `bridge`'s file watch becomes readable. Both wakeups are
+/// hints, not records: the next pass reads the watermark and drains the watch.
+/// A watch that cannot wait, or whose wait fails, leaves the original listener
+/// wait in charge for the rest of this pause.
 fn wait_unless_stopped(
-    listener: Option<&mut spawn_postgres::Listener>,
+    mut listener: Option<&mut spawn_postgres::Listener>,
+    bridge: Option<&spawn_core::bridge::Bridge>,
     pause: Duration,
     stop: &AtomicBool,
 ) -> Waited {
-    let Some(listener) = listener else {
-        return if pause_unless_stopped(pause, stop) {
-            Waited::Stopped
-        } else {
-            Waited::TimedOut
-        };
-    };
-    let until = std::time::Instant::now() + pause;
+    let deadline = std::time::Instant::now() + pause;
+    let mut watch_files = bridge.is_some();
     loop {
         if stop.load(Ordering::SeqCst) {
             return Waited::Stopped;
         }
-        let left = until.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
+        if let Some(listener) = listener.as_deref_mut() {
+            match listener.wait(Duration::ZERO) {
+                // A notification (or a burst of them) ends the wait: one pass
+                // acts on all of it.
+                Ok(1..) => return Waited::Notified,
+                Ok(0) => {}
+                // A broken connection, never a hint: returning at once would
+                // spin the loop on a wait that fails instantly, so it ends the
+                // wait for good and the caller listens again with a fresh one.
+                Err(_) => return Waited::Lost,
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             return Waited::TimedOut;
         }
-        match listener.wait(left) {
-            // A notification (or a burst of them) ends the wait: one pass
-            // acts on all of it.
-            Ok(1..) => return Waited::Notified,
-            Ok(0) => {}
-            // A broken connection, never a hint: returning at once would
-            // spin the loop on a wait that fails instantly, so it ends the
-            // wait for good and the caller listens again with a fresh one.
-            Err(_) => return Waited::Lost,
+        if watch_files && let Some(bridge) = bridge {
+            // Bound each file wait so buffered PostgreSQL notifications and
+            // the stop flag are still checked while both sources are quiet.
+            match bridge.wait_for_change(remaining.min(Duration::from_millis(25))) {
+                Ok(Some(true)) => return Waited::FilesChanged,
+                Ok(Some(false)) => continue,
+                Ok(None) => watch_files = false,
+                Err(error) => {
+                    eprintln!("spawn loop warning: {error}; file wakeup disabled for this wait");
+                    // An instantly failing watch must never become a spin
+                    // loop: only the ordinary listener/interval wait runs now.
+                    watch_files = false;
+                }
+            }
+        }
+        match listener.as_deref_mut() {
+            Some(listener) => match listener.wait(remaining) {
+                Ok(1..) => return Waited::Notified,
+                Ok(0) => {}
+                Err(_) => return Waited::Lost,
+            },
+            None => {
+                return if pause_unless_stopped(remaining, stop) {
+                    Waited::Stopped
+                } else {
+                    Waited::TimedOut
+                };
+            }
         }
     }
 }
@@ -390,9 +419,10 @@ impl Pace {
 /// the recovery, the dispatcher and the liveness rule run only when that
 /// watermark has moved since they last ran, or when a time one of their
 /// records named has come. Between passes the loop waits on `LISTEN
-/// spawn_events` with a timeout of the earlier of the pass interval and the
-/// next due time, so a change ends the wait at once and is acted on sooner
-/// than a clock could, and a notification lost costs one interval at most.
+/// spawn_events` and the Bridge's file watch, with a timeout of the earlier of
+/// the pass interval and the next due time, so a change ends the wait at once
+/// and is acted on sooner than a clock could, and a notification lost costs
+/// one interval at most.
 /// The Bridge's own reading of screens and transcripts is not on this
 /// schedule: neither is announced by an append, so it runs every pass.
 ///
@@ -889,8 +919,8 @@ impl Fleet<'_> {
 
     /// Wait for the next pass: the pass interval at most (the Bridge's
     /// screens need it), the earliest due time among the steps, or a failed
-    /// pass's backoff — ended early by a notification or a stop. True when
-    /// the loop must stop.
+    /// pass's backoff — ended early by a notification, a watched-file change,
+    /// or a stop. True when the loop must stop.
     fn wait(&mut self, stopping: &AtomicBool) -> bool {
         let pause = if self.pace.failures > 0 || self.pace.outages > 0 {
             // The pause [`Pace`] put after the last failed pass: a database
@@ -918,9 +948,10 @@ impl Fleet<'_> {
                 }
             }
         }
-        match wait_unless_stopped(self.listener.as_mut(), pause, stopping) {
+        let bridge = self.running.as_ref().map(|(bridge, _)| bridge);
+        match wait_unless_stopped(self.listener.as_mut(), bridge, pause, stopping) {
             Waited::Stopped => true,
-            Waited::Notified | Waited::TimedOut => false,
+            Waited::Notified | Waited::FilesChanged | Waited::TimedOut => false,
             // A dead listening connection is no hint and no reason to spin:
             // the loop waits out the interval (its watermark read is the
             // record either way) and opens a fresh listener next pass.
@@ -935,13 +966,90 @@ impl Fleet<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use spawn_core::bridge::{Bridge, BridgeConfig};
+    use spawn_core::memory::MemoryStore;
+    use spawn_core::port::{FileWatch, WatchError};
+    use spawn_core::time::SystemClock;
+
     use super::{
-        MAX_FAILURES, MAX_OUTAGE_INTERVALS, Pace, Schedule, Step, backoff, pause_unless_stopped,
-        stop_on_signal,
+        MAX_FAILURES, MAX_OUTAGE_INTERVALS, Pace, Schedule, Step, Waited, backoff,
+        pause_unless_stopped, stop_on_signal, wait_unless_stopped,
     };
+
+    /// A watch a unit test makes ready or permanently failing.
+    #[derive(Debug)]
+    struct StubWatch {
+        fails: bool,
+        waits: AtomicUsize,
+    }
+
+    impl StubWatch {
+        fn new(fails: bool) -> Self {
+            Self {
+                fails,
+                waits: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl FileWatch for StubWatch {
+        fn watch(&self, _key: &str, _path: &str) -> Result<(), WatchError> {
+            Ok(())
+        }
+
+        fn unwatch(&self, _key: &str) {}
+
+        fn drain(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn wait(&self, _timeout: Duration) -> Result<Option<bool>, WatchError> {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            if self.fails {
+                Err(WatchError("persistent test failure".to_string()))
+            } else {
+                Ok(Some(true))
+            }
+        }
+    }
+
+    /// A real Bridge with no executions, over memory ports and `watch`.
+    fn memory_bridge(watch: Arc<dyn FileWatch>) -> Bridge {
+        let store = Arc::new(MemoryStore::new("wait-test", Arc::new(SystemClock)));
+        let mut config = BridgeConfig::new("wait-test");
+        config.watch = Some(watch);
+        Bridge::new(store.clone(), store.clone(), store.clone(), store, config)
+    }
+
+    /// A transcript file of one integration test, removed on every exit.
+    #[cfg(target_os = "linux")]
+    struct ScratchFile(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl ScratchFile {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let path = std::env::temp_dir().join(format!(
+                "spawn-loop-{name}-{}-{nanos}.jsonl",
+                std::process::id()
+            ));
+            std::fs::write(&path, "{\"type\":\"start\"}\n").expect("initial transcript");
+            Self(path)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     /// A schedule whose steps have all run on `watermark` and wait for no
     /// clock, for the cases that set one of them.
@@ -1076,6 +1184,172 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         stop.store(false, Ordering::SeqCst);
         assert!(!pause_unless_stopped(Duration::from_millis(10), &stop));
+    }
+
+    /// A ready file watch ends the wait with a hint for another Bridge pass.
+    #[test]
+    fn a_file_change_ends_the_wait() {
+        let watch = Arc::new(StubWatch::new(false));
+        let bridge = memory_bridge(watch.clone());
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let waited = wait_unless_stopped(None, Some(&bridge), Duration::from_secs(30), &stop);
+        assert!(matches!(waited, Waited::FilesChanged));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(watch.waits.load(Ordering::SeqCst), 1);
+    }
+
+    /// The stop flag wins before a watch is polled.
+    #[test]
+    fn the_stop_flag_ends_a_file_watch_wait() {
+        let watch = Arc::new(StubWatch::new(false));
+        let bridge = memory_bridge(watch.clone());
+        let stop = AtomicBool::new(true);
+        let waited = wait_unless_stopped(None, Some(&bridge), Duration::from_secs(30), &stop);
+        assert!(matches!(waited, Waited::Stopped));
+        assert_eq!(watch.waits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A permanently failing watch is tried once, then the ordinary pause
+    /// waits out the remainder instead of spinning on the same error.
+    #[test]
+    fn a_watch_error_falls_back_without_spinning() {
+        let watch = Arc::new(StubWatch::new(true));
+        let bridge = memory_bridge(watch.clone());
+        let stop = AtomicBool::new(false);
+        let pause = Duration::from_millis(40);
+        let started = Instant::now();
+        let waited = wait_unless_stopped(None, Some(&bridge), pause, &stop);
+        assert!(matches!(waited, Waited::TimedOut));
+        assert_eq!(
+            watch.waits.load(Ordering::SeqCst),
+            1,
+            "the persistent error is not retried in a spin loop"
+        );
+        assert!(
+            started.elapsed() >= pause,
+            "the fallback waited out the remainder"
+        );
+    }
+
+    /// PostgreSQL still wakes the multiplexed wait while its file watch is
+    /// quiet. Needs `SPAWN_TEST_DATABASE_URL`, like the store integration
+    /// tests.
+    #[cfg(target_os = "linux")] // the inotify side of the multiplexed wait
+    #[test]
+    fn a_postgresql_notification_still_ends_the_multiplexed_wait() {
+        use spawn_core::port::CommandQueue;
+
+        let schema = spawn_postgres::testing::TestSchema::new("loop_pg_wake");
+        let store = Arc::new(schema.store());
+        let mut listener = store.listen().expect("listen");
+        let bridge = memory_bridge(Arc::new(
+            spawn_host::InotifyWatch::new().expect("inotify watch"),
+        ));
+        let stop = AtomicBool::new(false);
+        // `spawn_events` is database-wide across parallel `TestSchema` cases;
+        // drain any unrelated notifications already buffered before waiting.
+        let _ = listener.wait(Duration::ZERO).expect("drain notifications");
+        let before = store.watermark().expect("watermark");
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let submission = spawn_core::command::Submission {
+                    agent_id: spawn_core::id::AgentId::new("agent_loop_pg_wake").expect("agent"),
+                    session_id: spawn_core::id::SessionId::new("session_loop_pg_wake")
+                        .expect("session"),
+                    idempotency_key: spawn_core::id::IdempotencyKey::new("loop-pg-wake")
+                        .expect("key"),
+                    action: spawn_core::command::CommandAction::Stop,
+                };
+                store
+                    .submit(
+                        &spawn_core::id::Principal::new("human").expect("principal"),
+                        &submission,
+                    )
+                    .expect("submit");
+            })
+        };
+        let started = Instant::now();
+        let waited = wait_unless_stopped(
+            Some(&mut listener),
+            Some(&bridge),
+            Duration::from_secs(10),
+            &stop,
+        );
+        writer.join().expect("notification writer");
+        assert!(matches!(waited, Waited::Notified));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the notification ended the wait, not its timeout"
+        );
+        assert!(store.watermark().expect("watermark") > before);
+    }
+
+    /// A real transcript append wakes the wait through inotify alone: no
+    /// event is appended and no PostgreSQL notification arrives. Needs
+    /// `SPAWN_TEST_DATABASE_URL` for the other half of the multiplexed wait.
+    #[cfg(target_os = "linux")] // the inotify adapter
+    #[test]
+    fn a_transcript_write_wakes_without_a_postgresql_notification() {
+        let schema = spawn_postgres::testing::TestSchema::new("loop_file_wake");
+        let store = schema.store();
+        // `spawn_events` is database-wide across every parallel `TestSchema`
+        // test and test process sharing `SPAWN_TEST_DATABASE_URL`, so listening
+        // on this test's unique schema name exercises the real PostgreSQL
+        // `Listener` connection without cross-test notifications.
+        let mut listener = store
+            .listen_on(&schema)
+            .expect("listen on isolated channel");
+        assert_eq!(
+            listener.wait(Duration::ZERO).expect("drain notifications"),
+            0
+        );
+        let transcript = ScratchFile::new("file-wake");
+        let watch = Arc::new(spawn_host::InotifyWatch::new().expect("inotify watch"));
+        watch
+            .watch("transcript", &transcript.0.display().to_string())
+            .expect("watch transcript");
+        assert!(watch.drain().is_empty(), "nothing changed yet");
+        let bridge = memory_bridge(watch);
+        let stop = AtomicBool::new(false);
+        let before = store.watermark().expect("watermark");
+        let writer = {
+            let path = transcript.0.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .expect("open transcript");
+                std::io::Write::write_all(&mut file, b"{\"type\":\"message\"}\n")
+                    .expect("append transcript");
+            })
+        };
+        let started = Instant::now();
+        let waited = wait_unless_stopped(
+            Some(&mut listener),
+            Some(&bridge),
+            Duration::from_secs(5),
+            &stop,
+        );
+        writer.join().expect("transcript writer");
+        assert!(matches!(waited, Waited::FilesChanged));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "inotify ended the wait far before its timeout"
+        );
+        assert_eq!(
+            listener.wait(Duration::ZERO).expect("drain notifications"),
+            0,
+            "the file wakeup had no PostgreSQL notification"
+        );
+        assert_eq!(
+            store.watermark().expect("watermark"),
+            before,
+            "the transcript append wrote no PostgreSQL event"
+        );
     }
 
     /// A pass that failed only because the database could not be reached is

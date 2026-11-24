@@ -331,6 +331,30 @@ impl FileWatch for InotifyWatch {
             self.drain_linux()
         }
     }
+
+    fn wait(&self, timeout: std::time::Duration) -> Result<Option<bool>, WatchError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = timeout;
+            Ok(None)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+            let timeout = Timespec {
+                tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: i64::from(timeout.subsec_nanos()),
+            };
+            let mut fds = [PollFd::new(&self.fd, PollFlags::IN)];
+            match poll(&mut fds, Some(&timeout)) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => Ok(Some(false)),
+                Ok(_) if fds[0].revents().contains(PollFlags::IN) => Ok(Some(true)),
+                Ok(_) => Err(WatchError("inotify poll: descriptor error".to_string())),
+                Err(error) => Err(WatchError(format!("inotify poll: {error}"))),
+            }
+        }
+    }
 }
 
 /// The deepest directory above `file` that exists, itself included when it
@@ -460,6 +484,72 @@ mod tests {
         watch.unwatch("c");
         std::fs::write(&file, "0").expect("write");
         assert!(watch.drain().is_empty(), "an unwatched key is quiet");
+    }
+
+    /// A write wakes a blocked wait long before its timeout.
+    #[cfg(target_os = "linux")] // the inotify adapter
+    #[test]
+    fn a_write_wakes_wait_before_its_timeout() {
+        let scratch = Scratch::new("wait-write");
+        let file = scratch.path().join("transcript.jsonl");
+        std::fs::write(&file, "one\n").expect("initial transcript");
+        let watch = std::sync::Arc::new(InotifyWatch::new().expect("a watch"));
+        watch
+            .watch("a", &file.display().to_string())
+            .expect("watch the transcript");
+        assert!(watch.drain().is_empty(), "nothing changed yet");
+        let written = file.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(written)
+                .expect("open transcript");
+            std::io::Write::write_all(&mut file, b"two\n").expect("append transcript");
+        });
+        let started = std::time::Instant::now();
+        let waited = watch.wait(std::time::Duration::from_secs(5));
+        writer.join().expect("writer");
+        assert!(matches!(waited, Ok(Some(true))), "the write woke wait");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait did not run to its multi-second timeout"
+        );
+    }
+
+    /// No file change makes wait report its timeout.
+    #[cfg(target_os = "linux")] // the inotify adapter
+    #[test]
+    fn wait_times_out_without_a_change() {
+        let scratch = Scratch::new("wait-timeout");
+        let file = scratch.path().join("transcript.jsonl");
+        std::fs::write(&file, "one\n").expect("initial transcript");
+        let watch = InotifyWatch::new().expect("a watch");
+        watch
+            .watch("a", &file.display().to_string())
+            .expect("watch the transcript");
+        assert!(matches!(
+            watch.wait(std::time::Duration::from_millis(20)),
+            Ok(Some(false))
+        ));
+    }
+
+    /// Draining the ready events leaves an immediate wait quiet.
+    #[cfg(target_os = "linux")] // the inotify adapter
+    #[test]
+    fn an_immediate_wait_after_drain_times_out() {
+        let scratch = Scratch::new("wait-drained");
+        let file = scratch.path().join("transcript.jsonl");
+        let watch = InotifyWatch::new().expect("a watch");
+        watch
+            .watch("a", &file.display().to_string())
+            .expect("watch a missing transcript");
+        std::fs::write(&file, "one\n").expect("write transcript");
+        assert_eq!(watch.drain(), vec!["a".to_string()]);
+        assert!(matches!(
+            watch.wait(std::time::Duration::ZERO),
+            Ok(Some(false))
+        ));
     }
 
     /// The anchor of a path is the deepest directory above it that exists.

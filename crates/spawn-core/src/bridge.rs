@@ -112,8 +112,8 @@ use crate::ingest::{claude_line, claude_usage, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
-    ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
-    WorkspaceStore,
+    ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive, WatchError,
+    WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -1179,6 +1179,16 @@ impl Bridge {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Wait until an engine's watched files may have changed. `Ok(None)`
+    /// means this Bridge has no watch that can wait; `Ok(Some(false))` means
+    /// the timeout elapsed. Polling and reading the files stay in [`Self::poll`].
+    pub fn wait_for_change(&self, timeout: Duration) -> Result<Option<bool>, WatchError> {
+        match &self.config.watch {
+            Some(watch) => watch.wait(timeout),
+            None => Ok(None),
+        }
     }
 
     /// Sessions the Bridge tracks.
