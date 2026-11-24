@@ -1437,6 +1437,26 @@ enum Fact {
     End(End),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthRetry {
+    Input,
+    Resume,
+    Handoff,
+}
+
+/// The way an expired login's periodic retry reaches the engine. Input works
+/// only in a live execution; a stopped one takes the usual resume bounds,
+/// handing off when there is no native session or resumes are spent.
+fn auth_retry_action(live: bool, native_bound: bool, failed_resumes: u32) -> AuthRetry {
+    if live {
+        return AuthRetry::Input;
+    }
+    match bounded(Path::Resume, native_bound, failed_resumes).0 {
+        Path::Resume => AuthRetry::Resume,
+        _ => AuthRetry::Handoff,
+    }
+}
+
 impl One<'_> {
     /// The session's pass, in order: the outage it lived through, the next
     /// fact of its execution, then the way back from its latest
@@ -2287,14 +2307,29 @@ impl One<'_> {
             return Ok(());
         }
         let key = format!("{prefix}-auth-{}", tried.saturating_add(1));
-        self.submit(
-            &key,
-            CommandAction::Input {
-                text: Self::input_text(last, Cause::ModelAuth),
-                tags: Vec::new(),
-            },
-            "retrying the expired login",
-        )
+        match auth_retry_action(
+            self.live(),
+            self.row.native_session_id.is_some(),
+            self.failures_in_a_row(),
+        ) {
+            AuthRetry::Input => self.submit(
+                &key,
+                CommandAction::Input {
+                    text: Self::input_text(last, Cause::ModelAuth),
+                    tags: Vec::new(),
+                },
+                "retrying the expired login",
+            ),
+            AuthRetry::Resume => self.submit(
+                &key,
+                CommandAction::Resume {
+                    prompt: Some(self.resume_text(last, Cause::ModelAuth)),
+                    model: None,
+                },
+                "resuming its native session to retry the expired login",
+            ),
+            AuthRetry::Handoff => self.handoff(last, Cause::ModelAuth),
+        }
     }
 
     /// Take the interruption's way back: `input` into the live engine,
@@ -2747,10 +2782,10 @@ mod credentials_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
-        Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
-        disk_cleared, key, model_due, model_resumes, model_retries, pending, refused, resume_due,
-        resume_failed, retry_at, server_gone, way,
+        AuthRetry, Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path,
+        Recorded, Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_action, auth_retry_due,
+        classify, counts_as_failure, disk_cleared, key, model_due, model_resumes, model_retries,
+        pending, refused, resume_due, resume_failed, retry_at, server_gone, way,
     };
     use serde_json::json;
 
@@ -3620,6 +3655,50 @@ mod tests {
         assert!(counts_as_failure(&[
             "storage backend failure: something".to_string()
         ]));
+    }
+
+    /// An expired login's periodic retry types only into a live execution;
+    /// native-session and failed-resume bounds apply only once it has ended.
+    #[test]
+    fn a_live_model_auth_retry_is_an_input() {
+        for native_bound in [false, true] {
+            for failed_resumes in [0, super::RESUME_ATTEMPTS] {
+                assert_eq!(
+                    auth_retry_action(true, native_bound, failed_resumes),
+                    AuthRetry::Input
+                );
+            }
+        }
+    }
+
+    /// A stopped execution with a native session is resumed, rather than
+    /// sent input that its supervisor must reject, until the resumes are spent.
+    #[test]
+    fn a_stopped_resumable_model_auth_retry_is_a_resume() {
+        for failed_resumes in 0..super::RESUME_ATTEMPTS {
+            assert_eq!(
+                auth_retry_action(false, true, failed_resumes),
+                AuthRetry::Resume,
+                "{failed_resumes} failed resumes"
+            );
+        }
+    }
+
+    /// With no native session to resume, or after the usual resume bound, an
+    /// expired login's stopped execution follows the handoff path instead.
+    #[test]
+    fn a_stopped_non_resumable_model_auth_retry_hands_off() {
+        for failed_resumes in 0..=super::RESUME_ATTEMPTS {
+            assert_eq!(
+                auth_retry_action(false, false, failed_resumes),
+                AuthRetry::Handoff,
+                "no native session, {failed_resumes} failed resumes"
+            );
+        }
+        assert_eq!(
+            auth_retry_action(false, true, super::RESUME_ATTEMPTS),
+            AuthRetry::Handoff
+        );
     }
 
     /// An expired login is retried only on its slow schedule — never while
