@@ -1543,9 +1543,18 @@ impl WorkspaceStore for OverlayWorkspace {
     ///    step and deleted. Only the kernel's own `work/` subdirectories
     ///    get their permissions changed, and a `*.jsonl` is never deleted.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+        self.unmount_when(workspace, &|| Ok(()))
+    }
+
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
         let state = self.state_dir(workspace)?;
         let merged = self.merged_dir(workspace)?;
         let _lock = self.lock_workspace(workspace.sandbox())?;
+        ready()?;
         match std::fs::symlink_metadata(&state) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

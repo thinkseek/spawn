@@ -114,7 +114,7 @@ use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, MOUNT_CANCELLED,
     READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive,
-    WatchError, WorkspaceError, WorkspaceStore,
+    UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -3603,6 +3603,9 @@ impl Bridge {
         }
         self.catch_up()?;
         drop(self.workspaces.hold(&workspace));
+        if !self.workspaces.is_mounted(&workspace) {
+            return Ok(MountProgress::Pending);
+        }
         Ok(MountProgress::Ready(workspace))
     }
 
@@ -3633,6 +3636,9 @@ impl Bridge {
                 return Ok(Some(MountProgress::Pending));
             }
             drop(self.workspaces.hold(&workspace));
+            if !self.workspaces.is_mounted(&workspace) {
+                return Ok(Some(MountProgress::Pending));
+            }
             return Ok(Some(MountProgress::Ready(workspace)));
         }
         self.append(
@@ -3763,8 +3769,14 @@ impl Bridge {
         if self.workspace_in_use(&workspace, None) {
             return;
         }
-        match self.workspaces.unmount(&workspace) {
+        let after = self.cursor;
+        let log = Arc::clone(&self.log);
+        let workspaces = Arc::clone(&self.workspaces);
+        match self.workspaces.unmount_when(&workspace, &|| {
+            unmount_still_safe(&log, &workspaces, &workspace, after)
+        }) {
             Ok(()) => {}
+            Err(WorkspaceError::Refused { code, .. }) if code == UNMOUNT_IN_USE => {}
             Err(error) => {
                 let recorded_generation =
                     self.persist_abandoned_mount(&agent_id, &session_id, command_id, &workspace);
@@ -3800,11 +3812,22 @@ impl Bridge {
                 if self.workspace_in_use(&abandoned.workspace, ignore) {
                     continue;
                 }
-                if self.workspaces.unmount(&abandoned.workspace).is_err() {
-                    self.abandoned_mounts.push(abandoned);
-                    continue;
+                let after = self.cursor;
+                let log = Arc::clone(&self.log);
+                let workspaces = Arc::clone(&self.workspaces);
+                let target = abandoned.workspace.clone();
+                match self.workspaces.unmount_when(&target, &|| {
+                    unmount_still_safe(&log, &workspaces, &target, after)
+                }) {
+                    Ok(()) => abandoned.unmounted = true,
+                    Err(WorkspaceError::Refused { code, .. }) if code == UNMOUNT_IN_USE => {
+                        continue;
+                    }
+                    Err(_) => {
+                        self.abandoned_mounts.push(abandoned);
+                        continue;
+                    }
                 }
-                abandoned.unmounted = true;
             }
             if let Some(generation) = abandoned.recorded_generation
                 && self
@@ -6653,6 +6676,106 @@ fn fold_mount_liveness(
     }
 }
 
+/// Re-check the event log under the store's branch lock before unmounting an
+/// abandoned workspace: refuses with [`UNMOUNT_IN_USE`] if a newer mount or
+/// execution for the same canonical workspace appeared after `after`, and
+/// fails closed (returning [`WorkspaceError::Unavailable`]) if the log cannot
+/// be read.
+fn unmount_still_safe(
+    log: &Arc<dyn EventLog>,
+    workspaces: &Arc<dyn WorkspaceStore>,
+    workspace: &WorkspaceId,
+    after: GlobalPosition,
+) -> Result<(), WorkspaceError> {
+    const BATCH: usize = 200;
+    let canonical = workspaces.canonical(workspace);
+    let mut cursor = after;
+    let mut mounted: HashMap<CommandId, WorkspaceId> = HashMap::new();
+    let mut open_executions: HashSet<ExecutionId> = HashSet::new();
+    loop {
+        let batch = log.read_global(cursor, BATCH).map_err(|error| {
+            WorkspaceError::Unavailable(format!("check log before unmounting {workspace}: {error}"))
+        })?;
+        if batch.is_empty() {
+            break;
+        }
+        for record in &batch {
+            fold_unmount_liveness(
+                &record.event,
+                workspaces,
+                &canonical,
+                &mut mounted,
+                &mut open_executions,
+            );
+        }
+        cursor = batch.last().expect("non-empty batch").position;
+        if batch.len() < BATCH {
+            break;
+        }
+    }
+    if !open_executions.is_empty() || !mounted.is_empty() {
+        return Err(WorkspaceError::Refused {
+            code: UNMOUNT_IN_USE.to_string(),
+            message: format!("{workspace} is in use by a newer mount or execution"),
+        });
+    }
+    Ok(())
+}
+
+fn fold_unmount_liveness(
+    event: &NewEvent,
+    workspaces: &Arc<dyn WorkspaceStore>,
+    canonical: &WorkspaceId,
+    mounted: &mut HashMap<CommandId, WorkspaceId>,
+    open_executions: &mut HashSet<ExecutionId>,
+) {
+    match &event.kind {
+        EventKind::CommandStepped {
+            command_id,
+            step: CommandStep::Mounted,
+            workspace: Some(ws),
+        } if event.source == Source::Bridge && workspaces.canonical(ws) == *canonical => {
+            mounted.insert(*command_id, ws.clone());
+        }
+        EventKind::CommandStepped {
+            command_id,
+            step: CommandStep::MountReleased,
+            workspace: ws,
+        } if event.source == Source::Bridge => {
+            let release = mounted.get(command_id).is_some_and(|recorded| {
+                ws.is_none()
+                    || ws
+                        .as_ref()
+                        .is_some_and(|w| workspaces.canonical(w) == workspaces.canonical(recorded))
+            });
+            if release {
+                mounted.remove(command_id);
+            }
+        }
+        EventKind::CommandFinished { command_id, .. } => {
+            mounted.remove(command_id);
+        }
+        EventKind::ExecutionStarted {
+            command_id,
+            workspace: ws,
+            ..
+        } => {
+            mounted.remove(command_id);
+            if workspaces.canonical(ws) == *canonical
+                && let Some(execution_id) = event.execution_id.clone()
+            {
+                open_executions.insert(execution_id);
+            }
+        }
+        EventKind::ExecutionEnded { .. } if event.source == Source::Bridge => {
+            if let Some(execution_id) = &event.execution_id {
+                open_executions.remove(execution_id);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -7406,6 +7529,8 @@ mod tests {
         );
     }
 
+    type UnmountHook = Box<dyn FnOnce() + Send>;
+
     /// A workspace store whose selected mounts wait at a test gate. It also
     /// counts the largest number of mount calls simultaneously in flight.
     struct GatedMounts {
@@ -7420,6 +7545,7 @@ mod tests {
         check_ready_after_gate: AtomicBool,
         preset_mounts: Mutex<HashMap<BranchName, WorkspaceId>>,
         canonical_aliases: Mutex<HashMap<WorkspaceId, WorkspaceId>>,
+        before_unmount_ready: Mutex<Option<UnmountHook>>,
     }
 
     impl GatedMounts {
@@ -7436,7 +7562,12 @@ mod tests {
                 check_ready_after_gate: AtomicBool::new(false),
                 preset_mounts: Mutex::new(HashMap::new()),
                 canonical_aliases: Mutex::new(HashMap::new()),
+                before_unmount_ready: Mutex::new(None),
             }
+        }
+
+        fn on_unmount_before_ready(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.before_unmount_ready.lock().expect("hook") = Some(Box::new(hook));
         }
 
         fn check_ready_after_gate(&self, enabled: bool) {
@@ -7565,6 +7696,19 @@ mod tests {
                 ));
             }
             self.inner.unmount(workspace)
+        }
+
+        fn unmount_when(
+            &self,
+            workspace: &WorkspaceId,
+            ready: &dyn Fn() -> Result<(), WorkspaceError>,
+        ) -> Result<(), WorkspaceError> {
+            let hook = self.before_unmount_ready.lock().expect("hook").take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            ready()?;
+            self.unmount(workspace)
         }
 
         fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
@@ -9977,5 +10121,47 @@ mod tests {
         assert_eq!(unmount_calls(&store), 0);
         assert!(mounts.is_mounted(&ws1));
         assert!(bridge_a.mounting.is_empty());
+    }
+
+    #[test]
+    fn abandoned_unmount_rechecks_log_under_lock_and_spares_peer_workspace() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let branch = BranchName::for_agent(&resumable_agent(1));
+        mounts.hold(branch.clone());
+        let mut bridge_a = Bridge::new(
+            store.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("bridge-a"),
+        )
+        .with_clock(clock);
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge_a, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 1
+        });
+
+        let ws1 = store.mount(&branch).expect("peer mount");
+        mounts.preset_mount(branch.clone(), ws1.clone());
+        let store_hook = Arc::clone(&store);
+        let ws_hook = ws1.clone();
+        mounts.on_unmount_before_ready(move || {
+            record_peer_mount(&store_hook, 1, id, &ws_hook);
+        });
+        mounts.release(&branch);
+        while !bridge_a
+            .mounting
+            .values()
+            .all(|pending| pending.handle.is_finished())
+        {
+            std::thread::yield_now();
+        }
+
+        drop(bridge_a);
+        assert_eq!(unmount_calls(&store), 0);
+        assert!(mounts.is_mounted(&ws1));
     }
 }

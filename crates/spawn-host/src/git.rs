@@ -1651,9 +1651,18 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+        self.unmount_when(workspace, &|| Ok(()))
+    }
+
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
         let branch = workspace.sandbox();
         let directory = self.checked_path(workspace)?;
         let _lock = self.lock_branch(branch)?;
+        ready()?;
         // Not even a discard removes a stale directory before it is kept.
         self.keep_stale_locked(branch, &directory)?;
         // A pending merge stays only when the branch carries its markers.
@@ -4435,11 +4444,78 @@ mod tests {
             "duplicate worker must not replace peer's active workspace"
         );
         assert!(w.store_b.is_mounted(&ws));
-        let staged_left = std::fs::read_dir(&w.work)
-            .expect("read work root")
+        let mount_dir = w.work.join(".mount");
+        assert!(mount_dir.is_dir(), "expected work/.mount staging directory");
+        let staged_left = std::fs::read_dir(&mount_dir)
+            .expect("read work/.mount")
             .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().contains(".staged-"));
+            .any(|entry| entry.file_name().to_string_lossy().contains(".staged."));
         assert!(!staged_left, "cancelled staged tree was not cleaned up");
         let _ = std::fs::remove_dir_all(&w.base);
+    }
+
+    #[test]
+    fn unmount_when_rechecks_under_branch_lock_and_spares_workspace() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        use spawn_core::port::UNMOUNT_IN_USE;
+
+        let base =
+            std::env::temp_dir().join(format!("spawn-git-unmount-when-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        let work = base.join("work");
+        std::fs::create_dir_all(&checkout).expect("create repo");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+
+        let store = Arc::new(GitWorkspace::new(checkout.join(".git"), &work));
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let ws = store.mount(&branch).expect("mount");
+        let peer_file = Path::new(ws.path()).join("peer.txt");
+        std::fs::write(&peer_file, "peer\n").expect("write peer");
+
+        let hold = store.hold(&ws).expect("branch lock");
+        let store_worker = Arc::clone(&store);
+        let ws_worker = ws.clone();
+        let owned = Arc::new(AtomicBool::new(false));
+        let owned_worker = Arc::clone(&owned);
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_worker = Arc::clone(&entered);
+        let handle = std::thread::spawn(move || {
+            entered_worker.store(true, Ordering::SeqCst);
+            store_worker.unmount_when(&ws_worker, &|| {
+                if owned_worker.load(Ordering::SeqCst) {
+                    Err(WorkspaceError::Refused {
+                        code: UNMOUNT_IN_USE.to_string(),
+                        message: "peer owns workspace".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        owned.store(true, Ordering::SeqCst);
+        drop(hold);
+
+        let result = handle.join().expect("join unmount worker");
+        assert!(
+            matches!(&result, Err(WorkspaceError::Refused { code, .. }) if code == UNMOUNT_IN_USE),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&peer_file).expect("kept"), "peer\n");
+        assert!(store.is_mounted(&ws));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

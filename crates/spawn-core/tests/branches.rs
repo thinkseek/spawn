@@ -936,6 +936,13 @@ impl WorkspaceStore for Telling {
     ) -> Result<(), spawn_core::port::WorkspaceError> {
         self.inner.unmount(workspace)
     }
+    fn unmount_when(
+        &self,
+        workspace: &spawn_core::id::WorkspaceId,
+        ready: &dyn Fn() -> Result<(), spawn_core::port::WorkspaceError>,
+    ) -> Result<(), spawn_core::port::WorkspaceError> {
+        self.inner.unmount_when(workspace, ready)
+    }
     fn is_mounted(&self, workspace: &spawn_core::id::WorkspaceId) -> bool {
         self.inner.is_mounted(workspace)
     }

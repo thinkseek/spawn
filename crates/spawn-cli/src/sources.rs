@@ -968,6 +968,16 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(workspace.sandbox())?.store.unmount(workspace)
     }
 
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
+        self.route(workspace.sandbox())?
+            .store
+            .unmount_when(workspace, ready)
+    }
+
     fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
         self.route(workspace.sandbox()).map_or_else(
             |_| self.default.is_mounted(workspace),

@@ -2760,7 +2760,16 @@ impl WorkspaceStore for CowWorkspace {
     /// workspaces (`<root>/.transcripts`) is never a workspace and is never
     /// touched.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+        self.unmount_when(workspace, &|| Ok(()))
+    }
+
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
         let _lock = self.lock_branch(workspace.sandbox())?;
+        ready()?;
         self.clear_diagnostics();
         self.unmount_locked(workspace)
     }

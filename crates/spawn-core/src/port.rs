@@ -179,6 +179,11 @@ pub const MERGE_WAITS: &str = "MergeWaits";
 /// ([`WorkspaceStore::mount_when`]).
 pub const MOUNT_CANCELLED: &str = "MountCancelled";
 
+/// The [`WorkspaceError::Refused`] code of a delayed/abandoned unmount that
+/// observed a newer mount or live execution under the branch lock
+/// ([`WorkspaceStore::unmount_when`]).
+pub const UNMOUNT_IN_USE: &str = "UnmountInUse";
+
 /// What [`WorkspaceStore::hold`] returns: the workspace is held until it is
 /// dropped.
 pub type Hold = Box<dyn std::any::Any + Send>;
@@ -347,6 +352,21 @@ pub trait WorkspaceStore: Send + Sync {
 
     /// Unmount the workspace. Committed state stays on the branch.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
+
+    /// Unmount `workspace` only while `ready` still allows it.
+    ///
+    /// Production stores check `ready` under the branch's lock before
+    /// removing or stopping the workspace; if `ready` returns an error
+    /// (such as [`UNMOUNT_IN_USE`] or a transient log read error), nothing
+    /// is removed and that error is returned.
+    fn unmount_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<(), WorkspaceError> {
+        ready()?;
+        self.unmount(workspace)
+    }
 
     /// Whether `workspace` is currently mounted in this store. Used when a
     /// reclaimed start considers reusing a recorded `CommandStep::Mounted`
