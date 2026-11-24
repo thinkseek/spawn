@@ -366,17 +366,36 @@ impl Facts {
     /// back. A model's answer (it carries a fingerprint) is written for every
     /// new situation, so a stale one waits for the model's judgement of the
     /// turn, as before.
+    /// Why a report may not be collected yet, or `None` when it is due.
+    ///
+    /// This is the single definition of the gate: [`Self::report_due`] is its
+    /// negation, so an operator diagnostic cannot drift from collection.
+    pub(crate) fn report_blocker(&self) -> Option<&'static str> {
+        if !self.live {
+            return Some("worker not live");
+        }
+        if self.open_command {
+            return Some("command in flight");
+        }
+        if !self.turn_ended {
+            return Some("turn has not ended in the transcript");
+        }
+        let Some(latest) = self.observation.as_ref() else {
+            return Some("no observation");
+        };
+        match self.current_observation() {
+            Some(current) if stopped_at_prompt(current) => None,
+            // A model's answer is written for every new situation. A stale
+            // one therefore waits for its model's judgement of this turn;
+            // an idle rules-only judgement may predate the transcript's end.
+            None if latest.fingerprint.is_some() => Some("observation is stale and model-judged"),
+            None if stopped_at_prompt(latest) => None,
+            Some(_) | None => Some("latest observation is not stopped at a prompt"),
+        }
+    }
+
     pub(crate) fn report_due(&self) -> bool {
-        let idle = stopped_at_prompt;
-        self.live_and_free()
-            && self.turn_ended
-            && match self.current_observation() {
-                Some(current) => idle(current),
-                None => self
-                    .observation
-                    .as_ref()
-                    .is_some_and(|latest| latest.fingerprint.is_none() && idle(latest)),
-            }
+        self.report_blocker().is_none()
     }
 
     pub(crate) fn idle_at_prompt(&self) -> bool {

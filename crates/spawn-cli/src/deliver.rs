@@ -452,7 +452,7 @@ impl TaskRow {
     }
 
     /// Idempotency key of this task's current delivery.
-    fn delivery_key(&self) -> String {
+    pub(crate) fn delivery_key(&self) -> String {
         format!("deliver-{}-{}", self.id, self.revisions)
     }
 
@@ -2093,6 +2093,76 @@ pub(crate) fn mark_delivery(root: &Path, order: &Order) -> Result<(), String> {
 /// The most of a report [`new_report`] reads.
 const REPORT_LIMIT: u64 = 1 << 20;
 
+/// What the filesystem says about a delivered task's report. This is a
+/// read-only operator diagnostic; in particular an absent report is not a
+/// database event and is never recorded once per dispatcher pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportStatus {
+    Absent,
+    Unreadable,
+    OlderThanDelivery,
+    Empty,
+    Draft,
+    Collectible,
+}
+
+impl ReportStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "report absent",
+            Self::Unreadable => "report unreadable or not a regular file",
+            Self::OlderThanDelivery => "report older than delivery mark",
+            Self::Empty => "report empty",
+            Self::Draft => "draft markers present",
+            Self::Collectible => "collectible",
+        }
+    }
+}
+
+/// Inspect a report once for both collection and operator diagnostics. The
+/// text is returned for empty and draft reports too, preserving
+/// [`new_report`]'s contract; only collection decides what to do with them.
+fn inspect_report(workspace: &Path, key: &str) -> (ReportStatus, Option<String>) {
+    use spawn_host::agent_files::{open_regular, read_regular};
+    let (bytes, metadata, _) = match read_regular(workspace, &TreePath::from(REPORT), REPORT_LIMIT)
+    {
+        Ok(Some(report)) => report,
+        Ok(None) => return (ReportStatus::Absent, None),
+        Err(_) => return (ReportStatus::Unreadable, None),
+    };
+    let Ok(written) = metadata.modified() else {
+        return (ReportStatus::Unreadable, None);
+    };
+    let sent = match open_regular(workspace, &delivery_mark(key)) {
+        Ok(None) => None,
+        Ok(Some(mark)) => match mark.metadata.modified() {
+            Ok(modified) => Some(modified),
+            Err(_) => return (ReportStatus::Unreadable, None),
+        },
+        Err(_) => return (ReportStatus::Unreadable, None),
+    };
+    if sent.is_some_and(|sent| written < sent) {
+        return (ReportStatus::OlderThanDelivery, None);
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return (ReportStatus::Unreadable, None);
+    };
+    let status = if text.trim().is_empty() {
+        ReportStatus::Empty
+    } else if unfinished::markers(&text).is_empty() {
+        ReportStatus::Collectible
+    } else {
+        ReportStatus::Draft
+    };
+    (status, Some(text))
+}
+
+/// The report's filesystem state for `spawn mission show`, using exactly the
+/// same safe opens, delivery-mark comparison and draft rules as collection.
+pub(crate) fn report_status(workspace: &Path, key: &str) -> ReportStatus {
+    inspect_report(workspace, key).0
+}
+
 /// The report in `workspace` written for the delivery `key`, if there is
 /// one: written at or after the delivery's mark, by the same filesystem
 /// clock. Without a mark the workspace was mounted after the delivery was
@@ -2103,20 +2173,7 @@ const REPORT_LIMIT: u64 = 1 << 20;
 /// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
 /// is never new.
 fn new_report(workspace: &Path, key: &str) -> Option<String> {
-    use spawn_host::agent_files::{open_regular, read_regular};
-    let (bytes, metadata, _) = read_regular(workspace, &TreePath::from(REPORT), REPORT_LIMIT)
-        .ok()
-        .flatten()?;
-    let written = metadata.modified().ok()?;
-    let sent = match open_regular(workspace, &delivery_mark(key)) {
-        Ok(None) => None,
-        Ok(Some(mark)) => Some(mark.metadata.modified().ok()?),
-        Err(_) => return None,
-    };
-    if sent.is_some_and(|sent| written < sent) {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
+    inspect_report(workspace, key).1
 }
 
 /// Collect the reports of delivered tasks whose worker's turn stopped at an
@@ -2326,9 +2383,9 @@ fn send_note(
 mod tests {
     use super::{
         CREDENTIALS_LINE, Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, PROCESSES_LINE,
-        PausedMission, PausedWorker, REPORT, Restart, TaskRow, Work, delivered, delivery_mark,
-        mark_delivery, new_report, news_items, next_due, next_up, notice_task, put_aside,
-        report_contract, report_due, retry_wait_ms, task_prompt, typed,
+        PausedMission, PausedWorker, REPORT, ReportStatus, Restart, TaskRow, Work, delivered,
+        delivery_mark, mark_delivery, new_report, news_items, next_due, next_up, notice_task,
+        put_aside, report_contract, report_due, report_status, retry_wait_ms, task_prompt, typed,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -2451,6 +2508,11 @@ mod tests {
         let task = task(7, TaskState::Delivered, "ephemeral");
         let facts = ready_screen_before_the_turn_end();
         assert!(facts.turn_stopped_idle(), "the screen alone says idle");
+        assert_eq!(
+            facts.report_blocker(),
+            Some("turn has not ended in the transcript")
+        );
+        assert!(!facts.report_due());
         assert!(
             report_due(&task, std::slice::from_ref(&facts)).is_none(),
             "the turn that wrote the report has not ended in the log: its checkpoint may not exist"
@@ -2487,6 +2549,10 @@ mod tests {
             Confidence::new(0.9).expect("valid"),
             "rules",
         ));
+        assert_eq!(
+            busy.report_blocker(),
+            Some("latest observation is not stopped at a prompt")
+        );
         assert!(
             report_due(&task, &[busy]).is_none(),
             "a verdict that changed since holds it back"
@@ -2495,16 +2561,25 @@ mod tests {
         if let Some(observation) = answered.observation.as_mut() {
             observation.fingerprint = Some("asked".to_string());
         }
+        assert_eq!(
+            answered.report_blocker(),
+            Some("observation is stale and model-judged")
+        );
         assert!(
             report_due(&task, &[answered]).is_none(),
             "a model's answer is written for every new situation: a stale one waits for the next"
         );
         let mut open = rows[0].clone();
         open.open_command = true;
+        assert_eq!(open.report_blocker(), Some("command in flight"));
         assert!(report_due(&task, &[open]).is_none(), "a command in flight");
         let mut gone = rows[0].clone();
         gone.live = false;
+        assert_eq!(gone.report_blocker(), Some("worker not live"));
         assert!(report_due(&task, &[gone]).is_none(), "not live");
+        let mut unobserved = rows[0].clone();
+        unobserved.observation = None;
+        assert_eq!(unobserved.report_blocker(), Some("no observation"));
         let mut none = rows[0].clone();
         none.checkpoint = None;
         assert_eq!(
@@ -3444,13 +3519,41 @@ mod tests {
             None,
             "left over from before"
         );
+        assert_eq!(
+            report_status(&workspace, "deliver-4-0"),
+            ReportStatus::OlderThanDelivery
+        );
         set_modified(&report, sent + std::time::Duration::from_secs(10));
         assert_eq!(
             new_report(&workspace, "deliver-4-0").as_deref(),
             Some("## Outcome\ndone")
         );
+        assert_eq!(
+            report_status(&workspace, "deliver-4-0"),
+            ReportStatus::Collectible
+        );
+        std::fs::write(&report, "  \n").expect("empty report");
+        set_modified(&report, sent + std::time::Duration::from_secs(10));
+        assert_eq!(
+            report_status(&workspace, "deliver-4-0"),
+            ReportStatus::Empty
+        );
+        std::fs::write(&report, "## Outcome\nIn progress (draft)").expect("draft report");
+        set_modified(&report, sent + std::time::Duration::from_secs(10));
+        assert_eq!(
+            report_status(&workspace, "deliver-4-0"),
+            ReportStatus::Draft
+        );
+        assert!(
+            new_report(&workspace, "deliver-4-0").is_some(),
+            "the collector still applies the existing draft path"
+        );
         std::fs::remove_file(&report).expect("remove the report");
         assert_eq!(new_report(&workspace, "deliver-4-0"), None);
+        assert_eq!(
+            report_status(&workspace, "deliver-4-0"),
+            ReportStatus::Absent
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3497,6 +3600,10 @@ mod tests {
         std::fs::remove_file(&report).expect("remove the report");
         std::os::unix::fs::symlink(&secret, &report).expect("symlink");
         assert_eq!(new_report(&workspace, &order.key), None, "not followed");
+        assert_eq!(
+            report_status(&workspace, &order.key),
+            ReportStatus::Unreadable
+        );
 
         std::fs::remove_file(&report).expect("remove the symlink");
         let made = std::process::Command::new("mkfifo")
@@ -4133,7 +4240,7 @@ mod tests {
 
     /// A schema of its own in the test database, dropped afterwards.
     struct Db {
-        store: spawn_postgres::PostgresStore,
+        store: std::sync::Arc<spawn_postgres::PostgresStore>,
         url: String,
         schema: spawn_postgres::testing::TestSchema,
     }
@@ -4143,8 +4250,9 @@ mod tests {
             // Dropped after the store (declared after it), when the test passes (P19).
             let schema = spawn_postgres::testing::TestSchema::new(case);
             let url = schema.url().to_string();
-            let store =
-                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect");
+            let store = std::sync::Arc::new(
+                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+            );
             Self { store, url, schema }
         }
 
@@ -4441,6 +4549,225 @@ PENDING_ISSUES\n";
             1,
             "a finished report adds no note"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Append a Bridge/Claude fact for the lifecycle regression. Observer
+    /// facts use `EventLog::append` instead, so their judgement is folded.
+    fn append_fact(
+        db: &Db,
+        agent: &str,
+        session: &str,
+        execution: Option<&str>,
+        source: &str,
+        kind: &serde_json::Value,
+    ) -> u64 {
+        db.client()
+            .query_one(
+                "insert into spawn_events (agent_id, session_id, execution_id, source, kind,
+                                           session_seq, recorded_at_ms)
+                 values ($1, $2, $3, $4, $5,
+                         (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                           where session_id = $2), spawn_now_ms())
+                 returning session_seq",
+                &[&agent, &session, &execution, &source, &kind],
+            )
+            .expect("append transcript fact")
+            .get::<_, i64>(0)
+            .cast_unsigned()
+    }
+
+    /// The whole delivery/report lifecycle through real store transitions and
+    /// dispatcher passes. A ready screen is not enough; the Bridge's
+    /// checkpoint and transcript turn end make the same report collectible.
+    #[allow(clippy::too_many_lines)] // one real lifecycle, kept in record order
+    #[test]
+    fn a_successful_delivery_reports_once_after_the_bridge_turn_end() {
+        use spawn_core::command::Outcome;
+        use spawn_core::event::{EventKind, NewEvent, SessionSeq, Source};
+        use spawn_core::id::{AgentId, ExecutionId, SessionId};
+        use spawn_core::port::{CommandQueue, EventLog};
+        let db = Db::new("report_lifecycle");
+        let mission = db
+            .store
+            .mission_add("Lifecycle", &json!(["/tmp/source.git"]), "human")
+            .expect("mission");
+        let task = db
+            .store
+            .task_assign(mission, "ephemeral", "lifecycle", "brief", "default")
+            .expect("task");
+        let root =
+            std::env::temp_dir().join(format!("spawn-report-lifecycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let pass = || {
+            crate::dispatch::step(
+                &db.store,
+                false,
+                "spawn",
+                Some(&root),
+                &crate::disk::Monitor::new(None),
+                &crate::dispatch::Bounds::default(),
+                super::Waits::default(),
+            )
+            .expect("dispatcher pass")
+            .0
+        };
+
+        let first = pass();
+        assert!(
+            first
+                .iter()
+                .any(|line| line.contains(&format!("deliver-{task}-0"))),
+            "{first:?}"
+        );
+        let claimed = db
+            .store
+            .claim("issue75-test", std::time::Duration::from_mins(1))
+            .expect("claim")
+            .expect("the delivery command");
+        assert_eq!(claimed.action["type"], "start");
+        db.store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("successful delivery");
+        let second = pass();
+        assert!(
+            second
+                .iter()
+                .any(|line| line.contains(&format!("task #{task} delivered"))),
+            "{second:?}"
+        );
+        assert_eq!(db.task(task).0, "delivered");
+
+        let row = db
+            .client()
+            .query_one(
+                "select agent_id, session_id from mission_tasks where id = $1",
+                &[&task],
+            )
+            .expect("worker ids");
+        let agent: String = row.get(0);
+        let session: String = row.get(1);
+        let workspace = root.join(&agent);
+        std::fs::create_dir_all(workspace.join(".spawn")).expect("workspace");
+        std::fs::write(workspace.join(REPORT), "## Outcome\ndone\n").expect("report");
+
+        let execution = "exec_issue75";
+        let started_seq = append_fact(
+            &db,
+            &agent,
+            &session,
+            Some(execution),
+            "bridge",
+            &json!({"name": "execution.started", "detail": {
+                "engine": "claude", "workspace": workspace, "command_id": claimed.command_id.0,
+            }}),
+        );
+        let mut idle = Observation::basic(
+            SemanticState::Waiting,
+            None,
+            SessionSeq(started_seq),
+            Confidence::new(0.9).expect("confidence"),
+            "rules",
+        );
+        idle.ambiguity = Some(Ambiguity::TurnStoppedIdle);
+        db.store
+            .append(NewEvent {
+                agent_id: AgentId::new(agent.clone()).expect("agent id"),
+                session_id: SessionId::new(session.clone()).expect("session id"),
+                execution_id: Some(ExecutionId::new(execution).expect("execution id")),
+                source: Source::Observer,
+                source_event_id: Some("issue75-idle".to_string()),
+                kind: EventKind::ObservationRecorded { observation: idle },
+            })
+            .expect("Observer judgement folded into session state");
+        let (rows, _) = crate::dispatch::load(&db.store, super::Waits::default()).expect("facts");
+        let facts = rows
+            .iter()
+            .find(|facts| facts.session_id == session)
+            .expect("worker facts");
+        assert_eq!(
+            facts.report_blocker(),
+            Some("turn has not ended in the transcript")
+        );
+        let ready = pass();
+        assert!(
+            !ready.iter().any(|line| line.contains("reported")),
+            "{ready:?}"
+        );
+        assert_eq!(db.task(task).0, "delivered");
+        assert!(
+            workspace.join(REPORT).is_file(),
+            "a ready screen alone takes nothing"
+        );
+
+        let checkpoint = "0123456789abcdef0123456789abcdef01234567";
+        append_fact(
+            &db,
+            &agent,
+            &session,
+            Some(execution),
+            "bridge",
+            &json!({"name": "artifact.committed", "detail": {
+                "reason": "turn_stopped", "artifact": {
+                    "project": "missions", "branch": agent, "commit": checkpoint,
+                },
+            }}),
+        );
+        append_fact(
+            &db,
+            &agent,
+            &session,
+            Some(execution),
+            "claude",
+            &json!({"name": "turn.stopped", "detail": {
+                "input_tokens": null, "output_tokens": null,
+            }}),
+        );
+        let (rows, _) = crate::dispatch::load(&db.store, super::Waits::default()).expect("facts");
+        let facts = rows
+            .iter()
+            .find(|facts| facts.session_id == session)
+            .expect("worker facts");
+        assert!(facts.report_due(), "{:?}", facts.report_blocker());
+        assert_eq!(facts.checkpoint.as_deref(), Some(checkpoint));
+        let collected = pass();
+        assert!(
+            collected
+                .iter()
+                .any(|line| line == &format!("deliver: task #{task} reported")),
+            "{collected:?}"
+        );
+        assert_eq!(db.task(task).0, "reported");
+        assert!(!workspace.join(REPORT).exists());
+        assert!(
+            workspace
+                .join(format!(".spawn/reports/task-{task}.md"))
+                .is_file()
+        );
+        assert_eq!(db.records(task, "task.reported")[0]["commit"], checkpoint);
+
+        for _ in 0..2 {
+            pass();
+        }
+        let mut client = db.client();
+        let deliveries: i64 = client
+            .query_one(
+                "select count(*) from spawn_commands where principal = 'spawn-dispatch'
+                   and idempotency_key like 'deliver-%'",
+                &[],
+            )
+            .expect("delivery count")
+            .get(0);
+        let tasks: i64 = client
+            .query_one(
+                "select count(*) from mission_tasks where mission_id = $1",
+                &[&mission],
+            )
+            .expect("task count")
+            .get(0);
+        assert_eq!(deliveries, 1, "no blind redelivery on later passes");
+        assert_eq!(tasks, 1, "no duplicate task on later passes");
         let _ = std::fs::remove_dir_all(&root);
     }
 

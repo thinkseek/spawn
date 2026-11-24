@@ -348,6 +348,20 @@ fn mirror_name(source: &str) -> String {
     )
 }
 
+/// The path [`ensure_mirror`] uses, without touching the filesystem. The
+/// validated source's stored spelling, not a canonicalized path, keys the
+/// mirror name so a read-only operator view resolves exactly the same mirror.
+pub(crate) fn mirror_path(root: &Path, source: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+    let directory = root.join(".sources");
+    match source {
+        None => Ok(directory.join("scratch.git")),
+        Some(source) => {
+            let source = MissionSource::parse(source).map_err(unavailable)?;
+            Ok(directory.join(mirror_name(source.as_str())))
+        }
+    }
+}
+
 impl MissionWorkspaces {
     pub(crate) fn new(
         default: GitWorkspace,
@@ -478,21 +492,20 @@ impl MissionWorkspaces {
 /// The mirror of a mission's source under `<root>/.sources/`, cloned on
 /// first use; an empty scratch repository when the mission has none.
 pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+    let mirror = mirror_path(root, source)?;
     let directory = root.join(".sources");
     std::fs::create_dir_all(&directory)
         .map_err(|error| unavailable(format!("create {}: {error}", directory.display())))?;
     let Some(source) = source else {
-        let scratch = directory.join("scratch.git");
-        if !scratch.exists() {
-            git(&["init", "--quiet", "--bare", &scratch.to_string_lossy()])?;
+        if !mirror.exists() {
+            git(&["init", "--quiet", "--bare", &mirror.to_string_lossy()])?;
         }
-        return Ok(scratch);
+        return Ok(mirror);
     };
     // A source is handed to git only once it is one ([`MissionSource`]):
     // a source stored before the check is refused here, not run.
     let source = MissionSource::parse(source).map_err(unavailable)?;
     let source = source.as_str();
-    let mirror = directory.join(mirror_name(source));
     if !mirror.exists() {
         git(&[
             "clone",
@@ -1039,7 +1052,8 @@ impl Drop for MissionWorkspaces {
 mod tests {
     use super::{
         MissionSource, Routed, commit_routed, ensure_mirror, fetch_pushed_into, mirror_name,
-        port_is_digits, receives_branches, restore_published, source_readable, test_git as git,
+        mirror_path, port_is_digits, receives_branches, restore_published, source_readable,
+        test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, CommitId, WorkspaceId};
@@ -1854,6 +1868,62 @@ mod tests {
         assert!(b.starts_with("widget-"));
         assert_ne!(a, b);
         assert!(mirror_name("git@host:team/x y.git").starts_with("xy-"));
+    }
+
+    #[test]
+    fn mirror_path_is_pure_and_is_exactly_what_ensure_mirror_uses() {
+        let base = std::env::temp_dir().join(format!("spawn-mirror-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed repo");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let root = base.join("root with ' quote");
+        let remote = "https://git.example.org/acme/widget.git";
+        let local_path = mirror_path(&root, Some(&seed_path)).expect("local path");
+        let remote_path = mirror_path(&root, Some(remote)).expect("remote path");
+        let scratch_path = mirror_path(&root, None).expect("scratch path");
+        assert!(!root.exists(), "the pure lookup created nothing");
+        assert_eq!(
+            local_path,
+            root.join(".sources").join(mirror_name(&seed_path))
+        );
+        assert_eq!(remote_path, root.join(".sources").join(mirror_name(remote)));
+        assert_eq!(scratch_path, root.join(".sources/scratch.git"));
+
+        // Existing mirrors make ensure_mirror a pure path lookup too: no
+        // fetch or clone of the remote URL is needed for this equality test.
+        for (source, expected) in [(seed_path.as_str(), local_path), (remote, remote_path)] {
+            std::fs::create_dir_all(expected.parent().expect("mirror parent")).expect("parent");
+            git(&[
+                "clone",
+                "-q",
+                "--bare",
+                &seed_path,
+                &expected.to_string_lossy(),
+            ])
+            .expect("preexisting mirror");
+            assert_eq!(
+                ensure_mirror(&root, Some(source)).expect("ensure"),
+                expected
+            );
+        }
+        assert_eq!(ensure_mirror(&root, None).expect("scratch"), scratch_path);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `agent_x`'s store on `mirror`, routed as a mission's agent on

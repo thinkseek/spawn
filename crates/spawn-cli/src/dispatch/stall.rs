@@ -404,6 +404,42 @@ fn judged_next(stalls: &Stalls) -> BTreeSet<i64> {
     next.into_values().collect()
 }
 
+/// The report collection gate and the facts behind it, for an activity
+/// stall. This adds no event of its own: it rides the existing once-per-stall
+/// item so an absent or uncollectible report is diagnosable where the wait is
+/// already reported.
+fn report_gate(facts: Option<&Facts>) -> String {
+    let Some(facts) = facts else {
+        return "report blocker: no session facts".to_string();
+    };
+    let coverage = match (facts.observation.as_ref(), facts.current_observation()) {
+        (None, _) => "none".to_string(),
+        (Some(latest), Some(_)) => format!("current (based on seq {})", latest.based_on_seq.0),
+        (Some(latest), None) => format!(
+            "stale (based on seq {}, latest fact seq {})",
+            latest.based_on_seq.0,
+            facts
+                .evidence_seq
+                .map_or_else(|| "unknown".to_string(), |seq| seq.to_string())
+        ),
+    };
+    format!(
+        "report blocker: {}; turn_ended={}; turn_seq={}; checkpoint={}; observation={}; \
+         observation coverage={}",
+        facts.report_blocker().unwrap_or("none"),
+        facts.turn_ended,
+        facts
+            .turn_seq
+            .map_or_else(|| "none".to_string(), |seq| seq.to_string()),
+        facts.checkpoint.as_deref().unwrap_or("none"),
+        facts.observation.as_ref().map_or_else(
+            || "none".to_string(),
+            |observation| observation.state.key().to_string()
+        ),
+        coverage
+    )
+}
+
 /// A delivered task's `activity` step: from the later of its delivery
 /// record and its session's latest fact; none while its worker's turn has
 /// ended with a background job of its own open (it works on that job; past
@@ -437,10 +473,11 @@ fn activity(
         },
     );
     let line = format!(
-        "delivered by {}; {fact_line}; {}; {}; tried: {}",
+        "delivered by {}; {fact_line}; {}; {}; {}; tried: {}",
         named(record, now),
         judgement(facts),
         liveness(facts),
+        report_gate(facts),
         tried_on_worker(facts, context.told, task)
     );
     Some(match fact {
