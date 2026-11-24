@@ -1,12 +1,15 @@
 //! `spawn node add`, `spawn node serve` and `spawn node register` (issue
-//! #85): each command's flags read into what it does (tested without a
-//! node), then done.
+//! #85), and `spawn node coord`, `spawn node connect` and `spawn node
+//! probe` (issue #87): each command's flags read into what it does (tested
+//! without a node), then done.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::coord::{self, CoordUrl};
+use super::crypto::{NodeIdentity, TrustPolicy, valid_node_id};
 use super::transport::{self, Endpoint, Mode, Op, Transport};
 use super::{
     Flags, INVENTORY, JOIN_TIMEOUT, USAGE, bounded, inventory, name_word, open_store, relay,
@@ -29,30 +32,51 @@ fn via_names(text: Option<&str>, name: &str) -> Result<Vec<String>, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddTarget {
     pub(crate) transport: Transport,
-    /// The ssh destination, or the tcp or udp endpoint's URL.
+    /// The ssh destination, or the tcp or udp endpoint's URL, or the
+    /// coordinator's.
     pub(crate) endpoint: String,
     pub(crate) via: Vec<String>,
     pub(crate) mode: Mode,
+    /// A coord node's id (`--node-id`) or, to look up, its name at the
+    /// coordinator (`--peer`).
+    pub(crate) node_id: Option<String>,
+    pub(crate) peer: Option<String>,
 }
 
-/// `spawn node add`'s flags: exactly one of `--ssh`, `--tcp`, `--udp`;
-/// `--via`; `--mode` (relay with hops, else direct, by default); `--note`.
+/// `spawn node add`'s flags: exactly one of `--ssh`, `--tcp`, `--udp`,
+/// `--coord`; `--via`; `--mode` (relay with hops, else direct, by
+/// default; a coord node's relay or hole_punch); `--note`; for `--coord`
+/// exactly one of `--node-id` and `--peer`, and no `--via` (the
+/// coordinator is its way).
 pub(crate) fn add_target(name: &str, flags: &Flags) -> Result<AddTarget, String> {
-    if let Some(unknown) = flags
-        .names()
-        .find(|flag| !matches!(*flag, "ssh" | "tcp" | "udp" | "via" | "mode" | "note"))
-    {
+    if let Some(unknown) = flags.names().find(|flag| {
+        !matches!(
+            *flag,
+            "ssh" | "tcp" | "udp" | "coord" | "node-id" | "peer" | "via" | "mode" | "note"
+        )
+    }) {
         return Err(format!("spawn node add has no --{unknown}\n{USAGE}"));
     }
-    let given: Vec<(Transport, String)> = [Transport::Ssh, Transport::Tcp, Transport::Udp]
-        .into_iter()
-        .filter_map(|transport| flags.get(transport.name()).map(|value| (transport, value)))
-        .collect();
+    let given: Vec<(Transport, String)> = [
+        Transport::Ssh,
+        Transport::Tcp,
+        Transport::Udp,
+        Transport::Coord,
+    ]
+    .into_iter()
+    .filter_map(|transport| flags.get(transport.name()).map(|value| (transport, value)))
+    .collect();
     let Ok([(transport, value)]) = <[_; 1]>::try_from(given) else {
         return Err(format!(
-            "spawn node add takes exactly one of --ssh, --tcp, --udp\n{USAGE}"
+            "spawn node add takes exactly one of --ssh, --tcp, --udp, --coord\n{USAGE}"
         ));
     };
+    if transport == Transport::Coord {
+        return coord_target(name, &value, flags);
+    }
+    if flags.get("node-id").is_some() || flags.get("peer").is_some() {
+        return Err("--node-id and --peer name a node behind a coordinator (--coord)".to_string());
+    }
     let endpoint = if transport == Transport::Ssh {
         if !valid_ssh(&value) {
             return Err(
@@ -79,6 +103,40 @@ pub(crate) fn add_target(name: &str, flags: &Flags) -> Result<AddTarget, String>
         endpoint,
         via,
         mode,
+        node_id: None,
+        peer: None,
+    })
+}
+
+/// `spawn node add <name> --coord <url> --node-id <hex> | --peer <name>`.
+fn coord_target(name: &str, url: &str, flags: &Flags) -> Result<AddTarget, String> {
+    let url = CoordUrl::parse(url).map_err(|error| format!("--coord: {error}"))?;
+    if flags.get("via").is_some() {
+        return Err("--via: a coord node is reached through its coordinator".to_string());
+    }
+    let (node_id, peer) = match (flags.get("node-id"), flags.get("peer")) {
+        (Some(id), None) if valid_node_id(&id) => (Some(id), None),
+        (Some(_), None) => return Err("--node-id is 64 lowercase hex digits".to_string()),
+        (None, Some(peer)) if valid_name(&peer) => (None, Some(peer)),
+        (None, Some(_)) => return Err("--peer is a node's name".to_string()),
+        _ => {
+            return Err(format!(
+                "spawn node add {name} --coord takes exactly one of --node-id, --peer"
+            ));
+        }
+    };
+    let mode = match flags.get("mode").as_deref() {
+        None | Some("relay") => Mode::Relay,
+        Some("hole_punch") => Mode::HolePunch,
+        Some(_) => return Err("--mode: a coord node's mode is relay or hole_punch".to_string()),
+    };
+    Ok(AddTarget {
+        transport: Transport::Coord,
+        endpoint: url.url(),
+        via: Vec::new(),
+        mode,
+        node_id,
+        peer,
     })
 }
 
@@ -134,20 +192,65 @@ pub(crate) fn add(words: &[String]) -> Result<i32, String> {
             "--via: a hop is reached through {name} itself (a loop)"
         ));
     }
-    let route = transport::route(target.transport, &target.endpoint, &target.via, &members)
-        .map_err(|error| format!("--via: {error}"))?;
     let over = target.transport.name();
     let token = crate::config::env_value("SPAWN_NODE_TOKEN");
-    let output = transport::probe_route(&route, Op::Inventory, JOIN_TIMEOUT, token.as_deref())
-        .map_err(|error| format!("the preflight of {name} over {over} failed: {error}"))?;
-    let facts = inventory(&output)
-        .map_err(|error| format!("the preflight of {name} over {over} failed: {error}"))?;
-    let record = joined_record(name, &target, facts, flags.get("note").as_deref());
+    let failed = |error: String| format!("the preflight of {name} over {over} failed: {error}");
+    let record = if target.transport == Transport::Coord {
+        let url = CoordUrl::parse(&target.endpoint)?;
+        let context = coord::ProbeContext::from_env(token.as_deref())?;
+        let probed = coord::ask(
+            &url,
+            target.node_id.as_deref(),
+            target.peer.as_deref(),
+            None,
+            &json!({"op": "inventory"}),
+            JOIN_TIMEOUT,
+            &context,
+        )
+        .map_err(failed)?;
+        let output = transport::accepted(probed.reply)
+            .and_then(|reply| transport::output_of(&reply))
+            .map_err(failed)?;
+        let facts = inventory(&output).map_err(failed)?;
+        let mut record = coord_joined(
+            joined_record(name, &target, facts, flags.get("note").as_deref()),
+            &probed.peer,
+        );
+        // No --mode said: the way the preflight took.
+        if flags.get("mode").is_none() {
+            record["mode"] = json!(probed.mode);
+        }
+        record
+    } else {
+        let route = transport::route(target.transport, &target.endpoint, &target.via, &members)
+            .map_err(|error| format!("--via: {error}"))?;
+        let output = transport::probe_route(&route, Op::Inventory, JOIN_TIMEOUT, token.as_deref())
+            .map_err(failed)?;
+        let facts = inventory(&output).map_err(failed)?;
+        joined_record(name, &target, facts, flags.get("note").as_deref())
+    };
     let event = store
         .node_record(&record)
         .map_err(|error| error.to_string())?;
     println!("node {name} joined (event {event})");
     Ok(0)
+}
+
+/// A coord node's `node.joined`: `record` with the identity, role and
+/// zone of `peer` (its record at the coordinator, keys checked).
+pub(crate) fn coord_joined(mut record: Value, peer: &Value) -> Value {
+    record["node_id"] = peer["node_id"].clone();
+    record["pubkey"] = peer["pubkey"].clone();
+    record["role"] = json!(if peer["role"] == "peer" {
+        "peer"
+    } else {
+        "worker"
+    });
+    record["zone"] = match peer["zone"].as_str() {
+        Some(zone) if coord::valid_zone(zone) => json!(zone),
+        _ => Value::Null,
+    };
+    record
 }
 
 /// `spawn node serve`'s endpoints to listen on: `--listen` (one or more,
@@ -190,13 +293,22 @@ pub(crate) struct ServeConfig {
     pub(crate) register_store: bool,
     pub(crate) allow_loopback_forward: bool,
     pub(crate) token: Option<String>,
+    /// `--allow-unauthenticated`: listen beyond loopback without a token.
+    pub(crate) allow_unauthenticated: bool,
 }
 
 /// `spawn node serve`'s flags, with `token` (`SPAWN_NODE_TOKEN`):
 /// `--register-store` without a token is refused (fail closed: no
 /// registration is ever taken unauthenticated).
 pub(crate) fn serve_config(words: &[String], token: Option<String>) -> Result<ServeConfig, String> {
-    let flags = Flags::parse_with_switches(words, &["register-store", "allow-loopback-forward"])?;
+    let flags = Flags::parse_with_switches(
+        words,
+        &[
+            "register-store",
+            "allow-loopback-forward",
+            "allow-unauthenticated",
+        ],
+    )?;
     let binds = serve_binds(&flags)?;
     let token = token.filter(|token| !token.is_empty());
     let register_store = flags.switch("register-store");
@@ -208,13 +320,39 @@ pub(crate) fn serve_config(words: &[String], token: Option<String>) -> Result<Se
         register_store,
         allow_loopback_forward: flags.switch("allow-loopback-forward"),
         token,
+        allow_unauthenticated: flags.switch("allow-unauthenticated"),
     })
+}
+
+/// Issue #87: a `spawn node serve` (or `spawn node coord`) listening on
+/// anything but loopback answers anyone who reaches it, so it needs its
+/// token (`what`) unless `--allow-unauthenticated` says otherwise; one on
+/// loopback only (a test, a local relay) does not.
+pub(crate) fn require_auth(
+    exposed: bool,
+    token: bool,
+    allow_unauthenticated: bool,
+    what: &str,
+) -> Result<(), String> {
+    if exposed && !token && !allow_unauthenticated {
+        return Err(format!(
+            "listening beyond loopback without {what} answers anyone: set {what}, or pass \
+             --allow-unauthenticated"
+        ));
+    }
+    Ok(())
 }
 
 /// `spawn node serve`: answer probes, relay forwards and (with
 /// `--register-store`, owner only) record registrations, until killed.
 pub(crate) fn serve(words: &[String]) -> Result<i32, String> {
     let config = serve_config(words, crate::config::env_value("SPAWN_NODE_TOKEN"))?;
+    require_auth(
+        config.binds.iter().any(|bind| !bind.loopback()),
+        config.token.is_some(),
+        config.allow_unauthenticated,
+        "SPAWN_NODE_TOKEN",
+    )?;
     let registrar: Option<relay::Registrar> = if config.register_store {
         let store = Mutex::new(open_store()?);
         Some(Arc::new(move |record: &Value| {
@@ -227,12 +365,15 @@ pub(crate) fn serve(words: &[String]) -> Result<i32, String> {
     } else {
         None
     };
-    let relay = Arc::new(relay::Relay::new(
-        relay::local_runner(),
-        registrar,
-        config.token,
-        config.allow_loopback_forward,
-    ));
+    let relay = Arc::new(
+        relay::Relay::new(
+            relay::local_runner(),
+            registrar,
+            config.token,
+            config.allow_loopback_forward,
+        )
+        .with_previous_token(crate::config::env_value("SPAWN_NODE_TOKEN_PREV")),
+    );
     let listening = relay::listen(&relay, &config.binds)?;
     for endpoint in &listening.endpoints {
         println!("node serve: listening on {endpoint}");
@@ -375,5 +516,304 @@ pub(crate) fn register(words: &[String]) -> Result<i32, String> {
         "node {} registered (event {event})",
         registration.message["name"].as_str().unwrap_or("?")
     );
+    Ok(0)
+}
+
+/// `spawn node coord`'s flags, with `token` (`SPAWN_COORD_TOKEN`): `--ws`,
+/// `--tcp` (one at least), `--udp`, `--zone`, `--parent`, `--key-file`,
+/// `--lease-secs`; a ws or tcp bind beyond loopback needs the token or
+/// `--allow-unauthenticated`.
+pub(crate) fn coord_config(
+    words: &[String],
+    token: Option<String>,
+) -> Result<coord::CoordConfig, String> {
+    let flags = Flags::parse_with_switches(words, &["allow-unauthenticated"])?;
+    if let Some(unknown) = flags.names().find(|flag| {
+        !matches!(
+            *flag,
+            "ws" | "tcp" | "udp" | "zone" | "parent" | "key-file" | "lease-secs"
+        )
+    }) {
+        return Err(format!("spawn node coord has no --{unknown}\n{USAGE}"));
+    }
+    let (ws, tcp) = (flags.get("ws"), flags.get("tcp"));
+    if ws.is_none() && tcp.is_none() {
+        return Err(format!("spawn node coord needs --ws or --tcp\n{USAGE}"));
+    }
+    let token = token.filter(|token| !token.is_empty());
+    let mut exposed = false;
+    for bind in ws.iter().chain(tcp.iter()) {
+        let address = bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("{bind}: a bind is ip:port (port 0 for any)"))?;
+        exposed |= !address.ip().is_loopback();
+    }
+    if let Some(udp) = flags.get("udp") {
+        udp.parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("--udp {udp}: a bind is ip:port"))?;
+    }
+    require_auth(
+        exposed,
+        token.is_some(),
+        flags.switch("allow-unauthenticated"),
+        "SPAWN_COORD_TOKEN",
+    )?;
+    let zone = flags.get("zone");
+    if zone.as_deref().is_some_and(|zone| !coord::valid_zone(zone)) {
+        return Err("--zone is 1 to 63 letters, digits, dots, dashes or underscores".to_string());
+    }
+    let parent = flags
+        .get("parent")
+        .map(|url| CoordUrl::parse(&url).map_err(|error| format!("--parent: {error}")))
+        .transpose()?;
+    let lease = flags
+        .get("lease-secs")
+        .map(|secs| {
+            secs.parse::<u64>()
+                .ok()
+                .filter(|secs| (1..=600).contains(secs))
+                .map(Duration::from_secs)
+                .ok_or("--lease-secs is 1 to 600")
+        })
+        .transpose()?;
+    Ok(coord::CoordConfig {
+        ws,
+        tcp,
+        udp: flags.get("udp"),
+        zone,
+        parent,
+        token,
+        key_file: flags.get("key-file").map(std::path::PathBuf::from),
+        lease,
+    })
+}
+
+/// `spawn node coord`: a coordinator, until killed.
+pub(crate) fn coord(words: &[String]) -> Result<i32, String> {
+    let config = coord_config(words, crate::config::env_value("SPAWN_COORD_TOKEN"))?;
+    let running = coord::start(&config)?;
+    println!(
+        "node coord: {} (zone {})",
+        running.coordinator.node_id(),
+        config.zone.as_deref().unwrap_or("-")
+    );
+    for (what, address) in [
+        ("ws", running.ws),
+        ("tcp", running.tcp),
+        ("udp", running.udp),
+    ] {
+        if let Some(address) = address {
+            println!("node coord: listening on {what}://{address}");
+        }
+    }
+    if let Some(parent) = &config.parent {
+        println!(
+            "node coord: zone {} under {parent}",
+            config.zone.as_deref().unwrap_or("-")
+        );
+    }
+    running.wait();
+    Ok(0)
+}
+
+/// `spawn node connect`'s flags, with `node_token` (`SPAWN_NODE_TOKEN`)
+/// and `coord_token` (`SPAWN_COORD_TOKEN`): `--coord`, `--name`, `--role`
+/// (worker by default, or peer), `--zone`, `--key-file`, `--udp-stun`,
+/// `--register-to`, `--register-store`, `--note`, `--allow-unauthenticated`.
+/// The node token is needed (it is mixed into the envelope's keys, so only
+/// the fleet can seal to this node) unless `--allow-unauthenticated`; a
+/// registration, sent or taken, always needs it.
+pub(crate) fn connect_config(
+    words: &[String],
+    node_token: Option<&str>,
+    coord_token: Option<String>,
+) -> Result<coord::ConnectConfig, String> {
+    let flags = Flags::parse_with_switches(words, &["register-store", "allow-unauthenticated"])?;
+    if let Some(unknown) = flags.names().find(|flag| {
+        !matches!(
+            *flag,
+            "coord" | "name" | "role" | "zone" | "key-file" | "udp-stun" | "register-to" | "note"
+        )
+    }) {
+        return Err(format!("spawn node connect has no --{unknown}\n{USAGE}"));
+    }
+    let url =
+        CoordUrl::parse(&flags.required("coord")?).map_err(|error| format!("--coord: {error}"))?;
+    let name = flags.required("name")?;
+    if !valid_name(&name) {
+        return Err(
+            "--name: a node's name is 1 to 63 letters, digits, dots, dashes or underscores, \
+             first a letter or digit"
+                .to_string(),
+        );
+    }
+    let role = flags.get("role").unwrap_or_else(|| "worker".to_string());
+    if !matches!(role.as_str(), "worker" | "peer") {
+        return Err("--role is worker or peer".to_string());
+    }
+    let zone = flags.get("zone");
+    if zone.as_deref().is_some_and(|zone| !coord::valid_zone(zone)) {
+        return Err("--zone is 1 to 63 letters, digits, dots, dashes or underscores".to_string());
+    }
+    let register_to = flags.get("register-to");
+    if register_to
+        .as_deref()
+        .is_some_and(|to| !valid_name(to) && !valid_node_id(to))
+    {
+        return Err("--register-to is the primary's name or node id".to_string());
+    }
+    let register_store = flags.switch("register-store");
+    let token = node_token.is_some_and(|token| !token.is_empty());
+    if register_store && !token {
+        return Err("--register-store requires SPAWN_NODE_TOKEN".to_string());
+    }
+    if register_to.is_some() && !token {
+        return Err("--register-to requires SPAWN_NODE_TOKEN (the primary's)".to_string());
+    }
+    // Fail closed, as serve and coord do: without the token, any client of
+    // the coordinator may seal a probe to this node.
+    if !token && !flags.switch("allow-unauthenticated") {
+        return Err(
+            "spawn node connect without SPAWN_NODE_TOKEN answers any client of the \
+             coordinator: set SPAWN_NODE_TOKEN, or pass --allow-unauthenticated"
+                .to_string(),
+        );
+    }
+    let note = flags.get("note");
+    if note
+        .as_deref()
+        .is_some_and(|note| note.chars().count() > 500 || note.chars().any(char::is_control))
+    {
+        return Err("--note is at most 500 printable characters".to_string());
+    }
+    if let Some(stun) = flags.get("udp-stun") {
+        stun.parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("--udp-stun {stun}: ip:port of a coordinator's --udp"))?;
+    }
+    Ok(coord::ConnectConfig {
+        url,
+        name,
+        role,
+        zone,
+        key_file: flags.get("key-file").map(std::path::PathBuf::from),
+        udp_stun: flags.get("udp-stun"),
+        register_to,
+        register_store,
+        note,
+        coord_token: coord_token.filter(|token| !token.is_empty()),
+        punch_loopback: false,
+    })
+}
+
+/// `spawn node connect`: this node reached through a coordinator, until
+/// killed.
+pub(crate) fn connect(words: &[String]) -> Result<i32, String> {
+    let policy = TrustPolicy::from_env();
+    let config = connect_config(
+        words,
+        policy.token(),
+        crate::config::env_value("SPAWN_COORD_TOKEN"),
+    )?;
+    let (identity, source) = NodeIdentity::load(config.key_file.as_deref())?;
+    match source {
+        super::crypto::KeySource::Ephemeral => {
+            println!("node connect: a key for this run only (--key-file keeps one)");
+        }
+        super::crypto::KeySource::File(file, true) => {
+            println!("node connect: a new key in {}", file.display());
+        }
+        _ => {}
+    }
+    let registrar: Option<relay::Registrar> = if config.register_store {
+        let store = Mutex::new(open_store()?);
+        Some(Arc::new(move |record: &Value| {
+            store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .node_record(record)
+                .map_err(|error| error.to_string())
+        }))
+    } else {
+        None
+    };
+    let identity = Arc::new(identity);
+    let service = Arc::new(coord::NodeService {
+        responder: super::crypto::Responder::new(Arc::clone(&identity), policy),
+        runner: relay::local_runner(),
+        registrar,
+        in_flight: Arc::default(),
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let say: coord::Say = Arc::new(|line: String| println!("{line}"));
+    coord::run_connector(&config, &identity, &service, &stop, None, &say)?;
+    Ok(0)
+}
+
+/// `spawn node probe`'s flags: `--op` (inventory or beat, beat by
+/// default) and `--json`.
+pub(crate) fn probe_flags(words: &[String]) -> Result<(Op, bool), String> {
+    let flags = Flags::parse_with_switches(words, &["json"])?;
+    if let Some(unknown) = flags.names().find(|flag| *flag != "op") {
+        return Err(format!("spawn node probe has no --{unknown}\n{USAGE}"));
+    }
+    let op = match flags.get("op").as_deref() {
+        None | Some("beat") => Op::Beat,
+        Some("inventory") => Op::Inventory,
+        Some(other) => return Err(format!("--op is inventory or beat, not {other:?}")),
+    };
+    Ok((op, flags.switch("json")))
+}
+
+/// What `spawn node probe --json` says of one probe's `output`.
+pub(crate) fn probe_json(
+    name: &str,
+    op: Op,
+    transport: &Value,
+    output: &str,
+    elapsed: Duration,
+) -> Result<Value, String> {
+    let facts = match op {
+        Op::Inventory => inventory(output)?,
+        Op::Beat => {
+            let sample = super::beat(output)?;
+            json!({"load1": sample.load1, "mem_available": sample.mem_available,
+                   "disk_free": sample.disk_free})
+        }
+    };
+    Ok(json!({
+        "name": name, "op": op.name(), "transport": transport,
+        "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        "facts": facts,
+    }))
+}
+
+/// `spawn node probe <name>`: one probe of a joined node over its route
+/// (ssh, tcp, udp, or its coordinator), its output said, or read as
+/// JSON; nothing recorded.
+pub(crate) fn probe(words: &[String]) -> Result<i32, String> {
+    let (name, rest) = name_word(words)?;
+    let (op, json_out) = probe_flags(rest)?;
+    let members = open_store()?
+        .node_members()
+        .map_err(|error| error.to_string())?;
+    let member = members
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|member| member["name"] == name)
+        .ok_or_else(|| format!("node {name} is not joined"))?;
+    let route = transport::Member::of(member)
+        .ok_or_else(|| format!("node {name} has no route"))?
+        .route(&members)?;
+    let token = crate::config::env_value("SPAWN_NODE_TOKEN");
+    let begun = Instant::now();
+    let output = transport::probe_route(&route, op, JOIN_TIMEOUT, token.as_deref())
+        .map_err(|error| format!("node {name}: {error}"))?;
+    if json_out {
+        let out = probe_json(name, op, &member["transport"], &output, begun.elapsed())?;
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        print!("{output}");
+    }
     Ok(0)
 }

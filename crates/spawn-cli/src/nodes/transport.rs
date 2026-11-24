@@ -24,7 +24,23 @@
 //! Every exchange is bounded: by its deadline (each relay passes on less
 //! time than it took, [`HOP_MARGIN`]), by its frame ([`TCP_FRAME`],
 //! [`UDP_FRAME`]), and by [`MAX_HOPS`]. Udp sends again while no reply
-//! comes, at most until the deadline.
+//! comes, at most until the deadline, but gives up after two refusals in
+//! a row (a closed port says so at once: ~250 ms, not the whole bound).
+//! A tcp connect tries each address the host resolves to, IPv6 and IPv4
+//! interleaved ([`happy_order`]), each bounded by half the time left and
+//! at most 2 s ([`connect_happy`]), so an unreachable IPv6 never stalls a
+//! host IPv4 reaches.
+//!
+//! Issue #87: with a token, [`send`] seals each request (super::crypto's
+//! wire seal, `spawn-wire-v1`, `op: "sealed"`; a forward's inner request
+//! too) and opens its `sealed_reply`. That seal is keyed by the fleet's
+//! shared `SPAWN_NODE_TOKEN`: it keeps the probes and registrations from
+//! a passive reader of the path and from anyone without the token, NOT
+//! from a relay that is a fleet member (it holds the token, so it could
+//! open the inner request it forwards). Only a node reached through a
+//! coordinator (`transport` coord) is probed zero-trust: an end-to-end
+//! envelope (`spawn-e2e-v1`, super::coord) sealed to that node's own key,
+//! which no coordinator or relay can open.
 
 use std::io::{Read, Write};
 use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -48,6 +64,8 @@ pub(crate) const HOP_MARGIN: Duration = Duration::from_millis(400);
 const HOP_LEAST: Duration = Duration::from_millis(300);
 /// Udp's first wait before it sends again (doubling, up to a second).
 const UDP_RETRY: Duration = Duration::from_millis(250);
+/// The refusals in a row (`ECONNREFUSED`) that end a udp exchange.
+const UDP_REFUSALS: u32 = 2;
 
 /// How a node is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +73,9 @@ pub(crate) enum Transport {
     Ssh,
     Tcp,
     Udp,
+    /// Through a coordinator (issue #87): the node keeps an outbound
+    /// connection to it (`spawn node connect`).
+    Coord,
 }
 
 impl Transport {
@@ -63,6 +84,7 @@ impl Transport {
             "ssh" => Some(Self::Ssh),
             "tcp" => Some(Self::Tcp),
             "udp" => Some(Self::Udp),
+            "coord" => Some(Self::Coord),
             _ => None,
         }
     }
@@ -72,7 +94,13 @@ impl Transport {
             Self::Ssh => "ssh",
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Coord => "coord",
         }
+    }
+
+    /// Whether a `spawn node serve` endpoint speaks it: tcp or udp.
+    pub(crate) fn wire(self) -> bool {
+        matches!(self, Self::Tcp | Self::Udp)
     }
 }
 
@@ -159,7 +187,7 @@ impl Endpoint {
             Some((scheme, rest)) => (
                 Some(
                     Transport::parse(scheme)
-                        .filter(|t| *t != Transport::Ssh)
+                        .filter(|t| t.wire())
                         .ok_or_else(bad)?,
                 ),
                 rest,
@@ -169,7 +197,7 @@ impl Endpoint {
         let transport = match (scheme, transport) {
             (Some(said), Some(wanted)) if said != wanted => return Err(bad()),
             (Some(said), _) => said,
-            (None, Some(wanted)) if wanted != Transport::Ssh => wanted,
+            (None, Some(wanted)) if wanted.wire() => wanted,
             _ => return Err(bad()),
         };
         let (host, port) = rest.rsplit_once(':').ok_or_else(bad)?;
@@ -198,6 +226,15 @@ impl Endpoint {
     /// `tcp://host:port` or `udp://host:port`.
     pub(crate) fn url(&self) -> String {
         format!("{}://{}:{}", self.transport.name(), self.host, self.port)
+    }
+
+    /// Whether the host is a loopback address (or `localhost`).
+    pub(crate) fn loopback(&self) -> bool {
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     }
 
     /// Whether the host is the unspecified address, which listens on every
@@ -257,6 +294,13 @@ pub(crate) enum Route {
         jumps: Vec<String>,
     },
     Net(Vec<Endpoint>),
+    /// Through the coordinator at `url` to the node `node_id`, its key
+    /// `pubkey` (base64) when its join pinned one (issue #87).
+    Coord {
+        url: String,
+        node_id: String,
+        pubkey: Option<String>,
+    },
 }
 
 /// One joined node as the store's membership says it (`node_members`):
@@ -266,6 +310,9 @@ pub(crate) struct Member<'a> {
     pub(crate) transport: Transport,
     pub(crate) endpoint: &'a str,
     pub(crate) via: Vec<String>,
+    /// A coord node's id and pinned key (issue #87).
+    pub(crate) node_id: Option<&'a str>,
+    pub(crate) pubkey: Option<&'a str>,
 }
 
 impl<'a> Member<'a> {
@@ -282,7 +329,25 @@ impl<'a> Member<'a> {
             transport,
             endpoint,
             via,
+            node_id: member["node_id"].as_str(),
+            pubkey: member["pubkey"].as_str(),
         })
+    }
+
+    /// The route to this member: [`route`], or through its coordinator.
+    pub(crate) fn route(&self, members: &Value) -> Result<Route, String> {
+        if self.transport == Transport::Coord {
+            let node_id = self
+                .node_id
+                .filter(|id| super::crypto::valid_node_id(id))
+                .ok_or("a coord node without its node id")?;
+            return Ok(Route::Coord {
+                url: super::coord::CoordUrl::parse(self.endpoint)?.url(),
+                node_id: node_id.to_string(),
+                pubkey: self.pubkey.map(str::to_string),
+            });
+        }
+        route(self.transport, self.endpoint, &self.via, members)
     }
 }
 
@@ -333,11 +398,19 @@ pub(crate) fn route(
     via: &[String],
     members: &Value,
 ) -> Result<Route, String> {
+    if transport == Transport::Coord {
+        return Err("a coord node is reached through its coordinator, by its node id".to_string());
+    }
     let mut hops = Vec::new();
     for hop in via {
         let member = find(members, hop)
             .and_then(Member::of)
             .ok_or_else(|| format!("hop {hop} is not joined"))?;
+        if !(member.transport == Transport::Ssh || member.transport.wire()) {
+            return Err(format!(
+                "hop {hop} is reached through a coordinator: it relays no tcp or udp"
+            ));
+        }
         let over_ssh = member.transport == Transport::Ssh;
         if over_ssh != (transport == Transport::Ssh) {
             return Err(format!(
@@ -428,15 +501,26 @@ pub(crate) fn probe_route(
         }
         Route::Net(path) => {
             let reply = accepted(send(path, &request(op, token), timeout, token)?)?;
-            let output = reply["output"]
-                .as_str()
-                .filter(|output| {
-                    output.len() <= usize::try_from(OUTPUT_LIMIT).unwrap_or(usize::MAX)
-                })
-                .ok_or("the node's answer has no output")?;
-            Ok(spawn_core::redact::redact(output))
+            output_of(&reply)
+        }
+        Route::Coord {
+            url,
+            node_id,
+            pubkey,
+        } => {
+            let reply = super::coord::probe(url, node_id, pubkey.as_deref(), op, timeout, token)?;
+            output_of(&reply)
         }
     }
+}
+
+/// A probe's reply's output, bounded and masked.
+pub(crate) fn output_of(reply: &Value) -> Result<String, String> {
+    let output = reply["output"]
+        .as_str()
+        .filter(|output| output.len() <= usize::try_from(OUTPUT_LIMIT).unwrap_or(usize::MAX))
+        .ok_or("the node's answer has no output")?;
+    Ok(spawn_core::redact::redact(output))
 }
 
 /// A new nonce: 16 bytes of `/dev/urandom` in hex, then a counter of this
@@ -489,7 +573,9 @@ pub(crate) fn accepted(reply: Value) -> Result<Value, String> {
 /// Send `inner` along `path` (relays, then its node), bounded by
 /// `timeout`: straight to the node without a relay, else wrapped in a
 /// `forward` to the first relay. The inner request's reply, its nonce
-/// checked, `ok` or not. The `forward` is signed with `token`.
+/// checked, `ok` or not. The `forward` is signed with `token`; with one,
+/// the request and the forward are each sealed (issue #87), so a relay
+/// passes on an inner request it cannot read, and their replies opened.
 pub(crate) fn send(
     path: &[Endpoint],
     inner: &Value,
@@ -499,15 +585,55 @@ pub(crate) fn send(
     let (first, rest) = path.split_first().ok_or("no endpoint to send to")?;
     let inner_nonce = inner["nonce"].as_str().unwrap_or_default().to_string();
     if rest.is_empty() {
-        return exchange(first, inner, timeout);
+        return match token {
+            Some(token) => exchange_sealed(first, None, inner, timeout, token),
+            None => exchange(first, inner, timeout),
+        };
     }
-    let envelope = forward(rest, inner, timeout, token)?;
-    let reply = accepted(exchange(first, &envelope, timeout)?)?;
+    let (wire, key) = match token {
+        Some(token) => {
+            let (sealed, key) = super::crypto::seal_wire(inner, token)?;
+            (sealed, Some(key))
+        }
+        None => (inner.clone(), None),
+    };
+    let envelope = forward(rest, &wire, timeout, token)?;
+    let reply = accepted(match token {
+        Some(token) => exchange_sealed(first, None, &envelope, timeout, token)?,
+        None => exchange(first, &envelope, timeout)?,
+    })?;
     let inner = reply["reply"].clone();
     if inner["nonce"] != inner_nonce.as_str() {
         return Err("the relayed reply names another request".to_string());
     }
-    Ok(inner)
+    match key {
+        // A refusal before it was opened (its auth) comes back plain.
+        Some(key) if inner["op"] == "sealed_reply" => key.open_reply(&inner),
+        Some(_) if inner["ok"] == false => Ok(inner),
+        Some(_) => Err("the relayed reply to a sealed request is not sealed".to_string()),
+        None => Ok(inner),
+    }
+}
+
+/// [`exchange`] (at `addresses` when given) of `message` sealed under
+/// `token`, its `sealed_reply` opened; a plain refusal (the node took no
+/// auth of it, so opened nothing) is passed on as it came.
+pub(crate) fn exchange_sealed(
+    to: &Endpoint,
+    addresses: Option<&[SocketAddr]>,
+    message: &Value,
+    timeout: Duration,
+    token: &str,
+) -> Result<Value, String> {
+    let (sealed, key) = super::crypto::seal_wire(message, token)?;
+    let reply = exchange_with(to, addresses, &sealed, timeout)?;
+    if reply["op"] == "sealed_reply" {
+        return key.open_reply(&reply);
+    }
+    if reply["ok"] == false {
+        return Ok(reply);
+    }
+    Err(format!("{to} answered a sealed request in the clear"))
 }
 
 /// The `forward` that has a relay send `inner` along `hops` (at most
@@ -611,9 +737,69 @@ fn exchange_with(
     }
     let reply = tcp_exchange(to, &addresses, &frame, deadline)?;
     if reply["nonce"] != nonce {
+        // A refusal said before the request was read (its nonce unknown:
+        // a request cut short, too slow) is the node's answer, its words
+        // kept (masked by `accepted`).
+        if early_refusal(&reply) {
+            return Ok(reply);
+        }
         return Err(format!("{to} answered another request"));
     }
     Ok(reply)
+}
+
+/// Whether `reply` is a refusal said before the request's nonce was read.
+fn early_refusal(reply: &Value) -> bool {
+    reply["ok"] == false && reply["nonce"].is_null() && reply["error"].is_string()
+}
+
+/// `addresses` IPv6 and IPv4 interleaved, the first resolved family first
+/// (RFC 8305's order), each family's own order kept.
+pub(crate) fn happy_order(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+    let first_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut lead, mut other): (Vec<SocketAddr>, Vec<SocketAddr>) = addresses
+        .iter()
+        .partition(|address| address.is_ipv6() == first_v6);
+    lead.reverse();
+    other.reverse();
+    let mut ordered = Vec::with_capacity(addresses.len());
+    while !lead.is_empty() || !other.is_empty() {
+        ordered.extend(lead.pop());
+        ordered.extend(other.pop());
+    }
+    ordered
+}
+
+/// The longest a connect to one address of several may take.
+const CONNECT_EACH: Duration = Duration::from_secs(2);
+
+/// A tcp connection to the first of `addresses` ([`happy_order`]) that
+/// takes one by `deadline`: each but the last bounded by half the time
+/// left and at most [`CONNECT_EACH`], so a silent address costs at most
+/// that before the next is tried.
+pub(crate) fn connect_happy(
+    to: &dyn std::fmt::Display,
+    addresses: &[SocketAddr],
+    deadline: Instant,
+) -> Result<TcpStream, String> {
+    let ordered = happy_order(addresses);
+    let mut why = format!("{to}: no address");
+    for (index, address) in ordered.iter().enumerate() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("{to}: no answer in time"));
+        }
+        let bound = if index + 1 == ordered.len() {
+            left
+        } else {
+            (left / 2).min(CONNECT_EACH).max(Duration::from_millis(1))
+        };
+        match TcpStream::connect_timeout(address, bound) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => why = format!("{to}: {error}"),
+        }
+    }
+    Err(why)
 }
 
 /// The time left before `deadline`, or an error naming `to`.
@@ -632,18 +818,8 @@ fn tcp_exchange(
     frame: &[u8],
     deadline: Instant,
 ) -> Result<Value, String> {
-    let mut why = String::new();
-    let mut stream = None;
-    for address in addresses {
-        match TcpStream::connect_timeout(address, left(deadline, to)?) {
-            Ok(connected) => {
-                stream = Some(connected);
-                break;
-            }
-            Err(error) => why = format!("{to}: {error}"),
-        }
-    }
-    let mut stream = stream.ok_or(why)?;
+    left(deadline, to)?;
+    let mut stream = connect_happy(to, addresses, deadline)?;
     let io = |error: std::io::Error| format!("{to}: {error}");
     stream
         .set_write_timeout(Some(left(deadline, to)?))
@@ -728,11 +904,28 @@ fn udp_exchange(
     let mut buffer = vec![0_u8; UDP_FRAME + 1];
     let mut wait = UDP_RETRY;
     let mut why = format!("{to}: no answer in time");
+    // Refusals in a row (the port closed: an ICMP port unreachable): two
+    // end the exchange at once, the port is not going to answer. Anything
+    // else in between (a datagram, another error) starts the count again.
+    let mut refused = 0_u32;
+    let refusal =
+        |error: &std::io::Error, why: &mut String, refused: &mut u32| -> Result<(), String> {
+            *why = format!("{to}: {error}");
+            if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                *refused += 1;
+                if *refused >= UDP_REFUSALS {
+                    return Err(why.clone());
+                }
+            } else {
+                *refused = 0;
+            }
+            Ok(())
+        };
     loop {
         left(deadline, to).map_err(|_| why.clone())?;
         if let Err(error) = socket.send(frame) {
             // A port that refused an earlier datagram says so here.
-            why = format!("{to}: {error}");
+            refusal(&error, &mut why, &mut refused)?;
         }
         let resend = Instant::now() + wait;
         wait = (wait * 2).min(Duration::from_secs(1));
@@ -746,6 +939,10 @@ fn udp_exchange(
             socket.set_read_timeout(Some(until)).map_err(io)?;
             match socket.recv(&mut buffer) {
                 Ok(read) if read <= UDP_FRAME => {
+                    refused = 0;
+                    // Only a reply naming this request: a refusal without a
+                    // nonce is taken on tcp alone (its connection is this
+                    // request's), never from a datagram anyone may send.
                     if let Ok(reply) = parse(&buffer[..read])
                         && reply["nonce"] == nonce
                     {
@@ -753,14 +950,17 @@ fn udp_exchange(
                     }
                     // Another request's reply, or none: dropped.
                 }
-                Ok(_) => why = format!("{to}: a reply over {UDP_FRAME} bytes"),
+                Ok(_) => {
+                    refused = 0;
+                    why = format!("{to}: a reply over {UDP_FRAME} bytes");
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
                 Err(error) => {
-                    why = format!("{to}: {error}");
+                    refusal(&error, &mut why, &mut refused)?;
                     std::thread::sleep(until.min(Duration::from_millis(50)));
                 }
             }

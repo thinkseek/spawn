@@ -1825,14 +1825,16 @@ fn nodes() -> Result<Value, String> {
 }
 
 /// The store's nodes as the web reads them: without where each is reached
-/// (its ssh destination, its tcp or udp endpoint) nor its note; how it is
-/// reached (`transport`, `mode`, its hops' names in `via`) stays.
+/// (its ssh destination, its tcp or udp endpoint, its coordinator's URL),
+/// its note nor its public key; how it is reached (`transport`, `mode`,
+/// its hops' names in `via`), its `state`, `role` and `zone` stay.
 fn public_nodes(mut nodes: Value) -> Value {
     for node in nodes.as_array_mut().into_iter().flatten() {
         if let Some(node) = node.as_object_mut() {
             node.remove("ssh");
             node.remove("endpoint");
             node.remove("note");
+            node.remove("pubkey");
         }
     }
     nodes
@@ -6111,5 +6113,34 @@ mod tests {
             json!(["udp", "hole_punch", ["gw"], "lost"])
         );
         assert_eq!(nodes[0]["transport"], "ssh");
+    }
+
+    /// Issue #87: a coord node's coordinator URL and public key stay out of
+    /// `/api/nodes`; its role, zone and node id stay in.
+    #[test]
+    fn the_nodes_read_withholds_a_coord_nodes_url_and_public_key() {
+        let nodes = public_nodes(json!([
+            {"name": "laptop", "ssh": null, "note": "home", "transport": "coord",
+             "endpoint": "wss://coord.example/mesh", "via": [], "mode": "relay",
+             "state": "live", "node_id": "ab".repeat(32),
+             "pubkey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+             "role": "peer", "zone": "home"},
+        ]));
+        let node = &nodes[0];
+        for key in ["ssh", "endpoint", "note", "pubkey"] {
+            assert!(node.get(key).is_none(), "{key}: {node}");
+        }
+        assert_eq!(
+            json!([
+                node["transport"],
+                node["mode"],
+                node["via"],
+                node["state"],
+                node["role"],
+                node["zone"]
+            ]),
+            json!(["coord", "relay", [], "live", "peer", "home"])
+        );
+        assert_eq!(node["node_id"], "ab".repeat(32));
     }
 }
