@@ -5157,7 +5157,7 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Read(~/.claude/paste-cache/**)",
     "Read(~/.claude/dev-mods/**)",
     "Read(~/.claude/seed-admin/**)",
-    "Read(~/.claude/projects/*/*.jsonl)",
+    "Read(~/.claude/projects/*/*.jsonl*)",
     "Read(~/.claude/projects/*/*/subagents/**)",
     "Read(~/.claude/projects/*/*/tool-results/**)",
     "Read(~/.claude/**/*.key)",
@@ -5194,7 +5194,7 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Edit(~/.claude/paste-cache/**)",
     "Edit(~/.claude/dev-mods/**)",
     "Edit(~/.claude/seed-admin/**)",
-    "Edit(~/.claude/projects/*/*.jsonl)",
+    "Edit(~/.claude/projects/*/*.jsonl*)",
     "Edit(~/.claude/projects/*/*/subagents/**)",
     "Edit(~/.claude/projects/*/*/tool-results/**)",
     "Edit(~/.claude/**/*.key)",
@@ -5451,8 +5451,9 @@ pub const CREDENTIAL_DENY: &[&str] = &[
 /// records and environments, keys, the prompt history, MCP auth state, the
 /// IDE locks (their auth tokens), the shell snapshots (the environment of
 /// the user's shell), debug logs, the file and paste histories, the owner's
-/// dev mods and admin seed, and the sessions' own transcripts, subagent
-/// transcripts and tool results (whatever a session ever printed). A
+/// dev mods and admin seed, and the sessions' own transcripts (with their
+/// peer copies, `<session>.jsonl.rebuilt-pending`), subagent transcripts
+/// and tool results (whatever a session ever printed). A
 /// project's `memory/` and `workflows/` are not among them.
 pub const CLAUDE_DIR_SENSITIVE: &[&str] = &[
     "settings*",
@@ -5472,7 +5473,7 @@ pub const CLAUDE_DIR_SENSITIVE: &[&str] = &[
     "paste-cache/**",
     "dev-mods/**",
     "seed-admin/**",
-    "projects/*/*.jsonl",
+    "projects/*/*.jsonl*",
     "projects/*/*/subagents/**",
     "projects/*/*/tool-results/**",
     "**/*.key",
@@ -6069,6 +6070,7 @@ mod tests {
             "~/.claude/dev-mods/m.js",
             "~/.claude/seed-admin/seed.json",
             "~/.claude/projects/-proj/abc.jsonl",
+            "~/.claude/projects/-proj/abc.jsonl.rebuilt-pending",
             "~/.claude/projects/-proj/abc/subagents/x.jsonl",
             "~/.claude/projects/-proj/abc/tool-results/x",
             "~/.claude/gateway.key",
@@ -6202,6 +6204,7 @@ mod tests {
             "//home/bb/.claude-fleet/.claude.json",
             "//home/bb/.claude-fleet/.credentials.json",
             "//home/bb/.claude-fleet/projects/-proj/abc.jsonl",
+            "//home/bb/.claude-fleet/projects/-proj/abc.jsonl.rebuilt-pending",
         ] {
             assert!(denied("Read", path), "Read {path}");
             assert!(denied("Edit", path), "Edit {path}");

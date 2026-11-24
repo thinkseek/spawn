@@ -34,6 +34,12 @@ pub(super) struct Snapshot {
     screen: Option<ScreenState>,
     screen_at: Option<Timestamp>,
     turn: Option<TurnFact>,
+    /// The latest failure (a tool's or a turn's) that nothing clean has
+    /// superseded since: a tool that completed, a turn that stopped, a
+    /// message, a typed input or a new execution clears it. An early failed
+    /// command must not follow a session through hundreds of clean tools
+    /// to a clean end, where the judge read it as the turn's (live
+    /// dogfooding, mission #7: false WAITING alerts on finished tasks).
     last_error: Option<String>,
     exit_code: Option<i32>,
     pub(super) evidence_seq: SessionSeq,
@@ -69,6 +75,13 @@ impl Snapshot {
     fn tool_started(&mut self, tool_name: &str, tool_use_id: &str) {
         self.last_tool = Some(tool_name.to_string());
         self.open_tools.insert(tool_use_id.to_string());
+    }
+
+    /// A tool call ended: one that failed is the latest error, one that
+    /// completed supersedes any error before it.
+    fn tool_ended(&mut self, tool_use_id: &str, error: Option<&String>) {
+        self.open_tools.remove(tool_use_id);
+        self.last_error = error.cloned();
     }
 
     /// Apply one event.
@@ -136,15 +149,13 @@ impl Snapshot {
                 tool_use_id,
                 ..
             } => self.tool_started(tool_name, tool_use_id),
-            EventKind::ToolCompleted { tool_use_id, .. }
-            | EventKind::ToolFailed { tool_use_id, .. } => {
-                self.open_tools.remove(tool_use_id);
-                if let EventKind::ToolFailed { error, .. } = &record.event.kind {
-                    self.last_error = Some(error.clone());
-                }
+            EventKind::ToolCompleted { tool_use_id, .. } => self.tool_ended(tool_use_id, None),
+            EventKind::ToolFailed { tool_use_id, error } => {
+                self.tool_ended(tool_use_id, Some(error));
             }
             EventKind::TurnStopped { .. } => {
                 self.turn = Some(TurnFact::Stopped);
+                self.last_error = None;
                 self.open_tools.clear();
             }
             EventKind::JobStarted { .. } | EventKind::JobEnded { .. } => self.job(record),
@@ -168,6 +179,7 @@ impl Snapshot {
             }
             EventKind::MessageReceived => {
                 self.turn = None;
+                self.last_error = None;
             }
             // The Bridge reads the pane as ready right before it types
             // input, and records the typing (`typed`, once per command). A
@@ -183,6 +195,7 @@ impl Snapshot {
             } if self.screen == Some(ScreenState::Ready) => {
                 self.screen = None;
                 self.turn = None;
+                self.last_error = None;
             }
             _ => {}
         }
@@ -222,6 +235,7 @@ impl Snapshot {
         self.permission_pending = false;
         self.screen = None;
         self.turn = None;
+        self.last_error = None;
     }
 
     /// The running execution's workspace and the session's transcript:
@@ -274,5 +288,218 @@ impl Snapshot {
             reply: None,
             perpetual: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Snapshot;
+    use crate::event::{
+        CommandStep, EventKind, EventRecord, GlobalPosition, ModelProfile, NewEvent, SessionSeq,
+        Source,
+    };
+    use crate::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
+    use crate::screen::ScreenState;
+    use crate::time::Timestamp;
+
+    /// Folds `kinds` into a fresh snapshot, in order, and returns the
+    /// `last_error` its judge input carries.
+    fn last_error(kinds: Vec<(Source, EventKind)>) -> Option<String> {
+        let mut snapshot = Snapshot::default();
+        for (n, (source, kind)) in (1_u64..).zip(kinds) {
+            snapshot.apply(&EventRecord {
+                position: GlobalPosition(n),
+                session_seq: SessionSeq(n),
+                recorded_at: Timestamp(i64::try_from(n).expect("small") * 1_000),
+                event: NewEvent {
+                    agent_id: AgentId::new("agent_w").expect("valid agent"),
+                    session_id: SessionId::new("session_w").expect("valid session"),
+                    execution_id: Some(ExecutionId::new("exec_1").expect("valid execution")),
+                    source,
+                    source_event_id: None,
+                    kind,
+                },
+            });
+        }
+        snapshot
+            .input(
+                &AgentId::new("agent_w").expect("valid agent"),
+                &SessionId::new("session_w").expect("valid session"),
+                Timestamp(1_000_000),
+            )
+            .last_error
+    }
+
+    fn started() -> (Source, EventKind) {
+        (
+            Source::Bridge,
+            EventKind::ExecutionStarted {
+                engine: "claude".to_string(),
+                workspace: WorkspaceId::new("w:/workspaces/w").expect("valid workspace"),
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+                launch: None,
+            },
+        )
+    }
+
+    fn tool(id: &str) -> (Source, EventKind) {
+        (
+            Source::Claude,
+            EventKind::ToolStarted {
+                tool_name: "Bash".to_string(),
+                tool_use_id: id.to_string(),
+                summary: None,
+                summary_whole: false,
+            },
+        )
+    }
+
+    fn tool_failed(id: &str) -> (Source, EventKind) {
+        (
+            Source::Claude,
+            EventKind::ToolFailed {
+                tool_use_id: id.to_string(),
+                error: "exit status 101".to_string(),
+            },
+        )
+    }
+
+    fn tool_completed(id: &str) -> (Source, EventKind) {
+        (
+            Source::Claude,
+            EventKind::ToolCompleted {
+                tool_use_id: id.to_string(),
+                duration_ms: None,
+            },
+        )
+    }
+
+    fn turn_stopped() -> (Source, EventKind) {
+        (
+            Source::Claude,
+            EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        )
+    }
+
+    fn turn_failed() -> (Source, EventKind) {
+        (
+            Source::Claude,
+            EventKind::TurnFailed {
+                error: "API Error: 529 overloaded".to_string(),
+                status: Some(529),
+                error_kind: Some("overloaded".to_string()),
+            },
+        )
+    }
+
+    /// A failure nothing clean has followed is the session's latest error.
+    #[test]
+    fn a_failure_nothing_clean_followed_stays_the_latest_error() {
+        assert_eq!(
+            last_error(vec![started(), tool("t1"), tool_failed("t1")]).as_deref(),
+            Some("exit status 101")
+        );
+        assert_eq!(
+            last_error(vec![
+                started(),
+                tool("t1"),
+                tool_completed("t1"),
+                turn_failed()
+            ])
+            .as_deref(),
+            Some("API Error: 529 overloaded")
+        );
+        // A clean tool before the failure does not hide it.
+        assert_eq!(
+            last_error(vec![
+                started(),
+                tool("t1"),
+                tool_completed("t1"),
+                tool("t2"),
+                tool_failed("t2"),
+            ])
+            .as_deref(),
+            Some("exit status 101")
+        );
+    }
+
+    /// Mission #7: an early failed test script followed by hundreds of
+    /// clean tools and a clean end of turn kept its error to the end, and
+    /// the judge read the finished task as waiting. A tool that completes
+    /// after the failure supersedes it.
+    #[test]
+    fn a_tool_completed_after_a_failed_one_clears_the_error() {
+        let mut kinds = vec![started(), tool("t1"), tool_failed("t1")];
+        for n in 2..300 {
+            let id = format!("t{n}");
+            kinds.push(tool(&id));
+            kinds.push(tool_completed(&id));
+        }
+        assert_eq!(last_error(kinds), None);
+    }
+
+    /// A turn that stopped cleanly after a failed tool ended clean.
+    #[test]
+    fn a_turn_stopped_after_a_failed_tool_clears_the_error() {
+        assert_eq!(
+            last_error(vec![
+                started(),
+                tool("t1"),
+                tool_failed("t1"),
+                turn_stopped()
+            ]),
+            None
+        );
+    }
+
+    /// A new execution starts with no error: the previous one's failed
+    /// turn is not its.
+    #[test]
+    fn a_new_execution_clears_a_failed_turns_error() {
+        assert_eq!(last_error(vec![started(), turn_failed(), started()]), None);
+    }
+
+    /// A message, or input typed at a ready prompt, starts a new turn: the
+    /// failure of the turn before is not its.
+    #[test]
+    fn a_message_or_typed_input_clears_a_failed_turns_error() {
+        assert_eq!(
+            last_error(vec![
+                started(),
+                turn_failed(),
+                (Source::Claude, EventKind::MessageReceived)
+            ]),
+            None
+        );
+        let ready = (
+            Source::Bridge,
+            EventKind::ScreenObserved {
+                state: ScreenState::Ready,
+                evidence: "prompt".to_string(),
+            },
+        );
+        let typed = (
+            Source::Bridge,
+            EventKind::CommandStepped {
+                command_id: CommandId(2),
+                step: CommandStep::Typed,
+                workspace: None,
+            },
+        );
+        assert_eq!(
+            last_error(vec![started(), turn_failed(), ready, typed.clone()]),
+            None
+        );
+        // Typed into a pane not read as ready: no new turn, the error stays.
+        assert_eq!(
+            last_error(vec![started(), turn_failed(), typed]).as_deref(),
+            Some("API Error: 529 overloaded")
+        );
     }
 }

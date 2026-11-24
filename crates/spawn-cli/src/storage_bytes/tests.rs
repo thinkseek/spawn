@@ -532,6 +532,26 @@ fn real_script() -> Option<PathBuf> {
     }
 }
 
+/// Whether the filesystem holding `dir` maps a file's extents for the
+/// script (FIEMAP). A tmpfs does not (the ioctl fails with `EOPNOTSUPP`), so
+/// the script counts every file there as unreadable: a `TMPDIR` on tmpfs
+/// says so and skips the counts that need extents. Any other filesystem,
+/// or one statfs cannot read, checks them all.
+fn maps_extents(dir: &Path) -> bool {
+    match crate::alerts::fs_type(dir) {
+        Ok(kind) if kind == crate::alerts::TMPFS_MAGIC => {
+            eprintln!(
+                "{} is on a tmpfs, which maps no extents (FIEMAP): the script's file counts \
+                 there are not checked; run with TMPDIR on an extent filesystem (btrfs, ext4) \
+                 to check them",
+                dir.display()
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 #[test]
 fn the_extents_script_gives_no_partial_count_past_its_bound() {
     let Some(script) = real_script() else {
@@ -575,7 +595,9 @@ fn the_extents_script_gives_no_partial_count_past_its_bound() {
     // Within its bound, the files are counted (each extent once).
     let read =
         run_script(&script, &script_input(&full, BOUND_SECS), limit, &go).expect("the answer");
-    assert_eq!(read["sources"][0]["files"], 2, "{read}");
+    if maps_extents(&dir) {
+        assert_eq!(read["sources"][0]["files"], 2, "{read}");
+    }
     assert!(
         !read.to_string().contains(&*dir.display().to_string()),
         "never a path: {read}"
@@ -615,7 +637,7 @@ fn the_extents_script_counts_a_directory_it_cannot_list() {
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
     let read = read.expect("the answer");
-    if !listable {
+    if !listable && maps_extents(&dir) {
         // Never measured low with no sign.
         assert_eq!(read["sources"][0]["unreadable"], 1, "{read}");
         assert_eq!(read["sources"][0]["files"], 1, "{read}");

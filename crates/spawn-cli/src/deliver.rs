@@ -1689,12 +1689,21 @@ of mission #{mission}. When it is done, write `{REPORT}` as the task asked, once
 }
 
 /// The next step for a resident not yet told that its latest task was
-/// cancelled: a live one is stopped once for the task (a stop that fails is
-/// pursued by [`crate::dispatch`]), and once stopped, a live one gets the
-/// notice typed in; one that no longer runs is resumed with the notice,
-/// whose work is set aside first ([`crate::dispatch::step`]). A notice that
-/// failed (a busy pane refuses input) goes again under a key of its own,
-/// after a wait that doubles ([`retry_wait_ms`]), live or not (GitHub #76).
+/// cancelled (`!told`: no `cancel-notice-<task>-<n>` command is recorded).
+/// Nothing while a command of the session is in flight or a Stop is under
+/// way ([`crate::dispatch`] pursues a Stop that failed). A live one is
+/// stopped once for the task: it counts as stopped when a Stop for the task
+/// did not fail, the cancel's own (`cancel-stop-<task>-<execution>`), the
+/// reassign's ([`reassign_stop_key`]), or the dispatcher's retry of a cancel
+/// stop that failed (`stop-<execution>-retry-<n>`, [`retried_cancel_stop`]).
+/// Once stopped, a live one gets the notice typed in, only when its turn
+/// stopped idle at its prompt; one that no longer runs is resumed with the
+/// notice, its work set aside first ([`crate::dispatch::step`]). Any
+/// recorded notice counts as told whatever its outcome (FM-18,
+/// `CANCELLED_DELIVERIES`), so one a busy pane refused is not sent again:
+/// the wait after a failed attempt ([`retry_wait_ms`]) and the next unused
+/// number only guard a pass whose task row predates a notice the commands
+/// already hold.
 fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Order> {
     if facts.open_command || facts.stopping() {
         return None;
@@ -1734,7 +1743,9 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
         let stop_prefix = format!("cancel-stop-{}-", cancelled.id);
         let reassign_stop = reassign_stop_key(cancelled.id);
         let stopped_for_task = facts.dispatched.iter().any(|sent| {
-            (sent.key.starts_with(&stop_prefix) || sent.key == reassign_stop)
+            (sent.key.starts_with(&stop_prefix)
+                || sent.key == reassign_stop
+                || retried_cancel_stop(&sent.key, &stop_prefix, facts))
                 && sent.succeeded != Some(false)
         });
         if stopped_for_task {
@@ -1770,6 +1781,28 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
             model: None,
         },
     ))
+}
+
+/// Whether `key` is the dispatcher's retry of a cancel stop for the task
+/// (`stop-<execution>-retry-<n>`, [`crate::dispatch`]'s pursuit of a Stop
+/// that failed) of an execution the task's own stop
+/// (`<stop_prefix><execution>`) was sent into: a retry that reached the
+/// worker stopped it for the task as the first stop would have, so it is
+/// not stopped again (the recovery reads it the same way, `recover`'s
+/// `dispatchers_stop`).
+fn retried_cancel_stop(key: &str, stop_prefix: &str, facts: &Facts) -> bool {
+    let Some((execution, number)) = key
+        .strip_prefix("stop-")
+        .and_then(|rest| rest.rsplit_once("-retry-"))
+    else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && facts
+            .dispatched
+            .iter()
+            .any(|sent| sent.key.strip_prefix(stop_prefix) == Some(execution))
 }
 
 /// The line every task's prompt carries about databases and credentials.
@@ -3817,6 +3850,60 @@ mod tests {
         assert_eq!(plan.len(), 1, "{plan:?}");
         assert_eq!(plan[0].key, "cancel-notice-7-0");
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+    }
+
+    /// A cancel stop that failed and was reached by the dispatcher's retry
+    /// of it (`stop-<execution>-retry-<n>`, `dispatch::stops`) stopped the
+    /// worker for the task: once something resumed it, it gets the notice,
+    /// not a second round of stops. A retry that failed too, or a retry of a
+    /// Stop into an execution the task's stop never went to (someone
+    /// else's stop), stopped nothing for the task.
+    #[test]
+    fn a_cancel_stop_reached_by_its_retry_counts_as_stopped_for_the_task() {
+        let refused = Some("kill-session refused");
+        let resumed = |dispatched: Vec<Sent>| {
+            let mut facts = worker(true, true);
+            facts.execution_id = Some("exec_5".to_string());
+            facts.dispatched = dispatched;
+            facts
+        };
+        let recovered = resumed(vec![
+            sent(20, "cancel-stop-7-exec_3", 1_000, refused),
+            sent(21, "stop-exec_3-retry-1", 70_000, refused),
+            sent(22, "stop-exec_3-retry-2", 200_000, None),
+        ]);
+        let plan = orders(&after_cancel(false), &[recovered]);
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert_eq!(plan[0].key, "cancel-notice-7-0", "{plan:?}");
+        assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+
+        for dispatched in [
+            // Its retries failed as well: nothing reached the worker.
+            vec![
+                sent(20, "cancel-stop-7-exec_3", 1_000, refused),
+                sent(21, "stop-exec_3-retry-1", 70_000, refused),
+            ],
+            // A retry of a Stop into another execution than the task's.
+            vec![
+                sent(20, "cancel-stop-7-exec_3", 1_000, refused),
+                sent(21, "stop-exec_4-retry-1", 70_000, None),
+            ],
+            // Another task's cancel stop, retried.
+            vec![
+                sent(20, "cancel-stop-70-exec_3", 1_000, refused),
+                sent(21, "stop-exec_3-retry-1", 70_000, None),
+            ],
+            // Not a retry key.
+            vec![
+                sent(20, "cancel-stop-7-exec_3", 1_000, refused),
+                sent(21, "stop-exec_3-retry-x", 70_000, None),
+            ],
+        ] {
+            let plan = orders(&after_cancel(false), &[resumed(dispatched.clone())]);
+            assert_eq!(plan.len(), 1, "{dispatched:?}: {plan:?}");
+            assert_eq!(plan[0].key, "cancel-stop-7-exec_5", "{dispatched:?}");
+            assert_eq!(plan[0].action, CommandAction::Stop);
+        }
     }
 
     /// GitHub #76, 2026-11-20: a notice a busy pane refused is retried on

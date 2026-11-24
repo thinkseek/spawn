@@ -32,7 +32,11 @@
 //! manager is asked once (`--user show ...`, the same bound, logged, kept
 //! the same), since a drill can be a `--user` unit (objective 231: the
 //! controllers' drill, installed in ~/.config/systemd/user, read as never
-//! passed). A unit both managers know is the system manager's, and so is
+//! passed). A unit the user manager knew is remembered as the user's
+//! ([`USER_UNITS`]) and asked of it first from then on, so the system
+//! manager's "not found" is not asked (and logged) again on every reading;
+//! once the user manager no longer knows it, it is forgotten and the system
+//! manager asked again. A unit both managers know is the system manager's, and so is
 //! an answer with no `LoadState` line (a stand-in, an older systemd); a
 //! system call that fails is no reading, never asked again. A unit name other than
 //! `[A-Za-z0-9][A-Za-z0-9@._-]*.service` is never run ([`unit_allowed`]) and
@@ -341,6 +345,10 @@ static UNITS: Mutex<BTreeMap<String, (i64, Reading)>> = Mutex::new(BTreeMap::new
 /// its call and takes what it kept, so each unit is asked once.
 static SHOWING: Mutex<()> = Mutex::new(());
 
+/// The units the user manager knew when the system manager did not, by
+/// `(program, unit)`: asked of the user manager first ([`read_unit`]).
+static USER_UNITS: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
 /// The refused names already in the log: each is named once.
 static REFUSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -393,7 +401,38 @@ pub(super) fn not_found(text: &str) -> bool {
 /// its duration: the system manager's answer, or, when it says the unit is
 /// not found, the user manager's (objective 231), asked once with the same
 /// `limit`. A system call that fails is no reading and is not asked again.
+/// A unit the user manager knew is remembered ([`USER_UNITS`]) and asked of
+/// it first on the next reading, without the system manager's probe; when
+/// the user manager no longer knows it, it is forgotten and the system
+/// manager is asked as above (a unit moved back to the system's).
 fn read_unit(program: &str, unit: &str, limit: Duration) -> Reading {
+    let key = (program.to_string(), unit.to_string());
+    let user_units = || {
+        USER_UNITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if user_units().contains(&key) {
+        let started = Instant::now();
+        let shown = show(program, unit, true, limit);
+        let took = started.elapsed().as_millis();
+        match shown {
+            Ok(text) if not_found(&text) => {
+                eprintln!(
+                    "core-lines: {program} --user show {unit}: no longer a user unit ({took} ms); asking the system manager"
+                );
+                user_units().remove(&key);
+            }
+            Ok(text) => {
+                eprintln!("core-lines: {program} --user show {unit}: {took} ms");
+                return unit_of(&text);
+            }
+            Err(why) => {
+                eprintln!("core-lines: {program} --user show {unit}: {why} ({took} ms)");
+                return Reading::default();
+            }
+        }
+    }
     let started = Instant::now();
     let shown = show(program, unit, false, limit);
     let took = started.elapsed().as_millis();
@@ -408,6 +447,9 @@ fn read_unit(program: &str, unit: &str, limit: Duration) -> Reading {
             match shown {
                 Ok(text) => {
                     eprintln!("core-lines: {program} --user show {unit}: {took} ms");
+                    if !not_found(&text) {
+                        user_units().insert(key);
+                    }
                     text
                 }
                 Err(why) => {
@@ -425,9 +467,14 @@ fn read_unit(program: &str, unit: &str, limit: Duration) -> Reading {
             return Reading::default();
         }
     };
+    unit_of(&text)
+}
+
+/// A unit's last pass and last run from its `systemctl show` answer.
+fn unit_of(text: &str) -> Reading {
     Reading {
-        passed_at_ms: parse_show(&text),
-        last: parse_last(&text),
+        passed_at_ms: parse_show(text),
+        last: parse_last(text),
     }
 }
 
@@ -1249,6 +1296,73 @@ mod tests {
             std::fs::read_to_string(&calls).expect("the calls"),
             format!("{SYSTEM_CALL}\n")
         );
+    }
+
+    /// A unit the user manager knew is asked of it first on the next
+    /// reading: the system manager's "not found" is not probed (and logged)
+    /// again on every tick. Once the user manager no longer knows it, the
+    /// system manager is asked again and its answer is the reading, and the
+    /// unit is the system's from then on.
+    #[test]
+    fn a_known_user_unit_is_asked_of_the_user_manager_first() {
+        let dir = Scratch::new();
+        let calls = dir.as_path().join("calls");
+        let system = dir.as_path().join("system");
+        let user = dir.as_path().join("user");
+        let answer = |path: &std::path::Path, text: &str| {
+            std::fs::write(path, text).expect("write the answer");
+        };
+        let program = script(
+            dir.as_path(),
+            &format!(
+                "echo \"$*\" >>{calls}\nif [ \"$1\" = --user ]; then cat {user}; else cat {system}; fi",
+                calls = calls.display(),
+                user = user.display(),
+                system = system.display()
+            ),
+        );
+        let calls_made = || {
+            let made = std::fs::read_to_string(&calls).expect("the calls");
+            std::fs::remove_file(&calls).expect("clear the calls");
+            made
+        };
+        let not_found =
+            "LoadState=not-found\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=\n";
+        answer(&system, not_found);
+        answer(
+            &user,
+            "LoadState=loaded\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=@7\n",
+        );
+        let first = read_unit(&program, "a.service", Duration::from_secs(5));
+        assert_eq!(first.passed_at_ms, Some(7000));
+        assert_eq!(
+            calls_made(),
+            format!("{SYSTEM_CALL}\n--user {SYSTEM_CALL}\n")
+        );
+        // The second reading asks the user manager alone.
+        let second = read_unit(&program, "a.service", Duration::from_secs(5));
+        assert_eq!(second, first);
+        assert_eq!(calls_made(), format!("--user {SYSTEM_CALL}\n"));
+        // Another unit of the same program is not remembered by it.
+        read_unit(&program, "b.service", Duration::from_secs(5));
+        assert!(calls_made().starts_with("show "), "b.service: system first");
+
+        // Moved back to the system manager: asked there once the user
+        // manager no longer knows it, and there first from then on.
+        answer(&user, not_found);
+        answer(
+            &system,
+            "LoadState=loaded\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=@9\n",
+        );
+        let moved = read_unit(&program, "a.service", Duration::from_secs(5));
+        assert_eq!(moved.passed_at_ms, Some(9000));
+        assert_eq!(
+            calls_made(),
+            format!("--user {SYSTEM_CALL}\n{SYSTEM_CALL}\n")
+        );
+        let again = read_unit(&program, "a.service", Duration::from_secs(5));
+        assert_eq!(again.passed_at_ms, Some(9000));
+        assert_eq!(calls_made(), format!("{SYSTEM_CALL}\n"));
     }
 
     /// Only `LoadState=not-found` is not found; every other load state is

@@ -211,7 +211,11 @@ select jsonb_build_object(
 /// its deliveries (a delivery is confirmed from its command), its restarts'
 /// Stops and resumes (`restart-<task>-<n>[-stop]`, each sent once), its
 /// cancel notices (`cancel-notice-<task>-<n>`: a failed one goes again under
-/// the next number, which must not be one already used), the nudges of
+/// the next number, which must not be one already used), its cancel stops
+/// (`cancel-stop-<task>-<execution>`) and the retries of the Stops into an
+/// execution one went to (`stop-<execution>-retry-<n>`): a resident paused
+/// or slow to recover for more than a day is still stopped for its task,
+/// and not stopped again (`deliver`'s `cancel_order`), the nudges of
 /// the current episode and the resume of the current execution (an old one
 /// is not "not sent"); the tags of every input it delivered there
 /// (`told`: the escalations its digests carried, however long ago);
@@ -296,6 +300,17 @@ from (
              or c.idempotency_key like 'deliver-%'
              or starts_with(c.idempotency_key, 'restart-')
              or starts_with(c.idempotency_key, 'cancel-notice-')
+             or starts_with(c.idempotency_key, 'cancel-stop-')
+             or (starts_with(c.idempotency_key, 'stop-')
+                 and strpos(c.idempotency_key, '-retry-') > 0
+                 and exists (select 1 from spawn_commands k
+                              where k.session_id = c.session_id
+                                and k.principal = 'spawn-dispatch'
+                                and starts_with(k.idempotency_key, 'cancel-stop-')
+                                and '-' || split_part(substr(c.idempotency_key, 6), '-retry-', 1)
+                                    = right(k.idempotency_key,
+                                            length(split_part(substr(c.idempotency_key, 6),
+                                                              '-retry-', 1)) + 1)))
              or c.idempotency_key = 'dispatch-resume-' || coalesce(s.execution_id, 'none')
              or c.idempotency_key = 'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
              or starts_with(c.idempotency_key,

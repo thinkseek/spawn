@@ -1607,7 +1607,10 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
 /// notice older than the day the facts keep for other commands, read as
 /// never sent, made the retry reuse a key already used. A submit under an
 /// existing key makes no new command, so nothing was sent and the resident
-/// stayed blocked.
+/// stayed blocked. A cancel's stop (`cancel-stop-<task>-<execution>`) and
+/// the dispatcher's retries of the Stops into that execution
+/// (`stop-<execution>-retry-<n>`) stay too: a resident paused or slow to
+/// recover past a day was stopped for its task, and is not stopped again.
 #[test]
 fn a_dispatchers_cancel_notices_stay_among_its_facts_however_old() {
     let (store, schema) = store("facts_cancel_notice");
@@ -1645,6 +1648,9 @@ fn a_dispatchers_cancel_notices_stay_among_its_facts_however_old() {
         .finish(&claimed, &Outcome::Failed("pane not ready".to_string()))
         .expect("finish succeeds");
     submit("cancel-stop-4-exec_1");
+    submit("stop-exec_1-retry-1");
+    submit("stop-exec_2-retry-1");
+    submit("stop-exec_1");
     admin(&schema)
         .execute(
             "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000",
@@ -1660,8 +1666,13 @@ fn a_dispatchers_cancel_notices_stay_among_its_facts_however_old() {
         .collect();
     assert_eq!(
         kept,
-        vec![("cancel-notice-4-0", Some(false))],
-        "the failed notice stays, two days old; an old stop does not"
+        vec![
+            ("cancel-notice-4-0", Some(false)),
+            ("cancel-stop-4-exec_1", None),
+            ("stop-exec_1-retry-1", None),
+        ],
+        "the failed notice, the cancel's stop and the retry of a Stop into its execution \
+         stay, two days old; another execution's retry and another stop do not"
     );
     assert_eq!(
         submit("cancel-notice-4-0"),

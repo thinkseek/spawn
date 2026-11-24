@@ -4712,10 +4712,10 @@ fn names(list: &Value) -> Vec<String> {
 }
 
 /// The statfs type of a tmpfs (`TMPFS_MAGIC`, linux/magic.h).
-const TMPFS_MAGIC: u64 = 0x0102_1994;
+pub(crate) const TMPFS_MAGIC: u64 = 0x0102_1994;
 
 /// The statfs type of the filesystem holding `path`.
-fn fs_type(path: &Path) -> Result<u64, String> {
+pub(crate) fn fs_type(path: &Path) -> Result<u64, String> {
     let stat =
         rustix::fs::statfs(path).map_err(|error| format!("statfs {}: {error}", path.display()))?;
     fs_type_of(path, &stat)
