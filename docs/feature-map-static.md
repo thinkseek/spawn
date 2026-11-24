@@ -109,9 +109,9 @@
 
 - 能力：增量归一化 Claude Code JSONL 与 pane 屏尾，保存 append-only transcript copies，规则优先并在歧义时调用 Jev。
 - 入口：`claude_line`、`read_claude_screen`、`TranscriptArchive`、`Observer::tick`、`JevJudge::judge`。
-- 代码：`crates/spawn-core/src/ingest.rs:917-1009`、`crates/spawn-core/src/screen.rs:355-409`、`crates/spawn-host/src/transcripts.rs:128-224`、`crates/spawn-core/src/observe/observer.rs:294-370`、`crates/spawn-jev/src/lib.rs:198-221`、`crates/spawn-host/src/watch.rs:161-175`、`crates/spawn-host/src/watch.rs:297-312`。
+- 代码：`crates/spawn-core/src/ingest.rs:917-1009`、`crates/spawn-core/src/screen.rs:355-409`、`crates/spawn-host/src/transcripts.rs:128-224`、`crates/spawn-core/src/observe/observer.rs:294-370`、`crates/spawn-jev/src/lib.rs:198-221`、`crates/spawn-host/src/watch.rs:167-181`、`crates/spawn-host/src/watch.rs:303-322`。
 - 实现状态：`部分实现`。Linux 使用 inotify；当前非 Linux `unwatch` 仍调用仅 Linux 定义的 `release`，旧图中的无适配器回退不存在。
-- 测试证据：`crates/spawn-core/src/ingest.rs:1308-1396` 覆盖事件归一与未知行；`crates/spawn-core/src/transcripts.rs:857-871`、`crates/spawn-core/src/transcripts.rs:978-1012`、`crates/spawn-core/src/transcripts.rs:1029-1064`、`crates/spawn-core/src/transcripts.rs:1248-1276` 覆盖归档和恢复；`crates/spawn-core/tests/observe_tiers.rs:180-338` 覆盖规则/Jev 分层；`crates/spawn-host/src/watch.rs:344-345` 只有 `cfg(test)`，没有旧图所述的 Linux-only 门禁。旧提交 `41ece56e` 的 Darwin 构建与 Linux 单元测试结果是历史证据；当前 Darwin/aarch64 的 `cargo test -p spawn-cli deliver::tests` 在 `spawn-host` 的 Linux-only 代码编译失败，不记为通过。
+- 测试证据：`crates/spawn-core/src/ingest.rs:1308-1396` 覆盖事件归一与未知行；`crates/spawn-core/src/transcripts.rs:857-871`、`crates/spawn-core/src/transcripts.rs:978-1012`、`crates/spawn-core/src/transcripts.rs:1029-1064`、`crates/spawn-core/src/transcripts.rs:1248-1276` 覆盖归档和恢复；`crates/spawn-core/tests/observe_tiers.rs:180-338` 覆盖规则/Jev 分层；`crates/spawn-host/src/watch.rs:355-356` 只有 `cfg(test)`，没有旧图所述的 Linux-only 门禁。旧提交 `41ece56e` 的 Darwin 构建与 Linux 单元测试结果是历史证据；当前 Darwin/aarch64 的 `cargo test -p spawn-cli deliver::tests` 在 `spawn-host` 的 Linux-only 代码编译失败，不记为通过。
 - 部署状态：`部署未验证`。本次未读取真实 transcript、归档或 Jev relay。
 - 已知缺口：解析依赖 Claude Code 版本格式。归档在 turn end 和 execution end 触发，不是连续复制。本地归档不提供跨主机容灾；非 Linux 没有 inotify 或等价 `/proc` 清理保证，且当前 `spawn-host` 存在平台编译缺口。
 - 下一步：引擎升级时新增真实 fixtures，并在目标环境演练 rewrite/delete/resume 与 loopback Jev 故障；需要非 Linux 支持时先修复平台门禁。
