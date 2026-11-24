@@ -16,7 +16,8 @@ file whole. Measured on this host (git 2.56, btrfs):
 | A 200 MiB binary committed to git, with 1 MiB rewritten between checkpoints | **3.1 s** on the Bridge's loop, **+211 MiB** in the repository each time; repacking three versions still takes 622 MiB |
 
 So each kind of object goes where its shape fits, and a workspace file
-over a size cap stays out of git (below).
+over a size cap stays out of git (below). The repeatable end-to-end benchmark
+for these host storage paths is in [storage-benchmark.md](storage-benchmark.md).
 
 ## Kinds of object
 
