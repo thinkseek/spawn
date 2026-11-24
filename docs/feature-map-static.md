@@ -19,7 +19,7 @@
 
 - 能力：创建和配置 mission，记录 owner push、hold/release，驱动 task 状态及 gate verdict 折叠。
 - 入口：`spawn mission ...`、`spawn task ...`、SQL control-record 写入与 refold。
-- 代码：`crates/spawn-cli/src/main.rs:172-174`、`crates/spawn-cli/src/missions.rs:669-719`、`crates/spawn-core/src/mission.rs:14`、`crates/spawn-postgres/sql/schema.sql:2553`、`crates/spawn-postgres/sql/schema.sql:2631`。
+- 代码：`crates/spawn-cli/src/main.rs:173-175`、`crates/spawn-cli/src/missions.rs:921-971`、`crates/spawn-core/src/mission.rs:14`、`crates/spawn-postgres/sql/schema.sql:2637`、`crates/spawn-postgres/sql/schema.sql:2719`。
 - 实现状态：`已实现`。配置和任务变化先成为记录，SQL 再折叠为读模型；`aborted` 本身不把 task 推进到完成态。
 - 测试证据：`crates/spawn-core/src/mission.rs:87-125` 固定状态值和未知值错误；`crates/spawn-postgres/tests/control.rs:51-135` 覆盖 mission/resident 控制记录折叠。本次在 Darwin/aarch64 运行 `cargo test -p spawn-core mission::tests`，2 个测试通过。
 - 部署状态：`部署未验证`。需要同一套 CLI、schema 和 loop；本次未执行端到端 mission 生命周期。
@@ -63,7 +63,7 @@
 
 - 能力：显式 `init-db` 原地迁移，回填 projection，提供 per-database 受限登录和持久化 recovery facts。
 - 入口：`spawn init-db`、`PostgresStore::migrate`、`role_url`、`spawn_host_record`。
-- 代码：`crates/spawn-cli/src/main.rs:152-155`、`crates/spawn-postgres/src/lib.rs:292-362`、`crates/spawn-postgres/sql/schema.sql:129-200`、`crates/spawn-postgres/src/gateway.rs:178-313`、`crates/spawn-postgres/src/lib.rs:501-533`、`crates/spawn-postgres/src/recovery.rs:27-106`、`crates/spawn-postgres/sql/schema.sql:5342-5385`。
+- 代码：`crates/spawn-cli/src/main.rs:153-156`、`crates/spawn-postgres/src/lib.rs:294-364`、`crates/spawn-postgres/sql/schema.sql:129-200`、`crates/spawn-postgres/src/gateway.rs:178-313`、`crates/spawn-postgres/src/lib.rs:503-535`、`crates/spawn-postgres/src/recovery.rs:27-106`、`crates/spawn-postgres/sql/schema.sql:5834-5877`。
 - 实现状态：`已实现`。普通 `open_store` 只连接；迁移是独立部署步骤。受限登录由 owner 密码派生，recovery writer 只接受 owner。
 - 测试证据：`crates/spawn-postgres/tests/upgrade.rs:91` 覆盖旧表升级；`crates/spawn-postgres/tests/api.rs:3043-3093` 覆盖迁移竞争；`crates/spawn-postgres/tests/roles.rs:108-149` 覆盖数据库间角色隔离；`crates/spawn-postgres/tests/recovery.rs:56`、`crates/spawn-postgres/tests/recovery.rs:117` 覆盖 recovery writer。
 - 部署状态：`部署未验证`。本次未执行 init-db、角色连接或数据库重启。
@@ -76,7 +76,7 @@
 
 - 能力：propose/approve/retire resident，维持已批准 worker，按持久化恢复事实选择 resume、wait、handoff 或 final。
 - 入口：`spawn resident propose|approve|retire`、`supervise::keep_residents`、loop recovery step。
-- 代码：`crates/spawn-cli/src/missions.rs:1109-1130`、`crates/spawn-cli/src/supervise.rs:358-437`、`crates/spawn-cli/src/commands/loops.rs:399-477`、`crates/spawn-cli/src/recover.rs:1169-1248`。
+- 代码：`crates/spawn-cli/src/missions.rs:1341-1362`、`crates/spawn-cli/src/supervise.rs:358-437`、`crates/spawn-cli/src/commands/loops.rs:399-477`、`crates/spawn-cli/src/recover.rs:1169-1248`。
 - 实现状态：`已实现`。retire 会进入 open-task 取消路径；resident 后续投递还受 FM-18 的通知顺序约束。
 - 测试证据：`crates/spawn-postgres/tests/control.rs:51-80` 覆盖 propose/approve/retire；`crates/spawn-cli/src/supervise.rs:630-672` 覆盖 revival backoff 与 handoff；`crates/spawn-cli/src/recover.rs:2933`、`crates/spawn-cli/src/recover.rs:2972` 覆盖恢复退避和 handoff/final。
 - 部署状态：`部署未验证`。本次未进行 owner 审批、退休、进程重启或恢复演练。
@@ -214,7 +214,7 @@
 
 - 能力：取消通知的顺序保证及其对同一 resident session 后续任务的影响。
 - 入口：`CANCELLED_DELIVERIES` → `Work::blocked` → `next_up`/`deliver::orders`。
-- 代码：`crates/spawn-postgres/src/missions.rs:365-432`、`crates/spawn-postgres/sql/schema.sql:3807-3822`、`crates/spawn-cli/src/deliver.rs:770-791`、`crates/spawn-cli/src/deliver.rs:1488-1496`、`crates/spawn-cli/src/dispatch.rs:1000-1012`。
+- 代码：`crates/spawn-postgres/src/missions.rs:365-432`、`crates/spawn-postgres/sql/schema.sql:4299-4314`、`crates/spawn-cli/src/deliver.rs:770-791`、`crates/spawn-cli/src/deliver.rs:1488-1496`、`crates/spawn-cli/src/dispatch.rs:1000-1012`。
 - 实现状态：`已实现`。匹配的 cancel-notice 命令落盘即为 `told=true`，不再要求 `succeeded`；work stealing 使用同一 recorded 语义。首次 notice 前的 `told=false` 仍保证 stop→set-aside→notice；open command 仍串行化输入，failed 或 dispatcher restart 不再阻塞后续任务，也不会重复 notice。事件格式未变。
 - 测试证据：`crates/spawn-postgres/tests/cancelled.rs:97-169` 分别覆盖 submitted、succeeded=true、succeeded=false；`crates/spawn-postgres/tests/steal.rs:279-365` 覆盖 submitted/failed notice 与 idle 判定；`crates/spawn-cli/src/deliver.rs:3673-3717` 覆盖 Assigned/Revise、failed/restart 后空闲 pane 直接 Input 以及 open 时不并发输入。`5e416443` 基线在 Darwin/aarch64、PostgreSQL 18 运行两个数据库回归，cancelled 在 submitted 断言得到 `left: Bool(false), right: true`，steal 在 `succeeded=None` 断言失败，均为 0 通过、1 失败；修复后同一命令各 1 个通过。基线的 idle-pane planner 新回归已 1 个通过，所以 planner 生产代码零移植。Linux/x86_64、Rust 1.95.0、PostgreSQL 19 上运行 `cargo test -p spawn-cli deliver::tests -- --test-threads=1`，63 个通过；`cargo test -p spawn-postgres --test cancelled -- --test-threads=1`，2 个通过；`cargo test -p spawn-postgres --test steal -- --test-threads=1`，4 个通过。最终源码在同一 Linux 环境运行 `cargo test --workspace -- --test-threads=1`，73 个 test binaries 加 5 组 doc-tests 共 2028 个通过、0 失败、5 忽略，日志 `cargo-workspace-candidate-r5.log`，退出状态 0。合并 `origin/main` 基线 `6544fe42` 后的 head `1cffa02c`，在 Linux/x86_64、Debian 12、ext4、Rust 1.95.0、一次性 PostgreSQL 16.4 隔离环境（独立 checkout/target/socket/logs），于 2026-11-22 再运行：具名 `cargo test -p spawn-cli dispatch::steal` 5 通过、0 失败、1234 过滤；`cargo test -p spawn-postgres --test steal` 5 通过、0 失败（含 `a_delivery_row_carries_its_missions_state_and_halt`）；`cargo test -p spawn-cli` 整体 1236 通过、0 失败、3 忽略。这些是隔离临时目录的结果，不连接任何现有服务。head `6728527e`（合入 PR #82 后）在 r9 隔离环境复验（2026-11-22，细节见 FM-13）：具名 `cargo test -p spawn-cli dispatch::steal` 5 通过、0 失败，`cargo test -p spawn-postgres --test steal` 5 通过、0 失败，覆盖该修复依赖的 recorded notice 与 idle 判定路径；`cargo test -p spawn-cli` 整体 1266 通过、0 失败、3 忽略。r9 未单独重跑 `--test cancelled`，其 r5 证据仍以本段前述记录为准。
 - 部署状态：`部署未验证`。本次只做源码、一次性数据库和纯函数验证，未操作真实 resident 或现有服务；目标运行环境是否未修复或已经部署，本次均未核实。
@@ -225,7 +225,7 @@
 
 - 能力：normal gate mode 的 revision 输入校验，以及空 base 与空 candidate 在 integrator 中的不同分类。
 - 入口：`gate.sh` 参数解析、`git rev-parse --verify`、`gate::judge_seeing_base_check` → `judge_in` → `decide`、`task.gated` fold。
-- 代码：`scripts/rsi/gate.sh:633-650`、`crates/spawn-cli/src/gate.rs:1078-1089`、`crates/spawn-cli/src/gate.rs:1158-1167`、`crates/spawn-cli/src/integrate.rs:4050-4076`、`crates/spawn-cli/src/integrate.rs:4125-4180`、`crates/spawn-cli/src/integrate.rs:4238-4256`、`crates/spawn-cli/src/integrate.rs:4347-4410`、`crates/spawn-cli/src/integrate/landing.rs:17-27`、`crates/spawn-cli/src/integrate/verdicts.rs:1003-1018`、`crates/spawn-cli/src/integrate/owner.rs:1807-1864`、`crates/spawn-postgres/sql/schema.sql:2631-2635`。
+- 代码：`scripts/rsi/gate.sh:633-650`、`crates/spawn-cli/src/gate.rs:1078-1089`、`crates/spawn-cli/src/gate.rs:1158-1167`、`crates/spawn-cli/src/integrate.rs:4050-4076`、`crates/spawn-cli/src/integrate.rs:4125-4180`、`crates/spawn-cli/src/integrate.rs:4238-4256`、`crates/spawn-cli/src/integrate.rs:4347-4410`、`crates/spawn-cli/src/integrate/landing.rs:17-27`、`crates/spawn-cli/src/integrate/verdicts.rs:1003-1018`、`crates/spawn-cli/src/integrate/owner.rs:1807-1864`、`crates/spawn-postgres/sql/schema.sql:2719-2723`。
 - 实现状态：`已实现`。standalone 在 bwrap/scratch/rev-parse 前对完整 Rust trim 空白集返回专用 exit 64。Rust 在创建私有目录或启动 gate 前返回 `GateFailure::Parameter`。生产 base 入口、normal/adopted candidate 和 stale 检查都记录 `aborted` 加 `evidence=parameter_error`，由现有连续 abort 规则限次；candidate 与 main 前进竞态也不会改写为 stale。合法 nonexistent ref 仍走 rev-parse exit 3 和 `Aborted`。
 - 测试证据：`scripts/rsi/test-gate.sh:220-283` 覆盖 nonexistent ref、empty + 25 个 Rust 空白字符的 52 个 standalone 输入和非 UTF-8 locale；`crates/spawn-cli/src/gate.rs:3010-3058` 覆盖 52 个 Rust 参数错误、gate 未执行和 nonexistent-ref 兼容；`crates/spawn-cli/src/integrate/tests.rs:1219-1267` 覆盖 stale 防护与序列化；`crates/spawn-cli/src/integrate/database_tests.rs:3454-3545` 覆盖 empty/space/U+3000 的 base/candidate 持久化、abort 计数和 main 前进竞态；`crates/spawn-cli/src/integrate/database_tests.rs:5823-5853` 覆盖 owner repeat 分类。`5e416443` 基线的 empty/space/tab/newline 输入均返回 exit 3；修复后 Darwin/aarch64 上 52/52 返回 exit 64，nonexistent ref 为 exit 3。审查发现 `zh_CN.GB18030` 的 NBSP 曾落到 exit 3；固定 `tr` 和 `grep` 为 C locale 后，GB18030 的 52 个输入全部返回 exit 64，6 个非 UTF-8 locale 的 NBSP/U+3000 两侧共 24/24 返回 exit 64。Linux/x86_64、Rust 1.95.0、PostgreSQL 19 上，上述 Rust gate、stale、serialization、empty base、empty candidate 和 repeat 六个命令各 1 个测试通过。竞态回归先得到 `verdict=stale`、0 通过、1 失败，修复后 base/candidate 两个命令各 1 个通过。最终源码运行 `cargo test --workspace -- --test-threads=1`，73 个 test binaries 加 5 组 doc-tests 共 2028 个通过、0 失败、5 忽略，日志 `cargo-workspace-candidate-r5.log`，退出状态 0。
 - 部署状态：`部署未验证`。本次未运行真实 integrator loop，也未读取或改变目标运行环境的部署；目标运行环境是否未修复或已经部署，本次均未核实。
