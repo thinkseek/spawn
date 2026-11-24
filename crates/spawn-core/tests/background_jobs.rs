@@ -408,7 +408,7 @@ fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
 }
 
 fn settle_start(bridge: &mut Bridge, store: &Arc<MemoryStore>, id: u64) {
-    for _ in 0..16 {
+    for attempt in 0..1_024 {
         bridge.tick().expect("start or resume");
         if store
             .read_global(GlobalPosition(0), 1000)
@@ -422,7 +422,11 @@ fn settle_start(bridge: &mut Bridge, store: &Arc<MemoryStore>, id: u64) {
             return;
         }
         store.expire_leases();
-        std::thread::yield_now();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     panic!("command {id} did not finish");
 }

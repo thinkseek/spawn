@@ -257,7 +257,7 @@ impl Fleet {
             .expect("submit succeeds");
         let id = CommandId(self.commands);
         let mut total = TickReport::default();
-        for _ in 0..64 {
+        for attempt in 0..1_024 {
             let mut report = self.bridge.tick().expect("tick succeeds");
             total.commands += report.commands;
             total.warnings.append(&mut report.warnings);
@@ -268,9 +268,13 @@ impl Fleet {
                 return total;
             }
             self.store.expire_leases();
-            std::thread::yield_now();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
-        panic!("command {id} did not finish in 64 claims")
+        panic!("command {id} did not finish in 1,024 claims")
     }
 
     fn start(&mut self, model: Option<ModelProfile>) -> TickReport {

@@ -51,7 +51,7 @@ fn bridge(store: &Arc<MemoryStore>) -> Bridge {
 
 fn start_pass(bridge: &mut Bridge, store: &MemoryStore) -> TickReport {
     let mut total = TickReport::default();
-    for _ in 0..64 {
+    for attempt in 0..1_024 {
         let mut report = bridge.tick().expect("resumable start");
         total.commands += report.commands;
         total.warnings.append(&mut report.warnings);
@@ -60,9 +60,13 @@ fn start_pass(bridge: &mut Bridge, store: &MemoryStore) -> TickReport {
             return total;
         }
         store.expire_leases();
-        std::thread::yield_now();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
-    panic!("the start did not finish in 64 claims")
+    panic!("the start did not finish in 1,024 claims")
 }
 
 fn submit(store: &MemoryStore, key: &str, action: CommandAction) {

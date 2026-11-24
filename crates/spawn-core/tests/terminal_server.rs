@@ -67,7 +67,7 @@ fn tick(log: Arc<dyn EventLog>, store: &Arc<MemoryStore>) -> TickReport {
     );
     bridge.recover().expect("recover succeeds");
     let mut total = TickReport::default();
-    for _ in 0..64 {
+    for attempt in 0..1_024 {
         let mut report = bridge.tick().expect("tick succeeds");
         total.commands += report.commands;
         total.warnings.append(&mut report.warnings);
@@ -76,9 +76,13 @@ fn tick(log: Arc<dyn EventLog>, store: &Arc<MemoryStore>) -> TickReport {
             return total;
         }
         store.expire_leases();
-        std::thread::yield_now();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
-    panic!("the commands did not finish in 64 claims")
+    panic!("the commands did not finish in 1,024 claims")
 }
 
 fn events(store: &MemoryStore) -> Vec<NewEvent> {

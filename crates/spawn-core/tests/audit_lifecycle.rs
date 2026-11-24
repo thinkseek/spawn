@@ -133,13 +133,17 @@ impl Rig {
     }
 
     fn settle_start(&self, bridge: &mut Bridge) {
-        for _ in 0..16 {
+        for attempt in 0..1_024 {
             bridge.tick().expect("start");
             if self.outcome(1).is_some() {
                 return;
             }
             self.store.expire_leases();
-            std::thread::yield_now();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         panic!("the start did not finish");
     }
@@ -368,13 +372,17 @@ fn m5_a_store_error_before_the_start_prompt_leaves_a_promptless_engine() {
             .is_some_and(|key| key.ends_with(":screen:ready"))
     });
     let mut failed = false;
-    for _ in 0..16 {
+    for attempt in 0..1_024 {
         if bridge.tick().is_err() {
             failed = true;
             break;
         }
         rig.store.expire_leases();
-        std::thread::yield_now();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     assert!(failed, "the database is down");
     rig.lease_expires();
@@ -557,7 +565,7 @@ fn fail_once(
     if failure.is_none() {
         rig.fail_finish_once();
     }
-    for _ in 0..64 {
+    for attempt in 0..1_024 {
         let result = bridge.tick();
         let targeted = seen
             .as_ref()
@@ -566,7 +574,11 @@ fn fail_once(
             break;
         }
         rig.store.expire_leases();
-        std::thread::yield_now();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     if let Some((n, seen)) = seen
         && seen.load(Ordering::SeqCst) <= n

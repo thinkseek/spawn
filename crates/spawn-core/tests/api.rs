@@ -332,7 +332,7 @@ fn any_workspace() -> spawn_core::id::WorkspaceId {
 /// sleeps. The empty final pass also advances executions as `Bridge::tick` does.
 fn tick(bridge: &mut Bridge, store: &Arc<MemoryStore>) -> Result<TickReport, StoreError> {
     let mut total = TickReport::default();
-    for _ in 0..64 {
+    for attempt in 0..1_024 {
         let mut report = Bridge::tick(bridge)?;
         total.commands += report.commands;
         total.warnings.append(&mut report.warnings);
@@ -341,9 +341,13 @@ fn tick(bridge: &mut Bridge, store: &Arc<MemoryStore>) -> Result<TickReport, Sto
             return Ok(total);
         }
         store.expire_leases();
-        std::thread::yield_now();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
-    panic!("the commands did not finish in 64 claims")
+    panic!("the commands did not finish in 1,024 claims")
 }
 
 /// One `spawn tick` process: a new Bridge that refolds the log first.

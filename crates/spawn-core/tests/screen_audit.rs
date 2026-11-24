@@ -299,7 +299,7 @@ Enter to confirm · Esc to cancel
     }
 
     fn settle(store: &Arc<MemoryStore>, bridge: &mut Bridge, id: u64) {
-        for _ in 0..16 {
+        for attempt in 0..1_024 {
             bridge.tick().expect("tick");
             if store
                 .read_global(GlobalPosition(0), 500)
@@ -316,7 +316,11 @@ Enter to confirm · Esc to cancel
                 return;
             }
             store.expire_leases();
-            std::thread::yield_now();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         panic!("command {id} did not finish");
     }

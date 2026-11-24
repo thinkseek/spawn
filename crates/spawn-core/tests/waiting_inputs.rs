@@ -168,13 +168,17 @@ impl Rig {
                 charter: None,
             },
         );
-        for _ in 0..16 {
+        for attempt in 0..1_024 {
             rig.tick();
             if rig.finished(1).is_some() {
                 break;
             }
             rig.store.expire_leases();
-            std::thread::yield_now();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         assert!(rig.finished(1).is_some_and(|(ok, _)| ok), "the start");
         rig

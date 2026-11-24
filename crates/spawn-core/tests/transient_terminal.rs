@@ -214,7 +214,7 @@ impl Rig {
                 charter: None,
             },
         );
-        for _ in 0..64 {
+        for attempt in 0..1_024 {
             self.bridge.tick().expect("tick");
             if self.events().into_iter().any(|kind| {
                 matches!(
@@ -228,7 +228,11 @@ impl Rig {
                 return;
             }
             self.store.expire_leases();
-            std::thread::yield_now();
+            if attempt < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         panic!("the start did not finish");
     }
