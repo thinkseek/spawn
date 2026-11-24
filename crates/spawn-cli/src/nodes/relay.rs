@@ -31,6 +31,20 @@
 //! - At most [`MAX_ACTIVE`] requests at once per listener, [`PER_PEER`] of
 //!   them from one address; a tcp peer has [`REQUEST_TIMEOUT`] to send its
 //!   request.
+//! - Issue #87: a sealed request (`op: "sealed"`, super::crypto's wire
+//!   seal) is opened with the token, or the one before it
+//!   (`SPAWN_NODE_TOKEN_PREV`, [`Relay::with_previous_token`]), answered
+//!   as its inner request would be, and its answer sealed back
+//!   (`sealed_reply`, its own salt and nonce each); a forward's sealed
+//!   inner request is passed on as it came, unread. The seal is the
+//!   fleet's shared token's: it keeps a passive reader of the path out,
+//!   not a relay that holds the token (a fleet member could open what it
+//!   forwards). Zero-trust relaying is the coordinators' `spawn-e2e-v1`
+//!   alone (super::coord). An answer is kept against a resend until the request's
+//!   own `at_ms` can no longer pass the auth ([`keep_for`]), however fast
+//!   its sender's clock. A store's refusal of a registration is said in
+//!   its own words only when they are the writer's, never SQL
+//!   ([`store_refusal`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
@@ -43,8 +57,8 @@ use serde_json::{Map, Value, json};
 
 use super::auth;
 use super::transport::{
-    Endpoint, MAX_HOPS, Mode, TCP_FRAME, Transport, UDP_FRAME, exchange_at, forbidden, forward,
-    hop_names, local_command, parse, read_line, valid_nonce,
+    Endpoint, MAX_HOPS, Mode, TCP_FRAME, Transport, UDP_FRAME, exchange_at, exchange_sealed,
+    forbidden, forward, hop_names, local_command, parse, read_line, valid_nonce,
 };
 use super::{JOIN_TIMEOUT, OUTPUT_LIMIT, PROBE_TIMEOUT, bounded, inventory, valid_name};
 
@@ -83,10 +97,21 @@ pub(crate) fn local_runner() -> Runner {
     })
 }
 
-/// A nonce's state: being answered, or answered (when, and how).
+/// A nonce's state: being answered, or answered (until when, and how).
 enum Seen {
     InFlight,
     Done(Instant, Value),
+}
+
+/// How long the answer to `message` is kept against a resend: at least
+/// [`SEEN_TTL`], and until its `at_ms` plus the skew (and 5 s) is past,
+/// so a request from a clock running fast is never run twice while its
+/// auth holds; never more than twice the skew and 10 s.
+pub(crate) fn keep_for(message: &Value, now_ms: i64) -> Duration {
+    let at = message["at_ms"].as_i64().unwrap_or(now_ms);
+    let until = super::crypto::replay_until(at, now_ms);
+    let millis = u64::try_from(until.saturating_sub(now_ms)).unwrap_or(0);
+    Duration::from_millis(millis).max(SEEN_TTL)
 }
 
 /// What [`Relay::admit`] makes of a request.
@@ -105,6 +130,7 @@ pub(crate) enum Admit {
 pub(crate) struct Ticket {
     relay: Arc<Relay>,
     nonce: String,
+    keep: Duration,
     done: bool,
 }
 
@@ -118,7 +144,7 @@ impl Ticket {
             .unwrap_or_else(PoisonError::into_inner);
         seen.insert(
             std::mem::take(&mut self.nonce),
-            Seen::Done(Instant::now(), reply.clone()),
+            Seen::Done(Instant::now() + self.keep, reply.clone()),
         );
     }
 }
@@ -143,6 +169,8 @@ pub(crate) struct Relay {
     runner: Runner,
     registrar: Option<Registrar>,
     token: Option<String>,
+    /// The token before it, still taken while a fleet rotates.
+    previous: Option<String>,
     allow_loopback: bool,
     seen: Mutex<HashMap<String, Seen>>,
 }
@@ -167,9 +195,27 @@ impl Relay {
             runner,
             registrar,
             token: token.filter(|token| !token.is_empty()),
+            previous: None,
             allow_loopback,
             seen: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Also take requests signed or sealed with `previous`
+    /// (`SPAWN_NODE_TOKEN_PREV`), while this node has a token of its own.
+    #[must_use]
+    pub(crate) fn with_previous_token(mut self, previous: Option<String>) -> Self {
+        self.previous = previous.filter(|token| !token.is_empty() && self.token.is_some());
+        self
+    }
+
+    /// The tokens a request may be signed or sealed with.
+    fn tokens(&self) -> Vec<&str> {
+        [&self.token, &self.previous]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect()
     }
 
     /// Before any slot is taken: refuse a request without a nonce or its
@@ -182,9 +228,11 @@ impl Relay {
         if let Err(why) = self.authorized(message) {
             return Admit::Reply(refusal(Some(nonce), &why));
         }
+        let keep = keep_for(message, crate::verify::now_ms());
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
         seen.retain(|_, state| match state {
-            Seen::Done(at, _) => at.elapsed() < SEEN_TTL,
+            Seen::Done(until, _) => *until > now,
             Seen::InFlight => true,
         });
         match seen.get(nonce) {
@@ -211,6 +259,7 @@ impl Relay {
         Admit::Run(Ticket {
             relay: Arc::clone(self),
             nonce: nonce.to_string(),
+            keep,
             done: false,
         })
     }
@@ -239,15 +288,52 @@ impl Relay {
     /// token or it is a `register`.
     fn authorized(&self, message: &Value) -> Result<(), String> {
         match (&self.token, message["op"].as_str()) {
-            (Some(token), _) => auth::verify(message, token),
+            (Some(token), _) => {
+                let first = auth::verify(message, token);
+                if first.is_ok() {
+                    return first;
+                }
+                match &self.previous {
+                    Some(previous) => auth::verify(message, previous).or(first),
+                    None => first,
+                }
+            }
             (None, Some("register")) => {
                 Err("this node takes no registration without SPAWN_NODE_TOKEN".to_string())
+            }
+            (None, Some("sealed")) => {
+                Err("this node opens no sealed request without SPAWN_NODE_TOKEN".to_string())
             }
             (None, _) => Ok(()),
         }
     }
 
     fn reply(&self, message: &Value) -> Value {
+        if message["op"] == "sealed" {
+            return self.sealed_reply(message);
+        }
+        self.plain_reply(message)
+    }
+
+    /// A sealed request opened, answered as its inner request, the answer
+    /// sealed back; one that does not open is refused in the clear (it
+    /// says nothing the request did not).
+    fn sealed_reply(&self, sealed: &Value) -> Value {
+        let nonce = sealed["nonce"].as_str();
+        let (inner, key) = match super::crypto::open_wire(sealed, &self.tokens()) {
+            Ok(opened) => opened,
+            Err(why) => return refusal(nonce, &why),
+        };
+        let reply = if inner["op"] == "sealed" {
+            refusal(nonce, "a sealed request inside another")
+        } else {
+            self.plain_reply(&inner)
+        };
+        key.seal_reply(&reply)
+            .unwrap_or_else(|why| refusal(nonce, &why))
+    }
+
+    fn plain_reply(&self, message: &Value) -> Value {
         let nonce = message["nonce"].as_str();
         match self.answer(message) {
             Ok(Value::Object(mut fields)) => {
@@ -275,7 +361,7 @@ impl Relay {
                     .as_ref()
                     .ok_or("this node takes no registration (spawn node serve --register-store)")?;
                 let record = registration(message)?;
-                let event = registrar(&record)?;
+                let event = registrar(&record).map_err(|error| store_refusal(&error))?;
                 Ok(json!({"event": event}))
             }
             Some("forward") => self.relay(message),
@@ -331,8 +417,12 @@ impl Relay {
             exchange_at(next, &addresses, &inner, timeout).map_err(|_| NO_ANSWER.to_string())?
         } else {
             let envelope = forward(rest, &inner, timeout, self.token.as_deref())?;
-            let reply = exchange_at(next, &addresses, &envelope, timeout)
-                .map_err(|_| NO_ANSWER.to_string())?;
+            // With a token, the forward this relay sends on is sealed too.
+            let reply = match self.token.as_deref() {
+                Some(token) => exchange_sealed(next, Some(&addresses), &envelope, timeout, token),
+                None => exchange_at(next, &addresses, &envelope, timeout),
+            }
+            .map_err(|_| NO_ANSWER.to_string())?;
             if reply["ok"] != true {
                 return Err(format!(
                     "{next}: {}",
@@ -378,6 +468,9 @@ fn only_keys(message: &Value, allowed: &[&str], what: &str) -> Result<(), String
 /// op, or key, is refused.
 pub(crate) fn inner_request(inner: &Value) -> Result<Value, String> {
     const PROBE: &[&str] = &["op", "nonce", "at_ms", "auth"];
+    // Issue #87: an inner request sealed for the last node, passed on
+    // unread.
+    const SEALED: &[&str] = &["op", "nonce", "at_ms", "auth", "salt", "ct"];
     const REGISTER: &[&str] = &[
         "op",
         "nonce",
@@ -394,6 +487,7 @@ pub(crate) fn inner_request(inner: &Value) -> Result<Value, String> {
     let allowed = match inner["op"].as_str() {
         Some("inventory" | "beat") => PROBE,
         Some("register") => REGISTER,
+        Some("sealed") => SEALED,
         _ => return Err("a forward carries a probe or a register only".to_string()),
     };
     only_keys(inner, allowed, "a forward's inner request")?;
@@ -422,6 +516,61 @@ pub(crate) fn inner_request(inner: &Value) -> Result<Value, String> {
     Ok(Value::Object(rebuilt))
 }
 
+/// What a registration's refusal by the store says back: the writer's own
+/// words (`spawn_node_record`'s: a name joined already, a hop not
+/// joined, a field), its first line only, without the driver's prefix;
+/// anything else (SQL, a schema, a connection) as one line that says
+/// nothing of it.
+pub(crate) fn store_refusal(error: &str) -> String {
+    const GENERIC: &str = "the primary's store refused the registration";
+    const SAID: &[&str] = &[
+        "joined already",
+        "is not joined",
+        "makes a loop",
+        "a node's ",
+        "a coord node's ",
+        "an ssh node's ",
+        "a direct node",
+        "is reached over another transport",
+        "cannot be a hop",
+        "names a hop twice",
+        "record's ",
+    ];
+    const INTERNAL: &[&str] = &[
+        "sql",
+        "relation",
+        "column",
+        "function",
+        "schema",
+        "syntax",
+        "permission",
+        "pl/pgsql",
+        "context",
+        "spawn_",
+        "connection",
+        "statement",
+        "transaction",
+        "postgres",
+        "db error",
+    ];
+    let line = error.lines().next().unwrap_or_default().trim();
+    let line = ["db error: ", "ERROR: ", "error: "]
+        .iter()
+        .fold(line, |line, prefix| {
+            line.strip_prefix(prefix).unwrap_or(line)
+        })
+        .trim();
+    let lower = line.to_ascii_lowercase();
+    if line.is_empty()
+        || line.chars().count() > 300
+        || !SAID.iter().any(|said| line.contains(said))
+        || INTERNAL.iter().any(|word| lower.contains(word))
+    {
+        return GENERIC.to_string();
+    }
+    spawn_core::redact::redact(line)
+}
+
 /// The `node.joined` a `register` asks for, each field checked as
 /// `spawn_node_record` checks it, its inventory read as `spawn node add`
 /// reads one, every text masked.
@@ -433,7 +582,7 @@ pub(crate) fn registration(message: &Value) -> Result<Value, String> {
     let transport = message["transport"]
         .as_str()
         .and_then(Transport::parse)
-        .filter(|transport| *transport != Transport::Ssh)
+        .filter(|transport| transport.wire())
         .ok_or("a registration's transport is tcp or udp")?;
     let endpoint = Endpoint::parse(
         message["endpoint"].as_str().unwrap_or_default(),

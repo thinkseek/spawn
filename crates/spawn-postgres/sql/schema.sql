@@ -6068,7 +6068,12 @@ create index if not exists spawn_events_host_storage_bytes
 --     hops from the primary to this node in order, none the node itself,
 --     none twice, no loop through the hops' own `via`; `mode`, absent or
 --     direct, relay or hole_punch (absent reads as relay with hops and
---     direct without);
+--     direct without). Issue #87: `transport` coord, a node reached
+--     through a coordinator (`spawn node connect`), its `endpoint` the
+--     coordinator's `ws://`, `wss://` or `tcp://` URL, its mode relay or
+--     hole_punch, its hops (if any) tcp, udp or coord nodes; and, on any
+--     join, optional `node_id` (64 hex: SHA-256 of its Ed25519 key),
+--     `pubkey` (that key, base64), `role` (worker or peer) and `zone`;
 --   node.drained, node.undrained, node.removed {name};
 --   node.heartbeat {name, join, load1, mem_available, disk_free},
 --   node.lost {name, join, last_seen_ms, silent_ms, error},
@@ -6152,8 +6157,53 @@ begin
         raise exception 'a node''s name is 1 to 63 letters, digits, dots, dashes or underscores, first a letter or digit'
             using errcode = '22023';
     end if;
-    if v_type = 'node.joined' and v_transport not in ('ssh', 'tcp', 'udp') then
-        raise exception 'a node''s transport is ssh, tcp or udp'
+    if v_type = 'node.joined' and v_transport not in ('ssh', 'tcp', 'udp', 'coord') then
+        raise exception 'a node''s transport is ssh, tcp or udp, or coord (through a coordinator)'
+            using errcode = '22023';
+    end if;
+    -- A coord node (issue #87) is reached through a coordinator: its
+    -- endpoint is the coordinator's URL, its mode relay or hole_punch.
+    if v_type = 'node.joined' and v_transport = 'coord'
+       and (jsonb_typeof(p_record -> 'endpoint') is distinct from 'string'
+            or length(p_record ->> 'endpoint') > 255
+            or p_record ->> 'endpoint' ~ '[@[:space:][:cntrl:]]'
+            or p_record ->> 'endpoint' !~ ('^(ws|wss|tcp)://'
+                                           '([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\])'
+                                           '(:[0-9]{1,5})?'
+                                           '(/[A-Za-z0-9._~:/?#\[\]@!$&''()*+,;=%-]*)?$')
+            or coalesce(substring(p_record ->> 'endpoint'
+                                  from '^[a-z]+://(?:[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]*\]):([0-9]{1,5})')::integer
+                        between 1 and 65535, true) is not true) then
+        raise exception 'a coord node''s endpoint is its coordinator''s ws://, wss:// or tcp://host[:port][/path], the port 1 to 65535'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined' and v_transport = 'coord'
+       and coalesce(p_record ->> 'mode', '') not in ('relay', 'hole_punch') then
+        raise exception 'a coord node''s mode is relay or hole_punch'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined'
+       and ((coalesce(jsonb_typeof(p_record -> 'node_id'), 'null') <> 'null'
+             and (jsonb_typeof(p_record -> 'node_id') <> 'string'
+                  or p_record ->> 'node_id' !~ '^[0-9a-f]{64}$'))
+            or (coalesce(jsonb_typeof(p_record -> 'pubkey'), 'null') <> 'null'
+                and (jsonb_typeof(p_record -> 'pubkey') <> 'string'
+                     or p_record ->> 'pubkey' !~ '^[A-Za-z0-9+/_-]{43,44}={0,2}$'))) then
+        raise exception 'a node''s node_id is 64 lowercase hex digits and its pubkey a base64 Ed25519 key'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined'
+       and coalesce(jsonb_typeof(p_record -> 'role'), 'null') <> 'null'
+       and (jsonb_typeof(p_record -> 'role') <> 'string'
+            or p_record ->> 'role' not in ('worker', 'peer')) then
+        raise exception 'a node''s role is worker or peer'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined'
+       and coalesce(jsonb_typeof(p_record -> 'zone'), 'null') <> 'null'
+       and (jsonb_typeof(p_record -> 'zone') <> 'string'
+            or p_record ->> 'zone' !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') then
+        raise exception 'a node''s zone is 1 to 63 letters, digits, dots, dashes or underscores, first a letter or digit'
             using errcode = '22023';
     end if;
     if v_type = 'node.joined'
@@ -6213,14 +6263,14 @@ begin
         if v_bad is not null then
             raise exception 'hop % of the via is not joined', v_bad using errcode = 'P0002';
         end if;
-        -- An ssh node's hops are its jump hosts, ssh nodes; a tcp or udp
-        -- node's are relays, tcp or udp nodes.
+        -- An ssh node's hops are its jump hosts, ssh nodes; a tcp, udp or
+        -- coord node's are relays, tcp, udp or coord nodes.
         select h into v_bad from jsonb_array_elements_text(v_via) with ordinality v(h, o)
          cross join lateral spawn_node_latest('node.joined', v.h, 0) j
          where (coalesce(j.record ->> 'transport', 'ssh') = 'ssh') <> (v_transport = 'ssh')
          order by o limit 1;
         if v_bad is not null then
-            raise exception 'hop % is reached over another transport: an ssh node''s hops are ssh nodes, a tcp or udp node''s are tcp or udp nodes',
+            raise exception 'hop % is reached over another transport: an ssh node''s hops are ssh nodes, a tcp, udp or coord node''s are tcp, udp or coord nodes',
                 v_bad using errcode = '22023';
         end if;
         if p_record ->> 'mode' = 'direct' and jsonb_array_length(v_via) > 0 then

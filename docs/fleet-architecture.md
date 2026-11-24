@@ -181,7 +181,7 @@ runs no job yet, and a drain changes no scheduling.
   recovery between two reads are both told, in order, and a failed alert
   write is made at the next read.
 - `spawn node list [--json]` and `GET /api/nodes` (the reader login; no
-  ssh destination, no note, no clock) give each joined node with `state`
+  ssh destination, endpoint, note or public key, no clock) give each joined node with `state`
   (`lost` before `drained` before `live`), `lost_since_ms` while lost and
   its latest heartbeat sample. The Fleet details show one row per node and
   say when the read failed.
@@ -219,9 +219,9 @@ node behind a NAT, a firewall or another network still joins.
   hops' own `via` (current joins only, each name once) to refuse a loop.
   The readers default an old join to `ssh`, `[]`, `direct`; `node_members`
   (the heartbeat's) gives the ssh destination as `endpoint`, `NODES` does
-  not, and `/api/nodes` withholds `ssh`, `endpoint` and `note` alike: the
-  web learns how a node is reached (`transport`, `mode`, its hops' names),
-  never where.
+  not, and `/api/nodes` withholds `ssh`, `endpoint` and `note` alike (and,
+  since #87, `pubkey`): the web learns how a node is reached (`transport`,
+  `mode`, its hops' names), never where.
 - The wire: one JSON object a message, a line on tcp (one exchange a
   connection), a datagram on udp, each `{nonce, op, at_ms, auth?, ...}`
   answered `{nonce, ok, ...}`. Every nonce is 16 bytes of `/dev/urandom` and a
@@ -286,10 +286,165 @@ node behind a NAT, a firewall or another network still joins.
   `ssh/relay`, `tcp/hole_punch`) and `via a->b`; the Fleet row shows the
   same badge, in the same words, and `via a → b`.
 
-The tcp and udp transports are authenticated but not encrypted: a reader
-on the path sees the probes' outputs and the registrations, and one token
-is shared by the fleet. Run them over a network already trusted (a VPN, a
-LAN), as §4.2 of the distributed research leaves the overlay to the owner.
+With `SPAWN_NODE_TOKEN` set, the tcp and udp transports are encrypted too
+(issue #87, below): a reader on the path, or anyone without the token,
+sees who talks to whom and when, never a probe's output, a registration
+or an op. The key is the fleet's one shared token (rotated with
+`SPAWN_NODE_TOKEN_PREV`), so this is not zero-trust: a relay hop is a
+fleet member holding the token and could open what it forwards. Only the
+coordinator path below (`spawn-e2e-v1`, sealed to the target node's own
+key) is a blind relay. A node without a token speaks the #85 wire in the
+clear, so run that over a network already trusted (a VPN, a LAN), as §4.2
+of the distributed research leaves the overlay to the owner.
+
+#### The end-to-end mesh (issue #87)
+
+A node anywhere (behind any NAT, firewall or carrier-grade NAT, no inbound
+port open) joins through a *coordinator* it dials out to, and everything
+it is asked and answers is sealed end to end: the coordinators (one, a
+tree of them, or a Cloudflare Worker and Durable Object relay on `:443`)
+forward ciphertext they cannot open. Two layers:
+
+- **Layer 1, the seal** (`nodes/crypto.rs`). Each node has an Ed25519
+  identity (PKCS#8 v2, `ring`): its `node_id` is SHA-256 of the 32-byte
+  public key in lowercase hex, its `pubkey` that key in base64. It is read
+  from `--key-file` or `SPAWN_NODE_KEY_FILE` (made with mode 0600, its
+  missing directories 0700, when absent; never overwritten), else
+  `SPAWN_NODE_KEY` (base64 PKCS#8, wiped after use), else made for the run.
+  It signs a rotating X25519 prekey: `prekey_sig = Ed25519(
+  "spawn-prekey-v1" || node_id || x25519_pub || epoch_be64)`; the prekey
+  before the current one still opens what was sealed to it. A request
+  (`spawn-e2e-v1`) checks the target's id against its key, its key against
+  the one pinned at its join, and its prekey's signature; takes a fresh
+  ephemeral X25519 key, and derives with HKDF-SHA256 (domain
+  `spawn-e2e-v1`, the token mixed into the salt when there is one) two
+  ChaCha20-Poly1305 keys, the request's and the reply's, bound to both ids,
+  the epoch, the channel, the time and the direction (wiped when dropped,
+  `zeroize`). The header `(domain, from, to, from_pub, eph, to_xpub,
+  epoch, channel_id, at_ms, req_nonce)` is signed by the sender and is the
+  AEAD's associated data; the whole request is the ciphertext `ct`. The
+  responder refuses a revoked sender (`SPAWN_NODE_REVOKED`, node ids),
+  an `at_ms` more than 120 s off, a bad signature or id, a replay (each
+  `(from, req_nonce)` kept until its `at_ms` can no longer pass), a prekey
+  it no longer holds, and a ciphertext that opens under neither the token
+  nor `SPAWN_NODE_TOKEN_PREV`; its reply is sealed under the reply key.
+  X25519 is computed in Rust (RFC 7748's ladder, checked against the RFC's
+  vectors and `ring`'s own agreement): `ring` keeps no reusable X25519
+  key, and a prekey answers many requests.
+- **The tcp and udp wire's seal** (`spawn-wire-v1`, `op: "sealed"`). With
+  a token, `spawn node add`, `register`, `probe` and the heartbeat seal
+  each request under a key HKDF derives from the token, 32 random bytes of
+  salt, the nonce and the time, and keep the #85 `auth` on the outside
+  (checked before anything is opened); a forward's inner request is sealed
+  by the sender for the last node and a relay's own forwards are sealed
+  too. Each reply comes back `sealed_reply` with a fresh 32-byte
+  `reply_salt` (its key, HKDF of the token bound to the request's nonce,
+  time and salt) and a fresh 12-byte `reply_nonce`, both in its AEAD data,
+  so two replies to one request (two nodes sharing the token, a resend
+  answered again) never share a keystream. What this protects against: a
+  passive reader of the path, and anyone without the token. What it does
+  not: a fleet member on the route (a `--via` relay holds the same token
+  and could open the inner request); the zero-trust blind relay is the
+  coordinators' `spawn-e2e-v1` alone. A request signed in the clear (#85)
+  is still answered as before.
+- **Layer 2, the coordinators** (`nodes/ws.rs`, `nodes/coord.rs`). One
+  protocol, `spawn-coord-v1`, one JSON object a WebSocket text frame
+  (`ws://`, `wss://`) or a line (`tcp://`). The WebSocket is RFC 6455,
+  synchronous, without an async runtime: client frames masked, server
+  frames not (each side refuses the other way), fragments assembled,
+  pings answered, every message at most 512 KiB; the TLS handshake and
+  the upgrade are bounded by the connect's timeout, every read and write
+  of them by the time left; `wss://` is TLS by
+  `rustls` on `ring`, verified against the Mozilla roots (`webpki-roots`)
+  and the PEM certificates of `SPAWN_COORD_CA_FILE` when set. Messages:
+  `hello`/`welcome` (keys, prekey bundle, `name`, `role`, `zone`,
+  `udp_reflexive`, `kind` node, client or coord; signed by the sender's
+  key; with `SPAWN_COORD_TOKEN`, the hello's `coord_auth`, HMAC-SHA256 of
+  it under the token, and on `wss://` also the upgrade's `Authorization:
+  Bearer`, sent inside TLS only: on `ws://` and `tcp://` the token never
+  crosses the network, `coord_auth` alone proves it), `lookup` /
+  `peer_info` (public keys, zone, role, udp mapping only), `relay {from,
+  to, envelope}` (`from` must be the session's own node id, the envelope
+  forwarded untouched), `zone_summary`, `punch`, `ping`/`pong`, `error`.
+- **The recursive tree.** `spawn node coord --ws <bind> | --tcp <bind>
+  [--udp <bind>] [--zone <name>] [--parent <ws://|wss://|tcp://...>]
+  [--key-file <path>] [--lease-secs <n>] [--allow-unauthenticated]` keeps
+  an in-memory directory of its sessions (soft state: a node that
+  reconnects takes its id back, but a client's hello never takes a
+  connected node's or coordinator's id: it is refused, and a probe asks
+  again with a key of its own; a silent session closes after 75 s; at
+  most 4096 sessions, 256 queued messages each, 256 connections not past
+  their hello (more are closed at once), 64 lookups asked of the parent
+  at once). A summary is cut to what fits one 512 KiB frame. With `--parent` it dials
+  its parent as a `coord` session and pushes `zone_summary {zone,
+  peers_summary, lease_epoch, lease_ms}`, its whole subtree, O(K) in its
+  peers, at a third of its lease and at once when a session comes or goes
+  (on the same connection, before anything that session sends); the
+  parent forgets a summary when its lease runs out or its session closes,
+  and takes from a child only the ids of its summary. A lookup or relay
+  for an id it does not hold goes down the child whose summary has it, or
+  up to its parent; one nobody holds is answered `error: no such peer`.
+  A ws or tcp bind beyond loopback needs `SPAWN_COORD_TOKEN` or
+  `--allow-unauthenticated`. `--udp` answers `{"op":"stun","nonce"}` with
+  the address the datagram came from.
+- **A node behind it.** `spawn node connect --coord <url> --name <name>
+  [--role worker|peer] [--zone <name>] [--key-file <path>] [--udp-stun
+  <host:port>] [--register-to <primary>] [--register-store] [--note
+  <text>]` keeps one outbound connection (made again with a backoff from
+  250 ms to 60 s; its prekey rotated hourly, the hello said again), and
+  answers each sealed `inventory` or `beat` with its own copy of the fixed
+  scripts, at most 32 at once (more are refused as busy). Without
+  `SPAWN_NODE_TOKEN` it refuses to start unless `--allow-unauthenticated`
+  (any client of the coordinator could then seal a probe to it). `--register-to` looks the primary up by name or id and sends it
+  a sealed `register` (needs `SPAWN_NODE_TOKEN`, mixed into the keys):
+  `transport` coord, `endpoint` the coordinator's URL, its `node_id`,
+  `pubkey`, `role`, `zone`. A node run with `--register-store` (the
+  owner's login, `SPAWN_NODE_TOKEN`) records it, the identity checked
+  against the envelope's own sender, every field as the writer checks it,
+  a store's refusal said in the writer's words only (never SQL). With
+  `--udp-stun`, the node learns its udp mapping and announces it; a probe
+  then tries that mapping straight over udp for 700 ms (P4, mode
+  `hole_punch`), falling back at once to the relay (P3). The scope of P4
+  as built: it reaches a node that is public or behind a NAT that lets
+  datagrams into a mapping from anyone (endpoint-independent filtering);
+  the prober announces no mapping of its own, so it asks no punch and
+  opens no address-restricted NAT. A node does answer a `punch` that
+  names an asker's mapping (for peers that announce one): one fixed
+  datagram `{"op":"punch_probe","nonce"}` (a checked nonce) from its
+  mapped socket, never to a loopback, unspecified, link-local, broadcast
+  or multicast address, at most one per address and 16 in all every 2 s,
+  so a punch cannot make it a reflector.
+- **The primary.** `spawn node add <name> --coord <url> --node-id <hex> |
+  --peer <name> [--mode relay|hole_punch]` runs the preflight inventory
+  through the coordinator and records `node.joined` with `transport`
+  coord, the coordinator's URL as `endpoint`, and the `node_id`, `pubkey`,
+  `role` and `zone` it verified; `spawn node probe <name> [--op
+  inventory|beat] [--json]` probes any joined node once over its route
+  (ssh, tcp, udp or coord) and records nothing; the heartbeat probes a
+  coord node through its coordinator, sealed to the key its join pinned,
+  so a coordinator that answers with another node's keys is refused.
+- **The writer.** `spawn_node_record` takes `transport` coord with an
+  `endpoint` `^(ws|wss|tcp)://host[:port][/path]$` (at most 255
+  characters, no `@`, space or control character, port 1 to 65535), a
+  mode of `relay` or `hole_punch`, hops (if any) tcp, udp or coord nodes;
+  and on any join optional `node_id` (`^[0-9a-f]{64}$`), `pubkey`
+  (base64), `role` (worker or peer) and `zone`. `NODES` projects
+  `node_id`, `role` (worker by default) and `zone`; `node_members` adds
+  `node_id`, `pubkey`, `role`, `zone` when a join holds them;
+  `/api/nodes` withholds `ssh`, `endpoint`, `note` and `pubkey`.
+- **Hardening found in the tracks' runs.** A request's answer is kept
+  against a resend until its own `at_ms` plus the skew and 5 s (at most
+  twice the skew and 10 s), so a request from a clock running fast never
+  runs twice. A udp exchange gives up after two `ECONNREFUSED` in a row
+  (about 250 ms) instead of its 30 s bound. A node's refusal said before
+  it read the request's nonce (`no whole message in time`) is shown in its
+  words, not as "answered another request". A tcp connect interleaves the
+  host's IPv6 and IPv4 addresses (RFC 8305's order) and bounds each by
+  half the time left, at most 2 s: measured, a closed tcp port refuses in
+  about 1 ms, while a silent one (its packets dropped) held a connect for
+  its whole bound, 3.0 s, before the next address was tried. `spawn node
+  serve` beyond loopback needs `SPAWN_NODE_TOKEN` or
+  `--allow-unauthenticated`.
 
 The records are `node.recorded` events of the control session, outside the
 control fold: a refold of this schema, or of one rolled back to before P1,

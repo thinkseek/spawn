@@ -81,7 +81,10 @@ select coalesce(jsonb_agg(x.node order by x.name), '[]'::jsonb) from (select ",
 /// `transport` (`ssh` for a join that says none), `endpoint` (a tcp or udp
 /// node's; null for ssh, whose destination stays in `ssh`, which the web
 /// read drops), `via` (its hops, `[]` without) and `mode` (relay with hops
-/// and direct without when the join says none); `state`, `lost` before
+/// and direct without when the join says none); `node_id`, `role`
+/// (`worker` when the join says none) and `zone` (issue #87, null when the
+/// join says none; a join's `pubkey` stays among its fields, which the web
+/// read drops); `state`, `lost` before
 /// `drained` before `live`; `lost_since_ms`, the time of its open
 /// `node.lost` (null unless lost); `heartbeat`, its latest sample
 /// `{at_ms, load1, mem_available, disk_free}` or null.
@@ -97,6 +100,9 @@ pub(crate) const NODES: &str = joined!(
                        case when jsonb_array_length(case when jsonb_typeof(j.record -> 'via') = 'array'
                                                          then j.record -> 'via' else '[]'::jsonb end) > 0
                             then 'relay' else 'direct' end),
+      'node_id', j.record ->> 'node_id',
+      'role', coalesce(j.record ->> 'role', 'worker'),
+      'zone', j.record ->> 'zone',
       'state', case when l.seq > coalesce(b.seq, 0) then 'lost'
                     when d.seq > coalesce(u.seq, 0) then 'drained' else 'live' end,
       'lost_since_ms', case when l.seq > coalesce(b.seq, 0) then l.at_ms end,
@@ -107,7 +113,10 @@ pub(crate) const NODES: &str = joined!(
 );
 
 /// What the heartbeat worker needs of each node: `{name, ssh, transport,
-/// endpoint, via, mode, join, beat_ms, lost}` (`transport` `ssh`,
+/// endpoint, via, mode, join, beat_ms, lost}` and, when its join names
+/// them (issue #87), `node_id`, `pubkey`, `role` and `zone` (a coord
+/// node's `node_id` and `pubkey` pin whom its probes are sealed to; a join
+/// without a role is a worker's) (`transport` `ssh`,
 /// `endpoint` the ssh destination, `via` `[]` and `mode` as [`NODES`] says
 /// for a join that names none), `beat_ms` its latest heartbeat's time or null, `lost`
 /// its latest `node.lost` since the join (with `event_id`, `at_ms`,
@@ -128,7 +137,10 @@ pub(crate) const MEMBERS: &str = joined!(
       'lost', case when l.id is not null then l.record || jsonb_build_object(
           'event_id', l.id, 'at_ms', l.at_ms, 'open', l.seq > coalesce(b.seq, 0),
           'alerted', exists (select 1 from spawn_alerts a
-                              where a.key = format('node_lost:%s:%s', j.name, l.id))) end) as node"
+                              where a.key = format('node_lost:%s:%s', j.name, l.id))) end)
+      || jsonb_strip_nulls(jsonb_build_object(
+          'node_id', j.record ->> 'node_id', 'pubkey', j.record ->> 'pubkey',
+          'role', j.record ->> 'role', 'zone', j.record ->> 'zone')) as node"
 );
 
 /// The open `node_lost` alerts, `{key: subject}`: read once per connection

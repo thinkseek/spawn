@@ -718,3 +718,217 @@ fn the_reads_say_how_each_node_is_reached_and_default_an_old_join() {
     let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
     assert_eq!(reader.nodes().expect("read"), store.nodes().expect("read"));
 }
+
+const NODE_ID: &str = "3f1c2b4a5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708";
+const PUBKEY: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+
+/// A join reached through a coordinator (issue #87): `endpoint` the
+/// coordinator's URL, mode relay, its identity, role and zone.
+fn through_coord(name: &str, endpoint: &str) -> Value {
+    let mut record = reached(name, "coord", endpoint);
+    record["mode"] = json!("relay");
+    record["node_id"] = json!(NODE_ID);
+    record["pubkey"] = json!(PUBKEY);
+    record["role"] = json!("peer");
+    record["zone"] = json!("home-lab");
+    record
+}
+
+/// Issue #87: a coord join names its coordinator's ws, wss or tcp URL, a
+/// relay or hole_punch mode, and its optional identity, role and zone; the
+/// reads project them (role `worker` when a join says none), the members
+/// read with the public key that pins whom a probe is sealed to.
+#[test]
+fn a_coord_join_names_its_coordinator_and_its_identity_role_and_zone() {
+    let (store, _schema) = store("nodes_coord_joins");
+    let laptop = store
+        .node_record(&through_coord(
+            "laptop",
+            "wss://coord.example.com/mesh?zone=eu",
+        ))
+        .expect("a coord join over wss");
+    store
+        .node_record(&with(
+            through_coord("rack", "tcp://[2001:db8::9]:7443"),
+            "mode",
+            json!("hole_punch"),
+        ))
+        .expect("a coord join over tcp, hole_punch");
+    let mut bare = reached("bare", "coord", "ws://10.0.0.5");
+    bare["mode"] = json!("relay");
+    store
+        .node_record(&bare)
+        .expect("a coord join without identity fields");
+    // The optional fields on other transports too.
+    store
+        .node_record(&with(
+            with(reached("gw", "tcp", "gw:7000"), "zone", json!("dc1")),
+            "role",
+            json!("worker"),
+        ))
+        .expect("a tcp join with a zone and role");
+    // A coord node relayed by a tcp node.
+    store
+        .node_record(&with(
+            through_coord("behind", "ws://coord.example:8080"),
+            "via",
+            json!(["gw"]),
+        ))
+        .expect("a coord join via a tcp node");
+
+    let nodes = store.nodes().expect("the nodes");
+    let node = named(&nodes, "laptop");
+    assert_eq!(
+        json!([
+            node["join"],
+            node["transport"],
+            node["endpoint"],
+            node["mode"],
+            node["node_id"],
+            node["role"],
+            node["zone"]
+        ]),
+        json!([
+            laptop,
+            "coord",
+            "wss://coord.example.com/mesh?zone=eu",
+            "relay",
+            NODE_ID,
+            "peer",
+            "home-lab"
+        ])
+    );
+    let bare = named(&nodes, "bare");
+    assert_eq!(
+        json!([bare["node_id"], bare["role"], bare["zone"]]),
+        json!([null, "worker", null])
+    );
+    assert_eq!(named(&nodes, "rack")["mode"], "hole_punch");
+    assert_eq!(named(&nodes, "gw")["zone"], "dc1");
+    let members = store.node_members().expect("members");
+    let member = named(&members, "laptop");
+    assert_eq!(
+        json!([
+            member["transport"],
+            member["endpoint"],
+            member["node_id"],
+            member["pubkey"],
+            member["role"],
+            member["zone"],
+            member["mode"]
+        ]),
+        json!([
+            "coord",
+            "wss://coord.example.com/mesh?zone=eu",
+            NODE_ID,
+            PUBKEY,
+            "peer",
+            "home-lab",
+            "relay"
+        ])
+    );
+    let bare = named(&members, "bare");
+    assert!(
+        bare.get("role").is_none() && bare.get("node_id").is_none(),
+        "{bare}"
+    );
+    assert_eq!(named(&members, "behind")["via"], json!(["gw"]));
+}
+
+/// Issue #87: a coord join with a bad coordinator URL, a direct (or no)
+/// mode, an ssh hop, or a malformed identity, role or zone is refused with
+/// nothing recorded.
+#[test]
+fn a_bad_coord_join_or_identity_is_refused() {
+    let (store, schema) = store("nodes_coord_checks");
+    let mut client = admin(&schema);
+    store
+        .node_record(&joined("jump", "ckl@jump"))
+        .expect("an ssh join");
+    let before = counts(&mut client);
+    let coord = || through_coord("x", "wss://coord.example/mesh");
+    for (record, why) in [
+        (
+            through_coord("x", "coord.example:443"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", "udp://coord.example:443"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", "http://coord.example"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", "wss://user@coord.example"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", "wss://coord.example:0"),
+            "the port 1 to 65535",
+        ),
+        (
+            through_coord("x", "wss://coord.example:70000"),
+            "the port 1 to 65535",
+        ),
+        (
+            through_coord("x", "wss://coord example"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", "wss://-coord.example"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", "wss://coord.example/a b"),
+            "coordinator's ws://",
+        ),
+        (
+            through_coord("x", &format!("wss://c.example/{}", "a".repeat(250))),
+            "coordinator's ws://",
+        ),
+        (
+            with(coord(), "endpoint", Value::Null),
+            "coordinator's ws://",
+        ),
+        (
+            with(coord(), "mode", json!("direct")),
+            "relay or hole_punch",
+        ),
+        (with(coord(), "mode", Value::Null), "relay or hole_punch"),
+        (
+            with(coord(), "via", json!(["jump"])),
+            "reached over another transport",
+        ),
+        (with(coord(), "node_id", json!("ABC")), "node_id is 64"),
+        (
+            with(coord(), "node_id", json!(NODE_ID.to_uppercase())),
+            "node_id is 64",
+        ),
+        (with(coord(), "node_id", json!(7)), "node_id is 64"),
+        (with(coord(), "pubkey", json!("short")), "pubkey"),
+        (
+            with(coord(), "pubkey", json!(format!("{PUBKEY}!"))),
+            "pubkey",
+        ),
+        (
+            with(coord(), "role", json!("primary")),
+            "role is worker or peer",
+        ),
+        (with(coord(), "zone", json!("-eu")), "zone is 1 to 63"),
+        (
+            with(coord(), "zone", json!("a".repeat(64))),
+            "zone is 1 to 63",
+        ),
+        (
+            with(reached("x", "tcp", "x:1"), "zone", json!("a b")),
+            "zone",
+        ),
+        (with(reached("x", "tcp", "x:1"), "role", json!(1)), "role"),
+    ] {
+        let error = store.node_record(&record).expect_err(why);
+        assert!(error.to_string().contains(why), "{why}: {error}");
+    }
+    assert_eq!(counts(&mut client), before, "nothing recorded");
+}

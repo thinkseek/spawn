@@ -19,7 +19,8 @@ pub(crate) const MAX_SKEW_MS: i64 = 120_000;
 
 /// The fields a request's MAC covers, in order: `[domain, op, nonce,
 /// at_ms, ...]`, then for `register` its `name, transport, endpoint, via,
-/// mode, note, inventory`, for `forward` its `hops, ttl, timeout_ms` and
+/// mode, note, inventory`, for `sealed` its `salt, ct`, for `forward` its
+/// `hops, ttl, timeout_ms` and
 /// its inner request's `op` and `nonce`; `inventory` and `beat` nothing
 /// more. None for another op.
 fn canonical(message: &Value) -> Option<Vec<u8>> {
@@ -42,6 +43,13 @@ fn canonical(message: &Value) -> Option<Vec<u8>> {
                 "note",
                 "inventory",
             ] {
+                fields.push(message[key].clone());
+            }
+        }
+        // Issue #87: a sealed request (super::crypto's wire seal), its
+        // salt and ciphertext: checked before anything is opened.
+        "sealed" => {
+            for key in ["salt", "ct"] {
                 fields.push(message[key].clone());
             }
         }

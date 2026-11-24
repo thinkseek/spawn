@@ -46,8 +46,11 @@ use crate::{Flags, open_store};
 
 mod auth;
 mod commands;
+mod coord;
+mod crypto;
 mod relay;
 mod transport;
+mod ws;
 
 use transport::{Op, Route};
 
@@ -88,7 +91,7 @@ const OUTPUT_LIMIT: u64 = 256 * 1024;
 /// The longest text of a node (an arch, a GPU's name, an error) kept.
 const TEXT_CHARS: usize = 200;
 
-pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node add <name> --ssh <dest>|--tcp <[tcp://]host:port>|--udp <[udp://]host:port> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward]\n       spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]";
+pub(crate) const USAGE: &str = "usage: spawn node add <name> --ssh <[user@]host|ssh://[user@]host[:port]> [--note <text>]   (owner only)\n       spawn node add <name> --ssh <dest>|--tcp <[tcp://]host:port>|--udp <[udp://]host:port> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node list [--json]\n       spawn node drain|undrain|remove <name>   (owner only)\n       spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward] [--allow-unauthenticated]\n       spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]\n       spawn node add <name> --coord <ws://|wss://|tcp://...> --node-id <hex>|--peer <name> [--mode relay|hole_punch] [--note <text>]\n       spawn node probe <name> [--op inventory|beat] [--json]\n       spawn node coord --ws <bind>|--tcp <bind> [--udp <bind>] [--zone <name>] [--parent <ws://|wss://|tcp://...>] [--key-file <path>] [--lease-secs <n>] [--allow-unauthenticated]\n       spawn node connect --coord <ws://|wss://|tcp://...> --name <name> [--role worker|peer] [--zone <name>] [--key-file <path>] [--udp-stun <host:port>] [--register-to <primary>] [--register-store] [--note <text>] [--allow-unauthenticated]";
 
 /// One line of text from a node, kept only when printable, and short.
 fn clean_text(text: &str) -> Option<String> {
@@ -546,6 +549,9 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
         "add" => commands::add(words),
         "serve" => commands::serve(words),
         "register" => commands::register(words),
+        "coord" => commands::coord(words),
+        "connect" => commands::connect(words),
+        "probe" => commands::probe(words),
         "list" => {
             let json = match words {
                 [] => false,
@@ -740,8 +746,7 @@ impl HeartbeatScheduler {
             };
             // Resolved again at each read: a hop removed, or joined again
             // elsewhere, changes the way, never the join.
-            let route =
-                transport::route(reached.transport, reached.endpoint, &reached.via, members);
+            let route = reached.route(members);
             let open = member["lost"]["open"] == true;
             let last_seen = member["lost"]["last_seen_ms"]
                 .as_i64()
@@ -1186,5 +1191,7 @@ fn work(connector: &StoreConnector, lost_ms: i64, say: &Sender<String>) {
     }
 }
 
+#[cfg(test)]
+mod hardening_tests;
 #[cfg(test)]
 mod tests;
