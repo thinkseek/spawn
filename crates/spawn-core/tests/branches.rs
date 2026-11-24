@@ -914,6 +914,13 @@ impl WorkspaceStore for Telling {
     ) -> Result<spawn_core::id::WorkspaceId, spawn_core::port::WorkspaceError> {
         self.inner.mount(branch)
     }
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<spawn_core::id::WorkspaceId, spawn_core::port::WorkspaceError> {
+        self.inner.mount_when(branch, ready)
+    }
     fn commit(
         &self,
         workspace: &spawn_core::id::WorkspaceId,

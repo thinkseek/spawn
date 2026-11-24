@@ -933,6 +933,14 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(branch.as_str())?.store.mount(branch)
     }
 
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        self.route(branch.as_str())?.store.mount_when(branch, ready)
+    }
+
     /// Every mission's store keeps its workspaces under the one root, so
     /// the default store names any of them; nothing is routed.
     fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {

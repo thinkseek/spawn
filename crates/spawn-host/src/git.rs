@@ -39,8 +39,8 @@ use std::process::{Command, Output, Stdio};
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    BaseMerge, Branch, Commit, ForkFrom, Hold, MERGE_WAITS, SetAside, WORKSPACE_STALE,
-    WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, Commit, ForkFrom, Hold, MERGE_WAITS, MOUNT_CANCELLED, SetAside,
+    WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
 };
 
 use crate::tree_path::{TreePath, nul_fields};
@@ -1202,16 +1202,16 @@ impl GitWorkspace {
         )))
     }
 
-    /// Export the branch head into a new directory beside the workspaces,
+    /// Export `commit` into a new directory beside the workspaces,
     /// before the workspace is touched; its path. On any error the directory
     /// is removed.
-    fn stage_mount(&self, branch: &str) -> Result<PathBuf, WorkspaceError> {
+    fn stage_mount_commit(&self, branch: &str, commit: &str) -> Result<PathBuf, WorkspaceError> {
         let staged = self.staging_path(branch, "staged")?;
         let built = std::fs::create_dir(&staged)
             .map_err(|error| {
                 WorkspaceError::Unavailable(format!("create {}: {error}", staged.display()))
             })
-            .and_then(|()| self.export(branch, &staged));
+            .and_then(|()| self.export_commit(commit, &staged));
         match built {
             Ok(()) => Ok(staged),
             Err(error) => {
@@ -1246,11 +1246,11 @@ impl GitWorkspace {
         })
     }
 
-    /// Write the tree of the branch head into `directory` (`git archive`).
-    fn export(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
+    /// Write the tree of `commit` into `directory` (`git archive`).
+    fn export_commit(&self, commit: &str, directory: &Path) -> Result<(), WorkspaceError> {
         let mut archive = self
             .command()
-            .args(["archive", &format!("refs/heads/{branch}")])
+            .args(["archive", commit])
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
             .spawn()
@@ -1268,14 +1268,14 @@ impl GitWorkspace {
         let archived = archive.wait();
         if !archived.is_ok_and(|status| status.success()) {
             return Err(WorkspaceError::Unavailable(format!(
-                "archive {branch} failed"
+                "archive {commit} failed"
             )));
         }
         let extracted =
             extracted.map_err(|error| WorkspaceError::Unavailable(format!("extract: {error}")))?;
         if !extracted.success() {
             return Err(WorkspaceError::Unavailable(format!(
-                "extract {branch}: tar exited {extracted}"
+                "extract {commit}: tar exited {extracted}"
             )));
         }
         Ok(())
@@ -1323,6 +1323,51 @@ impl GitWorkspace {
             let _ = std::fs::remove_dir_all(aside);
         }
         Ok(())
+    }
+
+    /// Check `ready` and branch stability under the branch's lock before
+    /// touching `directory`, then install the pre-staged tree.
+    fn install_staged_mount(
+        &self,
+        branch: &str,
+        head: &str,
+        staged: &Path,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        let _lock = self.lock_branch(branch)?;
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: MOUNT_CANCELLED.to_string(),
+            message: why,
+        })?;
+        let current = self
+            .git_output(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
+        if current != head {
+            return Err(WorkspaceError::Refused {
+                code: MOUNT_CANCELLED.to_string(),
+                message: format!("branch {branch} moved during mount"),
+            });
+        }
+        let directory = self.root.join(branch);
+        // A stale directory holds work its branch does not: kept before it
+        // is replaced, or the mount fails and the directory stays.
+        self.keep_stale_locked(branch, &directory)?;
+        // A pending merge stays only when the branch carries its markers.
+        self.settle_pending(branch);
+        // `.spawn/` is never committed: main's copies for an open conflict
+        // markers cannot show come back from their record, into the staged
+        // tree, so a copy that fails fails the mount like any other step.
+        self.restore_main_copies(branch, staged)?;
+        self.replace_workspace(branch, staged, &directory)?;
+        // A fresh export is the branch head: nothing stale is left.
+        self.clear_stale(branch);
+        WorkspaceId::new(format!("{branch}:{}", directory.display()))
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
     }
 }
 
@@ -1566,47 +1611,36 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     /// Export the branch head as the workspace. The whole new tree is built
-    /// beside the workspace first ([`GitWorkspace::stage_mount`]): a mount
-    /// that fails (no commit, a head that names files outside git) leaves the
-    /// existing workspace, uncommitted files and all, as it was. Only then is
+    /// beside the workspace first ([`GitWorkspace::stage_mount_commit`]): a
+    /// mount that fails (no commit, a head that names files outside git)
+    /// leaves the existing workspace, uncommitted files and all, as it was.
+    /// Only then, under the branch's lock and if `ready` still wants it, is
     /// the workspace replaced, by renames.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
+        self.mount_when(branch, &|| Ok(()))
+    }
+
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
         self.exclude_build_output()?;
-        self.git_output(&[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
+        let head = self
+            .git_output(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
         self.refuse_files_outside_git(branch.as_str())?;
-        let staged = self.stage_mount(branch.as_str())?;
-
-        let directory = self.root.join(branch.as_str());
-        // A stale directory holds work its branch does not: kept before it
-        // is replaced, or the mount fails and the directory stays.
-        if let Err(error) = self.keep_stale_directory(branch.as_str(), &directory) {
+        let staged = self.stage_mount_commit(branch.as_str(), &head)?;
+        let installed = self.install_staged_mount(branch.as_str(), &head, &staged, ready);
+        if installed.is_err() {
             let _ = std::fs::remove_dir_all(&staged);
-            return Err(error);
         }
-        // A pending merge stays only when the branch carries its markers.
-        self.settle_pending(branch.as_str());
-        // `.spawn/` is never committed: main's copies for an open conflict
-        // markers cannot show come back from their record, into the staged
-        // tree, so a copy that fails fails the mount like any other step.
-        if let Err(error) = self.restore_main_copies(branch.as_str(), &staged) {
-            let _ = std::fs::remove_dir_all(&staged);
-            return Err(error);
-        }
-        if let Err(error) = self.replace_workspace(branch.as_str(), &staged, &directory) {
-            let _ = std::fs::remove_dir_all(&staged);
-            return Err(error);
-        }
-        // A fresh export is the branch head: nothing stale is left.
-        self.clear_stale(branch.as_str());
-
-        WorkspaceId::new(format!("{branch}:{}", directory.display()))
-            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+        installed
     }
 
     /// [`GitWorkspace::commit_or_take_back`] with a take-back that does
@@ -1617,18 +1651,20 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+        let branch = workspace.sandbox();
         let directory = self.checked_path(workspace)?;
+        let _lock = self.lock_branch(branch)?;
         // Not even a discard removes a stale directory before it is kept.
-        self.keep_stale_directory(workspace.sandbox(), &directory)?;
+        self.keep_stale_locked(branch, &directory)?;
         // A pending merge stays only when the branch carries its markers.
-        self.settle_pending(workspace.sandbox());
+        self.settle_pending(branch);
         match std::fs::remove_dir_all(&directory) {
             Ok(()) => {
-                self.clear_stale(workspace.sandbox());
+                self.clear_stale(branch);
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.clear_stale(workspace.sandbox());
+                self.clear_stale(branch);
                 Ok(())
             }
             Err(error) => Err(WorkspaceError::Unavailable(format!(
@@ -2331,12 +2367,12 @@ impl GitWorkspace {
     }
 
     /// When `branch` is marked stale and its directory exists, keep the
-    /// directory's state ([`Self::keep_stale`]) under the branch's lock.
-    fn keep_stale_directory(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
+    /// directory's state ([`Self::keep_stale`]); the caller already holds the
+    /// branch's lock.
+    fn keep_stale_locked(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
         if !self.is_stale(branch) || std::fs::symlink_metadata(directory).is_err() {
             return Ok(());
         }
-        let _lock = self.lock_branch(branch)?;
         self.keep_stale(branch, directory).map(|_| ())
     }
 
@@ -4190,5 +4226,220 @@ mod tests {
         let english = run("C", None);
         assert_eq!(english.len(), 3, "{english:?}");
         assert_eq!(run("zh_CN.UTF-8", Some("zh_CN:zh")), english);
+    }
+
+    struct GitRaceWorld {
+        base: PathBuf,
+        work: PathBuf,
+        staged_flag: PathBuf,
+        release_flag: PathBuf,
+        store_a: std::sync::Arc<GitWorkspace>,
+        store_b: std::sync::Arc<GitWorkspace>,
+        clock: std::sync::Arc<spawn_core::time::ManualClock>,
+        mem: std::sync::Arc<spawn_core::memory::MemoryStore>,
+        id: spawn_core::id::CommandId,
+    }
+
+    impl GitRaceWorld {
+        fn outcome(&self) -> Option<spawn_core::command::Outcome> {
+            use spawn_core::command::Outcome;
+            use spawn_core::event::{EventKind, GlobalPosition};
+            use spawn_core::port::EventLog;
+            self.mem
+                .read_global(GlobalPosition(0), 1_000)
+                .expect("read")
+                .into_iter()
+                .find_map(|record| match record.event.kind {
+                    EventKind::CommandFinished {
+                        command_id,
+                        succeeded,
+                        error,
+                    } if command_id == self.id => Some(if succeeded {
+                        Outcome::Succeeded
+                    } else {
+                        Outcome::Failed(error.unwrap_or_default())
+                    }),
+                    _ => None,
+                })
+        }
+
+        fn started_workspace(&self) -> WorkspaceId {
+            use spawn_core::event::{EventKind, GlobalPosition};
+            use spawn_core::port::EventLog;
+            self.mem
+                .read_global(GlobalPosition(0), 1_000)
+                .expect("read")
+                .into_iter()
+                .find_map(|record| match record.event.kind {
+                    EventKind::ExecutionStarted {
+                        command_id,
+                        workspace,
+                        ..
+                    } if command_id == self.id => Some(workspace),
+                    _ => None,
+                })
+                .expect("execution started")
+        }
+    }
+
+    fn setup_git_race_world(tag: &str) -> GitRaceWorld {
+        use spawn_core::command::{CommandAction, Submission};
+        use spawn_core::event::ENGINE;
+        use spawn_core::id::{
+            AgentId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+        };
+        use spawn_core::memory::MemoryStore;
+        use spawn_core::port::CommandQueue;
+        use spawn_core::time::{ManualClock, Timestamp};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        const READY: &str = "❯ \n  ready · 100 tok/s";
+        let base = std::env::temp_dir().join(format!("spawn-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        let work = base.join("work");
+        std::fs::create_dir_all(&checkout).expect("create repo");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+
+        let staged_flag = base.join("staged.flag");
+        let release_flag = base.join("release.flag");
+        let script = base.join("gated-git");
+        let body = format!(
+            "#!/bin/sh\nset -eu\ngit \"$@\"\nhas_archive=0\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"archive\" ]; then\n    has_archive=1\n  fi\ndone\nif [ \"$has_archive\" = \"1\" ]; then\n  exec 1>&-\n  : > '{}'\n  while [ ! -f '{}' ]; do\n    sleep 0.01\n  done\nfi\n",
+            staged_flag.display(),
+            release_flag.display(),
+        );
+        std::fs::write(&script, body).expect("write gated-git");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod gated-git");
+
+        let store_b = GitWorkspace::new(checkout.join(".git"), &work);
+        let store_a = GitWorkspace {
+            git: script.to_string_lossy().to_string(),
+            ..store_b.clone()
+        };
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let mem = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let id = mem
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_a").expect("agent"),
+                    session_id: SessionId::new("session_a").expect("session"),
+                    idempotency_key: IdempotencyKey::new("git-race-1").expect("key"),
+                    action: CommandAction::Start {
+                        engine: ENGINE.to_string(),
+                        prompt: String::new(),
+                        parent_session_id: None,
+                        from: None,
+                        model: None,
+                        charter: None,
+                    },
+                },
+            )
+            .expect("submit");
+        mem.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id)),
+            READY,
+        );
+        GitRaceWorld {
+            base,
+            work,
+            staged_flag,
+            release_flag,
+            store_a: Arc::new(store_a),
+            store_b: Arc::new(store_b),
+            clock,
+            mem,
+            id,
+        }
+    }
+
+    #[test]
+    fn a_duplicate_mount_worker_does_not_replace_a_peers_active_git_workspace() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, Instant};
+
+        use spawn_core::bridge::{Bridge, BridgeConfig};
+        use spawn_core::command::Outcome;
+
+        struct ReleaseOnDrop(PathBuf);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"go\n");
+            }
+        }
+
+        let w = setup_git_race_world("git-dup-mount-race");
+        let mut bridge_a = Bridge::new(
+            w.mem.clone(),
+            w.mem.clone(),
+            w.store_a.clone(),
+            w.mem.clone(),
+            BridgeConfig::new("bridge-a"),
+        )
+        .with_clock(w.clock.clone());
+        let _release_guard = ReleaseOnDrop(w.release_flag.clone());
+        bridge_a.work().expect("bridge_a starts mount worker");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !w.staged_flag.exists() {
+            assert!(Instant::now() < deadline, "bridge_a worker never staged");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        w.mem.expire_leases();
+        let mut bridge_b = Bridge::new(
+            w.mem.clone(),
+            w.mem.clone(),
+            w.store_b.clone(),
+            w.mem.clone(),
+            BridgeConfig::new("bridge-b"),
+        )
+        .with_clock(w.clock.clone());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while w.outcome().is_none() {
+            assert!(Instant::now() < deadline, "bridge_b never finished start");
+            bridge_b.work().expect("bridge_b work");
+            w.mem.expire_leases();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(w.outcome(), Some(Outcome::Succeeded));
+
+        let ws = w.started_workspace();
+        let live_file = Path::new(ws.path()).join("live-engine-work.txt");
+        std::fs::write(&live_file, "peer active writes\n").expect("write live file");
+        let before_meta = std::fs::symlink_metadata(ws.path()).expect("workspace metadata");
+
+        std::fs::write(&w.release_flag, b"go\n").expect("release duplicate worker");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while bridge_a.starts_pending() && Instant::now() < deadline {
+            bridge_a.work().expect("bridge_a work");
+            bridge_a.poll().expect("bridge_a poll");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(bridge_a);
+        drop(bridge_b);
+
+        assert_eq!(
+            std::fs::read_to_string(&live_file).expect("live file survives"),
+            "peer active writes\n"
+        );
+        let after_meta = std::fs::symlink_metadata(ws.path()).expect("workspace still present");
+        assert_eq!(
+            (after_meta.dev(), after_meta.ino()),
+            (before_meta.dev(), before_meta.ino()),
+            "duplicate worker must not replace peer's active workspace"
+        );
+        assert!(w.store_b.is_mounted(&ws));
+        let staged_left = std::fs::read_dir(&w.work)
+            .expect("read work root")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".staged-"));
+        assert!(!staged_left, "cancelled staged tree was not cleaned up");
+        let _ = std::fs::remove_dir_all(&w.base);
     }
 }

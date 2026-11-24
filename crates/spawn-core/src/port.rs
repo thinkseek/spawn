@@ -174,6 +174,11 @@ pub const WORKSPACE_STALE: &str = "WorkspaceStale";
 /// tried again later. The message says why.
 pub const MERGE_WAITS: &str = "MergeWaits";
 
+/// The [`WorkspaceError::Refused`] code of a background mount that was
+/// cancelled before installing or replacing the workspace
+/// ([`WorkspaceStore::mount_when`]).
+pub const MOUNT_CANCELLED: &str = "MountCancelled";
+
 /// What [`WorkspaceStore::hold`] returns: the workspace is held until it is
 /// dropped.
 pub type Hold = Box<dyn std::any::Any + Send>;
@@ -305,6 +310,23 @@ pub trait WorkspaceStore: Send + Sync {
     /// resolved): the pane starts there, and the engine files its transcript
     /// under that path.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError>;
+
+    /// Materialize `branch` only while `ready` still wants the mount.
+    ///
+    /// Production stores check `ready` under the branch's lock right before
+    /// creating or replacing any workspace tree; if `ready` returns an error,
+    /// nothing is modified and [`MOUNT_CANCELLED`] is returned.
+    fn mount_when(
+        &self,
+        branch: &BranchName,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WorkspaceId, WorkspaceError> {
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: MOUNT_CANCELLED.to_string(),
+            message: why,
+        })?;
+        self.mount(branch)
+    }
 
     /// `workspace` as this store names it now ([`Self::mount`]). An id
     /// recorded under another spelling of the store's root (the root as it

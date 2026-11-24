@@ -95,6 +95,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -111,9 +112,9 @@ use crate::id::{
 use crate::ingest::{claude_line, claude_usage, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, READ_LIMIT, Runner,
-    ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive, WatchError,
-    WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, MOUNT_CANCELLED,
+    READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive,
+    WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -1078,10 +1079,20 @@ impl Default for PromptProgress {
 struct PendingMount {
     agent_id: AgentId,
     session_id: SessionId,
+    branch: BranchName,
+    cancel: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<Result<WorkspaceId, WorkspaceError>>,
-    /// Another Bridge finished the command. Join and release this worker's
-    /// unrecorded result as soon as it finishes, freeing its bounded slot.
+    /// Another Bridge finished the command or took over the mount. Join and
+    /// release this worker's unrecorded result as soon as it finishes, freeing
+    /// its bounded slot.
     cancelled: bool,
+}
+
+impl PendingMount {
+    fn cancel(&mut self) {
+        self.cancelled = true;
+        self.cancel.store(true, Ordering::SeqCst);
+    }
 }
 
 /// An unrecorded workspace from a cancelled or dropped mount worker whose
@@ -1206,14 +1217,17 @@ impl Drop for Bridge {
             let caught_up = self.catch_up().is_ok();
             self.retry_abandoned_mounts(caught_up);
         }
-        // No mount worker outlives the store and runtime it borrowed. A mount
-        // that never reached a `mounted` record has no owner: release it here
-        // on the Bridge thread after joining its worker, and persist any
-        // failed unmount so a restart can recover it (or reuse it if the
-        // command itself stays unfinished). Do not retry newly failed mounts
-        // from `self.mounting` here so an unfinished command's freshly
+        // No mount worker outlives the store and runtime it borrowed. Signal
+        // cancellation on every pending worker up front, then join each one on
+        // the Bridge thread and release any unrecorded mount unless the log
+        // shows a live execution or peer owns it. Do not retry newly failed
+        // mounts from `self.mounting` here so an unfinished command's freshly
         // persisted workspace stays mounted on disk for reuse.
-        for (command_id, pending) in std::mem::take(&mut self.mounting) {
+        let mounting = std::mem::take(&mut self.mounting);
+        for pending in mounting.values() {
+            pending.cancel.store(true, Ordering::SeqCst);
+        }
+        for (command_id, pending) in mounting {
             if let Ok(Ok(workspace)) = pending.handle.join() {
                 let caught_up = self.catch_up().is_ok();
                 self.release_abandoned_mount(
@@ -1638,7 +1652,7 @@ impl Bridge {
                     self.prepared.remove(&claimed.command_id);
                     self.prompting.remove(&claimed.command_id);
                     if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
-                        pending.cancelled = true;
+                        pending.cancel();
                     }
                     self.reap_cancelled_mounts();
                     self.queue.finish(&claimed, &outcome)?;
@@ -1722,7 +1736,7 @@ impl Bridge {
         self.prepared.remove(command_id);
         self.prompting.remove(command_id);
         if let Some(pending) = self.mounting.get_mut(command_id) {
-            pending.cancelled = true;
+            pending.cancel();
         }
     }
 
@@ -3523,47 +3537,19 @@ impl Bridge {
         branch: &BranchName,
     ) -> Result<MountProgress, StoreError> {
         self.reap_cancelled_mounts();
-        let steps = self.recorded_steps(claimed);
-        if let Some(workspace) = steps.mounted
-            && !steps.released
-        {
-            if self.workspaces.is_mounted(&workspace) {
-                if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
-                    pending.cancelled = true;
-                }
-                self.reap_cancelled_mounts();
-                return Ok(MountProgress::Ready(workspace));
-            }
-            self.append(
-                &claimed.agent_id,
-                &claimed.session_id,
-                None,
-                Source::Bridge,
-                Some(mount_released_key(claimed.command_id, steps.mounts.max(1))),
-                EventKind::CommandStepped {
-                    command_id: claimed.command_id,
-                    step: CommandStep::MountReleased,
-                    workspace: Some(workspace),
-                },
-            )?;
-            self.catch_up()?;
+        if let Some(progress) = self.reuse_recorded_mount(claimed, branch)? {
+            return Ok(progress);
         }
         if !self.mounting.contains_key(&claimed.command_id) {
-            if self.mounting.len() >= MAX_CONCURRENT_MOUNTS {
+            if self.mounting.len() >= MAX_CONCURRENT_MOUNTS
+                || self
+                    .mounting
+                    .values()
+                    .any(|pending| pending.branch == *branch)
+            {
                 return Ok(MountProgress::Pending);
             }
-            let workspaces = Arc::clone(&self.workspaces);
-            let branch = branch.clone();
-            let handle = std::thread::spawn(move || workspaces.mount(&branch));
-            self.mounting.insert(
-                claimed.command_id,
-                PendingMount {
-                    agent_id: claimed.agent_id.clone(),
-                    session_id: claimed.session_id.clone(),
-                    handle,
-                    cancelled: false,
-                },
-            );
+            self.spawn_mount_worker(claimed, branch);
         }
         if self
             .mounting
@@ -3578,6 +3564,15 @@ impl Bridge {
             .expect("the mount was inserted above");
         let workspace = match pending.handle.join() {
             Ok(Ok(workspace)) => workspace,
+            Ok(Err(WorkspaceError::Refused { code, .. })) if code == MOUNT_CANCELLED => {
+                self.catch_up()?;
+                if self.recorded_steps(claimed).started {
+                    return Ok(MountProgress::Pending);
+                }
+                return Ok(self
+                    .reuse_recorded_mount(claimed, branch)?
+                    .unwrap_or(MountProgress::Pending));
+            }
             Ok(Err(error)) => {
                 return Ok(MountProgress::Failed(format!("mount {branch}: {error}")));
             }
@@ -3607,7 +3602,80 @@ impl Bridge {
             return Err(error);
         }
         self.catch_up()?;
+        drop(self.workspaces.hold(&workspace));
         Ok(MountProgress::Ready(workspace))
+    }
+
+    fn reuse_recorded_mount(
+        &mut self,
+        claimed: &Claimed,
+        branch: &BranchName,
+    ) -> Result<Option<MountProgress>, StoreError> {
+        let steps = self.recorded_steps(claimed);
+        let Some(workspace) = steps.mounted else {
+            return Ok(None);
+        };
+        if steps.released {
+            return Ok(None);
+        }
+        if self.workspaces.is_mounted(&workspace) {
+            for pending in self.mounting.values_mut() {
+                if pending.branch == *branch {
+                    pending.cancel();
+                }
+            }
+            self.reap_cancelled_mounts();
+            if self
+                .mounting
+                .values()
+                .any(|pending| pending.branch == *branch)
+            {
+                return Ok(Some(MountProgress::Pending));
+            }
+            drop(self.workspaces.hold(&workspace));
+            return Ok(Some(MountProgress::Ready(workspace)));
+        }
+        self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            None,
+            Source::Bridge,
+            Some(mount_released_key(claimed.command_id, steps.mounts.max(1))),
+            EventKind::CommandStepped {
+                command_id: claimed.command_id,
+                step: CommandStep::MountReleased,
+                workspace: Some(workspace),
+            },
+        )?;
+        self.catch_up()?;
+        Ok(None)
+    }
+
+    fn spawn_mount_worker(&mut self, claimed: &Claimed, branch: &BranchName) {
+        let workspaces = Arc::clone(&self.workspaces);
+        let log = Arc::clone(&self.log);
+        let worker_branch = branch.clone();
+        let agent_id = claimed.agent_id.clone();
+        let command_id = claimed.command_id;
+        let after = self.cursor;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
+            workspaces.mount_when(&worker_branch, &|| {
+                mount_still_wanted(&log, &worker_cancel, &agent_id, command_id, after)
+            })
+        });
+        self.mounting.insert(
+            command_id,
+            PendingMount {
+                agent_id: claimed.agent_id.clone(),
+                session_id: claimed.session_id.clone(),
+                branch: branch.clone(),
+                cancel,
+                handle,
+                cancelled: false,
+            },
+        );
     }
 
     /// Join canceled commands' finished mount workers and retry any earlier
@@ -6496,6 +6564,95 @@ fn is_pane_rule(line: &str) -> bool {
     }) && count >= 3
 }
 
+/// Read log events appended after `after` and check whether a background mount
+/// for `(agent_id, command_id)` is still wanted (neither locally cancelled,
+/// finished, nor superseded by another Bridge's recorded mount or open
+/// execution on that agent's branch).
+fn mount_still_wanted(
+    log: &Arc<dyn EventLog>,
+    cancel: &AtomicBool,
+    agent_id: &AgentId,
+    command_id: CommandId,
+    after: GlobalPosition,
+) -> Result<(), String> {
+    const BATCH: usize = 200;
+    if cancel.load(Ordering::SeqCst) {
+        return Err(format!("mount for {command_id} cancelled"));
+    }
+    let mut cursor = after;
+    let mut mounted: HashMap<CommandId, Option<WorkspaceId>> = HashMap::new();
+    let mut open_executions: HashSet<ExecutionId> = HashSet::new();
+    loop {
+        let batch = log
+            .read_global(cursor, BATCH)
+            .map_err(|error| format!("check mount readiness for {command_id}: {error}"))?;
+        if batch.is_empty() {
+            break;
+        }
+        for record in &batch {
+            let event = &record.event;
+            if matches!(
+                event.kind,
+                EventKind::CommandFinished { command_id: id, .. } if id == command_id
+            ) {
+                return Err(format!("{command_id} already finished"));
+            }
+            if &event.agent_id != agent_id {
+                continue;
+            }
+            fold_mount_liveness(event, &mut mounted, &mut open_executions);
+        }
+        cursor = batch.last().expect("non-empty batch").position;
+        if batch.len() < BATCH {
+            break;
+        }
+    }
+    if !open_executions.is_empty() || !mounted.is_empty() {
+        return Err(format!("peer already holds workspace for {agent_id}"));
+    }
+    Ok(())
+}
+
+fn fold_mount_liveness(
+    event: &NewEvent,
+    mounted: &mut HashMap<CommandId, Option<WorkspaceId>>,
+    open_executions: &mut HashSet<ExecutionId>,
+) {
+    match &event.kind {
+        EventKind::CommandStepped {
+            command_id,
+            step: CommandStep::Mounted,
+            workspace,
+        } if event.source == Source::Bridge => {
+            mounted.insert(*command_id, workspace.clone());
+        }
+        EventKind::CommandStepped {
+            command_id,
+            step: CommandStep::MountReleased,
+            workspace,
+        } if event.source == Source::Bridge => {
+            let release = mounted.get(command_id).is_some_and(|recorded| {
+                workspace.is_none() || recorded.as_ref() == workspace.as_ref()
+            });
+            if release {
+                mounted.remove(command_id);
+            }
+        }
+        EventKind::ExecutionStarted { command_id, .. } => {
+            mounted.remove(command_id);
+            if let Some(execution_id) = event.execution_id.clone() {
+                open_executions.insert(execution_id);
+            }
+        }
+        EventKind::ExecutionEnded { .. } if event.source == Source::Bridge => {
+            if let Some(execution_id) = &event.execution_id {
+                open_executions.remove(execution_id);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -7260,6 +7417,7 @@ mod tests {
         calls: AtomicUsize,
         completed: AtomicUsize,
         fail_unmounts: AtomicBool,
+        check_ready_after_gate: AtomicBool,
         preset_mounts: Mutex<HashMap<BranchName, WorkspaceId>>,
         canonical_aliases: Mutex<HashMap<WorkspaceId, WorkspaceId>>,
     }
@@ -7275,9 +7433,59 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 completed: AtomicUsize::new(0),
                 fail_unmounts: AtomicBool::new(false),
+                check_ready_after_gate: AtomicBool::new(false),
                 preset_mounts: Mutex::new(HashMap::new()),
                 canonical_aliases: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn check_ready_after_gate(&self, enabled: bool) {
+            self.check_ready_after_gate.store(enabled, Ordering::SeqCst);
+        }
+
+        fn mount_with(
+            &self,
+            branch: &BranchName,
+            ready: Option<&dyn Fn() -> Result<(), String>>,
+        ) -> Result<WorkspaceId, WorkspaceError> {
+            let check_after = self.check_ready_after_gate.load(Ordering::SeqCst);
+            if !check_after
+                && let Some(ready) = ready
+                && let Err(why) = ready()
+            {
+                return Err(WorkspaceError::Refused {
+                    code: crate::port::MOUNT_CANCELLED.to_string(),
+                    message: why,
+                });
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let mut held = self.held.lock().expect("held");
+            while held.contains(branch) {
+                held = self.moved.wait(held).expect("held");
+            }
+            drop(held);
+            if check_after
+                && let Some(ready) = ready
+                && let Err(why) = ready()
+            {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                self.completed.fetch_add(1, Ordering::SeqCst);
+                return Err(WorkspaceError::Refused {
+                    code: crate::port::MOUNT_CANCELLED.to_string(),
+                    message: why,
+                });
+            }
+            let mounted = self
+                .preset_mounts
+                .lock()
+                .expect("preset")
+                .remove(branch)
+                .map_or_else(|| self.inner.mount(branch), Ok);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            mounted
         }
 
         fn preset_mount(&self, branch: BranchName, workspace: WorkspaceId) {
@@ -7335,23 +7543,15 @@ mod tests {
         }
 
         fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak.fetch_max(active, Ordering::SeqCst);
-            let mut held = self.held.lock().expect("held");
-            while held.contains(branch) {
-                held = self.moved.wait(held).expect("held");
-            }
-            drop(held);
-            let mounted = self
-                .preset_mounts
-                .lock()
-                .expect("preset")
-                .remove(branch)
-                .map_or_else(|| self.inner.mount(branch), Ok);
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            self.completed.fetch_add(1, Ordering::SeqCst);
-            mounted
+            self.mount_with(branch, None)
+        }
+
+        fn mount_when(
+            &self,
+            branch: &BranchName,
+            ready: &dyn Fn() -> Result<(), String>,
+        ) -> Result<WorkspaceId, WorkspaceError> {
+            self.mount_with(branch, Some(ready))
         }
 
         fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
@@ -9428,7 +9628,7 @@ mod tests {
             mounts.calls.load(Ordering::SeqCst) == 1
         });
 
-        bridge.mounting.get_mut(&id).expect("mounting").cancelled = true;
+        bridge.mounting.get_mut(&id).expect("mounting").cancel();
         mounts.fail_unmounts(true);
         mounts.release(&branch);
         while !bridge
@@ -9620,6 +9820,13 @@ mod tests {
 
         let ws1 = store.mount(&branch).expect("peer mount");
         record_peer_mount(&store, 1, id, &ws1);
+        store.expire_leases();
+        bridge.work().expect("work cancels duplicate worker");
+        assert_eq!(command_outcome(&store, id), None);
+        let pending = bridge.mounting.get(&id).expect("still mounting");
+        assert!(pending.cancelled);
+        assert!(pending.cancel.load(Ordering::SeqCst));
+
         mounts.preset_mount(branch.clone(), ws1.clone());
         mounts.release(&branch);
         while !bridge
@@ -9654,7 +9861,7 @@ mod tests {
             store1.clone(),
             mounts1.clone(),
             store1.clone(),
-            BridgeConfig::new("tester"),
+            BridgeConfig::new("bridge-1"),
         )
         .with_clock(clock.clone());
         let _release1 = ReleaseMounts(&mounts1);
@@ -9664,11 +9871,21 @@ mod tests {
 
         let ws1 = store1.mount(&branch1).expect("peer mount 1");
         record_peer_mount(&store1, 1, id1, &ws1);
-        mounts1.preset_mount(branch1.clone(), ws1.clone());
         store1.expire_leases();
-        drive_work(&mut bridge1, &store1, || {
+        let mut bridge_peer = Bridge::new(
+            store1.clone(),
+            store1.clone(),
+            mounts1.clone(),
+            store1.clone(),
+            BridgeConfig::new("bridge-peer"),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge_peer, &store1, || {
             command_outcome(&store1, id1).is_some()
         });
+        assert_eq!(command_outcome(&store1, id1), Some(Outcome::Succeeded));
+
+        mounts1.preset_mount(branch1.clone(), ws1.clone());
         mounts1.release(&branch1);
         while !bridge1
             .mounting
@@ -9677,6 +9894,7 @@ mod tests {
         {
             std::thread::yield_now();
         }
+        bridge1.work().expect("work reaps delayed duplicate");
         bridge1.poll().expect("poll reaps delayed worker");
         assert_eq!(unmount_calls(&store1), 0);
         assert!(mounts1.is_mounted(&ws1));
@@ -9710,5 +9928,54 @@ mod tests {
         drop(bridge2);
         assert_eq!(unmount_calls(&store2), 0);
         assert!(mounts2.is_mounted(&ws2));
+    }
+
+    #[test]
+    fn late_mount_when_cancel_refuses_without_failing_command_when_peer_mounted() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        mounts.check_ready_after_gate(true);
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let branch = BranchName::for_agent(&resumable_agent(1));
+        mounts.hold(branch.clone());
+        let mut bridge_a = Bridge::new(
+            store.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("bridge-a"),
+        )
+        .with_clock(clock);
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge_a, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 1
+        });
+
+        let ws1 = store.mount(&branch).expect("peer mount");
+        record_peer_mount(&store, 1, id, &ws1);
+        mounts.release(&branch);
+        while !bridge_a
+            .mounting
+            .values()
+            .all(|pending| pending.handle.is_finished())
+        {
+            std::thread::yield_now();
+        }
+
+        store.expire_leases();
+        drive_work(&mut bridge_a, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        let inner_mounts = store
+            .workspace_calls()
+            .iter()
+            .filter(|call| call.starts_with("mount "))
+            .count();
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        assert_eq!(inner_mounts, 1);
+        assert_eq!(unmount_calls(&store), 0);
+        assert!(mounts.is_mounted(&ws1));
+        assert!(bridge_a.mounting.is_empty());
     }
 }
