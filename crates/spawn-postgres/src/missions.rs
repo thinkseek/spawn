@@ -687,6 +687,44 @@ select jsonb_build_object(
 )"
 );
 
+/// One mission by id, with the same explicit fields and task stages as
+/// [`MISSION_BOARD`]. Unlike the board this has no recency window: an old or
+/// closed mission remains directly inspectable. `$1` is the mission id.
+pub(crate) const MISSION_BY_ID: &str = r"
+select row_to_json(x) from (
+      select m.id, m.text, m.origin, m.sources, m.state, m.summary,
+             m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
+             case when m.halted is not null then jsonb_build_object(
+                 'event', m.halt_event, 'reason', m.halted, 'at_ms', m.halt_at_ms,
+                 'gone', m.halt_gone) end as halt,
+             case when m.pause_event is not null then jsonb_build_object(
+                 'at_ms', m.pause_at_ms, 'event_id', m.pause_event,
+                 'reason', m.pause_reason) end as paused,
+             (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
+             coalesce((select jsonb_agg(jsonb_build_object(
+                 'objective', o.objective, 'by', o.by, 'reason', o.reason,
+                 'caller', o.caller, 'at_ms', o.at_ms) order by o.at_ms, o.event)
+               from mission_retired_objectives o where o.mission_id = m.id), '[]'::jsonb)
+               as retired,
+             m.created_at_ms, m.updated_at_ms,
+             coalesce((select jsonb_agg(jsonb_build_object(
+                 'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                 'session_id', k.session_id, 'brief', left(k.brief, 600),
+                 'state', k.state, 'revisions', k.revisions,
+                 'review_note', k.review_note, 'report', k.report,
+                 'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
+                 'model', k.model, 'stages', spawn_task_stages(k.id),
+                 'held_by', k.held_by,
+                 'parked', case when k.gate_parked_pushed is not null then
+                     jsonb_build_object('pushed', k.gate_parked_pushed,
+                                        'scenarios', k.gate_load_sensitive_scenarios) end,
+                 'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
+                 'updated_at_ms', k.updated_at_ms) order by k.id)
+               from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
+        from mission_missions m
+       where m.id = $1
+) x";
+
 /// What the labels of the tasks `$1` (an array of ids) are made of, read
 /// as [`MISSION_BOARD`] reads them (the mission's whole text, a brief's
 /// first 600 characters), so a label is the one `/api/missions` gives:
@@ -2594,6 +2632,12 @@ impl PostgresStore {
         self.query_json(MISSION_BOARD, &[&limit])
     }
 
+    /// One mission with its tasks by id, not through the board's recency
+    /// window. `None` when there is no such mission.
+    pub fn mission_by_id(&self, id: i64) -> Result<Option<Value>, StoreError> {
+        self.query_opt_json(MISSION_BY_ID, &[&id])
+    }
+
     /// What the dashboard's labels are made of ([`LABEL_FACTS`]).
     pub fn label_facts(&self) -> Result<Value, StoreError> {
         self.query_json(LABEL_FACTS, &[])
@@ -3238,6 +3282,71 @@ mod tests {
             least[0] - least[1] < 1.0,
             "the translation's part of the gated read: {least:?}"
         );
+    }
+
+    #[test]
+    fn mission_by_id_finds_an_old_closed_mission_outside_the_board_window() {
+        use serde_json::json;
+        let schema = crate::testing::TestSchema::new("mission_by_id");
+        let store = schema.store();
+        let old = store
+            .mission_add("old mission", &json!(["/tmp/old source.git"]), "human")
+            .expect("old mission");
+        let task = store
+            .task_assign(old, "ephemeral", "old-worker", "old brief", "default")
+            .expect("old task");
+        store
+            .mission_close(old, "done", "finished long ago")
+            .expect("close old mission");
+        for n in 0..20 {
+            store
+                .mission_add(&format!("newer {n}"), &json!([]), "human")
+                .expect("newer mission");
+        }
+        let board = store.mission_board(20).expect("board");
+        assert!(
+            board["missions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|mission| mission["id"] != old)
+        );
+        let found = store
+            .mission_by_id(old)
+            .expect("direct read")
+            .expect("old mission");
+        assert_eq!(found["id"], old);
+        assert_eq!(found["text"], "old mission");
+        assert_eq!(found["state"], "done");
+        assert_eq!(found["sources"], json!(["/tmp/old source.git"]));
+        for field in [
+            "gate",
+            "accept",
+            "baseline",
+            "objectives",
+            "hold",
+            "halt",
+            "paused",
+        ] {
+            assert!(found.get(field).is_some(), "missing {field}: {found}");
+        }
+        assert_eq!(found["tasks"][0]["id"], task);
+        assert_eq!(found["tasks"][0]["state"], "cancelled");
+        for field in [
+            "kind",
+            "agent_id",
+            "session_id",
+            "revisions",
+            "candidate",
+            "objective",
+            "stages",
+        ] {
+            assert!(
+                found["tasks"][0].get(field).is_some(),
+                "missing task {field}"
+            );
+        }
+        assert_eq!(store.mission_by_id(i64::MAX).expect("unknown"), None);
     }
 
     /// The values allowed by the check constraint on `mission_tasks.state`,

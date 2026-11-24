@@ -658,6 +658,12 @@ fn the_activity_line_names_the_latest_fact_and_the_judgement_state() {
         "message.received",
         "WORKING",
         "covers the latest fact",
+        "report blocker: turn has not ended in the transcript",
+        "turn_ended=false",
+        "turn_seq=none",
+        "checkpoint=none",
+        "observation=WORKING",
+        "observation coverage=current (based on seq 20)",
     ] {
         assert!(item.line.contains(word), "{word}: {}", item.line);
     }
@@ -685,6 +691,45 @@ fn a_stall_reaches_the_supervisor_once_under_its_heading() {
     assert!(
         text.contains(&format!("- {SESSION} — stalled: task #7")),
         "{text}"
+    );
+    let rows = [resident, supervisor(tags)];
+    let host = items(&rows, &tasks, &found, &bounds());
+    let plan = decide_with(&rows, &tasks, &host, true, NOW, "spawn");
+    assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+}
+
+/// A delivered task's activity stall carries the report blocker once, under
+/// its existing tag; telling it does not make another item on later passes.
+#[test]
+fn an_activity_stall_names_the_report_blocker_once() {
+    let tasks = work(&[row(7, "delivered", SESSION)]);
+    let found = stalls(json!({
+        "tasks": [open(7, "delivered", (140, "task.delivered", 1_000_000))],
+        "sessions": [{"session_id": SESSION, "seq": 20, "event_name": "turn.stopped",
+                      "at_ms": NOW - 950_000}],
+    }));
+    let resident = worker(SemanticState::Waiting, true);
+    let rows = [resident.clone(), supervisor(&[])];
+    let host = items(&rows, &tasks, &found, &bounds());
+    assert_eq!(host.len(), 1, "{host:#?}");
+    assert!(
+        host[0].line.contains("report blocker: none"),
+        "{}",
+        host[0].line
+    );
+    assert!(host[0].line.contains("turn_ended=true"), "{}", host[0].line);
+    let plan = decide_with(&rows, &tasks, &host, true, NOW, "spawn");
+    let digest = plan
+        .orders
+        .iter()
+        .find(|order| order.session_id == "session_supervisor")
+        .expect("one digest");
+    let spawn_core::command::CommandAction::Input { tags, .. } = &digest.action else {
+        panic!("a digest is typed input");
+    };
+    assert!(
+        tags.contains(&format!("{SESSION} stall-7-activity-20")),
+        "{tags:?}"
     );
     let rows = [resident, supervisor(tags)];
     let host = items(&rows, &tasks, &found, &bounds());

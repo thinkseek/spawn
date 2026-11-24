@@ -110,6 +110,10 @@ const USAGE: &str = "usage:
   spawn mission release --source <path>   (owner: the waiting tasks land at the next pass; with
       no hold it records nothing and prints `released` null)
   spawn mission list [--limit N]   (every task with its stages)
+  spawn mission show --id N [--root <workspace root>]
+      (one mission by id, including one outside list's window: its resolved source and mirror,
+      actual landing repository, gate and backlog paths, per-open-task delivery/report/gate
+      diagnostics, and shell-quoted read-only checks. Prints JSON and creates nothing)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
                     [--model default|cheap] [--again] [--pin]   (cheap: every model on DeepSeek)
@@ -279,6 +283,299 @@ pub(crate) fn hold_source(
         .map_err(|error| error.to_string())?;
     drop(lock);
     Ok(held)
+}
+
+/// Shell-quote one argument with single quotes. Embedded quotes close the
+/// quoted word, add an escaped quote, and open it again (`'` -> `'\''`).
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// A stage without gate environment bindings: what an operator needs, never
+/// an environment dump.
+fn stage_view(stage: &Value) -> Value {
+    json!({
+        "stage": stage["stage"],
+        "verdict": stage["verdict"],
+        "at_ms": stage["at_ms"],
+        "took_ms": stage["took_ms"],
+    })
+}
+
+fn gate_view(gate: &Value) -> Value {
+    if gate.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "verdict": gate["verdict"],
+        "reason": gate["reason"],
+        "metric": gate["metric"],
+        "candidate": gate["candidate"],
+        "at_ms": gate["at_ms"],
+    })
+}
+
+/// Operator diagnostics for a delivered task: filesystem report status plus
+/// report-blocker facts when the caller's database login permits reading them.
+fn delivered_task_diagnostics(
+    task: &Value,
+    task_id: i64,
+    root: &std::path::Path,
+    found: Option<&crate::deliver::TaskRow>,
+    facts: Option<&crate::dispatch::Facts>,
+    dispatcher_available: bool,
+) -> Value {
+    let key = found.map_or_else(
+        || {
+            format!(
+                "deliver-{task_id}-{}",
+                task["revisions"].as_i64().unwrap_or(0)
+            )
+        },
+        crate::deliver::TaskRow::delivery_key,
+    );
+    let workspace = root.join(task["agent_id"].as_str().unwrap_or_default());
+    let report = workspace.join(crate::deliver::REPORT);
+    let report_fs = json!({
+        "path": report,
+        "status": crate::deliver::report_status(&workspace, &key).as_str(),
+    });
+    if !dispatcher_available {
+        return json!({
+            "report_blocker": Value::Null,
+            "facts_unavailable": "restricted login",
+            "report": report_fs,
+            "turn_ended": Value::Null,
+            "turn_seq": Value::Null,
+            "checkpoint": Value::Null,
+            "observation": Value::Null,
+            "observation_current": false,
+        });
+    }
+    let blocker = facts.map_or(
+        Some("no session facts"),
+        crate::dispatch::Facts::report_blocker,
+    );
+    json!({
+        "report_blocker": blocker,
+        "report": report_fs,
+        "turn_ended": facts.map(|facts| facts.turn_ended),
+        "turn_seq": facts.and_then(|facts| facts.turn_seq),
+        "checkpoint": facts.and_then(|facts| facts.checkpoint.as_deref()),
+        "observation": facts.and_then(|facts| facts.observation.as_ref())
+            .map(|observation| observation.state.key()),
+        "observation_current": facts
+            .is_some_and(|facts| facts.current_observation().is_some()),
+    })
+}
+
+/// One task and the diagnostics appropriate to its state. Every lookup is a
+/// read: in particular a delivered task's report is inspected, never moved,
+/// and no missing workspace path is made.
+fn mission_task_view(
+    task: &Value,
+    root: &std::path::Path,
+    dispatcher: Option<(&[crate::dispatch::Facts], &crate::deliver::Work)>,
+    last_gates: Option<&Value>,
+    now_ms: i64,
+) -> Value {
+    let task_id = task["id"].as_i64().unwrap_or_default();
+    let state = task["state"].as_str().unwrap_or("unknown");
+    let stages: Vec<Value> = task["stages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(stage_view)
+        .collect();
+    let mut view = json!({
+        "id": task["id"],
+        "kind": task["kind"],
+        "agent_id": task["agent_id"],
+        "session_id": task["session_id"],
+        "status": state,
+        "revisions": task["revisions"],
+        "candidate": task["candidate"],
+        "objective": task["objective"],
+        "stages": stages,
+    });
+    let found = dispatcher.and_then(|(_, work)| work.tasks.iter().find(|row| row.id == task_id));
+    let facts = dispatcher.and_then(|(rows, _)| {
+        rows.iter()
+            .find(|facts| Some(facts.session_id.as_str()) == task["session_id"].as_str())
+    });
+    let diagnostics = match state {
+        "assigned" | "revise" => match dispatcher {
+            Some((_, work)) => found.map(|row| {
+                let status = crate::deliver::delivery_status(work, row, facts, now_ms);
+                json!({"delivery": {"given_up": status.given_up, "line": status.line}})
+            }),
+            None => Some(json!({"delivery": {"unavailable": "restricted login"}})),
+        },
+        "delivered" => Some(delivered_task_diagnostics(
+            task,
+            task_id,
+            root,
+            found,
+            facts,
+            dispatcher.is_some(),
+        )),
+        "reported" | "accepted" | "landing" => {
+            let latest_landing = stages
+                .iter()
+                .rev()
+                .find(|stage| stage["stage"] == "landed")
+                .cloned();
+            let latest_gate = match last_gates {
+                Some(gates) => gate_view(gates.get(task_id.to_string()).unwrap_or(&Value::Null)),
+                None => stages
+                    .iter()
+                    .rev()
+                    .find(|stage| stage["stage"] == "gated")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            };
+            let mut diag = json!({
+                "latest_gate": latest_gate,
+                "landing": {
+                    "candidate": task["candidate"],
+                    "latest": latest_landing,
+                },
+            });
+            if last_gates.is_none()
+                && let Some(object) = diag.as_object_mut()
+            {
+                object.insert(
+                    "gate_details_unavailable".to_string(),
+                    json!("restricted login"),
+                );
+            }
+            Some(diag)
+        }
+        _ => None,
+    };
+    if let (Some(diagnostics), Some(object)) = (diagnostics, view.as_object_mut()) {
+        object.insert("diagnostics".to_string(), diagnostics);
+    }
+    view
+}
+
+/// The read-only operator projection. `runner` is resolved by the caller from
+/// `SPAWN_GATE`; this function never reads the process environment.
+fn mission_view(
+    mission: &Value,
+    root: &std::path::Path,
+    runner: &std::path::Path,
+    dispatcher: Option<(&[crate::dispatch::Facts], &crate::deliver::Work)>,
+    last_gates: Option<&Value>,
+    now_ms: i64,
+) -> Result<Value, String> {
+    let configured = mission["sources"].clone();
+    let resolved = configured
+        .as_array()
+        .and_then(|sources| sources.first())
+        .and_then(Value::as_str);
+    let mirror = crate::sources::mirror_path(root, resolved).map_err(|error| error.to_string())?;
+    let scenarios = mission["gate"].as_str();
+    let backlog = mission["objectives"]["backlog"].as_str();
+    let landing_kind = match resolved {
+        None => "scratch",
+        Some(source) if source.starts_with('/') && !source.contains("://") => "host-path",
+        Some(_) => "remote",
+    };
+    let tasks: Vec<Value> = mission["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|task| mission_task_view(task, root, dispatcher, last_gates, now_ms))
+        .collect();
+    let quoted_mirror = shell_quote(&mirror.to_string_lossy());
+    let quoted_runner = shell_quote(&runner.to_string_lossy());
+    let mut checks = vec![
+        format!("git --git-dir {quoted_mirror} rev-parse --verify refs/heads/main"),
+        format!("git --git-dir {quoted_mirror} log -1 --oneline refs/heads/main"),
+        format!("test -f {quoted_runner} && test -r {quoted_runner}"),
+    ];
+    if let Some(source) = resolved {
+        checks.push(format!(
+            "git ls-remote --symref -- {} HEAD refs/heads/main",
+            shell_quote(source)
+        ));
+        checks.push(format!(
+            "spawn mission landing --source {}",
+            shell_quote(source)
+        ));
+    }
+    if let Some(directory) = scenarios {
+        checks.push(format!("test -d {}", shell_quote(directory)));
+    }
+    if let Some(directory) = backlog {
+        checks.push(format!("test -d {}", shell_quote(directory)));
+    }
+    checks.extend(tasks.iter().filter_map(|task| {
+        let open = matches!(
+            task["status"].as_str(),
+            Some("assigned" | "revise" | "delivered" | "reported" | "accepted" | "landing")
+        );
+        open.then(|| {
+            format!(
+                "spawn task stages --id {}",
+                task["id"].as_i64().unwrap_or(0)
+            )
+        })
+    }));
+    Ok(json!({
+        "mission": mission["id"],
+        "state": mission["state"],
+        "source": {"configured": configured, "resolved": resolved},
+        "workspace_root": root,
+        "mirror": {"path": mirror, "exists": mirror.exists()},
+        // The integrator pushes to the source itself, never to this mirror.
+        "landing_repo": {"target": resolved, "kind": landing_kind},
+        "gate": {
+            "scenarios_dir": scenarios,
+            "exists": scenarios.is_some_and(|path| std::path::Path::new(path).is_dir()),
+            "runner": runner,
+        },
+        "backlog": {
+            "directory": backlog,
+            "exists": backlog.is_some_and(|path| std::path::Path::new(path).is_dir()),
+        },
+        "tasks": tasks,
+        "checks": checks,
+    }))
+}
+
+/// `spawn mission show --id N [--root <dir>]`: the source and filesystem an
+/// operator actually needs to inspect, plus the dispatcher's own per-task
+/// blockers. Direct id lookup keeps missions beyond `mission list`'s window
+/// visible. No mirror is ensured and no filesystem object is created.
+fn show(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    use spawn_core::time::{Clock, SystemClock};
+    let id = id(flags, "id")?;
+    let root = crate::config::workspace_root(flags)
+        .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
+    let runner = std::path::absolute(crate::env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
+        .map_err(|error| format!("SPAWN_GATE: {error}"))?;
+    let mission = store
+        .mission_by_id(id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("mission #{id} not found"))?;
+    let dispatcher = crate::dispatch::load_if_permitted(store, crate::deliver::Waits::default())?;
+    let last_gates = match store.last_gates() {
+        Ok(gates) => Some(gates),
+        Err(spawn_core::port::StoreError::Rejected(_)) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    mission_view(
+        &mission,
+        std::path::Path::new(&root),
+        &runner,
+        dispatcher
+            .as_ref()
+            .map(|(rows, work)| (rows.as_slice(), work)),
+        last_gates.as_ref(),
+        Clock::now(&SystemClock).0,
+    )
 }
 
 fn print(value: &Value) {
@@ -947,6 +1244,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             print(&store.source_release(&source).map_err(err)?);
         }
         "objectives" => print(&list_objectives(&store, &flags)?),
+        "show" => print(&show(&store, &flags)?),
         "list" => {
             let limit = flags
                 .get("limit")
@@ -1424,7 +1722,7 @@ pub(crate) fn resident(rest: &[String]) -> Result<i32, String> {
 mod tests {
     use spawn_core::event::ModelProfile;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         change, hold_bound, model, objectives_row, pushes_commit, pushes_limit, split_mission,
@@ -2180,5 +2478,329 @@ mod tests {
         assert_eq!(row["solved"], json!(1));
         assert_eq!(row["met"], json!(1));
         assert_eq!(row["next_objective"], json!(30));
+    }
+
+    #[allow(clippy::too_many_lines)] // all open states plus remote and scratch projections
+    #[test]
+    fn mission_view_quotes_checks_and_diagnoses_each_open_task_without_creating_paths() {
+        use spawn_core::event::SessionSeq;
+        use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
+        let root =
+            std::env::temp_dir().join(format!("spawn mission '75' view {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source 'repo'.git").to_string_lossy().to_string();
+        let scenarios = root.join("missing scenarios").to_string_lossy().to_string();
+        let backlog = root.join("missing backlog").to_string_lossy().to_string();
+        let runner = root.join("missing gate.sh");
+        let states = [
+            "assigned",
+            "revise",
+            "delivered",
+            "reported",
+            "accepted",
+            "landing",
+        ];
+        let tasks: Vec<Value> = states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| {
+                let id = index + 1;
+                json!({
+                    "id": id, "kind": "ephemeral", "agent_id": format!("agent_worker_{id}"),
+                    "session_id": format!("session_worker_{id}"), "state": state,
+                    "revisions": 0, "candidate": format!("candidate-{id}"), "objective": id,
+                    "stages": [{"stage": "gated", "verdict": "accepted", "at_ms": 10,
+                                "env": {"SPAWN_DATABASE_URL": "postgres://supersecret@db/spawn"}}],
+                })
+            })
+            .collect();
+        let work = crate::deliver::Work {
+            tasks: serde_json::from_value(json!(
+                tasks
+                    .iter()
+                    .map(|task| json!({
+                        "id": task["id"], "mission_id": 75, "kind": task["kind"],
+                        "agent_id": task["agent_id"], "session_id": task["session_id"],
+                        "brief": "brief", "state": task["state"], "revisions": 0,
+                    }))
+                    .collect::<Vec<_>>()
+            ))
+            .expect("work rows"),
+            ..crate::deliver::Work::default()
+        };
+        let mut observation = Observation::basic(
+            SemanticState::Waiting,
+            None,
+            SessionSeq(5),
+            Confidence::new(0.9).expect("confidence"),
+            "rules",
+        );
+        observation.ambiguity = Some(Ambiguity::TurnStoppedIdle);
+        let rows: Vec<crate::dispatch::Facts> = serde_json::from_value(json!([{
+            "session_id": "session_worker_3", "agent_id": "agent_worker_3", "live": true,
+            "turn_ended": false, "turn_seq": 5, "checkpoint": "checkpoint-3",
+            "observation": observation, "evidence_seq": 5,
+        }]))
+        .expect("facts");
+        let last_gates = json!({
+            "4": {"verdict": "accepted", "candidate": "candidate-4", "at_ms": 20,
+                  "env": {"SPAWN_TEST_DATABASE_URL": "postgres://supersecret@db/test"}},
+            "5": {"verdict": "accepted", "candidate": "candidate-5"},
+            "6": {"verdict": "accepted", "candidate": "candidate-6"},
+        });
+        let mission = json!({
+            "id": 75, "state": "open", "sources": [source], "gate": scenarios,
+            "objectives": {"backlog": backlog}, "tasks": tasks,
+        });
+        let view = super::mission_view(
+            &mission,
+            &root,
+            &runner,
+            Some((&rows, &work)),
+            Some(&last_gates),
+            100,
+        )
+        .expect("operator view");
+        assert_eq!(view["landing_repo"]["target"], source);
+        assert_eq!(view["landing_repo"]["kind"], "host-path");
+        assert_eq!(view["mirror"]["exists"], false);
+        assert_eq!(view["gate"]["exists"], false);
+        assert_eq!(view["backlog"]["exists"], false);
+        assert!(!root.exists(), "the view created a path");
+        assert!(view["tasks"][0]["diagnostics"]["delivery"]["line"].is_string());
+        assert!(view["tasks"][1]["diagnostics"]["delivery"]["line"].is_string());
+        assert_eq!(
+            view["tasks"][2]["diagnostics"]["report_blocker"],
+            "turn has not ended in the transcript"
+        );
+        assert_eq!(
+            view["tasks"][2]["diagnostics"]["report"]["status"],
+            "report absent"
+        );
+        for index in 3..6 {
+            assert_eq!(
+                view["tasks"][index]["diagnostics"]["latest_gate"]["verdict"],
+                "accepted"
+            );
+            assert!(view["tasks"][index]["diagnostics"]["landing"].is_object());
+        }
+        let checks: Vec<&str> = view["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let quoted_mirror = super::shell_quote(view["mirror"]["path"].as_str().expect("mirror"));
+        let quoted_runner = super::shell_quote(&runner.to_string_lossy());
+        let quoted_source = super::shell_quote(&source);
+        assert!(
+            checks.contains(
+                &format!("git --git-dir {quoted_mirror} rev-parse --verify refs/heads/main")
+                    .as_str()
+            ),
+            "{checks:?}"
+        );
+        assert!(
+            checks.contains(
+                &format!("git --git-dir {quoted_mirror} log -1 --oneline refs/heads/main").as_str()
+            ),
+            "{checks:?}"
+        );
+        assert!(
+            !checks
+                .iter()
+                .any(|check| check.contains("rev-parse --verify HEAD")),
+            "{checks:?}"
+        );
+        assert!(
+            checks
+                .contains(&format!("test -f {quoted_runner} && test -r {quoted_runner}").as_str()),
+            "{checks:?}"
+        );
+        assert!(
+            checks.contains(
+                &format!("git ls-remote --symref -- {quoted_source} HEAD refs/heads/main").as_str()
+            ),
+            "{checks:?}"
+        );
+        let printed = view.to_string();
+        for secret in [
+            "SPAWN_DATABASE_URL",
+            "SPAWN_TEST_DATABASE_URL",
+            "postgres://",
+            "supersecret",
+        ] {
+            assert!(
+                !printed.contains(secret),
+                "output contains {secret}: {printed}"
+            );
+        }
+
+        // Absent session facts under an owner view must report `no session facts`,
+        // not falsely claim `worker not live`.
+        let absent_facts_view = super::mission_view(
+            &mission,
+            &root,
+            &runner,
+            Some((&[], &work)),
+            Some(&last_gates),
+            100,
+        )
+        .expect("absent facts view");
+        assert_eq!(
+            absent_facts_view["tasks"][2]["diagnostics"]["report_blocker"],
+            "no session facts"
+        );
+
+        let remote = "https://git.example.org/acme/widget.git";
+        let remote_view = super::mission_view(
+            &json!({"id": 76, "state": "open", "sources": [remote], "tasks": []}),
+            &root,
+            &runner,
+            Some((&[], &crate::deliver::Work::default())),
+            Some(&json!({})),
+            100,
+        )
+        .expect("remote view");
+        assert_eq!(remote_view["landing_repo"]["kind"], "remote");
+        assert!(
+            remote_view["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|check| {
+                    check.as_str().is_some_and(|check| {
+                        check
+                            == format!("git ls-remote --symref -- '{remote}' HEAD refs/heads/main")
+                    })
+                })
+        );
+        assert!(
+            remote_view["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|check| {
+                    !check
+                        .as_str()
+                        .is_some_and(|check| check.starts_with("git --git-dir 'https://"))
+                })
+        );
+        let scratch = super::mission_view(
+            &json!({"id": 77, "state": "done", "sources": [], "tasks": []}),
+            &root,
+            &runner,
+            Some((&[], &crate::deliver::Work::default())),
+            Some(&json!({})),
+            100,
+        )
+        .expect("scratch view");
+        assert_eq!(
+            scratch["landing_repo"],
+            json!({"target": null, "kind": "scratch"})
+        );
+        assert_eq!(scratch["gate"]["exists"], false);
+        assert_eq!(scratch["backlog"]["exists"], false);
+        assert!(!root.exists(), "remote and scratch views created nothing");
+    }
+
+    #[test]
+    fn mission_show_finds_an_old_closed_mission_and_an_unknown_id_is_clean() {
+        let schema = spawn_postgres::testing::TestSchema::new("mission_show");
+        let store = schema.store();
+        let old = store
+            .mission_add("old", &json!([]), "human")
+            .expect("old mission");
+        store.mission_close(old, "done", "finished").expect("close");
+        for n in 0..20 {
+            store
+                .mission_add(&format!("newer {n}"), &json!([]), "human")
+                .expect("newer mission");
+        }
+        let root =
+            std::env::temp_dir().join(format!("spawn-mission-show-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let id = old.to_string();
+        let root_text = root.to_string_lossy().to_string();
+        let shown = super::show(&store, &flags(&["--id", &id, "--root", &root_text]))
+            .expect("old mission is shown");
+        assert_eq!(shown["mission"], old);
+        assert_eq!(shown["state"], "done");
+        assert_eq!(shown["mirror"]["exists"], false);
+        assert!(!root.exists(), "show created its root or mirror");
+        let missing = i64::MAX.to_string();
+        let error = super::show(&store, &flags(&["--id", &missing, "--root", &root_text]))
+            .expect_err("unknown mission");
+        assert_eq!(error, format!("mission #{} not found", i64::MAX));
+        assert!(!shown.to_string().contains("SPAWN_DATABASE_URL"));
+        assert!(!shown.to_string().contains("SPAWN_TEST_DATABASE_URL"));
+    }
+
+    #[test]
+    fn mission_show_succeeds_under_the_restricted_supervisor_login() {
+        let schema = spawn_postgres::testing::TestSchema::new("mission_show_sup");
+        let store = schema.store();
+        let mission = store
+            .mission_add("supervisor view mission", &json!([]), "human")
+            .expect("mission");
+        let _assigned = store
+            .task_assign(mission, "ephemeral", "w_sup_1", "brief 1", "default")
+            .expect("assigned");
+        let delivered = store
+            .task_assign(mission, "ephemeral", "w_sup_2", "brief 2", "default")
+            .expect("delivered assign");
+        store.task_delivered(delivered, 1).expect("delivered");
+        let reported = store
+            .task_assign(mission, "ephemeral", "w_sup_3", "brief 3", "default")
+            .expect("reported assign");
+        store.task_delivered(reported, 1).expect("delivered 3");
+        assert!(store.task_reported(reported, "done").expect("reported"));
+
+        let url = schema.url();
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let schema_url = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let sup_url =
+            spawn_postgres::role_url(&schema_url, "spawn_supervisor").expect("supervisor url");
+        let sup_store = spawn_postgres::PostgresStore::connect(&sup_url).expect("supervisor store");
+
+        let root =
+            std::env::temp_dir().join(format!("spawn-mission-show-sup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let id = mission.to_string();
+        let root_text = root.to_string_lossy().to_string();
+        let shown = super::show(&sup_store, &flags(&["--id", &id, "--root", &root_text]))
+            .expect("supervisor login must show the mission");
+        assert_eq!(shown["mission"], mission);
+        assert_eq!(shown["landing_repo"]["kind"], "scratch");
+        assert_eq!(shown["mirror"]["exists"], false);
+        assert!(!root.exists(), "supervisor show created paths on disk");
+
+        let tasks = shown["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(
+            tasks[0]["diagnostics"]["delivery"]["unavailable"],
+            "restricted login"
+        );
+        assert_eq!(tasks[1]["diagnostics"]["report_blocker"], Value::Null);
+        assert_eq!(
+            tasks[1]["diagnostics"]["facts_unavailable"],
+            "restricted login"
+        );
+        assert_eq!(tasks[1]["diagnostics"]["report"]["status"], "report absent");
+        assert_eq!(
+            tasks[2]["diagnostics"]["gate_details_unavailable"],
+            "restricted login"
+        );
+        assert!(tasks[2]["diagnostics"]["landing"].is_object());
+        let printed = shown.to_string();
+        for secret in [
+            "SPAWN_DATABASE_URL",
+            "SPAWN_TEST_DATABASE_URL",
+            "postgres://",
+        ] {
+            assert!(!printed.contains(secret), "{secret}: {printed}");
+        }
+        drop(sup_store);
+        drop(store);
     }
 }
