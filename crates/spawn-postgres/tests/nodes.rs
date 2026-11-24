@@ -209,6 +209,70 @@ fn with(mut record: Value, key: &str, value: Value) -> Value {
     record
 }
 
+/// Issue #555: a node record in the log never stops a global reader (the
+/// Bridge, the Observer): `read_global` decodes it as a control-session
+/// event, the node's facts as written.
+#[test]
+fn the_global_log_decodes_node_records_as_control_session_events() {
+    use spawn_core::event::{EventKind, GlobalPosition};
+    use spawn_core::port::EventLog;
+
+    let (store, _schema) = store("nodes_read_global");
+    let join = store
+        .node_record(&joined("runner", "spawn-runner"))
+        .expect("joined");
+    let at = store.node_record(&beat(join)).expect("a heartbeat");
+    let records = store
+        .read_global(GlobalPosition(0), 1000)
+        .expect("the whole log decodes");
+    let nodes: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.event.kind {
+            EventKind::NodeRecorded { record: fact } => Some((record, fact)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nodes.len(), 2, "{records:?}");
+    for (record, _) in &nodes {
+        assert_eq!(record.event.session_id.as_str(), "session_control");
+        assert!(record.event.kind.is_control());
+        assert_eq!(record.event.kind.name(), "node.recorded");
+    }
+    assert_eq!(
+        (
+            nodes[0].0.position.0,
+            &nodes[0].1["type"],
+            &nodes[0].1["name"]
+        ),
+        (
+            u64::try_from(join).expect("an id"),
+            &json!("node.joined"),
+            &json!("runner")
+        )
+    );
+    assert_eq!(
+        (
+            nodes[1].0.position.0,
+            &nodes[1].1["type"],
+            &nodes[1].1["join"]
+        ),
+        (
+            u64::try_from(at).expect("an id"),
+            &json!("node.heartbeat"),
+            &json!(join)
+        )
+    );
+    // A reader resuming between the two takes the heartbeat alone.
+    let rest = store
+        .read_global(nodes[0].0.position, 1000)
+        .expect("the rest decodes");
+    assert!(
+        rest.iter()
+            .any(|record| matches!(record.event.kind, EventKind::NodeRecorded { .. })),
+        "{rest:?}"
+    );
+}
+
 #[test]
 fn a_probe_of_a_removed_join_records_nothing_for_the_next_one() {
     let (store, schema) = store("nodes_rejoin");

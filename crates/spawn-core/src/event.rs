@@ -680,6 +680,17 @@ pub enum EventKind {
         /// The record, `{"type": ..., ...}`.
         record: serde_json::Value,
     },
+    /// One fact of a node (multi-host): its join, drain, undrain, removal,
+    /// or the loop's heartbeat, lost and back. `spawn_node_record` appends
+    /// it to `session_control` under this name, outside the control fold
+    /// (`spawn_control_refold` reads only `control.recorded`). It belongs
+    /// to no agent, so nothing observes or bridges it; every global reader
+    /// must still decode it, or one `spawn node add` stalls them all.
+    #[serde(rename = "node.recorded")]
+    NodeRecorded {
+        /// The record, `{"type": "node.<fact>", "name": ..., ...}`.
+        record: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -720,13 +731,17 @@ impl EventKind {
             Self::ScreenObserved { .. } => "screen.observed",
             Self::ObservationRecorded { .. } => "observation.recorded",
             Self::ControlRecorded { .. } => "control.recorded",
+            Self::NodeRecorded { .. } => "node.recorded",
         }
     }
 
-    /// Whether this is a control-stream record rather than a fact about an
-    /// agent's session.
+    /// Whether this is a control-session record (a control-stream or a
+    /// node record) rather than a fact about an agent's session.
     pub fn is_control(&self) -> bool {
-        matches!(self, Self::ControlRecorded { .. })
+        matches!(
+            self,
+            Self::ControlRecorded { .. } | Self::NodeRecorded { .. }
+        )
     }
 
     /// Checkpoint the Bridge must take after this event, if any.
@@ -795,4 +810,25 @@ pub struct Appended {
     pub record: EventRecord,
     /// False when the source key already existed.
     pub inserted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventKind;
+    use serde_json::json;
+
+    #[test]
+    fn a_node_record_decodes_as_a_control_session_event() {
+        let wire = json!({"name": "node.recorded",
+                          "detail": {"record": {"type": "node.heartbeat", "name": "runner",
+                                                "join": 7, "load1": 0.5}}});
+        let kind: EventKind = serde_json::from_value(wire.clone()).expect("node.recorded decodes");
+        assert!(
+            matches!(&kind, EventKind::NodeRecorded { record } if record["type"] == "node.heartbeat")
+        );
+        assert_eq!(kind.name(), "node.recorded");
+        assert!(kind.is_control());
+        assert!(kind.checkpoint_reason().is_none());
+        assert_eq!(serde_json::to_value(&kind).expect("encodes"), wire);
+    }
 }
