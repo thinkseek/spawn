@@ -1437,6 +1437,206 @@ enum Fact {
     End(End),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthRetry {
+    Input,
+    Resume,
+    Handoff,
+}
+
+/// The way an expired login's periodic retry reaches the engine. Input works
+/// only in a live execution; a stopped one takes the usual resume bounds,
+/// handing off when there is no native session or resumes are spent.
+fn auth_retry_action(live: bool, native_bound: bool, failed_resumes: u32) -> AuthRetry {
+    if live {
+        return AuthRetry::Input;
+    }
+    match bounded(Path::Resume, native_bound, failed_resumes).0 {
+        Path::Resume => AuthRetry::Resume,
+        _ => AuthRetry::Handoff,
+    }
+}
+
+/// A recovery command planned by a pass before submission.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedCommand {
+    pub(crate) key: String,
+    pub(crate) action: CommandAction,
+    pub(crate) note: &'static str,
+}
+
+/// The pure decision of a revival or auth-retry planning pass.
+#[derive(Debug, Clone)]
+pub(crate) enum RevivalPlan {
+    Idle,
+    HoldUntil(i64),
+    Submit(Box<PlannedCommand>),
+}
+
+/// Shared execution context needed to plan a revival or auth retry.
+#[derive(Clone, Copy)]
+struct RevivalEnv<'a> {
+    execution_id: &'a str,
+    commands: &'a [Sent],
+    config: &'a Config,
+    now_ms: i64,
+    live: bool,
+}
+
+fn resume_text_for(execution_id: &str, last: &Recorded, cause: Cause) -> String {
+    if cancelled_stop(last) {
+        return CANCELLED_REVIVAL.to_string();
+    }
+    format!(
+        "Spawn restarted your engine: execution {execution_id} {} ({}). Continue your task from where \
+         you were; what you did is in your workspace.",
+        cause.name(),
+        describe(last)
+    )
+}
+
+fn is_retry_key(candidate: &str, retry_prefix: &str) -> bool {
+    candidate.strip_prefix(retry_prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn start_handoff_action(prompt: String, charter: Option<String>) -> CommandAction {
+    CommandAction::Start {
+        engine: ENGINE.to_string(),
+        prompt,
+        parent_session_id: None,
+        from: None,
+        model: None,
+        charter,
+    }
+}
+
+/// Plan the next `<key>-r<n>` retry after a failed revival command, preserving
+/// `build_action` so a failed handoff `Start` retries as `Start` rather than `Resume`.
+fn plan_retry_action(
+    commands: &[Sent],
+    config: &Config,
+    now_ms: i64,
+    key: &str,
+    build_action: impl FnOnce() -> CommandAction,
+) -> RevivalPlan {
+    let retry_prefix = format!("{key}-r");
+    let retries: Vec<&Sent> = commands
+        .iter()
+        .filter(|sent| is_retry_key(&sent.key, &retry_prefix))
+        .collect();
+    if retries.iter().any(|sent| sent.succeeded != Some(false)) {
+        return RevivalPlan::Idle;
+    }
+    let failures = u32::try_from(retries.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let failed_at = commands
+        .iter()
+        .filter(|sent| sent.key == key || is_retry_key(&sent.key, &retry_prefix))
+        .filter_map(|sent| sent.finished_at_ms)
+        .max()
+        .unwrap_or(now_ms);
+    let due = resume_due(config.resume_backoff, failures, Some(failed_at), now_ms);
+    if now_ms < due {
+        return RevivalPlan::HoldUntil(due);
+    }
+    let next = format!("{key}-r{}", retries.len().saturating_add(1));
+    RevivalPlan::Submit(Box::new(PlannedCommand {
+        key: next,
+        action: build_action(),
+        note: "retrying a failed revival",
+    }))
+}
+
+/// Plan a handoff: stop a live execution first, or start (and retry on
+/// failure as `CommandAction::Start`) a new native session once stopped.
+fn plan_handoff(
+    env: &RevivalEnv<'_>,
+    last: &Recorded,
+    handoff_prompt: impl FnOnce() -> (String, Option<String>),
+) -> RevivalPlan {
+    let key = key(env.execution_id, last.attempt());
+    let stop = format!("{key}-stop");
+    if env.live {
+        if env.commands.iter().any(|sent| sent.key == stop) {
+            return RevivalPlan::Idle;
+        }
+        return RevivalPlan::Submit(Box::new(PlannedCommand {
+            key: stop,
+            action: CommandAction::Stop,
+            note: "stopping for its handoff",
+        }));
+    }
+    if let Some(sent) = env.commands.iter().find(|sent| sent.key == key) {
+        return match sent.succeeded {
+            None | Some(true) => RevivalPlan::Idle,
+            Some(false) => plan_retry_action(env.commands, env.config, env.now_ms, &key, || {
+                let (prompt, charter) = handoff_prompt();
+                start_handoff_action(prompt, charter)
+            }),
+        };
+    }
+    let due = last.due_ms().unwrap_or(env.now_ms);
+    if env.now_ms < due {
+        return RevivalPlan::HoldUntil(due);
+    }
+    let (prompt, charter) = handoff_prompt();
+    RevivalPlan::Submit(Box::new(PlannedCommand {
+        key,
+        action: start_handoff_action(prompt, charter),
+        note: "starting a new native session for its handoff",
+    }))
+}
+
+/// Plan one periodic retry of an expired login while the credentials file holds.
+fn plan_auth_retry(
+    env: &RevivalEnv<'_>,
+    last: &Recorded,
+    native_bound: bool,
+    failed_resumes: u32,
+    handoff_prompt: impl FnOnce() -> (String, Option<String>),
+) -> RevivalPlan {
+    let prefix = key(env.execution_id, last.attempt());
+    let auth_prefix = format!("{prefix}-auth-");
+    let tried = env
+        .commands
+        .iter()
+        .filter(|sent| sent.key.starts_with(&auth_prefix))
+        .count();
+    let last_try = env
+        .commands
+        .iter()
+        .filter(|sent| sent.key.starts_with(&auth_prefix))
+        .map(|sent| sent.created_at_ms)
+        .max();
+    let due = auth_retry_due(env.config, last.at_ms, last_try);
+    if env.now_ms < due {
+        return RevivalPlan::Idle;
+    }
+    let retry_key = format!("{auth_prefix}{}", tried.saturating_add(1));
+    match auth_retry_action(env.live, native_bound, failed_resumes) {
+        AuthRetry::Input => RevivalPlan::Submit(Box::new(PlannedCommand {
+            key: retry_key,
+            action: CommandAction::Input {
+                text: One::input_text(last, Cause::ModelAuth),
+                tags: Vec::new(),
+            },
+            note: "retrying the expired login",
+        })),
+        AuthRetry::Resume => RevivalPlan::Submit(Box::new(PlannedCommand {
+            key: retry_key,
+            action: CommandAction::Resume {
+                prompt: Some(resume_text_for(env.execution_id, last, Cause::ModelAuth)),
+                model: None,
+            },
+            note: "resuming its native session to retry the expired login",
+        })),
+        AuthRetry::Handoff => plan_handoff(env, last, handoff_prompt),
+    }
+}
+
 impl One<'_> {
     /// The session's pass, in order: the outage it lived through, the next
     /// fact of its execution, then the way back from its latest
@@ -2268,33 +2468,22 @@ impl One<'_> {
     /// One retry of an expired login, every `auth_retry` while the
     /// credentials file does not change.
     fn auth_retry(&mut self, last: &Recorded) -> Result<(), String> {
-        let prefix = self.key_prefix(last);
-        let tried = self
-            .row
-            .commands
-            .iter()
-            .filter(|sent| sent.key.starts_with(&format!("{prefix}-auth-")))
-            .count();
-        let last_try = self
-            .row
-            .commands
-            .iter()
-            .filter(|sent| sent.key.starts_with(&format!("{prefix}-auth-")))
-            .filter_map(|sent| sent.created_at_ms.into())
-            .max();
-        let due = auth_retry_due(self.config, last.at_ms, last_try);
-        if self.now_ms < due {
-            return Ok(());
-        }
-        let key = format!("{prefix}-auth-{}", tried.saturating_add(1));
-        self.submit(
-            &key,
-            CommandAction::Input {
-                text: Self::input_text(last, Cause::ModelAuth),
-                tags: Vec::new(),
-            },
-            "retrying the expired login",
-        )
+        let execution_id = self.execution().id;
+        let env = RevivalEnv {
+            execution_id: &execution_id,
+            commands: &self.row.commands,
+            config: self.config,
+            now_ms: self.now_ms,
+            live: self.live(),
+        };
+        let plan = plan_auth_retry(
+            &env,
+            last,
+            self.row.native_session_id.is_some(),
+            self.failures_in_a_row(),
+            || self.handoff_prompt(last, Cause::ModelAuth),
+        );
+        self.apply_plan(plan)
     }
 
     /// Take the interruption's way back: `input` into the live engine,
@@ -2377,82 +2566,48 @@ impl One<'_> {
     /// A revival whose command failed: again after the resume's backoff,
     /// under a key of its own.
     fn retry(&mut self, last: &Recorded, cause: Cause, key: &str) -> Result<(), String> {
-        let retries: Vec<&Sent> = self
-            .row
-            .commands
-            .iter()
-            .filter(|sent| sent.key.starts_with(&format!("{key}-r")))
-            .collect();
-        let failures = u32::try_from(retries.len())
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
-        let failed_at = self
-            .row
-            .commands
-            .iter()
-            .find(|sent| sent.key == key)
-            .and_then(|sent| sent.finished_at_ms)
-            .unwrap_or(self.now_ms);
-        let due = resume_due(
-            self.config.resume_backoff,
-            failures,
-            Some(failed_at),
-            self.now_ms,
-        );
-        if self.now_ms < due {
-            self.state.hold_until(due);
-            return Ok(());
-        }
-        let next = format!("{key}-r{}", retries.len().saturating_add(1));
-        let action = if self.live() {
-            CommandAction::Input {
-                text: Self::input_text(last, cause),
-                tags: Vec::new(),
+        let execution_id = self.execution().id;
+        let live = self.live();
+        let plan = plan_retry_action(&self.row.commands, self.config, self.now_ms, key, || {
+            if live {
+                CommandAction::Input {
+                    text: Self::input_text(last, cause),
+                    tags: Vec::new(),
+                }
+            } else {
+                CommandAction::Resume {
+                    prompt: Some(resume_text_for(&execution_id, last, cause)),
+                    model: None,
+                }
             }
-        } else {
-            CommandAction::Resume {
-                prompt: Some(self.resume_text(last, cause)),
-                model: None,
-            }
-        };
-        self.submit(&next, action, "retrying a failed revival")
+        });
+        self.apply_plan(plan)
     }
 
     /// A handoff: stop the execution if it still runs, then start a new
     /// native session in the same Spawn session, workspace and branch.
     fn handoff(&mut self, last: &Recorded, cause: Cause) -> Result<(), String> {
-        let key = self.key_prefix(last);
-        let stop = format!("{key}-stop");
-        if self.live() {
-            if !self.row.commands.iter().any(|sent| sent.key == stop) {
-                self.submit(&stop, CommandAction::Stop, "stopping for its handoff")?;
+        let execution_id = self.execution().id;
+        let env = RevivalEnv {
+            execution_id: &execution_id,
+            commands: &self.row.commands,
+            config: self.config,
+            now_ms: self.now_ms,
+            live: self.live(),
+        };
+        let plan = plan_handoff(&env, last, || self.handoff_prompt(last, cause));
+        self.apply_plan(plan)
+    }
+
+    fn apply_plan(&mut self, plan: RevivalPlan) -> Result<(), String> {
+        match plan {
+            RevivalPlan::Idle => Ok(()),
+            RevivalPlan::HoldUntil(due) => {
+                self.state.hold_until(due);
+                Ok(())
             }
-            return Ok(());
+            RevivalPlan::Submit(planned) => self.submit(&planned.key, planned.action, planned.note),
         }
-        if let Some(sent) = self.row.commands.iter().find(|sent| sent.key == key) {
-            return match sent.succeeded {
-                None | Some(true) => Ok(()),
-                Some(false) => self.retry(last, cause, &key),
-            };
-        }
-        let due = last.due_ms().unwrap_or(self.now_ms);
-        if self.now_ms < due {
-            self.state.hold_until(due);
-            return Ok(());
-        }
-        let (prompt, charter) = self.handoff_prompt(last, cause);
-        self.submit(
-            &key,
-            CommandAction::Start {
-                engine: ENGINE.to_string(),
-                prompt,
-                parent_session_id: None,
-                from: None,
-                model: None,
-                charter,
-            },
-            "starting a new native session for its handoff",
-        )
     }
 
     /// Submit one command as the recovery; the engine runs on under the disk
@@ -2494,16 +2649,7 @@ impl One<'_> {
     /// interruption, by its cause and evidence, and that its work is where
     /// it left it.
     fn resume_text(&self, last: &Recorded, cause: Cause) -> String {
-        if cancelled_stop(last) {
-            return CANCELLED_REVIVAL.to_string();
-        }
-        format!(
-            "Spawn restarted your engine: execution {} {} ({}). Continue your task from where \
-             you were; what you did is in your workspace.",
-            self.execution().id,
-            cause.name(),
-            describe(last)
-        )
+        resume_text_for(&self.execution().id, last, cause)
     }
 
     fn input_text(last: &Recorded, cause: Cause) -> String {
@@ -2747,10 +2893,11 @@ mod credentials_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cause, Config, Credentials, End, Executed, Execution, Facts, Outage, Path, Recorded,
-        Recovery, Sent, Stop, ToolFailure, Turn, auth_retry_due, classify, counts_as_failure,
-        disk_cleared, key, model_due, model_resumes, model_retries, pending, refused, resume_due,
-        resume_failed, retry_at, server_gone, way,
+        AuthRetry, Cause, CommandAction, Config, Credentials, ENGINE, End, Executed, Execution,
+        Facts, Outage, Path, PlannedCommand, Recorded, Recovery, RevivalEnv, RevivalPlan, Sent,
+        Stop, ToolFailure, Turn, auth_retry_action, auth_retry_due, classify, counts_as_failure,
+        disk_cleared, key, model_due, model_resumes, model_retries, pending, plan_auth_retry,
+        refused, resume_due, resume_failed, retry_at, server_gone, way,
     };
     use serde_json::json;
 
@@ -3620,6 +3767,275 @@ mod tests {
         assert!(counts_as_failure(&[
             "storage backend failure: something".to_string()
         ]));
+    }
+
+    /// An expired login's periodic retry types only into a live execution;
+    /// native-session and failed-resume bounds apply only once it has ended.
+    #[test]
+    fn a_live_model_auth_retry_is_an_input() {
+        for native_bound in [false, true] {
+            for failed_resumes in [0, super::RESUME_ATTEMPTS] {
+                assert_eq!(
+                    auth_retry_action(true, native_bound, failed_resumes),
+                    AuthRetry::Input
+                );
+            }
+        }
+    }
+
+    /// A stopped execution with a native session is resumed, rather than
+    /// sent input that its supervisor must reject, until the resumes are spent.
+    #[test]
+    fn a_stopped_resumable_model_auth_retry_is_a_resume() {
+        for failed_resumes in 0..super::RESUME_ATTEMPTS {
+            assert_eq!(
+                auth_retry_action(false, true, failed_resumes),
+                AuthRetry::Resume,
+                "{failed_resumes} failed resumes"
+            );
+        }
+    }
+
+    /// With no native session to resume, or after the usual resume bound, an
+    /// expired login's stopped execution follows the handoff path instead.
+    #[test]
+    fn a_stopped_non_resumable_model_auth_retry_hands_off() {
+        for failed_resumes in 0..=super::RESUME_ATTEMPTS {
+            assert_eq!(
+                auth_retry_action(false, false, failed_resumes),
+                AuthRetry::Handoff,
+                "no native session, {failed_resumes} failed resumes"
+            );
+        }
+        assert_eq!(
+            auth_retry_action(false, true, super::RESUME_ATTEMPTS),
+            AuthRetry::Handoff
+        );
+    }
+
+    fn assert_start_action(
+        planned: PlannedCommand,
+        expected_key: &str,
+        expected_prompt: &str,
+        expected_charter: Option<&str>,
+    ) {
+        assert_eq!(planned.key, expected_key);
+        match planned.action {
+            CommandAction::Start {
+                engine,
+                prompt,
+                parent_session_id,
+                from,
+                model,
+                charter,
+            } => {
+                assert_eq!(engine, ENGINE);
+                assert_eq!(prompt, expected_prompt);
+                assert_eq!(parent_session_id, None);
+                assert_eq!(from, None);
+                assert_eq!(model, None);
+                assert_eq!(charter.as_deref(), expected_charter);
+            }
+            other => panic!("expected CommandAction::Start for {expected_key}, got {other:?}"),
+        }
+    }
+
+    /// A failed `Start` from `AuthRetry::Handoff` with no native session must
+    /// wait its resume backoff and then retry under `-r1` as `CommandAction::Start`
+    /// (preserving the handoff prompt and charter), never `CommandAction::Resume`.
+    #[test]
+    fn a_failed_model_auth_handoff_without_native_session_retries_as_start() {
+        let config = Config::default();
+        let last = Recorded {
+            event_id: 1,
+            at_ms: 1_000,
+            record: json!({
+                "type": "execution.interrupted",
+                "cause": "model_auth",
+                "path": "wait",
+                "attempt": 1,
+                "due_ms": 1_801_000,
+            }),
+        };
+        let commands = vec![Sent {
+            key: "recover-exec_7-1".to_string(),
+            created_at_ms: 1_801_000,
+            finished_at_ms: Some(1_802_000),
+            succeeded: Some(false),
+        }];
+        let expected_due = resume_due(config.resume_backoff, 1, Some(1_802_000), 1_810_000);
+
+        let early_env = RevivalEnv {
+            execution_id: "exec_7",
+            commands: &commands,
+            config: &config,
+            now_ms: expected_due - 1,
+            live: false,
+        };
+        assert!(matches!(
+            plan_auth_retry(&early_env, &last, false, 0, || {
+                ("handoff prompt".to_string(), Some("charter-1".to_string()))
+            }),
+            RevivalPlan::HoldUntil(due) if due == expected_due
+        ));
+
+        let due_env = RevivalEnv {
+            execution_id: "exec_7",
+            commands: &commands,
+            config: &config,
+            now_ms: expected_due,
+            live: false,
+        };
+        match plan_auth_retry(&due_env, &last, false, 0, || {
+            ("handoff prompt".to_string(), Some("charter-1".to_string()))
+        }) {
+            RevivalPlan::Submit(planned) => assert_start_action(
+                *planned,
+                "recover-exec_7-1-r1",
+                "handoff prompt",
+                Some("charter-1"),
+            ),
+            other => panic!("failed handoff start should emit -r1 once due, got {other:?}"),
+        }
+    }
+
+    /// A failed `Start` from `AuthRetry::Handoff` after resumes were already spent
+    /// must also retry as `CommandAction::Start`, never returning to the unrecoverable
+    /// native session with `CommandAction::Resume`.
+    #[test]
+    fn a_failed_model_auth_handoff_after_spent_resumes_retries_as_start() {
+        let config = Config::default();
+        let last = Recorded {
+            event_id: 1,
+            at_ms: 1_000,
+            record: json!({
+                "type": "execution.interrupted",
+                "cause": "model_auth",
+                "path": "wait",
+                "attempt": 1,
+                "due_ms": 1_801_000,
+            }),
+        };
+        let commands = vec![Sent {
+            key: "recover-exec_7-1".to_string(),
+            created_at_ms: 1_801_000,
+            finished_at_ms: Some(1_802_000),
+            succeeded: Some(false),
+        }];
+        let expected_due = resume_due(config.resume_backoff, 1, Some(1_802_000), 1_802_000);
+        let env = RevivalEnv {
+            execution_id: "exec_7",
+            commands: &commands,
+            config: &config,
+            now_ms: expected_due,
+            live: false,
+        };
+        match plan_auth_retry(&env, &last, true, super::RESUME_ATTEMPTS, || {
+            (
+                "spent-resumes handoff".to_string(),
+                Some("charter-2".to_string()),
+            )
+        }) {
+            RevivalPlan::Submit(planned) => assert_start_action(
+                *planned,
+                "recover-exec_7-1-r1",
+                "spent-resumes handoff",
+                Some("charter-2"),
+            ),
+            other => panic!("spent-resumes failed handoff start should emit -r1, got {other:?}"),
+        }
+    }
+
+    /// While `-r1` is still in flight or already succeeded, no `-r2` is emitted;
+    /// once `-r1` also fails, `-r2` backs off from `-r1` and emits `Start`.
+    #[test]
+    fn a_pending_or_succeeded_handoff_retry_emits_nothing_and_a_failed_r1_schedules_r2_as_start() {
+        let config = Config::default();
+        let last = Recorded {
+            event_id: 1,
+            at_ms: 1_000,
+            record: json!({
+                "type": "execution.interrupted",
+                "cause": "model_auth",
+                "path": "wait",
+                "attempt": 1,
+                "due_ms": 1_801_000,
+            }),
+        };
+        let base_failed = Sent {
+            key: "recover-exec_7-1".to_string(),
+            created_at_ms: 1_801_000,
+            finished_at_ms: Some(1_802_000),
+            succeeded: Some(false),
+        };
+        for outcome in [None, Some(true)] {
+            let commands = vec![
+                base_failed.clone(),
+                Sent {
+                    key: "recover-exec_7-1-r1".to_string(),
+                    created_at_ms: 1_822_000,
+                    finished_at_ms: outcome.map(|_| 1_825_000),
+                    succeeded: outcome,
+                },
+            ];
+            let env = RevivalEnv {
+                execution_id: "exec_7",
+                commands: &commands,
+                config: &config,
+                now_ms: 2_000_000,
+                live: false,
+            };
+            assert!(
+                matches!(
+                    plan_auth_retry(&env, &last, false, 0, || { ("unused".to_string(), None) }),
+                    RevivalPlan::Idle
+                ),
+                "retry outcome {outcome:?} must not emit -r2"
+            );
+        }
+
+        let failed_r1 = vec![
+            base_failed,
+            Sent {
+                key: "recover-exec_7-1-r1".to_string(),
+                created_at_ms: 1_822_000,
+                finished_at_ms: Some(1_825_000),
+                succeeded: Some(false),
+            },
+        ];
+        let due_r2 = resume_due(config.resume_backoff, 2, Some(1_825_000), 1_825_000);
+        let early_env = RevivalEnv {
+            execution_id: "exec_7",
+            commands: &failed_r1,
+            config: &config,
+            now_ms: due_r2 - 1,
+            live: false,
+        };
+        assert!(matches!(
+            plan_auth_retry(&early_env, &last, false, 0, || {
+                ("second retry".to_string(), Some("charter-3".to_string()))
+            }),
+            RevivalPlan::HoldUntil(due) if due == due_r2
+        ));
+
+        let due_env = RevivalEnv {
+            execution_id: "exec_7",
+            commands: &failed_r1,
+            config: &config,
+            now_ms: due_r2,
+            live: false,
+        };
+        match plan_auth_retry(&due_env, &last, false, 0, || {
+            ("second retry".to_string(), Some("charter-3".to_string()))
+        }) {
+            RevivalPlan::Submit(planned) => assert_start_action(
+                *planned,
+                "recover-exec_7-1-r2",
+                "second retry",
+                Some("charter-3"),
+            ),
+            other => panic!("failed -r1 should schedule -r2, got {other:?}"),
+        }
     }
 
     /// An expired login is retried only on its slow schedule — never while

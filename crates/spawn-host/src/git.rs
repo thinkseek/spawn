@@ -638,10 +638,16 @@ impl GitWorkspace {
     ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
         clear_dead_lock(index);
         let pending_main = self.pending_merge(branch).map(|pending| pending.main);
-        let kept_in = self.source_commits(pending_main.as_deref());
         let (mut oversized, special) = self.left_out_files(directory, index)?;
-        let blobs = self.blobs_in(&kept_in, &oversized)?;
-        oversized.retain(|(path, _)| !blobs.contains(path));
+        // Most checkpoints have no oversized file. Do not resolve main just
+        // to discover that there are no paths whose blobs need looking up.
+        let mut kept_in = None;
+        if !oversized.is_empty() {
+            let commits = self.source_commits(pending_main.as_deref());
+            let blobs = self.blobs_in(&commits, &oversized)?;
+            oversized.retain(|(path, _)| !blobs.contains(path));
+            kept_in = Some(commits);
+        }
         // A special file (a FIFO, a socket, a device) is never committed:
         // `git add` refuses one at a tracked path, which would fail every
         // checkpoint, so it is left out too, silently: it holds no content.
@@ -654,8 +660,11 @@ impl GitWorkspace {
         // A file that grew past the cap between the size check and `add`
         // was hashed anyway; it is left out all the same.
         let mut grown = self.oversized_blobs(&tree)?;
-        let blobs = self.blobs_in(&kept_in, &grown)?;
-        grown.retain(|(path, _)| !blobs.contains(path));
+        if !grown.is_empty() {
+            let kept_in = kept_in.unwrap_or_else(|| self.source_commits(pending_main.as_deref()));
+            let blobs = self.blobs_in(&kept_in, &grown)?;
+            grown.retain(|(path, _)| !blobs.contains(path));
+        }
         if grown.is_empty() {
             return Ok((tree, oversized));
         }
@@ -1358,13 +1367,20 @@ impl GitWorkspace {
             return Err(stale_refusal(&branch, Some(&kept)));
         }
         let reference = format!("refs/heads/{branch}");
-        if !self.names_commit(&reference) {
+        let mut parent = self.commit_and_tree(&reference)?;
+        if parent.is_none() {
             take_back()?;
-            if !self.names_commit(&reference) {
+            parent = self.commit_and_tree(&reference)?;
+            if parent.is_none() {
                 return self.recreate(&branch, &directory, &index, message);
             }
         }
-        let parent = self.git_output(&["rev-parse", &reference])?;
+        // One `git log -1` reads the parent commit and its tree from a single
+        // resolved commit object. Besides saving two git processes per
+        // checkpoint, both values necessarily describe that same commit even
+        // under a concurrent ref update. The compare-and-swap below still
+        // protects against a writer that does not honor Spawn's branch lock.
+        let (parent, parent_tree) = parent.expect("a present branch has a parent and tree");
         let tree = self.tree_of(&directory, &index, &branch, &parent);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
@@ -1372,7 +1388,6 @@ impl GitWorkspace {
         let (tree, oversized) = tree?;
         self.record_oversized(&branch, &oversized);
 
-        let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
         let merged = self.resolved_merge(&branch, &directory);
@@ -1398,15 +1413,43 @@ impl GitWorkspace {
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
     }
 
-    /// Whether `reference` names a commit now.
-    fn names_commit(&self, reference: &str) -> bool {
-        self.git_output(&[
-            "rev-parse",
-            "--verify",
-            "--quiet",
+    /// The commit `reference` names and that commit's tree, read atomically
+    /// from one resolved commit object by a single git process. `None` is the
+    /// branch-gone case: a commit whose tree cannot be read is an error, not
+    /// permission to recreate the branch.
+    fn commit_and_tree(&self, reference: &str) -> Result<Option<(String, String)>, WorkspaceError> {
+        let answer = match self.git_output(&[
+            "log",
+            "-1",
+            "--format=%H%n%T",
             &format!("{reference}^{{commit}}"),
-        ])
-        .is_ok()
+            "--",
+        ]) {
+            Ok(answer) => answer,
+            Err(error) => {
+                if self
+                    .git_output(&[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("{reference}^{{commit}}"),
+                    ])
+                    .is_ok()
+                {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+        };
+        let mut lines = answer.lines();
+        let commit = lines.next().unwrap_or_default();
+        let tree = lines.next().unwrap_or_default();
+        if commit.is_empty() || tree.is_empty() || lines.next().is_some() {
+            return Err(WorkspaceError::Unavailable(format!(
+                "git log returned an invalid commit/tree pair for {reference}"
+            )));
+        }
+        Ok(Some((commit.to_string(), tree.to_string())))
     }
 
     /// Make `branch`, gone from the store, again from the workspace in
