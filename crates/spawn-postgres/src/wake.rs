@@ -64,10 +64,39 @@ impl PostgresStore {
     /// Listen for this database's event notifications on a connection of
     /// its own ([`Listener`]).
     pub fn listen(&self) -> Result<Listener, StoreError> {
+        self.listen_channel(CHANNEL)
+    }
+
+    /// Listen on a caller-chosen PostgreSQL channel on a connection of its own.
+    ///
+    /// Tests sharing `SPAWN_TEST_DATABASE_URL` via [`crate::testing::TestSchema`]
+    /// share the database-wide `spawn_events` channel, so a test asserting that
+    /// no PostgreSQL notification wakes its wait isolates itself by listening on
+    /// a schema-unique channel instead.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn listen_on(&self, channel: &str) -> Result<Listener, StoreError> {
+        let valid = !channel.is_empty()
+            && channel.len() <= 63
+            && channel
+                .bytes()
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase() || first == b'_')
+            && channel
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+        if !valid {
+            return Err(StoreError::Rejected(format!(
+                "channel name {channel:?} is not a lowercase bare identifier of at most 63 bytes"
+            )));
+        }
+        self.listen_channel(channel)
+    }
+
+    fn listen_channel(&self, channel: &str) -> Result<Listener, StoreError> {
         let config = crate::passfile::config(&self.url).map_err(|error| backend(&error))?;
         let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
         client
-            .batch_execute(&format!("listen {CHANNEL}"))
+            .batch_execute(&format!("listen {channel}"))
             .map_err(|error| backend(&error))?;
         Ok(Listener { client })
     }
@@ -207,6 +236,64 @@ mod tests {
         assert!(claimed.is_some(), "the Bridge claims the command");
         let due = store.next_lease_ms().expect("lease").expect("a lease");
         assert!(due > 0, "the claimed command's lease dates the next pass");
+        drop(store);
+    }
+
+    /// `listen_on` validates channel identifiers and isolates a test listener
+    /// from the database-wide `spawn_events` channel while still delivering real
+    /// PostgreSQL notifications on its own channel. Needs
+    /// `SPAWN_TEST_DATABASE_URL`.
+    #[test]
+    fn listen_on_rejects_invalid_channels_and_isolates_from_spawn_events() {
+        use postgres::NoTls;
+        use spawn_core::port::{CommandQueue, StoreError};
+
+        let url = std::env::var(crate::testing::TEST_DATABASE_URL)
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
+        let schema = crate::testing::TestSchema::new("wake_chan");
+        let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
+
+        let too_long = "a".repeat(64);
+        for bad in ["", "1bad", "a; select 1", "Upper", too_long.as_str()] {
+            assert!(
+                matches!(store.listen_on(bad), Err(StoreError::Rejected(_))),
+                "invalid channel {bad:?} must be rejected"
+            );
+        }
+
+        let mut listener = store.listen_on(&schema).expect("listen_on");
+        let submission = spawn_core::command::Submission {
+            agent_id: spawn_core::id::AgentId::new("agent_resident_wake_chan").expect("agent"),
+            session_id: spawn_core::id::SessionId::new("session_resident_wake_chan")
+                .expect("session"),
+            idempotency_key: spawn_core::id::IdempotencyKey::new("wake-chan-test").expect("key"),
+            action: spawn_core::command::CommandAction::Stop,
+        };
+        store
+            .submit(
+                &spawn_core::id::Principal::new("human").expect("principal"),
+                &submission,
+            )
+            .expect("submit");
+        assert_eq!(
+            listener.wait(Duration::from_millis(50)).expect("wait"),
+            0,
+            "database-wide spawn_events must not wake an isolated test channel"
+        );
+
+        let mut notify = crate::passfile::config(&url)
+            .expect("config")
+            .connect(NoTls)
+            .expect("notify client");
+        notify
+            .batch_execute(&format!("notify {}", schema.name()))
+            .expect("notify");
+        assert!(
+            listener.wait(Duration::from_secs(5)).expect("wait") >= 1,
+            "isolated channel must still deliver real PostgreSQL notifications"
+        );
+        drop(listener);
+        drop(notify);
         drop(store);
     }
 }

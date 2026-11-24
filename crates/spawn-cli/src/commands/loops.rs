@@ -1025,11 +1025,6 @@ mod tests {
         Bridge::new(store.clone(), store.clone(), store.clone(), store, config)
     }
 
-    /// PostgreSQL notifications use one database-wide channel, so the two
-    /// integration cases cannot be allowed to wake each other's listener.
-    #[cfg(target_os = "linux")]
-    static DATABASE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A transcript file of one integration test, removed on every exit.
     #[cfg(target_os = "linux")]
     struct ScratchFile(std::path::PathBuf);
@@ -1245,9 +1240,6 @@ mod tests {
     fn a_postgresql_notification_still_ends_the_multiplexed_wait() {
         use spawn_core::port::CommandQueue;
 
-        let _serial = DATABASE_TEST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let schema = spawn_postgres::testing::TestSchema::new("loop_pg_wake");
         let store = Arc::new(schema.store());
         let mut listener = store.listen().expect("listen");
@@ -1255,10 +1247,9 @@ mod tests {
             spawn_host::InotifyWatch::new().expect("inotify watch"),
         ));
         let stop = AtomicBool::new(false);
-        assert_eq!(
-            listener.wait(Duration::ZERO).expect("drain notifications"),
-            0
-        );
+        // `spawn_events` is database-wide across parallel `TestSchema` cases;
+        // drain any unrelated notifications already buffered before waiting.
+        let _ = listener.wait(Duration::ZERO).expect("drain notifications");
         let before = store.watermark().expect("watermark");
         let writer = {
             let store = store.clone();
@@ -1302,12 +1293,15 @@ mod tests {
     #[cfg(target_os = "linux")] // the inotify adapter
     #[test]
     fn a_transcript_write_wakes_without_a_postgresql_notification() {
-        let _serial = DATABASE_TEST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let schema = spawn_postgres::testing::TestSchema::new("loop_file_wake");
         let store = schema.store();
-        let mut listener = store.listen().expect("listen");
+        // `spawn_events` is database-wide across every parallel `TestSchema`
+        // test and test process sharing `SPAWN_TEST_DATABASE_URL`, so listening
+        // on this test's unique schema name exercises the real PostgreSQL
+        // `Listener` connection without cross-test notifications.
+        let mut listener = store
+            .listen_on(&schema)
+            .expect("listen on isolated channel");
         assert_eq!(
             listener.wait(Duration::ZERO).expect("drain notifications"),
             0
