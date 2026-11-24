@@ -828,10 +828,15 @@ pub(crate) struct Monitor {
     /// ended with them when last read, by the time each falls due: read
     /// again then.
     pending: BTreeMap<i64, i64>,
-    /// From when the next reading looks for a `message.taken` or an
-    /// `execution.ended` that may clear an open alert: the last reading's
-    /// time, less a margin for an append that committed late.
+    /// From when the next reading looks for a `message.taken`, an
+    /// `execution.ended` or a `source = 'claude'` transcript event that may
+    /// clear an open alert: the last reading's time, less a margin for an
+    /// append that committed late.
     messages_since: i64,
+    /// `messages_since` before the latest successful message reading. A
+    /// transient failure to record a message alert's clear restores it, so
+    /// the event that justified the clear remains in the retry's window.
+    messages_previous_since: i64,
     /// What the supervisor had to dispatch when last read
     /// ([`crate::serve::attention::supervisor_dispatch`]), read only while
     /// its latest judgement is stuck or its `agent_stuck` is open; `None`
@@ -1029,6 +1034,7 @@ impl Monitor {
             messages_after: 0,
             pending: BTreeMap::new(),
             messages_since: 0,
+            messages_previous_since: 0,
             supervisor: None,
             supervisor_due_ms: 0,
             database_due_ms: 0,
@@ -1105,10 +1111,11 @@ impl Monitor {
             self.commands_after = now.saturating_sub(1000);
         }
         // The messages are read when the log moved (a new command, a taking,
-        // an end all append) and when a pending one falls due: the new
-        // commands, the pending ones due, and the open alerts' whose session
-        // took a message or ended since, so an idle pass reads next to
-        // nothing (objective 023).
+        // an end or a transcript event all append) and when a pending one
+        // falls due: the new commands, the pending ones due, and the open
+        // alerts' whose session took a message, ended or recorded a
+        // `source = 'claude'` transcript event since, so an idle pass reads
+        // next to nothing (objective 023).
         if moved || self.messages_due.is_some_and(|due| now >= due) {
             self.read_messages(store, now, &mut events, &mut lines);
         }
@@ -2853,15 +2860,17 @@ times in a row)",
     /// `message_not_taken`: a tracked message no `message.taken` names past
     /// its bound, its session not ended with it, no later message of its
     /// session taken and, if typed, no transcript line read since its typing,
-    /// fires once. A typed message whose transcript moved fires nothing and
-    /// leaves no pending bound (issue #66 Part 1). An open one clears once it
-    /// is taken, else once a later message of its session is taken
-    /// (`later_taken`), else once its session ended with it untaken, else once
-    /// its transcript moved after the typing (`read_since_typed`).
-    /// One not due yet is pending, read again until it is taken, ends, its
-    /// transcript moves or it fires; the next bound is the earliest pending
+    /// fires once. A typed message whose transcript moved is suppressed at its
+    /// first reading, before or at its bound, and leaves no pending bound
+    /// (issue #66 Part 1). One read before its bound with no transcript line
+    /// stays pending until due, then is read again and suppressed if the
+    /// transcript moved meanwhile. An open one clears once it is taken, else
+    /// once a later message of its session is taken (`later_taken`), else once
+    /// its session ended with it untaken, else once its transcript moved after
+    /// the typing (`read_since_typed`). The next bound is the earliest pending
     /// one's.
     fn messages(&mut self, messages: &Value, out: &mut Vec<Event>) {
+        self.messages_previous_since = self.messages_since;
         for message in messages["messages"].as_array().into_iter().flatten() {
             let Some(id) = message["command_id"].as_i64() else {
                 continue;
@@ -4406,12 +4415,25 @@ times in a row)",
         events: &[Event],
         lines: &mut Vec<String>,
     ) {
+        self.flush_with(now, events, lines, |record| store.alert_record(record));
+    }
+
+    /// The writer is separate so the state after each store outcome can be
+    /// exercised without a database; production always writes through
+    /// [`PostgresStore::alert_record`].
+    fn flush_with(
+        &mut self,
+        now: i64,
+        events: &[Event],
+        lines: &mut Vec<String>,
+        mut write: impl FnMut(&Value) -> Result<i64, StoreError>,
+    ) {
         for event in events {
             let key = event.key().to_string();
             let Some(record) = self.record_of(event, now) else {
                 continue;
             };
-            match store.alert_record(&record) {
+            match write(&record) {
                 Ok(id) => {
                     let kind = record["kind"].as_str().unwrap_or_default().to_string();
                     let subject = record["subject"].as_str().unwrap_or_default().to_string();
@@ -4471,6 +4493,16 @@ times in a row)",
                     lines.push(format!("alerts: {key}: {why}"));
                 }
                 Err(error) => {
+                    // The alert stays open, but its message reading already
+                    // moved the watermark past the clearing event. Put that
+                    // watermark back and make the next pass read the open
+                    // alert again, even after the late-append margin. A
+                    // refusal above is different: the store says the alert
+                    // is no longer open, so there is nothing to retry.
+                    if record["type"] == "alert.cleared" && key.starts_with("message_not_taken:") {
+                        self.messages_since = self.messages_previous_since;
+                        self.messages_due = Some(now);
+                    }
                     lines.push(format!("alerts: {key}: {error}"));
                 }
             }
@@ -7368,6 +7400,73 @@ mod tests {
             ],
             "{out:?}"
         );
+    }
+
+    /// A transient store failure leaves a message alert open. Its clear must
+    /// remain discoverable after the reading's watermark would otherwise have
+    /// advanced past the transcript event and its 60-second late-append
+    /// margin; the next pass retries the write and clears it once.
+    #[test]
+    fn a_transient_message_clear_failure_restores_its_reading_for_retry() {
+        let mut monitor = monitor();
+        let id = 66;
+        let key = format!("message_not_taken:{id}");
+        monitor.known.insert(
+            key.clone(),
+            Row {
+                kind: "message_not_taken".to_string(),
+                subject: "session_worker_a".to_string(),
+                state: "open".to_string(),
+                evidence: json!({"command": id}),
+                fired_event_id: 12,
+                fired_at_ms: 0,
+            },
+        );
+        monitor.messages_since = 100_000;
+        let reading = |now| {
+            json!({"now_ms": now, "max_id": id, "messages": [
+                {"command_id": id, "agent_id": "agent_worker_a",
+                 "session_id": "session_worker_a", "action": "input",
+                 "created_at_ms": 380_000, "due_ms": 500_000, "tracked": true,
+                 "not_taken": true, "typed": true, "read_since_typed": 1,
+                 "taken": 0, "ended": false, "state": "typed"}
+            ]})
+        };
+        let mut out = Vec::new();
+        monitor.messages(&reading(500_000), &mut out);
+        assert!(matches!(&out[..], [Event::Clear { key: clear, .. }] if *clear == key));
+        assert_eq!(monitor.messages_since, 440_000);
+        assert_eq!(monitor.messages_due, None);
+
+        let mut lines = Vec::new();
+        monitor.flush_with(500_000, &out, &mut lines, |_record| {
+            Err(spawn_core::port::StoreError::Unreachable(
+                "connection reset".to_string(),
+            ))
+        });
+        assert!(monitor.is_open(&key), "the failed clear stays open");
+        assert_eq!(
+            monitor.messages_since, 100_000,
+            "the clearing event is inside the retry's window"
+        );
+        assert_eq!(monitor.messages_due, Some(500_000), "retry next pass");
+        monitor.plan(500_000);
+        assert_eq!(monitor.next_bound_ms, Some(500_000));
+
+        let later = 500_000 + super::MESSAGES_MARGIN_MS + 1_000;
+        let mut retry = Vec::new();
+        monitor.messages(&reading(later), &mut retry);
+        assert!(matches!(&retry[..], [Event::Clear { key: clear, .. }] if *clear == key));
+        let mut writes = 0;
+        monitor.flush_with(later, &retry, &mut lines, |record| {
+            writes += 1;
+            assert_eq!(record["type"], "alert.cleared");
+            assert_eq!(record["key"], json!(key));
+            Ok(99)
+        });
+        assert_eq!(writes, 1);
+        assert!(!monitor.is_open(&key), "the retry records the clear");
+        assert!(lines.iter().any(|line| line.contains("connection reset")));
     }
 
     /// Objective 056 after a restart: an owner alert read back (per source)
@@ -11076,13 +11175,29 @@ execute function alerts_test_deploys_mid_start();
 
         /// Run `case` on a migrated schema of its own, dropped afterwards.
         fn in_schema(name: &str, case: impl FnOnce(&PostgresStore)) {
+            in_schema_with_client(name, |store, _| case(store));
+        }
+
+        /// [`in_schema`], with an owner connection for a case that must put a
+        /// record at an exact time rather than wait for the database's clock.
+        fn in_schema_with_client(
+            name: &str,
+            case: impl FnOnce(&PostgresStore, &mut postgres::Client),
+        ) {
             let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
                 "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
             );
             let schema = spawn_postgres::testing::TestSchema::new(name);
             let store = PostgresStore::connect_in_schema(&url, &schema)
                 .expect("a schema of its own, migrated");
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case(&store)));
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+            let mut client =
+                postgres::Client::connect(&owner, postgres::NoTls).expect("the owner connects");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                case(&store, &mut client);
+            }));
+            drop(client);
             drop(store);
             if let Err(panic) = result {
                 std::panic::resume_unwind(panic);
@@ -12250,6 +12365,63 @@ execute function alerts_test_deploys_mid_start();
                     "{unread_text}"
                 );
                 assert!(!unread_text.contains("has not taken"), "{unread_text}");
+            });
+        }
+
+        /// With the real, non-zero bound, transcript movement before the first
+        /// reading suppresses a typed message immediately rather than leaving
+        /// it pending. With no movement at that first pre-due reading it stays
+        /// pending; movement while pending suppresses it when its bound falls
+        /// due and it is read again.
+        #[test]
+        fn typed_messages_are_suppressed_before_due_or_rechecked_at_their_bound() {
+            in_schema_with_client("messages_pre_due", |store, client| {
+                let _early_session = marked_session(store, "early");
+                let early = input(store, "early", "early-message", "a");
+                typed(store, "early", "exec_early_1", early, true);
+                turn_ended(store, "early", "exec_early_1", "early-transcript");
+                let early_id = i64::try_from(early.0).expect("an id");
+                let mut immediate = Monitor::with(super::settings());
+                let events = read(&mut immediate, store);
+                assert!(message_alert(&events, early).is_none(), "{events:?}");
+                assert!(
+                    !immediate.pending.contains_key(&early_id),
+                    "already moved before the first pre-due read: {:?}",
+                    immediate.pending
+                );
+
+                let _pending_session = marked_session(store, "pending");
+                let pending = input(store, "pending", "pending-message", "b");
+                typed(store, "pending", "exec_pending_1", pending, true);
+                let pending_id = i64::try_from(pending.0).expect("an id");
+                let mut waiting = Monitor::with(super::settings());
+                assert!(read(&mut waiting, store).is_empty());
+                let due = waiting.pending.get(&pending_id).copied();
+                assert!(
+                    due.is_some_and(|due| due > store.now_ms().expect("the clock")),
+                    "a real non-zero bound is still pending: {due:?}"
+                );
+
+                // The transcript moves only after that zero-count reading.
+                turn_ended(store, "pending", "exec_pending_1", "pending-transcript");
+                // Age the command past its bound instead of sleeping for it.
+                client
+                    .execute(
+                        "update spawn_commands set created_at_ms = created_at_ms - $2
+                          where id = $1",
+                        &[&pending_id, &(super::settings().message_taken_ms + 1_000)],
+                    )
+                    .expect("put the pending message at its bound");
+                // The clock advancing would wake this cached bound too.
+                waiting.pending.insert(pending_id, 0);
+                waiting.messages_due = Some(0);
+                let events = read(&mut waiting, store);
+                assert!(message_alert(&events, pending).is_none(), "{events:?}");
+                assert!(
+                    !waiting.pending.contains_key(&pending_id),
+                    "the due reading sees the transcript movement: {:?}",
+                    waiting.pending
+                );
             });
         }
 

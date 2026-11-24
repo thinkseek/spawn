@@ -126,6 +126,12 @@ create index if not exists spawn_events_tool_done
 create index if not exists spawn_events_name_time
     on spawn_events (event_name, recorded_at_ms);
 
+-- The message_not_taken alert reads one session's transcript after its typing,
+-- ordered by time and event id so lines in the same millisecond stay ordered.
+-- The partial index leaves every other event source out of that read.
+create index if not exists spawn_events_claude_time
+    on spawn_events (session_id, recorded_at_ms, id) where source = 'claude';
+
 -- Projection: one row per session, written by `spawn_append` in the same
 -- transaction as the event, so `agent_state`, `agent_status` and
 -- `agent_freshness` read one row instead of folding the log. The log stays

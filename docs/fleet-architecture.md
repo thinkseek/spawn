@@ -1682,8 +1682,11 @@ A message's id is its command's id, carried end to end:
   lines the Bridge recorded since the typing, `read_since_typed`, at most
   100 counted) once per message when it becomes not taken while its session
   has not ended with it and, if typed, its transcript has not moved since the
-  typing. A typed message with a positive `read_since_typed` neither fires nor
-  remains pending (issue #66 Part 1). An open alert clears, in precedence
+  typing. Whenever a typed message is read, before or at its bound, a positive
+  `read_since_typed` suppresses it immediately and removes it from `pending`
+  (issue #66 Part 1). If that pre-due count is zero, it stays pending until its
+  `due_ms` bound, when it is read again: transcript movement by then suppresses
+  it, otherwise it fires. An open alert clears, in precedence
   order, when the message is taken, when a later message of its session is
   taken (evidence `later_taken`), when the session ends with it untaken (the
   execution it was typed into, or its own start's, ended; a never-typed one

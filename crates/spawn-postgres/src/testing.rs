@@ -180,6 +180,10 @@ impl Drop for TestSchema {
 /// interventions count must read the day, not the log: tests/experience.rs).
 pub const FLEET_HEALTH: &str = crate::fleet::FLEET_HEALTH;
 
+/// The message alert's incremental read, for a test to read its plan (the
+/// transcript lookup uses its session/time/event-id index: tests/message_due.rs).
+pub const ALERT_MESSAGES_SINCE: &str = crate::alerts::MESSAGES_SINCE;
+
 /// The nodes' two reads, for a test to read their plans (each fact one
 /// seek, never a scan of a node's heartbeats: tests/nodes.rs).
 pub const NODES: &str = crate::nodes::NODES;
