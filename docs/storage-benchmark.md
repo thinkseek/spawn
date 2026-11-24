@@ -1,5 +1,9 @@
 # Storage benchmark
 
+For a large, real-agent fleet case, see **Agent cluster golden benchmark** below.
+That case deliberately uses the live event log and starts model-backed agents;
+the single-process benchmark below is the isolated microbenchmark.
+
 Spawn's storage benchmark is an end-to-end exercise of the host adapters, not a
 synthetic disk-speed test. It creates an isolated repository and workspace, then
 repeatedly performs and validates:
@@ -101,3 +105,64 @@ files can make physical usage lower; use `scripts/storage-extents.py` for the
 physical-extent reading. Transcript appends and PostgreSQL commits are durable;
 the benchmark does not add an extra `fsck` or filesystem sync inside any timed
 operation.
+
+## Agent cluster golden benchmark
+
+`scripts/storage-cluster-benchmark.py` measures the whole fleet path with real
+Spawn missions, tasks, engines, checkpoints, event-log writes and transcript
+handling. Unlike the isolated example, its `run` command deliberately uses the
+configured live Spawn store and starts model-backed agents. Run it only when
+that load and model usage are intended.
+
+Generate the default deterministic golden repository: 32 shards, 64 files per
+shard, 256 KiB per file, **512 MiB total**. Every file and shard has a SHA-256
+in `golden/manifest.json`; the payload is a reproducible, incompressible hash
+stream.
+
+```sh
+python3 -I scripts/storage-cluster-benchmark.py generate \
+  --root /new/empty/storage-golden
+```
+
+The generator writes `seed/`, `golden.git/` and `golden-config.json`. Keep the
+bare repository to reproduce or rerun the case. The generated repository's
+`tools/golden_workload.py` is what agents execute; it reads and validates the
+worker's shard, then writes a deterministic 1 MiB artifact and a JSON result
+with durable file and directory syncs.
+
+Start 32 real agents for eight iterations each:
+
+```sh
+SPAWN_BIN="$HOME/.local/share/spawn-rsi/bin/spawn" \
+python3 -I scripts/storage-cluster-benchmark.py run \
+  --source /new/empty/storage-golden/golden.git \
+  --output /new/empty/storage-cluster-result \
+  --agents 32 --iterations 8
+```
+
+The environment must already contain the normal Spawn owner configuration. The
+runner refuses to start unless the filesystem can hold every mounted dataset
+plus a 20 GiB reserve. Each brief requires a separate Bash call per iteration,
+not one shell loop, so every iteration has its own `tool.started`,
+`tool.completed` and `artifact.committed` timing. Agents may not modify the
+golden inputs or tools, use the network or start subagents.
+
+For every worker and iteration, the runner reads the JSON result and binary
+artifact from the published agent branch, independently recomputes the golden
+artifact hash, and checks that `golden/` and `tools/` are unchanged. It reports:
+
+- per-iteration internal workload, observed tool-event, checkpoint-delay and
+  total event-observation latency distributions (event ingestion can batch a
+  fast start and completion, so these are deliberately separate measures);
+- cluster wall time and stragglers for each iteration number;
+- whole-run verified read bytes and new artifact bytes;
+- deduplicated model token usage and transcript archive failure events;
+- one-second CPU, load, memory, free-space and block-device I/O samples;
+- source size before cleanup and the number of fully verified agents.
+
+The result directory keeps the configuration, task mapping, per-agent event
+tails, host samples, every iteration's raw timing row and `cluster-report.json`.
+The runner best-effort stops all known executions on success or failure and
+closes its temporary mission as dropped. The golden repository and event history
+remain for inspection; mounted workspaces are removed by Spawn's normal stop
+path. Start with `--agents 2 --iterations 2` as a pilot before a large run.
