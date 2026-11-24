@@ -596,6 +596,11 @@ export function objectiveName(mission: number, objective: number | null): string
  * detail. */
 export function gapText(gap: FeatureGap, mission: number): string {
   const named = gap.objectives.map((objective) => objectiveName(mission, objective)).join(", ");
+  // A gap of a capability that names no objective (a gated owner landing)
+  // says what it is about in its detail, not in objective names.
+  if (gap.objectives.length === 0 && gap.detail !== null) {
+    if (gap.kind === "unverified" || gap.kind === "not_deployed") return gap.detail;
+  }
   switch (gap.kind) {
     case "objective_missing":
       return `mapping names ${named}, not in the backlog`;
@@ -620,6 +625,20 @@ export function gapText(gap: FeatureGap, mission: number): string {
     default:
       return gap.detail ?? gap.kind;
   }
+}
+
+/** A landing in words, for the inspector and the map's cards alike:
+ * `landed task #12 · <commit> · <when>`, `solved on the base a task`, or
+ * `gated owner landing · <commit> · <when>`. `when` is the landing's
+ * relative time, empty when it has none. An owner landing is a gated
+ * `spawn mission push`, so it names no task. */
+export function landingLabel(landing: FeatureLanding, when: string): string {
+  const commit = landing.commit ? ` · ${landing.commit.slice(0, 10)}` : "";
+  const at = when ? ` · ${when}` : "";
+  if (landing.kind === "owner_landing") return `gated owner landing${commit}${at}`;
+  const task = landing.task === null ? "a task" : `task #${landing.task}`;
+  const solved = landing.kind === "solved_on_base" ? "solved on the base" : "landed";
+  return `${solved} ${task}${commit}${at}`;
 }
 
 /** A source's short name: `Objective 4/003`, `Issue #63`, `Owner request`. */

@@ -11,7 +11,9 @@ by the `model` of its JSON body:
 - Everything else goes unchanged to the upstream gateway, with the client's
   own auth headers. The relay never holds the gateway's token.
 - With `MODEL_RELAY_EVERY_MODEL_AS` set (a `deepseek-*` name), every other
-  model goes to DeepSeek too, as that model. For when the gateway cannot
+  model goes to DeepSeek too, as that model (a value that is not
+  `deepseek-*` is cleared and ignored, with a warning at start, not refused,
+  so the relay does not crash-loop). For when the gateway cannot
   serve (its quota spent), so engines keep working without a restart; unset
   it to send them back. The request's `model` is rewritten, and its history
   made one DeepSeek takes (checked 2026-11-07 with deepseek-v4-pro):
@@ -70,7 +72,9 @@ Environment:
   DEEPSEEK_API_KEY        required
   DEEPSEEK_ANTHROPIC_URL  default https://api.deepseek.com/anthropic
   MODEL_RELAY_EVERY_MODEL_AS  a deepseek-* model every other model is sent
-                          to DeepSeek as; unset (the default) for none
+                          to DeepSeek as; unset (the default) for none; a
+                          value that is not deepseek-* is cleared and
+                          ignored, with a warning at start
   MODEL_RELAY_UPSTREAM    the gateway every other model goes to; default the
                           `env.ANTHROPIC_BASE_URL` of Claude Code's user
                           settings ($CLAUDE_CONFIG_DIR or ~/.claude), which
@@ -610,15 +614,35 @@ def refusal(settings):
         return "DEEPSEEK_API_KEY is not set"
     if not settings["upstream"]:
         return "no upstream; set MODEL_RELAY_UPSTREAM"
-    if settings["every_model_as"] and not settings["every_model_as"].startswith("deepseek-"):
-        return (
-            f"MODEL_RELAY_EVERY_MODEL_AS names {settings['every_model_as']}, "
-            "not a deepseek-* model"
-        )
+    # A bad MODEL_RELAY_EVERY_MODEL_AS is not refused here: an exit under
+    # systemd's Restart=always would loop and take every worker's model
+    # down. normalize_every_model_override() clears it with a warning.
     # Whoever reaches the relay spends the key, so it serves loopback only.
     if settings["host"] not in ("127.0.0.1", "::1", "[::1]", "localhost"):
         return f"refusing to listen on {settings['host']}; use 127.0.0.1"
     return None
+
+
+EVERY_MODEL_AS_SHOWN = 80
+
+
+def normalize_every_model_override(settings):
+    """Clears a MODEL_RELAY_EVERY_MODEL_AS that does not name a deepseek-*
+    model, so the relay serves the normal route instead of exiting (and
+    crash-looping under Restart=always). Returns the one-line warning to
+    write, or None when the setting is empty or valid. The value shown is
+    flattened to one line and at most EVERY_MODEL_AS_SHOWN characters."""
+    value = settings["every_model_as"]
+    if not value or value.startswith("deepseek-"):
+        return None
+    settings["every_model_as"] = ""
+    shown = "".join(c if c.isprintable() else "?" for c in value)
+    if len(shown) > EVERY_MODEL_AS_SHOWN:
+        shown = shown[: EVERY_MODEL_AS_SHOWN - 3] + "..."
+    return (
+        f"model-relay: MODEL_RELAY_EVERY_MODEL_AS names {shown!r}, not a "
+        "deepseek-* model; ignored, every model keeps its normal route"
+    )
 
 
 def not_dumpable():
@@ -641,6 +665,9 @@ def main():
     problem = refusal(settings)
     if problem:
         sys.exit(f"model-relay: {problem}")
+    warning = normalize_every_model_override(settings)
+    if warning:
+        sys.stderr.write(warning + "\n")
     server = serve(settings)
     upstream = urllib.parse.urlsplit(settings["upstream"]).hostname
     deepseek = urllib.parse.urlsplit(settings["deepseek"]).hostname

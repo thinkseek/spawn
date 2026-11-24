@@ -11,6 +11,8 @@
 //!
 //! - API keys by their prefix: `sk-…`, `ghp_…` (and GitHub's other `gh?_`
 //!   tokens), `github_pat_…`, `AKIA…` (AWS access key ids);
+//! - an `sk-` key shown elided, as Claude Code's API-key dialog prints it:
+//!   `sk-ant-...` (or `…`) and the key's last characters;
 //! - `Bearer <token>`;
 //! - a credential header's value: `Authorization:` and
 //!   `Proxy-Authorization:` whatever the scheme (`Basic …`, `token …`, a
@@ -149,7 +151,8 @@ fn prefixed_keys(text: &str) -> String {
                         .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
                     && bytes.get(at + 20).is_none_or(|next| !word_byte(*next))
             });
-            if let Some(length) = length.or(aws.then_some(20)) {
+            let elided = elided_sk_key_len(&bytes[at..]);
+            if let Some(length) = elided.or(length).or(aws.then_some(20)) {
                 out.extend_from_slice(REDACTED.as_bytes());
                 at += length;
                 continue;
@@ -159,6 +162,43 @@ fn prefixed_keys(text: &str) -> String {
         at += 1;
     }
     text_of(out)
+}
+
+/// The length of an `sk-` key shown elided at the start of `bytes`: `sk-`,
+/// then nothing or token bytes ending in `-` (`ant-`, `proj-`), `...` or
+/// `…`, then at least 4 bytes of the key's tail (`sk-ant-...AbCd1234`).
+/// Claude Code's API-key dialog prints a key so; the tail alone is still
+/// part of the secret. The head must end in `-`, so a word such as
+/// `sk-learn...done` stays. The tail is every printable, non-space ASCII
+/// byte but a closing delimiter ([`elided_tail_byte`]): a custom key's tail
+/// may hold `.`, `/`, `+` or `=`, and it still ends at a space, a quote or
+/// a box border (`│`).
+fn elided_sk_key_len(bytes: &[u8]) -> Option<usize> {
+    let rest = bytes.strip_prefix(b"sk-")?;
+    let head = rest.iter().take_while(|byte| word_byte(**byte)).count();
+    if head != 0 && rest[head - 1] != b'-' {
+        return None;
+    }
+    let after = &rest[head..];
+    let dots = if after.starts_with(b"...") {
+        3
+    } else if after.starts_with("\u{2026}".as_bytes()) {
+        "\u{2026}".len()
+    } else {
+        return None;
+    };
+    let tail = after[dots..]
+        .iter()
+        .take_while(|byte| elided_tail_byte(**byte))
+        .count();
+    (tail >= 4).then_some(3 + head + dots + tail)
+}
+
+/// A byte of an elided key's tail: printable, non-space ASCII that does not
+/// close or enclose what holds the key (a quote, `,`, `;`, a closing
+/// bracket, `>`).
+fn elided_tail_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic() && !b"'\"`,;)]}>".contains(&byte)
 }
 
 /// `Bearer <token>`: the word stays, the token goes.
@@ -521,8 +561,65 @@ mod tests {
         );
         // Words that merely start the same way stay.
         assert_eq!(redact("pip install sk-learn"), "pip install sk-learn");
+        assert_eq!(redact("risk-...done"), "risk-...done");
+        assert_eq!(redact("sk-... and more"), "sk-... and more");
+        assert_eq!(redact("sk-learn...done"), "sk-learn...done");
+        assert_eq!(
+            redact("use sk-learn\u{2026}done here"),
+            "use sk-learn\u{2026}done here"
+        );
         assert_eq!(redact("risk-assessment"), "risk-assessment");
         assert_eq!(redact("AKIAX is short"), "AKIAX is short");
+    }
+
+    #[test]
+    fn an_elided_sk_key_as_claude_s_api_key_dialog_shows_it_goes() {
+        assert_eq!(
+            redact("ANTHROPIC_API_KEY: sk-ant-...Zq9xW3vT0aBcDeFgHiJk"),
+            format!("ANTHROPIC_API_KEY: {REDACTED}")
+        );
+        assert_eq!(
+            redact("key sk-ant-\u{2026}Zq9x used"),
+            format!("key {REDACTED} used")
+        );
+        assert_eq!(redact("sk-...Zq9xW3"), REDACTED);
+        let once = redact("│ ANTHROPIC_API_KEY: sk-ant-...Zq9xW3vT0aBcDeFgHiJk │");
+        assert_eq!(redact(&once), once);
+        assert!(!once.contains("Zq9x"));
+        assert!(once.ends_with(" \u{2502}"));
+        assert_eq!(
+            redact("key sk-proj-...Zq9xW3 used"),
+            format!("key {REDACTED} used")
+        );
+    }
+
+    #[test]
+    fn an_elided_sk_key_whose_tail_holds_non_token_bytes_goes_whole() {
+        for tail in [
+            "ab.cdefghijklmnopqr",
+            "abcd/efgh+ijkl=",
+            "x.y/z+w=",
+            "a_b-c.d",
+        ] {
+            let text = format!("ANTHROPIC_API_KEY: sk-ant-...{tail} set");
+            assert_eq!(
+                redact(&text),
+                format!("ANTHROPIC_API_KEY: {REDACTED} set"),
+                "{tail}"
+            );
+        }
+        // The tail stops at a quote, a closing delimiter or a box border.
+        assert_eq!(
+            redact("key='sk-...ab.cd/ef', next"),
+            format!("key='{REDACTED}', next")
+        );
+        assert_eq!(redact("(sk-...abcd=)"), format!("({REDACTED})"));
+        assert_eq!(
+            redact("\u{2502}sk-ant-...ab+cd\u{2502}"),
+            format!("\u{2502}{REDACTED}\u{2502}")
+        );
+        // Still at least 4 bytes of tail.
+        assert_eq!(redact("sk-...a.b"), "sk-...a.b");
     }
 
     #[test]

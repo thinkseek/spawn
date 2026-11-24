@@ -1112,8 +1112,16 @@ enum Removal {
     Failed(String),
 }
 
+/// A file's device and inode, as wide as std's `MetadataExt` gives them:
+/// the ids a sweep holds come from there.
 fn id_of(stat: &rustix::fs::Stat) -> (u64, u64) {
-    (stat.st_dev, stat.st_ino)
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev;
+    // macOS's `dev_t` is 32 bits and signed; std widens it the same way.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::cast_sign_loss)]
+    let device = stat.st_dev as u64;
+    (device, stat.st_ino)
 }
 
 fn open_dir(at: impl AsFd, name: &OsStr) -> rustix::io::Result<OwnedFd> {

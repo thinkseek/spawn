@@ -23,7 +23,11 @@
 #       event, never a silently short stream (Claude Code reads it as a
 #       server error, not a finished answer);
 #   (5) a body over MODEL_RELAY_MAX_BODY is refused with 413 and reaches
-#       neither upstream.
+#       neither upstream;
+#   (6) a MODEL_RELAY_EVERY_MODEL_AS that is not deepseek-* does not stop
+#       the relay (an exit under Restart=always crash-loops every worker's
+#       model): it starts, warns once on stderr that the value is ignored,
+#       and routes a `claude-*` request to the gateway as usual.
 # A relay with any of these removed fails it with 1 (each was shown so on a
 # copy with the behaviour taken out).
 #
@@ -142,13 +146,16 @@ def start_relay(gateway, deepseek, extra):
     relays.append(proc)
     deadline = time.monotonic() + 15
     line = ""
+    before = []
     while time.monotonic() < deadline:
         line = proc.stderr.readline()
         if "http://127.0.0.1:" in line or not line:
             break
+        before.append(line)
     if "http://127.0.0.1:" not in line:
         raise Harness(f"the relay did not start: {line.strip() or 'no output'} (exit {proc.poll()})")
     port = int(line.split("http://127.0.0.1:")[1].split("/")[0])
+    startup_lines[f"http://127.0.0.1:{port}"] = before + [line]
 
     def drain():
         for rest in proc.stderr:
@@ -191,12 +198,18 @@ CLIENT_AUTH = {"Authorization": "Bearer gateway-token-of-the-client", "x-api-key
 HISTORY = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "earlier answer"},
            {"role": "user", "content": "go on"}]
 relays = []
+startup_lines = {}
 
 
 def main():
     gateway, deepseek = Stub("gateway"), Stub("deepseek")
     plain = start_relay(gateway, deepseek, {"MODEL_RELAY_MAX_BODY": "4096"})
     mapped = start_relay(gateway, deepseek, {"MODEL_RELAY_EVERY_MODEL_AS": "deepseek-check"})
+    try:  # a relay that exits on it is this check's failure (1), not the harness's
+        misnamed = start_relay(gateway, deepseek, {"MODEL_RELAY_EVERY_MODEL_AS": "claude-not-deepseek"})
+    except Harness as error:
+        misnamed = None
+        check(False, f"(6) a non-deepseek MODEL_RELAY_EVERY_MODEL_AS must not stop the relay: {error}")
 
     # (1) the route by model
     gateway.replies.append(("json", 200, {"type": "message", "from": "gateway"}))
@@ -255,6 +268,21 @@ def main():
     check(status == 413, f"(5) a body over MODEL_RELAY_MAX_BODY is refused with 413 ({status})")
     check(len(gateway.seen) + len(deepseek.seen) == seen, "(5) and reaches neither upstream")
 
+    # (6) a non-deepseek MODEL_RELAY_EVERY_MODEL_AS is ignored, not fatal
+    if misnamed is None:
+        return
+    said = "".join(startup_lines.get(misnamed, []))
+    check("claude-not-deepseek" in said and "ignored" in said,
+          "(6) a non-deepseek MODEL_RELAY_EVERY_MODEL_AS starts the relay with a warning that it is ignored")
+    check("others to 127.0.0.1" in said, "(6) and the relay says it routes others to the gateway")
+    gateway.replies.append(("json", 200, {"type": "message", "from": "gateway"}))
+    before, ds_before = len(gateway.seen), len(deepseek.seen)
+    status, body = post(misnamed, {"model": "claude-check-6", "messages": HISTORY, "max_tokens": 8}, CLIENT_AUTH)
+    check(status == 200 and b'"gateway"' in body,
+          f"(6) its claude-* request is answered by the gateway (status {status})")
+    check(len(gateway.seen) == before + 1 and len(deepseek.seen) == ds_before,
+          "(6) and DeepSeek never sees it")
+
     for proc in relays:
         if proc.poll() is not None:
             raise Harness(f"a relay exited during the check (exit {proc.returncode})")
@@ -280,6 +308,6 @@ if failures:
             for line in tail:
                 print(f"  {name}: {line}")
     sys.exit(1)
-print("check-model-relay: route, mapping, stream retry, cut signal and body cap hold")
+print("check-model-relay: route, mapping, stream retry, cut signal, body cap and ignored bad mapping hold")
 PY
 python3 -I "$work/check.py" "$relay" "$work"

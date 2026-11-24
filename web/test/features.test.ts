@@ -7,13 +7,14 @@ import {
   deployNote,
   gapText,
   groupByState,
+  landingLabel,
   normalizeFeatureMap,
   objectiveName,
   ownerText,
   sourceLabel,
   verificationNote,
 } from "../src/features.ts";
-import type { FeatureBlocker } from "../src/features.ts";
+import type { FeatureBlocker, FeatureLanding } from "../src/features.ts";
 
 const blocker = (value: Partial<FeatureBlocker>): FeatureBlocker => ({
   kind: "unknown",
@@ -211,6 +212,53 @@ test("gaps name the objective that is behind, not a percentage", () => {
   );
   assert.equal(objectiveName(4, 3), "4/003");
   assert.equal(objectiveName(4, null), "objective ?");
+});
+
+test("an owner-landed capability's gaps say what they are about in their detail", () => {
+  const detail =
+    "last changed by gated owner landing 453cc14134a1 (request 230398); no objective verification is recorded for it";
+  assert.equal(gapText({ kind: "unverified", objectives: [], detail }, 4), detail);
+  const waiting = "gated owner landing 453cc14134a1 landed after the newest successful deploy";
+  assert.equal(gapText({ kind: "not_deployed", objectives: [], detail: waiting }, 4), waiting);
+  const behind =
+    "the domain names no objective; 1 of its 2 direct capabilities are not yet live and verified";
+  assert.equal(gapText({ kind: "children_behind", objectives: [], detail: behind }, 4), behind);
+});
+
+test("a landing reads as what landed it: a task, a solve on the base, or a gated owner landing", () => {
+  const landing = (value: Partial<FeatureLanding>): FeatureLanding => ({
+    objective: 3,
+    task: 12,
+    kind: "landed",
+    at_ms: 1_000,
+    event: 40,
+    commit: "453cc14134a1bd51459f0358bbc131eaf225a3bb",
+    base: null,
+    ...value,
+  });
+  assert.equal(landingLabel(landing({}), "2h ago"), "landed task #12 · 453cc14134 · 2h ago");
+  assert.equal(
+    landingLabel(landing({ task: null, commit: null, at_ms: null }), ""),
+    "landed a task",
+  );
+  assert.equal(
+    landingLabel(landing({ kind: "solved_on_base", task: 7 }), "5m ago"),
+    "solved on the base task #7 · 453cc14134 · 5m ago",
+  );
+  assert.equal(
+    landingLabel(landing({ kind: "solved_on_base", task: null, commit: null }), ""),
+    "solved on the base a task",
+  );
+  const owner = landingLabel(
+    landing({ kind: "owner_landing", objective: null, task: null }),
+    "2h ago",
+  );
+  assert.equal(owner, "gated owner landing · 453cc14134 · 2h ago");
+  assert.ok(!owner.includes("landed a task"));
+  assert.equal(
+    landingLabel(landing({ kind: "owner_landing", task: null, commit: null, at_ms: null }), ""),
+    "gated owner landing",
+  );
 });
 
 test("sources keep their kind and stable reference, native or external", () => {

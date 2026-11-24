@@ -200,7 +200,7 @@
       "provenance": {
         "objectives": [
           "4/001",
-          "4/004"
+          "4/015"
         ],
         "tasks": [],
         "agents": [],
@@ -237,7 +237,7 @@
       ],
       "provenance": {
         "objectives": [
-          "4/015",
+          "4/023",
           "4/145"
         ],
         "tasks": [],
@@ -275,11 +275,23 @@
         {
           "kind": "contains",
           "target": "cap-transcript-archive"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-resource-envelopes"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-overlay-workspaces"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-cow-cas-workspaces"
         }
       ],
       "provenance": {
         "objectives": [
-          "4/015",
+          "4/003",
           "4/028"
         ],
         "tasks": [],
@@ -317,8 +329,8 @@
       ],
       "provenance": {
         "objectives": [
-          "4/004",
-          "4/241"
+          "4/011",
+          "4/039"
         ],
         "tasks": [],
         "agents": [],
@@ -356,6 +368,10 @@
         {
           "kind": "contains",
           "target": "cap-agent-grading"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-node-registry"
         }
       ],
       "provenance": {
@@ -488,7 +504,8 @@
       ],
       "provenance": {
         "objectives": [
-          "4/488",
+          "4/040",
+          "4/051",
           "t559u"
         ],
         "tasks": [
@@ -651,8 +668,15 @@
       "relations": [],
       "provenance": {
         "objectives": [
-          "4/001",
-          "4/004"
+          "4/015",
+          "4/023",
+          "4/025",
+          "4/044",
+          "4/045",
+          "4/206",
+          "4/214",
+          "4/241",
+          "4/243"
         ],
         "tasks": [],
         "agents": [],
@@ -687,7 +711,9 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/001"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [
@@ -758,7 +784,15 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/023",
+          "4/043",
+          "4/055",
+          "4/109",
+          "4/139",
+          "4/170",
+          "4/171"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -796,15 +830,11 @@
         "crates/spawn-cli/src/storage.rs",
         "crates/spawn-cli/src/storage_bytes.rs",
         "crates/spawn-cli/src/storage_bytes/tests.rs",
-        "crates/spawn-host/src/cas_dedup.rs",
-        "crates/spawn-host/src/overlay.rs",
         "crates/spawn-host/src/scratch.rs",
         "crates/spawn-postgres/src/commit_map.rs",
         "crates/spawn-postgres/tests/commit_map.rs",
         "crates/spawn-postgres/tests/commit_map_checkpoints.rs",
         "crates/spawn-postgres/tests/storage.rs",
-        "docs/cross-os-cow-storage.md",
-        "docs/layerfs-v2-overlay.md",
         "docs/recoverable-storage-keys.md",
         "docs/storage.md",
         "rsi/backlog/054.json",
@@ -882,7 +912,36 @@
       ],
       "provenance": {
         "objectives": [
-          "4/145"
+          "4/054",
+          "4/055",
+          "4/065",
+          "4/074",
+          "4/083",
+          "4/085",
+          "4/091",
+          "4/094",
+          "4/097",
+          "4/098",
+          "4/139",
+          "4/140",
+          "4/141",
+          "4/145",
+          "4/155",
+          "4/173",
+          "4/177",
+          "4/178",
+          "4/180",
+          "4/182",
+          "4/185",
+          "4/202",
+          "4/204",
+          "4/215",
+          "4/220",
+          "4/222",
+          "4/225",
+          "4/228",
+          "4/232",
+          "4/236"
         ],
         "tasks": [],
         "agents": [],
@@ -903,7 +962,7 @@
       "title": "Git Workspaces, Branch Checkpoints, Merge & Set-Aside",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "Canonical workspace root resolution, descriptor-safe agent file access, mission workspace materialization, git checkpointing, main-branch merge, background push, and set-aside commits.",
+      "summary": "Canonical workspace root resolution, descriptor-safe agent file access, mission workspace materialization, git checkpointing, main-branch merge, background push, and set-aside commits. Overlay and copy-on-write stores: cap-overlay-workspaces, cap-cow-cas-workspaces.",
       "files": [
         "crates/spawn-cli/src/commit_now.rs",
         "crates/spawn-cli/src/main_merge.rs",
@@ -917,21 +976,15 @@
         "crates/spawn-host/src/agent_files.rs",
         "crates/spawn-host/src/beneath.rs",
         "crates/spawn-host/src/beneath/tests.rs",
-        "crates/spawn-host/src/cow.rs",
         "crates/spawn-host/src/git.rs",
         "crates/spawn-host/src/home.rs",
         "crates/spawn-host/src/lib.rs",
-        "crates/spawn-host/src/overlay.rs",
         "crates/spawn-host/src/root.rs",
         "crates/spawn-host/src/tree_path.rs",
         "crates/spawn-host/tests/branches.rs",
-        "crates/spawn-host/tests/cow.rs",
         "crates/spawn-host/tests/identity.rs",
-        "crates/spawn-host/tests/overlay.rs",
         "crates/spawn-host/tests/runtime_files.rs",
         "crates/spawn-postgres/tests/sources.rs",
-        "docs/cross-os-cow-storage.md",
-        "docs/layerfs-v2-overlay.md",
         "docs/storage.md",
         "rsi/backlog/003.json",
         "rsi/backlog/004.json",
@@ -960,16 +1013,25 @@
       ],
       "provenance": {
         "objectives": [
-          "4/015",
-          "4/028"
+          "4/003",
+          "4/004",
+          "4/008",
+          "4/012",
+          "4/014",
+          "4/021",
+          "4/026",
+          "4/173",
+          "4/177",
+          "4/178",
+          "4/194",
+          "4/205"
         ],
         "tasks": [],
         "agents": [],
         "commits": [],
         "tests": [
           "crates/spawn-host/tests/branches.rs",
-          "crates/spawn-host/tests/identity.rs",
-          "crates/spawn-host/tests/overlay.rs"
+          "crates/spawn-host/tests/identity.rs"
         ],
         "deploys": [],
         "artifacts": [
@@ -1002,10 +1064,8 @@
         "crates/spawn-postgres/tests/zombie.rs",
         "rsi/backlog/025.json",
         "rsi/backlog/028.json",
-        "rsi/backlog/029.json",
         "rsi/backlog/032.json",
         "rsi/backlog/044.json",
-        "rsi/scenarios/nightly/029.sh",
         "rsi/scenarios/nightly/044.sh",
         "rsi/scenarios/nightly/check-j06-recover-a.sh",
         "rsi/scenarios/nightly/check-j07-recover-b.sh",
@@ -1019,7 +1079,12 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/025",
+          "4/028",
+          "4/032",
+          "4/044"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -1065,7 +1130,14 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/048",
+          "4/175",
+          "4/179",
+          "4/193",
+          "4/214",
+          "4/241"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -1075,6 +1147,124 @@
         "deploys": [],
         "artifacts": [
           "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-resource-envelopes",
+      "title": "Per-Execution & Per-Gate systemd Resource Envelopes",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "Owner-judged objective 4/029, not landed: each execution and each gate in a systemd user scope of Spawn's slice with limits that hold, a memory-limit kill that ends one execution and is resumed, a gate its envelope kills judged again as a host fault, and admission that waits for room.",
+      "files": [
+        "rsi/backlog/029.json",
+        "rsi/scenarios/nightly/029.sh"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-tmux-runner"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-rsi-integration-gate"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-deploy-and-systemd"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "4/029"
+        ],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-overlay-workspaces",
+      "title": "Overlay v2 (layerfs) Workspace Store",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "The layerfs v2 overlay workspace store: a read-only base layer shared by agent workspaces with a private upper layer per agent (M7 #556).",
+      "files": [
+        "crates/spawn-host/src/overlay.rs",
+        "crates/spawn-host/tests/overlay.rs",
+        "docs/layerfs-v2-overlay.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-storage-lifecycle"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "140acf7dd"
+        ],
+        "tests": [
+          "crates/spawn-host/tests/overlay.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/layerfs-v2-overlay.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-cow-cas-workspaces",
+      "title": "Copy-on-Write Workspace Store with CAS Dedup",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "The cross-OS copy-on-write workspace store (reflink clones) with content-addressed block deduplication (M7 #557).",
+      "files": [
+        "crates/spawn-host/src/cas_dedup.rs",
+        "crates/spawn-host/src/cow.rs",
+        "crates/spawn-host/tests/cow.rs",
+        "docs/cross-os-cow-storage.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-overlay-workspaces"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-storage-lifecycle"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "2a785c5cd"
+        ],
+        "tests": [
+          "crates/spawn-host/tests/cow.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/cross-os-cow-storage.md"
         ],
         "discussions": []
       }
@@ -1116,7 +1306,10 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/010",
+          "4/011"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -1176,7 +1369,9 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/039"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -1197,7 +1392,7 @@
       "title": "Missions, Task Dispatch, Supervision & Verifications",
       "kind": "capability",
       "parent": "domain-missions-fleet",
-      "summary": "Mission/task/resident CLI & PG views, charter & digest dispatch, delivery retry/reissue, stall detection, work-stealing, supervisor, and `spawn verify`.",
+      "summary": "Mission/task/resident CLI & PG views, charter & digest dispatch, delivery retry/reissue, stall detection, work-stealing, supervisor, and `spawn verify` (fleet nodes: cap-node-registry).",
       "files": [
         "crates/spawn-cli/src/deliver.rs",
         "crates/spawn-cli/src/deliver/unfinished.rs",
@@ -1212,8 +1407,6 @@
         "crates/spawn-cli/src/dispatch/stops.rs",
         "crates/spawn-cli/src/dispatch/worker.rs",
         "crates/spawn-cli/src/missions.rs",
-        "crates/spawn-cli/src/nodes.rs",
-        "crates/spawn-cli/src/nodes/tests.rs",
         "crates/spawn-cli/src/objectives.rs",
         "crates/spawn-cli/src/sources.rs",
         "crates/spawn-cli/src/supervise.rs",
@@ -1226,7 +1419,6 @@
         "crates/spawn-postgres/src/experience.rs",
         "crates/spawn-postgres/src/fleet.rs",
         "crates/spawn-postgres/src/missions.rs",
-        "crates/spawn-postgres/src/nodes.rs",
         "crates/spawn-postgres/src/recovery.rs",
         "crates/spawn-postgres/src/sessions.rs",
         "crates/spawn-postgres/src/verifications.rs",
@@ -1241,7 +1433,6 @@
         "crates/spawn-postgres/tests/judgings.rs",
         "crates/spawn-postgres/tests/merges.rs",
         "crates/spawn-postgres/tests/message_due.rs",
-        "crates/spawn-postgres/tests/nodes.rs",
         "crates/spawn-postgres/tests/pause.rs",
         "crates/spawn-postgres/tests/recovery.rs",
         "crates/spawn-postgres/tests/reissue.rs",
@@ -1300,7 +1491,22 @@
       ],
       "provenance": {
         "objectives": [
+          "4/007",
+          "4/009",
+          "4/012",
+          "4/013",
+          "4/019",
+          "4/026",
+          "4/028",
+          "4/032",
+          "4/039",
+          "4/042",
+          "4/099",
+          "4/102",
+          "4/133",
+          "4/135",
           "4/211",
+          "4/212",
           "4/239"
         ],
         "tasks": [],
@@ -1455,7 +1661,32 @@
       ],
       "provenance": {
         "objectives": [
+          "4/004",
+          "4/010",
+          "4/014",
+          "4/016",
+          "4/018",
+          "4/020",
+          "4/021",
+          "4/033",
+          "4/034",
+          "4/035",
+          "4/036",
+          "4/037",
+          "4/052",
+          "4/053",
+          "4/096",
+          "4/129",
+          "4/131",
+          "4/168",
+          "4/169",
+          "4/172",
           "4/208",
+          "4/210",
+          "4/221",
+          "4/223",
+          "4/234",
+          "4/237",
           "4/243"
         ],
         "tasks": [],
@@ -1543,6 +1774,51 @@
         "artifacts": [
           "docs/agent-grading.md",
           "evals/onboarding/README.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-node-registry",
+      "title": "Fleet Node Registry, Heartbeats & Drain",
+      "kind": "capability",
+      "parent": "domain-missions-fleet",
+      "summary": "Owned machines as fleet nodes (M7 #555): `spawn node add|list|drain|undrain|remove`, the heartbeat worker, the PostgreSQL node store and the Fleet page's node rows.",
+      "files": [
+        "crates/spawn-cli/src/nodes.rs",
+        "crates/spawn-cli/src/nodes/tests.rs",
+        "crates/spawn-postgres/src/nodes.rs",
+        "crates/spawn-postgres/tests/nodes.rs",
+        "docs/fleet-architecture.md",
+        "web/src/components/fleet/NodeRows.tsx",
+        "web/src/nodes.ts",
+        "web/test/nodes.test.ts"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-mission-dispatch"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [
+          "0f8c968de"
+        ],
+        "tests": [
+          "crates/spawn-cli/src/nodes/tests.rs",
+          "crates/spawn-postgres/tests/nodes.rs",
+          "web/test/nodes.test.ts"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/fleet-architecture.md"
         ],
         "discussions": []
       }
@@ -1641,8 +1917,31 @@
       ],
       "provenance": {
         "objectives": [
+          "4/017",
+          "4/041",
+          "4/043",
+          "4/047",
           "4/048",
-          "4/159"
+          "4/049",
+          "4/059",
+          "4/060",
+          "4/061",
+          "4/062",
+          "4/067",
+          "4/076",
+          "4/077",
+          "4/081",
+          "4/086",
+          "4/088",
+          "4/095",
+          "4/132",
+          "4/156",
+          "4/158",
+          "4/159",
+          "4/168",
+          "4/181",
+          "4/195",
+          "4/207"
         ],
         "tasks": [],
         "agents": [],
@@ -1736,8 +2035,32 @@
       ],
       "provenance": {
         "objectives": [
+          "4/030",
+          "4/045",
+          "4/046",
+          "4/050",
+          "4/053",
+          "4/056",
+          "4/057",
+          "4/058",
+          "4/071",
+          "4/074",
+          "4/080",
+          "4/089",
           "4/092",
-          "4/151"
+          "4/106",
+          "4/135",
+          "4/138",
+          "4/148",
+          "4/151",
+          "4/166",
+          "4/172",
+          "4/192",
+          "4/193",
+          "4/204",
+          "4/209",
+          "4/215",
+          "4/219"
         ],
         "tasks": [],
         "agents": [],
@@ -1813,7 +2136,20 @@
       ],
       "provenance": {
         "objectives": [
-          "4/123"
+          "4/108",
+          "4/109",
+          "4/113",
+          "4/114",
+          "4/115",
+          "4/116",
+          "4/117",
+          "4/121",
+          "4/122",
+          "4/123",
+          "4/170",
+          "4/171",
+          "4/175",
+          "4/206"
         ],
         "tasks": [],
         "agents": [],
@@ -1935,7 +2271,32 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/031",
+          "4/082",
+          "4/087",
+          "4/093",
+          "4/097",
+          "4/104",
+          "4/105",
+          "4/107",
+          "4/112",
+          "4/114",
+          "4/115",
+          "4/116",
+          "4/136",
+          "4/149",
+          "4/167",
+          "4/186",
+          "4/198",
+          "4/199",
+          "4/200",
+          "4/203",
+          "4/216",
+          "4/217",
+          "4/224",
+          "4/231"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2014,10 +2375,8 @@
         "deploy/test-deploy.sh",
         "deploy/test-on-landing.sh",
         "docs/upgrading.md",
-        "rsi/backlog/029.json",
         "rsi/backlog/149.json",
         "rsi/backlog/186.json",
-        "rsi/scenarios/nightly/029.sh",
         "rsi/scenarios/nightly/149.sh",
         "rsi/scenarios/186.sh",
         "rsi/scenarios/nightly/238.sh",
@@ -2036,7 +2395,10 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/149",
+          "4/186"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [
@@ -2153,8 +2515,34 @@
       ],
       "provenance": {
         "objectives": [
+          "4/015",
           "4/040",
-          "4/051"
+          "4/051",
+          "4/064",
+          "4/066",
+          "4/070",
+          "4/073",
+          "4/078",
+          "4/084",
+          "4/090",
+          "4/093",
+          "4/094",
+          "4/100",
+          "4/105",
+          "4/132",
+          "4/141",
+          "4/148",
+          "4/156",
+          "4/176",
+          "4/181",
+          "4/182",
+          "4/185",
+          "4/207",
+          "4/222",
+          "4/228",
+          "4/230",
+          "4/231",
+          "4/233"
         ],
         "tasks": [],
         "agents": [],
@@ -2202,9 +2590,7 @@
         }
       ],
       "provenance": {
-        "objectives": [
-          "4/488"
-        ],
+        "objectives": [],
         "tasks": [
           "488",
           "492",
@@ -2318,7 +2704,11 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/119",
+          "4/120",
+          "4/131"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2431,7 +2821,39 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/049",
+          "4/051",
+          "4/056",
+          "4/058",
+          "4/064",
+          "4/065",
+          "4/069",
+          "4/070",
+          "4/071",
+          "4/073",
+          "4/078",
+          "4/082",
+          "4/083",
+          "4/084",
+          "4/086",
+          "4/087",
+          "4/088",
+          "4/089",
+          "4/090",
+          "4/091",
+          "4/092",
+          "4/098",
+          "4/100",
+          "4/102",
+          "4/103",
+          "4/112",
+          "4/120",
+          "4/176",
+          "4/230",
+          "4/232",
+          "4/233"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2494,10 +2916,21 @@
         {
           "kind": "relates_to",
           "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-node-registry"
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/040",
+          "4/042",
+          "4/103",
+          "4/158",
+          "4/225",
+          "4/227"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2533,7 +2966,10 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/080",
+          "4/151"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2595,7 +3031,16 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/041",
+          "4/059",
+          "4/060",
+          "4/062",
+          "4/068",
+          "4/075",
+          "4/077",
+          "4/079"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2628,7 +3073,9 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/072"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2676,7 +3123,10 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/066",
+          "4/211"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2722,7 +3172,10 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "4/052",
+          "4/063"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [],
@@ -2824,8 +3277,7 @@
       "provenance": {
         "objectives": [
           "t559u",
-          "t565u",
-          "4/488"
+          "t565u"
         ],
         "tasks": [
           "494",

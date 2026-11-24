@@ -795,9 +795,35 @@ class RelayTest(unittest.TestCase):
         for change in (
             {"DEEPSEEK_API_KEY": ""},
             {"MODEL_RELAY_ADDRESS": "0.0.0.0:8791"},
-            {"MODEL_RELAY_EVERY_MODEL_AS": "claude-opus-5-5"},
         ):
             self.assertIsNotNone(relay.refusal(relay.config({**good, **change})))
+        # No upstream stays fatal (config may fall back to Claude's settings).
+        self.assertIsNotNone(relay.refusal({**relay.config(good), "upstream": ""}))
+
+    def test_a_non_deepseek_every_model_as_is_cleared_with_a_warning_not_fatal(self):
+        """A bad MODEL_RELAY_EVERY_MODEL_AS must not stop the relay: under
+        Restart=always an exit loops and takes every worker's model down."""
+        good = {"DEEPSEEK_API_KEY": FAKE_KEY, "MODEL_RELAY_UPSTREAM": "http://gateway"}
+        settings = relay.config({**good, "MODEL_RELAY_EVERY_MODEL_AS": "claude-opus-5-5"})
+        self.assertIsNone(relay.refusal(settings))
+        warning = relay.normalize_every_model_override(settings)
+        self.assertEqual(settings["every_model_as"], "")
+        self.assertIn("claude-opus-5-5", warning)
+        self.assertIn("ignored", warning)
+        # A valid or empty value is kept, and says nothing.
+        for value in ("deepseek-v4-pro", ""):
+            settings = relay.config({**good, "MODEL_RELAY_EVERY_MODEL_AS": value})
+            self.assertIsNone(relay.normalize_every_model_override(settings))
+            self.assertEqual(settings["every_model_as"], value)
+        # A hostile value is shown on one bounded line.
+        settings = relay.config({**good, "MODEL_RELAY_EVERY_MODEL_AS": "x\ny\r\tz" + "w" * 500})
+        warning = relay.normalize_every_model_override(settings)
+        self.assertEqual(settings["every_model_as"], "")
+        self.assertNotIn("\n", warning)
+        self.assertNotIn("\r", warning)
+        self.assertNotIn("\t", warning)
+        self.assertLess(len(warning), 80 + 200)
+        self.assertNotIn("w" * 100, warning)
 
     def test_a_relay_is_not_dumpable_so_its_environment_is_its_own(self):
         """The key lives in the relay's environment; a same-user process

@@ -1213,6 +1213,84 @@ fn a_prompt_that_cannot_be_typed_ends_the_execution_as_lost() {
     );
 }
 
+/// The error of the last `command.finished` in the log, if it failed.
+fn last_command_failure_error(store: &MemoryStore) -> Option<String> {
+    events(store)
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.kind {
+            EventKind::CommandFinished {
+                succeeded: false,
+                error,
+                ..
+            } => error,
+            _ => None,
+        })
+}
+
+#[test]
+fn a_ready_wait_that_fails_quotes_the_pane_s_redacted_tail() {
+    let store = store();
+    let mut config = BridgeConfig::new("tester");
+    config.ready_attempts = 2;
+    config.ready_interval = std::time::Duration::from_millis(1);
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        config,
+    );
+    // Claude Code's API-key dialog: the ready wait does not know it, and it
+    // prints the key elided.
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(
+        &terminal,
+        "Detected a custom API key in your environment\n\n\
+         ANTHROPIC_API_KEY: sk-ant-...Zq9xW3vT0aBcDeFgHiJk\n\n\
+         Do you want to use this API key?\n\
+         \u{276f} 1. Yes\n  2. No (recommended)\n",
+    );
+    submit_start(&store, "list the files");
+    bridge.tick().expect("tick succeeds");
+    let error = last_command_failure_error(&store).expect("the start failed");
+    assert!(
+        error.starts_with("pane never became ready, last state "),
+        "{error}"
+    );
+    assert!(
+        error.contains("; last pane: Detected a custom API key"),
+        "{error}"
+    );
+    assert!(
+        error.contains("Do you want to use this API key?"),
+        "{error}"
+    );
+    assert!(!error.contains("Zq9x"), "the key's tail leaked: {error}");
+}
+
+#[test]
+fn a_ready_wait_over_a_blank_pane_quotes_no_pane() {
+    let store = store();
+    let mut config = BridgeConfig::new("tester");
+    config.ready_attempts = 2;
+    config.ready_interval = std::time::Duration::from_millis(1);
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        config,
+    );
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, "\n   \n");
+    submit_start(&store, "list the files");
+    bridge.tick().expect("tick succeeds");
+    let error = last_command_failure_error(&store).expect("the start failed");
+    assert!(error.starts_with("pane never became ready"), "{error}");
+    assert!(!error.contains("; last pane:"), "{error}");
+}
+
 #[test]
 fn bridge_refuses_input_while_a_turn_runs() {
     let store = store();

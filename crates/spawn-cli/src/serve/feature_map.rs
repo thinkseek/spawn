@@ -83,6 +83,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Map, Value, json};
 
@@ -152,14 +153,310 @@ fn read_map(
     let blockers = store
         .mission_blockers()
         .map_err(|error| error.to_string())?;
-    Ok(build(
+    let owner_file_landings = owner_file_landings_of(&missions, |source| {
+        store
+            .source_pushes(source, None, MAX_OWNER_PUSHES_READ)
+            .ok()
+    });
+    Ok(build_with_owner_landings(
         &missions,
         &verifications,
         &deployments,
         &live_anchor,
         &blockers,
+        &owner_file_landings,
         now_ms(),
     ))
+}
+
+/// One gated owner landing as a repo file saw it: the applied `source.moved`
+/// (its `event` and `at_ms`) that answered a gated `spawn mission push`
+/// (`request`, with the owner's `reason`), and the `commit` inside that
+/// landing's `from..to` window that last touched the file. It is code on
+/// the source that passed the gate, never a verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatedFileLanding {
+    event: i64,
+    at_ms: i64,
+    commit: String,
+    request: Option<i64>,
+    reason: Option<String>,
+}
+
+/// One applied gated owner landing: main moved `from` -> `to`. `landing`'s
+/// commit is `to` until a file inside the window names its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatedLandingWindow {
+    from: String,
+    to: String,
+    landing: GatedFileLanding,
+}
+
+/// One first-parent commit of the source's main and the repo-relative
+/// paths it touched (against its first parent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirstParentCommit {
+    commit: String,
+    paths: Vec<String>,
+}
+
+/// The owner landing requests read per source (`source_pushes`' limit).
+const MAX_OWNER_PUSHES_READ: i64 = 500;
+/// The first-parent commits of main one git log reads.
+const MAX_FIRST_PARENT_COMMITS: usize = 500;
+/// The most commits one landing window attributes. A window whose `from` is
+/// not reached within it (a rewritten or foreign `from`) attributes its
+/// `to` commit only, so old ancestors that never went through that landing
+/// are never credited to it.
+const MAX_COMMITS_PER_LANDING_WINDOW: usize = 128;
+/// The sources whose attribution is kept between reads: `/api/features` is
+/// polled every few seconds, and an unchanged landing log costs no git run.
+const MAX_GATED_FILE_LANDING_CACHE_ENTRIES: usize = 16;
+
+/// The attribution of one source at its newest applied gated landing.
+type GatedFileLandingCacheEntry = ((String, i64), BTreeMap<String, GatedFileLanding>);
+
+/// The per-source attribution cache, keyed by `(source path, newest applied
+/// gated landing's event id)`: a new landing changes the key, so a stale
+/// entry is never read; the oldest entry goes first past the bound.
+static GATED_FILE_LANDING_CACHE: OnceLock<Mutex<Vec<GatedFileLandingCacheEntry>>> = OnceLock::new();
+
+/// Each mission's newest gated owner landing per repo file, for the missions
+/// whose mapping names files and whose first source is a local repository
+/// on this host. `source_pushes` reads one source's owner landing requests
+/// (the store's `source_pushes`), once per source. A source that cannot be
+/// read gives no landings: the map stays useful, and those capabilities
+/// stay where their objectives put them.
+fn owner_file_landings_of(
+    missions: &[Value],
+    source_pushes: impl Fn(&str) -> Option<Value>,
+) -> BTreeMap<i64, BTreeMap<String, GatedFileLanding>> {
+    let mut by_source: BTreeMap<String, BTreeMap<String, GatedFileLanding>> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for mission in missions {
+        let Some(id) = mission["id"].as_i64() else {
+            continue;
+        };
+        if mission["features_file"].as_str().is_none() {
+            continue;
+        }
+        let Some(source) = mission["sources"]
+            .as_array()
+            .and_then(|sources| sources.first())
+            .and_then(Value::as_str)
+            .filter(|source| source.starts_with('/') && Path::new(source).exists())
+        else {
+            continue;
+        };
+        if !by_source.contains_key(source) {
+            let windows = source_pushes(source)
+                .map(|pushes| applied_gated_windows(&pushes))
+                .unwrap_or_default();
+            by_source.insert(source.to_string(), source_file_landings(source, &windows));
+        }
+        if let Some(landings) = by_source
+            .get(source)
+            .filter(|landings| !landings.is_empty())
+        {
+            out.insert(id, landings.clone());
+        }
+    }
+    out
+}
+
+/// The applied, gated owner landings of one source's `source_pushes`
+/// answer, newest first: each `source.moved` outcome with its `from`, `to`,
+/// event, time, request and reason. Pending, refused and ungated pushes are
+/// not gated landings.
+fn applied_gated_windows(pushes: &Value) -> Vec<GatedLandingWindow> {
+    let mut windows: Vec<GatedLandingWindow> = pushes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|push| push["state"] == "applied" && push["gated"] == true)
+        .filter_map(|push| {
+            let outcome = &push["outcome"];
+            if outcome["type"] != "source.moved" {
+                return None;
+            }
+            let to = outcome["to"].as_str().filter(|to| !to.is_empty())?;
+            let from = outcome["from"].as_str().unwrap_or_default();
+            Some(GatedLandingWindow {
+                from: from.to_string(),
+                to: to.to_string(),
+                landing: GatedFileLanding {
+                    event: outcome["event_id"].as_i64()?,
+                    at_ms: outcome["at_ms"].as_i64()?,
+                    commit: to.to_string(),
+                    request: push["request"]
+                        .as_i64()
+                        .or_else(|| outcome["request"].as_i64()),
+                    reason: push["reason"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty())
+                        .map(str::to_string),
+                },
+            })
+        })
+        .collect();
+    windows.sort_by_key(|window| std::cmp::Reverse((window.landing.at_ms, window.landing.event)));
+    windows
+}
+
+/// `source`'s newest gated landing per repo file, from the cache when its
+/// newest landing is unchanged, else from one first-parent git log of main
+/// read from the newest landing's `to`.
+fn source_file_landings(
+    source: &str,
+    windows: &[GatedLandingWindow],
+) -> BTreeMap<String, GatedFileLanding> {
+    let Some(newest) = windows.first() else {
+        return BTreeMap::new();
+    };
+    let key = (source.to_string(), newest.landing.event);
+    if let Some(landings) = cached_file_landings(&key) {
+        return landings;
+    }
+    // A log that cannot be read attributes nothing and is not kept: the
+    // next poll runs git again, so a transient failure heals by itself
+    // instead of hiding every owner landing until the next one.
+    let Ok(log) = first_parent_log(source, &newest.to) else {
+        return BTreeMap::new();
+    };
+    let landings = attribute_gated_file_landings(&log, windows);
+    let cache = GATED_FILE_LANDING_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut entries) = cache.lock() {
+        entries.retain(|(seen, _)| seen.0 != key.0);
+        if entries.len() >= MAX_GATED_FILE_LANDING_CACHE_ENTRIES {
+            entries.remove(0);
+        }
+        entries.push((key, landings.clone()));
+    }
+    landings
+}
+
+/// The attribution kept for `key` (source path, newest applied gated
+/// landing's event id), if a read of that log succeeded.
+fn cached_file_landings(key: &(String, i64)) -> Option<BTreeMap<String, GatedFileLanding>> {
+    let entries = GATED_FILE_LANDING_CACHE.get()?.lock().ok()?;
+    entries
+        .iter()
+        .find(|(seen, _)| seen == key)
+        .map(|(_, landings)| landings.clone())
+}
+
+/// `git log --first-parent --name-only` of `head` in `source`, at most
+/// [`MAX_FIRST_PARENT_COMMITS`] commits, newest first: a landing's merge
+/// commit lists what it brought onto main (its diff against the first
+/// parent).
+fn first_parent_log(source: &str, head: &str) -> Result<Vec<FirstParentCommit>, String> {
+    let output = crate::sources::controller_git()
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "-C",
+            source,
+            "log",
+            "--first-parent",
+            "--diff-merges=first-parent",
+            "--name-only",
+            "--format=COMMIT %H",
+            "-n",
+            &MAX_FIRST_PARENT_COMMITS.to_string(),
+            head,
+            "--",
+        ])
+        .output()
+        .map_err(|error| format!("git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("git log {head} in {source} failed"));
+    }
+    Ok(parse_first_parent_log(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The commits of `git log --name-only --format='COMMIT %H'` output, in its
+/// order, each with the paths listed under it.
+fn parse_first_parent_log(text: &str) -> Vec<FirstParentCommit> {
+    let mut commits: Vec<FirstParentCommit> = Vec::new();
+    for line in text.lines() {
+        if let Some(commit) = line.strip_prefix("COMMIT ") {
+            commits.push(FirstParentCommit {
+                commit: commit.trim().to_string(),
+                paths: Vec::new(),
+            });
+        } else if let Some(current) = commits.last_mut() {
+            let path = line.trim();
+            if !path.is_empty() {
+                current.paths.push(path.to_string());
+            }
+        }
+    }
+    commits
+}
+
+/// The newest gated landing of each path touched by a commit inside an
+/// applied landing's `(from..to]` window, walking main's first-parent
+/// chain down from `to` until `from`. A window whose `to` is not in the log
+/// attributes nothing; one whose `from` is not reached within
+/// [`MAX_COMMITS_PER_LANDING_WINDOW`] commits attributes its `to` only.
+fn attribute_gated_file_landings(
+    log: &[FirstParentCommit],
+    windows: &[GatedLandingWindow],
+) -> BTreeMap<String, GatedFileLanding> {
+    let at: BTreeMap<&str, usize> = log
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.commit.as_str(), index))
+        .collect();
+    let mut newest: BTreeMap<String, GatedFileLanding> = BTreeMap::new();
+    for window in windows {
+        let Some(&start) = at.get(window.to.as_str()) else {
+            continue;
+        };
+        let walked: Vec<&FirstParentCommit> = log[start..]
+            .iter()
+            .take(MAX_COMMITS_PER_LANDING_WINDOW)
+            .take_while(|entry| entry.commit != window.from)
+            .collect();
+        let reached_from = log[start..]
+            .iter()
+            .take(MAX_COMMITS_PER_LANDING_WINDOW + 1)
+            .any(|entry| entry.commit == window.from);
+        let inside: &[&FirstParentCommit] = if reached_from {
+            &walked
+        } else {
+            &walked[..walked.len().min(1)]
+        };
+        // Newest commit first: the first commit inside the window to touch
+        // a path is the one this landing credits it to.
+        for entry in inside {
+            for path in &entry.paths {
+                let landing = GatedFileLanding {
+                    commit: entry.commit.clone(),
+                    ..window.landing.clone()
+                };
+                let newer = newest
+                    .get(path)
+                    .is_none_or(|seen| (landing.at_ms, landing.event) > (seen.at_ms, seen.event));
+                if newer {
+                    newest.insert(path.clone(), landing);
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Documentation only: a doc tree, Markdown or plain text. A capability
+/// whose files are all documentation has nothing a landing could ship.
+fn is_documentation_only_path(path: &str) -> bool {
+    path.starts_with("docs/")
+        || Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension == "md" || extension == "txt")
 }
 
 /// One capability as the mapping (or the backlog fallback) names it.
@@ -308,16 +605,46 @@ struct Facts<'a> {
     /// anchor, which the display window does not bound.
     anchor: Option<&'a Value>,
     blockers: &'a [Value],
+    /// Each mission's newest gated owner landing per repo file
+    /// ([`owner_file_landings_of`]), keyed by mission id: what a capability
+    /// that names no objective has landed.
+    owner_file_landings: &'a BTreeMap<i64, BTreeMap<String, GatedFileLanding>>,
 }
+
+/// No mission's owner landings: the answer of a read without them.
+#[cfg(test)]
+static NO_OWNER_FILE_LANDINGS: BTreeMap<i64, BTreeMap<String, GatedFileLanding>> = BTreeMap::new();
 
 /// The whole answer, from already-read records: pure apart from the
 /// mapping files `mission_row` reads.
+#[cfg(test)]
 fn build(
     missions: &[Value],
     verification: &Value,
     deployments: &Value,
     live_anchor: &Value,
     blockers: &Value,
+    now: i64,
+) -> Value {
+    build_with_owner_landings(
+        missions,
+        verification,
+        deployments,
+        live_anchor,
+        blockers,
+        &NO_OWNER_FILE_LANDINGS,
+        now,
+    )
+}
+
+/// [`build`], with each mission's gated owner landings per repo file.
+fn build_with_owner_landings(
+    missions: &[Value],
+    verification: &Value,
+    deployments: &Value,
+    live_anchor: &Value,
+    blockers: &Value,
+    owner_file_landings: &BTreeMap<i64, BTreeMap<String, GatedFileLanding>>,
     now: i64,
 ) -> Value {
     let facts = Facts {
@@ -330,6 +657,7 @@ fn build(
         deployments: deployments.as_array().map_or(&[], Vec::as_slice),
         anchor: live_anchor.as_object().map(|_| live_anchor),
         blockers: blockers.as_array().map_or(&[], Vec::as_slice),
+        owner_file_landings,
     };
     let rows: Vec<Value> = missions
         .iter()
@@ -354,6 +682,7 @@ fn mission_row(mission: &Value, facts: &Facts) -> Value {
         .iter()
         .map(|spec| derive(spec, mission, facts))
         .collect();
+    roll_up_domains(&specs, &mut features);
     // Planned first, then implemented, verified, live: the page's columns.
     features.sort_by(|left, right| {
         state_rank(&left["state"])
@@ -414,6 +743,108 @@ fn mission_row(mission: &Value, facts: &Facts) -> Value {
         "features": features,
         "unmapped": unmapped,
     })
+}
+
+/// A domain that names no objective is as far as all of its direct
+/// deliverable children: implemented, verified, live and complete only when
+/// every one of them is. `features` holds each spec's derived row, in
+/// `specs` order; a domain that names objectives keeps its own derivation,
+/// and one with no deliverable child stays planned.
+fn roll_up_domains(specs: &[Spec], features: &mut [Value]) {
+    for (index, domain) in specs.iter().enumerate() {
+        if domain.kind != "domain" || !domain.objectives.is_empty() {
+            continue;
+        }
+        let children: Vec<&Value> = specs
+            .iter()
+            .zip(features.iter())
+            .filter(|(child, _)| {
+                child.parent.as_deref() == Some(domain.id.as_str()) && deliverable_child(child)
+            })
+            .map(|(_, row)| row)
+            .collect();
+        if children.is_empty() {
+            continue;
+        }
+        let all = |field: &str| children.iter().all(|row| row[field] == true);
+        let (implemented, verified, live, complete) = (
+            all("implemented"),
+            all("verified"),
+            all("live"),
+            all("complete"),
+        );
+        let behind: Vec<Value> = children
+            .iter()
+            .filter(|row| row["live"] != true || row["verified"] != true)
+            .map(|row| json!({"id": row["id"], "state": row["state"]}))
+            .collect();
+        let newest_landing = children
+            .iter()
+            .filter_map(|row| row["evidence"]["newest_landing_at_ms"].as_i64())
+            .max();
+        let state = if live {
+            "live"
+        } else if verified {
+            "verified"
+        } else if implemented {
+            "implemented"
+        } else {
+            "planned"
+        };
+        let ids: Vec<Value> = children.iter().map(|row| row["id"].clone()).collect();
+        let row = &mut features[index];
+        let mut gaps: Vec<Value> = row["gaps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|gap| gap["kind"] != "no_objective" && gap["kind"] != "no_task")
+            .cloned()
+            .collect();
+        if !behind.is_empty() {
+            gaps.push(json!({
+                "kind": "children_behind",
+                "features": behind,
+                "detail": format!(
+                    "the domain names no objective; {} of its {} direct capabilities are not yet live and verified",
+                    behind.len(),
+                    ids.len()
+                ),
+            }));
+        }
+        let owned = row["owner"].is_object();
+        if let Some(fields) = row.as_object_mut() {
+            fields.insert("state".to_string(), json!(state));
+            fields.insert("planned".to_string(), json!(!implemented));
+            fields.insert("implemented".to_string(), json!(implemented));
+            fields.insert("verified".to_string(), json!(verified));
+            fields.insert("live".to_string(), json!(live));
+            fields.insert("complete".to_string(), json!(complete));
+            fields.insert("unowned".to_string(), json!(state != "live" && !owned));
+            if live {
+                fields.insert("blocked".to_string(), Value::Null);
+            }
+            fields.insert("gaps".to_string(), Value::Array(gaps));
+            fields.insert(
+                "rollup".to_string(),
+                json!({"kind": "direct_children", "children": ids}),
+            );
+            if let Some(evidence) = fields.get_mut("evidence").and_then(Value::as_object_mut) {
+                evidence.insert("newest_landing_at_ms".to_string(), json!(newest_landing));
+            }
+        }
+    }
+}
+
+/// A child a domain rolls up: a non-domain, non-research capability that
+/// names an objective or a deliverable (non-documentation) file.
+fn deliverable_child(spec: &Spec) -> bool {
+    spec.kind != "domain"
+        && spec.kind != "research-initiative"
+        && (!spec.objectives.is_empty()
+            || spec
+                .files
+                .iter()
+                .any(|path| !is_documentation_only_path(path)))
 }
 
 /// Mission-level graph summary over the capabilities' hierarchy, typed links,
@@ -1396,12 +1827,17 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
     // sibling never lifts a never-landed one. Verified and live inherit
     // this, and a landed objective without a pass holds the capability at
     // implemented.
-    let implemented = !spec.objectives.is_empty()
+    let objectives_landed = !spec.objectives.is_empty()
         && spec
             .objectives
             .iter()
             .all(|objective| landed.contains_key(objective));
-    let verified = implemented && checks.iter().all(|check| check["result"] == "pass");
+    // A capability that names no objective is implemented by a gated owner
+    // landing of one of its deliverable files, and never verified by it: no
+    // objective's verification exists to say so.
+    let owner_landing = owner_landing_of(spec, mission_id, facts);
+    let implemented = objectives_landed || owner_landing.is_some();
+    let verified = objectives_landed && checks.iter().all(|check| check["result"] == "pass");
     let unverified: Vec<u32> = checks
         .iter()
         .filter(|check| check["result"] != "pass")
@@ -1409,11 +1845,14 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         .collect();
     let anchor = facts.anchor;
     let shipped = shipped_by_deploy(mission);
+    let newest_landing_at_ms = owner_landing.map_or_else(
+        || newest_landing.map(|landing| landing.at_ms),
+        |landing| Some(landing.at_ms),
+    );
     let live = implemented
         && shipped
         && anchor.is_some_and(|anchor| {
-            anchor["at_ms"].as_i64().unwrap_or(i64::MAX)
-                > newest_landing.map_or(i64::MIN, |landing| landing.at_ms)
+            anchor["at_ms"].as_i64().unwrap_or(i64::MAX) > newest_landing_at_ms.unwrap_or(i64::MIN)
         });
     let state = if live {
         "live"
@@ -1438,16 +1877,41 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         newest_task,
         facts,
     );
-    let mut gaps = landing_gaps(spec, &present, &landed, &unverified, &checks);
+    let mut gaps = match owner_landing {
+        Some(landing) => vec![owner_landing_gap(landing)],
+        None => landing_gaps(spec, &present, &landed, &unverified, &checks),
+    };
     gaps.extend(delivery_gaps(
         state,
         &landed,
+        owner_landing,
         anchor,
         shipped,
         tasks.is_empty(),
     ));
     gaps.extend(accepted_gaps(spec, mission));
     let complete = live && verified && missing.is_empty() && landed.len() == spec.objectives.len();
+    let mut sources = sources_json(
+        spec,
+        mission,
+        &rows,
+        &tasks,
+        &checks,
+        live.then_some(anchor).flatten(),
+        facts,
+    );
+    let mut evidence = evidence_of(
+        &landed,
+        &checks,
+        newest_landing,
+        anchor,
+        facts.deployments.first(),
+        &tasks,
+        live,
+    );
+    if let Some(landing) = owner_landing {
+        with_owner_landing(&mut sources, &mut evidence, landing);
+    }
     json!({
         "id": spec.id,
         "title": spec.title,
@@ -1472,17 +1936,105 @@ fn derive(spec: &Spec, mission: &Value, facts: &Facts) -> Value {
         "objectives": spec.objectives,
         "objective_rows": rows.iter().map(|row| json!({
             "id": row["id"], "title": row["title"], "status": row["status"]})).collect::<Vec<_>>(),
-        "sources": sources_json(spec, mission, &rows, &tasks, &checks,
-                                 live.then_some(anchor).flatten(), facts),
+        "sources": sources,
         "owner": newest_in_flight.map_or(Value::Null, owner_json),
         "last_owner": newest_task.map_or(Value::Null, owner_json),
         "unowned": state != "live" && newest_in_flight.is_none(),
         "blocked": blocker,
         "gaps": gaps,
-        "evidence": evidence_of(
-            &landed, &checks, newest_landing, anchor, facts.deployments.first(), &tasks, live,
+        "evidence": evidence,
+    })
+}
+
+/// The newest gated owner landing of a capability that names no objective:
+/// over its deliverable (non-documentation) files, in its mission's
+/// [`Facts::owner_file_landings`]. A domain (rolled up from its children,
+/// [`roll_up_domains`]), a research initiative (research, not a
+/// deliverable) and a capability of documentation only have none.
+fn owner_landing_of<'a>(
+    spec: &Spec,
+    mission_id: i64,
+    facts: &Facts<'a>,
+) -> Option<&'a GatedFileLanding> {
+    if !spec.objectives.is_empty() || spec.kind == "domain" || spec.kind == "research-initiative" {
+        return None;
+    }
+    let landings = facts.owner_file_landings.get(&mission_id)?;
+    spec.files
+        .iter()
+        .filter(|path| !is_documentation_only_path(path))
+        .filter_map(|path| landings.get(path))
+        .max_by_key(|landing| (landing.at_ms, landing.event))
+}
+
+/// The honest gap of an owner-landed capability: it passed the gate, and no
+/// objective's verification says anybody checked it.
+fn owner_landing_gap(landing: &GatedFileLanding) -> Value {
+    let commit = short(&json!(landing.commit));
+    let request = landing
+        .request
+        .map_or_else(String::new, |request| format!(" (request {request})"));
+    json!({
+        "kind": "unverified",
+        "objectives": [],
+        "detail": format!(
+            "last changed by gated owner landing {commit}{request}; no objective verification is recorded for it"
         ),
     })
+}
+
+/// Add an owner landing's evidence and provenance: the landing beside the
+/// objective landings, its time as the newest, and the landing record and
+/// its commit as linked sources.
+fn with_owner_landing(sources: &mut Vec<Value>, evidence: &mut Value, landing: &GatedFileLanding) {
+    let commit = short(&json!(landing.commit));
+    let mut seen: BTreeSet<String> = sources
+        .iter()
+        .map(|source| text(&source["ref"]).to_string())
+        .collect();
+    push_source(
+        sources,
+        &mut seen,
+        json!({
+            "kind": "owner-landing",
+            "ref": format!("owner-landing:{}", landing.event),
+            "url": Value::Null,
+            "title": landing.reason.as_deref().map_or_else(
+                || format!("gated owner landing {commit}"),
+                |reason| format!("gated owner landing {commit}: {}", first_line(reason)),
+            ),
+            "native": true,
+            "linked": true,
+        }),
+    );
+    push_source(
+        sources,
+        &mut seen,
+        json!({
+            "kind": "commit",
+            "ref": format!("commit:{}", landing.commit),
+            "url": Value::Null,
+            "title": format!("landed by gated owner landing (event {})", landing.event),
+            "native": false,
+            "linked": true,
+        }),
+    );
+    if let Some(fields) = evidence.as_object_mut() {
+        if let Some(landings) = fields.get_mut("landings").and_then(Value::as_array_mut) {
+            landings.push(json!({
+                "kind": "owner_landing",
+                "objective": Value::Null,
+                "task": Value::Null,
+                "event": landing.event,
+                "at_ms": landing.at_ms,
+                "commit": landing.commit,
+                "base": Value::Null,
+                "request": landing.request,
+                "reason": landing.reason.as_deref().map_or(Value::Null, |reason| cut(&json!(reason))),
+            }));
+        }
+        fields.insert("newest_landing_at_ms".to_string(), json!(landing.at_ms));
+    }
 }
 
 fn named(spec: &Spec, value: &Value) -> bool {
@@ -1701,6 +2253,7 @@ fn landing_gaps(
 fn delivery_gaps(
     state: &str,
     landed: &BTreeMap<u32, Landing>,
+    owner_landing: Option<&GatedFileLanding>,
     anchor: Option<&Value>,
     shipped: bool,
     no_task: bool,
@@ -1732,6 +2285,12 @@ fn delivery_gaps(
     if !waiting.is_empty() {
         gaps.push(json!({"kind": "not_deployed", "objectives": waiting,
                          "detail": "landed after the newest successful deploy"}));
+    }
+    if let Some(landing) = owner_landing.filter(|landing| landing.at_ms >= at) {
+        gaps.push(json!({"kind": "not_deployed", "objectives": [],
+                         "detail": format!(
+                             "gated owner landing {} landed after the newest successful deploy",
+                             short(&json!(landing.commit)))}));
     }
     gaps
 }
@@ -2157,8 +2716,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Facts, Native, Source, Spec, build, derive, fallback_specs, parse_mapping, read_map,
-        read_mapping, shipped_by_deploy, with_deployed,
+        Facts, FirstParentCommit, GatedFileLanding, GatedLandingWindow, NO_OWNER_FILE_LANDINGS,
+        Native, Source, Spec, applied_gated_windows, attribute_gated_file_landings, build,
+        build_with_owner_landings, cached_file_landings, derive, fallback_specs, first_parent_log,
+        owner_file_landings_of, parse_first_parent_log, parse_mapping, read_map, read_mapping,
+        shipped_by_deploy, source_file_landings, with_deployed,
     };
 
     fn spec(id: &str, objectives: &[u32]) -> Spec {
@@ -2239,6 +2801,7 @@ mod tests {
             deployments,
             anchor,
             blockers,
+            owner_file_landings: &NO_OWNER_FILE_LANDINGS,
         }
     }
 
@@ -2257,6 +2820,7 @@ mod tests {
             deployments,
             anchor: Some(anchor),
             blockers,
+            owner_file_landings: &NO_OWNER_FILE_LANDINGS,
         }
     }
 
@@ -2377,6 +2941,719 @@ mod tests {
             "{feature}"
         );
         assert_eq!(feature["evidence"]["deploy"], Value::Null);
+    }
+
+    /// The gated owner landing 453cc1413 as the live store recorded it:
+    /// `source.moved` at 1795494391336, `deploy.finished` at 1795494516507.
+    const OWNER_LANDED_AT_MS: i64 = 1_795_494_391_336;
+    const OWNER_DEPLOYED_AT_MS: i64 = 1_795_494_516_507;
+    const OWNER_LANDED_COMMIT: &str = "453cc14134a1bd51459f0358bbc131eaf225a3bb";
+
+    fn owner_landing_at(
+        path: &str,
+    ) -> std::collections::BTreeMap<i64, std::collections::BTreeMap<String, GatedFileLanding>> {
+        let landing = GatedFileLanding {
+            event: 230_404,
+            at_ms: OWNER_LANDED_AT_MS,
+            commit: OWNER_LANDED_COMMIT.to_string(),
+            request: Some(230_398),
+            reason: Some("Fix GitHub Issue #75".to_string()),
+        };
+        let files = std::collections::BTreeMap::from([(path.to_string(), landing)]);
+        std::collections::BTreeMap::from([(4, files)])
+    }
+
+    fn file_spec(id: &str, kind: &str, files: &[&str]) -> Spec {
+        Spec {
+            kind: kind.to_string(),
+            files: files.iter().map(|path| (*path).to_string()).collect(),
+            ..spec(id, &[])
+        }
+    }
+
+    /// [`facts_of`] with each mission's owner landings per file.
+    fn facts_owned<'a>(
+        deployments: &'a [Value],
+        owner: &'a std::collections::BTreeMap<
+            i64,
+            std::collections::BTreeMap<String, GatedFileLanding>,
+        >,
+    ) -> Facts<'a> {
+        Facts {
+            owner_file_landings: owner,
+            ..facts_of(&[], &[], deployments, &[])
+        }
+    }
+
+    fn deploy_at(at_ms: i64) -> Value {
+        json!({"event": 230_500, "at_ms": at_ms, "ok": true, "head": OWNER_LANDED_COMMIT,
+               "by": "landing", "reason": ""})
+    }
+
+    /// The kinds of a derived row's gaps, in order.
+    fn gap_kinds(feature: &Value) -> Vec<String> {
+        feature["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gap| gap["kind"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A capability that names no objective, one of whose code files (and
+    /// not its doc) went through the gated owner landing 453cc1413.
+    fn owner_landed_capability() -> (
+        std::collections::BTreeMap<i64, std::collections::BTreeMap<String, GatedFileLanding>>,
+        Spec,
+    ) {
+        let owner = owner_landing_at("crates/spawn-cli/src/serve/feature_map.rs");
+        let capability = file_spec(
+            "cap-owner-landed",
+            "capability",
+            &[
+                "crates/spawn-cli/src/serve/feature_map.rs",
+                "docs/feature-map/README.md",
+            ],
+        );
+        (owner, capability)
+    }
+
+    /// A capability that names no objective is implemented by a gated owner
+    /// landing of one of its deliverable files, and never verified or
+    /// complete by it: its gap says it shipped unverified (not "no
+    /// objective"), with the landing as evidence and native provenance.
+    #[test]
+    fn an_owner_landed_capability_is_implemented_with_its_landing_as_evidence() {
+        let (owner, capability) = owner_landed_capability();
+        let landed = derive(&capability, &mission(), &facts_owned(&[], &owner));
+        assert_eq!(landed["state"], "implemented", "{landed}");
+        assert_eq!(landed["implemented"], true);
+        assert_eq!(landed["planned"], false);
+        assert_eq!(landed["verified"], false);
+        assert_eq!(landed["live"], false);
+        assert_eq!(landed["complete"], false);
+        let kinds = gap_kinds(&landed);
+        assert!(kinds.contains(&"unverified".to_string()), "{landed}");
+        assert!(kinds.contains(&"no_deploy_record".to_string()), "{landed}");
+        assert!(!kinds.contains(&"no_objective".to_string()), "{landed}");
+        assert!(!kinds.contains(&"no_task".to_string()), "{landed}");
+        let unverified = landed["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["kind"] == "unverified")
+            .unwrap();
+        let detail = unverified["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("gated owner landing 453cc14134a1"),
+            "{detail}"
+        );
+        assert!(detail.contains("no objective verification"), "{detail}");
+        assert_eq!(unverified["objectives"], json!([]));
+        let evidence = &landed["evidence"];
+        assert_eq!(evidence["newest_landing_at_ms"], OWNER_LANDED_AT_MS);
+        assert_eq!(
+            evidence["landings"],
+            json!([{"kind": "owner_landing", "objective": null, "task": null, "event": 230_404,
+                    "at_ms": OWNER_LANDED_AT_MS, "commit": OWNER_LANDED_COMMIT, "base": null,
+                    "request": 230_398, "reason": "Fix GitHub Issue #75"}])
+        );
+        let sources = landed["sources"].as_array().unwrap();
+        let landing_source = sources
+            .iter()
+            .find(|source| source["ref"] == "owner-landing:230404")
+            .expect("the landing record is a native source");
+        assert_eq!(landing_source["native"], true);
+        assert_eq!(landing_source["linked"], true);
+        assert!(
+            sources.iter().any(
+                |source| source["ref"] == format!("commit:{OWNER_LANDED_COMMIT}")
+                    && source["linked"] == true
+            ),
+            "{landed}"
+        );
+    }
+
+    /// An owner-landed capability is live once a successful deploy finished
+    /// after its landing (not one at the landing's own millisecond), still
+    /// unverified and never complete; a mission no deploy ships never is.
+    #[test]
+    fn an_owner_landed_capability_is_live_only_after_a_later_deploy() {
+        let (owner, capability) = owner_landed_capability();
+        // A deploy at the landing's own millisecond does not ship it.
+        let at_landing = [deploy_at(OWNER_LANDED_AT_MS)];
+        let same = derive(&capability, &mission(), &facts_owned(&at_landing, &owner));
+        assert_eq!(same["state"], "implemented", "{same}");
+        assert!(
+            gap_kinds(&same).contains(&"not_deployed".to_string()),
+            "{same}"
+        );
+
+        // The deploy that finished after the landing ships it: live, still
+        // unverified, never complete.
+        let after_landing = [deploy_at(OWNER_DEPLOYED_AT_MS)];
+        let live = derive(
+            &capability,
+            &mission(),
+            &facts_owned(&after_landing, &owner),
+        );
+        assert_eq!(live["state"], "live", "{live}");
+        assert_eq!(live["implemented"], true);
+        assert_eq!(live["live"], true);
+        assert_eq!(live["verified"], false);
+        assert_eq!(live["complete"], false);
+        assert_eq!(live["unowned"], false);
+        assert_eq!(live["evidence"]["deploy"]["at_ms"], OWNER_DEPLOYED_AT_MS);
+        assert!(
+            gap_kinds(&live).contains(&"unverified".to_string()),
+            "{live}"
+        );
+        assert!(
+            !gap_kinds(&live).contains(&"not_deployed".to_string()),
+            "{live}"
+        );
+        assert!(
+            live["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| source["ref"] == "deploy:230500"),
+            "{live}"
+        );
+
+        // A mission no deploy ships is never live on an owner landing.
+        let mut unshipped = mission();
+        unshipped["shipped_by_deploy"] = json!(false);
+        let elsewhere = derive(
+            &capability,
+            &unshipped,
+            &facts_owned(&after_landing, &owner),
+        );
+        assert_eq!(elsewhere["state"], "implemented", "{elsewhere}");
+        assert!(gap_kinds(&elsewhere).contains(&"live_not_observable".to_string()));
+    }
+
+    /// A research initiative and a capability of documentation only stay
+    /// planned when an owner landing touched their files: research is not a
+    /// deliverable, and a doc is not shipped code. A capability that names
+    /// objectives keeps its objective derivation whatever landed its files.
+    #[test]
+    fn research_doc_only_and_objective_capabilities_ignore_owner_landings() {
+        let mut owner = owner_landing_at("docs/research/notes.md");
+        let files = owner.get_mut(&4).unwrap();
+        let landing = files["docs/research/notes.md"].clone();
+        for path in ["README.md", "rsi/notes.txt", "crates/spawn-core/src/lib.rs"] {
+            files.insert(path.to_string(), landing.clone());
+        }
+        let after_landing = [deploy_at(OWNER_DEPLOYED_AT_MS)];
+        let facts = facts_owned(&after_landing, &owner);
+        let research = file_spec(
+            "research-owner",
+            "research-initiative",
+            &["docs/research/notes.md", "crates/spawn-core/src/lib.rs"],
+        );
+        let doc_only = file_spec(
+            "docs-owner",
+            "capability",
+            &["docs/research/notes.md", "README.md", "rsi/notes.txt"],
+        );
+        let domain = file_spec("domain-owner", "domain", &["crates/spawn-core/src/lib.rs"]);
+        for spec in [&research, &doc_only, &domain] {
+            let feature = derive(spec, &mission(), &facts);
+            assert_eq!(feature["state"], "planned", "{feature}");
+            assert_eq!(feature["implemented"], false, "{feature}");
+            assert_eq!(feature["evidence"]["landings"], json!([]), "{feature}");
+            assert!(
+                feature["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|gap| gap["kind"] == "no_objective"),
+                "{feature}"
+            );
+        }
+        // Objective 1 never landed: the owner landing of its file does not
+        // lift it.
+        let with_objective = Spec {
+            files: vec!["crates/spawn-core/src/lib.rs".to_string()],
+            ..spec("objective-backed", &[1])
+        };
+        let feature = derive(&with_objective, &mission(), &facts);
+        assert_eq!(feature["state"], "planned", "{feature}");
+        assert!(
+            feature["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "not_landed" && gap["objectives"] == json!([1])),
+            "{feature}"
+        );
+    }
+
+    /// One first-parent log attributes each path to the newest applied gated
+    /// landing whose `(from..to]` window holds a commit that touched it: a
+    /// multi-commit stack credits every commit in it, `from` and older
+    /// commits belong to older windows, and a window whose `from` is not in
+    /// the log credits only its `to`.
+    #[test]
+    fn a_first_parent_log_attributes_files_to_their_landing_windows() {
+        let log = parse_first_parent_log(
+            "COMMIT c6\n\nweb/src/app.ts\n\
+             COMMIT c5\n\ncrates/a/src/lib.rs\nREADME.md\n\
+             COMMIT c4\n\ncrates/b/src/lib.rs\n\
+             COMMIT c3\n\ncrates/a/src/lib.rs\ncrates/c/src/lib.rs\n\
+             COMMIT c2\n\ncrates/d/src/lib.rs\n\
+             COMMIT c1\n\ncrates/e/src/lib.rs\n\
+             COMMIT c0\n\ncrates/never/src/lib.rs\n",
+        );
+        assert_eq!(log.len(), 7);
+        assert_eq!(
+            log[1],
+            FirstParentCommit {
+                commit: "c5".to_string(),
+                paths: vec!["crates/a/src/lib.rs".to_string(), "README.md".to_string()],
+            }
+        );
+        let pushes = json!([
+            // Newest: a three-commit stack c3..c5 on top of c2.
+            {"state": "applied", "gated": true, "request": 31, "reason": "stack",
+             "outcome": {"type": "source.moved", "from": "c2", "to": "c5", "event_id": 32,
+                         "at_ms": 3000, "request": 31}},
+            // Refused, pending and ungated pushes are not gated landings.
+            {"state": "refused", "gated": true, "request": 41,
+             "outcome": {"type": "source.push_refused", "event_id": 42, "at_ms": 4000}},
+            {"state": "pending", "gated": true, "request": 51, "outcome": null},
+            {"state": "applied", "gated": false, "request": 61,
+             "outcome": {"type": "source.moved", "from": "c5", "to": "c6", "event_id": 62,
+                         "at_ms": 6000}},
+            // Older: c1..c2 on top of c0.
+            {"state": "applied", "gated": true, "request": 21, "reason": null,
+             "outcome": {"type": "source.moved", "from": "c0", "to": "c2", "event_id": 22,
+                         "at_ms": 2000}},
+            // A window whose `from` was rewritten away: only its `to`.
+            {"state": "applied", "gated": true, "request": 11,
+             "outcome": {"type": "source.moved", "from": "gone", "to": "c1", "event_id": 12,
+                         "at_ms": 1000}},
+        ]);
+        let windows = applied_gated_windows(&pushes);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.landing.event)
+                .collect::<Vec<_>>(),
+            vec![32, 22, 12],
+            "applied gated landings only, newest first"
+        );
+        assert_eq!(
+            windows[0],
+            GatedLandingWindow {
+                from: "c2".to_string(),
+                to: "c5".to_string(),
+                landing: GatedFileLanding {
+                    event: 32,
+                    at_ms: 3000,
+                    commit: "c5".to_string(),
+                    request: Some(31),
+                    reason: Some("stack".to_string()),
+                },
+            }
+        );
+        let landings = attribute_gated_file_landings(&log, &windows);
+        let credited = |path: &str| {
+            landings
+                .get(path)
+                .map(|landing| (landing.event, landing.commit.as_str()))
+        };
+        // Every commit of the stack is credited to its landing, a path
+        // touched twice in it by its newest commit.
+        assert_eq!(credited("crates/a/src/lib.rs"), Some((32, "c5")));
+        assert_eq!(credited("README.md"), Some((32, "c5")));
+        assert_eq!(credited("crates/b/src/lib.rs"), Some((32, "c4")));
+        assert_eq!(credited("crates/c/src/lib.rs"), Some((32, "c3")));
+        // `from` (c2) belongs to the older window, with c1.
+        assert_eq!(credited("crates/d/src/lib.rs"), Some((22, "c2")));
+        assert_eq!(credited("crates/e/src/lib.rs"), Some((22, "c1")));
+        assert_eq!(landings["crates/d/src/lib.rs"].request, Some(21));
+        assert_eq!(landings["crates/d/src/lib.rs"].reason, None);
+        // The ungated push's commit and the never-landed ancestor are
+        // nobody's gated landing.
+        assert_eq!(credited("web/src/app.ts"), None);
+        assert_eq!(credited("crates/never/src/lib.rs"), None);
+        assert_eq!(landings.len(), 6);
+
+        // Only the window whose `from` is gone: its `to` alone, never the
+        // ancestors below it.
+        let alone = attribute_gated_file_landings(&log, &windows[2..]);
+        assert_eq!(
+            alone.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["crates/e/src/lib.rs"]
+        );
+        // A window whose `to` is not in the log credits nothing.
+        let missing = attribute_gated_file_landings(&log[..2], &windows[1..2]);
+        assert!(missing.is_empty());
+    }
+
+    /// A commit in the work tree of [`bare_repository_with_a_merge`]
+    /// writing `files`, and its id.
+    fn commit_in(work: &Path, message: &str, files: &[&str]) -> String {
+        use crate::sources::test_git as git;
+        let work_path = work.to_string_lossy().to_string();
+        for file in files {
+            let path = work.join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("parent");
+            std::fs::write(&path, format!("{message}\n")).expect("write");
+        }
+        git(&["-C", &work_path, "add", "-A"]).expect("add");
+        git(&["-C", &work_path, "commit", "-qm", message]).expect("commit");
+        git(&["-C", &work_path, "rev-parse", "HEAD"]).expect("rev-parse")
+    }
+
+    /// A temporary bare repository cloned from a work tree whose main is:
+    /// `first` (two files), `second` (one file), and `merge`, a `--no-ff`
+    /// merge of a side branch whose one commit `side` adds `web/src/d.ts`.
+    /// Answers the temporary root, the work tree, the bare repository and
+    /// `[first, second, side, merge]`.
+    fn bare_repository_with_a_merge(
+        name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String, [String; 4]) {
+        use crate::sources::test_git as git;
+        let root =
+            std::env::temp_dir().join(format!("spawn-feature-map-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work directory");
+        let work_path = work.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &work_path]).expect("init");
+        let first = commit_in(
+            &work,
+            "first",
+            &["crates/a/src/lib.rs", "crates/b/src/lib.rs"],
+        );
+        let second = commit_in(&work, "second", &["crates/c/src/lib.rs"]);
+        git(&["-C", &work_path, "checkout", "-q", "-b", "side"]).expect("side");
+        let side = commit_in(&work, "side", &["web/src/d.ts"]);
+        git(&["-C", &work_path, "checkout", "-q", "main"]).expect("main");
+        git(&[
+            "-C",
+            &work_path,
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "merge side",
+            "side",
+        ])
+        .expect("merge");
+        let merge = git(&["-C", &work_path, "rev-parse", "HEAD"]).expect("merge commit");
+        let source = root.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &work_path, &source]).expect("bare clone");
+        (root, work, source, [first, second, side, merge])
+    }
+
+    /// The `source_pushes` answer of one applied gated landing `from..to`.
+    fn gated_landing(from: &str, to: &str, event: i64, at_ms: i64) -> Value {
+        json!({"state": "applied", "gated": true, "request": event - 1, "reason": "stack",
+               "outcome": {"type": "source.moved", "from": from, "to": to,
+                           "event_id": event, "at_ms": at_ms, "request": event - 1}})
+    }
+
+    /// The path's landing event and commit, if one is credited.
+    fn credited_in(
+        landings: &std::collections::BTreeMap<String, GatedFileLanding>,
+        path: &str,
+    ) -> Option<(i64, String)> {
+        landings
+            .get(path)
+            .map(|landing| (landing.event, landing.commit.clone()))
+    }
+
+    /// The exact first-parent `git log` over a real bare repository lists a
+    /// `--no-ff` merge's files against its first parent and never the side
+    /// commit, and the store-shaped answer maps a commit plus a merge in one
+    /// `(from..to]` window onto each mission with a mapping and a local
+    /// source, reading that source once, and caches the attribution.
+    #[test]
+    fn a_real_first_parent_log_maps_a_merge_window_onto_the_missions() {
+        let (root, _work, source, [first, second, side, merge]) =
+            bare_repository_with_a_merge("owner-landings-map");
+        let log = first_parent_log(&source, &merge).expect("git log runs");
+        assert_eq!(
+            log.iter()
+                .map(|entry| entry.commit.as_str())
+                .collect::<Vec<_>>(),
+            vec![merge.as_str(), second.as_str(), first.as_str()],
+            "the side commit is not on the first-parent chain"
+        );
+        assert_eq!(log[0].paths, vec!["web/src/d.ts".to_string()]);
+        assert_eq!(log[1].paths, vec!["crates/c/src/lib.rs".to_string()]);
+
+        let pushes = json!([gated_landing(&first, &merge, 100, 5000)]);
+        let missions = json!([
+            {"id": 4, "features_file": "docs/feature-map/registry.json", "sources": [&source]},
+            // The same source again: one store read and one git log serve both.
+            {"id": 7, "features_file": "docs/feature-map/registry.json", "sources": [&source]},
+            // No mapping, or a source that is not a local path: never read.
+            {"id": 5, "sources": [&source]},
+            {"id": 6, "features_file": "registry.json", "sources": ["relative/source.git"]},
+        ]);
+        let reads = std::cell::Cell::new(0);
+        let answer = owner_file_landings_of(missions.as_array().expect("missions"), |read| {
+            reads.set(reads.get() + 1);
+            (read == source).then(|| pushes.clone())
+        });
+        assert_eq!(reads.get(), 1, "one store read per source");
+        assert_eq!(answer.keys().copied().collect::<Vec<_>>(), vec![4, 7]);
+        let landings = &answer[&4];
+        assert_eq!(answer[&7], *landings);
+        // `from` is the older history; the window holds the commit and the
+        // merge, which carries the side branch's file.
+        assert_eq!(
+            credited_in(landings, "crates/c/src/lib.rs"),
+            Some((100, second))
+        );
+        assert_eq!(
+            credited_in(landings, "web/src/d.ts"),
+            Some((100, merge.clone()))
+        );
+        assert_eq!(credited_in(landings, "crates/a/src/lib.rs"), None);
+        assert_eq!(credited_in(landings, "crates/b/src/lib.rs"), None);
+        assert!(landings.values().all(|landing| landing.commit != side));
+        assert_eq!(landings.len(), 2);
+        assert_eq!(landings["web/src/d.ts"].request, Some(99));
+        assert_eq!(landings["web/src/d.ts"].reason.as_deref(), Some("stack"));
+        assert_eq!(
+            cached_file_landings(&(source.clone(), 100)).as_ref(),
+            Some(landings)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// While the newest landing is unchanged the cache answers without git;
+    /// a newer landing whose read fails attributes nothing and is not
+    /// cached, so the next read runs git again and recovers, replacing the
+    /// older entry.
+    #[test]
+    fn owner_landings_cache_good_reads_only_and_follow_a_newer_landing() {
+        let (root, work, source, [first, second, _side, merge]) =
+            bare_repository_with_a_merge("owner-landings-cache");
+        let pushes = json!([gated_landing(&first, &merge, 100, 5000)]);
+        let windows = applied_gated_windows(&pushes);
+        let landings = source_file_landings(&source, &windows);
+        assert_eq!(landings.len(), 2);
+        let older = (source.clone(), 100);
+        assert_eq!(cached_file_landings(&older).as_ref(), Some(&landings));
+
+        // With the repository moved away a git run would fail: the answer
+        // comes from the cache.
+        let moved = root.join("source.moved");
+        std::fs::rename(&source, &moved).expect("move the repository away");
+        assert!(first_parent_log(&source, &merge).is_err());
+        assert_eq!(source_file_landings(&source, &windows), landings);
+        std::fs::rename(&moved, &source).expect("move the repository back");
+
+        // A newer landing whose commit the repository does not hold yet.
+        let third = commit_in(&work, "third", &["crates/e/src/lib.rs"]);
+        let newer = json!([
+            gated_landing(&merge, &third, 200, 6000),
+            gated_landing(&first, &merge, 100, 5000),
+        ]);
+        let missions = json!([
+            {"id": 4, "features_file": "docs/feature-map/registry.json", "sources": [&source]},
+        ]);
+        let read = || {
+            owner_file_landings_of(missions.as_array().expect("missions"), |_| {
+                Some(newer.clone())
+            })
+        };
+        let failed = read();
+        assert!(
+            failed.is_empty(),
+            "a failed read credits nothing: {failed:?}"
+        );
+        assert_eq!(cached_file_landings(&(source.clone(), 200)), None);
+
+        // Once the commit is there the next read runs git again.
+        let work_path = work.to_string_lossy().to_string();
+        crate::sources::test_git(&["-C", &work_path, "push", "-q", &source, "main"]).expect("push");
+        let recovered = read();
+        let landings = &recovered[&4];
+        assert_eq!(
+            credited_in(landings, "crates/e/src/lib.rs"),
+            Some((200, third))
+        );
+        assert_eq!(
+            credited_in(landings, "crates/c/src/lib.rs"),
+            Some((100, second))
+        );
+        assert_eq!(credited_in(landings, "web/src/d.ts"), Some((100, merge)));
+        assert_eq!(landings.len(), 3);
+        assert_eq!(
+            cached_file_landings(&(source.clone(), 200)).as_ref(),
+            Some(landings)
+        );
+        assert_eq!(cached_file_landings(&older), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The answer over a mapping of three domains (one with no objective and
+    /// a deliverable, a research, a documentation and an objective child;
+    /// one that names objective 1; one with documentation children only),
+    /// with `crates/x/src/lib.rs` landed by the gated owner landing.
+    fn rollup_answer(landings: &Value, deploys: &Value) -> Value {
+        let map_json = json!({
+            "features": [
+                {"id": "domain-rolled", "title": "Rolled domain", "kind": "domain",
+                 "files": ["crates/x/src/lib.rs"]},
+                {"id": "cap-owner-landed", "title": "Owner landed", "kind": "capability",
+                 "parent": "domain-rolled", "files": ["crates/x/src/lib.rs"]},
+                {"id": "cap-objective", "title": "Objective backed", "kind": "capability",
+                 "parent": "domain-rolled", "files": ["crates/y/src/lib.rs"],
+                 "sources": [{"kind": "objective", "objective": 3}]},
+                {"id": "research-child", "title": "Research", "kind": "research-initiative",
+                 "parent": "domain-rolled", "files": ["docs/research.md"]},
+                {"id": "docs-child", "title": "Docs", "kind": "capability",
+                 "parent": "domain-rolled", "files": ["docs/guide.md"]},
+                {"id": "domain-objective", "title": "Objective domain", "kind": "domain",
+                 "files": ["crates/z/src/lib.rs"],
+                 "sources": [{"kind": "objective", "objective": 1}]},
+                {"id": "cap-under-objective-domain", "title": "Under", "kind": "capability",
+                 "parent": "domain-objective", "files": ["crates/x/src/lib.rs"]},
+                {"id": "domain-empty", "title": "Empty domain", "kind": "domain",
+                 "files": ["docs/empty.md"]},
+                {"id": "docs-only-child", "title": "Docs only", "kind": "slice",
+                 "parent": "domain-empty", "files": ["docs/only.md"]}
+            ]
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-feature-rollup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let map_path = dir.join("features.json");
+        std::fs::write(&map_path, map_json.to_string()).expect("write map");
+        let mut row = mission();
+        row["features_file"] = json!(map_path.display().to_string());
+        let anchor = deploys
+            .as_array()
+            .and_then(|deploys| deploys.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let answer = build_with_owner_landings(
+            &[row],
+            &json!({"landings": landings, "verifications": []}),
+            deploys,
+            &anchor,
+            &json!([]),
+            &owner_landing_at("crates/x/src/lib.rs"),
+            42,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        answer
+    }
+
+    /// The row of feature `id` in a one-mission answer.
+    fn feature_in(answer: &Value, id: &str) -> Value {
+        answer["missions"][0]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|feature| feature["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} in {answer}"))
+    }
+
+    /// A domain that names no objective is rolled up from its direct
+    /// deliverable children: implemented when all of them are, live when all
+    /// of them are, and its gap names the children behind. Research and
+    /// documentation-only children are not deliverables.
+    #[test]
+    fn a_domain_without_objectives_rolls_up_its_direct_children() {
+        // Objective 3 never landed: one child planned holds the domain at
+        // planned, and the gap names the children behind.
+        let answer = rollup_answer(&json!([]), &json!([deploy_at(OWNER_DEPLOYED_AT_MS)]));
+        assert_eq!(feature_in(&answer, "cap-owner-landed")["state"], "live");
+        assert_eq!(feature_in(&answer, "cap-objective")["state"], "planned");
+        let domain = feature_in(&answer, "domain-rolled");
+        assert_eq!(domain["state"], "planned", "{domain}");
+        assert_eq!(domain["implemented"], false);
+        assert_eq!(
+            domain["rollup"]["children"],
+            json!(["cap-owner-landed", "cap-objective"]),
+            "research and documentation-only children are not rolled up"
+        );
+        let behind = domain["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["kind"] == "children_behind")
+            .expect("the gap names the children behind");
+        assert_eq!(
+            behind["features"],
+            json!([{"id": "cap-owner-landed", "state": "live"},
+                   {"id": "cap-objective", "state": "planned"}])
+        );
+        assert!(
+            !domain["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "no_objective"),
+            "{domain}"
+        );
+
+        // Objective 3 lands before the deploy: every child is live, so the
+        // domain is live; never verified while the owner landing is not.
+        let answer = rollup_answer(
+            &json!([{"mission": 4, "objective": 3, "task": 30, "landed_ms": 100, "event": 102}]),
+            &json!([deploy_at(OWNER_DEPLOYED_AT_MS)]),
+        );
+        let domain = feature_in(&answer, "domain-rolled");
+        assert_eq!(domain["state"], "live", "{domain}");
+        assert_eq!(domain["implemented"], true);
+        assert_eq!(domain["live"], true);
+        assert_eq!(domain["verified"], false);
+        assert_eq!(domain["complete"], false);
+        assert_eq!(domain["blocked"], Value::Null);
+        assert_eq!(
+            domain["evidence"]["newest_landing_at_ms"],
+            OWNER_LANDED_AT_MS
+        );
+        // The two children, the domain and the owner-landed capability under
+        // the objective domain.
+        assert_eq!(answer["missions"][0]["counts"]["live"], 4, "{answer}");
+
+        // Without a deploy both children are implemented, and so is the
+        // domain.
+        let answer = rollup_answer(
+            &json!([{"mission": 4, "objective": 3, "task": 30, "landed_ms": 100, "event": 102}]),
+            &json!([]),
+        );
+        assert_eq!(feature_in(&answer, "domain-rolled")["state"], "implemented");
+    }
+
+    /// A domain that names objectives keeps its own derivation whatever its
+    /// children did, and one with documentation children only stays planned.
+    #[test]
+    fn a_domain_with_objectives_or_no_deliverable_child_is_not_rolled_up() {
+        let answer = rollup_answer(
+            &json!([{"mission": 4, "objective": 3, "task": 30, "landed_ms": 100, "event": 102}]),
+            &json!([]),
+        );
+        // A domain that names objectives keeps its own derivation (objective
+        // 1 never landed), whatever its children did; one with only
+        // documentation children stays planned.
+        let objective_domain = feature_in(&answer, "domain-objective");
+        assert_eq!(objective_domain["state"], "planned", "{objective_domain}");
+        assert_eq!(objective_domain["rollup"], Value::Null);
+        assert_eq!(
+            feature_in(&answer, "cap-under-objective-domain")["state"],
+            "implemented"
+        );
+        let empty = feature_in(&answer, "domain-empty");
+        assert_eq!(empty["state"], "planned", "{empty}");
+        assert_eq!(empty["rollup"], Value::Null);
     }
 
     /// Only a source ending `/missions/spawn.git` is shipped by Spawn's own
@@ -3648,6 +4925,46 @@ mod tests {
             summary["hierarchy_roots"]
                 .as_array()
                 .is_some_and(|roots| !roots.is_empty())
+        );
+    }
+
+    /// Every backlog objective is a native source of a non-domain capability
+    /// of the repository registry, nothing names one the backlog lacks, and
+    /// the owner-judged, unlanded 4/029 has a planned node of its own.
+    #[test]
+    fn the_repository_registry_maps_every_backlog_objective() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let specs = read_mapping(&root.join("docs/feature-map/registry.json"), 4)
+            .expect("docs/feature-map/registry.json reads");
+        let backlog: std::collections::BTreeSet<u32> = std::fs::read_dir(root.join("rsi/backlog"))
+            .expect("rsi/backlog")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".json")?.parse().ok()
+            })
+            .collect();
+        let capabilities: std::collections::BTreeSet<u32> = specs
+            .iter()
+            .filter(|spec| spec.kind != "domain")
+            .flat_map(|spec| spec.objectives.iter().copied())
+            .collect();
+        assert_eq!(capabilities, backlog, "every backlog objective is mapped");
+        assert!(
+            specs
+                .iter()
+                .flat_map(|spec| spec.objectives.iter())
+                .all(|objective| backlog.contains(objective)),
+            "no registry objective is missing from rsi/backlog"
+        );
+        let envelopes: Vec<&str> = specs
+            .iter()
+            .filter(|spec| spec.objectives.contains(&29))
+            .map(|spec| spec.id.as_str())
+            .collect();
+        assert_eq!(
+            envelopes,
+            ["cap-resource-envelopes"],
+            "4/029 is its own node"
         );
     }
 }
