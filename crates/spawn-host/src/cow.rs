@@ -466,6 +466,16 @@ enum SharedMaps {
 /// process-level file disappears mid-scan.
 #[cfg(target_os = "linux")]
 fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
+    let tasks = fs::read_dir(base.join("task"))?.map(|task| task.map(|entry| entry.path()));
+    process_inside_tasks(base, tasks, directory)
+}
+
+#[cfg(target_os = "linux")]
+fn process_inside_tasks(
+    base: &Path,
+    tasks: impl IntoIterator<Item = io::Result<PathBuf>>,
+    directory: &Path,
+) -> io::Result<bool> {
     let inside = |link: &Path| -> io::Result<bool> {
         match fs::read_link(link) {
             Ok(to) => Ok(to.starts_with(directory)),
@@ -475,9 +485,9 @@ fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
     };
     let mut shared_maps = SharedMaps::Unread;
     let mut maps_error = None;
-    for task in fs::read_dir(base.join("task"))? {
+    for task in tasks {
         let task = match task {
-            Ok(task) => task.path(),
+            Ok(task) => task,
             Err(error) if exited(&error) => continue,
             Err(error) => return Err(error),
         };
@@ -2866,8 +2876,10 @@ mod tests {
             "restricted process maps must not hide a task working inside the workspace"
         );
 
-        // Multi-task fixture: task1 sits outside the workspace (triggering the
-        // deferred `base/maps` failure) while task2 holds an open descriptor inside it.
+        // Multi-task fixture: explicitly visit `task1` first so it sits outside
+        // the workspace and triggers the deferred `base/maps` failure before
+        // `task2` is checked, proving `maps` errors never mask a later task's fd;
+        // also check the reversed order and real `read_dir`-backed traversal.
         fs::remove_file(task1.join("cwd")).expect("clear task1 cwd");
         std::os::unix::fs::symlink("/elsewhere", task1.join("cwd")).expect("outside cwd");
         let task2 = base.join("task/2");
@@ -2875,9 +2887,21 @@ mod tests {
         std::os::unix::fs::symlink("/elsewhere", task2.join("cwd")).expect("task2 cwd");
         std::os::unix::fs::symlink("/work/a/open.txt", task2.join("fd/0")).expect("task2 fd link");
         assert!(
-            process_inside(&base, Path::new("/work/a"))
-                .expect("later task descriptor must still be detected"),
+            process_inside_tasks(
+                &base,
+                [Ok(task1.clone()), Ok(task2.clone())],
+                Path::new("/work/a")
+            )
+            .expect("later task descriptor must still be detected after maps failure"),
             "an earlier task's maps error must not skip subsequent tasks' fd checks"
+        );
+        assert!(
+            process_inside_tasks(&base, [Ok(task2.clone()), Ok(task1)], Path::new("/work/a"))
+                .expect("descriptor first must succeed immediately")
+        );
+        assert!(
+            process_inside(&base, Path::new("/work/a"))
+                .expect("directory traversal must find occupied task")
         );
 
         // When no task holds cwd, root or fd inside the workspace, the maps
