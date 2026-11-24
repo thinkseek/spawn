@@ -21,6 +21,9 @@ Every run ends with `git fsck --full --no-dangling`. The JSON report contains
 sample counts, min, p50, p95, p99, max and mean latency, whole-cycle throughput,
 and apparent bytes/files for the repository, workspace and transcript archive.
 Progress goes to stderr, so stdout can be redirected directly to a report file.
+The checkpoint path requires Git's `--pathspec-from-file` support (Git 2.25 or
+later); `environment.git_version` records the executable that produced each
+report. Do not compare reports produced by different Git versions.
 
 ## Run
 
