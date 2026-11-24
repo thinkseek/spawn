@@ -718,32 +718,64 @@ pub(crate) struct Work {
     pub(crate) waits: Waits,
 }
 
+enum LoadFailure {
+    Rejected(String),
+    Fatal(String),
+}
+
+impl LoadFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Rejected(message) | Self::Fatal(message) => message,
+        }
+    }
+}
+
+fn load_table<T: serde::de::DeserializeOwned>(
+    read: Result<serde_json::Value, spawn_core::port::StoreError>,
+    what: &str,
+) -> Result<T, LoadFailure> {
+    let value = read.map_err(|error| match error {
+        spawn_core::port::StoreError::Rejected(_) => LoadFailure::Rejected(error.to_string()),
+        other => LoadFailure::Fatal(other.to_string()),
+    })?;
+    serde_json::from_value(value).map_err(|error| LoadFailure::Fatal(format!("{what}: {error}")))
+}
+
 impl Work {
     /// Read the mission layer's rows.
     pub(crate) fn load(store: &PostgresStore) -> Result<Self, String> {
-        let error = |error: spawn_core::port::StoreError| error.to_string();
+        Self::load_with_access(store).map_err(LoadFailure::into_message)
+    }
+
+    /// Read the mission layer's rows when the caller's database login is
+    /// permitted to read the dispatcher tables, returning `Ok(None)` on SQL
+    /// privilege refusal so restricted logins (such as `spawn_supervisor`) can
+    /// degrade cleanly.
+    pub(crate) fn load_if_permitted(store: &PostgresStore) -> Result<Option<Self>, String> {
+        match Self::load_with_access(store) {
+            Ok(work) => Ok(Some(work)),
+            Err(LoadFailure::Rejected(_)) => Ok(None),
+            Err(LoadFailure::Fatal(error)) => Err(error),
+        }
+    }
+
+    fn load_with_access(store: &PostgresStore) -> Result<Self, LoadFailure> {
         // The roster, read once: the retired residents and the pools.
-        let residents: Vec<Resident> =
-            serde_json::from_value(store.resident_roster().map_err(error)?)
-                .map_err(|error| format!("resident roster: {error}"))?;
+        let residents: Vec<Resident> = load_table(store.resident_roster(), "resident roster")?;
         let retired = residents
             .iter()
             .filter(|resident| resident.state == "retired")
             .map(|resident| (resident.agent_id.clone(), resident.session_id.clone()))
             .collect();
         Ok(Self {
-            tasks: serde_json::from_value(store.delivery_rows().map_err(error)?)
-                .map_err(|error| format!("delivery rows: {error}"))?,
-            news: serde_json::from_value(store.mission_news().map_err(error)?)
-                .map_err(|error| format!("mission news: {error}"))?,
+            tasks: load_table(store.delivery_rows(), "delivery rows")?,
+            news: load_table(store.mission_news(), "mission news")?,
             retired,
             residents,
-            cancelled: serde_json::from_value(store.cancelled_deliveries().map_err(error)?)
-                .map_err(|error| format!("cancelled deliveries: {error}"))?,
-            moved: serde_json::from_value(store.latest_source_moved().map_err(error)?)
-                .map_err(|error| format!("latest source.moved: {error}"))?,
-            pauses: serde_json::from_value(store.mission_pauses().map_err(error)?)
-                .map_err(|error| format!("mission pauses: {error}"))?,
+            cancelled: load_table(store.cancelled_deliveries(), "cancelled deliveries")?,
+            moved: load_table(store.latest_source_moved(), "latest source.moved")?,
+            pauses: load_table(store.mission_pauses(), "mission pauses")?,
             waits: Waits::default(),
         })
     }
@@ -2119,48 +2151,80 @@ impl ReportStatus {
     }
 }
 
-/// Inspect a report once for both collection and operator diagnostics. The
-/// text is returned for empty and draft reports too, preserving
-/// [`new_report`]'s contract; only collection decides what to do with them.
-fn inspect_report(workspace: &Path, key: &str) -> (ReportStatus, Option<String>) {
+enum InspectedReport {
+    Absent,
+    Unreadable,
+    OlderThanDelivery,
+    Empty(String),
+    Draft {
+        text: String,
+        markers: Vec<unfinished::Marker>,
+    },
+    Collectible(String),
+}
+
+impl InspectedReport {
+    fn status(&self) -> ReportStatus {
+        match self {
+            Self::Absent => ReportStatus::Absent,
+            Self::Unreadable => ReportStatus::Unreadable,
+            Self::OlderThanDelivery => ReportStatus::OlderThanDelivery,
+            Self::Empty(_) => ReportStatus::Empty,
+            Self::Draft { .. } => ReportStatus::Draft,
+            Self::Collectible(_) => ReportStatus::Collectible,
+        }
+    }
+
+    fn into_text(self) -> Option<String> {
+        match self {
+            Self::Empty(text) | Self::Draft { text, .. } | Self::Collectible(text) => Some(text),
+            Self::Absent | Self::Unreadable | Self::OlderThanDelivery => None,
+        }
+    }
+}
+
+/// Inspect a report once for both collection and operator diagnostics, scanning
+/// [`unfinished::markers`] at most once so collection reuses the parsed markers.
+fn inspect_report(workspace: &Path, key: &str) -> InspectedReport {
     use spawn_host::agent_files::{open_regular, read_regular};
     let (bytes, metadata, _) = match read_regular(workspace, &TreePath::from(REPORT), REPORT_LIMIT)
     {
         Ok(Some(report)) => report,
-        Ok(None) => return (ReportStatus::Absent, None),
-        Err(_) => return (ReportStatus::Unreadable, None),
+        Ok(None) => return InspectedReport::Absent,
+        Err(_) => return InspectedReport::Unreadable,
     };
     let Ok(written) = metadata.modified() else {
-        return (ReportStatus::Unreadable, None);
+        return InspectedReport::Unreadable;
     };
     let sent = match open_regular(workspace, &delivery_mark(key)) {
         Ok(None) => None,
         Ok(Some(mark)) => match mark.metadata.modified() {
             Ok(modified) => Some(modified),
-            Err(_) => return (ReportStatus::Unreadable, None),
+            Err(_) => return InspectedReport::Unreadable,
         },
-        Err(_) => return (ReportStatus::Unreadable, None),
+        Err(_) => return InspectedReport::Unreadable,
     };
     if sent.is_some_and(|sent| written < sent) {
-        return (ReportStatus::OlderThanDelivery, None);
+        return InspectedReport::OlderThanDelivery;
     }
     let Ok(text) = String::from_utf8(bytes) else {
-        return (ReportStatus::Unreadable, None);
+        return InspectedReport::Unreadable;
     };
-    let status = if text.trim().is_empty() {
-        ReportStatus::Empty
-    } else if unfinished::markers(&text).is_empty() {
-        ReportStatus::Collectible
+    if text.trim().is_empty() {
+        return InspectedReport::Empty(text);
+    }
+    let markers = unfinished::markers(&text);
+    if markers.is_empty() {
+        InspectedReport::Collectible(text)
     } else {
-        ReportStatus::Draft
-    };
-    (status, Some(text))
+        InspectedReport::Draft { text, markers }
+    }
 }
 
 /// The report's filesystem state for `spawn mission show`, using exactly the
 /// same safe opens, delivery-mark comparison and draft rules as collection.
 pub(crate) fn report_status(workspace: &Path, key: &str) -> ReportStatus {
-    inspect_report(workspace, key).0
+    inspect_report(workspace, key).status()
 }
 
 /// The report in `workspace` written for the delivery `key`, if there is
@@ -2172,8 +2236,9 @@ pub(crate) fn report_status(workspace: &Path, key: &str) -> ReportStatus {
 /// waited on, the times are the opened files' own, and at most
 /// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
 /// is never new.
+#[cfg_attr(not(test), allow(dead_code))]
 fn new_report(workspace: &Path, key: &str) -> Option<String> {
-    inspect_report(workspace, key).1
+    inspect_report(workspace, key).into_text()
 }
 
 /// Collect the reports of delivered tasks whose worker's turn stopped at an
@@ -2210,31 +2275,32 @@ pub(crate) fn collect_reports(
         };
         let workspace = root.join(&task.agent_id);
         let key = task.delivery_key();
-        let Some(report) = new_report(&workspace, &key) else {
-            continue;
-        };
-        if report.trim().is_empty() {
-            continue;
-        }
-        let markers = unfinished::markers(&report);
-        if !markers.is_empty() {
-            match refuse_unfinished(store, task, facts, &report, &markers, &work.waits, now_ms) {
-                Ok(line) => lines.extend(line),
-                Err(error) => lines.push(format!(
-                    "deliver: task #{} unfinished report: {error}",
-                    task.id
-                )),
+        match inspect_report(&workspace, &key) {
+            InspectedReport::Absent
+            | InspectedReport::Unreadable
+            | InspectedReport::OlderThanDelivery
+            | InspectedReport::Empty(_) => {}
+            InspectedReport::Draft { text, markers } => {
+                match refuse_unfinished(store, task, facts, &text, &markers, &work.waits, now_ms) {
+                    Ok(line) => lines.extend(line),
+                    Err(error) => lines.push(format!(
+                        "deliver: task #{} unfinished report: {error}",
+                        task.id
+                    )),
+                }
             }
-            continue;
-        }
-        match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref()) {
-            Ok(true) => {
-                put_aside(&workspace, task.id);
-                let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
-                lines.push(format!("deliver: task #{} reported", task.id));
+            InspectedReport::Collectible(report) => {
+                match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref())
+                {
+                    Ok(true) => {
+                        put_aside(&workspace, task.id);
+                        let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
+                        lines.push(format!("deliver: task #{} reported", task.id));
+                    }
+                    Ok(false) => {}
+                    Err(error) => lines.push(format!("deliver: task #{} report: {error}", task.id)),
+                }
             }
-            Ok(false) => {}
-            Err(error) => lines.push(format!("deliver: task #{} report: {error}", task.id)),
         }
     }
     lines

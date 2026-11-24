@@ -706,6 +706,26 @@ pub(crate) fn load(
     Ok((rows, work))
 }
 
+/// Like [`load`], but returns `Ok(None)` when a restricted database login
+/// (such as `spawn_supervisor`) lacks privilege on the dispatcher relations.
+pub(crate) fn load_if_permitted(
+    store: &PostgresStore,
+    waits: deliver::Waits,
+) -> Result<Option<(Vec<Facts>, Work)>, String> {
+    let raw = match store.dispatch_facts() {
+        Ok(raw) => raw,
+        Err(spawn_core::port::StoreError::Rejected(_)) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let rows: Vec<Facts> =
+        serde_json::from_value(raw).map_err(|error| format!("dispatch facts: {error}"))?;
+    let Some(mut work) = Work::load_if_permitted(store)? else {
+        return Ok(None);
+    };
+    work.waits = waits;
+    Ok(Some((rows, work)))
+}
+
 /// What stalls are measured from, read after the facts and rows: a record
 /// newer than them only makes a step look younger.
 fn load_stalls(store: &PostgresStore) -> Result<stall::Stalls, String> {
