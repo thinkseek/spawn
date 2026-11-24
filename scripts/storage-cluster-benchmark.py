@@ -260,6 +260,24 @@ def brief(worker, iterations):
     ) % (worker, iterations - 1, worker, worker)
 
 
+def iteration_brief(worker, iteration):
+    return (
+        "Storage worker %d: perform only iteration %d now. Use one Bash tool call to run "
+        "python3 -I tools/golden_workload.py --worker %d --iteration %d. "
+        "Do not run any other iteration, use a shell loop, modify golden/ or tools/, use "
+        "network, or start subagents. Do not write .spawn/report.md. After the command "
+        "succeeds, reply STORAGE_CLUSTER_ITERATION_%d_DONE and wait for the next input."
+    ) % (worker, iteration, worker, iteration, iteration)
+
+
+def finalize_brief(worker, iterations):
+    return (
+        "Storage worker %d: all %d workload iterations are complete. Do not run the workload "
+        "again. Write .spawn/report.md now with Outcome done and the completed iteration and "
+        "byte counts, then reply STORAGE_CLUSTER_WORKER_%03d_DONE."
+    ) % (worker, iterations, worker)
+
+
 class HostMonitor(threading.Thread):
     def __init__(self, path, root):
         super().__init__(daemon=True)
@@ -519,6 +537,7 @@ def run_cluster(args):
         "iterations": args.iterations,
         "golden_bytes": manifest["bytes"],
         "golden_sha256": manifest["sha256"],
+        "mode": "autonomous-single-turn" if args.autonomous_single_turn else "synchronized-turns",
         "started_at_ms": int(time.time() * 1000),
     }
     (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -535,10 +554,11 @@ def run_cluster(args):
         mission_id = added["mission"]
         config["mission"] = mission_id
         for worker in range(args.agents):
+            initial = brief(worker, args.iterations) if args.autonomous_single_turn else iteration_brief(worker, 0)
             task_id = spawn_json([
                 "task", "assign", "--mission", str(mission_id), "--kind", "ephemeral",
                 "--worker", "storage%03d" % worker,
-                "--brief", brief(worker, args.iterations), "--model", "default",
+                "--brief", initial, "--model", "default",
             ])["task"]
             tasks[task_id] = {"id": task_id}
             print("assigned task %s worker %d" % (task_id, worker), file=sys.stderr)
@@ -546,25 +566,89 @@ def run_cluster(args):
 
         deadline = began + args.timeout
         terminal = {"reported", "accepted", "landed"}
-        while True:
-            board = spawn_json(["mission", "list", "--limit", "200"])
-            states = {}
-            for task_id in tasks:
-                task = find_task(board, mission_id, task_id)
-                if task is not None:
-                    tasks[task_id].update(task)
-                    states[task_id] = task.get("state")
-            counts = collections.Counter(states.values())
-            print("state %s elapsed=%.1fs" % (dict(counts), time.monotonic() - began), file=sys.stderr)
-            if len(states) == len(tasks) and all(state in terminal for state in states.values()):
-                break
-            failures = {state for state in states.values() if state in ("cancelled", "failed", "rejected")}
-            if failures:
-                raise RuntimeError("tasks entered failure states: %s" % sorted(failures))
-            if time.monotonic() > deadline:
-                (output / "last-board.json").write_text(json.dumps(board, indent=2) + "\n")
-                raise TimeoutError("cluster did not finish within %d seconds" % args.timeout)
-            time.sleep(args.poll)
+        merged_events = {}
+        if not args.autonomous_single_turn:
+            # Wait for every task to have a live agent/session before driving
+            # the synchronized turns. The initial prompt is iteration zero.
+            while True:
+                board = spawn_json(["mission", "list", "--limit", "200"])
+                for task_id in tasks:
+                    task = find_task(board, mission_id, task_id)
+                    if task is not None:
+                        tasks[task_id].update(task)
+                ready = sum(
+                    bool(task.get("agent_id") and task.get("session_id")) and task.get("state") in terminal | {"delivered"}
+                    for task in tasks.values()
+                )
+                print("delivery ready %d/%d elapsed=%.1fs" % (
+                    ready, len(tasks), time.monotonic() - began), file=sys.stderr, flush=True)
+                if ready == len(tasks):
+                    break
+                if time.monotonic() > deadline:
+                    raise TimeoutError("agents were not delivered before the timeout")
+                time.sleep(args.poll)
+            (output / "tasks.json").write_text(json.dumps(tasks, indent=2) + "\n")
+
+            # One extra turn writes .spawn/report.md. Keeping finalization out
+            # of the workload turns makes every measured iteration identical.
+            for iteration in range(args.iterations + 1):
+                if iteration > 0:
+                    for task_id, task in sorted(tasks.items()):
+                        worker = int(re.search(r"storage(\d+)(?:_|$)", task["agent_id"]).group(1))
+                        if iteration < args.iterations:
+                            text = iteration_brief(worker, iteration)
+                        else:
+                            text = finalize_brief(worker, args.iterations)
+                        run_command([
+                            spawn_binary(), "submit", "--agent", task["agent_id"],
+                            "--session", task["session_id"],
+                            "--key", "storage-cluster-input-%d-%d" % (task_id, iteration),
+                            "--action", json.dumps({"type": "input", "text": text}),
+                        ])
+                pending = set(tasks)
+                while pending:
+                    for task_id in list(pending):
+                        task = tasks[task_id]
+                        tail = spawn_json([
+                            "tail", "--session", task["session_id"], "--events", "200"])
+                        events = tail.get("events", [])
+                        turns = sum(event.get("event_name") == "turn.stopped" for event in events)
+                        worker = int(re.search(r"storage(\d+)(?:_|$)", task["agent_id"]).group(1))
+                        merged = merged_events.setdefault(task_id, {})
+                        for event in events:
+                            merged[event["session_seq"]] = event
+                        if turns >= iteration + 1:
+                            (output / ("tail-%03d-turn-%03d.json" % (worker, iteration))).write_text(
+                                json.dumps(tail, indent=2) + "\n")
+                            pending.remove(task_id)
+                    print("iteration %d turns complete %d/%d elapsed=%.1fs" % (
+                        iteration, len(tasks) - len(pending), len(tasks), time.monotonic() - began),
+                        file=sys.stderr, flush=True)
+                    if pending and time.monotonic() > deadline:
+                        raise TimeoutError("iteration %d did not finish: tasks %s" % (iteration, sorted(pending)))
+                    if pending:
+                        time.sleep(args.poll)
+        else:
+            while True:
+                board = spawn_json(["mission", "list", "--limit", "200"])
+                states = {}
+                for task_id in tasks:
+                    task = find_task(board, mission_id, task_id)
+                    if task is not None:
+                        tasks[task_id].update(task)
+                        states[task_id] = task.get("state")
+                counts = collections.Counter(states.values())
+                print("state %s elapsed=%.1fs" % (dict(counts), time.monotonic() - began), file=sys.stderr)
+                if len(states) == len(tasks) and all(state in terminal for state in states.values()):
+                    break
+                failures = {state for state in states.values() if state in ("cancelled", "failed", "rejected")}
+                if failures:
+                    raise RuntimeError("tasks entered failure states: %s" % sorted(failures))
+                if time.monotonic() > deadline:
+                    (output / "last-board.json").write_text(json.dumps(board, indent=2) + "\n")
+                    raise TimeoutError("cluster did not finish within %d seconds" % args.timeout)
+                time.sleep(args.poll)
+        (output / "tasks.json").write_text(json.dumps(tasks, indent=2) + "\n")
 
         time.sleep(6)  # Let the background branch pusher catch up.
         all_iterations = []
@@ -576,7 +660,10 @@ def run_cluster(args):
             if not match:
                 raise RuntimeError("cannot identify the worker from %s" % task["agent_id"])
             worker = int(match.group(1))
-            tail = spawn_json(["tail", "--session", task["session_id"], "--events", "200"])
+            if args.autonomous_single_turn:
+                tail = spawn_json(["tail", "--session", task["session_id"], "--events", "200"])
+            else:
+                tail = {"events": [merged_events[task_id][seq] for seq in sorted(merged_events[task_id])]}
             (output / ("tail-%03d.json" % worker)).write_text(json.dumps(tail, indent=2) + "\n")
             archive_failures += sum(event.get("event_name") == "archive.failed" for event in tail.get("events", []))
             messages = {}
@@ -658,6 +745,8 @@ def run_cluster(args):
 
 
 def main():
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     make = subcommands.add_parser("generate")
@@ -673,6 +762,11 @@ def main():
     run.add_argument("--iterations", type=int, default=8)
     run.add_argument("--timeout", type=int, default=1800)
     run.add_argument("--poll", type=float, default=5.0)
+    run.add_argument(
+        "--autonomous-single-turn",
+        action="store_true",
+        help="let each agent issue all tool calls in one turn; useful for measuring checkpoint coalescing",
+    )
     run.set_defaults(function=run_cluster)
     args = parser.parse_args()
     if args.command == "generate" and min(args.file_kib, args.shards, args.files_per_shard) < 1:

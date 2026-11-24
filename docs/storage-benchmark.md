@@ -142,10 +142,24 @@ python3 -I scripts/storage-cluster-benchmark.py run \
 
 The environment must already contain the normal Spawn owner configuration. The
 runner refuses to start unless the filesystem can hold every mounted dataset
-plus a 20 GiB reserve. Each brief requires a separate Bash call per iteration,
-not one shell loop, so every iteration has its own `tool.started`,
-`tool.completed` and `artifact.committed` timing. Agents may not modify the
-golden inputs or tools, use the network or start subagents.
+plus a 20 GiB reserve. By default the controller drives **synchronized turns**:
+the initial prompt runs iteration zero, and it sends the next input only after
+every agent's previous `turn.stopped`. Each measured turn is exactly one
+workload Bash call. An additional finalization turn writes `.spawn/report.md`
+only after all measured turns, keeping report generation out of iteration
+latency. This forces a real turn boundary and checkpoint per iteration instead
+of assuming that eight tool calls in one model turn necessarily produce eight
+checkpoints. Agents may not modify the golden inputs or tools, use the network
+or start subagents.
+
+`--autonomous-single-turn` preserves the alternative pressure case: each agent
+issues all tool calls autonomously in one model turn. Under concurrency Spawn
+may legitimately batch transcript ingestion and coalesce several tool calls
+into one `artifact.committed`; that mode is useful for measuring this behavior,
+but the strict per-iteration timing validation fails when the checkpoints are
+coalesced. Never interpret coalesced tool timing as separate physical
+checkpoints. Per-turn event snapshots are merged by session sequence number so
+a later 200-event tail cannot erase early iterations.
 
 For every worker and iteration, the runner reads the JSON result and binary
 artifact from the published agent branch, independently recomputes the golden
