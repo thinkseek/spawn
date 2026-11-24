@@ -719,6 +719,12 @@ pub trait FileWatch: Send + Sync + std::fmt::Debug {
 
     /// The keys whose paths changed since the last call, each at most once.
     fn drain(&self) -> Vec<String>;
+
+    /// Wait until this watch may have changes. `Ok(None)` means the adapter
+    /// cannot wait; `Ok(Some(false))` means timeout.
+    fn wait(&self, _timeout: Duration) -> Result<Option<bool>, WatchError> {
+        Ok(None)
+    }
 }
 
 /// Transcript archive failure.
