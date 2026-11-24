@@ -400,7 +400,7 @@ fn stalls(store: &MemoryStore) -> Vec<(EndCause, u32)> {
 fn stalled(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Bridge {
     let mut bridge = bridge(store).with_clock(clock.clone());
     start(store, None);
-    start_pass(&mut bridge, &store);
+    start_pass(&mut bridge, store);
     store.fail_commits(true);
     submit(store, "key_stop", CommandAction::Stop);
     // The stop tries once, and the same tick's pass over executions again.

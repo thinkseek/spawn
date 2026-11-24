@@ -1318,6 +1318,20 @@ impl Bridge {
             })
     }
 
+    /// Whether a start or resume waits on an off-thread mount or on its
+    /// engine's prompt readiness: a one-shot caller (`spawn tick`) ticks
+    /// again until it finishes, as it does for [`Self::ends_pending`].
+    pub fn starts_pending(&self) -> bool {
+        self.mounting.values().any(|pending| !pending.cancelled)
+            || !self.prompting.is_empty()
+            || self.held.values().any(|claimed| {
+                matches!(
+                    claimed.action(),
+                    Ok(CommandAction::Start { .. } | CommandAction::Resume { .. })
+                )
+            })
+    }
+
     /// Rebuild state from the whole log.
     pub fn recover(&mut self) -> Result<(), StoreError> {
         self.cursor = GlobalPosition(0);
@@ -1509,6 +1523,7 @@ impl Bridge {
     /// (`lease_until_ms`) is the caller's to time.
     pub fn work(&mut self) -> Result<(TickReport, bool), StoreError> {
         self.catch_up()?;
+        self.reap_cancelled_mounts();
         let mut report = TickReport::default();
         // Waiting commands keep their lease until the claims of this tick
         // are done, so commands on other sessions (and behind waiting inputs)
@@ -1526,6 +1541,10 @@ impl Bridge {
                     self.held.remove(&claimed.command_id);
                     self.prepared.remove(&claimed.command_id);
                     self.prompting.remove(&claimed.command_id);
+                    if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
+                        pending.cancelled = true;
+                    }
+                    self.reap_cancelled_mounts();
                     self.queue.finish(&claimed, &outcome)?;
                 }
                 Handled::Waiting { retry } => {
@@ -1601,6 +1620,7 @@ impl Bridge {
         let EventKind::CommandFinished { command_id, .. } = &event.kind else {
             return;
         };
+        self.held.remove(command_id);
         self.prepared.remove(command_id);
         self.prompting.remove(command_id);
         if let Some(pending) = self.mounting.get_mut(command_id) {
@@ -2247,8 +2267,20 @@ impl Bridge {
             .any(|claimed| &claimed.session_id == session)
     }
 
+    /// Whether an execution is waiting on its start or resume prompt, so
+    /// [`Self::follow_screen`] leaves the pane to `type_prompt` until the
+    /// initial prompt is typed.
+    fn prompting_execution(&self, execution: &ExecutionId) -> bool {
+        self.prompting
+            .keys()
+            .any(|id| ExecutionId::for_command(*id) == *execution)
+    }
+
     /// Why this pass wants the pane read, if it does.
     fn screen_wanted(&self, session: &SessionId, active: &Active) -> Wanted {
+        if self.prompting_execution(&active.execution_id) {
+            return Wanted::Nothing;
+        }
         let follow = &active.follow;
         // No watch: read on every pass, as before watches. A command in
         // flight reads it too: its next move waits on what the pane says.
@@ -3243,7 +3275,15 @@ impl Bridge {
         let branch = BranchName::for_agent(&claimed.agent_id);
         let prepared = match self.prepare_start(claimed, &branch, model, from, report)? {
             Ok(prepared) => prepared,
-            Err(why) => return finished(Outcome::Failed(why)),
+            Err(why) => {
+                let steps = self.recorded_steps(claimed);
+                if let Some(workspace) = steps.mounted
+                    && !steps.released
+                {
+                    return finished(self.give_up_mount(claimed, &workspace, why));
+                }
+                return finished(Outcome::Failed(why));
+            }
         };
         let workspace = match self.mount_for_start(claimed, &branch)? {
             MountProgress::Ready(workspace) => workspace,
@@ -3373,6 +3413,10 @@ impl Bridge {
         if let Some(workspace) = steps.mounted
             && !steps.released
         {
+            if let Some(pending) = self.mounting.get_mut(&claimed.command_id) {
+                pending.cancelled = true;
+            }
+            self.reap_cancelled_mounts();
             return Ok(MountProgress::Ready(workspace));
         }
         if !self.mounting.contains_key(&claimed.command_id) {
@@ -6855,15 +6899,26 @@ mod tests {
     /// Drive released claims with no wall-clock sleep. The memory clock is
     /// deliberately bypassed by this test-only queue helper.
     fn drive_work(bridge: &mut Bridge, store: &Arc<MemoryStore>, mut done: impl FnMut() -> bool) {
+        drive_until(bridge, store, |_| done());
+    }
+
+    fn drive_until(
+        bridge: &mut Bridge,
+        store: &Arc<MemoryStore>,
+        mut done: impl FnMut(&Bridge) -> bool,
+    ) {
         for _ in 0..1_024 {
-            if done() {
+            if done(bridge) {
                 return;
             }
             bridge.work().expect("work");
             store.expire_leases();
             std::thread::yield_now();
         }
-        assert!(done(), "the condition was not reached in 1,024 claims");
+        assert!(
+            done(bridge),
+            "the condition was not reached in 1,024 claims"
+        );
     }
 
     /// A workspace store whose selected mounts wait at a test gate. It also
@@ -8446,5 +8501,202 @@ mod tests {
         );
         assert!(bridge.prompting.is_empty());
         assert!(bridge.mounting.is_empty());
+    }
+
+    #[test]
+    fn starts_pending_tracks_mounting_and_prompting_but_not_waiting_inputs() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        assert!(!bridge.starts_pending());
+
+        let start_id = submit_resumable_start(&store, 1, "go", BUSY);
+        let branch = BranchName::for_agent(&resumable_agent(1));
+        mounts.hold(branch.clone());
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 1
+        });
+        assert!(
+            bridge.starts_pending(),
+            "pending mount worker marks starts_pending"
+        );
+
+        mounts.release(&branch);
+        drive_until(&mut bridge, &store, |bridge| !bridge.prompting.is_empty());
+        assert!(bridge.mounting.is_empty());
+        assert!(
+            bridge.starts_pending(),
+            "pending prompt readiness marks starts_pending"
+        );
+
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(start_id));
+        store.set_pane(&terminal, READY);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, start_id).is_some()
+        });
+        assert_eq!(command_outcome(&store, start_id), Some(Outcome::Succeeded));
+        assert!(
+            !bridge.starts_pending(),
+            "finished start clears starts_pending"
+        );
+
+        store.set_pane(&terminal, BUSY);
+        let input_id = store
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(1),
+                    session_id: resumable_session(1),
+                    idempotency_key: IdempotencyKey::new("waiting-input").expect("key"),
+                    action: CommandAction::Input {
+                        text: "still busy".to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit input");
+        bridge.work().expect("work holds waiting input");
+        assert!(bridge.held.contains_key(&input_id));
+        assert!(
+            !bridge.starts_pending(),
+            "waiting Input is not a pending start"
+        );
+        assert!(!bridge.ends_pending(), "waiting Input is not a pending end");
+    }
+
+    #[test]
+    fn another_bridges_finish_clears_held_and_reaps_cancelled_mount_without_new_starts() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mounts = Arc::new(GatedMounts::new(store.clone()));
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let branch = BranchName::for_agent(&resumable_agent(1));
+        mounts.hold(branch.clone());
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            mounts.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        let _release = ReleaseMounts(&mounts);
+        drive_work(&mut bridge, &store, || {
+            mounts.calls.load(Ordering::SeqCst) == 1
+        });
+        assert!(bridge.held.contains_key(&id));
+        assert!(bridge.starts_pending());
+        assert_eq!(bridge.mounting.len(), 1);
+
+        let claimed = store
+            .claim("other", Duration::from_mins(1))
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(claimed.command_id, id);
+        store
+            .finish(
+                &claimed,
+                &Outcome::Failed("cancelled elsewhere".to_string()),
+            )
+            .expect("finish");
+
+        bridge.catch_up().expect("catch_up");
+        assert!(
+            !bridge.held.contains_key(&id),
+            "fold_finished_command clears held"
+        );
+        assert!(
+            !bridge.starts_pending(),
+            "cancelled mount no longer counts as pending start"
+        );
+        assert!(
+            bridge
+                .mounting
+                .get(&id)
+                .is_some_and(|pending| pending.cancelled)
+        );
+
+        mounts.release(&branch);
+        while !bridge
+            .mounting
+            .values()
+            .all(|pending| pending.handle.is_finished())
+        {
+            std::thread::yield_now();
+        }
+        bridge.work().expect("work reaps without new starts");
+        assert!(
+            bridge.mounting.is_empty(),
+            "work reaped cancelled mount without new starts"
+        );
+        assert_eq!(
+            store
+                .workspace_calls()
+                .iter()
+                .filter(|call| *call == "unmount")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn follow_screen_does_not_record_ready_while_start_is_prompting() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let id = submit_resumable_start(&store, 1, "delayed prompt", BUSY);
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        drive_until(&mut bridge, &store, |bridge| !bridge.prompting.is_empty());
+
+        store.set_pane(&terminal, READY);
+        bridge.poll().expect("first poll while prompting");
+        bridge.poll().expect("second poll while prompting");
+        let ready_before_typing = store
+            .read_global(GlobalPosition(0), 1_000)
+            .expect("read")
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event.kind,
+                    EventKind::ScreenObserved {
+                        state: ScreenState::Ready,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            ready_before_typing, 0,
+            "follow_screen did not record Ready while type_prompt was still pending"
+        );
+
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let pane = store
+            .capture_tail(
+                &terminal,
+                &WorkspaceId::new("1:/workspaces/1").expect("workspace"),
+                super::TAIL_LINES,
+            )
+            .expect("pane");
+        assert!(pane.contains("delayed prompt"), "{pane}");
     }
 }

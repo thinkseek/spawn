@@ -77,25 +77,42 @@ fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration 
     interval.saturating_mul(failures.clamp(1, MAX_BACKOFF_INTERVALS))
 }
 
-/// How long `spawn tick` goes on ticking for an end whose kill waits off
-/// the Bridge's loop: longer than a host's kill takes at its bound (tmux:
-/// 7 s) plus a waiting command's retry (1 s by default).
+/// Most intervals a execution end waits before its kill finishes.
+/// Longer than a host's kill takes at its bound (tmux: 7 s) plus a
+/// waiting command's retry (1 s by default).
 const TICK_ENDS_LIMIT: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// Most time `spawn tick` goes on ticking for a start or resume whose mount
+/// runs off the Bridge thread or whose engine has not painted its prompt yet:
+/// covers a mount plus two prompt readiness budgets (trust dialog + prompt)
+/// and any abandon kill.
+const TICK_STARTS_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// `spawn tick`: one Bridge and Observer pass. A command whose end waits for
-/// its kill, which runs off the Bridge's loop (backlog P7), would finish
-/// only at a later pass; this one-shot pass ticks the Bridge again, every
-/// 50 ms, until no end waits (at most [`TICK_ENDS_LIMIT`]), so a stop it
-/// claims is finished when it returns, as before the kill left the loop.
+/// its kill, which runs off the Bridge's loop (backlog P7), or a start or
+/// resume waiting on its mount worker or prompt readiness, would finish only
+/// at a later pass; this one-shot pass ticks the Bridge again until neither
+/// waits (within [`TICK_ENDS_LIMIT`] or [`TICK_STARTS_LIMIT`]), so commands it
+/// claims are finished when it returns, as before.
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     let (mut bridge, mut observer) = runtime(flags)?;
     let mut report = bridge.tick().map_err(|error| error.to_string())?;
-    let deadline = std::time::Instant::now() + TICK_ENDS_LIMIT;
-    while bridge.ends_pending() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Its commands are the first pass's claimed again (a waiting stop),
-        // not new ones: `commands=` says what this tick was given.
+    let start = std::time::Instant::now();
+    let mut had_start = bridge.starts_pending();
+    while (bridge.ends_pending() || bridge.starts_pending())
+        && start.elapsed()
+            < if had_start {
+                TICK_STARTS_LIMIT
+            } else {
+                TICK_ENDS_LIMIT
+            }
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        // Its commands are the first pass's claimed again (a waiting stop,
+        // start or resume), not new ones: `commands=` says what this tick
+        // was given.
         let more = bridge.tick().map_err(|error| error.to_string())?;
+        had_start |= bridge.starts_pending();
         report.warnings.extend(more.warnings);
         report.notes.extend(more.notes);
     }

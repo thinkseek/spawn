@@ -91,6 +91,12 @@ fn tick(log: Arc<dyn EventLog>, store: &Arc<PostgresStore>, host: &Arc<MemorySto
     );
     bridge.recover().expect("recover");
     bridge.tick().expect("tick");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while (bridge.ends_pending() || bridge.starts_pending()) && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        bridge.tick().expect("tick");
+    }
 }
 
 fn events(store: &PostgresStore) -> Vec<NewEvent> {

@@ -356,7 +356,7 @@ fn tick_fresh(store: &Arc<MemoryStore>) -> spawn_core::bridge::TickReport {
         BridgeConfig::new("tester"),
     );
     bridge.recover().expect("recover succeeds");
-    tick(&mut bridge, &store).expect("tick succeeds")
+    tick(&mut bridge, store).expect("tick succeeds")
 }
 
 fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
