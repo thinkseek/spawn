@@ -938,6 +938,106 @@ fn a_verdict_does_not_bring_back_a_cancelled_task() {
 }
 
 #[test]
+fn an_accepted_task_in_a_gated_mission_can_be_cancelled() {
+    let (store, schema) = store("control_cancel_accepted_gated");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "review", None, None)
+        .expect("configure");
+    let accepted = |brief: &str| {
+        let task = store
+            .task_assign(mission, "ephemeral", "w", brief, "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "", None).expect("accept");
+        task
+    };
+    let cancel_first = accepted("cancel first");
+    let accept_first = accepted("accept first");
+    let retryable = accepted("aborted and stale");
+    let mut client = admin(&schema);
+    for task in [cancel_first, accept_first, retryable] {
+        assert!(gated_task_ids(&store, mission).contains(&task));
+    }
+    let accepted_verdict = |task: i64| {
+        json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "accepted",
+               "base": "b", "candidate": format!("c{task}")})
+    };
+
+    // The append lock serializes cancel and acceptance. Cancel first wins:
+    // the gate's later acceptance cannot bring the task back.
+    store.task_cancel(cancel_first).expect("cancel accepted");
+    assert_eq!(task_state(&mut client, cancel_first), "cancelled");
+    assert!(
+        store
+            .integrator_record(&accepted_verdict(cancel_first))
+            .is_err()
+    );
+
+    // Acceptance first wins the other order: the task is landing and closed
+    // to cancellation, as before.
+    store
+        .integrator_record(&accepted_verdict(accept_first))
+        .expect("accept first");
+    assert_eq!(task_state(&mut client, accept_first), "landing");
+    assert!(store.task_cancel(accept_first).is_err());
+
+    // Neither retryable outcome closes accepted work, so both leave it under
+    // the operator's cancellation handle.
+    for verdict in ["aborted", "stale"] {
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": retryable, "revision": 0,
+                                       "verdict": verdict, "base": "b", "reason": verdict,
+                                       "log": "no verdict"}),
+            )
+            .expect("retryable verdict");
+        assert_eq!(task_state(&mut client, retryable), "accepted");
+    }
+    store.task_cancel(retryable).expect("cancel after retries");
+    assert_eq!(task_state(&mut client, retryable), "cancelled");
+    assert!(
+        store.task_cancel(retryable).is_err(),
+        "a second cancel fails"
+    );
+    assert_eq!(cancelled_records(&mut client, retryable), 1);
+
+    let handed = gated_task_ids(&store, mission);
+    assert!(!handed.contains(&cancel_first));
+    assert!(!handed.contains(&retryable));
+    assert!(handed.contains(&accept_first), "landing still goes on");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live, "the tables are the log's fold");
+}
+
+#[test]
+fn an_accepted_task_without_a_gate_remains_closed() {
+    let (store, schema) = store("control_cancel_accepted_ungated");
+    let mission = store
+        .mission_add("Ungated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store.task_review(task, true, "", None).expect("accept");
+
+    assert!(store.task_cancel(task).is_err(), "accepted is final");
+    let mut client = admin(&schema);
+    assert_eq!(task_state(&mut client, task), "accepted");
+    assert_eq!(cancelled_records(&mut client, task), 0);
+    assert!(gated_task_ids(&store, mission).is_empty());
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live, "the refusal records nothing");
+}
+
+#[test]
 fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
     let (store, schema) = store("control_closed");
     let accepted_task = |text: &str| {

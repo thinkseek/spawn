@@ -2485,7 +2485,10 @@ impl PostgresStore {
         )
     }
 
-    /// Cancel a task that is not closed yet.
+    /// Cancel a task still in flight: assigned, delivered, reported or sent
+    /// back, or accepted in a gated mission while its gate may still run.
+    /// Accepted work without a gate, and cancelled, landing or landed work,
+    /// is closed and refused.
     pub fn task_cancel(&self, task: i64) -> Result<(), StoreError> {
         self.execute("select spawn_task_cancel($1)", &[&task])?;
         Ok(())
