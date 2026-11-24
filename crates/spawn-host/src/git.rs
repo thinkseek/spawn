@@ -1375,10 +1375,11 @@ impl GitWorkspace {
                 return self.recreate(&branch, &directory, &index, message);
             }
         }
-        // One rev-parse reads the parent and its tree. Besides saving two git
-        // processes per checkpoint, both values necessarily describe the same
-        // head. The compare-and-swap below still protects against a writer
-        // that does not honor Spawn's branch lock.
+        // One `git log -1` reads the parent commit and its tree from a single
+        // resolved commit object. Besides saving two git processes per
+        // checkpoint, both values necessarily describe that same commit even
+        // under a concurrent ref update. The compare-and-swap below still
+        // protects against a writer that does not honor Spawn's branch lock.
         let (parent, parent_tree) = parent.expect("a present branch has a parent and tree");
         let tree = self.tree_of(&directory, &index, &branch, &parent);
         if tree.is_err() {
@@ -1412,14 +1413,17 @@ impl GitWorkspace {
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
     }
 
-    /// The commit `reference` names and that commit's tree, read by one git
-    /// process. `None` is the branch-gone case: a commit whose tree cannot be
-    /// read is an error, not permission to recreate the branch.
+    /// The commit `reference` names and that commit's tree, read atomically
+    /// from one resolved commit object by a single git process. `None` is the
+    /// branch-gone case: a commit whose tree cannot be read is an error, not
+    /// permission to recreate the branch.
     fn commit_and_tree(&self, reference: &str) -> Result<Option<(String, String)>, WorkspaceError> {
         let answer = match self.git_output(&[
-            "rev-parse",
+            "log",
+            "-1",
+            "--format=%H%n%T",
             &format!("{reference}^{{commit}}"),
-            &format!("{reference}^{{tree}}"),
+            "--",
         ]) {
             Ok(answer) => answer,
             Err(error) => {
@@ -1442,7 +1446,7 @@ impl GitWorkspace {
         let tree = lines.next().unwrap_or_default();
         if commit.is_empty() || tree.is_empty() || lines.next().is_some() {
             return Err(WorkspaceError::Unavailable(format!(
-                "rev-parse returned an invalid commit/tree pair for {reference}"
+                "git log returned an invalid commit/tree pair for {reference}"
             )));
         }
         Ok(Some((commit.to_string(), tree.to_string())))
