@@ -973,6 +973,7 @@
         "crates/spawn-cli/src/sources.rs",
         "crates/spawn-core/tests/branches.rs",
         "crates/spawn-host/Cargo.toml",
+        "crates/spawn-host/examples/storage_benchmark.rs",
         "crates/spawn-host/src/agent_files.rs",
         "crates/spawn-host/src/beneath.rs",
         "crates/spawn-host/src/beneath/tests.rs",
@@ -985,6 +986,7 @@
         "crates/spawn-host/tests/identity.rs",
         "crates/spawn-host/tests/runtime_files.rs",
         "crates/spawn-postgres/tests/sources.rs",
+        "docs/storage-benchmark.md",
         "docs/storage.md",
         "rsi/backlog/003.json",
         "rsi/backlog/004.json",
@@ -1003,7 +1005,9 @@
         "rsi/scenarios/177.sh",
         "rsi/scenarios/nightly/178.sh",
         "rsi/scenarios/nightly/194.sh",
-        "rsi/scenarios/nightly/205.sh"
+        "rsi/scenarios/nightly/205.sh",
+        "scripts/storage-benchmark-compare.py",
+        "scripts/storage-cluster-benchmark.py"
       ],
       "relations": [
         {
@@ -1035,6 +1039,7 @@
         ],
         "deploys": [],
         "artifacts": [
+          "docs/storage-benchmark.md",
           "docs/storage.md"
         ],
         "discussions": []

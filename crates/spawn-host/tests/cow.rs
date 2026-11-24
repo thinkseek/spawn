@@ -1054,6 +1054,39 @@ fn unmount_refuses_while_a_process_works_inside() {
     assert!(!directory.exists());
 }
 
+/// A descriptor opened by a non-leader thread still keeps its workspace
+/// busy; sharing the process-level maps must not skip per-thread checks.
+#[test]
+fn unmount_refuses_while_a_worker_thread_holds_a_file_inside() {
+    let base = scratch("cow-busy-thread");
+    let repo = seeded(&base, 1);
+    let store = CowWorkspace::new(&repo, base.join("work"));
+    store
+        .ensure_branch(&branch("agent_a"), None)
+        .expect("ensure");
+    let workspace = store.mount(&branch("agent_a")).expect("mount");
+    let directory = PathBuf::from(workspace.path());
+    let (opened, opened_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let worker_directory = directory.clone();
+    let result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let held = fs::File::open(worker_directory.join("README.md")).expect("open in worker");
+            opened.send(()).expect("opened");
+            release_rx.recv().expect("release");
+            drop(held);
+        });
+        opened_rx.recv().expect("worker opened the file");
+        let result = store.unmount(&workspace);
+        release.send(()).expect("release worker");
+        result
+    });
+    refused_with(result, WORKSPACE_BUSY);
+    assert!(directory.join("README.md").exists());
+    store.unmount(&workspace).expect("unmount after worker");
+    assert!(!directory.exists());
+}
+
 /// Review #517 F9a (probe p8): the transcripts kept for `a` are only
 /// `a`'s, never `a-b`'s.
 #[test]

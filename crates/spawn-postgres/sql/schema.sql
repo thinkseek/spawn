@@ -4056,8 +4056,16 @@ begin
     if spawn_mission_caller() is null then
         raise exception '% may not cancel tasks', session_user using errcode = '42501';
     end if;
-    if not exists (select 1 from mission_tasks where id = p_task
-                     and state not in ('accepted', 'cancelled', 'landing', 'landed')) then
+    if not exists (
+        select 1
+          from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+         where k.id = p_task
+           and (
+               k.state in ('assigned', 'delivered', 'reported', 'revise')
+               or (k.state = 'accepted' and m.gate is not null)
+           )
+    ) then
         raise exception 'task % is already closed', p_task;
     end if;
     perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,

@@ -439,10 +439,43 @@ pub fn directory_occupancy(directory: &Path) -> io::Result<DirectoryOccupancy> {
     Ok(found)
 }
 
+/// Whether a `/proc/<pid>/maps` snapshot maps `directory` or anything below
+/// it, without constructing a path for every entry.
+#[cfg(target_os = "linux")]
+fn maps_inside(maps: &[u8], directory: &Path) -> bool {
+    maps.split(|byte| *byte == b'\n').any(|line| {
+        line.iter()
+            .position(|byte| *byte == b'/')
+            .is_some_and(|at| Path::new(OsStr::from_bytes(&line[at..])).starts_with(directory))
+    })
+}
+
+#[cfg(target_os = "linux")]
+enum SharedMaps {
+    Unread,
+    Outside,
+    Fallback,
+    Failed,
+}
+
 /// Whether any thread of the process at `/proc/<pid>` works under
-/// `directory`.
+/// `directory`. Every thread's `cwd`, `root` and open descriptors are checked
+/// first so a restricted `/proc/<pid>/maps` cannot bypass `WORKSPACE_BUSY`;
+/// when maps inspection is needed, `/proc/<pid>/maps` is read once per
+/// process and reused across threads, falling back per task only if the
+/// process-level file disappears mid-scan.
 #[cfg(target_os = "linux")]
 fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
+    let tasks = fs::read_dir(base.join("task"))?.map(|task| task.map(|entry| entry.path()));
+    process_inside_tasks(base, tasks, directory)
+}
+
+#[cfg(target_os = "linux")]
+fn process_inside_tasks(
+    base: &Path,
+    tasks: impl IntoIterator<Item = io::Result<PathBuf>>,
+    directory: &Path,
+) -> io::Result<bool> {
     let inside = |link: &Path| -> io::Result<bool> {
         match fs::read_link(link) {
             Ok(to) => Ok(to.starts_with(directory)),
@@ -450,9 +483,11 @@ fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
             Err(error) => Err(error),
         }
     };
-    for task in fs::read_dir(base.join("task"))? {
+    let mut shared_maps = SharedMaps::Unread;
+    let mut maps_error = None;
+    for task in tasks {
         let task = match task {
-            Ok(task) => task.path(),
+            Ok(task) => task,
             Err(error) if exited(&error) => continue,
             Err(error) => return Err(error),
         };
@@ -474,19 +509,34 @@ fn process_inside(base: &Path, directory: &Path) -> io::Result<bool> {
                 return Ok(true);
             }
         }
-        let maps = match fs::read(task.join("maps")) {
-            Ok(maps) => maps,
-            Err(error) if exited(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        let mapped = maps.split(|byte| *byte == b'\n').any(|line| {
-            line.iter()
-                .position(|byte| *byte == b'/')
-                .is_some_and(|at| Path::new(OsStr::from_bytes(&line[at..])).starts_with(directory))
-        });
-        if mapped {
-            return Ok(true);
+        if matches!(shared_maps, SharedMaps::Unread) {
+            shared_maps = match fs::read(base.join("maps")) {
+                Ok(maps) => {
+                    if maps_inside(&maps, directory) {
+                        return Ok(true);
+                    }
+                    SharedMaps::Outside
+                }
+                Err(error) if exited(&error) => SharedMaps::Fallback,
+                Err(error) => {
+                    maps_error.get_or_insert(error);
+                    SharedMaps::Failed
+                }
+            };
         }
+        if matches!(shared_maps, SharedMaps::Fallback) {
+            match fs::read(task.join("maps")) {
+                Ok(maps) if maps_inside(&maps, directory) => return Ok(true),
+                Ok(_) => {}
+                Err(error) if exited(&error) => {}
+                Err(error) => {
+                    maps_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = maps_error {
+        return Err(error);
     }
     Ok(false)
 }
@@ -2764,6 +2814,104 @@ mod tests {
         assert!(!stamp(99).racy((100, 0)));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maps_match_only_the_workspace_and_its_descendants() {
+        let directory = Path::new("/work/a");
+        assert!(maps_inside(
+            b"1000-2000 r--p 00000000 00:00 1 /work/a\n",
+            directory
+        ));
+        assert!(maps_inside(
+            b"1000-2000 r--p 00000000 00:00 1 /work/a/src/lib.rs\n",
+            directory
+        ));
+        assert!(!maps_inside(
+            b"1000-2000 r--p 00000000 00:00 1 /work/a-other\n",
+            directory
+        ));
+        assert!(!maps_inside(
+            b"1000-2000 rw-p 00000000 00:00 0 [anonymous]\n",
+            directory
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_process_maps_falls_back_to_each_task() {
+        let scratch = Scratch::new("cow-task-maps");
+        let base = scratch.join("proc/123");
+        let task = base.join("task/456");
+        fs::create_dir_all(task.join("fd")).expect("task fd");
+        fs::write(
+            task.join("maps"),
+            b"1000-2000 r--p 00000000 00:00 1 /work/a/lib.so\n",
+        )
+        .expect("task maps");
+        assert!(process_inside(&base, Path::new("/work/a")).expect("task maps"));
+
+        // A task that vanishes during the fallback is skipped, as before.
+        fs::remove_file(task.join("maps")).expect("remove task maps");
+        assert!(!process_inside(&base, Path::new("/work/a")).expect("gone task"));
+
+        // Any other per-task read failure still fails closed.
+        fs::create_dir(task.join("maps")).expect("unreadable maps stand-in");
+        let error = process_inside(&base, Path::new("/work/a")).expect_err("maps read fails");
+        assert!(!exited(&error));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_process_maps_does_not_mask_task_cwd_or_descriptors() {
+        // Single task whose `cwd` is inside the workspace while process-level
+        // `maps` fails with a non-exited error (`EISDIR`).
+        let scratch = Scratch::new("cow-unreadable-maps");
+        let base = scratch.join("proc/200");
+        let task1 = base.join("task/1");
+        fs::create_dir_all(task1.join("fd")).expect("task1 fd");
+        fs::create_dir(base.join("maps")).expect("unreadable process maps stand-in");
+        std::os::unix::fs::symlink("/work/a", task1.join("cwd")).expect("cwd link");
+        assert!(
+            process_inside(&base, Path::new("/work/a")).expect("cwd must win before maps"),
+            "restricted process maps must not hide a task working inside the workspace"
+        );
+
+        // Multi-task fixture: explicitly visit `task1` first so it sits outside
+        // the workspace and triggers the deferred `base/maps` failure before
+        // `task2` is checked, proving `maps` errors never mask a later task's fd;
+        // also check the reversed order and real `read_dir`-backed traversal.
+        fs::remove_file(task1.join("cwd")).expect("clear task1 cwd");
+        std::os::unix::fs::symlink("/elsewhere", task1.join("cwd")).expect("outside cwd");
+        let task2 = base.join("task/2");
+        fs::create_dir_all(task2.join("fd")).expect("task2 fd");
+        std::os::unix::fs::symlink("/elsewhere", task2.join("cwd")).expect("task2 cwd");
+        std::os::unix::fs::symlink("/work/a/open.txt", task2.join("fd/0")).expect("task2 fd link");
+        assert!(
+            process_inside_tasks(
+                &base,
+                [Ok(task1.clone()), Ok(task2.clone())],
+                Path::new("/work/a")
+            )
+            .expect("later task descriptor must still be detected after maps failure"),
+            "an earlier task's maps error must not skip subsequent tasks' fd checks"
+        );
+        assert!(
+            process_inside_tasks(&base, [Ok(task2.clone()), Ok(task1)], Path::new("/work/a"))
+                .expect("descriptor first must succeed immediately")
+        );
+        assert!(
+            process_inside(&base, Path::new("/work/a"))
+                .expect("directory traversal must find occupied task")
+        );
+
+        // When no task holds cwd, root or fd inside the workspace, the maps
+        // failure still propagates so occupancy fails closed as uninspected.
+        fs::remove_file(task2.join("fd/0")).expect("clear task2 fd");
+        let error = process_inside(&base, Path::new("/work/a"))
+            .expect_err("unreadable process maps must fail closed when nothing else matches");
+        assert!(!exited(&error));
+    }
+
     #[test]
     fn branch_names_stay_under_the_root() {
         for bad in ["", "-x", ".cow", ".transcripts", "a/b", "..", "a b", "a@b"] {
@@ -3046,5 +3194,44 @@ mod tests {
         });
         store.faults.baseline.store(false, Ordering::Relaxed);
         store.mount(&branch).expect("mount");
+    }
+
+    /// `cargo test -p spawn-host --lib bench_occupancy_of_a_multithreaded_process -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "micro-benchmark: prints occupancy and retirement timings"]
+    fn bench_occupancy_of_a_multithreaded_process() {
+        const THREADS: usize = 64;
+        let scratch = Scratch::new("cow-occupancy-bench");
+        let (_repo, store, _workspace) = mounted(&scratch);
+        let directory = scratch.join("work/agent_a");
+        let start = std::sync::Barrier::new(THREADS + 1);
+        let finish = std::sync::Barrier::new(THREADS + 1);
+        let (occupancy, occupancy_time, retired, retire_time) = std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    start.wait();
+                    finish.wait();
+                });
+            }
+            start.wait();
+            let started = std::time::Instant::now();
+            let occupancy = directory_occupancy(&directory);
+            let occupancy_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let retired = store.retire("agent_a", &directory);
+            let retire_time = started.elapsed();
+            finish.wait();
+            (occupancy, occupancy_time, retired, retire_time)
+        });
+        let occupancy = occupancy.expect("occupancy");
+        println!(
+            "{THREADS} threads: directory_occupancy {occupancy_time:?} ({} pids, {} uninspected); retire {retire_time:?}",
+            occupancy.pids.len(),
+            occupancy.uninspected.len()
+        );
+        assert!(!occupancy.pids.contains(&std::process::id()));
+        retired.expect("retire");
+        assert!(!directory.exists());
     }
 }

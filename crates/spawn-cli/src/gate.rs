@@ -819,9 +819,9 @@ pub(crate) enum GateFailure {
         log: String,
     },
     /// An adopted gate whose directory went while it was waited for: the
-    /// integrator that started it read its status and reaped it (gate v2
-    /// step 2, D4), so its outcome is that one's to record, and this
-    /// judging records nothing.
+    /// integrator that started it reaped it (gate v2 step 2, D4). Normally
+    /// the store returns that integrator's outcome without appending another;
+    /// if it left no outcome, a task judging records an abort to bound retries.
     Reaped,
     /// Main is red on a check (exit [`HOST_FAULT_EXIT`] with the gate's
     /// fact `on` `main`): it failed twice on the base with the same failing
@@ -3945,8 +3945,9 @@ mod tests {
     /// and no unit is left behind.
     /// A gate whose runner is gone: with its directory still there and no
     /// status, abandoned (a host fault `on` `runner`); with its directory
-    /// gone, reaped by the integrator that started it, which read the
-    /// status and recorded the outcome, so the adopter records nothing.
+    /// gone, reaped by the integrator that started it. A task adopter then
+    /// records an abort only when that integrator left no outcome; the store
+    /// deduplicates the normal case by judging id.
     #[test]
     fn a_gone_runner_is_abandoned_unless_its_directory_was_reaped() {
         let directory =
