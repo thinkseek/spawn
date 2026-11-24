@@ -352,6 +352,10 @@
         {
           "kind": "contains",
           "target": "cap-rsi-integration-gate"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-agent-grading"
         }
       ],
       "provenance": {
@@ -1466,6 +1470,79 @@
         "deploys": [],
         "artifacts": [
           "docs/rsi.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-agent-grading",
+      "title": "Agent Grading: grading catalog, onboarding exams, routing & calibration",
+      "kind": "capability",
+      "parent": "domain-missions-fleet",
+      "summary": "Graded presets (`grading_presets`, the fold of the control session's `grading.recorded` events, outside the control fold) mapped to a `ModelProfile`, offline onboarding exams (`evals/onboarding/`), minimum-sufficient task routing by `TaskDifficulty` with a quality-rejection rework step-up (`task.rerouted`) and a fallback to `--model default` for unflagged assignments the catalog cannot cover, and integer-only calibration over quality outcomes read from `mission_tasks` (`spawn grade`, `spawn task assign --difficulty/--preset`).",
+      "files": [
+        "crates/spawn-cli/src/grading.rs",
+        "crates/spawn-cli/src/missions.rs",
+        "crates/spawn-core/src/grading.rs",
+        "crates/spawn-postgres/sql/schema.sql",
+        "crates/spawn-postgres/src/grading.rs",
+        "crates/spawn-postgres/tests/first-shapes.sql",
+        "crates/spawn-postgres/tests/grading.rs",
+        "docs/agent-grading.md",
+        "evals/onboarding/README.md",
+        "evals/onboarding/l1-slugify/check.sh",
+        "evals/onboarding/l1-slugify/reference/slugify.sh",
+        "evals/onboarding/l1-slugify/spec.md",
+        "evals/onboarding/l2-semver-sort/check.sh",
+        "evals/onboarding/l2-semver-sort/reference/semver_sort.sh",
+        "evals/onboarding/l2-semver-sort/spec.md",
+        "evals/onboarding/l3-toposort/cases/01.code",
+        "evals/onboarding/l3-toposort/cases/01.in",
+        "evals/onboarding/l3-toposort/cases/01.out",
+        "evals/onboarding/l3-toposort/cases/02.code",
+        "evals/onboarding/l3-toposort/cases/02.in",
+        "evals/onboarding/l3-toposort/cases/02.out",
+        "evals/onboarding/l3-toposort/cases/03.code",
+        "evals/onboarding/l3-toposort/cases/03.in",
+        "evals/onboarding/l3-toposort/cases/03.out",
+        "evals/onboarding/l3-toposort/cases/04.code",
+        "evals/onboarding/l3-toposort/cases/04.in",
+        "evals/onboarding/l3-toposort/cases/04.out",
+        "evals/onboarding/l3-toposort/cases/05.code",
+        "evals/onboarding/l3-toposort/cases/05.in",
+        "evals/onboarding/l3-toposort/cases/05.out",
+        "evals/onboarding/l3-toposort/cases/06.code",
+        "evals/onboarding/l3-toposort/cases/06.in",
+        "evals/onboarding/l3-toposort/cases/06.out",
+        "evals/onboarding/l3-toposort/cases/07.code",
+        "evals/onboarding/l3-toposort/cases/07.in",
+        "evals/onboarding/l3-toposort/cases/07.out",
+        "evals/onboarding/l3-toposort/check.sh",
+        "evals/onboarding/l3-toposort/reference/toposort.sh",
+        "evals/onboarding/l3-toposort/spec.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-mission-dispatch"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-postgres/tests/grading.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/agent-grading.md",
+          "evals/onboarding/README.md"
         ],
         "discussions": []
       }

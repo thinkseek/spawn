@@ -705,9 +705,10 @@ fn real_project_registry_covers_every_in_scope_file_with_zero_drift() {
         report.stale_references
     );
     assert!(report.consistency.is_clean(), "{:?}", report.consistency);
-    // r16 merge: 990 base + 2 static feature-map files (our side) + 16 m7
-    // node-registry/overlay/CoW/herdr files (upstream) = 1008; calibrated by test run.
-    assert_eq!(report.counts.in_scope, 1008);
+    // r18 merge: 1006 (1367a22c base) + 2 static feature-map files (our side)
+    // + 36 agent-grading/onboarding files (upstream c2a5c9bd) = 1044;
+    // calibrated by the zero-drift test run, no exclusion rule added.
+    assert_eq!(report.counts.in_scope, 1044);
     assert_eq!(report.counts.covered, report.counts.in_scope);
     assert!(report.counts.multi_feature_files >= 100);
 

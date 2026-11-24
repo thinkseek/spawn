@@ -92,6 +92,7 @@ mod experience;
 mod features;
 mod fleet;
 mod gateway;
+mod grading;
 mod host;
 mod missions;
 mod nodes;
@@ -111,6 +112,7 @@ pub use cost::{
     ArchiveCounted, ArchiveFile, ArchivedMessage, SessionCounted, SessionFile, SessionMessage,
 };
 pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
+pub use grading::RoutedTask;
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
