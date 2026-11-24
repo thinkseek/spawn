@@ -691,6 +691,16 @@ pub enum EventKind {
         /// The record, `{"type": "node.<fact>", "name": ..., ...}`.
         record: serde_json::Value,
     },
+    /// One change to the grading catalog (docs/agent-grading.md): a
+    /// `preset.*` record of the control session, outside the control fold
+    /// (`spawn_control_refold` reads only `control.recorded`); the
+    /// database folds it into `grading_presets` (`spawn_grading_refold`).
+    /// Like a control record it belongs to no agent.
+    #[serde(rename = "grading.recorded")]
+    GradingRecorded {
+        /// The record, `{"type": "preset.…", ...}`.
+        record: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -732,15 +742,16 @@ impl EventKind {
             Self::ObservationRecorded { .. } => "observation.recorded",
             Self::ControlRecorded { .. } => "control.recorded",
             Self::NodeRecorded { .. } => "node.recorded",
+            Self::GradingRecorded { .. } => "grading.recorded",
         }
     }
 
-    /// Whether this is a control-session record (a control-stream or a
-    /// node record) rather than a fact about an agent's session.
+    /// Whether this is a control-session record (a control-stream, node,
+    /// or grading record) rather than a fact about an agent's session.
     pub fn is_control(&self) -> bool {
         matches!(
             self,
-            Self::ControlRecorded { .. } | Self::NodeRecorded { .. }
+            Self::ControlRecorded { .. } | Self::NodeRecorded { .. } | Self::GradingRecorded { .. }
         )
     }
 
