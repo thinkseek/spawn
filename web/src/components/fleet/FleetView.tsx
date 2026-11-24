@@ -24,6 +24,7 @@ import { coreLinesView } from "../../coreLines";
 import { figureState } from "../../interventions.ts";
 import { INTERVENTIONS_POLL_MS, fetchInterventions } from "./Interventions";
 import { HealthStrip } from "./HealthStrip";
+import { NodeRows } from "./NodeRows";
 import type { Liveness } from "./HealthStrip";
 
 interface FleetViewProps {
@@ -206,6 +207,7 @@ export function FleetView({
               liveness={liveness}
               diagnostics={coreLines.data ? coreLinesView(coreLines.data).diagnostics : []}
             />
+            <NodeRows />
             <FleetBoard
               groups={groups}
               total={data.agents}

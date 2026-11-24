@@ -1,12 +1,6 @@
 # Scenarios the gate runs with nothing else of the gate beside them (SPAWN_GATE_JOBS > 1).
-# Only the gate reads this file. Task 121 measured these as host-load sensitive:
-# check-j04-observe.sh: 011 whole, which counts observations in a 20 s idle window; a busy
-# host lands one already in flight (its exact counts are its catches: tasks 46 and 184).
-# (023, 025, 032 and 036 went to the nightly, rsi/scenarios/nightly/: scripts/rsi/nightly.sh
-# runs each alone on a held host.)
-check-j04-observe.sh
-# 107.sh: 30 s of 16-thread fake-systemctl test runs, a statistical check (96 runs; the
-# base fails 7 to 12 in 100): its threads must not load the scenarios beside it (099), and
-# its own result must not depend on them. Once 107 has landed, the lead moves it to
-# rsi/scenarios/nightly/ in a later contract push.
-107.sh
+# Only the gate reads this file. None at present: every scenario that was here went to the
+# nightly, rsi/scenarios/nightly/, where scripts/rsi/nightly.sh runs each alone on a held host
+# (023, 025, 032 and 036 first; check-j04-observe.sh, 011 whole, whose idle-window counts are
+# host-load sensitive, and 107.sh, 30 s of 16-thread statistical test runs, in the gate ROI
+# push of 2026-11-24).

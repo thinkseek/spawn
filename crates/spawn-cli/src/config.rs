@@ -304,6 +304,23 @@ mod tests {
     }
 
     #[test]
+    fn the_terminal_backend_is_tmux_unless_herdr_is_asked_for() {
+        assert_eq!(terminal_backend(None), Ok(TerminalBackend::Tmux));
+        assert_eq!(terminal_backend(Some("")), Ok(TerminalBackend::Tmux));
+        assert_eq!(terminal_backend(Some("tmux")), Ok(TerminalBackend::Tmux));
+        assert_eq!(terminal_backend(Some("herdr")), Ok(TerminalBackend::Herdr));
+        assert_eq!(
+            terminal_backend(Some(" herdr ")),
+            Ok(TerminalBackend::Herdr)
+        );
+        for unknown in ["screen", "Herdr", "TMUX", "zellij"] {
+            let error = terminal_backend(Some(unknown)).expect_err(unknown);
+            assert!(error.contains("SPAWN_TERMINAL_BACKEND"), "{error}");
+            assert!(error.contains(unknown), "{error}");
+        }
+    }
+
+    #[test]
     fn workspace_root_reads_the_root_flag() {
         let flags = Flags::parse(&["--root".to_string(), "/w".to_string()]).unwrap();
         assert_eq!(workspace_root(&flags).as_deref(), Some("/w"));
@@ -377,11 +394,47 @@ impl Flags {
     }
 }
 
+/// The terminal backends `SPAWN_TERMINAL_BACKEND` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalBackend {
+    Tmux,
+    Herdr,
+}
+
+/// The backend `value` (`SPAWN_TERMINAL_BACKEND`) names: tmux when it is
+/// unset or empty, Herdr when it says so; anything else is refused, never
+/// read as tmux.
+pub(crate) fn terminal_backend(value: Option<&str>) -> Result<TerminalBackend, String> {
+    match value.map(str::trim) {
+        None | Some("" | "tmux") => Ok(TerminalBackend::Tmux),
+        Some("herdr") => Ok(TerminalBackend::Herdr),
+        Some(other) => Err(format!(
+            "SPAWN_TERMINAL_BACKEND={other:?} names no terminal backend: use tmux (the default) \
+             or herdr"
+        )),
+    }
+}
+
 /// The terminal host the environment describes: tmux on this machine, on
-/// the server of `SPAWN_TMUX_SOCKET` when it is set.
-pub(crate) fn terminal_host() -> spawn_host::TmuxHost {
-    spawn_host::TmuxHost::on_socket(
-        &env_or("SPAWN_TMUX_PROGRAM", "tmux"),
-        env_value("SPAWN_TMUX_SOCKET"),
+/// the server of `SPAWN_TMUX_SOCKET` when it is set; or, with
+/// `SPAWN_TERMINAL_BACKEND=herdr`, Herdr (`SPAWN_HERDR_PROGRAM`, `herdr` by
+/// default) on the session `SPAWN_HERDR_SESSION` (`spawn` by default).
+pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
+    Ok(
+        match terminal_backend(env_value("SPAWN_TERMINAL_BACKEND").as_deref())? {
+            TerminalBackend::Tmux => {
+                spawn_host::LocalTerminalHost::Tmux(spawn_host::TmuxHost::on_socket(
+                    &env_or("SPAWN_TMUX_PROGRAM", "tmux"),
+                    env_value("SPAWN_TMUX_SOCKET"),
+                ))
+            }
+            TerminalBackend::Herdr => spawn_host::LocalTerminalHost::Herdr(
+                spawn_host::HerdrHost::on_session(
+                    &env_or("SPAWN_HERDR_PROGRAM", "herdr"),
+                    &env_or("SPAWN_HERDR_SESSION", spawn_host::herdr::DEFAULT_SESSION),
+                )
+                .map_err(|error| format!("SPAWN_HERDR_SESSION: {}", error.0))?,
+            ),
+        },
     )
 }

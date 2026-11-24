@@ -28,6 +28,33 @@
 # guard refused). Any unexpected exit is reported as 2.
 
 set -eu
+# Only when the tree differs from the base (SPAWN_BASELINE_TREE) in what this
+# check runs or reads: deploy/on-landing.sh, its test and deploy/backup/lib.sh,
+# and the spawn commands the test drives (spawn mission landing, hold, release,
+# deployed, push: spawn-cli's main.rs, missions.rs and integrate, and
+# spawn-postgres's sources and schema). Otherwise it passes at once, as
+# check-test-gate.sh does, so a tree that leaves them alone pays nothing (it
+# never caught a regression in the gate ROI audit of 2026-11-24). Its own file
+# is on the list, so a change to the check runs it.
+base=${SPAWN_BASELINE_TREE-}
+if [ -n "$base" ] && [ -d "$base" ]; then
+    same=1
+    for path in deploy/on-landing.sh deploy/test-on-landing.sh deploy/backup/lib.sh \
+        crates/spawn-cli/src/main.rs crates/spawn-cli/src/missions.rs crates/spawn-cli/src/integrate.rs \
+        crates/spawn-cli/src/integrate crates/spawn-postgres/src crates/spawn-postgres/sql \
+        rsi/scenarios/check-on-landing.sh; do
+        if [ -e "$path" ] || [ -e "$base/$path" ]; then
+            diff -rq -- "$base/$path" "$path" >/dev/null 2>&1 || {
+                same=""
+                echo "changed against the base: $path"
+            }
+        fi
+    done
+    if [ -n "$same" ]; then
+        echo "check-on-landing: on-landing, its test and the commands it drives are the base's: not run"
+        exit 0
+    fi
+fi
 
 asserted=""
 harness() {

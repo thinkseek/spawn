@@ -889,6 +889,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/cost" => Box::new(move || cost(query)),
         "/api/core-lines" => Box::new(core_lines::core_lines),
         "/api/verifications" => Box::new(verifications),
+        "/api/nodes" => Box::new(nodes),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
@@ -1814,6 +1815,21 @@ fn verifications() -> Result<Value, String> {
     Ok(crate::verify::list(&facts, now_ms()))
 }
 
+/// `/api/nodes`: every node joined and not removed (multi-host P1, crate
+/// nodes.rs), `{nodes: [...]}`, each as the store lists it without its ssh
+/// destination and note, read through the reader login like every other
+/// read. No clock in it, so an unchanged list keeps its ETag.
+fn nodes() -> Result<Value, String> {
+    let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+    for node in nodes.as_array_mut().into_iter().flatten() {
+        if let Some(node) = node.as_object_mut() {
+            node.remove("ssh");
+            node.remove("note");
+        }
+    }
+    Ok(json!({ "nodes": nodes }))
+}
+
 /// `/api/missions/task/<id>`: one task's brief, report and review note in
 /// full, `{id, mission_id, brief, report, review_note, updated_at_ms}`, as
 /// the Missions page asks when a task is opened.
@@ -2504,7 +2520,7 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let terminal = TerminalName::for_execution(&execution.execution_id);
     let root = env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
     let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
-    let host = crate::config::terminal_host();
+    let host = crate::config::terminal_host()?;
     let text = if live {
         host.capture_tail(&terminal, &workspace, PANE_LINES)
             .unwrap_or_default()

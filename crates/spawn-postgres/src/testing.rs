@@ -180,6 +180,11 @@ impl Drop for TestSchema {
 /// interventions count must read the day, not the log: tests/experience.rs).
 pub const FLEET_HEALTH: &str = crate::fleet::FLEET_HEALTH;
 
+/// The nodes' two reads, for a test to read their plans (each fact one
+/// seek, never a scan of a node's heartbeats: tests/nodes.rs).
+pub const NODES: &str = crate::nodes::NODES;
+pub const NODE_MEMBERS: &str = crate::nodes::MEMBERS;
+
 #[cfg(test)]
 mod tests {
     use super::TestSchema;

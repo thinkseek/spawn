@@ -424,6 +424,7 @@ const ALERT_TITLES: Record<string, string> = {
   controller_behind: "A landing waits for its deploy",
   deploy_failed: "A deploy failed",
   mission_halted: "A mission is halted",
+  node_lost: "A node does not answer",
   task_undelivered: "A task was never delivered",
   admission_wait: "Work waits for room",
   backup_stale: "A backup is late",

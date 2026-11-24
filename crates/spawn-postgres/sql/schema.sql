@@ -5538,6 +5538,173 @@ create index if not exists spawn_events_host_storage_bytes
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.storage_bytes';
 
+-- The nodes (multi-host P1; docs/fleet-architecture.md §1.2): the machines
+-- Spawn may use and whether they answer. Their records are `node.recorded`
+-- events of the control session, outside the fold: no
+-- spawn_control_refold, this schema's or an older one's, reads them, so a
+-- schema rolled back still refolds a log that holds them.
+--   node.joined {name, ssh, note, arch, os, kernel, cores, cpu_max,
+--     mem_total, mem_max, disk_free, gpu, exit_country} (`spawn node add`);
+--   node.drained, node.undrained, node.removed {name};
+--   node.heartbeat {name, join, load1, mem_available, disk_free},
+--   node.lost {name, join, last_seen_ms, silent_ms, error},
+--   node.back {name, join, down_ms} (`spawn loop`'s heartbeat worker).
+-- One index, spawn_events_node on (type, name, session_seq) of these
+-- records, finds a node's latest record of a type in one seek, for the
+-- writer's checks and the readers alike. It is not made here: this file
+-- runs in one transaction under the append lock, and a first build reads
+-- all of spawn_events. `PostgresStore::migrate` builds it after that
+-- transaction commits, concurrently, so appends never wait for it
+-- (spawn-postgres nodes.rs `NODE_INDEX`). Until it is there the node reads
+-- are right, only slower.
+
+-- The latest record of type `p_type` of node `p_name` after `p_after` (a
+-- session_seq), through spawn_events_node.
+create or replace function spawn_node_latest(p_type text, p_name text, p_after bigint)
+returns table (id bigint, seq bigint, at_ms bigint, record jsonb)
+language sql stable as $$
+    select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record'
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'node.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'type' = p_type
+       and e.kind -> 'detail' -> 'record' ->> 'name' = p_name
+       and e.session_seq > p_after
+     order by e.session_seq desc
+     limit 1
+$$;
+
+-- Whether `p_value` is a JSON number at least 0.
+create or replace function spawn_node_count(p_value jsonb)
+returns boolean language sql immutable as $$
+    select case when jsonb_typeof(p_value) = 'number' then p_value::text::numeric >= 0
+                else false end
+$$;
+
+-- The reader login (`/api/nodes`) reads through spawn_node_latest, with its
+-- own rights; nobody else is handed either helper.
+revoke execute on function spawn_node_latest(text, text, bigint) from public;
+revoke execute on function spawn_node_count(jsonb) from public;
+do $$
+begin
+    execute format('grant execute on function spawn_node_latest(text, text, bigint) to %I',
+                   spawn_login_role('spawn_reader'));
+end
+$$;
+
+-- The writer of a node's facts (owner only). Under the append lock: a join
+-- of a name not joined (a removed name joins again); any other record of
+-- a joined name, the loop's heartbeat, lost and back of its current join
+-- (`join`, the node.joined event id), so a probe started for an earlier
+-- join records nothing; no drain, undrain, lost or back recorded twice.
+-- Returns the record's event id.
+create or replace function spawn_node_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+    v_name text := p_record ->> 'name';
+    v_bad text;
+    v_join bigint;
+    v_seq bigint;
+    v_on bigint;
+    v_off bigint;
+    v_id bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner records a node''s facts; % may not', session_user
+            using errcode = '42501';
+    end if;
+    if v_type is null or v_type not in ('node.joined', 'node.drained', 'node.undrained',
+                                        'node.removed', 'node.heartbeat', 'node.lost',
+                                        'node.back') then
+        raise exception 'not a node record: its type is none of node.joined, node.drained, node.undrained, node.removed, node.heartbeat, node.lost, node.back'
+            using errcode = '22023';
+    end if;
+    if v_name is null or v_name !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$' then
+        raise exception 'a node''s name is 1 to 63 letters, digits, dots, dashes or underscores, first a letter or digit'
+            using errcode = '22023';
+    end if;
+    if v_type = 'node.joined'
+       and (p_record ->> 'ssh' is null or length(p_record ->> 'ssh') > 255
+            or p_record ->> 'ssh' !~ ('^(([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*'
+                                      '|ssh://([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?)$')
+            or coalesce(substring(p_record ->> 'ssh' from ':([0-9]{1,5})$')::integer
+                        between 1 and 65535, true) is not true) then
+        raise exception 'a node''s ssh destination is [user@]host or ssh://[user@]host[:port], the port 1 to 65535'
+            using errcode = '22023';
+    end if;
+    -- Each field this record type holds, named when it is wrong; the
+    -- record itself is never said back.
+    select c.field, c.what into v_bad, v_on
+      from (values (1, 'node.joined', 'arch', 0), (2, 'node.joined', 'os', 0),
+                   (3, 'node.joined', 'kernel', 0), (4, 'node.joined', 'cores', 1),
+                   (5, 'node.joined', 'mem_total', 1), (6, 'node.joined', 'disk_free', 1),
+                   (7, 'node.joined', 'cpu_max', 3), (8, 'node.joined', 'mem_max', 3),
+                   (9, 'node.joined', 'gpu', 3), (10, 'node.joined', 'exit_country', 3),
+                   (11, 'node.joined', 'note', 4),
+                   (12, 'node.heartbeat', 'load1', 1), (13, 'node.heartbeat', 'mem_available', 1),
+                   (14, 'node.heartbeat', 'disk_free', 1), (15, 'node.lost', 'silent_ms', 1),
+                   (16, 'node.lost', 'last_seen_ms', 2), (17, 'node.back', 'down_ms', 2))
+           as c(o, type, field, what)
+     where c.type = v_type
+       and not coalesce(case c.what
+               when 0 then jsonb_typeof(p_record -> c.field) = 'string'
+               when 1 then spawn_node_count(p_record -> c.field)
+               when 2 then coalesce(jsonb_typeof(p_record -> c.field), 'null') = 'null'
+                           or spawn_node_count(p_record -> c.field)
+               when 3 then p_record ? c.field
+               else char_length(coalesce(p_record ->> c.field, '')) <= 500 end, false)
+     order by c.o
+     limit 1;
+    if v_bad is not null then
+        raise exception 'a % record''s % is %', v_type, v_bad,
+            case v_on when 0 then 'text' when 1 then 'a number at least 0'
+                      when 2 then 'null or a number at least 0' when 3 then 'there, null or not'
+                      else 'at most 500 characters' end
+            using errcode = '22023';
+    end if;
+    v_on := null;
+    select j.id, j.seq into v_join, v_seq from spawn_node_latest('node.joined', v_name, 0) j;
+    if v_join is not null and exists (select 1 from spawn_node_latest('node.removed', v_name, v_seq)) then
+        v_join := null;
+    end if;
+    if v_type = 'node.joined' then
+        if v_join is not null then
+            raise exception 'node % is joined already (spawn node remove first)', v_name
+                using errcode = '23505';
+        end if;
+    elsif v_join is null then
+        raise exception 'node % is not joined', v_name using errcode = 'P0002';
+    elsif v_type in ('node.heartbeat', 'node.lost', 'node.back')
+          and (p_record -> 'join') is distinct from to_jsonb(v_join) then
+        raise exception 'node % is joined as event %, and this record names another: a stale probe',
+            v_name, v_join using errcode = '55000';
+    elsif v_type in ('node.drained', 'node.undrained') then
+        select d.seq into v_on from spawn_node_latest('node.drained', v_name, v_seq) d;
+        select u.seq into v_off from spawn_node_latest('node.undrained', v_name, v_seq) u;
+        if (coalesce(v_on, 0) > coalesce(v_off, 0)) = (v_type = 'node.drained') then
+            raise exception 'node % is % already', v_name,
+                case when v_type = 'node.drained' then 'drained' else 'not drained' end
+                using errcode = '55000';
+        end if;
+    end if;
+    if v_type in ('node.lost', 'node.back') then
+        select l.seq into v_on from spawn_node_latest('node.lost', v_name, v_seq) l;
+        select b.seq into v_off from spawn_node_latest('node.back', v_name, v_seq) b;
+        if (coalesce(v_on, 0) > coalesce(v_off, 0)) = (v_type = 'node.lost') then
+            raise exception 'node % is % already', v_name,
+                case when v_type = 'node.lost' then 'lost' else 'not lost' end
+                using errcode = '55000';
+        end if;
+    end if;
+    select a.out_id into v_id
+      from spawn_append_trusted('agent_control', 'session_control', null, 'control', null,
+                                jsonb_build_object('name', 'node.recorded',
+                                                   'detail', jsonb_build_object('record', p_record))) a;
+    return v_id;
+end $$;
+
+
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
 -- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
@@ -6986,6 +7153,7 @@ begin
         'spawn_mission_resume(bigint)', 'spawn_mission_pause(bigint, text)',
         'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
+        'spawn_node_record(jsonb)',
         'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
         'spawn_deploy_record(jsonb)', 'spawn_verification_record(jsonb)',
         'spawn_objective_retire(jsonb)', 'spawn_cost_record(jsonb)',

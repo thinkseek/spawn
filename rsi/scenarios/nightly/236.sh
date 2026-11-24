@@ -46,12 +46,27 @@ harness() {
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
 tree=$(pwd)
-[ -f "$tree/rsi/scenarios/145.sh" ] || harness "run from the tree under test: no rsi/scenarios/145.sh under $tree"
+# 145.sh: the gate's (rsi/scenarios/145.sh) or, since it left the gate, the nightly's
+# (rsi/scenarios/nightly/145.sh). 145 takes its controller two levels above itself, the
+# tree as it ran here; a nightly copy runs from $WORK/c145/rsi/scenarios/ beside a link to
+# the tree's scripts/ (below, once $WORK exists), so that stays the tree.
+if [ -f "$tree/rsi/scenarios/145.sh" ]; then
+    s145=rsi/scenarios/145.sh
+elif [ -f "$tree/rsi/scenarios/nightly/145.sh" ]; then
+    s145=rsi/scenarios/nightly/145.sh
+else
+    harness "run from the tree under test: no rsi/scenarios/145.sh or rsi/scenarios/nightly/145.sh under $tree"
+fi
 for tool in gpg-connect-agent gpgconf readlink; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
+if [ "$s145" != rsi/scenarios/145.sh ]; then
+    mkdir -p "$WORK/c145/rsi/scenarios" && cp "$tree/$s145" "$WORK/c145/rsi/scenarios/145.sh" &&
+        ln -s "$tree/scripts" "$WORK/c145/scripts" || harness "cannot stage $s145 under $WORK/c145"
+    s145=$WORK/c145/rsi/scenarios/145.sh
+fi
 REAL=$SPAWN_BIN
 cleanup() {
     # Every agent the wrapper started, by its own home; then the homes.
@@ -154,7 +169,7 @@ run145() { # <label> <quiet secs> <left> [<mode>]: 145.sh with the wrapper; its 
     echo "$3" >"$WORK/left"
     t0=$(date +%s)
     (cd "$tree" && BB236_WORK=$WORK BB236_REAL=$REAL BB236_MODE=${4:-churn} SPAWN_BIN=$WORK/bin/spawn SPAWN_145_QUIET_SECS=$2 \
-        sh rsi/scenarios/145.sh >"$WORK/$1.out" 2>"$WORK/$1.err") && rc=0 || rc=$?
+        sh "$s145" >"$WORK/$1.out" 2>"$WORK/$1.err") && rc=0 || rc=$?
     took=$(($(date +%s) - t0))
     started=$(wc -l <"$WORK/started" 2>/dev/null | tr -d ' ')
     note "$1: 145.sh rc=$rc in ${took} s, agents started ${started:-0}, rounds: $(grep -o '(3) round [0-9]*: [^;]*' "$WORK/$1.err" | tr '\n' '|')"

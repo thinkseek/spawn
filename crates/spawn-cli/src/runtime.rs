@@ -65,7 +65,7 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         &roots[1],
         &spawn_host::home::Home::of_account(),
     )?;
-    let mut host = crate::config::terminal_host();
+    let mut host = crate::config::terminal_host()?;
     if let Some(projects) = pinned.projects {
         host = host.with_files_beneath(projects);
     }
