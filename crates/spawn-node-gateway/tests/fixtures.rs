@@ -11,9 +11,13 @@ mod common;
 use common::{Harness, Req, boot_id, no_database, node_id, read, signer, stranger, v};
 use serde_json::Value;
 use spawn_node_gateway::Rid;
+use spawn_node_gateway::http::Timeouts;
 use spawn_node_proto::response::{HEADER_PRIMARY_KEY, HEADER_PRIMARY_SIG};
 use spawn_node_proto::{Limit, Method, Refusal};
 use std::fmt::Write as _;
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 /// A request fixture: request line, `Name: value` lines, an empty line, the
 /// body.
@@ -381,16 +385,26 @@ fn artifact_misses_and_the_registry_manifest() {
     harness
         .get(&signer, "/node/v1/registry-manifest", 3, &[])
         .assert_refused_status(404, "not_found", 3);
+    // Not a manifest: the operator's fault, a signed 503.
     std::fs::write(
         harness.artifacts.join("registry-manifest.json"),
         b"{\"crates\":[]}",
     )
     .unwrap();
-    let manifest = harness.get(&signer, "/node/v1/registry-manifest", 4, &[]);
-    assert_eq!(
-        (manifest.status, manifest.body.as_slice()),
-        (200, &b"{\"crates\":[]}"[..])
-    );
+    harness
+        .get(&signer, "/node/v1/registry-manifest", 4, &[])
+        .assert_refused(Refusal::Unavailable, 4);
+    // A manifest: signed JSON like every answer but an artifact's body.
+    write_manifest(&harness);
+    let manifest = harness.get(&signer, "/node/v1/registry-manifest", 7, &[]);
+    assert_eq!(manifest.status, 200);
+    assert_eq!(manifest.header("Content-Type"), Some("application/json"));
+    let time = manifest.verify(&node_id(), &boot_id(), 7);
+    let body = manifest.json();
+    assert_eq!(body["v"], 1);
+    assert_eq!(body["server_time_ms"], time);
+    assert_eq!(body["registry"], "e".repeat(64).as_str());
+    assert_eq!(body["pack"]["size"], 1234);
     // A boot the cache does not hold is not served.
     let other_boot =
         spawn_node_proto::NodeSigner::new(common::node_key(), &"f".repeat(32)).unwrap();
@@ -419,11 +433,23 @@ fn artifact_misses_and_the_registry_manifest() {
     assert_eq!(harness.gateway.db_calls(), 0);
 }
 
+fn write_manifest(harness: &Harness) {
+    let digest = spawn_node_proto::ContentDigest::sha256_of(b"pack");
+    std::fs::write(
+        harness.artifacts.join("registry-manifest.json"),
+        format!(
+            r#"{{"registry":"{}","pack":{{"digest":"{digest}","size":1234}}}}"#,
+            "e".repeat(64)
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn the_public_prefix_is_stripped_and_required() {
     let harness = Harness::start_with_prefix("prefix", no_database(), "/gw");
     harness.remember_node();
-    std::fs::write(harness.artifacts.join("registry-manifest.json"), b"m").unwrap();
+    write_manifest(&harness);
     let signer = signer();
     // The signature covers the target without the prefix.
     let envelope = signer
@@ -441,7 +467,8 @@ fn the_public_prefix_is_stripped_and_required() {
         .map(|(name, value)| (name.to_string(), value))
         .collect();
     let reply = harness.send("GET", "/gw/node/v1/registry-manifest", &headers, None);
-    assert_eq!((reply.status, reply.body.as_slice()), (200, &b"m"[..]));
+    assert_eq!(reply.status, 200);
+    reply.verify(&node_id(), &boot_id(), 1);
     let bare = harness.send("GET", "/node/v1/registry-manifest", &headers, None);
     bare.assert_refused(Refusal::BadRequest, 1);
 }
@@ -506,4 +533,113 @@ impl RefusedStatus for common::Reply {
         );
         self.verify(&node_id(), &boot_id(), seq);
     }
+}
+
+/// Short deadlines, so the tests of slow peers take seconds.
+fn quick() -> Timeouts {
+    Timeouts {
+        idle: Duration::from_millis(800),
+        head: Duration::from_millis(1500),
+        ..Timeouts::default()
+    }
+}
+
+/// How long until the gateway closes `stream` (a read gives EOF or an
+/// error), while `trickle` bytes are sent one every 200 ms.
+fn time_to_close(stream: &mut TcpStream, trickle: &[u8]) -> Duration {
+    let started = Instant::now();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut buf = [0_u8; 1024];
+    let mut sent = 0;
+    while started.elapsed() < Duration::from_secs(20) {
+        if sent < trickle.len() && stream.write_all(&trickle[sent..=sent]).is_ok() {
+            sent += 1;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return started.elapsed(),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return started.elapsed(),
+        }
+    }
+    panic!("the connection was never closed");
+}
+
+#[test]
+fn a_head_trickled_byte_by_byte_is_cut_off_at_its_deadline() {
+    let harness = Harness::start_with("slow_head", no_database(), "", quick());
+    let mut stream = TcpStream::connect(harness.addr).unwrap();
+    // A head that would take a minute at this pace.
+    let head = format!(
+        "GET /node/v1/registry-manifest HTTP/1.1\r\nX-Pad: {}\r\n\r\n",
+        "a".repeat(300)
+    );
+    let closed = time_to_close(&mut stream, head.as_bytes());
+    assert!(
+        closed >= Duration::from_millis(1400) && closed < Duration::from_secs(4),
+        "closed after {closed:?}, the head deadline is 1.5 s"
+    );
+}
+
+#[test]
+fn an_idle_connection_is_closed_and_the_workers_stay_free() {
+    let harness = Harness::start_with("idle", no_database(), "", quick());
+    // As many idle connections as workers (4): each is closed after the
+    // idle deadline, and a request after them is answered.
+    let mut idle: Vec<TcpStream> = (0..4)
+        .map(|_| TcpStream::connect(harness.addr).unwrap())
+        .collect();
+    for stream in &mut idle {
+        let closed = time_to_close(stream, b"");
+        assert!(closed < Duration::from_secs(3), "idle for {closed:?}");
+    }
+    let reply = harness.raw(b"NOT A REQUEST\r\n\r\n");
+    assert_eq!(reply.status, 400);
+}
+
+#[test]
+fn a_refused_multi_mebibyte_upload_still_reads_its_signed_refusal() {
+    let harness = Harness::start("big_refusal", no_database());
+    // No cached key: 409 beat_first before any log byte is read, while the
+    // client is still writing 6 MiB (more than the 4 MiB drained).
+    let target = "/node/v1/jobs/gate-0123456789ab-k3x9q2ma/result";
+    let meta = b"{}";
+    let envelope = signer()
+        .sign(Method::Post, target, 3, common::now_ms(), meta)
+        .unwrap();
+    let mut request = format!("POST {target} HTTP/1.1\r\n");
+    for (name, value) in envelope.to_headers() {
+        let _ = write!(request, "{name}: {value}\r\n");
+    }
+    let log = vec![b'x'; 6 * 1024 * 1024];
+    let _ = write!(
+        request,
+        "Content-Length: {}\r\n\r\n",
+        meta.len() + 1 + log.len()
+    );
+    let mut bytes = request.into_bytes();
+    bytes.extend_from_slice(meta);
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&log);
+
+    let mut stream = TcpStream::connect(harness.addr).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    // Like Go's net/http: the body is written while the answer is read.
+    let sending = std::thread::spawn(move || writer.write_all(&bytes).is_ok());
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let reply = common::Reply::read_from(&mut stream);
+    reply.assert_refused(Refusal::BeatFirst, 3);
+    let _ = sending.join();
+
+    // Under the drain cap the whole upload is taken and nothing is reset.
+    let small = harness.post(&signer(), "/node/v1/spec", 4, &vec![b' '; 70 * 1024]);
+    small.assert_refused(Refusal::BadRequest, 4);
 }

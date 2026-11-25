@@ -170,7 +170,7 @@ impl Harness {
             .unwrap();
         // A refused upload may be closed before all of it is written.
         let _ = stream.write_all(bytes);
-        Reply::read(&mut stream)
+        Reply::read_from(&mut stream)
     }
 
     /// A request with these headers (and `Content-Length` when `body` is
@@ -283,7 +283,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn read(stream: &mut TcpStream) -> Self {
+    pub fn read_from(stream: &mut TcpStream) -> Self {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).expect("a status line");
