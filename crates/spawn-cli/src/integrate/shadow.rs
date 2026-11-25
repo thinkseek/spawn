@@ -650,7 +650,7 @@ pub(super) fn record_of(
         want,
         runner,
         given,
-        Ended2 {
+        Shadowed {
             result,
             verdict,
             exit,
@@ -662,7 +662,7 @@ pub(super) fn record_of(
 }
 
 /// How a shadow ended, whatever judged it: the record's own fields.
-struct Ended2 {
+struct Shadowed {
     result: Value,
     verdict: Option<String>,
     exit: i64,
@@ -672,8 +672,8 @@ struct Ended2 {
 }
 
 /// The one shape of `task.shadow_gated`, for a runner's end and a node's.
-fn shadow_record(want: &Want, runner: &str, given: &Value, ended: Ended2) -> Value {
-    let Ended2 {
+fn shadow_record(want: &Want, runner: &str, given: &Value, ended: Shadowed) -> Value {
+    let Shadowed {
         result,
         verdict,
         exit,
@@ -708,6 +708,410 @@ fn shadow_record(want: &Want, runner: &str, given: &Value, ended: Ended2) -> Val
         "unequal": unequal,
         "agrees": agrees,
     })
+}
+
+/// A shadow queued for a node: the verdict it shadows, its job, the inputs
+/// it was granted, since when it waits for a lease, and when it was queued.
+struct NodeShadow {
+    want: Want,
+    job_id: String,
+    given: Value,
+    since: Instant,
+}
+
+/// The node source's shadows ([`NODE_ENV`]): queued, looked at once a pass,
+/// recorded when a node's result is read.
+pub(super) struct NodeShadows {
+    settings: NodeSettings,
+    /// The gate's environment, of which a grant carries a part
+    /// ([`remote::grant_env`]).
+    gate_env: Vec<(String, String)>,
+    artifacts: remote::Artifacts,
+    /// Snapshots of gate directories, while their pack is made.
+    work: PathBuf,
+    offered: u64,
+    jobs: Vec<NodeShadow>,
+    registry: Option<(Instant, remote::RegistryManifest)>,
+    /// Records that could not be written yet, tried again each pass.
+    unrecorded: Vec<Value>,
+}
+
+impl NodeShadows {
+    pub(super) fn new(settings: NodeSettings, gate_env: Vec<(String, String)>, work: PathBuf) -> Self {
+        let artifacts = remote::Artifacts::new(settings.artifacts.clone());
+        Self {
+            settings,
+            gate_env,
+            artifacts,
+            work,
+            offered: 0,
+            jobs: Vec::new(),
+            registry: None,
+            unrecorded: Vec::new(),
+        }
+    }
+
+    /// A verdict to shadow on a node: queued now, unless this is not an
+    /// N-th verdict or [`NODE_IN_FLIGHT`] shadows wait already (skipped,
+    /// never queued later).
+    pub(super) fn offer(&mut self, store: &PostgresStore, want: Want) {
+        self.offered += 1;
+        let task = want.task;
+        if !self.offered.is_multiple_of(self.settings.every) {
+            println!(
+                "integrate: task {task}: verdict not shadowed on a node (every {}-th is)",
+                self.settings.every
+            );
+            return;
+        }
+        if self.jobs.len() >= NODE_IN_FLIGHT {
+            println!(
+                "integrate: task {task}: verdict not shadowed on a node: {NODE_IN_FLIGHT} \
+                 node shadows wait already"
+            );
+            return;
+        }
+        match self.enqueue(store, &want) {
+            Ok((job_id, given)) => {
+                println!("integrate: task {task}: shadow queued for a node as {job_id}");
+                self.jobs.push(NodeShadow {
+                    want,
+                    job_id,
+                    given,
+                    since: Instant::now(),
+                });
+            }
+            Err(error) => {
+                println!("integrate: task {task}: verdict not shadowed on a node: {error}");
+            }
+        }
+    }
+
+    /// The registry's manifest, read again after [`REGISTRY_EVERY`].
+    fn registry(&mut self) -> Result<remote::RegistryManifest, String> {
+        if let Some((read, manifest)) = &self.registry
+            && read.elapsed() < REGISTRY_EVERY
+        {
+            return Ok(manifest.clone());
+        }
+        let manifest = self.artifacts.registry_manifest(&self.settings.cargo_home)?;
+        self.registry = Some((Instant::now(), manifest.clone()));
+        Ok(manifest)
+    }
+
+    /// Write the job's artifacts and queue it: its id and the inputs it
+    /// was granted.
+    fn enqueue(&mut self, store: &PostgresStore, want: &Want) -> Result<(String, Value), String> {
+        let controller = inputs::controller_of(&want.scenarios)
+            .ok_or_else(|| format!("{} has no controller above it", want.scenarios.display()))?;
+        let controller_commit = inputs::controller_commit(&controller).ok_or_else(|| {
+            format!(
+                "{} names no controller commit: a node could not say what it judged",
+                controller.join(".controller").display()
+            )
+        })?;
+        let scenarios_at = want
+            .scenarios
+            .strip_prefix(&controller)
+            .map_err(|_| format!("{} is not inside its controller", want.scenarios.display()))?
+            .to_path_buf();
+        let base = want.inputs["base"].as_str().unwrap_or_default();
+        let candidate = want.inputs["candidate"].as_str().unwrap_or_default();
+        let registry = self.registry()?;
+        // The set, a snapshot read once: what the pack holds is this copy.
+        std::fs::create_dir_all(&self.work)
+            .map_err(|error| format!("{}: {error}", self.work.display()))?;
+        let snapshot = self.work.join(format!(
+            "{}-{}-{}",
+            want.task,
+            std::process::id(),
+            self.offered
+        ));
+        remove_tree(&snapshot);
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg("--")
+            .arg(&want.scenarios)
+            .arg(&snapshot)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("cannot run cp: {error}"))?;
+        if !copied.status.success() {
+            remove_tree(&snapshot);
+            return Err(format!(
+                "cannot copy {}: {}",
+                want.scenarios.display(),
+                String::from_utf8_lossy(&copied.stderr).trim()
+            ));
+        }
+        let scenarios_sha256 = inputs::scenarios_sha256(&snapshot);
+        let pack = self.artifacts.controller_pack(
+            &controller,
+            &snapshot,
+            &scenarios_at,
+            scenarios_sha256
+                .as_deref()
+                .map(|digest| format!("{controller_commit}-{digest}"))
+                .as_deref(),
+        );
+        remove_tree(&snapshot);
+        let pack = pack?;
+        let delta = self.artifacts.delta_bundle(&want.repo, base, candidate)?;
+        let baseline = self.artifacts.baseline_bundle(&want.repo, base)?;
+        let given = json!({
+            "base": base,
+            "candidate": candidate,
+            "controller": controller_commit,
+            "scenarios_sha256": scenarios_sha256,
+            "scenario": null,
+        });
+        let mut requires = std::collections::BTreeMap::from([
+            ("registry".to_string(), registry.registry),
+            ("pg".to_string(), remote::PG_MAJOR.to_string()),
+        ]);
+        if let Some(lock) = remote::web_lock(&controller) {
+            requires.insert("web_lock".to_string(), lock);
+        }
+        if let Some(channel) = remote::toolchain_channel(&controller) {
+            requires.insert("toolchain".to_string(), channel);
+        }
+        let repo = want
+            .repo
+            .file_name()
+            .map(|name| name.to_string_lossy().trim_end_matches(".git").to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "repo".to_string());
+        let job = remote::GateJob {
+            kind: spawn_postgres::RemoteJobKind::GateShadow,
+            job_id: remote::job_id("gs", candidate),
+            judging_id: want.judging_id.clone(),
+            task_id: Some(want.task),
+            repo,
+            inputs: given.clone(),
+            env: remote::grant_env(&self.gate_env),
+            artifacts: vec![
+                delta.url(ArtifactRole::DeltaBundle),
+                baseline.url(ArtifactRole::BaselineBundle),
+                pack.url(ArtifactRole::ControllerPack),
+            ],
+            requires,
+        };
+        let job_id = remote::enqueue(store, &job)?;
+        Ok((job_id, given))
+    }
+
+    /// Each pass: the jobs in flight looked at once. One no node leased in
+    /// time is taken back (nothing recorded); a node's result is read,
+    /// judged on the ledger (a fault re-queued waits again) and recorded
+    /// with `write`, once (a record that could not be written is tried
+    /// again at the next pass).
+    pub(super) fn poll(
+        &mut self,
+        store: &PostgresStore,
+        write: &dyn Fn(&Value) -> Result<(), String>,
+    ) {
+        self.unrecorded.retain(|record| write(record).is_err());
+        let wait = self.settings.queue_wait;
+        let mut kept = Vec::new();
+        for mut job in std::mem::take(&mut self.jobs) {
+            let task = job.want.task;
+            match remote::step(store, &job.job_id, job.since, wait) {
+                Ok(remote::Waited::Queued | remote::Waited::Leased(_)) => kept.push(job),
+                Ok(remote::Waited::TakenLocal) => println!(
+                    "integrate: task {task}'s node shadow {}: no node leased it within {} s; \
+                     nothing recorded",
+                    job.job_id,
+                    wait.as_secs()
+                ),
+                Ok(remote::Waited::Ended(state)) => println!(
+                    "integrate: task {task}'s node shadow {} ended {state:?}; nothing recorded",
+                    job.job_id
+                ),
+                Ok(remote::Waited::Completed(row)) => {
+                    match self.completed(store, &job, &row) {
+                        Completion::Requeued => {
+                            job.since = Instant::now();
+                            kept.push(job);
+                        }
+                        Completion::Record(record) => {
+                            if let Err(error) = write(&record) {
+                                eprintln!(
+                                    "integrate: task {task}'s node shadow record: {error}; \
+                                     tried again at the next pass"
+                                );
+                                self.unrecorded.push(record);
+                            }
+                        }
+                        Completion::Nothing => {}
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "integrate: task {task}'s node shadow {}: {error}; looked at again",
+                        job.job_id
+                    );
+                    kept.push(job);
+                }
+            }
+        }
+        self.jobs = kept;
+    }
+
+    /// A completed job: its stored result judged (§6.2) and settled on the
+    /// ledger; its record, unless the job went to another node.
+    fn completed(
+        &self,
+        store: &PostgresStore,
+        job: &NodeShadow,
+        row: &spawn_postgres::RemoteJob,
+    ) -> Completion {
+        let task = job.want.task;
+        let stored = match remote::read_stored(&self.settings.results, &row.job_id, row.lease_epoch)
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                println!(
+                    "integrate: task {task}'s node shadow {}: its result cannot be read: \
+                     {error}; nothing recorded",
+                    row.job_id
+                );
+                let unread = remote::Judged::unreadable(error);
+                if let Err(error) = remote::settle(store, row, &unread) {
+                    eprintln!("integrate: task {task}'s node shadow {}: {error}", row.job_id);
+                }
+                return Completion::Nothing;
+            }
+        };
+        let judged = remote::judge_stored(&stored, &job.given);
+        let settled = remote::settle(store, row, &judged);
+        let requeued = matches!(
+            &settled,
+            Ok(Some(outcome)) if outcome.ok && outcome.next == Some(spawn_postgres::FaultNext::Queued)
+        );
+        match &settled {
+            Ok(Some(outcome)) => println!(
+                "integrate: task {task}'s node shadow {}: {} ({}): strike {}, next {:?}{}",
+                row.job_id,
+                judged.evidence,
+                judged.reason,
+                judged.strike,
+                outcome.next,
+                if outcome.poison == Some(true) {
+                    ", the job is the poison"
+                } else {
+                    ""
+                }
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "integrate: task {task}'s node shadow {}: its fault not judged: {error}",
+                row.job_id
+            ),
+        }
+        if requeued {
+            return Completion::Requeued;
+        }
+        if judged.evidence == "self_fenced" {
+            return Completion::Nothing;
+        }
+        let runner = format!("node:{}", node_name(store, row, &stored));
+        Completion::Record(node_record_of(&job.want, &runner, &stored, &judged))
+    }
+
+    /// The node shadows in flight's jobs, for tests.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> Vec<String> {
+        self.jobs.iter().map(|job| job.job_id.clone()).collect()
+    }
+}
+
+/// What a completed node shadow leaves.
+enum Completion {
+    /// Its record.
+    Record(Value),
+    /// Back in the queue for another node: waited for again.
+    Requeued,
+    /// Nothing (a self-fenced run, a result that cannot be read).
+    Nothing,
+}
+
+/// The name of the node that ran `row`: the ledger's, else what the node
+/// said, else its id's first 12 digits.
+fn node_name(
+    store: &PostgresStore,
+    row: &spawn_postgres::RemoteJob,
+    stored: &remote::Stored,
+) -> String {
+    let id = row.node_id.clone().unwrap_or_default();
+    store
+        .nodes_v1()
+        .ok()
+        .and_then(|nodes| {
+            nodes
+                .into_iter()
+                .find(|node| node.node_id.as_deref() == Some(id.as_str()))
+        })
+        .map(|node| node.name)
+        .or_else(|| {
+            stored
+                .meta
+                .env
+                .as_ref()
+                .and_then(|env| env.get("node").cloned())
+        })
+        .unwrap_or_else(|| id.chars().take(12).collect())
+}
+
+/// The `task.shadow_gated` record of a node's stored result for `want`,
+/// judged `judged`, on `runner` (`node:<name>`): the shape a runner's end
+/// has ([`record_of`]); `inputs` what the node says it judged, a verdict
+/// only when the node's gate wrote one, and `agrees` only for a verdict on
+/// the job's own commits with every input equal to the primary's.
+pub(super) fn node_record_of(
+    want: &Want,
+    runner: &str,
+    stored: &remote::Stored,
+    judged: &remote::Judged,
+) -> Value {
+    let meta = &stored.meta;
+    let given = meta
+        .inputs
+        .as_ref()
+        .and_then(|inputs| serde_json::to_value(inputs).ok())
+        .unwrap_or(Value::Null);
+    let exit = meta.exit_code.unwrap_or_else(|| match &meta.signal {
+        Some(spawn_node_proto::result::Signal::Number(number)) => {
+            128 + i64::try_from(*number).unwrap_or(0)
+        }
+        _ => -1,
+    });
+    let env = |name: &str| meta.env.as_ref().and_then(|env| env.get(name).cloned());
+    let toolchain = env("toolchain").or_else(|| {
+        meta.streams(&stored.log)
+            .ok()
+            .and_then(|(stdout, _)| inputs::toolchain_of(&String::from_utf8_lossy(stdout)))
+    });
+    let believed = judged.verdict.is_some();
+    shadow_record(
+        want,
+        runner,
+        &given,
+        Shadowed {
+            result: if believed {
+                json!("verdict")
+            } else {
+                json!(judged.evidence)
+            },
+            // A verdict on other commits is said, never compared.
+            verdict: judged.stated.clone().filter(|_| believed || judged.evidence == "unequal_inputs"),
+            exit,
+            seconds: meta.seconds,
+            host: env("host"),
+            toolchain,
+        },
+    )
 }
 
 #[cfg(test)]
