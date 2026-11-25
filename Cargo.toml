@@ -5,6 +5,7 @@ members = [
     "crates/spawn-postgres",
     "crates/spawn-jev",
     "crates/spawn-host",
+    "crates/spawn-cas",
     "crates/spawn-cli",
     "crates/spawn-kdf",
     "crates/spawn-codegraph",
@@ -23,6 +24,7 @@ spawn-core = { path = "crates/spawn-core" }
 spawn-postgres = { path = "crates/spawn-postgres" }
 spawn-jev = { path = "crates/spawn-jev" }
 spawn-host = { path = "crates/spawn-host" }
+spawn-cas = { path = "crates/spawn-cas" }
 spawn-kdf = { path = "crates/spawn-kdf" }
 spawn-codegraph = { path = "crates/spawn-codegraph" }
 spawn-node-proto = { path = "crates/spawn-node-proto" }

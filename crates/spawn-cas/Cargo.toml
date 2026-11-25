@@ -1,0 +1,18 @@
+[package]
+name = "spawn-cas"
+description = "spawn-cas: the unified content-addressed store (objects by algorithm, pins, per-namespace LRU GC), crash-only, on-disk compatible with spawn-node's Go store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# SHA-256 content addresses (already linked through the PostgreSQL driver).
+sha2.workspace = true
+thiserror.workspace = true
+# O_NOFOLLOW | O_NONBLOCK on object opens.
+libc.workspace = true
+
+[lints]
+workspace = true

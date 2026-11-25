@@ -1243,8 +1243,15 @@
       "title": "Copy-on-Write Workspace Store with CAS Dedup",
       "kind": "capability",
       "parent": "domain-host-execution",
-      "summary": "The cross-OS copy-on-write workspace store (reflink clones) with content-addressed block deduplication (M7 #557).",
+      "summary": "The cross-OS copy-on-write workspace store (reflink clones) with content-addressed block deduplication (M7 #557), stored in the unified spawn-cas crate (objects/<algo>/<2 hex>/<hex>, pins, per-namespace LRU GC; legacy <2 hex>/<hex> blobs adopted in place, ST1).",
       "files": [
+        "crates/spawn-cas/Cargo.toml",
+        "crates/spawn-cas/src/digest.rs",
+        "crates/spawn-cas/src/gc.rs",
+        "crates/spawn-cas/src/legacy.rs",
+        "crates/spawn-cas/src/lib.rs",
+        "crates/spawn-cas/src/store.rs",
+        "crates/spawn-cas/tests/store.rs",
         "crates/spawn-host/src/cas_dedup.rs",
         "crates/spawn-host/src/cow.rs",
         "crates/spawn-host/tests/cow.rs",
@@ -1272,6 +1279,7 @@
           "2a785c5cd"
         ],
         "tests": [
+          "crates/spawn-cas/tests/store.rs",
           "crates/spawn-host/tests/cow.rs"
         ],
         "deploys": [],

@@ -698,6 +698,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawn-cas"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "spawn-cli"
 version = "0.1.0"
 dependencies = [
@@ -752,7 +761,7 @@ dependencies = [
  "libc",
  "rustix",
  "serde_json",
- "sha2",
+ "spawn-cas",
  "spawn-core",
  "spawn-host",
  "spawn-postgres",
