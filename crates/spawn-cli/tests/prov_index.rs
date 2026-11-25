@@ -535,7 +535,7 @@ fn a_commit_the_commit_map_renamed_is_recorded_already_and_shown_by_either_id() 
     assert_eq!(run["recorded"], 0, "{run}");
     assert_eq!(run["main_commits_recorded_before"], 1, "{run}");
     for id in [&old, &new] {
-        let shown = changes(&spawn_json(schema, &["prov", "show", id]));
+        let shown = changes(&spawn_json(&schema, &["prov", "show", id]));
         assert_eq!(shown.len(), 1, "{id}: {shown:?}");
         assert_eq!(shown[0]["change"]["id"], recorded);
     }
