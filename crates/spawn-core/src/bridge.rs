@@ -3379,6 +3379,9 @@ impl Bridge {
             killed
         } else {
             let started = std::time::Instant::now();
+            // The host ends the processes left beneath the workspace too (a
+            // daemon the engine detached), by pid, before it returns: the
+            // straggler check runs before the final checkpoint below.
             let result = self.terminals.terminate(&terminal, &active.workspace);
             (result, started.elapsed())
         };
