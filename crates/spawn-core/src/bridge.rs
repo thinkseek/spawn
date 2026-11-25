@@ -8893,6 +8893,16 @@ mod tests {
         store.append_file(&path, &user("someone else's prompt"));
         bridge.poll().expect("poll");
         assert!(natives(&store).is_empty());
+        // A forged report (`pane.report_agent_session` is open to any client
+        // of the server): its transcript quotes a marker of a later command,
+        // which this session never typed (another session's). Never bound.
+        store.replace_file(
+            &path,
+            user(&crate::message::marked("forged", CommandId(id.0 + 50), true)).as_bytes(),
+        );
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert!(natives(&store).is_empty(), "a marker this session never typed");
         // A foreign agent's session in the pane is never bound either.
         let mut foreign = reported.clone();
         foreign.agent = Some("claude".to_string());
@@ -9049,6 +9059,55 @@ mod tests {
             (ScreenState::Ready, Some("exec_1:hs:77.1700:5".to_string()))
         );
         assert!(host.asked.load(Ordering::SeqCst) > 0);
+    }
+
+    /// Claude Code's screens under Herdr are not captured yet against
+    /// Herdr's claude manifest (design §9.2): on a host that reads agents,
+    /// Claude Code is not merged with the host's reading, nor keyed by it,
+    /// and the host is never asked. Its screen goes by two readings in a
+    /// row, as on tmux.
+    #[test]
+    fn claude_on_an_agent_host_stays_on_its_own_readings_for_now() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        store.set_terminal_server(crate::port::ServerSeen::Answers(Some(
+            crate::port::TerminalServer {
+                pid: 77,
+                started_at_ms: 1_700,
+            },
+        )));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("claude"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        store.set_pane(&terminal, BUSY);
+        host.set(agy_reading(Some("claude"), crate::port::AgentStatus::Working, 2));
+        bridge.poll().expect("poll");
+        let busy = |store: &Arc<MemoryStore>| {
+            screens_with_keys(store)
+                .into_iter()
+                .filter(|(state, _)| *state == ScreenState::Busy)
+                .collect::<Vec<_>>()
+        };
+        assert!(busy(&store).is_empty(), "one reading is no fact, whatever the host says");
+        bridge.poll().expect("poll");
+        assert_eq!(busy(&store), vec![(ScreenState::Busy, None)], "unkeyed");
+        assert!(
+            screens_with_keys(&store).iter().all(|(_, key)| key.is_none()),
+            "{:?}",
+            screens_with_keys(&store)
+        );
+        assert_eq!(host.asked.load(Ordering::SeqCst), 0, "the host is not asked");
     }
 
     /// The merge, case by case: a state is taken at once only where both
