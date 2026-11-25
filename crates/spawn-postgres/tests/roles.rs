@@ -487,3 +487,437 @@ fn a_login_password_never_appears_in_statement_text() {
     let mut supervisor = Client::connect(&real, NoTls).expect("the supervisor logs in");
     supervisor.batch_execute("select 1").expect("a query");
 }
+
+/// Issue #98, the catalog-wide rules for the functions that run as the
+/// owner, over one migrated schema (never the cluster): every SECURITY
+/// DEFINER function pins its search path to the schema, temp schema last
+/// (a caller's temporary table cannot stand in for one of ours), and
+/// public may call only the gateway (`agent_commands`' trigger and
+/// `spawn_gateway_submit`) and the grant-filtered `spawn_read_*` readers
+/// (docs/view-architecture.md §6), which filter on `session_user`
+/// themselves.
+#[test]
+fn every_definer_function_pins_its_path_and_public_calls_only_the_gateway() {
+    let (_store, schema) = store("roles_definer");
+    let mut client = admin(&schema);
+    let mut definers: Vec<(String, bool, bool)> = client
+        .query(
+            "select p.oid::regprocedure::text,
+                    coalesce(p.proconfig, '{}') = array['search_path='
+                        || quote_ident(current_schema()) || ', pg_temp'],
+                    has_function_privilege('public', p.oid, 'execute')
+               from pg_proc p
+              where p.pronamespace = current_schema()::regnamespace and p.prosecdef",
+            &[],
+        )
+        .expect("the schema's definer functions")
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    definers.sort();
+    // Not vacuous: a filter that matched nothing would pass every rule.
+    assert!(
+        definers.len() >= 50,
+        "{} definer functions in {schema}",
+        definers.len()
+    );
+    let unpinned: Vec<&str> = definers
+        .iter()
+        .filter(|(_, pinned, _)| !pinned)
+        .map(|(function, _, _)| function.as_str())
+        .collect();
+    assert!(unpinned.is_empty(), "search path not pinned: {unpinned:?}");
+
+    let public: Vec<&str> = definers
+        .iter()
+        .filter(|(_, _, public)| *public)
+        .map(|(function, _, _)| function.as_str())
+        .collect();
+    assert_eq!(
+        public,
+        [
+            "spawn_gateway_insert()",
+            "spawn_gateway_submit(text,text,text,jsonb)",
+            "spawn_read_freshness()",
+            "spawn_read_judgements(text)",
+            "spawn_read_state()",
+            "spawn_read_status()",
+            "spawn_read_tasks()",
+            "spawn_read_timeline(text)",
+        ],
+        "the definer functions public may call"
+    );
+    // The gateway's trigger runs the first of them.
+    let trigger: String = client
+        .query_one(
+            "select t.tgfoid::regprocedure::text from pg_trigger t
+              where t.tgrelid = 'agent_commands'::regclass
+                and t.tgname = 'spawn_gateway_insert'",
+            &[],
+        )
+        .expect("the gateway trigger")
+        .get(0);
+    assert_eq!(trigger, "spawn_gateway_insert()");
+}
+
+/// The first column of `sql`'s rows, in byte order (not the server's
+/// collation, which may sort `_rows(` before `(`).
+fn column(
+    client: &mut Client,
+    sql: &str,
+    params: &[&(dyn postgres::types::ToSql + Sync)],
+) -> Vec<String> {
+    let mut values: Vec<String> = client
+        .query(sql, params)
+        .expect("the catalog")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    values.sort();
+    values
+}
+
+/// What a role holds over the schema of the database `client` is in: the
+/// functions granted to it, the relations it may select by a grant of its
+/// own, every other privilege it has on a relation or sequence by any grant
+/// (public's included), its column grants and its role memberships.
+struct Held {
+    functions: Vec<String>,
+    selects: Vec<String>,
+    writes: Vec<String>,
+    columns: Vec<String>,
+    memberships: Vec<String>,
+}
+
+fn held(client: &mut Client, role: &str) -> Held {
+    Held {
+        functions: column(
+            client,
+            "select p.oid::regprocedure::text || ' ' || a.privilege_type
+               from pg_proc p cross join lateral aclexplode(p.proacl) a
+              where p.pronamespace = current_schema()::regnamespace
+                and a.grantee = $1::text::regrole
+",
+            &[&role],
+        ),
+        selects: column(
+            client,
+            "select c.relname::text
+               from pg_class c cross join lateral aclexplode(c.relacl) a
+              where c.relnamespace = current_schema()::regnamespace
+                and a.grantee = $1::text::regrole and a.privilege_type = 'SELECT'
+",
+            &[&role],
+        ),
+        writes: column(
+            client,
+            "select c.relname || ' ' || p.privilege
+               from pg_class c
+              cross join unnest(array['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES',
+                                      'TRIGGER']) p(privilege)
+              where c.relnamespace = current_schema()::regnamespace
+                and c.relkind in ('r', 'p', 'v', 'm', 'f')
+                and has_table_privilege($1::text, c.oid, p.privilege)
+             union all
+             select c.relname || ' ' || p.privilege
+               from pg_class c cross join unnest(array['USAGE', 'UPDATE']) p(privilege)
+              where c.relnamespace = current_schema()::regnamespace and c.relkind = 'S'
+                and has_sequence_privilege($1::text, c.oid, p.privilege)
+",
+            &[&role],
+        ),
+        columns: column(
+            client,
+            "select c.relname || '.' || t.attname || ' ' || a.privilege_type
+               from pg_attribute t
+               join pg_class c on c.oid = t.attrelid
+              cross join lateral aclexplode(t.attacl) a
+              where c.relnamespace = current_schema()::regnamespace
+                and a.grantee = $1::text::regrole
+",
+            &[&role],
+        ),
+        memberships: column(
+            client,
+            "select m.roleid::regrole::text from pg_auth_members m
+              where m.member = $1::text::regrole",
+            &[&role],
+        ),
+    }
+}
+
+/// The functions granted to a database's human login (schema.sql).
+const HUMAN_FUNCTIONS: [&str; 4] = [
+    "spawn_human_input(text,text,text) EXECUTE",
+    "spawn_human_key(text,text,text) EXECUTE",
+    "spawn_human_resume(bigint,bigint,text) EXECUTE",
+    "spawn_human_task(text,text,text) EXECUTE",
+];
+
+/// The functions granted to a database's reader login (schema.sql).
+const READER_FUNCTIONS: [&str; 6] = [
+    "spawn_command_message(bigint,text,jsonb,text,boolean,bigint,bigint,bigint,bigint,bigint) \
+    EXECUTE",
+    "spawn_commit_now(text) EXECUTE",
+    "spawn_commit_now_rows(text) EXECUTE",
+    "spawn_messages_marked_from() EXECUTE",
+    "spawn_node_latest(text,text,bigint) EXECUTE",
+    "spawn_task_stages(bigint) EXECUTE",
+];
+
+/// The functions granted to a database's supervisor login (schema.sql).
+const SUPERVISOR_FUNCTIONS: [&str; 14] = [
+    "spawn_commit_now(text) EXECUTE",
+    "spawn_commit_now_rows(text) EXECUTE",
+    "spawn_mission_add(text,jsonb,text) EXECUTE",
+    "spawn_mission_close(bigint,text,text) EXECUTE",
+    "spawn_objective_retire(jsonb) EXECUTE",
+    "spawn_resident_propose(text,text,text) EXECUTE",
+    "spawn_resident_retire(text) EXECUTE",
+    "spawn_task_assign(bigint,text,text,text,text,boolean,boolean,integer,text) EXECUTE",
+    "spawn_task_cancel(bigint) EXECUTE",
+    "spawn_task_reassign(bigint,text) EXECUTE",
+    "spawn_task_reroute(bigint,text,integer,integer) EXECUTE",
+    "spawn_task_restart(bigint,text) EXECUTE",
+    "spawn_task_review(bigint,boolean,text,integer) EXECUTE",
+    "spawn_task_stages(bigint) EXECUTE",
+];
+
+/// The relations a database's supervisor login selects by a grant of its own.
+const SUPERVISOR_SELECTS: [&str; 15] = [
+    "grading_presets",
+    "mission_missions",
+    "mission_residents",
+    "mission_retired_objectives",
+    "mission_source_holds",
+    "mission_source_reds",
+    "mission_tasks",
+    "spawn_alert_scores",
+    "spawn_alerts",
+    "spawn_commit_map",
+    "spawn_decisions",
+    "spawn_escalations",
+    "spawn_human_intents",
+    "spawn_interventions",
+    "spawn_outcomes",
+];
+
+/// Issue #98's review (M1): no grant reaches the schema, its database or
+/// the logins by another path. In the database `client` is in, which a
+/// case made for itself:
+///
+/// - every function, relation, column and type of the schema is granted to
+///   its owner, public and the three logins alone (no `pg_monitor`, no
+///   other role), and no column carries a grant of its own;
+/// - the schema is used by public and the logins, created in by none of
+///   them; the database is created in by none of them, and they may
+///   connect (public: connect and temporary, PostgreSQL's default);
+/// - no default privileges are set in the database;
+/// - each login is a plain login: no superuser, createrole, createdb,
+///   bypassrls or replication.
+fn nothing_else_is_granted(client: &mut Client, logins: [&str; 3]) {
+    let logins: Vec<String> = logins.iter().map(ToString::to_string).collect();
+    let strangers = column(
+        client,
+        "with acl(kind, name, owner, acl) as (
+             select 'function', p.oid::regprocedure::text, p.proowner, p.proacl
+               from pg_proc p where p.pronamespace = current_schema()::regnamespace
+             union all
+             select 'relation', c.relname::text, c.relowner, c.relacl
+               from pg_class c where c.relnamespace = current_schema()::regnamespace
+             union all
+             select 'column', c.relname || '.' || t.attname, c.relowner, t.attacl
+               from pg_attribute t join pg_class c on c.oid = t.attrelid
+              where c.relnamespace = current_schema()::regnamespace
+             union all
+             select 'type', y.typname::text, y.typowner, y.typacl
+               from pg_type y where y.typnamespace = current_schema()::regnamespace)
+         select acl.kind || ' ' || acl.name || ' to ' || a.grantee::regrole::text
+           from acl cross join lateral aclexplode(acl.acl) a
+          where a.grantee <> 0 and a.grantee <> acl.owner
+            and a.grantee::regrole::text <> all($1::text[])",
+        &[&logins],
+    );
+    assert!(
+        strangers.is_empty(),
+        "granted to another role: {strangers:?}"
+    );
+    let columns = column(
+        client,
+        "select c.relname || '.' || t.attname
+           from pg_attribute t join pg_class c on c.oid = t.attrelid
+          where c.relnamespace = current_schema()::regnamespace and t.attacl is not null",
+        &[],
+    );
+    assert!(columns.is_empty(), "column grants: {columns:?}");
+
+    // The schema's and the database's own grants, but the owner's.
+    let schema = column(
+        client,
+        "select case a.grantee when 0 then 'public' else a.grantee::regrole::text end
+                || ' ' || a.privilege_type
+           from pg_namespace n cross join lateral aclexplode(n.nspacl) a
+          where n.oid = current_schema()::regnamespace and a.grantee <> n.nspowner",
+        &[],
+    );
+    let mut expected: Vec<String> = std::iter::once("public".to_string())
+        .chain(logins.iter().cloned())
+        .map(|grantee| format!("{grantee} USAGE"))
+        .collect();
+    expected.sort();
+    assert_eq!(schema, expected, "the schema's grants");
+    let database = column(
+        client,
+        "select case a.grantee when 0 then 'public' else a.grantee::regrole::text end
+                || ' ' || a.privilege_type
+           from pg_database d cross join lateral aclexplode(d.datacl) a
+          where d.datname = current_database() and a.grantee <> d.datdba",
+        &[],
+    );
+    let mut expected: Vec<String> = ["public CONNECT", "public TEMPORARY"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(logins.iter().map(|login| format!("{login} CONNECT")))
+        .collect();
+    expected.sort();
+    assert_eq!(database, expected, "the database's grants");
+    for role in std::iter::once("public").chain(logins.iter().map(String::as_str)) {
+        let creates: (bool, bool) = client
+            .query_one(
+                "select has_schema_privilege($1::text, current_schema(), 'CREATE'),
+                        has_database_privilege($1::text, current_database(), 'CREATE')",
+                &[&role],
+            )
+            .map(|row| (row.get(0), row.get(1)))
+            .expect("the privileges");
+        assert_eq!(
+            creates,
+            (false, false),
+            "{role} creates in the schema or database"
+        );
+    }
+
+    let defaults = column(
+        client,
+        "select d.defaclrole::regrole::text || ' ' || d.defaclobjtype::text
+           from pg_default_acl d",
+        &[],
+    );
+    assert!(defaults.is_empty(), "default privileges: {defaults:?}");
+
+    let powers = column(
+        client,
+        "select r.rolname::text from pg_roles r
+          where r.rolname = any($1::text[])
+            and (r.rolsuper or r.rolcreaterole or r.rolcreatedb or r.rolbypassrls
+                 or r.rolreplication)",
+        &[&logins],
+    );
+    assert!(powers.is_empty(), "logins with powers: {powers:?}");
+}
+
+/// Issue #98: each restricted login of a database holds exactly its grants
+/// over the schema, in a database of its own so its logins are this
+/// case's alone. The human login calls its four `spawn_human_*` functions
+/// and selects nothing; the reader selects every relation, calls its read
+/// functions and writes nothing; the supervisor calls the mission
+/// functions it decides with and selects their tables. None is a member of
+/// another role, and none writes a relation but by public's gateway insert
+/// into `agent_commands`, whose trigger checks its grants. Only the owner
+/// records an alert. The database and its logins go with the guard.
+#[test]
+fn each_login_holds_exactly_its_grants_and_no_more() {
+    let database = Database::new("roles_matrix", None);
+    let name = database.name.clone();
+    PostgresStore::connect(&database.url())
+        .expect("connect")
+        .migrate()
+        .expect("migrate");
+    let mut client = Client::connect(&database.url(), NoTls).expect("the owner in the database");
+    let human = format!("spawn_human_{name}");
+    let reader = format!("spawn_reader_{name}");
+    let supervisor = format!("spawn_supervisor_{name}");
+    let gateway = ["agent_commands INSERT"];
+
+    let held_human = held(&mut client, &human);
+    assert_eq!(held_human.functions, HUMAN_FUNCTIONS);
+    assert!(held_human.selects.is_empty(), "{:?}", held_human.selects);
+    assert_eq!(held_human.writes, gateway);
+
+    let held_reader = held(&mut client, &reader);
+    assert_eq!(held_reader.functions, READER_FUNCTIONS);
+    let relations = column(
+        &mut client,
+        "select c.relname::text from pg_class c
+          where c.relnamespace = current_schema()::regnamespace
+            and c.relkind in ('r', 'p', 'v', 'm', 'f')",
+        &[],
+    );
+    assert!(relations.len() >= 40, "{} relations", relations.len());
+    assert_eq!(
+        held_reader.selects, relations,
+        "the reader selects every relation"
+    );
+    assert_eq!(held_reader.writes, gateway);
+
+    let held_supervisor = held(&mut client, &supervisor);
+    assert_eq!(held_supervisor.functions, SUPERVISOR_FUNCTIONS);
+    assert_eq!(held_supervisor.selects, SUPERVISOR_SELECTS);
+    assert_eq!(held_supervisor.writes, gateway);
+
+    for (role, holding) in [
+        (&human, &held_human),
+        (&reader, &held_reader),
+        (&supervisor, &held_supervisor),
+    ] {
+        assert!(holding.columns.is_empty(), "{role}: {:?}", holding.columns);
+        assert!(
+            holding.memberships.is_empty(),
+            "{role}: {:?}",
+            holding.memberships
+        );
+    }
+    // Public's own grants on relations are the gateway insert alone.
+    let public = column(
+        &mut client,
+        "select c.relname || ' ' || a.privilege_type
+           from pg_class c cross join lateral aclexplode(c.relacl) a
+          where c.relnamespace = current_schema()::regnamespace
+            and a.grantee = 0",
+        &[],
+    );
+    assert_eq!(public, gateway);
+
+    // The alert writer is the owner's alone.
+    for role in [
+        "public",
+        human.as_str(),
+        reader.as_str(),
+        supervisor.as_str(),
+    ] {
+        let alerts: bool = client
+            .query_one(
+                "select has_function_privilege($1::text, 'spawn_alert_record(jsonb)', 'execute')",
+                &[&role],
+            )
+            .expect("the privilege")
+            .get(0);
+        assert!(!alerts, "{role} may record an alert");
+    }
+
+    nothing_else_is_granted(&mut client, [&human, &reader, &supervisor]);
+
+    drop(client);
+    drop(database);
+    let left: i64 = admin("public")
+        .query_one(
+            "select (select count(*) from pg_database where datname = $1)
+                  + (select count(*) from pg_roles
+                      where rolname in ('spawn_human_' || $1, 'spawn_reader_' || $1,
+                                        'spawn_supervisor_' || $1))",
+            &[&name],
+        )
+        .expect("what is left")
+        .get(0);
+    assert_eq!(left, 0, "the database and its logins are dropped");
+}

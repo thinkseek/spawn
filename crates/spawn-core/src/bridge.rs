@@ -5871,6 +5871,14 @@ fn files_digest(files: &[String]) -> u64 {
 /// needs bubblewrap and socat. The Bash rules also deny ordinary commands
 /// that name these files, e.g. `git diff deploy/deploy.sh`; the Read tool
 /// still reads the checkout's scripts.
+///
+/// Keep's delivery folders (`/run/keep`, and `/run/keep-test` for its test
+/// deliveries) hold credentials as `~/.config/spawn` does (issue #98), so
+/// they are denied the same way, and as there, the files it delivers are
+/// denied by name too: a command that spells the folder another way
+/// (`cd /run && less keep/typesafe.api-key`, `/run//keep/...`) still names
+/// the file. The folder rule names `run/keep`, which the checkout's
+/// `scripts/keep/` does not.
 pub const CREDENTIAL_DENY: &[&str] = &[
     "Read(~/.local/share/spawn-rsi/*.env*)",
     "Read(~/.local/share/spawn-rsi/env.sh)",
@@ -5905,6 +5913,8 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Read(~/.claude.json*)",
     "Read(~/.ssh/**)",
     "Read(~/.gnupg/**)",
+    "Read(//run/keep/**)",
+    "Read(//run/keep-test/**)",
     "Read(//data/tmp/ccd/**)",
     "Read(//data/tmp/ccd-pg/**)",
     "Read(//var/tmp/spawn/**/*.sh)",
@@ -5942,6 +5952,8 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Edit(~/.claude.json*)",
     "Edit(~/.ssh/**)",
     "Edit(~/.gnupg/**)",
+    "Edit(//run/keep/**)",
+    "Edit(//run/keep-test/**)",
     "Edit(//data/tmp/ccd/**)",
     "Edit(//data/tmp/ccd-pg/**)",
     "Edit(//var/tmp/spawn/**/*.sh)",
@@ -5953,6 +5965,12 @@ pub const CREDENTIAL_DENY: &[&str] = &[
     "Bash(*spawn-rsi/backups*)",
     "Bash(*fleet-pg*)",
     "Bash(*.config/spawn*)",
+    // Keep's delivery folders, `/run/keep` and `/run/keep-test` both, and
+    // the files Keep delivers, by name.
+    "Bash(*run/keep*)",
+    "Bash(*typesafe.api-key*)",
+    "Bash(*ccd-db.url*)",
+    "Bash(*ccd-db.pw*)",
     // A passfile by its variable or by its name (113): engines need not
     // name it, since libpq and spawn read it themselves. `echo $PGPASSFILE`
     // is refused too; a search of the code uses Grep, which these miss.
@@ -6972,6 +6990,56 @@ mod tests {
             "~/.claude/settings*",
             "~/.claude/projects/settings.json"
         ));
+    }
+
+    /// Issue #98: Keep's delivery folders are denied to the Read and Edit
+    /// tools and to every Bash command that names them; the checkout's
+    /// `scripts/keep/` and a mere `keep` still run.
+    #[test]
+    fn engines_are_denied_keep_s_delivery_folders() {
+        for path in [
+            "//run/keep/typesafe.api-key",
+            "//run/keep/a/b",
+            "//run/keep-test/VERSION",
+        ] {
+            assert!(denied_by("Read", path), "Read {path}");
+            assert!(denied_by("Edit", path), "Edit {path}");
+        }
+        for path in ["//run/keeper/x", "//run/user/1000/keep"] {
+            assert!(!denied_by("Read", path), "Read {path}");
+        }
+        for command in [
+            "cat /run/keep/typesafe.api-key",
+            "ls -la /run/keep",
+            "ls /run/keep-test/",
+            "cat /run/keep-test/VERSION",
+            "python3 -c \"open('/run/keep/typesafe.api-key')\"",
+            "cd /run && less keep/typesafe.api-key",
+            "less /run//keep/typesafe.api-key",
+            "cd /run/./keep && cat ccd-db.url",
+            "cd / && cat run//keep/ccd-db.pw",
+        ] {
+            assert!(bash_refused(command), "{command}");
+        }
+        for rule in [
+            "Bash(*typesafe.api-key*)",
+            "Bash(*ccd-db.url*)",
+            "Bash(*ccd-db.pw*)",
+        ] {
+            assert!(super::CREDENTIAL_DENY.contains(&rule), "{rule}");
+        }
+        for command in [
+            "bash scripts/keep/credential-health.sh",
+            "bash scripts/keep/test-credential-health.sh",
+            "ls scripts/keep",
+            "git log -- scripts/keep/",
+            "cargo test -p spawn-core keep",
+            "cargo test -p spawn-core --lib -- engines_are_denied_keep_s_delivery_folders",
+            "systemctl --user status spawn-jev-relay",
+            "bash rsi/scenarios/nightly/201.sh",
+        ] {
+            assert!(!bash_refused(command), "{command}");
+        }
     }
 
     /// Issue #78: Claude Code's sensitive files under `~/.claude` stay

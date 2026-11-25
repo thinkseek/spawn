@@ -478,6 +478,14 @@ fn every_engine_the_bridge_starts_is_denied_the_credential_files() {
             "Read(~/.local/share/spawn-rsi/fleet-pg/**)",
             "Bash(*fleet-pg*)",
         ),
+        // Keep's delivery folders (issue #98).
+        ("Read(//run/keep/**)", "Bash(*run/keep*)"),
+        ("Read(//run/keep-test/**)", "Bash(*run/keep*)"),
+        ("Edit(//run/keep/**)", "Bash(*run/keep*)"),
+        ("Edit(//run/keep-test/**)", "Bash(*run/keep*)"),
+        ("Read(//run/keep/**)", "Bash(*typesafe.api-key*)"),
+        ("Read(//run/keep/**)", "Bash(*ccd-db.url*)"),
+        ("Read(//run/keep/**)", "Bash(*ccd-db.pw*)"),
     ] {
         assert!(rules.iter().any(|rule| rule == tool_rule), "{tool_rule}");
         assert!(rules.iter().any(|rule| rule == bash_rule), "{bash_rule}");
