@@ -1401,9 +1401,10 @@ pub(super) mod tests {
         spawn_node_proto::check_target(url).unwrap();
     }
 
-    /// Section 6.2, row by row, as `gate::decide` reads a stored result.
+    /// Section 6.2, row by row, as `gate::decide` reads a stored result:
+    /// exit 0 (this test), exits 2 to 5, exit 6, and the rows of no exit
+    /// (the tests after it).
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn every_row_of_the_outcomes_matrix() {
         let inputs = job_inputs();
         let judge = |stored: &Stored| judge_stored(stored, &inputs);
@@ -1474,6 +1475,12 @@ pub(super) mod tests {
             row(&judge(&stored(Some(0), Some(&two), "", ""))).0,
             "aborted"
         );
+    }
+
+    #[test]
+    fn exits_2_to_5_are_the_nodes_aborts_its_base_or_its_room() {
+        let inputs = job_inputs();
+        let judge = |stored: &Stored| judge_stored(stored, &inputs);
 
         // Exit 2: not a gate.sh status.
         assert_eq!(
@@ -1527,6 +1534,12 @@ pub(super) mod tests {
             row(&judge(&stored(Some(5), Some(slot), "", ""))),
             ("no_room_slot", false, Some(FaultNext::Queued))
         );
+    }
+
+    #[test]
+    fn exit_6_is_routed_by_the_fact_the_node_wrote() {
+        let inputs = job_inputs();
+        let judge = |stored: &Stored| judge_stored(stored, &inputs);
 
         // Exit 6: where the host fault was, a red main, a scenario the node
         // cannot judge, a validator's defect, no fact.
@@ -1577,6 +1590,12 @@ pub(super) mod tests {
             row(&judge(&stored(Some(6), None, "", ""))),
             ("aborted", true, Some(FaultNext::FallbackLocal))
         );
+    }
+
+    #[test]
+    fn a_skew_a_signal_a_timeout_a_wrapper_error_and_a_self_fence() {
+        let inputs = job_inputs();
+        let judge = |stored: &Stored| judge_stored(stored, &inputs);
 
         // A fact of another version: a skew, not a fault.
         for exit in [0, 5, 6] {
@@ -2200,16 +2219,11 @@ pub(super) mod tests {
         (judged, outcome)
     }
 
-    /// The ledger end to end: a verdict leaves no fault; a scenario the
-    /// node cannot judge excludes it unstruck; a skewed fact is no strike;
-    /// a node's exit 5 without a fact goes local with a strike and nothing
-    /// measured; three strikes make the node degraded (no grants) until an
-    /// undrain; and nothing of it is recorded for a task. Every job names
-    /// its judging `judging_id` (F11): several jobs of one judging never
-    /// meet the judging outcome's unique index.
+    /// The ledger end to end, without a strike: a verdict leaves no fault;
+    /// a scenario the node cannot judge excludes it unstruck; a skewed fact
+    /// is no strike. Every job names its judging `judging_id` (F11).
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn remote_outcomes_on_the_ledger_strike_exclude_and_degrade() {
+    fn remote_verdicts_exclusions_and_skews_strike_nothing_on_the_ledger() {
         let ledger = Ledger::new("remote_outcomes");
         let results = Scratch::new("outcomes-results");
         let node = ledger.enroll("n252", 1, &json!({"pg": "16"}));
@@ -2263,6 +2277,22 @@ pub(super) mod tests {
         assert_eq!(judged.evidence, "unread_version");
         assert_eq!(outcome.unwrap().next, Some(FaultNext::FallbackLocal));
         assert_eq!(ledger.strikes("n252"), (0, false));
+        for record in ledger.records("remote_job.host_fault") {
+            assert!(record.get("judging").is_none(), "{record}");
+            assert_eq!(record["strike"], false);
+        }
+    }
+
+    /// The ledger end to end, with strikes: a node's exit 5 without a fact
+    /// goes local with a strike and nothing measured (NB9); three strikes
+    /// make the node degraded (no grants) until an undrain; and nothing of
+    /// it is recorded for a task. Several jobs of one judging, each naming
+    /// it `judging_id` (F11), never meet the judging outcome's unique index.
+    #[test]
+    fn remote_outcomes_on_the_ledger_strike_exclude_and_degrade() {
+        let ledger = Ledger::new("remote_strikes");
+        let results = Scratch::new("strikes-results");
+        let node = ledger.enroll("n252", 1, &json!({"pg": "16"}));
 
         // NB9: exit 5, no fact: struck, local, nothing measured here.
         let room = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
@@ -2309,7 +2339,7 @@ pub(super) mod tests {
         // task record came of any remote run (no abort, host fault or
         // no_room toward a halt or a back-off).
         let faults = ledger.records("remote_job.host_fault");
-        assert_eq!(faults.len(), 5, "{faults:?}");
+        assert_eq!(faults.len(), 3, "{faults:?}");
         for record in faults.iter().chain(&ledger.records("remote_job.completed")) {
             assert!(record.get("judging").is_none(), "{record}");
             assert_eq!(record["proto"], "node-v1");
@@ -2436,5 +2466,29 @@ pub(super) mod tests {
         );
         integrator.pass_on(&ledger.store).expect("the next pass");
         assert_eq!(ledger.records("node.lost").len(), 1);
+    }
+
+    /// The grant a node is given carries the job's `requires` in its spec
+    /// (the gateway builds the grant's `requires` from it), equal to the
+    /// row's own, which the ledger schedules by.
+    #[test]
+    fn a_grant_carries_the_jobs_requires() {
+        let ledger = Ledger::new("remote_grant_requires");
+        let mut job = gate_job(JUDGING);
+        job.requires.insert("registry".to_string(), "r".repeat(64));
+        job.requires.insert("web_lock".to_string(), "w".repeat(64));
+        let id = enqueue(&ledger.store, &job).unwrap();
+        // A node without the registry is granted nothing.
+        let short = ledger.enroll("short", 5, &json!({"pg": "16"}));
+        assert!(ledger.beat_grants(&short).is_empty());
+        let holds = serde_json::to_value(&job.requires).unwrap();
+        let node = ledger.enroll("holder", 6, &holds);
+        let grants = ledger.beat_grants(&node);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0]["job_id"], id);
+        assert_eq!(grants[0]["spec"]["requires"], holds);
+        let row = ledger.store.remote_job(&id).unwrap().unwrap();
+        assert_eq!(row.requires, holds);
+        assert_eq!(row.spec["requires"], row.requires);
     }
 }
