@@ -454,6 +454,9 @@ fn holds_email(line: &str) -> bool {
                 && host
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+                && host.rsplit('.').next().is_some_and(|tld| {
+                    tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+                })
         })
 }
 
