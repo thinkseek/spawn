@@ -409,6 +409,350 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
     }
 }
 
+/// The questions the Antigravity CLI (`agy`) trust dialog asks before its
+/// prompt box, lowercased. Captured from agy 1.5.14: "Do you trust the
+/// contents of this project?", the choice "Yes, I trust this folder", and
+/// the key row "↑/↓ Navigate · enter Confirm".
+const AGY_TRUST: [&str; 3] = [
+    "do you trust the contents of this project?",
+    "yes, i trust this folder",
+    "enter confirm",
+];
+
+/// Keys that accept the agy trust dialog: its first choice (trust) is
+/// selected, Enter confirms it.
+pub const AGY_TRUST_KEYS: [&str; 1] = ["Enter"];
+
+/// The lowest non-empty lines of a pane, ANSI stripped, trimmed, at most
+/// [`TAIL_LINES`] of them, oldest first.
+fn tail_lines(pane: &str) -> Vec<String> {
+    let lines: Vec<String> = pane
+        .lines()
+        .map(|line| strip_ansi(line).trim_end().to_string())
+        .collect();
+    let end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |at| at + 1);
+    let start = end.saturating_sub(TAIL_LINES);
+    lines[start..end].to_vec()
+}
+
+/// Whether a line carries an e-mail address (`name@host.tld`): agy draws the
+/// signed-in account (and its plan) in its startup banner, which never goes
+/// into a reading's evidence or an excerpt Spawn records.
+fn holds_email(line: &str) -> bool {
+    line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | ',' | ';'))
+        .any(|word| {
+            let Some((user, host)) = word.split_once('@') else {
+                return false;
+            };
+            !user.is_empty()
+                && host.contains('.')
+                && !host.starts_with('.')
+                && !host.ends_with('.')
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        })
+}
+
+/// The pane without agy's account lines: every line that holds an e-mail
+/// address (the startup banner's `▀▀▀▀▀▀ <account> (<plan>)`) is dropped,
+/// so neither a reading's evidence nor the excerpt of a pane that never got
+/// ready names the account.
+pub fn drop_agy_account_lines(pane: &str) -> String {
+    let mut kept = String::with_capacity(pane.len());
+    for line in pane.lines() {
+        if holds_email(&strip_ansi(line)) {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// Whether the pane shows agy's workspace trust dialog: its question, its
+/// trusting choice and its key row, in its last lines (as Herdr's manifest
+/// reads it, `bottom_non_empty_lines(8)`). A prompt box drawn after it is
+/// no dialog any more.
+pub fn is_agy_trust_dialog(pane: &str) -> bool {
+    let lines: Vec<String> = tail_lines(pane)
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let bottom = &lines[lines.len().saturating_sub(8)..];
+    let text = bottom.join("\n").to_lowercase();
+    AGY_TRUST.iter().all(|part| text.contains(part)) && agy_prompt_box(&lines).is_none()
+}
+
+/// agy's prompt line: `>`, alone or followed by a space and the draft.
+fn agy_prompt(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('>')?;
+    (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim())
+}
+
+/// agy's prompt box in the non-empty `lines`: the index of its prompt line,
+/// which a rule bounds above and below. The lowest one.
+fn agy_prompt_box(lines: &[String]) -> Option<usize> {
+    (1..lines.len().saturating_sub(1))
+        .rev()
+        .find(|&at| {
+            agy_prompt(&lines[at]).is_some() && is_rule(&lines[at - 1]) && is_rule(&lines[at + 1])
+        })
+}
+
+/// Whether a footer part counts open background work: `2 tasks`,
+/// `1 task`, `1 subagent`, `3 subagents`.
+fn open_work_part(part: &str) -> bool {
+    let mut words = part.split_whitespace();
+    let (Some(count), Some(noun), None) = (words.next(), words.next(), words.next()) else {
+        return false;
+    };
+    count.parse::<u32>().is_ok_and(|count| count > 0)
+        && matches!(noun, "task" | "tasks" | "subagent" | "subagents")
+}
+
+/// A braille spinner followed by text (`⠋ Thinking`): a running turn.
+fn agy_spinner(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let mut spun = false;
+    for character in chars.by_ref() {
+        if ('\u{2801}'..='\u{28ff}').contains(&character) {
+            spun = true;
+        } else {
+            return spun && character.is_whitespace() && !chars.as_str().trim().is_empty();
+        }
+    }
+    false
+}
+
+/// Parse the tail of an Antigravity CLI (`agy`) pane. Only agy's own UI at
+/// the bottom of the pane counts, never the transcript above it:
+///
+/// - its dialogs (a permission, a question) replace the prompt box and end
+///   with a key row (`↑/↓ Navigate · tab Amend …`, `… esc Skip`) in the last
+///   two lines: [`ScreenState::Permission`];
+/// - the trust dialog, before the prompt box is first drawn, is
+///   [`ScreenState::Unknown`], as Claude Code's is: the Bridge answers it
+///   ([`is_agy_trust_dialog`]);
+/// - a running turn reads `esc to cancel` right under the prompt box, or a
+///   braille spinner line above it: [`ScreenState::Busy`];
+/// - the prompt box (`>` between two rules) with the `? for shortcuts`
+///   footer: [`ScreenState::Ready`] when empty, [`ScreenState::Drafted`]
+///   when it holds text. A banner above it (an announcement, a warning, the
+///   line of an interrupted turn) is no dialog. A footer that counts open
+///   background tasks or subagents (`· 2 tasks · /tasks`) is
+///   [`ScreenState::Busy`]: agy is at its prompt, but the turn goes on when
+///   they report back.
+///
+/// The evidence never holds agy's account line ([`drop_agy_account_lines`]).
+pub fn read_agy_screen(pane: &str) -> ScreenReading {
+    let pane = drop_agy_account_lines(pane);
+    let lines: Vec<String> = tail_lines(&pane)
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let Some(last) = lines.last() else {
+        return ScreenReading::unknown();
+    };
+    let bottom = lines[lines.len().saturating_sub(2)..]
+        .join("\n")
+        .to_lowercase();
+    if bottom.contains("navigate") && (bottom.contains("tab amend") || bottom.contains("esc skip"))
+    {
+        let row = lines[lines.len().saturating_sub(2)..]
+            .iter()
+            .find(|line| line.to_lowercase().contains("navigate"))
+            .unwrap_or(last);
+        return ScreenReading::new(ScreenState::Permission, row);
+    }
+    if is_agy_trust_dialog(&pane) {
+        return ScreenReading::unknown();
+    }
+    let Some(at) = agy_prompt_box(&lines) else {
+        return ScreenReading::unknown();
+    };
+    let footer = lines.get(at + 2).map_or("", String::as_str);
+    if footer.trim().starts_with("esc to cancel") {
+        return ScreenReading::new(ScreenState::Busy, footer);
+    }
+    if let Some(spinner) = lines[..at.saturating_sub(1)]
+        .iter()
+        .rev()
+        .take(10)
+        .find(|line| agy_spinner(line))
+    {
+        return ScreenReading::new(ScreenState::Busy, spinner);
+    }
+    if !footer.contains("? for shortcuts") {
+        return ScreenReading::unknown();
+    }
+    if footer.split('·').any(|part| open_work_part(part.trim())) {
+        return ScreenReading::new(ScreenState::Busy, footer);
+    }
+    match agy_prompt(&lines[at]) {
+        Some("") => ScreenReading::new(ScreenState::Ready, &lines[at]),
+        Some(_) => ScreenReading::new(ScreenState::Drafted, &lines[at]),
+        None => ScreenReading::unknown(),
+    }
+}
+
+#[cfg(test)]
+mod agy_tests {
+    use super::{
+        ScreenState, drop_agy_account_lines, is_agy_trust_dialog, is_trust_dialog,
+        read_agy_screen,
+    };
+
+    const RULE: &str = "────────────────────────────────────────────────────────";
+
+    /// agy 1.5.14's trust dialog, as captured (the workspace path made up).
+    const TRUST: &str = "Accessing workspace:\n\n/tmp/ws/agent_a\n\n\
+                         Do you trust the contents of this project?\n\n\
+                         Antigravity CLI requires permission to read, edit, and execute files here.\n\n\
+                         > Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm\n";
+
+    /// The startup banner: the logo, the version, a made-up account and
+    /// plan (never a real one), the workspace.
+    fn banner() -> String {
+        "      ▄▀▀▄        Antigravity CLI 1.5.14\n     ▀▀▀▀▀▀       someone@example.invalid (Pro)\n    \
+         ▀▀▀▀▀▀▀▀      /tmp/ws/agent_a\n"
+            .to_string()
+    }
+
+    fn idle_with(above: &str, prompt: &str, footer: &str, below: &str) -> String {
+        format!("{}{above}{RULE}\n{prompt}\n{RULE}\n{footer}\n{below}", banner())
+    }
+
+    #[test]
+    fn the_trust_dialog_is_recognized_and_reads_as_nothing_yet() {
+        assert!(is_agy_trust_dialog(TRUST));
+        assert!(!is_trust_dialog(TRUST), "not Claude Code's dialog");
+        let reading = read_agy_screen(TRUST);
+        assert_eq!(reading.state, ScreenState::Unknown);
+        let padded = format!("{TRUST}{}", "\n".repeat(30));
+        assert!(is_agy_trust_dialog(&padded));
+        // The prompt box drawn after it: the dialog is history.
+        let after = format!("{TRUST}{}", idle_with("", ">", "? for shortcuts", ""));
+        assert!(!is_agy_trust_dialog(&after));
+        assert_eq!(read_agy_screen(&after).state, ScreenState::Ready);
+    }
+
+    #[test]
+    fn the_idle_prompt_box_is_ready_under_any_banner() {
+        let plain = idle_with("", ">", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&plain).state, ScreenState::Ready);
+        // An announcement banner above the box is no dialog.
+        let announced = idle_with(
+            "╭──────────────────────────╮\n│ New: Gemini 4 is here    │\n╰──────────────────────────╯\n\
+             ⚠ Warning\n  ⎿  model x is not recognized as a known model. Ignoring the flag.\n",
+            ">",
+            "? for shortcuts",
+            "",
+        );
+        let reading = read_agy_screen(&announced);
+        assert_eq!(reading.state, ScreenState::Ready, "{reading:?}");
+        let drafted = idle_with("", "> half a thought", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&drafted).state, ScreenState::Drafted);
+    }
+
+    #[test]
+    fn open_tasks_or_subagents_keep_the_turn_busy_at_the_prompt() {
+        for footer in [
+            "? for shortcuts · 2 tasks · /tasks",
+            "? for shortcuts · 1 task · /tasks",
+            "? for shortcuts · 1 subagent · 2 tasks · /tasks",
+            "? for shortcuts · 3 subagents · /tasks",
+        ] {
+            let pane = idle_with(
+                "",
+                ">",
+                footer,
+                "  ⎿ task-2 sleep 25; echo JOB_A_DONE\n  ⎿ task-3 sleep 40; echo JOB_B_DONE\n",
+            );
+            let reading = read_agy_screen(&pane);
+            assert_eq!(reading.state, ScreenState::Busy, "{footer}");
+            assert_eq!(reading.evidence, footer);
+        }
+        let none = idle_with("", ">", "? for shortcuts · 0 tasks", "");
+        assert_eq!(read_agy_screen(&none).state, ScreenState::Ready);
+    }
+
+    #[test]
+    fn a_running_turn_is_busy() {
+        let footer = idle_with("⠋ Thinking about the change\n", ">", "esc to cancel", "");
+        let reading = read_agy_screen(&footer);
+        assert_eq!(reading.state, ScreenState::Busy);
+        assert_eq!(reading.evidence, "esc to cancel");
+        // The spinner alone, before the footer is drawn.
+        let spinner = idle_with("⠹ Reading files\n", ">", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&spinner).state, ScreenState::Busy);
+        // A braille character in the transcript with nothing after it is no spinner.
+        let quoted = idle_with("⠿\n", ">", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&quoted).state, ScreenState::Ready);
+    }
+
+    #[test]
+    fn permission_and_question_dialogs_wait_for_an_answer() {
+        let permission = format!(
+            "{}Run command?\n  cargo test\n> 1. Yes\n  2. No\n\
+             ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel\n",
+            banner()
+        );
+        let reading = read_agy_screen(&permission);
+        assert_eq!(reading.state, ScreenState::Permission);
+        assert!(reading.evidence.contains("tab Amend"), "{reading:?}");
+        let diff = "Edit file?\n↑/↓ Navigate · tab Amend · f full diff\nesc to cancel\n";
+        assert_eq!(read_agy_screen(diff).state, ScreenState::Permission);
+        let question =
+            "Which one?\n> 1. A\n  2. B\n↑/↓ Navigate · enter Select · esc Skip\nesc to cancel\n";
+        assert_eq!(read_agy_screen(question).state, ScreenState::Permission);
+        // Only the footer rows count: the words quoted higher up are transcript.
+        let quoted = idle_with(
+            "it said ↑/↓ Navigate · tab Amend\n",
+            ">",
+            "? for shortcuts",
+            "",
+        );
+        assert_eq!(read_agy_screen(&quoted).state, ScreenState::Ready);
+    }
+
+    #[test]
+    fn an_interrupted_turn_is_back_at_the_prompt() {
+        let pane = idle_with(
+            "> do the thing\n  ⎿  Interrupted · What should Antigravity CLI do instead?\n",
+            ">",
+            "? for shortcuts",
+            "",
+        );
+        assert_eq!(read_agy_screen(&pane).state, ScreenState::Ready);
+    }
+
+    #[test]
+    fn nothing_known_is_unknown() {
+        for pane in ["", "\n\n", "$ ls\nCargo.toml\n", "> no box around me\n"] {
+            assert_eq!(read_agy_screen(pane).state, ScreenState::Unknown, "{pane:?}");
+        }
+    }
+
+    #[test]
+    fn the_account_line_never_reaches_evidence_or_excerpts() {
+        let pane = idle_with("", "> mail someone@example.invalid", "? for shortcuts", "");
+        let reading = read_agy_screen(&pane);
+        assert!(!reading.evidence.contains("example.invalid"), "{reading:?}");
+        let kept = drop_agy_account_lines(&banner());
+        assert!(!kept.contains('@'), "{kept}");
+        assert!(kept.contains("Antigravity CLI 1.5.14"), "{kept}");
+        assert!(kept.contains("/tmp/ws/agent_a"), "{kept}");
+        // Not an address: kept.
+        let plain = drop_agy_account_lines("cargo@1.95 a@b\n@scope/pkg\n");
+        assert_eq!(plain, "cargo@1.95 a@b\n@scope/pkg\n");
+    }
+}
+
 #[cfg(test)]
 mod trust_tests {
     use super::{ScreenState, is_trust_dialog, read_claude_screen};
