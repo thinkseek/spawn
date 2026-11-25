@@ -68,13 +68,12 @@ impl Limit {
     pub const fn bytes(self) -> usize {
         match self {
             Self::Beat => 4096,
-            Self::Spec => 64 * 1024,
+            Self::Spec | Self::Verdict => 64 * 1024,
             Self::Enroll => 64 * 1024 + 1024,
             Self::GetBody => 0,
             Self::Grant => 8 * 1024,
             Self::ResultMeta => 256 * 1024,
             Self::ResultLog => 32 * 1024 * 1024,
-            Self::Verdict => 64 * 1024,
         }
     }
 }

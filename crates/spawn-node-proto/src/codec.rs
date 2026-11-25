@@ -42,7 +42,7 @@ pub fn is_lower_hex(text: &str, len: usize) -> bool {
 
 /// The bytes of `len` lowercase hex digits; `None` for anything else.
 pub fn unhex(text: &str, len: usize) -> Option<Vec<u8>> {
-    if !is_lower_hex(text, len) || len % 2 != 0 {
+    if !is_lower_hex(text, len) || !len.is_multiple_of(2) {
         return None;
     }
     let nibble = |b: u8| match b {
