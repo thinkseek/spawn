@@ -162,7 +162,7 @@ impl Scan<'_> {
         Ok(value)
     }
 
-    /// A string, decoded (so `"v"` and `"v"` are the same key).
+    /// A string, decoded (so `"v"` and `"\u0076"` are the same key).
     fn string(&mut self) -> Result<String, Error> {
         self.expect(b'"')?;
         let mut out = String::new();
@@ -323,6 +323,7 @@ mod tests {
         for (bad, why) in [
             (&br#"{"v":1,"v":1}"#[..], "duplicate key"),
             (br#"{"a":{"v":1,"v":2}}"#, "duplicate key"),
+            (br#"{"v":1,"\u0076":1}"#, "duplicate key"),
             (br#"{"x":1.25}"#, "float"),
             (br#"{"x":1e3}"#, "float"),
             (br#"{"x":1E3}"#, "float"),
