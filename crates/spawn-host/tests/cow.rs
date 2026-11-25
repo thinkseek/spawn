@@ -916,7 +916,7 @@ fn prune_adopts_legacy_blobs_and_keeps_pinned_ones() {
         .expect("stat")
         .ino();
     // Within the grace period: adopted, nothing removed.
-    let pruned = prune_unused(&cas, Duration::from_secs(3600)).expect("prune");
+    let pruned = prune_unused(&cas, Duration::from_hours(1)).expect("prune");
     assert_eq!(pruned.blobs_removed, 0, "{pruned:?}");
     assert_eq!(pruned.blobs_kept, 2, "{pruned:?}");
     let adopted = cas.join("objects/sha256/ab").join(&hash);
