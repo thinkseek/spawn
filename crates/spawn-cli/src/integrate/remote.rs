@@ -93,7 +93,7 @@ pub(super) const PG_MAJOR: &str = "16";
 
 /// The name of the registry manifest in the artifact directory
 /// (`GET /node/v1/registry-manifest`).
-pub(super) const REGISTRY_MANIFEST: &str = "registry-manifest";
+pub(super) const REGISTRY_MANIFEST: &str = "registry-manifest.json";
 
 /// [`QUEUE_WAIT_ENV`]'s text as a wait: whole seconds from 1; anything
 /// else is the default.
@@ -674,6 +674,9 @@ impl GateJob {
                 "inputs": inputs,
                 "env": self.env,
                 "artifact_urls": self.artifacts,
+                // The grant's `requires`, as the gateway builds it from the
+                // spec; the row's own copy schedules.
+                "requires": self.requires,
             }),
             requires: self.requires.clone(),
             cost: BTreeMap::from([
@@ -911,36 +914,11 @@ fn stated_verdict(verdict: Option<&str>) -> Option<String> {
 /// Judge a node's stored result for a job whose inputs are `inputs`
 /// (`{base, candidate, controller, scenarios_sha256, scenario}`), as
 /// [`gate::decide`] judges a local run and section 6.2 routes it.
-#[allow(clippy::too_many_lines)] // one ordered list: the rows of §6.2
 pub(super) fn judge_stored(stored: &Stored, inputs: &Value) -> Judged {
+    if let Some(early) = judge_without_a_run(&stored.meta) {
+        return early;
+    }
     let meta = &stored.meta;
-    if meta.self_fenced {
-        return Judged {
-            evidence: "self_fenced",
-            verdict: None,
-            failure: None,
-            stated: None,
-            strike: false,
-            next: None,
-            reason: "the node fenced itself: the epoch has moved".to_string(),
-        };
-    }
-    if let Some(error) = &meta.wrapper_error {
-        return Judged::fault(
-            "wrapper_error",
-            true,
-            FaultNext::Queued,
-            format!("the gate never started on the node: {error}"),
-        );
-    }
-    if meta.timed_out {
-        return Judged::fault(
-            "timed_out",
-            true,
-            FaultNext::FallbackLocal,
-            "the gate ran past its wall clock on the node",
-        );
-    }
     let verdict = meta.verdict_raw.as_deref();
     let Some(run) = run_of(stored) else {
         let reason = match &meta.signal {
@@ -958,70 +936,101 @@ pub(super) fn judge_stored(stored: &Stored, inputs: &Value) -> Judged {
     // A fact of a version this integrator does not read: a skew, not a
     // fault; judged locally.
     if let Some(version) = unread_fact_version(verdict) {
-        let failure = gate::decide(&run, verdict).err();
         let mut judged = Judged::fault(
             "unread_version",
             false,
             FaultNext::FallbackLocal,
             format!("the node's gate wrote a fact of version {version}"),
         );
-        judged.failure = failure;
+        judged.failure = gate::decide(&run, verdict).err();
         return judged;
     }
-    let code = run.status.code();
     match gate::decide(&run, verdict) {
-        Ok(decided) => {
-            // Believed only when the node judged this job's own commits and
-            // inputs: the verdict's base and candidate, then all five fields.
-            let line: Value = verdict
-                .and_then(|line| serde_json::from_str(line.trim()).ok())
-                .unwrap_or(Value::Null);
-            let stated = Some(
-                if decided.accepted {
-                    "accepted"
-                } else {
-                    "rejected"
-                }
-                .to_string(),
-            );
-            let commits_differ = ["base", "candidate"]
-                .into_iter()
-                .any(|field| line[field].as_str() != inputs[field].as_str());
-            let theirs = meta
-                .inputs
-                .as_ref()
-                .and_then(|inputs| serde_json::to_value(inputs).ok())
-                .unwrap_or(Value::Null);
-            let unequal = super::inputs::unequal(&theirs, inputs);
-            if commits_differ || !unequal.is_empty() {
-                let mut judged = Judged::fault(
-                    "unequal_inputs",
-                    true,
-                    FaultNext::Queued,
-                    if commits_differ {
-                        "the node's verdict names other commits".to_string()
-                    } else {
-                        format!("the node judged other inputs: {}", unequal.join(", "))
-                    },
-                );
-                judged.stated = stated;
-                return judged;
-            }
-            Judged {
-                evidence: if decided.accepted {
-                    "accepted"
-                } else {
-                    "rejected"
-                },
-                stated,
-                verdict: Some(decided),
-                failure: None,
-                strike: false,
-                next: None,
-                reason: "the node's gate gave a verdict".to_string(),
-            }
-        }
-        Err(failure) => route_failure(code, failure, stated_verdict(verdict)),
+        Ok(decided) => judge_verdict(decided, verdict, meta, inputs),
+        Err(failure) => route_failure(run.status.code(), failure, stated_verdict(verdict)),
+    }
+}
+
+/// The rows of §6.2 that need no run: a self-fenced job, a gate that never
+/// started, one past its wall clock.
+fn judge_without_a_run(meta: &ResultMeta) -> Option<Judged> {
+    if meta.self_fenced {
+        return Some(Judged {
+            evidence: "self_fenced",
+            verdict: None,
+            failure: None,
+            stated: None,
+            strike: false,
+            next: None,
+            reason: "the node fenced itself: the epoch has moved".to_string(),
+        });
+    }
+    if let Some(error) = &meta.wrapper_error {
+        return Some(Judged::fault(
+            "wrapper_error",
+            true,
+            FaultNext::Queued,
+            format!("the gate never started on the node: {error}"),
+        ));
+    }
+    meta.timed_out.then(|| {
+        Judged::fault(
+            "timed_out",
+            true,
+            FaultNext::FallbackLocal,
+            "the gate ran past its wall clock on the node",
+        )
+    })
+}
+
+/// Exit 0 with a verdict: believed only when the node judged this job's
+/// own commits and inputs (the verdict's base and candidate, then all five
+/// fields); otherwise an abort of the node's, struck.
+fn judge_verdict(
+    decided: gate::Verdict,
+    verdict: Option<&str>,
+    meta: &ResultMeta,
+    inputs: &Value,
+) -> Judged {
+    let line: Value = verdict
+        .and_then(|line| serde_json::from_str(line.trim()).ok())
+        .unwrap_or(Value::Null);
+    let word = if decided.accepted {
+        "accepted"
+    } else {
+        "rejected"
+    };
+    let commits_differ = ["base", "candidate"]
+        .into_iter()
+        .any(|field| line[field].as_str() != inputs[field].as_str());
+    let theirs = meta
+        .inputs
+        .as_ref()
+        .and_then(|inputs| serde_json::to_value(inputs).ok())
+        .unwrap_or(Value::Null);
+    let unequal = super::inputs::unequal(&theirs, inputs);
+    if commits_differ || !unequal.is_empty() {
+        let mut judged = Judged::fault(
+            "unequal_inputs",
+            true,
+            FaultNext::Queued,
+            if commits_differ {
+                "the node's verdict names other commits".to_string()
+            } else {
+                format!("the node judged other inputs: {}", unequal.join(", "))
+            },
+        );
+        judged.stated = Some(word.to_string());
+        return judged;
+    }
+    Judged {
+        evidence: word,
+        stated: Some(word.to_string()),
+        verdict: Some(decided),
+        failure: None,
+        strike: false,
+        next: None,
+        reason: "the node's gate gave a verdict".to_string(),
     }
 }
 
