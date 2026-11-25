@@ -99,13 +99,6 @@ impl Work {
     }
 }
 
-struct History {
-    import: String,
-    a1: String,
-    a2: String,
-    landing: String,
-    message: String,
-}
 
 /// The history up to the branch (no landing yet).
 fn branch(root: &Path) -> (Work, String, String, String) {
@@ -425,8 +418,10 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     let scratch = Scratch::new("plan");
     let (mut work, import, a1, a2) = branch(&scratch.0);
     let (landing, _) = land(&mut work, &a2);
-    work.write("src/a.txt", b"zero\none\nTWO\n");
+    work.write("README.md", b"the project, again\n");
     let own = work.commit("main's own");
+    work.write("src/a.txt", b"zero\none\nTWO\n");
+    let edited = work.commit("main edits a.txt");
     let git_dir = work.git_dir();
     let before = holdings(&git_dir);
     let view = View::of(&git_dir).expect("a view");
@@ -447,6 +442,20 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     assert_eq!(git_in(&hand, 1, &["write-tree"]), reverted["tree"]);
     git_in(&hand, 1, &["reset", "-q", "--hard"]);
     run_commands(&hand, &reverted["commands"]);
+    // A file the landing added and main edited since: the revert
+    // conflicts on it, as by hand.
+    let conflicted = plan::revert(&view, &edited, &landed).expect("revert");
+    assert_eq!(conflicted["tree"], Value::Null);
+    assert_eq!(conflicted["conflicts"], json!(["src/a.txt"]));
+    git_in(&hand, 1, &["switch", "-q", "--detach", &edited]);
+    let by_hand = spawn_host::test_git_command()
+        .arg("-C")
+        .arg(&hand)
+        .args(["revert", "--no-commit", "-m", "1", &landing])
+        .output()
+        .expect("run git");
+    assert!(!by_hand.status.success(), "by hand too");
+    git_in(&hand, 1, &["revert", "--abort"]);
 
     let split = plan::split(&view, &landed, &["src".to_string()]).expect("split");
     let first = &split["parts"][0];

@@ -770,8 +770,64 @@ pub(super) fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::foreign;
+    use super::{change_trailers, foreign, with_change_trailers};
     use crate::sources::test_git as git;
+
+    /// Decision D1: a landing whose branch brings in a checkpoint ends with
+    /// one `Spawn-Change` line, its task's `edit` Change in the domain of
+    /// the source the mirror was cloned from, after the integrator's other
+    /// trailers, which still read as before. A branch with no checkpoint, a
+    /// message with no `Spawn-Task` or a mirror with no origin adds none.
+    #[test]
+    fn a_landing_ends_with_the_spawn_change_of_its_tasks_checkpoints() {
+        let base = std::env::temp_dir().join(format!("spawn-change-trailer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("file"), "m0\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "m0");
+        let main = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("main");
+        std::fs::write(seed.join("file"), "w\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "work");
+        let plain = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("plain");
+        std::fs::write(seed.join("file"), "c\n").expect("write");
+        super::super::tests::commit_in(&seed_path, "spawn checkpoint exec_1");
+        let checkpoint = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("checkpoint");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("source");
+        let mirror = base.join("mirror.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", "--", &source, &mirror]).expect("mirror");
+
+        let message = "Title (task 7)\n\nThe task's report is empty.\n\nSpawn-Task: 7\nSpawn-Head: h\n";
+        let changes = change_trailers(&mirror, &main, &checkpoint, message);
+        assert_eq!(changes, vec![crate::provenance::source_change(&source, 7)]);
+        let full = with_change_trailers(message, &changes);
+        assert_eq!(
+            full,
+            format!(
+                "Title (task 7)\n\nThe task's report is empty.\n\nSpawn-Task: 7\nSpawn-Head: \
+                 h\nSpawn-Change: {}\n",
+                changes[0]
+            )
+        );
+        assert_eq!(crate::provenance::index::trailers(&full).task, Some(7));
+        assert_eq!(crate::provenance::spawn_changes(&full), changes);
+        assert_eq!(with_change_trailers(message, &[]), message);
+
+        assert!(change_trailers(&mirror, &main, &plain, message).is_empty(), "no checkpoint");
+        assert!(
+            change_trailers(&mirror, &main, &checkpoint, "Title\n\nno trailers\n").is_empty(),
+            "no Spawn-Task"
+        );
+        let unnamed = format!("{seed_path}/.git");
+        assert!(
+            change_trailers(&unnamed, &main, &checkpoint, message).is_empty(),
+            "no origin"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Objective 173: a landing's candidate descends from its base (a merge
     /// whose first parent is the base); one off the base's line, as a
