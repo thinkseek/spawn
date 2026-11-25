@@ -496,11 +496,27 @@ fn agy_prompt(line: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim())
 }
 
+/// The most lines a draft wraps onto below agy's prompt line.
+const AGY_WRAPPED_LINES: usize = 8;
+
 /// agy's prompt box in the non-empty `lines`: the index of its prompt line,
 /// which a rule bounds above and below. The lowest one.
 fn agy_prompt_box(lines: &[String]) -> Option<usize> {
-    (1..lines.len().saturating_sub(1)).rev().find(|&at| {
-        agy_prompt(&lines[at]).is_some() && is_rule(&lines[at - 1]) && is_rule(&lines[at + 1])
+    agy_prompt_span(lines).map(|(at, _)| at)
+}
+
+/// agy's prompt box in the non-empty `lines`: its prompt line and its lower
+/// rule. A draft longer than the box is wide wraps onto the lines under the
+/// prompt line (at most [`AGY_WRAPPED_LINES`]), so the lower rule may be
+/// below them (carry list N11). The lowest box.
+fn agy_prompt_span(lines: &[String]) -> Option<(usize, usize)> {
+    (1..lines.len().saturating_sub(1)).rev().find_map(|at| {
+        if agy_prompt(&lines[at]).is_none() || !is_rule(&lines[at - 1]) {
+            return None;
+        }
+        let lower = (at + 1..lines.len().min(at + 2 + AGY_WRAPPED_LINES))
+            .find(|&below| is_rule(&lines[below]))?;
+        Some((at, lower))
     })
 }
 
@@ -529,12 +545,12 @@ fn agy_panel_line(line: &str) -> bool {
         && (trimmed.starts_with('●') || trimmed.starts_with('⎿') || line.starts_with(' '))
 }
 
-/// agy's footer below the prompt box whose prompt line is `at`: the last
+/// agy's footer below the prompt box whose lower rule is `lower`: the last
 /// non-empty line of the pane, past the box's lower rule and an optional
 /// task panel with its closing rule. Anything else between them is no
 /// layout of agy's, and there is no footer.
-fn agy_footer(lines: &[String], at: usize) -> Option<&str> {
-    let (footer, between) = lines.get(at + 2..)?.split_last()?;
+fn agy_footer(lines: &[String], lower: usize) -> Option<&str> {
+    let (footer, between) = lines.get(lower + 1..)?.split_last()?;
     (!is_rule(footer)
         && between
             .iter()
@@ -602,10 +618,10 @@ pub fn read_agy_screen(pane: &str) -> ScreenReading {
     if is_agy_trust_dialog(&pane) {
         return ScreenReading::unknown();
     }
-    let Some(at) = agy_prompt_box(&lines) else {
+    let Some((at, lower)) = agy_prompt_span(&lines) else {
         return ScreenReading::unknown();
     };
-    let footer = agy_footer(&lines, at).unwrap_or_default();
+    let footer = agy_footer(&lines, lower).unwrap_or_default();
     if footer.trim().starts_with("esc to cancel") {
         return ScreenReading::new(ScreenState::Busy, footer);
     }
@@ -624,6 +640,9 @@ pub fn read_agy_screen(pane: &str) -> ScreenReading {
         return ScreenReading::new(ScreenState::Busy, footer);
     }
     match agy_prompt(&lines[at]) {
+        // A draft wrapped onto the lines under the prompt line is a draft,
+        // whatever its first line holds.
+        Some(_) if lower > at + 1 => ScreenReading::new(ScreenState::Drafted, &lines[at]),
         Some("") => ScreenReading::new(ScreenState::Ready, &lines[at]),
         Some(_) => ScreenReading::new(ScreenState::Drafted, &lines[at]),
         None => ScreenReading::unknown(),
