@@ -110,12 +110,31 @@ pub trait EventLog: Send + Sync {
     }
 }
 
+/// Exclusive ownership of one named Bridge worker.
+///
+/// The backend releases this ownership when its process dies. Holding the
+/// guard is what makes [`CommandQueue::recover_worker`] safe: a replacement
+/// cannot take a still-live worker's leases. Every same-named Bridge in a
+/// deployment must participate; a pre-protocol process holds no lock, so old
+/// and new binaries must not run the same worker concurrently.
+pub trait CommandOwnership: Send + Sync {}
+
 /// Leased command queue.
 ///
 /// Commands of one session run in submission order, one at a time. A lease
 /// expires after its ttl; the next claim takes the same command with a higher
 /// attempt.
 pub trait CommandQueue: Send + Sync {
+    /// Exclusively own `worker` for the returned guard's life, then make its
+    /// unfinished leases immediately claimable without changing their fencing
+    /// attempts. The count says how many live leases were recovered. A second
+    /// live Bridge with the same name is refused, without changing its leases.
+    /// Combining acquisition and recovery makes an unowned recovery impossible.
+    fn recover_worker(
+        &self,
+        worker: &str,
+    ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError>;
+
     /// Insert a command and its `command.accepted` event atomically. A
     /// repeated `(principal, idempotency_key)` returns the first command and
     /// writes nothing.

@@ -744,7 +744,9 @@ fn a_checkpoint_whose_record_waited_is_recorded_after_a_restart() {
         [(CheckpointReason::TurnStopped, head.clone())],
         "the branch head is recorded"
     );
-    // A branch whose head the log records gets nothing more.
+    // A branch whose head the log records gets nothing more after the
+    // restarted worker is gone.
+    drop(restarted);
     let mut again = self::bridge(&store);
     again.recover().expect("recover");
     quiet(&again.tick().expect("after a second restart"));

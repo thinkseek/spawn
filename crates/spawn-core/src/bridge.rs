@@ -285,6 +285,13 @@ pub struct BridgeConfig {
     /// database, given only once it is known not to be the gates' server or
     /// the live one.
     pub launch_environment: Option<Arc<dyn LaunchEnvironment>>,
+    /// Whether the first [`Bridge::recover`] takes ownership of `worker` and
+    /// makes its previous process's unfinished leases claimable at once
+    /// ([`CommandQueue::recover_worker`]). The resident `spawn loop` does; a
+    /// one-shot `spawn tick` does not, so it neither holds the worker nor
+    /// expires a lease a live holder (a loop, or a claim made without the
+    /// ownership protocol) still has: those wait out their TTL, as before.
+    pub recover_worker_leases: bool,
 }
 
 /// Environment an engine gets only when it is safe at its launch (see
@@ -318,6 +325,7 @@ impl BridgeConfig {
             engines: Vec::new(),
             watch: None,
             launch_environment: None,
+            recover_worker_leases: true,
         }
     }
 
@@ -1217,6 +1225,59 @@ const MOUNT_POLL_RETRY: Duration = Duration::from_millis(25);
 /// The number of workspace copies that may run at once.
 const MAX_CONCURRENT_MOUNTS: usize = 8;
 
+/// Bounded parallelism when committing turn checkpoints across sessions.
+const MAX_CONCURRENT_CHECKPOINTS: usize = 8;
+
+/// One transcript tail read returned by [`Bridge::read_followed`].
+type FollowedRead = Result<Option<(Vec<u8>, usize)>, TerminalError>;
+
+/// Pre-committed turn checkpoints keyed by session id.
+type PrecommittedMap = HashMap<SessionId, Result<Commit, WorkspaceError>>;
+
+/// Active session snapshot gathered at the start of [`Bridge::act`].
+struct RunningSession {
+    session: SessionId,
+    agent_id: AgentId,
+    native: Option<String>,
+    active: Active,
+}
+
+/// Whose a pre-committed checkpoint is, to record one no `advance` took
+/// ([`Bridge::keep_unconsumed_precommits`]).
+struct PrecommitOwner {
+    agent_id: AgentId,
+    execution: ExecutionId,
+    reason: CheckpointReason,
+}
+
+/// Prefetched transcript reads and pre-committed checkpoints for one pass.
+struct PrefetchedPass {
+    registered: HashSet<SessionId>,
+    reads: HashMap<SessionId, FollowedRead>,
+    precommitted: PrecommittedMap,
+}
+
+/// Watch-registration state and prefetched artifacts passed into [`Bridge::advance`].
+struct AdvancePrefetch<'a> {
+    register_watch: bool,
+    read: Option<FollowedRead>,
+    precommitted: Option<&'a mut PrecommittedMap>,
+}
+
+/// Prefetched transcript read and pre-committed checkpoints passed into [`Bridge::follow_output`].
+struct FollowPrefetch<'a> {
+    read: Option<FollowedRead>,
+    precommitted: Option<&'a mut PrecommittedMap>,
+}
+
+/// Session identity and transcript path passed into [`Bridge::ingest_followed_bytes`].
+struct TranscriptTarget<'a> {
+    agent_id: &'a AgentId,
+    session: &'a SessionId,
+    native: &'a str,
+    path: &'a str,
+}
+
 enum MountProgress {
     Ready(WorkspaceId),
     Pending,
@@ -1227,6 +1288,8 @@ enum MountProgress {
 pub struct Bridge {
     log: Arc<dyn EventLog>,
     queue: Arc<dyn CommandQueue>,
+    /// Crash-released ownership of this worker, acquired by the first recover.
+    ownership: Option<Box<dyn crate::port::CommandOwnership>>,
     workspaces: Arc<dyn WorkspaceStore>,
     terminals: Arc<dyn TerminalHost>,
     config: BridgeConfig,
@@ -1426,6 +1489,7 @@ impl Bridge {
         Self {
             log,
             queue,
+            ownership: None,
             workspaces,
             terminals,
             config,
@@ -1539,8 +1603,22 @@ impl Bridge {
             })
     }
 
-    /// Rebuild state from the whole log.
+    /// Rebuild state from the whole log. The first recovery exclusively owns
+    /// this worker and makes the previous owner's unfinished leases claimable;
+    /// a still-live previous owner makes this fail instead of duplicating work.
+    /// With [`BridgeConfig::recover_worker_leases`] off it takes no ownership
+    /// and expires no lease.
     pub fn recover(&mut self) -> Result<(), StoreError> {
+        if self.config.recover_worker_leases && self.ownership.is_none() {
+            let (ownership, recovered) = self.queue.recover_worker(&self.config.worker)?;
+            self.ownership = Some(ownership);
+            if recovered > 0 {
+                eprintln!(
+                    "spawn: {} recovered {recovered} unfinished command lease(s) left by its previous process",
+                    self.config.worker
+                );
+            }
+        }
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
         self.catch_up()?;
@@ -1736,7 +1814,7 @@ impl Bridge {
         // Waiting commands keep their lease until the claims of this tick
         // are done, so commands on other sessions (and behind waiting inputs)
         // are claimed now. Each is then released for its own retry delay.
-        let mut waited: Vec<(Claimed, Duration)> = Vec::new();
+        let mut waited: Vec<(Claimed, i64, Duration)> = Vec::new();
         while report.commands < self.config.max_commands_per_tick {
             let Some(claimed) = self
                 .queue
@@ -1758,17 +1836,20 @@ impl Bridge {
                 }
                 Handled::Waiting { retry } => {
                     self.held.insert(claimed.command_id, claimed.clone());
-                    waited.push((claimed, retry));
+                    waited.push((claimed, self.clock.now().0, retry));
                 }
             }
             report.commands += 1;
             report.command_ids.push(command_id);
             self.catch_up()?;
         }
-        for (claimed, retry) in &waited {
+        let released_at = self.clock.now().0;
+        for (claimed, handled_at, retry) in &waited {
             // One its execution's end failed meanwhile is not released.
             if self.held.contains_key(&claimed.command_id) {
-                self.queue.release(claimed, *retry)?;
+                let elapsed = u64::try_from(released_at.saturating_sub(*handled_at)).unwrap_or(0);
+                let remaining = retry.saturating_sub(Duration::from_millis(elapsed));
+                self.queue.release(claimed, remaining)?;
             }
         }
         report.notes.append(&mut self.stray_notes);
@@ -1957,33 +2038,192 @@ impl Bridge {
         }
     }
 
+    fn prefetch_and_precommit(
+        &self,
+        running: &mut [RunningSession],
+        report: &mut TickReport,
+    ) -> PrefetchedPass {
+        let mut registered: HashSet<SessionId> = HashSet::new();
+        let mut reads: HashMap<SessionId, FollowedRead> = HashMap::new();
+        let mut commit_jobs: Vec<(SessionId, WorkspaceId, String)> = Vec::new();
+        for item in running {
+            if self.has_unrecorded_commits(&item.session) {
+                continue;
+            }
+            let can_prefetch = item.active.driver.traits().session != SessionBinding::Reported
+                || !matches!(item.active.follow.binding, Binding::Unbound);
+            let mut has_ends_turn = false;
+            if can_prefetch {
+                let bound_native = match &item.active.follow.binding {
+                    Binding::Bound(Some(bound)) => Some(bound.clone()),
+                    _ => item.native.clone(),
+                };
+                self.register_watch(
+                    &item.session,
+                    bound_native.as_deref(),
+                    &mut item.active,
+                    report,
+                );
+                registered.insert(item.session.clone());
+                let watched = self.config.watch.is_some() && !item.active.follow.watch.poll;
+                let should_read = !(watched
+                    && !item.active.follow.watch.dirty
+                    && !self.due_to_read(&item.active));
+                if should_read && let Some(native) = bound_native.as_deref() {
+                    item.active.follow.reading(native);
+                    let path =
+                        self.transcript_of(item.active.driver, &item.active.workspace, native);
+                    let read_res =
+                        self.read_followed(&item.session, &path, &mut item.active, report);
+                    has_ends_turn = matches!(
+                        &read_res,
+                        Ok(Some((bytes, _)))
+                            if Self::bytes_end_turn(
+                                item.active.driver,
+                                &item.active.follow.cursor,
+                                bytes,
+                            )
+                    );
+                    reads.insert(item.session.clone(), read_res);
+                }
+            }
+            if !item.active.unmounting
+                && (has_ends_turn
+                    || (item.active.checkpoint.is_some() && item.active.reported_end.is_none()))
+            {
+                commit_jobs.push((
+                    item.session.clone(),
+                    item.active.workspace.clone(),
+                    format!("spawn checkpoint {}", item.active.execution_id),
+                ));
+            }
+        }
+        let precommitted = if commit_jobs.len() >= 2 {
+            let workers = commit_jobs.len().min(MAX_CONCURRENT_CHECKPOINTS);
+            let workspaces = &self.workspaces;
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let results = std::sync::Mutex::new(HashMap::with_capacity(commit_jobs.len()));
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        loop {
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((session, workspace, message)) = commit_jobs.get(idx) else {
+                                break;
+                            };
+                            let outcome = workspaces.commit(workspace, message);
+                            results
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(session.clone(), outcome);
+                        }
+                    });
+                }
+            });
+            results
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            HashMap::new()
+        };
+        PrefetchedPass {
+            registered,
+            reads,
+            precommitted,
+        }
+    }
+
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
         self.pass_started = self.clock.now().0;
         // Sessions with no running execution have no `advance` to do it.
         self.flush_unrecorded(report);
-        let running: Vec<(SessionId, AgentId, Option<String>, Active)> = self
+        let mut running: Vec<RunningSession> = self
             .sessions
             .iter()
             .filter_map(|(session, view)| {
                 let active = view.active.clone()?;
-                Some((
-                    session.clone(),
-                    view.agent_id.clone(),
-                    view.native.clone(),
+                Some(RunningSession {
+                    session: session.clone(),
+                    agent_id: view.agent_id.clone(),
+                    native: view.native.clone(),
                     active,
-                ))
+                })
             })
             .collect();
+        let mut prefetched = self.prefetch_and_precommit(&mut running, report);
+        let owners: HashMap<SessionId, PrecommitOwner> = running
+            .iter()
+            .filter(|item| prefetched.precommitted.contains_key(&item.session))
+            .map(|item| {
+                let owner = PrecommitOwner {
+                    agent_id: item.agent_id.clone(),
+                    execution: item.active.execution_id.clone(),
+                    reason: item
+                        .active
+                        .checkpoint
+                        .unwrap_or(CheckpointReason::TurnStopped),
+                };
+                (item.session.clone(), owner)
+            })
+            .collect();
+        let advanced = self.advance_running(running, &mut prefetched, report);
+        // Whether the pass went through or stopped early, no precommit's
+        // record is dropped with the map.
+        self.keep_unconsumed_precommits(std::mem::take(&mut prefetched.precommitted), owners);
+        let ended_now = advanced?;
+        if !ended_now.is_empty() {
+            // What waited for a turn of an execution that ended is never
+            // typed: failed now, with how the execution ended.
+            self.catch_up()?;
+            for (session, execution) in ended_now {
+                let cause = self
+                    .sessions
+                    .get(&session)
+                    .and_then(|view| view.inputs.ended.get(&execution).copied());
+                self.fail_waiting(&session, cause)?;
+            }
+        }
+        self.archive_ended(report);
+        Ok(())
+    }
+
+    /// [`Self::advance`] every running session of this pass, in turn, with
+    /// what [`Self::prefetch_and_precommit`] read and committed for it.
+    /// Returns the executions that ended. An error stops the pass at that
+    /// session; the precommits of the sessions after it stay in `prefetched`.
+    fn advance_running(
+        &mut self,
+        running: Vec<RunningSession>,
+        prefetched: &mut PrefetchedPass,
+        report: &mut TickReport,
+    ) -> Result<Vec<(SessionId, ExecutionId)>, StoreError> {
         let mut ended_now = Vec::new();
         // Terminals whose agent the host saw change (a host that detects
         // agents, Herdr): their panes are read on this pass.
         let changed: HashSet<TerminalName> = self.terminals.agent_changes().into_iter().collect();
-        for (session, agent_id, native, mut active) in running {
+        for RunningSession {
+            session,
+            agent_id,
+            native,
+            mut active,
+        } in running
+        {
             if changed.contains(&active.terminal()) {
                 active.follow.again = true;
             }
-            let ended =
-                self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
+            let prefetch = AdvancePrefetch {
+                register_watch: !prefetched.registered.contains(&session),
+                read: prefetched.reads.remove(&session),
+                precommitted: Some(&mut prefetched.precommitted),
+            };
+            let ended = self.advance(
+                &agent_id,
+                &session,
+                native.as_deref(),
+                &mut active,
+                prefetch,
+                report,
+            )?;
             if ended {
                 // The Bridge's view of what runs changes only by folding the
                 // log (the end just recorded, read back below): it never
@@ -2005,20 +2245,7 @@ impl Bridge {
                 held.follow = active.follow;
             }
         }
-        if !ended_now.is_empty() {
-            // What waited for a turn of an execution that ended is never
-            // typed: failed now, with how the execution ended.
-            self.catch_up()?;
-            for (session, execution) in ended_now {
-                let cause = self
-                    .sessions
-                    .get(&session)
-                    .and_then(|view| view.inputs.ended.get(&execution).copied());
-                self.fail_waiting(&session, cause)?;
-            }
-        }
-        self.archive_ended(report);
-        Ok(())
+        Ok(ended_now)
     }
 
     /// Record what the engine did since the last tick, commit a pending
@@ -2039,6 +2266,7 @@ impl Bridge {
         session: &SessionId,
         native: Option<&str>,
         active: &mut Active,
+        mut prefetch: AdvancePrefetch<'_>,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         // Nothing of this session goes into the log before its waiting
@@ -2051,8 +2279,20 @@ impl Bridge {
         }
         let bound = self.native_of(agent_id, session, native, active)?;
         let native = bound.as_deref();
-        self.register_watch(session, native, active, report);
-        self.follow_output(agent_id, session, native, active, report)?;
+        if prefetch.register_watch {
+            self.register_watch(session, native, active, report);
+        }
+        self.follow_output(
+            agent_id,
+            session,
+            native,
+            active,
+            FollowPrefetch {
+                read: prefetch.read,
+                precommitted: prefetch.precommitted.as_deref_mut(),
+            },
+            report,
+        )?;
         let end = if self.looked_at(session, active) {
             match active
                 .reported_end
@@ -2082,14 +2322,37 @@ impl Bridge {
             None
         };
         if let Some(ending) = end {
+            if let Some(reason) = active.checkpoint
+                && let Some(precommit) = prefetch
+                    .precommitted
+                    .as_mut()
+                    .and_then(|map| map.remove(session))
+                && self.checkpoint(agent_id, session, active, reason, Some(precommit), report)?
+            {
+                active.checkpoint = None;
+            }
             // What the engine wrote last comes before its end.
-            self.follow_output(agent_id, session, native, active, report)?;
+            self.follow_output(
+                agent_id,
+                session,
+                native,
+                active,
+                FollowPrefetch {
+                    read: None,
+                    precommitted: None,
+                },
+                report,
+            )?;
             self.keep_archive(agent_id, session, active, true, report);
             return self.end(agent_id, session, active, ending, false, report);
         }
         if let Some(reason) = active.checkpoint {
+            let precommit = prefetch
+                .precommitted
+                .as_mut()
+                .and_then(|map| map.remove(session));
             // A commit that failed was reported; the checkpoint stays due.
-            if self.checkpoint(agent_id, session, active, reason, report)? {
+            if self.checkpoint(agent_id, session, active, reason, precommit, report)? {
                 active.checkpoint = None;
             }
         }
@@ -2207,12 +2470,110 @@ impl Bridge {
     /// taken, turns and usage missed). Reading again appends nothing twice:
     /// a line's events carry its key (`source_event_id`), which the log
     /// takes once per session.
+    fn bytes_end_turn(driver: &dyn AgentDriver, cursor: &LineCursor, bytes: &[u8]) -> bool {
+        let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+            return false;
+        };
+        let mut probe = cursor.clone();
+        bytes[..end].split(|byte| *byte == b'\n').any(|line| {
+            let line = String::from_utf8_lossy(line);
+            driver
+                .read_line(&line, &mut probe)
+                .events
+                .iter()
+                .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped))
+        })
+    }
+
+    fn ingest_followed_bytes(
+        &self,
+        target: &TranscriptTarget<'_>,
+        active: &mut Active,
+        bytes: &[u8],
+        mut precommitted: Option<&mut PrecommittedMap>,
+        report: &mut TickReport,
+    ) -> Result<bool, StoreError> {
+        let mut read = 0_usize;
+        // One checkpoint per read: the workspace does not change while the
+        // lines are read, so a later turn end in the same read finds the
+        // one taken for the first, and a transcript read again from the
+        // start commits once, not at each of its old turns (rev-g on S15).
+        let mut checkpointed = false;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            let start = read;
+            read += line.len() + 1;
+            let line = String::from_utf8_lossy(line);
+            // A model call's usage, for the cost step, comes before the
+            // line's other events, so a turn's end follows its last call's
+            // usage ([`AgentDriver::read_line`]).
+            let facts = active.driver.read_line(&line, &mut active.follow.cursor);
+            let events = facts.events;
+            // A turn's checkpoint is part of the turn's end: the workspace
+            // is committed (and its `artifact.committed` recorded) before
+            // the `turn.stopped` or `turn.failed` that ends it, so whoever
+            // reads the turn's end from the log also finds the checkpoint
+            // of what it wrote. A commit that fails holds the line back: it
+            // is read (and committed) again next tick.
+            let ends_turn = events
+                .iter()
+                .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped));
+            if ends_turn {
+                // The screen has not shown this turn over yet, or this pass
+                // would not be reading it: see [`Follow::settling`].
+                active.follow.settling = Some(self.clock.now().0);
+            }
+            if ends_turn && !checkpointed {
+                let precommit = precommitted
+                    .as_mut()
+                    .and_then(|map| map.remove(target.session));
+                if !self.checkpoint(
+                    target.agent_id,
+                    target.session,
+                    active,
+                    CheckpointReason::TurnStopped,
+                    precommit,
+                    report,
+                )? {
+                    active.follow.advance(&bytes[..start]);
+                    // The commit stays due: the line is read again next pass.
+                    return Ok(false);
+                }
+                checkpointed = true;
+                active.checkpoint = None;
+            }
+            if active.follow.version.is_none()
+                && let Some(version) = facts.version
+            {
+                self.record_version(
+                    target.agent_id,
+                    target.session,
+                    target.native,
+                    active,
+                    target.path,
+                    version,
+                )?;
+            }
+            for event in events {
+                self.log.append(NewEvent {
+                    agent_id: target.agent_id.clone(),
+                    session_id: target.session.clone(),
+                    execution_id: Some(active.execution_id.clone()),
+                    source: Source::Claude,
+                    source_event_id: event.source_event_id,
+                    kind: event.kind,
+                })?;
+            }
+        }
+        Ok(true)
+    }
+
     fn follow_output(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
         native: Option<&str>,
         active: &mut Active,
+        prefetch: FollowPrefetch<'_>,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
         let watched = self.config.watch.is_some() && !active.follow.watch.poll;
@@ -2226,7 +2587,11 @@ impl Bridge {
         active.follow.reading(native);
         // Read past the offset only while the file holds what was read there
         // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
-        let (bytes, limit) = match self.read_followed(session, &path, active, report) {
+        let read_result = match prefetch.read {
+            Some(result) => result,
+            None => self.read_followed(session, &path, active, report),
+        };
+        let (bytes, limit) = match read_result {
             Ok(Some(read)) => read,
             Ok(None) => {
                 let now = self.clock.now().0;
@@ -2284,67 +2649,22 @@ impl Bridge {
             }
             return Ok(());
         };
-        let mut read = 0_usize;
-        // One checkpoint per read: the workspace does not change while the
-        // lines are read, so a later turn end in the same read finds the
-        // one taken for the first, and a transcript read again from the
-        // start commits once, not at each of its old turns (rev-g on S15).
-        let mut checkpointed = false;
-        for line in bytes[..end].split(|byte| *byte == b'\n') {
-            let start = read;
-            read += line.len() + 1;
-            let line = String::from_utf8_lossy(line);
-            // A model call's usage, for the cost step, comes before the
-            // line's other events, so a turn's end follows its last call's
-            // usage ([`AgentDriver::read_line`]).
-            let facts = active.driver.read_line(&line, &mut active.follow.cursor);
-            let events = facts.events;
-            // A turn's checkpoint is part of the turn's end: the workspace
-            // is committed (and its `artifact.committed` recorded) before
-            // the `turn.stopped` or `turn.failed` that ends it, so whoever
-            // reads the turn's end from the log also finds the checkpoint
-            // of what it wrote. A commit that fails holds the line back: it
-            // is read (and committed) again next tick.
-            let ends_turn = events
-                .iter()
-                .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped));
-            if ends_turn {
-                // The screen has not shown this turn over yet, or this pass
-                // would not be reading it: see [`Follow::settling`].
-                active.follow.settling = Some(self.clock.now().0);
-            }
-            if ends_turn && !checkpointed {
-                if !self.checkpoint(
-                    agent_id,
-                    session,
-                    active,
-                    CheckpointReason::TurnStopped,
-                    report,
-                )? {
-                    active.follow.advance(&bytes[..start]);
-                    // The commit stays due: the line is read again next pass.
-                    return Ok(());
-                }
-                checkpointed = true;
-            }
-            if active.follow.version.is_none()
-                && let Some(version) = facts.version
-            {
-                self.record_version(agent_id, session, native, active, &path, version)?;
-            }
-            for event in events {
-                self.log.append(NewEvent {
-                    agent_id: agent_id.clone(),
-                    session_id: session.clone(),
-                    execution_id: Some(active.execution_id.clone()),
-                    source: Source::Claude,
-                    source_event_id: event.source_event_id,
-                    kind: event.kind,
-                })?;
-            }
+        let target = TranscriptTarget {
+            agent_id,
+            session,
+            native,
+            path: &path,
+        };
+        if self.ingest_followed_bytes(
+            &target,
+            active,
+            &bytes[..end],
+            prefetch.precommitted,
+            report,
+        )? {
+            active.follow.advance(&bytes[..=end]);
+            active.follow.watch.dirty = false;
         }
-        active.follow.advance(&bytes[..=end]);
-        active.follow.watch.dirty = false;
         Ok(())
     }
 
@@ -2922,6 +3242,7 @@ impl Bridge {
             session,
             active,
             CheckpointReason::ExecutionEnded,
+            None,
             report,
         )?;
         if !committed && discard {
@@ -3168,10 +3489,14 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
         reason: CheckpointReason,
+        precommitted: Option<Result<Commit, WorkspaceError>>,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         let message = format!("spawn checkpoint {}", active.execution_id);
-        let outcome = self.workspaces.commit(&active.workspace, &message);
+        let outcome = match precommitted {
+            Some(outcome) if reason != CheckpointReason::ExecutionEnded => outcome,
+            _ => self.workspaces.commit(&active.workspace, &message),
+        };
         if outcome.is_ok() && active.follow.commit_failed.take().is_some() {
             report
                 .notes
@@ -3194,7 +3519,7 @@ impl Bridge {
                          {commit} from the workspace, with no parent (the store has no main)"
                     ),
                 });
-                self.record_recreated(agent_id, session, active, &commit, parent);
+                self.record_recreated(agent_id, session, &active.execution_id, &commit, parent);
                 self.record_checkpoint(agent_id, session, active, reason, commit)?;
             }
             // The store kept the workspace's state off its branch: an
@@ -3247,23 +3572,83 @@ impl Bridge {
         reason: CheckpointReason,
         commit: CommitId,
     ) -> Result<(), StoreError> {
-        let artifact = ArtifactRef {
-            project: self.workspaces.project().to_string(),
-            branch: BranchName::for_agent(agent_id),
-            commit,
-        };
-        self.record_commit(
+        self.queue_commit(self.checkpoint_event(
             agent_id,
             session,
-            Some(&active.execution_id),
-            Source::Bridge,
-            Some(format!("commit:{}", artifact.commit)),
-            EventKind::ArtifactCommitted {
+            &active.execution_id,
+            reason,
+            commit,
+        ));
+        self.record_unrecorded_commit(session)
+    }
+
+    /// The `artifact.committed` of checkpoint `commit` of `execution`, keyed
+    /// `commit:<id>`, so a second append of one that did land is a no-op.
+    fn checkpoint_event(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        execution: &ExecutionId,
+        reason: CheckpointReason,
+        commit: CommitId,
+    ) -> NewEvent {
+        NewEvent {
+            agent_id: agent_id.clone(),
+            session_id: session.clone(),
+            execution_id: Some(execution.clone()),
+            source: Source::Bridge,
+            source_event_id: Some(format!("commit:{commit}")),
+            kind: EventKind::ArtifactCommitted {
                 reason,
-                artifact,
+                artifact: ArtifactRef {
+                    project: self.workspaces.project().to_string(),
+                    branch: BranchName::for_agent(agent_id),
+                    commit,
+                },
                 files: Vec::new(),
             },
-        )
+        }
+    }
+
+    /// Queue the records of every precommit of this pass no `advance` took
+    /// ([`Self::prefetch_and_precommit`]): its branch already moved, so a
+    /// pass that stopped early (an append the log refused for an earlier
+    /// session) must not lose the commit's `artifact.committed`, which the
+    /// next pass would read as [`Commit::Unchanged`] and so never record
+    /// before the turn's `turn.stopped`. It waits with the session's commit
+    /// records and is appended before anything else of that session. A
+    /// failed or empty precommit records nothing: its checkpoint stays due.
+    fn keep_unconsumed_precommits(
+        &self,
+        precommitted: PrecommittedMap,
+        mut owners: HashMap<SessionId, PrecommitOwner>,
+    ) {
+        for (session, outcome) in precommitted {
+            let Some(owner) = owners.remove(&session) else {
+                continue;
+            };
+            let commit = match outcome {
+                Ok(Commit::Created(commit)) => commit,
+                Ok(Commit::Recreated { commit, parent }) => {
+                    self.record_recreated(
+                        &owner.agent_id,
+                        &session,
+                        &owner.execution,
+                        &commit,
+                        parent,
+                    );
+                    commit
+                }
+                Ok(Commit::Unchanged) | Err(_) => continue,
+            };
+            self.queue_commit(self.checkpoint_event(
+                &owner.agent_id,
+                &session,
+                &owner.execution,
+                owner.reason,
+                commit,
+            ));
+        }
     }
 
     /// Queue the `artifact.branch_recreated` of a branch the store made
@@ -3277,14 +3662,14 @@ impl Bridge {
         &self,
         agent_id: &AgentId,
         session: &SessionId,
-        active: &Active,
+        execution: &ExecutionId,
         commit: &CommitId,
         parent: Option<CommitId>,
     ) {
         self.queue_commit(NewEvent {
             agent_id: agent_id.clone(),
             session_id: session.clone(),
-            execution_id: Some(active.execution_id.clone()),
+            execution_id: Some(execution.clone()),
             source: Source::Bridge,
             source_event_id: Some(format!("recreated:{commit}")),
             kind: EventKind::ArtifactBranchRecreated {
@@ -3382,6 +3767,12 @@ impl Bridge {
         self.unrecorded_commits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn has_unrecorded_commits(&self, session: &SessionId) -> bool {
+        self.unrecorded_commits_lock()
+            .get(session)
+            .is_some_and(|waiting| !waiting.is_empty())
     }
 
     fn handle(
@@ -5675,8 +6066,14 @@ impl Bridge {
     /// detailed final failure after the last one.
     fn prompt_retry(&self, progress: &PromptProgress) -> Handled {
         if progress.attempts < self.config.ready_attempts {
+            let delay = match progress.attempts {
+                0..=1 => Duration::from_millis(25),
+                2 => Duration::from_millis(50),
+                3 => Duration::from_millis(100),
+                _ => self.config.ready_interval,
+            };
             return Handled::Waiting {
-                retry: self.config.ready_interval,
+                retry: self.config.ready_interval.min(delay),
             };
         }
         let why = progress
@@ -7238,7 +7635,7 @@ mod tests {
     };
     use crate::memory::{MemoryStore, MemoryWatch};
     use crate::port::{
-        Branch, CommandQueue, Commit, EventLog, Launch, TerminalError, TerminalHost,
+        Branch, CommandQueue, Commit, EventLog, Launch, StoreError, TerminalError, TerminalHost,
         WorkspaceError, WorkspaceStore,
     };
     use crate::screen::ScreenState;
@@ -11570,5 +11967,608 @@ mod tests {
         };
         assert!(reason.contains("already runs an execution"), "{reason}");
         assert_eq!(seen, BTreeSet::from([start_1, start_2]));
+    }
+
+    struct ConcurrentCommits {
+        inner: Arc<MemoryStore>,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        entered: Mutex<usize>,
+        cv: Condvar,
+    }
+
+    impl ConcurrentCommits {
+        fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                entered: Mutex::new(0),
+                cv: Condvar::new(),
+            })
+        }
+    }
+
+    impl WorkspaceStore for ConcurrentCommits {
+        fn project(&self) -> &str {
+            self.inner.project()
+        }
+        fn ensure_branch(
+            &self,
+            branch: &BranchName,
+            from: Option<&str>,
+        ) -> Result<crate::port::Branch, WorkspaceError> {
+            self.inner.ensure_branch(branch, from)
+        }
+        fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
+            self.inner.mount(branch)
+        }
+        fn commit(
+            &self,
+            workspace: &WorkspaceId,
+            message: &str,
+        ) -> Result<crate::port::Commit, WorkspaceError> {
+            let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(cur, Ordering::SeqCst);
+            {
+                let mut entered = self.entered.lock().expect("entered");
+                *entered += 1;
+                self.cv.notify_all();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while *entered < super::MAX_CONCURRENT_CHECKPOINTS {
+                    let rem = deadline.saturating_duration_since(std::time::Instant::now());
+                    if rem.is_zero() {
+                        break;
+                    }
+                    let (next, _) = self.cv.wait_timeout(entered, rem).expect("wait");
+                    entered = next;
+                }
+            }
+            let out = self.inner.commit(workspace, message);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+        fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
+            self.inner.unmount(workspace)
+        }
+        fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
+            self.inner.is_mounted(workspace)
+        }
+        fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
+            self.inner.notices(workspace)
+        }
+        fn notices_told(&self, workspace: &WorkspaceId, notices: &[String]) {
+            self.inner.notices_told(workspace, notices);
+        }
+        fn branch_head(
+            &self,
+            branch: &BranchName,
+        ) -> Result<Option<crate::id::CommitId>, WorkspaceError> {
+            self.inner.branch_head(branch)
+        }
+    }
+
+    #[test]
+    fn act_runs_turn_checkpoints_concurrently_across_sessions_bounded_to_eight() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let commits = ConcurrentCommits::new(store.clone());
+        let watch = Arc::new(MemoryWatch::new());
+        let mut config = BridgeConfig::new("tester");
+        config.max_commands_per_tick = 16;
+        config.watch = Some(watch.clone());
+        let mut ids = Vec::new();
+        for number in 1..=10 {
+            ids.push(submit_resumable_start(&store, number, "", READY));
+        }
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            commits.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock);
+
+        drive_work(&mut bridge, &store, || {
+            ids.iter().all(|id| command_outcome(&store, *id).is_some())
+        });
+
+        let mut paths: HashMap<SessionId, String> = HashMap::new();
+        let mut workspaces: HashMap<SessionId, WorkspaceId> = HashMap::new();
+        for record in store.read_global(GlobalPosition(0), 1_000).expect("read") {
+            match record.event.kind {
+                EventKind::NativeSessionStarted {
+                    transcript_path: Some(path),
+                    ..
+                } => {
+                    paths.insert(record.event.session_id, path);
+                }
+                EventKind::ExecutionStarted { workspace, .. } => {
+                    workspaces.insert(record.event.session_id, workspace);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(paths.len(), 10);
+        assert_eq!(workspaces.len(), 10);
+
+        // Dirty every workspace so every commit produces Commit::Created.
+        for number in 1..=10 {
+            let session = resumable_session(number);
+            store.mark_dirty(&workspaces[&session]);
+            let path = &paths[&session];
+            store.append_file(
+                path,
+                &format!(
+                    "{{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"t-{number}\"}}\n"
+                ),
+            );
+            watch.changed(path);
+        }
+
+        let _ = bridge.poll().expect("concurrent poll");
+        let peak = commits.peak.load(Ordering::SeqCst);
+        assert!(peak >= 2, "expected concurrent commits, saw peak {peak}");
+        assert_eq!(
+            peak,
+            super::MAX_CONCURRENT_CHECKPOINTS,
+            "expected peak bounded to MAX_CONCURRENT_CHECKPOINTS (8)"
+        );
+
+        let events = store.read_global(GlobalPosition(0), 2_000).expect("events");
+        for number in 1..=10 {
+            let session = resumable_session(number);
+            let sess_events: Vec<&EventKind> = events
+                .iter()
+                .filter(|r| r.event.session_id == session)
+                .map(|r| &r.event.kind)
+                .collect();
+            let art_pos = sess_events
+                .iter()
+                .position(|k| {
+                    matches!(
+                        k,
+                        EventKind::ArtifactCommitted {
+                            reason: crate::event::CheckpointReason::TurnStopped,
+                            ..
+                        }
+                    )
+                })
+                .expect("ArtifactCommitted present");
+            let stop_pos = sess_events
+                .iter()
+                .position(|k| matches!(k, EventKind::TurnStopped { .. }))
+                .expect("TurnStopped present");
+            assert!(
+                art_pos < stop_pos,
+                "{session}: ArtifactCommitted ({art_pos}) must precede TurnStopped ({stop_pos})"
+            );
+        }
+    }
+
+    /// A log that, once armed, refuses the next `artifact.committed` with a
+    /// backend failure (not an unreachable database), then takes everything.
+    struct RefuseCommitLog {
+        inner: Arc<MemoryStore>,
+        armed: AtomicBool,
+    }
+
+    impl EventLog for RefuseCommitLog {
+        fn append(
+            &self,
+            event: NewEvent,
+        ) -> Result<crate::event::Appended, crate::port::StoreError> {
+            if matches!(event.kind, EventKind::ArtifactCommitted { .. })
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                return Err(crate::port::StoreError::Backend(
+                    "refused artifact.committed".to_string(),
+                ));
+            }
+            self.inner.append(event)
+        }
+
+        fn read_global(
+            &self,
+            after: GlobalPosition,
+            limit: usize,
+        ) -> Result<Vec<crate::event::EventRecord>, crate::port::StoreError> {
+            self.inner.read_global(after, limit)
+        }
+    }
+
+    /// The branch head of resumable agent `number`.
+    fn agent_head(store: &MemoryStore, number: u64) -> crate::id::CommitId {
+        store
+            .branch_head(&BranchName::for_agent(&resumable_agent(number)))
+            .expect("head")
+            .expect("branch")
+    }
+
+    /// Dirty each running session's workspace and end its turn in its
+    /// transcript, told to the watch. Returns the transcripts' paths.
+    fn end_turns_on_dirty_workspaces(
+        store: &MemoryStore,
+        watch: &MemoryWatch,
+        numbers: &[u64],
+    ) -> HashMap<SessionId, String> {
+        let mut paths: HashMap<SessionId, String> = HashMap::new();
+        let mut workspaces: HashMap<SessionId, WorkspaceId> = HashMap::new();
+        for record in store.read_global(GlobalPosition(0), 1_000).expect("read") {
+            match record.event.kind {
+                EventKind::NativeSessionStarted {
+                    transcript_path: Some(path),
+                    ..
+                } => {
+                    paths.insert(record.event.session_id, path);
+                }
+                EventKind::ExecutionStarted { workspace, .. } => {
+                    workspaces.insert(record.event.session_id, workspace);
+                }
+                _ => {}
+            }
+        }
+        for number in numbers {
+            let session = resumable_session(*number);
+            store.mark_dirty(&workspaces[&session]);
+            store.append_file(
+                &paths[&session],
+                &format!(
+                    "{{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"t-{number}\"}}\n"
+                ),
+            );
+            watch.changed(&paths[&session]);
+        }
+        paths
+    }
+
+    #[test]
+    fn act_that_stops_early_keeps_the_later_sessions_precommitted_checkpoints() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let log = Arc::new(RefuseCommitLog {
+            inner: store.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let watch = Arc::new(MemoryWatch::new());
+        let mut config = BridgeConfig::new("tester");
+        config.watch = Some(watch.clone());
+        let numbers = [1_u64, 2, 3];
+        let ids: Vec<CommandId> = numbers
+            .iter()
+            .map(|number| submit_resumable_start(&store, *number, "", READY))
+            .collect();
+        let mut bridge = Bridge::new(
+            log.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            ids.iter().all(|id| command_outcome(&store, *id).is_some())
+        });
+        let paths = end_turns_on_dirty_workspaces(&store, &watch, &numbers);
+
+        let recorded = || {
+            store
+                .read_global(GlobalPosition(0), 2_000)
+                .expect("events")
+                .into_iter()
+                .filter(|record| matches!(record.event.kind, EventKind::ArtifactCommitted { .. }))
+                .count()
+        };
+        let before = recorded();
+        // Every turn end is precommitted in parallel; the first session's
+        // record is refused, so the pass stops there.
+        log.armed.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(bridge.poll(), Err(StoreError::Backend(_))),
+            "the refused append stops the pass"
+        );
+        assert_eq!(recorded(), before, "no checkpoint was recorded yet");
+        // Every session's branch moved, and every session's commit waits to
+        // be recorded, the later ones' too.
+        for number in numbers {
+            let session = resumable_session(number);
+            let head = agent_head(&store, number);
+            let waiting = bridge
+                .unrecorded_commits_lock()
+                .get(&session)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                waiting.iter().any(|event| matches!(
+                    &event.kind,
+                    EventKind::ArtifactCommitted { artifact, .. } if artifact.commit == head
+                )),
+                "{session}: its precommitted {head} waits to be recorded: {waiting:?}"
+            );
+        }
+
+        // The next pass records each checkpoint before its turn's end.
+        for number in numbers {
+            watch.changed(&paths[&resumable_session(number)]);
+        }
+        bridge.poll().expect("next poll");
+        let events = store.read_global(GlobalPosition(0), 2_000).expect("events");
+        for number in numbers {
+            let session = resumable_session(number);
+            let head = agent_head(&store, number);
+            let kinds: Vec<&EventKind> = events
+                .iter()
+                .filter(|record| record.event.session_id == session)
+                .map(|record| &record.event.kind)
+                .collect();
+            let committed = kinds
+                .iter()
+                .position(|kind| {
+                    matches!(
+                        kind,
+                        EventKind::ArtifactCommitted { artifact, .. } if artifact.commit == head
+                    )
+                })
+                .unwrap_or_else(|| panic!("{session}: {head} recorded"));
+            let stopped = kinds
+                .iter()
+                .position(|kind| matches!(kind, EventKind::TurnStopped { .. }))
+                .unwrap_or_else(|| panic!("{session}: turn.stopped recorded"));
+            assert!(
+                committed < stopped,
+                "{session}: artifact.committed ({committed}) precedes turn.stopped ({stopped})"
+            );
+        }
+    }
+
+    struct RecordedQueue {
+        inner: Arc<MemoryStore>,
+        releases: Mutex<Vec<(CommandId, Duration)>>,
+    }
+
+    impl RecordedQueue {
+        fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                releases: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn take_releases(&self) -> Vec<(CommandId, Duration)> {
+            std::mem::take(&mut *self.releases.lock().expect("releases"))
+        }
+    }
+
+    impl CommandQueue for RecordedQueue {
+        fn recover_worker(
+            &self,
+            worker: &str,
+        ) -> Result<(Box<dyn crate::port::CommandOwnership>, usize), StoreError> {
+            self.inner.recover_worker(worker)
+        }
+
+        fn submit(
+            &self,
+            principal: &Principal,
+            submission: &crate::command::Submission,
+        ) -> Result<CommandId, StoreError> {
+            self.inner.submit(principal, submission)
+        }
+        fn claim(
+            &self,
+            worker: &str,
+            ttl: Duration,
+        ) -> Result<Option<crate::command::Claimed>, StoreError> {
+            self.inner.claim(worker, ttl)
+        }
+        fn finish(
+            &self,
+            claimed: &crate::command::Claimed,
+            outcome: &Outcome,
+        ) -> Result<(), StoreError> {
+            self.inner.finish(claimed, outcome)
+        }
+        fn release(
+            &self,
+            claimed: &crate::command::Claimed,
+            retry_in: Duration,
+        ) -> Result<(), StoreError> {
+            self.releases
+                .lock()
+                .expect("releases")
+                .push((claimed.command_id, retry_in));
+            self.inner.release(claimed, retry_in)
+        }
+    }
+
+    struct SteppingTerminal {
+        inner: Arc<MemoryStore>,
+        clock: Arc<ManualClock>,
+        step_on: Mutex<Option<(TerminalName, u64)>>,
+    }
+
+    impl SteppingTerminal {
+        fn new(inner: Arc<MemoryStore>, clock: Arc<ManualClock>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                clock,
+                step_on: Mutex::new(None),
+            })
+        }
+
+        fn arm(&self, terminal: TerminalName, millis: u64) {
+            *self.step_on.lock().expect("step_on") = Some((terminal, millis));
+        }
+    }
+
+    impl TerminalHost for SteppingTerminal {
+        fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+            self.inner.start(launch)
+        }
+        fn stage_text(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            text: &str,
+        ) -> Result<(), TerminalError> {
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
+        }
+        fn send_keys(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &[&str],
+        ) -> Result<(), TerminalError> {
+            self.inner.send_keys(terminal, workspace, keys)
+        }
+        fn is_alive(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<bool, TerminalError> {
+            self.inner.is_alive(terminal, workspace)
+        }
+        fn runner(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<crate::port::Runner, TerminalError> {
+            self.inner.runner(terminal, workspace)
+        }
+        fn capture_tail(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            lines: usize,
+        ) -> Result<String, TerminalError> {
+            let advance_ms = {
+                let mut slot = self.step_on.lock().expect("step_on");
+                if slot.as_ref().is_some_and(|(target, _)| target == terminal) {
+                    slot.take().map(|(_, millis)| millis)
+                } else {
+                    None
+                }
+            };
+            if let Some(millis) = advance_ms {
+                self.clock.advance(Duration::from_millis(millis));
+            }
+            self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn read_from(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            offset: u64,
+        ) -> Result<Option<Vec<u8>>, TerminalError> {
+            self.inner.read_from(workspace, path, offset)
+        }
+        fn write_new(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<bool, TerminalError> {
+            self.inner.write_new(workspace, path, bytes)
+        }
+        fn terminate(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.terminate(terminal, workspace)
+        }
+    }
+
+    fn assert_prompt_backoff_sequence(ready_interval_ms: u64, expected_ms: &[u64]) {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let queue = RecordedQueue::new(store.clone());
+        let mut config = BridgeConfig::new("tester");
+        config.ready_interval = Duration::from_millis(ready_interval_ms);
+        config.ready_attempts = expected_ms.len() + 2;
+        let cmd_id = submit_resumable_start(&store, 1, "work", BUSY);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            queue.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock);
+        drive_until(&mut bridge, &store, |b| b.prompting.contains_key(&cmd_id));
+        let mut observed: Vec<u64> = queue
+            .take_releases()
+            .into_iter()
+            .filter(|(id, _)| *id == cmd_id)
+            .map(|(_, d)| u64::try_from(d.as_millis()).expect("ms"))
+            .next_back()
+            .into_iter()
+            .collect();
+        while observed.len() < expected_ms.len() {
+            store.expire_leases();
+            bridge.work().expect("work");
+            for (id, d) in queue.take_releases() {
+                if id == cmd_id {
+                    observed.push(u64::try_from(d.as_millis()).expect("ms"));
+                }
+            }
+        }
+        assert_eq!(observed, expected_ms, "ready_interval={ready_interval_ms}");
+    }
+
+    #[test]
+    fn prompt_retry_uses_progressive_backoff_and_work_subtracts_elapsed_on_release() {
+        // Part A: progressive backoff sequence capped by ready_interval
+        assert_prompt_backoff_sequence(250, &[25, 50, 100, 250, 250]);
+        assert_prompt_backoff_sequence(40, &[25, 40, 40]);
+
+        // Part B: elapsed time during work() is subtracted when releasing earlier waiting commands
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let queue = RecordedQueue::new(store.clone());
+        let terminals = SteppingTerminal::new(store.clone(), clock.clone());
+        let mut config = BridgeConfig::new("tester");
+        config.max_commands_per_tick = 16;
+        config.ready_interval = Duration::from_millis(250);
+        config.ready_attempts = 30;
+        let cmd1 = submit_resumable_start(&store, 1, "work-1", BUSY);
+        let cmd2 = submit_resumable_start(&store, 2, "work-2", BUSY);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            queue.clone(),
+            store.clone(),
+            terminals.clone(),
+            config,
+        )
+        .with_clock(clock);
+
+        drive_until(&mut bridge, &store, |b| {
+            b.prompting.get(&cmd1).is_some_and(|p| p.attempts >= 4)
+                && b.prompting.get(&cmd2).is_some_and(|p| p.attempts >= 4)
+        });
+        let _ = queue.take_releases();
+        store.expire_leases();
+        terminals.arm(
+            TerminalName::for_execution(&ExecutionId::for_command(cmd2)),
+            15,
+        );
+        let (report, _) = bridge.work().expect("work with elapsed advance");
+        assert_eq!(report.commands, 2);
+        let rels: HashMap<CommandId, u64> = queue
+            .take_releases()
+            .into_iter()
+            .map(|(id, d)| (id, u64::try_from(d.as_millis()).expect("ms")))
+            .collect();
+        // Both are past attempt 4 so prompt_retry returns ready_interval (250ms); cmd1 waited 15ms while cmd2 ran capture_tail.
+        assert_eq!(rels.get(&cmd1), Some(&235));
+        assert_eq!(rels.get(&cmd2), Some(&250));
     }
 }
