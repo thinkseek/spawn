@@ -18,6 +18,8 @@ spawn-host.workspace = true
 spawn-jev.workspace = true
 # The code graph behind `spawn features graph` (issue #100).
 spawn-codegraph.workspace = true
+# spawn-node v1's protocol: `scenarios_sha256` is its `tree_sha256_v1`.
+spawn-node-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The backups' sha256, computed as a record spells it.
