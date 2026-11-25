@@ -284,28 +284,11 @@ fn entry<'a>(shown: &'a Value, path: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no entry for {path}: {shown}"))
 }
 
-#[test]
-fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read_them() {
-    let schema = TestSchema::new("prov_index");
-    let store = schema.store();
-    let scratch = Scratch::new("index");
-    let mut work = Work::init(&scratch.0);
-    let h = history(&mut work);
-    let git_dir = work.git_dir();
-    let mut client = Client::connect(&schema_url(&schema), NoTls).expect("the owner");
-    facts(&mut client);
-
-    let first = index(&schema, &git_dir);
-    assert_eq!(
-        (&first["edit"], &first["land"], &first["import"]),
-        (&json!(4), &json!(1), &json!(2)),
-        "{first}"
-    );
-    assert_eq!(first["domain"], format!("git:{SOURCE}"));
-
+/// Task 11's edit Change and its landing.
+fn check_task(schema: &str, work: &Work, h: &History) {
     // Task 11: one edit Change, a revision per checkpoint, attributed by
     // the log, on the task's preset.
-    let task = changes(&spawn_json(&schema, &["prov", "show", "11"]));
+    let task = changes(&spawn_json(schema, &["prov", "show", "11"]));
     let edits: Vec<&Value> = task
         .iter()
         .filter(|shown| shown["change"]["kind"] == "edit")
@@ -377,59 +360,34 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
             .all(|entry| entry["path"] != "docs/owner.md"),
         "main's own commit is not the landing's: {land}"
     );
+}
 
+/// The imports and the unlanded branch.
+fn check_imports_and_branch(schema: &str, h: &History) {
     // The imports: the first commit (Cargo.lock generated) and the owner's.
-    let import = changes(&spawn_json(&schema, &["prov", "show", &h.import]));
+    let import = changes(&spawn_json(schema, &["prov", "show", &h.import]));
     assert_eq!(import.len(), 1);
     assert_eq!(import[0]["change"]["kind"], "import");
     assert_eq!(import[0]["change"]["attributed"], "imported");
     assert_eq!(import[0]["change"]["boundary"], "backfill");
     assert_eq!(entry(&import[0], "Cargo.lock")["class"], "generated");
     assert_eq!(entry(&import[0], "README.md")["before"], Value::Null);
-    let owner = changes(&spawn_json(&schema, &["prov", "show", &h.owner]));
+    let owner = changes(&spawn_json(schema, &["prov", "show", &h.owner]));
     assert_eq!(owner[0]["change"]["kind"], "import");
 
     // The unlanded branch: its agent's task at the time, inferred (its
     // execution is in no log).
-    let b = changes(&spawn_json(&schema, &["prov", "show", &h.b1]));
+    let b = changes(&spawn_json(schema, &["prov", "show", &h.b1]));
     assert_eq!(b.len(), 1);
     assert_eq!(b[0]["change"]["task_id"], 12);
     assert_eq!(b[0]["change"]["agent_id"], "agent_b");
     assert_eq!(b[0]["change"]["attributed"], "inferred");
     assert_eq!(b[0]["change"]["execution_id"], "exec_b1");
     assert_eq!(b[0]["change"]["rev"], 1);
+}
 
-    // No entry with the same before and after but a mode's change.
-    let same: i64 = client
-        .query_one(
-            "select count(*) from prov_entries where before = after and class <> 'mechanical'",
-            &[],
-        )
-        .expect("a count")
-        .get(0);
-    assert_eq!(same, 0);
-
-    // A second run records nothing and leaves every canonical value as it
-    // was.
-    let before = canonical(&mut client);
-    let rows = (
-        count(&mut client, "prov_changes"),
-        count(&mut client, "prov_entries"),
-        count(&mut client, "prov_edges"),
-    );
-    let second = index(&schema, &git_dir);
-    assert_eq!(second["recorded"], 0, "{second}");
-    assert_eq!(second["main_commits_recorded_before"], 3, "{second}");
-    assert_eq!(canonical(&mut client), before);
-    assert_eq!(
-        rows,
-        (
-            count(&mut client, "prov_changes"),
-            count(&mut client, "prov_entries"),
-            count(&mut client, "prov_edges"),
-        )
-    );
-
+/// `who`, by line and by file.
+fn check_who(schema: &str, git_dir: &str, h: &History) {
     // who: a line's blame names the checkpoint that wrote it; a file names
     // the landing and the revision its content came from.
     let line = spawn_json(
@@ -473,6 +431,62 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
     assert_eq!(file["change"]["kind"], "land");
     assert_eq!(file["origin"]["rev"], 3);
     assert_eq!(file["execution_id"], "exec_a3");
+}
+
+#[test]
+fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read_them() {
+    let schema = TestSchema::new("prov_index");
+    let store = schema.store();
+    let scratch = Scratch::new("index");
+    let mut work = Work::init(&scratch.0);
+    let h = history(&mut work);
+    let git_dir = work.git_dir();
+    let mut client = Client::connect(&schema_url(&schema), NoTls).expect("the owner");
+    facts(&mut client);
+
+    let first = index(&schema, &git_dir);
+    assert_eq!(
+        (&first["edit"], &first["land"], &first["import"]),
+        (&json!(4), &json!(1), &json!(2)),
+        "{first}"
+    );
+    assert_eq!(first["domain"], format!("git:{SOURCE}"));
+
+    check_task(&schema, &work, &h);
+    check_imports_and_branch(&schema, &h);
+
+    // No entry with the same before and after but a mode's change.
+    let same: i64 = client
+        .query_one(
+            "select count(*) from prov_entries where before = after and class <> 'mechanical'",
+            &[],
+        )
+        .expect("a count")
+        .get(0);
+    assert_eq!(same, 0);
+
+    // A second run records nothing and leaves every canonical value as it
+    // was.
+    let before = canonical(&mut client);
+    let rows = (
+        count(&mut client, "prov_changes"),
+        count(&mut client, "prov_entries"),
+        count(&mut client, "prov_edges"),
+    );
+    let second = index(&schema, &git_dir);
+    assert_eq!(second["recorded"], 0, "{second}");
+    assert_eq!(second["main_commits_recorded_before"], 3, "{second}");
+    assert_eq!(canonical(&mut client), before);
+    assert_eq!(
+        rows,
+        (
+            count(&mut client, "prov_changes"),
+            count(&mut client, "prov_entries"),
+            count(&mut client, "prov_edges"),
+        )
+    );
+
+    check_who(&schema, &git_dir, &h);
 
     // The reader login reads what the routes read.
     let reader = PostgresStore::connect(
@@ -521,7 +535,7 @@ fn a_commit_the_commit_map_renamed_is_recorded_already_and_shown_by_either_id() 
     assert_eq!(run["recorded"], 0, "{run}");
     assert_eq!(run["main_commits_recorded_before"], 1, "{run}");
     for id in [&old, &new] {
-        let shown = changes(&spawn_json(&schema, &["prov", "show", id]));
+        let shown = changes(&spawn_json(schema, &["prov", "show", id]));
         assert_eq!(shown.len(), 1, "{id}: {shown:?}");
         assert_eq!(shown[0]["change"]["id"], recorded);
     }
