@@ -111,7 +111,8 @@ use crate::event::{
     EventRecord, Fork, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
-    AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
+    TerminalName, WorkspaceId,
 };
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
