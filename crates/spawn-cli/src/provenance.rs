@@ -386,20 +386,23 @@ pub(crate) fn who_recorded(
             .prov_path_history(domain, path, folded(path))
             .map_err(|error| error.to_string())?,
         None => {
-            let mut all = Vec::new();
-            for change in store
+            let mut domains: Vec<String> = store
                 .prov_changes_for_path(path)
                 .map_err(|error| error.to_string())?
-            {
-                for (found, entry) in store
-                    .prov_path_history(&change.domain, path, folded(path))
-                    .map_err(|error| error.to_string())?
-                {
-                    if found.id == change.id {
-                        all.push((found, entry));
-                    }
-                }
+                .into_iter()
+                .map(|change| change.domain)
+                .collect();
+            domains.sort();
+            domains.dedup();
+            let mut all = Vec::new();
+            for domain in domains {
+                all.extend(
+                    store
+                        .prov_path_history(&domain, path, folded(path))
+                        .map_err(|error| error.to_string())?,
+                );
             }
+            all.sort_by_key(|(change, _)| (change.at_ms, change.id));
             all
         }
     };
