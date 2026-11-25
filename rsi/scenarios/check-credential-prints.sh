@@ -25,6 +25,12 @@
 #
 # Exit 0 clean. Exit 1 on a finding, a failing case, or a refusal.
 set -eu
+controller=$(cd "$(dirname "$0")/../.." && pwd)
+if [ -z "${SPAWN_SECRET_VALUES-}" ] && [ ! -f /usr/local/lib/spawn/redact/secret-values.py ] &&
+    [ -f "$controller/scripts/redact/secret-values.py" ]; then
+    SPAWN_SECRET_VALUES=$controller/scripts/redact/secret-values.py
+    export SPAWN_SECRET_VALUES
+fi
 here=$(pwd)
 check_py=$here/scripts/rsi/check-credential-prints.py
 tests=$here/scripts/rsi/test-check-credential-prints.sh
