@@ -1848,4 +1848,119 @@ mod tests {
         assert_eq!(Record::parse("{}"), None);
         assert_eq!(Record::parse("not json"), None);
     }
+
+    /// Herdr's refusals of input before typing: an agent not ready (its
+    /// first seconds after `agent.start`) and one blocked on a dialog. A
+    /// gone pane or agent is no such refusal.
+    #[test]
+    fn not_ready_and_blocked_are_refusals_before_typing() {
+        assert!(super::refused_before_typing("agent_not_ready"));
+        assert!(super::refused_before_typing("agent_blocked"));
+        for other in ["agent_not_found", "pane_not_found", "unknown", ""] {
+            assert!(!super::refused_before_typing(other), "{other}");
+        }
+    }
+
+    /// The server is started without update or manifest checks, and never
+    /// resumes agents itself.
+    #[test]
+    fn the_server_s_configuration_pins_updates_and_manifests() {
+        let config = super::SERVER_CONFIG;
+        assert!(
+            config.contains("[update]\nversion_check = false\nmanifest_check = false\n"),
+            "{config}"
+        );
+        assert!(config.contains("resume_agents_on_restore = false"));
+        assert_eq!(super::PROTOCOL, 22);
+    }
+
+    /// `agent.get` and `agent.explain` as herdr 0.9.5 answers them (live
+    /// probes): `done` is idle, the session only when reported as an id,
+    /// the fallback has no rule.
+    #[test]
+    fn readings_and_explanations_parse_as_herdr_answers() {
+        use spawn_core::port::AgentStatus;
+        let agent = serde_json::json!({
+            "terminal_id": "term_1", "agent": "agy", "agent_status": "done",
+            "pane_id": "w1:p1", "state_change_seq": 6, "launch_pending": false,
+            "agent_session": {"source": "hook", "agent": "agy", "kind": "id", "value": "conv-1"},
+        });
+        let reading = super::reading_of(&agent);
+        assert_eq!(reading.agent.as_deref(), Some("agy"));
+        assert_eq!(reading.status, AgentStatus::Idle);
+        assert_eq!(reading.seq, 6);
+        assert_eq!(reading.session.as_deref(), Some("conv-1"));
+        let by_path = serde_json::json!({
+            "agent": "agy", "agent_status": "working",
+            "agent_session": {"source": "hook", "agent": "agy", "kind": "path", "value": "/x"},
+        });
+        let reading = super::reading_of(&by_path);
+        assert_eq!(reading.status, AgentStatus::Working);
+        assert_eq!(reading.session, None);
+        let pending = serde_json::json!({"agent_status": "unknown", "launch_pending": true});
+        let reading = super::reading_of(&pending);
+        assert_eq!((reading.agent, reading.status), (None, AgentStatus::Unknown));
+        for (status, read) in [
+            ("idle", AgentStatus::Idle),
+            ("done", AgentStatus::Idle),
+            ("working", AgentStatus::Working),
+            ("blocked", AgentStatus::Blocked),
+            ("unknown", AgentStatus::Unknown),
+            ("new", AgentStatus::Unknown),
+        ] {
+            assert_eq!(AgentStatus::from_herdr(status), read, "{status}");
+        }
+        let blocked = serde_json::json!({
+            "agent": "agy", "manifest_version": "2026.10.05.1", "state": "blocked",
+            "matched_rule": {"id": "permission_prompt", "priority": 300, "state": "blocked"},
+            "visible_blocker": true, "fallback_reason": null,
+        });
+        let explained = super::explanation(&blocked, AgentStatus::Blocked);
+        assert_eq!(explained.rule.as_deref(), Some("permission_prompt"));
+        assert!(explained.blocker);
+        assert_eq!(explained.manifest.as_deref(), Some("2026.10.05.1"));
+        let idle = serde_json::json!({
+            "agent": "agy", "manifest_version": "2026.10.05.1", "state": "idle",
+            "matched_rule": null, "visible_blocker": false,
+            "fallback_reason": "default_known_agent_idle_fallback",
+        });
+        let explained = super::explanation(&idle, AgentStatus::Idle);
+        assert_eq!(explained.rule, None);
+        assert!(!explained.blocker);
+    }
+
+    /// What the subscription pushes (as herdr 0.9.5 names its events): a
+    /// followed pane's detection or status change queues its terminal once;
+    /// a detection or a release (a status of none) marks the pane settling;
+    /// anything else is ignored.
+    #[test]
+    fn pushed_events_queue_their_terminal_once() {
+        let mut agents = super::Agents::default();
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        agents.panes.insert("w1:p1".to_string(), terminal.clone());
+        let status = r#"{"data":{"agent":"agy","agent_status":"working","pane_id":"w1:p1","workspace_id":"w1"},"event":"pane.agent_status_changed"}"#;
+        super::pushed(&mut agents, status);
+        super::pushed(&mut agents, status);
+        assert_eq!(agents.changed, vec![terminal.clone()]);
+        assert!(agents.pushed.is_empty(), "a status change is no start");
+        let detected = r#"{"data":{"agent":"agy","pane_id":"w1:p1","type":"pane_agent_detected","workspace_id":"w1"},"event":"pane_agent_detected"}"#;
+        super::pushed(&mut agents, detected);
+        assert!(agents.pushed.contains_key("w1:p1"));
+        agents.pushed.clear();
+        let released = r#"{"data":{"agent_status":null,"pane_id":"w1:p1"},"event":"pane.agent_status_changed"}"#;
+        super::pushed(&mut agents, released);
+        assert!(agents.pushed.contains_key("w1:p1"));
+        agents.changed.clear();
+        for other in [
+            r#"{"data":{"agent_status":"idle","pane_id":"w9:p1"},"event":"pane.agent_status_changed"}"#,
+            r#"{"data":{"pane_id":"w1:p1"},"event":"pane.output_matched"}"#,
+            r#"{"id":"spawn:events","result":{"type":"subscription_started"}}"#,
+            "not json",
+        ] {
+            super::pushed(&mut agents, other);
+        }
+        assert!(agents.changed.is_empty(), "{:?}", agents.changed);
+        agents.mark_all();
+        assert_eq!(agents.changed, vec![terminal]);
+    }
 }
