@@ -179,22 +179,21 @@ impl Harness {
         self.raw(&bytes)
     }
 
-    /// A request signed by `signer` over `signed_body` (the whole body, or
-    /// a result's metadata line).
-    #[allow(clippy::too_many_arguments)]
+    /// A request signed by `signer` (see [`Req`]), with `extra` headers.
     pub fn signed(
         &self,
         signer: &NodeSigner,
-        method: Method,
-        target: &str,
-        seq: u64,
-        ts_ms: u64,
-        signed_body: &[u8],
-        body: Option<&[u8]>,
+        request: &Req<'_>,
         extra: &[(String, String)],
     ) -> Reply {
         let envelope = signer
-            .sign(method, target, seq, ts_ms, signed_body)
+            .sign(
+                request.method,
+                request.target,
+                request.seq,
+                request.ts_ms,
+                request.signed_body,
+            )
             .unwrap();
         let mut headers: Vec<(String, String)> = envelope
             .to_headers()
@@ -202,18 +201,25 @@ impl Harness {
             .map(|(name, value)| (name.to_string(), value))
             .collect();
         headers.extend_from_slice(extra);
-        self.send(method.as_str(), target, &headers, body)
+        self.send(
+            request.method.as_str(),
+            request.target,
+            &headers,
+            request.body,
+        )
     }
 
     pub fn post(&self, signer: &NodeSigner, target: &str, seq: u64, body: &[u8]) -> Reply {
         self.signed(
             signer,
-            Method::Post,
-            target,
-            seq,
-            now_ms(),
-            body,
-            Some(body),
+            &Req {
+                method: Method::Post,
+                target,
+                seq,
+                ts_ms: now_ms(),
+                signed_body: body,
+                body: Some(body),
+            },
             &[],
         )
     }
@@ -225,8 +231,31 @@ impl Harness {
         seq: u64,
         extra: &[(String, String)],
     ) -> Reply {
-        self.signed(signer, Method::Get, target, seq, now_ms(), b"", None, extra)
+        self.signed(
+            signer,
+            &Req {
+                method: Method::Get,
+                target,
+                seq,
+                ts_ms: now_ms(),
+                signed_body: b"",
+                body: None,
+            },
+            extra,
+        )
     }
+}
+
+/// A request to sign: the signature covers `signed_body` (the whole body,
+/// or a result's metadata line); `body` is sent (with its
+/// `Content-Length`) when not `None`.
+pub struct Req<'a> {
+    pub method: Method,
+    pub target: &'a str,
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub signed_body: &'a [u8],
+    pub body: Option<&'a [u8]>,
 }
 
 /// An answer as received.

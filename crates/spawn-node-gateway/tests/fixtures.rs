@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{Harness, boot_id, no_database, node_id, read, signer, stranger, v};
+use common::{Harness, Req, boot_id, no_database, node_id, read, signer, stranger, v};
 use serde_json::Value;
 use spawn_node_gateway::Rid;
 use spawn_node_proto::response::{HEADER_PRIMARY_KEY, HEADER_PRIMARY_SIG};
@@ -140,12 +140,14 @@ fn bad_request_row_end_to_end() {
     let body = b"{\"v\":1,";
     let reply = harness.signed(
         &signer(),
-        Method::Post,
-        "/node/v1/heartbeat",
-        10,
-        time,
-        body,
-        Some(body),
+        &Req {
+            method: Method::Post,
+            target: "/node/v1/heartbeat",
+            seq: 10,
+            ts_ms: time,
+            signed_body: body,
+            body: Some(body),
+        },
         &[],
     );
     assert_row(&reply, &row);
@@ -197,12 +199,14 @@ fn clock_skew_row_end_to_end() {
     let beat = v("beat_body");
     let reply = harness.signed(
         &signer(),
-        Method::Post,
-        "/node/v1/heartbeat",
-        14,
-        1_795_600_000_000,
-        beat.as_bytes(),
-        Some(beat.as_bytes()),
+        &Req {
+            method: Method::Post,
+            target: "/node/v1/heartbeat",
+            seq: 14,
+            ts_ms: 1_795_600_000_000,
+            signed_body: beat.as_bytes(),
+            body: Some(beat.as_bytes()),
+        },
         &[],
     );
     assert_row(&reply, &row);
@@ -216,12 +220,14 @@ fn beat_first_row_for_an_artifact_without_a_cached_key() {
     harness.set_clock(time);
     let reply = harness.signed(
         &signer(),
-        Method::Get,
-        &v("artifact_path"),
-        17,
-        time,
-        b"",
-        None,
+        &Req {
+            method: Method::Get,
+            target: &v("artifact_path"),
+            seq: 17,
+            ts_ms: time,
+            signed_body: b"",
+            body: None,
+        },
         &[],
     );
     // The signature binds (node, boot, seq), status, time and body, not the
@@ -261,24 +267,28 @@ fn busy_429_row_after_twenty_requests_in_ten_seconds() {
     for seq in 0..20 {
         let reply = harness.signed(
             &signer(),
-            Method::Post,
-            "/node/v1/heartbeat",
-            seq + 100,
-            time,
-            body,
-            Some(body),
+            &Req {
+                method: Method::Post,
+                target: "/node/v1/heartbeat",
+                seq: seq + 100,
+                ts_ms: time,
+                signed_body: body,
+                body: Some(body),
+            },
             &[],
         );
         assert_eq!(reply.status, 400);
     }
     let reply = harness.signed(
         &signer(),
-        Method::Post,
-        "/node/v1/heartbeat",
-        20,
-        time,
-        body,
-        Some(body),
+        &Req {
+            method: Method::Post,
+            target: "/node/v1/heartbeat",
+            seq: 20,
+            ts_ms: time,
+            signed_body: body,
+            body: Some(body),
+        },
         &[],
     );
     assert_row(&reply, &row);
@@ -294,12 +304,14 @@ fn busy_503_row_when_the_ledger_is_unreachable() {
     let beat = v("beat_body");
     let reply = harness.signed(
         &signer(),
-        Method::Post,
-        "/node/v1/heartbeat",
-        21,
-        time,
-        beat.as_bytes(),
-        Some(beat.as_bytes()),
+        &Req {
+            method: Method::Post,
+            target: "/node/v1/heartbeat",
+            seq: 21,
+            ts_ms: time,
+            signed_body: beat.as_bytes(),
+            body: Some(beat.as_bytes()),
+        },
         &[],
     );
     assert_row(&reply, &row);

@@ -12,11 +12,11 @@
 //! handler did not read to its end closes the connection, and the
 //! `Content-Length` is the handler's to judge.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -327,7 +327,11 @@ enum Head {
     Malformed,
 }
 
-fn connection<H: Handler>(stream: TcpStream, handler: &mut H, timeouts: Timeouts) -> io::Result<()> {
+fn connection<H: Handler>(
+    stream: TcpStream,
+    handler: &mut H,
+    timeouts: Timeouts,
+) -> io::Result<()> {
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let peer = stream.peer_addr()?.ip();

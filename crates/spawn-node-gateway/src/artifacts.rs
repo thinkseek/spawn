@@ -65,7 +65,12 @@ pub fn manifest_body(path: &Path, now: u64) -> Result<Vec<u8>, ManifestError> {
         .get("digest")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|digest| ContentDigest::parse(digest).is_ok());
-    if !digest_ok || pack.get("size").and_then(serde_json::Value::as_u64).is_none() {
+    if !digest_ok
+        || pack
+            .get("size")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
         return Err(invalid("pack is not {digest, size}"));
     }
     manifest.insert("v".to_string(), spawn_node_proto::VERSION.into());

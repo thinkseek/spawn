@@ -30,7 +30,9 @@ use serde_json::Value;
 use spawn_node_proto::codec::{parse_decimal, sha256, sha256_hex};
 use spawn_node_proto::enroll::{EnrollAnswer, EnrollRequest};
 use spawn_node_proto::envelope::{REQUEST_HEADERS, is_clock_skewed, strip_public_prefix};
-use spawn_node_proto::grant::{ArtifactRole, ArtifactUrl, Grant, GrantInputs, JobKind, SignedGrant};
+use spawn_node_proto::grant::{
+    ArtifactRole, ArtifactUrl, Grant, GrantInputs, JobKind, SignedGrant,
+};
 use spawn_node_proto::heartbeat::{Ack, Beat, Fenced, LeaseRef};
 use spawn_node_proto::json::{self, OrderedMap};
 use spawn_node_proto::response::{
@@ -338,7 +340,11 @@ impl Gateway {
             Verb::Heartbeat => self.beat(store, &checked, now, rid),
             Verb::Spec => self.spec(store, &checked, now, rid),
             Verb::Result { job_id } => {
-                let call = Call { checked: &checked, now, rid };
+                let call = Call {
+                    checked: &checked,
+                    now,
+                    rid,
+                };
                 self.result(store, request, &call, len, job_id)
             }
             Verb::Artifact(_) => self.artifact(request, &checked),
@@ -969,7 +975,10 @@ mod tests {
             [ArtifactRole::DeltaBundle, ArtifactRole::ControllerPack]
         );
         let grant: Grant = serde_json::from_slice(&warm).unwrap();
-        assert_eq!((grant.lease_epoch, grant.expires_ms, grant.timeout_s), (2, 9, Some(600)));
+        assert_eq!(
+            (grant.lease_epoch, grant.expires_ms, grant.timeout_s),
+            (2, 9, Some(600))
+        );
         assert_eq!(grant.node_id, node);
     }
 

@@ -11,7 +11,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::{Harness, Reply, boot_id, node_id, now_ms, primary_key, read, signer, stranger, v};
+use common::{
+    Harness, Reply, Req, boot_id, node_id, now_ms, primary_key, read, signer, stranger, v,
+};
 use serde_json::json;
 use spawn_node_gateway::{ResultAnswer, SpecAnswer};
 use spawn_node_proto::enroll::{EnrollAnswer, EnrollToken};
@@ -124,12 +126,14 @@ fn result_body(job_id: &str, epoch: u64, log: &[u8]) -> (Vec<u8>, Vec<u8>) {
 fn post_result(harness: &Harness, seq: u64, job_id: &str, line: &[u8], body: &[u8]) -> Reply {
     harness.signed(
         &signer(),
-        Method::Post,
-        &format!("/node/v1/jobs/{job_id}/result"),
-        seq,
-        now_ms(),
-        line,
-        Some(body),
+        &Req {
+            method: Method::Post,
+            target: &format!("/node/v1/jobs/{job_id}/result"),
+            seq,
+            ts_ms: now_ms(),
+            signed_body: line,
+            body: Some(body),
+        },
         &[],
     )
 }
