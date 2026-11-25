@@ -2,7 +2,7 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
-结论：Spawn 用 8 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
+结论：Spawn 用 9 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-cas`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
 
 ## 1. 能力与边界
 
@@ -26,7 +26,8 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | --- | --- | --- |
 | `spawn-core` | 类型、端口、事件归一、Bridge、Observer、能力图模型；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、sha2、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`sql/schema.sql`、读方法、`LISTEN spawn_events` 连接（`wake.rs`） | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
-| `spawn-host` | 终端（`TerminalHost`：`TmuxHost` 默认，`HerdrHost` 由 `SPAWN_TERMINAL_BACKEND=herdr` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重）、transcript 归档、inotify | spawn-core、libc、rustix、serde_json、sha2 |
+| `spawn-host` | 终端（`TerminalHost`：`TmuxHost` 默认，`HerdrHost` 由 `SPAWN_TERMINAL_BACKEND=herdr` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
+| `spawn-cas` | 统一内容寻址存储：带算法前缀的摘要（`sha256:<64 hex>`）、`objects/<algo>/<2 hex>/<hex>`（0444）、`pins/<owner>/<name>`、按命名空间的 LRU GC（`access/<ns>/`）、`tmp/` 暂存；crash-only，不 fsync；与 Go `spawn-node/cas` 同一磁盘布局；旧 `cas_dedup` 的 `<2 hex>/<hex>` 原地改名收编，不重算哈希 | sha2、thiserror、libc |
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译） | sha2、hmac |
 | `spawn-codegraph` | 能力图的代码依赖事实：从仓库文件抽取代码图 | spawn-core、syn、proc-macro2 |
@@ -40,6 +41,7 @@ flowchart LR
   pg[spawn-postgres]
   jev[spawn-jev]
   host[spawn-host]
+  cas[spawn-cas]
   graph[spawn-codegraph]
   proto[spawn-node-proto]
   cli[spawn-cli]
@@ -47,6 +49,7 @@ flowchart LR
   pg --> kdf
   jev --> core
   host --> core
+  host --> cas
   graph --> core
   cli --> pg
   cli --> jev
@@ -55,7 +58,7 @@ flowchart LR
   cli --> proto
 ```
 
-依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间唯一的依赖是 `spawn-postgres` 用 `spawn-kdf` 派生登录口令。
+依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间的依赖只有两条：`spawn-postgres` 用 `spawn-kdf` 派生登录口令，`spawn-host` 的 `cas_dedup` 把块存进 `spawn-cas`。
 
 ## 3. 一次任务的链路
 
