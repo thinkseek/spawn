@@ -542,6 +542,14 @@ struct Follow {
 const FOLLOW_OVERLAP: usize = 4096;
 
 impl Follow {
+    /// The log records the execution's native session: it is known, as
+    /// this Bridge bound it or not.
+    fn recorded_binding(&mut self) {
+        if self.binding == Binding::Unbound {
+            self.binding = Binding::Bound(None);
+        }
+    }
+
     /// The driver reads the lines of `native`: its keys begin with the
     /// session whose lines they are, so another session starts afresh.
     fn reading(&mut self, native: &str) {
@@ -1922,11 +1930,8 @@ impl Bridge {
                     view.transcript_read = false;
                 }
                 view.native = Some(native_session_id.clone());
-                if current
-                    && let Some(active) = view.active.as_mut()
-                    && active.follow.binding == Binding::Unbound
-                {
-                    active.follow.binding = Binding::Bound(None);
+                if current && let Some(active) = view.active.as_mut() {
+                    active.follow.recorded_binding();
                 }
             }
             // A merge of main is no checkpoint of the agent's work: one
