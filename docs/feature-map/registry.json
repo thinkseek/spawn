@@ -2704,6 +2704,7 @@
       "files": [
         "crates/spawn-cli/src/serve/approvals.rs",
         "crates/spawn-cli/src/serve/approvals/tests.rs",
+        "crates/spawn-cli/src/resolve.rs",
         "crates/spawn-cli/src/serve/digest.rs",
         "crates/spawn-cli/src/serve/digest/tests.rs",
         "crates/spawn-cli/src/serve/stream.rs",
