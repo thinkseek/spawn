@@ -663,7 +663,30 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
     ];
     let mut last = trust;
     for (typed, status, rule, screen) in steps {
-        host.submit_text(&agy, &workspace, typed).expect("typed");
+        if last.status == AgentStatus::Blocked {
+            // Herdr's `agent.prompt` refuses a blocked agent before any
+            // byte (what PR 3's `submit_staged` relies on): nothing typed,
+            // the text still staged. The stub is driven past its dialog
+            // through the pane itself, as a person's keyboard would.
+            let refused = host
+                .submit_text(&agy, &workspace, typed)
+                .expect_err("a blocked agent takes no prompt");
+            assert!(
+                refused.0.contains("refused before typing (agent_blocked)"),
+                "{refused}"
+            );
+            let pane = session.pane_of(&agy);
+            session.call(
+                "pane.send_text",
+                &serde_json::json!({ "pane_id": pane, "text": typed }),
+            );
+            session.call(
+                "pane.send_keys",
+                &serde_json::json!({ "pane_id": pane, "keys": ["enter"] }),
+            );
+        } else {
+            host.submit_text(&agy, &workspace, typed).expect("typed");
+        }
         let reading = reading_within(&host, &agy, &workspace, |reading| {
             // Herdr counts status changes only: permission to question
             // (blocked to blocked) keeps its seq, and changes its rule.
