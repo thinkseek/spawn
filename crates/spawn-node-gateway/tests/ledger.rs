@@ -139,13 +139,21 @@ fn post_result(harness: &Harness, seq: u64, job_id: &str, line: &[u8], body: &[u
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn enroll_beat_grant_result_and_their_refusals() {
     let (_schema, owner, harness) = setup("gw_flow");
-    let node = signer();
+    enroll_and_first_beats(&owner, &harness);
+    granted(&owner, &harness);
+    results(&owner, &harness);
+    let digest = spec_and_artifacts(&harness);
+    replay_rollback_and_revoke(&owner, &harness, &digest);
+}
 
+/// Enroll (proof of possession, the token consumed, the primary pinned),
+/// a first beat, and a cache hit's forged beat.
+fn enroll_and_first_beats(owner: &PostgresStore, harness: &Harness) {
+    let node = signer();
     // Enroll: proof of possession, the token consumed, the primary pinned.
-    let enrolled = enroll(&owner, &harness);
+    let enrolled = enroll(owner, harness);
     assert_eq!(enrolled.status, 200, "{}", enrolled.json());
     enrolled.verify(&node_id(), &boot_id(), 0);
     let answer: EnrollAnswer = serde_json::from_slice(&enrolled.body).unwrap();
@@ -170,7 +178,7 @@ fn enroll_beat_grant_result_and_their_refusals() {
     again.assert_refused(Refusal::UnknownNode, 0);
 
     // A first beat: nothing queued, the spec held.
-    let first = beat(&harness, &node, 1);
+    let first = beat(harness, &node, 1);
     assert_eq!(first.status, 200, "{}", first.json());
     first.verify(&node_id(), &boot_id(), 1);
     let ack = Ack::parse(&first.body).unwrap();
@@ -178,13 +186,17 @@ fn enroll_beat_grant_result_and_their_refusals() {
 
     // A cache hit refuses a bad signature with no database call.
     let calls = harness.gateway.db_calls();
-    let forged = forged_beat(&harness, 2);
+    let forged = forged_beat(harness, 2);
     forged.assert_refused(Refusal::BadSignature, 2);
     assert_eq!(harness.gateway.db_calls(), calls, "zero database calls");
+}
 
+/// A queued job, granted with its exact bytes signed.
+fn granted(owner: &PostgresStore, harness: &Harness) {
+    let node = signer();
     // A job: granted, its exact bytes signed.
     owner.remote_job_enqueue(&job(JOB)).unwrap();
-    let granted = beat(&harness, &node, 3);
+    let granted = beat(harness, &node, 3);
     assert_eq!(granted.status, 200);
     granted.verify(&node_id(), &boot_id(), 3);
     let ack = Ack::parse(&granted.body).unwrap();
@@ -206,13 +218,16 @@ fn enroll_beat_grant_result_and_their_refusals() {
         Some(&1)
     );
     assert!(grant.expires_ms > now_ms() + 60_000);
+}
 
+/// The result streamed, stored and completed; again; fenced; mismatched.
+fn results(owner: &PostgresStore, harness: &Harness) {
     // The result: 3 MiB streamed to disk, checked, then completed.
     let log: Vec<u8> = (0..3 * 1024 * 1024_u32)
         .map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8)
         .collect();
     let (line, body) = result_body(JOB, 1, &log);
-    let done = post_result(&harness, 4, JOB, &line, &body);
+    let done = post_result(harness, 4, JOB, &line, &body);
     assert_eq!(done.status, 200, "{}", done.json());
     done.verify(&node_id(), &boot_id(), 4);
     let answer: ResultAnswer = serde_json::from_slice(&done.body).unwrap();
@@ -229,12 +244,12 @@ fn enroll_beat_grant_result_and_their_refusals() {
         Some(spawn_node_proto::codec::sha256_hex(&line).as_str())
     );
     // The same result again: accepted, nothing rewritten.
-    let twice = post_result(&harness, 5, JOB, &line, &body);
+    let twice = post_result(harness, 5, JOB, &line, &body);
     assert_eq!(twice.status, 200);
 
     // A result at an epoch the job never had: the files go again.
     let (line2, body2) = result_body(JOB, 2, b"other log");
-    let fenced = post_result(&harness, 6, JOB, &line2, &body2);
+    let fenced = post_result(harness, 6, JOB, &line2, &body2);
     fenced.assert_refused(Refusal::LeaseFenced, 6);
     assert!(
         !harness.results.join(format!("{JOB}.2")).exists(),
@@ -243,13 +258,18 @@ fn enroll_beat_grant_result_and_their_refusals() {
     // A log that does not match its metadata.
     let (line3, mut body3) = result_body(JOB, 1, b"abc");
     *body3.last_mut().unwrap() = b'x';
-    post_result(&harness, 7, JOB, &line3, &body3).assert_refused(Refusal::BadRequest, 7);
+    post_result(harness, 7, JOB, &line3, &body3).assert_refused(Refusal::BadRequest, 7);
     assert_eq!(
         std::fs::read(dir.join("log")).unwrap(),
         log,
         "the stored result is untouched"
     );
+}
 
+/// Spec, and ranged artifact GETs on the cached key; the artifact's
+/// address.
+fn spec_and_artifacts(harness: &Harness) -> spawn_node_proto::ContentDigest {
+    let node = signer();
     // Spec: the same bytes change nothing.
     let spec = harness.post(&node, "/node/v1/spec", 8, &read("spec.json"));
     assert_eq!(spec.status, 200);
@@ -283,16 +303,25 @@ fn enroll_beat_grant_result_and_their_refusals() {
         calls,
         "artifacts never reach the ledger"
     );
+    digest
+}
 
+/// Replay, verify-then-commit's rollback, revoke.
+fn replay_rollback_and_revoke(
+    owner: &PostgresStore,
+    harness: &Harness,
+    digest: &spawn_node_proto::ContentDigest,
+) {
+    let node = signer();
     // Replay: a beat seq at or below the stored one.
-    beat(&harness, &node, 3).assert_refused(Refusal::Replay, 3);
+    beat(harness, &node, 3).assert_refused(Refusal::Replay, 3);
 
     // Verify-then-commit: on a cache miss the forged beat reaches the
     // ledger, whose work is rolled back.
     harness.gateway.keys().evict(&node_id());
     let before = owner.node_v1("n252").unwrap().unwrap();
     let calls = harness.gateway.db_calls();
-    forged_beat(&harness, 50).assert_refused(Refusal::BadSignature, 50);
+    forged_beat(harness, 50).assert_refused(Refusal::BadSignature, 50);
     assert!(harness.gateway.db_calls() > calls, "a miss asks the ledger");
     let after = owner.node_v1("n252").unwrap().unwrap();
     assert_eq!(after.beat_seq, before.beat_seq, "rolled back");
@@ -303,10 +332,10 @@ fn enroll_beat_grant_result_and_their_refusals() {
     );
 
     // Revoked: refused, and the cache forgets the key.
-    assert_eq!(beat(&harness, &node, 51).status, 200, "a good beat");
+    assert_eq!(beat(harness, &node, 51).status, 200, "a good beat");
     assert!(harness.gateway.keys().get(&node_id()).is_some());
     assert!(owner.node_admin("n252", NodeAction::Revoke).unwrap());
-    beat(&harness, &node, 52).assert_refused(Refusal::Revoked, 52);
+    beat(harness, &node, 52).assert_refused(Refusal::Revoked, 52);
     assert!(harness.gateway.keys().get(&node_id()).is_none(), "evicted");
     harness
         .get(&node, &digest.artifact_path(), 53, &[])
