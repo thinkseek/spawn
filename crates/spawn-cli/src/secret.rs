@@ -1,6 +1,6 @@
 //! `spawn secret set|generate|rotate|list`: the store of secrets by name
-//! (sync/design-secret-injection.md, section 5, step B; rotation, section
-//! 3.2, objective 123).
+//! (sync/design-secret-injection.md, a fleet note, outside this repository:
+//! section 5, step B; rotation, section 3.2, objective 123).
 //!
 //! The store is the directory `SPAWN_SECRET_STORE` names: absolute, existing,
 //! owned by the running user, mode 700, not a symbolic link. Each secret is

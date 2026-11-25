@@ -2038,17 +2038,19 @@ The Scorecard's "How the fleet decides" reads it over the page's window;
 | Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
-The API reads, as `spawn_reader`, with GET only (any other method on a
-read is 405): `/api/overview`, `/api/fleet` (with
-`/api/fleet/<session>/judgements` and `/commands`, each command with
-`waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
-`/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
-`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`),
-`/api/scorecard` and `/api/scorecard/fleet` (§4), `/api/interventions`
-(§0) (`crates/spawn-cli/src/serve.rs`; the answer of
-`/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
+Every route the API answers, with its method, what it answers, its CLI twin
+and who reads it, is listed once in [docs/api.md](./api.md): 24 GET route
+patterns and 7 POST routes on `main`. The reads run as `spawn_reader`, with
+GET only (any other method on a read is 405); each read's answer is
+documented on its handler in `crates/spawn-cli/src/serve.rs` (the answer of
+`/api/attention` in `crates/spawn-cli/src/serve/attention.rs`).
 
-It writes two things. The first is a person's input to a session, `POST
+Of the seven POST routes, five are a person's writes, as the `spawn_human`
+login: an input to a session and a named key (below), a restart or a
+reassign of a stalled worker (§3.2), and the resume of a halted mission
+(§10.3). The other two are the feature registry's scan and association,
+which change no record (docs/feature-map.md). The input is a person's input
+to a session, `POST
 /api/session/<id>/input` with `{"text", "key"}` (the key, an idempotency
 key, may come as an `Idempotency-Key` header). That is the command `spawn
 submit --principal human --agent <the session's agent> --session <id> --key
@@ -2057,9 +2059,11 @@ idempotency rule (a retried POST types once), and like every person's input
 it waits for the session's turn (§3). It answers 202 with the command, which
 `/commands` then follows; `{"probe": true}` passes every guard and writes
 nothing, so the page knows before it offers the box. It runs as the
-`spawn_human` login, whose rights are `spawn_human_input` and
+`spawn_human` login, whose rights for a session are `spawn_human_input` and
 `spawn_human_key`: an input or a named key, as principal `human`, to the
-agent the session belongs to; no other action, no read, no event. Its guards, in order: the read guard (the clients that may
+agent the session belongs to; no other action, no read, no event (its other
+two rights, `spawn_human_task` and `spawn_human_resume`, are the restart or
+reassign and the resume). Its guards, in order: the read guard (the clients that may
 read may write: the token, `SPAWN_SERVE_LOCAL_OPEN`'s owner client,
 `SPAWN_SERVE_OPEN_NETWORKS`' clients naming the server by its address);
 POST only (405); without the token, an `Origin` naming the server as the
@@ -2073,7 +2077,7 @@ same session and text, or key name): sent for another session or with other
 content it is 409, makes no command, and the page takes a new key
 (`spawn_human_replay`).
 
-The second is a person's named key, `POST /api/session/<id>/key` with
+The key is a person's named key, `POST /api/session/<id>/key` with
 `{"name", "key"}` (§3, "Named keys never wait"): the command `spawn submit
 --principal human ... --action '{"type":"key","key":<name>}'` makes, through
 `spawn_human_key` (the `spawn_human` login's other right), with the input's

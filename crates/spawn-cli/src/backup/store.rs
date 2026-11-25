@@ -1,6 +1,7 @@
-//! `spawn store put|get|list|verify`: the off-host copy of the
+//! `spawn store put|plan|get|list|verify`: the off-host copy of the
 //! transcript archive and the native sessions, upload-only (sync/plan-r2.md,
-//! design D as the lead and rev-g settled it, 2026-11-13).
+//! a fleet note, outside this repository: design D as the lead and rev-g
+//! settled it, 2026-11-13).
 //!
 //! Two areas, nothing more (the owner's cut of 11-05: no general store):
 //! - `transcripts`: the workspace's transcript archive (`<root>/.transcripts`);

@@ -1,30 +1,43 @@
 //! The `spawn` binary: assembles stores, host adapters and the Bridge.
 //!
-//! Subcommands:
+//! Subcommands, all 29 (their verbs and flags are in [`full_usage`]):
 //!
 //! - `init-db` installs the SQL schema.
-//! - `submit` writes one command to the queue.
+//! - `submit` writes one command to the queue; `ack` answers one from inside
+//!   an agent's pane.
 //! - `tick` runs one Bridge and Observer pass.
 //! - `loop` runs the fleet until killed: Bridge, Observer, dispatcher and
 //!   the supervisor's liveness rule.
-//! - `mission`, `task`, `resident` manage the mission layer.
+//! - `mission`, `task`, `resident` manage the mission layer; `objective`
+//!   retires an objective; `verify` records an objective's verification
+//!   after its landing and lists what is landed and not verified.
 //! - `integrate` lands gated missions' work and assigns objectives (RSI).
-//! - `serve` serves the read-only dashboard and API.
+//! - `serve` serves the dashboard and the HTTP API: reads, and a person's
+//!   writes (docs/api.md lists every route).
 //! - `scorecard` measures every dimension of the fleet at once, from the
 //!   record alone (docs/design.md §15).
 //! - `fleet` prints every session with its judgement; `tail` one session's
 //!   judgement, events, judgements and commands.
 //! - `node` joins, lists, drains and removes the machines Spawn may use
 //!   (docs/fleet-architecture.md, "Runtime layer: nodes").
-//! - `alerts` prints the alerts Spawn raised, once or as they are recorded
+//! - `alerts` prints the alerts Spawn raised, once or as they are recorded;
+//!   `alert` records the owner's judgement of one, or an alert itself
 //!   (docs/fleet-architecture.md, "Alerts").
 //! - `backup` dumps, bundles and drills the fleet's record off this host
-//!   (docs/storage.md, "Where state lives").
-//! - `verify` records an objective's verification after its landing and
-//!   lists what is landed and not verified.
+//!   (docs/storage.md, "Where state lives"); `store` puts the transcript
+//!   archive and the native sessions in the off-host object store.
+//! - `mask` and `mask-hook` replace known secret values in what a program
+//!   prints; `secret` keeps secrets by name.
+//! - `commit-map` loads a map of rewritten commit ids.
+//! - `features` scans and checks the feature registry
+//!   (docs/feature-map/registry.json) and associates files with it.
+//! - `grade` keeps the grading catalog (docs/agent-grading.md).
+//! - `scratch` claims, renews, releases and sweeps scratch directories.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
 //! - `version` prints `spawn <crate version>`.
+//!
+//! The nouns are as in docs/glossary.md.
 //!
 //! Configuration is environment first, so a terminal started by the Bridge
 //! carries everything its runner needs.
@@ -78,8 +91,9 @@ pub(crate) use config::{Flags, env_or, env_value, open_store};
 
 use commands::{engine, inspect, loops, queue};
 
-/// The commands, as the black-box contract (scripts/blackbox/scenarios/
-/// 010-cli-contract.sh) reads them verbatim.
+/// The contract's line of commands, read verbatim by the operator scenario
+/// (rsi/scenarios/check-j05-operator.sh) and by tests/help.rs: it never
+/// changes, and the commands after it are on lines of their own.
 const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|fleet|tail|run|version>";
 
 /// The commands the contract's line does not hold, each on a line of its own

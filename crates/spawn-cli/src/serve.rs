@@ -1,12 +1,16 @@
-//! HTTP API and static files for the observer UI: reads, and a person's
-//! writes: an input to a session, a key, a restart or a reassign of a
-//! stalled worker, and the resume of a halted mission.
+//! HTTP API and static files for the observer UI: reads, and seven POST
+//! routes. Five are a person's writes: an input to a session, a key, a
+//! restart or a reassign of a stalled worker, and the resume of a halted
+//! mission. Two are the feature registry's: a fresh scan, which changes
+//! nothing, and a file's association ([`feature_scan_post`],
+//! [`feature_associate_post`]). Every route, with its method and CLI twin,
+//! is listed in docs/api.md.
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
 //! state. An API path that reads answers 405 to any method but GET and HEAD.
 //!
-//! The one write is `POST /api/session/<id>/input` with `{"text": "...",
+//! The first write is `POST /api/session/<id>/input` with `{"text": "...",
 //! "key": "<idempotency key>"}` (the key may come in an `Idempotency-Key`
 //! header instead): the input `spawn submit --principal human --agent <the
 //! session's agent> --session <id> --key <key> --action
@@ -38,7 +42,7 @@
 //! types (not blank, at most [`MAX_INPUT_TEXT`] bytes, no control character
 //! but tab and line ends), 400 otherwise.
 //!
-//! The other write is `POST /api/session/<id>/key` with `{"name":
+//! The second write is `POST /api/session/<id>/key` with `{"name":
 //! "escape", "key": "<idempotency key>"}` (backlog P1): the key command
 //! `spawn submit --principal human ... --action '{"type":"key","key":...}'`
 //! makes, through `spawn_human_key`, with the same guards and idempotency

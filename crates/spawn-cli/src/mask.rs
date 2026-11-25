@@ -1,6 +1,7 @@
-//! The mask (objective 117; sync/design-secret-injection.md 3.4 and 5.A):
-//! known secret values replaced by `[SECRET:NAME]` in every form a program
-//! prints them, before output reaches an agent, and so a transcript.
+//! The mask (objective 117; sync/design-secret-injection.md 3.4 and 5.A, a
+//! fleet note, outside this repository): known secret values replaced by
+//! `[SECRET:NAME]` in every form a program prints them, before output
+//! reaches an agent, and so a transcript.
 //!
 //! The values file holds `NAME=value` lines (`#` comments and blank lines
 //! ignored; NAME upper-case letters, digits and `_`; one NAME on several

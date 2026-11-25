@@ -594,8 +594,10 @@
       "files": [
         "README.md",
         "README.zh-CN.md",
+        "docs/api.md",
         "docs/architecture.md",
-        "docs/design.md"
+        "docs/design.md",
+        "docs/glossary.md"
       ],
       "relations": [
         {
@@ -2477,6 +2479,7 @@
         "crates/spawn-postgres/tests/human_key.rs",
         "crates/spawn-postgres/tests/human_resume.rs",
         "deploy/systemd/spawn-serve.service",
+        "docs/api.md",
         "docs/architecture.md",
         "rsi/backlog/015.json",
         "rsi/backlog/040.json",
