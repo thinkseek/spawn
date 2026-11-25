@@ -341,11 +341,12 @@ fn malformed_http_and_content_length_are_signed_bad_requests() {
             .send("POST", "/node/v1/heartbeat", &with, None)
             .assert_refused(Refusal::BadRequest, 1);
     }
-    // Twice the same Spawn-Node-* header.
+    // Twice the same Spawn-Node-* header (Seq): the answer binds seq 0,
+    // a repeated header being no value at all.
     headers.push(headers[2].clone());
     harness
         .send("POST", "/node/v1/heartbeat", &headers, Some(beat.as_bytes()))
-        .assert_refused(Refusal::BadRequest, 1);
+        .assert_refused(Refusal::BadRequest, 0);
     // A POST with no Content-Length.
     headers.pop();
     harness
