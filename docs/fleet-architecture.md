@@ -2166,6 +2166,128 @@ Running agy in the fleet needs, on the host:
 
 The SQL gateway's own command checks are unchanged by this PR.
 
+### 3.7 Zero-human answers and lifecycle hardening on Herdr (issue #91, PR 3)
+
+**The resolver.** `spawn loop` runs `crates/spawn-cli/src/resolve.rs` each
+pass. It answers a dialog an engine shows at run time from a fixed table
+(`spawn_core::driver::table_answer`), as `key` commands of its own
+principal, `spawn-resolve`. That principal is one of `LOOP_PRINCIPALS`; a
+key never waits for a turn, so listing it changes no input rule. The
+resolver uses the approvals page's detection and dialog id
+(`serve/approvals.rs`, `detect`), so a person and the resolver see one
+dialog under one id.
+
+The table answers only the rows whose screen was seen working: agy's
+`trust_prompt` for its own workspace (probed), and Claude Code's trust
+dialog (in production) and numbered permission whose first choice is "Yes"
+(approvals fixtures). Every other row escalates. So does a hard block
+(`spawn_core::driver::hard_block`): a login, a quota, a rate limit, a needed
+update, or exit-only choices.
+
+Before any key, every guard must hold:
+
+- two equal pane reads in a row;
+- for an engine other than Claude Code, Herdr reads it `blocked` by a named
+  rule, with the blocker visible;
+- the driver reads the pane as `Permission`;
+- the row's own guard holds;
+- no command of the session is unfinished;
+- the breaker is closed.
+
+The breaker is folded from the log, never kept in memory alone. Its counts
+come from the commands of `spawn-resolve`, plus `submit`'s idempotency on
+the key `resolve:<execution>:<dialog id>:<n>:<k>`. It opens:
+
+- for a dialog that still shows 5 to 30 s after its answer;
+- for a dialog on its third answer (a second comes only from 30 s on);
+- for an execution after 5 answers in 10 minutes;
+- for the host after 20 answers across the fleet in a minute.
+
+**The switch.** `SPAWN_AUTO_APPROVE = off | startup | all`, default
+`startup`, which changes nothing. Landing PR 3 is inert until the owner sets
+`all`, and a test pins that the resolver reads and submits nothing
+otherwise. `off` stops the resolver too. The Bridge's startup trust answer is
+part of a start, and `off` does not switch it.
+
+**The audit trail.** Each automatic answer is on the record with kinds that
+exist: `screen.observed permission`, `command.accepted` (principal
+`spawn-resolve`), `command.step pressing` and `pressed`, `command.finished`,
+then the next `screen.observed`. The Bridge's startup trust answer was
+unrecorded before and now goes the same way:
+
+1. It submits one key command per key, keyed
+   `resolve:<execution>:trust:1:<k>`.
+2. It records `pressing`, sends the keys together as before, and records
+   `pressed`.
+3. The commands queue behind the start. Once the start is done, the Bridge
+   finishes them without pressing again.
+
+A restarted Bridge that sees the dialog again finds the keys pressed and
+presses nothing. A live probe found no protected scenario that draws Claude
+Code's trust dialog, so no scenario's record changes.
+
+**Stragglers.** After a terminal is closed and its runner's session has
+exited, both hosts look for processes of this user whose working directory
+is beneath the workspace. They read it from `/proc/<pid>/cwd`, an exact
+link; they never match an argument pattern (`pgrep -f`, `pkill -f`). An
+engine may have detached such a process: agy's `--bg-updater`, a `nohup`
+server. It is ended by pid through a pidfd, SIGTERM then SIGKILL, before the
+final checkpoint. One that outlives both is a terminate error naming it. A
+directory too broad to be one workspace is never swept: fewer than three
+parts, or the home, temporary or current directory, or any directory above
+one of them.
+
+**Typing on Herdr.** `submit_staged` hands the staged text to the pane's
+agent with `agent.prompt`: one ordered, paste-aware write, then its
+submission. It never passes `wait`, which returns on a false idle. It uses
+`agent.prompt` only while the request line stays under 256 KiB, because
+Herdr 0.9.5 resets a connection whose request line passes 1 MiB (probed).
+Three cases still go through chunked `pane.send_text` and Enter, as before:
+a longer text, an empty one, and a pane with no agent Herdr detects
+(`agent_not_found`; nothing typed).
+
+`agent_blocked` and `agent_not_ready` are refusals before typing: nothing
+is typed, and the text stays staged. But the Bridge records a typing before
+it submits, so a refusal at that point still reads as one that may have
+typed. The check at staging is what keeps that rare.
+
+**One Spawn deployment per Herdr session.** A host writes a terminal's
+record before `workspace.create`, as a pending record that names only the
+server. A sweep of restored workspaces (§3.6) that lists the new workspace in
+between therefore keeps it. A start that stopped in between leaves the
+pending record behind, and the terminal's terminate closes the workspace
+labelled with its name.
+
+The sweep closes every Spawn-labelled workspace that no record of this
+host's names. So two Spawn deployments on the same Herdr session
+(`SPAWN_HERDR_SESSION`) would close each other's workspaces: run one
+deployment per session.
+
+**Subscriptions and manifests.** The host's event subscriber asks for the
+session's snapshot, and marks every followed terminal changed, only after a
+real reconnect (a dropped connection). Subscribing again because the
+followed panes changed does neither.
+
+Besides the protocol, a server is checked against the agent detection
+manifests Spawn was tested with (`server.agent_manifests`): agy
+`2026.10.05.1` and claude `2026.10.11.1`, Herdr 0.9.5's bundled ones. A
+server whose active version differs, or that has none, is refused before
+anything starts, and the message names the pinned and the actual version.
+The `[update]` pin holds only for a server this host started; this check
+holds for any server.
+
+**agy's transcript does not rotate (N10, probed).** One scratch conversation
+on agy 1.5.17 was driven past 6.44 MB of `transcript_full.jsonl` with cheap
+tool calls. The file kept its inode and only grew by appends
+(`NO_ROTATION`), and no `chunks/` directory appeared. The reader keeps
+following the one file. The existing rule for a shrunk or replaced file
+stays as the safety net.
+
+**A wrapped draft.** A draft wider than agy's prompt box wraps onto the
+lines under the prompt line, which moves the lower rule down.
+`read_agy_screen` reads it as `Drafted`, for up to 8 wrapped lines, never as
+`Unknown` or `Ready`.
+
 ## 4. Experience
 
 Nothing is stored outside the log. Every model judgement is an
