@@ -567,7 +567,7 @@ fn cas_dedup_converges_three_workers_on_one_extent() {
         assert!(app.with_file_name("run.jsonl").exists());
     }
     if linux_extents {
-        let blob = fs::read_dir(base.join("cas"))
+        let blob = fs::read_dir(base.join("cas/objects/sha256"))
             .expect("cas")
             .flatten()
             .filter(|shard| shard.file_name().len() == 2)
@@ -742,7 +742,7 @@ fn cas_dedup_refuses_a_tampered_blob() {
     config.min_age = Duration::ZERO;
 
     // Planted before any pass: the root is not a CAS, nothing is used.
-    let shard = base.join("cas").join(&hash[..2]);
+    let shard = base.join("cas/objects/sha256").join(&hash[..2]);
     fs::create_dir_all(&shard).expect("mkdir");
     fs::write(shard.join(&hash), vec![2_u8; 100_000]).expect("plant");
     assert!(matches!(
@@ -790,10 +790,16 @@ fn prune_refuses_a_foreign_root_and_keeps_foreign_names() {
     assert!(root.join("ab/session.jsonl").exists());
     assert!(root.join("tmp/notes.txt").exists());
 
-    // Marked: still only `<hh>/<hash>` and `tmp/<hash>.<pid>-<n>` go.
+    // Marked: still only `objects/sha256/<hh>/<hash>` and
+    // `tmp/<hash>.<pid>-<n>` go.
     fs::write(root.join(CAS_MARKER), "spawn\n").expect("marker");
     let hash = format!("ab{}", "0".repeat(62));
-    fs::write(root.join("ab").join(&hash), "blob").expect("write");
+    let objects = root.join("objects/sha256");
+    fs::create_dir_all(objects.join("ab")).expect("mkdir");
+    fs::write(objects.join("ab").join(&hash), "blob").expect("write");
+    fs::write(objects.join("ab/session.jsonl"), "{}\n").expect("write");
+    fs::create_dir_all(objects.join("cd")).expect("mkdir");
+    fs::write(objects.join("cd").join(&hash), "wrong shard").expect("write");
     fs::write(root.join("ab").join(format!("{hash}.jsonl")), "{}\n").expect("write");
     fs::write(root.join("cd").with_extension("jsonl"), "{}\n").expect("write");
     fs::create_dir_all(root.join("cd")).expect("mkdir");
@@ -802,8 +808,10 @@ fn prune_refuses_a_foreign_root_and_keeps_foreign_names() {
     let report = prune_unused(&root, Duration::ZERO).expect("prune");
     assert_eq!(report.blobs_removed, 1, "{report:?}");
     assert_eq!(report.temporaries_removed, 1, "{report:?}");
-    assert!(!root.join("ab").join(&hash).exists());
+    assert!(!objects.join("ab").join(&hash).exists());
     for kept in [
+        objects.join("ab/session.jsonl"),
+        objects.join("cd").join(&hash),
         root.join("ab/session.jsonl"),
         root.join("ab").join(format!("{hash}.jsonl")),
         root.join("cd.jsonl"),
