@@ -2,13 +2,22 @@
 
 Every route `spawn serve` answers under `/api/`, on one page. The router is
 `handle()` and `reader()` in
-[`crates/spawn-cli/src/serve.rs`](../crates/spawn-cli/src/serve.rs); what
-each answer holds is documented on its handler there. Words are as in the
-[glossary](./glossary.md).
+[`crates/spawn-cli/src/serve.rs`](../crates/spawn-cli/src/serve.rs), which
+dispatch on one table, `ROUTES`; what each answer holds is documented on its
+handler there. Words are as in the [glossary](./glossary.md).
 
-`main` serves 28 GET route patterns and 9 POST routes. Any other path,
-under `/api/` or not, is looked up as a file of the built UI (`--web`,
-`SPAWN_WEB_DIR`, default `web/dist`), so an unknown API path is a 404.
+`main` serves 29 GET route patterns and 9 POST routes. (Before issue 98's
+canonical names it was 28 GET patterns: a session's commands and
+judgements were one pattern, `/api/fleet/<session>/<view>`, and are two
+routes now.) A `<name>` in a path is one non-empty segment: `<id>` a
+session id (under `/api/sessions/`) or a mission id (under
+`/api/missions/`), `<n>` a task number, `<m>/<n>` a mission id and an
+objective number. Any other path, under `/api/` or not, is looked up as a
+file of the built UI (`--web`, `SPAWN_WEB_DIR`, default `web/dist`), so an
+unknown API path is a 404. The route tables below and the alias table are
+checked against `ROUTES` and `ALIASES` by the unit test
+`serve::tests::routes_match_docs_api_md`: a route added, renamed or removed
+in one and not the other fails `cargo test`.
 
 ## Reads
 
@@ -22,21 +31,22 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | --- | --- | --- | --- | --- |
 | GET | `/api/overview` | Every session's state and judgement, without the judgement's evidence | – | web (`api.ts`) |
 | GET | `/api/fleet` | The fleet board: every session with its judgement, activity and label, plus the host's health, the decision ladder and gate-room waits | `spawn fleet`: the sessions alone, without the health | web (Fleet, Home) |
-| GET | `/api/fleet/<session>/judgements`, `/api/fleet/<session>/commands` | One session's judgements, or its commands (each with `waiting` while the Bridge holds it for the turn); `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
 | GET | `/api/attention` | The Escalations queue, computed by the dispatcher's own code; the supervisor's question and "For the owner:" lines | – | web (Fleet, Home, sidebar) |
 | GET | `/api/missions` | The mission board: missions, each task with its stages and last gate verdict, the owner's holds; texts as first lines | `spawn mission list` (the same board; the route adds labels) | web (Missions) |
-| GET | `/api/missions/task/<id>` | One task's brief, report and review note in full | – | web (Missions) |
-| GET | `/api/events` | The whole log in log order, a page at a time: `?after=<position>` or `?since_ms=<ms>`, `?limit=` (200, at most 1000), and `next` | – | web (Show) |
-| GET | `/api/session/<id>` | One session: state, executions (with `restart_of`), its events after `?after=`, `reassigned_to` and `reassigned_from` | `spawn tail --session <id>` (overlapping) | web (agent detail) |
-| GET | `/api/pane/<id>` | The tail of the session's live terminal, read from tmux | – | web (agent detail) |
-| GET | `/api/rsi` | Every open objective mission: its backlog's objectives, tasks, gate verdicts, metrics and resident | `spawn mission objectives` (the backlog alone) | web (RSI) |
-| GET | `/api/rsi/task/<id>` | One objective task in full: brief, report, latest gate log, every gate verdict with its log | `spawn task stages --id N` (its stages alone) | web (RSI) |
-| GET | `/api/rsi/objective/<mission>/<id>` | One objective's whole prompt | – | web (RSI) |
-| GET | `/api/rsi/pane` | The live pane of an objective mission's resident; `?mission=` (the first open objective mission by default) | – | web (RSI) |
+| GET | `/api/events` | The whole log in log order, a page at a time: `?after=<position>` or `?since_ms=<ms>` (alias `?since=<ms>`), `?limit=` (200, at most 1000), and `next` | – | web (Show) |
+| GET | `/api/sessions/<id>` | One session: state, executions (with `restart_of`), its events after `?after=`, `reassigned_to` and `reassigned_from` | `spawn tail --session <id>` (overlapping) | web (agent detail) |
+| GET | `/api/sessions/<id>/commands` | One session's commands, each with `waiting` while the Bridge holds it for the turn; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
+| GET | `/api/sessions/<id>/judgements` | One session's judgements, newest first; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
+| GET | `/api/sessions/<id>/pane` | The tail of the session's live terminal, read from tmux | – | web (agent detail) |
+| GET | `/api/tasks/<n>` | One task's brief, report and review note in full | – | web (Missions) |
+| GET | `/api/tasks/<n>/gate` | One objective task in full: brief, report, latest gate log, every gate verdict with its log | `spawn task stages --id N` (its stages alone) | web (RSI) |
+| GET | `/api/objectives` | Every open objective mission: its backlog's objectives, tasks, gate verdicts, metrics and resident | `spawn mission objectives` (the backlog alone) | web (RSI) |
+| GET | `/api/objectives/<m>/<n>` | One objective's whole prompt | – | web (RSI) |
+| GET | `/api/objectives/pane` | The live pane of an objective mission's resident; `?mission=` (the first open objective mission by default) | – | web (RSI) |
 | GET | `/api/scorecard` | Every dimension of the fleet at once; `?mission=&since=&until=` | `spawn scorecard --json` with the same flags: the same JSON | web (Scorecard) |
 | GET | `/api/scorecard/fleet` | How the fleet decides over a window; `?window=24h\|7d\|30d\|90d&until=<RFC 3339>` | – | web (Scorecard) |
 | GET | `/api/interventions` | The north star (human interventions per agent-hour) and the interventions behind it; `?window=24h\|7d&until=` | – | web (Home, Fleet) |
-| GET | `/api/alerts` | The alerts raised, notices folded; `?since=<span>` (the configured window when empty) | `spawn alerts --once --json` with the same flag: the same array | web (Home, sidebar) |
+| GET | `/api/alerts` | The alerts raised, notices folded; `?since=<span>` (alias `?window=<span>`) (the configured window when empty) | `spawn alerts --once --json` with the same flag: the same array | web (Home, sidebar) |
 | GET | `/api/cost` | What the model calls cost per model, mission, task, agent and execution, and per landing; `?window=24h\|7d` | – | web (Cost) |
 | GET | `/api/core-lines` | The core lines the owner steers by, each figure with its value, range and state | – | web (Home) |
 | GET | `/api/verifications` | What is landed and verified or not | `spawn verify list` (the same, ages aside) | no web page; nightly scenario 133 |
@@ -63,11 +73,11 @@ writes nothing, so the page knows before it offers the box.
 
 | Method | Path | Does | CLI twin | Read by |
 | --- | --- | --- | --- | --- |
-| POST | `/api/session/<id>/input` | A person's input to a session, `{"text", "key"}`, typed when the agent's turn ends; 202 with the command | `spawn submit --principal human --action '{"type":"input",...}'`: the same command | web (agent detail, the supervisor's box) |
-| POST | `/api/session/<id>/key` | A named key (escape, up, down, left, right, enter, y, n, digit1 to digit9; a bare `1` to `9` is its digit), `{"name", "key"}`, sent at once | `spawn submit --principal human --action '{"type":"key",...}'` | web (terminal panel) |
-| POST | `/api/session/<id>/restart` | Restarts the session's delivered task on a fresh execution, `{"reason"}` | `spawn task restart --id <task>` (by task, not by session) | web (agent detail) |
-| POST | `/api/session/<id>/reassign` | Moves the session's delivered task to a fresh worker, `{"reason"}` | `spawn task reassign --id <task>` (by task) | web (agent detail) |
-| POST | `/api/mission/<id>/resume` | Resumes the mission from the named halt, `{"halt", "key"}` | `spawn mission resume --id N` (which also ends a pause) | web (Home, Needs you) |
+| POST | `/api/sessions/<id>/input` | A person's input to a session, `{"text", "key"}`, typed when the agent's turn ends; 202 with the command | `spawn submit --principal human --action '{"type":"input",...}'`: the same command | web (agent detail, the supervisor's box) |
+| POST | `/api/sessions/<id>/key` | A named key (escape, up, down, left, right, enter, y, n, digit1 to digit9; a bare `1` to `9` is its digit), `{"name", "key"}`, sent at once | `spawn submit --principal human --action '{"type":"key",...}'` | web (terminal panel) |
+| POST | `/api/sessions/<id>/restart` | Restarts the session's delivered task on a fresh execution, `{"reason"}` | `spawn task restart --id <task>` (by task, not by session) | web (agent detail) |
+| POST | `/api/sessions/<id>/reassign` | Moves the session's delivered task to a fresh worker, `{"reason"}` | `spawn task reassign --id <task>` (by task) | web (agent detail) |
+| POST | `/api/missions/<id>/resume` | Resumes the mission from the named halt, `{"halt", "key"}` | `spawn mission resume --id N` (which also ends a pause) | web (Home, Needs you) |
 | POST | `/api/master/message` | A person's message to the supervisor, `{"text", "mode", "key"}` (`mode` auto, steer, queue or restart; auto by default), through `spawn_human_master_message`: a stopped or stopping supervisor is woken first, the message typed when its turn ends; 202 with the command ids; the same request again answers the first call's ids, another under the key is 409 | `spawn submit --principal human --session session_supervisor --action '{"type":"input",...}'` (no wake, no mode) | not yet (the issue 91 dashboard) |
 | POST | `/api/approvals/<session_id>/act` | Answers one prompt of `/api/approvals`, `{"action", "approval_id", "keys", "text", "key"}`: `allow`, `allow_always` and `deny` need the item's `approval_id` (400 without) and press its keys only while the pane still shows that prompt (409 otherwise); `keys` presses named keys, `text` types a text; 202 with the command ids | `spawn submit --principal human --action '{"type":"key",...}'`, one per key | not yet (the issue 91 dashboard) |
 | POST | `/api/features/scan` | A fresh read-only scan of the feature registry's coverage; changes no file | `spawn features scan` | web (Coverage) |
@@ -80,11 +90,51 @@ token or this page's own `Origin`; `?mission=<id>` names the project.
 
 ## Aliases
 
-Every path above is the only spelling of its route. One query parameter
-has a second spelling: `/api/stream?after_event_id=<id>` is
-`/api/stream?after=<id>` (the cursor `/api/events` and `/api/session/<id>`
-take); both at once is 400. When a route gains a second spelling, both are
-listed here, the old one with the canonical path it answers as.
+Every route above has one canonical path. Issue 98 renamed 11 of them
+to the nouns the UI and the CLI use (sessions, tasks, objectives); each old
+spelling still answers, as an alias: 14 alias patterns (the table below;
+the session writes are four rows of one rename). `handle()` rewrites a legacy path to
+its canonical path before anything else (the read guard, the method, the
+shared answer's key), so a legacy request gets exactly the canonical
+answer, status and body, from the same cached answer, plus the header
+`Link: <canonical path>; rel="successor-version"`. The header is left
+out, the answer otherwise the same, when the path holds a byte that is not
+graphic ASCII (a space, CR, LF or other control byte) or one of `<`, `>`
+and `"`: a request line cannot write a header of its own. The server logs
+the first request of each legacy spelling, once per process, as its two
+patterns (legacy and canonical), never the request's own bytes. A legacy path
+that fits no row below (an empty or extra segment) is an unknown path: 404.
+The web UI reads only canonical paths.
+
+| Legacy path | Canonical path |
+| --- | --- |
+| `/api/session/<id>` | `/api/sessions/<id>` |
+| `/api/fleet/<id>/commands` | `/api/sessions/<id>/commands` |
+| `/api/fleet/<id>/judgements` | `/api/sessions/<id>/judgements` |
+| `/api/pane/<id>` | `/api/sessions/<id>/pane` |
+| `/api/session/<id>/input` | `/api/sessions/<id>/input` |
+| `/api/session/<id>/key` | `/api/sessions/<id>/key` |
+| `/api/session/<id>/restart` | `/api/sessions/<id>/restart` |
+| `/api/session/<id>/reassign` | `/api/sessions/<id>/reassign` |
+| `/api/mission/<id>/resume` | `/api/missions/<id>/resume` |
+| `/api/missions/task/<n>` | `/api/tasks/<n>` |
+| `/api/rsi/task/<n>` | `/api/tasks/<n>/gate` |
+| `/api/rsi` | `/api/objectives` |
+| `/api/rsi/objective/<m>/<n>` | `/api/objectives/<m>/<n>` |
+| `/api/rsi/pane` | `/api/objectives/pane` |
+
+`/api/missions/task/resume` is the legacy task path, answered as
+`/api/tasks/resume` (a malformed task number), as it always was, not a
+resume of mission `task` (a mission id is a number).
+
+Three query parameters have a second spelling. Giving both spellings at
+once is 400.
+
+| Parameter | Alias | On |
+| --- | --- | --- |
+| `since=<span>` | `window=<span>` | `/api/alerts` |
+| `since_ms=<ms>` | `since=<ms>` | `/api/events` |
+| `after=<id>` | `after_event_id=<id>` | `/api/stream` (the cursor `/api/events` and `/api/sessions/<id>` take) |
 
 ## Access
 

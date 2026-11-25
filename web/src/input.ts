@@ -1,8 +1,8 @@
 // A person's input to a session, typed on this page: `POST
-// /api/session/<id>/input` (crates/spawn-cli/src/serve.rs), the one thing
+// /api/sessions/<id>/input` (crates/spawn-cli/src/serve.rs), the one thing
 // the page writes. This module holds the rules the input box follows: what
 // may be sent, what the probe and the answer say, and what became of a
-// message, read from the session's commands (`/api/fleet/<id>/commands`:
+// message, read from the session's commands (`/api/sessions/<id>/commands`:
 // its state, and `waiting` once the Bridge holds it for the agent's turn).
 //
 // Pure: no runtime imports, so `node --test` loads it as it is.
@@ -104,7 +104,7 @@ export function keepsKey(status: number | null): boolean {
 }
 
 /** The server's answer to a restart or a reassign (`POST
- * /api/session/<id>/restart`, `/reassign`): the task and the worker's
+ * /api/sessions/<id>/restart`, `/reassign`): the task and the worker's
  * session that now carry the work, or why it was refused (409: the session
  * holds no delivered task). */
 export type MoveAnswer =
@@ -139,7 +139,7 @@ export interface Sent {
   outcome?: Progress;
 }
 
-/** A command of the session, as `/api/fleet/<id>/commands` lists it. */
+/** A command of the session, as `/api/sessions/<id>/commands` lists it. */
 export interface CommandState {
   command_id: number | null;
   state: string | null;
@@ -238,7 +238,7 @@ export function withSent(sent: readonly Sent[], entry: Sent, keep = 3): Sent[] {
   return [entry, ...sent.filter((other) => other.key !== entry.key)].slice(0, keep);
 }
 
-/** Normalize one entry of `/api/fleet/<id>/commands` to what [`progress`]
+/** Normalize one entry of `/api/sessions/<id>/commands` to what [`progress`]
  * reads (an older server lists no `waiting`). */
 export function commandState(value: unknown): CommandState {
   const raw = object(value);

@@ -460,7 +460,7 @@ export async function fetchAttention(signal: AbortSignal): Promise<Attention> {
   return readApi("/api/attention", signal, normalizeAttention);
 }
 
-/** `POST /api/session/<id>/input` with `body` (a person's input, or the
+/** `POST /api/sessions/<id>/input` with `body` (a person's input, or the
  * probe): the HTTP status, null when the server was not reached, and its
  * JSON answer. The one write of the page (crates/spawn-cli/src/serve.rs):
  * the browser adds this page's Origin, and the token goes as with reads. */
@@ -472,7 +472,7 @@ export async function postInput(
   return postWrite(sessionId, "input", body, signal);
 }
 
-/** `POST /api/session/<id>/key` with `{name, key}`: a person's named key
+/** `POST /api/sessions/<id>/key` with `{name, key}`: a person's named key
  * (backlog P1), a command of its own, with the input's guards. 409 when the
  * session runs no execution, with the reason. */
 export async function postKey(
@@ -483,7 +483,7 @@ export async function postKey(
   return postWrite(sessionId, "key", body, signal);
 }
 
-/** `POST /api/session/<id>/restart` or `/reassign` with `{reason}`: a
+/** `POST /api/sessions/<id>/restart` or `/reassign` with `{reason}`: a
  * person restarts the session's delivered task (a fresh execution of its
  * own session, its work kept) or reassigns it to a fresh worker whose
  * branch starts from this one's work. 202 with `{task, session_id,
@@ -498,7 +498,7 @@ export async function postTaskMove(
   return postWrite(sessionId, action, body, signal);
 }
 
-/** `POST /api/mission/<id>/resume` with `{halt, key}`: a person resumes a
+/** `POST /api/missions/<id>/resume` with `{halt, key}`: a person resumes a
  * halted mission on the halt the page showed (its `mission.halted` event).
  * 202 with `{event}`, the `mission.resumed` record (the same one for the
  * same key again); 409 with the reason when the mission is not halted, or
@@ -508,7 +508,7 @@ export async function postResume(
   body: { halt: number; key: string } | { probe: true },
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
-  return postJson(`/api/mission/${encodeURIComponent(String(mission))}/resume`, body, signal);
+  return postJson(`/api/missions/${encodeURIComponent(String(mission))}/resume`, body, signal);
 }
 
 async function postWrite(
@@ -517,7 +517,7 @@ async function postWrite(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
-  return postJson(`/api/session/${encodeURIComponent(sessionId)}/${path}`, body, signal);
+  return postJson(`/api/sessions/${encodeURIComponent(sessionId)}/${path}`, body, signal);
 }
 
 /** POST `body` as JSON to `url` with the page's headers: the HTTP status,
@@ -565,7 +565,7 @@ export async function fetchSession(
   id: string,
   signal: AbortSignal,
 ): Promise<SessionDetail> {
-  const url = `/api/session/${encodeURIComponent(id)}?after=0&limit=300`;
+  const url = `/api/sessions/${encodeURIComponent(id)}?after=0&limit=300`;
   return readApi(url, signal, normalizeSession);
 }
 
@@ -574,7 +574,7 @@ export async function fetchSession(
  * event answers its state with an empty timeline), then the newest `count`
  * sequence numbers, read back further while the observer's hidden events
  * leave it short. `timeline` is the window's events. No endpoint of its
- * own: /api/session pages forward from `after`. */
+ * own: /api/sessions/<id> pages forward from `after`. */
 export interface SessionTail extends SessionDetail {
   window: EventWindow;
 }
@@ -584,7 +584,7 @@ export async function fetchSessionTail(
   count: number,
   signal: AbortSignal,
 ): Promise<SessionTail> {
-  const base = `/api/session/${encodeURIComponent(id)}`;
+  const base = `/api/sessions/${encodeURIComponent(id)}`;
   const head = await readApi(`${base}?after=${Number.MAX_SAFE_INTEGER}&limit=1`, signal, normalizeSession);
   const latest = Math.max(head.session_seq, head.freshness?.last_session_seq ?? 0);
   const window = await readTail(latest, sessionReader(id, signal), count, count);
@@ -596,7 +596,7 @@ export function sessionReader(id: string, signal: AbortSignal): PageReader {
   return async (after, limit) =>
     (
       await readApi(
-        `/api/session/${encodeURIComponent(id)}?after=${after}&limit=${limit}`,
+        `/api/sessions/${encodeURIComponent(id)}?after=${after}&limit=${limit}`,
         signal,
         normalizeSession,
       )

@@ -313,7 +313,7 @@ fn the_items_are_the_prompts_the_asking_judgements_and_the_halted_missions() {
     assert_eq!(listed[1]["label"], "asks which branch to use");
     assert_eq!(listed[1]["options"], json!([]));
     let halted = &listed[2];
-    assert_eq!(halted["resume"]["endpoint"], "/api/mission/7/resume");
+    assert_eq!(halted["resume"]["endpoint"], "/api/missions/7/resume");
     assert_eq!(halted["resume"]["halt"], 991);
     // Its option has the documented fields, and only them.
     let mut fields: Vec<&str> = halted["options"][0]

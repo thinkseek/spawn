@@ -1,5 +1,5 @@
 //! A person's key from the web page (`spawn serve`, `POST
-//! /api/session/<id>/key`, backlog P1): the `spawn_human` login calls
+//! /api/sessions/<id>/key`, backlog P1): the `spawn_human` login calls
 //! `spawn_human_key`, which makes the key command `spawn submit --principal
 //! human --action '{"type":"key","key":...}'` makes, to the session's own
 //! agent, with the same idempotency rule, as its own action type. A session

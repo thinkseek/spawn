@@ -1,5 +1,5 @@
-// Read model of the fleet: `/api/fleet`, `/api/fleet/<id>/judgements`,
-// `/api/fleet/<id>/commands` and `/api/pane/<id>`. Every field is normalized,
+// Read model of the fleet: `/api/fleet`, `/api/sessions/<id>/judgements`,
+// `/api/sessions/<id>/commands` and `/api/sessions/<id>/pane`. Every field is normalized,
 // so a server that omits one renders an empty value instead of crashing.
 
 import type { SessionState } from "./api";
@@ -540,7 +540,7 @@ export async function fetchJudgements(
   limit = 60,
 ): Promise<JudgementRecord[]> {
   return readApi(
-    `/api/fleet/${sessionPath(sessionId)}/judgements?limit=${limit}`,
+    `/api/sessions/${sessionPath(sessionId)}/judgements?limit=${limit}`,
     signal,
     normalizeJudgements,
   );
@@ -552,7 +552,7 @@ export async function fetchCommands(
   limit = 40,
 ): Promise<CommandRecord[]> {
   return readApi(
-    `/api/fleet/${sessionPath(sessionId)}/commands?limit=${limit}`,
+    `/api/sessions/${sessionPath(sessionId)}/commands?limit=${limit}`,
     signal,
     normalizeCommands,
   );
@@ -562,7 +562,7 @@ export async function fetchAgentPane(
   sessionId: string,
   signal: AbortSignal,
 ): Promise<RsiPane> {
-  return readApi(`/api/pane/${sessionPath(sessionId)}`, signal, normalizePane);
+  return readApi(`/api/sessions/${sessionPath(sessionId)}/pane`, signal, normalizePane);
 }
 
 // ---------------------------------------------------------------------------

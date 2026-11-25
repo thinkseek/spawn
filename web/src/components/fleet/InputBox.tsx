@@ -32,7 +32,7 @@ import { cx } from "../ui";
 const MAX_HEIGHT = 200;
 
 /**
- * A person's input to one session (`POST /api/session/<id>/input`): one
+ * A person's input to one session (`POST /api/sessions/<id>/input`): one
  * line that grows, Enter sends, Shift+Enter starts a new line. Under it,
  * what this page sent there and what became of each: queued, waiting for
  * the agent's turn, typed, or why not (from the session's commands). It

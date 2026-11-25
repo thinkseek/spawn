@@ -20,7 +20,7 @@ import { FOCUS_RING, FOCUS_RING_INSET, cx, sinceText } from "../ui";
 /** What a resume from the page came to. */
 type Resumed = { state: "idle" } | { state: "sending" } | { state: "done" } | { state: "refused"; why: string };
 
-/** A halted mission's Resume: `POST /api/mission/<id>/resume` naming the
+/** A halted mission's Resume: `POST /api/missions/<id>/resume` naming the
  * halt the item shows. One idempotency key per halt, kept across clicks,
  * so a retried click (the answer lost) resumes once; a page not refreshed
  * since another halt is refused by the server with the reason. */

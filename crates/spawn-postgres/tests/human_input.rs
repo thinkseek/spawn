@@ -1,5 +1,5 @@
 //! A person's input from the web page (`spawn serve`, `POST
-//! /api/session/<id>/input`): the `spawn_human` login calls
+//! /api/sessions/<id>/input`): the `spawn_human` login calls
 //! `spawn_human_input`, which makes the command `spawn submit --principal
 //! human --action '{"type":"input",...}'` makes, to the session's own agent,
 //! with the same idempotency rule. That login can do nothing else.

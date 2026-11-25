@@ -1,6 +1,6 @@
 /* Named keys for an agent (backlog P1): Esc, the arrows, Enter, Y and N,
  * sent from the terminal panel as recorded commands of their own
- * (`POST /api/session/<id>/key`), never as text. A key goes only while the
+ * (`POST /api/sessions/<id>/key`), never as text. A key goes only while the
  * terminal panel itself has focus and is armed: never from a text box,
  * never with Ctrl, Alt or Meta (the browser's and the page's shortcuts), and
  * never an auto-repeat (a held arrow would queue a command per repeat).

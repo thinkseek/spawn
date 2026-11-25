@@ -29,7 +29,7 @@ const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
 /** The mission's gate verdicts: its tasks on a time axis, each verdict a
  * mark on its task's bar and each send-back a return arrow, or the table
  * of verdicts, newest first. The timeline reads the task stages from
- * /api/missions and each verdict's reason from /api/rsi. */
+ * /api/missions and each verdict's reason from /api/objectives. */
 export function GateVerdicts({
   mission,
   selected,

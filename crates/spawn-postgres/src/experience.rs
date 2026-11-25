@@ -179,7 +179,7 @@ impl PostgresStore {
     ///
     /// A mission's `owner_work` reads its last configuration record, and
     /// that is its configuration as its fold has it (`mission_missions`,
-    /// what `/api/rsi` shows): every configure records every setting
+    /// what `/api/objectives` shows): every configure records every setting
     /// (`spawn mission configure` merges its change into the row through
     /// `spawn_mission_reconfigure`), and the fold replaces them, so a later
     /// configure that names only `accept` or a budget keeps the backlog

@@ -3,8 +3,8 @@
  * What Spawn types into an agent for a command (an input, a start or a
  * resume with a prompt) is a message, tracked by the command's id from the
  * records: recorded, typed, taken (its marker reached the engine's
- * transcript), answered (the turn it started ended). `GET /api/fleet/
- * <session>/commands` gives each command its `message`, null for one that
+ * transcript), answered (the turn it started ended). `GET /api/sessions/
+ * <id>/commands` gives each command its `message`, null for one that
  * types nothing. The agent page says it beside the command:
  * "not typed yet", "typed, not taken yet", "not taken (never typed)",
  * "not taken (typed)", "taken in 2 s · answered in 4 min · taken 2×".

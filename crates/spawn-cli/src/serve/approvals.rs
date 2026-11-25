@@ -5,7 +5,7 @@
 //! No agent protocol is spoken (no ACP): the engines (Claude Code, Codex
 //! CLI, AGY CLI, OpenCode) run in Spawn's terminal host as ever (`tmux` or
 //! Herdr, `config::terminal_host`), and what each shows is read from the
-//! tail of its pane, as `/api/pane/<id>` reads it, by [`detect`]: a fixed
+//! tail of its pane, as `/api/sessions/<id>/pane` reads it, by [`detect`]: a fixed
 //! set of text rules, the same for every engine, no model involved. An
 //! answer is the named keys (spawn-core `NamedKey`, the digits `digit1` to
 //! `digit9` of a numbered choice included) or the text a person could
@@ -28,7 +28,7 @@
 //!     "options": [{"id", "label", "keys": ["digit1"], "text": null, "danger": false,
 //!                  "action": "allow" | "allow_always" | "deny" | "keys" | "resume"}],
 //!     "judgement": {state, needs_human, attention, reason} | null,
-//!     "resume": {"endpoint": "/api/mission/<id>/resume", "halt": <event>},  // mission_halted only
+//!     "resume": {"endpoint": "/api/missions/<id>/resume", "halt": <event>},  // mission_halted only
 //!     "detected_at_ms": ...
 //! }], "warnings": [...] }
 //! ```
@@ -76,7 +76,7 @@
 //! "allow_always" | "deny" | "keys" | "text", "approval_id"?: "<item id>",
 //! "keys"?: [...], "text"?: "...", "key": "<idempotency key>"}` (the key
 //! may come in an `Idempotency-Key` header), or `{"probe": true}`, with
-//! every guard of `POST /api/session/<id>/input` in its order. `allow`,
+//! every guard of `POST /api/sessions/<id>/input` in its order. `allow`,
 //! `allow_always` and `deny` need `approval_id`, the `id` of the item the
 //! page showed (400 without): the pane is read again now, and the keys of
 //! the answer are pressed only when the prompt showing has that id; 409,
@@ -778,7 +778,7 @@ pub(super) fn items(panes: &[Pane], board: &Value, now: i64) -> Vec<Value> {
                 "id": "resume", "label": "Resume the mission", "keys": [], "text": null,
                 "danger": false, "action": "resume",
             }],
-            "resume": {"endpoint": format!("/api/mission/{id}/resume"), "halt": event},
+            "resume": {"endpoint": format!("/api/missions/{id}/resume"), "halt": event},
             "judgement": null,
             "detected_at_ms": halt.get("at_ms").and_then(Value::as_i64).unwrap_or(now),
         }));
@@ -794,7 +794,7 @@ fn backend(host: &spawn_host::LocalTerminalHost) -> &'static str {
     }
 }
 
-/// The pane tail of execution `execution` of `agent`, as `/api/pane/<id>`
+/// The pane tail of execution `execution` of `agent`, as `/api/sessions/<id>/pane`
 /// reads it (nothing when it cannot be captured).
 fn capture(
     host: &spawn_host::LocalTerminalHost,

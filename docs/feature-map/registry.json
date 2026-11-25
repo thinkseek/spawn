@@ -184,7 +184,6 @@
       "id": "domain-core-runtime",
       "title": "Core Domain, Bridge & Event Engine",
       "kind": "domain",
-      "parent": null,
       "summary": "Pure domain types, event normalization, Bridge orchestration, CLI entrypoint, and synchronous runtime loop.",
       "files": [],
       "relations": [
@@ -222,7 +221,6 @@
       "id": "domain-storage-postgres",
       "title": "PostgreSQL Event Store, KDF & Storage Lifecycle",
       "kind": "domain",
-      "parent": null,
       "summary": "Append-only PostgreSQL event log, command queue, role KDF, disk/extent accounting, commit map, and scratch lease lifecycle.",
       "files": [],
       "relations": [
@@ -260,7 +258,6 @@
       "id": "domain-host-execution",
       "title": "Host Execution, Git Workspaces, tmux & Transcripts",
       "kind": "domain",
-      "parent": null,
       "summary": "Host-level git workspace branching/merging/set-aside, tmux terminal lifecycle, and durable transcript archiving.",
       "files": [],
       "relations": [
@@ -314,7 +311,6 @@
       "id": "domain-observer-jev",
       "title": "Semantic Observer, Screen Parser & Jev Judge Relay",
       "kind": "domain",
-      "parent": null,
       "summary": "Tail-screen state parser, tiered semantic observation rules, shadow observer, and Jev/model HTTP judge relays.",
       "files": [],
       "relations": [
@@ -353,7 +349,6 @@
       "id": "domain-missions-fleet",
       "title": "Missions, Fleet Dispatch, Verification & RSI Gate",
       "kind": "domain",
-      "parent": null,
       "summary": "Mission/task/resident lifecycle, supervisor & stall escalation, verification records, and autonomous RSI integration gate.",
       "files": [],
       "relations": [
@@ -402,7 +397,6 @@
       "id": "domain-observability-ops",
       "title": "Scorecard, Cost, Alerts, Security, Backup & Deployment",
       "kind": "domain",
-      "parent": null,
       "summary": "Fleet scorecard, token cost accounting, alerts/acks, secret masking, backup/restore drills, systemd units, and host deployment.",
       "files": [],
       "relations": [
@@ -453,7 +447,6 @@
       "id": "domain-dashboard-web",
       "title": "Observer HTTP API & Web Dashboard",
       "kind": "domain",
-      "parent": null,
       "summary": "Authenticated HTTP/ETag server (`spawn serve`), capability feature map, design system, and individual web dashboard views.",
       "files": [],
       "relations": [
@@ -540,7 +533,6 @@
       "id": "domain-workspace-foundation",
       "title": "Workspace Toolchain & Project Overview Docs",
       "kind": "domain",
-      "parent": null,
       "summary": "Top-level Rust workspace build manifests, pinned toolchain/formatter configuration, and project-wide overview documentation.",
       "files": [],
       "relations": [
@@ -2576,6 +2568,8 @@
         "rsi/backlog/231.json",
         "rsi/backlog/233.json",
         "rsi/scenarios/040.sh",
+        "rsi/scenarios/176.sh",
+        "rsi/scenarios/check-j05-operator.sh",
         "rsi/scenarios/nightly/051.sh",
         "rsi/scenarios/nightly/064.sh",
         "rsi/scenarios/nightly/066.sh",
@@ -2590,7 +2584,6 @@
         "rsi/scenarios/nightly/132.sh",
         "rsi/scenarios/nightly/148.sh",
         "rsi/scenarios/nightly/156.sh",
-        "rsi/scenarios/176.sh",
         "rsi/scenarios/nightly/181.sh",
         "rsi/scenarios/nightly/182.sh",
         "rsi/scenarios/nightly/185.sh",
@@ -2601,7 +2594,7 @@
         "rsi/scenarios/nightly/231.sh",
         "rsi/scenarios/nightly/233.sh",
         "rsi/scenarios/nightly/check-j03-human.sh",
-        "rsi/scenarios/check-j05-operator.sh"
+        "web/test/canonicalRoutes.test.ts"
       ],
       "relations": [
         {
@@ -3396,7 +3389,6 @@
       "id": "t559u-feature-map-initiative",
       "title": "Full-Project Feature Map Initiative (t559u)",
       "kind": "initiative",
-      "parent": null,
       "summary": "Owner initiative t559u expanding Spawn's feature map with interactive mindmap visualization (Slice A), semantic file coverage & one-click wild-file scan (Slice B / t565u), and content-derived storage keys (Slice C).",
       "status_note": "Active multi-slice initiative branched from main 6c5d22782.",
       "files": [
@@ -3593,7 +3585,7 @@
     },
     {
       "id": "t565u-wild-file-scan",
-      "title": "One-Click Unassociated-File ('\u91ce\u6587\u4ef6') Scan (t565u)",
+      "title": "One-Click Unassociated-File ('野文件') Scan (t565u)",
       "kind": "capability",
       "parent": "t559u-feature-map-initiative",
       "summary": "Owner capability t565u: one-click scan surfacing unassociated in-scope files with evidence and feature suggestions, strictly separating stale references and explicit exclusions, supporting non-destructive many-to-many linking.",
@@ -3694,9 +3686,8 @@
       "id": "t567u-multi-machine-distributed",
       "title": "Multi-Machine Distributed Compute & Storage Research (t567u/t568u)",
       "kind": "research-initiative",
-      "parent": null,
       "summary": "Distinct staged research & design initiative (Stages 1-4: failure model, mature consensus evaluation, isolated PoCs, discarded alternatives & owner decisions). Explicitly NOT a production implementation and NOT a 4th slice of t559u; permanently excludes sold machine mac16.",
-      "status_note": "Staged research/design only \u2014 NOT a production implementation and NOT a 4th slice of t559u. Permanently excludes sold mac16.",
+      "status_note": "Staged research/design only — NOT a production implementation and NOT a 4th slice of t559u. Permanently excludes sold mac16.",
       "files": [
         "docs/feature-map/library-extraction-analysis.md",
         "docs/feature-map/t567u-t568u-distributed-research.md",

@@ -25,7 +25,7 @@
 //!   `?token=`, `SPAWN_SERVE_LOCAL_OPEN`, `SPAWN_SERVE_OPEN_NETWORKS`), and
 //!   only GET is taken (405 otherwise).
 //! - Catch-up. `Last-Event-ID` (the browser's own reconnect), else
-//!   `?after=<id>` (the cursor `/api/events` and `/api/session/<id>` take;
+//!   `?after=<id>` (the cursor `/api/events` and `/api/sessions/<id>` take;
 //!   `?after_event_id=<id>` is its alias, both at once a 400, as is a value
 //!   that is no whole number at least 0) replays the events after that id, at most
 //!   [`REPLAY_MAX`], before the live ones, none twice; a cursor further
@@ -429,7 +429,7 @@ pub(super) fn listen(
 
 /// The cursor a stream asks to catch up from: `Last-Event-ID` (the
 /// browser's reconnect, newer than its URL's), else `?after=` as
-/// `/api/events` and `/api/session/<id>` take it, `?after_event_id=` its
+/// `/api/events` and `/api/sessions/<id>` take it, `?after_event_id=` its
 /// alias. Both query names at once, or a value that is no whole number at
 /// least 0, is the caller's mistake (400).
 pub(super) fn cursor(last_event_id: Option<&str>, query: &str) -> Result<Option<i64>, String> {

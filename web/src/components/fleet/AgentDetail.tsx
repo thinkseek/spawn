@@ -1255,7 +1255,7 @@ function CommandItem({ record }: { record: CommandRecord }) {
 
 /** Named keys for the agent on screen (backlog P1), when `to` names it
  * (it runs, and the live view shows) and this page may write: each key a
- * command of its own, `POST /api/session/<id>/key`, with a fresh
+ * command of its own, `POST /api/sessions/<id>/key`, with a fresh
  * idempotency key; the last one's fate shows under the panel ("Esc sent",
  * or the server's refusal, e.g. a session that stopped meanwhile). */
 function useAgentKeys(

@@ -96,8 +96,8 @@ test("each URL keeps its own answer, and an untagged answer is not kept", async 
 test("a second reader of one URL gets the answer in its own reading", async () => {
   const { fetcher } = server([{ body: { n: 3 }, etag: 'W/"c"' }]);
   const reads = new Validated(fetcher);
-  await reads.read("/api/rsi", (raw) => (raw as { n: number }).n, options());
-  const other = await reads.read("/api/rsi", (raw) => `n=${(raw as { n: number }).n}`, options());
+  await reads.read("/api/objectives", (raw) => (raw as { n: number }).n, options());
+  const other = await reads.read("/api/objectives", (raw) => `n=${(raw as { n: number }).n}`, options());
   assert.equal(other, "n=3");
 });
 

@@ -104,7 +104,7 @@ export interface NeedItem {
   /** The command that acts on it, to copy. */
   command: string | null;
   /** A halted mission's resume from the page (`POST
-   * /api/mission/<mission>/resume`): the mission and the halt it resumes
+   * /api/missions/<id>/resume`): the mission and the halt it resumes
    * (its `mission.halted` event), so a page not refreshed resumes no other. */
   resume?: { mission: number; halt: number } | null;
   /** The session whose page answers it (a question, an escalated agent). */

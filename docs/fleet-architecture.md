@@ -1096,7 +1096,7 @@ it, on the same ladder.
   why a worker at its prompt is in no queue. The owner can type to the
   supervisor at any time (the box at the top of the Fleet page, its pane, or
   `spawn submit`), and to any agent (the box in its detail drawer; both
-  boxes are `POST /api/session/<id>/input`, §5); the supervisor reads that
+  boxes are `POST /api/sessions/<id>/input`, §5); the supervisor reads that
   as an instruction, which may reverse one of its decisions, not as the
   answer to a question. Each human action is a command with principal
   `human`; it is the event the whole system tries to make rarer.
@@ -1298,7 +1298,7 @@ execution, or its task a fresh worker, without losing its work, by the
 owner or the supervisor (`spawn task restart --id N [--reason <text>]`,
 `spawn task reassign --id N [--reason <text>]`, the store's
 `spawn_task_restart` and `spawn_task_reassign`), or by a person from the
-agent page (`POST /api/session/<id>/restart` and `/reassign`, `by` `human`,
+agent page (`POST /api/sessions/<id>/restart` and `/reassign`, `by` `human`,
 through `spawn_human_task`); a stuck worker's `agent_stuck` alert names its
 `spawn task restart --id N` ("Alerts"). Each takes a `delivered` task only, refuses any
 other naming its state (nothing recorded or sent), and prints `{task,
@@ -1311,7 +1311,7 @@ session_id, agent_id}`: the task and the worker that now carry the work.
   dispatcher then resumes the same native session on the same workspace,
   once (`restart-<task>-<n>`), with a prompt naming the restart and its
   reason. A worker that no longer ran is resumed at once. `GET
-  /api/session/<id>` names, on the execution the resume started, the one it
+  /api/sessions/<id>` names, on the execution the resume started, the one it
   replaced (`restart_of`).
 - *Reassign.* In one transaction, as the re-issue: the old task's
   `task.cancelled` names `by`, `reason` and `reassigned_as`; the new task's
@@ -1326,7 +1326,7 @@ session_id, agent_id}`: the task and the worker that now carry the work.
   `from`. A Stop of the old worker that fails is pursued and escalated
   (`dispatch::stops`, its line naming the reassign); once escalated, the
   new task goes without waiting further, from the last recorded checkpoint.
-  `GET /api/session/<id>` links the two: `reassigned_to` on the old
+  `GET /api/sessions/<id>` links the two: `reassigned_to` on the old
   session, `reassigned_from` on the new, each `{task, session_id}`.
 
 **Work stealing (objective 239).** Each resident's pending queue is its
@@ -1818,7 +1818,7 @@ A message's id is its command's id, carried end to end:
   `message_not_taken` (below, issue #66 Part 1), even when the line is the
   agent's own output; that movement alone does not mark the message taken or
   answered.
-- **The lifecycle, from records only.** `GET /api/fleet/<session>/commands`
+- **The lifecycle, from records only.** `GET /api/sessions/<id>/commands`
   gives each command a `message` (`spawn_command_message` in the schema),
   null for a command that types nothing: `{state, typed_at_ms, taken_at_ms,
   answered_at_ms, taken, not_taken}`. `typed_at_ms` is the Bridge's `typed`
@@ -2065,11 +2065,25 @@ The Scorecard's "How the fleet decides" reads it over the page's window;
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
 Every route the API answers, with its method, what it answers, its CLI twin
-and who reads it, is listed once in [docs/api.md](./api.md): 28 GET route
-patterns and 9 POST routes on `main`. The reads run as `spawn_reader`, with
-GET only (any other method on a read is 405); each read's answer is
-documented on its handler in `crates/spawn-cli/src/serve.rs` (the answer of
-`/api/attention` in `crates/spawn-cli/src/serve/attention.rs`).
+and who reads it, is listed once in [docs/api.md](./api.md): 29 GET route
+patterns and 9 POST routes on `main`, all from one table, `ROUTES` in
+`crates/spawn-cli/src/serve.rs`, which the router dispatches on and a unit
+test (`routes_match_docs_api_md`) holds equal to docs/api.md. The paths name
+the record's nouns (issue 98): a session's reads and writes are under
+`/api/sessions/<id>`, a task's under `/api/tasks/<n>`, the objective
+missions' under `/api/objectives`, a mission's resume under
+`/api/missions/<id>/resume`. The 14 older spellings (14 alias patterns for
+the 11 renamed routes: `/api/session/`,
+`/api/fleet/<id>/commands`, `/api/pane/`, `/api/rsi`, ...) are aliases
+(`ALIASES`): `handle()` rewrites one to its canonical path before the read
+guard and the shared answer's key, answers exactly as the canonical path
+does with `Link: <canonical>; rel="successor-version"` (left out when the
+path holds a byte unsafe in a header), and logs the first of each spelling
+once, as its two patterns only. The web UI reads only canonical paths. The reads run
+as `spawn_reader`, with GET only (any other method on a read is 405); each
+read's answer is documented on its handler in
+`crates/spawn-cli/src/serve.rs` (the answer of `/api/attention` in
+`crates/spawn-cli/src/serve/attention.rs`).
 
 Of the nine POST routes, seven are a person's writes, as the `spawn_human`
 login: an input to a session and a named key (below), a restart or a
@@ -2078,7 +2092,7 @@ reassign of a stalled worker (§3.2), the resume of a halted mission
 (issue #91, below). The other two are the feature registry's scan and association,
 which change no record (docs/feature-map.md). The input is a person's input
 to a session, `POST
-/api/session/<id>/input` with `{"text", "key"}` (the key, an idempotency
+/api/sessions/<id>/input` with `{"text", "key"}` (the key, an idempotency
 key, may come as an `Idempotency-Key` header). That is the command `spawn
 submit --principal human --agent <the session's agent> --session <id> --key
 <key> --action '{"type":"input","text":...}'` makes, with the same
@@ -2105,7 +2119,7 @@ same session and text, or key name): sent for another session or with other
 content it is 409, makes no command, and the page takes a new key
 (`spawn_human_replay`).
 
-The key is a person's named key, `POST /api/session/<id>/key` with
+The key is a person's named key, `POST /api/sessions/<id>/key` with
 `{"name", "key"}` (§3, "Named keys never wait"): the command `spawn submit
 --principal human ... --action '{"type":"key","key":<name>}'` makes, through
 `spawn_human_key` (the `spawn_human` login's other right), with the input's
@@ -2185,11 +2199,11 @@ record.
   Markdown `digest_text` under 4000 bytes, masked; a part that cannot be
   read is named in `warnings` (`crates/spawn-cli/src/serve/digest.rs`).
 
-`/api/missions` and `/api/rsi` send what the lists show: a task's brief,
+`/api/missions` and `/api/objectives` send what the lists show: a task's brief,
 report and review note come as their first lines with their whole length
-(`<field>_bytes`), and `/api/missions/task/<id>` answers the whole texts
+(`<field>_bytes`), and `/api/tasks/<n>` answers the whole texts
 when a task is opened; an objective's prompt comes as its first lines and
-`/api/rsi/objective/<mission>/<id>` answers it whole when the objective is
+`/api/objectives/<m>/<n>` answers it whole when the objective is
 pointed at. Every answer carries a weak `ETag` and a read that
 sends it back (`If-None-Match`) gets 304 while nothing it shows changed; a
 read that says `Cache-Control: max-age=1`, as the page's polls do, may be
@@ -2240,7 +2254,7 @@ Jev on ambiguity, with the full payload. The dispatcher's policy decides
 fixed cases by rules, allows one guarded Jev-gated nudge (`continue`), and
 escalates everything else to the supervisor, which may escalate to a human.
 A human reads the escalations queue when they choose and types to any
-session from the web page (`POST /api/session/<id>/input`) or with `spawn
+session from the web page (`POST /api/sessions/<id>/input`) or with `spawn
 submit --principal human`.
 Every decision is in the log with its evidence and what followed it.
 
@@ -3217,7 +3231,7 @@ are per-agent uids or a mount per engine.
     `main_moved`), so `spawn mission moved` can tell it from any other.
 
   A halted mission lands nothing until a human runs `spawn mission resume`,
-  or resumes it from Needs you (`POST /api/mission/<id>/resume` {halt, key},
+  or resumes it from Needs you (`POST /api/missions/<id>/resume` {halt, key},
   as the `spawn_human` login through `spawn_human_resume`: the same
   `mission.resumed`, with `by` `human` and the `halt` it resumes, refused
   with the reason unless the mission is halted on exactly that halt, once
@@ -3615,11 +3629,11 @@ are per-agent uids or a mount per engine.
     (`recurring`, `metric`, `target`) stays open until the metric of its
     latest landing meets the target; the metric comes from the gate's
     verdict, never from scenario output.
-- **The RSI page** reads the objective missions: `/api/rsi` lists each open
+- **The RSI page** reads the objective missions: `/api/objectives` lists each open
   objective mission with its backlog's objectives (status, landed metric
   values), its tasks with their `task.gated` verdicts, the halt reason and
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
-  every view of the backlog (`/api/rsi`, `/api/overview`'s RSI summary,
+  every view of the backlog (`/api/objectives`, `/api/overview`'s RSI summary,
   `spawn mission objectives`) reads the integrator's records as the
   integrator does: an objective with an `objective.solved` record of its
   own mission is solved, as a landing makes it, and its row names the record
@@ -3630,8 +3644,8 @@ are per-agent uids or a mount per engine.
   flight, the attempts and the held objectives), null when it would assign
   nothing. Mission 4's objective 34, solved on the base on 2026-11-08, was
   still shown open and next three days later before this;
-  `/api/rsi/task/<id>` answers one task, `/api/rsi/objective/<mission>/<id>`
-  one objective's whole prompt; `/api/rsi/pane` shows the
+  `/api/tasks/<n>/gate` answers one task, `/api/objectives/<m>/<n>`
+  one objective's whole prompt; `/api/objectives/pane` shows the
   resident's terminal.
 - **One gate at a time, for now.** A judging (fetch, gate, landing) runs
   on a thread of its own. A mission has at most one in flight, and so does

@@ -1,6 +1,6 @@
 // Run by rsi/scenarios/check-web.sh: `node --test test/`. The input box's
 // rules (web/src/input.ts): what may be sent, what the probe and the answer
-// of `POST /api/session/<id>/input` say, and what became of a message, from
+// of `POST /api/sessions/<id>/input` say, and what became of a message, from
 // the session's commands.
 import assert from "node:assert/strict";
 import { test } from "node:test";

@@ -5,7 +5,7 @@
 ## Source and output
 - **Reads**, only from the local page service at 127.0.0.1:8787. The host is fixed, no redirect is followed, and each read has a 5 s socket timeout:
   - `GET /api/fleet` on every run, capped at 1 MiB.
-  - Only for a live agent with an open turn (at most 8 per run): `GET /api/session/<session>?limit=1` for the session's last position, then `?after=<last-64>&limit=64` for its newest events. Each answer is capped at 256 KiB. A session id is put in the path only if it matches `[A-Za-z0-9_.:-]{1,128}` and is not dots only, and it is percent-encoded.
+  - Only for a live agent with an open turn (at most 8 per run): `GET /api/session/<id>?limit=1` (a legacy alias of `/api/sessions/<id>`, docs/api.md) for the session's last position, then `?after=<last-64>&limit=64` for its newest events. Each answer is capped at 256 KiB. A session id is put in the path only if it matches `[A-Za-z0-9_.:-]{1,128}` and is not dots only, and it is percent-encoded.
   - No database, environment file or credential is read.
 - **Writes**, in `~/.local/state/spawn-agent-presence/`, a 0700 folder owned by the user, all files 0600:
   - `presence.json`: the document, at most 16384 bytes. It is written atomically (temp file, then rename), at most once every 10 s; the timer runs every 15 s.

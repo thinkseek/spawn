@@ -4,7 +4,7 @@
 //! - Validation. Every API answer that succeeded carries a weak `ETag`, a
 //!   hash of what it says; a request whose `If-None-Match` names it gets
 //!   `304 Not Modified` and no body. A clock the answer carries only to say
-//!   when it was made (`generated_at_ms` of `/api/rsi` and
+//!   when it was made (`generated_at_ms` of `/api/objectives` and
 //!   `/api/attention`, `captured_at_ms` of a pane) is left out of the hash:
 //!   an answer that differs only there is the same answer, read later
 //!   ([`CLOCKS`]). The page keeps what it last read with its tag, sends the
@@ -87,22 +87,34 @@ pub(super) fn answer(path: &str, read: Result<Value, String>, bad_request: &str)
 fn clocks(path: &str) -> &'static [&'static str] {
     CLOCKS
         .iter()
-        .find(|(prefix, _)| match prefix.strip_suffix('*') {
-            Some(start) => path.starts_with(start),
-            None => path == *prefix,
-        })
+        .find(|(pattern, _)| fits(pattern, path))
         .map_or(&[], |(_, fields)| fields)
 }
 
-/// [`clocks`]' table: a path, or a prefix ending in `*`, and its clocks.
+/// Whether `path` fits `pattern`, segment by segment: a `*` segment is any
+/// one segment that is not empty, any other must be equal.
+fn fits(pattern: &str, path: &str) -> bool {
+    let mut wanted = pattern.split('/');
+    let mut given = path.split('/');
+    loop {
+        match (wanted.next(), given.next()) {
+            (None, None) => return true,
+            (Some("*"), Some(segment)) if !segment.is_empty() => {}
+            (Some(want), Some(segment)) if want == segment => {}
+            _ => return false,
+        }
+    }
+}
+
+/// [`clocks`]' table: a canonical path (`*` for one segment) and its clocks.
 const CLOCKS: [(&str, &[&str]); 7] = [
-    ("/api/rsi", &["generated_at_ms"]),
+    ("/api/objectives", &["generated_at_ms"]),
     ("/api/approvals", &["generated_at_ms"]),
     ("/api/context/digest", &["generated_at_ms"]),
     ("/api/attention", &["generated_at_ms"]),
     ("/api/features", &["generated_at_ms"]),
-    ("/api/rsi/pane", &["captured_at_ms"]),
-    ("/api/pane/*", &["captured_at_ms"]),
+    ("/api/objectives/pane", &["captured_at_ms"]),
+    ("/api/sessions/*/pane", &["captured_at_ms"]),
 ];
 
 /// The weak ETag of an answer of `path`: a hash of its body (`body`, the
@@ -171,7 +183,8 @@ pub(super) fn accepted_age(cache_control: Option<&str>) -> Duration {
 }
 
 /// Whether `path`'s answers are shared ([`SHARE_FOR`]): the boards every
-/// open page polls, and the panes. A session's commands and judgements,
+/// open page polls, and the panes. `path` is canonical: `handle()` has
+/// rewritten a legacy alias already. A session's commands and judgements,
 /// its timeline, the log and a task's texts are read fresh every time (the
 /// page's input box follows its commands).
 pub(super) fn shared(path: &str) -> bool {
@@ -181,15 +194,13 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/attention"
             | "/api/fleet"
             | "/api/missions"
-            | "/api/rsi"
-            | "/api/rsi/pane"
+            | "/api/objectives"
+            | "/api/objectives/pane"
             | "/api/features"
             | "/api/scorecard"
             | "/api/approvals"
             | "/api/context/digest"
-    ) || path
-        .strip_prefix("/api/pane/")
-        .is_some_and(|id| !id.is_empty())
+    ) || fits("/api/sessions/*/pane", path)
 }
 
 /// The key a shared answer is kept under: the path and its query without
@@ -311,7 +322,7 @@ pub(super) fn respond(
         .etag
         .as_deref()
         .is_some_and(|etag| not_modified(if_none_match, etag));
-    let response = match tag {
+    let mut response = match tag {
         Some(tag) if unchanged => Response::empty(304)
             .with_header(tag)
             .with_header(cache)
@@ -329,6 +340,9 @@ pub(super) fn respond(
             response.boxed()
         }
     };
+    if let Some(link) = super::successor_link() {
+        response.add_header(link);
+    }
     request.respond(response).map_err(|error| error.to_string())
 }
 
@@ -406,7 +420,7 @@ fn closed(mission: &Value) -> bool {
 /// and review note cut to their first lines, and its report too, except in
 /// a closed mission or a cancelled task (both folded on the page), whose
 /// report is sent as its length alone. The texts in full are
-/// `/api/missions/task/<id>`.
+/// `/api/tasks/<n>`.
 pub(super) fn slim_board(board: &mut Value) {
     let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
         return;
@@ -436,18 +450,18 @@ pub(super) fn slim_board(board: &mut Value) {
     }
 }
 
-/// Lines of an objective's prompt `/api/rsi` sends: more than the four its
+/// Lines of an objective's prompt `/api/objectives` sends: more than the four its
 /// card shows. Pointed at, the page reads the whole prompt
-/// (`/api/rsi/objective/<mission>/<id>`) for its title.
+/// (`/api/objectives/<mission>/<id>`) for its title.
 const PROMPT_LINES: usize = 10;
 
-/// Bytes of an objective's prompt `/api/rsi` sends.
+/// Bytes of an objective's prompt `/api/objectives` sends.
 const PROMPT_BYTES: usize = 1024;
 
-/// `/api/rsi`'s missions as the page shows them: each objective's prompt
-/// cut to its first lines (whole at `/api/rsi/objective/<mission>/<id>`),
+/// `/api/objectives`'s missions as the page shows them: each objective's prompt
+/// cut to its first lines (whole at `/api/objectives/<mission>/<id>`),
 /// and each task's brief and review note as their lengths alone (no list
-/// of the page shows them; the task in full is `/api/rsi/task/<id>`).
+/// of the page shows them; the task in full is `/api/tasks/<id>/gate`).
 pub(super) fn slim_rsi(missions: &mut [Value]) {
     for mission in missions {
         if let Some(objectives) = mission.get_mut("objectives").and_then(Value::as_array_mut) {
@@ -503,19 +517,19 @@ mod tests {
     #[test]
     fn a_clock_that_only_says_when_is_left_out_of_the_tag_and_kept_in_the_body() {
         let early = answer(
-            "/api/rsi",
+            "/api/objectives",
             Ok(json!({"generated_at_ms": 1, "missions": []})),
             "",
         );
         let late = answer(
-            "/api/rsi",
+            "/api/objectives",
             Ok(json!({"generated_at_ms": 2, "missions": []})),
             "",
         );
         assert_eq!(early.etag, late.etag, "the same answer, read later");
         assert!(late.body.contains("\"generated_at_ms\":2"));
         let changed = answer(
-            "/api/rsi",
+            "/api/objectives",
             Ok(json!({"generated_at_ms": 2, "missions": [1]})),
             "",
         );
@@ -537,7 +551,7 @@ mod tests {
         // A pane's capture time likewise; the fleet's clock is part of it.
         let pane = |at: i64| {
             answer(
-                "/api/pane/session_a",
+                "/api/sessions/session_a/pane",
                 Ok(json!({"captured_at_ms": at, "text": "x"})),
                 "",
             )
@@ -579,22 +593,23 @@ mod tests {
             "/api/attention",
             "/api/fleet",
             "/api/missions",
-            "/api/rsi",
-            "/api/rsi/pane",
+            "/api/objectives",
+            "/api/objectives/pane",
             "/api/features",
             "/api/scorecard",
-            "/api/pane/session_a",
+            "/api/sessions/session_a/pane",
         ] {
             assert!(shared(path), "{path}");
         }
         for path in [
-            "/api/fleet/session_a/commands",
-            "/api/fleet/session_a/judgements",
-            "/api/session/session_a",
+            "/api/sessions/session_a/commands",
+            "/api/sessions/session_a/judgements",
+            "/api/sessions/session_a",
             "/api/events",
-            "/api/missions/task/3",
-            "/api/rsi/task/3",
-            "/api/pane/",
+            "/api/tasks/3",
+            "/api/tasks/3/gate",
+            "/api/sessions//pane",
+            "/api/sessions/a/b/pane",
         ] {
             assert!(!shared(path), "{path}");
         }

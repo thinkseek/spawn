@@ -191,7 +191,7 @@ test("landings are known by task, up to now", () => {
   assert.deepEqual([...landings(events, 300)], [[3, 100], [4, 200]]);
 });
 
-// A mission of `/api/rsi`: task 1 landed at 1000, task 2 at 5000, task 3 in flight.
+// A mission of `/api/objectives`: task 1 landed at 1000, task 2 at 5000, task 3 in flight.
 const HISTORY = {
   objectives: [
     { landings: [{ at_ms: 1_000 }] },

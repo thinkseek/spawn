@@ -9,7 +9,7 @@ import { isCut, OnDemand } from "../../validated";
  * changes length. */
 const wholePrompts = new OnDemand<string>();
 
-/** An objective's title, its prompt as the pointer's title. `/api/rsi`
+/** An objective's title, its prompt as the pointer's title. `/api/objectives`
  * sends the prompt's first lines; pointed at, a cut prompt is read whole
  * (one GET, once per prompt), in time for the browser's tooltip. */
 export function ObjectiveName({

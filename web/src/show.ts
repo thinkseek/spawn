@@ -366,7 +366,7 @@ export function landings(events: readonly LogEvent[], nowMs: number): Map<number
   return landed;
 }
 
-/** The part of a `/api/rsi` mission its last landing is read from. */
+/** The part of a `/api/objectives` mission its last landing is read from. */
 export interface LandingMission {
   objectives?: readonly { landings?: readonly { at_ms: number }[] | null }[] | null;
   tasks?: readonly { id: number }[] | null;

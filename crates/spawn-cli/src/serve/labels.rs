@@ -928,7 +928,7 @@ pub(super) fn label_cost(answer: &mut Value, context: &Context) {
     }
 }
 
-/// `/api/rsi`'s missions labelled, as [`label_board`] does, each resident
+/// `/api/objectives`'s missions labelled, as [`label_board`] does, each resident
 /// too; an objective title a brief lacks comes from the loaded backlog (the
 /// mission's `objectives` rows).
 pub(super) fn label_rsi(missions: &mut [Value]) {

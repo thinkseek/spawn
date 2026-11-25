@@ -1111,7 +1111,7 @@ select coalesce((
                         in ('tool_completed', 'turn_stopped', 'execution_ended'))
    order by (p.id = k.reassign_of) is true desc, p.id desc limit 1), 'null'::jsonb)";
 
-/// What replaced what in one session (`GET /api/session/<id>`), as
+/// What replaced what in one session (`GET /api/sessions/<id>`), as
 /// `{restart_of, reassigned_to, reassigned_from}`:
 ///
 /// - `restart_of`: for each execution a restart's resume started (the

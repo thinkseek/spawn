@@ -1,6 +1,6 @@
 // Read model of the RSI page: the open objective missions
-// (docs/fleet-architecture.md §10.4) from `/api/rsi`, one task from
-// `/api/rsi/task/<id>` and the resident's pane from `/api/rsi/pane`. Every
+// (docs/fleet-architecture.md §10.4) from `/api/objectives`, one task from
+// `/api/tasks/<n>/gate` and the resident's pane from `/api/objectives/pane`. Every
 // field is normalized, so a server that omits one renders an empty value
 // instead of crashing the page.
 
@@ -50,8 +50,8 @@ export interface RsiTask extends Labels {
   brief: string | null;
   review_note: string | null;
   /** Whole lengths in bytes of `brief` and `review_note`, which
-   * `/api/rsi` sends as null (no list shows them; the task's own read,
-   * `/api/rsi/task/<id>`, sends them whole, and no length). */
+   * `/api/objectives` sends as null (no list shows them; the task's own read,
+   * `/api/tasks/<n>/gate`, sends them whole, and no length). */
   brief_bytes?: number | null;
   review_note_bytes?: number | null;
   created_by: string | null;
@@ -470,14 +470,14 @@ export function metricPoints(objective: RsiObjective | null): MetricPoint[] {
 export async function fetchDashboard(
   signal: AbortSignal,
 ): Promise<RsiDashboard> {
-  return readApi("/api/rsi", signal, normalizeDashboard);
+  return readApi("/api/objectives", signal, normalizeDashboard);
 }
 
 export async function fetchTask(
   task: number,
   signal: AbortSignal,
 ): Promise<RsiTaskDetail> {
-  return readApi(`/api/rsi/task/${task}`, signal, normalizeTaskDetail);
+  return readApi(`/api/tasks/${task}/gate`, signal, normalizeTaskDetail);
 }
 
 export async function fetchPane(
@@ -485,7 +485,7 @@ export async function fetchPane(
   signal: AbortSignal,
 ): Promise<RsiPane> {
   const query = mission === null ? "" : `?mission=${mission}`;
-  return readApi(`/api/rsi/pane${query}`, signal, normalizePane);
+  return readApi(`/api/objectives/pane${query}`, signal, normalizePane);
 }
 
 /** An objective's prompt as a pointer's title shows it until the whole
@@ -496,7 +496,7 @@ export function promptTitle(objective: Pick<RsiObjective, "prompt" | "prompt_byt
     : objective.prompt;
 }
 
-/** One objective's whole prompt (`/api/rsi/objective/<mission>/<id>`). */
+/** One objective's whole prompt (`/api/objectives/<m>/<n>`). */
 export interface WholePrompt {
   prompt: string;
   prompt_bytes: number | null;
@@ -512,5 +512,5 @@ export async function fetchWholePrompt(
   objective: number,
   signal: AbortSignal,
 ): Promise<WholePrompt> {
-  return readApi(`/api/rsi/objective/${mission}/${objective}`, signal, normalizeWholePrompt);
+  return readApi(`/api/objectives/${mission}/${objective}`, signal, normalizeWholePrompt);
 }

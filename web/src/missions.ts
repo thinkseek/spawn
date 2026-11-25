@@ -441,7 +441,7 @@ export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
   return readApi("/api/missions", signal, normalizeMissions);
 }
 
-/** A task's texts in full, as `/api/missions/task/<id>` answers them. */
+/** A task's texts in full, as `/api/tasks/<n>` answers them. */
 export interface TaskTexts {
   id: number | null;
   brief: string | null;
@@ -461,10 +461,10 @@ export function normalizeTaskTexts(value: unknown): TaskTexts {
   };
 }
 
-/** GET /api/missions/task/<id>: a task's brief, report and review note in
+/** GET /api/tasks/<n>: a task's brief, report and review note in
  * full, read when the task is opened. */
 export async function fetchTaskTexts(task: number, signal: AbortSignal): Promise<TaskTexts> {
-  return readApi(`/api/missions/task/${task}`, signal, normalizeTaskTexts);
+  return readApi(`/api/tasks/${task}`, signal, normalizeTaskTexts);
 }
 
 /** How a task's record shows as a step: what it moved the task to.

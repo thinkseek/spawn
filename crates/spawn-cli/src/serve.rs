@@ -1,18 +1,24 @@
-//! HTTP API and static files for the observer UI: 28 GET route patterns
+//! HTTP API and static files for the observer UI: 29 GET route patterns
 //! (`GET /api/stream` among them) and nine POST routes. Seven are a
 //! person's writes: an input to a session, a key, a restart or a reassign
 //! of a stalled worker, the resume of a halted mission, a message to the
 //! supervisor ([`master_message`]) and the answer to an approval prompt
 //! (`POST /api/approvals/<session_id>/act`). Two are the feature registry's: a fresh scan, which changes
 //! nothing, and a file's association ([`feature_scan_post`],
-//! [`feature_associate_post`]). Every route, with its method and CLI twin,
-//! is listed in docs/api.md.
+//! [`feature_associate_post`]). Every route is a row of [`ROUTES`], which
+//! the router dispatches on; every route, with its method and CLI twin, is
+//! listed in docs/api.md, and a test keeps the two equal. The 11 routes
+//! issue 98 renamed answer under their old spellings too, 14 alias patterns
+//! ([`ALIASES`]):
+//! `handle()` rewrites a legacy path to its canonical one first, and the
+//! answer adds `Link: <canonical>; rel="successor-version"` (only when the
+//! path is safe in a header: [`linkable`]).
 //!
 //! Every read goes through the same store methods the CLI uses, as the
 //! read-only `spawn_reader` login, so a defect in a read cannot change
 //! state. An API path that reads answers 405 to any method but GET and HEAD.
 //!
-//! The first write is `POST /api/session/<id>/input` with `{"text": "...",
+//! The first write is `POST /api/sessions/<id>/input` with `{"text": "...",
 //! "key": "<idempotency key>"}` (the key may come in an `Idempotency-Key`
 //! header instead): the input `spawn submit --principal human --agent <the
 //! session's agent> --session <id> --key <key> --action
@@ -20,7 +26,7 @@
 //! a retried POST types once (the same session and text: a key another
 //! session's input used, or other text, is 409 and nothing is made, GitHub
 //! #16 item 8); like every person's input it waits for the session's turn.
-//! It answers 202 with the command, which `/api/fleet/<id>/commands` then
+//! It answers 202 with the command, which `/api/sessions/<id>/commands` then
 //! follows. A session no agent has used is
 //! 404; one that runs no execution (it never ran one, or its latest ended)
 //! is 409 with the reason ("<session> runs no execution: an input needs a
@@ -44,7 +50,7 @@
 //! types (not blank, at most [`MAX_INPUT_TEXT`] bytes, no control character
 //! but tab and line ends), 400 otherwise.
 //!
-//! The second write is `POST /api/session/<id>/key` with `{"name":
+//! The second write is `POST /api/sessions/<id>/key` with `{"name":
 //! "escape", "key": "<idempotency key>"}` (backlog P1): the key command
 //! `spawn submit --principal human ... --action '{"type":"key","key":...}'`
 //! makes, through `spawn_human_key`, with the same guards and idempotency
@@ -56,8 +62,8 @@
 //! idempotency key another request used; no command is made.
 //!
 //! A person may also restart or reassign a stalled worker from its agent
-//! page: `POST /api/session/<id>/restart` and `POST
-//! /api/session/<id>/reassign` with `{"reason": "..."}` (at most
+//! page: `POST /api/sessions/<id>/restart` and `POST
+//! /api/sessions/<id>/reassign` with `{"reason": "..."}` (at most
 //! [`MAX_REASON`] bytes, no control character), through `spawn_human_task`
 //! (the `spawn_human` login's third function), with the input's guards. The
 //! session's delivered task is restarted (`task.restarted`, the dispatcher
@@ -67,13 +73,13 @@
 //! `{"task", "session_id", "agent_id", "principal": "human"}`, the task and
 //! the worker that now carry the work, or 409 with the reason for a session
 //! that holds no delivered task, and nothing is recorded. `GET
-//! /api/session/<id>` links old and new: each execution's `restart_of` (the
+//! /api/sessions/<id>` links old and new: each execution's `restart_of` (the
 //! execution of the same session a restart's resume replaced, else null),
 //! and the session's `reassigned_to` and `reassigned_from` (`{"task",
 //! "session_id"}` or null).
 //!
 //! A person may also resume a halted mission from Needs you (objective
-//! 051): `POST /api/mission/<id>/resume` with `{"halt": <event>, "key":
+//! 051): `POST /api/missions/<id>/resume` with `{"halt": <event>, "key":
 //! "<idempotency key>"}` (the key may come in an `Idempotency-Key` header),
 //! with the input's guards in the same order, `{"probe": true}` passing them
 //! and writing nothing (200). It runs through `spawn_human_resume`, the
@@ -113,7 +119,7 @@
 //! of `/api/nodes` carries its `power` and the low-battery soft drain
 //! (`low_battery_drain`, `effective_drained`, `schedulable`).
 //!
-//! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
+//! Reading is still worth guarding: `/api/sessions/<id>/pane` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
 //! it refuses to start without `SPAWN_SERVE_TOKEN`. With a token set, every
 //! API request must carry it (`Authorization: Bearer <token>` or
@@ -190,7 +196,7 @@ const DEFAULT_LIMIT: usize = 200;
 /// Largest page the timeline returns.
 const MAX_LIMIT: usize = 1000;
 
-/// Largest body `POST /api/session/<id>/input` takes, in bytes.
+/// Largest body `POST /api/sessions/<id>/input` takes, in bytes.
 const MAX_INPUT_BODY: usize = 16 * 1024;
 
 /// Longest text a person types from the page, in bytes. `spawn_human_input`
@@ -853,61 +859,250 @@ fn access(request: &Request, query: &str, shared: &Shared) -> Access {
     }
 }
 
+/// Every canonical API route `spawn serve` answers: its method (`GET`
+/// takes HEAD too) and its path pattern, where a `<name>` segment is any one
+/// segment that is not empty. `handle()` and `reader()` dispatch on these
+/// patterns only, and the test `routes_match_docs_api_md` keeps
+/// docs/api.md's tables equal to this one. No two patterns fit one path.
+const ROUTES: &[(&str, &str)] = &[
+    ("GET", "/api/overview"),
+    ("GET", "/api/fleet"),
+    ("GET", "/api/attention"),
+    ("GET", "/api/missions"),
+    ("GET", "/api/events"),
+    ("GET", "/api/sessions/<id>"),
+    ("GET", "/api/sessions/<id>/commands"),
+    ("GET", "/api/sessions/<id>/judgements"),
+    ("GET", "/api/sessions/<id>/pane"),
+    ("GET", "/api/tasks/<n>"),
+    ("GET", "/api/tasks/<n>/gate"),
+    ("GET", "/api/objectives"),
+    ("GET", "/api/objectives/<m>/<n>"),
+    ("GET", "/api/objectives/pane"),
+    ("GET", "/api/scorecard"),
+    ("GET", "/api/scorecard/fleet"),
+    ("GET", "/api/interventions"),
+    ("GET", "/api/alerts"),
+    ("GET", "/api/cost"),
+    ("GET", "/api/core-lines"),
+    ("GET", "/api/verifications"),
+    ("GET", "/api/nodes"),
+    ("GET", "/api/grading"),
+    ("GET", "/api/features"),
+    ("GET", "/api/features/coverage"),
+    ("GET", "/api/features/coverage/projects"),
+    ("GET", "/api/stream"),
+    ("GET", "/api/approvals"),
+    ("GET", "/api/context/digest"),
+    ("POST", "/api/sessions/<id>/input"),
+    ("POST", "/api/sessions/<id>/key"),
+    ("POST", "/api/sessions/<id>/restart"),
+    ("POST", "/api/sessions/<id>/reassign"),
+    ("POST", "/api/missions/<id>/resume"),
+    ("POST", "/api/master/message"),
+    ("POST", "/api/approvals/<session_id>/act"),
+    ("POST", "/api/features/scan"),
+    ("POST", "/api/features/associate"),
+];
+
+/// The legacy spelling of each renamed route and the canonical pattern it
+/// answers as (the same `<name>`s). A request to a legacy path is answered
+/// exactly as its canonical path is, plus `Link: <canonical>;
+/// rel="successor-version"`; the first one of each spelling is logged.
+const ALIASES: &[(&str, &str)] = &[
+    ("/api/session/<id>", "/api/sessions/<id>"),
+    ("/api/fleet/<id>/commands", "/api/sessions/<id>/commands"),
+    (
+        "/api/fleet/<id>/judgements",
+        "/api/sessions/<id>/judgements",
+    ),
+    ("/api/pane/<id>", "/api/sessions/<id>/pane"),
+    ("/api/session/<id>/input", "/api/sessions/<id>/input"),
+    ("/api/session/<id>/key", "/api/sessions/<id>/key"),
+    ("/api/session/<id>/restart", "/api/sessions/<id>/restart"),
+    ("/api/session/<id>/reassign", "/api/sessions/<id>/reassign"),
+    ("/api/mission/<id>/resume", "/api/missions/<id>/resume"),
+    ("/api/missions/task/<n>", "/api/tasks/<n>"),
+    ("/api/rsi/task/<n>", "/api/tasks/<n>/gate"),
+    ("/api/rsi", "/api/objectives"),
+    ("/api/rsi/objective/<m>/<n>", "/api/objectives/<m>/<n>"),
+    ("/api/rsi/pane", "/api/objectives/pane"),
+];
+
+/// The segments of `path` that `pattern`'s `<name>`s stand for, in order,
+/// when `path` fits it (as [`ROUTES`] says), else `None`.
+fn fit<'a>(pattern: &str, path: &'a str) -> Option<Vec<&'a str>> {
+    let mut wanted = pattern.split('/');
+    let mut given = path.split('/');
+    let mut values = Vec::new();
+    loop {
+        match (wanted.next(), given.next()) {
+            (None, None) => return Some(values),
+            (Some(want), Some(segment)) if want.starts_with('<') && want.ends_with('>') => {
+                if segment.is_empty() {
+                    return None;
+                }
+                values.push(segment);
+            }
+            (Some(want), Some(segment)) if want == segment => {}
+            _ => return None,
+        }
+    }
+}
+
+/// The route `path` names: its method, pattern and the values of the
+/// pattern's `<name>`s.
+fn route(path: &str) -> Option<(&'static str, &'static str, Vec<&str>)> {
+    ROUTES
+        .iter()
+        .find_map(|(method, pattern)| fit(pattern, path).map(|values| (*method, *pattern, values)))
+}
+
+/// The canonical path a legacy `path` answers as, with the legacy pattern
+/// it fits, or `None` for a path that is no legacy alias.
+fn canonical(path: &str) -> Option<(String, &'static str)> {
+    ALIASES.iter().find_map(|(legacy, successor)| {
+        let values = fit(legacy, path)?;
+        let mut values = values.into_iter();
+        let rewritten: Vec<&str> = successor
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('<') {
+                    values.next().unwrap_or(segment)
+                } else {
+                    segment
+                }
+            })
+            .collect();
+        Some((rewritten.join("/"), *legacy))
+    })
+}
+
+std::thread_local! {
+    /// The canonical path of the legacy request this thread is answering,
+    /// if it is one: every response sent meanwhile names it ([`Successor`]).
+    static SUCCESSOR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, this thread's responses carry `Link: <path>;
+/// rel="successor-version"` (one request is answered on one thread).
+struct Successor;
+
+impl Successor {
+    fn new(path: String) -> Self {
+        SUCCESSOR.with(|successor| *successor.borrow_mut() = Some(path));
+        Successor
+    }
+}
+
+impl Drop for Successor {
+    fn drop(&mut self) {
+        SUCCESSOR.with(|successor| successor.borrow_mut().take());
+    }
+}
+
+/// The `Link` header naming the canonical path of the legacy request this
+/// thread answers, if it is answering one whose path is safe in a header
+/// ([`linkable`]); otherwise none, though the request is still answered as
+/// its canonical path.
+fn successor_link() -> Option<Header> {
+    SUCCESSOR.with(|successor| {
+        successor
+            .borrow()
+            .as_deref()
+            .filter(|path| linkable(path))
+            .and_then(|path| {
+                Header::from_bytes("Link", format!("<{path}>; rel=\"successor-version\"")).ok()
+            })
+    })
+}
+
+/// Whether `path` may go into a `Link` header as `<path>`: graphic ASCII
+/// only (no CR, LF, space or other control byte, which would split the
+/// response) and none of `<`, `>` or `"`, which would end the URI
+/// reference or open a parameter of the client's choosing.
+fn linkable(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .bytes()
+            .all(|byte| (0x21..=0x7E).contains(&byte) && !matches!(byte, b'<' | b'>' | b'"'))
+}
+
+/// The legacy spellings already logged by this process: each once.
+static LOGGED_ALIASES: std::sync::Mutex<BTreeSet<&'static str>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// The log line of the `legacy` spelling: its pattern and its canonical
+/// pattern, both from [`ALIASES`], never a byte of the request.
+fn alias_log_line(legacy: &'static str) -> String {
+    let successor = ALIASES
+        .iter()
+        .find(|(pattern, _)| *pattern == legacy)
+        .map_or("?", |(_, successor)| *successor);
+    format!(
+        "serve: legacy path {legacy} answered as {successor} (logged once; docs/api.md lists \
+         the canonical routes)"
+    )
+}
+
+/// Log the first request of the `legacy` spelling (its pattern only).
+fn log_alias(legacy: &'static str) {
+    let first = LOGGED_ALIASES
+        .lock()
+        .is_ok_and(|mut logged| logged.insert(legacy));
+    if first {
+        eprintln!("{}", alias_log_line(legacy));
+    }
+}
+
 fn handle(request: Request, shared: &Shared) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
+    // A legacy path answers as its canonical one, from the first guard to
+    // the shared answer's key, so both spellings share one answer.
+    let rewritten = canonical(path);
+    let _successor = rewritten.as_ref().map(|(successor, legacy)| {
+        log_alias(legacy);
+        Successor::new(successor.clone())
+    });
+    let path = rewritten
+        .as_ref()
+        .map_or(path, |(successor, _)| successor.as_str());
     if path.starts_with("/api/") {
         let access = access(&request, query, shared);
         if !access.read {
             return refuse(request, shared.token.is_some());
         }
-        if let Some(id) = path
-            .strip_prefix("/api/session/")
-            .and_then(|rest| rest.strip_suffix("/input"))
-        {
-            return input(request, id, access, shared);
-        }
-        if let Some(id) = path
-            .strip_prefix("/api/session/")
-            .and_then(|rest| rest.strip_suffix("/key"))
-        {
-            return key(request, id, access, shared);
-        }
-        if let Some(id) = path
-            .strip_prefix("/api/mission/")
-            .and_then(|rest| rest.strip_suffix("/resume"))
-        {
-            return resume(request, id, access, shared);
-        }
-        for action in ["restart", "reassign"] {
-            if let Some(id) = path
-                .strip_prefix("/api/session/")
-                .and_then(|rest| rest.strip_suffix(&format!("/{action}")))
-            {
-                return moved(request, id, action, access, shared);
+        let Some((method, pattern, values)) = route(path) else {
+            return static_file(request, &shared.web, path);
+        };
+        let id = values.first().copied().unwrap_or_default();
+        match pattern {
+            "/api/sessions/<id>/input" => return input(request, id, access, shared),
+            "/api/sessions/<id>/key" => return key(request, id, access, shared),
+            "/api/missions/<id>/resume" => return resume(request, id, access, shared),
+            "/api/sessions/<id>/restart" => {
+                return moved(request, id, "restart", access, shared);
             }
+            "/api/sessions/<id>/reassign" => {
+                return moved(request, id, "reassign", access, shared);
+            }
+            "/api/master/message" => return master_message(request, access, shared),
+            "/api/stream" => return stream::stream(request, query),
+            "/api/approvals/<session_id>/act" => {
+                return approvals::act(request, id, access, shared);
+            }
+            "/api/features/scan" => return feature_scan_post(request, query, access, shared),
+            "/api/features/associate" => {
+                return feature_associate_post(request, query, access, shared);
+            }
+            _ => {}
         }
-        if path == "/api/master/message" {
-            return master_message(request, access, shared);
-        }
-        if path == "/api/stream" {
-            return stream::stream(request, query);
-        }
-        if let Some(id) = path
-            .strip_prefix("/api/approvals/")
-            .and_then(|rest| rest.strip_suffix("/act"))
-        {
-            return approvals::act(request, id, access, shared);
-        }
-        if path == "/api/features/scan" {
-            return feature_scan_post(request, query, access, shared);
-        }
-        if path == "/api/features/associate" {
-            return feature_associate_post(request, query, access, shared);
-        }
+        debug_assert_eq!(method, "GET", "every POST route is answered above");
         if !matches!(request.method(), Method::Get | Method::Head) {
             return request
                 .respond(not_allowed("GET"))
@@ -941,13 +1136,22 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
 /// One API read, not run yet.
 type Read<'a> = Box<dyn FnOnce() -> Result<Value, String> + 'a>;
 
-/// The read at `path` with `query`, or `None` when `path` is no API read
-/// (a static file, or a 404).
+/// The read at canonical `path` with `query`, or `None` when `path` is no
+/// API read (a static file, or a 404).
 fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
-    Some(match path {
+    let (method, pattern, values) = route(path)?;
+    if method != "GET" {
+        return None;
+    }
+    let id = values.first().copied().unwrap_or_default();
+    Some(match pattern {
         "/api/overview" => Box::new(overview),
-        "/api/rsi" => Box::new(rsi_overview),
-        "/api/rsi/pane" => Box::new(move || rsi_pane(query)),
+        "/api/objectives" => Box::new(rsi_overview),
+        "/api/objectives/pane" => Box::new(move || rsi_pane(query)),
+        "/api/objectives/<m>/<n>" => {
+            let rest = path.strip_prefix("/api/objectives/").unwrap_or_default();
+            Box::new(move || rsi_objective(rest))
+        }
         "/api/fleet" => Box::new(fleet),
         "/api/attention" => Box::new(attention::attention),
         "/api/missions" => Box::new(missions),
@@ -966,23 +1170,13 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
-        _ => {
-            if let Some(id) = path.strip_prefix("/api/session/") {
-                Box::new(move || session(id, query))
-            } else if let Some(task) = path.strip_prefix("/api/rsi/task/") {
-                Box::new(move || rsi_task(task))
-            } else if let Some(rest) = path.strip_prefix("/api/rsi/objective/") {
-                Box::new(move || rsi_objective(rest))
-            } else if let Some(task) = path.strip_prefix("/api/missions/task/") {
-                Box::new(move || mission_task(task))
-            } else if let Some(id) = path.strip_prefix("/api/pane/") {
-                Box::new(move || pane(id, None))
-            } else if let Some(rest) = path.strip_prefix("/api/fleet/") {
-                Box::new(move || fleet_session(rest, query))
-            } else {
-                return None;
-            }
-        }
+        "/api/sessions/<id>" => Box::new(move || session(id, query)),
+        "/api/sessions/<id>/commands" => Box::new(move || session_list(id, "commands", query)),
+        "/api/sessions/<id>/judgements" => Box::new(move || session_list(id, "judgements", query)),
+        "/api/sessions/<id>/pane" => Box::new(move || pane(id, None)),
+        "/api/tasks/<n>" => Box::new(move || mission_task(id)),
+        "/api/tasks/<n>/gate" => Box::new(move || rsi_task(id)),
+        _ => return None,
     })
 }
 
@@ -1013,7 +1207,7 @@ fn not_allowed(allow: &'static str) -> Response<std::io::Cursor<Vec<u8>>> {
     .with_header(header)
 }
 
-/// `POST /api/session/<id>/input`, past the read guard (`access`): a
+/// `POST /api/sessions/<id>/input`, past the read guard (`access`): a
 /// person's input to session `id`, or a probe of whether one would be taken
 /// (module doc).
 fn input(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
@@ -1031,7 +1225,7 @@ fn input(mut request: Request, id: &str, access: Access, shared: &Shared) -> Res
         .map_err(|error| error.to_string())
 }
 
-/// The body of `POST /api/session/<id>/input`: a person's text and its
+/// The body of `POST /api/sessions/<id>/input`: a person's text and its
 /// idempotency key, or `{"probe": true}` alone. Nothing else: no action
 /// type, no agent, no principal.
 #[derive(Debug, serde::Deserialize)]
@@ -1161,7 +1355,7 @@ fn typed(
     }
 }
 
-/// `POST /api/session/<id>/key`, past the read guard (`access`): a
+/// `POST /api/sessions/<id>/key`, past the read guard (`access`): a
 /// person's named key for session `id` (module doc, backlog P1).
 fn key(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
     if *request.method() != Method::Post {
@@ -1178,7 +1372,7 @@ fn key(mut request: Request, id: &str, access: Access, shared: &Shared) -> Resul
         .map_err(|error| error.to_string())
 }
 
-/// The body of `POST /api/session/<id>/key`: the key's name (`escape`,
+/// The body of `POST /api/sessions/<id>/key`: the key's name (`escape`,
 /// `up`, `down`, `left`, `right`, `enter`, `y`, `n`) and the idempotency
 /// key. Nothing else: no text, no action type, no agent, no principal.
 #[derive(Debug, serde::Deserialize)]
@@ -1231,7 +1425,7 @@ fn pressed(
     }
 }
 
-/// `POST /api/session/<id>/restart` and `/reassign`, past the read guard
+/// `POST /api/sessions/<id>/restart` and `/reassign`, past the read guard
 /// (`access`): a person restarts the delivered task of session `id`, or
 /// reassigns it to a fresh worker (module doc).
 fn moved(
@@ -1255,7 +1449,7 @@ fn moved(
         .map_err(|error| error.to_string())
 }
 
-/// The body of `POST /api/session/<id>/restart` and `/reassign`: why, and
+/// The body of `POST /api/sessions/<id>/restart` and `/reassign`: why, and
 /// nothing else.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1417,7 +1611,7 @@ fn messaged(
     }
 }
 
-/// `POST /api/mission/<id>/resume`, past the read guard (`access`): a
+/// `POST /api/missions/<id>/resume`, past the read guard (`access`): a
 /// person resumes mission `id` on the halt the page showed (module doc).
 fn resume(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
     if *request.method() != Method::Post {
@@ -1434,7 +1628,7 @@ fn resume(mut request: Request, id: &str, access: Access, shared: &Shared) -> Re
         .map_err(|error| error.to_string())
 }
 
-/// The body of `POST /api/mission/<id>/resume`: the halt it resumes (its
+/// The body of `POST /api/missions/<id>/resume`: the halt it resumes (its
 /// `mission.halted` event) and the idempotency key, or `{"probe": true}`
 /// alone. Nothing else: no principal, no reason.
 #[derive(Debug, serde::Deserialize)]
@@ -1906,9 +2100,13 @@ fn writer(shared: &Shared) -> Result<spawn_postgres::PostgresStore, String> {
 fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
     let header = Header::from_bytes("Content-Type", "application/json; charset=utf-8")
         .expect("static header is valid");
-    Response::from_string(body.to_string())
+    let response = Response::from_string(body.to_string())
         .with_status_code(status)
-        .with_header(header)
+        .with_header(header);
+    match successor_link() {
+        Some(link) => response.with_header(link),
+        None => response,
+    }
 }
 
 fn overview() -> Result<Value, String> {
@@ -1920,7 +2118,7 @@ fn overview() -> Result<Value, String> {
         .map(|state| {
             // The list shows the judgement's state, reason, confidence and
             // judge; its evidence (the screen it saw, most of the bytes) is
-            // the session's own read (`/api/session/<id>`, `/api/fleet`).
+            // the session's own read (`/api/sessions/<id>`, `/api/fleet`).
             let mut observation = json!(state.observation);
             if let Some(fields) = observation.as_object_mut() {
                 fields.remove("evidence");
@@ -1959,7 +2157,7 @@ fn now_ms() -> i64 {
 /// first lines, each with its length in bytes (`brief_bytes`, ...); a
 /// closed mission's or a cancelled task's report is its length alone
 /// ([`answers::slim_board`]). The texts in full are
-/// `/api/missions/task/<id>`. Each mission carries its `mission_name`, each
+/// `/api/tasks/<n>`. Each mission carries its `mission_name`, each
 /// task its `label`, `task_title` and `mission_name`, each resident its
 /// `label` ([`labels`]).
 fn missions() -> Result<Value, String> {
@@ -2030,7 +2228,7 @@ fn public_nodes(mut nodes: Value) -> Value {
     nodes
 }
 
-/// `/api/missions/task/<id>`: one task's brief, report and review note in
+/// `/api/tasks/<n>`: one task's brief, report and review note in
 /// full, `{id, mission_id, brief, report, review_note, updated_at_ms}`, as
 /// the Missions page asks when a task is opened.
 fn mission_task(task: &str) -> Result<Value, String> {
@@ -2096,7 +2294,7 @@ fn with_activity(board: &mut Value, activity: &Value) {
 /// mission, read from the mission tables, the control stream and the
 /// mission's backlog.
 ///
-/// `GET /api/rsi` answers:
+/// `GET /api/objectives` answers:
 ///
 /// ```text
 /// {
@@ -2159,17 +2357,17 @@ fn with_activity(board: &mut Value, activity: &Value) {
 /// ([`answers::slim_rsi`]: `prompt_bytes`, `brief_bytes`,
 /// `review_note_bytes`).
 ///
-/// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
+/// `GET /api/tasks/<n>/gate` answers one task: the fields above plus the full
 /// `brief`, `report`, `gate_log` (the latest), `mission_id`, and `log` on
 /// every gate verdict.
 ///
-/// `GET /api/rsi/objective/<mission>/<id>` answers one objective's whole
+/// `GET /api/objectives/<m>/<n>` answers one objective's whole
 /// prompt, `{mission, id, title, prompt, prompt_bytes}`, as the page asks
 /// when the objective is pointed at.
 ///
-/// `GET /api/rsi/pane[?mission=<id>]` answers the live pane of the mission's
+/// `GET /api/objectives/pane[?mission=<id>]` answers the live pane of the mission's
 /// resident (the first open objective mission by default), in the shape of
-/// `/api/pane/<session>` plus `session_id`.
+/// `/api/sessions/<id>/pane` plus `session_id`.
 fn rsi_overview() -> Result<Value, String> {
     let store = open_store()?;
     let mut missions = objective_missions(&store)?;
@@ -2545,8 +2743,8 @@ fn rsi_task(task: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("task {id} does not exist"))
 }
 
-/// `/api/rsi/objective/<mission>/<id>`: one objective's whole prompt, read
-/// from the backlog of that open objective mission (`/api/rsi` sends the
+/// `/api/objectives/<m>/<n>`: one objective's whole prompt, read
+/// from the backlog of that open objective mission (`/api/objectives` sends the
 /// prompt's first lines).
 fn rsi_objective(rest: &str) -> Result<Value, String> {
     let bad = || format!("{BAD_REQUEST}bad objective {rest}");
@@ -2675,11 +2873,10 @@ fn label_context(store: &spawn_postgres::PostgresStore) -> Result<labels::Contex
     Ok(labels::Context::from_board(&facts, &labels::Titles::new()))
 }
 
-/// `/api/fleet/<session>/judgements` and `/api/fleet/<session>/commands`.
-fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
-    let (id, what) = rest
-        .split_once('/')
-        .ok_or_else(|| format!("{BAD_REQUEST}unknown fleet path {rest}"))?;
+/// `/api/sessions/<id>/judgements` (`what` `judgements`) and
+/// `/api/sessions/<id>/commands` (any other `what`), `?limit=` (50, at most
+/// 500).
+fn session_list(id: &str, what: &str, query: &str) -> Result<Value, String> {
     let session = session_id(id)?;
     let limit = parameter(query, "limit")
         .and_then(|text| text.parse::<u32>().ok())
@@ -2688,10 +2885,9 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
     let store = open_store()?;
     match what {
         "judgements" => store.judgements_json(session.as_str(), limit).map_err(err),
-        "commands" => store
+        _ => store
             .commands_json(session.as_str(), limit, crate::config::message_taken_ms())
             .map_err(err),
-        other => Err(format!("{BAD_REQUEST}unknown fleet view {other}")),
     }
 }
 
@@ -2837,7 +3033,8 @@ enum LogStart {
 }
 
 /// The start and page size of `/api/events`: `after=<position>` or
-/// `since_ms=<epoch ms>` (not both), and `limit`, capped. A number that does
+/// `since_ms=<epoch ms>` (not both; `since=` is `since_ms=`'s alias, both
+/// spellings at once a 400), and `limit`, capped. A number that does
 /// not parse is the caller's mistake.
 fn log_window(query: &str) -> Result<(LogStart, usize), String> {
     let number = |name: &str| -> Result<Option<i64>, String> {
@@ -2850,7 +3047,15 @@ fn log_window(query: &str) -> Result<(LogStart, usize), String> {
             })
             .transpose()
     };
-    let start = match (number("after")?, number("since_ms")?) {
+    let since = match (number("since_ms")?, number("since")?) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{BAD_REQUEST}since_ms or its alias since, not both"
+            ));
+        }
+        (since_ms, since) => since_ms.or(since),
+    };
+    let start = match (number("after")?, since) {
         (Some(_), Some(_)) => return Err(format!("{BAD_REQUEST}after or since_ms, not both")),
         (_, Some(since)) => LogStart::Since(since),
         (after, None) => LogStart::After(after.unwrap_or(0).unsigned_abs()),
@@ -2999,16 +3204,30 @@ fn interventions(query: &str) -> Result<Value, String> {
     crate::scorecard::interventions::measure(&store, name, span).map_err(failure)
 }
 
-/// `/api/alerts?since=`: exactly the JSON array of `spawn alerts --once
+/// `/api/alerts?since=` (or its alias `?window=`, not both): exactly the JSON array of `spawn alerts --once
 /// --json` with the same flag (`crate::alerts::window`, notices folded:
 /// objectives 151 and 166), from the same store method, read through the
 /// reader login. An empty parameter is the configured window.
 fn alerts(query: &str) -> Result<Value, String> {
     let store = open_store()?;
-    let since = parameter(query, "since")
-        .map(|text| percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad since {text}")))
-        .transpose()?;
+    let since = alerts_since(query)?;
     crate::alerts::window(&store, since.as_deref())
+}
+
+/// `/api/alerts`' span: `?since=`, or its alias `?window=` (both at once,
+/// or one that does not decode, is the caller's mistake).
+fn alerts_since(query: &str) -> Result<Option<String>, String> {
+    let spelled = |name: &str| {
+        parameter(query, name)
+            .map(|text| {
+                percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad {name} {text}"))
+            })
+            .transpose()
+    };
+    match (spelled("since")?, spelled("window")?) {
+        (Some(_), Some(_)) => Err(format!("{BAD_REQUEST}since or its alias window, not both")),
+        (since, window) => Ok(since.or(window)),
+    }
 }
 
 /// `/api/cost?window=24h|7d` (24h when absent; any other window is the
@@ -6694,5 +6913,459 @@ mod tests {
                 .expect("commands");
             assert_eq!(listed[0]["text"], "digit3");
         });
+    }
+
+    /// Pairs of strings: (method, path) or (legacy, canonical).
+    type Pairs = Vec<(String, String)>;
+
+    /// The canonical routes and legacy aliases of docs/api.md: each table
+    /// row `| GET | `<path>` |` or `| POST | `<path>` |`, and each alias row
+    /// `| `<legacy>` | `<canonical>` |`.
+    fn documented_routes(doc: &str) -> (Pairs, Pairs) {
+        let quoted = |line: &str| -> Vec<String> {
+            line.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        let mut routes = Vec::new();
+        let mut aliases = Vec::new();
+        for line in doc.lines() {
+            for method in ["GET", "POST"] {
+                if line.starts_with(&format!("| {method} | `")) {
+                    routes.push((method.to_string(), quoted(line)[0].clone()));
+                }
+            }
+            if line.starts_with("| `/api/") {
+                let paths = quoted(line);
+                aliases.push((paths[0].clone(), paths[1].clone()));
+            }
+        }
+        (routes, aliases)
+    }
+
+    #[test]
+    fn routes_match_docs_api_md() {
+        let doc = include_str!("../../../docs/api.md");
+        let (routes, aliases) = documented_routes(doc);
+        let table: Vec<(String, String)> = super::ROUTES
+            .iter()
+            .map(|(method, path)| (method.to_string(), path.to_string()))
+            .collect();
+        assert_eq!(
+            routes, table,
+            "docs/api.md's route tables and serve.rs's ROUTES, in the same order"
+        );
+        let gets = super::ROUTES.iter().filter(|(m, _)| *m == "GET").count();
+        let posts = super::ROUTES.iter().filter(|(m, _)| *m == "POST").count();
+        assert_eq!((gets, posts), (29, 9));
+        assert!(
+            doc.contains(&format!(
+                "serves {gets} GET route patterns and {posts} POST routes"
+            )),
+            "docs/api.md states the counts"
+        );
+        let legacy: Vec<(String, String)> = super::ALIASES
+            .iter()
+            .map(|(old, new)| (old.to_string(), new.to_string()))
+            .collect();
+        assert_eq!(
+            aliases, legacy,
+            "docs/api.md's alias table and serve.rs's ALIASES, in the same order"
+        );
+    }
+
+    /// A path that fits `pattern`, each `<name>` filled with `value`.
+    fn filled(pattern: &str, value: &str) -> String {
+        pattern
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('<') {
+                    value
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    #[test]
+    fn every_route_and_alias_names_one_route_only() {
+        for (method, pattern) in super::ROUTES {
+            assert!(["GET", "POST"].contains(method), "{pattern}");
+            assert!(pattern.starts_with("/api/"), "{pattern}");
+            for value in ["7", "session_a", "pane", "task"] {
+                let path = filled(pattern, value);
+                let matching: Vec<&str> = super::ROUTES
+                    .iter()
+                    .filter(|(_, other)| super::fit(other, &path).is_some())
+                    .map(|(_, other)| *other)
+                    .collect();
+                assert_eq!(matching, vec![*pattern], "{path}");
+                // The one overlap: `/api/missions/task/resume` is the legacy
+                // `/api/missions/task/<n>` (as it always was), never mission
+                // "task" (a mission id is a number).
+                let shadowed = *pattern == "/api/missions/<id>/resume" && value == "task";
+                assert_eq!(
+                    super::canonical(&path).is_some(),
+                    shadowed,
+                    "a canonical path is no alias: {path}"
+                );
+            }
+        }
+        for (legacy, successor) in super::ALIASES {
+            assert!(
+                super::ROUTES.iter().any(|(_, route)| route == successor),
+                "{legacy} answers as a route: {successor}"
+            );
+            assert!(
+                super::route(legacy).is_none(),
+                "a legacy pattern is no canonical route: {legacy}"
+            );
+            let path = filled(legacy, "7");
+            assert_eq!(
+                super::canonical(&path),
+                Some((filled(successor, "7"), *legacy)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_path_is_rewritten_to_its_canonical_path() {
+        let rewritten = |path: &str| super::canonical(path).map(|(path, _)| path);
+        for (legacy, successor) in [
+            ("/api/session/session_a", "/api/sessions/session_a"),
+            (
+                "/api/session/not%20a%20session",
+                "/api/sessions/not%20a%20session",
+            ),
+            (
+                "/api/fleet/session_a/commands",
+                "/api/sessions/session_a/commands",
+            ),
+            (
+                "/api/fleet/session_a/judgements",
+                "/api/sessions/session_a/judgements",
+            ),
+            ("/api/pane/session_a", "/api/sessions/session_a/pane"),
+            (
+                "/api/session/session_a/input",
+                "/api/sessions/session_a/input",
+            ),
+            ("/api/session/session_a/key", "/api/sessions/session_a/key"),
+            (
+                "/api/session/session_a/restart",
+                "/api/sessions/session_a/restart",
+            ),
+            (
+                "/api/session/session_a/reassign",
+                "/api/sessions/session_a/reassign",
+            ),
+            ("/api/mission/6/resume", "/api/missions/6/resume"),
+            ("/api/missions/task/12", "/api/tasks/12"),
+            ("/api/rsi/task/12", "/api/tasks/12/gate"),
+            ("/api/rsi", "/api/objectives"),
+            ("/api/rsi/objective/3/41", "/api/objectives/3/41"),
+            ("/api/rsi/pane", "/api/objectives/pane"),
+        ] {
+            assert_eq!(rewritten(legacy).as_deref(), Some(successor), "{legacy}");
+        }
+        for path in [
+            "/api/overview",
+            "/api/sessions/session_a",
+            "/api/session/",
+            "/api/fleet/session_a",
+            "/api/fleet/session_a/pane",
+            "/api/rsi/objective/pane",
+            "/api/rsi/",
+            "/api/missions",
+            "/index.html",
+        ] {
+            assert_eq!(rewritten(path), None, "{path}");
+        }
+    }
+
+    /// The successor `Link` header in a response head, if any.
+    fn link_of(head: &str) -> Option<String> {
+        head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("link")
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    #[test]
+    fn a_legacy_path_answers_as_its_canonical_path_and_links_to_it() {
+        let send = |token: Option<&'static str>, method: &str, path: &str| {
+            exchange(
+                token,
+                "",
+                None,
+                &format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        };
+        let reads = [
+            (
+                "/api/session/not%20a%20session",
+                "/api/sessions/not%20a%20session",
+            ),
+            (
+                "/api/fleet/bad%20id/commands",
+                "/api/sessions/bad%20id/commands",
+            ),
+            (
+                "/api/fleet/bad%20id/judgements",
+                "/api/sessions/bad%20id/judgements",
+            ),
+            ("/api/pane/bad%20id", "/api/sessions/bad%20id/pane"),
+            ("/api/missions/task/x", "/api/tasks/x"),
+            ("/api/rsi/task/x", "/api/tasks/x/gate"),
+            ("/api/rsi", "/api/objectives"),
+            ("/api/rsi/objective/x/4", "/api/objectives/x/4"),
+            ("/api/rsi/pane?mission=x", "/api/objectives/pane?mission=x"),
+        ];
+        let writes = [
+            (
+                "/api/session/session_a/input",
+                "/api/sessions/session_a/input",
+            ),
+            ("/api/session/session_a/key", "/api/sessions/session_a/key"),
+            (
+                "/api/session/session_a/restart",
+                "/api/sessions/session_a/restart",
+            ),
+            (
+                "/api/session/session_a/reassign",
+                "/api/sessions/session_a/reassign",
+            ),
+            ("/api/mission/6/resume", "/api/missions/6/resume"),
+        ];
+        let mut cases = Vec::new();
+        for (legacy, successor) in reads {
+            // The read itself, a write method (405 GET) and a refusal (401).
+            cases.push((None, "GET", legacy, successor));
+            cases.push((None, "PUT", legacy, successor));
+            cases.push((Some("secret"), "GET", legacy, successor));
+        }
+        for (legacy, successor) in writes {
+            // A write without JSON or Origin, a read method (405 POST) and a
+            // refusal (401).
+            cases.push((None, "POST", legacy, successor));
+            cases.push((None, "GET", legacy, successor));
+            cases.push((Some("secret"), "POST", legacy, successor));
+        }
+        for (token, method, legacy, successor) in cases {
+            let old = send(token, method, legacy);
+            let new = send(token, method, successor);
+            assert_eq!(old.status, new.status, "{method} {legacy}");
+            assert_ne!(old.status, 404, "{method} {legacy} is routed");
+            if old.status != 200 {
+                assert_eq!(old.body, new.body, "{method} {legacy}");
+            }
+            let path = successor.split('?').next().unwrap_or(successor);
+            assert_eq!(
+                link_of(&old.head),
+                Some(format!("<{path}>; rel=\"successor-version\"")),
+                "{method} {legacy}: {}",
+                old.head
+            );
+            assert_eq!(link_of(&new.head), None, "{method} {successor}");
+        }
+        // The read reached its own handler, not another's.
+        let read = |path: &str| send(None, "GET", path);
+        let task = read("/api/missions/task/x");
+        assert_eq!(task.status, 400);
+        assert_eq!(task.body["error"], format!("{BAD_REQUEST}bad task x"));
+        let objective = read("/api/rsi/objective/x/4");
+        assert_eq!(
+            objective.body["error"],
+            format!("{BAD_REQUEST}bad objective x/4")
+        );
+        let pane = read("/api/rsi/pane?mission=x");
+        assert_eq!(pane.body["error"], format!("{BAD_REQUEST}bad mission x"));
+        // A canonical path under no route is a 404, as before.
+        assert_eq!(read("/api/sessions/a/b/c").status, 404);
+        assert_eq!(read("/api/session/").status, 404);
+    }
+
+    #[test]
+    fn the_time_parameters_take_their_aliases() {
+        assert_eq!(
+            log_window("since=1700000000000"),
+            Ok((LogStart::Since(1_700_000_000_000), DEFAULT_LIMIT)),
+            "since= is since_ms="
+        );
+        for bad in ["since=1&since_ms=1", "since=x", "since=1&after=2"] {
+            let error = log_window(bad).expect_err(bad);
+            assert!(error.starts_with(BAD_REQUEST), "{bad}: {error}");
+        }
+        // `/api/alerts`: window= is since=; both at once is a 400.
+        let since = super::alerts_since;
+        assert_eq!(since(""), Ok(None));
+        assert_eq!(since("since=1h"), Ok(Some("1h".to_string())));
+        assert_eq!(since("window=7d"), Ok(Some("7d".to_string())));
+        for bad in ["since=1h&window=1h", "window=7d&since="] {
+            let error = since(bad).expect_err(bad);
+            assert!(error.starts_with(BAD_REQUEST), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_path_unsafe_in_a_header_gets_no_link_and_is_never_logged() {
+        for path in [
+            "/api/sessions/session_a",
+            "/api/objectives/3/41",
+            "/api/sessions/a%0Ab",
+        ] {
+            assert!(super::linkable(path), "{path}");
+        }
+        for path in [
+            "",
+            "/api/sessions/x\nX-Injected:1",
+            "/api/sessions/x\rX-Injected:1",
+            "/api/sessions/x\r\nX-Injected:1",
+            "/api/sessions/a\u{1}b",
+            "/api/sessions/a\u{7f}b",
+            "/api/sessions/a\tb",
+            "/api/sessions/a b",
+            "/api/sessions/a>;rel=x",
+            "/api/sessions/<a",
+            "/api/sessions/a\"b",
+            "/api/sessions/é",
+        ] {
+            assert!(!super::linkable(path), "{path:?}");
+            let _successor = super::Successor::new(path.to_string());
+            assert!(super::successor_link().is_none(), "{path:?}");
+        }
+        {
+            let _successor = super::Successor::new("/api/sessions/session_a".to_string());
+            let link = super::successor_link().expect("a safe path links");
+            assert_eq!(
+                link.value.as_str(),
+                "</api/sessions/session_a>; rel=\"successor-version\""
+            );
+        }
+        assert!(super::successor_link().is_none(), "the guard clears it");
+        // The log line holds the two patterns and nothing of a request.
+        for (legacy, successor) in super::ALIASES {
+            assert_eq!(
+                super::alias_log_line(legacy),
+                format!(
+                    "serve: legacy path {legacy} answered as {successor} (logged once; \
+                     docs/api.md lists the canonical routes)"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostile_legacy_path_cannot_write_a_header_or_a_log_line() {
+        let raw = |token: Option<&'static str>, path: &str| {
+            exchange(
+                token,
+                "",
+                None,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        };
+        for (legacy, successor) in [
+            (
+                "/api/session/x\nX-Injected:1",
+                "/api/sessions/x\nX-Injected:1",
+            ),
+            (
+                "/api/session/x\rX-Injected:1",
+                "/api/sessions/x\rX-Injected:1",
+            ),
+            ("/api/session/a\u{1}b", "/api/sessions/a\u{1}b"),
+            ("/api/session/a>;rel=x", "/api/sessions/a>;rel=x"),
+            ("/api/session/<a", "/api/sessions/<a"),
+            ("/api/session/a\"b", "/api/sessions/a\"b"),
+            (
+                "/api/pane/x\nX-Injected:1",
+                "/api/sessions/x\nX-Injected:1/pane",
+            ),
+        ] {
+            assert!(super::canonical(legacy).is_some(), "{legacy:?} is an alias");
+            // Unauthenticated to a token-guarded server, and token-less.
+            for token in [Some("secret"), None] {
+                let old = raw(token, legacy);
+                let new = raw(token, successor);
+                assert_eq!(old.status, new.status, "{legacy:?} answers as canonical");
+                assert_eq!(old.body, new.body, "{legacy:?}");
+                if token.is_some() {
+                    assert_eq!(old.status, 401, "{legacy:?}");
+                }
+                assert_eq!(link_of(&old.head), None, "{legacy:?}: {}", old.head);
+                assert!(
+                    !old.head.to_ascii_lowercase().contains("x-injected")
+                        && !old.head.contains("rel=x"),
+                    "{legacy:?}: {}",
+                    old.head
+                );
+                let lines: Vec<&str> = old.head.split("\r\n").collect();
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| !line.contains(['\n', '\r', '\u{1}'])),
+                    "{legacy:?}: every header line is whole: {lines:?}"
+                );
+            }
+        }
+        // A safe legacy path still links.
+        let fine = raw(Some("secret"), "/api/session/session_a");
+        assert_eq!(fine.status, 401);
+        assert_eq!(
+            link_of(&fine.head),
+            Some("</api/sessions/session_a>; rel=\"successor-version\"".to_string())
+        );
+    }
+
+    #[test]
+    fn every_post_route_reaches_its_own_handler() {
+        let posts: Vec<&str> = super::ROUTES
+            .iter()
+            .filter(|(method, _)| *method == "POST")
+            .map(|(_, pattern)| *pattern)
+            .collect();
+        assert_eq!(posts.len(), 9);
+        for pattern in posts {
+            let path = filled(pattern, "7");
+            // A read method: the write's own 405, naming POST (a route
+            // left to the reads would answer 405 naming GET, or 404).
+            let read = exchange(
+                None,
+                "",
+                None,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert_eq!(read.status, 405, "{path}");
+            assert!(
+                read.head
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("allow: post")),
+                "{path}: {}",
+                read.head
+            );
+            // A POST is taken by it: refused by a write guard, never 404 or
+            // the reads' 405.
+            let write = post(None, "", None, &path, "Host: 127.0.0.1:PORT\r\n", "{}");
+            assert!(
+                ![404, 405].contains(&write.status),
+                "{path}: {}",
+                write.status
+            );
+        }
     }
 }
