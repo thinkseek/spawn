@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
-use spawn_node_gateway::{Connector, Gateway, Settings, spawn};
+use spawn_node_gateway::http::Timeouts;
+use spawn_node_gateway::{Connector, Gateway, Settings, spawn_with};
 use spawn_node_proto::response::{RefusalBody, RequestId, verify_response};
 use spawn_node_proto::{Method, NodeSigner, PublicKey, Refusal, SigningKey};
 
@@ -92,6 +93,16 @@ pub struct Harness {
     pub clock: Arc<AtomicU64>,
     pub artifacts: PathBuf,
     pub results: PathBuf,
+    /// The test's scratch directory, removed when the harness is dropped.
+    root: PathBuf,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // The workers keep running (they end with the process); open files
+        // under the directory do not keep it from going.
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 /// A connector for a gateway with no database at all.
@@ -105,6 +116,10 @@ impl Harness {
     }
 
     pub fn start_with_prefix(name: &str, connector: Connector, prefix: &str) -> Self {
+        Self::start_with(name, connector, prefix, Timeouts::default())
+    }
+
+    pub fn start_with(name: &str, connector: Connector, prefix: &str, timeouts: Timeouts) -> Self {
         let root = scratch(name);
         let artifacts = root.join("artifacts");
         let results = root.join("results");
@@ -125,13 +140,14 @@ impl Harness {
             connector,
         }));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = spawn(listener, &gateway, 4).unwrap();
+        let addr = spawn_with(listener, &gateway, 4, timeouts).unwrap();
         Self {
             addr,
             gateway,
             clock,
             artifacts,
             results,
+            root,
         }
     }
 
