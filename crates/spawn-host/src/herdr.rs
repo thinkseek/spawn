@@ -1476,8 +1476,9 @@ impl TerminalHost for HerdrHost {
         // Herdr's request line cap ([`prompt_fits`]). Its refusals of a
         // blocked or not-ready agent type nothing: the text stays staged.
         // A pane with no agent Herdr detects (`agent_not_found`, nothing
-        // typed either) takes the text the old way.
-        if prompt_fits(&record.pane, &text) {
+        // typed either) takes the text the old way, and so does an empty
+        // text (Herdr refuses an empty prompt): Enter alone.
+        if !text.is_empty() && prompt_fits(&record.pane, &text) {
             match self.call(
                 "agent.prompt",
                 &json!({ "target": record.pane, "text": text }),

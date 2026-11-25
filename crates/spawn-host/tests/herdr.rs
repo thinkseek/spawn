@@ -397,7 +397,8 @@ fn herdr_required() -> bool {
 /// draws each state agy draws (as agy 1.5.14 does, CR LF line ends; open
 /// work as its task panel of `●` entries and a closing rule between the
 /// prompt box and a footer counting `subagent(s)` and `task(s)`), reads
-/// a line per state change (bash `read -t`, Enter as CR or LF), turns
+/// a line per state change (bash `read -t`, Enter as CR or LF, a bracketed
+/// paste's markers dropped, as `agent.prompt` writes one), turns
 /// bracketed paste on as agy does and off again when it exits (`EXIT`
 /// trap), so the pane is left clean. The banner names a made-up account.
 const STUB_AGY: &str = r#"#!/bin/bash
@@ -432,6 +433,8 @@ draw "$state"
 while true; do
   if IFS= read -r -t 1 line; then
     line=${line%$'\r'}
+    # A bracketed paste (agent.prompt's write) arrives between its markers.
+    line=${line#$'\e[200~'}; line=${line%$'\e[201~'}
     case "$line" in
       "") [ "$state" = trust ] && state=idle ;;
       exit) exit 0 ;;
