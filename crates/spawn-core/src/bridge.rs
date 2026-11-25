@@ -8461,6 +8461,83 @@ mod tests {
     /// end, so nothing is committed).
     const TOOL_LINE: &str = "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n";
 
+    /// What a2f1ab397 records for [`claude_on_a_host_without_agent_readings_records_what_it_did_before`].
+    const PINNED_SEQUENCE: [&str; 13] = [
+        "command.accepted Gateway - cmd_1:accepted",
+        "command.step Bridge - cmd_1:mounted",
+        "execution.started Bridge exec_1 exec_1:started",
+        "session.native_started Bridge exec_1 exec_1:native",
+        "command.finished Gateway - cmd_1:finished",
+        "screen.observed Bridge exec_1 - Ready \"❯\"",
+        "tool.started Claude exec_1 toolu_1:started",
+        "screen.observed Bridge exec_1 - Busy \"✽ Effecting… (esc to interrupt)\"",
+        "screen.observed Bridge exec_1 - Permission \"❯ 1. main\"",
+        "screen.observed Bridge exec_1 - Busy \"✽ Effecting… (esc to interrupt)\"",
+        "screen.observed Bridge exec_1 - Busy \"✽ Effecting… (esc to interrupt)\"",
+        "turn.stopped Claude exec_1 t1",
+        "screen.observed Bridge exec_1 - Ready \"❯\"",
+    ];
+
+    /// Issue #91 P2 PR 2: on a host that reads no agent (tmux, in memory),
+    /// Claude Code's execution records exactly what it did before the host's
+    /// second witness existed: every event, in order, with its source and
+    /// key, through a start, a turn that runs, a dialog, the turn's end and
+    /// a busy screen recorded again after `screen_refresh`. The expected
+    /// sequence is the one the base (a2f1ab397) records.
+    #[test]
+    fn claude_on_a_host_without_agent_readings_records_what_it_did_before() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TOOL_LINE);
+        for _ in 0..4 {
+            world.advance(600);
+            world.tick();
+        }
+        world.set_pane(DIALOG);
+        for _ in 0..3 {
+            world.advance(31_000);
+            world.tick();
+        }
+        world.set_pane(BUSY);
+        for _ in 0..3 {
+            world.advance(31_000);
+            world.tick();
+        }
+        world.engine_writes(TURN_LINE);
+        world.set_pane(READY);
+        for _ in 0..4 {
+            world.advance(600);
+            world.tick();
+        }
+        let sequence: Vec<String> = world
+            .store
+            .read_global(GlobalPosition(0), 1_000)
+            .expect("read")
+            .into_iter()
+            .map(|record| {
+                let state = match &record.event.kind {
+                    EventKind::ScreenObserved { state, evidence } => {
+                        format!(" {state:?} {evidence:?}")
+                    }
+                    _ => String::new(),
+                };
+                format!(
+                    "{} {:?} {} {}{state}",
+                    record.event.kind.name(),
+                    record.event.source,
+                    record
+                        .event
+                        .execution_id
+                        .as_ref()
+                        .map_or("-", |execution| execution.as_str()),
+                    record.event.source_event_id.as_deref().unwrap_or("-"),
+                )
+            })
+            .collect();
+        let expected: &[&str] = &PINNED_SEQUENCE;
+        assert_eq!(sequence, expected, "actual:\n{sequence:#?}");
+    }
+
     /// A session whose command is in flight (an input waiting for its turn)
     /// is captured on every pass: its screen is what the delivery waits for.
     #[test]
