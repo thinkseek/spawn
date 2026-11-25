@@ -635,8 +635,37 @@ fn link_name(link: ProvLink) -> &'static str {
 ///   `origin`, nearest first, each with its link and one shortest path;
 /// - `used`: the part of the radius reached by `used` edges alone.
 pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, String> {
-    let error = |error: spawn_core::port::StoreError| error.to_string();
     let start = changes_of(store, target)?;
+    let (after, landed_by) = later_on_paths(store, &start)?;
+    let (radius, used) = dependents(store, &start)?;
+    let by_depth = |map: BTreeMap<i64, Value>| {
+        let mut values: Vec<(i64, i64, Value)> = map
+            .into_iter()
+            .map(|(id, value)| (value["depth"].as_i64().unwrap_or_default(), id, value))
+            .collect();
+        values.sort_by_key(|(depth, id, _)| (*depth, *id));
+        values
+            .into_iter()
+            .map(|(_, _, value)| value)
+            .collect::<Vec<_>>()
+    };
+    Ok(json!({
+        "indexed": !start.is_empty(),
+        "changes": start.iter().map(change_json).collect::<Vec<_>>(),
+        "later": after,
+        "landed_by": landed_by,
+        "radius": by_depth(radius),
+        "used": by_depth(used),
+    }))
+}
+
+/// [`blast`]'s `later` and `landed_by`: the later Changes on the paths of
+/// `start`, each with those paths, oldest first.
+fn later_on_paths(
+    store: &PostgresStore,
+    start: &[ProvChangeRecord],
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let error = |error: spawn_core::port::StoreError| error.to_string();
     let ids: HashSet<i64> = start.iter().map(|change| change.id).collect();
     let change_ids: HashSet<&str> = start
         .iter()
@@ -644,7 +673,7 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
         .collect();
     // Each path once per domain, from the earliest start Change touching it.
     let mut paths: BTreeMap<(String, String), (i64, i64, bool)> = BTreeMap::new();
-    for change in &start {
+    for change in start {
         for entry in store.prov_entries(change.id).map_err(error)? {
             let tree = entry.class == ProvEntryClass::Tree;
             let key = (change.domain.clone(), entry.path);
@@ -695,6 +724,17 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
             after.push(shown);
         }
     }
+    Ok((after, landed_by))
+}
+
+/// [`blast`]'s `radius` and `used`, by id.
+#[allow(clippy::type_complexity)]
+fn dependents(
+    store: &PostgresStore,
+    start: &[ProvChangeRecord],
+) -> Result<(BTreeMap<i64, Value>, BTreeMap<i64, Value>), String> {
+    let error = |error: spawn_core::port::StoreError| error.to_string();
+    let ids: HashSet<i64> = start.iter().map(|change| change.id).collect();
     let mut names: HashMap<i64, String> = start
         .iter()
         .map(|change| (change.id, format!("{}#{}", change.change_id, change.rev)))
@@ -702,7 +742,7 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
     let mut radius: BTreeMap<i64, Value> = BTreeMap::new();
     let mut depths: HashMap<i64, i32> = HashMap::new();
     let mut used: BTreeMap<i64, Value> = BTreeMap::new();
-    for change in &start {
+    for change in start {
         let nodes = store
             .prov_blast_radius(change.id, ProvDirection::Forward, BLAST_DEPTH)
             .map_err(error)?;
@@ -741,25 +781,7 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
             radius.insert(node.id, shown);
         }
     }
-    let by_depth = |map: BTreeMap<i64, Value>| {
-        let mut values: Vec<(i64, i64, Value)> = map
-            .into_iter()
-            .map(|(id, value)| (value["depth"].as_i64().unwrap_or_default(), id, value))
-            .collect();
-        values.sort_by_key(|(depth, id, _)| (*depth, *id));
-        values
-            .into_iter()
-            .map(|(_, _, value)| value)
-            .collect::<Vec<_>>()
-    };
-    Ok(json!({
-        "indexed": !start.is_empty(),
-        "changes": start.iter().map(change_json).collect::<Vec<_>>(),
-        "later": after,
-        "landed_by": landed_by,
-        "radius": by_depth(radius),
-        "used": by_depth(used),
-    }))
+    Ok((radius, used))
 }
 
 /// The arguments of a plan: its words, whether `--plan` was given, and
@@ -803,13 +825,13 @@ fn planned_change(
         Target::Task(task) => changes_of(store, target)?
             .into_iter()
             .filter(|change| in_domain(change) && change.kind == ProvChangeKind::Land)
-            .last()
+            .next_back()
             .ok_or_else(|| format!("task {task} has no landing in {domain}")),
         Target::Change(change_id) => {
             let last = changes_of(store, target)?
                 .into_iter()
                 .filter(in_domain)
-                .last()
+                .next_back()
                 .ok_or_else(|| format!("{change_id} is no Change of {domain}"))?;
             if last.kind != ProvChangeKind::Edit {
                 return Ok(last);
