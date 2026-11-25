@@ -878,6 +878,14 @@ impl NodeShadows {
             ("pg".to_string(), remote::PG_MAJOR.to_string()),
         ]);
         if let Some(lock) = remote::web_lock(&controller) {
+            // The node installs its web dependencies from this lockfile,
+            // fetched by the digest it requires.
+            let published = self
+                .artifacts
+                .put_copy(&controller.join("web/package-lock.json"))?;
+            if published.digest.hex != lock {
+                return Err("web/package-lock.json changed while it was published".to_string());
+            }
             requires.insert("web_lock".to_string(), lock);
         }
         if let Some(channel) = remote::toolchain_channel(&controller) {
@@ -919,12 +927,19 @@ impl NodeShadows {
         write: &dyn Fn(&Value) -> Result<(), String>,
     ) {
         self.unrecorded.retain(|record| write(record).is_err());
+        self.reclaim_orphans(store);
         let wait = self.settings.queue_wait;
         let mut kept = Vec::new();
         for mut job in std::mem::take(&mut self.jobs) {
             let task = job.want.task;
             match remote::step(store, &job.job_id, job.since, wait) {
-                Ok(remote::Waited::Queued | remote::Waited::Leased(_)) => kept.push(job),
+                Ok(remote::Waited::Queued) => kept.push(job),
+                // Its wait starts again from here: a lease fenced back to
+                // the queue gets a whole wait, not an immediate take-back.
+                Ok(remote::Waited::Leased(_)) => {
+                    job.since = Instant::now();
+                    kept.push(job);
+                }
                 Ok(remote::Waited::TakenLocal) => println!(
                     "integrate: task {task}'s node shadow {}: no node leased it within {} s; \
                      nothing recorded",
@@ -961,6 +976,37 @@ impl NodeShadows {
             }
         }
         self.jobs = kept;
+    }
+
+    /// Take back every queued shadow this integrator does not wait for (a
+    /// predecessor's, left by a restart): nobody would read its result, and
+    /// it would hold a node's slot and its `need_sync` on a registry that
+    /// may be gone. A node that won the race keeps it.
+    fn reclaim_orphans(&self, store: &PostgresStore) {
+        let queued = match store.remote_jobs_queued(spawn_postgres::RemoteJobKind::GateShadow) {
+            Ok(queued) => queued,
+            Err(error) => {
+                eprintln!("integrate: the queued node shadows not read: {error}");
+                return;
+            }
+        };
+        for orphan in queued
+            .iter()
+            .filter(|job| !self.jobs.iter().any(|mine| mine.job_id == job.job_id))
+        {
+            match store.remote_job_take_local(&orphan.job_id, orphan.lease_epoch) {
+                Ok(true) => println!(
+                    "integrate: node shadow {} (task {:?}) queued by an earlier integrator: \
+                     taken back",
+                    orphan.job_id, orphan.task_id
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "integrate: node shadow {} not taken back: {error}",
+                    orphan.job_id
+                ),
+            }
+        }
     }
 
     /// A completed job: its stored result judged (§6.2) and settled on the
@@ -1083,11 +1129,13 @@ pub(super) fn node_record_of(
     judged: &remote::Judged,
 ) -> Value {
     let meta = &stored.meta;
+    // A node that said no inputs (its fetch failed before it read them):
+    // an empty object, never null, which the record's writer refuses.
     let given = meta
         .inputs
         .as_ref()
         .and_then(|inputs| serde_json::to_value(inputs).ok())
-        .unwrap_or(Value::Null);
+        .unwrap_or_else(|| json!({}));
     let exit = meta.exit_code.unwrap_or_else(|| match &meta.signal {
         Some(spawn_node_proto::result::Signal::Number(number)) => {
             128 + i64::try_from(*number).unwrap_or(0)
@@ -1655,7 +1703,7 @@ mod tests {
                 .join(&digest.hex);
             digest.verify(&std::fs::read(file).unwrap()).unwrap();
         }
-        assert!(dir.0.join("artifacts/registry-manifest").is_file());
+        assert!(dir.0.join("artifacts/registry-manifest.json").is_file());
         assert_eq!(row.requires["pg"], "16");
         assert_eq!(row.requires["registry"].as_str().unwrap().len(), 64);
         assert!(row.requires.get("web_lock").is_none());
