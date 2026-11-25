@@ -268,13 +268,6 @@ impl Artifacts {
         Ok(Published { digest, size })
     }
 
-    /// Write `bytes` as an artifact.
-    pub(super) fn put_bytes(&self, bytes: &[u8]) -> Result<Published, String> {
-        let scratch = self.scratch("bytes")?;
-        std::fs::write(&scratch, bytes).map_err(|error| format!("{}: {error}", scratch.display()))?;
-        self.put_file(&scratch)
-    }
-
     fn cache_path(&self, kind: &str, key: &str) -> PathBuf {
         self.root.join(".cache").join(format!("{kind}-{key}"))
     }
@@ -745,7 +738,12 @@ pub(super) fn step(
 
 /// Wait for job `job_id` to be leased, up to `wait` from now, looking every
 /// `every`; past it, take it back ([`step`]). Returns the first state that
-/// is not `Queued`.
+/// is not `Queued`. The primary path's wait (`SPAWN_GATE_REMOTE=node`, PR
+/// S5); the shadows look once a pass instead ([`step`]), never waiting.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the primary path's wait, PR S5; tested here")
+)]
 pub(super) fn wait_for_lease(
     store: &PostgresStore,
     job_id: &str,
