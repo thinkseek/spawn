@@ -579,8 +579,10 @@ fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be
     assert_eq!(uninterrupted["land"], 30, "{uninterrupted}");
     assert_eq!(uninterrupted["edit"], 60, "{uninterrupted}");
 
-    // Kill runs until one has recorded something and not everything, then
-    // let one finish.
+    // Kill runs, each a little later, until one has recorded something (on
+    // this history a kill then lands midway), then let one finish.
+
+
     let total = count(&mut whole_client, "prov_changes");
     let mut delay = std::time::Duration::from_millis(20);
     for _ in 0..40 {
