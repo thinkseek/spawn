@@ -714,8 +714,17 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
         .expect("read");
     assert_eq!(none.agent, None);
 
-    // The stub exits: its EXIT trap turned bracketed paste off again.
-    host.submit_text(&agy, &workspace, "exit").expect("typed");
+    // The stub exits: its EXIT trap turned bracketed paste off again. It
+    // shows its question (blocked), so through the pane as above.
+    let pane = session.pane_of(&agy);
+    session.call(
+        "pane.send_text",
+        &serde_json::json!({ "pane_id": pane, "text": "exit" }),
+    );
+    session.call(
+        "pane.send_keys",
+        &serde_json::json!({ "pane_id": pane, "keys": ["enter"] }),
+    );
     assert_eq!(
         runner_within(&host, &agy, &workspace, &Runner::Gone),
         Runner::Gone
