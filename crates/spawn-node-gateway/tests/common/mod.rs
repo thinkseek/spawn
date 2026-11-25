@@ -171,7 +171,7 @@ impl Harness {
             let _ = write!(head, "{name}: {value}\r\n");
         }
         if let Some(body) = body {
-            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            let _ = write!(head, "Content-Length: {}\r\n", body.len());
         }
         head.push_str("Connection: close\r\n\r\n");
         let mut bytes = head.into_bytes();
