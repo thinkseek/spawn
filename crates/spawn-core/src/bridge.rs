@@ -102,7 +102,10 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
-use crate::driver::{AgentDriver, EngineHome, EngineLaunch, LineCursor, driver_or_default};
+use crate::driver::{
+    AgentDriver, EngineHome, EngineLaunch, LineCursor, SessionBinding, driver_or_default,
+    plain_session_id,
+};
 use crate::event::{
     ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, EndCause, EventKind,
     EventRecord, Fork, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
@@ -112,9 +115,9 @@ use crate::id::{
 };
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, MOUNT_CANCELLED,
-    READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive,
-    UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
+    AgentReading, AgentStatus, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch,
+    Launch, MOUNT_CANCELLED, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
+    TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
@@ -268,7 +271,9 @@ pub struct BridgeConfig {
     pub model_relay: Option<ModelRelay>,
     /// Where engines other than Claude Code live, by driver id
     /// ([`BridgeConfig::engine_home`]). Claude Code's home is always
-    /// `claude_program` and `claude_projects`, whatever this holds.
+    /// `claude_program` and `claude_projects`, whatever this holds. An
+    /// engine with no home here is not enabled on this host
+    /// (`SPAWN_ENGINES`): a start naming it is refused.
     pub engines: Vec<(String, EngineHome)>,
     /// The watch on the files the engines write (transcripts and exit
     /// statuses), when the host has one. `None` reads every live execution's
@@ -324,6 +329,7 @@ impl BridgeConfig {
             return Some(EngineHome {
                 program: self.claude_program.clone(),
                 sessions: self.claude_projects.clone(),
+                model: None,
             });
         }
         self.engines
@@ -337,6 +343,7 @@ impl BridgeConfig {
         self.engine_home(driver.id()).unwrap_or_else(|| EngineHome {
             program: self.claude_program.clone(),
             sessions: self.claude_projects.clone(),
+            model: None,
         })
     }
 }
@@ -384,9 +391,11 @@ impl Active {
             reported_end: None,
             unmounting: false,
             // The execution's lines are the ones after where the transcript
-            // ended when it started, after a restart too.
+            // ended when it started, after a restart too. A resume runs a
+            // session already named: its engine reports no new one.
             follow: Follow {
                 offset: transcript_from.unwrap_or(0),
+                bound: transcript_from.is_some(),
                 ..Follow::default()
             },
         }
@@ -444,6 +453,19 @@ struct Follow {
     seen: Option<ScreenState>,
     /// When this Bridge first followed the execution, by its own clock.
     first_seen: Option<i64>,
+    /// The execution's native session is known: named by the Bridge, or
+    /// resumed, or (an engine that names its own,
+    /// [`SessionBinding::Reported`]) reported by the host and checked
+    /// ([`Bridge::bind_reported`]). Until it is, such an engine's
+    /// transcript is not read: the session's last one is another
+    /// execution's.
+    bound: bool,
+    /// The native session bound by this Bridge ([`Bridge::bind_reported`])
+    /// before the log's record of it is folded.
+    native: Option<String>,
+    /// The host's agent reading (its `seq`) a recorded screen was last
+    /// keyed by: a reading recorded once is never keyed again.
+    keyed_seq: Option<u64>,
     /// The engine's file is missing after the start grace, or unreadable;
     /// warned once.
     warned: bool,
@@ -1871,6 +1893,9 @@ impl Bridge {
                     view.transcript_read = false;
                 }
                 view.native = Some(native_session_id.clone());
+                if current && let Some(active) = view.active.as_mut() {
+                    active.follow.bound = true;
+                }
             }
             // A merge of main is no checkpoint of the agent's work: one
             // still due stays due. Nor is a commit of an earlier execution.
@@ -1913,7 +1938,13 @@ impl Bridge {
             })
             .collect();
         let mut ended_now = Vec::new();
+        // Terminals whose agent the host saw change (a host that detects
+        // agents, Herdr): their panes are read on this pass.
+        let changed: HashSet<TerminalName> = self.terminals.agent_changes().into_iter().collect();
         for (session, agent_id, native, mut active) in running {
+            if changed.contains(&active.terminal()) {
+                active.follow.again = true;
+            }
             let ended =
                 self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
             if ended {
@@ -1981,6 +2012,8 @@ impl Bridge {
             ));
             return Ok(false);
         }
+        let bound = self.native_of(agent_id, session, native, active)?;
+        let native = bound.as_deref();
         self.register_watch(session, native, active, report);
         self.follow_output(agent_id, session, native, active, report)?;
         let end = if self.looked_at(session, active) {
@@ -2153,6 +2186,13 @@ impl Bridge {
             return Ok(());
         };
         let path = self.transcript_of(active.driver, &active.workspace, native);
+        // The driver's keys begin with the session whose lines it reads.
+        if active.follow.cursor.native != native {
+            active.follow.cursor = LineCursor {
+                native: native.to_string(),
+                ..LineCursor::default()
+            };
+        }
         // Read past the offset only while the file holds what was read there
         // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
         let (bytes, limit) = match self.read_followed(session, &path, active, report) {
@@ -2550,13 +2590,41 @@ impl Bridge {
         let now = self.clock.now().0;
         active.follow.last_capture = Some(now);
         active.follow.unread_since = None;
-        let reading = active.driver.read_screen(&pane);
+        let mut reading = active.driver.read_screen(&pane);
+        // The host's own reading of the agent, when it has one (Herdr): a
+        // second witness. Without one (tmux, in memory) nothing below
+        // changes.
+        let witness = self
+            .terminals
+            .agent(&active.terminal(), &active.workspace)
+            .ok()
+            .flatten();
+        let mut agreed = false;
+        if let Some(witness) = &witness {
+            match merge_witness(active.driver, witness, &reading) {
+                Merged::Agrees(state, evidence) => {
+                    reading.state = state;
+                    reading.evidence = evidence;
+                    agreed = true;
+                }
+                Merged::Own => {}
+                // The engine may have exited: its exit status is read on
+                // the next pass, and the screen goes by its own readings.
+                Merged::Gone => active.follow.watch.dirty = true,
+                // Another agent in the engine's pane: nothing is known.
+                Merged::Foreign => {
+                    active.follow.seen = None;
+                    active.follow.again = true;
+                    return Ok(());
+                }
+            }
+        }
         // A reading that accepts input is the screen showing the turn over:
         // what a turn's end in the transcript was waiting for.
         if reading.state.accepts_input() {
             active.follow.settling = None;
         }
-        let confirmed = active.follow.seen == Some(reading.state);
+        let confirmed = agreed || active.follow.seen == Some(reading.state);
         active.follow.seen = Some(reading.state);
         let due = match active.follow.screen {
             None => true,
@@ -2574,19 +2642,139 @@ impl Bridge {
         if !record {
             return Ok(());
         }
+        // Keyed by the host's reading when there is one, so a reading
+        // recorded once (by a Bridge before a restart too) is recorded once;
+        // a busy screen recorded again after `screen_refresh` is the same
+        // reading, and goes unkeyed so it is never taken for a repeat.
+        let changed = active
+            .follow
+            .screen
+            .is_none_or(|(state, _)| state != reading.state);
+        let key = match (&witness, self.terminals.server()) {
+            (Some(witness), ServerSeen::Answers(Some(server)))
+                if changed && active.follow.keyed_seq != Some(witness.seq) =>
+            {
+                active.follow.keyed_seq = Some(witness.seq);
+                Some(format!(
+                    "{}:hs:{}.{}:{}",
+                    active.execution_id, server.pid, server.started_at_ms, witness.seq
+                ))
+            }
+            _ => None,
+        };
         active.follow.screen = Some((reading.state, now));
         self.append(
             agent_id,
             session,
             Some(&active.execution_id),
             Source::Bridge,
-            None,
+            key,
             EventKind::ScreenObserved {
                 state: reading.state,
                 evidence: reading.evidence,
             },
         )?;
         Ok(())
+    }
+
+    /// The native session whose transcript the execution writes, when it is
+    /// known: the session's, for an engine the Bridge names the session of
+    /// (or a resume); for an engine that names its own
+    /// ([`SessionBinding::Reported`]) only once this execution's is bound
+    /// ([`Self::bind_reported`]), never the session's last one, which is an
+    /// earlier execution's.
+    fn native_of(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        native: Option<&str>,
+        active: &mut Active,
+    ) -> Result<Option<String>, StoreError> {
+        if active.driver.traits().session != SessionBinding::Reported {
+            return Ok(native.map(str::to_string));
+        }
+        if active.follow.bound {
+            return Ok(active
+                .follow
+                .native
+                .clone()
+                .or_else(|| native.map(str::to_string)));
+        }
+        self.bind_reported(agent_id, session, active)
+    }
+
+    /// Bind the native session an engine named itself
+    /// ([`SessionBinding::Reported`]): the host reports it for the
+    /// execution's own pane ([`TerminalHost::agent`]), as the engine's own
+    /// agent's (`agent` is the driver's id), its transcript is there below
+    /// the engine's home, and a prompt in it holds a marker Spawn typed for
+    /// this execution or later (a command of its start or after). Then
+    /// `session.native_started` is recorded, and the transcript is read from
+    /// its start. Until then nothing is bound, and asked again next pass.
+    fn bind_reported(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &mut Active,
+    ) -> Result<Option<String>, StoreError> {
+        let Ok(Some(reading)) = self.terminals.agent(&active.terminal(), &active.workspace) else {
+            return Ok(None);
+        };
+        if reading.agent.as_deref() != Some(active.driver.id()) {
+            return Ok(None);
+        }
+        let Some(native) = reading.session.filter(|native| plain_session_id(native)) else {
+            return Ok(None);
+        };
+        let home = self.config.home_of(active.driver);
+        let path = active
+            .driver
+            .transcript_path(&home, &active.workspace, &native);
+        let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        if !path.starts_with(&root) {
+            return Ok(None);
+        }
+        let Ok(Some(bytes)) = self.terminals.read_from(&active.workspace, &path, 0) else {
+            return Ok(None);
+        };
+        let first = active
+            .execution_id
+            .as_str()
+            .strip_prefix("exec_")
+            .and_then(|command| command.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                value["type"] == "USER_INPUT"
+                    && value["content"].as_str().is_some_and(|content| {
+                        crate::message::markers(content)
+                            .iter()
+                            .any(|command| command.0 >= first)
+                    })
+            })
+        });
+        if !typed {
+            return Ok(None);
+        }
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:native", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine: active.driver.id().to_string(),
+                native_session_id: native.clone(),
+                transcript_path: Some(path),
+                engine_version: None,
+            },
+        )?;
+        active.follow.bound = true;
+        active.follow.native = Some(native.clone());
+        active.follow.offset = 0;
+        active.follow.tail.clear();
+        active.follow.watch.dirty = true;
+        Ok(Some(native))
     }
 
     /// Kill, final checkpoint, unmount, then `execution.ended`. Returns
@@ -3445,6 +3633,20 @@ impl Bridge {
             }
             MountProgress::Failed(why) => return finished(Outcome::Failed(why)),
         };
+        // An engine other than Claude Code is followed through the host's
+        // own agent readings (its session, its state): a host with none
+        // (tmux) cannot run it.
+        if driver.id() != crate::driver::DEFAULT {
+            let terminal = TerminalName::for_execution(&ExecutionId::for_command(claimed.command_id));
+            if !matches!(self.terminals.agent(&terminal, &workspace), Ok(Some(_))) {
+                let why = format!(
+                    "engine {} needs the herdr terminal backend (SPAWN_TERMINAL_BACKEND=herdr): \
+                     this terminal host reads no agent",
+                    driver.id()
+                );
+                return finished(self.give_up_mount(claimed, &workspace, why));
+            }
+        }
         // A resumed session's transcript holds the earlier executions' lines:
         // this execution's are the ones after its length now.
         let transcript_from = match native
@@ -3477,7 +3679,10 @@ impl Bridge {
             checkpoint: None,
             reported_end: None,
             unmounting: false,
-            follow: Follow::default(),
+            follow: Follow {
+                bound: native.is_some(),
+                ..Follow::default()
+            },
         };
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
@@ -3552,6 +3757,27 @@ impl Bridge {
     ) -> Result<Result<PreparedStart, String>, StoreError> {
         if let Some(prepared) = self.prepared.get(&claimed.command_id) {
             return Ok(Ok(prepared.clone()));
+        }
+        // Only the engines this host enables (`SPAWN_ENGINES`) start, and
+        // one other than Claude Code only with its model named: an engine
+        // left to pick its own may pick its costliest.
+        if driver.id() != crate::driver::DEFAULT {
+            match self.config.engine_home(driver.id()) {
+                None => {
+                    return Ok(Err(format!(
+                        "engine {} is not enabled on this host: SPAWN_ENGINES does not name it",
+                        driver.id()
+                    )));
+                }
+                Some(home) if home.model.is_none() => {
+                    return Ok(Err(format!(
+                        "engine {} has no model named on this host (SPAWN_{}_MODEL)",
+                        driver.id(),
+                        driver.id().to_ascii_uppercase()
+                    )));
+                }
+                Some(_) => {}
+            }
         }
         let model = model.unwrap_or_else(|| {
             self.sessions
@@ -4243,6 +4469,7 @@ impl Bridge {
                 relay: prepared.relay.as_ref(),
                 profile: prepared.model,
                 config_dir: prepared.config_dir.as_deref(),
+                cwd: Some(active.workspace.path()),
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
@@ -5297,7 +5524,7 @@ impl Bridge {
                     .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
                 {
                     Ok(pane) => {
-                        progress.last_pane = Some(pane.clone());
+                        progress.last_pane = Some(active.driver.excerpt_source(&pane));
                         pane
                     }
                     Err(error) => {
@@ -6612,6 +6839,78 @@ const PANE_SIDE_BORDERS: [char; 3] = ['\u{2502}', '\u{2503}', '\u{2551}'];
 /// Horizontal box-drawing characters (`─`, `━`, `═`): a run of more than 3
 /// of one inside a line is kept as 3.
 const PANE_RUN_CHARS: [char; 3] = ['\u{2500}', '\u{2501}', '\u{2550}'];
+
+/// What the host's agent reading ([`AgentReading`]) and the driver's own
+/// reading of the pane make together ([`Bridge::follow_screen`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Merged {
+    /// Both witnesses say this: a fact at once, without the second capture
+    /// a reading alone needs.
+    Agrees(ScreenState, String),
+    /// They do not agree, or the host cannot tell: the screen goes by the
+    /// driver's readings alone, two in a row, as without a host reading.
+    Own,
+    /// The host sees no agent in the pane: the engine may have exited (its
+    /// exit status says), and the screen goes by the driver's readings.
+    Gone,
+    /// The host sees another agent than the engine's in its pane: nothing
+    /// is known, and nothing is recorded.
+    Foreign,
+}
+
+/// The two witnesses of an engine's screen, merged. The host's reading
+/// never decides alone what the driver reads otherwise, and a state is
+/// taken at once only where both agree:
+///
+/// - `working` with the driver reading a running turn (or nothing it
+///   knows): [`ScreenState::Busy`];
+/// - `blocked` by a rule that saw a dialog on screen, with the driver
+///   reading a dialog (or nothing it knows): [`ScreenState::Permission`];
+/// - `idle` with the driver reading its prompt (a positive reading: the
+///   host's idle is often its fallback, for any screen no rule matched, so
+///   an unknown popup is never taken for a prompt): the driver's state;
+/// - anything else, `unknown` included: the driver's own readings.
+fn merge_witness(
+    driver: &dyn AgentDriver,
+    witness: &AgentReading,
+    reading: &crate::screen::ScreenReading,
+) -> Merged {
+    let Some(agent) = witness.agent.as_deref() else {
+        return Merged::Gone;
+    };
+    if agent != driver.id() {
+        return Merged::Foreign;
+    }
+    let said = |what: &str| {
+        let rule = witness
+            .rule
+            .as_deref()
+            .map_or_else(String::new, |rule| format!(" ({rule})"));
+        format!("herdr {agent}: {what}{rule}")
+    };
+    match (witness.status, reading.state) {
+        (AgentStatus::Working, ScreenState::Busy) => {
+            Merged::Agrees(ScreenState::Busy, reading.evidence.clone())
+        }
+        (AgentStatus::Working, ScreenState::Unknown) => {
+            Merged::Agrees(ScreenState::Busy, said("working"))
+        }
+        (AgentStatus::Blocked, ScreenState::Permission)
+            if witness.rule.is_some() && witness.blocker_visible =>
+        {
+            Merged::Agrees(ScreenState::Permission, reading.evidence.clone())
+        }
+        (AgentStatus::Blocked, ScreenState::Unknown)
+            if witness.rule.is_some() && witness.blocker_visible =>
+        {
+            Merged::Agrees(ScreenState::Permission, said("blocked"))
+        }
+        (AgentStatus::Idle, state) if state.accepts_input() => {
+            Merged::Agrees(state, reading.evidence.clone())
+        }
+        _ => Merged::Own,
+    }
+}
 
 /// The tail of `pane` as one bounded line for a failed ready wait's error,
 /// or `None` when it holds no text. Credentials go first
