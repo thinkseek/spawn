@@ -2462,6 +2462,9 @@ end $$;
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
     select case when x.p is null or x.p in ('spawn_reader', 'human') then null
+                -- The node gateway's login (spawn-node v1) calls only its
+                -- four spawn_node_gw_* functions, and is nobody here.
+                when x.p = spawn_login_role('spawn_node_gateway') then null
                 when x.p = 'spawn_supervisor' then 'spawn_supervisor'
                 else 'owner' end
       from (select spawn_principal() as p) x
@@ -6733,6 +6736,13 @@ begin
             raise exception 'node % is joined already (spawn node remove first)', v_name
                 using errcode = '23505';
         end if;
+        -- A spawn-node v1 node's name (spawn_node_state, below) is never a
+        -- P1 node's too, revoked or not: spawn_node_enroll_token checks
+        -- the other way round.
+        if exists (select 1 from spawn_node_state s where s.name = v_name) then
+            raise exception 'node % is a spawn-node v1 node (spawn node enroll-token): one name is one node',
+                v_name using errcode = '23505';
+        end if;
     elsif v_join is null then
         raise exception 'node % is not joined', v_name using errcode = 'P0002';
     elsif v_type in ('node.heartbeat', 'node.lost', 'node.back')
@@ -7618,7 +7628,6 @@ begin
 end
 $$;
 -- spawn-node v1 ledger: end (PR S1).
-
 
 
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
