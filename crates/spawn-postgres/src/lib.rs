@@ -16,6 +16,7 @@
 //! - `missions`: missions, tasks and residents, and the integrator's lock.
 //! - `scorecard`: the facts `spawn scorecard` measures, read in one snapshot.
 //! - `verifications`: objectives' verifications after their landings.
+//! - `remote_jobs`: spawn-node v1's ledger, the nodes' leases of remote jobs.
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -98,6 +99,7 @@ mod missions;
 mod nodes;
 mod passfile;
 mod recovery;
+mod remote_jobs;
 mod row;
 mod scorecard;
 mod sessions;
@@ -119,6 +121,10 @@ pub use grading::RoutedTask;
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
+pub use remote_jobs::{
+    Committed, FaultNext, FaultOutcome, NodeAction, NodeEnroll, NodeV1, RemoteJob, RemoteJobKind,
+    RemoteJobSpec, SweepOutcome,
+};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
@@ -183,9 +189,16 @@ pub struct PostgresStore {
 /// The restricted logins, by their base name; each database has its own
 /// role for each (`spawn_login_role`). `spawn_supervisor` and `spawn_reader`
 /// act as the principals of their names, `spawn_human` (which may only call
-/// `spawn_human_input`) as `human`. Their passwords derive from the owner's
-/// ([`role_url`]) and are set on every migration.
-const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
+/// `spawn_human_input`) as `human`, and `spawn_node_gateway` (spawn-node
+/// v1's gateway, which may only call the four `spawn_node_gw_*` functions)
+/// as nobody. Their passwords derive from the owner's ([`role_url`]) and are
+/// set on every migration.
+const LOGINS: [&str; 4] = [
+    "spawn_supervisor",
+    "spawn_reader",
+    "spawn_human",
+    remote_jobs::GATEWAY_LOGIN,
+];
 
 impl PostgresStore {
     /// Connect to the database in the URL.
@@ -338,6 +351,7 @@ impl PostgresStore {
         // migration turns the logins off (spawn_logins_off warns).
         if self.password.is_empty() {
             transaction.batch_execute("select spawn_logins_off()")?;
+            remote_jobs::gateway_login_off(&mut transaction)?;
         } else {
             for base in LOGINS {
                 // The schema above made the login and its salt, in this
@@ -357,6 +371,7 @@ impl PostgresStore {
                 ))?;
             }
         }
+        remote_jobs::gateway_login_timeouts(&mut transaction)?;
         transaction.commit()
     }
 }
