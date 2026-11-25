@@ -235,7 +235,9 @@ fn engine() -> String {
 /// The `engine` of a start: [`ENGINE`] only.
 fn claude_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     let engine = String::deserialize(deserializer)?;
-    if engine == ENGINE {
+    // A registered driver (crate::driver); Claude Code is the only one, so
+    // the error still names it alone.
+    if crate::driver::driver(&engine).is_some() {
         Ok(engine)
     } else {
         Err(serde::de::Error::custom(format!(

@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod command;
 #[cfg(feature = "testing")]
 pub mod contract;
+pub mod driver;
 pub mod event;
 pub mod feature_coverage;
 pub mod feature_deps;

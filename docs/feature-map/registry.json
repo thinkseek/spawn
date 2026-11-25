@@ -631,6 +631,7 @@
         "crates/spawn-core/src/bridge.rs",
         "crates/spawn-core/src/command.rs",
         "crates/spawn-core/src/contract.rs",
+        "crates/spawn-core/src/driver.rs",
         "crates/spawn-core/src/event.rs",
         "crates/spawn-core/src/id.rs",
         "crates/spawn-core/src/ingest.rs",

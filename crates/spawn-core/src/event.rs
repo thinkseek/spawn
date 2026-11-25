@@ -16,17 +16,21 @@ use crate::time::Timestamp;
 /// on a character boundary (objective 179).
 pub const ARCHIVE_REASON_MAX: usize = 500;
 
-/// Wire name of the engine every execution runs: Claude Code, interactive
-/// in a terminal. Executions and native sessions record it in their
-/// `engine` field, which the `agent_executions` view shows; nothing
-/// branches on it, and a record naming another engine still reads.
+/// Wire name of Claude Code, interactive in a terminal: the engine every
+/// execution runs, and the default driver (`crate::driver::DEFAULT`, the
+/// only one registered). Executions and native sessions record it in their
+/// `engine` field, which the `agent_executions` view shows; the Bridge
+/// resolves a driver from it (`crate::driver::driver_or_default`), so a
+/// record naming another engine still reads, as Claude Code's.
 pub const ENGINE: &str = "claude";
 
 /// System that produced a fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
-    /// The Claude Code transcript, and the runner's exit report.
+    /// The engine's transcript (Claude Code's, read through its driver,
+    /// `crate::driver`), and the runner's exit report. The wire name stays
+    /// `claude`.
     Claude,
     /// Agent Bridge lifecycle facts.
     Bridge,

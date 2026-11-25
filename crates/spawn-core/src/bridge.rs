@@ -102,21 +102,21 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
+use crate::driver::{AgentDriver, EngineHome, EngineLaunch, LineCursor, driver_or_default};
 use crate::event::{
-    ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind,
+    ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, EndCause, EventKind,
     EventRecord, Fork, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
 };
 use crate::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
 };
-use crate::ingest::{claude_line, claude_usage, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, MOUNT_CANCELLED,
     READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive,
     UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
 };
-use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
+use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
 use crate::transcripts::{self, ArchiveProgress};
 
@@ -148,17 +148,6 @@ enum Wanted {
     Nothing,
 }
 
-/// The session and settings of one launch.
-///
-/// Grouped so that [`Bridge::launch`] keeps a readable parameter list.
-struct Run<'a> {
-    native: Option<&'a str>,
-    /// `native` names an earlier session to resume, not a new one.
-    resume: bool,
-    /// Claude Code's inline settings ([`claude_settings`]).
-    settings: &'a str,
-}
-
 /// What one start asks for. Grouped so that [`Bridge::start`] keeps a
 /// readable parameter list.
 struct Begin<'a> {
@@ -170,6 +159,9 @@ struct Begin<'a> {
     from: Option<&'a str>,
     /// Models the engine runs on; unset keeps the session's last profile.
     model: Option<ModelProfile>,
+    /// The engine's driver: the start's engine, or the session's for a
+    /// resume.
+    driver: &'static dyn AgentDriver,
 }
 
 /// The loopback relay engines reach their models through
@@ -274,6 +266,10 @@ pub struct BridgeConfig {
     pub screen_quiet: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
+    /// Where engines other than Claude Code live, by driver id
+    /// ([`BridgeConfig::engine_home`]). Claude Code's home is always
+    /// `claude_program` and `claude_projects`, whatever this holds.
+    pub engines: Vec<(String, EngineHome)>,
     /// The watch on the files the engines write (transcripts and exit
     /// statuses), when the host has one. `None` reads every live execution's
     /// files on every pass, as Spawn did before watches: correct, and the
@@ -314,9 +310,34 @@ impl BridgeConfig {
             screen_refresh: Duration::from_secs(30),
             screen_quiet: Duration::from_millis(500),
             model_relay: None,
+            engines: Vec::new(),
             watch: None,
             launch_environment: None,
         }
+    }
+
+    /// Where the engine of driver `id` lives: Claude Code's from
+    /// `claude_program` and `claude_projects`, another's from `engines`;
+    /// `None` for an engine with no home here.
+    pub fn engine_home(&self, id: &str) -> Option<EngineHome> {
+        if id == crate::driver::DEFAULT {
+            return Some(EngineHome {
+                program: self.claude_program.clone(),
+                sessions: self.claude_projects.clone(),
+            });
+        }
+        self.engines
+            .iter()
+            .find(|(known, _)| known == id)
+            .map(|(_, home)| home.clone())
+    }
+
+    /// The home of `driver`, else Claude Code's.
+    fn home_of(&self, driver: &dyn AgentDriver) -> EngineHome {
+        self.engine_home(driver.id()).unwrap_or_else(|| EngineHome {
+            program: self.claude_program.clone(),
+            sessions: self.claude_projects.clone(),
+        })
     }
 }
 
@@ -331,6 +352,8 @@ type Ending = (EndCause, Option<i32>, Option<i32>);
 struct Active {
     execution_id: ExecutionId,
     workspace: WorkspaceId,
+    /// The driver of the engine it runs, from its `execution.started`.
+    driver: &'static dyn AgentDriver,
     /// A tool or turn finished after the last commit.
     // ponytail: an `Unchanged` commit writes no event, so after a refold an
     // idle session repeats one no-op commit per tick; record attempts if
@@ -351,10 +374,12 @@ impl Active {
         execution_id: ExecutionId,
         workspace: WorkspaceId,
         transcript_from: Option<u64>,
+        driver: &'static dyn AgentDriver,
     ) -> Self {
         Self {
             execution_id,
             workspace,
+            driver,
             checkpoint: None,
             reported_end: None,
             unmounting: false,
@@ -403,6 +428,8 @@ struct Follow {
     due_at: Option<i64>,
     /// Bytes of the transcript read so far.
     offset: u64,
+    /// What the engine's driver keeps between transcript lines.
+    cursor: LineCursor,
     /// The last bytes read before `offset`, at most [`FOLLOW_OVERLAP`]:
     /// what the file must still hold there for the offset to mean anything.
     /// A file that is shorter than the offset, or holds other bytes before
@@ -714,6 +741,9 @@ struct SessionView {
     /// The profile the session's last execution started with: what a start
     /// or resume that names none runs on.
     model: ModelProfile,
+    /// The engine the session's last execution started: what a resume
+    /// runs.
+    engine: String,
     active: Option<Active>,
     /// What the log last says the agent's branch points at: the commit of
     /// its last `artifact.committed`, or the fork its branch was created at.
@@ -831,6 +861,7 @@ impl SessionView {
             native: None,
             transcript_read: false,
             model: ModelProfile::Default,
+            engine: crate::driver::DEFAULT.to_string(),
             active: None,
             recorded_head: None,
             latest: None,
@@ -1045,7 +1076,13 @@ pub fn failure_key(error: &WorkspaceError) -> String {
 /// the command waits so its one `execution.started` has one launch summary.
 #[derive(Clone)]
 struct PreparedStart {
-    settings: String,
+    /// The engine's driver.
+    driver: &'static dyn AgentDriver,
+    /// The model relay the engine goes through: the one that was reachable
+    /// when the start was prepared, else none.
+    relay: Option<ModelRelay>,
+    /// The engine's configuration directory ([`Bridge::claude_config_dir`]).
+    config_dir: Option<String>,
     launch: LaunchSummary,
     model: ModelProfile,
     fork: Option<Fork>,
@@ -1764,17 +1801,24 @@ impl Bridge {
             .is_some_and(|active| event.execution_id.as_ref() == Some(&active.execution_id));
         match &event.kind {
             EventKind::ExecutionStarted {
+                engine,
                 workspace,
                 model,
                 transcript_from,
                 ..
             } => {
                 view.model = *model;
+                view.engine.clone_from(engine);
                 if let Some(execution_id) = event.execution_id.clone() {
                     // As the store names it now: a record from before the
                     // root was resolved names the same directory.
                     let workspace = self.workspaces.canonical(workspace);
-                    view.active = Some(Active::started(execution_id, workspace, *transcript_from));
+                    view.active = Some(Active::started(
+                        execution_id,
+                        workspace,
+                        *transcript_from,
+                        driver_or_default(engine),
+                    ));
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
@@ -2108,7 +2152,7 @@ impl Bridge {
         let Some(native) = native else {
             return Ok(());
         };
-        let path = transcript_path(&self.config.claude_projects, &active.workspace, native);
+        let path = self.transcript_of(active.driver, &active.workspace, native);
         // Read past the offset only while the file holds what was read there
         // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
         let (bytes, limit) = match self.read_followed(session, &path, active, report) {
@@ -2179,12 +2223,11 @@ impl Bridge {
             let start = read;
             read += line.len() + 1;
             let line = String::from_utf8_lossy(line);
-            let mut events = claude_line(&line);
-            // A model call's usage, for the cost step: before the line's
-            // other events, so a turn's end follows its last call's usage.
-            if let Some(usage) = claude_usage(&line) {
-                events.insert(0, usage);
-            }
+            // A model call's usage, for the cost step, comes before the
+            // line's other events, so a turn's end follows its last call's
+            // usage ([`AgentDriver::read_line`]).
+            let facts = active.driver.read_line(&line, &mut active.follow.cursor);
+            let events = facts.events;
             // A turn's checkpoint is part of the turn's end: the workspace
             // is committed (and its `artifact.committed` recorded) before
             // the `turn.stopped` or `turn.failed` that ends it, so whoever
@@ -2214,7 +2257,7 @@ impl Bridge {
                 checkpointed = true;
             }
             if active.follow.version.is_none()
-                && let Some(version) = claude_version(&line)
+                && let Some(version) = facts.version
             {
                 self.record_version(agent_id, session, native, active, &path, version)?;
             }
@@ -2307,11 +2350,7 @@ impl Bridge {
         }
         let mut paths = vec![exit_file(active)];
         if let Some(native) = native {
-            paths.push(transcript_path(
-                &self.config.claude_projects,
-                &active.workspace,
-                native,
-            ));
+            paths.push(self.transcript_of(active.driver, &active.workspace, native));
         }
         for path in paths {
             if let Err(error) = watch.watch(&key, &path) {
@@ -2480,7 +2519,7 @@ impl Bridge {
             Source::Claude,
             Some(format!("{}:engine_version", active.execution_id)),
             EventKind::NativeSessionStarted {
-                engine: ENGINE.to_string(),
+                engine: active.driver.id().to_string(),
                 native_session_id: native.to_string(),
                 transcript_path: Some(path.to_string()),
                 engine_version: Some(version),
@@ -2511,7 +2550,7 @@ impl Bridge {
         let now = self.clock.now().0;
         active.follow.last_capture = Some(now);
         active.follow.unread_since = None;
-        let reading = read_claude_screen(&pane);
+        let reading = active.driver.read_screen(&pane);
         // A reading that accepts input is the screen showing the turn over:
         // what a turn's end in the transcript was waiting for.
         if reading.state.accepts_input() {
@@ -3183,7 +3222,7 @@ impl Bridge {
         }
         match action {
             CommandAction::Start {
-                engine: _,
+                engine,
                 prompt,
                 parent_session_id,
                 from,
@@ -3199,6 +3238,7 @@ impl Bridge {
                     native: None,
                     from: from.as_deref(),
                     model,
+                    driver: driver_or_default(&engine),
                 },
                 report,
             ),
@@ -3251,6 +3291,7 @@ impl Bridge {
     /// have: the view follows the log again.
     fn track_from_log(&mut self, session: &SessionId, record: &EventRecord) -> Option<Active> {
         let EventKind::ExecutionStarted {
+            engine,
             workspace,
             transcript_from,
             ..
@@ -3262,6 +3303,7 @@ impl Bridge {
             record.event.execution_id.clone()?,
             self.workspaces.canonical(workspace),
             *transcript_from,
+            driver_or_default(engine),
         );
         if let Some(view) = self.sessions.get_mut(session) {
             view.active = Some(active.clone());
@@ -3380,6 +3422,7 @@ impl Bridge {
             native,
             from,
             model,
+            driver,
         } = *begin;
         let finished = |outcome| Ok(Handled::Finished(outcome));
         // Another Bridge may have started the session since this tick read
@@ -3389,7 +3432,7 @@ impl Bridge {
             return handled;
         }
         let branch = BranchName::for_agent(&claimed.agent_id);
-        let prepared = match self.prepare_start(claimed, &branch, model, from, report)? {
+        let prepared = match self.prepare_start(claimed, &branch, (driver, model), from, report)? {
             Ok(prepared) => prepared,
             Err(why) => return finished(self.fail_prepared_start(claimed, why)),
         };
@@ -3405,7 +3448,7 @@ impl Bridge {
         // A resumed session's transcript holds the earlier executions' lines:
         // this execution's are the ones after its length now.
         let transcript_from = match native
-            .map(|native| self.resumed_transcript(claimed, &workspace, native, report))
+            .map(|native| self.resumed_transcript(claimed, (driver, &workspace), native, report))
             .transpose()
         {
             Ok(length) => length.flatten(),
@@ -3430,6 +3473,7 @@ impl Bridge {
         let active = Active {
             execution_id: ExecutionId::for_command(claimed.command_id),
             workspace,
+            driver: prepared.driver,
             checkpoint: None,
             reported_end: None,
             unmounting: false,
@@ -3444,13 +3488,13 @@ impl Bridge {
             Source::Bridge,
             Some(format!("{}:started", active.execution_id)),
             EventKind::ExecutionStarted {
-                engine: ENGINE.to_string(),
+                engine: prepared.driver.id().to_string(),
                 workspace: active.workspace.clone(),
                 command_id: claimed.command_id,
-                fork: prepared.fork,
+                fork: prepared.fork.clone(),
                 model: prepared.model,
                 transcript_from,
-                launch: (!prepared.launch.is_empty()).then_some(prepared.launch),
+                launch: (!prepared.launch.is_empty()).then(|| prepared.launch.clone()),
             },
         );
         match recorded {
@@ -3469,7 +3513,7 @@ impl Bridge {
             }
         }
         self.prepared.remove(&claimed.command_id);
-        self.launch_and_prompt(claimed, &active, native, &prepared.settings, prompt, report)
+        self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
     }
 
     fn fail_prepared_start(&self, claimed: &Claimed, why: String) -> Outcome {
@@ -3502,7 +3546,7 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         branch: &BranchName,
-        model: Option<ModelProfile>,
+        (driver, model): (&'static dyn AgentDriver, Option<ModelProfile>),
         from: Option<&str>,
         report: &mut TickReport,
     ) -> Result<Result<PreparedStart, String>, StoreError> {
@@ -3514,7 +3558,7 @@ impl Bridge {
                 .get(&claimed.session_id)
                 .map_or(ModelProfile::Default, |view| view.model)
         });
-        let (settings, launch) = match self.engine_settings(claimed, model, report) {
+        let (relay, config_dir, launch) = match self.engine_settings(claimed, model, report) {
             Ok(settings) => settings,
             Err(why) => return Ok(Err(why)),
         };
@@ -3524,7 +3568,9 @@ impl Bridge {
         };
         self.merge_main_at_start(claimed, branch, report)?;
         let prepared = PreparedStart {
-            settings,
+            driver,
+            relay,
+            config_dir,
             launch,
             model,
             fork,
@@ -4183,7 +4229,7 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         native: Option<&str>,
-        settings: &str,
+        prepared: &PreparedStart,
         prompt: &str,
         report: &mut TickReport,
     ) -> Result<Handled, StoreError> {
@@ -4191,10 +4237,12 @@ impl Bridge {
         let launch = self.launch(
             claimed,
             active,
-            &Run {
+            &EngineLaunch {
                 native: fresh.as_deref().or(native),
                 resume: native.is_some(),
-                settings,
+                relay: prepared.relay.as_ref(),
+                profile: prepared.model,
+                config_dir: prepared.config_dir.as_deref(),
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
@@ -4273,11 +4321,11 @@ impl Bridge {
     fn ready_transcript(
         &self,
         claimed: &Claimed,
-        workspace: &WorkspaceId,
+        (driver, workspace): (&dyn AgentDriver, &WorkspaceId),
         native: &str,
         report: &mut TickReport,
     ) -> Result<(), String> {
-        let path = transcript_path(&self.config.claude_projects, workspace, native);
+        let path = self.transcript_of(driver, workspace, native);
         let read_before = self
             .sessions
             .get(&claimed.session_id)
@@ -4369,7 +4417,7 @@ impl Bridge {
         let (Some(archive), Some(native)) = (self.transcripts.as_deref(), native) else {
             return;
         };
-        let path = transcript_path(&self.config.claude_projects, &active.workspace, &native);
+        let path = self.transcript_of(active.driver, &active.workspace, &native);
         let state = &mut active.follow.archiving;
         if state.due || !live {
             let pass = self.copy_transcript(
@@ -4683,8 +4731,8 @@ impl Bridge {
             let done = if live {
                 true
             } else {
-                let path = transcript_path(
-                    &self.config.claude_projects,
+                let path = self.transcript_of(
+                    self.session_driver(&progress.session),
                     &progress.workspace,
                     &progress.native,
                 );
@@ -4892,22 +4940,23 @@ impl Bridge {
     fn resumed_transcript(
         &self,
         claimed: &Claimed,
-        workspace: &WorkspaceId,
+        (driver, workspace): (&dyn AgentDriver, &WorkspaceId),
         native: &str,
         report: &mut TickReport,
     ) -> Result<Option<u64>, String> {
-        self.ready_transcript(claimed, workspace, native, report)?;
-        self.transcript_length(workspace, native)
+        self.ready_transcript(claimed, (driver, workspace), native, report)?;
+        self.transcript_length(driver, workspace, native)
     }
 
     /// How long the transcript of `native` is, as the engine will see it;
     /// `None` when it does not exist (yet).
     fn transcript_length(
         &self,
+        driver: &dyn AgentDriver,
         workspace: &WorkspaceId,
         native: &str,
     ) -> Result<Option<u64>, String> {
-        let path = transcript_path(&self.config.claude_projects, workspace, native);
+        let path = self.transcript_of(driver, workspace, native);
         let mut length = 0u64;
         loop {
             match self.terminals.read_from(workspace, &path, length) {
@@ -4947,9 +4996,11 @@ impl Bridge {
         }
     }
 
-    /// Claude Code's inline settings for an engine on `model`, with what
-    /// they launch it with for the record ([`LaunchSummary`]), or why it
-    /// cannot start. The default profile falls back on Claude Code's own
+    /// What an engine on `model` launches with: the relay it goes through
+    /// and its configuration directory, which its driver makes its settings
+    /// of ([`AgentDriver::launch`], Claude Code's inline settings), with
+    /// the summary for the record ([`LaunchSummary`]), or why it cannot
+    /// start. The default profile falls back on Claude Code's own
     /// settings (the gateway, its own small model) when the relay is down,
     /// and its summary names no relay; the cheap profile has no fallback,
     /// and fails where its sender sees it.
@@ -4958,7 +5009,7 @@ impl Bridge {
         claimed: &Claimed,
         model: ModelProfile,
         report: &mut TickReport,
-    ) -> Result<(String, LaunchSummary), String> {
+    ) -> Result<(Option<ModelRelay>, Option<String>, LaunchSummary), String> {
         let relay = self.config.model_relay.as_ref();
         let reachable = relay.filter(|relay| relay.reachable());
         let config_dir = self.claude_config_dir(&claimed.session_id);
@@ -4971,10 +5022,7 @@ impl Bridge {
                 small_model: relay.map(|relay| relay.small_model.clone()),
                 config_dir: config_dir.clone(),
             };
-            (
-                claude_settings_in(relay, model, config_dir.as_deref()),
-                summary,
-            )
+            (relay.cloned(), config_dir.clone(), summary)
         };
         match (model, relay, reachable) {
             (_, _, Some(relay)) => Ok(settings(Some(relay))),
@@ -5096,7 +5144,10 @@ impl Bridge {
         if native.is_some() {
             return Ok(None);
         }
-        let id = claude_session_id(&active.execution_id);
+        let Some(id) = active.driver.new_session_id(&active.execution_id) else {
+            return Ok(None);
+        };
+        let home = self.config.home_of(active.driver);
         self.append(
             &claimed.agent_id,
             &claimed.session_id,
@@ -5104,18 +5155,36 @@ impl Bridge {
             Source::Bridge,
             Some(format!("{}:native", active.execution_id)),
             EventKind::NativeSessionStarted {
-                engine: ENGINE.to_string(),
+                engine: active.driver.id().to_string(),
                 native_session_id: id.clone(),
-                transcript_path: Some(transcript_path(
-                    &self.config.claude_projects,
-                    &active.workspace,
-                    &id,
-                )),
+                transcript_path: Some(active.driver.transcript_path(&home, &active.workspace, &id)),
                 engine_version: None,
             },
         )?;
         self.catch_up()?;
         Ok(Some(id))
+    }
+
+    /// Where `driver`'s engine writes the transcript of `native` when it
+    /// runs in `workspace`, from its home ([`BridgeConfig::engine_home`]).
+    fn transcript_of(
+        &self,
+        driver: &dyn AgentDriver,
+        workspace: &WorkspaceId,
+        native: &str,
+    ) -> String {
+        driver.transcript_path(&self.config.home_of(driver), workspace, native)
+    }
+
+    /// The driver of the engine `session` last started
+    /// ([`driver_or_default`]: Claude Code's for a session that never ran
+    /// one, or ran one no driver is registered for).
+    fn session_driver(&self, session: &SessionId) -> &'static dyn AgentDriver {
+        driver_or_default(
+            self.sessions
+                .get(session)
+                .map_or(crate::driver::DEFAULT, |view| view.engine.as_str()),
+        )
     }
 
     /// The Claude Code directory the engine of `session` runs with
@@ -5138,18 +5207,12 @@ impl Bridge {
             .filter(|dir| !dir.is_empty())
     }
 
-    fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
-        let Run {
-            native,
-            resume,
-            settings,
-        } = *run;
-        let mut arguments = vec![
-            "run".to_string(),
-            "--".to_string(),
-            self.config.claude_program.clone(),
-        ];
-        arguments.extend(claude_arguments(native, resume, settings));
+    fn launch(&self, claimed: &Claimed, active: &Active, run: &EngineLaunch<'_>) -> Launch {
+        let plan = active
+            .driver
+            .launch(&self.config.home_of(active.driver), run);
+        let mut arguments = vec!["run".to_string(), "--".to_string(), plan.program];
+        arguments.extend(plan.arguments);
         let mut environment = self.config.environment.clone();
         if let Some(launch) = &self.config.launch_environment {
             for (name, value) in launch.environment() {
@@ -5165,6 +5228,11 @@ impl Bridge {
                 environment.retain(|(known, _)| known != name);
                 environment.push((name.clone(), value.clone()));
             }
+        }
+        // What the engine needs of its own (none for Claude Code).
+        for (name, value) in plan.environment {
+            environment.retain(|(known, _)| *known != name);
+            environment.push((name, value));
         }
         environment.push(("SPAWN_AGENT_ID".to_string(), claimed.agent_id.to_string()));
         environment.push((
@@ -5242,13 +5310,16 @@ impl Bridge {
                         return Ok(self.prompt_retry(&progress));
                     }
                 };
-            let reading = read_claude_screen(&pane);
+            let reading = active.driver.read_screen(&pane);
             progress.prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it,
             // whether the session is fresh or resumed. Answer once (a second
             // answer would land in the input box), and only the dialog itself:
             // on two equal reads, before any prompt.
-            if !progress.answered_trust && !progress.prompt_seen && is_trust_dialog(&pane) {
+            if !progress.answered_trust
+                && !progress.prompt_seen
+                && let Some(keys) = active.driver.startup_answer(&pane)
+            {
                 if progress.dialog.as_deref() != Some(pane.as_str()) {
                     progress.dialog = Some(pane);
                     return Ok(self.prompt_retry(&progress));
@@ -5256,7 +5327,7 @@ impl Bridge {
                 progress.answered_trust = true;
                 if let Err(error) =
                     self.terminals
-                        .send_keys(&active.terminal(), &active.workspace, &TRUST_KEYS)
+                        .send_keys(&active.terminal(), &active.workspace, keys)
                 {
                     return Ok(Handled::Finished(Outcome::Failed(format!(
                         "answer trust dialog: {error}"
@@ -5449,7 +5520,7 @@ impl Bridge {
                         continue;
                     }
                 };
-            let reading = read_claude_screen(&pane);
+            let reading = active.driver.read_screen(&pane);
             // A waiting input's busy readings are not recorded again each
             // time it is tried: they are no new fact.
             if reading.state.accepts_input() || !waited {
@@ -5699,11 +5770,11 @@ impl Bridge {
                 claimed.session_id
             ))));
         }
-        let Some(native) = self
-            .sessions
-            .get(&claimed.session_id)
-            .and_then(|view| view.native.clone())
-        else {
+        let Some((native, engine)) = self.sessions.get(&claimed.session_id).and_then(|view| {
+            view.native
+                .clone()
+                .map(|native| (native, view.engine.clone()))
+        }) else {
             return Ok(Handled::Finished(Outcome::Failed(
                 "no native session to resume".to_string(),
             )));
@@ -5716,6 +5787,7 @@ impl Bridge {
                 native: Some(native.as_str()),
                 from: None,
                 model,
+                driver: driver_or_default(&engine),
             },
             report,
         )
