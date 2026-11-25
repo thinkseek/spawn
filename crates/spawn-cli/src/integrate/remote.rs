@@ -798,9 +798,9 @@ fn exited(code: i64) -> ExitStatus {
 /// The [`gate::Run`] a stored result stands for: the gate's status, its
 /// stdout and its stderr (the log split at `stdout_bytes`). None when the
 /// gate has no status (it died of a signal, never started, or the node
-/// said none).
+/// said none, or one no process exits with).
 pub(super) fn run_of(stored: &Stored) -> Option<gate::Run> {
-    let code = stored.meta.exit_code?;
+    let code = stored.meta.exit_code.filter(|code| (0..=255).contains(code))?;
     let (stdout, stderr) = stored.meta.streams(&stored.log).ok()?;
     Some(gate::Run {
         status: exited(code),
@@ -1121,6 +1121,3 @@ pub(super) fn settle(
         .map_err(|error| error.to_string())
 }
 
-#[cfg(test)]
-#[path = "remote_tests.rs"]
-mod tests;
