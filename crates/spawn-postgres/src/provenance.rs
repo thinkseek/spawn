@@ -11,9 +11,11 @@
 //! Reads: one change by `(change_id, rev)` or id, the changes that touched a
 //! path or were made by an agent or an execution, and the blast radius of a
 //! change ([`PostgresStore::prov_blast_radius`]): the changes that depend on
-//! it (forward) or that it depends on (backward), however far, through
-//! cycles too.
+//! it (forward) or that it depends on (backward), up to a depth, each
+//! expanded once (a breadth-first walk), so diamonds, cliques and cycles
+//! cost what they hold, not their paths.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -260,7 +262,7 @@ pub struct ProvBlastRadiusNode {
     /// Steps from the start (1: a direct dependency or dependent).
     pub depth: i32,
     /// The ids from the start to this change, both included: one shortest
-    /// path.
+    /// path (the parent pointers of the walk).
     pub path: Vec<i64>,
     /// The link of the path's last step.
     pub via: ProvLink,
@@ -339,57 +341,58 @@ fn edge_json(edge: &ProvEdgeInput) -> Value {
     Value::Object(object)
 }
 
-/// The blast radius walk. `$1` the start's id, `$2` true to walk forward,
-/// `$3` the deepest step. A change X depends on a change Y when one of X's
-/// edges names Y's `change_id`, Y's `result` or the `after` digest of one of
-/// Y's entries, or one of X's entries has Y as its `origin`. Each step
-/// extends a path that never holds a change twice (`<> all(path)`), so a
-/// cycle ends the path that would close it, and no path is longer than the
-/// depth bound: the walk ends on any graph. Each change reached is returned
-/// once, by its shortest path (the start itself is not returned).
-const BLAST_RADIUS: &str = "\
-with recursive walk(id, change_id, result, depth, path, via) as (
-    select c.id, c.change_id, c.result, 0, array[c.id], null::text
-      from prov_changes c where c.id = $1
+/// One step of the blast radius walk, forward: from each change of the
+/// frontier `$1` to the changes that depend on it, each target once (by its
+/// smallest frontier change, then link). A change X depends on a change Y
+/// when one of X's edges names Y's `change_id`, Y's `result` or the `after`
+/// digest of one of Y's entries, or one of X's entries has Y as its
+/// `origin`. Every arm is an index lookup (`prov_edges_dst`,
+/// `prov_entries_origin`, the entries' key).
+const STEP_FORWARD: &str = "\
+with f(id) as (select unnest($1::bigint[])),
+links(src, dst, via) as (
+    select f.id, e.src, e.kind
+      from f join prov_changes w on w.id = f.id join prov_edges e on e.dst = w.change_id
     union all
-    select nx.id, nx.change_id, nx.result, w.depth + 1, w.path || nx.id, nx.via
-      from walk w
-     cross join lateral (
-        select c.id, c.change_id, c.result, e.kind as via
-          from prov_edges e join prov_changes c on c.id = e.src
-         where $2 and (e.dst = w.change_id or e.dst = w.result
-                       or e.dst in (select n.after from prov_entries n
-                                     where n.change = w.id and n.after is not null))
-        union all
-        select c.id, c.change_id, c.result, 'origin'
-          from prov_entries n join prov_changes c on c.id = n.change
-         where $2 and n.origin = w.id
-        union all
-        select c.id, c.change_id, c.result, e.kind
-          from prov_edges e join prov_changes c on c.change_id = e.dst
-         where not $2 and e.src = w.id
-        union all
-        select c.id, c.change_id, c.result, e.kind
-          from prov_edges e join prov_changes c on c.result = e.dst
-         where not $2 and e.src = w.id
-        union all
-        select c.id, c.change_id, c.result, e.kind
-          from prov_edges e join prov_entries n on n.after = e.dst
-          join prov_changes c on c.id = n.change
-         where not $2 and e.src = w.id
-        union all
-        select c.id, c.change_id, c.result, 'origin'
-          from prov_entries n join prov_changes c on c.id = n.origin
-         where not $2 and n.change = w.id
-     ) nx
-     where w.depth < $3 and nx.id <> all(w.path)
+    select f.id, e.src, e.kind
+      from f join prov_changes w on w.id = f.id join prov_edges e on e.dst = w.result
+    union all
+    select f.id, e.src, e.kind
+      from f join prov_entries n on n.change = f.id and n.after is not null
+      join prov_edges e on e.dst = n.after
+    union all
+    select f.id, n.change, 'origin'
+      from f join prov_entries n on n.origin = f.id
 )
-select r.id, c.change_id, c.rev, c.agent_id, r.depth, r.path, r.via
-  from (select distinct on (w.id) w.id, w.depth, w.path, w.via
-          from walk w where w.depth > 0
-         order by w.id, w.depth, w.path, w.via) r
-  join prov_changes c on c.id = r.id
- order by r.depth, r.id";
+select distinct on (dst) src, dst, via from links order by dst, src, via";
+
+/// [`STEP_FORWARD`] backward: from each change of the frontier `$1` to the
+/// changes it depends on (`prov_changes_result`, the `(change_id, rev)`
+/// key, `prov_entries_after`, `prov_edges_src`).
+const STEP_BACKWARD: &str = "\
+with f(id) as (select unnest($1::bigint[])),
+links(src, dst, via) as (
+    select f.id, c.id, e.kind
+      from f join prov_edges e on e.src = f.id join prov_changes c on c.change_id = e.dst
+    union all
+    select f.id, c.id, e.kind
+      from f join prov_edges e on e.src = f.id join prov_changes c on c.result = e.dst
+    union all
+    select f.id, n.change, e.kind
+      from f join prov_edges e on e.src = f.id join prov_entries n on n.after = e.dst
+    union all
+    select f.id, n.origin, 'origin'
+      from f join prov_entries n on n.change = f.id and n.origin is not null
+)
+select distinct on (dst) src, dst, via from links order by dst, src, via";
+
+/// Where the walk reached a change: its depth, the change it was reached
+/// from and the link.
+struct Reached {
+    depth: i32,
+    parent: i64,
+    via: String,
+}
 
 impl PostgresStore {
     /// Record `change` with its `entries` and `edges`, atomically, through
@@ -525,35 +528,104 @@ impl PostgresStore {
 
     /// The blast radius of the change `id`: every change that depends on it
     /// ([`ProvDirection::Forward`]) or that it depends on
-    /// ([`ProvDirection::Backward`]), at most `max_depth` steps away, each
-    /// once by its shortest path, nearest first. Cycles are safe: no path
-    /// holds a change twice. An unknown id has an empty radius.
+    /// ([`ProvDirection::Backward`]), at most `max_depth` steps away, nearest
+    /// first (then by id). An unknown id has an empty radius.
+    ///
+    /// A breadth-first walk, one statement per depth, in one read-only
+    /// repeatable-read transaction (one snapshot): each change is expanded
+    /// at most once, at the depth it is first reached, so the work is
+    /// linear in the changes and links reached whatever the graph's shape
+    /// (diamonds, cliques, cycles), and that depth is the exact shortest
+    /// distance. Each change keeps the change it was first reached from
+    /// (the smallest id of the frontier, then the link), and its `path` is
+    /// rebuilt from those parent pointers: one shortest path.
     pub fn prov_blast_radius(
         &self,
         id: i64,
         direction: ProvDirection,
         max_depth: u16,
     ) -> Result<Vec<ProvBlastRadiusNode>, StoreError> {
-        let forward = direction == ProvDirection::Forward;
-        let depth = i32::from(max_depth);
-        self.query(BLAST_RADIUS, &[&id, &forward, &depth])?
+        let step = match direction {
+            ProvDirection::Forward => STEP_FORWARD,
+            ProvDirection::Backward => STEP_BACKWARD,
+        };
+        let mut client = self.lock();
+        let mut transaction = client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|error| crate::backend(&error))?;
+        let statement = transaction
+            .prepare(step)
+            .map_err(|error| crate::backend(&error))?;
+        let mut reached: HashMap<i64, Reached> = HashMap::new();
+        let mut order: Vec<i64> = Vec::new();
+        let mut frontier = vec![id];
+        let mut depth: i32 = 0;
+        while !frontier.is_empty() && depth < i32::from(max_depth) {
+            depth += 1;
+            let mut next = Vec::new();
+            for row in transaction
+                .query(&statement, &[&frontier])
+                .map_err(|error| crate::backend(&error))?
+            {
+                let target: i64 = row.get(1);
+                if target == id || reached.contains_key(&target) {
+                    continue;
+                }
+                reached.insert(
+                    target,
+                    Reached {
+                        depth,
+                        parent: row.get(0),
+                        via: row.get(2),
+                    },
+                );
+                order.push(target);
+                next.push(target);
+            }
+            next.sort_unstable();
+            frontier = next;
+        }
+        let rows = transaction
+            .query(
+                "select id, change_id, rev, agent_id from prov_changes where id = any($1)",
+                &[&order],
+            )
+            .map_err(|error| crate::backend(&error))?;
+        transaction
+            .commit()
+            .map_err(|error| crate::backend(&error))?;
+        drop(client);
+        let mut nodes = rows
             .iter()
             .map(|row| {
-                let via: String = row.get(6);
+                let node: i64 = row.get(0);
+                let at = &reached[&node];
+                let mut path = vec![node];
+                let mut back = node;
+                while back != id {
+                    back = reached[&back].parent;
+                    path.push(back);
+                }
+                path.reverse();
                 Ok(ProvBlastRadiusNode {
-                    id: row.get(0),
+                    id: node,
                     change_id: row.get(1),
                     rev: row.get(2),
                     agent_id: row.get(3),
-                    depth: row.get(4),
-                    path: row.get(5),
-                    via: if via == "origin" {
+                    depth: at.depth,
+                    path,
+                    via: if at.via == "origin" {
                         ProvLink::Origin
                     } else {
-                        ProvLink::Edge(via.parse()?)
+                        ProvLink::Edge(at.via.parse()?)
                     },
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        nodes.sort_by_key(|node| (node.depth, node.id));
+        Ok(nodes)
     }
 }

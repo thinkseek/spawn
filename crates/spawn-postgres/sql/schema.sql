@@ -8302,23 +8302,26 @@ $$;
 -- - `prov_edges`: what a change used, included, superseded or redacted;
 --   `dst` names a change by its `change_id`, a tree digest (`result`) or a
 --   content digest (`prov_entries.after`).
+-- Every value is checked once, as it is written (rows are never changed):
+-- non-empty ids, digests, domain and path, a revision from 1, a size of 0 or
+-- more and an edge's detail a JSON object.
 -- Only `spawn_prov_record_change` (owner only) writes them; every update,
 -- delete and truncate is refused by trigger. The reader selects them.
 create table if not exists prov_changes (
     id bigint generated always as identity primary key,
-    change_id text collate "C" not null,
-    rev integer not null,
+    change_id text collate "C" not null check (char_length(change_id) > 0),
+    rev integer not null check (rev >= 1),
     kind text not null check (kind in ('edit', 'derive', 'land', 'revert', 'import')),
-    domain text not null,
-    agent_id text not null,
+    domain text not null check (char_length(domain) > 0),
+    agent_id text not null check (char_length(agent_id) > 0),
     execution_id text,
     task_id bigint,
     preset_id text,
     model_label text,
     transcript_ref text,
     attributed text not null default 'host' check (attributed in ('host', 'inferred', 'imported')),
-    base text collate "C" not null,
-    result text collate "C" not null,
+    base text collate "C" not null check (char_length(base) > 0),
+    result text collate "C" not null check (char_length(result) > 0),
     boundary text not null check (boundary in ('checkpoint', 'submit', 'land', 'job', 'backfill')),
     at_ms bigint not null,
     unique (change_id, rev)
@@ -8330,10 +8333,10 @@ create index if not exists prov_changes_result on prov_changes (result);
 
 create table if not exists prov_entries (
     change bigint not null references prov_changes (id),
-    path text collate "C" not null,
+    path text collate "C" not null check (char_length(path) > 0),
     before text collate "C",
     after text collate "C",
-    size bigint,
+    size bigint check (size is null or size >= 0),
     class text not null default 'content' check (class in ('content', 'mechanical', 'generated', 'tree')),
     origin bigint references prov_changes (id),
     primary key (change, path)
@@ -8348,7 +8351,7 @@ create table if not exists prov_edges (
     kind text not null check (kind in ('used', 'includes', 'supersedes', 'redacts')),
     src bigint not null references prov_changes (id),
     dst text collate "C" not null,
-    detail jsonb not null default '{}'::jsonb,
+    detail jsonb not null default '{}'::jsonb check (jsonb_typeof(detail) = 'object'),
     at_ms bigint not null
 );
 create index if not exists prov_edges_dst on prov_edges (dst);
