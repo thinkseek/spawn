@@ -1772,7 +1772,10 @@ fn runner_of(terminal: &TerminalName, record: &Record) -> Runner {
 
 #[cfg(test)]
 mod tests {
-    use super::{Press, Record, chunks, herdr_key, launch_script, socket_of_status};
+    use super::{
+        Ended, MANIFESTS, PROMPT_LINE_LIMIT, Press, Record, chunks, herdr_key, launch_script,
+        manifest_mismatch, prompt_fits, resubscribes_after, socket_of_status,
+    };
     use spawn_core::id::{TerminalName, WorkspaceId};
     use spawn_core::port::{Launch, Runner, TerminalHost, TerminalServer};
 
@@ -2191,5 +2194,76 @@ mod tests {
         assert!(agents.changed.is_empty(), "{:?}", agents.changed);
         agents.mark_all();
         assert_eq!(agents.changed, vec![terminal]);
+    }
+
+    /// `agent.prompt` carries a text only while its whole request line,
+    /// JSON escapes counted, stays under the cap; above it the text goes in
+    /// chunks through `pane.send_text`.
+    #[test]
+    fn agent_prompt_takes_a_text_only_well_under_the_request_line_cap() {
+        assert!(prompt_fits("w1:p1", "hello"));
+        assert!(prompt_fits("w1:p1", &"x".repeat(200 * 1024)));
+        assert!(!prompt_fits("w1:p1", &"x".repeat(PROMPT_LINE_LIMIT)));
+        // Escapes count: 60 KiB of quotes is 120 KiB on the line, 60 KiB of
+        // control bytes is 360 KiB.
+        assert!(prompt_fits("w1:p1", &"\"".repeat(60 * 1024)));
+        assert!(!prompt_fits("w1:p1", &"\u{1}".repeat(60 * 1024)));
+        assert!(PROMPT_LINE_LIMIT * 4 <= 1024 * 1024, "well under the probed 1 MiB cap");
+    }
+
+    /// Carry list N8: a server whose active manifest of a pinned agent
+    /// differs, or that has none, is refused naming both versions.
+    #[test]
+    fn a_manifest_other_than_the_pinned_one_is_refused_naming_both() {
+        let pinned: Vec<(String, String)> = MANIFESTS
+            .iter()
+            .map(|(agent, version)| ((*agent).to_string(), (*version).to_string()))
+            .collect();
+        let listed = |agy: &str| {
+            serde_json::json!({ "type": "agent_manifest_status", "manifests": [
+                { "agent": "pi", "active_version": "2026.10.01.1" },
+                { "agent": "claude", "source": "bundled", "active_version": "2026.10.11.1" },
+                { "agent": "agy", "source": "bundled", "active_version": agy },
+            ]})
+        };
+        assert_eq!(manifest_mismatch("s", &pinned, &listed("2026.10.05.1")), None);
+        let refused = manifest_mismatch("s", &pinned, &listed("2026.11.01.1")).expect("refused");
+        assert!(
+            refused.contains("agy pinned 2026.10.05.1, actual 2026.11.01.1"),
+            "{refused}"
+        );
+        assert!(!refused.contains("claude pinned"), "{refused}");
+        let none = manifest_mismatch("s", &pinned, &serde_json::json!({ "manifests": [] }))
+            .expect("refused");
+        assert!(none.contains("claude pinned 2026.10.11.1, actual none"), "{none}");
+        assert!(none.contains("agy pinned 2026.10.05.1, actual none"), "{none}");
+    }
+
+    /// Carry list N7: only a dropped connection makes the next subscription
+    /// ask the snapshot and mark every terminal changed.
+    #[test]
+    fn only_a_dropped_connection_marks_every_terminal_changed() {
+        assert!(resubscribes_after(Ended::Dropped));
+        assert!(!resubscribes_after(Ended::Moved));
+    }
+
+    /// Carry list N3: the record written before `workspace.create` names
+    /// only the server, reads as no terminal, and is told apart.
+    #[test]
+    fn a_pending_record_names_its_server_and_no_terminal() {
+        let server = TerminalServer {
+            pid: 42,
+            started_at_ms: 7,
+        };
+        let text = Record::pending_text(server);
+        assert_eq!(Record::pending_server(&text), Some(server));
+        assert_eq!(Record::parse(&text), None);
+        let full = Record {
+            pane: "w1:p1".to_string(),
+            workspace: "w1".to_string(),
+            leader: crate::process::ProcessId { pid: 42, start: 7 },
+            server,
+        };
+        assert_eq!(Record::pending_server(&full.to_text()), None);
     }
 }

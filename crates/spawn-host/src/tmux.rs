@@ -1430,7 +1430,10 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_LIMIT, read_in_workspace, read_local, replace_local, runner_of};
+    use super::{
+        READ_LIMIT, end_stragglers, read_in_workspace, read_local, replace_local, runner_of,
+        stragglers_beneath, sweepable,
+    };
     use spawn_core::id::TerminalName;
     use spawn_core::port::Runner;
     use std::time::{Duration, Instant};
@@ -1801,5 +1804,66 @@ mod tests {
         assert_eq!(super::server_identity(" \n"), None);
         assert_eq!(super::server_identity("2283540\n"), None);
         assert_eq!(super::server_identity("#{pid} #{start_time}\n"), None);
+    }
+
+    /// Never a directory too broad to be one workspace.
+    #[test]
+    fn only_a_narrow_directory_is_swept() {
+        for broad in ["/", "/tmp", "/tmp/a", "/home/someone", "relative/a/b", "/a/../b/c"] {
+            assert!(!sweepable(std::path::Path::new(broad)), "{broad}");
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if let Some(home) = home {
+            assert!(!sweepable(&home));
+            assert!(home.parent().is_none_or(|parent| !sweepable(parent)));
+        }
+        let here = std::env::current_dir().expect("cwd");
+        assert!(!sweepable(&here));
+        assert!(sweepable(std::path::Path::new("/workspaces/agents/agent_a")));
+    }
+
+    /// A process the test starts with its working directory below a
+    /// workspace, detached from any session, is found by pid and ended;
+    /// one elsewhere is left alone.
+    #[test]
+    fn a_detached_process_beneath_the_workspace_is_ended_by_pid() {
+        let scratch = crate::Scratch::new("spawn-straggler-test");
+        let workspace = scratch.join("ws");
+        let nested = workspace.join("deep");
+        std::fs::create_dir_all(&nested).expect("dirs");
+        let elsewhere = scratch.join("other");
+        std::fs::create_dir_all(&elsewhere).expect("dirs");
+        if !sweepable(&workspace) {
+            eprintln!("skipped: the scratch {} is not sweepable", workspace.display());
+            return;
+        }
+        let mut inside = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&nested)
+            .spawn()
+            .expect("sleep");
+        let mut outside = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&elsewhere)
+            .spawn()
+            .expect("sleep");
+        assert_eq!(stragglers_beneath(&workspace), vec![inside.id()]);
+        // The child is reaped here so that it is gone, not a zombie.
+        let reaper = std::thread::spawn(move || inside.wait());
+        end_stragglers(
+            &workspace.display().to_string(),
+            (Duration::from_secs(2), Duration::from_secs(2)),
+        )
+        .expect("ended");
+        let status = reaper.join().expect("joined").expect("waited");
+        assert!(!status.success(), "ended by a signal: {status:?}");
+        assert!(stragglers_beneath(&workspace).is_empty());
+        assert_eq!(outside.try_wait().expect("try_wait"), None, "left alone");
+        let _ = outside.kill();
+        let _ = outside.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && !stragglers_beneath(&elsewhere).is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
