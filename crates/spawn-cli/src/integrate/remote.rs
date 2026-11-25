@@ -1127,3 +1127,1201 @@ pub(super) fn settle(
         .map_err(|error| error.to_string())
 }
 
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use spawn_node_proto::json::OrderedMap;
+    use spawn_node_proto::result::ResultInputs;
+    use spawn_postgres::NodeEnroll;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    pub(in crate::integrate) const BASE: &str = "1111111111111111111111111111111111111111";
+    pub(in crate::integrate) const CANDIDATE: &str = "2222222222222222222222222222222222222222";
+    const CONTROLLER: &str = "3333333333333333333333333333333333333333";
+    const SCENARIOS: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+    pub(in crate::integrate) const SPEC_SHA: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A scratch directory, removed when dropped.
+    pub(in crate::integrate) struct Scratch(pub(in crate::integrate) PathBuf);
+    impl Scratch {
+        pub(in crate::integrate) fn new(case: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "spawn-remote-test-{case}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            super::super::shadow::remove_tree(&self.0);
+        }
+    }
+
+    pub(in crate::integrate) fn job_inputs() -> Value {
+        json!({"base": BASE, "candidate": CANDIDATE, "controller": CONTROLLER,
+               "scenarios_sha256": SCENARIOS, "scenario": null})
+    }
+
+    fn result_inputs(inputs: &Value) -> ResultInputs {
+        serde_json::from_value(inputs.clone()).unwrap()
+    }
+
+    /// A node's result: the gate's `exit`, its verdict file `verdict`, its
+    /// `stdout` and `stderr`, as judging `inputs`.
+    pub(in crate::integrate) fn meta(
+        job_id: &str,
+        epoch: i64,
+        exit: Option<i64>,
+        verdict: Option<&str>,
+        stdout: &str,
+        stderr: &str,
+        inputs: Option<&Value>,
+    ) -> (ResultMeta, Vec<u8>) {
+        let log = [stdout.as_bytes(), stderr.as_bytes()].concat();
+        let meta = ResultMeta {
+            v: 1,
+            job_id: job_id.to_string(),
+            lease_epoch: u64::try_from(epoch).unwrap(),
+            exit_code: exit,
+            signal: None,
+            timed_out: false,
+            self_fenced: false,
+            seconds: 42,
+            verdict_raw: verdict.map(|line| format!("{line}\n")),
+            stdout_bytes: stdout.len() as u64,
+            log_bytes: log.len() as u64,
+            log_sha256: spawn_node_proto::codec::sha256_hex(&log),
+            truncated: None,
+            inputs: inputs.map(result_inputs),
+            env: Some(OrderedMap(vec![
+                ("host".to_string(), "n252-host".to_string()),
+                ("toolchain".to_string(), "rustc 1.95.0 x86_64".to_string()),
+                ("node".to_string(), "n252".to_string()),
+                ("tier".to_string(), "tmpfs-bwrap".to_string()),
+            ])),
+            wrapper_error: None,
+        };
+        (meta, log)
+    }
+
+    fn stored(exit: Option<i64>, verdict: Option<&str>, stdout: &str, stderr: &str) -> Stored {
+        let (meta, log) = meta(
+            "gate-0123456789ab-k3x9q2ma",
+            1,
+            exit,
+            verdict,
+            stdout,
+            stderr,
+            Some(&job_inputs()),
+        );
+        Stored { meta, log }
+    }
+
+    pub(in crate::integrate) fn verdict_on(word: &str, base: &str, candidate: &str) -> String {
+        format!(
+            r#"{{"v":1,"verdict":"{word}","reason":"r","base":"{base}","candidate":"{candidate}"}}"#
+        )
+    }
+
+    fn verdict(word: &str) -> String {
+        verdict_on(word, BASE, CANDIDATE)
+    }
+
+    /// Judged as the row it is: evidence, strike, next.
+    fn row(judged: &Judged) -> (&'static str, bool, Option<FaultNext>) {
+        (judged.evidence, judged.strike, judged.next)
+    }
+
+    #[test]
+    fn the_grant_env_is_the_gate_env_without_what_the_node_sets_or_any_database() {
+        let mut gate_env: Vec<(String, String)> = gate::GATE_ENV
+            .iter()
+            .map(|name| ((*name).to_string(), format!("value-of-{name}")))
+            .collect();
+        // Never a real URL: the shape alone (no password).
+        let url = ["postgres", "://", "owner@db.example/spawn"].concat();
+        gate_env.push(("SPAWN_DATABASE_URL".into(), url.clone()));
+        gate_env.push(("ANTHROPIC_API_KEY".into(), "not-a-real-key".into()));
+        // A database URL smuggled in under a name the gate may get.
+        gate_env.retain(|(name, _)| name != "SUPPLY_PA_DEPS");
+        gate_env.push((
+            "SUPPLY_PA_DEPS".into(),
+            ["PostgreSQL", "://", "user@db.example/x"].concat(),
+        ));
+        let env = grant_env(&gate_env);
+        for owned in NODE_OWNED_ENV {
+            assert!(!env.contains_key(owned), "{owned} reaches the node");
+        }
+        for name in ["SPAWN_DATABASE_URL", "ANTHROPIC_API_KEY", "SUPPLY_PA_DEPS"] {
+            assert!(!env.contains_key(name), "{name} reaches the node");
+        }
+        assert!(env.values().all(|value| !names_a_database(value)));
+        assert!(env.values().all(|value| !value.contains("not-a-real-key")));
+        // Only GATE_ENV's names, every one the node does not own.
+        assert!(env.keys().all(|name| gate::GATE_ENV.contains(&name.as_str())));
+        assert_eq!(env["SPAWN_GATE_JOBS"], "value-of-SPAWN_GATE_JOBS");
+        assert_eq!(env["SPAWN_GATE_HOST_JOBS"], "value-of-SPAWN_GATE_HOST_JOBS");
+        assert_eq!(env["SPAWN_GATE_BUILD_JOBS"], "value-of-SPAWN_GATE_BUILD_JOBS");
+        assert_eq!(env["LANG"], "value-of-LANG");
+        // The node's floor (F4), whatever the primary's.
+        assert_eq!(env["SPAWN_GATE_MIN_FREE_GB"], NODE_MIN_FREE_GB);
+        // A grant of it is one the node takes (its own refusal list).
+        let grant = spawn_node_proto::grant::Grant {
+            v: 1,
+            job_id: "gate-0123456789ab-k3x9q2ma".into(),
+            lease_epoch: 1,
+            node_id: "a".repeat(64),
+            kind: spawn_node_proto::grant::JobKind::Gate,
+            expires_ms: 1,
+            attempt: None,
+            cost: None,
+            timeout_s: None,
+            inputs: None,
+            env: Some(env.clone().into_iter().collect()),
+            requires: None,
+            artifact_urls: None,
+        };
+        grant.validate().unwrap();
+        // An empty environment still gets a LANG and the floor.
+        let bare = grant_env(&[]);
+        assert_eq!(bare["LANG"], "C.UTF-8");
+        assert_eq!(bare.len(), 2);
+    }
+
+    #[test]
+    fn the_queue_wait_is_whole_seconds_with_a_default_of_30() {
+        assert_eq!(queue_wait(None), Duration::from_secs(30));
+        assert_eq!(queue_wait(Some(" 5 ")), Duration::from_secs(5));
+        for bad in ["0", "-1", "x", "1.5", ""] {
+            assert_eq!(queue_wait(Some(bad)), DEFAULT_QUEUE_WAIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_job_spec_carries_the_grant_and_names_its_judging_judging_id() {
+        let job = GateJob {
+            kind: RemoteJobKind::GateShadow,
+            job_id: job_id("gs", CANDIDATE),
+            judging_id: Some("0123456789ab0123456789abcdef".into()),
+            task_id: Some(7),
+            repo: "spawn".into(),
+            inputs: job_inputs(),
+            env: grant_env(&[("SPAWN_GATE_JOBS".into(), "8".into())]),
+            artifacts: vec![
+                Published {
+                    digest: ContentDigest::sha256_of(b"delta"),
+                    size: 5,
+                }
+                .url(ArtifactRole::DeltaBundle),
+            ],
+            requires: BTreeMap::from([("pg".to_string(), "16".to_string())]),
+        };
+        assert!(job.job_id.starts_with("gs-222222222222-"), "{}", job.job_id);
+        assert!(spawn_node_proto::envelope::is_job_id(&job.job_id));
+        let spec = job.spec();
+        let value = serde_json::to_value(&spec).unwrap();
+        // F11: `judging_id`, never `judging`.
+        assert_eq!(value["judging_id"], "0123456789ab0123456789abcdef");
+        assert!(value.get("judging").is_none());
+        assert!(!value.to_string().contains("\"judging\""));
+        assert_eq!(value["kind"], "gate_shadow");
+        assert_eq!(value["base_commit"], BASE);
+        assert_eq!(value["cost"], json!({"gate_sandbox": 1, "tmpfs_mb": 20480}));
+        assert_eq!(value["spec"]["timeout_s"], 7200);
+        assert_eq!(value["spec"]["inputs"]["repo"], "spawn");
+        assert_eq!(value["spec"]["inputs"]["candidate"], CANDIDATE);
+        assert_eq!(value["spec"]["env"]["SPAWN_GATE_JOBS"], "8");
+        assert_eq!(value["spec"]["artifact_urls"][0]["role"], "delta_bundle");
+        let url = value["spec"]["artifact_urls"][0]["url"].as_str().unwrap();
+        assert!(url.starts_with("/node/v1/artifacts/sha256:"), "{url}");
+        spawn_node_proto::check_target(url).unwrap();
+    }
+
+    /// Section 6.2, row by row, as `gate::decide` reads a stored result.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_row_of_the_outcomes_matrix() {
+        let inputs = job_inputs();
+        let judge = |stored: &Stored| judge_stored(stored, &inputs);
+
+        // Exit 0 with a verdict on the job's own inputs: believed (no
+        // fault, no strike), stderr marked `! `.
+        let accepted = judge(&stored(
+            Some(0),
+            Some(&verdict("accepted")),
+            "| gate ok\n",
+            "warn\n",
+        ));
+        assert_eq!(row(&accepted), ("accepted", false, None));
+        let said = accepted.verdict.as_ref().unwrap();
+        assert!(said.accepted);
+        assert!(said.output.contains("! warn"), "{}", said.output);
+        assert!(said.output.contains("| gate ok"));
+        let rejected = judge(&stored(Some(0), Some(&verdict("rejected")), "", ""));
+        assert_eq!(row(&rejected), ("rejected", false, None));
+        assert!(!rejected.verdict.unwrap().accepted);
+
+        // Exit 0 on other commits, other inputs, or none said: an abort.
+        let other = verdict_on("accepted", BASE, &"9".repeat(40));
+        let other = judge(&stored(Some(0), Some(&other), "", ""));
+        assert_eq!(
+            row(&other),
+            ("unequal_inputs", true, Some(FaultNext::Queued))
+        );
+        assert!(other.verdict.is_none());
+        assert_eq!(other.stated.as_deref(), Some("accepted"));
+        let mut theirs = inputs.clone();
+        theirs["scenarios_sha256"] = json!("5".repeat(64));
+        let (m, log) = meta(
+            "gate-0123456789ab-k3x9q2ma",
+            1,
+            Some(0),
+            Some(&verdict("accepted")),
+            "",
+            "",
+            Some(&theirs),
+        );
+        let unequal = judge(&Stored { meta: m, log });
+        assert_eq!(
+            row(&unequal),
+            ("unequal_inputs", true, Some(FaultNext::Queued))
+        );
+        assert!(
+            unequal.reason.contains("scenarios_sha256"),
+            "{}",
+            unequal.reason
+        );
+        let (m, log) = meta(
+            "gate-0123456789ab-k3x9q2ma",
+            1,
+            Some(0),
+            Some(&verdict("accepted")),
+            "",
+            "",
+            None,
+        );
+        assert_eq!(row(&judge(&Stored { meta: m, log })).0, "unequal_inputs");
+        // Exit 0 with no verdict file, or two lines in it.
+        let none = judge(&stored(Some(0), None, "", ""));
+        assert_eq!(row(&none), ("aborted", true, Some(FaultNext::Queued)));
+        assert!(matches!(none.failure, Some(GateFailure::Aborted { .. })));
+        let two = format!("{}\n{}", verdict("accepted"), verdict("rejected"));
+        assert_eq!(row(&judge(&stored(Some(0), Some(&two), "", ""))).0, "aborted");
+
+        // Exit 2: not a gate.sh status.
+        assert_eq!(
+            row(&judge(&stored(Some(2), None, "", "boom\n"))),
+            ("aborted", true, Some(FaultNext::Queued))
+        );
+        // Exit 3: setup refused; struck, excluded (by the fault), local.
+        assert_eq!(
+            row(&judge(&stored(Some(3), None, "", "no bwrap\n"))),
+            ("aborted", true, Some(FaultNext::FallbackLocal))
+        );
+        // Exit 4 with the gate's pair, and without.
+        let pair = "| check-x.sh exited 1, then 0 on the base: a harness error, not a verdict; \
+                    the gate aborts\n| stage gate aborted 12ms base: check-x.sh again \
+                    (unsolved needs two runs that agree)\n";
+        let disagrees = judge(&stored(Some(4), None, pair, ""));
+        assert_eq!(
+            row(&disagrees),
+            ("base_disagrees", true, Some(FaultNext::Queued))
+        );
+        assert!(matches!(
+            disagrees.failure,
+            Some(GateFailure::BaseDisagrees { .. })
+        ));
+        assert_eq!(
+            row(&judge(&stored(Some(4), None, "| nothing\n", ""))),
+            ("aborted", true, Some(FaultNext::Queued))
+        );
+
+        // Exit 5: the node's tmpfs (a strike), a slot wait (none).
+        let disk = r#"{"v":1,"no_room":true,"free_kb":10,"min_gb":8,"tmpdir":"/data01/spawn-node/w/0/t"}"#;
+        let disk = judge(&stored(Some(5), Some(disk), "", ""));
+        assert_eq!(row(&disk), ("no_room", true, Some(FaultNext::Queued)));
+        match &disk.failure {
+            Some(GateFailure::NoRoom {
+                short: Shortfall::Disk {
+                    tmpdir, free_kb, ..
+                },
+                ..
+            }) => {
+                // The node's own measure, never this host's.
+                assert_eq!(tmpdir, "/data01/spawn-node/w/0/t");
+                assert_eq!(*free_kb, 10);
+            }
+            other => panic!("{other:?}"),
+        }
+        let slot = r#"{"v":1,"no_room":true,"check":"host scenario slot","waited_ms":5000,"budget":32}"#;
+        assert_eq!(
+            row(&judge(&stored(Some(5), Some(slot), "", ""))),
+            ("no_room_slot", false, Some(FaultNext::Queued))
+        );
+
+        // Exit 6: where the host fault was, a red main, a scenario the node
+        // cannot judge, a validator's defect, no fact.
+        let sandbox = r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"sandbox","runs":"","reason":"r","evidence":"sandbox_never_started","tree":"candidate"}"#;
+        assert_eq!(
+            row(&judge(&stored(Some(6), Some(sandbox), "", ""))),
+            ("host_fault", true, Some(FaultNext::Queued))
+        );
+        let server = r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"test server","runs":"","reason":"r","evidence":"test_server_never_started","tree":"gate"}"#;
+        assert_eq!(
+            row(&judge(&stored(Some(6), Some(server), "", ""))),
+            ("host_fault", true, Some(FaultNext::Queued))
+        );
+        let base = r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"base","runs":"2","reason":"r"}"#;
+        assert_eq!(
+            row(&judge(&stored(Some(6), Some(base), "", ""))),
+            ("host_fault", true, Some(FaultNext::FallbackLocal))
+        );
+        let both = r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"candidate and base","runs":"1, 1","reason":"r"}"#;
+        assert_eq!(
+            row(&judge(&stored(Some(6), Some(both), "", ""))),
+            ("host_fault", true, Some(FaultNext::FallbackLocal))
+        );
+        let defect = r#"{"v":1,"host_fault":true,"scenario":"check-a.sh","on":"candidate and base","runs":"1, 1","reason":"r","evidence":"validator_defect","validator_defects":["check-a.sh"]}"#;
+        assert_eq!(
+            row(&judge(&stored(Some(6), Some(defect), "", ""))),
+            ("validator_defect", true, Some(FaultNext::FallbackLocal))
+        );
+        let red = r#"{"v":1,"host_fault":true,"on":"main","scenario":"check-tests.sh","runs":"1, 1","failures":[{"test":"a::b","message":"m"}]}"#;
+        let red = judge(&stored(Some(6), Some(red), "", ""));
+        assert_eq!(
+            row(&red),
+            ("main_red", false, Some(FaultNext::FallbackLocal))
+        );
+        assert!(matches!(red.failure, Some(GateFailure::MainRed { .. })));
+        let cannot =
+            r#"{"v":1,"cannot_judge":true,"scenario":"t029.sh","reason":"no user scopes"}"#;
+        let cannot = judge(&stored(Some(6), Some(cannot), "", ""));
+        assert_eq!(
+            row(&cannot),
+            ("cannot_judge", false, Some(FaultNext::FallbackLocal))
+        );
+        assert!(matches!(
+            cannot.failure,
+            Some(GateFailure::CannotJudge { .. })
+        ));
+        assert_eq!(
+            row(&judge(&stored(Some(6), None, "", ""))),
+            ("aborted", true, Some(FaultNext::FallbackLocal))
+        );
+
+        // A fact of another version: a skew, not a fault.
+        for exit in [0, 5, 6] {
+            let future = r#"{"v":2,"verdict":"accepted"}"#;
+            let skew = judge(&stored(Some(exit), Some(future), "", ""));
+            assert_eq!(
+                row(&skew),
+                ("unread_version", false, Some(FaultNext::FallbackLocal)),
+                "{exit}"
+            );
+            assert!(skew.verdict.is_none());
+        }
+
+        // A signal: as a status 128+N, or reported as a signal.
+        assert_eq!(
+            row(&judge(&stored(Some(137), None, "", ""))),
+            ("signal", true, Some(FaultNext::Queued))
+        );
+        let mut killed = stored(None, None, "", "");
+        killed.meta.signal = Some(Signal::Number(9));
+        let killed = judge(&killed);
+        assert_eq!(row(&killed), ("signal", true, Some(FaultNext::Queued)));
+        assert!(killed.reason.contains("signal 9"));
+        // Past its wall clock; never started; fenced itself.
+        let mut late = stored(None, None, "", "");
+        late.meta.timed_out = true;
+        assert_eq!(
+            row(&judge(&late)),
+            ("timed_out", true, Some(FaultNext::FallbackLocal))
+        );
+        let mut never = stored(None, None, "", "");
+        never.meta.wrapper_error = Some("digest_mismatch".into());
+        let never = judge(&never);
+        assert_eq!(
+            row(&never),
+            ("wrapper_error", true, Some(FaultNext::Queued))
+        );
+        assert!(never.reason.contains("digest_mismatch"));
+        let mut fenced = stored(Some(0), Some(&verdict("accepted")), "", "");
+        fenced.meta.self_fenced = true;
+        assert_eq!(row(&judge(&fenced)), ("self_fenced", false, None));
+        // A status no process exits with: the node's fault.
+        assert_eq!(
+            row(&judge(&stored(Some(300), None, "", ""))).0,
+            "wrapper_error"
+        );
+    }
+
+    /// NB9: a node's exit 5 without its fact is an abort of the node's,
+    /// never a `no_room` measured on this host's disk (which `judge_in`
+    /// does for a local gate), even with a no-room line in its stdout.
+    #[test]
+    fn a_remote_exit_5_is_never_measured_on_this_host() {
+        let inputs = job_inputs();
+        let judged = judge_stored(
+            &stored(
+                Some(5),
+                None,
+                "| x\n{\"v\":1,\"no_room\":true,\"free_kb\":1,\"min_gb\":8,\"tmpdir\":\"/t\"}\n",
+                "",
+            ),
+            &inputs,
+        );
+        assert_eq!(
+            row(&judged),
+            ("aborted", true, Some(FaultNext::FallbackLocal))
+        );
+        match &judged.failure {
+            Some(GateFailure::Aborted { reason, log }) => {
+                assert!(reason.contains("exit status: 5"), "{reason}");
+                assert!(!log.contains("integrate: "), "{log}");
+                assert!(!log.contains("measured"), "{log}");
+            }
+            other => panic!("not an abort: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shadow_is_never_judged_locally_and_its_row_is_kept() {
+        for next in [FaultNext::FallbackLocal, FaultNext::DeadLetter] {
+            assert_eq!(next_for(RemoteJobKind::GateShadow, next), FaultNext::Keep);
+            assert_eq!(next_for(RemoteJobKind::Gate, next), next);
+        }
+        assert_eq!(
+            next_for(RemoteJobKind::GateShadow, FaultNext::Queued),
+            FaultNext::Queued
+        );
+    }
+
+    /// Write a node's result where the gateway does.
+    pub(in crate::integrate) fn store_result(results: &Path, meta: &ResultMeta, log: &[u8]) {
+        let dir = results.join(format!("{}.{}", meta.job_id, meta.lease_epoch));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut line = meta.to_bytes();
+        line.push(b'\n');
+        std::fs::write(dir.join("meta.json"), line).unwrap();
+        std::fs::write(dir.join("log"), log).unwrap();
+    }
+
+    #[test]
+    fn a_stored_result_is_read_for_its_job_and_epoch_and_split_into_its_streams() {
+        let dir = Scratch::new("stored");
+        let job = "gate-0123456789ab-k3x9q2ma";
+        let (m, log) = meta(
+            job,
+            3,
+            Some(1),
+            None,
+            "| out\n",
+            "err one\nerr two\n",
+            Some(&job_inputs()),
+        );
+        store_result(&dir.0, &m, &log);
+        let read = read_stored(&dir.0, job, 3).unwrap();
+        let run = run_of(&read).unwrap();
+        assert_eq!(run.status.code(), Some(1));
+        assert_eq!(run.stdout, "| out\n");
+        assert_eq!(run.stderr, "err one\nerr two\n");
+        match gate::decide(&run, None).unwrap_err() {
+            GateFailure::Aborted { log, .. } => {
+                assert_eq!(log, "| out\n! err one\n! err two\n");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Another epoch, another job, a log that is not the one it binds.
+        assert!(read_stored(&dir.0, job, 2).is_err());
+        let other = dir.0.join("gate-other-00000.3");
+        std::fs::create_dir_all(&other).unwrap();
+        let mine = dir.0.join(format!("{job}.3"));
+        std::fs::copy(mine.join("meta.json"), other.join("meta.json")).unwrap();
+        std::fs::copy(mine.join("log"), other.join("log")).unwrap();
+        assert!(
+            read_stored(&dir.0, "gate-other-00000", 3)
+                .unwrap_err()
+                .contains("is for")
+        );
+        std::fs::write(mine.join("log"), "changed").unwrap();
+        assert!(read_stored(&dir.0, job, 3).unwrap_err().contains("log"));
+    }
+
+    pub(in crate::integrate) fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A bare repository with a base and a candidate on it: `(repo, base,
+    /// candidate)`.
+    pub(in crate::integrate) fn repository(dir: &Path) -> (PathBuf, String, String) {
+        let seed = dir.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(seed.join("a"), "base\n").unwrap();
+        git(&seed, &["add", "a"]);
+        git(&seed, &["commit", "-q", "-m", "base"]);
+        let base = git(&seed, &["rev-parse", "HEAD"]);
+        std::fs::write(seed.join("b"), "candidate\n").unwrap();
+        git(&seed, &["add", "b"]);
+        git(&seed, &["commit", "-q", "-m", "candidate"]);
+        let candidate = git(&seed, &["rev-parse", "HEAD"]);
+        let repo = dir.join("source.git");
+        let output = Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(&seed)
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        (repo, base, candidate)
+    }
+
+    #[test]
+    fn bundles_ship_the_delta_on_its_base_and_the_baseline_once_per_base() {
+        let dir = Scratch::new("bundles");
+        let (repo, base, candidate) = repository(&dir.0);
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+        let delta = artifacts.delta_bundle(&repo, &base, &candidate).unwrap();
+        let path = artifacts.path_of(&delta.digest);
+        assert!(path.starts_with(dir.0.join("artifacts/sha256")));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), delta.size);
+        delta.digest.verify(&std::fs::read(&path).unwrap()).unwrap();
+        // Its prerequisite is the base; its one head the candidate.
+        let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(text.contains(&format!("-{base}")));
+        assert!(text.contains(&format!("{candidate} refs/gate/candidate")));
+        // A clone of the baseline takes it.
+        let baseline = artifacts.baseline_bundle(&repo, &base).unwrap();
+        let mirror = dir.0.join("mirror.git");
+        let output = Command::new("git")
+            .args(["clone", "-q", "--bare"])
+            .arg(artifacts.path_of(&baseline.digest))
+            .arg(&mirror)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bundle = path.to_string_lossy().to_string();
+        git(&mirror, &["bundle", "verify", "-q", &bundle]);
+        git(
+            &mirror,
+            &["fetch", "-q", &bundle, "refs/gate/candidate:refs/c"],
+        );
+        assert_eq!(git(&mirror, &["rev-parse", "refs/c"]), candidate);
+        // Cached per base: the same artifact, not made again.
+        std::fs::remove_dir_all(dir.0.join("artifacts/.tmp")).unwrap();
+        assert_eq!(artifacts.baseline_bundle(&repo, &base).unwrap(), baseline);
+        assert!(!dir.0.join("artifacts/.tmp").exists());
+        // No delta when there is nothing past the base.
+        assert!(artifacts.delta_bundle(&repo, &base, &base).is_err());
+    }
+
+    /// A controller: scripts, a scenario set and a web lockfile.
+    pub(in crate::integrate) fn controller(dir: &Path) -> PathBuf {
+        let ctl = dir.join("ctl");
+        std::fs::create_dir_all(ctl.join("scripts/rsi")).unwrap();
+        std::fs::create_dir_all(ctl.join("rsi/scenarios/sub")).unwrap();
+        std::fs::create_dir_all(ctl.join("web")).unwrap();
+        std::fs::write(ctl.join("scripts/rsi/gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(ctl.join("rsi/scenarios/check-ok.sh"), "exit 0\n").unwrap();
+        std::fs::write(ctl.join("rsi/scenarios/sub/001.sh"), "exit 0\n").unwrap();
+        std::fs::write(
+            ctl.join("web/package-lock.json"),
+            "{\"lockfileVersion\":3}\n",
+        )
+        .unwrap();
+        std::fs::write(ctl.join("web/package.json"), "{}\n").unwrap();
+        std::fs::write(
+            ctl.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.95.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(ctl.join(".controller"), format!("{CONTROLLER}\n")).unwrap();
+        ctl
+    }
+
+    fn tar_list(path: &Path) -> Vec<String> {
+        let output = Command::new("tar")
+            .args(["--numeric-owner", "-tvf"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn names(listing: &[String]) -> Vec<String> {
+        listing
+            .iter()
+            .map(|line| line.split_whitespace().last().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_controller_pack_is_deterministic_and_holds_only_what_the_gate_needs() {
+        let dir = Scratch::new("pack");
+        let ctl = controller(&dir.0);
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+        let scenarios = ctl.join("rsi/scenarios");
+        let at = Path::new("rsi/scenarios");
+        let first = artifacts
+            .controller_pack(&ctl, &scenarios, at, None)
+            .unwrap();
+        // Touched files, a later time: the same bytes.
+        std::thread::sleep(Duration::from_millis(1100));
+        for file in ["scripts/rsi/gate.sh", "rsi/scenarios/check-ok.sh"] {
+            let text = std::fs::read(ctl.join(file)).unwrap();
+            std::fs::write(ctl.join(file), text).unwrap();
+        }
+        let second = artifacts
+            .controller_pack(&ctl, &scenarios, at, None)
+            .unwrap();
+        assert_eq!(first, second);
+        let listing = tar_list(&artifacts.path_of(&first.digest));
+        assert_eq!(
+            names(&listing),
+            [
+                "rsi/scenarios/",
+                "rsi/scenarios/check-ok.sh",
+                "rsi/scenarios/sub/",
+                "rsi/scenarios/sub/001.sh",
+                "scripts/",
+                "scripts/rsi/",
+                "scripts/rsi/gate.sh",
+                "web/package-lock.json",
+            ]
+        );
+        for line in &listing {
+            assert!(line.contains(" 0/0 "), "{line}");
+            assert!(line.contains("1970-01-01"), "{line}");
+        }
+        // ustar.
+        let bytes = std::fs::read(artifacts.path_of(&first.digest)).unwrap();
+        assert_eq!(&bytes[257..263], b"ustar\0");
+        // A snapshot elsewhere, packed under the controller's place.
+        let snapshot = dir.0.join("snapshot");
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg(&scenarios)
+            .arg(&snapshot)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        let from_snapshot = artifacts
+            .controller_pack(&ctl, &snapshot, at, None)
+            .unwrap();
+        assert_eq!(from_snapshot, first);
+        // Another set, another pack; a key caches it.
+        std::fs::write(snapshot.join("check-new.sh"), "exit 0\n").unwrap();
+        let keyed = artifacts
+            .controller_pack(&ctl, &snapshot, at, Some("k1"))
+            .unwrap();
+        assert_ne!(keyed, first);
+        assert_eq!(
+            artifacts
+                .controller_pack(&ctl, &scenarios, at, Some("k1"))
+                .unwrap(),
+            keyed
+        );
+        assert!(
+            artifacts
+                .controller_pack(&ctl, &scenarios, Path::new("../x"), None)
+                .is_err()
+        );
+        assert!(
+            artifacts
+                .controller_pack(&ctl, &scenarios, Path::new("/abs"), None)
+                .is_err()
+        );
+        assert_eq!(toolchain_channel(&ctl).as_deref(), Some("1.95.0"));
+        assert_eq!(web_lock(&ctl).unwrap().len(), 64);
+        assert_eq!(web_lock(&dir.0), None);
+    }
+
+    #[test]
+    fn the_registry_manifest_is_the_tree_of_registry_and_git_without_cargos_locks() {
+        let dir = Scratch::new("registry");
+        let home = dir.0.join("cargo");
+        for (path, text) in [
+            ("registry/index/x/config.json", "{}"),
+            ("registry/cache/x/a-1.0.crate", "crate"),
+            ("registry/.package-cache", "lock"),
+            ("git/db/repo/HEAD", "ref"),
+            ("bin/cargo", "not shipped"),
+            ("config.toml", "not shipped"),
+        ] {
+            let file = home.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        let digest = registry_sha256(&home).unwrap();
+        // The same as tree_sha256_v1 over a directory holding just the two.
+        let only = dir.0.join("only");
+        std::fs::create_dir_all(&only).unwrap();
+        for top in ["registry", "git"] {
+            let copied = Command::new("cp")
+                .arg("-R")
+                .arg(home.join(top))
+                .arg(only.join(top))
+                .status()
+                .unwrap();
+            assert!(copied.success());
+        }
+        assert_eq!(digest, spawn_node_proto::registry_sha256(&only).unwrap());
+        // Cargo's lock files never move it; a crate does.
+        std::fs::write(home.join("registry/.package-cache"), "other").unwrap();
+        std::fs::write(home.join("registry/.package-cache-mutate"), "x").unwrap();
+        assert_eq!(registry_sha256(&home).unwrap(), digest);
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+        let manifest = artifacts.registry_manifest(&home).unwrap();
+        assert_eq!(manifest.registry, digest);
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.0.join("artifacts").join(REGISTRY_MANIFEST)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written, manifest.to_json());
+        assert_eq!(written["pack"]["digest"], manifest.pack.digest.to_string());
+        let packed = names(&tar_list(&artifacts.path_of(&manifest.pack.digest)));
+        assert!(
+            packed.contains(&"registry/cache/x/a-1.0.crate".to_string()),
+            "{packed:?}"
+        );
+        assert!(packed.contains(&"git/db/repo/HEAD".to_string()));
+        assert!(
+            packed.iter().all(|name| !name.contains(".package-cache")),
+            "{packed:?}"
+        );
+        assert!(
+            packed
+                .iter()
+                .all(|name| !name.starts_with("bin") && name != "config.toml")
+        );
+        std::fs::write(home.join("registry/cache/x/b-1.0.crate"), "new").unwrap();
+        let moved = artifacts.registry_manifest(&home).unwrap();
+        assert_ne!(moved.registry, digest);
+        assert_ne!(moved.pack, manifest.pack);
+        assert!(artifacts.registry_manifest(&dir.0.join("none")).is_err());
+    }
+
+    /// A ledger in a schema of its own, with nodes a test enrolls and
+    /// beats for, as the gateway would.
+    pub(in crate::integrate) struct Ledger {
+        pub(in crate::integrate) store: PostgresStore,
+        seqs: RefCell<HashMap<String, i64>>,
+        // Dropped after the store.
+        schema: spawn_postgres::testing::TestSchema,
+    }
+
+    impl Ledger {
+        pub(in crate::integrate) fn new(case: &str) -> Self {
+            let schema = spawn_postgres::testing::TestSchema::new(case);
+            let store = PostgresStore::connect_in_schema(schema.url(), &schema).expect("connect");
+            Self {
+                store,
+                seqs: RefCell::new(HashMap::new()),
+                schema,
+            }
+        }
+
+        fn boot() -> &'static str {
+            "00000000000000018796a5b4c3d2e1f0"
+        }
+
+        /// Enroll node `name` (key from `seed`) holding `holds`; its id.
+        pub(in crate::integrate) fn enroll(&self, name: &str, seed: u8, holds: &Value) -> String {
+            let token = [seed; 32];
+            let pubkey = [seed.wrapping_add(100); 32];
+            self.store
+                .node_enroll_token(name, None, &token, 600_000)
+                .expect("a token");
+            let spec = json!({"v": 1, "name": name, "holds": holds});
+            let enrolled = self
+                .store
+                .node_gw_enroll(
+                    &NodeEnroll {
+                        token_sha256: &token,
+                        pubkey: &pubkey,
+                        boot_id: Self::boot(),
+                        spec_sha256: SPEC_SHA,
+                        spec: &spec,
+                    },
+                    |answer| answer["ok"] == true,
+                )
+                .expect("enroll");
+            assert!(enrolled.committed, "{}", enrolled.answer);
+            enrolled.answer["node_id"].as_str().unwrap().to_string()
+        }
+
+        /// One beat of `node`, holding nothing: the grants it got.
+        pub(in crate::integrate) fn beat(&self, node: &str) -> Vec<(String, i64)> {
+            let seq = {
+                let mut seqs = self.seqs.borrow_mut();
+                let seq = seqs.entry(node.to_string()).or_insert(0);
+                *seq += 1;
+                *seq
+            };
+            let body = json!({"v": 1, "cell_id": "c0", "state": "idle", "spec_sha256": SPEC_SHA,
+                              "capacities": {"gate_sandbox": {"free": 4, "total": 4}},
+                              "tmpfs_budget_mb": {"free": 262_144, "total": 262_144},
+                              "leases": [], "lease_results_pending": [],
+                              "warm_bases": [], "edge": "timer"});
+            let answer = self
+                .store
+                .node_gw_beat(node, Self::boot(), seq, &body, |_| true)
+                .expect("a beat")
+                .answer;
+            answer["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|grant| {
+                    (
+                        grant["job_id"].as_str().unwrap().to_string(),
+                        grant["lease_epoch"].as_i64().unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        /// `node`'s result, stored and completed as the gateway does it.
+        pub(in crate::integrate) fn complete(
+            &self,
+            results: &Path,
+            node: &str,
+            meta: &ResultMeta,
+            log: &[u8],
+        ) {
+            store_result(results, meta, log);
+            let line = meta.to_bytes();
+            let mut result = serde_json::to_value(meta).unwrap();
+            result["result_sha256"] = json!(spawn_node_proto::codec::sha256_hex(&line));
+            result["log_bytes"] = json!(meta.log_bytes.to_string());
+            let done = self
+                .store
+                .node_gw_result(
+                    node,
+                    &meta.job_id,
+                    i64::try_from(meta.lease_epoch).unwrap(),
+                    &result,
+                    |_| true,
+                )
+                .expect("a result");
+            assert!(done.answer, "{} completes", meta.job_id);
+        }
+
+        pub(in crate::integrate) fn strikes(&self, name: &str) -> (i32, bool) {
+            let node = self.store.node_v1(name).unwrap().unwrap();
+            (node.host_fault_strikes, node.degraded)
+        }
+
+        /// The records of `kind` in the log, in order.
+        pub(in crate::integrate) fn records(&self, kind: &str) -> Vec<Value> {
+            let mut client = postgres::Client::connect(self.schema.url(), postgres::NoTls)
+                .expect("an admin connection");
+            client
+                .batch_execute(&format!("set search_path to {}", self.schema))
+                .unwrap();
+            client
+                .query(
+                    "select kind #> '{detail,record}' from spawn_events
+                      where kind #>> '{detail,record,type}' = $1 order by id",
+                    &[&kind],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+    }
+
+    fn gate_job(judging: &str) -> GateJob {
+        GateJob {
+            kind: RemoteJobKind::Gate,
+            job_id: job_id("gate", CANDIDATE),
+            judging_id: Some(judging.to_string()),
+            task_id: Some(7),
+            repo: "spawn".into(),
+            inputs: job_inputs(),
+            env: grant_env(&[]),
+            artifacts: Vec::new(),
+            requires: BTreeMap::from([("pg".to_string(), "16".to_string())]),
+        }
+    }
+
+    const JUDGING: &str = "0123456789ab0123456789abcdef";
+
+    /// Run `job` on `node` to a stored result of `exit` and `verdict`,
+    /// judged and settled: the judging and the fault's outcome.
+    fn run_on(
+        ledger: &Ledger,
+        results: &Path,
+        node: &str,
+        job: &str,
+        exit: Option<i64>,
+        verdict: Option<&str>,
+    ) -> (Judged, Option<FaultOutcome>) {
+        let grants = ledger.beat(node);
+        let epoch = grants
+            .iter()
+            .find(|(id, _)| id == job)
+            .unwrap_or_else(|| panic!("{job} not granted to {node}: {grants:?}"))
+            .1;
+        assert_eq!(
+            step(&ledger.store, job, Instant::now(), DEFAULT_QUEUE_WAIT).unwrap(),
+            Waited::Leased(epoch)
+        );
+        let (m, log) = meta(
+            job,
+            epoch,
+            exit,
+            verdict,
+            "| out\n",
+            "err\n",
+            Some(&job_inputs()),
+        );
+        ledger.complete(results, node, &m, &log);
+        let Waited::Completed(row) =
+            step(&ledger.store, job, Instant::now(), DEFAULT_QUEUE_WAIT).unwrap()
+        else {
+            panic!("{job} not completed");
+        };
+        let stored = read_stored(results, job, row.lease_epoch).unwrap();
+        let judged = judge_stored(&stored, &job_inputs());
+        let outcome = settle(&ledger.store, &row, &judged).unwrap();
+        (judged, outcome)
+    }
+
+    /// The ledger end to end: a verdict leaves no fault; a scenario the
+    /// node cannot judge excludes it unstruck; a skewed fact is no strike;
+    /// a node's exit 5 without a fact goes local with a strike and nothing
+    /// measured; three strikes make the node degraded (no grants) until an
+    /// undrain; and nothing of it is recorded for a task. Every job names
+    /// its judging `judging_id` (F11): several jobs of one judging never
+    /// meet the judging outcome's unique index.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn remote_outcomes_on_the_ledger_strike_exclude_and_degrade() {
+        let ledger = Ledger::new("remote_outcomes");
+        let results = Scratch::new("outcomes-results");
+        let node = ledger.enroll("n252", 1, &json!({"pg": "16"}));
+
+        let accepted = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (judged, outcome) = run_on(
+            &ledger,
+            &results.0,
+            &node,
+            &accepted,
+            Some(0),
+            Some(&verdict("accepted")),
+        );
+        assert_eq!(row(&judged), ("accepted", false, None));
+        assert!(outcome.is_none());
+        assert_eq!(ledger.strikes("n252"), (0, false));
+        let after = ledger.store.remote_job(&accepted).unwrap().unwrap();
+        assert_eq!(after.state, RemoteJobState::Completed);
+        assert_eq!(after.judging_id.as_deref(), Some(JUDGING));
+
+        // A scenario the node cannot judge: excluded, unstruck, local.
+        let cannot = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (judged, outcome) = run_on(
+            &ledger,
+            &results.0,
+            &node,
+            &cannot,
+            Some(6),
+            Some(r#"{"v":1,"cannot_judge":true,"scenario":"t029.sh"}"#),
+        );
+        assert_eq!(judged.evidence, "cannot_judge");
+        let outcome = outcome.unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.next, Some(FaultNext::FallbackLocal));
+        let job = ledger.store.remote_job(&cannot).unwrap().unwrap();
+        assert_eq!(job.state, RemoteJobState::FallbackLocal);
+        assert_eq!(job.excluded_nodes, vec![node.clone()]);
+        assert!(job.fault_nodes.is_empty());
+        assert_eq!(ledger.strikes("n252"), (0, false));
+
+        // An unread fact version: a skew, no strike.
+        let skew = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (judged, outcome) = run_on(
+            &ledger,
+            &results.0,
+            &node,
+            &skew,
+            Some(0),
+            Some(r#"{"v":2,"verdict":"accepted"}"#),
+        );
+        assert_eq!(judged.evidence, "unread_version");
+        assert_eq!(outcome.unwrap().next, Some(FaultNext::FallbackLocal));
+        assert_eq!(ledger.strikes("n252"), (0, false));
+
+        // NB9: exit 5, no fact: struck, local, nothing measured here.
+        let room = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (judged, outcome) = run_on(&ledger, &results.0, &node, &room, Some(5), None);
+        assert_eq!(
+            row(&judged),
+            ("aborted", true, Some(FaultNext::FallbackLocal))
+        );
+        assert!(matches!(judged.failure, Some(GateFailure::Aborted { .. })));
+        let outcome = outcome.unwrap();
+        assert_eq!((outcome.strikes, outcome.degraded), (Some(1), Some(false)));
+        assert_eq!(
+            ledger.store.remote_job(&room).unwrap().unwrap().state,
+            RemoteJobState::FallbackLocal
+        );
+
+        // Exit 2, then exit 3: the second and the third strike; degraded.
+        let two = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (_, outcome) = run_on(&ledger, &results.0, &node, &two, Some(2), None);
+        let outcome = outcome.unwrap();
+        assert_eq!((outcome.strikes, outcome.degraded), (Some(2), Some(false)));
+        // Back in the queue, never to this node again.
+        let job = ledger.store.remote_job(&two).unwrap().unwrap();
+        assert_eq!(job.state, RemoteJobState::Queued);
+        assert_eq!(job.excluded_nodes, vec![node.clone()]);
+        let three = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (_, outcome) = run_on(&ledger, &results.0, &node, &three, Some(3), None);
+        let outcome = outcome.unwrap();
+        assert_eq!((outcome.strikes, outcome.degraded), (Some(3), Some(true)));
+        assert_eq!(outcome.next, Some(FaultNext::FallbackLocal));
+        assert_eq!(ledger.strikes("n252"), (3, true));
+        // A degraded node is granted nothing, until the owner's undrain.
+        enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        assert!(ledger.beat(&node).is_empty());
+        assert!(
+            ledger
+                .store
+                .node_admin("n252", spawn_postgres::NodeAction::Undrain)
+                .unwrap()
+        );
+        assert_eq!(ledger.strikes("n252"), (0, false));
+
+        // F11: the ledger's records name the job, never a `judging`; and no
+        // task record came of any remote run (no abort, host fault or
+        // no_room toward a halt or a back-off).
+        let faults = ledger.records("remote_job.host_fault");
+        assert_eq!(faults.len(), 5, "{faults:?}");
+        for record in faults
+            .iter()
+            .chain(&ledger.records("remote_job.completed"))
+        {
+            assert!(record.get("judging").is_none(), "{record}");
+            assert_eq!(record["proto"], "node-v1");
+        }
+        for kind in ["task.gated", "task.halted", "task.shadow_gated"] {
+            assert!(ledger.records(kind).is_empty(), "{kind}");
+        }
+    }
+
+    /// Poison pill: a job that faults on two nodes is the cause; the first
+    /// node's strike is given back and the job goes local.
+    #[test]
+    fn a_job_that_faults_on_two_nodes_gives_the_first_its_strike_back() {
+        let ledger = Ledger::new("remote_poison");
+        let results = Scratch::new("poison-results");
+        let first = ledger.enroll("na", 1, &json!({"pg": "16"}));
+        let second = ledger.enroll("nb", 2, &json!({"pg": "16"}));
+        let job = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let (judged, outcome) = run_on(&ledger, &results.0, &first, &job, Some(2), None);
+        assert!(judged.strike);
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.next, Some(FaultNext::Queued));
+        assert_eq!(outcome.poison, Some(false));
+        assert_eq!(ledger.strikes("na"), (1, false));
+        // Never back to the first node.
+        assert!(ledger.beat(&first).is_empty());
+        let (_, outcome) = run_on(&ledger, &results.0, &second, &job, Some(137), None);
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.poison, Some(true));
+        assert_eq!(outcome.next, Some(FaultNext::FallbackLocal));
+        assert_eq!(ledger.strikes("na"), (0, false));
+        assert_eq!(ledger.strikes("nb"), (0, false));
+        let row = ledger.store.remote_job(&job).unwrap().unwrap();
+        assert_eq!(row.state, RemoteJobState::FallbackLocal);
+        assert_eq!(row.fault_nodes, vec![first, second]);
+        let faults = ledger.records("remote_job.host_fault");
+        assert_eq!(faults.last().unwrap()["poison"], true);
+        assert_eq!(faults.last().unwrap()["strike"], false);
+    }
+
+    /// No node leases it within the wait: the primary takes it back, once;
+    /// a job a node holds is never taken back.
+    #[test]
+    fn a_job_no_node_leases_in_time_is_taken_back_by_the_primary() {
+        let ledger = Ledger::new("remote_take_local");
+        let job = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        assert_eq!(
+            step(&ledger.store, &job, Instant::now(), Duration::from_secs(30)).unwrap(),
+            Waited::Queued
+        );
+        let waited = wait_for_lease(
+            &ledger.store,
+            &job,
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(waited, Waited::TakenLocal);
+        let row = ledger.store.remote_job(&job).unwrap().unwrap();
+        assert_eq!(row.state, RemoteJobState::FallbackLocal);
+        assert_eq!(
+            step(&ledger.store, &job, Instant::now(), Duration::ZERO).unwrap(),
+            Waited::Ended(Some(RemoteJobState::FallbackLocal))
+        );
+        // Leased first: the wait ends with the lease, nothing taken back.
+        let node = ledger.enroll("n1", 3, &json!({"pg": "16"}));
+        let leased = enqueue(&ledger.store, &gate_job(JUDGING)).unwrap();
+        let grants = ledger.beat(&node);
+        assert_eq!(grants.len(), 1);
+        let waited =
+            wait_for_lease(&ledger.store, &leased, Duration::ZERO, Duration::ZERO).unwrap();
+        assert_eq!(waited, Waited::Leased(grants[0].1));
+        assert_eq!(
+            step(
+                &ledger.store,
+                "no-such-job-0000",
+                Instant::now(),
+                Duration::ZERO
+            )
+            .unwrap(),
+            Waited::Ended(None)
+        );
+        // The sweep runs as the owner, as the integrator's pass does.
+        let swept = sweep(&ledger.store).unwrap();
+        assert_eq!(swept.fenced, 0);
+    }
+}
