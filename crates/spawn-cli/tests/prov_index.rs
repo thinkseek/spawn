@@ -139,7 +139,10 @@ fn history(work: &mut Work) -> History {
     work.git(&["checkout", "-q", "spawn/agent_a"]);
     work.merge("main", "spawn: merge main into agent_a");
     work.write("src/a.rs", "one\nTWO\nthree\nfour\n");
-    work.git(&["update-index", "--chmod=+x", "tool.sh"]);
+    let tool = work.dir.join("tool.sh");
+    let mut mode = std::fs::metadata(&tool).expect("tool.sh").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    std::fs::set_permissions(&tool, mode).expect("tool.sh made executable");
     let a3 = work.commit("spawn checkpoint exec_a3");
     work.git(&["checkout", "-q", "main"]);
     let landing = work.merge(
