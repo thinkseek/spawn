@@ -1,4 +1,4 @@
-//! HTTP API and static files for the observer UI: 29 GET route patterns
+//! HTTP API and static files for the observer UI: 31 GET route patterns
 //! (`GET /api/stream` among them) and nine POST routes. Seven are a
 //! person's writes: an input to a session, a key, a restart or a reassign
 //! of a stalled worker, the resume of a halted mission, a message to the
@@ -151,6 +151,7 @@ pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
 mod labels;
+mod prov;
 mod pwa;
 mod storage;
 mod stream;
@@ -978,6 +979,8 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/stream"),
     ("GET", "/api/approvals"),
     ("GET", "/api/context/digest"),
+    ("GET", "/api/prov/who"),
+    ("GET", "/api/prov/change/<id>"),
     ("POST", "/api/sessions/<id>/input"),
     ("POST", "/api/sessions/<id>/key"),
     ("POST", "/api/sessions/<id>/restart"),
@@ -1256,6 +1259,8 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/grading" => Box::new(grading),
         "/api/approvals" => Box::new(approvals::approvals),
         "/api/context/digest" => Box::new(digest::digest),
+        "/api/prov/who" => Box::new(move || prov::who(query)),
+        "/api/prov/change/<id>" => Box::new(move || prov::change(id)),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
@@ -7254,7 +7259,7 @@ mod tests {
         );
         let gets = super::ROUTES.iter().filter(|(m, _)| *m == "GET").count();
         let posts = super::ROUTES.iter().filter(|(m, _)| *m == "POST").count();
-        assert_eq!((gets, posts), (29, 9));
+        assert_eq!((gets, posts), (31, 9));
         assert!(
             doc.contains(&format!(
                 "serves {gets} GET route patterns and {posts} POST routes"

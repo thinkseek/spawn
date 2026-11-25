@@ -30,12 +30,12 @@
 #       status file, not measured.
 #   (3) a loop started again within the day takes no second reading.
 #
-# Needs a file system with reflinks (btrfs, xfs) under TMPDIR; a harness
-# failure (2) otherwise.
+# Needs a file system with reflinks (btrfs, xfs) under TMPDIR; cannot_judge
+# (6) otherwise.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
-# missing or wrong); 2 a harness or infrastructure failure. Any unexpected
-# exit is reported as 2.
+# missing or wrong); 2 a harness or infrastructure failure; 6 cannot_judge
+# (host lacks reflinks under TMPDIR). Any unexpected exit is reported as 2.
 #
 # Fails with 1 on the base (176, 01ee71ef): "(1) the loop did not say,
 # within 60 s, that a hold put the reading off"; "(2) the loop recorded no
@@ -47,6 +47,10 @@ asserted=""
 harness() {
     echo "180: harness: $*" >&2
     exit 2
+}
+cannot_judge() {
+    echo "180: cannot_judge: $*" >&2
+    exit 6
 }
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
@@ -102,7 +106,7 @@ cleanup() {
 finish() {
     rc=$?
     trap - EXIT
-    if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 6 ]; then
         if [ -s "$WORK/loop.log" ]; then
             echo "180: the loop's last storage lines:" >&2
             grep -i "storage" "$WORK/loop.log" | tail -n 8 >&2 || true
@@ -115,6 +119,7 @@ finish() {
     fi
     cleanup
     if [ "$rc" -eq 0 ]; then exit 0; fi
+    if [ "$rc" -eq 6 ]; then exit 6; fi
     if [ "$rc" -eq 1 ] && [ -n "$asserted" ]; then exit 1; fi
     [ "$rc" -eq 2 ] || echo "180: harness: unexpected exit $rc" >&2
     exit 2
@@ -257,7 +262,7 @@ blob "$SPAWN_WORKSPACE_ROOT/.transcripts/agent_a/t.jsonl" $((256 * KIB))
 blob "$SPAWN_CLAUDE_PROJECTS/-bb/s.jsonl" $((256 * KIB))
 sync "$scratch/a.bin" "$cache/c.bin"
 cp --reflink=always "$scratch/a.bin" "$scratch/a-reflink.bin" 2>/dev/null ||
-    harness "TMPDIR's file system makes no reflinks (cp --reflink=always failed under $WORK)"
+    cannot_judge "TMPDIR's file system makes no reflinks (cp --reflink=always failed under $WORK)"
 cp --reflink=always "$cache/c.bin" "$scratch/c-reflink.bin" ||
     harness "the build cache's file could not be reflinked into scratch"
 cp --reflink=never "$scratch/a.bin" "$scratch/a-plain.bin"

@@ -51,7 +51,7 @@ reset() {
   export FAKE_ACTIVE=active FAKE_STARTED="$(date -d '-5 min' '+%a %F %T %z')" FAKE_HEALTH=200 CH_UPTIME_S=100000
 }
 run() {
-  PATH="$bin:/usr/bin:/bin" HOME="$scratch/home" FAKE_UNIT="$scratch/unit" FAKE_JOURNAL="$scratch/journal" \
+  PATH="$bin:$PATH" HOME="$scratch/home" FAKE_UNIT="$scratch/unit" FAKE_JOURNAL="$scratch/journal" \
     CH_KEEP_DIR="$scratch/keep" CH_LEGACY_FILE="$scratch/home/typesafe.env" CH_UNIT_DIR="$scratch/units" \
     CH_FAKE_ALERTS="$scratch/alerts" bash "$check"
 }
