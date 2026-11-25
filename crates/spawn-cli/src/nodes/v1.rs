@@ -329,7 +329,7 @@ pub(super) fn list_command(words: &[String]) -> Result<i32, String> {
     } else {
         let p1_lines = super::lines(&nodes, now);
         let p1_empty = nodes.as_array().is_none_or(Vec::is_empty);
-        if !(p1_empty && !v1.is_empty()) {
+        if !p1_empty || v1.is_empty() {
             for line in p1_lines {
                 println!("{line}");
             }

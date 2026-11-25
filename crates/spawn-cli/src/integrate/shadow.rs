@@ -80,7 +80,7 @@ const NODE_IN_FLIGHT: usize = 4;
 
 /// How long the registry's manifest is reused before it is read again (it
 /// hashes the whole cargo registry).
-const REGISTRY_EVERY: Duration = Duration::from_secs(3600);
+const REGISTRY_EVERY: Duration = Duration::from_hours(1);
 
 /// The shadow's pid file, in the shadow directory.
 pub(super) const PID_FILE: &str = "shadow.pid";
@@ -1596,7 +1596,7 @@ mod tests {
                 artifacts: dir.0.join("artifacts"),
                 results: results.clone(),
                 cargo_home,
-                queue_wait: Duration::from_secs(60),
+                queue_wait: Duration::from_mins(1),
             },
             vec![
                 ("PATH".to_string(), "/usr/bin".to_string()),

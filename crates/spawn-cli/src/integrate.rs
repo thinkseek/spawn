@@ -1475,19 +1475,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     }
     // The shadow judging on spawn-node v1 (shadow.rs, remote.rs), beside
     // the runner's when both are on.
-    match shadow::node_settings(crate::config::env_value) {
-        Ok(Some(settings)) => {
-            println!(
-                "integrate: judged verdicts are shadowed on spawn-node v1 (every {}-th)",
-                settings.every
-            );
-            let work = integrator.judge.root.join(".shadow-node");
-            let gate_env = integrator.judge.gate_env.clone();
-            integrator = integrator.with_node_shadow(settings, gate_env, work);
-        }
-        Ok(None) => {}
-        Err(error) => eprintln!("integrate: {error}; no shadow judging on nodes"),
-    }
+    integrator = integrator.with_node_shadow_from_env();
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -2795,6 +2783,28 @@ impl Integrator {
         self
     }
 
+    /// This integrator shadowing judged verdicts on spawn-node v1 too, when
+    /// `SPAWN_GATE_SHADOW_NODE=1` ([`shadow::node_settings`]); its
+    /// snapshots beside the mirrors.
+    fn with_node_shadow_from_env(self) -> Self {
+        match shadow::node_settings(crate::config::env_value) {
+            Ok(Some(settings)) => {
+                println!(
+                    "integrate: judged verdicts are shadowed on spawn-node v1 (every {}-th)",
+                    settings.every
+                );
+                let work = self.judge.root.join(".shadow-node");
+                let gate_env = self.judge.gate_env.clone();
+                self.with_node_shadow(settings, gate_env, work)
+            }
+            Ok(None) => self,
+            Err(error) => {
+                eprintln!("integrate: {error}; no shadow judging on nodes");
+                self
+            }
+        }
+    }
+
     /// This integrator shadowing judged verdicts on spawn-node v1 too
     /// ([`shadow::NodeShadows`]), its snapshots in `work`.
     fn with_node_shadow(
@@ -2860,7 +2870,7 @@ impl Integrator {
     /// The nodes' level-triggered sweep (`spawn_node_sweep`: leases past
     /// their time wait for a result, then are fenced; silent nodes are
     /// recorded lost), once a pass; never an error of the pass.
-    fn sweep_nodes(&self, store: &PostgresStore) {
+    fn sweep_nodes(store: &PostgresStore) {
         match remote::sweep(store) {
             Ok(swept) if swept.waiting + swept.fenced + swept.lost > 0 => println!(
                 "integrate: nodes swept: {} lease(s) waiting for a result, {} fenced, {} \
@@ -3070,7 +3080,7 @@ impl Integrator {
         self.stop_for(&urgent);
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm(store, steps.is_ok());
-        self.sweep_nodes(store);
+        Self::sweep_nodes(store);
         self.poll_shadow(store);
         steps
     }
