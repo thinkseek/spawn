@@ -95,8 +95,10 @@ fn clocks(path: &str) -> &'static [&'static str] {
 }
 
 /// [`clocks`]' table: a path, or a prefix ending in `*`, and its clocks.
-const CLOCKS: [(&str, &[&str]); 5] = [
+const CLOCKS: [(&str, &[&str]); 7] = [
     ("/api/rsi", &["generated_at_ms"]),
+    ("/api/approvals", &["generated_at_ms"]),
+    ("/api/context/digest", &["generated_at_ms"]),
     ("/api/attention", &["generated_at_ms"]),
     ("/api/features", &["generated_at_ms"]),
     ("/api/rsi/pane", &["captured_at_ms"]),
@@ -183,6 +185,8 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/rsi/pane"
             | "/api/features"
             | "/api/scorecard"
+            | "/api/approvals"
+            | "/api/context/digest"
     ) || path
         .strip_prefix("/api/pane/")
         .is_some_and(|id| !id.is_empty())

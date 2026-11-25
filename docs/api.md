@@ -6,14 +6,14 @@ Every route `spawn serve` answers under `/api/`, on one page. The router is
 each answer holds is documented on its handler there. Words are as in the
 [glossary](./glossary.md).
 
-`main` serves 25 GET route patterns and 7 POST routes. Any other path,
+`main` serves 28 GET route patterns and 9 POST routes. Any other path,
 under `/api/` or not, is looked up as a file of the built UI (`--web`,
 `SPAWN_WEB_DIR`, default `web/dist`), so an unknown API path is a 404.
 
 ## Reads
 
-GET or HEAD only: any other method on a read answers 405. Every read runs as
-the read-only `spawn_reader` login. Each answer carries a weak `ETag`, and
+GET or HEAD only (`/api/stream`: GET only): any other method on a read
+answers 405. Every read runs as the read-only `spawn_reader` login. Each answer carries a weak `ETag`, and
 `If-None-Match` gets 304 while nothing it shows changed; a board read with
 `Cache-Control: max-age=1` may share the answer computed for another page up
 to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs)).
@@ -45,6 +45,9 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/features` | The feature map of every open objective mission (a mission's `--features` file), or of `?mission=`; `?limit=` (10, at most 50) | – | web (Features) |
 | GET | `/api/features/coverage` | The feature registry's file coverage (`docs/feature-map/registry.json`): wild files, stale references, features; `?mission=<id>` for that mission's project | `spawn features scan --json` | web (Coverage) |
 | GET | `/api/features/coverage/projects` | Every project the Coverage page can read, over all open objective missions | – | web (Coverage) |
+| GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), `: keepalive` every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; on 64 slots of its own (503 when all are taken), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | not yet (the issue 91 dashboard) |
+| GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)) | – | not yet (the issue 91 dashboard) |
+| GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | not yet (the issue 91 dashboard) |
 
 ## Writes
 
@@ -54,17 +57,19 @@ each records as principal `human` and nothing else. Their guards, in order:
 the read guard below; POST; without the token, an `Origin` naming this
 server as the `Host` does, and with no token set at all, a client socket the
 owner's uid holds; `Content-Type: application/json` (415); a body of at most
-16 KiB (413); then the route's own fields (400). On the input and the
-resume, `{"probe": true}` passes every guard and writes nothing, so the page
-knows before it offers the box.
+16 KiB (413); then the route's own fields (400). On the input, the resume,
+the master message and the act, `{"probe": true}` passes every guard and
+writes nothing, so the page knows before it offers the box.
 
 | Method | Path | Does | CLI twin | Read by |
 | --- | --- | --- | --- | --- |
 | POST | `/api/session/<id>/input` | A person's input to a session, `{"text", "key"}`, typed when the agent's turn ends; 202 with the command | `spawn submit --principal human --action '{"type":"input",...}'`: the same command | web (agent detail, the supervisor's box) |
-| POST | `/api/session/<id>/key` | A named key (escape, up, down, left, right, enter, y, n), `{"name", "key"}`, sent at once | `spawn submit --principal human --action '{"type":"key",...}'` | web (terminal panel) |
+| POST | `/api/session/<id>/key` | A named key (escape, up, down, left, right, enter, y, n, digit1 to digit9; a bare `1` to `9` is its digit), `{"name", "key"}`, sent at once | `spawn submit --principal human --action '{"type":"key",...}'` | web (terminal panel) |
 | POST | `/api/session/<id>/restart` | Restarts the session's delivered task on a fresh execution, `{"reason"}` | `spawn task restart --id <task>` (by task, not by session) | web (agent detail) |
 | POST | `/api/session/<id>/reassign` | Moves the session's delivered task to a fresh worker, `{"reason"}` | `spawn task reassign --id <task>` (by task) | web (agent detail) |
 | POST | `/api/mission/<id>/resume` | Resumes the mission from the named halt, `{"halt", "key"}` | `spawn mission resume --id N` (which also ends a pause) | web (Home, Needs you) |
+| POST | `/api/master/message` | A person's message to the supervisor, `{"text", "mode", "key"}` (`mode` auto, steer, queue or restart; auto by default), through `spawn_human_master_message`: a stopped or stopping supervisor is woken first, the message typed when its turn ends; 202 with the command ids; the same request again answers the first call's ids, another under the key is 409 | `spawn submit --principal human --session session_supervisor --action '{"type":"input",...}'` (no wake, no mode) | not yet (the issue 91 dashboard) |
+| POST | `/api/approvals/<session_id>/act` | Answers one prompt of `/api/approvals`, `{"action", "approval_id", "keys", "text", "key"}`: `allow`, `allow_always` and `deny` need the item's `approval_id` (400 without) and press its keys only while the pane still shows that prompt (409 otherwise); `keys` presses named keys, `text` types a text; 202 with the command ids | `spawn submit --principal human --action '{"type":"key",...}'`, one per key | not yet (the issue 91 dashboard) |
 | POST | `/api/features/scan` | A fresh read-only scan of the feature registry's coverage; changes no file | `spawn features scan` | web (Coverage) |
 | POST | `/api/features/associate` | Associates one file with features and saves the registry | `spawn features associate --path <file> --feature <id>` | web (Coverage) |
 
@@ -75,9 +80,11 @@ token or this page's own `Origin`; `?mission=<id>` names the project.
 
 ## Aliases
 
-None on `main`: every path above is the only spelling of its route. When a
-route gains a second spelling, both are listed here, the old one with the
-canonical path it answers as.
+Every path above is the only spelling of its route. One query parameter
+has a second spelling: `/api/stream?after_event_id=<id>` is
+`/api/stream?after=<id>` (the cursor `/api/events` and `/api/session/<id>`
+take); both at once is 400. When a route gains a second spelling, both are
+listed here, the old one with the canonical path it answers as.
 
 ## Access
 

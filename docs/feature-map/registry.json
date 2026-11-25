@@ -500,6 +500,10 @@
         {
           "kind": "contains",
           "target": "cap-web-session-trace-views"
+        },
+        {
+          "kind": "contains",
+          "target": "cap-web-dashboard"
         }
       ],
       "provenance": {
@@ -1790,7 +1794,7 @@
       "title": "Fleet Node Registry, Heartbeats & Drain",
       "kind": "capability",
       "parent": "domain-missions-fleet",
-      "summary": "Owned machines as fleet nodes (M7 #555): `spawn node add|list|probe|drain|undrain|remove`, the heartbeat worker, tcp/udp transports with multi-hop relays and upward registration (`spawn node serve|register`, issue 85), the global E2E-encrypted mesh of issue 87 (Ed25519 node identities, spawn-e2e-v1 sealed envelopes, AEAD-sealed tcp/udp wire, a pure sync WebSocket+TLS client and server, `spawn node coord|connect` with a recursive coordinator tree, STUN/punch and blind relays), the PostgreSQL node store and the Fleet page's node rows.",
+      "summary": "Owned machines as fleet nodes (M7 #555): `spawn node add|list|probe|drain|undrain|remove`, the heartbeat worker, tcp/udp transports with multi-hop relays and upward registration (`spawn node serve|register`, issue 85), the global E2E-encrypted mesh of issue 87 (Ed25519 node identities, spawn-e2e-v1 sealed envelopes, AEAD-sealed tcp/udp wire, a pure sync WebSocket+TLS client and server, `spawn node coord|connect` with a recursive coordinator tree, STUN/punch and blind relays), the PostgreSQL node store and the Fleet page's node rows. Issue 91 P1a: macOS (Darwin) inventory and heartbeat, battery/AC power telemetry and the low-battery soft drain (`SPAWN_NODE_LOW_BATTERY_PCT`).",
       "files": [
         "crates/spawn-cli/src/nodes.rs",
         "crates/spawn-cli/src/nodes/auth.rs",
@@ -1800,6 +1804,8 @@
         "crates/spawn-cli/src/nodes/crypto.rs",
         "crates/spawn-cli/src/nodes/crypto/tests.rs",
         "crates/spawn-cli/src/nodes/hardening_tests.rs",
+        "crates/spawn-cli/src/nodes/power.rs",
+        "crates/spawn-cli/src/nodes/power/tests.rs",
         "crates/spawn-cli/src/nodes/relay.rs",
         "crates/spawn-cli/src/nodes/relay/tests.rs",
         "crates/spawn-cli/src/nodes/tests.rs",
@@ -1825,7 +1831,9 @@
         }
       ],
       "provenance": {
-        "objectives": [],
+        "objectives": [
+          "issue-91/P1a"
+        ],
         "tasks": [],
         "agents": [],
         "commits": [
@@ -1835,6 +1843,7 @@
           "crates/spawn-cli/src/nodes/coord/tests.rs",
           "crates/spawn-cli/src/nodes/crypto/tests.rs",
           "crates/spawn-cli/src/nodes/hardening_tests.rs",
+          "crates/spawn-cli/src/nodes/power/tests.rs",
           "crates/spawn-cli/src/nodes/tests.rs",
           "crates/spawn-cli/src/nodes/ws/tests.rs",
           "crates/spawn-postgres/tests/nodes.rs",
@@ -2591,6 +2600,64 @@
         ],
         "deploys": [],
         "artifacts": [],
+        "discussions": []
+      }
+    },
+    {
+      "id": "cap-web-dashboard",
+      "title": "Dashboard Backend: Live Stream, Master Control, Approvals & Digest (issue 91 P1a)",
+      "kind": "capability",
+      "parent": "domain-dashboard-web",
+      "summary": "The Rust backend of the issue 91 dashboard: `GET /api/stream` (Server-Sent Events on slots of their own, one `LISTEN spawn_events` listener, Last-Event-ID / ?after= catch-up), `POST /api/master/message` (`spawn_human_master_message`: a message to the supervisor that auto-wakes it, in auto/steer/queue/restart modes), the no-ACP approval detector `GET /api/approvals` with its one-click `POST /api/approvals/<session_id>/act` (named keys, the digits of numbered prompts included), and the token-saving `GET /api/context/digest`.",
+      "files": [
+        "crates/spawn-cli/src/serve/approvals.rs",
+        "crates/spawn-cli/src/serve/approvals/tests.rs",
+        "crates/spawn-cli/src/serve/digest.rs",
+        "crates/spawn-cli/src/serve/digest/tests.rs",
+        "crates/spawn-cli/src/serve/stream.rs",
+        "crates/spawn-cli/src/serve/stream/tests.rs",
+        "crates/spawn-postgres/tests/master_message.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-serve-http-api"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-postgres-event-log"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-node-registry"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-tmux-runner"
+        }
+      ],
+      "provenance": {
+        "objectives": [
+          "issue-91/P1a"
+        ],
+        "tasks": [
+          "565"
+        ],
+        "agents": [
+          "agent_worker_issue91_p1a_backend_565"
+        ],
+        "commits": [],
+        "tests": [
+          "crates/spawn-cli/src/serve/approvals/tests.rs",
+          "crates/spawn-cli/src/serve/digest/tests.rs",
+          "crates/spawn-cli/src/serve/stream/tests.rs",
+          "crates/spawn-cli/src/serve.rs",
+          "crates/spawn-postgres/tests/master_message.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/fleet-architecture.md"
+        ],
         "discussions": []
       }
     },

@@ -1,7 +1,9 @@
-//! HTTP API and static files for the observer UI: reads, and seven POST
-//! routes. Five are a person's writes: an input to a session, a key, a
-//! restart or a reassign of a stalled worker, and the resume of a halted
-//! mission. Two are the feature registry's: a fresh scan, which changes
+//! HTTP API and static files for the observer UI: 28 GET route patterns
+//! (`GET /api/stream` among them) and nine POST routes. Seven are a
+//! person's writes: an input to a session, a key, a restart or a reassign
+//! of a stalled worker, the resume of a halted mission, a message to the
+//! supervisor ([`master_message`]) and the answer to an approval prompt
+//! (`POST /api/approvals/<session_id>/act`). Two are the feature registry's: a fresh scan, which changes
 //! nothing, and a file's association ([`feature_scan_post`],
 //! [`feature_associate_post`]). Every route, with its method and CLI twin,
 //! is listed in docs/api.md.
@@ -46,8 +48,9 @@
 //! "escape", "key": "<idempotency key>"}` (backlog P1): the key command
 //! `spawn submit --principal human ... --action '{"type":"key","key":...}'`
 //! makes, through `spawn_human_key`, with the same guards and idempotency
-//! rule. The name is one of escape, up, down, left, right, enter, y, n (400
-//! otherwise). A key is its own action, never text, and does not wait for
+//! rule. The name is one of escape, up, down, left, right, enter, y, n,
+//! digit1, digit2, digit3 (the bare `1` to `3` name the digits too; issue
+//! #91) (400 otherwise). A key is its own action, never text, and does not wait for
 //! the turn: the Bridge sends it at once. A session no agent has used is
 //! 404; one that runs no execution is 409 with the reason, and so is an
 //! idempotency key another request used; no command is made.
@@ -84,6 +87,32 @@
 //! the mission is not halted or is halted on another halt (a page not
 //! refreshed since); 404 for no such mission; 400 without a key or a halt.
 //!
+//! Master Control (issue #91 P1a): `POST /api/master/message` with
+//! `{"text": "...", "mode": "auto" | "steer" | "queue" | "restart", "key":
+//! "<idempotency key>"}` (the key may come in an `Idempotency-Key` header;
+//! the mode is `auto` when left out), or `{"probe": true}`, with the
+//! input's guards in its order, writes to the supervisor through
+//! `spawn_human_master_message`, the `spawn_human` login's fifth function.
+//! It never answers 409 for a supervisor that runs no execution: it wakes
+//! it first (a resume when a native session is bound, else a start; none
+//! when one is already in flight) and the input follows; `steer` presses
+//! Esc into a running turn first, `restart` stops a running supervisor
+//! first. 202 `{command_id, wake_command_id, stop_command_id,
+//! steer_command_id, session_id, mode, principal, woke, replayed}`; a
+//! retried POST makes nothing; 409 only for a key another request used.
+//!
+//! Approvals ([`approvals`]): `GET /api/approvals` lists the permission
+//! and selection prompts the live panes show, found by fixed text rules (no
+//! agent protocol), and `POST /api/approvals/<session_id>/act` answers one with
+//! named keys or a text through `spawn_human_key` and `spawn_human_input`,
+//! with the input's guards. `GET /api/context/digest` ([`digest`]) is the
+//! fleet in one small answer with a bounded Markdown block. `GET
+//! /api/stream` ([`stream`]) is the log as Server-Sent Events, on slots of
+//! its own beside [`MAX_IN_FLIGHT`], fed by one `LISTEN spawn_events`
+//! listener, with `Last-Event-ID` / `?after=` catch-up. Each node
+//! of `/api/nodes` carries its `power` and the low-battery soft drain
+//! (`low_battery_drain`, `effective_drained`, `schedulable`).
+//!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
 //! it refuses to start without `SPAWN_SERVE_TOKEN`. With a token set, every
@@ -110,11 +139,14 @@
 //! [`answers`]'s.
 
 mod answers;
+mod approvals;
 pub(crate) mod attention;
 pub(crate) mod core_lines;
+mod digest;
 pub(crate) mod feature_map;
 mod labels;
 mod storage;
+mod stream;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -225,6 +257,7 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         .to_ip()
         .map_or_else(|| address.clone(), |address| address.to_string());
     let slots = Slots::new(MAX_IN_FLIGHT);
+    let streams = Slots::new(stream::SSE_SLOTS);
     // The Core lines reading, once, beside the requests: the first person
     // after a restart gets the kept figures, not the cold computation. A
     // request meanwhile waits on the performance figures' lock (archive and
@@ -235,7 +268,7 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     keep_listening(
         server,
         &bound,
-        |server| serve_requests(server, &shared, &slots),
+        |server| serve_requests(server, &shared, &slots, &streams),
         |address| Server::http(address).map_err(|error| error.to_string()),
         listen_again_pause,
     )
@@ -364,16 +397,31 @@ impl Drop for Slot {
 }
 
 /// Serve `server`'s requests until its listener stops: each on a thread of
-/// its own, at most the slots' limit at once, and 503 past them. Returns why
-/// it stopped.
-fn serve_requests(server: &Server, shared: &Arc<Shared>, slots: &Arc<Slots>) -> std::io::Error {
+/// its own, at most the slots' limit at once, and 503 past them. A stream
+/// (`GET /api/stream`, [`stream`]) takes one of `streams` instead, never
+/// one of `slots`, so pages that stream never starve the other requests.
+/// Returns why it stopped.
+fn serve_requests(
+    server: &Server,
+    shared: &Arc<Shared>,
+    slots: &Arc<Slots>,
+    streams: &Arc<Slots>,
+) -> std::io::Error {
     loop {
         let request = match server.recv() {
             Ok(request) => request,
             Err(error) => return error,
         };
-        let Some(slot) = Slots::take(slots) else {
-            let busy = json_response(503, &json!({ "error": "busy: too many requests at once" }));
+        let streaming = stream::is_stream(&request);
+        let Some(slot) = Slots::take(if streaming { streams } else { slots }) else {
+            let busy = json_response(
+                503,
+                &json!({ "error": if streaming {
+                    "busy: too many streams at once"
+                } else {
+                    "busy: too many requests at once"
+                } }),
+            );
             if let Err(error) = request.respond(busy) {
                 eprintln!("serve: {error}");
             }
@@ -842,6 +890,18 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
                 return moved(request, id, action, access, shared);
             }
         }
+        if path == "/api/master/message" {
+            return master_message(request, access, shared);
+        }
+        if path == "/api/stream" {
+            return stream::stream(request, query);
+        }
+        if let Some(id) = path
+            .strip_prefix("/api/approvals/")
+            .and_then(|rest| rest.strip_suffix("/act"))
+        {
+            return approvals::act(request, id, access, shared);
+        }
         if path == "/api/features/scan" {
             return feature_scan_post(request, query, access, shared);
         }
@@ -901,6 +961,8 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/verifications" => Box::new(verifications),
         "/api/nodes" => Box::new(nodes),
         "/api/grading" => Box::new(grading),
+        "/api/approvals" => Box::new(approvals::approvals),
+        "/api/context/digest" => Box::new(digest::digest),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
@@ -1257,6 +1319,100 @@ fn move_task(
             Ok((202, moved))
         }
         Ok(spawn_postgres::HumanTask::Refused(why)) => Err((409, why)),
+        Err(error) => Err((500, error.to_string())),
+    }
+}
+
+/// `POST /api/master/message`, past the read guard (`access`): a person's
+/// message to the supervisor from Master Control (issue #91 P1a; module
+/// doc), or a probe of whether one would be taken.
+fn master_message(mut request: Request, access: Access, shared: &Shared) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match messaged(&mut request, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The body of `POST /api/master/message`: the text, its mode (`auto`,
+/// `steer`, `queue`, `restart`; `auto` when left out) and the idempotency
+/// key, or `{"probe": true}` alone. Nothing else: no session (it is the
+/// supervisor's), no agent, no principal.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MasterBody {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    probe: bool,
+}
+
+/// The checks of a person's message after its method (the input's guards,
+/// in its order), then the probe's answer or the submission: `(202,
+/// {command_id, wake_command_id, session_id, mode, principal, ...})`, or
+/// `(status, why)` when refused. A stopped or idle supervisor is woken,
+/// never refused: the only 409 is a key another request used.
+fn messaged(
+    request: &mut Request,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    let (body, header_key) = write_body(request, access, shared, "a message")?;
+    let body: MasterBody = serde_json::from_slice(&body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}the body is not a message: {error}"),
+        )
+    })?;
+    if body.probe {
+        if body.text.is_some() || body.key.is_some() || body.mode.is_some() || header_key.is_some()
+        {
+            return Err((
+                400,
+                format!("{BAD_REQUEST}a probe carries no text, no mode and no key"),
+            ));
+        }
+        writer(shared).map_err(|error| (500, error))?;
+        return Ok((
+            200,
+            json!({ "writable": true, "session_id": crate::supervise::SUPERVISOR_SESSION,
+                    "max_text_bytes": MAX_INPUT_TEXT,
+                    "max_key_bytes": spawn_postgres::MAX_MASTER_KEY_BYTES,
+                    "modes": spawn_postgres::MasterMessageMode::ALL
+                        .iter()
+                        .map(|mode| mode.name())
+                        .collect::<Vec<_>>() }),
+        ));
+    }
+    let mode = spawn_postgres::MasterMessageMode::from_name(body.mode.as_deref().unwrap_or("auto"))
+        .map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
+    let key = idempotency(body.key, header_key, "a message")?;
+    if key.as_str().len() > spawn_postgres::MAX_MASTER_KEY_BYTES {
+        return Err((
+            400,
+            format!(
+                "{BAD_REQUEST}a message's idempotency key is at most {} bytes",
+                spawn_postgres::MAX_MASTER_KEY_BYTES
+            ),
+        ));
+    }
+    let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
+    let store = writer(shared).map_err(|error| (500, error))?;
+    match store.human_master_message(&key, &text, mode) {
+        Ok(spawn_postgres::HumanMaster::Submitted(answer)) => Ok((202, answer)),
+        Ok(spawn_postgres::HumanMaster::KeyUsed(why)) => Err((409, why)),
+        Ok(spawn_postgres::HumanMaster::Refused(why)) => Err((400, format!("{BAD_REQUEST}{why}"))),
         Err(error) => Err((500, error.to_string())),
     }
 }
@@ -1847,9 +2003,14 @@ fn grading() -> Result<Value, String> {
 /// `/api/nodes`: every node joined and not removed (multi-host P1, crate
 /// nodes.rs), `{nodes: [...]}`, each as the store lists it ([`public_nodes`]),
 /// read through the reader login like every other read. No clock in it, so
-/// an unchanged list keeps its ETag.
+/// an unchanged list keeps its ETag. Each node carries its `power` (null
+/// without a battery or AC sensor) and the low-battery soft drain at
+/// `SPAWN_NODE_LOW_BATTERY_PCT` (issue #91, crate nodes/power.rs):
+/// `low_battery_drain`, `effective_drained` and `schedulable`, which leave
+/// its `state` and the owner's drain as they are.
 fn nodes() -> Result<Value, String> {
-    let nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+    let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+    crate::nodes::power::with_soft_drain(&mut nodes, crate::nodes::power::low_battery_from_env());
     Ok(json!({ "nodes": public_nodes(nodes) }))
 }
 
@@ -2995,13 +3156,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_INPUT_BODY,
-        MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token, backups,
-        coverage_projects, coverage_registry_checked, feature_associate_at, feature_paths, handle,
-        is_json, is_loopback, keep_listening, listen_again_pause, local_exemption, log_window,
-        mission_feature_paths, mission_query, objective_json, objective_prompt,
+        Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_IN_FLIGHT,
+        MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token,
+        backups, coverage_projects, coverage_registry_checked, feature_associate_at, feature_paths,
+        handle, is_json, is_loopback, keep_listening, listen_again_pause, local_exemption,
+        log_window, mission_feature_paths, mission_query, objective_json, objective_prompt,
         open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, public_nodes,
-        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
+        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts, stream,
         tokenless_request, typed_text, with_activity, with_last_gates, with_objectives,
     };
     use crate::objectives::Task;
@@ -5419,7 +5580,8 @@ mod tests {
             owner_url: None,
         });
         let slots = Slots::new(limit);
-        std::thread::spawn(move || serve_requests(&server, &shared, &slots));
+        let streams = Slots::new(stream::SSE_SLOTS);
+        std::thread::spawn(move || serve_requests(&server, &shared, &slots, &streams));
         (port, web)
     }
 
@@ -5498,6 +5660,7 @@ mod tests {
         });
         let address = format!("127.0.0.1:{port}");
         let slots = Slots::new(4);
+        let streams = Slots::new(stream::SSE_SLOTS);
         let mut first = true;
         // Asked only once the new listener is bound: a request the stopped
         // one took before it was dropped is answered 500 by tiny_http.
@@ -5511,7 +5674,7 @@ mod tests {
                         // As a failed accept ends tiny_http's accept thread.
                         return std::io::Error::other("test: the accept thread stopped");
                     }
-                    serve_requests(server, &shared, &slots)
+                    serve_requests(server, &shared, &slots, &streams)
                 },
                 |address| {
                     let server =
@@ -6171,5 +6334,365 @@ mod tests {
             json!(["coord", "relay", [], "live", "peer", "home"])
         );
         assert_eq!(node["node_id"], "ab".repeat(32));
+    }
+
+    /// A server running `serve`'s loop with `regular` request slots and
+    /// `streams` stream slots, `token` set. Returns its port.
+    fn serving_slots(token: Option<&'static str>, regular: usize, streams: usize) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Arc::new(Shared {
+            web: std::env::temp_dir(),
+            token: token.map(str::to_string),
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: Vec::new(),
+            owner_url: None,
+        });
+        let (slots, streams) = (Slots::new(regular), Slots::new(streams));
+        std::thread::spawn(move || serve_requests(&server, &shared, &slots, &streams));
+        port
+    }
+
+    /// One raw GET to `port`: the status and the body.
+    fn raw_status(port: u16, path: &str, headers: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("send");
+        let mut answer = String::new();
+        let _ = client.read_to_string(&mut answer);
+        let status = answer
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        (status, answer)
+    }
+
+    /// Issue #91: a stream takes one of the stream slots, never one of the
+    /// requests' (`MAX_IN_FLIGHT`): with every request slot taken a stream
+    /// still reaches its handler (here the read guard, which refuses it
+    /// without the token), and with every stream slot taken a stream is
+    /// 503 while the other requests are served.
+    #[test]
+    fn streams_take_their_own_slots_never_the_requests() {
+        assert_eq!(stream::SSE_SLOTS, 64);
+        assert_eq!(MAX_IN_FLIGHT, 16);
+        // Two stream slots: a slot is freed only after its answer is read,
+        // so a second stream sent at once may find the first still held.
+        let no_requests = serving_slots(Some("secret"), 0, 2);
+        let (status, body) = raw_status(no_requests, "/api/overview", "");
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("too many requests"), "{body}");
+        let (status, body) = raw_status(no_requests, "/api/stream", "");
+        assert_eq!(status, 401, "the stream reached the read guard: {body}");
+        let (status, _) = raw_status(no_requests, "/api/stream?after_event_id=3", "");
+        assert_eq!(status, 401);
+        let no_streams = serving_slots(Some("secret"), 1, 0);
+        let (status, body) = raw_status(
+            no_streams,
+            "/api/stream",
+            "Authorization: Bearer secret\r\n",
+        );
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("too many streams"), "{body}");
+        // Review S1: a bad or doubled cursor is the caller's mistake, said
+        // before the stream subscribes.
+        // A slot each: one is freed only after its answer is read.
+        let one_stream = serving_slots(Some("secret"), 0, 3);
+        for path in [
+            "/api/stream?after=x",
+            "/api/stream?after=-1",
+            "/api/stream?after=3&after_event_id=3",
+        ] {
+            let (status, body) = raw_status(one_stream, path, "Authorization: Bearer secret\r\n");
+            assert_eq!(status, 400, "{path}: {body}");
+        }
+        let (status, body) = raw_status(no_streams, "/api/overview", "");
+        assert_eq!(status, 401, "a request is still served: {body}");
+    }
+
+    const MASTER: &str = "/api/master/message";
+
+    /// `POST /api/master/message` has the input's guards in its order, and
+    /// its body is a text, a mode and a key, or a probe, nothing else.
+    #[test]
+    fn the_master_messages_path_has_the_inputs_guards() {
+        let answer = exchange(
+            Some("secret"),
+            "",
+            None,
+            &format!("GET {MASTER} HTTP/1.1\r\n{SCRIPT}Connection: close\r\n\r\n"),
+        );
+        assert_eq!(answer.status, 405, "{answer:?}");
+        let body = r#"{"text":"hello","key":"m-1"}"#;
+        let cross = "Host: 127.0.0.1:PORT\r\nOrigin: http://evil.example\r\n\
+                     Content-Type: application/json\r\n";
+        assert_eq!(post(None, "", None, MASTER, cross, body).status, 403);
+        let plain = "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                     Content-Type: text/plain\r\n";
+        assert_eq!(
+            post(Some("secret"), "", None, MASTER, plain, body).status,
+            415
+        );
+        let huge = format!(r#"{{"text":"{}","key":"m"}}"#, "x".repeat(MAX_INPUT_BODY));
+        assert_eq!(
+            post(Some("secret"), "", None, MASTER, SCRIPT, &huge).status,
+            413
+        );
+        for (bad, why) in [
+            (r#"{"text":"hi"}"#, "no key"),
+            (r#"{"text":"   ","key":"k"}"#, "a blank text"),
+            (r#"{"text":"a\u001b[2J","key":"k"}"#, "an escape"),
+            (
+                r#"{"text":"hi","key":"k","mode":"shout"}"#,
+                "an unknown mode",
+            ),
+            (
+                r#"{"text":"hi","key":"k","session":"session_worker_a"}"#,
+                "a session",
+            ),
+            (r#"{"probe":true,"text":"hi"}"#, "a probe with a text"),
+        ] {
+            let answer = post(Some("secret"), "", None, MASTER, SCRIPT, bad);
+            assert_eq!(answer.status, 400, "{why}: {answer:?}");
+        }
+        let long = format!(
+            r#"{{"text":"{}","key":"k"}}"#,
+            "x".repeat(MAX_INPUT_TEXT + 1)
+        );
+        assert_eq!(
+            post(Some("secret"), "", None, MASTER, SCRIPT, &long).status,
+            400
+        );
+        let reached = post(Some("secret"), "", None, MASTER, SCRIPT, body);
+        assert_eq!(reached.status, 500, "{reached:?}");
+        assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
+    }
+
+    /// Issue #91, through the handler into the test database: a message to
+    /// a supervisor that runs no execution wakes it (never 409), a retried
+    /// POST makes nothing, every mode is taken, and another request under a
+    /// used key is 409.
+    #[test]
+    fn a_master_message_wakes_a_stopped_supervisor_and_is_typed_once() {
+        in_test_schema(|owner, store| {
+            let commands = || {
+                store
+                    .commands_json("session_supervisor", 50, 120_000)
+                    .expect("commands")
+            };
+            let to = |body: &str| {
+                post(
+                    Some("secret"),
+                    "",
+                    Some(owner.to_string()),
+                    MASTER,
+                    SCRIPT,
+                    body,
+                )
+            };
+            let probe = to(r#"{"probe":true}"#);
+            assert_eq!(probe.status, 200, "{probe:?}");
+            assert_eq!(probe.body["session_id"], "session_supervisor");
+            assert_eq!(
+                probe.body["modes"],
+                json!(["auto", "steer", "queue", "restart"])
+            );
+            assert_eq!(commands(), json!([]), "a probe writes nothing");
+
+            let body = r#"{"text":"Are you there?","key":"mm-1"}"#;
+            let woke = to(body);
+            assert_eq!(woke.status, 202, "{woke:?}");
+            assert_eq!(woke.body["session_id"], "session_supervisor");
+            assert_eq!(woke.body["principal"], "human");
+            assert_eq!(woke.body["mode"], "auto");
+            assert!(woke.body["wake_command_id"].is_i64(), "{woke:?}");
+            assert!(woke.body["command_id"].is_i64());
+            let again = to(body);
+            assert_eq!(again.status, 202);
+            assert_eq!(again.body["command_id"], woke.body["command_id"]);
+            assert_eq!(again.body["wake_command_id"], woke.body["wake_command_id"]);
+            let listed = commands();
+            assert_eq!(listed.as_array().map(Vec::len), Some(2), "{listed}");
+            // Newest first: the input after its wake.
+            assert_eq!(listed[0]["action"], "input");
+            assert_eq!(listed[0]["text"], "Are you there?");
+            assert_eq!(listed[1]["action"], "start");
+            let other = to(r#"{"text":"Something else","key":"mm-1"}"#);
+            assert_eq!(other.status, 409, "{other:?}");
+
+            execution_starts(store);
+            for (mode, key) in [("queue", "mm-2"), ("steer", "mm-3"), ("restart", "mm-4")] {
+                let answer = to(&format!(
+                    r#"{{"text":"mode {mode}","key":"{key}","mode":"{mode}"}}"#
+                ));
+                assert_eq!(answer.status, 202, "{mode}: {answer:?}");
+                assert_eq!(answer.body["mode"], mode);
+            }
+            let header = format!("{SCRIPT}Idempotency-Key: mm-5\r\n");
+            let keyed = post(
+                Some("secret"),
+                "",
+                Some(owner.to_string()),
+                MASTER,
+                &header,
+                r#"{"text":"by header"}"#,
+            );
+            assert_eq!(keyed.status, 202, "{keyed:?}");
+            let actions: Vec<String> = commands()
+                .as_array()
+                .expect("a list")
+                .iter()
+                .map(|command| command["action"].as_str().unwrap_or("?").to_string())
+                .collect();
+            // Newest first: by header (woken by restart's start, after its
+            // pending stop: no wake of its own); restart's input, its own
+            // start (the first start, still in flight, is older than the
+            // stop that would end what it begins) and its stop; steer's
+            // input and Esc; queue's input; the first input and its start.
+            assert_eq!(
+                actions,
+                [
+                    "input", "input", "start", "stop", "input", "key", "input", "input", "start"
+                ]
+                .map(str::to_string),
+                "the newest first"
+            );
+            let listed = commands();
+            let (restart_wake, restart_stop) = (
+                listed[2]["command_id"].as_i64().expect("an id"),
+                listed[3]["command_id"].as_i64().expect("an id"),
+            );
+            assert!(
+                restart_wake > restart_stop,
+                "the wake is newer than the stop"
+            );
+        });
+    }
+
+    /// Issue #91: `POST /api/approvals/<session_id>/act` with `keys` and `text`,
+    /// through the handler into the test database: each key its own
+    /// command, a digit stored as `digit<n>`; refused 409 while nothing
+    /// runs, and nothing recorded.
+    #[test]
+    fn an_act_presses_keys_and_types_text_into_a_running_engine_once() {
+        in_test_schema(|owner, store| {
+            const ACT: &str = "/api/approvals/session_supervisor/act";
+            let commands = || {
+                store
+                    .commands_json("session_supervisor", 50, 120_000)
+                    .expect("commands")
+            };
+            let to = |body: &str| {
+                post(
+                    Some("secret"),
+                    "",
+                    Some(owner.to_string()),
+                    ACT,
+                    SCRIPT,
+                    body,
+                )
+            };
+            let probe = to(r#"{"probe":true}"#);
+            assert_eq!(probe.status, 200, "{probe:?}");
+            assert!(
+                probe.body["keys"]
+                    .as_array()
+                    .is_some_and(|keys| keys.contains(&json!("digit1")))
+            );
+            let stopped = to(r#"{"action":"keys","keys":["2"],"key":"act-1"}"#);
+            assert_eq!(stopped.status, 409, "{stopped:?}");
+            assert_eq!(commands(), json!([]), "nothing recorded");
+            execution_starts(store);
+            let body = r#"{"action":"keys","keys":["2","enter"],"key":"act-2"}"#;
+            let pressed = to(body);
+            assert_eq!(pressed.status, 202, "{pressed:?}");
+            assert_eq!(pressed.body["keys"], json!(["digit2", "enter"]));
+            assert_eq!(pressed.body["principal"], "human");
+            let ids = pressed.body["command_ids"].clone();
+            assert_eq!(ids.as_array().map(Vec::len), Some(2));
+            assert_eq!(
+                to(body).body["command_ids"],
+                ids,
+                "a retried POST presses once"
+            );
+            let typed = to(r#"{"action":"text","text":"use main","key":"act-3"}"#);
+            assert_eq!(typed.status, 202, "{typed:?}");
+            assert_eq!(typed.body["text"], "use main");
+            let listed = commands();
+            let listed: Vec<(String, String)> = listed
+                .as_array()
+                .expect("a list")
+                .iter()
+                .map(|command| {
+                    (
+                        command["action"].as_str().unwrap_or("?").to_string(),
+                        command["text"].as_str().unwrap_or("?").to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                listed,
+                [("input", "use main"), ("key", "enter"), ("key", "digit2")]
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+            );
+            let unknown = post(
+                Some("secret"),
+                "",
+                Some(owner.to_string()),
+                "/api/approvals/session_never_seen/act",
+                SCRIPT,
+                r#"{"action":"keys","keys":["y"],"key":"act-4"}"#,
+            );
+            assert_eq!(unknown.status, 404, "{unknown:?}");
+            for (bad, why) in [
+                (
+                    r#"{"action":"keys","keys":["f1"],"key":"k"}"#,
+                    "a key outside the set",
+                ),
+                (r#"{"action":"approve","key":"k"}"#, "an unknown action"),
+                (
+                    r#"{"action":"allow","key":"k"}"#,
+                    "an answer without its approval_id",
+                ),
+                (r#"{"keys":["y"],"key":"k"}"#, "no action"),
+                (r#"{"action":"keys","keys":["y"]}"#, "no key"),
+            ] {
+                assert_eq!(to(bad).status, 400, "{why}");
+            }
+        });
+    }
+
+    /// The named-key path takes the digits of a numbered prompt (issue #91).
+    #[test]
+    fn a_persons_digit_key_reaches_the_test_database() {
+        in_test_schema(|owner, store| {
+            execution_starts(store);
+            let answer = post(
+                Some("secret"),
+                "",
+                Some(owner.to_string()),
+                KEY,
+                SCRIPT,
+                r#"{"name":"3","key":"digit-1"}"#,
+            );
+            assert_eq!(answer.status, 202, "{answer:?}");
+            assert_eq!(answer.body["key"], "digit3");
+            let listed = store
+                .commands_json("session_supervisor", 50, 120_000)
+                .expect("commands");
+            assert_eq!(listed[0]["text"], "digit3");
+        });
     }
 }

@@ -267,13 +267,48 @@ fn only_the_human_login_presses_and_only_named_keys() {
     let message = error.as_db_error().map(|db| db.message().to_string());
     assert_eq!(
         message.as_deref(),
-        Some("key 'f1' is not one of escape, up, down, left, right, enter, y, n")
+        Some("key 'f1' is not one of escape, up, down, left, right, enter, y, n, digit1 to digit9")
     );
+    for name in ["0", "digit0", "digit10", "Digit1", "11", "1a"] {
+        let error = call(&mut page, "k9", Some(name)).expect_err(name);
+        assert_eq!(
+            error.code(),
+            Some(&SqlState::INVALID_PARAMETER_VALUE),
+            "{name}"
+        );
+    }
     for name in NamedKey::ALL {
         assert!(
             call(&mut page, &format!("ok-{}", name.name()), Some(name.name())).is_ok(),
             "{}",
             name.name()
+        );
+    }
+    // A bare digit (issue #91) names the same key, stored as `digit<n>`, so
+    // the Bridge parses every stored key.
+    for bare in ["1", "2", "9"] {
+        assert!(
+            call(&mut page, &format!("bare-{bare}"), Some(bare)).is_ok(),
+            "{bare}"
+        );
+    }
+    let stored: Vec<serde_json::Value> = commands(&schema)
+        .into_iter()
+        .filter(|command| command.1.starts_with("bare-"))
+        .map(|command| command.4)
+        .collect();
+    assert_eq!(
+        stored,
+        [
+            serde_json::json!({"type": "key", "key": "digit1"}),
+            serde_json::json!({"type": "key", "key": "digit2"}),
+            serde_json::json!({"type": "key", "key": "digit9"}),
+        ]
+    );
+    for action in &stored {
+        assert!(
+            serde_json::from_value::<CommandAction>(action.clone()).is_ok(),
+            "{action}"
         );
     }
     let error = call(&mut admin(&schema), "k7", Some("up")).expect_err("the owner");
@@ -288,7 +323,7 @@ fn only_the_human_login_presses_and_only_named_keys() {
     assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
     assert_eq!(
         commands(&schema).len(),
-        NamedKey::ALL.len(),
-        "only the named keys"
+        NamedKey::ALL.len() + 3,
+        "only the named keys (and the three bare digits)"
     );
 }

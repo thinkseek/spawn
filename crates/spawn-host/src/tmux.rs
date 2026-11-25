@@ -779,7 +779,11 @@ impl TerminalHost for TmuxHost {
     ) -> Result<(), TerminalError> {
         let target = Self::pane(terminal);
         // One key per call. A dialog reads the first key and redraws; keys
-        // sent in the same burst can arrive before it listens again.
+        // sent in the same burst can arrive before it listens again. A
+        // person's named keys come as tmux names them (spawn-core
+        // `NamedKey::tmux`): `Escape`, the arrows, `Enter`, `y`, `n`, and
+        // the digits `1` to `9` of a numbered permission prompt, which
+        // `send-keys` without `-l` presses as those keys.
         for key in keys {
             let send = vec![
                 "send-keys".to_string(),

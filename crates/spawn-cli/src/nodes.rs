@@ -48,24 +48,72 @@ mod auth;
 mod commands;
 mod coord;
 mod crypto;
+pub(crate) mod power;
 mod relay;
 mod transport;
 mod ws;
 
 use transport::{Op, Route};
 
+/// Linux's power supplies, each a line `supply <name>` and its attributes
+/// `<name>=<value>` ([`power::sysfs`]); nothing without any. No glob (a
+/// login shell such as zsh refuses one that matches nothing).
+macro_rules! power_supplies {
+    () => {
+        concat!(
+            "for d in $(ls /sys/class/power_supply 2>/dev/null); do ",
+            "echo \"supply $d\"; ",
+            "for f in type online status capacity scope time_to_empty_now time_to_full_now ",
+            "energy_now power_now charge_now current_now; do ",
+            "if [ -r \"/sys/class/power_supply/$d/$f\" ]; then ",
+            "echo \"$f=$(cat \"/sys/class/power_supply/$d/$f\" 2>/dev/null)\"; fi; ",
+            "done; done; "
+        )
+    };
+}
+
 /// What `spawn node add` runs on a node: read-only commands only. Each
 /// section starts with a line `@<name>`; `@end` says the output is whole.
-pub(crate) const INVENTORY: &str = "echo @arch; uname -m; echo @os; uname -o; \
-echo @kernel; uname -r; echo @cores; nproc; \
-echo @cpu_max; cat /sys/fs/cgroup/cpu.max 2>/dev/null; echo @meminfo; cat /proc/meminfo; \
-echo @mem_max; cat /sys/fs/cgroup/memory.max 2>/dev/null; echo @df; df -Pk \"$HOME\"; \
-echo @gpu; if command -v nvidia-smi >/dev/null 2>&1; then \
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits; fi; echo @end";
+/// POSIX `sh`, dispatched on `uname -s` (issue #91): macOS (`Darwin`)
+/// answers with `sw_vers`, `sysctl` and `pmset`, which it has, instead of
+/// `/proc`, `nproc` and `uname -o`, which it has not (a `darwin/arm64`
+/// node once failed to join on "the probe's output has no cores"); every
+/// other system as Linux does, its cgroup's limits, its GPUs and
+/// `/sys/class/power_supply` included. `@power` is the node's power
+/// ([`power`]), empty without a battery or an AC sensor.
+pub(crate) const INVENTORY: &str = concat!(
+    "if [ \"$(uname -s 2>/dev/null)\" = Darwin ]; then ",
+    "echo @arch; uname -m; echo @os; sw_vers -productName 2>/dev/null || uname -s; ",
+    "echo @kernel; uname -r; echo @cores; sysctl -n hw.ncpu; ",
+    "echo @memsize; sysctl -n hw.memsize; echo @df; df -Pk \"$HOME\"; ",
+    "echo @gpu; echo @power; pmset -g batt 2>/dev/null; ",
+    "else ",
+    "echo @arch; uname -m; echo @os; uname -o; ",
+    "echo @kernel; uname -r; echo @cores; nproc; ",
+    "echo @cpu_max; cat /sys/fs/cgroup/cpu.max 2>/dev/null; echo @meminfo; cat /proc/meminfo; ",
+    "echo @mem_max; cat /sys/fs/cgroup/memory.max 2>/dev/null; echo @df; df -Pk \"$HOME\"; ",
+    "echo @gpu; if command -v nvidia-smi >/dev/null 2>&1; then ",
+    "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits; fi; ",
+    "echo @power; ",
+    power_supplies!(),
+    "fi; echo @end"
+);
 
-/// What a heartbeat runs: the load, the available memory, the free disk.
-pub(crate) const BEAT: &str = "echo @loadavg; cat /proc/loadavg; \
-echo @meminfo; grep '^MemAvailable:' /proc/meminfo; echo @df; df -Pk \"$HOME\"; echo @end";
+/// What a heartbeat runs: the load, the available memory, the free disk
+/// and the power, dispatched on `uname -s` as [`INVENTORY`] is: macOS's
+/// load from `sysctl -n vm.loadavg` (`{ 1.52 1.71 1.80 }`), its available
+/// memory from `vm_stat`'s pages, its power from `pmset -g batt`.
+pub(crate) const BEAT: &str = concat!(
+    "if [ \"$(uname -s 2>/dev/null)\" = Darwin ]; then ",
+    "echo @loadavg; sysctl -n vm.loadavg; echo @vm_stat; vm_stat; ",
+    "echo @df; df -Pk \"$HOME\"; echo @power; pmset -g batt 2>/dev/null; ",
+    "else ",
+    "echo @loadavg; cat /proc/loadavg; ",
+    "echo @meminfo; grep '^MemAvailable:' /proc/meminfo; echo @df; df -Pk \"$HOME\"; ",
+    "echo @power; ",
+    power_supplies!(),
+    "fi; echo @end"
+);
 
 /// Between two heartbeat probes of a node.
 pub(crate) const PROBE_EVERY_MS: i64 = 15_000;
@@ -174,14 +222,74 @@ impl Sections<'_> {
         meminfo(self.lines("meminfo"), field)
             .ok_or_else(|| format!("the probe's output has no {field}"))
     }
+
+    /// The total memory: Linux's `MemTotal`, or macOS's `hw.memsize` (bytes).
+    fn total_memory(&self) -> Result<u64, String> {
+        if self.0.contains_key("memsize") {
+            return self
+                .first("memsize")
+                .and_then(|text| text.parse::<u64>().ok())
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| "the probe's output has no memsize".to_string());
+        }
+        self.memory("MemTotal")
+    }
+
+    /// The available memory: Linux's `MemAvailable`, or macOS's free,
+    /// inactive and speculative pages ([`vm_stat_available`]).
+    fn available_memory(&self) -> Result<u64, String> {
+        if self.0.contains_key("vm_stat") {
+            return vm_stat_available(self.lines("vm_stat"))
+                .ok_or_else(|| "the probe's output has no vm_stat pages".to_string());
+        }
+        self.memory("MemAvailable")
+    }
+
+    /// The node's power, from `pmset -g batt` (a `Now drawing from` line)
+    /// or `/sys/class/power_supply` (`supply` lines); none for a node with
+    /// neither, or whose probe has no `@power` (an older node's own copy).
+    fn power(&self) -> Option<power::PowerTelemetry> {
+        let lines = self.lines("power");
+        if lines.iter().any(|line| line.contains("Now drawing from")) {
+            power::pmset(lines)
+        } else {
+            power::sysfs(lines)
+        }
+    }
+}
+
+/// macOS's available memory from `vm_stat`: the free, inactive and
+/// speculative pages (memory the kernel hands out without paging anything
+/// out, as Activity Monitor counts it), times the page size its first line
+/// says (`Mach Virtual Memory Statistics: (page size of 16384 bytes)`).
+fn vm_stat_available(lines: &[&str]) -> Option<u64> {
+    let page: u64 = lines.iter().find_map(|line| {
+        let rest = line.split_once("page size of")?.1;
+        rest.split_whitespace().next()?.parse().ok()
+    })?;
+    let pages = |field: &str| -> Option<u64> {
+        lines.iter().find_map(|line| {
+            let value = line.trim().strip_prefix(field)?.strip_prefix(':')?;
+            value.trim().trim_end_matches('.').parse().ok()
+        })
+    };
+    let free = pages("Pages free")?;
+    let inactive = pages("Pages inactive").unwrap_or(0);
+    let speculative = pages("Pages speculative").unwrap_or(0);
+    free.checked_add(inactive)?
+        .checked_add(speculative)?
+        .checked_mul(page)
 }
 
 /// [`INVENTORY`]'s output as the facts `node.joined` records: `arch`,
 /// `os`, `kernel`, `cores`, `cpu_max` (the cgroup's `cpu.max` as written,
 /// or null), `mem_total`, `mem_max` (the cgroup's `memory.max` in bytes,
-/// null for `max`), `disk_free` (of the node user's `$HOME`) and `gpu`
-/// (each card's `name` and `memory_mb`, or null without one). An output
-/// cut short, or without what every Linux host answers, is refused.
+/// null for `max`), `disk_free` (of the node user's `$HOME`), `gpu`
+/// (each card's `name` and `memory_mb`, or null without one) and, when
+/// the node has a battery or an AC sensor, `power` ([`power`]; left out
+/// otherwise, as every join before it). macOS answers `memsize` for the
+/// total memory and no cgroup (null limits). An output cut short, or
+/// without what every Linux or macOS host answers, is refused.
 pub(crate) fn inventory(output: &str) -> Result<Value, String> {
     let sections = Sections(sections(output)?);
     let cores = sections
@@ -202,39 +310,70 @@ pub(crate) fn inventory(output: &str) -> Result<Value, String> {
             Some(json!({"name": clean_text(name)?, "memory_mb": memory.trim().parse::<u64>().ok()}))
         })
         .collect();
-    Ok(json!({
+    let mut facts = json!({
         "arch": sections.text("arch")?,
         "os": sections.text("os")?,
         "kernel": sections.text("kernel")?,
         "cores": cores,
         "cpu_max": cpu_max,
-        "mem_total": sections.memory("MemTotal")?,
+        "mem_total": sections.total_memory()?,
         "mem_max": sections.first("mem_max").and_then(|text| text.parse::<u64>().ok()),
         "disk_free": sections.free_disk()?,
         "gpu": if gpus.is_empty() { Value::Null } else { Value::Array(gpus) },
-    }))
+    });
+    if let Some(power) = sections.power() {
+        facts["power"] = power.json();
+    }
+    Ok(facts)
 }
 
-/// What a heartbeat reads ([`BEAT`]).
+/// What a heartbeat reads ([`BEAT`]): its power is none on a node with no
+/// battery and no AC sensor, or whose probe says none.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct HeartbeatSample {
     pub(crate) load1: f64,
     pub(crate) mem_available: u64,
     pub(crate) disk_free: u64,
+    pub(crate) power: Option<power::PowerTelemetry>,
+}
+
+impl HeartbeatSample {
+    /// The facts of its `node.heartbeat` (and of `spawn node probe --op
+    /// beat --json`): `power` only when there is one, as every heartbeat
+    /// before it.
+    pub(crate) fn facts(&self) -> Value {
+        let mut facts = json!({
+            "load1": self.load1, "mem_available": self.mem_available,
+            "disk_free": self.disk_free,
+        });
+        if let Some(power) = self.power {
+            facts["power"] = power.json();
+        }
+        facts
+    }
 }
 
 /// [`BEAT`]'s output; one cut short, or missing a value, is no answer.
+/// The load average is the first figure of Linux's `/proc/loadavg` or of
+/// macOS's `vm.loadavg` (`{ 1.52 1.71 1.80 }`, its brace stripped).
 pub(crate) fn beat(output: &str) -> Result<HeartbeatSample, String> {
     let sections = Sections(sections(output)?);
     let load1 = sections
         .first("loadavg")
-        .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+        .and_then(|text| {
+            text.trim_start_matches('{')
+                .split_whitespace()
+                .next()?
+                .parse::<f64>()
+                .ok()
+        })
         .filter(|load| load.is_finite() && *load >= 0.0)
         .ok_or("the probe's output has no load average")?;
     Ok(HeartbeatSample {
         load1,
-        mem_available: sections.memory("MemAvailable")?,
+        mem_available: sections.available_memory()?,
         disk_free: sections.free_disk()?,
+        power: sections.power(),
     })
 }
 
@@ -473,6 +612,30 @@ fn hops_text(node: &Value) -> Option<String> {
     (!hops.is_empty()).then(|| format!("via {}", hops.join("->")))
 }
 
+/// A node's power as `spawn node list` says it (`battery 57% discharging
+/// 3h12m`, `AC 100%`, `AC`), with `LOW-BATTERY DRAIN` when the soft drain
+/// holds it ([`power::with_soft_drain`]); nothing without a power.
+fn power_text(node: &Value) -> Option<String> {
+    let power = node["power"].as_object()?;
+    let on_ac = power.get("on_ac").and_then(Value::as_bool).unwrap_or(false);
+    let mut words = vec![if on_ac { "AC" } else { "battery" }.to_string()];
+    if let Some(pct) = power.get("battery_pct").and_then(Value::as_u64) {
+        words.push(format!("{pct}%"));
+    }
+    if power.get("charging").and_then(Value::as_bool) == Some(true) {
+        words.push("charging".to_string());
+    } else if !on_ac {
+        words.push("discharging".to_string());
+    }
+    if let Some(mins) = power.get("remaining_mins").and_then(Value::as_u64) {
+        words.push(format!("{}h{:02}m", mins / 60, mins % 60));
+    }
+    if node["low_battery_drain"] == true {
+        words.push("LOW-BATTERY DRAIN".to_string());
+    }
+    Some(words.join(" "))
+}
+
 /// One line per node for `spawn node list`, from the store's list.
 fn lines(nodes: &Value, now: i64) -> Vec<String> {
     let nodes = nodes.as_array().map_or(&[][..], Vec::as_slice);
@@ -510,6 +673,10 @@ fn lines(nodes: &Value, now: i64) -> Vec<String> {
         );
         let sampled = match hops_text(node) {
             Some(hops) => format!("{sampled}  {hops}"),
+            None => sampled,
+        };
+        let sampled = match power_text(node) {
+            Some(power) => format!("{sampled}  {power}"),
             None => sampled,
         };
         out.push(row([
@@ -558,7 +725,8 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
                 [flag] if flag == "--json" => true,
                 _ => return Err(USAGE.to_string()),
             };
-            let nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+            let mut nodes = open_store()?.nodes().map_err(|error| error.to_string())?;
+            power::with_soft_drain(&mut nodes, power::low_battery_from_env());
             if json {
                 println!(
                     "{}",
@@ -690,6 +858,10 @@ struct Node {
     watched: i64,
     /// Its latest heartbeat recorded (monotonic).
     beat: Option<i64>,
+    /// The power its latest heartbeat this worker recorded holds: a power
+    /// that moved from it ([`power::PowerTelemetry::moved_from`]) records
+    /// a heartbeat before the ten-minute one is due.
+    power: Option<power::PowerTelemetry>,
     due: i64,
     probing: bool,
     /// Why its last probe failed, said once per streak.
@@ -778,6 +950,7 @@ impl HeartbeatScheduler {
                     lost_seen: last_seen,
                     watched: now.mono,
                     beat: beat.map(|at| at.mono),
+                    power: None,
                     due: now.mono,
                     probing: false,
                     failing: None,
@@ -816,16 +989,18 @@ impl HeartbeatScheduler {
                         change: NodeTransition::Back,
                     });
                 }
-                if node
-                    .beat
-                    .is_none_or(|last| at.mono.saturating_sub(last) >= RECORD_EVERY_MS)
+                let power_moved = beat.power.is_some_and(|power| power.moved_from(node.power));
+                if power_moved
+                    || node
+                        .beat
+                        .is_none_or(|last| at.mono.saturating_sub(last) >= RECORD_EVERY_MS)
                 {
+                    let mut record = beat.facts();
+                    record["type"] = json!("node.heartbeat");
+                    record["name"] = json!(name);
+                    record["join"] = json!(join);
                     self.proposals.push(NodeRecordIntent {
-                        record: json!({
-                            "type": "node.heartbeat", "name": name, "join": join,
-                            "load1": beat.load1, "mem_available": beat.mem_available,
-                            "disk_free": beat.disk_free,
-                        }),
+                        record,
                         name,
                         join,
                         change: NodeTransition::Beat(at),
@@ -908,6 +1083,7 @@ impl HeartbeatScheduler {
             }
             NodeTransition::Beat(at) => {
                 node.beat = Some(at.mono);
+                node.power = serde_json::from_value(proposal.record["power"].clone()).ok();
                 None
             }
         }

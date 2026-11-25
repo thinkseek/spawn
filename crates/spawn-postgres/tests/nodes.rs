@@ -932,3 +932,107 @@ fn a_bad_coord_join_or_identity_is_refused() {
     }
     assert_eq!(counts(&mut client), before, "nothing recorded");
 }
+
+/// Issue #91: a node's `power` rides on its join and its heartbeats,
+/// checked by `spawn_node_record`; the read gives the latest heartbeat's
+/// power, its join's when no heartbeat holds one, and null for a node with
+/// none and for every record from before power was read.
+#[test]
+fn a_nodes_power_rides_on_its_join_and_heartbeats_and_reads_back() {
+    let (store, schema) = store("nodes_power");
+    let mut client = admin(&schema);
+    // An old join and heartbeat with no power: null, the rest as before.
+    let old = store
+        .node_record(&joined("desktop", "desktop-gr"))
+        .expect("an old join");
+    store
+        .node_record(&with(beat(old), "name", json!("desktop")))
+        .expect("an old heartbeat");
+    let desktop = only(&store);
+    assert_eq!(desktop["power"], Value::Null, "{desktop}");
+    assert_eq!(desktop["heartbeat"]["power"], Value::Null);
+    assert_eq!(desktop["heartbeat"]["load1"], 7.6);
+
+    let battery = json!({"on_ac": false, "battery_pct": 85, "charging": false,
+                         "remaining_mins": 272});
+    let join = store
+        .node_record(&with(
+            with(joined("mac24", "ckl@mac24"), "power", battery.clone()),
+            "os",
+            json!("macOS"),
+        ))
+        .expect("a mac joins with its power");
+    let named = |name: &str| {
+        store
+            .nodes()
+            .expect("the nodes")
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|node| node["name"] == name)
+            .cloned()
+            .expect("listed")
+    };
+    assert_eq!(named("mac24")["power"], battery, "the join's power");
+    assert_eq!(named("mac24")["heartbeat"], Value::Null);
+
+    // A heartbeat with no power keeps the join's.
+    store
+        .node_record(&with(beat(join), "name", json!("mac24")))
+        .expect("a heartbeat without power");
+    assert_eq!(named("mac24")["power"], battery);
+    let low = json!({"on_ac": false, "battery_pct": 15, "charging": false,
+                     "remaining_mins": 31});
+    store
+        .node_record(&with(
+            with(beat(join), "name", json!("mac24")),
+            "power",
+            low.clone(),
+        ))
+        .expect("a heartbeat with power");
+    assert_eq!(named("mac24")["power"], low, "the latest heartbeat's power");
+    assert_eq!(named("mac24")["heartbeat"]["power"], low);
+
+    // A bad power is refused, naming the field, nothing recorded.
+    let (before, _) = counts(&mut client);
+    for bad in [
+        json!("on battery"),
+        json!({"battery_pct": 15, "charging": false}),
+        json!({"on_ac": "no", "battery_pct": 15, "charging": false}),
+        json!({"on_ac": false, "battery_pct": 101, "charging": false}),
+        json!({"on_ac": false, "battery_pct": 1.5, "charging": false}),
+        json!({"on_ac": false, "battery_pct": -1, "charging": false}),
+        json!({"on_ac": false, "battery_pct": 15, "charging": false, "remaining_mins": -3}),
+    ] {
+        let error = client
+            .query_one(
+                "select spawn_node_record($1)",
+                &[&with(
+                    with(beat(join), "name", json!("mac24")),
+                    "power",
+                    bad.clone(),
+                )],
+            )
+            .expect_err("a bad power");
+        assert_eq!(
+            error.code(),
+            Some(&SqlState::INVALID_PARAMETER_VALUE),
+            "{bad}"
+        );
+        let message = error
+            .as_db_error()
+            .map(|db| db.message().to_string())
+            .unwrap_or_default();
+        assert!(message.contains("power"), "{bad}: {message}");
+    }
+    assert_eq!(counts(&mut client).0, before, "nothing recorded");
+    // An explicit null is no power.
+    store
+        .node_record(&with(
+            with(beat(join), "name", json!("mac24")),
+            "power",
+            Value::Null,
+        ))
+        .expect("a null power");
+    assert_eq!(named("mac24")["power"], Value::Null);
+}

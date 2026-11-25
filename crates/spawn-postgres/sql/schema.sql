@@ -1300,7 +1300,10 @@ $$;
 -- '{"type":"key","key":<name>}'` makes, through the same `spawn_submit` with
 -- the same idempotency rule, as its own action type and never text. The name
 -- is one of the closed set (spawn-core's `NamedKey`): escape, up, down, left,
--- right, enter, y, n. Returns the command, or null when no agent has used
+-- right, enter, y, n, and the digits of a numbered permission or selection
+-- prompt, digit1 to digit9 (issue #91; the bare `1` to `9` name them
+-- too, and the action stores the `digit<n>` name, so every stored key
+-- parses). Returns the command, or null when no agent has used
 -- the session. A key needs a running engine: a session with no live
 -- execution is refused here with the reason (SQLSTATE 55000, which the page
 -- answers 409), and records no command, since nothing reached an agent; a
@@ -1325,8 +1328,9 @@ begin
         raise exception 'a key needs an idempotency key of 1 to 256 bytes, no control character'
             using errcode = '22023';
     end if;
-    if p_name is null or p_name not in ('escape', 'up', 'down', 'left', 'right', 'enter', 'y', 'n') then
-        raise exception 'key % is not one of escape, up, down, left, right, enter, y, n',
+    if p_name is null or (p_name not in ('escape', 'up', 'down', 'left', 'right', 'enter', 'y', 'n')
+                          and p_name !~ '^(digit)?[1-9]$') then
+        raise exception 'key % is not one of escape, up, down, left, right, enter, y, n, digit1 to digit9',
             coalesce(quote_literal(p_name), 'null') using errcode = '22023';
     end if;
     select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
@@ -1335,7 +1339,9 @@ begin
     end if;
     select c.id into v_first from spawn_commands c
      where c.principal = 'human' and c.idempotency_key = p_key;
-    v_action := jsonb_build_object('type', 'key', 'key', p_name);
+    v_action := jsonb_build_object('type', 'key', 'key',
+                                   case when p_name ~ '^[1-9]$' then 'digit' || p_name
+                                        else p_name end);
     if v_first is not null then
         return spawn_human_replay(v_first, p_key, p_session, v_action);
     end if;
@@ -1353,6 +1359,202 @@ begin
                    current_schema());
     execute 'revoke execute on function spawn_human_key(text, text, text) from public';
     execute format('grant execute on function spawn_human_key(text, text, text) to %I',
+                   spawn_login_role('spawn_human'));
+end
+$$;
+
+-- A person's message to the supervisor from the web page's Master Control
+-- (`spawn serve`, `POST /api/master/message`, issue #91 P1a). Unlike
+-- `spawn_human_input` it never refuses a supervisor that runs no
+-- execution: a message to a stopped or idle supervisor wakes it and is
+-- delivered after the wake. Everything is a command `spawn submit
+-- --principal human` could make, to `session_supervisor` and its agent
+-- (`agent_supervisor` when it never ran), through the same `spawn_submit`,
+-- in this order, so the Bridge runs them in this order (`spawn_claim`: one
+-- command per session at a time, in id order):
+--   restart, while it runs: `{"type":"stop"}` (key `<key>:stop`), which
+--     ends it with a checkpoint; it then runs no execution;
+--   steer, while it runs: `{"type":"key","key":"escape"}` (key
+--     `<key>:steer`), which interrupts the turn at once (Esc keeps the
+--     native session's context), so the input is read next;
+--   whenever it runs no execution, or a stop or discard not finished yet
+--     will end the one it runs (any mode): the wake (key `<key>:wake`),
+--     `{"type":"resume"}` when a native session is bound to resume
+--     (`session.native_started`), else `{"type":"start"}` with a short
+--     prompt and no charter: after a cold start the dispatcher types the
+--     charter in at the supervisor's first idle prompt, as after any start
+--     that gave none (crate dispatch, `charter`). No wake is made when a
+--     start or resume is already in flight after every unfinished stop and
+--     discard (the liveness rule's, or an earlier message's): its id is
+--     the wake then. A wake is never older than a stop ahead of it, so the
+--     stop never ends the execution the wake begins;
+--   always the input `{"type":"input","text":<text>,"tags":[...]}` (key
+--     `<key>`), which waits for the turn as every person's input does. Its
+--     tags are `master:<mode>` first, then `master-stop:<id>`,
+--     `master-steer:<id>` and `master-wake:<id>` of the commands this
+--     message made or took as its wake: the record of what it did, which a
+--     repeat of the request is answered from.
+-- auto and queue are the plain input (auto-woken); the tag says which.
+-- Idempotent: the key's input made, the same request (same text and mode)
+-- returns exactly the commands the first call answered and makes none;
+-- another request under the key is refused (SQLSTATE 23505, which the
+-- page answers 409). A key whose derived keys (`<key>:stop`, `:steer`,
+-- `:wake`) another request already used is refused the same way, before
+-- anything is made, so a message never takes an earlier command for its
+-- own. The key is 1 to 240 bytes (its derived keys stay within 256;
+-- spawn-postgres `MAX_MASTER_KEY_BYTES`), the text what a person types as
+-- for `spawn_human_input`, the mode one of auto, steer, queue, restart
+-- (null: auto; spawn-postgres `MasterMessageMode`). Returns `{command_id,
+-- wake_command_id, stop_command_id, steer_command_id, session_id, mode,
+-- principal, woke, replayed}`, ids null where none was made. Only the
+-- `spawn_human` login may call it.
+create or replace function spawn_human_master_message(p_key text, p_text text, p_mode text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_session constant text := 'session_supervisor';
+    v_mode text := coalesce(p_mode, 'auto');
+    v_agent text;
+    v_action jsonb;
+    v_first bigint;
+    v_first_action jsonb;
+    v_first_session text;
+    v_live boolean;
+    v_ahead bigint;
+    v_stop bigint;
+    v_steer bigint;
+    v_wake bigint;
+    v_wake_action jsonb;
+    v_tags jsonb;
+    v_input bigint;
+begin
+    if spawn_principal() is distinct from 'human' then
+        raise exception '% may not write to the supervisor as a person (only the spawn_human login does)',
+            session_user using errcode = '42501';
+    end if;
+    if coalesce(p_key, '') = '' or octet_length(p_key) > 240 or p_key ~ '[[:cntrl:]]' then
+        raise exception 'a message needs an idempotency key of 1 to 240 bytes, no control character'
+            using errcode = '22023';
+    end if;
+    if v_mode not in ('auto', 'steer', 'queue', 'restart') then
+        raise exception 'mode % is not one of auto, steer, queue, restart', quote_literal(v_mode)
+            using errcode = '22023';
+    end if;
+    if coalesce(btrim(p_text, E' \t\r\n'), '') = '' then
+        raise exception 'a message needs text' using errcode = '22023';
+    end if;
+    if octet_length(p_text) > 8192 then
+        raise exception 'a message is at most 8192 bytes, not %', octet_length(p_text)
+            using errcode = '22023';
+    end if;
+    if p_text ~ '[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]' then
+        raise exception 'a message holds no control character but tab and line ends'
+            using errcode = '22023';
+    end if;
+    -- One message at a time decides on the supervisor's state: the append
+    -- lock spawn_submit takes, held to commit.
+    perform pg_advisory_xact_lock(1399957335);
+    select c.id, c.action, c.session_id into v_first, v_first_action, v_first_session
+      from spawn_commands c
+     where c.principal = 'human' and c.idempotency_key = p_key;
+    if v_first is not null then
+        -- The same request again: answered from the first call's record.
+        if v_first_session is distinct from v_session
+           or v_first_action ->> 'type' is distinct from 'input'
+           or v_first_action ->> 'text' is distinct from p_text
+           or v_first_action -> 'tags' ->> 0 is distinct from 'master:' || v_mode then
+            raise exception 'idempotency key % was already used for another input or key: send this one with a new key',
+                quote_literal(p_key) using errcode = '23505';
+        end if;
+        select max(substring(t from '^master-stop:([0-9]+)$')::bigint),
+               max(substring(t from '^master-steer:([0-9]+)$')::bigint),
+               max(substring(t from '^master-wake:([0-9]+)$')::bigint)
+          into v_stop, v_steer, v_wake
+          from jsonb_array_elements_text(coalesce(v_first_action -> 'tags', '[]'::jsonb)) t;
+        return jsonb_build_object('command_id', v_first, 'wake_command_id', v_wake,
+                                  'stop_command_id', v_stop, 'steer_command_id', v_steer,
+                                  'session_id', v_session, 'mode', v_mode,
+                                  'principal', 'human', 'woke', v_wake is not null,
+                                  'replayed', true);
+    end if;
+    if exists (select 1 from spawn_commands c
+                where c.principal = 'human'
+                  and c.idempotency_key in (p_key || ':stop', p_key || ':steer', p_key || ':wake')) then
+        raise exception 'idempotency key % derives keys another request already used (%:stop, :steer or :wake): send this one with a new key',
+            quote_literal(p_key), p_key using errcode = '23505';
+    end if;
+    select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = v_session;
+    v_agent := coalesce(v_agent, 'agent_supervisor');
+    v_live := exists (select 1 from agent_status a where a.session_id = v_session and a.live);
+    -- A stop or discard not finished yet ends the execution it runs: the
+    -- message needs a wake after it.
+    select max(c.id) into v_ahead from spawn_commands c
+     where c.session_id = v_session and c.state <> 'finished'
+       and c.action ->> 'type' in ('stop', 'discard');
+    if v_ahead is not null then
+        v_live := false;
+    end if;
+    if v_live and v_mode = 'restart' then
+        select spawn_human_replay(s.out_id, p_key || ':stop', v_session,
+                                  jsonb_build_object('type', 'stop')) into v_stop
+          from spawn_submit('human', p_key || ':stop', v_agent, v_session,
+                            jsonb_build_object('type', 'stop')) s;
+        v_ahead := v_stop;
+        v_live := false;
+    elsif v_live and v_mode = 'steer' then
+        select spawn_human_replay(s.out_id, p_key || ':steer', v_session,
+                                  jsonb_build_object('type', 'key', 'key', 'escape')) into v_steer
+          from spawn_submit('human', p_key || ':steer', v_agent, v_session,
+                            jsonb_build_object('type', 'key', 'key', 'escape')) s;
+    end if;
+    if not v_live then
+        -- A start or resume in flight after every stop ahead wakes it.
+        select c.id into v_wake from spawn_commands c
+         where c.session_id = v_session and c.state <> 'finished'
+           and c.action ->> 'type' in ('start', 'resume')
+           and c.id > coalesce(v_ahead, 0)
+         order by c.id desc limit 1;
+        if v_wake is null then
+            v_wake_action := case
+                when exists (select 1 from spawn_events e
+                              where e.session_id = v_session
+                                and e.event_name = 'session.native_started')
+                then jsonb_build_object('type', 'resume')
+                else jsonb_build_object(
+                    'type', 'start', 'engine', 'claude',
+                    'prompt', 'The owner wrote to you from the dashboard (Master '
+                              'Control) while you were stopped; the message follows '
+                              'as your next input. Read it, then go on with your work.')
+            end;
+            select spawn_human_replay(s.out_id, p_key || ':wake', v_session, v_wake_action)
+              into v_wake
+              from spawn_submit('human', p_key || ':wake', v_agent, v_session, v_wake_action) s;
+        end if;
+    end if;
+    v_tags := jsonb_build_array('master:' || v_mode);
+    if v_stop is not null then
+        v_tags := v_tags || to_jsonb('master-stop:' || v_stop);
+    end if;
+    if v_steer is not null then
+        v_tags := v_tags || to_jsonb('master-steer:' || v_steer);
+    end if;
+    if v_wake is not null then
+        v_tags := v_tags || to_jsonb('master-wake:' || v_wake);
+    end if;
+    v_action := jsonb_build_object('type', 'input', 'text', p_text, 'tags', v_tags);
+    select spawn_human_replay(s.out_id, p_key, v_session, v_action) into v_input
+      from spawn_submit('human', p_key, v_agent, v_session, v_action) s;
+    return jsonb_build_object('command_id', v_input, 'wake_command_id', v_wake,
+                              'stop_command_id', v_stop, 'steer_command_id', v_steer,
+                              'session_id', v_session, 'mode', v_mode, 'principal', 'human',
+                              'woke', v_wake is not null, 'replayed', false);
+end $$;
+
+do $$
+begin
+    execute format('alter function spawn_human_master_message(text, text, text) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_human_master_message(text, text, text) from public';
+    execute format('grant execute on function spawn_human_master_message(text, text, text) to %I',
                    spawn_login_role('spawn_human'));
 end
 $$;
@@ -2255,7 +2457,8 @@ end $$;
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
 -- page's typing login (`human`, which may only call `spawn_human_input`,
--- `spawn_human_key`, `spawn_human_task` and `spawn_human_resume`).
+-- `spawn_human_key`, `spawn_human_task`, `spawn_human_resume` and
+-- `spawn_human_master_message`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
     select case when x.p is null or x.p in ('spawn_reader', 'human') then null
@@ -4902,7 +5105,8 @@ end $$;
 -- same mission and halt only (another is refused, SQLSTATE 23505). No such
 -- mission is SQLSTATE P0002 (404). Returns the record's event id. Only the
 -- `spawn_human` login may call it, beside `spawn_human_input`,
--- `spawn_human_key` and `spawn_human_task`: it resumes and does nothing else.
+-- `spawn_human_key`, `spawn_human_task` and `spawn_human_master_message`:
+-- it resumes and does nothing else.
 create or replace function spawn_human_resume(p_mission bigint, p_halt bigint, p_key text)
 returns bigint language plpgsql security definer as $$
 declare
@@ -6129,6 +6333,11 @@ create index if not exists spawn_events_host_storage_bytes
 --     `pubkey` (that key, base64), `role` (worker or peer) and `zone`;
 --   node.drained, node.undrained, node.removed {name};
 --   node.heartbeat {name, join, load1, mem_available, disk_free},
+--   and on node.joined and node.heartbeat an optional `power` (issue #91):
+--     null or {on_ac, battery_pct, charging, remaining_mins}, on_ac and
+--     charging booleans, battery_pct null or a whole number 0 to 100,
+--     remaining_mins null or a whole number at least 0 (absent: a node
+--     with no battery or AC sensor, and every record before it);
 --   node.lost {name, join, last_seen_ms, silent_ms, error},
 --   node.back {name, join, down_ms} (`spawn loop`'s heartbeat worker).
 -- One index, spawn_events_node on (type, name, session_seq) of these
@@ -6381,6 +6590,21 @@ begin
                       when 2 then 'null or a number at least 0' when 3 then 'there, null or not'
                       else 'at most 500 characters' end
             using errcode = '22023';
+    end if;
+    if v_type in ('node.joined', 'node.heartbeat')
+       and coalesce(jsonb_typeof(p_record -> 'power'), 'null') <> 'null'
+       and (jsonb_typeof(p_record -> 'power') <> 'object'
+            or jsonb_typeof(p_record #> '{power,on_ac}') is distinct from 'boolean'
+            or jsonb_typeof(p_record #> '{power,charging}') is distinct from 'boolean'
+            or (coalesce(jsonb_typeof(p_record #> '{power,battery_pct}'), 'null') <> 'null'
+                and (jsonb_typeof(p_record #> '{power,battery_pct}') <> 'number'
+                     or (p_record #>> '{power,battery_pct}') !~ '^[0-9]{1,3}$'
+                     or (p_record #>> '{power,battery_pct}')::integer > 100))
+            or (coalesce(jsonb_typeof(p_record #> '{power,remaining_mins}'), 'null') <> 'null'
+                and (jsonb_typeof(p_record #> '{power,remaining_mins}') <> 'number'
+                     or (p_record #>> '{power,remaining_mins}') !~ '^[0-9]{1,9}$'))) then
+        raise exception 'a % record''s power is null or {on_ac, battery_pct, charging, remaining_mins}: on_ac and charging booleans, battery_pct null or 0 to 100, remaining_mins null or a whole number at least 0',
+            v_type using errcode = '22023';
     end if;
     v_on := null;
     select j.id, j.seq into v_join, v_seq from spawn_node_latest('node.joined', v_name, 0) j;

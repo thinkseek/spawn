@@ -168,6 +168,10 @@ pub(crate) enum Press {
 /// Herdr presses it, or why it has none. Every key of a call is translated
 /// before the first is pressed, so an unknown one presses nothing. Herdr
 /// 0.9.5 has no Home, End, page, Delete or Insert key: those are refused.
+/// The digits of a numbered permission or selection prompt (spawn-core
+/// `NamedKey::Digit1` to `Digit9`, tmux `1` to `9`) are single characters,
+/// typed as text below, exactly as a person's keyboard sends them: Claude Code, Codex
+/// CLI, AGY CLI and OpenCode pick the numbered choice on that byte.
 pub(crate) fn herdr_key(key: &str) -> Result<Press, TerminalError> {
     let named = match key {
         "Enter" | "KPEnter" => Some("enter"),
@@ -1054,6 +1058,29 @@ mod tests {
             "NPage", "DC", "IC",
         ] {
             assert!(herdr_key(unknown).is_err(), "{unknown:?}");
+        }
+    }
+
+    /// Every key a person may press from the page (spawn-core `NamedKey`,
+    /// the digits of a numbered prompt included) has a Herdr press: the
+    /// named ones a logical key, `y`, `n` and the digits their character.
+    #[test]
+    fn every_named_key_a_person_presses_has_a_herdr_press() {
+        use spawn_core::command::NamedKey;
+        for key in NamedKey::ALL {
+            let press = herdr_key(key.tmux()).unwrap_or_else(|error| panic!("{key:?}: {error}"));
+            let expected = match key {
+                NamedKey::Escape => Press::Key("esc".to_string()),
+                NamedKey::Up => Press::Key("up".to_string()),
+                NamedKey::Down => Press::Key("down".to_string()),
+                NamedKey::Left => Press::Key("left".to_string()),
+                NamedKey::Right => Press::Key("right".to_string()),
+                NamedKey::Enter => Press::Key("enter".to_string()),
+                NamedKey::Y => Press::Text("y".to_string()),
+                NamedKey::N => Press::Text("n".to_string()),
+                digit => Press::Text(digit.tmux().to_string()),
+            };
+            assert_eq!(press, expected, "{key:?}");
         }
     }
 

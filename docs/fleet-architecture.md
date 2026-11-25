@@ -186,6 +186,32 @@ runs no job yet, and a drain changes no scheduling.
   its latest heartbeat sample. The Fleet details show one row per node and
   say when the read failed.
 
+#### macOS nodes, power and the low-battery soft drain (issue #91 P1a)
+
+- The inventory and the heartbeat probe are POSIX `sh` dispatched on
+  `uname -s`: on macOS (`Darwin`) they read `sw_vers -productName`,
+  `sysctl -n hw.ncpu`, `sysctl -n hw.memsize`, `vm_stat` (free, inactive
+  and speculative pages times its page size: the available memory),
+  `sysctl -n vm.loadavg` (`{ 1.52 1.71 1.80 }`) and `pmset -g batt`; on
+  Linux what they read before, and `/sys/class/power_supply/*` (no glob:
+  `ls`, so a zsh login shell takes it). A `darwin/arm64` node joins and
+  beats instead of failing on "the probe's output has no cores".
+- `power` (`{on_ac, battery_pct, charging, remaining_mins}`) rides on
+  `node.joined` and `node.heartbeat` when the node has a battery or an AC
+  sensor, and is left out otherwise (a desktop, a VM, every record before
+  it); `spawn_node_record` checks its shape. The heartbeat records a sample
+  early when the power moves (AC plugged or unplugged, charging started or
+  stopped, the charge moved by 5 points), so the soft drain below takes
+  effect within a probe's interval. `spawn node list`, `GET /api/nodes` and
+  the digest give each node's `power` (the latest heartbeat's, else its
+  join's, else null).
+- The soft drain (crate `nodes/power.rs`): a node on battery at or under
+  `SPAWN_NODE_LOW_BATTERY_PCT` (default 20, `0` off) is
+  `low_battery_drain` and `effective_drained`, and `schedulable` (the
+  scheduling-eligibility helper: live and not soft-drained) is false. It is
+  read, never recorded: `state` and the owner's `drain`/`undrain` stand,
+  and a node plugged in again is eligible at once.
+
 #### Transports and hops (issue #85)
 
 A node is reached over ssh (as above), or over tcp or udp to its own
@@ -2039,16 +2065,17 @@ The Scorecard's "How the fleet decides" reads it over the page's window;
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
 Every route the API answers, with its method, what it answers, its CLI twin
-and who reads it, is listed once in [docs/api.md](./api.md): 24 GET route
-patterns and 7 POST routes on `main`. The reads run as `spawn_reader`, with
+and who reads it, is listed once in [docs/api.md](./api.md): 28 GET route
+patterns and 9 POST routes on `main`. The reads run as `spawn_reader`, with
 GET only (any other method on a read is 405); each read's answer is
 documented on its handler in `crates/spawn-cli/src/serve.rs` (the answer of
 `/api/attention` in `crates/spawn-cli/src/serve/attention.rs`).
 
-Of the seven POST routes, five are a person's writes, as the `spawn_human`
+Of the nine POST routes, seven are a person's writes, as the `spawn_human`
 login: an input to a session and a named key (below), a restart or a
-reassign of a stalled worker (§3.2), and the resume of a halted mission
-(§10.3). The other two are the feature registry's scan and association,
+reassign of a stalled worker (§3.2), the resume of a halted mission
+(§10.3), a message to the supervisor and the answer to an approval prompt
+(issue #91, below). The other two are the feature registry's scan and association,
 which change no record (docs/feature-map.md). The input is a person's input
 to a session, `POST
 /api/session/<id>/input` with `{"text", "key"}` (the key, an idempotency
@@ -2062,8 +2089,9 @@ nothing, so the page knows before it offers the box. It runs as the
 `spawn_human` login, whose rights for a session are `spawn_human_input` and
 `spawn_human_key`: an input or a named key, as principal `human`, to the
 agent the session belongs to; no other action, no read, no event (its other
-two rights, `spawn_human_task` and `spawn_human_resume`, are the restart or
-reassign and the resume). Its guards, in order: the read guard (the clients that may
+rights, `spawn_human_task`, `spawn_human_resume` and
+`spawn_human_master_message`, are the restart or reassign, the resume and
+the Master Control message to the supervisor). Its guards, in order: the read guard (the clients that may
 read may write: the token, `SPAWN_SERVE_LOCAL_OPEN`'s owner client,
 `SPAWN_SERVE_OPEN_NETWORKS`' clients naming the server by its address);
 POST only (405); without the token, an `Origin` naming the server as the
@@ -2093,6 +2121,69 @@ drag or selecting text to copy does not, so the Esc after a copy still closes
 the drawer. Armed, it is outlined and says "Keys on · Keys go to <agent>".
 Blur (a click outside included) or the keys going to another agent disarms
 it, and while it is not armed Esc closes the drawer and the arrows scroll.
+
+Issue #91 P1a adds four endpoints for the dashboard, with no agent
+protocol (no ACP): what an engine shows is read from its pane in the
+terminal host (`tmux` or Herdr), and every answer is a command on the
+record.
+
+- `GET /api/stream`: the event log as Server-Sent Events, with the read
+  guard of every API read. Streams hold their own 64 slots (`SSE_SLOTS`,
+  503 when all are taken), never the requests', and share one listener
+  thread holding `LISTEN spawn_events` as `spawn_reader`, which also polls
+  every second while anyone streams. `Last-Event-ID` (the browser's
+  reconnect), else `?after=<id>` as `/api/events` takes it
+  (`?after_event_id=` is its alias; both at once, or a cursor that is no
+  whole number at least 0, is 400), replays at most 500 events before the
+  live ones, none twice; a cursor further behind, or past the log's end, gets `event:
+  resync` with `{"reason", "after_event_id", "latest_event_id"}` (`behind`,
+  `cursor_ahead`, `stream_reset`, `slow_consumer`) and goes on live. Frames
+  are `event: ready`, then `id:`/`event:`/`data:` per event (the
+  `/api/events` row), and `: keepalive` every 15 s. A slow page (its
+  256-frame channel full) is told `resync` and closed; a page that stops
+  reading ends after a 10 s write timeout. An idle listener starts, once
+  every stream there is has caught up, from the lowest id one caught up to
+  (each stream's own floor, gone with it), never from the log's end, so no
+  first event after an idle spell is lost
+  (`crates/spawn-cli/src/serve/stream.rs`).
+- `POST /api/master/message` with `{"text", "mode", "key"}`: a person's
+  message to the supervisor from Master Control, through
+  `spawn_human_master_message` (the `spawn_human` login, SECURITY DEFINER),
+  with the input's guards. `mode` is `auto` (default) or `queue` (the plain
+  input), `steer` (Esc first while it runs) or `restart` (a stop first
+  while it runs). A supervisor that runs no execution, or will stop because
+  of an unfinished stop or discard, is woken first (`resume` when a native
+  session is bound, else `start`; the dispatcher types the charter at its
+  first idle prompt), and the wake is always newer than the stop ahead of
+  it. The key is 1 to 240 bytes (`MAX_MASTER_KEY_BYTES`); the same request
+  again answers the first call's command ids exactly and makes none;
+  another request under the key, or a key whose derived `:stop`, `:steer`
+  or `:wake` key was already used, is 409. `{"probe": true}` answers the
+  modes and the key bound.
+- `GET /api/approvals`: the prompts a person must answer, found on the live
+  panes' last 30 lines by fixed text rules (numbered choices only as a
+  dialog: the pane's last thing, with a cursor mark, a frame or a key
+  footer, never a reply's `● 1.` or a quoted `> 1.` list or a spinner's
+  `esc to interrupt`; permission buttons at the bottom; yes/no; confirm),
+  plus `attention` items (a judgement asking for a person) and
+  `mission_halted` items. Each item's `id` is `<session_id>:<FNV-1a of its
+  kind, question, body and answers>`; the body is what the dialog asks to
+  approve (in a frame, every line from its top; otherwise the lines from
+  the question, and a few contiguous ones above it, to the answers), so the
+  same question over another command is another id, while a spinner or
+  timer above leaves it. The engines' key maps are checked against
+  hand-written screens, not yet live panes of every engine. `POST /api/approvals/<session_id>/act` with
+  `{"action", "approval_id", "keys", "text", "key"}` answers one through
+  `spawn_human_key` / `spawn_human_input`: `allow`, `allow_always` and
+  `deny` need `approval_id` (400 without) and press only when the pane,
+  read again, still shows that prompt (409 otherwise: a stale click presses
+  nothing); `keys` (1 to 8 named keys, `digit1` to `digit9` included) and
+  `text` need none (`crates/spawn-cli/src/serve/approvals.rs`).
+- `GET /api/context/digest`: the fleet in one small answer (states, nodes
+  with power and the soft drain, open missions with their last gate
+  failure, pending approvals, the supervisor's notes for the owner) and a
+  Markdown `digest_text` under 4000 bytes, masked; a part that cannot be
+  read is named in `warnings` (`crates/spawn-cli/src/serve/digest.rs`).
 
 `/api/missions` and `/api/rsi` send what the lists show: a task's brief,
 report and review note come as their first lines with their whole length

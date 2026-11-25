@@ -774,11 +774,7 @@ pub(crate) fn probe_json(
 ) -> Result<Value, String> {
     let facts = match op {
         Op::Inventory => inventory(output)?,
-        Op::Beat => {
-            let sample = super::beat(output)?;
-            json!({"load1": sample.load1, "mem_available": sample.mem_available,
-                   "disk_free": sample.disk_free})
-        }
+        Op::Beat => super::beat(output)?.facts(),
     };
     Ok(json!({
         "name": name, "op": op.name(), "transport": transport,

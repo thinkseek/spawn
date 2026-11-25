@@ -58,7 +58,8 @@ pub enum CommandAction {
     /// decided the work can go.
     Discard,
     /// Press one named key in the running Claude session's terminal: Esc,
-    /// an arrow, Enter, Y or N (`{"type":"key","key":"escape"}`). Its own
+    /// an arrow, Enter, Y, N or a digit 1 to 9 (`{"type":"key","key":"escape"}`,
+    /// `{"type":"key","key":"digit2"}`). Its own
     /// action, never text: it is sent at once, in any pane state (Esc
     /// interrupts a turn, the others answer a dialog), at most once, and
     /// does not wait for the turn as an input does (`crate::bridge`).
@@ -79,8 +80,13 @@ pub enum CommandAction {
 }
 
 /// A key a [`CommandAction::Key`] presses: the closed set a person may send
-/// an agent from the page (backlog P1). Anything else does not parse, and
-/// the error names it.
+/// an agent from the page (backlog P1), and the digits that pick a numbered
+/// choice of a permission or selection prompt (`1. Yes`, `2. Yes, and don't
+/// ask again`, `3. No`; issue #91). Anything else does not parse, and the
+/// error names it. A digit is named `digit1` to `digit9` in an action;
+/// [`NamedKey::from_name`] also takes the bare `1` to `9` and gives the same
+/// key, so an action always stores the `digit<n>` name. A numbered choice
+/// is picked by its digit, wherever the prompt's cursor stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NamedKey {
@@ -100,11 +106,29 @@ pub enum NamedKey {
     Y,
     /// The n key.
     N,
+    /// The 1 key: the first numbered choice.
+    Digit1,
+    /// The 2 key: the second numbered choice.
+    Digit2,
+    /// The 3 key: the third numbered choice.
+    Digit3,
+    /// The 4 key.
+    Digit4,
+    /// The 5 key.
+    Digit5,
+    /// The 6 key.
+    Digit6,
+    /// The 7 key.
+    Digit7,
+    /// The 8 key.
+    Digit8,
+    /// The 9 key.
+    Digit9,
 }
 
 impl NamedKey {
     /// Every key, in the order the page lists them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 17] = [
         Self::Escape,
         Self::Up,
         Self::Down,
@@ -113,9 +137,28 @@ impl NamedKey {
         Self::Enter,
         Self::Y,
         Self::N,
+        Self::Digit1,
+        Self::Digit2,
+        Self::Digit3,
+        Self::Digit4,
+        Self::Digit5,
+        Self::Digit6,
+        Self::Digit7,
+        Self::Digit8,
+        Self::Digit9,
     ];
 
-    /// The key's name in an action (`escape`, `up`, ..., `y`, `n`).
+    /// The digit key `n` (1 to 9), none otherwise.
+    pub fn digit(n: u8) -> Option<Self> {
+        if (1..=9).contains(&n) {
+            Self::ALL.get(usize::from(n) + 7).copied()
+        } else {
+            None
+        }
+    }
+
+    /// The key's name in an action (`escape`, `up`, ..., `y`, `n`,
+    /// `digit1` to `digit9`).
     pub fn name(self) -> &'static str {
         match self {
             Self::Escape => "escape",
@@ -126,10 +169,20 @@ impl NamedKey {
             Self::Enter => "enter",
             Self::Y => "y",
             Self::N => "n",
+            Self::Digit1 => "digit1",
+            Self::Digit2 => "digit2",
+            Self::Digit3 => "digit3",
+            Self::Digit4 => "digit4",
+            Self::Digit5 => "digit5",
+            Self::Digit6 => "digit6",
+            Self::Digit7 => "digit7",
+            Self::Digit8 => "digit8",
+            Self::Digit9 => "digit9",
         }
     }
 
-    /// The key as tmux's `send-keys` names it.
+    /// The key as tmux's `send-keys` names it (a digit is its character,
+    /// which Herdr types as text: spawn-host `herdr_key`).
     pub fn tmux(self) -> &'static str {
         match self {
             Self::Escape => "Escape",
@@ -140,14 +193,26 @@ impl NamedKey {
             Self::Enter => "Enter",
             Self::Y => "y",
             Self::N => "n",
+            Self::Digit1 => "1",
+            Self::Digit2 => "2",
+            Self::Digit3 => "3",
+            Self::Digit4 => "4",
+            Self::Digit5 => "5",
+            Self::Digit6 => "6",
+            Self::Digit7 => "7",
+            Self::Digit8 => "8",
+            Self::Digit9 => "9",
         }
     }
 
-    /// The key named `name`, or why there is none.
+    /// The key named `name` (a digit also by its bare character, `1` to
+    /// `9`), or why there is none.
     pub fn from_name(name: &str) -> Result<Self, String> {
         Self::ALL
             .into_iter()
-            .find(|key| key.name() == name)
+            .find(|key| {
+                key.name() == name || (key.name().starts_with("digit") && key.tmux() == name)
+            })
             .ok_or_else(|| {
                 let names: Vec<&str> = Self::ALL.iter().map(|key| key.name()).collect();
                 format!("key {name:?} is not one of {}", names.join(", "))
@@ -241,8 +306,44 @@ mod tests {
         let tmux: Vec<&str> = NamedKey::ALL.iter().map(|key| key.tmux()).collect();
         assert_eq!(
             tmux,
-            ["Escape", "Up", "Down", "Left", "Right", "Enter", "y", "n"]
+            [
+                "Escape", "Up", "Down", "Left", "Right", "Enter", "y", "n", "1", "2", "3", "4",
+                "5", "6", "7", "8", "9"
+            ]
         );
+    }
+
+    #[test]
+    fn a_digit_is_named_digit_n_and_its_bare_character_names_it_too() {
+        for (bare, key) in [
+            ("1", NamedKey::Digit1),
+            ("2", NamedKey::Digit2),
+            ("3", NamedKey::Digit3),
+            ("4", NamedKey::Digit4),
+            ("9", NamedKey::Digit9),
+        ] {
+            assert_eq!(NamedKey::from_name(bare), Ok(key));
+            assert_eq!(NamedKey::from_name(key.name()), Ok(key));
+            assert_eq!(key.tmux(), bare);
+            // A bare digit parses in an action, and is stored by its name.
+            let action: CommandAction =
+                serde_json::from_str(&format!(r#"{{"type":"key","key":"{bare}"}}"#))
+                    .expect("a bare digit parses");
+            assert_eq!(
+                serde_json::to_value(&action).expect("serializes")["key"],
+                key.name()
+            );
+        }
+        for name in ["0", "digit0", "digit10", "Digit1", "10", "y1"] {
+            assert!(NamedKey::from_name(name).is_err(), "{name} parsed");
+        }
+        for n in 1..=9_u8 {
+            let key = NamedKey::digit(n).expect("a digit");
+            assert_eq!(key.name(), format!("digit{n}"));
+            assert_eq!(key.tmux(), n.to_string());
+        }
+        assert_eq!(NamedKey::digit(0), None);
+        assert_eq!(NamedKey::digit(10), None);
     }
 
     #[test]
@@ -251,7 +352,9 @@ mod tests {
             .expect_err("f1 is no named key");
         let text = error.to_string();
         assert!(
-            text.contains(r#"key "f1" is not one of escape, up, down, left, right, enter, y, n"#),
+            text.contains(
+                r#"key "f1" is not one of escape, up, down, left, right, enter, y, n, digit1, digit2, digit3, digit4, digit5, digit6, digit7, digit8, digit9"#
+            ),
             "{text}"
         );
         // Names are exact: no case folding, no text, no second field.

@@ -365,7 +365,11 @@ fn every_translated_key_is_one_herdr_presses() {
         "Enter", "Escape", "Tab", "BTab", "BSpace", "Space", "Up", "Down", "Left", "Right", "F1",
         "F12", "C-c", "C-d", "M-x", "y",
     ];
-    for key in all {
+    let named: Vec<&str> = spawn_core::command::NamedKey::ALL
+        .iter()
+        .map(|key| key.tmux())
+        .collect();
+    for key in all.into_iter().chain(named) {
         host.send_keys(&keys, &workspace, &[key])
             .unwrap_or_else(|error| panic!("{key}: {error}"));
     }

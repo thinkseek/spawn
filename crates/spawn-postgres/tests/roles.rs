@@ -647,9 +647,10 @@ fn held(client: &mut Client, role: &str) -> Held {
 }
 
 /// The functions granted to a database's human login (schema.sql).
-const HUMAN_FUNCTIONS: [&str; 4] = [
+const HUMAN_FUNCTIONS: [&str; 5] = [
     "spawn_human_input(text,text,text) EXECUTE",
     "spawn_human_key(text,text,text) EXECUTE",
+    "spawn_human_master_message(text,text,text) EXECUTE",
     "spawn_human_resume(bigint,bigint,text) EXECUTE",
     "spawn_human_task(text,text,text) EXECUTE",
 ];

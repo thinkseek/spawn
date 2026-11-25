@@ -87,7 +87,11 @@ select coalesce(jsonb_agg(x.node order by x.name), '[]'::jsonb) from (select ",
 /// read drops); `state`, `lost` before
 /// `drained` before `live`; `lost_since_ms`, the time of its open
 /// `node.lost` (null unless lost); `heartbeat`, its latest sample
-/// `{at_ms, load1, mem_available, disk_free}` or null.
+/// `{at_ms, load1, mem_available, disk_free, power}` or null; `power`
+/// (issue #91), its latest heartbeat's power, or its join's when no
+/// heartbeat holds one, `{on_ac, battery_pct, charging, remaining_mins}`
+/// or null (no battery or AC sensor, or records from before power was
+/// read).
 pub(crate) const NODES: &str = joined!(
     r"j.name, (j.record - 'type') || jsonb_build_object(
       'join', j.id, 'joined_ms', j.at_ms,
@@ -109,7 +113,10 @@ pub(crate) const NODES: &str = joined!(
       'heartbeat', case when h.id is not null then jsonb_build_object(
           'at_ms', h.at_ms, 'load1', h.record -> 'load1',
           'mem_available', h.record -> 'mem_available',
-          'disk_free', h.record -> 'disk_free') end) as node"
+          'disk_free', h.record -> 'disk_free',
+          'power', h.record -> 'power') end,
+      'power', case when h.id is not null and h.record ? 'power' then h.record -> 'power'
+                    else j.record -> 'power' end) as node"
 );
 
 /// What the heartbeat worker needs of each node: `{name, ssh, transport,

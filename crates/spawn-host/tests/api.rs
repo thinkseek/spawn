@@ -530,6 +530,46 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     assert_eq!(states, vec![(name, spawn_core::port::Runner::Gone)]);
 }
 
+/// The digit keys a person presses on a numbered permission prompt (spawn-
+/// core `NamedKey::Digit1` to `Digit3`, issue #91) reach the pane through
+/// tmux's `send-keys` as the digits themselves, one per call, and Enter ends
+/// the line: `/bin/cat` echoes `123` back.
+#[test]
+fn tmux_presses_the_digit_keys_of_a_numbered_prompt() {
+    use spawn_core::command::NamedKey;
+    let _exclusive = exclusive();
+    let tmux = isolated_tmux("digits");
+    let host = host_in(&tmux.scratch, &tmux.program);
+    let name = terminal("digits");
+    start_session(&host, &launch(&name)).expect("start succeeds");
+    let keys: Vec<&str> = [
+        NamedKey::Digit1,
+        NamedKey::Digit2,
+        NamedKey::Digit3,
+        NamedKey::Enter,
+    ]
+    .iter()
+    .map(|key| key.tmux())
+    .collect();
+    assert_eq!(keys, ["1", "2", "3", "Enter"]);
+    host.send_keys(&name, &workspace(), &keys)
+        .expect("tmux takes every digit key");
+    let mut pane = String::new();
+    for _ in 0..50 {
+        pane = host
+            .capture_tail(&name, &workspace(), 20)
+            .expect("capture succeeds");
+        if pane.matches("123").count() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The terminal's echo of the typed line, then cat's copy of it.
+    assert!(pane.matches("123").count() >= 2, "pane: {pane}");
+    host.terminate(&name, &workspace())
+        .expect("terminate succeeds");
+}
+
 /// A prompt longer than tmux's message size (16 KiB; an objective's brief
 /// can be) is staged and pasted whole: `set-buffer <text>` refused it as
 /// "command too long", and the dispatcher retried that refusal forever.

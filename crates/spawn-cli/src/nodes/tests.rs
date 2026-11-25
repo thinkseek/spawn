@@ -3,6 +3,7 @@
 //! the watch's decisions (lost, back, the ten-minute sample, the join a
 //! probe was started for), and the bounded run with fake commands.
 
+use super::power::PowerTelemetry;
 use super::{
     BEAT, HeartbeatSample, HeartbeatScheduler, INVENTORY, NodeStoreHandle, PROBE_EVERY_MS,
     ProbeClock, ProbeOutcome, RECORD_EVERY_MS, alert_plan, beat, bounded, inventory, lost_ms,
@@ -113,6 +114,7 @@ fn a_heartbeat_reads_load_available_memory_and_free_disk() {
             load1: 7.6,
             mem_available: 7_101_652 * KIB,
             disk_free: 215_161_168 * KIB,
+            power: None,
         }
     );
     let spaced = RUNNER_BEAT.replace("30% /", "30% /mnt/my disk");
@@ -181,6 +183,7 @@ fn answer(join: i64, ms: i64) -> ProbeOutcome {
             load1: 0.5,
             mem_available: 8 * KIB * KIB * KIB,
             disk_free: 100 * KIB * KIB * KIB,
+            power: None,
         }),
     }
 }
@@ -1018,4 +1021,238 @@ fn the_heartbeat_probes_each_node_over_its_own_transport_and_hops() {
     );
     let error = route("orphan").expect_err("its hop is gone");
     assert!(error.contains("hop removed is not joined"), "{error}");
+}
+
+/// [`INVENTORY`]'s output on a MacBook (darwin/arm64, issue #91), as its
+/// `Darwin` branch prints it: `sw_vers`, `sysctl`, `df` and `pmset`.
+const MAC_INVENTORY: &str = "@arch
+arm64
+@os
+macOS
+@kernel
+24.1.0
+@cores
+10
+@memsize
+17179869184
+@df
+Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/disk3s5     482797652 301258792 165338100    65% /System/Volumes/Data
+@gpu
+@power
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=4653155)\t85%; discharging; 4:32 remaining present: true
+@end
+";
+
+/// [`BEAT`]'s output on the same MacBook.
+const MAC_BEAT: &str = "@loadavg
+{ 1.52 1.71 1.80 }
+@vm_stat
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               12000.
+Pages active:                            300000.
+Pages inactive:                          200000.
+Pages speculative:                         8000.
+Pages throttled:                              0.
+Pages wired down:                        150000.
+Pages purgeable:                          10000.
+@df
+Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/disk3s5     482797652 301258792 165338100    65% /System/Volumes/Data
+@power
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=4653155)\t18%; discharging; 0:41 remaining present: true
+@end
+";
+
+#[test]
+fn a_mac_joins_with_its_cores_memory_and_battery() {
+    assert_eq!(
+        inventory(MAC_INVENTORY).expect("a whole macOS inventory"),
+        json!({
+            "arch": "arm64", "os": "macOS", "kernel": "24.1.0", "cores": 10,
+            "cpu_max": null, "mem_total": 17_179_869_184_u64, "mem_max": null,
+            "disk_free": 165_338_100 * KIB, "gpu": null,
+            "power": {"on_ac": false, "battery_pct": 85, "charging": false,
+                      "remaining_mins": 272},
+        })
+    );
+    // A Mac with no battery (a mini): on AC, no charge.
+    let mini = MAC_INVENTORY.replace(
+        "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=4653155)\t85%; discharging; 4:32 remaining present: true\n",
+        "Now drawing from 'AC Power'\n",
+    );
+    assert_eq!(
+        inventory(&mini).expect("a mini")["power"],
+        json!({"on_ac": true, "battery_pct": null, "charging": false, "remaining_mins": null})
+    );
+    // No pmset at all: no power key, as every join before it.
+    let bare = MAC_INVENTORY.replace("@power\nNow drawing from 'Battery Power'\n -InternalBattery-0 (id=4653155)\t85%; discharging; 4:32 remaining present: true\n", "@power\n");
+    assert!(inventory(&bare).expect("no power").get("power").is_none());
+    // Without memsize a macOS output is refused by name.
+    let error = inventory(&MAC_INVENTORY.replace("@memsize\n17179869184\n", "")).unwrap_err();
+    assert!(error.contains("MemTotal"), "{error}");
+    let error = inventory(&MAC_INVENTORY.replace("17179869184", "x")).unwrap_err();
+    assert!(error.contains("memsize"), "{error}");
+}
+
+#[test]
+fn a_mac_heartbeat_reads_vm_loadavg_vm_stat_and_pmset() {
+    let sample = beat(MAC_BEAT).expect("a whole macOS beat");
+    assert!((sample.load1 - 1.52).abs() < 1e-9, "{sample:?}");
+    assert_eq!(sample.mem_available, (12_000 + 200_000 + 8_000) * 16_384);
+    assert_eq!(sample.disk_free, 165_338_100 * KIB);
+    assert_eq!(
+        sample.power,
+        Some(PowerTelemetry {
+            on_ac: false,
+            battery_pct: Some(18),
+            charging: false,
+            remaining_mins: Some(41),
+        })
+    );
+    assert_eq!(
+        sample.facts()["power"],
+        json!({"on_ac": false, "battery_pct": 18, "charging": false, "remaining_mins": 41})
+    );
+    let error = beat(&MAC_BEAT.replace("page size of", "pages of")).unwrap_err();
+    assert!(error.contains("vm_stat"), "{error}");
+    assert!(beat(&MAC_BEAT.replace("{ 1.52", "{ x")).is_err());
+}
+
+#[test]
+fn a_linux_laptop_reads_its_power_supplies_and_a_desktop_has_none() {
+    let laptop = RUNNER_BEAT.replace(
+        "@end\n",
+        "@power\nsupply AC\ntype=Mains\nonline=0\nsupply BAT0\ntype=Battery\n\
+         status=Discharging\ncapacity=57\nenergy_now=24140000\npower_now=8610000\n\
+         supply hidpp_battery_0\ntype=Battery\nscope=Device\ncapacity=5\nstatus=Discharging\n@end\n",
+    );
+    assert_eq!(
+        beat(&laptop).expect("a laptop's beat").power,
+        Some(PowerTelemetry {
+            on_ac: false,
+            battery_pct: Some(57),
+            charging: false,
+            remaining_mins: Some(168),
+        })
+    );
+    let charging = laptop.replace("online=0", "online=1").replace(
+        "status=Discharging\ncapacity=57",
+        "status=Charging\ncapacity=57\ntime_to_full_now=1800",
+    );
+    assert_eq!(
+        beat(&charging).expect("charging").power,
+        Some(PowerTelemetry {
+            on_ac: true,
+            battery_pct: Some(57),
+            charging: true,
+            remaining_mins: Some(30),
+        })
+    );
+    // An empty @power (a desktop, a VM), or none (an older node): no power,
+    // and every other fact as before.
+    let desktop = RUNNER_BEAT.replace("@end\n", "@power\n@end\n");
+    assert_eq!(
+        beat(&desktop).expect("a desktop"),
+        beat(RUNNER_BEAT).expect("old")
+    );
+    assert_eq!(beat(RUNNER_BEAT).expect("old").power, None);
+    assert!(inventory(DESKTOP).expect("old").get("power").is_none());
+    // Only a peripheral's battery: no power either.
+    let mouse = RUNNER_BEAT.replace(
+        "@end\n",
+        "@power\nsupply hid\ntype=Battery\nscope=Device\ncapacity=40\n@end\n",
+    );
+    assert_eq!(beat(&mouse).expect("mouse").power, None);
+}
+
+#[test]
+fn the_probes_dispatch_on_uname_and_run_under_posix_sh() {
+    for probe in [INVENTORY, BEAT] {
+        assert!(
+            probe.contains("uname -s") && probe.contains("Darwin"),
+            "{probe}"
+        );
+        assert!(probe.contains("pmset -g batt") && probe.contains("/sys/class/power_supply"));
+    }
+    assert!(INVENTORY.contains("sysctl -n hw.ncpu") && INVENTORY.contains("sysctl -n hw.memsize"));
+    assert!(INVENTORY.contains("nproc") && INVENTORY.contains("/proc/meminfo"));
+    assert!(BEAT.contains("vm_stat") && BEAT.contains("sysctl -n vm.loadavg"));
+    // This host (Linux) runs both under `sh` and reads its own answers.
+    let run = |script: &str| {
+        let output = Command::new("sh")
+            .args(["-c", script])
+            .output()
+            .expect("sh");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("utf-8")
+    };
+    let facts = inventory(&run(INVENTORY)).expect("this host's inventory");
+    assert!(
+        facts["cores"].as_u64().is_some_and(|cores| cores > 0),
+        "{facts}"
+    );
+    let sample = beat(&run(BEAT)).expect("this host's beat");
+    assert!(sample.mem_available > 0);
+}
+
+#[test]
+fn a_power_that_moves_records_a_heartbeat_before_ten_minutes() {
+    let mut watch = HeartbeatScheduler::new(60_000);
+    watch.sync(&member(7, &Value::Null, None), at(0));
+    let plugged = |pct: u8, on_ac: bool| ProbeOutcome {
+        answer: Ok(HeartbeatSample {
+            load1: 0.5,
+            mem_available: 1,
+            disk_free: 1,
+            power: Some(PowerTelemetry {
+                on_ac,
+                battery_pct: Some(pct),
+                charging: false,
+                remaining_mins: None,
+            }),
+        }),
+        ..answer(7, 0)
+    };
+    let types = |records: &[Value]| -> Vec<String> {
+        records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    decide(&mut watch, at(0), true);
+    watch.take(ProbeOutcome {
+        at: at(1_000),
+        ..plugged(80, true)
+    });
+    let first = decide(&mut watch, at(1_000), true);
+    assert_eq!(types(&first), ["node.heartbeat"]);
+    assert_eq!(first[0]["power"]["battery_pct"], 80);
+    // The same power a probe later: nothing until ten minutes.
+    watch.take(ProbeOutcome {
+        at: at(16_000),
+        ..plugged(78, true)
+    });
+    assert!(decide(&mut watch, at(16_000), true).is_empty());
+    // Unplugged: recorded at once.
+    watch.take(ProbeOutcome {
+        at: at(31_000),
+        ..plugged(78, false)
+    });
+    let unplugged = decide(&mut watch, at(31_000), true);
+    assert_eq!(types(&unplugged), ["node.heartbeat"]);
+    assert_eq!(unplugged[0]["power"]["on_ac"], false);
+    // Five points down: recorded; two more: not.
+    watch.take(ProbeOutcome {
+        at: at(46_000),
+        ..plugged(73, false)
+    });
+    assert_eq!(decide(&mut watch, at(46_000), true).len(), 1);
+    watch.take(ProbeOutcome {
+        at: at(61_000),
+        ..plugged(71, false)
+    });
+    assert!(decide(&mut watch, at(61_000), true).is_empty());
 }

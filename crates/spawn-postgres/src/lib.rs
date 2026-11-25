@@ -111,7 +111,10 @@ pub use control_mask::stored_text as control_stored_text;
 pub use cost::{
     ArchiveCounted, ArchiveFile, ArchivedMessage, SessionCounted, SessionFile, SessionMessage,
 };
-pub use gateway::{HumanInput, HumanKey, HumanResume, HumanTask, HumanWrite};
+pub use gateway::{
+    HumanInput, HumanKey, HumanMaster, HumanResume, HumanTask, HumanWrite, MAX_MASTER_KEY_BYTES,
+    MasterMessageMode,
+};
 pub use grading::RoutedTask;
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};

@@ -91,6 +91,72 @@ pub(crate) const HUMAN_TASK: &str = "select spawn_human_task($1, $2, $3)";
 /// idempotency key.
 pub(crate) const HUMAN_RESUME: &str = "select spawn_human_resume($1, $2, $3)";
 
+/// A person's message to the supervisor from Master Control, through
+/// `spawn_human_master_message` (issue #91): `{command_id, wake_command_id,
+/// stop_command_id, steer_command_id, session_id, mode, principal, woke,
+/// replayed}`.
+pub(crate) const HUMAN_MASTER: &str = "select spawn_human_master_message($1, $2, $3)";
+
+/// The longest idempotency key of a message to the supervisor (and of an
+/// approval's act), in bytes: its derived keys (`<key>:wake`, `<key>:9`)
+/// stay within the 256 bytes every key may hold.
+/// `spawn_human_master_message` holds the same bound.
+pub const MAX_MASTER_KEY_BYTES: usize = 240;
+
+/// How a message to the supervisor is delivered
+/// (`spawn_human_master_message`): `Auto` and `Queue` type it at the
+/// supervisor's turn, `Steer` interrupts a running turn first (Esc),
+/// `Restart` stops a running supervisor first; each wakes a supervisor that
+/// runs no execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MasterMessageMode {
+    Auto,
+    Steer,
+    Queue,
+    Restart,
+}
+
+impl MasterMessageMode {
+    /// Every mode, in the order the page lists them.
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Steer, Self::Queue, Self::Restart];
+
+    /// The mode's name (`auto`, `steer`, `queue`, `restart`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+            Self::Restart => "restart",
+        }
+    }
+
+    /// The mode named `name`, or why there is none.
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.name() == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(|mode| mode.name()).collect();
+                format!("mode {name:?} is not one of {}", names.join(", "))
+            })
+    }
+}
+
+/// What became of a person's message to the supervisor
+/// ([`PostgresStore::human_master_message`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HumanMaster {
+    /// Submitted (or the same request's commands again, for a repeated
+    /// key): the function's answer.
+    Submitted(serde_json::Value),
+    /// An idempotency key another request used (SQLSTATE 23505), with the
+    /// reason; nothing was made.
+    KeyUsed(String),
+    /// A text, key or mode the function refuses (SQLSTATE 22023), with the
+    /// reason; nothing was made.
+    Refused(String),
+}
+
 /// What became of a person's resume of a halted mission
 /// ([`PostgresStore::human_resume`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +363,37 @@ impl PostgresStore {
                 Ok(HumanTask::Refused(message))
             }
             Err(error) => Err(crate::backend(&error)),
+        }
+    }
+
+    /// Send `text` to the supervisor as a person in `mode`, through
+    /// `spawn_human_master_message`:
+    /// a supervisor that runs no execution is woken first, never refused.
+    /// Only a store connected as the `spawn_human` login may call it.
+    pub fn human_master_message(
+        &self,
+        key: &IdempotencyKey,
+        text: &str,
+        mode: MasterMessageMode,
+    ) -> Result<HumanMaster, StoreError> {
+        let answer = self
+            .lock()
+            .query_one(HUMAN_MASTER, &[&key.as_str(), &text, &mode.name()]);
+        match answer {
+            Ok(row) => Ok(HumanMaster::Submitted(row.get::<_, serde_json::Value>(0))),
+            Err(error)
+                if error.as_db_error().is_some_and(|db| {
+                    *db.code() == postgres::error::SqlState::INVALID_PARAMETER_VALUE
+                }) =>
+            {
+                let message = error
+                    .as_db_error()
+                    .map_or_else(String::new, |db| db.message().to_string());
+                Ok(HumanMaster::Refused(message))
+            }
+            Err(error) => key_used(&error)
+                .map(HumanMaster::KeyUsed)
+                .ok_or_else(|| crate::backend(&error)),
         }
     }
 
