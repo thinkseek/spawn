@@ -163,12 +163,33 @@ const LAUNCH_SETTLE: Duration = Duration::from_secs(1);
 /// host is gone or the panes it follows changed.
 const EVENT_POLL: Duration = Duration::from_millis(500);
 
+/// The largest `agent.prompt` request line this host sends, newline
+/// included: Herdr 0.9.5 resets the connection of a request line over
+/// 1 MiB (probed 2026-11-26: 1 000 000 bytes of text taken, 1 100 000
+/// reset), so a quarter of it. A longer text goes in [`TEXT_CHUNK`] pieces
+/// through `pane.send_text`.
+const PROMPT_LINE_LIMIT: usize = 256 * 1024;
+
+/// Whether `text` goes to `pane`'s agent in one `agent.prompt`: its request
+/// line, as [`call_at`] writes it, is at most [`PROMPT_LINE_LIMIT`].
+pub(crate) fn prompt_fits(pane: &str, text: &str) -> bool {
+    let request = json!({
+        "id": "spawn:agent.prompt",
+        "method": "agent.prompt",
+        "params": { "target": pane, "text": text },
+    });
+    request.to_string().len() < PROMPT_LINE_LIMIT
+}
+
 /// Herdr's error codes that refuse input to an agent: not ready yet (it was
 /// started moments ago) or blocked on a dialog. When `agent.get` answers with
 /// one, nothing was typed, and the caller may try again. In practice
 /// `agent.get` answers neither: `agent_not_ready` and `agent_blocked` come
-/// from Herdr's agent input calls (`agent.send_keys`, `agent.prompt`), which
-/// this host does not use yet (PR 3). A blocked agent's status, read from
+/// from Herdr's agent input calls; `submit_staged` uses `agent.prompt` and
+/// maps both to a refusal before typing (the text stays staged). Because
+/// the Bridge records a typing before it submits, such a refusal there is
+/// still read as one that may have typed: the guard that keeps it rare is
+/// this check at staging. A blocked agent's status, read from
 /// `agent.get`, refuses nothing here: the Bridge types only into a pane its
 /// own reading accepts input on.
 const NOT_TYPED: [&str; 2] = ["agent_not_ready", "agent_blocked"];
@@ -1449,6 +1470,36 @@ impl TerminalHost for HerdrHost {
         let text = std::fs::read_to_string(&staged)
             .map_err(|error| TerminalError(format!("nothing staged for {terminal}: {error}")))?;
         let record = self.live_pane(terminal)?;
+        // To the pane's agent first, through `agent.prompt` (one ordered,
+        // paste-aware write, then its submission), never with `wait` (it
+        // returns on a false idle): only while the request stays well under
+        // Herdr's request line cap ([`prompt_fits`]). Its refusals of a
+        // blocked or not-ready agent type nothing: the text stays staged.
+        // A pane with no agent Herdr detects (`agent_not_found`, nothing
+        // typed either) takes the text the old way.
+        if prompt_fits(&record.pane, &text) {
+            match self.call(
+                "agent.prompt",
+                &json!({ "target": record.pane, "text": text }),
+                CALL_LIMIT,
+            ) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&staged);
+                    return Ok(());
+                }
+                Err(Call::Refused { code, .. }) if refused_before_typing(&code) => {
+                    return Err(TerminalError(format!(
+                        "herdr refused before typing ({code}): the agent in {terminal} does not \
+                         take input now; nothing was typed"
+                    )));
+                }
+                Err(Call::Refused { code, .. }) if code == "agent_not_found" => {}
+                Err(call) => {
+                    let _ = std::fs::remove_file(&staged);
+                    return Err(call.into_error("agent.prompt"));
+                }
+            }
+        }
         // Typed as it is, then one Enter: a newline in the text is a line
         // feed, which an engine's prompt box reads as a new line, not as
         // its submission.
