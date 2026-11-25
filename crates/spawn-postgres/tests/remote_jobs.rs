@@ -702,7 +702,7 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
             .expect("enqueue");
         let read_epoch = state(&store, &id).lease_epoch;
         let start = Barrier::new(2);
-        let (uploaded, took_back) = std::thread::scope(|scope| {
+        let (node_won, local_won) = std::thread::scope(|scope| {
             let upload = scope.spawn(|| {
                 start.wait();
                 let answer =
@@ -721,11 +721,14 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
                     .remote_job_take_local(&id, read_epoch)
                     .expect("take local")
             });
-            (upload.join().expect("upload"), take_back.join().expect("take"))
+            (
+                upload.join().expect("upload"),
+                take_back.join().expect("take"),
+            )
         });
-        assert!(uploaded != took_back, "round {round}: exactly one winner");
+        assert!(node_won != local_won, "round {round}: exactly one winner");
         let job = state(&store, &id);
-        if uploaded {
+        if node_won {
             remote += 1;
             assert_eq!(job.state, RemoteJobState::Completed);
         } else {
