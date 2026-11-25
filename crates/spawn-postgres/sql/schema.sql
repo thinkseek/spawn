@@ -1,9 +1,10 @@
 -- Spawn storage: event log, command queue, read views.
 --
 -- Times are Unix epoch milliseconds in bigint, so no client date library is
--- needed. Every append takes one transaction-level advisory lock: it makes
--- "id order equals commit order" true, which lets a global reader store its
--- last position and never skip an event.
+-- needed. Every newly inserted event gets its id under one transaction-level
+-- advisory lock: it makes "id order equals commit order" true, which lets a
+-- global reader store its last position and never skip an event. A committed
+-- idempotent repeat can be read without joining a contended lock queue.
 
 -- A connection whose search_path names a schema that does not exist yet
 -- (an isolated test run) gets it created, so everything below lands there.
@@ -283,7 +284,25 @@ declare
     -- Only the Observer's judgement is the projected state.
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    -- Keep the uncontended path free of an extra index read. Only a caller
+    -- that would otherwise wait looks for a committed duplicate, which
+    -- allocates no id and changes no state. A racing first write is not yet
+    -- visible here; the caller takes the lock and finds that event below.
+    if not pg_try_advisory_xact_lock(1399957335) then
+        if p_source_key is not null then
+            select e.id, e.session_seq, e.recorded_at_ms into v_id, v_seq, v_at
+                from spawn_events e
+                where e.session_id = p_session
+                  and e.source = p_source
+                  and e.source_event_id = p_source_key
+                limit 1;
+            if found then
+                return query select v_id, v_seq, v_at, false;
+                return;
+            end if;
+        end if;
+        perform pg_advisory_xact_lock(1399957335);
+    end if;
 
     if p_source_key is not null and exists (
         select 1 from spawn_events e
@@ -479,8 +498,19 @@ declare
     v_id bigint;
 begin
     -- The id is taken under the append lock, which is held to commit:
-    -- commands commit in id order, the order `spawn_claim` relies on.
-    perform pg_advisory_xact_lock(1399957335);
+    -- commands commit in id order, the order `spawn_claim` relies on. Only a
+    -- caller that would wait looks for an already committed key first; a
+    -- first submission still in flight uses the conflict path below.
+    if not pg_try_advisory_xact_lock(1399957335) then
+        select c.id into v_id
+            from spawn_commands c
+            where c.principal = p_principal and c.idempotency_key = p_key;
+        if v_id is not null then
+            return query select v_id;
+            return;
+        end if;
+        perform pg_advisory_xact_lock(1399957335);
+    end if;
     insert into spawn_commands
         (principal, idempotency_key, agent_id, session_id, action, state, created_at_ms)
     values
