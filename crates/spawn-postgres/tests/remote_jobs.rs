@@ -219,14 +219,21 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     assert_eq!(idle["next_beat_ms"], 5000, "a queued job: beat often");
     let replay = beat_once(&store, &node, &b1, 1, &json!({}));
     assert_eq!(replay["error"], "replay");
-    assert_eq!(node_records(&mut client), before, "idle beats record nothing");
+    assert_eq!(
+        node_records(&mut client),
+        before,
+        "idle beats record nothing"
+    );
 
     let spec = json!({"holds": {"pg": "16", "registry": "R1"}});
     let registered = store
         .node_gw_spec(&node, &b1, SPEC_SHA, &spec, |_| true)
         .expect("spec")
         .answer;
-    assert_eq!(registered["changed"], false, "the same digest changes nothing");
+    assert_eq!(
+        registered["changed"], false,
+        "the same digest changes nothing"
+    );
     let other = "a".repeat(64);
     let registered = store
         .node_gw_spec(&node, &b1, &other, &spec, |_| true)
@@ -236,7 +243,11 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     let mut body = beat(&[], &[], 4, 30_000);
     body["spec_sha256"] = json!(other);
     let one = beat_once(&store, &node, &b1, 2, &body);
-    assert_eq!(grants(&one), [(jobs[0].clone(), 1)], "only one fits the tmpfs");
+    assert_eq!(
+        grants(&one),
+        [(jobs[0].clone(), 1)],
+        "only one fits the tmpfs"
+    );
 
     // The next beat does not hold it: the grant was lost, given back, and
     // granted again with another (two at most).
@@ -245,7 +256,11 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     let lost = beat_once(&store, &node, &b1, 3, &body);
     assert_eq!(grants(&lost), [(jobs[0].clone(), 3), (jobs[1].clone(), 1)]);
     assert_eq!(lost["grants"][0]["needs_baseline"], true);
-    assert_eq!(state(&store, &jobs[0]).attempts, 1, "the lost grant is refunded");
+    assert_eq!(
+        state(&store, &jobs[0]).attempts,
+        1,
+        "the lost grant is refunded"
+    );
 
     let held = [
         (jobs[0].clone(), 3),
@@ -270,12 +285,20 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     };
     assert!(!at(2, &result(0, 'd')), "a stale epoch is fenced");
     assert!(at(3, &result(0, 'd')), "the current epoch completes");
-    assert!(at(3, &result(0, 'd')), "the same result again is idempotent");
+    assert!(
+        at(3, &result(0, 'd')),
+        "the same result again is idempotent"
+    );
     assert!(!at(3, &result(6, 'f')), "another result is refused");
 
     // A new boot: the finished job is kept, the running one fenced at once.
     let b2 = boot(2);
-    let mut body = beat(&[], &[(jobs[1].clone(), 1), (jobs[0].clone(), 3)], 4, 262_144);
+    let mut body = beat(
+        &[],
+        &[(jobs[1].clone(), 1), (jobs[0].clone(), 3)],
+        4,
+        262_144,
+    );
     body["spec_sha256"] = json!(other);
     body["state"] = json!("draining");
     let rebooted = beat_once(&store, &node, &b2, 1, &body);
@@ -286,7 +309,10 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     assert_eq!(grants(&rebooted), [], "a draining node takes nothing");
     assert_eq!(state(&store, &jobs[1]).state, RemoteJobState::ResultPending);
     let fenced = state(&store, &jobs[2]);
-    assert_eq!((fenced.state, fenced.lease_epoch), (RemoteJobState::Queued, 2));
+    assert_eq!(
+        (fenced.state, fenced.lease_epoch),
+        (RemoteJobState::Queued, 2)
+    );
     let stale = beat_once(&store, &node, &b1, 9, &json!({}));
     assert_eq!(stale["error"], "stale_boot");
 
@@ -297,7 +323,10 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     let fault = store
         .remote_job_fault(&jobs[0], 3, "sandbox_never_started", true, FaultNext::Keep)
         .expect("a fault");
-    assert_eq!((fault.ok, fault.strikes, fault.degraded), (true, Some(1), Some(false)));
+    assert_eq!(
+        (fault.ok, fault.strikes, fault.degraded),
+        (true, Some(1), Some(false))
+    );
 
     client
         .batch_execute(&format!(
@@ -309,7 +338,11 @@ fn the_ledger_behaves_as_the_design_measured_it() {
     let swept = store.node_sweep().expect("a sweep");
     assert_eq!((swept.waiting, swept.fenced, swept.lost), (0, 1, 1));
     let again = store.node_sweep().expect("a sweep");
-    assert_eq!((again.waiting, again.fenced, again.lost), (0, 0, 0), "level-triggered");
+    assert_eq!(
+        (again.waiting, again.fenced, again.lost),
+        (0, 0, 0),
+        "level-triggered"
+    );
     let records = node_records(&mut client);
     for (record, count) in [
         ("node.enrolled", 1),
@@ -325,11 +358,17 @@ fn the_ledger_behaves_as_the_design_measured_it() {
 
     assert!(store.node_admin("n252", NodeAction::Drain).expect("drain"));
     assert!(!store.node_admin("n252", NodeAction::Drain).expect("drain"));
-    assert!(store.node_admin("n252", NodeAction::Revoke).expect("revoke"));
+    assert!(
+        store
+            .node_admin("n252", NodeAction::Revoke)
+            .expect("revoke")
+    );
     let revoked = beat_once(&store, &node, &b2, 2, &json!({}));
     assert_eq!(revoked["error"], "revoked");
     assert!(
-        store.node_enroll_token("n252", None, &[9; 32], 600_000).is_err(),
+        store
+            .node_enroll_token("n252", None, &[9; 32], 600_000)
+            .is_err(),
         "a revoked name is never enrolled again"
     );
     // No v1 record is a P1 node's.
@@ -352,9 +391,15 @@ fn a_call_the_gateway_does_not_commit_changes_nothing() {
         })
         .expect("a beat");
     assert!(!refused.committed);
-    assert_eq!(state(&store, "gate-rollback-0001").state, RemoteJobState::Queued);
+    assert_eq!(
+        state(&store, "gate-rollback-0001").state,
+        RemoteJobState::Queued
+    );
     let seq: i64 = admin(&schema)
-        .query_one("select beat_seq from spawn_node_state where name = 'n1'", &[])
+        .query_one(
+            "select beat_seq from spawn_node_state where name = 'n1'",
+            &[],
+        )
         .expect("the node")
         .get(0);
     assert_eq!(seq, 0, "the replay window did not move");
@@ -374,7 +419,11 @@ fn two_concurrent_beats_of_two_nodes_grant_each_job_once() {
     ];
     for n in 0..JOBS {
         store
-            .remote_job_enqueue(&job(&format!("gate-pair-{n:04}"), &[], &[("gate_sandbox", 1)]))
+            .remote_job_enqueue(&job(
+                &format!("gate-pair-{n:04}"),
+                &[],
+                &[("gate_sandbox", 1)],
+            ))
             .expect("enqueue");
     }
     let start = Barrier::new(2);
@@ -388,13 +437,8 @@ fn two_concurrent_beats_of_two_nodes_grant_each_job_once() {
                     let mut held: Vec<(String, i64)> = Vec::new();
                     start.wait();
                     for seq in 1..=200 {
-                        let answer = beat_once(
-                            &connection,
-                            node,
-                            &boot(1),
-                            seq,
-                            &beat(&held, &[], 1000, 0),
-                        );
+                        let answer =
+                            beat_once(&connection, node, &boot(1), seq, &beat(&held, &[], 1000, 0));
                         assert_eq!(answer["ok"], true, "{answer}");
                         assert_eq!(answer["fenced"], json!([]), "nothing is lost");
                         let new = grants(&answer);
@@ -446,13 +490,23 @@ fn an_owner_sweep_racing_a_beat_never_deadlocks_past_one_retry() {
     let node = enroll(&store, "ns", 5, &json!({}));
     for n in 0..4 {
         store
-            .remote_job_enqueue(&job(&format!("gate-race-{n:04}"), &[], &[("gate_sandbox", 1)]))
+            .remote_job_enqueue(&job(
+                &format!("gate-race-{n:04}"),
+                &[],
+                &[("gate_sandbox", 1)],
+            ))
             .expect("enqueue");
     }
     let mut seq = 1;
     let mut held = Vec::new();
     while held.len() < 4 {
-        held.extend(grants(&beat_once(&store, &node, &boot(1), seq, &beat(&held, &[], 4, 0))));
+        held.extend(grants(&beat_once(
+            &store,
+            &node,
+            &boot(1),
+            seq,
+            &beat(&held, &[], 4, 0),
+        )));
         seq += 1;
     }
     let sweeper = store.new_connection().expect("a connection");
@@ -479,9 +533,8 @@ fn an_owner_sweep_racing_a_beat_never_deadlocks_past_one_retry() {
             let beating = scope.spawn(|| {
                 start.wait();
                 at_most_one_retry("the beat", || {
-                    beater.node_gw_beat(&node, &boot(1), this_seq, &beat(&held, &[], 4, 0), |_| {
-                        true
-                    })
+                    beater
+                        .node_gw_beat(&node, &boot(1), this_seq, &beat(&held, &[], 4, 0), |_| true)
                 })
             });
             sweep.join().expect("the sweep") + beating.join().expect("the beat")
@@ -490,7 +543,10 @@ fn an_owner_sweep_racing_a_beat_never_deadlocks_past_one_retry() {
     assert_eq!(deadlocks, 0, "one lock order: no deadlock at all");
     for (job_id, epoch) in &held {
         let job = state(&store, job_id);
-        assert_eq!(job.lease_epoch, *epoch, "{job_id}: never fenced (grace not over)");
+        assert_eq!(
+            job.lease_epoch, *epoch,
+            "{job_id}: never fenced (grace not over)"
+        );
     }
 }
 
@@ -505,16 +561,37 @@ fn a_job_faulting_on_two_nodes_is_the_poison_and_refunds_the_strike() {
     store
         .remote_job_enqueue(&job(id, &[], &[("gate_sandbox", 1)]))
         .expect("enqueue");
-    let granted = grants(&beat_once(&store, &first, &boot(1), 1, &beat(&[], &[], 1, 0)));
+    let granted = grants(&beat_once(
+        &store,
+        &first,
+        &boot(1),
+        1,
+        &beat(&[], &[], 1, 0),
+    ));
     assert_eq!(granted, [(id.to_string(), 1)]);
     complete(&store, &first, id, 1);
     let fault = store
         .remote_job_fault(id, 1, "host_fault", true, FaultNext::Queued)
         .expect("a fault");
-    assert_eq!((fault.next, fault.poison, fault.strikes), (Some(FaultNext::Queued), Some(false), Some(1)));
-    let excluded = grants(&beat_once(&store, &first, &boot(1), 2, &beat(&[], &[], 1, 0)));
+    assert_eq!(
+        (fault.next, fault.poison, fault.strikes),
+        (Some(FaultNext::Queued), Some(false), Some(1))
+    );
+    let excluded = grants(&beat_once(
+        &store,
+        &first,
+        &boot(1),
+        2,
+        &beat(&[], &[], 1, 0),
+    ));
     assert_eq!(excluded, [], "the node it faulted on is excluded");
-    let granted = grants(&beat_once(&store, &second, &boot(1), 1, &beat(&[], &[], 1, 0)));
+    let granted = grants(&beat_once(
+        &store,
+        &second,
+        &boot(1),
+        1,
+        &beat(&[], &[], 1, 0),
+    ));
     assert_eq!(granted, [(id.to_string(), 3)]);
     complete(&store, &second, id, 3);
     let poison = store
@@ -531,7 +608,11 @@ fn a_job_faulting_on_two_nodes_is_the_poison_and_refunds_the_strike() {
             .expect("the node")
             .host_fault_strikes
     };
-    assert_eq!((strikes("np1"), strikes("np2")), (0, 0), "neither node is blamed");
+    assert_eq!(
+        (strikes("np1"), strikes("np2")),
+        (0, 0),
+        "neither node is blamed"
+    );
     let job = state(&store, id);
     assert_eq!(job.state, RemoteJobState::FallbackLocal);
     assert_eq!(job.fault_nodes, [first.clone(), second.clone()]);
@@ -545,13 +626,23 @@ fn three_strikes_degrade_a_node_and_an_undrain_clears_them() {
     let node = enroll(&store, "nd", 8, &json!({}));
     for n in 0..4 {
         store
-            .remote_job_enqueue(&job(&format!("gate-strike-{n:04}"), &[], &[("gate_sandbox", 1)]))
+            .remote_job_enqueue(&job(
+                &format!("gate-strike-{n:04}"),
+                &[],
+                &[("gate_sandbox", 1)],
+            ))
             .expect("enqueue");
     }
     let mut seq = 1;
     for n in 0..3 {
         let id = format!("gate-strike-{n:04}");
-        let granted = grants(&beat_once(&store, &node, &boot(1), seq, &beat(&[], &[], 1, 0)));
+        let granted = grants(&beat_once(
+            &store,
+            &node,
+            &boot(1),
+            seq,
+            &beat(&[], &[], 1, 0),
+        ));
         seq += 1;
         assert_eq!(granted, [(id.clone(), 1)]);
         complete(&store, &node, &id, 1);
@@ -571,14 +662,26 @@ fn three_strikes_degrade_a_node_and_an_undrain_clears_them() {
     let none = beat_once(&store, &node, &boot(1), seq, &beat(&[], &[], 1, 0));
     seq += 1;
     assert_eq!(grants(&none), [], "a degraded node gets no grants");
-    assert!(store.node_admin("nd", NodeAction::Undrain).expect("undrain"));
+    assert!(
+        store
+            .node_admin("nd", NodeAction::Undrain)
+            .expect("undrain")
+    );
     let node_row = store.node_v1("nd").expect("a node").expect("the node");
     assert_eq!((node_row.degraded, node_row.host_fault_strikes), (false, 0));
     assert!(
-        !store.node_admin("nd", NodeAction::Undrain).expect("undrain"),
+        !store
+            .node_admin("nd", NodeAction::Undrain)
+            .expect("undrain"),
         "nothing left to undrain"
     );
-    let granted = grants(&beat_once(&store, &node, &boot(1), seq, &beat(&[], &[], 1, 0)));
+    let granted = grants(&beat_once(
+        &store,
+        &node,
+        &boot(1),
+        seq,
+        &beat(&[], &[], 1, 0),
+    ));
     assert_eq!(granted, [("gate-strike-0003".to_string(), 1)]);
 }
 
@@ -601,7 +704,8 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
         let (uploaded, taken) = std::thread::scope(|scope| {
             let upload = scope.spawn(|| {
                 start.wait();
-                let answer = beat_once(&uploader, &node, &boot(1), round + 1, &beat(&[], &[], 1, 0));
+                let answer =
+                    beat_once(&uploader, &node, &boot(1), round + 1, &beat(&[], &[], 1, 0));
                 grants(&answer).into_iter().any(|(job_id, epoch)| {
                     job_id == id
                         && uploader
@@ -770,7 +874,7 @@ fn catalog(client: &mut Client) -> Vec<String> {
                     || coalesce(p.proacl::text, '')
                from pg_proc p where p.pronamespace = current_schema()::regnamespace
              union all
-             select 'rel ' || c.relname || ' ' || c.relkind || ' ' || coalesce(c.relacl::text, '')
+             select 'rel ' || c.relname || ' ' || c.relkind::text || ' ' || coalesce(c.relacl::text, '')
                     || ' ' || coalesce(array_to_string(c.reloptions, ','), '')
                from pg_class c where c.relnamespace = current_schema()::regnamespace
              union all
@@ -824,14 +928,19 @@ fn a_second_migration_changes_nothing() {
     let mut client = admin(&schema);
     let before = catalog(&mut client);
     assert!(
-        before.iter().any(|line| line.starts_with("fn spawn_node_gw_beat(")),
+        before
+            .iter()
+            .any(|line| line.starts_with("fn spawn_node_gw_beat(")),
         "the ledger is in the catalog"
     );
     store.migrate().expect("migrate again");
     let after = catalog(&mut client);
     let gone: Vec<&String> = before.iter().filter(|line| !after.contains(line)).collect();
     let new: Vec<&String> = after.iter().filter(|line| !before.contains(line)).collect();
-    assert!(gone.is_empty() && new.is_empty(), "changed: {gone:?} -> {new:?}");
+    assert!(
+        gone.is_empty() && new.is_empty(),
+        "changed: {gone:?} -> {new:?}"
+    );
 }
 
 /// The schema as it was before PR S1: this file without its S1 block. (The
@@ -854,16 +963,32 @@ fn an_old_schema_refolds_a_log_holding_the_v1_records() {
         .mission_add("Remote", &json!([]), "human")
         .expect("a mission");
     store
-        .task_assign(mission, "ephemeral", "worker", "judge it remotely", "default")
+        .task_assign(
+            mission,
+            "ephemeral",
+            "worker",
+            "judge it remotely",
+            "default",
+        )
         .expect("a task");
     // Every v1 record type.
     let node = enroll(&store, "nr", 11, &json!({}));
     store
-        .node_gw_spec(&node, &boot(1), &"a".repeat(64), &json!({"holds": {}}), |_| true)
+        .node_gw_spec(
+            &node,
+            &boot(1),
+            &"a".repeat(64),
+            &json!({"holds": {}}),
+            |_| true,
+        )
         .expect("spec");
     for n in 0..2 {
         store
-            .remote_job_enqueue(&job(&format!("gate-old-{n:04}"), &[], &[("gate_sandbox", 1)]))
+            .remote_job_enqueue(&job(
+                &format!("gate-old-{n:04}"),
+                &[],
+                &[("gate_sandbox", 1)],
+            ))
             .expect("enqueue");
     }
     let mut body = beat(&[], &[], 2, 0);
@@ -880,7 +1005,9 @@ fn an_old_schema_refolds_a_log_holding_the_v1_records() {
     store.node_sweep().expect("a sweep: lost");
     beat_once(&store, &node, &boot(2), 1, &body); // back, and a new boot's fence
     store.node_admin("nr", NodeAction::Drain).expect("drain");
-    store.node_admin("nr", NodeAction::Undrain).expect("undrain");
+    store
+        .node_admin("nr", NodeAction::Undrain)
+        .expect("undrain");
     store.node_admin("nr", NodeAction::Revoke).expect("revoke");
     let records = node_records(&mut client);
     for record in [
@@ -896,7 +1023,10 @@ fn an_old_schema_refolds_a_log_holding_the_v1_records() {
         "remote_job.host_fault",
         "remote_job.lease_fenced",
     ] {
-        assert!(records.contains_key(record), "{record} in the log: {records:?}");
+        assert!(
+            records.contains_key(record),
+            "{record} in the log: {records:?}"
+        );
     }
 
     // The old schema, in a schema of its own, given that log.
@@ -947,8 +1077,15 @@ fn an_old_schema_refolds_a_log_holding_the_v1_records() {
             .collect()
     };
     let new_fold = folded(&mut client);
-    assert!(new_fold.iter().any(|line| line.starts_with("task ")), "{new_fold:?}");
-    assert_eq!(folded(&mut old_client), new_fold, "the same fold, old schema or new");
+    assert!(
+        new_fold.iter().any(|line| line.starts_with("task ")),
+        "{new_fold:?}"
+    );
+    assert_eq!(
+        folded(&mut old_client),
+        new_fold,
+        "the same fold, old schema or new"
+    );
     drop(old_client);
 }
 
@@ -963,7 +1100,10 @@ fn a_v1_name_is_never_a_p1_node() {
         "cores": 4, "mem_total": 1, "disk_free": 1, "cpu_max": null, "mem_max": null,
         "gpu": null, "exit_country": null}));
     let error = joined.expect_err("a v1 name is not joined");
-    assert!(format!("{error:?}").contains("spawn-node v1 node"), "{error:?}");
+    assert!(
+        format!("{error:?}").contains("spawn-node v1 node"),
+        "{error:?}"
+    );
     store
         .node_record(&json!({"type": "node.joined", "name": "p1only",
             "ssh": "host.example", "arch": "x86_64", "os": "linux", "kernel": "6",
