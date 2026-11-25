@@ -917,3 +917,70 @@ pub fn spawn_with(
         store: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn lease(needs_baseline: Option<bool>) -> Value {
+        let url = |role: &str, byte: char| {
+            let digest = format!("sha256:{}", byte.to_string().repeat(64));
+            json!({"role": role, "digest": digest, "size": 10,
+                   "url": format!("/node/v1/artifacts/{digest}")})
+        };
+        let mut lease = json!({
+            "job_id": "gate-0123456789ab-k3x9q2ma", "lease_epoch": 2, "kind": "gate",
+            "cost": {"gate_sandbox": 1}, "attempt": 1,
+            "spec": {"timeout_s": 600, "artifact_urls": [
+                url("delta_bundle", 'a'), url("baseline_bundle", 'b'), url("controller_pack", 'c')]}
+        });
+        if let Some(needed) = needs_baseline {
+            lease["needs_baseline"] = needed.into();
+        }
+        lease
+    }
+
+    fn roles(bytes: &[u8]) -> Vec<ArtifactRole> {
+        let grant: Grant = serde_json::from_slice(bytes).unwrap();
+        grant
+            .artifact_urls
+            .unwrap()
+            .into_iter()
+            .map(|url| url.role)
+            .collect()
+    }
+
+    #[test]
+    fn the_baseline_bundle_is_granted_only_when_needed() {
+        let node = "0".repeat(64);
+        let all = [
+            ArtifactRole::DeltaBundle,
+            ArtifactRole::BaselineBundle,
+            ArtifactRole::ControllerPack,
+        ];
+        let needed = build_grant(&lease(Some(true)), &node, 9).unwrap();
+        assert_eq!(roles(&needed), all);
+        let absent = build_grant(&lease(None), &node, 9).unwrap();
+        assert_eq!(roles(&absent), all, "absent means needed");
+        let warm = build_grant(&lease(Some(false)), &node, 9).unwrap();
+        assert_eq!(
+            roles(&warm),
+            [ArtifactRole::DeltaBundle, ArtifactRole::ControllerPack]
+        );
+        let grant: Grant = serde_json::from_slice(&warm).unwrap();
+        assert_eq!((grant.lease_epoch, grant.expires_ms, grant.timeout_s), (2, 9, Some(600)));
+        assert_eq!(grant.node_id, node);
+    }
+
+    #[test]
+    fn a_lease_that_makes_no_valid_grant_is_refused() {
+        let node = "0".repeat(64);
+        let mut forbidden = lease(None);
+        forbidden["spec"]["env"] = json!({"PATH": "/tmp"});
+        assert!(build_grant(&forbidden, &node, 9).is_err());
+        let mut odd = lease(None);
+        odd["kind"] = "mystery".into();
+        assert!(build_grant(&odd, &node, 9).is_err());
+    }
+}
