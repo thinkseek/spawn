@@ -7,6 +7,7 @@ pub mod command;
 pub mod contract;
 pub mod event;
 pub mod feature_coverage;
+pub mod feature_deps;
 pub mod grading;
 pub mod id;
 pub mod ingest;

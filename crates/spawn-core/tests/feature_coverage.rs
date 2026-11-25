@@ -706,8 +706,8 @@ fn real_project_registry_covers_every_in_scope_file_with_zero_drift() {
     );
     assert!(report.consistency.is_clean(), "{:?}", report.consistency);
     assert!(
-        report.counts.in_scope >= 1048,
-        "expected at least 1048 in-scope repo files, got {}",
+        report.counts.in_scope >= 1084,
+        "expected at least 1084 in-scope repo files, got {}",
         report.counts.in_scope
     );
     assert_eq!(report.counts.covered, report.counts.in_scope);

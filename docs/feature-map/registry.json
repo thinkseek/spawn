@@ -3638,6 +3638,35 @@
       }
     },
     {
+      "id": "cap-feature-dependency-truth",
+      "title": "Code Dependency Truth for the Feature Map (issue #100)",
+      "kind": "capability",
+      "parent": "t559u-feature-map-initiative",
+      "summary": "Checks the registry's depends_on against the real code graph: file edges projected onto many-to-many owner sets, declared reachability, and findings for under-declared, implied-only, ghost, inverted and unverifiable dependencies, static cycles, kernel and entrypoint roles, and waivers.",
+      "status_note": "PR 1 (pure model and findings in spawn-core::feature_deps) and PR 2 (spawn-codegraph Rust extractor and spawn features graph) of the issue #100 design; check integration and schema 2 follow.",
+      "files": [
+        "crates/spawn-core/src/feature_deps.rs"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "t565u-wild-file-scan"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [],
+        "deploys": [],
+        "artifacts": [],
+        "discussions": [
+          "https://github.com/acupof-ai/Spawn/issues/100"
+        ]
+      }
+    },
+    {
       "id": "t559u-slice-c-storage-keys",
       "title": "Slice C: Content-Derived Storage Keys & Manifests (`fm-cas/v1`)",
       "kind": "slice",
