@@ -4,8 +4,8 @@
 use spawn_postgres::provenance::ProvEntryClass;
 
 use super::index::{
-    Checkpoint, RawDiff, Trailers, base32, change_id, checkpoint_execution, classify, domain_of,
-    edit_branch_key, edit_task_key, import_key, land_key, parse_commit, parse_raw, stored_path,
+    Checkpoint, RawDiff, Repo, Trailers, base32, change_id, checkpoint_execution, classify, domain_of,
+    edit_branch_key, edit_task_key, import_key, land_key, parse_commit, parse_header, parse_raw, stored_path,
     trailers,
 };
 use super::{Target, path_and_line, target};
@@ -218,4 +218,67 @@ fn who_reads_a_trailing_line_number() {
         Ok(("odd:name.rs".to_string(), None))
     );
     assert!(path_and_line("src/a.rs:0").is_err());
+}
+
+#[test]
+fn a_cat_file_answer_is_read_from_its_end_so_a_name_with_spaces_can_be_missing() {
+    let oid = "a".repeat(40);
+    assert_eq!(
+        parse_header(&format!("{oid} tree 123\n")),
+        Ok(Some((oid.clone(), "tree".to_string(), 123)))
+    );
+    for missing in [
+        format!("{oid}:a dir missing\n"),
+        format!("{oid}:a dir with three spaces missing\n"),
+        format!("{oid}:x missing\n"),
+        "abc ambiguous\n".to_string(),
+    ] {
+        assert_eq!(parse_header(&missing), Ok(None), "{missing:?}");
+    }
+    for bad in ["", "nonsense\n", "a b c d\n", "oid blob notasize\n"] {
+        assert!(parse_header(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// The regression of a fold (a Change over 10,000 entries) that adds or
+/// removes a top-level directory whose name holds a space: the directory's
+/// tree is asked of the side that lacks it, and git's `missing` answer
+/// must read as absent, not as an error that stops every later run.
+#[test]
+fn a_missing_top_level_directory_with_spaces_in_its_name_is_absent() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "spawn-prov-subtree-{}-{nanos:x}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("has space")).expect("a work tree");
+    let result = std::panic::catch_unwind(|| {
+        let git = |arguments: &[&str]| {
+            let output = spawn_host::test_git_command()
+                .arg("-C")
+                .arg(&dir)
+                .args(arguments)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {arguments:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("has space/x"), "x\n").expect("a file");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one"]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        let mut repo = Repo::open(&dir.join(".git").display().to_string()).expect("the repo");
+        assert!(repo.subtree(&commit, "has space").expect("asked").is_some());
+        assert_eq!(repo.subtree(&commit, "no such dir").expect("asked"), None);
+        assert_eq!(repo.subtree(&commit, "has space/x").expect("asked"), None);
+        // The process still answers after a missing name.
+        assert!(repo.subtree(&commit, "has space").expect("asked").is_some());
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
