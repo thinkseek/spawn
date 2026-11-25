@@ -1718,20 +1718,17 @@ pub(super) mod tests {
         let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
         assert!(text.contains(&format!("-{base}")));
         assert!(text.contains(&format!("{candidate} refs/gate/candidate")));
-        // A clone of the baseline takes it.
+        // A mirror that fetched the baseline takes it.
         let baseline = artifacts.baseline_bundle(&repo, &base).unwrap();
         let mirror = dir.0.join("mirror.git");
-        let output = Command::new("git")
-            .args(["clone", "-q", "--bare"])
-            .arg(artifacts.path_of(&baseline.digest))
-            .arg(&mirror)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        std::fs::create_dir_all(&mirror).unwrap();
+        git(&mirror, &["init", "-q", "--bare"]);
+        let whole = artifacts.path_of(&baseline.digest);
+        git(
+            &mirror,
+            &["fetch", "-q", &whole.to_string_lossy(), "refs/gate/base:refs/b"],
         );
+        assert_eq!(git(&mirror, &["rev-parse", "refs/b"]), base);
         let bundle = path.to_string_lossy().to_string();
         git(&mirror, &["bundle", "verify", "-q", &bundle]);
         git(
