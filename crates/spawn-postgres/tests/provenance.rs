@@ -650,7 +650,6 @@ fn the_checks_refuse_empty_and_out_of_range_values() {
         assert!(error.contains("check constraint"), "{statement}: {error}");
     }
 }
-}
 
 /// The blast radius walks forward to what depends on a change and backward
 /// to what it depends on, through change ids, tree and content digests and
