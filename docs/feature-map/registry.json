@@ -1717,7 +1717,7 @@
       "title": "Agent Grading: grading catalog, onboarding exams, routing & calibration",
       "kind": "capability",
       "parent": "domain-missions-fleet",
-      "summary": "Graded presets (`grading_presets`, the fold of the control session's `grading.recorded` events, outside the control fold) mapped to a `ModelProfile`, offline onboarding exams (`evals/onboarding/`), minimum-sufficient task routing by `TaskDifficulty` with a quality-rejection rework step-up (`task.rerouted`) and a fallback to `--model default` for unflagged assignments the catalog cannot cover, and integer-only calibration over quality outcomes read from `mission_tasks` (`spawn grade`, `spawn task assign --difficulty/--preset`).",
+      "summary": "Graded presets (`grading_presets`, the fold of the control session's `grading.recorded` events, outside the control fold) mapped to a `ModelProfile`, offline onboarding exams (`evals/onboarding/`), minimum-sufficient task routing by `TaskDifficulty` with a quality-rejection rework step-up (`task.rerouted`) and a fallback to `--model default` for unflagged assignments the catalog cannot cover, and integer-only calibration over quality outcomes read from `mission_tasks` (`spawn grade`, `spawn task assign --difficulty/--preset`). Phase 2: a deterministic brief difficulty classifier for unflagged ephemeral assignments (recorded on `task.assigned` as `classification`), gate `rejected` verdicts stepping rework up in the verdict's own statement, the fleet loop's periodic grading upkeep with an anti-starvation re-probe, and named execution profiles beyond `default|cheap` (`execution_profile`, `/api/grading`).",
       "files": [
         "crates/spawn-cli/src/grading.rs",
         "crates/spawn-cli/src/missions.rs",

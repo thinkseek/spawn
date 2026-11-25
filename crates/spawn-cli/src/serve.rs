@@ -900,6 +900,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/core-lines" => Box::new(core_lines::core_lines),
         "/api/verifications" => Box::new(verifications),
         "/api/nodes" => Box::new(nodes),
+        "/api/grading" => Box::new(grading),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
@@ -1823,6 +1824,24 @@ fn verifications() -> Result<Value, String> {
     let store = open_store()?;
     let facts = store.verification_facts().map_err(err)?;
     Ok(crate::verify::list(&facts, now_ms()))
+}
+
+/// `/api/grading`: the grading catalog (docs/agent-grading.md) as the web
+/// reads it ([`crate::grading::api_catalog`]): every preset as `spawn grade
+/// list --json` prints it, with its routing grade, the profile it runs as
+/// (its named execution profile, else its model profile) and whether it is
+/// due an anti-starvation re-probe now; and every profile the catalog
+/// names. Read through the reader login like every other read.
+fn grading() -> Result<Value, String> {
+    let store = open_store()?;
+    let catalog = store.grading_catalog().map_err(err)?;
+    let activity = store.grading_activity().map_err(err)?;
+    Ok(crate::grading::api_catalog(
+        &catalog,
+        &activity,
+        now_ms(),
+        crate::grading::reprobe_interval_ms(),
+    ))
 }
 
 /// `/api/nodes`: every node joined and not removed (multi-host P1, crate

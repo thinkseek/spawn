@@ -1045,3 +1045,292 @@ fn calibrations_window_counts_quality_rejections_alone() {
         "{plan:?}"
     );
 }
+
+/// Phase 2: a preset may name its execution profile, any name of a preset
+/// id's shape but the two model profiles' own; it is folded, refolded and
+/// read with the catalog, and a phase-1 registration is as it was.
+#[test]
+fn a_named_execution_profile_is_registered_folded_and_checked() {
+    let (store, schema) = store("grading_profiles");
+    let mut client = admin(&schema);
+    register(&store, "plain", "default", 1);
+    store
+        .grading_record(&json!({"type": "preset.registered", "preset_id": "opus",
+                                "engine_label": "claude", "model_label": "opus",
+                                "model_profile": "default", "cost_rank": 2,
+                                "execution_profile": "opus-max"}))
+        .expect("register a named profile");
+    store
+        .grading_record(&json!({"type": "preset.registered", "preset_id": "qwen",
+                                "engine_label": "local", "model_label": "qwen",
+                                "model_profile": "cheap", "cost_rank": 0,
+                                "execution_profile": "local-qwen"}))
+        .expect("register another");
+    let catalog = store.grading_catalog().expect("catalog");
+    let names: Vec<(&str, &str, Option<&str>)> = catalog
+        .iter()
+        .map(|p| {
+            (
+                p.preset_id.as_str(),
+                p.profile_name(),
+                p.execution_profile
+                    .as_ref()
+                    .map(spawn_core::grading::ExecutionProfile::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("opus", "opus-max", Some("opus-max")),
+            ("plain", "default", None),
+            ("qwen", "local-qwen", Some("local-qwen")),
+        ]
+    );
+    assert_eq!(catalog[2].model_profile, ModelProfile::Cheap);
+    // The phase-1 shape of a preset without one.
+    let plain = serde_json::to_value(&catalog[1]).expect("json");
+    assert!(plain.get("execution_profile").is_none(), "{plain}");
+    for (profile, says) in [
+        (json!("cheap"), "execution profile"),
+        (json!("default"), "execution profile"),
+        (json!("Opus Max"), "execution profile"),
+        (json!(""), "execution profile"),
+        (json!(7), "execution profile"),
+        (json!(null), "execution profile"),
+    ] {
+        let error = refusal(
+            &store,
+            &json!({"type": "preset.registered", "preset_id": "bad",
+                    "engine_label": "e", "model_label": "m", "model_profile": "default",
+                    "cost_rank": 1, "execution_profile": profile}),
+        );
+        assert!(error.contains(says), "{profile}: {error}");
+    }
+    // Other records take no execution profile.
+    let error = refusal(
+        &store,
+        &json!({"type": "preset.state_changed", "preset_id": "opus",
+                "from_state": "unexamined", "to_state": "disabled",
+                "execution_profile": "opus-max"}),
+    );
+    assert!(error.contains("and nothing else"), "{error}");
+    let before = catalog_rows(&mut client);
+    client
+        .batch_execute("select spawn_grading_refold(); select spawn_grading_refold();")
+        .expect("refold");
+    assert_eq!(catalog_rows(&mut client), before);
+    // The table refuses a builtin name stored as one.
+    let error = client
+        .batch_execute("update grading_presets set execution_profile = 'cheap'")
+        .expect_err("checked");
+    assert!(format!("{error:?}").contains("check"), "{error:?}");
+}
+
+/// Phase 2's assignment: a named preset's execution profile and the
+/// classifier's decision are recorded on `task.assigned`, a reroute names
+/// the new preset's profile, a malformed classification is refused, and
+/// every earlier call (nine arguments and fewer) assigns as before.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_assignment_records_its_classification_and_profile() {
+    let (store, schema) = store("grading_classified");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Classified", &json!([]), "human")
+        .expect("add");
+    store
+        .grading_record(&json!({"type": "preset.registered", "preset_id": "qwen",
+                                "engine_label": "local", "model_label": "qwen",
+                                "model_profile": "cheap", "cost_rank": 0,
+                                "execution_profile": "local-qwen"}))
+        .expect("register");
+    onboard(&store, "qwen", "unexamined", "l1");
+    store
+        .grading_record(&json!({"type": "preset.registered", "preset_id": "opus",
+                                "engine_label": "claude", "model_label": "opus",
+                                "model_profile": "default", "cost_rank": 2,
+                                "execution_profile": "opus-max"}))
+        .expect("register");
+    onboard(&store, "opus", "unexamined", "l3");
+    let classification = json!({"difficulty": "l1", "score": -2, "rules": "brief-v1",
+                                "signals": [{"rule": "low_risk", "points": -2,
+                                             "evidence": ["typo"]}],
+                                "rationale": "l1 (score -2: low_risk -2 [typo])"});
+    let task = store
+        .task_assign_classified(
+            mission,
+            "ephemeral",
+            "w",
+            "fix the typo",
+            "cheap",
+            false,
+            false,
+            TaskDifficulty::L1,
+            Some("qwen"),
+            Some(&classification),
+        )
+        .expect("assign");
+    let record = assigned_record(&mut client, task);
+    assert_eq!(record["classification"], classification);
+    assert_eq!(record["execution_profile"], json!("local-qwen"));
+    assert_eq!(record["preset_id"], json!("qwen"));
+    assert_eq!(record["difficulty"], json!("l1"));
+    // Malformed classifications record nothing.
+    let events = count(&mut client, "select count(*) from spawn_events");
+    for bad in [
+        json!([]),
+        json!({"difficulty": "l4", "signals": []}),
+        json!({"difficulty": "l2"}),
+        json!({"difficulty": "l2", "signals": {}}),
+    ] {
+        let error = client
+            .query_one(
+                "select spawn_task_assign($1, 'ephemeral', 'w', 'refused', 'default', false,
+                                          false, 2, null, $2)",
+                &[&mission, &bad],
+            )
+            .expect_err("refused");
+        assert!(
+            sql_refusal(&error).contains("a classification is an object"),
+            "{bad}: {error:?}"
+        );
+    }
+    assert_eq!(
+        count(&mut client, "select count(*) from spawn_events"),
+        events
+    );
+    // The nine-argument call of phase 1, positional: as before, and no
+    // classification recorded.
+    let nine: i64 = client
+        .query_one(
+            "select spawn_task_assign($1, 'ephemeral', 'w', 'nine', 'cheap', false, false, 1,
+                                      'qwen')",
+            &[&mission],
+        )
+        .expect("nine arguments")
+        .get(0);
+    let record = assigned_record(&mut client, nine);
+    assert!(record.get("classification").is_none(), "{record}");
+    assert_eq!(record["execution_profile"], json!("local-qwen"));
+    // Without a preset: no profile, as before.
+    let plain = store
+        .task_assign_with(mission, "ephemeral", "w", "plain", "default", false, false)
+        .expect("assign");
+    let record = assigned_record(&mut client, plain);
+    assert!(record.get("execution_profile").is_none(), "{record}");
+    assert!(record.get("classification").is_none(), "{record}");
+
+    // The reroute names the new preset's profile; the refold keeps it all.
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let rerouted = store
+        .task_reject_rerouted(task, "again", None, "opus", 1, TaskDifficulty::L2)
+        .expect("reroute");
+    assert_eq!(rerouted["execution_profile"], json!("opus-max"));
+    assert_eq!(rerouted["model"], json!("default"));
+    let before = tasks(&mut client);
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold");
+    assert_eq!(tasks(&mut client), before);
+
+    // When each preset last had a task first assigned to it, by difficulty.
+    let activity = store.grading_activity().expect("activity");
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].preset_id, "qwen");
+    assert_eq!(activity[0].difficulty, TaskDifficulty::L1);
+    let newest: i64 = client
+        .query_one(
+            "select max(created_at_ms) from mission_tasks where first_preset_id = 'qwen'",
+            &[],
+        )
+        .expect("read")
+        .get(0);
+    assert_eq!(activity[0].last_assigned_ms, newest);
+}
+
+/// A gate's quality rejection and its rework reroute are one statement:
+/// both or neither, as a review's.
+#[test]
+fn a_gates_rejection_and_its_reroute_are_recorded_both_or_neither() {
+    let (store, schema) = store("grading_gate_reroute");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Gated", &json!([]), "human")
+        .expect("add");
+    register(&store, "small", "cheap", 0);
+    register(&store, "mid", "default", 1);
+    onboard(&store, "small", "unexamined", "l1");
+    onboard(&store, "mid", "unexamined", "l2");
+    let task = reported(
+        &store,
+        mission,
+        "gated",
+        "cheap",
+        TaskDifficulty::L1,
+        "small",
+        1,
+    );
+    let verdict = |revision: i32| {
+        json!({"type": "task.gated", "id": task, "verdict": "rejected", "revision": revision,
+               "base": "b", "note": "a check failed"})
+    };
+    let gates = |client: &mut Client| {
+        count(
+            client,
+            "select count(*) from spawn_events
+              where kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'",
+        )
+    };
+    // Refused reroutes take the verdict with them.
+    for (preset, revision, difficulty, says) in [
+        (
+            "nobody",
+            1,
+            TaskDifficulty::L2,
+            "not in the grading catalog",
+        ),
+        (
+            "small",
+            1,
+            TaskDifficulty::L2,
+            "runs on preset small already",
+        ),
+        ("mid", 4, TaskDifficulty::L2, "is at revision 1, not 4"),
+        ("mid", 1, TaskDifficulty::L3, "is routed at l2, not l3"),
+    ] {
+        let error = store
+            .integrator_record_rerouted(&verdict(0), preset, revision, difficulty)
+            .expect_err("refused");
+        assert!(format!("{error:?}").contains(says), "{says}: {error:?}");
+        assert_eq!(gates(&mut client), 0);
+        assert_eq!(
+            store.routed_task(task).expect("read").expect("task").state,
+            "reported"
+        );
+    }
+    let (event, rerouted) = store
+        .integrator_record_rerouted(&verdict(0), "mid", 1, TaskDifficulty::L2)
+        .expect("both");
+    assert!(event > 0);
+    assert_eq!(
+        rerouted,
+        json!({"type": "task.rerouted", "id": task, "preset_id": "mid", "model": "default",
+               "from_preset_id": "small", "revision": 1, "routed_difficulty": "l2"})
+    );
+    assert_eq!(gates(&mut client), 1);
+    let routed = store.routed_task(task).expect("read").expect("task");
+    assert_eq!(routed.state, "revise");
+    assert_eq!((routed.revisions, routed.quality_rejections), (1, 1));
+    assert_eq!(routed.preset_id.as_deref(), Some("mid"));
+    assert_eq!(routed.first_preset_id.as_deref(), Some("small"));
+    // The integrator's own refusal of a record still holds: a second
+    // verdict on the revision it already judged reroutes nothing.
+    assert!(
+        store
+            .integrator_record_rerouted(&verdict(0), "mid", 1, TaskDifficulty::L2)
+            .is_err()
+    );
+    assert_eq!(gates(&mut client), 1);
+}

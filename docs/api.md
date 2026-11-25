@@ -6,7 +6,7 @@ Every route `spawn serve` answers under `/api/`, on one page. The router is
 each answer holds is documented on its handler there. Words are as in the
 [glossary](./glossary.md).
 
-`main` serves 24 GET route patterns and 7 POST routes. Any other path,
+`main` serves 25 GET route patterns and 7 POST routes. Any other path,
 under `/api/` or not, is looked up as a file of the built UI (`--web`,
 `SPAWN_WEB_DIR`, default `web/dist`), so an unknown API path is a 404.
 
@@ -41,6 +41,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/core-lines` | The core lines the owner steers by, each figure with its value, range and state | – | web (Home) |
 | GET | `/api/verifications` | What is landed and verified or not | `spawn verify list` (the same, ages aside) | no web page; nightly scenario 133 |
 | GET | `/api/nodes` | Every node joined and not removed, without `ssh`, `endpoint`, `note` or `pubkey` | `spawn node list --json` (which also prints those four) | web (Fleet) |
+| GET | `/api/grading` | The grading catalog: every preset with every `spawn grade list --json` field plus `routing_grade`, `profile` (its execution profile, else its model profile) and `reprobe_due`; `profiles`, every profile name, sorted | `spawn grade list --json` (the presets alone, without the three added fields) | no web page yet |
 | GET | `/api/features` | The feature map of every open objective mission (a mission's `--features` file), or of `?mission=`; `?limit=` (10, at most 50) | – | web (Features) |
 | GET | `/api/features/coverage` | The feature registry's file coverage (`docs/feature-map/registry.json`): wild files, stale references, features; `?mission=<id>` for that mission's project | `spawn features scan --json` | web (Coverage) |
 | GET | `/api/features/coverage/projects` | Every project the Coverage page can read, over all open objective missions | – | web (Coverage) |

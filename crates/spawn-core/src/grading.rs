@@ -276,6 +276,12 @@ pub struct GradedPreset {
     /// The [`ModelProfile`] the dispatcher starts its worker on: in phase 1
     /// the only part of a preset that reaches a worker.
     pub model_profile: ModelProfile,
+    /// The named execution profile it stands for (phase 2, any
+    /// [`ExecutionProfile`] name: `opus-max`, `local-qwen`, ...), run on
+    /// `model_profile`. None (left out of every record and answer): the
+    /// preset's profile is its `model_profile`'s name, as in phase 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<ExecutionProfile>,
     /// Lower is cheaper; ties broken by `preset_id`.
     pub cost_rank: u32,
     pub state: PresetState,
@@ -312,6 +318,14 @@ impl GradedPreset {
     pub fn is_routable(&self) -> bool {
         self.routing_grade().is_some()
     }
+
+    /// The name of the profile it runs as: its [`ExecutionProfile`], else
+    /// its `model_profile`'s wire name (`default` or `cheap`).
+    pub fn profile_name(&self) -> &str {
+        self.execution_profile
+            .as_ref()
+            .map_or_else(|| self.model_profile.as_str(), ExecutionProfile::as_str)
+    }
 }
 
 /// Whether some routable preset of `catalog` is graded for `difficulty`:
@@ -341,6 +355,18 @@ pub struct RoutingDecision {
     pub cost_rank: u32,
     /// Whether the assigner named the preset.
     pub explicit: bool,
+    /// The preset's named [`ExecutionProfile`], when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<ExecutionProfile>,
+    /// Whether the anti-starvation re-probe chose the preset
+    /// ([`route_with_reprobe`]) over the minimum-sufficient one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reprobe: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RoutingDecision {
@@ -406,6 +432,8 @@ pub fn route_preset(
         preset_grade: grade,
         cost_rank: preset.cost_rank,
         explicit,
+        execution_profile: preset.execution_profile.clone(),
+        reprobe: false,
     };
     if let Some(name) = explicit_preset {
         let preset = catalog
@@ -634,8 +662,547 @@ pub fn calibrate_preset(
     hold("within band")
 }
 
+/// The longest [`ExecutionProfile`] name.
+pub const EXECUTION_PROFILE_MAX: usize = 64;
+
+/// A named execution profile a graded preset stands for (phase 2): any
+/// name of [`is_preset_id`]'s shape, so a catalog tells apart as many
+/// runtimes as it names, not two. It travels as its bare name, like a
+/// [`ModelProfile`]; the two phase-1 names (`default`, `cheap`) are the
+/// [`ModelProfile`]s themselves and are never stored as one (a preset
+/// named on them keeps `execution_profile` null, exactly as in phase 1).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ExecutionProfile(String);
+
+impl ExecutionProfile {
+    /// The profile named `text`, when it is a name: `[a-z0-9][a-z0-9_-]{0,63}`.
+    pub fn parse(text: &str) -> Option<Self> {
+        is_preset_id(text).then(|| Self(text.to_string()))
+    }
+
+    /// Its name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The [`ModelProfile`] of the same name, for `default` and `cheap`.
+    pub fn builtin(&self) -> Option<ModelProfile> {
+        ModelProfile::parse(&self.0)
+    }
+}
+
+impl TryFrom<String> for ExecutionProfile {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text).ok_or_else(|| {
+            format!("an execution profile is [a-z0-9][a-z0-9_-]{{0,63}}, not {text}")
+        })
+    }
+}
+
+impl From<ExecutionProfile> for String {
+    fn from(profile: ExecutionProfile) -> Self {
+        profile.0
+    }
+}
+
+impl From<ModelProfile> for ExecutionProfile {
+    fn from(profile: ModelProfile) -> Self {
+        Self(profile.as_str().to_string())
+    }
+}
+
+impl fmt::Display for ExecutionProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The profile a preset registers as, from `spawn grade register`'s
+/// `--model-profile` (the runtime switch, `default` or `cheap`) and
+/// `--execution-profile` (any name): `(model_profile, execution_profile)`.
+/// A builtin name given as the execution profile is that model profile
+/// (and must agree with `--model-profile` when both are given); any other
+/// name runs on `--model-profile`, `default` unless given.
+pub fn registered_profile(
+    model_profile: Option<&str>,
+    execution_profile: Option<&str>,
+) -> Result<(ModelProfile, Option<ExecutionProfile>), String> {
+    let model = model_profile
+        .map(|text| {
+            ModelProfile::parse(text)
+                .ok_or_else(|| format!("--model-profile is default or cheap, not {text}"))
+        })
+        .transpose()?;
+    let Some(text) = execution_profile else {
+        return Ok((model.unwrap_or_default(), None));
+    };
+    let named = ExecutionProfile::parse(text).ok_or_else(|| {
+        format!("--execution-profile is a name [a-z0-9][a-z0-9_-]{{0,63}}, not {text}")
+    })?;
+    match (named.builtin(), model) {
+        (Some(builtin), Some(model)) if builtin != model => Err(format!(
+            "--execution-profile {text} is the {text} model profile, not --model-profile {model}",
+            model = model.as_str()
+        )),
+        (Some(builtin), _) => Ok((builtin, None)),
+        (None, model) => Ok((model.unwrap_or_default(), Some(named))),
+    }
+}
+
+/// The version of [`classify_difficulty`]'s rules, carried on every
+/// classification so a recorded one says which rules decided it.
+pub const CLASSIFIER_RULES: &str = "brief-v1";
+
+/// A classification's score at or above which a task is `l3`.
+pub const CLASSIFY_L3_AT: i32 = 4;
+
+/// A classification's score at or below which a task is `l1` (only when
+/// no risk marker matched, see [`classify_difficulty`]).
+pub const CLASSIFY_L1_AT: i32 = -2;
+
+/// The longest brief [`classify_difficulty`] may call `l1`.
+pub const CLASSIFY_L1_MAX_CHARS: usize = 400;
+
+/// One rule of [`classify_difficulty`] that matched: its name, the points
+/// it gave and what it matched. The evidence is the rule's own vocabulary
+/// (a keyword of its list, a count): never free text of the brief, so a
+/// recorded classification carries nothing the brief's masking would hide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassificationSignal {
+    pub rule: String,
+    pub points: i32,
+    pub evidence: Vec<String>,
+}
+
+/// What [`classify_difficulty`] decided, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DifficultyClassification {
+    pub difficulty: TaskDifficulty,
+    pub score: i32,
+    /// [`CLASSIFIER_RULES`].
+    pub rules: String,
+    /// Every rule that matched, in the rule-set's order.
+    pub signals: Vec<ClassificationSignal>,
+}
+
+impl DifficultyClassification {
+    /// Whether any rule matched: a brief no rule says anything of is the
+    /// default `l2`, exactly as an unflagged phase-1 assignment.
+    pub fn has_signal(&self) -> bool {
+        !self.signals.is_empty()
+    }
+
+    /// One line for a person: `l3 (score 5: security +4 [auth]; ...)`.
+    pub fn rationale(&self) -> String {
+        if self.signals.is_empty() {
+            return format!("{} (no signal: the default)", self.difficulty);
+        }
+        let parts: Vec<String> = self
+            .signals
+            .iter()
+            .map(|signal| {
+                format!(
+                    "{} {:+} [{}]",
+                    signal.rule,
+                    signal.points,
+                    signal.evidence.join(", ")
+                )
+            })
+            .collect();
+        format!(
+            "{} (score {}: {})",
+            self.difficulty,
+            self.score,
+            parts.join("; ")
+        )
+    }
+}
+
+/// Security markers: a token starting with one of these.
+const SECURITY_STEMS: &[&str] = &[
+    "security",
+    "vulnerab",
+    "exploit",
+    "cve-",
+    "authenticat",
+    "authoriz",
+    "credential",
+    "password",
+    "privilege",
+    "injection",
+    "csrf",
+    "xss",
+    "sandbox",
+    "secret",
+];
+
+/// Migration markers: a token starting with one of these, or a phrase.
+const MIGRATION_STEMS: &[&str] = &["migrat", "schema", "backfill", "refold"];
+const MIGRATION_PHRASES: &[&str] = &["alter table", "data loss", "breaking change"];
+
+/// Concurrency markers.
+const CONCURRENCY_STEMS: &[&str] = &["deadlock", "concurren", "transaction", "atomic"];
+const CONCURRENCY_PHRASES: &[&str] = &["race condition", "advisory lock"];
+
+/// Cross-cutting markers.
+const CROSS_CUTTING_STEMS: &[&str] = &["refactor", "redesign", "architect", "rewrite"];
+const CROSS_CUTTING_PHRASES: &[&str] = &["across crates", "every crate", "backwards compat"];
+
+/// Multi-step markers.
+const MULTI_STEP_STEMS: &[&str] = &["multi-step", "end-to-end", "phase", "pipeline"];
+
+/// Low-risk markers: small, well-specified work.
+/// Only markers that name the change itself: a generic verb or noun
+/// (`comment`, `rename`, `bump`) also names real engineering work ("add
+/// comment support", "rename it and update every caller", "bump tokio
+/// and fix whatever breaks"), so none of those is one.
+const LOW_RISK_STEMS: &[&str] = &[
+    "typo",
+    "spelling",
+    "wording",
+    "readme",
+    "docstring",
+    "formatting",
+    "one-line",
+];
+
+/// Words that widen a change past a small one: any of them cancels the
+/// low-risk rule.
+const BROADENING_STEMS: &[&str] = &[
+    "every",
+    "whatever",
+    "caller",
+    "implement",
+    "support",
+    "feature",
+];
+
+/// File extensions a path token ends with.
+const PATH_EXTENSIONS: &[&str] = &[
+    ".rs", ".sql", ".ts", ".tsx", ".md", ".sh", ".toml", ".json", ".py", ".yml", ".yaml",
+];
+
+/// The keywords of `stems` (prefixes of a word) and `phrases` (anywhere
+/// in the text) that `words` / `text` hold, each once, in list order.
+fn matched(words: &[&str], text: &str, stems: &[&str], phrases: &[&str]) -> Vec<String> {
+    stems
+        .iter()
+        .filter(|stem| words.iter().any(|word| word.starts_with(*stem)))
+        .chain(phrases.iter().filter(|phrase| text.contains(*phrase)))
+        .map(|keyword| (*keyword).to_string())
+        .collect()
+}
+
+/// How many lines of `text` are enumerated steps: starting `- `, `* `, or
+/// a number of at most two digits and `.` or `)`.
+fn enumerated_steps(text: &str) -> usize {
+    text.lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line.split_once(['.', ')']).is_some_and(|(number, _)| {
+                    !number.is_empty()
+                        && number.len() <= 2
+                        && number.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+        .count()
+}
+
+/// How many distinct file paths `tokens` name: a token with a known
+/// extension, or with a `/` and a letter.
+fn named_paths(tokens: &[&str]) -> usize {
+    let mut paths: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .filter(|token| {
+            PATH_EXTENSIONS.iter().any(|ext| token.ends_with(ext))
+                || (token.contains('/') && token.bytes().any(|b| b.is_ascii_alphabetic()))
+        })
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths.len()
+}
+
+/// How many distinct crates `tokens` name: the segment after `crates/`
+/// in a path, or a `spawn-<name>` token, `spawn-` dropped either way.
+fn named_crates(tokens: &[&str]) -> usize {
+    let mut crates: Vec<&str> = tokens
+        .iter()
+        .filter_map(|token| {
+            token
+                .split('/')
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find(|pair| pair[0] == "crates")
+                .map(|pair| pair[1])
+                .or_else(|| {
+                    token
+                        .strip_prefix("spawn-")
+                        .filter(|rest| !rest.is_empty() && !rest.contains(['/', '.']))
+                        .map(|_| *token)
+                })
+        })
+        .map(|name| name.strip_prefix("spawn-").unwrap_or(name))
+        .filter(|name| !name.is_empty())
+        .collect();
+    crates.sort_unstable();
+    crates.dedup();
+    crates.len()
+}
+
+/// The difficulty a task's brief (and objective, if the caller appends
+/// it) reads as: a deterministic, integer-only rule-set over its structure
+/// and wording, every matched rule kept as evidence ([`CLASSIFIER_RULES`]).
+///
+/// Points, summed:
+/// - `security` +4: a security marker (auth, credential, injection, ...);
+/// - `migration` +4: a schema or data migration (migrat*, schema, alter
+///   table, backfill, data loss, ...);
+/// - `concurrency` +2: a race, deadlock, transaction, ...;
+/// - `cross_cutting` +2: a refactor, redesign, rewrite, ...;
+/// - `multi_step` +1 for three or more enumerated steps (lines starting
+///   `1.`, `2)`, `-` or `*`), +1 more from six, +1 for a multi-step marker;
+/// - `file_scope` +1 from three distinct file paths named, +2 from six;
+/// - `crate_scope` +1 from two distinct crates named (`crates/<name>` or a
+///   `spawn-<name>` token), +2 from three;
+/// - `long_brief` +1 above 2000 characters;
+/// - `low_risk` -2: a low-risk marker (typo, spelling, readme, docstring,
+///   ...), only when no `security`, `migration` or `concurrency` rule
+///   matched and no broadening word (every, whatever, caller, implement,
+///   support, feature) is there.
+///
+/// `l3` from [`CLASSIFY_L3_AT`]; `l1` at or below [`CLASSIFY_L1_AT`] when
+/// no risk rule matched, at most one file is named and the brief is at
+/// most [`CLASSIFY_L1_MAX_CHARS`] characters; `l2` otherwise, and for a
+/// brief no rule matched.
+pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
+    let text = brief.to_ascii_lowercase();
+    let tokens: Vec<&str> = text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
+        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/')))
+        .filter(|token| !token.is_empty())
+        .collect();
+    // Keywords are read in every path segment too: `sql/schema.sql` names
+    // the schema.
+    let words: Vec<&str> = tokens
+        .iter()
+        .flat_map(|token| token.split('/'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut signals = Vec::new();
+    let mut add = |rule: &str, points: i32, evidence: Vec<String>| {
+        if points != 0 && !evidence.is_empty() {
+            signals.push(ClassificationSignal {
+                rule: rule.to_string(),
+                points,
+                evidence,
+            });
+        }
+    };
+    let security = matched(&words, &text, SECURITY_STEMS, &[]);
+    let migration = matched(&words, &text, MIGRATION_STEMS, MIGRATION_PHRASES);
+    let concurrency = matched(&words, &text, CONCURRENCY_STEMS, CONCURRENCY_PHRASES);
+    let risky = !(security.is_empty() && migration.is_empty() && concurrency.is_empty());
+    add("security", 4, security);
+    add("migration", 4, migration);
+    add("concurrency", 2, concurrency);
+    add(
+        "cross_cutting",
+        2,
+        matched(&words, &text, CROSS_CUTTING_STEMS, CROSS_CUTTING_PHRASES),
+    );
+    let steps = enumerated_steps(&text);
+    let mut step_evidence = Vec::new();
+    let mut step_points = 0;
+    if steps >= 3 {
+        step_points += if steps >= 6 { 2 } else { 1 };
+        step_evidence.push(format!("{steps} steps"));
+    }
+    let markers = matched(&words, &text, MULTI_STEP_STEMS, &[]);
+    if !markers.is_empty() {
+        step_points += 1;
+        step_evidence.extend(markers);
+    }
+    add("multi_step", step_points, step_evidence);
+    let files = named_paths(&tokens);
+    add(
+        "file_scope",
+        match files {
+            0..=2 => 0,
+            3..=5 => 1,
+            _ => 2,
+        },
+        vec![format!("{files} paths")],
+    );
+    let crate_count = named_crates(&tokens);
+    add(
+        "crate_scope",
+        match crate_count {
+            0 | 1 => 0,
+            2 => 1,
+            _ => 2,
+        },
+        vec![format!("{crate_count} crates")],
+    );
+    let chars = brief.chars().count();
+    add(
+        "long_brief",
+        i32::from(chars > 2000),
+        vec![format!("{chars} chars")],
+    );
+    if !risky && matched(&words, &text, BROADENING_STEMS, &[]).is_empty() {
+        add(
+            "low_risk",
+            -2,
+            matched(&words, &text, LOW_RISK_STEMS, &["docs only", "doc only"]),
+        );
+    }
+    let score: i32 = signals.iter().map(|signal| signal.points).sum();
+    let difficulty = if score >= CLASSIFY_L3_AT {
+        TaskDifficulty::L3
+    } else if score <= CLASSIFY_L1_AT && !risky && files <= 1 && chars <= CLASSIFY_L1_MAX_CHARS {
+        TaskDifficulty::L1
+    } else {
+        TaskDifficulty::L2
+    };
+    DifficultyClassification {
+        difficulty,
+        score,
+        rules: CLASSIFIER_RULES.to_string(),
+        signals,
+    }
+}
+
+/// How long a routable preset may go without a task first assigned to it
+/// at its calibrated grade before the anti-starvation re-probe gives it
+/// one, by default: 6 hours.
+pub const REPROBE_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// When a preset last had a task first assigned to it at one difficulty
+/// (`mission_tasks.first_preset_id`, `difficulty`, `created_at_ms`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetActivity {
+    pub preset_id: String,
+    pub difficulty: TaskDifficulty,
+    pub last_assigned_ms: i64,
+}
+
+/// Whether `preset` is due a re-probe at `now_ms`: routable, its grade not
+/// locked (calibration leaves a locked preset alone, so probing it proves
+/// nothing), and no task first assigned to it at its calibrated grade's
+/// difficulty for `interval_ms`, counted from the later of that last
+/// assignment and its window's start (a preset just onboarded, enabled or
+/// regraded is never due at once). A demoted preset losing every task at
+/// its new grade to a cheaper one, or one graded above every task it is
+/// given, is what this finds.
+pub fn reprobe_due(
+    preset: &GradedPreset,
+    activity: &[PresetActivity],
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    if preset.locked_grade.is_some() || !preset.state.is_routable() {
+        return false;
+    }
+    let Some(grade) = preset.calibrated_grade else {
+        return false;
+    };
+    let last = activity
+        .iter()
+        .filter(|seen| seen.preset_id == preset.preset_id && seen.difficulty == grade.difficulty())
+        .map(|seen| seen.last_assigned_ms)
+        .max()
+        .unwrap_or(i64::MIN)
+        .max(preset.window_start_ms);
+    now_ms.saturating_sub(last) >= interval_ms.max(1)
+}
+
+/// Every preset of `catalog` due a re-probe ([`reprobe_due`]), by id.
+pub fn reprobe_plan(
+    catalog: &[GradedPreset],
+    activity: &[PresetActivity],
+    now_ms: i64,
+    interval_ms: i64,
+) -> Vec<String> {
+    catalog
+        .iter()
+        .filter(|preset| reprobe_due(preset, activity, now_ms, interval_ms))
+        .map(|preset| preset.preset_id.clone())
+        .collect()
+}
+
+/// [`route_preset`] for an unflagged assignment (never a named preset,
+/// never a rework), with the anti-starvation re-probe: when some preset
+/// graded exactly for `difficulty` (so the task lands in its calibration
+/// window) is due a re-probe ([`reprobe_due`]), the task goes to it
+/// instead of the minimum-sufficient one: the longest-starved first, then
+/// by cost rank and id. Bounded: once given the task, a preset is not due
+/// again for `interval_ms`, so each starved preset takes at most one task
+/// per interval, and every other task routes as [`route_preset`] says.
+pub fn route_with_reprobe(
+    difficulty: TaskDifficulty,
+    catalog: &[GradedPreset],
+    activity: &[PresetActivity],
+    now_ms: i64,
+    interval_ms: i64,
+) -> Result<RoutingDecision, RoutingError> {
+    let base = route_preset(difficulty, 0, None, catalog)?;
+    let required = difficulty.required_grade();
+    let last = |preset: &GradedPreset| {
+        activity
+            .iter()
+            .filter(|seen| seen.preset_id == preset.preset_id && seen.difficulty == difficulty)
+            .map(|seen| seen.last_assigned_ms)
+            .max()
+            .unwrap_or(i64::MIN)
+            .max(preset.window_start_ms)
+    };
+    let probe = catalog
+        .iter()
+        .filter(|preset| {
+            preset.preset_id != base.preset_id
+                && preset.calibrated_grade == Some(required)
+                && reprobe_due(preset, activity, now_ms, interval_ms)
+        })
+        .min_by(|a, b| {
+            last(a)
+                .cmp(&last(b))
+                .then(a.cost_rank.cmp(&b.cost_rank))
+                .then_with(|| a.preset_id.cmp(&b.preset_id))
+        });
+    Ok(match probe {
+        Some(preset) => RoutingDecision {
+            preset_id: preset.preset_id.clone(),
+            model_profile: preset.model_profile,
+            preset_grade: required,
+            cost_rank: preset.cost_rank,
+            execution_profile: preset.execution_profile.clone(),
+            reprobe: true,
+            ..base
+        },
+        None => base,
+    })
+}
+
+/// Whether a gate's verdict sends a task back for its quality: `rejected`
+/// alone. A merge `conflict` or an `incompatible` head (fleet concurrency),
+/// a `host_fault`, `no_room` or `aborted` (the host could not judge it,
+/// or a timeout), `stale` (nothing was judged) and `accepted` never count,
+/// and never step a task's rework up.
+pub fn is_quality_rejection(verdict: &str) -> bool {
+    verdict == "rejected"
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn preset(id: &str, grade: SkillGrade, cost_rank: u32) -> GradedPreset {
@@ -648,6 +1215,7 @@ mod tests {
             } else {
                 ModelProfile::Default
             },
+            execution_profile: None,
             cost_rank,
             state: PresetState::Active,
             onboarded_grade: Some(grade),
@@ -1201,5 +1769,380 @@ mod tests {
             serde_json::from_value::<ExamCaseResult>(result).unwrap(),
             case("l1-a", SkillGrade::L1, true)
         );
+    }
+
+    #[test]
+    fn execution_profiles_are_names_and_the_builtins_are_model_profiles() {
+        let named = ExecutionProfile::parse("opus-max").unwrap();
+        assert_eq!(named.as_str(), "opus-max");
+        assert_eq!(named.builtin(), None);
+        assert_eq!(
+            ExecutionProfile::parse("cheap").unwrap().builtin(),
+            Some(ModelProfile::Cheap)
+        );
+        assert_eq!(
+            ExecutionProfile::from(ModelProfile::Default).as_str(),
+            "default"
+        );
+        for bad in ["", "Opus", "a b", "-x", &"x".repeat(65)] {
+            assert_eq!(ExecutionProfile::parse(bad), None, "{bad}");
+        }
+        assert_eq!(serde_json::to_value(&named).unwrap(), json!("opus-max"));
+        assert_eq!(
+            serde_json::from_value::<ExecutionProfile>(json!("local-qwen")).unwrap(),
+            ExecutionProfile::parse("local-qwen").unwrap()
+        );
+        assert!(serde_json::from_value::<ExecutionProfile>(json!("Not A Name")).is_err());
+    }
+
+    #[test]
+    fn a_preset_without_an_execution_profile_serializes_as_in_phase_one() {
+        let mut p = preset("p", SkillGrade::L2, 0);
+        let value = serde_json::to_value(&p).unwrap();
+        assert!(value.get("execution_profile").is_none(), "{value}");
+        assert_eq!(p.profile_name(), "cheap");
+        // A phase-1 record (no execution_profile) still reads.
+        assert_eq!(serde_json::from_value::<GradedPreset>(value).unwrap(), p);
+        p.execution_profile = ExecutionProfile::parse("deepseek-r2");
+        assert_eq!(p.profile_name(), "deepseek-r2");
+        let value = serde_json::to_value(&p).unwrap();
+        assert_eq!(value["execution_profile"], json!("deepseek-r2"));
+        assert_eq!(value["model_profile"], json!("cheap"));
+    }
+
+    #[test]
+    fn routing_carries_any_number_of_named_profiles() {
+        let mut catalog = Vec::new();
+        for (id, profile, rank) in [
+            ("a", "local-qwen", 0),
+            ("b", "deepseek-r2", 1),
+            ("c", "opus-max", 2),
+            ("d", "gemini-pro", 3),
+        ] {
+            let mut p = preset(id, SkillGrade::L2, rank);
+            p.execution_profile = ExecutionProfile::parse(profile);
+            catalog.push(p);
+        }
+        for (named, profile) in [
+            ("a", "local-qwen"),
+            ("b", "deepseek-r2"),
+            ("c", "opus-max"),
+            ("d", "gemini-pro"),
+        ] {
+            let decision = route_preset(TaskDifficulty::L2, 0, Some(named), &catalog).unwrap();
+            assert_eq!(
+                decision
+                    .execution_profile
+                    .as_ref()
+                    .map(ExecutionProfile::as_str),
+                Some(profile)
+            );
+        }
+        let cheapest = route_preset(TaskDifficulty::L2, 0, None, &catalog).unwrap();
+        assert_eq!(cheapest.preset_id, "a");
+        let value = serde_json::to_value(&cheapest).unwrap();
+        assert_eq!(value["execution_profile"], json!("local-qwen"));
+        assert!(value.get("reprobe").is_none(), "{value}");
+        // Without one, a decision serializes as in phase 1.
+        let plain = route_preset(
+            TaskDifficulty::L2,
+            0,
+            None,
+            &[preset("p", SkillGrade::L2, 1)],
+        )
+        .unwrap();
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("execution_profile").is_none(), "{value}");
+    }
+
+    #[test]
+    fn registering_a_profile_keeps_the_builtins_strict_and_names_any_other() {
+        assert_eq!(
+            registered_profile(None, None),
+            Ok((ModelProfile::Default, None))
+        );
+        assert_eq!(
+            registered_profile(Some("cheap"), None),
+            Ok((ModelProfile::Cheap, None))
+        );
+        assert!(registered_profile(Some("x"), None).is_err());
+        assert_eq!(
+            registered_profile(None, Some("opus-max")),
+            Ok((ModelProfile::Default, ExecutionProfile::parse("opus-max")))
+        );
+        assert_eq!(
+            registered_profile(Some("cheap"), Some("local-qwen")),
+            Ok((ModelProfile::Cheap, ExecutionProfile::parse("local-qwen")))
+        );
+        // A builtin name is the model profile itself, never stored as a name.
+        assert_eq!(
+            registered_profile(None, Some("cheap")),
+            Ok((ModelProfile::Cheap, None))
+        );
+        assert!(registered_profile(Some("default"), Some("cheap")).is_err());
+        assert!(registered_profile(None, Some("Bad Name")).is_err());
+    }
+
+    #[test]
+    fn a_brief_no_rule_reads_is_the_default_l2() {
+        for brief in [
+            "a",
+            "fix it",
+            "one",
+            "Implement the thing the objective asks for.",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert_eq!(classified.difficulty, TaskDifficulty::L2, "{brief}");
+            assert!(!classified.has_signal(), "{brief}: {classified:?}");
+            assert_eq!(classified.score, 0);
+            assert_eq!(classified.rules, CLASSIFIER_RULES);
+        }
+        assert_eq!(
+            classify_difficulty("a").rationale(),
+            "l2 (no signal: the default)"
+        );
+    }
+
+    #[test]
+    fn security_and_migration_markers_classify_l3() {
+        let security = classify_difficulty("Harden authentication: stop the SQL injection");
+        assert_eq!(security.difficulty, TaskDifficulty::L3);
+        assert_eq!(security.signals[0].rule, "security");
+        assert_eq!(
+            security.signals[0].evidence,
+            vec!["authenticat".to_string(), "injection".to_string()]
+        );
+        let migration = classify_difficulty("Add a column with ALTER TABLE and backfill it");
+        assert_eq!(migration.difficulty, TaskDifficulty::L3);
+        assert!(
+            migration
+                .rationale()
+                .starts_with("l3 (score 4: migration +4")
+        );
+        // Two medium signals together reach l3 too.
+        let both = classify_difficulty("Refactor the dispatcher to remove the race condition");
+        assert_eq!(both.difficulty, TaskDifficulty::L3);
+        assert_eq!(both.score, 4);
+        // One alone does not.
+        assert_eq!(
+            classify_difficulty("Refactor the dispatcher loop").difficulty,
+            TaskDifficulty::L2
+        );
+    }
+
+    #[test]
+    fn scope_and_steps_add_up() {
+        let brief = "Change crates/spawn-core/src/a.rs, crates/spawn-cli/src/b.rs and \
+                     crates/spawn-postgres/sql/schema.sql:\n1. one\n2. two\n3. three\n";
+        let classified = classify_difficulty(brief);
+        let rules: Vec<&str> = classified
+            .signals
+            .iter()
+            .map(|signal| signal.rule.as_str())
+            .collect();
+        // schema.sql names a migration; three files, three crates, three steps.
+        assert_eq!(
+            rules,
+            vec!["migration", "multi_step", "file_scope", "crate_scope"]
+        );
+        assert_eq!(classified.difficulty, TaskDifficulty::L3);
+        let crates = classified
+            .signals
+            .iter()
+            .find(|signal| signal.rule == "crate_scope")
+            .unwrap();
+        assert_eq!(
+            (crates.points, crates.evidence[0].as_str()),
+            (2, "3 crates")
+        );
+        // Steps alone stay l2.
+        let steps = classify_difficulty("- a\n- b\n- c\n- d\n- e\n- f\n");
+        assert_eq!(steps.score, 2);
+        assert_eq!(steps.difficulty, TaskDifficulty::L2);
+    }
+
+    #[test]
+    fn small_low_risk_work_classifies_l1_unless_something_risky_is_named() {
+        let typo = classify_difficulty("Fix the typo in README.md");
+        assert_eq!(typo.difficulty, TaskDifficulty::L1);
+        assert_eq!(typo.signals[0].rule, "low_risk");
+        assert_eq!(typo.score, -2);
+        // A risk marker cancels the low-risk rule.
+        let risky = classify_difficulty("Fix the typo in the password check");
+        assert_eq!(risky.difficulty, TaskDifficulty::L3);
+        assert!(risky.signals.iter().all(|signal| signal.rule != "low_risk"));
+        // Too many files, or too long, is not l1.
+        assert_eq!(
+            classify_difficulty("Rename x in a.rs and b.rs").difficulty,
+            TaskDifficulty::L2
+        );
+        let long = format!("Fix a typo. {}", "word ".repeat(100));
+        assert_eq!(classify_difficulty(&long).difficulty, TaskDifficulty::L2);
+    }
+
+    #[test]
+    fn generic_words_never_send_real_work_to_l1() {
+        for brief in [
+            "Add comment support to the web timeline",
+            "Rename spawn_task_assign and update every caller",
+            "Bump tokio and fix whatever breaks",
+            "Fix the typo in every error message",
+            "Implement README rendering",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert!(
+                classified.difficulty >= TaskDifficulty::L2,
+                "{brief}: {classified:?}"
+            );
+            assert!(
+                classified
+                    .signals
+                    .iter()
+                    .all(|signal| signal.rule != "low_risk"),
+                "{brief}: {classified:?}"
+            );
+        }
+        assert_eq!(
+            classify_difficulty("Fix the spelling in the docstring").difficulty,
+            TaskDifficulty::L1
+        );
+    }
+
+    #[test]
+    fn classification_is_deterministic_and_carries_no_brief_text() {
+        let brief = "Rotate the credential in deploy/secret.env; tok=sk-abcdef0123456789";
+        let first = classify_difficulty(brief);
+        assert_eq!(first, classify_difficulty(brief));
+        let value = serde_json::to_value(&first).unwrap();
+        let text = value.to_string();
+        assert!(!text.contains("sk-abcdef"), "{text}");
+        assert!(!text.contains("deploy/secret.env"), "{text}");
+        assert_eq!(value["difficulty"], json!("l3"));
+        assert_eq!(value["rules"], json!(CLASSIFIER_RULES));
+    }
+
+    fn seen(id: &str, difficulty: TaskDifficulty, at: i64) -> PresetActivity {
+        PresetActivity {
+            preset_id: id.to_string(),
+            difficulty,
+            last_assigned_ms: at,
+        }
+    }
+
+    #[test]
+    fn a_preset_is_due_a_reprobe_only_after_an_interval_without_tasks() {
+        let interval = 1000;
+        let mut p = preset("p", SkillGrade::L2, 1);
+        p.window_start_ms = 5_000;
+        // Never assigned: counted from its window's start.
+        assert!(!reprobe_due(&p, &[], 5_999, interval));
+        assert!(reprobe_due(&p, &[], 6_000, interval));
+        // Assigned at its grade's difficulty recently: not due.
+        let recent = [seen("p", TaskDifficulty::L2, 5_500)];
+        assert!(!reprobe_due(&p, &recent, 6_000, interval));
+        assert!(reprobe_due(&p, &recent, 6_500, interval));
+        // A task at another difficulty, or another preset's, does not count.
+        let other = [
+            seen("p", TaskDifficulty::L1, 5_900),
+            seen("q", TaskDifficulty::L2, 5_900),
+        ];
+        assert!(reprobe_due(&p, &other, 6_000, interval));
+        // Locked, unroutable or ungraded: never due.
+        let mut locked = p.clone();
+        locked.locked_grade = Some(SkillGrade::L2);
+        assert!(!reprobe_due(&locked, &[], 1_000_000, interval));
+        let mut off = p.clone();
+        off.state = PresetState::Disabled;
+        assert!(!reprobe_due(&off, &[], 1_000_000, interval));
+        let mut ungraded = p.clone();
+        ungraded.calibrated_grade = None;
+        assert!(!reprobe_due(&ungraded, &[], 1_000_000, interval));
+        assert_eq!(
+            reprobe_plan(&[p, locked, off], &recent, 6_500, interval),
+            vec!["p".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_starved_demoted_preset_gets_one_probe_per_interval() {
+        let interval = 1000;
+        let cheap = preset("cheap-l1", SkillGrade::L1, 0);
+        let mut demoted = preset("demoted", SkillGrade::L2, 5);
+        demoted.calibrated_grade = Some(SkillGrade::L1);
+        demoted.state = PresetState::Demoted;
+        let strong = preset("strong", SkillGrade::L3, 9);
+        let catalog = vec![cheap, demoted, strong];
+        // Before the interval: the cheapest l1, as route_preset says.
+        let early = route_with_reprobe(TaskDifficulty::L1, &catalog, &[], 999, interval).unwrap();
+        assert_eq!(early.preset_id, "cheap-l1");
+        assert!(!early.reprobe);
+        // After it: the starved one, flagged.
+        let probe = route_with_reprobe(TaskDifficulty::L1, &catalog, &[], 1_000, interval).unwrap();
+        assert_eq!(probe.preset_id, "demoted");
+        assert!(probe.reprobe);
+        assert!(!probe.explicit);
+        assert_eq!(probe.preset_grade, SkillGrade::L1);
+        assert_eq!(probe.cost_rank, 5);
+        assert_eq!(
+            serde_json::to_value(&probe).unwrap()["reprobe"],
+            json!(true)
+        );
+        // Given that task, it is not due again within the interval: bounded.
+        let after = [seen("demoted", TaskDifficulty::L1, 1_000)];
+        assert_eq!(
+            route_with_reprobe(TaskDifficulty::L1, &catalog, &after, 1_500, interval)
+                .unwrap()
+                .preset_id,
+            "cheap-l1"
+        );
+        // The same facts decide the same way: idempotent.
+        assert_eq!(
+            route_with_reprobe(TaskDifficulty::L1, &catalog, &after, 1_500, interval),
+            route_with_reprobe(TaskDifficulty::L1, &catalog, &after, 1_500, interval)
+        );
+        // An l3 preset graded above an l2 task is never probed with it: the
+        // task would not land in its window.
+        assert_eq!(
+            route_with_reprobe(TaskDifficulty::L2, &catalog, &[], 10_000, interval)
+                .unwrap()
+                .preset_id,
+            "strong"
+        );
+    }
+
+    #[test]
+    fn the_longest_starved_preset_is_probed_first() {
+        let interval = 100;
+        let catalog = vec![
+            preset("base", SkillGrade::L2, 0),
+            preset("x", SkillGrade::L2, 3),
+            preset("y", SkillGrade::L2, 4),
+        ];
+        let activity = [
+            seen("x", TaskDifficulty::L2, 500),
+            seen("y", TaskDifficulty::L2, 200),
+        ];
+        let decision =
+            route_with_reprobe(TaskDifficulty::L2, &catalog, &activity, 1_000, interval).unwrap();
+        assert_eq!(decision.preset_id, "y");
+        // With nothing routable the refusal is route_preset's.
+        assert!(route_with_reprobe(TaskDifficulty::L3, &catalog, &[], 1_000, interval).is_err());
+    }
+
+    #[test]
+    fn only_a_gates_rejected_is_a_quality_rejection() {
+        assert!(is_quality_rejection("rejected"));
+        for verdict in [
+            "accepted",
+            "conflict",
+            "incompatible",
+            "host_fault",
+            "no_room",
+            "aborted",
+            "stale",
+            "",
+        ] {
+            assert!(!is_quality_rejection(verdict), "{verdict}");
+        }
     }
 }

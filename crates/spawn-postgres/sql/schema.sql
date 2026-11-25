@@ -1661,6 +1661,15 @@ create table if not exists grading_presets (
     last_event       bigint  not null
 );
 
+-- Agent grading phase 2: the named execution profile a preset stands for
+-- (`opus-max`, `local-qwen`, ...: any name of a preset id's shape but the
+-- two model profiles' own), run on `model_profile`; null: its profile is
+-- its `model_profile`, as in phase 1. Added here only, so a migrated
+-- table keeps a fresh one's column order.
+alter table grading_presets add column if not exists execution_profile text
+    check (execution_profile ~ '^[a-z0-9][a-z0-9_-]{0,63}$'
+           and execution_profile not in ('default', 'cheap'));
+
 -- Calibration's window: the tasks first assigned to a preset, at one
 -- difficulty, newest first (spawn-postgres grading.rs `OUTCOMES`).
 create index if not exists mission_tasks_first_preset
@@ -3389,6 +3398,8 @@ drop function if exists spawn_task_assign(bigint, text, text, text);
 drop function if exists spawn_task_assign(bigint, text, text, text, text);
 drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean);
 drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean, boolean);
+drop function if exists spawn_task_assign(bigint, text, text, text, text, boolean, boolean,
+                                          integer, text);
 -- `p_pin` (objective 239, `--pin`): the task stays with its worker, never
 -- stolen; the record names `pinned` true, and nothing otherwise.
 -- Agent grading (docs/agent-grading.md): `p_difficulty` (1 to 3, `l1` to
@@ -3399,13 +3410,20 @@ drop function if exists spawn_task_assign(bigint, text, text, text, text, boolea
 -- `p_model` its model profile. The record names `difficulty` (`l1` to
 -- `l3`) and `preset_id` only when a preset is named or the difficulty is
 -- not the default, so an assignment without the catalog records what it
--- did before.
+-- did before. Phase 2: `p_classification`, the difficulty classifier's
+-- decision and its rationale (`spawn_core::grading::classify_difficulty`,
+-- an object naming `difficulty`, `score`, `rules` and `signals`) for an
+-- unflagged assignment, recorded as `classification` so the record says
+-- why it was routed where it was; and a named preset's
+-- `execution_profile`, recorded when it has one. Without either the
+-- record is as before.
 create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text,
                                              p_brief text, p_model text default 'default',
                                              p_again boolean default false,
                                              p_pin boolean default false,
                                              p_difficulty integer default 2,
-                                             p_preset text default null)
+                                             p_preset text default null,
+                                             p_classification jsonb default null)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -3433,6 +3451,13 @@ begin
     end if;
     if p_difficulty is null or p_difficulty not in (1, 2, 3) then
         raise exception 'a task''s difficulty is 1, 2 or 3 (l1, l2 or l3), not %', p_difficulty;
+    end if;
+    if p_classification is not null
+       and (jsonb_typeof(p_classification) <> 'object'
+            or spawn_grade_wire(p_classification -> 'difficulty') is null
+            or jsonb_typeof(p_classification -> 'signals') is distinct from 'array') then
+        raise exception 'a classification is an object naming its difficulty and signals, not %',
+            p_classification;
     end if;
     if p_preset is not null then
         select * into v_preset from grading_presets where preset_id = p_preset;
@@ -3494,6 +3519,12 @@ begin
         || case when p_preset is not null or p_difficulty <> 2
                 then jsonb_strip_nulls(jsonb_build_object('difficulty', 'l' || p_difficulty,
                                                           'preset_id', p_preset))
+                else '{}'::jsonb end
+        || case when v_preset.execution_profile is not null
+                then jsonb_build_object('execution_profile', v_preset.execution_profile)
+                else '{}'::jsonb end
+        || case when p_classification is not null
+                then jsonb_build_object('classification', p_classification)
                 else '{}'::jsonb end);
     return v_id;
 end $$;
@@ -3776,7 +3807,11 @@ begin
     v_record := jsonb_build_object(
         'type', 'task.rerouted', 'id', p_task, 'preset_id', p_preset,
         'model', v_preset.model_profile, 'from_preset_id', v_task.preset_id,
-        'revision', p_revision, 'routed_difficulty', 'l' || p_routed_difficulty);
+        'revision', p_revision, 'routed_difficulty', 'l' || p_routed_difficulty)
+        -- Phase 2: the preset's named execution profile, when it has one.
+        || case when v_preset.execution_profile is not null
+                then jsonb_build_object('execution_profile', v_preset.execution_profile)
+                else '{}'::jsonb end;
     perform spawn_control_record(v_record);
     return v_record;
 end $$;
@@ -3788,7 +3823,8 @@ end $$;
 -- alone. Applying a record never validates: the log is the truth, and
 -- replaying it (`spawn_grading_refold`) gives the same table. Grades are
 -- wire names (`l1` to `l3`, null for none). Records:
---   preset.registered    {preset_id, engine_label, model_label, model_profile, cost_rank}
+--   preset.registered    {preset_id, engine_label, model_label, model_profile, cost_rank,
+--                         execution_profile (phase 2, optional: a named profile)}
 --   preset.onboarded     {preset_id, from_state, to_state, to_grade (null: failed l1),
 --                         passed, total, failed_cases, suite}
 --   preset.regraded      {preset_id, decision, from_grade, to_grade, from_state, to_state,
@@ -3805,10 +3841,10 @@ begin
     when 'preset.registered' then
         insert into grading_presets (preset_id, engine_label, model_label, model_profile,
                                      cost_rank, state, window_start_ms, created_at_ms,
-                                     updated_at_ms, last_event)
+                                     updated_at_ms, last_event, execution_profile)
         values (v_id, p_record ->> 'engine_label', p_record ->> 'model_label',
                 p_record ->> 'model_profile', (p_record ->> 'cost_rank')::integer,
-                'unexamined', p_at, p_at, p_at, p_event);
+                'unexamined', p_at, p_at, p_at, p_event, p_record ->> 'execution_profile');
     when 'preset.onboarded' then
         update grading_presets
            set onboarded_grade = spawn_grade_rank(p_record ->> 'to_grade'),
@@ -3880,6 +3916,10 @@ begin
     if v_keys is null then
         raise exception 'not a grading record: %', v_type;
     end if;
+    -- Phase 2: a registration may name its execution profile.
+    if v_type = 'preset.registered' and p_record ? 'execution_profile' then
+        v_keys := array_append(v_keys, 'execution_profile');
+    end if;
     if exists (select 1 from jsonb_object_keys(p_record) k where k <> all(v_keys))
        or exists (select 1 from unnest(v_keys) k where not p_record ? k) then
         raise exception 'a % record has %, and nothing else', v_type, array_to_string(v_keys, ', ');
@@ -3903,6 +3943,13 @@ begin
            or p_record ->> 'model_profile' not in ('default', 'cheap') then
             raise exception 'a preset runs on the default or cheap model profile, not %',
                 p_record -> 'model_profile';
+        end if;
+        if p_record ? 'execution_profile'
+           and (jsonb_typeof(p_record -> 'execution_profile') is distinct from 'string'
+                or p_record ->> 'execution_profile' !~ '^[a-z0-9][a-z0-9_-]{0,63}$'
+                or p_record ->> 'execution_profile' in ('default', 'cheap')) then
+            raise exception 'a preset''s execution profile is a name [a-z0-9][a-z0-9_-]{0,63} other than default and cheap (those are model_profile), not %',
+                p_record -> 'execution_profile';
         end if;
         if (case when jsonb_typeof(p_record -> 'cost_rank') = 'number'
                  then (p_record ->> 'cost_rank')::numeric
@@ -7807,7 +7854,7 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text, jsonb)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
@@ -7847,7 +7894,7 @@ begin
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text)',
+        'spawn_task_assign(bigint, text, text, text, text, boolean, boolean, integer, text, jsonb)',
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_restart(bigint, text)',
         'spawn_task_reassign(bigint, text)', 'spawn_resident_propose(text, text, text)',

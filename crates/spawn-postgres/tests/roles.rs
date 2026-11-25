@@ -674,7 +674,7 @@ const SUPERVISOR_FUNCTIONS: [&str; 14] = [
     "spawn_objective_retire(jsonb) EXECUTE",
     "spawn_resident_propose(text,text,text) EXECUTE",
     "spawn_resident_retire(text) EXECUTE",
-    "spawn_task_assign(bigint,text,text,text,text,boolean,boolean,integer,text) EXECUTE",
+    "spawn_task_assign(bigint,text,text,text,text,boolean,boolean,integer,text,jsonb) EXECUTE",
     "spawn_task_cancel(bigint) EXECUTE",
     "spawn_task_reassign(bigint,text) EXECUTE",
     "spawn_task_reroute(bigint,text,integer,integer) EXECUTE",

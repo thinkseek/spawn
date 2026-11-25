@@ -497,6 +497,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     warnings.extend(more);
     let (nodes, more) = crate::nodes::Heartbeat::from_env();
     warnings.extend(more);
+    let (grading, more) = crate::grading::Upkeep::from_env();
+    warnings.extend(more);
     // A price the loop cannot read would record every cost wrong: it stops
     // here, naming the setting.
     let prices = cost::Prices::from_env()?;
@@ -526,6 +528,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         storage_bytes: crate::storage_bytes::Sampler::default(),
         core_lines,
         nodes,
+        grading,
         terminals: crate::config::terminal_host()?,
         config,
         recovery: crate::recover::Recovery::new(),
@@ -581,6 +584,10 @@ struct Fleet<'a> {
     /// its probes and its records run on a worker thread with a database
     /// connection of its own; a pass only takes its lines.
     nodes: crate::nodes::Heartbeat,
+    /// Agent grading's upkeep (docs/agent-grading.md, "Upkeep"): calibration
+    /// applied and the presets due an anti-starvation re-probe listed, on
+    /// its own clock (`SPAWN_GRADING_UPKEEP_SECS`, [`crate::grading::Upkeep`]).
+    grading: crate::grading::Upkeep,
     /// The terminal host the recovery asks whether a native session's
     /// terminal server lives on (an end found with it gone is a host
     /// restart).
@@ -804,6 +811,12 @@ impl Fleet<'_> {
         // Nor the nodes' heartbeat: its probes and its reads and writes run
         // on its own worker; a pass takes only the lines it said.
         lines.extend(self.nodes.check(open));
+        // Nor agent grading's upkeep: bounded to one run a period, and a run
+        // that failed is said and tried again a minute later.
+        match self.grading.check(open, now) {
+            Ok(line) => lines.extend(line),
+            Err(error) => lines.push(error),
+        }
         // The recovery first of the rules that revive an agent: it records
         // every interruption once, with its cause and its evidence, and
         // takes the one way back that cause has. The dispatcher's

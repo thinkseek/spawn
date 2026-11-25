@@ -138,7 +138,7 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn commit-map load <file> --source <git dir>\n       \
      spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]\n       \
-     spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate ...   (the grading catalog: spawn grade --help for each verb's flags)";
+     spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =

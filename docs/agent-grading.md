@@ -1,4 +1,4 @@
-# Agent grading (phase 1)
+# Agent grading (phases 1 and 2)
 
 Which graded preset a task runs on: the cheapest one proven good enough for
 the task, moved to a stronger one when its rework keeps failing on quality,
@@ -97,10 +97,8 @@ preset in the same statement (both or neither). When no routable preset is
 strong enough, the task is still sent back and the answer carries
 `reroute_error`.
 
-Only a review reroutes. A gate's `rejected` counts as a quality rejection
-(it steps up the next review's reroute and fails first pass) but does not
-reroute by itself, so in a mission whose gate alone accepts (most of
-Spawn's own RSI missions) a task stays on its preset.
+A gate's `rejected` reroutes too (phase 2, "Gate step-up" below). In
+phase 1 only a review did.
 
 ## Storage (`crates/spawn-postgres/sql/schema.sql`)
 
@@ -192,9 +190,149 @@ check at 30 s in Rust and treats exit 2, a signal or the time limit as a
 harness fault that stops the exam. It is not sandboxed, and the workspace
 must not see `evals/`: see `evals/onboarding/README.md`.
 
-## Known limits of phase 1
+## Phase 2 (GitHub issue #99)
 
-- **Demoted presets can starve.** Calibration reads only tasks at the
+Every phase-1 call, record, answer and test is unchanged: each addition is
+named only when it says something.
+
+### Difficulty classifier (`classify_difficulty`, rules `brief-v1`)
+
+An unflagged ephemeral `spawn task assign` (no `--difficulty`, `--preset`
+or `--model`; never a resident) with a non-empty catalog has its
+difficulty classified from the brief, before the catalog's coverage is
+checked (see below). The rules are pure, integer-only
+and deterministic, and every rule that matched is kept as evidence:
+
+| rule | points | matches |
+|---|---|---|
+| `security` | +4 | security, vulnerab*, exploit, authenticat*, authoriz*, credential, password, privilege, injection, csrf, xss, sandbox, secret |
+| `migration` | +4 | migrat*, schema, backfill, refold, "alter table", "data loss", "breaking change" |
+| `concurrency` | +2 | deadlock, concurren*, transaction, atomic, "race condition", "advisory lock" |
+| `cross_cutting` | +2 | refactor, redesign, architect*, rewrite, "across crates", "every crate", "backwards compat" |
+| `multi_step` | +1/+2, +1 | 3 (6) or more enumerated steps; a multi-step marker (phase, pipeline, end-to-end) |
+| `file_scope` | +1/+2 | 3 (6) or more distinct paths |
+| `crate_scope` | +1/+2 | 2 (3) or more distinct crates |
+| `long_brief` | +1 | above 2000 characters |
+| `low_risk` | -2 | typo, spelling, wording, readme, docstring, formatting, one-line, "docs only" (only when no risk rule matched and no broadening word is there: every, whatever, caller*, implement*, support*, feature*). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+
+Keywords are read per word and per path segment (`sql/schema.sql` names
+the schema). The score is `l3` from 4; `l1` at -2 or below with no risk
+rule, at most one path and at most 400 characters; `l2` otherwise. A brief
+no rule matches is `l2`, exactly as phase 1 routed it. The evidence is the
+rule's own vocabulary (a keyword of its list, a count), never text of the
+brief.
+
+The brief is classified before the catalog's coverage is checked. The
+task is routed at the classified difficulty when some routable preset is
+graded for it, else at `l2` when some is graded `l2` or above. Otherwise
+it is assigned on `--model default` with `routing_fallback`. This means
+an `l1` task still reaches an `l1` preset when nothing covers `l2`: for
+example, the sole preset demoted `l2 → l1` keeps taking `l1` work, refills
+its window and can be restored. The `task.assigned` record carries the
+decision as `classification` {difficulty, score, rules, signals,
+rationale, routed_at (only when it ran at another difficulty)}, through
+`spawn_task_assign`'s new last parameter `p_classification jsonb default
+null`. The answer carries `classification` when a rule matched, and says
+so on stderr. `--difficulty`, `--preset`, `--model` and `--again` behave
+exactly as before. An empty catalog still means `--model default`
+without a word.
+
+### Gate step-up
+
+A gate's `rejected` verdict (`is_quality_rejection`; never `conflict`,
+`incompatible`, `host_fault`, `no_room`, `aborted` or `stale`) of a task
+routed through the catalog reroutes its rework under `spawn task
+reject`'s rule (`quality_reroute`, the same `for_rework` thresholds,
+counting review and gate rejections together). It is recorded in the
+verdict's own statement: `spawn_integrator_record` and
+`spawn_task_reroute` in one SQL statement
+(`PostgresStore::integrator_record_rerouted`, crate spawn-cli
+`integrate::record_gated`), both or neither. A reroute the catalog cannot
+make (nothing strong enough) or the store refuses never costs the
+verdict: the integrator says so and records the verdict alone, as in
+phase 1.
+
+### Upkeep and the anti-starvation re-probe
+
+- **Re-probe** (`reprobe_due`, `route_with_reprobe`): a routable preset
+  whose grade is not locked, with no task first assigned to it at its
+  calibrated grade's difficulty for `SPAWN_GRADING_REPROBE_SECS` (default
+  21600; `0`: never), counted from the later of that task and its
+  `window_start_ms`, is *due*. The next unflagged assignment routed at
+  exactly that difficulty goes to it instead of the minimum-sufficient
+  preset: the longest-starved first, then cost rank, then id. The answer
+  says `reprobe: true`. This is bounded: once it has the task, the preset
+  is not due again for an interval. It is idempotent: it is derived from
+  `mission_tasks` (`PostgresStore::grading_activity`), not recorded.
+  Explicit routing and rework never re-probe. A demoted preset now
+  refills its window, and a dearer preset of the same grade is probed
+  too.
+- **Upkeep** (`spawn grade upkeep [--apply] [--json]`; the fleet loop runs
+  it with `--apply` every `SPAWN_GRADING_UPKEEP_SECS`, default 21600,
+  `0`: never, first at the loop's start): calibration as `spawn grade
+  calibrate`, then the presets due a re-probe and whether `l2` is
+  uncovered. Each run is one catalog read plus one window per routed
+  preset, with at most one record per preset. A regraded preset's window
+  starts afresh, so a second run holds. A failed run is said and tried
+  again a minute later; it never fails a pass. The loop prints a line only
+  when something was applied or is due.
+
+### Named execution profiles
+
+`grading_presets.execution_profile` (an added column, nullable) names the
+profile a preset stands for: any `[a-z0-9][a-z0-9_-]{0,63}` but `default`
+and `cheap`, which are `model_profile` itself. The worker still runs on
+`model_profile` (`--model default|cheap`, `mission_tasks.model`): the
+dispatcher knows two runtimes. The catalog, routing, `spawn grade` and
+the API now tell apart as many profiles as presets name.
+
+- `spawn grade register ... [--execution-profile <name>]` (the record's
+  optional `execution_profile`).
+- `spawn grade list`'s text table has a new `PROFILE` column, after
+  `MODEL`: the preset's execution profile, else its model profile's name.
+  The table is for people and its layout changed. `spawn grade list
+  --json` stays phase-1 compatible: every phase-1 field is as it was, and
+  `execution_profile` appears only on a preset that has one.
+- `RoutingDecision.execution_profile`, the assign answer's
+  `execution_profile`, and `task.assigned` / `task.rerouted` carry it when
+  the preset has one.
+- `GET /api/grading`: `{presets: [... every catalog field, routing_grade,
+  profile, reprobe_due], profiles: [sorted names]}`, read-only.
+
+## Known limits
+
+- **Only an unflagged ephemeral `spawn task assign` is classified and
+  routed.** A task made from an objective (the SQL function
+  `spawn_objective_assign`, which the integrator and the objective
+  missions use to assign by objective, such as Mission #4) carries no difficulty and no preset. It is never
+  classified or routed through the catalog, and has no gate step-up,
+  since a task without a preset is never rerouted. It runs on `--model
+  default` as before. The same holds for a resident task without
+  `--difficulty` or `--preset`.
+- **Item 4 of issue #99 is name-only.** `execution_profile` is carried by
+  the catalog, routing, the records, `spawn grade` and `/api/grading`, but
+  the dispatcher still runs every worker on `model_profile` (`default` or
+  `cheap`). `spawn mission list` and the web UI do not yet show a task's
+  difficulty, preset, classification or step-up history, and no page
+  reads `/api/grading`. This change does not close issue #99 on its own.
+- The classifier reads only the brief's words and structure. A low-risk
+  marker in a brief that names consequential work still reads `l1`: for
+  example, "One-line fix: make the dispatcher retry forever" classifies
+  `l1` on `one-line`. Name `--difficulty` when the wording understates
+  the change.
+- A malformed `SPAWN_GRADING_REPROBE_SECS` is warned about once per
+  process (on stderr), and the default is used. It does not
+  read the code a task will touch.
+- A re-probe gives a starved preset real work at its grade: work it is
+  graded for, though possibly dearer than the cheapest choice. Set
+  `SPAWN_GRADING_REPROBE_SECS=0` to turn it off.
+- An execution profile is not run by the dispatcher. It is a name the
+  catalog, routing and records carry, and the worker runs on its
+  `model_profile`.
+
+## Known limits of phase 1 (phase 2 addresses those marked)
+
+- **Demoted presets can starve** (phase 2: the re-probe). Calibration reads only tasks at the
   difficulty of a preset's calibrated grade, and routing gives each
   difficulty to the minimum-sufficient grade, then the cheapest. A preset
   demoted `l2 → l1` competes for `l1` tasks with every `l1` preset; if one
@@ -203,10 +341,13 @@ must not see `evals/`: see `evals/onboarding/README.md`.
   (`--preset`) on tasks at its grade. Likewise a preset graded above every
   difficulty it is given (an `l3` preset taking only `l2` work) has an
   empty window and is never calibrated.
-- Gate rejections do not reroute; only a review's `spawn task reject` does.
-- Calibration runs when a person runs it; nothing schedules it.
+- Gate rejections do not reroute; only a review's `spawn task reject` does
+  (phase 2: the gate step-up).
+- Calibration runs when a person runs it; nothing schedules it (phase 2:
+  the loop's upkeep).
 - A re-issued or reassigned task keeps its preset without checking that it
   is still routable.
 - The suite's default path is relative to the working directory.
-- No page shows the catalog; `spawn grade list` does. `spawn mission list`
+- No page shows the catalog; `spawn grade list` does (phase 2:
+  `/api/grading` serves it; no page reads it yet). `spawn mission list`
   shows a task's `model`, not its difficulty or preset.

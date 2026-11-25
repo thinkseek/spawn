@@ -13,7 +13,8 @@ use serde::Serialize;
 use serde_json::Value;
 use spawn_core::event::ModelProfile;
 use spawn_core::grading::{
-    CALIBRATION_WINDOW, GradedPreset, PresetState, SkillGrade, TaskDifficulty, TaskOutcomeSample,
+    CALIBRATION_WINDOW, ExecutionProfile, GradedPreset, PresetActivity, PresetState, SkillGrade,
+    TaskDifficulty, TaskOutcomeSample,
 };
 use spawn_core::port::StoreError;
 
@@ -22,8 +23,21 @@ use crate::PostgresStore;
 /// Every graded preset, by id.
 const CATALOG: &str = "select preset_id, engine_label, model_label, model_profile, cost_rank,
                               state, onboarded_grade, calibrated_grade, locked_grade,
-                              window_start_ms, created_at_ms, updated_at_ms, last_event
+                              window_start_ms, created_at_ms, updated_at_ms, last_event,
+                              execution_profile
                          from grading_presets order by preset_id";
+
+/// When each preset last had a task first assigned to it, by difficulty:
+/// the facts the anti-starvation re-probe reads
+/// (`spawn_core::grading::reprobe_due`). Grouped on the leading columns of
+/// `mission_tasks_first_preset` (`first_preset_id`, `difficulty`), whose
+/// rows it reads for `created_at_ms`, which that index does not hold (it
+/// holds `updated_at_ms`, calibration's order).
+const ACTIVITY: &str = "select first_preset_id, difficulty, max(created_at_ms)
+                          from mission_tasks
+                         where first_preset_id is not null
+                         group by first_preset_id, difficulty
+                         order by first_preset_id, difficulty";
 
 /// A preset's calibration window: the tasks first assigned to preset `$1`
 /// (`first_preset_id`, which a rework reroute never moves: a task counts
@@ -79,12 +93,20 @@ fn preset(row: &postgres::Row) -> Result<GradedPreset, StoreError> {
     let model: String = row.get("model_profile");
     let state: String = row.get("state");
     let cost_rank: i32 = row.get("cost_rank");
+    let execution_profile: Option<String> = row.get("execution_profile");
     Ok(GradedPreset {
         preset_id: row.get("preset_id"),
         engine_label: row.get("engine_label"),
         model_label: row.get("model_label"),
         model_profile: ModelProfile::parse(&model)
             .ok_or_else(|| StoreError::Backend(format!("a stored model profile {model}")))?,
+        execution_profile: execution_profile
+            .map(|name| {
+                ExecutionProfile::parse(&name).ok_or_else(|| {
+                    StoreError::Backend(format!("a stored execution profile {name}"))
+                })
+            })
+            .transpose()?,
         cost_rank: u32::try_from(cost_rank)
             .map_err(|_| StoreError::Backend(format!("a stored cost rank {cost_rank}")))?,
         state: PresetState::parse(&state)
@@ -169,6 +191,24 @@ impl PostgresStore {
         .transpose()
     }
 
+    /// When each preset last had a task first assigned to it, by
+    /// difficulty ([`ACTIVITY`]).
+    pub fn grading_activity(&self) -> Result<Vec<PresetActivity>, StoreError> {
+        self.query(ACTIVITY, &[])?
+            .iter()
+            .map(|row| {
+                let rank: i16 = row.get(1);
+                Ok(PresetActivity {
+                    preset_id: row.get(0),
+                    difficulty: TaskDifficulty::from_rank(i64::from(rank)).ok_or_else(|| {
+                        StoreError::Backend(format!("a stored difficulty {rank}"))
+                    })?,
+                    last_assigned_ms: row.get(2),
+                })
+            })
+            .collect()
+    }
+
     /// As [`Self::task_assign_with`], at `difficulty` and on the graded
     /// preset `preset` (routed by the caller; `model` its model profile),
     /// or on none.
@@ -185,8 +225,31 @@ impl PostgresStore {
         difficulty: TaskDifficulty,
         preset: Option<&str>,
     ) -> Result<i64, StoreError> {
+        self.task_assign_classified(
+            mission, kind, worker, brief, model, again, pin, difficulty, preset, None,
+        )
+    }
+
+    /// As [`Self::task_assign_routed`], recording the difficulty
+    /// classifier's decision (`classification`, an object naming its
+    /// `difficulty`, `score`, `rules` and `signals`) on the
+    /// `task.assigned` record when there is one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_assign_classified(
+        &self,
+        mission: i64,
+        kind: &str,
+        worker: &str,
+        brief: &str,
+        model: &str,
+        again: bool,
+        pin: bool,
+        difficulty: TaskDifficulty,
+        preset: Option<&str>,
+        classification: Option<&Value>,
+    ) -> Result<i64, StoreError> {
         let row = self.query_one(
-            "select spawn_task_assign($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "select spawn_task_assign($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
                 &mission,
                 &kind,
@@ -197,6 +260,7 @@ impl PostgresStore {
                 &pin,
                 &i32::from(difficulty.rank()),
                 &preset,
+                &classification,
             ],
         )?;
         Ok(row.get(0))
@@ -228,5 +292,47 @@ impl PostgresStore {
                 &i32::from(routed_difficulty.rank()),
             ],
         )
+    }
+
+    /// Record the integrator's `record` (a `task.gated` whose verdict is a
+    /// quality rejection, `rejected`) and, in the same statement, reroute
+    /// the task's next revision to `preset` (`spawn_task_reroute`, at
+    /// `routed_revision` and `routed_difficulty`), exactly as
+    /// [`Self::task_reject_rerouted`] does for a review: both are recorded
+    /// or neither. A record the integrator already made (its
+    /// `spawn_integrator_record` answers null) reroutes nothing and is
+    /// refused as [`Self::integrator_record`] refuses it. Returns the
+    /// verdict's event id and the `task.rerouted` record.
+    pub fn integrator_record_rerouted(
+        &self,
+        record: &Value,
+        preset: &str,
+        routed_revision: i32,
+        routed_difficulty: TaskDifficulty,
+    ) -> Result<(i64, Value), StoreError> {
+        let record = crate::control_mask::masked(record);
+        let task = record["id"].as_i64().ok_or_else(|| {
+            StoreError::Rejected(format!("a gate verdict names no task: {record}"))
+        })?;
+        let row = self.query_one(
+            "with gated as (select spawn_integrator_record($1) as event)
+             select event,
+                    case when event is null then null
+                         else spawn_task_reroute($2, $3, $4, $5) end
+               from gated",
+            &[
+                &record,
+                &task,
+                &preset,
+                &routed_revision,
+                &i32::from(routed_difficulty.rank()),
+            ],
+        )?;
+        let event: Option<i64> = row.get(0);
+        let rerouted: Option<Value> = row.get(1);
+        match (event, rerouted) {
+            (Some(event), Some(rerouted)) => Ok((event, rerouted)),
+            _ => Err(StoreError::Rejected(format!("already recorded: {record}"))),
+        }
     }
 }

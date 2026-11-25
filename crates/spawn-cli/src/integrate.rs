@@ -4341,8 +4341,16 @@ impl Judge {
             if let Some(head) = head_inputs.borrow().clone() {
                 record_value["head_inputs"] = head;
             }
-            record(store, &record_value)?;
+            // A quality rejection steps the rework up in the verdict's own
+            // statement (agent grading, [`record_gated`]).
+            let rerouted = record_gated(store, &record_value)?;
             println!("integrate: task {} gated: {verdict}", task.id);
+            if let Some(rerouted) = rerouted {
+                println!(
+                    "integrate: task {} rerouted to preset {} ({}) for its rework",
+                    task.id, rerouted["preset_id"], rerouted["routed_difficulty"]
+                );
+            }
             // A verdict a gate run gave may be judged again on a runner,
             // beside it ([`shadow`]): offered to the main thread, never
             // waited for.
@@ -5311,6 +5319,66 @@ pub(crate) fn record(store: &PostgresStore, value: &Value) -> Result<(), String>
         .integrator_record(&judging::named(&bound(value)))
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// [`record`] a gate's verdict and, when it is a quality rejection
+/// (`rejected`; never a conflict, an incompatible head, a host fault, no
+/// room, an abort or a stale judging) of a task routed through the grading
+/// catalog whose stepped-up rework its preset no longer takes
+/// (crate::grading `gate_reroute`), reroute the rework in the same
+/// statement (`task.rerouted`, docs/agent-grading.md): the verdict and its
+/// reroute are recorded both or neither, as a review's `spawn task
+/// reject` records them. A reroute the catalog or the store refuses never
+/// costs the verdict: it is said, and the verdict is recorded alone.
+/// Returns the `task.rerouted` record when there is one.
+pub(crate) fn record_gated(store: &PostgresStore, value: &Value) -> Result<Option<Value>, String> {
+    let task = value["id"].as_i64();
+    let verdict = value["verdict"].as_str().unwrap_or_default();
+    let reroute = match task.map(|task| crate::grading::gate_reroute(store, task, verdict)) {
+        Some(Ok(reroute)) => reroute,
+        Some(Err(error)) => {
+            eprintln!("integrate: task {task:?}: agent grading's step-up not read: {error}");
+            None
+        }
+        None => None,
+    };
+    let bounded = bound(value);
+    let named = judging::named(&bounded);
+    // Why the step-up was not recorded with the verdict, said only once the
+    // verdict itself is recorded: a verdict the integrator refuses (a stale
+    // revision, one already recorded) is refused as before, alone.
+    let unrouted = match reroute {
+        Some(crate::missions::ReworkReroute {
+            route: Ok(decision),
+            revision,
+            ..
+        }) => match store.integrator_record_rerouted(
+            &named,
+            &decision.preset_id,
+            revision,
+            decision.routed_difficulty,
+        ) {
+            Ok((_, rerouted)) => return Ok(Some(rerouted)),
+            Err(error) => Some(format!(
+                "the gate's rework step-up to preset {} was refused ({error}): the verdict \
+                 is recorded alone",
+                decision.preset_id
+            )),
+        },
+        Some(crate::missions::ReworkReroute {
+            route: Err(error), ..
+        }) => Some(format!(
+            "the gate's rejection steps its rework up, but {error}: it stays on its preset"
+        )),
+        None => None,
+    };
+    store
+        .integrator_record(&named)
+        .map_err(|error| error.to_string())?;
+    if let Some(why) = unrouted {
+        eprintln!("integrate: task {task:?}: {why}");
+    }
+    Ok(None)
 }
 
 /// What a verdict is a statement about (objective 035): `code` for a verdict
