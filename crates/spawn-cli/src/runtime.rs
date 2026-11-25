@@ -52,11 +52,19 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     // installed collector's places, or a stand-in honoured only in a gate's
     // sandbox and only for roots outside the account's home, said in one
     // line. With a stand-in both roots are pinned, and every file below them
-    // is reached without following a link.
-    let roots = [
+    // is reached without following a link. An enabled engine's own home
+    // (agy's, `SPAWN_ENGINES`) holds transcripts the archive copies too, so
+    // the mask covers it; Claude Code alone (the default) adds none.
+    let mut roots = vec![
         std::path::PathBuf::from(&root),
         std::path::PathBuf::from(&config.claude_projects),
     ];
+    roots.extend(
+        config
+            .engines
+            .iter()
+            .map(|(_, home)| std::path::PathBuf::from(&home.sessions)),
+    );
     let (archive_mask, stand_in) = spawn_host::archive_mask::CollectorMask::from_env(&roots);
     if let Some(stand_in) = &stand_in {
         eprintln!("{}", stand_in.said());
@@ -119,6 +127,7 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
+    config.engines = engines(env_value)?;
     config.model_relay = model_relay();
     config.screen_quiet = std::time::Duration::from_millis(
         env_value("SPAWN_SCREEN_QUIET_MS")
@@ -396,6 +405,51 @@ fn claude_config_env(
         .collect())
 }
 
+/// The engines this host runs besides Claude Code, and where each lives:
+/// `SPAWN_ENGINES`, a comma-separated list of registered engines
+/// (`claude`, `agy`), `claude` alone when unset, so that landing an engine
+/// enables nothing until the owner names it. agy's home is `SPAWN_AGY_HOME`
+/// (else `$HOME/.gemini/antigravity-cli`), its program `SPAWN_AGY_PROGRAM`
+/// (else `agy`) and its model `SPAWN_AGY_MODEL` (unset, a start of agy is
+/// refused: agy left to pick falls back to its costliest model). An
+/// unknown name stops `spawn loop`, said.
+fn engines(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, spawn_core::driver::EngineHome)>, String> {
+    let named = lookup("SPAWN_ENGINES").unwrap_or_else(|| spawn_core::driver::DEFAULT.to_string());
+    let mut engines = Vec::new();
+    for name in named.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        if spawn_core::driver::driver(name).is_none() {
+            let known: Vec<&str> = spawn_core::driver::drivers()
+                .iter()
+                .map(|driver| driver.id())
+                .collect();
+            return Err(format!(
+                "SPAWN_ENGINES names {name}, which is no engine: the engines are {}",
+                known.join(", ")
+            ));
+        }
+        if name == spawn_core::driver::DEFAULT
+            || engines.iter().any(|(known, _)| known == name)
+        {
+            continue;
+        }
+        let home = lookup("SPAWN_AGY_HOME").unwrap_or_else(|| {
+            let user = lookup("HOME").unwrap_or_else(|| "/root".to_string());
+            format!("{}/{}", user.trim_end_matches('/'), spawn_core::driver::AGY_HOME)
+        });
+        engines.push((
+            name.to_string(),
+            spawn_core::driver::EngineHome {
+                program: lookup("SPAWN_AGY_PROGRAM").unwrap_or_else(|| "agy".to_string()),
+                sessions: home,
+                model: lookup("SPAWN_AGY_MODEL"),
+            },
+        ));
+    }
+    Ok(engines)
+}
+
 /// Claude Code's transcript directory, which is where the Bridge reads it.
 pub(crate) fn claude_projects() -> String {
     resolve_claude_projects(env_value)
@@ -440,8 +494,8 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FleetTestDatabase, claude_config_env, resolve_claude_projects, resolve_model_relay,
-        supply_pa_env,
+        FleetTestDatabase, claude_config_env, engines, resolve_claude_projects,
+        resolve_model_relay, supply_pa_env,
     };
     use spawn_core::bridge::LaunchEnvironment;
 
@@ -709,5 +763,45 @@ mod tests {
             assert!(reason.contains(what), "{reason}");
             assert!(!reason.contains("pw"), "no password in {reason}");
         }
+    }
+
+    /// Claude Code alone unless `SPAWN_ENGINES` names agy; agy's home,
+    /// program and model from their own variables; an unknown engine is
+    /// refused.
+    #[test]
+    fn engines_are_claude_alone_until_spawn_engines_names_agy() {
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        assert!(engines(lookup(&[("HOME", "/home/a")])).expect("default").is_empty());
+        assert!(
+            engines(lookup(&[("SPAWN_ENGINES", "claude")]))
+                .expect("claude")
+                .is_empty()
+        );
+        let agy = engines(lookup(&[("SPAWN_ENGINES", "claude, agy,agy"), ("HOME", "/home/a/")]))
+            .expect("agy");
+        assert_eq!(agy.len(), 1);
+        assert_eq!(agy[0].0, "agy");
+        assert_eq!(agy[0].1.program, "agy");
+        assert_eq!(agy[0].1.sessions, "/home/a/.gemini/antigravity-cli");
+        assert_eq!(agy[0].1.model, None);
+        let named = engines(lookup(&[
+            ("SPAWN_ENGINES", "agy"),
+            ("SPAWN_AGY_HOME", "/srv/agy"),
+            ("SPAWN_AGY_PROGRAM", "/opt/agy/bin/agy"),
+            ("SPAWN_AGY_MODEL", "gemini-3.8-flash-low"),
+        ]))
+        .expect("agy");
+        assert_eq!(named[0].1.sessions, "/srv/agy");
+        assert_eq!(named[0].1.program, "/opt/agy/bin/agy");
+        assert_eq!(named[0].1.model.as_deref(), Some("gemini-3.8-flash-low"));
+        let refused = engines(lookup(&[("SPAWN_ENGINES", "claude,codex")])).expect_err("codex");
+        assert!(refused.contains("codex"), "{refused}");
     }
 }
