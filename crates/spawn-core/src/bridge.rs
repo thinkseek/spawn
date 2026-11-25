@@ -7720,8 +7720,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{Bridge, BridgeConfig, mounted_key};
-    use crate::command::{CommandAction, Outcome, Submission};
+    use super::{
+        Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits,
+    };
+    use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
         AgentId, BranchName, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId,
