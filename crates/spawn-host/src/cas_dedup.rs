@@ -739,15 +739,16 @@ impl Pass<'_> {
         if !still(path, before)? {
             return Ok(Err(Skip::Busy));
         }
-        let blob = blob_path(self.cas_root, &hash);
-        let source = match open_nofollow(&blob) {
+        let digest = sha256_digest(&hash)?;
+        let blob = self.store.object_path(&digest);
+        let source = match self.store.open_object(&digest) {
             Ok(source) => source,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match self.seed(path, &file, before, &hash, &blob)? {
+            Err(error) if error.is_not_found() => {
+                match self.seed(path, &file, before, &digest)? {
                     Seeded::Created => return Ok(Ok(())),
                     Seeded::Changed => return Ok(Err(Skip::Busy)),
                     // Someone else's blob: this file is a duplicate of it.
-                    Seeded::Lost => open_nofollow(&blob)?,
+                    Seeded::Lost => self.store.open_object(&digest)?,
                 }
             }
             Err(error) => {
@@ -782,11 +783,15 @@ impl Pass<'_> {
         let staged = path.with_file_name(format!(".{name}.cas-{}", unique_suffix()));
         let mut clone = reflink_new(&source, &staged)?;
         let finish = (|| -> io::Result<Result<(), Skip>> {
-            if sha256_reader(&mut clone)? != hash {
-                return Err(io::Error::other(format!(
-                    "blob {} does not hold the content it is named for: refused",
-                    blob.display()
-                )));
+            match verify_reader(&mut clone, &digest) {
+                Ok(_) => {}
+                Err(CasError::Mismatch { .. }) => {
+                    return Err(io::Error::other(format!(
+                        "blob {} does not hold the content it is named for: refused",
+                        blob.display()
+                    )));
+                }
+                Err(error) => return Err(error.into()),
             }
             take_owner(&clone, before, path)?;
             clone.set_permissions(fs::Permissions::from_mode(before.mode() & 0o7777))?;
@@ -813,39 +818,41 @@ impl Pass<'_> {
     }
 
     /// The first file of its content: the blob is cloned from it (so the
-    /// file already shares the blob's extents) and published without
-    /// replacing one a concurrent pass published first.
+    /// file already shares the blob's extents), verified, and published
+    /// through the store without replacing one a concurrent pass published
+    /// first ([`Store::publish`]).
     fn seed(
         &mut self,
         path: &Path,
         file: &fs::File,
         before: &fs::Metadata,
-        hash: &str,
-        blob: &Path,
+        digest: &spawn_cas::Digest,
     ) -> io::Result<Seeded> {
         let staged = self
-            .cas_root
-            .join("tmp")
-            .join(format!("{hash}.{}", unique_suffix()));
+            .store
+            .tmp_dir()
+            .join(format!("{}.{}", digest.hex(), unique_suffix()));
         let mut clone = reflink_new(file, &staged)?;
         let published = (|| -> io::Result<Seeded> {
             // The clone is what was hashed, or the file changed under us.
-            if sha256_reader(&mut clone)? != hash || !still(path, before)? {
+            let verified = match verify_reader(&mut clone, digest) {
+                Ok(verified) => verified,
+                Err(CasError::Mismatch { .. }) => return Ok(Seeded::Changed),
+                Err(error) => return Err(error.into()),
+            };
+            if !still(path, before)? {
                 return Ok(Seeded::Changed);
             }
-            clone.set_permissions(fs::Permissions::from_mode(0o444))?;
-            fs::create_dir_all(blob.parent().unwrap_or(self.cas_root))?;
             // A hard link never replaces: a blob published meanwhile wins.
-            match fs::hard_link(&staged, blob) {
-                Ok(()) => Ok(Seeded::Created),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Seeded::Lost),
-                Err(error) => Err(error),
+            match self.store.publish(&staged, &clone, &verified)? {
+                Publish::Created => Ok(Seeded::Created),
+                Publish::Exists => Ok(Seeded::Lost),
             }
         })();
         let published = with_cleanup(published, &staged)?;
         if published == Seeded::Created {
             self.report.blobs_created += 1;
-            self.added.push(IndexEntry::new(hash, path, before));
+            self.added.push(IndexEntry::new(digest.hex(), path, before));
         }
         Ok(published)
     }
@@ -856,9 +863,11 @@ impl Pass<'_> {
 /// than `grace` (a concurrent pass may have published one and not yet
 /// written its entry), and temporaries older than `grace`.
 ///
-/// Refused (`InvalidInput`) unless `cas_root` carries [`CAS_MARKER`]. Only
-/// names this module makes are ever removed: `<hh>/<hash>` with a 64-digit
-/// lowercase hex hash in its own shard, and `tmp/<hash>.<pid>-<n>`;
+/// Refused (`InvalidInput`) unless `cas_root` carries [`CAS_MARKER`]. Legacy
+/// blobs (`<hh>/<hash>`) are adopted into `objects/sha256/` first, without
+/// rehashing. Only names this module makes are ever removed:
+/// `objects/sha256/<hh>/<hash>` with a 64-digit lowercase hex hash in its
+/// own shard, never one a `spawn-cas` pin names, and `tmp/<hash>.<pid>-<n>`;
 /// anything else (a `*.jsonl` file included) is left where it is.
 ///
 /// Safe at any time: a workspace file's data is refcounted by the file
@@ -874,6 +883,10 @@ pub fn prune_unused(cas_root: &Path, grace: Duration) -> io::Result<PruneReport>
             ),
         ));
     }
+    let store = open_store(cas_root).map_err(|error| match error {
+        DedupError::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
+    })?;
     // No pass is between a blob and its index entry while this runs.
     let _publishing = IndexLock::take(cas_root, PUBLISH_LOCK, true)?;
     let _lock = IndexLock::take(cas_root, INDEX_LOCK, true)?;
@@ -903,61 +916,41 @@ pub fn prune_unused(cas_root: &Path, grace: Duration) -> io::Result<PruneReport>
             .duration_since(changed)
             .is_ok_and(|age| age >= grace)
     };
-    let removable = |path: &Path, name: &str| {
-        !is_jsonl(std::ffi::OsStr::new(name))
-            && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && old_enough(&meta))
-    };
-    for shard in fs::read_dir(cas_root)? {
-        let shard = shard?;
-        let shard_name = shard.file_name().to_string_lossy().into_owned();
-        if !shard.file_type()?.is_dir() {
-            continue;
-        }
-        if shard_name == "tmp" {
-            for temporary in fs::read_dir(shard.path())? {
-                let temporary = temporary?;
-                let name = temporary.file_name().to_string_lossy().into_owned();
-                if is_temporary(&name) && removable(&temporary.path(), &name) {
-                    match fs::remove_file(temporary.path()) {
-                        Ok(()) => report.temporaries_removed += 1,
-                        Err(error) => report
-                            .errors
-                            .push(format!("remove {}: {error}", temporary.path().display())),
-                    }
-                }
+    for temporary in fs::read_dir(store.tmp_dir())? {
+        let temporary = temporary?;
+        let name = temporary.file_name().to_string_lossy().into_owned();
+        let removable = fs::symlink_metadata(temporary.path())
+            .is_ok_and(|meta| meta.is_file() && old_enough(&meta));
+        if is_temporary(&name) && removable {
+            match fs::remove_file(temporary.path()) {
+                Ok(()) => report.temporaries_removed += 1,
+                Err(error) => report
+                    .errors
+                    .push(format!("remove {}: {error}", temporary.path().display())),
             }
+        }
+    }
+    // Pins are read, and blobs removed, with no pin written meanwhile.
+    let _pins = store.lock_gc().map_err(io::Error::from)?;
+    let pinned = store.pinned().map_err(io::Error::from)?;
+    for object in store.objects(Algo::Sha256).map_err(io::Error::from)? {
+        if referenced.contains(object.digest.hex())
+            || pinned.contains(&object.digest)
+            || !old_enough(&object.meta)
+        {
+            report.blobs_kept += 1;
             continue;
         }
-        let is_shard = shard_name.len() == 2 && is_hash(&format!("{shard_name:0<64}"));
-        if !is_shard {
-            continue;
-        }
-        for blob in fs::read_dir(shard.path())? {
-            let blob = blob?;
-            let hash = blob.file_name().to_string_lossy().into_owned();
-            if !is_hash(&hash) || !hash.starts_with(&shard_name) {
-                continue;
+        match store.remove_object(&object.digest) {
+            Ok(_) => {
+                report.blobs_removed += 1;
+                report.bytes_removed += object.meta.size();
             }
-            if referenced.contains(hash.as_str()) {
+            Err(error) => {
                 report.blobs_kept += 1;
-                continue;
-            }
-            let meta = fs::symlink_metadata(blob.path())?;
-            if !removable(&blob.path(), &hash) {
-                report.blobs_kept += 1;
-                continue;
-            }
-            match fs::remove_file(blob.path()) {
-                Ok(()) => {
-                    report.blobs_removed += 1;
-                    report.bytes_removed += meta.size();
-                }
-                Err(error) => {
-                    report.blobs_kept += 1;
-                    report
-                        .errors
-                        .push(format!("remove {}: {error}", blob.path().display()));
-                }
+                report
+                    .errors
+                    .push(format!("remove {}: {error}", object.path.display()));
             }
         }
     }
@@ -1112,10 +1105,11 @@ mod tests {
     fn a_prune_waits_for_a_pass_that_is_publishing() {
         let scratch = crate::scratch::Scratch::new("cas-publish");
         let root = scratch.join("cas");
-        fs::create_dir_all(root.join("ab")).expect("mkdir");
-        fs::write(root.join(CAS_MARKER), MARKER_TEXT).expect("marker");
+        let shard = root.join("objects/sha256/ab");
+        fs::create_dir_all(&shard).expect("mkdir");
+        fs::write(root.join(CAS_MARKER), "spawn-cas v1\n").expect("marker");
         let hash = format!("ab{}", "0".repeat(62));
-        fs::write(root.join("ab").join(&hash), "blob").expect("write");
+        fs::write(shard.join(&hash), "blob").expect("write");
         // A pass between its blob and its index entry.
         let publishing = IndexLock::take(&root, PUBLISH_LOCK, false).expect("lock");
         let (done, finished) = std::sync::mpsc::channel();
@@ -1127,7 +1121,7 @@ mod tests {
                 finished.recv_timeout(Duration::from_millis(300)).is_err(),
                 "the prune waits"
             );
-            assert!(root.join("ab").join(&hash).exists());
+            assert!(shard.join(&hash).exists());
             drop(publishing);
             let removed = finished
                 .recv_timeout(Duration::from_secs(10))
