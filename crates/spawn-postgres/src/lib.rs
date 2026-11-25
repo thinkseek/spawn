@@ -16,6 +16,7 @@
 //! - `missions`: missions, tasks and residents, and the integrator's lock.
 //! - `scorecard`: the facts `spawn scorecard` measures, read in one snapshot.
 //! - `verifications`: objectives' verifications after their landings.
+//! - `provenance`: universal file provenance, append-only, and its blast radius.
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -97,6 +98,7 @@ mod host;
 mod missions;
 mod nodes;
 mod passfile;
+pub mod provenance;
 mod recovery;
 mod row;
 mod scorecard;
@@ -119,6 +121,11 @@ pub use grading::RoutedTask;
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
+pub use provenance::{
+    ProvAttributionSource, ProvBlastRadiusNode, ProvBoundary, ProvChangeInput, ProvChangeKind,
+    ProvChangeRecord, ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEdgeRecord, ProvEntryClass,
+    ProvEntryInput, ProvEntryRecord, ProvLink,
+};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
