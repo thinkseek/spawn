@@ -393,7 +393,24 @@ pub(crate) fn who(
     if commit.is_empty() {
         return Err(format!("main never held {path}"));
     }
-    let change = change_for_commit(store, domain, &commit)?;
+    let mut change = change_for_commit(store, domain, &commit)?;
+    let mut via = change.as_ref().map(|_| "commit");
+    // A commit no Change records (a landing squashed, so its second parent
+    // is gone, or exported): its integrator's trailers name the landing's
+    // Change (`Spawn-Task` and `Spawn-Head` give its key), and its
+    // `Spawn-Change` lines the source Changes it included (D1).
+    let message = String::from_utf8_lossy(&repo.git(&["log", "-1", "--format=%B", &commit, "--"])?)
+        .into_owned();
+    if change.is_none() {
+        let trailers = index::trailers(&message);
+        if let (Some(task), Some(head)) = (trailers.task, trailers.head) {
+            let change_id = index::change_id(domain, &index::land_key(task, &head));
+            change = changes_of(store, &Target::Change(change_id))?.pop();
+            if change.is_some() {
+                via = Some("trailers");
+            }
+        }
+    }
     let (entry, origin) = match (&change, line) {
         (Some(change), None) => origin_of(store, change, &path)?,
         _ => (None, None),
@@ -405,7 +422,9 @@ pub(crate) fn who(
         "granularity": if line.is_some() { "line" } else { "file" },
         "commit": commit,
         "indexed": change.is_some(),
+        "via": via,
         "change": change.as_ref().map(change_json),
+        "spawn_change": spawn_changes(&message),
         "entry": entry.as_ref().map(|entry| entry_json(entry, &HashMap::new())),
         "origin": origin.as_ref().map(change_json),
         "agent_id": author.map(|change| change.agent_id.clone()),
