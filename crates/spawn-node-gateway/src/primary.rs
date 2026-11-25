@@ -19,13 +19,16 @@ use zeroize::Zeroizing;
 const PKCS8_V1_PREFIX: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
-/// The same for ring's v2 document (version 1, the public key after the
-/// seed as `[1] BIT STRING`).
-const PKCS8_V2_PREFIX: [u8; 16] = [
-    0x30, 0x53, 0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+/// The same for a v2 document (version 1), the public key after the seed:
+/// ring writes it as `[1] IMPLICIT BIT STRING` (`81 21 00`, 83 bytes in
+/// all), RFC 8410's example as `[1] EXPLICIT` (`a1 23 03 21 00`, 85).
+const PKCS8_V2_RING: ([u8; 2], &[u8], usize) = ([0x30, 0x51], &[0x81, 0x21, 0x00], 83);
+const PKCS8_V2_RFC: ([u8; 2], &[u8], usize) = ([0x30, 0x53], &[0xa1, 0x23, 0x03, 0x21, 0x00], 85);
+/// What follows the outer `SEQUENCE` header in every v2 document, up to
+/// the seed.
+const PKCS8_V2_BODY: [u8; 14] = [
+    0x02, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
-/// What follows the seed in a v2 document, before the public key.
-const PKCS8_V2_PUBLIC: [u8; 5] = [0xa1, 0x23, 0x03, 0x21, 0x00];
 
 /// The key in `path`, made (mode 0600, written whole and synced) when the
 /// file does not exist. A file that others may read or write, or that is
@@ -89,9 +92,14 @@ pub fn from_pkcs8(document: &[u8]) -> Result<SigningKey, String> {
     let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(document)
         .map_err(|_| "not an Ed25519 PKCS#8 key".to_string())?;
     let v1 = document.len() == 48 && document[..16] == PKCS8_V1_PREFIX;
-    let v2 = document.len() == 85
-        && document[..16] == PKCS8_V2_PREFIX
-        && document[48..53] == PKCS8_V2_PUBLIC;
+    let v2 = [PKCS8_V2_RING, PKCS8_V2_RFC]
+        .iter()
+        .any(|(head, public, len)| {
+            document.len() == *len
+                && document[..2] == *head
+                && document[2..16] == PKCS8_V2_BODY
+                && document[48..48 + public.len()] == **public
+        });
     if !v1 && !v2 {
         return Err("not a plain Ed25519 PKCS#8 key".to_string());
     }
