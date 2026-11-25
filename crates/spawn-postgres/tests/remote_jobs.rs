@@ -876,7 +876,7 @@ fn catalog(client: &mut Client) -> Vec<String> {
                from pg_proc p where p.pronamespace = current_schema()::regnamespace
              union all
              select 'rel ' || c.relname || ' ' || c.relkind::text || ' ' || coalesce(c.relacl,
-                             acldefault(case c.relkind when 'S' then 's' else 'r' end::"char", c.relowner))::text
+                             acldefault(case c.relkind when 'S' then 's' else 'r' end::\"char\", c.relowner))::text
                     || ' ' || coalesce(array_to_string(c.reloptions, ','), '')
                from pg_class c where c.relnamespace = current_schema()::regnamespace
              union all
