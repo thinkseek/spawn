@@ -169,7 +169,7 @@ impl SignedGrant {
         }
     }
 
-    /// The grant's bytes, decoded strictly; `None` past the 8 KB cap.
+    /// The grant's bytes, decoded strictly; refused past the 8 KB cap.
     pub fn bytes(&self) -> Result<Vec<u8>, Error> {
         decode_grant_bytes(&self.grant)
     }
