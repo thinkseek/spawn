@@ -700,10 +700,7 @@ mod agy_tests {
     /// rule, then `footer`: the layout of agy 1.5.14 while background work
     /// runs. The panel's entries are made up; their layout is agy's.
     fn with_panel(footer: &str, panel: &str) -> String {
-        format!(
-            "{}{RULE}\n>\n{RULE}\n{panel}{RULE}\n{footer}\n",
-            banner()
-        )
+        format!("{}{RULE}\n>\n{RULE}\n{panel}{RULE}\n{footer}\n", banner())
     }
 
     const PANEL: &str = "● Start job A (sleep 25; echo JOB_A_DONE)\n\
@@ -738,7 +735,11 @@ mod agy_tests {
             assert_eq!(reading.state, ScreenState::Ready, "{footer}");
             assert_eq!(reading.evidence, ">");
             let empty = with_panel(footer, "");
-            assert_eq!(read_agy_screen(&empty).state, ScreenState::Ready, "{footer}");
+            assert_eq!(
+                read_agy_screen(&empty).state,
+                ScreenState::Ready,
+                "{footer}"
+            );
         }
         // Something below the box that is no panel of agy's: unknown.
         let odd = format!("{RULE}\n>\n{RULE}\nplain text\n{OPEN_WORK_FOOTER}\n");
