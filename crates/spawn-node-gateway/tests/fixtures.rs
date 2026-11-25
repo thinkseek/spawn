@@ -643,3 +643,39 @@ fn a_refused_multi_mebibyte_upload_still_reads_its_signed_refusal() {
     let small = harness.post(&signer(), "/node/v1/spec", 4, &vec![b' '; 70 * 1024]);
     small.assert_refused(Refusal::BadRequest, 4);
 }
+
+#[test]
+fn a_body_trickled_too_slowly_is_cut_off_at_its_deadline() {
+    let harness = Harness::start_with(
+        "slow_body",
+        no_database(),
+        "",
+        Timeouts {
+            body_base: Duration::from_millis(1500),
+            ..quick()
+        },
+    );
+    let body = v("beat_body");
+    let envelope = signer()
+        .sign(
+            Method::Post,
+            "/node/v1/heartbeat",
+            1,
+            common::now_ms(),
+            body.as_bytes(),
+        )
+        .unwrap();
+    let mut head = "POST /node/v1/heartbeat HTTP/1.1\r\n".to_string();
+    for (name, value) in envelope.to_headers() {
+        let _ = write!(head, "{name}: {value}\r\n");
+    }
+    let _ = write!(head, "Content-Length: {}\r\n\r\n", body.len());
+    let mut stream = TcpStream::connect(harness.addr).unwrap();
+    stream.write_all(head.as_bytes()).unwrap();
+    // 324 bytes at 5 a second would take over a minute.
+    let closed = time_to_close(&mut stream, body.as_bytes());
+    assert!(
+        closed >= Duration::from_millis(1400) && closed < Duration::from_secs(5),
+        "closed after {closed:?}, the body deadline is 1.5 s"
+    );
+}
