@@ -101,7 +101,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
+use crate::command::{Claimed, CommandAction, NamedKey, Outcome, Submission};
 use crate::driver::{
     AgentDriver, EngineHome, EngineLaunch, LineCursor, SessionBinding, driver_or_default,
     plain_session_id,
@@ -4747,6 +4747,11 @@ impl Bridge {
     /// key goes (`pressing`) and the send after (`pressed`): a retried key
     /// whose `pressing` has no `pressed` is not sent again.
     fn press(&mut self, claimed: &Claimed, key: NamedKey) -> Result<Outcome, StoreError> {
+        // Pressed already (the Bridge's audited startup answer, or a press
+        // before a restart): done, whatever runs now.
+        if self.recorded_steps(claimed).press == Press::Pressed {
+            return Ok(Outcome::Succeeded);
+        }
         let Some(active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Failed(format!(
                 "{} runs no execution: a key needs a running engine; resume the session",
@@ -5997,10 +6002,7 @@ impl Bridge {
                     return Ok(self.prompt_retry(&progress));
                 }
                 progress.answered_trust = true;
-                if let Err(error) =
-                    self.terminals
-                        .send_keys(&active.terminal(), &active.workspace, keys)
-                {
+                if let Err(error) = self.answer_trust(claimed, active, keys)? {
                     return Ok(Handled::Finished(Outcome::Failed(format!(
                         "answer trust dialog: {error}"
                     ))));
@@ -6049,6 +6051,75 @@ impl Bridge {
             }
             finished => finished,
         }
+    }
+
+    /// The startup trust dialog's answer, audited: each key is a `key`
+    /// command of [`RESOLVE_PRINCIPAL`] (keyed [`trust_answer_key`]),
+    /// submitted, recorded `pressing`, pressed with the others in one send
+    /// (as before: the dialog reads keys, and they go together), and
+    /// recorded `pressed`. The commands queue behind this start, so the
+    /// Bridge claims them once the start is done, finds them pressed and
+    /// finishes them without pressing anything again. A key recorded
+    /// `pressing` or `pressed` already (a restarted Bridge on the same
+    /// dialog) presses nothing. A key Spawn has no command for (none of
+    /// today's) is pressed unaudited, as before.
+    fn answer_trust(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        keys: &[&str],
+    ) -> Result<Result<(), TerminalError>, StoreError> {
+        let named: Option<Vec<NamedKey>> = keys
+            .iter()
+            .map(|key| NamedKey::ALL.iter().copied().find(|named| named.tmux() == *key))
+            .collect();
+        let Some(named) = named else {
+            return Ok(self
+                .terminals
+                .send_keys(&active.terminal(), &active.workspace, keys));
+        };
+        let principal = Principal::new(RESOLVE_PRINCIPAL)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut audited = Vec::with_capacity(named.len());
+        for (at, key) in named.iter().enumerate() {
+            let idempotency_key = IdempotencyKey::new(trust_answer_key(&active.execution_id, at + 1))
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            let command_id = self.commands.submit(
+                &principal,
+                &Submission {
+                    agent_id: claimed.agent_id.clone(),
+                    session_id: claimed.session_id.clone(),
+                    idempotency_key,
+                    action: CommandAction::Key { key: *key },
+                },
+            )?;
+            audited.push(Claimed {
+                command_id,
+                attempt: 0,
+                agent_id: claimed.agent_id.clone(),
+                session_id: claimed.session_id.clone(),
+                principal: RESOLVE_PRINCIPAL.to_string(),
+                action: serde_json::Value::Null,
+            });
+        }
+        if audited
+            .iter()
+            .any(|key| self.recorded_steps(key).press != Press::Due)
+        {
+            return Ok(Ok(()));
+        }
+        for key in &audited {
+            self.step(key, Some(&active.execution_id), CommandStep::Pressing, None)?;
+        }
+        let sent = self
+            .terminals
+            .send_keys(&active.terminal(), &active.workspace, keys);
+        if sent.is_ok() {
+            for key in &audited {
+                self.step(key, Some(&active.execution_id), CommandStep::Pressed, None)?;
+            }
+        }
+        Ok(sent)
     }
 
     /// The resumable prompt entry point: one non-blocking readiness step per
@@ -6484,8 +6555,30 @@ pub const PANE_NOT_READY: &str = "does not accept input";
 /// the pane cannot take them ([`PANE_NOT_READY`]) and retried on their own
 /// schedule (the dispatcher's delivery retries, which its stall evidence
 /// reads); every other principal's input (a person's, the supervisor's)
-/// waits for its turn ([`CommandStep::Waiting`]).
-pub const LOOP_PRINCIPALS: [&str; 3] = ["spawn-dispatch", "spawn-integrate", "spawn-liveness"];
+/// waits for its turn ([`CommandStep::Waiting`]). The resolver
+/// ([`RESOLVE_PRINCIPAL`]) submits only `key` commands, which never wait in
+/// any case: listing it changes no input rule.
+pub const LOOP_PRINCIPALS: [&str; 4] = [
+    "spawn-dispatch",
+    "spawn-integrate",
+    "spawn-liveness",
+    RESOLVE_PRINCIPAL,
+];
+
+/// The principal of the automatic answers to an engine's dialogs: the
+/// run-time resolver of `spawn loop` (`spawn-cli`'s `resolve.rs`) and the
+/// Bridge's own answer to a startup trust dialog, each a `key` command on
+/// the record (design section 6.3, "What the audit shows").
+pub const RESOLVE_PRINCIPAL: &str = "spawn-resolve";
+
+/// The idempotency key of the `n`-th key (from 1) of the Bridge's answer
+/// to the startup trust dialog of `execution`: `resolve:<execution>:trust:1:<n>`,
+/// the resolver's key shape with the dialog named `trust`. A restarted
+/// Bridge that sees the dialog again submits the same keys, finds them
+/// pressed, and presses nothing twice.
+pub fn trust_answer_key(execution: &ExecutionId, n: usize) -> String {
+    format!("resolve:{execution}:trust:1:{n}")
+}
 
 /// Whether an input from `principal` waits for its turn instead of being
 /// refused while the pane cannot take it.
