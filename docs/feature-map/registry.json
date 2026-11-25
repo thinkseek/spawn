@@ -3645,6 +3645,17 @@
       "summary": "Checks the registry's depends_on against the real code graph: file edges projected onto many-to-many owner sets, declared reachability, and findings for under-declared, implied-only, ghost, inverted and unverifiable dependencies, static cycles, kernel and entrypoint roles, and waivers.",
       "status_note": "PR 1 (pure model and findings in spawn-core::feature_deps) and PR 2 (spawn-codegraph Rust extractor and spawn features graph) of the issue #100 design; check integration and schema 2 follow.",
       "files": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "crates/spawn-cli/src/feature_inventory.rs",
+        "crates/spawn-cli/tests/features_graph.rs",
+        "crates/spawn-codegraph/Cargo.toml",
+        "crates/spawn-codegraph/src/lib.rs",
+        "crates/spawn-codegraph/src/manifest.rs",
+        "crates/spawn-codegraph/src/resolve.rs",
+        "crates/spawn-codegraph/src/rust.rs",
+        "crates/spawn-codegraph/tests/fixtures/mod.rs",
+        "crates/spawn-codegraph/tests/rust_graph.rs",
         "crates/spawn-core/src/feature_deps.rs"
       ],
       "relations": [
@@ -3658,7 +3669,10 @@
         "tasks": [],
         "agents": [],
         "commits": [],
-        "tests": [],
+        "tests": [
+          "crates/spawn-cli/tests/features_graph.rs",
+          "crates/spawn-codegraph/tests/rust_graph.rs"
+        ],
         "deploys": [],
         "artifacts": [],
         "discussions": [

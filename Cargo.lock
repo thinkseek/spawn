@@ -713,6 +713,7 @@ dependencies = [
  "sha1",
  "sha2",
  "signal-hook",
+ "spawn-codegraph",
  "spawn-core",
  "spawn-host",
  "spawn-jev",
@@ -720,6 +721,16 @@ dependencies = [
  "tiny_http",
  "webpki-roots",
  "zeroize",
+]
+
+[[package]]
+name = "spawn-codegraph"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "serde_json",
+ "spawn-core",
+ "syn",
 ]
 
 [[package]]

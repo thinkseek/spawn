@@ -1,0 +1,21 @@
+[package]
+name = "spawn-codegraph"
+description = "Source extractors for the feature map's code dependency truth: Cargo manifests, Rust module trees and paths read with syn, resolved against the in-scope inventory. Performs no IO."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+spawn-core.workspace = true
+# Already locked for the derive macros; `full` and `visit` read whole
+# files, `span-locations` gives each reference its line. No new crate.
+syn = { version = "3", default-features = false, features = ["full", "parsing", "visit"] }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

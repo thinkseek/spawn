@@ -1,0 +1,74 @@
+//! Source extractors for the feature map's code dependency truth (GitHub
+//! issue #100): the code graph a repository's files make, in the model of
+//! [`spawn_core::feature_deps`].
+//!
+//! - [`manifest`]: a strict built-in reader for the TOML subset of
+//!   `Cargo.toml` (no `toml` crate: the gate builds offline);
+//! - [`rust`]: what one Rust file says, read with `syn`;
+//! - [`resolve`]: units, targets, module trees, and every reference resolved
+//!   to a file of the in-scope inventory.
+//!
+//! Pure: no filesystem, process or network. The caller (the `spawn features
+//! graph` command) is the only reader of files; it passes the in-scope
+//! inventory and the texts of the files [`wants`] accepts.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use spawn_core::feature_deps::CodeGraph;
+
+pub mod manifest;
+pub mod resolve;
+pub mod rust;
+
+/// A source file larger than this is not read (listed as skipped).
+pub const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What the graph cannot see, and which way each blind spot errs.
+pub const LIMITS: [&str; 9] = [
+    "value-flow-without-a-named-path: misses an edge",
+    "rust-shadowing-is-approximated: explicit names, child modules, crates, local items, then declarations behind globs, then macro mentions",
+    "cfg-not-evaluated: adds an edge",
+    "macro-generated-items: a name only an item-level macro call mentions is a guess with precision macro, consulted after every real declaration; others miss an edge",
+    "deep-or-oversized-code-degrades: a file nesting brackets past 256 levels is unparsed (no outgoing edges); a part that cannot be cut to the parser's token budget is read with a token walk (token_fallback: its a::b paths only)",
+    "only-rust-and-cargo-manifests-are-read: other files have no edges",
+    "reachability-is-per-file-not-per-item",
+    "references-resolve-only-to-in-scope-inventory-files",
+    "globs-are-not-chased-across-globs: a glob whose leading segment comes only from another glob (use super::*; use sub::*;) is not resolved; names it brings miss an edge",
+];
+
+/// Whether the extractors read `path` (repository-relative): Rust sources
+/// and `Cargo.toml` manifests.
+pub fn wants(path: &str) -> bool {
+    is_rust_source(path) || is_cargo_manifest(path)
+}
+
+/// A `.rs` file (the compiler reads no other spelling).
+pub fn is_rust_source(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "rs")
+}
+
+/// A `Cargo.toml`, at the root or in a directory.
+pub fn is_cargo_manifest(path: &str) -> bool {
+    path == "Cargo.toml" || path.ends_with("/Cargo.toml")
+}
+
+/// Build the code graph. `inventory` is every in-scope path: the only
+/// paths a reference may resolve to. `sources` holds the texts of the
+/// in-scope paths [`wants`] accepts.
+pub fn build(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
+    resolve::build(inventory, sources)
+}
+
+/// Build the code graph of a string table of `(path, text)`: every path is
+/// in scope, and the texts of the paths [`wants`] accepts are read.
+pub fn build_from_table(table: &[(&str, &str)]) -> CodeGraph {
+    let inventory = table.iter().map(|(path, _)| (*path).to_string()).collect();
+    let sources = table
+        .iter()
+        .filter(|(path, _)| wants(path))
+        .map(|(path, text)| ((*path).to_string(), (*text).to_string()))
+        .collect();
+    build(&inventory, &sources)
+}

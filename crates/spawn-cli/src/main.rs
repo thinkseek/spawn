@@ -138,6 +138,7 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn commit-map load <file> --source <git dir>\n       \
      spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]\n       \
+     spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]\n       \
      spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)";
 
 /// What the whole usage says last, after the commands.
@@ -684,6 +685,19 @@ mod tests {
         );
         assert!(
             !USAGE.contains("ack"),
+            "the contract's line stays as it was"
+        );
+    }
+
+    #[test]
+    fn the_usage_names_the_features_graph_after_the_contracts_line() {
+        assert!(
+            MORE_USAGE.contains("spawn features scan|check ")
+                && MORE_USAGE.contains("spawn features graph [--root <dir>]"),
+            "{MORE_USAGE}"
+        );
+        assert!(
+            !USAGE.contains("features"),
             "the contract's line stays as it was"
         );
     }

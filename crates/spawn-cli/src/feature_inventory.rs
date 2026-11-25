@@ -1,21 +1,26 @@
 //! IO adapter, CLI subcommand (`spawn features`), and HTTP payload builders
 //! for feature-map file coverage and one-click unassociated-file ("野文件")
-//! scanning.
+//! scanning, and the read-only code graph (`spawn features graph`) that
+//! checks the registry's `depends_on` against the code.
 //!
 //! All pure coverage/consistency logic lives in
 //! [`spawn_core::feature_coverage`]. This module performs bounded filesystem
 //! walking, git index querying, and atomic registry persistence.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use spawn_core::feature_coverage::{
     AssociationUpdate, BoundaryPolicy, FeatureRegistry, InventoryEntry, SCHEMA_VERSION, ScanReport,
     associate_file, match_directory_exclusion, match_exclusion, scan_coverage,
+};
+use spawn_core::feature_deps::{
+    self, CodeGraph, Diagnostic, DiagnosticCode, FeatureEdge, FeatureIndex, FileEdge, Scope,
+    TruthCounts, TruthPolicy, TruthReport,
 };
 
 /// Default registry path relative to the project root.
@@ -506,9 +511,11 @@ fn build_api_payload(
 /// The usage of `spawn features`, the only copy (main's help reads it).
 pub(crate) const USAGE: &str = "usage: spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
                                 spawn features associate --path <file> --feature <id> [--feature <id>]... \
-                                [--root <dir>] [--registry <file>] [--json]";
+                                [--root <dir>] [--registry <file>] [--json]\n       \
+                                spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] \
+                                [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]";
 
-/// Entrypoint for `spawn features <scan|associate|check>`.
+/// Entrypoint for `spawn features <scan|associate|check|graph>`.
 pub fn command(args: &[String]) -> Result<i32, String> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
@@ -517,8 +524,9 @@ pub fn command(args: &[String]) -> Result<i32, String> {
         "scan" => cmd_scan(rest, false),
         "check" => cmd_scan(rest, true),
         "associate" => cmd_associate(rest),
+        "graph" => cmd_graph(rest),
         other => Err(format!(
-            "unknown features subcommand {other:?}; expected scan, associate, or check"
+            "unknown features subcommand {other:?}; expected scan, associate, check, or graph"
         )),
     }
 }
@@ -710,10 +718,660 @@ fn print_human_report(report: &ScanReport) {
     }
 }
 
+/// The usage of `spawn features graph`.
+const GRAPH_USAGE: &str = "usage: spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]";
+
+/// The value flags `spawn features graph` takes (`--json` is a switch).
+const GRAPH_FLAGS: [&str; 6] = ["root", "registry", "level", "from", "to", "feature"];
+
+/// What `spawn features graph` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphLevel {
+    /// File edges.
+    File,
+    /// Edges between package units, against their manifests.
+    Unit,
+    /// File edges projected onto the registry's features, with the
+    /// dependency-truth findings.
+    Feature,
+}
+
+impl GraphLevel {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Unit => "unit",
+            Self::Feature => "feature",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GraphOpts {
+    root: PathBuf,
+    registry: PathBuf,
+    level: GraphLevel,
+    from: Option<String>,
+    to: Option<String>,
+    feature: Option<String>,
+    json: bool,
+}
+
+fn parse_graph_opts(args: &[String]) -> Result<GraphOpts, String> {
+    let flags = crate::Flags::parse_with_switches(args, &["json"])
+        .map_err(|error| format!("{error}\n{GRAPH_USAGE}"))?;
+    if let Some(unknown) = flags.names().find(|name| !GRAPH_FLAGS.contains(name)) {
+        return Err(format!("unexpected flag --{unknown}\n{GRAPH_USAGE}"));
+    }
+    let level = match flags.get("level").as_deref() {
+        None | Some("feature") => GraphLevel::Feature,
+        Some("file") => GraphLevel::File,
+        Some("unit") => GraphLevel::Unit,
+        Some(other) => {
+            return Err(format!(
+                "--level {other:?} is not file, unit or feature\n{GRAPH_USAGE}"
+            ));
+        }
+    };
+    let root = flags.get("root").map_or_else(default_root, PathBuf::from);
+    let registry = flags
+        .get("registry")
+        .map_or_else(|| default_registry_path(&root), PathBuf::from);
+    Ok(GraphOpts {
+        root,
+        registry,
+        level,
+        from: flags.get("from"),
+        to: flags.get("to"),
+        feature: flags.get("feature"),
+        json: flags.switch("json"),
+    })
+}
+
+/// Today's UTC date, `YYYY-MM-DD`: when a waiver stops applying.
+fn utc_today() -> String {
+    let stamp = crate::backup::Stamp::at(now_ms()).text();
+    format!("{}-{}-{}", &stamp[0..4], &stamp[4..6], &stamp[6..8])
+}
+
+/// The code graph of `root`'s in-scope files under `boundary`, and how
+/// long building it took. Only in-scope Rust sources and `Cargo.toml`
+/// files are read, each at most [`spawn_codegraph::MAX_SOURCE_BYTES`]; a
+/// file not read is listed as `skipped`.
+pub fn build_code_graph(
+    root: &Path,
+    boundary: &BoundaryPolicy,
+) -> Result<(CodeGraph, u128), String> {
+    let inventory = collect_inventory(root, boundary)?;
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|error| format!("resolve project root {}: {error}", root.display()))?;
+    let mut in_scope = BTreeSet::new();
+    let mut sources = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for entry in &inventory {
+        if entry.path.ends_with('/') || match_exclusion(boundary, &entry.path).is_some() {
+            continue;
+        }
+        in_scope.insert(entry.path.clone());
+        if !spawn_codegraph::wants(&entry.path) {
+            continue;
+        }
+        match read_source(&canonical_root, &entry.path) {
+            Ok(text) => {
+                sources.insert(entry.path.clone(), text);
+            }
+            Err(message) => skipped.push(Diagnostic {
+                code: DiagnosticCode::Skipped,
+                path: entry.path.clone(),
+                line: None,
+                message,
+            }),
+        }
+    }
+    let started = Instant::now();
+    let mut graph = spawn_codegraph::build(&in_scope, &sources);
+    let build_ms = started.elapsed().as_millis();
+    graph.diagnostics.extend(skipped);
+    graph.diagnostics.sort();
+    Ok((graph, build_ms))
+}
+
+/// The text of the in-scope source `rel`, or why it is not read. Never
+/// through a symlink (the link's own path passed the boundary, not its
+/// target's): the file itself and every directory on its way must be what
+/// the path says, it is opened with `O_NOFOLLOW`, and the size limit is
+/// checked on the opened file, then enforced while reading.
+fn read_source(canonical_root: &Path, rel: &str) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+
+    use rustix::fs::{Mode, OFlags};
+
+    let limit = spawn_codegraph::MAX_SOURCE_BYTES;
+    let path = canonical_root.join(rel);
+    let meta =
+        fs::symlink_metadata(&path).map_err(|error| format!("not read ({})", error.kind()))?;
+    if meta.file_type().is_symlink() {
+        return Err("a symlink: not followed".to_string());
+    }
+    if fs::canonicalize(&path).ok().as_deref() != Some(path.as_path()) {
+        return Err("a directory on its path is a symlink: not followed".to_string());
+    }
+    let descriptor: OwnedFd = rustix::fs::open(
+        &path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("not opened ({error}): not followed"))?;
+    let file = File::from(descriptor);
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("not read ({})", error.kind()))?;
+    if !opened.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let over = |bytes: u64| format!("{bytes} bytes, over the {limit} byte limit");
+    if opened.len() > limit {
+        return Err(over(opened.len()));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("not read ({})", error.kind()))?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > limit {
+        return Err(over(read));
+    }
+    String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())
+}
+
+/// The numbers of a code graph. No wall-clock figure: two runs on an
+/// unchanged tree print the same bytes.
+fn graph_summary(graph: &CodeGraph) -> Value {
+    let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_scope: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_precision: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut languages: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for info in graph.files.values() {
+        languages.entry(info.language.as_str()).or_default().0 += 1;
+    }
+    for edge in &graph.edges {
+        *by_kind.entry(edge.kind.as_str()).or_default() += 1;
+        *by_scope.entry(edge.scope.as_str()).or_default() += 1;
+        *by_precision.entry(edge.precision.as_str()).or_default() += 1;
+        if let Some(info) = graph.files.get(&edge.from) {
+            languages.entry(info.language.as_str()).or_default().1 += 1;
+        }
+    }
+    let mut diagnostic_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for diagnostic in &graph.diagnostics {
+        let code = serde_json::to_value(diagnostic.code)
+            .ok()
+            .and_then(|code| code.as_str().map(str::to_string))
+            .unwrap_or_default();
+        *diagnostic_counts.entry(code).or_default() += 1;
+    }
+    let structural = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind.is_structural())
+        .count();
+    json!({
+        "files_analyzed": graph.files.len(),
+        "files_parsed": graph.files.values().filter(|info| info.parsed).count(),
+        "edges": graph.edges.len(),
+        "structural_edges": structural,
+        "dependency_edges": graph.edges.len() - structural,
+        "external_imports": graph.external_imports,
+        "unresolved": diagnostic_counts.get("unresolved").copied().unwrap_or(0),
+        "unresolved_items": diagnostic_counts.get("unresolved_item").copied().unwrap_or(0),
+        "reexport_too_deep": diagnostic_counts.get("reexport_too_deep").copied().unwrap_or(0),
+        // Edges to a module whose macro call only mentions the name.
+        "macro_guesses": by_precision.get("macro").copied().unwrap_or(0),
+        "by_kind": by_kind,
+        "by_scope": by_scope,
+        "by_precision": by_precision,
+        "languages": languages
+            .iter()
+            .map(|(language, (files, edges))| (*language, json!({ "files": files, "edges": edges })))
+            .collect::<BTreeMap<_, _>>(),
+        "units": graph.units,
+        "diagnostic_counts": diagnostic_counts,
+        "diagnostics": graph.diagnostics,
+        "limits": spawn_codegraph::LIMITS,
+    })
+}
+
+/// Whether one end of an edge matches a `--from` / `--to` value: a feature
+/// id (any of `owners` in its subtree), else a path or a directory prefix.
+fn end_matches(
+    spec: Option<&str>,
+    owners: &BTreeSet<String>,
+    path: &str,
+    index: Option<&FeatureIndex>,
+) -> bool {
+    let Some(spec) = spec else {
+        return true;
+    };
+    if let Some(index) = index
+        && index.contains(spec)
+    {
+        let subtree = index.subtree(spec);
+        return owners.iter().any(|owner| subtree.contains(owner));
+    }
+    let spec = spec.trim_end_matches('/');
+    path == spec || path.starts_with(&format!("{spec}/"))
+}
+
+/// One line for a file edge: `from:line -> to (kind, scope[, via X])`.
+fn edge_line(edge: &FileEdge) -> String {
+    let via = edge
+        .via
+        .as_deref()
+        .map_or_else(String::new, |via| format!(", via {via}"));
+    format!(
+        "{}:{} -> {} ({}, {}{via})",
+        edge.from,
+        edge.line,
+        edge.to,
+        edge.kind.as_str(),
+        edge.scope.as_str()
+    )
+}
+
+/// The feature level: feature edges and findings, filtered by `--from`,
+/// `--to` and `--feature`.
+struct FeatureView {
+    edges: Vec<FeatureEdge>,
+    truth: TruthReport,
+}
+
+fn feature_view(opts: &GraphOpts, graph: &CodeGraph, registry: &FeatureRegistry) -> FeatureView {
+    let index = FeatureIndex::new(registry);
+    let projected = feature_deps::project(graph, registry);
+    let mut truth = feature_deps::truth(graph, registry, &TruthPolicy::default(), &utc_today());
+    let focus = opts.feature.as_ref().map(|id| index.subtree(id));
+    let touches = |ids: &[&Vec<String>]| {
+        focus.as_ref().is_none_or(|focus| {
+            ids.iter()
+                .any(|side| side.iter().any(|id| focus.contains(id)))
+        })
+    };
+    let mut edges = Vec::new();
+    for mut edge in projected.edges {
+        if !touches(&[&edge.from_any_of, &edge.to_any_of]) {
+            continue;
+        }
+        let from_owners: BTreeSet<String> = edge.from_any_of.iter().cloned().collect();
+        let to_owners: BTreeSet<String> = edge.to_any_of.iter().cloned().collect();
+        edge.evidence.retain(|file_edge| {
+            end_matches(
+                opts.from.as_deref(),
+                &from_owners,
+                &file_edge.from,
+                Some(&index),
+            ) && end_matches(opts.to.as_deref(), &to_owners, &file_edge.to, Some(&index))
+        });
+        if !edge.evidence.is_empty() {
+            edges.push(edge);
+        }
+    }
+    truth
+        .findings
+        .retain(|finding| touches(&[&finding.from_any_of, &finding.to_any_of, &finding.features]));
+    // The counts describe the findings shown.
+    truth.counts = TruthCounts::of(&truth.findings);
+    FeatureView { edges, truth }
+}
+
+/// Edges between package units, each with whether the source unit's
+/// manifest declares the target.
+fn unit_edges(graph: &CodeGraph) -> Vec<Value> {
+    let declared: BTreeMap<&str, &Vec<String>> = graph
+        .units
+        .iter()
+        .map(|unit| (unit.id.as_str(), &unit.declared_units))
+        .collect();
+    let unit_of = |path: &str| graph.files.get(path).and_then(|info| info.unit.as_deref());
+    let mut counts: BTreeMap<(&str, &str), (usize, usize)> = BTreeMap::new();
+    for edge in graph.edges.iter().filter(|edge| !edge.kind.is_structural()) {
+        let (Some(from), Some(to)) = (unit_of(&edge.from), unit_of(&edge.to)) else {
+            continue;
+        };
+        if from != to {
+            let count = counts.entry((from, to)).or_default();
+            count.0 += 1;
+            if edge.scope == Scope::Prod {
+                count.1 += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .map(|((from, to), (edges, prod_edges))| {
+            json!({
+                "from": from,
+                "to": to,
+                "edges": edges,
+                "prod_edges": prod_edges,
+                "declared": declared.get(from).is_some_and(|units| units.iter().any(|unit| unit == to)),
+            })
+        })
+        .collect()
+}
+
+/// The registry `graph` reads: required at the feature level, optional
+/// (for its boundary and owners) at the file and unit levels.
+fn graph_registry(opts: &GraphOpts) -> Result<Option<FeatureRegistry>, String> {
+    if opts.level == GraphLevel::Feature || opts.registry.exists() {
+        load_registry(&opts.registry).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The boundary when no registry gives one: the generic boundary named
+/// after the root directory.
+fn generic_boundary(root: &Path) -> BoundaryPolicy {
+    let name = fs::canonicalize(root)
+        .ok()
+        .and_then(|real| {
+            real.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "project".to_string());
+    BoundaryPolicy::default_generic_boundary(&name)
+}
+
+/// The JSON `spawn features graph --json` prints, and how long building
+/// the graph took (shown only by the human form).
+fn graph_payload(opts: &GraphOpts) -> Result<(Value, u128), String> {
+    let registry = graph_registry(opts)?;
+    if let Some(feature) = &opts.feature {
+        let Some(registry) = &registry else {
+            return Err(format!(
+                "--feature {feature} needs a registry; {} does not exist",
+                opts.registry.display()
+            ));
+        };
+        if !FeatureIndex::new(registry).contains(feature) {
+            return Err(format!(
+                "--feature {feature:?} names no feature of {}",
+                opts.registry.display()
+            ));
+        }
+    }
+    let boundary = registry
+        .as_ref()
+        .map_or_else(|| generic_boundary(&opts.root), |r| r.boundary.clone());
+    let (graph, build_ms) = build_code_graph(&opts.root, &boundary)?;
+    let mut payload = json!({
+        "schema_version": 1,
+        "root": opts.root.display().to_string(),
+        "registry_path": registry.as_ref().map(|_| opts.registry.display().to_string()),
+        "level": opts.level.as_str(),
+        "feature": opts.feature,
+        "graph": graph_summary(&graph),
+    });
+    let Some(object) = payload.as_object_mut() else {
+        return Ok((payload, build_ms));
+    };
+    match opts.level {
+        GraphLevel::File => {
+            let index = registry.as_ref().map(FeatureIndex::new);
+            let owners = |path: &str| {
+                index
+                    .as_ref()
+                    .map(|index| index.owners(path))
+                    .unwrap_or_default()
+            };
+            let edges: Vec<&FileEdge> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    end_matches(
+                        opts.from.as_deref(),
+                        &owners(&edge.from),
+                        &edge.from,
+                        index.as_ref(),
+                    ) && end_matches(
+                        opts.to.as_deref(),
+                        &owners(&edge.to),
+                        &edge.to,
+                        index.as_ref(),
+                    )
+                })
+                .collect();
+            object.insert("edges".to_string(), json!(edges));
+        }
+        GraphLevel::Unit => {
+            object.insert("unit_edges".to_string(), json!(unit_edges(&graph)));
+        }
+        GraphLevel::Feature => {
+            let registry =
+                registry.ok_or_else(|| "the feature level needs a registry".to_string())?;
+            let view = feature_view(opts, &graph, &registry);
+            let projection = feature_deps::project(&graph, &registry).summary;
+            object.insert("projection".to_string(), json!(projection));
+            object.insert(
+                "feature_edges".to_string(),
+                json!(
+                    view.edges
+                        .iter()
+                        .map(|edge| json!({
+                            "from_any_of": edge.from_any_of,
+                            "to_any_of": edge.to_any_of,
+                            "status": edge.status,
+                            "prod_edges": edge.prod_edges,
+                            "other_edges": edge.other_edges,
+                            "evidence_total": edge.evidence.len(),
+                            "evidence": edge.evidence,
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            object.insert("truth".to_string(), json!(view.truth));
+            object.insert("mode".to_string(), json!("report"));
+        }
+    }
+    Ok((payload, build_ms))
+}
+
+/// `spawn features graph`: read-only. The code graph of the project's
+/// in-scope Rust files, at file, unit or feature level, and why the tool
+/// says one feature depends on another, down to `file:line`.
+fn cmd_graph(args: &[String]) -> Result<i32, String> {
+    let opts = parse_graph_opts(args)?;
+    let (payload, build_ms) = graph_payload(&opts)?;
+    if opts.json {
+        let text = serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("serialize graph: {error}"))?;
+        println!("{text}");
+    } else {
+        print_graph_human(&opts, &payload, build_ms);
+    }
+    Ok(0)
+}
+
+fn count(value: &Value, key: &str) -> u64 {
+    value[key].as_u64().unwrap_or(0)
+}
+
+fn print_graph_human(opts: &GraphOpts, payload: &Value, build_ms: u128) {
+    let graph = &payload["graph"];
+    println!(
+        "code graph ({}) — files={} parsed={} edges={} dependency={} structural={} units={} external_imports={} unresolved={} unresolved_items={} macro_guesses={} diagnostics={} build_ms={build_ms}",
+        opts.level.as_str(),
+        count(graph, "files_analyzed"),
+        count(graph, "files_parsed"),
+        count(graph, "edges"),
+        count(graph, "dependency_edges"),
+        count(graph, "structural_edges"),
+        graph["units"].as_array().map_or(0, Vec::len),
+        count(graph, "external_imports"),
+        count(graph, "unresolved"),
+        count(graph, "unresolved_items"),
+        count(graph, "macro_guesses"),
+        graph["diagnostics"].as_array().map_or(0, Vec::len),
+    );
+    let focused = opts.from.is_some() || opts.to.is_some() || opts.feature.is_some();
+    let parse_edge = |value: &Value| serde_json::from_value::<FileEdge>(value.clone()).ok();
+    match opts.level {
+        GraphLevel::File => {
+            for edge in payload["edges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(parse_edge)
+            {
+                println!("  {}", edge_line(&edge));
+            }
+        }
+        GraphLevel::Unit => {
+            for edge in payload["unit_edges"].as_array().into_iter().flatten() {
+                println!(
+                    "  {} -> {} edges={} prod={} [{}]",
+                    edge["from"].as_str().unwrap_or(""),
+                    edge["to"].as_str().unwrap_or(""),
+                    count(edge, "edges"),
+                    count(edge, "prod_edges"),
+                    if edge["declared"].as_bool() == Some(true) {
+                        "declared"
+                    } else {
+                        "undeclared"
+                    }
+                );
+            }
+        }
+        GraphLevel::Feature => print_feature_level(payload, focused, parse_edge),
+    }
+}
+
+fn print_feature_level(
+    payload: &Value,
+    focused: bool,
+    parse_edge: impl Fn(&Value) -> Option<FileEdge>,
+) {
+    let projection = &payload["projection"];
+    println!(
+        "projection — internal={} hierarchy={} unowned={} declared={} implied={} undeclared={}",
+        count(projection, "internal"),
+        count(projection, "hierarchy"),
+        count(projection, "unowned"),
+        count(projection, "declared"),
+        count(projection, "implied"),
+        count(projection, "undeclared"),
+    );
+    let edges = payload["feature_edges"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    println!("feature edges ({}):", edges.len());
+    let ids = id_list;
+    for edge in &edges {
+        println!(
+            "  {} -> {} [{}] prod={} other={}",
+            ids(&edge["from_any_of"]),
+            ids(&edge["to_any_of"]),
+            edge["status"].as_str().unwrap_or(""),
+            count(edge, "prod_edges"),
+            count(edge, "other_edges"),
+        );
+        let evidence: Vec<FileEdge> = edge["evidence"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(&parse_edge)
+            .collect();
+        let shown = if focused { evidence.len() } else { 3 };
+        for file_edge in evidence.iter().take(shown) {
+            println!("      {}", edge_line(file_edge));
+        }
+        if evidence.len() > shown {
+            println!(
+                "      ... {} more: spawn features graph --from {} --to {}",
+                evidence.len() - shown,
+                edge["from_any_of"][0].as_str().unwrap_or(""),
+                edge["to_any_of"][0].as_str().unwrap_or("")
+            );
+        }
+    }
+    let truth = &payload["truth"];
+    let by_code = &truth["counts"]["by_code"];
+    let roles = count(by_code, "kernel_leak") + count(by_code, "entrypoint_imported");
+    println!(
+        "dependency truth (report) — under_declared={} implied={} test_only={} ghost={} inverted={} unverifiable={} cycles={} roles={} waived={}",
+        count(by_code, "under_declared"),
+        count(by_code, "implied_only"),
+        count(by_code, "test_only_undeclared"),
+        count(by_code, "ghost"),
+        count(by_code, "inverted"),
+        count(by_code, "unverifiable"),
+        count(by_code, "static_cycle"),
+        roles,
+        count(&truth["counts"], "waived"),
+    );
+    print_findings(truth, &parse_edge);
+}
+
+/// `a|b|c` for a JSON list of ids.
+fn id_list(value: &Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// One line per finding, with its first evidence edge and, on a cycle, how
+/// many undeclarable pairs it keeps out of `under_declared`.
+fn print_findings(truth: &Value, parse_edge: &impl Fn(&Value) -> Option<FileEdge>) {
+    let ids = id_list;
+    for finding in truth["findings"].as_array().into_iter().flatten() {
+        let names = if finding["features"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty())
+        {
+            ids(&finding["features"])
+        } else {
+            format!(
+                "{} -> {}",
+                ids(&finding["from_any_of"]),
+                ids(&finding["to_any_of"])
+            )
+        };
+        let first = finding["evidence"]
+            .as_array()
+            .and_then(|evidence| evidence.first())
+            .and_then(&parse_edge)
+            .map_or_else(String::new, |edge| format!(": {}", edge_line(&edge)));
+        let suppressed = &finding["suppressed"];
+        let first = if suppressed.is_object() {
+            format!(
+                "{first} [suppressed {} undeclarable pairs, {} file edges]",
+                count(suppressed, "total"),
+                count(suppressed, "file_edges")
+            )
+        } else {
+            first
+        };
+        println!(
+            "  {} {} {}{first} (edges={})",
+            finding["severity"].as_str().unwrap_or(""),
+            finding["code"].as_str().unwrap_or(""),
+            names,
+            count(finding, "evidence_total"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use spawn_core::feature_coverage::{FeatureKind, FeatureNode, FeatureProvenance};
+    use spawn_core::feature_deps::Finding;
 
     fn temp_fixture(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1203,5 +1861,371 @@ mod tests {
         assert_eq!(project_root_for_registry(&fresh), acme);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A temporary project directory, removed when dropped (passed or
+    /// failed), written from a string table of `(path, text)`.
+    struct Project(PathBuf);
+
+    impl Project {
+        fn new(name: &str, table: &[(&str, &str)]) -> Self {
+            let project = Self(temp_fixture(name));
+            for (path, text) in table {
+                let file = project.0.join(path);
+                fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+                fs::write(file, text).expect("write fixture file");
+            }
+            project
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Two crates: an app that uses a library item by crate name (once in
+    /// a macro body), and a test; no `depends_on` declared.
+    const GRAPH_PROJECT: &[(&str, &str)] = &[
+        ("Cargo.toml", "[workspace]\nmembers = [\"core\", \"app\"]\n"),
+        (
+            "core/Cargo.toml",
+            "[package]\nname = \"fx-core\"\nversion = \"0.1.0\"\n",
+        ),
+        ("core/src/lib.rs", "pub mod util;\npub use util::clamp;\n"),
+        (
+            "core/src/util.rs",
+            "pub fn clamp(x: i32) -> i32 {\n    x\n}\n",
+        ),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"fx-app\"\nversion = \"0.1.0\"\n\n[dependencies]\nfx-core = { path = \"../core\" }\n",
+        ),
+        (
+            "app/src/main.rs",
+            "use fx_core::clamp;\n\nfn main() {\n    println!(\"{}\", fx_core::util::clamp(clamp(1)));\n}\n",
+        ),
+        ("README.md", "# fx\n"),
+    ];
+
+    fn graph_registry_fixture() -> FeatureRegistry {
+        let node = |id: &str, kind, parent: Option<&str>, files: &[&str]| FeatureNode {
+            id: id.to_string(),
+            title: id.to_string(),
+            kind,
+            parent: parent.map(str::to_string),
+            summary: String::new(),
+            status_note: None,
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+            relations: Vec::new(),
+            provenance: FeatureProvenance::default(),
+        };
+        FeatureRegistry {
+            schema_version: SCHEMA_VERSION,
+            initiative_id: "fx".to_string(),
+            boundary: BoundaryPolicy::default_generic_boundary("fx"),
+            features: vec![
+                node("dom-fx", FeatureKind::Domain, None, &[]),
+                node(
+                    "cap-app",
+                    FeatureKind::Capability,
+                    Some("dom-fx"),
+                    &["app/Cargo.toml", "app/src/main.rs"],
+                ),
+                node(
+                    "cap-core",
+                    FeatureKind::Capability,
+                    Some("dom-fx"),
+                    &["core/Cargo.toml", "core/src/lib.rs", "core/src/util.rs"],
+                ),
+            ],
+        }
+    }
+
+    fn graph_args(project: &Project, extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--root".to_string(),
+            project.0.display().to_string(),
+            "--registry".to_string(),
+            project.0.join("registry.json").display().to_string(),
+        ];
+        args.extend(extra.iter().map(|word| (*word).to_string()));
+        args
+    }
+
+    #[test]
+    fn graph_from_to_lists_file_edges_with_lines() {
+        let project = Project::new("graph-from-to", GRAPH_PROJECT);
+        save_registry_atomic(&project.0.join("registry.json"), &graph_registry_fixture())
+            .expect("save registry");
+
+        let opts = parse_graph_opts(&graph_args(
+            &project,
+            &["--from", "cap-app", "--to", "cap-core"],
+        ))
+        .expect("options");
+        let (payload, _) = graph_payload(&opts).expect("graph");
+        assert_eq!(payload["level"], json!("feature"));
+        assert_eq!(payload["graph"]["files_analyzed"], json!(3));
+        let edges = payload["feature_edges"].as_array().expect("feature edges");
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0]["from_any_of"], json!(["cap-app"]));
+        assert_eq!(edges[0]["to_any_of"], json!(["cap-core"]));
+        assert_eq!(edges[0]["status"], json!("undeclared"));
+        let lines: Vec<(String, u64, String, Option<String>)> = edges[0]["evidence"]
+            .as_array()
+            .expect("evidence")
+            .iter()
+            .map(|edge| {
+                (
+                    edge["from"].as_str().expect("from").to_string(),
+                    edge["line"].as_u64().expect("line"),
+                    edge["to"].as_str().expect("to").to_string(),
+                    edge["via"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "app/src/main.rs".to_string(),
+                    1,
+                    "core/src/util.rs".to_string(),
+                    Some("core/src/lib.rs".to_string()),
+                ),
+                (
+                    "app/src/main.rs".to_string(),
+                    4,
+                    "core/src/util.rs".to_string(),
+                    None
+                ),
+            ]
+        );
+        let findings = payload["truth"]["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0]["code"], json!("under_declared"));
+        assert_eq!(findings[0]["evidence_total"], json!(2));
+
+        // The reverse direction has no edge; a path works as an end too.
+        let reverse = parse_graph_opts(&graph_args(
+            &project,
+            &["--from", "cap-core", "--to", "cap-app"],
+        ))
+        .expect("options");
+        let (payload, _) = graph_payload(&reverse).expect("graph");
+        assert_eq!(payload["feature_edges"], json!([]));
+        let by_path = parse_graph_opts(&graph_args(
+            &project,
+            &[
+                "--level",
+                "file",
+                "--from",
+                "app/src",
+                "--to",
+                "core/src/util.rs",
+            ],
+        ))
+        .expect("options");
+        let (payload, _) = graph_payload(&by_path).expect("graph");
+        assert_eq!(payload["edges"].as_array().map(Vec::len), Some(2));
+
+        // The human form runs read-only with rc 0 and leaves the tree as it was.
+        let before = fs::read_to_string(project.0.join("registry.json")).expect("registry");
+        let code = command(
+            &std::iter::once("graph".to_string())
+                .chain(graph_args(
+                    &project,
+                    &["--from", "cap-app", "--to", "cap-core"],
+                ))
+                .collect::<Vec<_>>(),
+        )
+        .expect("graph command");
+        assert_eq!(code, 0);
+        assert_eq!(
+            fs::read_to_string(project.0.join("registry.json")).expect("registry"),
+            before
+        );
+    }
+
+    #[test]
+    fn the_graph_usage_is_its_line_of_the_features_usage() {
+        let graph = GRAPH_USAGE.strip_prefix("usage: ").expect("a usage");
+        assert!(
+            USAGE.lines().any(|line| line.trim_start() == graph),
+            "{GRAPH_USAGE}\nis not a line of\n{USAGE}"
+        );
+    }
+
+    #[test]
+    fn graph_unit_level_needs_no_registry_and_bad_flags_are_refused() {
+        let project = Project::new("graph-unit", GRAPH_PROJECT);
+        let opts = parse_graph_opts(&graph_args(&project, &["--level", "unit", "--json"]))
+            .expect("options");
+        assert!(opts.json);
+        let (payload, _) = graph_payload(&opts).expect("no registry needed");
+        assert_eq!(payload["registry_path"], Value::Null);
+        assert_eq!(
+            payload["unit_edges"],
+            json!([{
+                "from": "cargo:fx-app",
+                "to": "cargo:fx-core",
+                "edges": 2,
+                "prod_edges": 2,
+                "declared": true,
+            }])
+        );
+        // The feature level needs the registry.
+        let feature = parse_graph_opts(&graph_args(&project, &[])).expect("options");
+        assert!(graph_payload(&feature).is_err());
+
+        for (bad, needle) in [
+            (&["--level", "crate"][..], "--level"),
+            (&["--colour", "red"], "unexpected flag --colour"),
+            (&["--json", "yes"], "takes no value"),
+            (&["--from"], "needs a value"),
+        ] {
+            let error = parse_graph_opts(&graph_args(&project, bad)).expect_err("refused");
+            assert!(error.contains(needle), "{bad:?}: {error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_never_follows_symlinks_or_reads_oversized_files() {
+        use std::os::unix::fs::symlink;
+
+        let project = Project::new("graph-symlinks", GRAPH_PROJECT);
+        let core = project.0.join("core");
+        fs::create_dir_all(core.join("secrets")).expect("secrets");
+        // An excluded file whose text must never reach the output.
+        fs::write(
+            core.join("secrets/k.rs"),
+            "use crate::leaked_secret_name::x;\npub fn leaked_secret_fn() {}\n",
+        )
+        .expect("secret");
+        symlink("../secrets/k.rs", core.join("src/link.rs")).expect("link to excluded");
+        fs::create_dir_all(core.join("big")).expect("big");
+        let limit = usize::try_from(spawn_codegraph::MAX_SOURCE_BYTES).expect("limit");
+        fs::write(
+            core.join("big/huge.rs"),
+            "// pad\n".repeat(limit / 7 + 1024),
+        )
+        .expect("huge");
+        symlink("../big/huge.rs", core.join("src/huge_link.rs")).expect("link to huge");
+        fs::write(
+            core.join("src/lib.rs"),
+            "pub mod util;\npub use util::clamp;\nmod link;\nmod huge_link;\n",
+        )
+        .expect("lib.rs");
+
+        let opts = parse_graph_opts(&graph_args(&project, &["--level", "file"])).expect("options");
+        let (payload, _) = graph_payload(&opts).expect("graph");
+        let text = payload.to_string();
+        assert!(
+            !text.contains("leaked_secret"),
+            "the excluded target's text leaked: {text}"
+        );
+        let skipped: BTreeMap<String, String> = payload["graph"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .filter(|d| d["code"] == json!("skipped"))
+            .map(|d| {
+                (
+                    d["path"].as_str().expect("path").to_string(),
+                    d["message"].as_str().expect("message").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            skipped.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "core/big/huge.rs",
+                "core/src/huge_link.rs",
+                "core/src/link.rs"
+            ],
+            "{skipped:?}"
+        );
+        assert!(
+            skipped["core/src/link.rs"].contains("symlink"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped["core/src/huge_link.rs"].contains("symlink"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped["core/big/huge.rs"].contains("over the"),
+            "{skipped:?}"
+        );
+        assert_eq!(payload["graph"]["files_parsed"], json!(3));
+    }
+
+    #[test]
+    fn graph_json_is_byte_identical_across_runs_and_has_no_clock() {
+        let project = Project::new("graph-bytes", GRAPH_PROJECT);
+        save_registry_atomic(&project.0.join("registry.json"), &graph_registry_fixture())
+            .expect("save registry");
+        let opts = parse_graph_opts(&graph_args(&project, &["--json"])).expect("options");
+        let first =
+            serde_json::to_string_pretty(&graph_payload(&opts).expect("graph").0).expect("json");
+        let second =
+            serde_json::to_string_pretty(&graph_payload(&opts).expect("graph").0).expect("json");
+        assert_eq!(first, second);
+        assert!(!first.contains("_ms"), "no wall-clock figure: {first}");
+    }
+
+    #[test]
+    fn graph_feature_filter_refuses_unknown_ids_and_recounts() {
+        let project = Project::new("graph-feature", GRAPH_PROJECT);
+        save_registry_atomic(&project.0.join("registry.json"), &graph_registry_fixture())
+            .expect("save registry");
+        let unknown = parse_graph_opts(&graph_args(&project, &["--feature", "no-such-feature"]))
+            .expect("options");
+        let error = graph_payload(&unknown).expect_err("unknown feature");
+        assert!(
+            error.contains("\"no-such-feature\" names no feature"),
+            "{error}"
+        );
+        let code = command(
+            &std::iter::once("graph".to_string())
+                .chain(graph_args(&project, &["--feature", "no-such-feature"]))
+                .collect::<Vec<_>>(),
+        );
+        assert!(code.is_err(), "the command fails (rc 1 through main)");
+
+        // The domain holds no file of its own: the filter is by subtree.
+        let scoped =
+            parse_graph_opts(&graph_args(&project, &["--feature", "cap-core"])).expect("options");
+        let (payload, _) = graph_payload(&scoped).expect("graph");
+        assert_eq!(payload["feature"], json!("cap-core"));
+        let findings: Vec<Finding> =
+            serde_json::from_value(payload["truth"]["findings"].clone()).expect("findings");
+        assert_eq!(findings.len(), 1);
+        let counts: TruthCounts =
+            serde_json::from_value(payload["truth"]["counts"].clone()).expect("counts");
+        assert_eq!(counts, TruthCounts::of(&findings));
+        // A feature no finding touches: zero counts, not the whole report's.
+        let mut registry = graph_registry_fixture();
+        registry.features.push(FeatureNode {
+            id: "cap-idle".to_string(),
+            title: "idle".to_string(),
+            kind: FeatureKind::Capability,
+            parent: Some("dom-fx".to_string()),
+            summary: String::new(),
+            status_note: None,
+            files: vec!["README.md".to_string()],
+            relations: Vec::new(),
+            provenance: FeatureProvenance::default(),
+        });
+        save_registry_atomic(&project.0.join("registry.json"), &registry).expect("save");
+        let idle =
+            parse_graph_opts(&graph_args(&project, &["--feature", "cap-idle"])).expect("options");
+        let (payload, _) = graph_payload(&idle).expect("graph");
+        assert_eq!(payload["truth"]["findings"], json!([]));
+        assert_eq!(payload["truth"]["counts"]["error"], json!(0));
+        assert_eq!(payload["truth"]["counts"]["by_code"], json!({}));
     }
 }

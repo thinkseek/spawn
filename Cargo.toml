@@ -7,6 +7,7 @@ members = [
     "crates/spawn-host",
     "crates/spawn-cli",
     "crates/spawn-kdf",
+    "crates/spawn-codegraph",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ spawn-postgres = { path = "crates/spawn-postgres" }
 spawn-jev = { path = "crates/spawn-jev" }
 spawn-host = { path = "crates/spawn-host" }
 spawn-kdf = { path = "crates/spawn-kdf" }
+spawn-codegraph = { path = "crates/spawn-codegraph" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
