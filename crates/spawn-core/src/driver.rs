@@ -117,11 +117,38 @@ pub struct LineFacts {
 }
 
 /// What a driver keeps between the lines of one transcript. Claude Code's
-/// lines read alone, so it only counts them.
+/// lines read alone, so it only counts them. agy's do not
+/// ([`crate::ingest::agy_line`]): a tool's result is the next step after
+/// the call, with no id tying them, and a turn ends only once the
+/// background work it opened has reported back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineCursor {
     /// Lines read through this cursor.
     pub lines: u64,
+    /// The native session whose transcript this is: the first part of the
+    /// keys of agy's events (the Bridge sets it).
+    pub native: String,
+    /// agy's tool calls whose result has not come yet: the step that made
+    /// each and its place among the step's calls, oldest first.
+    pub pending_tools: Vec<(u64, usize)>,
+    /// agy's background jobs started and not reported finished
+    /// (`<conversation>/task-<n>`).
+    pub open_jobs: std::collections::BTreeSet<String>,
+    /// agy's subagents created and not reported back (their conversation
+    /// ids).
+    pub open_subagents: std::collections::BTreeSet<String>,
+    /// The step of the last agy line read: steps an interrupt left out
+    /// (Esc writes no line) are gaps, never waited for.
+    pub last_step: Option<u64>,
+}
+
+impl LineCursor {
+    /// Whether agy work the transcript opened is still open: a background
+    /// job or a subagent that has not reported back. The turn stays open
+    /// while it is, whatever the screen's host says.
+    pub fn work_open(&self) -> bool {
+        !self.open_jobs.is_empty() || !self.open_subagents.is_empty()
+    }
 }
 
 /// One engine, as the Bridge sees it. Implementations are pure: no IO, no
