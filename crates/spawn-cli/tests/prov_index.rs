@@ -604,6 +604,7 @@ fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be
         delay += std::time::Duration::from_millis(20);
     }
     let partial = count(&mut killed_client, "prov_changes");
+    eprintln!("PARTIAL {partial} of {total}");
     let rest = index(&killed, &git_dir);
     assert_eq!(
         i64::try_from(rest["recorded"].as_u64().expect("a count")).expect("small") + partial,
