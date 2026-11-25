@@ -1,5 +1,7 @@
-//! A strict reader for the subset of TOML that `Cargo.toml` files use, and
-//! the manifest facts the resolver needs.
+//! A strict reader for the subset of TOML that `Cargo.toml` files use, a
+//! JSON reader for `package.json` and (with comments stripped)
+//! `tsconfig.json` / `jsconfig.json`, and the manifest facts the resolver
+//! needs.
 //!
 //! No `toml` crate: the gate builds offline and `toml` is not in Spawn's
 //! `Cargo.lock`. The subset is tables, arrays of tables, dotted and quoted
@@ -657,6 +659,447 @@ pub fn read_cargo(text: &str) -> Result<CargoManifest, TomlError> {
     Ok(manifest)
 }
 
+// ---------------------------------------------------------------------
+// JavaScript / TypeScript manifests: `package.json`, `tsconfig.json`,
+// `jsconfig.json`. A small JSON reader (no `serde_json` in this crate's
+// dependencies: none is added), and a comment-stripping pre-pass for the
+// JSON-with-comments that `tsconfig.json` allows.
+
+/// Deepest nesting a JSON manifest may have; a deeper one is refused.
+pub const MAX_JSON_DEPTH: usize = 128;
+
+/// One JSON value. Objects keep their keys in written order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Json {
+    Null,
+    Bool(bool),
+    /// A number, as written.
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// The value of `key` in an object (the last one written wins).
+    pub fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Self::Obj(entries) => entries.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl JsonParser<'_> {
+    fn error<T>(&self, message: &str) -> Result<T, String> {
+        let line = self.bytes[..self.at.min(self.bytes.len())]
+            .split(|b| *b == b'\n')
+            .count();
+        Err(format!("line {line}: {message}"))
+    }
+
+    fn skip_space(&mut self) {
+        while self.at < self.bytes.len() && self.bytes[self.at].is_ascii_whitespace() {
+            self.at += 1;
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Json, String> {
+        if depth > MAX_JSON_DEPTH {
+            return self.error(&format!("nested past {MAX_JSON_DEPTH} levels"));
+        }
+        self.skip_space();
+        match self.bytes.get(self.at) {
+            Some(b'{') => {
+                self.at += 1;
+                let mut entries = Vec::new();
+                self.skip_space();
+                if self.bytes.get(self.at) == Some(&b'}') {
+                    self.at += 1;
+                    return Ok(Json::Obj(entries));
+                }
+                loop {
+                    self.skip_space();
+                    if self.bytes.get(self.at) != Some(&b'"') {
+                        return self.error("expected a string key");
+                    }
+                    let key = self.string()?;
+                    self.skip_space();
+                    if self.bytes.get(self.at) != Some(&b':') {
+                        return self.error("expected `:`");
+                    }
+                    self.at += 1;
+                    let value = self.value(depth + 1)?;
+                    entries.push((key, value));
+                    self.skip_space();
+                    match self.bytes.get(self.at) {
+                        Some(b',') => self.at += 1,
+                        Some(b'}') => {
+                            self.at += 1;
+                            return Ok(Json::Obj(entries));
+                        }
+                        _ => return self.error("expected `,` or `}`"),
+                    }
+                }
+            }
+            Some(b'[') => {
+                self.at += 1;
+                let mut items = Vec::new();
+                self.skip_space();
+                if self.bytes.get(self.at) == Some(&b']') {
+                    self.at += 1;
+                    return Ok(Json::Arr(items));
+                }
+                loop {
+                    items.push(self.value(depth + 1)?);
+                    self.skip_space();
+                    match self.bytes.get(self.at) {
+                        Some(b',') => self.at += 1,
+                        Some(b']') => {
+                            self.at += 1;
+                            return Ok(Json::Arr(items));
+                        }
+                        _ => return self.error("expected `,` or `]`"),
+                    }
+                }
+            }
+            Some(b'"') => self.string().map(Json::Str),
+            Some(_) => {
+                let start = self.at;
+                while self.at < self.bytes.len()
+                    && (self.bytes[self.at].is_ascii_alphanumeric()
+                        || matches!(self.bytes[self.at], b'-' | b'+' | b'.'))
+                {
+                    self.at += 1;
+                }
+                let word = std::str::from_utf8(&self.bytes[start..self.at]).unwrap_or_default();
+                match word {
+                    "null" => Ok(Json::Null),
+                    "true" => Ok(Json::Bool(true)),
+                    "false" => Ok(Json::Bool(false)),
+                    _ if is_json_number(word) => Ok(Json::Num(word.to_string())),
+                    _ => {
+                        self.at = start;
+                        self.error("unexpected value")
+                    }
+                }
+            }
+            None => self.error("unexpected end"),
+        }
+    }
+
+    /// Exactly four hex digits after `\u`.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let Some(hex) = self
+            .bytes
+            .get(self.at..self.at + 4)
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        else {
+            return self.error("a \\u escape needs four hex digits");
+        };
+        let code = hex.iter().fold(0u32, |code, digit| {
+            code * 16 + char::from(*digit).to_digit(16).unwrap_or(0)
+        });
+        self.at += 4;
+        Ok(code)
+    }
+
+    /// The character of a `\u` escape after its `u`: a UTF-16 surrogate
+    /// pair (`\uD83D\uDE00`) is one character; a lone surrogate is U+FFFD.
+    fn unicode_escape(&mut self) -> Result<char, String> {
+        let high = self.hex4()?;
+        if (0xD800..0xDC00).contains(&high)
+            && self.bytes.get(self.at..self.at + 2) == Some(b"\\u".as_slice())
+        {
+            let back = self.at;
+            self.at += 2;
+            let low = self.hex4()?;
+            if (0xDC00..0xE000).contains(&low) {
+                let code = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                return Ok(char::from_u32(code).unwrap_or('\u{fffd}'));
+            }
+            self.at = back;
+        }
+        Ok(char::from_u32(high).unwrap_or('\u{fffd}'))
+    }
+
+    /// A string from its opening quote.
+    fn string(&mut self) -> Result<String, String> {
+        self.at += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let Some(&byte) = self.bytes.get(self.at) else {
+                return self.error("unterminated string");
+            };
+            self.at += 1;
+            match byte {
+                b'"' => return Ok(String::from_utf8_lossy(&out).into_owned()),
+                b'\\' => {
+                    let Some(&escape) = self.bytes.get(self.at) else {
+                        return self.error("unterminated string");
+                    };
+                    self.at += 1;
+                    match escape {
+                        b'"' | b'\\' | b'/' => out.push(escape),
+                        b'n' => out.push(b'\n'),
+                        b't' => out.push(b'\t'),
+                        b'r' => out.push(b'\r'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'u' => {
+                            let c = self.unicode_escape()?;
+                            let mut buffer = [0u8; 4];
+                            out.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
+                        }
+                        _ => return self.error("invalid escape in string"),
+                    }
+                }
+                byte if byte < 0x20 => return self.error("control character in string"),
+                other => out.push(other),
+            }
+        }
+    }
+}
+
+/// The JSON number grammar: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn is_json_number(word: &str) -> bool {
+    let bytes = word.strip_prefix('-').unwrap_or(word).as_bytes();
+    let digits = |at: usize| {
+        bytes[at..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    };
+    let int = digits(0);
+    if int == 0 || (int > 1 && bytes[0] == b'0') {
+        return false;
+    }
+    let mut at = int;
+    if bytes.get(at) == Some(&b'.') {
+        let frac = digits(at + 1);
+        if frac == 0 {
+            return false;
+        }
+        at += 1 + frac;
+    }
+    if matches!(bytes.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        if matches!(bytes.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        let exp = digits(at);
+        if exp == 0 {
+            return false;
+        }
+        at += exp;
+    }
+    at == bytes.len()
+}
+
+/// Parse strict JSON (RFC 8259: what `package.json` must be).
+pub fn parse_json(text: &str) -> Result<Json, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut parser = JsonParser {
+        bytes: text.as_bytes(),
+        at: 0,
+    };
+    let value = parser.value(0)?;
+    parser.skip_space();
+    if parser.at < parser.bytes.len() {
+        return parser.error("text after the value");
+    }
+    Ok(value)
+}
+
+/// JSON with comments and trailing commas made JSON: comments become
+/// spaces (newlines kept, so lines still count), and a `,` before `}` or
+/// `]` is dropped. Strings are left alone.
+pub fn strip_jsonc(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'"' {
+            out.push(byte);
+            at += 1;
+            while at < bytes.len() {
+                let inner = bytes[at];
+                out.push(inner);
+                at += 1;
+                if inner == b'\\' {
+                    if let Some(&next) = bytes.get(at) {
+                        out.push(next);
+                        at += 1;
+                    }
+                } else if inner == b'"' || inner == b'\n' {
+                    break;
+                }
+            }
+        } else if byte == b'/' && bytes.get(at + 1) == Some(&b'/') {
+            while at < bytes.len() && bytes[at] != b'\n' {
+                out.push(b' ');
+                at += 1;
+            }
+        } else if byte == b'/' && bytes.get(at + 1) == Some(&b'*') {
+            out.extend_from_slice(b"  ");
+            at += 2;
+            while at < bytes.len() && !(bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/')) {
+                out.push(if bytes[at] == b'\n' { b'\n' } else { b' ' });
+                at += 1;
+            }
+            if at < bytes.len() {
+                out.extend_from_slice(b"  ");
+                at += 2;
+            }
+        } else if byte == b'}' || byte == b']' {
+            // Drop a trailing comma before the closer.
+            let mut back = out.len();
+            while back > 0 && out[back - 1].is_ascii_whitespace() {
+                back -= 1;
+            }
+            if back > 0 && out[back - 1] == b',' {
+                out[back - 1] = b' ';
+            }
+            out.push(byte);
+            at += 1;
+        } else {
+            out.push(byte);
+            at += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// What the resolver needs from one `package.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageJson {
+    pub name: Option<String>,
+    /// `exports`, as written.
+    pub exports: Option<Json>,
+    /// `imports` (`#name` specifiers), as written.
+    pub imports: Option<Json>,
+    pub main: Option<String>,
+    pub module: Option<String>,
+    /// `types`, else `typings`.
+    pub types: Option<String>,
+    /// `bin` targets (a string, or each value of an object).
+    pub bin: Vec<String>,
+    /// Every package named in `dependencies`, `devDependencies`,
+    /// `peerDependencies` and `optionalDependencies`.
+    pub dependencies: Vec<String>,
+}
+
+fn json_string(value: &Json, key: &str) -> Option<String> {
+    value.get(key).and_then(Json::as_str).map(str::to_string)
+}
+
+/// Read a `package.json`.
+pub fn read_package_json(text: &str) -> Result<PackageJson, String> {
+    let value = parse_json(text)?;
+    if !matches!(value, Json::Obj(_)) {
+        return Err("not a JSON object".to_string());
+    }
+    let bin = match value.get("bin") {
+        Some(Json::Str(path)) => vec![path.clone()],
+        Some(Json::Obj(entries)) => entries
+            .iter()
+            .filter_map(|(_, path)| path.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut dependencies = Vec::new();
+    for table in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(Json::Obj(entries)) = value.get(table) {
+            dependencies.extend(entries.iter().map(|(name, _)| name.clone()));
+        }
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    Ok(PackageJson {
+        name: json_string(&value, "name").filter(|name| !name.is_empty()),
+        exports: value.get("exports").cloned(),
+        imports: value.get("imports").cloned(),
+        main: json_string(&value, "main"),
+        module: json_string(&value, "module"),
+        types: json_string(&value, "types").or_else(|| json_string(&value, "typings")),
+        bin,
+        dependencies,
+    })
+}
+
+/// What the resolver needs from one `tsconfig.json` / `jsconfig.json`,
+/// before its `extends` chain is merged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TsConfig {
+    /// `extends` (a string or, since TypeScript 5, an array), as written.
+    pub extends: Vec<String>,
+    pub base_url: Option<String>,
+    /// `compilerOptions.paths`: pattern to targets, in written order;
+    /// `None` when the file does not set it.
+    pub paths: Option<Vec<(String, Vec<String>)>>,
+}
+
+/// Read a `tsconfig.json` or `jsconfig.json` (comments and trailing commas
+/// allowed).
+pub fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
+    let value = parse_json(&strip_jsonc(text))?;
+    if !matches!(value, Json::Obj(_)) {
+        return Err("not a JSON object".to_string());
+    }
+    let extends = match value.get("extends") {
+        Some(Json::Str(path)) => vec![path.clone()],
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let options = value.get("compilerOptions");
+    let base_url = options.and_then(|options| json_string(options, "baseUrl"));
+    let paths = match options.and_then(|options| options.get("paths")) {
+        Some(Json::Obj(entries)) => Some(
+            entries
+                .iter()
+                .map(|(pattern, targets)| {
+                    let targets = match targets {
+                        Json::Arr(items) => items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect(),
+                        Json::Str(target) => vec![target.clone()],
+                        _ => Vec::new(),
+                    };
+                    (pattern.clone(), targets)
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    Ok(TsConfig {
+        extends,
+        base_url,
+        paths,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +1221,140 @@ fx-test = { path = "../test" }
         let error =
             read_cargo("[package]\nname = \"a\"\n[dependencies]\nb = 3\n").expect_err("dep");
         assert!(error.message.contains("dependency b"), "{error}");
+    }
+
+    #[test]
+    fn json_reads_every_value_and_refuses_what_is_not_json() {
+        let value = parse_json(
+            "{ \"a\": [1, -2.5e3, true, false, null], \"b\": { \"c\": \"x\\\"\\u00e9\\n\" }, \"a\": 7 }",
+        )
+        .expect("json");
+        assert_eq!(
+            value.get("a"),
+            Some(&Json::Num("7".to_string())),
+            "last key wins"
+        );
+        assert_eq!(
+            value
+                .get("b")
+                .and_then(|b| b.get("c"))
+                .and_then(Json::as_str),
+            Some("x\"\u{e9}\n")
+        );
+        for bad in [
+            "",
+            "{",
+            "{\"a\" 1}",
+            "[1,]",
+            "{\"a\": 1,}",
+            "nul",
+            "{} x",
+            "\"open",
+            "{'a': 1}",
+        ] {
+            assert!(parse_json(bad).is_err(), "{bad:?}");
+        }
+        let deep = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_DEPTH + 5),
+            "]".repeat(MAX_JSON_DEPTH + 5)
+        );
+        assert!(parse_json(&deep).expect_err("deep").contains("nested past"));
+        let error = parse_json("{\n\n  \"a\": ?\n}").expect_err("line");
+        assert!(error.starts_with("line 3:"), "{error}");
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas_are_stripped_but_strings_kept() {
+        let text = "{\n  // a comment with \"quotes\"\n  \"url\": \"http://x/*y*/\", /* block\n comment */\n  \"list\": [1, 2,],\n}\n";
+        let stripped = strip_jsonc(text);
+        assert_eq!(stripped.lines().count(), text.lines().count(), "lines kept");
+        let value = parse_json(&stripped).expect("json");
+        assert_eq!(
+            value.get("url").and_then(Json::as_str),
+            Some("http://x/*y*/")
+        );
+        assert_eq!(
+            value.get("list"),
+            Some(&Json::Arr(vec![
+                Json::Num("1".into()),
+                Json::Num("2".into())
+            ]))
+        );
+    }
+
+    #[test]
+    fn package_json_and_tsconfig_facts() {
+        let package = read_package_json(
+            r##"{ "name": "@a/b", "main": "./m.js", "module": "./m.mjs", "typings": "./t.d.ts",
+                 "bin": { "x": "./x.js", "y": "./y.js" }, "exports": { ".": "./e.js" },
+                 "imports": { "#i": "./i.js" },
+                 "dependencies": { "z": "1" }, "devDependencies": { "c": "1", "z": "2" } }"##,
+        )
+        .expect("package");
+        assert_eq!(package.name.as_deref(), Some("@a/b"));
+        assert_eq!(package.types.as_deref(), Some("./t.d.ts"));
+        assert_eq!(package.bin, vec!["./x.js", "./y.js"]);
+        assert_eq!(package.dependencies, vec!["c", "z"]);
+        assert!(package.exports.is_some() && package.imports.is_some());
+        assert!(read_package_json("[]").is_err());
+        assert_eq!(
+            read_package_json("{ \"bin\": \"./cli.js\", \"name\": \"\" }").expect("bin"),
+            PackageJson {
+                bin: vec!["./cli.js".to_string()],
+                ..PackageJson::default()
+            }
+        );
+
+        let config = read_tsconfig(
+            "{ // c\n \"extends\": [\"./a\", \"pkg/tsconfig\"],\n \"compilerOptions\": { \"baseUrl\": \"src\", \"paths\": { \"@/*\": [\"x/*\", \"y/*\",], \"one\": \"z\" } } }",
+        )
+        .expect("tsconfig");
+        assert_eq!(config.extends, vec!["./a", "pkg/tsconfig"]);
+        assert_eq!(config.base_url.as_deref(), Some("src"));
+        assert_eq!(
+            config.paths,
+            Some(vec![
+                (
+                    "@/*".to_string(),
+                    vec!["x/*".to_string(), "y/*".to_string()]
+                ),
+                ("one".to_string(), vec!["z".to_string()]),
+            ])
+        );
+        assert_eq!(read_tsconfig("{}").expect("empty"), TsConfig::default());
+    }
+
+    #[test]
+    fn json_decodes_surrogate_pairs_and_refuses_invalid_escapes_and_numbers() {
+        let value = parse_json(r#"["😀", "é\/", "\ud83d", "\ude00x", "\ud83dA"]"#).expect("json");
+        let Json::Arr(items) = value else {
+            panic!("an array");
+        };
+        let texts: Vec<&str> = items.iter().filter_map(Json::as_str).collect();
+        assert_eq!(
+            texts,
+            vec!["\u{1f600}", "\u{e9}/", "\u{fffd}", "\u{fffd}x", "\u{fffd}A"]
+        );
+        for bad in [
+            r#""\u+041""#,
+            r#""\u-041""#,
+            r#""\u12""#,
+            r#""\uZZZZ""#,
+            r#""\x41""#,
+            r#""\a""#,
+            r#""\'""#,
+            "\"tab\there\"",
+        ] {
+            assert!(parse_json(bad).is_err(), "{bad}");
+        }
+        for good in ["0", "-0", "12", "1.5", "-1.5e10", "2E-3", "3e+2"] {
+            assert_eq!(parse_json(good), Ok(Json::Num(good.to_string())), "{good}");
+        }
+        for bad in [
+            "01", "-", "1.", ".5", "1e", "1e+", "+1", "1.2.3", "0x10", "1-2", "Infinity",
+        ] {
+            assert!(parse_json(bad).is_err(), "{bad}");
+        }
     }
 }

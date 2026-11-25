@@ -795,9 +795,13 @@ fn utc_today() -> String {
 }
 
 /// The code graph of `root`'s in-scope files under `boundary`, and how
-/// long building it took. Only in-scope Rust sources and `Cargo.toml`
-/// files are read, each at most [`spawn_codegraph::MAX_SOURCE_BYTES`]; a
-/// file not read is listed as `skipped`.
+/// long building it took. Only the in-scope files
+/// [`spawn_codegraph::wants`] accepts are read (Rust sources and
+/// `Cargo.toml`; TypeScript / JavaScript sources and `package.json`,
+/// `tsconfig*.json`, `jsconfig*.json`), each at most
+/// [`spawn_codegraph::MAX_SOURCE_BYTES`]; a file not read is listed as
+/// `skipped`. Every in-scope path, read or not, is passed as the inventory
+/// references may resolve to (assets, `.vue` files listed `unsupported`).
 pub fn build_code_graph(
     root: &Path,
     boundary: &BoundaryPolicy,
@@ -1178,7 +1182,7 @@ fn graph_payload(opts: &GraphOpts) -> Result<(Value, u128), String> {
 }
 
 /// `spawn features graph`: read-only. The code graph of the project's
-/// in-scope Rust files, at file, unit or feature level, and why the tool
+/// in-scope Rust, TypeScript and JavaScript files, at file, unit or feature level, and why the tool
 /// says one feature depends on another, down to `file:line`.
 fn cmd_graph(args: &[String]) -> Result<i32, String> {
     let opts = parse_graph_opts(args)?;

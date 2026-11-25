@@ -1261,5 +1261,18 @@ fn graph_output_is_byte_identical_across_runs() {
 #[test]
 fn only_rust_sources_and_cargo_manifests_are_read() {
     assert!(wants("crates/a/src/lib.rs") && wants("Cargo.toml") && wants("crates/a/Cargo.toml"));
-    assert!(!wants("Cargo.lock") && !wants("web/src/main.ts") && !wants("docs/Cargo.toml.md"));
+    assert!(!wants("Cargo.lock") && !wants("docs/Cargo.toml.md"));
+    // Since the JS / TS extractor (issue #100 PR 3) the only other files
+    // read are its sources and manifests: `web/src/main.ts` now is one.
+    assert!(wants("web/src/main.ts"));
+}
+
+#[test]
+fn js_ts_sources_and_their_manifests_are_read_and_nothing_else() {
+    assert!(wants("web/src/main.ts") && wants("web/package.json") && wants("web/tsconfig.json"));
+    assert!(wants("tsconfig.base.json") && wants("a/jsconfig.json") && wants("x.d.ts"));
+    assert!(
+        !wants("web/pnpm-lock.yaml") && !wants("package-lock.json") && !wants("web/src/App.vue")
+    );
+    assert!(!wants("README.md") && !wants("web/index.html") && !wants("a/data.json"));
 }
