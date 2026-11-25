@@ -875,7 +875,9 @@ const LOW_RISK_PHRASES: &[&str] = &["cargo fmt", "registry entry"];
 
 /// Tagging markers that count only as the brief's first word, in the
 /// imperative form that names the work: exactly `tag` or `label` ("Tag the
-/// open tasks", "Label the stale issues"), or a word starting `bulk-`
+/// open tasks", "Label the stale issues", the next word one of
+/// [`DETERMINERS`], so "Tag matching is case-sensitive" is a report and
+/// "Tag release v1.2" is not counted), or a word starting `bulk-`
 /// ("Bulk-label ..."). A plural or a noun phrase there is the subject of a
 /// report ("Labels vanish after a restart", "Bulk import fails"), and
 /// anywhere else they name a thing the work is about ("fix the crash in
@@ -1054,7 +1056,9 @@ fn path_words<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
 fn low_risk_markers(words: &[&str], text: &str) -> Vec<String> {
     let mut markers = matched(words, text, LOW_RISK_STEMS, LOW_RISK_PHRASES);
     if let Some(lead) = words.first() {
-        if LOW_RISK_LEAD_WORDS.contains(lead) {
+        if LOW_RISK_LEAD_WORDS.contains(lead)
+            && words.get(1).is_some_and(|next| DETERMINERS.contains(next))
+        {
             markers.push((*lead).to_string());
         } else if lead.starts_with(LOW_RISK_LEAD_PREFIX) {
             markers.push("bulk".to_string());
@@ -1095,8 +1099,8 @@ fn low_risk_markers(words: &[&str], text: &str) -> Vec<String> {
 /// - `long_brief` +1 above 2000 characters;
 /// - `low_risk` -2: a mechanical marker (typo*, spelling*, formatting*,
 ///   whitespace*, rustfmt*, mechanical*, repetitive*, "cargo fmt",
-///   "registry entry" anywhere; `tag`, `label` or `bulk-*` only as the
-///   brief's first word, exactly so; regenerat* only when its object is a
+///   "registry entry" anywhere; `tag` or `label` only as the brief's first
+///   word followed by a determiner, `bulk-*` only as its first word; regenerat* only when its object is a
 ///   generated artifact: fixture*, snapshot*, lockfile*, golden*,
 ///   generated*), only when no `security`,
 ///   `migration` or `concurrency` rule matched and no broadening word is
@@ -2241,6 +2245,13 @@ mod tests {
             "Cleanup\n- Tag the open tasks\n- Remove the dead code path",
             "Regenerate the session token and update the snapshot test",
             "Regenerate the signing key next to the fixtures",
+            // A leading tag or label not followed by a determiner is the
+            // subject of a report (supervisor review of task 580, F5).
+            "Tag matching is case-sensitive; make it case-insensitive",
+            "Label overlaps the button on narrow screens",
+            "Tag colour is too dark in the sidebar",
+            "Label text is truncated on mobile",
+            "Tag is shown twice on the task page",
         ] {
             let classified = classify_difficulty(brief);
             assert!(
