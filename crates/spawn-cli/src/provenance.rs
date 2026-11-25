@@ -824,14 +824,12 @@ fn planned_change(
         }),
         Target::Task(task) => changes_of(store, target)?
             .into_iter()
-            .filter(|change| in_domain(change) && change.kind == ProvChangeKind::Land)
-            .next_back()
+            .rfind(|change| in_domain(change) && change.kind == ProvChangeKind::Land)
             .ok_or_else(|| format!("task {task} has no landing in {domain}")),
         Target::Change(change_id) => {
             let last = changes_of(store, target)?
                 .into_iter()
-                .filter(in_domain)
-                .next_back()
+                .rfind(in_domain)
                 .ok_or_else(|| format!("{change_id} is no Change of {domain}"))?;
             if last.kind != ProvChangeKind::Edit {
                 return Ok(last);
