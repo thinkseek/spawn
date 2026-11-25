@@ -6085,7 +6085,7 @@ impl Bridge {
         for (at, key) in named.iter().enumerate() {
             let idempotency_key = IdempotencyKey::new(trust_answer_key(&active.execution_id, at + 1))
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
-            let command_id = self.commands.submit(
+            let command_id = self.queue.submit(
                 &principal,
                 &Submission {
                     agent_id: claimed.agent_id.clone(),
