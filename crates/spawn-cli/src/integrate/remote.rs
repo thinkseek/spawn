@@ -10,7 +10,7 @@
 //!   `controller_pack` (a deterministic ustar of the controller's
 //!   `scripts/`, its scenarios directory and `web/package-lock.json`,
 //!   cached per controller and set) and the registry pack with its
-//!   `registry-manifest` (`tree_sha256_v1` of `$CARGO_HOME/registry` and
+//!   `registry-manifest.json` (`tree_sha256_v1` of `$CARGO_HOME/registry` and
 //!   `$CARGO_HOME/git`, cargo's lock files skipped).
 //! - **The grant's environment** ([`grant_env`]): [`gate::GATE_ENV`] minus
 //!   what the node sets itself ([`NODE_OWNED_ENV`]: `PATH`, `HOME`,
@@ -91,8 +91,9 @@ pub(super) const NODE_MIN_FREE_GB: &str = "8";
 /// The major version of the gate's private PostgreSQL a node must hold.
 pub(super) const PG_MAJOR: &str = "16";
 
-/// The name of the registry manifest in the artifact directory
-/// (`GET /node/v1/registry-manifest`).
+/// The name of the registry manifest in the artifact directory, the file
+/// the gateway answers `GET /node/v1/registry-manifest` with (S3's
+/// `artifacts.rs`, `docs/node-protocol-v1.md`).
 pub(super) const REGISTRY_MANIFEST: &str = "registry-manifest.json";
 
 /// [`QUEUE_WAIT_ENV`]'s text as a wait: whole seconds from 1; anything
@@ -267,6 +268,18 @@ impl Artifacts {
                 .map_err(|error| format!("{}: {error}", target.display()))?;
         }
         Ok(Published { digest, size })
+    }
+
+    /// A copy of `file` as an artifact (the file itself stays where it is):
+    /// what a node fetches by a digest the job names, such as the
+    /// controller's `web/package-lock.json` for `requires.web_lock`.
+    pub(super) fn put_copy(&self, file: &Path) -> Result<Published, String> {
+        let scratch = self.scratch("copy")?;
+        if let Err(error) = std::fs::copy(file, &scratch) {
+            let _ = std::fs::remove_file(&scratch);
+            return Err(format!("{}: {error}", file.display()));
+        }
+        self.put_file(&scratch)
     }
 
     fn cache_path(&self, kind: &str, key: &str) -> PathBuf {
@@ -1959,6 +1972,9 @@ pub(super) mod tests {
         let artifacts = Artifacts::new(dir.0.join("artifacts"));
         let manifest = artifacts.registry_manifest(&home).unwrap();
         assert_eq!(manifest.registry, digest);
+        // The name the gateway serves (S3's artifacts.rs).
+        assert!(dir.0.join("artifacts/registry-manifest.json").is_file());
+        assert!(!dir.0.join("artifacts/registry-manifest").exists());
         let written: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.0.join("artifacts").join(REGISTRY_MANIFEST)).unwrap(),
         )
