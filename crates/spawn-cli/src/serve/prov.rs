@@ -1,4 +1,4 @@
-//! The two read-only routes of file provenance (PV2, docs/provenance.md),
+//! The read-only routes of file provenance (PV2, docs/provenance.md),
 //! read through the reader login like every other read, from the database
 //! alone (`crate::provenance` has the answers; a line's blame needs the
 //! repository and is `spawn prov who`'s only):
@@ -14,6 +14,10 @@
 //!   task (digits) or the Change recorded for a commit (40 hex characters,
 //!   read through the commit map both ways), each with its entries and
 //!   edges; `{changes: []}` when none is recorded. 400 for anything else.
+//! - `/api/prov/blast?target=<id>` (PV3a): what `spawn prov blast <id>`
+//!   prints for the same three kinds of id: the later Changes on the same
+//!   paths, the landings that include them, the radius and its `used`
+//!   closure. 400 without a valid `target`.
 
 use serde_json::Value;
 
@@ -57,9 +61,21 @@ pub(super) fn change(id: &str) -> Result<Value, String> {
     provenance::show(&store, &target)
 }
 
+/// `/api/prov/blast`.
+pub(super) fn blast(query: &str) -> Result<Value, String> {
+    let text = parameter(query, "target")
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| format!("{BAD_REQUEST}?target= is required"))?;
+    let word =
+        percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad target {text}"))?;
+    let target = provenance::target(&word).map_err(|error| format!("{BAD_REQUEST}{error}"))?;
+    let store = open_store()?;
+    provenance::blast(&store, &target)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BAD_REQUEST, change, domain, who};
+    use super::{BAD_REQUEST, blast, change, domain, who};
 
     #[test]
     fn a_bad_request_is_refused_before_the_store_is_opened() {
@@ -76,6 +92,14 @@ mod tests {
         ] {
             let error = change(id).expect_err(id);
             assert!(error.starts_with(BAD_REQUEST), "{id}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_blast_without_a_valid_target_is_refused_before_the_store_is_opened() {
+        for query in ["", "target=", "id=12", "target=abc", "target=%zz", "target=c123"] {
+            let error = blast(query).expect_err(query);
+            assert!(error.starts_with(BAD_REQUEST), "{query}: {error}");
         }
     }
 
