@@ -2143,7 +2143,9 @@ record.
 
 - `GET /api/stream`: the event log as Server-Sent Events, with the read
   guard of every API read. Streams hold their own 64 slots (`SSE_SLOTS`,
-  503 when all are taken), never the requests', and share one listener
+  503 when all are taken), never the requests', at most 16 of them from
+  one client address that is not loopback (`STREAMS_PER_PEER`, 503 `too
+  many streams from this address`; loopback counts only toward the 64), and share one listener
   thread holding `LISTEN spawn_events` as `spawn_reader`, which also polls
   every second while anyone streams. `Last-Event-ID` (the browser's
   reconnect), else `?after=<id>` as `/api/events` takes it
@@ -2153,7 +2155,10 @@ record.
   resync` with `{"reason", "after_event_id", "latest_event_id"}` (`behind`,
   `cursor_ahead`, `stream_reset`, `slow_consumer`) and goes on live. Frames
   are `event: ready`, then `id:`/`event:`/`data:` per event (the
-  `/api/events` row), and `: keepalive` every 15 s. A slow page (its
+  `/api/events` row), a comment probe `:` every 500 ms of quiet (`PROBE`:
+  a page gone, a reset included, fails the next write, so its slot, writer
+  and socket are freed within about a second, with no database read), and
+  `: keepalive` in its place every 15 s. A slow page (its
   256-frame channel full) is told `resync` and closed; a page that stops
   reading ends after a 10 s write timeout. An idle listener starts, once
   every stream there is has caught up, from the lowest id one caught up to

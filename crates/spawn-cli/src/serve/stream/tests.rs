@@ -527,3 +527,202 @@ fn a_stream_with_after_replays_the_events_after_it() {
     drop(client);
     serving.join().expect("joined").expect("no error");
 }
+
+/// A stream server on `hub` for the churn test: each request on a thread
+/// of its own with the real `KEEPALIVE` (only the probe can find a page
+/// gone), `active` counting the streams still served; it stops at `stop`.
+fn churn_server(
+    hub: &Arc<Hub>,
+    open: &Opener,
+    stop: &Arc<AtomicBool>,
+) -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    std::thread::JoinHandle<()>,
+) {
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+    let port = server.server_addr().to_ip().expect("ip").port();
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (hub, open, counted, stop) = (
+        Arc::clone(hub),
+        Arc::clone(open),
+        Arc::clone(&active),
+        Arc::clone(stop),
+    );
+    let accepting = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(50)) else {
+                continue;
+            };
+            let (hub, open, counted) = (Arc::clone(&hub), Arc::clone(&open), Arc::clone(&counted));
+            counted.fetch_add(1, Ordering::AcqRel);
+            std::thread::spawn(move || {
+                let query = request
+                    .url()
+                    .split_once('?')
+                    .map(|(_, query)| query.to_string())
+                    .unwrap_or_default();
+                let outcome = serve_stream(request, &query, &hub, &*open, super::KEEPALIVE);
+                counted.fetch_sub(1, Ordering::AcqRel);
+                outcome.expect("no error");
+            });
+        }
+    });
+    (port, active, accepting)
+}
+
+/// A page asking `path` of the server on `port`.
+fn page(port: u16, path: &str) -> std::net::TcpStream {
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    client
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
+        .expect("send");
+    client
+}
+
+/// Read `client` into `seen` until it holds `wanted`.
+fn read_to(client: &mut std::net::TcpStream, seen: &mut String, wanted: &str) {
+    let mut buffer = [0u8; 4096];
+    while !seen.contains(wanted) {
+        let n = client.read(&mut buffer).expect("read");
+        assert!(n > 0, "closed before {wanted:?}: {seen}");
+        seen.push_str(&String::from_utf8_lossy(&buffer[..n]));
+    }
+}
+
+/// Task #574 (N252 Suite 2B): pages that vanish with a reset
+/// (`SO_LINGER=0`) while their streams are quiet free every stream, its
+/// writer and its hub channel within 2 s (the probe), not after a whole
+/// `KEEPALIVE`, round after round of 64; and the streams after them still
+/// catch up, resync and go on live.
+#[test]
+fn reset_pages_free_their_streams_within_two_seconds_round_after_round() {
+    let (schema, store, _) = reader_schema("stream_reset_churn");
+    // The owner's connections in the schema: the catch-ups of 64 streams
+    // at once, without 64 restricted (600 000-round) logins per round.
+    let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect("the test database");
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let owner = format!("{url}{separator}options=-csearch_path%3D{}", &*schema);
+    let open: Opener = Arc::new(move || {
+        PostgresStore::connect_with_statement_timeout(&owner, Duration::from_secs(10))
+            .map_err(|error| error.to_string())
+    });
+    let first = append(&store, 1);
+    let second = append(&store, 2);
+    let third = append(&store, 3);
+    let hub = Arc::new(Hub::new(64));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (port, active, accepting) = churn_server(&hub, &open, &stop);
+    for round in 1..=3 {
+        let clients: Vec<std::net::TcpStream> = (0..64)
+            .map(|_| {
+                let mut client = page(port, "/api/stream");
+                read_to(&mut client, &mut String::new(), "event: ready\n");
+                client
+            })
+            .collect();
+        assert_eq!(active.load(Ordering::Acquire), 64, "round {round}");
+        assert_eq!(hub.subscribers(), 64, "round {round}");
+        // Quiet streams; then every page resets its connection at once.
+        std::thread::sleep(Duration::from_millis(300));
+        for client in clients {
+            rustix::net::sockopt::set_socket_linger(&client, Some(Duration::ZERO))
+                .expect("SO_LINGER=0");
+            drop(client);
+        }
+        let reset = Instant::now();
+        while (active.load(Ordering::Acquire) > 0 || hub.subscribers() > 0)
+            && reset.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let freed = reset.elapsed();
+        assert_eq!(active.load(Ordering::Acquire), 0, "round {round}");
+        assert_eq!(hub.subscribers(), 0, "round {round}");
+        assert!(
+            freed < Duration::from_secs(2),
+            "round {round}: 64 reset streams freed in {freed:?}"
+        );
+    }
+    // After the churn: a catch-up replays, a cursor past the log resyncs,
+    // and a live frame still reaches a stream.
+    let mut caught = page(port, &format!("/api/stream?after={first}"));
+    let mut seen = String::new();
+    read_to(&mut caught, &mut seen, &format!("id: {third}\n"));
+    assert!(seen.contains("\"replayed\":2"), "{seen}");
+    assert!(seen.contains(&format!("id: {second}\n")), "{seen}");
+    let mut ahead = page(port, &format!("/api/stream?after={}", third + 1000));
+    read_to(
+        &mut ahead,
+        &mut String::new(),
+        "\"reason\":\"cursor_ahead\"",
+    );
+    hub.publish(&Arc::new(Frame {
+        id: Some(third + 1),
+        event: "tool.started".to_string(),
+        data: "{\"live\":true}".to_string(),
+    }));
+    read_to(&mut caught, &mut seen, "data: {\"live\":true}\n\n");
+    // A quiet stream's probes are comments, nothing more.
+    read_to(&mut caught, &mut seen, ":\n\n");
+    drop((caught, ahead));
+    stop.store(true, Ordering::Release);
+    accepting.join().expect("the acceptor ends");
+}
+
+/// Rev 1: a quiet stream writes the probe `:` every `PROBE` and, in its
+/// place, `: keepalive` once its keepalive has passed since the last one:
+/// probes come between keepalives, and keepalives are never closer than
+/// the keepalive.
+#[test]
+fn a_quiet_stream_probes_between_keepalives() {
+    let (_schema, store, open) = reader_schema("stream_quiet_keepalive");
+    append(&store, 1);
+    let hub = Arc::new(Hub::new(64));
+    let keepalive = super::PROBE * 3;
+    // Keepalives are never closer than this (one probe's slack).
+    let spacing = super::PROBE * 2;
+    let keep = ": keepalive\n\n";
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+    let port = server.server_addr().to_ip().expect("ip").port();
+    let serving = {
+        let (hub, open) = (Arc::clone(&hub), Arc::clone(&open));
+        std::thread::spawn(move || {
+            let request = server.recv().expect("a request");
+            serve_stream(request, "", &hub, &*open, keepalive)
+        })
+    };
+    let mut client = page(port, "/api/stream");
+    let mut seen = String::new();
+    read_to(&mut client, &mut seen, "event: ready\n");
+    let ready = Instant::now();
+    // Each segment: the text after the last marker, read to the next.
+    let mut segment = seen
+        .split_once("event: ready\n")
+        .map_or_else(String::new, |(_, rest)| rest.to_string());
+    let mut quiet = Vec::new();
+    let mut at = Vec::new();
+    for _ in 0..2 {
+        read_to(&mut client, &mut segment, keep);
+        at.push(ready.elapsed());
+        let (before, rest) = segment.split_once(keep).expect("a keepalive");
+        quiet.push(before.to_string());
+        segment = rest.to_string();
+    }
+    for (n, before) in quiet.iter().enumerate() {
+        assert!(
+            before.contains(super::PROBE_FRAME),
+            "probes before keepalive {n}: {before:?}"
+        );
+    }
+    assert!(at[0] >= spacing, "{at:?}");
+    assert!(
+        at[1].saturating_sub(at[0]) >= spacing,
+        "keepalives closer than the keepalive: {at:?}"
+    );
+    drop(client);
+    serving.join().expect("joined").expect("no error");
+}

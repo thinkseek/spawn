@@ -4,8 +4,12 @@
 //! - Its own slots. A stream lives as long as its page, so it never holds
 //!   one of the requests' [`super::MAX_IN_FLIGHT`] slots: `serve` hands a
 //!   `GET /api/stream` one of [`SSE_SLOTS`] instead, and answers 503 when
-//!   those are all taken ([`is_stream`], `serve_requests`). Every other
-//!   request is served exactly as before, however many pages stream.
+//!   those are all taken ([`is_stream`], `serve_requests`). One client
+//!   address that is not loopback holds at most [`STREAMS_PER_PEER`] of
+//!   them (503 `too many streams from this address` past that), so a far
+//!   client cannot take them all; loopback clients count only toward
+//!   [`SSE_SLOTS`]. Every other request is served exactly as before,
+//!   however many pages stream.
 //! - One listener. A single background thread ([`Hub::start`]) holds `LISTEN
 //!   spawn_events` on a connection of the read-only `spawn_reader` login
 //!   (`open_store`'s), reads each new event once through the reader's
@@ -45,15 +49,24 @@
 //!   live event. A floor leaves with its stream: one that connected and
 //!   dropped moves no later stream's start.
 //! - A page that stops reading ends its stream after [`WRITE_TIMEOUT`]
-//!   ([`TimedWriter`]); a stream that ends is pruned from the hub at once;
+//!   ([`TimedWriter`]); a page that is gone (closed, reset: `SO_LINGER=0`)
+//!   is found by the next write, and a quiet stream writes a 3-byte comment
+//!   probe `:` every [`PROBE`] (500 ms: few wakeups for a phone's PWA, and
+//!   well inside the page's `retry: 3000`), so a gone page frees its slot,
+//!   its writer and its socket within about a second, never after a whole
+//!   [`KEEPALIVE`]
+//!   (N252: 64 reset streams held every slot ~16 s, and the pages'
+//!   3-second reconnects found 503). The probe reads nothing: the database
+//!   is not asked. A stream that ends is pruned from the hub at once;
 //!   a listener whose thread ends (a panic included) is started again by
 //!   the next stream.
 //! - Frames: first `retry: 3000` and `event: ready` (`{"latest_event_id",
 //!   "replayed"}`), then one per event, `id: <event id>\nevent: <its
 //!   name>\ndata: <json>\n\n`, the JSON what `/api/events` lists for it
 //!   (`{id, agent_id, session_id, execution_id, source, event_name, detail,
-//!   recorded_at_ms}`), and a comment `: keepalive` every [`KEEPALIVE`]
-//!   with nothing to say, which also finds a page gone.
+//!   recorded_at_ms}`), the probe comment `:` every [`PROBE`] with nothing
+//!   to say, and the comment `: keepalive` in its place every
+//!   [`KEEPALIVE`] of quiet.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -73,8 +86,18 @@ pub(super) const SSE_SLOTS: usize = 64;
 /// The most events one catch-up replays (and the listener reads after a
 /// reconnect) before it says `resync` instead.
 pub(super) const REPLAY_MAX: usize = 500;
+/// The streams one client address that is not loopback holds at once (as
+/// `nodes/relay.rs`'s `PER_PEER`).
+pub(super) const STREAMS_PER_PEER: usize = 16;
 /// Between two keepalive comments of a quiet stream.
 pub(super) const KEEPALIVE: Duration = Duration::from_secs(15);
+/// Between two probe comments (`:`) of a quiet stream: each is a write,
+/// which fails once the page is gone, so the stream ends and frees its slot
+/// (module doc).
+pub(super) const PROBE: Duration = Duration::from_millis(500);
+/// A probe on the wire: a comment line and a blank line, which a browser's
+/// `EventSource` reads as nothing.
+pub(super) const PROBE_FRAME: &str = ":\n\n";
 /// The frames a stream's channel holds before the stream is dropped.
 pub(super) const CLIENT_BUFFER: usize = 256;
 /// The listener's read of the log while anyone streams, notified or not.
@@ -529,8 +552,13 @@ pub(super) fn serve_stream(
             return Ok(());
         }
     }
+    // A quiet stream probes every PROBE (never less often than its
+    // keepalive), and says `: keepalive` once `keepalive` has passed
+    // since its last frame or keepalive.
+    let probe = PROBE.min(keepalive);
+    let mut said = Instant::now();
     loop {
-        match live.recv_timeout(keepalive) {
+        match live.recv_timeout(probe) {
             Ok(frame) => {
                 if frame.id.is_some_and(|id| id <= sent) {
                     continue;
@@ -539,9 +567,16 @@ pub(super) fn serve_stream(
                 if writer.emit(&frame.render()).is_err() {
                     return Ok(());
                 }
+                said = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {
-                if writer.emit(": keepalive\n\n").is_err() {
+                let text = if said.elapsed() >= keepalive {
+                    said = Instant::now();
+                    ": keepalive\n\n"
+                } else {
+                    PROBE_FRAME
+                };
+                if writer.emit(text).is_err() {
                     return Ok(());
                 }
             }

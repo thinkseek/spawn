@@ -155,11 +155,11 @@ mod pwa;
 mod storage;
 mod stream;
 
-use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::collections::{BTreeSet, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use spawn_core::command::NamedKey;
@@ -264,7 +264,7 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         .to_ip()
         .map_or_else(|| address.clone(), |address| address.to_string());
     let slots = Slots::new(MAX_IN_FLIGHT);
-    let streams = Slots::new(stream::SSE_SLOTS);
+    let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
     // The Core lines reading, once, beside the requests: the first person
     // after a restart gets the kept figures, not the cold computation. A
     // request meanwhile waits on the performance figures' lock (archive and
@@ -369,37 +369,115 @@ struct Shared {
     owner_url: Option<String>,
 }
 
-/// Requests in flight, at most `limit`.
+/// Requests in flight, at most `limit`, and, when `per_peer` is set, at
+/// most that many from one client address that is not loopback (the
+/// streams' [`stream::STREAMS_PER_PEER`], as `nodes/relay.rs`'s
+/// `PER_PEER`): one far client cannot take every stream slot. Loopback
+/// clients (the owner's own machine, or a local proxy) count only toward
+/// `limit` (unless `count_loopback`, which only a test sets).
 struct Slots {
     taken: AtomicUsize,
     limit: usize,
+    per_peer: Option<usize>,
+    count_loopback: bool,
+    peers: Mutex<HashMap<IpAddr, usize>>,
 }
 
-/// One request's place among [`Slots`], given back when it is dropped.
-struct Slot(Arc<Slots>);
+/// One request's place among [`Slots`] (and its address's, if counted),
+/// given back when it is dropped.
+struct Slot {
+    slots: Arc<Slots>,
+    peer: Option<IpAddr>,
+}
+
+/// Why [`Slots::take_from`] gave no slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    /// Every slot is taken.
+    All,
+    /// This address holds its `per_peer` already.
+    Peer,
+}
 
 impl Slots {
     fn new(limit: usize) -> Arc<Self> {
+        Self::with_per_peer(limit, None)
+    }
+
+    fn with_per_peer(limit: usize, per_peer: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
             taken: AtomicUsize::new(0),
             limit,
+            per_peer,
+            count_loopback: false,
+            peers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// As [`Slots::with_per_peer`], loopback clients counted too: a test's
+    /// clients are all loopback.
+    #[cfg(test)]
+    fn counting_loopback(limit: usize, per_peer: usize) -> Arc<Self> {
+        Arc::new(Self {
+            taken: AtomicUsize::new(0),
+            limit,
+            per_peer: Some(per_peer),
+            count_loopback: true,
+            peers: Mutex::new(HashMap::new()),
         })
     }
 
     fn take(slots: &Arc<Self>) -> Option<Slot> {
+        Self::take_from(slots, None).ok()
+    }
+
+    /// A slot for a request from `peer`: one of `limit`, and one of its
+    /// address's `per_peer` if that is counted (a `per_peer` set, an
+    /// address that is not loopback).
+    fn take_from(slots: &Arc<Self>, peer: Option<IpAddr>) -> Result<Slot, Busy> {
         slots
             .taken
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
                 (taken < slots.limit).then_some(taken + 1)
             })
-            .ok()
-            .map(|_| Slot(Arc::clone(slots)))
+            .map_err(|_| Busy::All)?;
+        // Dropped on a refusal below, it gives the shared place back.
+        let mut slot = Slot {
+            slots: Arc::clone(slots),
+            peer: None,
+        };
+        let counted = slots
+            .per_peer
+            .zip(peer.map(|peer| peer.to_canonical()))
+            .filter(|(_, peer)| slots.count_loopback || !peer.is_loopback());
+        if let Some((per_peer, peer)) = counted {
+            let mut peers = slots.peers.lock().unwrap_or_else(PoisonError::into_inner);
+            if peers.get(&peer).copied().unwrap_or(0) >= per_peer {
+                return Err(Busy::Peer);
+            }
+            *peers.entry(peer).or_insert(0) += 1;
+            slot.peer = Some(peer);
+        }
+        Ok(slot)
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.taken.fetch_sub(1, Ordering::AcqRel);
+        if let Some(peer) = self.peer {
+            let mut peers = self
+                .slots
+                .peers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(held) = peers.get_mut(&peer) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    peers.remove(&peer);
+                }
+            }
+        }
+        self.slots.taken.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -420,13 +498,18 @@ fn serve_requests(
             Err(error) => return error,
         };
         let streaming = stream::is_stream(&request);
-        let Some(slot) = Slots::take(if streaming { streams } else { slots }) else {
+        let taken = if streaming {
+            Slots::take_from(streams, request.remote_addr().map(SocketAddr::ip))
+        } else {
+            Slots::take(slots).ok_or(Busy::All)
+        };
+        let Ok(slot) = taken else {
             let busy = json_response(
                 503,
-                &json!({ "error": if streaming {
-                    "busy: too many streams at once"
-                } else {
-                    "busy: too many requests at once"
+                &json!({ "error": match (streaming, taken.err()) {
+                    (true, Some(Busy::Peer)) => "busy: too many streams from this address",
+                    (true, _) => "busy: too many streams at once",
+                    (false, _) => "busy: too many requests at once",
                 } }),
             );
             if let Err(error) = request.respond(busy) {
@@ -6671,6 +6754,11 @@ mod tests {
     /// A server running `serve`'s loop with `regular` request slots and
     /// `streams` stream slots, `token` set. Returns its port.
     fn serving_slots(token: Option<&'static str>, regular: usize, streams: usize) -> u16 {
+        serving_on(token, Slots::new(regular), Slots::new(streams))
+    }
+
+    /// A server with the read guard of `token` on these slots: its port.
+    fn serving_on(token: Option<&'static str>, slots: Arc<Slots>, streams: Arc<Slots>) -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
         let port = server.server_addr().to_ip().expect("ip").port();
         let shared = Arc::new(Shared {
@@ -6681,9 +6769,31 @@ mod tests {
             open: Vec::new(),
             owner_url: None,
         });
-        let (slots, streams) = (Slots::new(regular), Slots::new(streams));
         std::thread::spawn(move || serve_requests(&server, &shared, &slots, &streams));
         port
+    }
+
+    /// Rev 1: over HTTP, a stream from an address that holds its share of
+    /// the stream slots is 503 `too many streams from this address` (not
+    /// the all-taken 503), and once one is given back the next reaches its
+    /// handler (here the read guard, 401 without the token).
+    #[test]
+    fn a_stream_past_its_addresss_share_is_503_over_http() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let streams = Slots::counting_loopback(stream::SSE_SLOTS, 1);
+        let port = serving_on(Some("secret"), Slots::new(1), Arc::clone(&streams));
+        let held = Slots::take_from(&streams, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .expect("this address's one stream");
+        let (status, body) = raw_status(port, "/api/stream", "Authorization: Bearer secret\r\n");
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            body.contains("too many streams from this address"),
+            "{body}"
+        );
+        assert!(!body.contains("at once"), "{body}");
+        drop(held);
+        let (status, body) = raw_status(port, "/api/stream", "");
+        assert_eq!(status, 401, "the stream reached the read guard: {body}");
     }
 
     /// One raw GET to `port`: the status and the body.
@@ -6752,6 +6862,78 @@ mod tests {
         }
         let (status, body) = raw_status(no_streams, "/api/overview", "");
         assert_eq!(status, 401, "a request is still served: {body}");
+    }
+
+    /// Task #574: one client address that is not loopback holds at most
+    /// `STREAMS_PER_PEER` stream slots, so it cannot take all 64; its
+    /// refusal is its own (`Busy::Peer`), other addresses are served, a
+    /// slot given back is its address's again, and loopback (the owner's
+    /// own machine: the 64-stream tests) counts only toward the 64.
+    #[test]
+    fn one_far_address_holds_at_most_its_share_of_the_stream_slots() {
+        use super::Busy;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert_eq!(stream::STREAMS_PER_PEER, 16);
+        let streams = Slots::with_per_peer(stream::SSE_SLOTS, Some(stream::STREAMS_PER_PEER));
+        let far = IpAddr::V4(Ipv4Addr::new(192, 168, 31, 7));
+        let other = IpAddr::V4(Ipv4Addr::new(192, 168, 31, 8));
+        let mut held: Vec<_> = (0..stream::STREAMS_PER_PEER)
+            .map(|n| Slots::take_from(&streams, Some(far)).unwrap_or_else(|_| panic!("{n}")))
+            .collect();
+        assert_eq!(
+            Slots::take_from(&streams, Some(far)).err(),
+            Some(Busy::Peer),
+            "the 17th from one address"
+        );
+        // The same address as an IPv4-mapped IPv6 one is the same address.
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 168, 31, 7).to_ipv6_mapped());
+        assert_eq!(
+            Slots::take_from(&streams, Some(mapped)).err(),
+            Some(Busy::Peer)
+        );
+        assert_eq!(
+            streams.taken.load(std::sync::atomic::Ordering::Acquire),
+            stream::STREAMS_PER_PEER,
+            "a refusal holds no shared slot"
+        );
+        let beside = Slots::take_from(&streams, Some(other)).expect("another address");
+        held.pop();
+        let again = Slots::take_from(&streams, Some(far)).expect("a slot given back");
+        // Loopback fills every slot left, uncapped by address.
+        let loopback: Vec<_> = (0..stream::SSE_SLOTS - stream::STREAMS_PER_PEER - 1)
+            .map(|n| {
+                let peer = if n % 2 == 0 {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                };
+                Slots::take_from(&streams, Some(peer)).unwrap_or_else(|_| panic!("{n}"))
+            })
+            .collect();
+        assert_eq!(
+            Slots::take_from(&streams, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))).err(),
+            Some(Busy::All),
+            "the 65th stream"
+        );
+        assert_eq!(
+            Slots::take_from(&streams, Some(other)).err(),
+            Some(Busy::All)
+        );
+        drop((held, beside, again, loopback));
+        assert_eq!(streams.taken.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(
+            streams
+                .peers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "every address's count is given back"
+        );
+        // The requests' slots count no address.
+        let requests = Slots::new(2);
+        let _a = Slots::take_from(&requests, Some(far)).expect("one");
+        let _b = Slots::take_from(&requests, Some(far)).expect("two");
+        assert!(Slots::take(&requests).is_none());
     }
 
     const MASTER: &str = "/api/master/message";
@@ -7087,6 +7269,80 @@ mod tests {
             aliases, legacy,
             "docs/api.md's alias table and serve.rs's ALIASES, in the same order"
         );
+    }
+
+    /// Task #574: docs/architecture.md tells the workspace as it is. Every
+    /// member of the workspace's Cargo.toml is named there (as `` `name` ``),
+    /// the crate count it states is the members' count, `spawn serve` is
+    /// said to be a control plane with `docs/api.md`'s POST count, and the
+    /// stale claims (five crates, no `LISTEN/NOTIFY`, a read-only serve with
+    /// one write, blake3/zstd) never come back.
+    #[test]
+    fn docs_architecture_md_names_every_workspace_crate_and_no_stale_claim() {
+        let doc = include_str!("../../../docs/architecture.md");
+        let manifest = include_str!("../../../Cargo.toml");
+        let members: Vec<&str> = manifest
+            .split_once("members = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("the workspace's members list")
+            .split(',')
+            .filter_map(|entry| entry.trim().strip_prefix("\"crates/"))
+            .filter_map(|entry| entry.strip_suffix('"'))
+            .collect();
+        assert!(!members.is_empty(), "the workspace's members");
+        for member in &members {
+            assert!(
+                doc.contains(&format!("| `{member}` |")),
+                "docs/architecture.md's crate table has no row for {member}"
+            );
+        }
+        assert!(
+            doc.contains(&format!("用 {} 个 Rust crate", members.len())),
+            "docs/architecture.md states the crate count"
+        );
+        let posts = super::ROUTES.iter().filter(|(m, _)| *m == "POST").count();
+        let gets = super::ROUTES.iter().filter(|(m, _)| *m == "GET").count();
+        assert!(
+            doc.contains("Thin Web + PWA 控制面"),
+            "serve is a control plane"
+        );
+        // Both places that give serve's route counts (§1 and §7's `serve`
+        // row) give ROUTES' counts, and no other count is given.
+        let counts = format!("{gets} 个 GET 路由模式和 {posts} 个 POST 路由");
+        assert_eq!(
+            doc.matches(&counts).count(),
+            2,
+            "docs/architecture.md states serve's route counts twice as {counts:?}"
+        );
+        assert_eq!(doc.matches("个 GET 路由模式").count(), 2);
+        assert_eq!(doc.matches("个 POST 路由").count(), 2);
+        // spawn-host stores no blocks with blake3 or zstd (the backups'
+        // zstd is spawn-cli's, and may be said elsewhere).
+        let host_row = doc
+            .lines()
+            .find(|line| line.starts_with("| `spawn-host` |"))
+            .expect("spawn-host's row");
+        for stale in ["blake3", "zstd"] {
+            assert!(!host_row.contains(stale), "spawn-host's row says {stale}");
+        }
+        assert!(doc.contains("pg_notify('spawn_events'"));
+        assert!(doc.contains("deploy/gate-runner.sh"));
+        assert!(doc.contains("轻通信多保活 · 事件同步 · 数据库隔离"));
+        for stale in [
+            "5 个 Rust crate",
+            "没有 `LISTEN/NOTIFY`",
+            "不是控制面",
+            "唯一的写入",
+            "只读看板",
+            "blake3",
+            "全部代码同步阻塞",
+        ] {
+            assert!(
+                !doc.contains(stale),
+                "docs/architecture.md says {stale:?} again"
+            );
+        }
     }
 
     /// A path that fits `pattern`, each `<name>` filled with `value`.

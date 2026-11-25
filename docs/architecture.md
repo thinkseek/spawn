@@ -2,7 +2,7 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
-结论：Spawn 用 5 个 Rust crate 连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件并对外提供 SQL 视图，Jev 判定语义状态，`spawn` 二进制只做装配。全部代码同步阻塞，不使用 async。
+结论：Spawn 用 7 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
 
 ## 1. 能力与边界
 
@@ -13,36 +13,46 @@
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
 | 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时只用规则） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
-| 终端 | tmux | 建会话、输入文本、抓取屏尾 |
+| 终端 | tmux（默认），或显式选择的 herdr | 建会话、输入文本、抓取屏尾 |
+| 变更提示 | PostgreSQL `LISTEN/NOTIFY` | 每次追加事件 `pg_notify('spawn_events', <id>)`；`spawn loop` 和 `GET /api/stream` 收到即读，提示丢了也照读记录 |
 
-Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。`spawn serve` 提供看板和事件查询（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token），其中包括把任务、落地、验证和部署分成 planned / implemented / verified / live 四态的能力图（`/api/features`、`#/features`，见 [feature-map.md](./feature-map.md)），不是控制面；它唯一的写入是人对某个会话的输入（`POST /api/sessions/<id>/input`，以 `spawn_human` 登录调用 `spawn_human_input`，即经 `spawn_submit` 提交 principal 为 `human` 的 input）；所有写入仍只经 Bridge 和 `spawn_submit`。
+Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。
+
+`spawn serve` 提供 Thin Web + PWA 控制面（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token）：29 个 GET 路由模式和 9 个 POST 路由。GET 包括看板、事件查询、`GET /api/stream` 的 SSE 实时事件流，以及把任务、落地、验证和部署分成 planned / implemented / verified / live 四态的能力图（`/api/features`、`#/features`，见 [feature-map.md](./feature-map.md)）。POST 中 7 个是人的写入，都以 `spawn_human` 登录调用对应的 `spawn_human_*` 函数：对会话的输入、按键、给 supervisor 的消息、对审批提示的回答（`spawn_human_input`、`spawn_human_key`、`spawn_human_master_message`）经 `spawn_submit` 提交 principal 为 `human` 的命令；停滞 worker 的重启与改派（`spawn_human_task`）调用 `spawn_task_restart_as` / `spawn_task_reassign_as`，写 `task.restarted` 等控制记录，`by` 为 `human`；停摆任务的恢复（`spawn_human_resume`）写一条 `mission.resumed` 记录。另 2 个是能力图的重新扫描与文件关联。完整路由表、方法与 CLI 对应见 [api.md](./api.md)（`serve.rs` 的测试保持两者一致）。发给 agent 会话的命令仍只经 `spawn_submit` 入队、由 Bridge 执行。
 
 ## 2. crate 结构
 
 | crate | 职责 | 依赖 |
 | --- | --- | --- |
-| `spawn-core` | 类型、端口、事件归一、Bridge、Observer；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、thiserror |
-| `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`schema.sql`、读方法 | spawn-core、postgres、sha2 |
-| `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde_json |
-| `spawn-host` | tmux、工作区存储（`LocalWorkspaceStore`：Git、Cow、overlay 三种引擎，同一 `WorkspaceStore` 契约）与块存储适配 | spawn-core、libc、blake3、zstd |
-| `spawn-cli` | 二进制 `spawn`，装配上述实现 | 全部 |
+| `spawn-core` | 类型、端口、事件归一、Bridge、Observer、能力图模型；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、sha2、thiserror |
+| `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`sql/schema.sql`、读方法、`LISTEN spawn_events` 连接（`wake.rs`） | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
+| `spawn-host` | 终端（`TerminalHost`：`TmuxHost` 默认，`HerdrHost` 由 `SPAWN_TERMINAL_BACKEND=herdr` 显式选择）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 三种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重）、transcript 归档、inotify | spawn-core、libc、rustix、serde_json、sha2 |
+| `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde、serde_json |
+| `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译） | sha2、hmac |
+| `spawn-codegraph` | 能力图的代码依赖事实：从仓库文件抽取代码图 | spawn-core、syn、proc-macro2 |
+| `spawn-cli` | 二进制 `spawn`，装配上述实现；`spawn serve` 的 HTTP 服务、节点网格 | 上述全部，以及 tiny_http、rustix、ring、rustls 等 |
 
 ```mermaid
 flowchart LR
   core[spawn-core<br/>types · ports · bridge · observer]
+  kdf[spawn-kdf]
   pg[spawn-postgres]
   jev[spawn-jev]
   host[spawn-host]
+  graph[spawn-codegraph]
   cli[spawn-cli]
   pg --> core
+  pg --> kdf
   jev --> core
   host --> core
+  graph --> core
   cli --> pg
   cli --> jev
   cli --> host
+  cli --> graph
 ```
 
-依赖单向：只有 `spawn-cli` 同时依赖实现层，其余 crate 之间不互相依赖。
+依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间唯一的依赖是 `spawn-postgres` 用 `spawn-kdf` 派生登录口令。
 
 ## 3. 一次任务的链路
 
@@ -113,7 +123,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信
 | `agent_tasks`、`agent_executions`、`agent_artifacts`、`agent_relations` | 任务、执行、产物、父子关系 |
 | `agent_commands` | 命令视图；`insert` 经 `spawn_gateway_insert` 校验 `spawn_grants` 后入队 |
 
-视图不用物化视图和 CDC。订阅方式是读取 `spawn_events` 增量，没有 `LISTEN/NOTIFY`。
+视图不用物化视图和 CDC。订阅方式是读取 `spawn_events` 增量，`LISTEN/NOTIFY` 只做提示：`spawn_append` 每写一条事件就 `pg_notify('spawn_events', <事件 id>)`。`spawn loop` 持一条 `LISTEN spawn_events` 连接，收到通知即结束等待、读水位（`max(spawn_events.id)`）；`spawn serve` 的 `GET /api/stream` 由一个监听线程以只读登录 `LISTEN`，读新事件后扇出给每个 SSE 流。通知丢了、晚了或没发都不算“没有变化”：两者都按时读记录本身（docs/design.md §14）。
 
 ## 7. 用法
 
@@ -137,7 +147,7 @@ spawn fleet
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
-| `serve` | 常驻：只读看板与 HTTP 查询 |
+| `serve` | 常驻：Thin Web + PWA 控制面，29 个 GET 路由模式和 9 个 POST 路由（[api.md](./api.md)） |
 | `scorecard` | 只读记录，一次量出八个维度（吞吐、前导时间、一次通过率、返工、自主、可靠、成本、门禁耗时），带 n、方向、上一窗口与趋势（[design.md](design.md) §15） |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
 | `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |
@@ -166,7 +176,7 @@ spawn fleet
 | `SPAWN_STALL_DELIVERY_SECS` | `600` | 停滞上限（整秒，下同；不是非负整数时在 loop 日志里警告并用默认值）：待投递的任务多久没送达就升级给 supervisor。远长于第一次重试（60 s）和工人结束一轮所需的时间 |
 | `SPAWN_STALL_ACTIVITY_SECS` | `900` | 已投递的任务，会话多久没有新事实就升级。一次长构建或测试可以几分钟不写任何东西；工人回合已结束、而它启动的后台任务（会话记录里的 `job.started` 没有 `job.ended`）仍开着时算作活动，不升级 |
 | `SPAWN_STALL_REVIEW_SECS` | `1800` | 报告等 supervisor 审阅多久就升级：审阅要读报告、看代码，supervisor 可能正忙 |
-| `SPAWN_STALL_GATE_SECS` | `3600` | 带门禁的任务等集成器判定多久就升级：门禁自己的墙钟是 45 分钟 |
+| `SPAWN_STALL_GATE_SECS` | `3600` | 带门禁的任务等集成器判定多久就升级：门禁自己的墙钟是 120 分钟（`SPAWN_GATE_WALL_CLOCK_MINUTES` 的默认值） |
 | `SPAWN_STALL_LANDING_SECS` | `600` | 门禁通过后多久没落地就升级：落地只是一次合并加推送，集成器下一趟就做 |
 | `SPAWN_STALL_STOP_SECS` | `300` | 关闭的临时任务，工人多久还在跑就升级：退役 Stop 在下一趟就发，失败的 Stop 一分钟后重发 |
 | `SPAWN_STALL_HALTED_SECS` | `0` | 停摆的任务（mission halted）多久后升级：停摆从一开始就在等人 |
@@ -191,6 +201,18 @@ scripts/rsi/test-gate.sh                                          # 门禁自身
 
 检查项都是 `rsi/scenarios/check-*.sh` 场景，见 [fleet-architecture.md](./fleet-architecture.md) §10.2。
 
-## 9. 依赖约束
+门禁一次运行自包含、无状态，所以可以离开本机：`deploy/gate-runner.sh <runner> <source.git> <base> <candidate> <scenarios> <out>` 把门禁所需（基线与候选的 git bundle、控制器的脚本与场景、本次作业的运行脚本）打包，经 SSH 送到远端 runner，在那里用 runner 自己的私有 PostgreSQL 和临时目录跑同一个 `scripts/rsi/gate.sh`，再把判定和完整日志带回（`<out>/<job>/{verdict.json,gate.log,record.json}`）。runner 拿不到主库地址；重试只针对传输，从不针对判定；判定环境与本机不一致的 runner（能看到主机文件、内存低于下限）被拒绝。`--check` 只验证 runner 是否会和本机判得一样。
 
-不使用 async 运行时，不使用 chrono、uuid、rand，不使用 HTTP 客户端库。时间统一为 `i64` 毫秒。`spawn-jev` 的 HTTP/1.1 客户端由标准库 socket 手写，支持 `Transfer-Encoding: chunked`。
+## 9. 多主机
+
+主机之间遵循三条原则：轻通信多保活 · 事件同步 · 数据库隔离。
+
+- 轻通信多保活：主机之间只传小消息（节点心跳每 15 s 一次的小探针、只读 inventory），不共享文件系统、不长连接搬数据；保活靠多处独立检查（`spawn loop` 的心跳线程、`node.lost` / `node.back`、告警），任何一处失败不阻塞主循环。
+- 事件同步：主机状态只经事件日志同步（`node.joined`、`node.heartbeat`、`node.lost`、`node.back`、`node.drained` 等），读方看 `GET /api/nodes` 或 `spawn node list`，不另设状态通道。
+- 数据库隔离：控制面和唯一的事件库在 primary；节点和远端门禁 runner 不持有主库登录（远端门禁用 runner 自己的私有 PostgreSQL），URL 从不出现在命令行上。
+
+节点的加入、探测和低电量软排空见 [fleet-architecture.md](./fleet-architecture.md) §1.2。
+
+## 10. 依赖约束
+
+“零 async”是 Spawn 自己源码的纪律：Spawn 的代码里没有 `async fn`、`.await`，也不启动、不持有 async 运行时；需要等待的地方用线程、阻塞调用和超时。依赖内部不受此限：阻塞的 `postgres` 驱动是 `tokio-postgres` 的同步包装，内部链接并驱动 `tokio`，这不改变 Spawn 源码同步阻塞的事实。不使用 chrono、uuid、rand，不使用 HTTP 客户端库。时间统一为 `i64` 毫秒。`spawn-jev` 的 HTTP/1.1 客户端由标准库 socket 手写，支持 `Transfer-Encoding: chunked`。
