@@ -625,36 +625,31 @@ fn the_checks_refuse_empty_and_out_of_range_values() {
         .expect("the bounds pass");
 
     // Written directly (as the owner), the same checks hold.
-    for statement in [
-        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
-         values ('d', 0, 'edit', 'code', 'a', 't0', 't1', 'job', 1)",
-        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
-         values ('', 1, 'edit', 'code', 'a', 't0', 't1', 'job', 1)",
-        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
-         values ('d', 1, 'edit', '', 'a', 't0', 't1', 'job', 1)",
-        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
-         values ('d', 1, 'edit', 'code', '', 't0', 't1', 'job', 1)",
-        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
-         values ('d', 1, 'edit', 'code', 'a', '', 't1', 'job', 1)",
-        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
-         values ('d', 1, 'edit', 'code', 'a', 't0', '', 'job', 1)",
-    ] {
-        let error = message(&client.batch_execute(statement).expect_err(statement));
-        assert!(error.contains("check constraint"), "{statement}: {error}");
-    }
-    for statement in [
+    let good = ["'d'", "1", "'code'", "'a'", "'t0'", "'t1'"];
+    let bad = ["''", "0", "''", "''", "''", "''"];
+    let mut statements: Vec<String> = (0..good.len())
+        .map(|column| {
+            let mut values = good;
+            values[column] = bad[column];
+            let [change_id, rev, domain, agent, base, result] = values;
+            format!(
+                "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, \
+                 boundary, at_ms) values ({change_id}, {rev}, 'edit', {domain}, {agent}, {base}, \
+                 {result}, 'job', 1)"
+            )
+        })
+        .collect();
+    statements.extend([
         format!("insert into prov_entries (change, path) values ({id}, '')"),
         format!("insert into prov_entries (change, path, size) values ({id}, 'z', -5)"),
-        format!(
-            "insert into prov_edges (kind, src, dst, detail, at_ms) values ('used', {id}, 'x', '[]', 1)"
-        ),
-        format!(
-            "insert into prov_edges (kind, src, dst, detail, at_ms) values ('used', {id}, 'x', 'null', 1)"
-        ),
-    ] {
+        format!("insert into prov_edges (kind, src, dst, detail, at_ms) values ('used', {id}, 'x', '[]', 1)"),
+        format!("insert into prov_edges (kind, src, dst, detail, at_ms) values ('used', {id}, 'x', 'null', 1)"),
+    ]);
+    for statement in statements {
         let error = message(&client.batch_execute(&statement).expect_err(&statement));
         assert!(error.contains("check constraint"), "{statement}: {error}");
     }
+}
 }
 
 /// The blast radius walks forward to what depends on a change and backward
