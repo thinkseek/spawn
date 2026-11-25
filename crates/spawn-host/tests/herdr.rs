@@ -638,10 +638,14 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
     for (typed, status, rule, screen) in steps {
         host.submit_text(&agy, &workspace, typed).expect("typed");
         let reading = reading_within(&host, &agy, &workspace, |reading| {
-            reading.status == status
-                && reading.rule.as_deref() == rule
-                && (reading.seq != last.seq || typed == "tasks")
+            // Herdr counts status changes only: permission to question
+            // (blocked to blocked) keeps its seq, and changes its rule.
+            reading.status == status && reading.rule.as_deref() == rule
         });
+        assert!(
+            reading.seq > last.seq || reading.status == last.status,
+            "{reading:?} after {last:?}"
+        );
         assert_eq!(reading.blocker_visible, status == AgentStatus::Blocked, "{typed}");
         // The stub draws in one write: the screen is whole by now.
         std::thread::sleep(Duration::from_millis(300));
