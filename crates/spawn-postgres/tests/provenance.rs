@@ -7,14 +7,18 @@
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`); every case runs
 //! in a schema of its own.
 
+use std::time::{Duration, Instant};
+
 use postgres::Client;
 use serde_json::json;
+use spawn_core::port::StoreError;
 
 mod common;
 use common::{admin, as_login, migrate_warnings, schema_url, store};
 use spawn_postgres::{
-    PostgresStore, ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind,
-    ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEntryClass, ProvEntryInput, ProvLink, role_url,
+    PostgresStore, ProvAttributionSource, ProvBlastRadiusNode, ProvBoundary, ProvChangeInput,
+    ProvChangeKind, ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEntryClass, ProvEntryInput,
+    ProvLink, role_url,
 };
 
 const TABLES: [&str; 3] = ["prov_changes", "prov_entries", "prov_edges"];
@@ -530,6 +534,129 @@ fn the_checks_refuse_values_outside_their_lists() {
     assert!(store.prov_edges(id).expect("edges").is_empty());
 }
 
+/// Values no change can have are refused, through the function and
+/// written directly: an empty id, domain, agent, digest or path, a revision
+/// below 1, a negative size and an edge's detail that is not an object.
+#[test]
+fn the_checks_refuse_empty_and_out_of_range_values() {
+    let (store, schema) = store("prov_values");
+    let mut client = admin(&schema);
+    let refused = |result: Result<i64, StoreError>, what: &str| {
+        let error = result.expect_err(what).to_string();
+        assert!(error.contains("check constraint"), "{what}: {error}");
+    };
+    let good = || change("c-val", 1, "agent_a", 1_000);
+    for (what, bad) in [
+        ("rev 0", ProvChangeInput { rev: 0, ..good() }),
+        ("rev -1", ProvChangeInput { rev: -1, ..good() }),
+        (
+            "change_id",
+            ProvChangeInput {
+                change_id: String::new(),
+                ..good()
+            },
+        ),
+        (
+            "domain",
+            ProvChangeInput {
+                domain: String::new(),
+                ..good()
+            },
+        ),
+        (
+            "agent_id",
+            ProvChangeInput {
+                agent_id: String::new(),
+                ..good()
+            },
+        ),
+        (
+            "base",
+            ProvChangeInput {
+                base: String::new(),
+                ..good()
+            },
+        ),
+        (
+            "result",
+            ProvChangeInput {
+                result: String::new(),
+                ..good()
+            },
+        ),
+    ] {
+        refused(store.record_change(&bad, &[], &[]), what);
+    }
+    refused(
+        store.record_change(&good(), &[entry("", "blob")], &[]),
+        "path",
+    );
+    let mut negative = entry("src/a.rs", "blob");
+    negative.size = Some(-1);
+    refused(store.record_change(&good(), &[negative], &[]), "size");
+    for detail in [json!([]), json!("text"), json!(1)] {
+        let mut bad = edge(ProvEdgeKind::Used, "x");
+        bad.detail = detail.clone();
+        refused(
+            store.record_change(&good(), &[], &[bad]),
+            &format!("detail {detail}"),
+        );
+    }
+    for table in TABLES {
+        assert_eq!(count(&mut client, table), 0, "{table}: nothing written");
+    }
+
+    // The bounds themselves pass: rev 1, size 0, one-character values.
+    let mut zero = entry("a", "b");
+    zero.size = Some(0);
+    let id = store
+        .record_change(
+            &ProvChangeInput {
+                change_id: "c".into(),
+                domain: "d".into(),
+                agent_id: "a".into(),
+                base: "b".into(),
+                result: "r".into(),
+                ..good()
+            },
+            &[zero],
+            &[edge(ProvEdgeKind::Used, "x")],
+        )
+        .expect("the bounds pass");
+
+    // Written directly (as the owner), the same checks hold.
+    for statement in [
+        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
+         values ('d', 0, 'edit', 'code', 'a', 't0', 't1', 'job', 1)",
+        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
+         values ('', 1, 'edit', 'code', 'a', 't0', 't1', 'job', 1)",
+        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
+         values ('d', 1, 'edit', '', 'a', 't0', 't1', 'job', 1)",
+        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
+         values ('d', 1, 'edit', 'code', '', 't0', 't1', 'job', 1)",
+        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
+         values ('d', 1, 'edit', 'code', 'a', '', 't1', 'job', 1)",
+        "insert into prov_changes (change_id, rev, kind, domain, agent_id, base, result, boundary, at_ms)
+         values ('d', 1, 'edit', 'code', 'a', 't0', '', 'job', 1)",
+    ] {
+        let error = message(&client.batch_execute(statement).expect_err(statement));
+        assert!(error.contains("check constraint"), "{statement}: {error}");
+    }
+    for statement in [
+        format!("insert into prov_entries (change, path) values ({id}, '')"),
+        format!("insert into prov_entries (change, path, size) values ({id}, 'z', -5)"),
+        format!(
+            "insert into prov_edges (kind, src, dst, detail, at_ms) values ('used', {id}, 'x', '[]', 1)"
+        ),
+        format!(
+            "insert into prov_edges (kind, src, dst, detail, at_ms) values ('used', {id}, 'x', 'null', 1)"
+        ),
+    ] {
+        let error = message(&client.batch_execute(&statement).expect_err(&statement));
+        assert!(error.contains("check constraint"), "{statement}: {error}");
+    }
+}
+
 /// The blast radius walks forward to what depends on a change and backward
 /// to what it depends on, through change ids, tree and content digests and
 /// origins; a cycle (A uses B, B uses A, and C uses itself) ends, each
@@ -663,12 +790,33 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     );
 }
 
-/// A dense cyclic graph (every change uses every other, and itself) ends
-/// under a deep bound, every change reached once at depth 1.
+/// The walk's bound for the graphs below: each is walked in well under it
+/// (the path-enumerating walk of Rev 0 took 15 s and 31 s on smaller ones).
+const QUICK: Duration = Duration::from_secs(2);
+
+/// A walk of `id`, timed against [`QUICK`].
+fn quick_walk(
+    store: &PostgresStore,
+    id: i64,
+    direction: ProvDirection,
+    max_depth: u16,
+) -> Vec<ProvBlastRadiusNode> {
+    let started = Instant::now();
+    let radius = store
+        .prov_blast_radius(id, direction, max_depth)
+        .expect("walk");
+    let took = started.elapsed();
+    assert!(took < QUICK, "{direction:?} walk took {took:?}");
+    radius
+}
+
+/// A 12-change clique (every change uses every other, and itself) is walked
+/// quickly under the deepest bound, both ways: every other change reached
+/// once, at depth 1, straight from the start.
 #[test]
 fn the_blast_radius_ends_on_a_dense_cycle() {
     let (store, _schema) = store("prov_dense");
-    let names = ["N0", "N1", "N2", "N3", "N4", "N5"];
+    let names: Vec<String> = (0..12).map(|n| format!("N{n}")).collect();
     let ids: Vec<i64> = names
         .iter()
         .enumerate()
@@ -687,14 +835,94 @@ fn the_blast_radius_ends_on_a_dense_cycle() {
         })
         .collect();
     for direction in [ProvDirection::Forward, ProvDirection::Backward] {
-        let radius = store
-            .prov_blast_radius(ids[0], direction, 64)
-            .expect("walk");
+        let radius = quick_walk(&store, ids[0], direction, u16::MAX);
         assert_eq!(
             radius.iter().map(|node| node.id).collect::<Vec<_>>(),
             ids[1..],
             "{direction:?}"
         );
-        assert!(radius.iter().all(|node| node.depth == 1), "{direction:?}");
+        for node in &radius {
+            assert_eq!(node.depth, 1, "{direction:?}");
+            assert_eq!(node.path, [ids[0], node.id], "{direction:?}");
+            assert_eq!(node.via, ProvLink::Edge(ProvEdgeKind::Used));
+        }
     }
+}
+
+/// 32 diamond layers, as landings make them (T(i-1) <- L(i), R(i) <- T(i):
+/// two sides use the top, the next top uses both): 2^32 paths from the
+/// first top to the last, walked quickly both ways, each change once at
+/// its exact distance, its path through the smaller side.
+#[test]
+fn the_blast_radius_walks_deep_diamonds_quickly() {
+    const LAYERS: usize = 32;
+    let (store, _schema) = store("prov_diamonds");
+    let mut at = 0;
+    let mut record = |name: &str, uses: &[&str]| {
+        at += 1;
+        let edges: Vec<ProvEdgeInput> = uses
+            .iter()
+            .map(|dst| edge(ProvEdgeKind::Used, dst))
+            .collect();
+        store
+            .record_change(&change(name, 1, "agent_d", at), &[], &edges)
+            .expect("record")
+    };
+    let mut tops = vec![record("T0", &[])];
+    let mut lefts = Vec::new();
+    let mut rights = Vec::new();
+    for layer in 1..=LAYERS {
+        let top = format!("T{}", layer - 1);
+        let (left, right) = (format!("L{layer}"), format!("R{layer}"));
+        lefts.push(record(&left, &[&top]));
+        rights.push(record(&right, &[&top]));
+        tops.push(record(&format!("T{layer}"), &[&left, &right]));
+    }
+
+    let forward = quick_walk(&store, tops[0], ProvDirection::Forward, u16::MAX);
+    assert_eq!(forward.len(), 3 * LAYERS, "every change once");
+    let mut path = vec![tops[0]];
+    for layer in 1..=LAYERS {
+        let depth = i32::try_from(2 * layer).expect("small");
+        let at = |id: i64| {
+            forward
+                .iter()
+                .find(|node| node.id == id)
+                .unwrap_or_else(|| panic!("{id} reached"))
+        };
+        let (left, right, top) = (at(lefts[layer - 1]), at(rights[layer - 1]), at(tops[layer]));
+        assert_eq!(
+            (left.depth, right.depth, top.depth),
+            (depth - 1, depth - 1, depth)
+        );
+        let mut side = path.clone();
+        side.push(rights[layer - 1]);
+        assert_eq!(right.path, side);
+        path.push(lefts[layer - 1]);
+        assert_eq!(left.path, path);
+        path.push(tops[layer]);
+        assert_eq!(top.path, path, "through the smaller side");
+    }
+    assert!(
+        forward
+            .windows(2)
+            .all(|w| (w[0].depth, w[0].id) < (w[1].depth, w[1].id)),
+        "nearest first, then by id"
+    );
+
+    let backward = quick_walk(&store, tops[LAYERS], ProvDirection::Backward, u16::MAX);
+    assert_eq!(backward.len(), 3 * LAYERS);
+    let first = backward
+        .iter()
+        .find(|node| node.id == tops[0])
+        .expect("the first top");
+    assert_eq!(first.depth, i32::try_from(2 * LAYERS).expect("small"));
+    assert_eq!(first.path.len(), 2 * LAYERS + 1);
+
+    // The bound cuts the walk at its depth.
+    let near = quick_walk(&store, tops[0], ProvDirection::Forward, 3);
+    assert_eq!(
+        near.iter().map(|node| node.id).collect::<Vec<_>>(),
+        [lefts[0], rights[0], tops[1], lefts[1], rights[1]]
+    );
 }
