@@ -17,6 +17,7 @@
 //! - `scorecard`: the facts `spawn scorecard` measures, read in one snapshot.
 //! - `verifications`: objectives' verifications after their landings.
 //! - `provenance`: universal file provenance, append-only, and its blast radius.
+//! - `remote_jobs`: spawn-node v1's ledger, the nodes' leases of remote jobs.
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -100,6 +101,7 @@ mod nodes;
 mod passfile;
 pub mod provenance;
 mod recovery;
+mod remote_jobs;
 mod row;
 mod scorecard;
 mod sessions;
@@ -125,6 +127,10 @@ pub use provenance::{
     ProvAttributionSource, ProvBlastRadiusNode, ProvBoundary, ProvChangeInput, ProvChangeKind,
     ProvChangeRecord, ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEdgeRecord, ProvEntryClass,
     ProvEntryInput, ProvEntryRecord, ProvLink,
+};
+pub use remote_jobs::{
+    Committed, FaultNext, FaultOutcome, NodeAction, NodeEnroll, NodeV1, RemoteJob, RemoteJobKind,
+    RemoteJobSpec, RemoteJobState, SweepOutcome,
 };
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
@@ -193,9 +199,16 @@ pub struct PostgresStore {
 /// The restricted logins, by their base name; each database has its own
 /// role for each (`spawn_login_role`). `spawn_supervisor` and `spawn_reader`
 /// act as the principals of their names, `spawn_human` (which may only call
-/// `spawn_human_input`) as `human`. Their passwords derive from the owner's
-/// ([`role_url`]) and are set on every migration.
-const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
+/// `spawn_human_input`) as `human`, and `spawn_node_gateway` (spawn-node
+/// v1's gateway, which may only call the four `spawn_node_gw_*` functions)
+/// as nobody. Their passwords derive from the owner's ([`role_url`]) and are
+/// set on every migration.
+const LOGINS: [&str; 4] = [
+    "spawn_supervisor",
+    "spawn_reader",
+    "spawn_human",
+    remote_jobs::GATEWAY_LOGIN,
+];
 
 impl PostgresStore {
     /// Connect to the database in the URL.
@@ -349,6 +362,7 @@ impl PostgresStore {
         // migration turns the logins off (spawn_logins_off warns).
         if self.password.is_empty() {
             transaction.batch_execute("select spawn_logins_off()")?;
+            remote_jobs::gateway_login_off(&mut transaction)?;
         } else {
             for base in LOGINS {
                 // The schema above made the login and its salt, in this
@@ -368,6 +382,7 @@ impl PostgresStore {
                 ))?;
             }
         }
+        remote_jobs::gateway_login_timeouts(&mut transaction)?;
         transaction.commit()
     }
 }
@@ -948,7 +963,7 @@ mod tests {
     }
 
     /// [`a_migration_without_the_owner_password_turns_the_logins_off`]'s check
-    /// after the passwordless migration: the three logins cannot log in, read
+    /// after the passwordless migration: the four logins cannot log in, read
     /// from `pg_roles`, which every login reads (`pg_authid` is the
     /// superuser's; the test server's login need not be one). Its `rolpassword`
     /// is a mask, so "no password is left" is shown by the refused logins, and
@@ -956,7 +971,7 @@ mod tests {
     fn assert_logins_off(name: &str, ours: &str) {
         use postgres::{Client, NoTls};
         let logins = "rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
-                              'spawn_human_' || $1)";
+                              'spawn_human_' || $1, 'spawn_node_gateway_' || $1)";
         let mut admin = Client::connect(ours, NoTls).expect("admin");
         let off: Vec<(String, bool)> = admin
             .query(
@@ -973,6 +988,7 @@ mod tests {
             off,
             [
                 (format!("spawn_human_{name}"), false),
+                (format!("spawn_node_gateway_{name}"), false),
                 (format!("spawn_reader_{name}"), false),
                 (format!("spawn_supervisor_{name}"), false),
             ]
@@ -994,7 +1010,7 @@ mod tests {
                 )
                 .expect("the passwords")
                 .get(0);
-            assert_eq!(passwords, 3, "no password is left");
+            assert_eq!(passwords, 4, "no password is left");
         }
     }
 
