@@ -225,6 +225,22 @@ impl Record {
         .to_string()
     }
 
+    /// What [`HerdrHost::start`] writes before `workspace.create` (carry
+    /// list N3): the terminal is being made on `server`, and its workspace
+    /// is Spawn's even before it is named, so a sweep that lists it in
+    /// between keeps it. Replaced by the full record once the pane is known.
+    fn pending_text(server: TerminalServer) -> String {
+        json!({ "pending": true, "server": server }).to_string()
+    }
+
+    /// The server a pending record ([`Record::pending_text`]) names.
+    fn pending_server(text: &str) -> Option<TerminalServer> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        (value["pending"] == true)
+            .then(|| serde_json::from_value(value["server"].clone()).ok())
+            .flatten()
+    }
+
     fn parse(text: &str) -> Option<Self> {
         let value: Value = serde_json::from_str(text).ok()?;
         Some(Self {
@@ -554,10 +570,13 @@ impl HerdrHost {
             .map_err(|call| call.into_error("workspace.list"))?;
         let state = self.state()?;
         let ours = |terminal: &TerminalName, workspace: &str| {
-            state
-                .as_deref()
-                .and_then(|state| Self::record_in(state, terminal).ok().flatten())
-                .is_some_and(|record| record.server == server && record.workspace == workspace)
+            state.as_deref().is_some_and(|state| {
+                Self::record_in(state, terminal)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.server == server && record.workspace == workspace)
+                    || Self::pending_in(state, terminal) == Some(server)
+            })
         };
         for workspace in listed["workspaces"].as_array().into_iter().flatten() {
             let (Some(label), Some(id)) = (
@@ -810,6 +829,40 @@ impl HerdrHost {
         }
     }
 
+    /// The server a pending record of `terminal` in `state` names: a start
+    /// that wrote it and has not named its pane yet, or one that stopped
+    /// in between (carry list N3).
+    fn pending_in(state: &Path, terminal: &TerminalName) -> Option<TerminalServer> {
+        std::fs::read_to_string(Self::record_path(state, terminal))
+            .ok()
+            .and_then(|text| Record::pending_server(&text))
+    }
+
+    /// Close every workspace on the server now that is labelled `terminal`:
+    /// what a start that stopped between `workspace.create` and its record
+    /// left (the pending record says one may exist).
+    fn close_labelled(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
+        let listed = match self.call("workspace.list", &json!({}), CALL_LIMIT) {
+            Ok(listed) => listed,
+            Err(call) if call.gone() => return Ok(()),
+            Err(call) => return Err(call.into_error("workspace.list")),
+        };
+        for workspace in listed["workspaces"].as_array().into_iter().flatten() {
+            if workspace["label"].as_str() != Some(terminal.as_str()) {
+                continue;
+            }
+            let Some(id) = workspace["workspace_id"].as_str() else {
+                continue;
+            };
+            match self.call("workspace.close", &json!({ "workspace_id": id }), CALL_LIMIT) {
+                Ok(_) => {}
+                Err(call) if call.gone() => {}
+                Err(call) => return Err(call.into_error("workspace.close")),
+            }
+        }
+        Ok(())
+    }
+
     /// Remove what this host keeps of `terminal`.
     fn forget(&self, terminal: &TerminalName) {
         if let Ok(state) = self.state_directory(false) {
@@ -884,18 +937,30 @@ impl HerdrHost {
         server: TerminalServer,
         script: &Path,
     ) -> Result<Record, TerminalError> {
+        // The record first (carry list N3): a sweep that lists the new
+        // workspace before its pane is recorded keeps it.
+        crate::process::write_private(
+            &state.join("terminals"),
+            launch.terminal.as_str(),
+            &Record::pending_text(server),
+        )
+        .map_err(|error| TerminalError(format!("record {}: {error}", launch.terminal)))?;
         let created = self
             .call(
                 "workspace.create",
                 &json!({ "cwd": launch.cwd, "label": launch.terminal.as_str(), "focus": false }),
                 CALL_LIMIT,
             )
-            .map_err(|call| call.into_error("workspace.create"))?;
+            .map_err(|call| {
+                let _ = std::fs::remove_file(Self::record_path(state, &launch.terminal));
+                call.into_error("workspace.create")
+            })?;
         let pane = created["root_pane"]["pane_id"].as_str().map(str::to_string);
         let workspace = created["workspace"]["workspace_id"]
             .as_str()
             .map(str::to_string);
         let (Some(pane), Some(workspace)) = (pane, workspace) else {
+            let _ = std::fs::remove_file(Self::record_path(state, &launch.terminal));
             return Err(TerminalError(format!(
                 "workspace.create named no pane: {created}"
             )));
@@ -1428,6 +1493,16 @@ impl TerminalHost for HerdrHost {
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         let Some(record) = self.record(terminal)? else {
+            // A start that stopped between its pending record and its
+            // pane (carry list N3): whatever workspace it made is closed.
+            if let Some(state) = self.state()?
+                && let Some(server) = Self::pending_in(&state, terminal)
+            {
+                if matches!(self.identity(), ServerSeen::Answers(Some(now)) if now == server) {
+                    self.close_labelled(terminal)?;
+                }
+                self.forget(terminal);
+            }
             return Ok(());
         };
         let leaders: Vec<u32> = if record.leader.leads_its_session() {
