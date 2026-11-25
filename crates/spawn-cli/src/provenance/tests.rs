@@ -127,7 +127,10 @@ fn a_raw_diff_is_parsed_with_every_byte_of_its_paths() {
     let diffs = parse_raw(listing.as_bytes()).expect("parsed");
     assert_eq!(diffs.len(), 3);
     assert_eq!(diffs[0].path, b"new file");
-    assert_eq!((diffs[0].old.as_deref(), diffs[0].new.as_deref()), (None, Some(a.as_str())));
+    assert_eq!(
+        (diffs[0].old.as_deref(), diffs[0].new.as_deref()),
+        (None, Some(a.as_str()))
+    );
     assert_eq!(diffs[1].old_mode, "100644");
     assert_eq!(diffs[1].new_mode, "100755");
     assert_eq!(diffs[2].path, b"gone\n");
@@ -153,15 +156,29 @@ fn a_class_is_mechanical_for_a_mode_alone_generated_for_the_list_and_the_attribu
     assert_eq!(classify(&content, None), ProvEntryClass::Content);
     let mode = diff("bin/run", Some("1"), Some("1"), ("100644", "100755"));
     assert_eq!(classify(&mode, None), ProvEntryClass::Mechanical);
-    for generated in ["Cargo.lock", "crates/x/Cargo.lock", "docs/feature-map/registry.json"] {
+    for generated in [
+        "Cargo.lock",
+        "crates/x/Cargo.lock",
+        "docs/feature-map/registry.json",
+    ] {
         let entry = diff(generated, Some("1"), Some("2"), plain);
-        assert_eq!(classify(&entry, None), ProvEntryClass::Generated, "{generated}");
+        assert_eq!(
+            classify(&entry, None),
+            ProvEntryClass::Generated,
+            "{generated}"
+        );
         assert_eq!(classify(&entry, Some("content")), ProvEntryClass::Content);
     }
     let lookalike = diff("docs/Cargo.lock.md", Some("1"), Some("2"), plain);
     assert_eq!(classify(&lookalike, None), ProvEntryClass::Content);
-    assert_eq!(classify(&content, Some("generated")), ProvEntryClass::Generated);
-    assert_eq!(classify(&content, Some("mechanical")), ProvEntryClass::Mechanical);
+    assert_eq!(
+        classify(&content, Some("generated")),
+        ProvEntryClass::Generated
+    );
+    assert_eq!(
+        classify(&content, Some("mechanical")),
+        ProvEntryClass::Mechanical
+    );
     assert_eq!(classify(&content, Some("opaque")), ProvEntryClass::Content);
 }
 
@@ -188,8 +205,17 @@ fn show_names_a_change_a_task_or_a_full_commit() {
 
 #[test]
 fn who_reads_a_trailing_line_number() {
-    assert_eq!(path_and_line("src/a.rs:12"), Ok(("src/a.rs".to_string(), Some(12))));
-    assert_eq!(path_and_line("src/a.rs"), Ok(("src/a.rs".to_string(), None)));
-    assert_eq!(path_and_line("odd:name.rs"), Ok(("odd:name.rs".to_string(), None)));
+    assert_eq!(
+        path_and_line("src/a.rs:12"),
+        Ok(("src/a.rs".to_string(), Some(12)))
+    );
+    assert_eq!(
+        path_and_line("src/a.rs"),
+        Ok(("src/a.rs".to_string(), None))
+    );
+    assert_eq!(
+        path_and_line("odd:name.rs"),
+        Ok(("odd:name.rs".to_string(), None))
+    );
     assert!(path_and_line("src/a.rs:0").is_err());
 }

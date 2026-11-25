@@ -456,9 +456,14 @@ impl Repo {
 
     /// The commit `name` names, `None` when it names none.
     pub(crate) fn resolve(&self, name: &str) -> Option<String> {
-        self.lines(&["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")])
-            .ok()
-            .and_then(|lines| lines.into_iter().next())
+        self.lines(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ])
+        .ok()
+        .and_then(|lines| lines.into_iter().next())
     }
 
     /// One commit.
@@ -499,15 +504,14 @@ impl Repo {
     /// commit, by name.
     pub(crate) fn branches(&self, prefix: &str) -> Result<Vec<(String, String)>, String> {
         let mut found: Vec<(String, String)> = self
-            .lines(&[
-                "for-each-ref",
-                "--format=%(objectname) %(refname)",
-                prefix,
-            ])?
+            .lines(&["for-each-ref", "--format=%(objectname) %(refname)", prefix])?
             .into_iter()
             .filter_map(|line| {
                 let (oid, name) = line.split_once(' ')?;
-                Some((name.strip_prefix("refs/heads/")?.to_string(), oid.to_string()))
+                Some((
+                    name.strip_prefix("refs/heads/")?.to_string(),
+                    oid.to_string(),
+                ))
             })
             .collect();
         found.sort();
@@ -527,7 +531,12 @@ impl Repo {
         commit: &str,
         paths: &[&[u8]],
     ) -> Result<HashMap<Vec<u8>, String>, String> {
-        if paths.is_empty() || self.objects.info(&format!("{commit}:.gitattributes"))?.is_none() {
+        if paths.is_empty()
+            || self
+                .objects
+                .info(&format!("{commit}:.gitattributes"))?
+                .is_none()
+        {
             return Ok(HashMap::new());
         }
         let mut child = crate::sources::controller_git()
@@ -744,7 +753,10 @@ impl Known {
             change_ids: HashMap::new(),
             entries: HashMap::new(),
         };
-        for row in store.prov_recorded(domain).map_err(|error| error.to_string())? {
+        for row in store
+            .prov_recorded(domain)
+            .map_err(|error| error.to_string())?
+        {
             if let Some(result) = row.result_now {
                 known.results.entry(result).or_insert(row.id);
             }
@@ -977,9 +989,10 @@ fn checkpoint_change(
             };
             edit_branch_key(&branch, merge_base)
         }
-        (None, Found::FirstParent) => {
-            edit_branch_key("main", commit.parents.first().map_or(EMPTY_TREE, String::as_str))
-        }
+        (None, Found::FirstParent) => edit_branch_key(
+            "main",
+            commit.parents.first().map_or(EMPTY_TREE, String::as_str),
+        ),
     };
     let change_id = change_id(domain, &key);
     let facts_of_task = task.and_then(|task| facts.tasks.get(&task));
@@ -1159,8 +1172,12 @@ pub(crate) fn index(
                 checkpoints,
             } => {
                 let change = main_change(domain, &known, &facts, commit, trailers);
-                let mut entries =
-                    entries(repo, commit.parents.first().map(String::as_str), &commit.id, &[])?;
+                let mut entries = entries(
+                    repo,
+                    commit.parents.first().map(String::as_str),
+                    &commit.id,
+                    &[],
+                )?;
                 let edges = includes(store, &mut known, checkpoints, &mut entries)?;
                 match change.kind {
                     ProvChangeKind::Land => summary.lands += 1,

@@ -86,9 +86,7 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
                     let Some(repo) = repo else {
                         return Err(error);
                     };
-                    let full = index::Repo::open(&repo)?
-                        .resolve(&word)
-                        .ok_or(error)?;
+                    let full = index::Repo::open(&repo)?.resolve(&word).ok_or(error)?;
                     Target::Commit(full)
                 }
             };
@@ -196,7 +194,10 @@ fn changes_by_id(
         if found.contains_key(&id) {
             continue;
         }
-        if let Some(change) = store.prov_change_by_id(id).map_err(|error| error.to_string())? {
+        if let Some(change) = store
+            .prov_change_by_id(id)
+            .map_err(|error| error.to_string())?
+        {
             found.insert(id, change);
         }
     }

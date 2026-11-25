@@ -331,7 +331,13 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
     // The third checkpoint follows a merge of main: the owner's file came
     // from main and is not its; the mode alone is mechanical.
     let a3 = edits[2];
-    assert_eq!(a3["change"]["base"], json!(format!("git1:{}", work.git(&["rev-parse", &format!("{}^1", h.a3)]))));
+    assert_eq!(
+        a3["change"]["base"],
+        json!(format!(
+            "git1:{}",
+            work.git(&["rev-parse", &format!("{}^1", h.a3)])
+        ))
+    );
     let paths: Vec<&str> = a3["entries"]
         .as_array()
         .expect("entries")
@@ -428,7 +434,15 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
     // the landing and the revision its content came from.
     let line = spawn_json(
         &schema,
-        &["prov", "who", "src/a.rs:2", "--source", SOURCE, "--repo", &git_dir],
+        &[
+            "prov",
+            "who",
+            "src/a.rs:2",
+            "--source",
+            SOURCE,
+            "--repo",
+            &git_dir,
+        ],
     );
     assert_eq!(line["commit"], h.a2.as_str(), "{line}");
     assert_eq!(line["granularity"], "line");
@@ -437,12 +451,22 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
     assert_eq!(line["task_id"], 11);
     let readme = spawn_json(
         &schema,
-        &["prov", "who", "README.md:1", "--source", SOURCE, "--repo", &git_dir],
+        &[
+            "prov",
+            "who",
+            "README.md:1",
+            "--source",
+            SOURCE,
+            "--repo",
+            &git_dir,
+        ],
     );
     assert_eq!(readme["attributed"], "imported");
     let file = spawn_json(
         &schema,
-        &["prov", "who", "src/a.rs", "--source", SOURCE, "--repo", &git_dir],
+        &[
+            "prov", "who", "src/a.rs", "--source", SOURCE, "--repo", &git_dir,
+        ],
     );
     assert_eq!(file["granularity"], "file");
     assert_eq!(file["commit"], h.landing.as_str(), "{file}");
@@ -491,10 +515,7 @@ fn a_commit_the_commit_map_renamed_is_recorded_already_and_shown_by_either_id() 
         .expect("recorded")
         .get(0);
     client
-        .query_one(
-            "select spawn_commit_map_load($1)",
-            &[&json!([[old, new]])],
-        )
+        .query_one("select spawn_commit_map_load($1)", &[&json!([[old, new]])])
         .expect("the map");
     let run = index(&schema, &work.git_dir());
     assert_eq!(run["recorded"], 0, "{run}");
@@ -532,7 +553,10 @@ fn many(work: &mut Work, client: &mut Client, landings: i64) {
         let branch = format!("spawn/{agent}");
         work.git(&["checkout", "-q", "-b", &branch]);
         for step in 1..=2 {
-            work.write(&format!("src/{task}/{step}.rs"), &format!("{task} {step}\n"));
+            work.write(
+                &format!("src/{task}/{step}.rs"),
+                &format!("{task} {step}\n"),
+            );
             work.write("shared.txt", &format!("{task} {step}\n"));
             work.commit(&format!("spawn checkpoint exec_{task}_{step}"));
         }
@@ -581,8 +605,6 @@ fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be
 
     // Kill runs, each a little later, until one has recorded something (on
     // this history a kill then lands midway), then let one finish.
-
-
     let total = count(&mut whole_client, "prov_changes");
     let mut delay = std::time::Duration::from_millis(20);
     for _ in 0..40 {

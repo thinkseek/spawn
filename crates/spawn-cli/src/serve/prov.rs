@@ -59,7 +59,13 @@ mod tests {
             let error = who(query).expect_err(query);
             assert!(error.starts_with(BAD_REQUEST), "{query}: {error}");
         }
-        for id in ["x", "abc", "c123", "12345678901234567890", "g".repeat(40).as_str()] {
+        for id in [
+            "x",
+            "abc",
+            "c123",
+            "12345678901234567890",
+            "g".repeat(40).as_str(),
+        ] {
             let error = change(id).expect_err(id);
             assert!(error.starts_with(BAD_REQUEST), "{id}: {error}");
         }

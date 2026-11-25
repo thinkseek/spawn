@@ -824,7 +824,10 @@ impl PostgresStore {
 
     /// Every task of the agents `agents`: `(agent, task, created_at_ms)`, by
     /// agent and then creation (then id).
-    pub fn prov_agent_tasks(&self, agents: &[String]) -> Result<Vec<(String, i64, i64)>, StoreError> {
+    pub fn prov_agent_tasks(
+        &self,
+        agents: &[String],
+    ) -> Result<Vec<(String, i64, i64)>, StoreError> {
         Ok(self
             .query(
                 "select agent_id, id, created_at_ms from mission_tasks
