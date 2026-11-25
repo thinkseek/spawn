@@ -701,7 +701,7 @@ mod agy_tests {
     /// runs. The panel's entries are made up; their layout is agy's.
     fn with_panel(footer: &str, panel: &str) -> String {
         format!(
-            "{}⠿ earlier output\n{RULE}\n>\n{RULE}\n{panel}{RULE}\n{footer}\n",
+            "{}{RULE}\n>\n{RULE}\n{panel}{RULE}\n{footer}\n",
             banner()
         )
     }
