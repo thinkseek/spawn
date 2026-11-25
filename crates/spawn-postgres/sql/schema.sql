@@ -6764,6 +6764,862 @@ begin
     return v_id;
 end $$;
 
+-- spawn-node v1 ledger: begin (PR S1).
+-- The nodes' state and the jobs they are leased (issue #96, design
+-- "spawn-node v1 and host-adaptive storage" §5). A v1 node's beat is a row
+-- update, never an event; only transitions are recorded, as `node.recorded`
+-- records of the control session with `"proto":"node-v1"` (outside the fold,
+-- like the P1 node records above). A v1 node's name is never a P1 node's:
+-- spawn_node_enroll_token refuses a joined name, spawn_node_record a name
+-- held here.
+-- Lock order in every function below: rows of spawn_node_state (in name
+-- order when several), then rows of spawn_remote_jobs, then, last and only
+-- on a recorded transition, the append lock (spawn_node_events), after which
+-- no row of either table is locked. A beat, the sweep, a result, a fault and
+-- an owner's change therefore never wait on each other in a cycle.
+-- Remote-job records and rows name a judging `judging_id`, never `judging`
+-- (spawn_events_control_judging_outcome keys on `record.judging`).
+
+create table if not exists spawn_node_state (
+    name                text primary key
+                        check (name ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'),
+    node_id             text unique check (node_id ~ '^[0-9a-f]{64}$'),
+    pubkey              bytea check (pubkey is null or octet_length(pubkey) = 32),
+    cell_id             text not null default 'c0' check (cell_id ~ '^[a-z0-9][a-z0-9-]{0,15}$'),
+    status              text not null default 'pending'
+                        check (status in ('pending', 'active', 'revoked')),
+    drained             boolean not null default false,
+    degraded            boolean not null default false,
+    lost_recorded       boolean not null default false,
+    host_fault_strikes  integer not null default 0 check (host_fault_strikes >= 0),
+    enroll_token_sha256 bytea unique
+                        check (enroll_token_sha256 is null or octet_length(enroll_token_sha256) = 32),
+    enroll_expires_ms   bigint,
+    enrolled_at_ms      bigint,
+    boot_id             text check (boot_id is null or boot_id ~ '^[0-9a-f]{32}$'),
+    boot_seen_ms        bigint,
+    beat_seq            bigint not null default 0,
+    seq_hi              bigint not null default 0,   -- v0.2 UDP: highest seq seen
+    seq_window          bigint not null default 0,   -- v0.2 UDP: 64-bit sliding bitmap below seq_hi
+    last_beat_ms        bigint,
+    beat                jsonb,
+    warm_bases          text[] not null default '{}',
+    spec_sha256         text check (spec_sha256 is null or spec_sha256 ~ '^[0-9a-f]{64}$'),
+    spec                jsonb,
+    spec_at_ms          bigint,
+    revoked_at_ms       bigint,
+    check ((node_id is null) = (pubkey is null)),
+    check (status <> 'active' or node_id is not null)
+) with (fillfactor = 50);
+
+create table if not exists spawn_remote_jobs (
+    job_id            text primary key check (job_id ~ '^[a-z0-9][a-z0-9._-]{7,63}$'),
+    cell_id           text not null default 'c0' check (cell_id ~ '^[a-z0-9][a-z0-9-]{0,15}$'),
+    kind              text not null check (kind in ('gate', 'gate_shadow', 'build', 'de_batch')),
+    state             text not null default 'queued'
+                      check (state in ('queued', 'leased', 'result_pending', 'completed',
+                                       'fallback_local', 'dead_letter', 'cancelled')),
+    priority          integer not null default 0,
+    judging_id        text,            -- never named `judging`: spawn_events_control_judging_outcome
+    mission_id        bigint,
+    task_id           bigint,
+    spec              jsonb not null
+                      check (jsonb_typeof(spec) = 'object' and octet_length(spec::text) <= 65536),
+    requires          jsonb not null default '{}' check (jsonb_typeof(requires) = 'object'),
+    cost              jsonb not null default '{}' check (jsonb_typeof(cost) = 'object'),
+    base_commit       text check (base_commit is null or base_commit ~ '^[0-9a-f]{40}$'),
+    excluded_nodes    text[] not null default '{}',
+    fault_nodes       text[] not null default '{}',
+    node_id           text,
+    boot_id           text,
+    lease_epoch       bigint not null default 0,
+    lease_expires_ms  bigint,
+    grace_until_ms    bigint,
+    grant_seq         bigint,
+    attempts          integer not null default 0,
+    max_attempts      integer not null default 2 check (max_attempts >= 1),
+    enqueued_at_ms    bigint not null,
+    queue_deadline_ms bigint,
+    leased_at_ms      bigint,
+    finished_at_ms    bigint,
+    exit_code         integer,
+    result            jsonb check (result is null or octet_length(result::text) <= 262144),
+    result_sha256     text,
+    log_sha256        text,
+    log_bytes         bigint check (log_bytes is null or log_bytes between 0 and 33554432),
+    check (state not in ('leased', 'result_pending')
+           or (node_id is not null and lease_expires_ms is not null))
+) with (fillfactor = 70);
+
+create index if not exists spawn_remote_jobs_queue
+    on spawn_remote_jobs (cell_id, priority desc, enqueued_at_ms) where state = 'queued';
+create index if not exists spawn_remote_jobs_held
+    on spawn_remote_jobs (node_id) where state in ('leased', 'result_pending');
+create index if not exists spawn_remote_jobs_judging
+    on spawn_remote_jobs (judging_id) where judging_id is not null;
+
+-- One `node.recorded` record of the control session. `p_key` makes a
+-- transition recorded once.
+create or replace function spawn_node_event(p_name text, p_type text, p_fields jsonb, p_key text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_id bigint;
+begin
+    select a.out_id into v_id
+      from spawn_append_trusted(
+               'agent_control', 'session_control', null, 'control', p_key,
+               jsonb_build_object('name', 'node.recorded', 'detail', jsonb_build_object(
+                   'record', jsonb_build_object('type', p_type, 'name', p_name, 'proto', 'node-v1')
+                             || coalesce(p_fields, '{}'::jsonb)))) a;
+    return v_id;
+end $$;
+
+-- The transitions a function collected, `[{name, type, fields, key}]`,
+-- recorded in order: the last step of every function below, after its rows
+-- (the append lock is taken here and no row of the two tables after it).
+create or replace function spawn_node_events(p_facts jsonb) returns integer
+language plpgsql security definer as $$
+declare
+    v_fact jsonb;
+    v_count integer := 0;
+begin
+    for v_fact in select f from jsonb_array_elements(coalesce(p_facts, '[]'::jsonb)) f loop
+        perform spawn_node_event(v_fact ->> 'name', v_fact ->> 'type', v_fact -> 'fields',
+                                 v_fact ->> 'key');
+        v_count := v_count + 1;
+    end loop;
+    return v_count;
+end $$;
+
+-- Fences every lease of `p_node_id` in `p_states` except the jobs in
+-- `p_keep` (and, when `p_only` is given, only those): the epoch moves, so
+-- nothing the old holder sends is believed. `p_refund` gives the attempt
+-- back (a grant the node never received). Returns the `remote_job.lease_fenced`
+-- facts for spawn_node_events; it records nothing itself.
+create or replace function spawn_node_fence(
+    p_node_id text, p_name text, p_states text[], p_keep text[], p_only text[], p_reason text,
+    p_refund boolean
+) returns jsonb language plpgsql security definer as $$
+declare
+    v_facts jsonb;
+begin
+    with fenced as (
+        update spawn_remote_jobs j
+           set lease_epoch = j.lease_epoch + 1,
+               attempts = j.attempts - case when p_refund then 1 else 0 end,
+               state = case
+                         when p_refund or j.attempts < j.max_attempts then 'queued'
+                         when j.kind = 'gate' then 'fallback_local'
+                         when j.kind = 'gate_shadow' then 'cancelled'
+                         else 'dead_letter' end,
+               node_id = null, boot_id = null, lease_expires_ms = null,
+               grace_until_ms = null, grant_seq = null
+         where j.node_id = p_node_id and j.state = any(p_states)
+           and not (j.job_id = any(coalesce(p_keep, '{}')))
+           and (p_only is null or j.job_id = any(p_only))
+        returning j.job_id, j.lease_epoch, j.state, j.kind)
+    select coalesce(jsonb_agg(jsonb_build_object(
+               'name', p_name, 'type', 'remote_job.lease_fenced',
+               'fields', jsonb_build_object('job_id', f.job_id, 'lease_epoch', f.lease_epoch,
+                                            'reason', p_reason, 'next', f.state, 'kind', f.kind),
+               'key', 'remote_job:' || f.job_id || ':' || f.lease_epoch || ':fenced')
+               order by f.job_id), '[]'::jsonb)
+      into v_facts from fenced f;
+    return v_facts;
+end $$;
+
+-- 1 of 4. POST /node/v1/enroll: consumes a one-time token, pins the key.
+create or replace function spawn_node_gw_enroll(
+    p_token_sha256 bytea, p_pubkey bytea, p_boot_id text, p_spec_sha256 text, p_spec jsonb
+) returns jsonb language plpgsql security definer as $$
+declare
+    v_now bigint := spawn_now_ms();
+    v_n spawn_node_state;
+    v_node_id text;
+    v_facts jsonb := '[]'::jsonb;
+begin
+    if octet_length(p_token_sha256) is distinct from 32 or octet_length(p_pubkey) is distinct from 32
+       or p_boot_id is null or p_boot_id !~ '^[0-9a-f]{32}$'
+       or p_spec_sha256 is null or p_spec_sha256 !~ '^[0-9a-f]{64}$'
+       or jsonb_typeof(p_spec) is distinct from 'object' or octet_length(p_spec::text) > 65536 then
+        return jsonb_build_object('ok', false, 'error', 'bad_request', 'server_time_ms', v_now);
+    end if;
+    select * into v_n from spawn_node_state where enroll_token_sha256 = p_token_sha256 for update;
+    if not found or v_n.status = 'revoked' or coalesce(v_n.enroll_expires_ms, 0) < v_now then
+        return jsonb_build_object('ok', false, 'error', 'bad_token', 'server_time_ms', v_now);
+    end if;
+    v_node_id := encode(sha256(p_pubkey), 'hex');
+    if exists (select 1 from spawn_node_state o where o.node_id = v_node_id and o.name <> v_n.name) then
+        return jsonb_build_object('ok', false, 'error', 'key_in_use', 'server_time_ms', v_now);
+    end if;
+    update spawn_node_state
+       set node_id = v_node_id, pubkey = p_pubkey, status = 'active',
+           enroll_token_sha256 = null, enroll_expires_ms = null, enrolled_at_ms = v_now,
+           boot_id = p_boot_id, boot_seen_ms = v_now, beat_seq = 0, seq_hi = 0, seq_window = 0,
+           last_beat_ms = v_now, beat = null, warm_bases = '{}', lost_recorded = false,
+           degraded = false, host_fault_strikes = 0,
+           spec_sha256 = p_spec_sha256, spec = p_spec, spec_at_ms = v_now
+     where name = v_n.name;
+    if v_n.node_id is not null then
+        -- A new key for the name: whatever the old key held is fenced.
+        v_facts := spawn_node_fence(v_n.node_id, v_n.name, array['leased', 'result_pending'], null,
+                                    null, 're_enrolled', false);
+    end if;
+    perform spawn_node_events(v_facts || jsonb_build_array(jsonb_build_object(
+        'name', v_n.name, 'type', 'node.enrolled',
+        'fields', jsonb_build_object('node_id', v_node_id, 'cell_id', v_n.cell_id,
+                                     'spec_sha256', p_spec_sha256, 'replaced', v_n.node_id),
+        'key', 'node:' || v_node_id || ':enrolled:' || v_now)));
+    return jsonb_build_object('ok', true, 'name', v_n.name, 'node_id', v_node_id,
+                              'cell_id', v_n.cell_id, 'server_time_ms', v_now);
+end $$;
+
+-- 2 of 4. POST /node/v1/heartbeat. Returns the node's key with its answer:
+-- the gateway verifies the request's signature against it and commits, or
+-- rolls the whole call back. No append lock and no event unless a state
+-- changes (a new boot, a node back, a lease granted or fenced).
+create or replace function spawn_node_gw_beat(
+    p_node_id text, p_boot_id text, p_seq bigint, p_beat jsonb
+) returns jsonb language plpgsql security definer as $$
+declare
+    c_ttl_ms constant bigint := 90000;
+    c_grace_ms constant bigint := 180000;
+    c_max_grants constant integer := 2;
+    v_now bigint := spawn_now_ms();
+    v_n spawn_node_state;
+    v_pub text;
+    v_new_boot boolean := false;
+    v_held jsonb;
+    v_pending jsonb;
+    v_keep text[];
+    v_renewed jsonb;
+    v_fenced jsonb;
+    v_acked jsonb;
+    v_need_spec boolean;
+    v_avail jsonb;
+    v_job spawn_remote_jobs;
+    v_fits boolean;
+    v_grants jsonb := '[]'::jsonb;
+    v_granted integer := 0;
+    v_need_sync jsonb := '{}'::jsonb;
+    v_busy boolean;
+    v_facts jsonb := '[]'::jsonb;
+begin
+    select * into v_n from spawn_node_state where node_id = p_node_id for update;
+    if not found or v_n.status = 'pending' then
+        return jsonb_build_object('ok', false, 'error', 'unknown_node', 'server_time_ms', v_now);
+    end if;
+    v_pub := encode(v_n.pubkey, 'base64');
+    if v_n.status = 'revoked' then
+        return jsonb_build_object('ok', false, 'error', 'revoked', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+    if p_boot_id is null or p_boot_id !~ '^[0-9a-f]{32}$' or p_seq is null or p_seq < 1
+       or jsonb_typeof(p_beat) is distinct from 'object' then
+        return jsonb_build_object('ok', false, 'error', 'bad_request', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+    -- A boot id's first 16 hex digits are the node's persistent boot counter.
+    if v_n.boot_id is null or left(p_boot_id, 16) > left(v_n.boot_id, 16) then
+        v_new_boot := true;
+    elsif p_boot_id <> v_n.boot_id then
+        return jsonb_build_object('ok', false, 'error', 'stale_boot', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    elsif p_seq <= v_n.beat_seq then
+        return jsonb_build_object('ok', false, 'error', 'replay', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+
+    v_held := case when jsonb_typeof(p_beat -> 'leases') = 'array' then p_beat -> 'leases'
+                   else '[]'::jsonb end;
+    v_pending := case when jsonb_typeof(p_beat -> 'lease_results_pending') = 'array'
+                      then p_beat -> 'lease_results_pending' else '[]'::jsonb end;
+
+    -- A finished job whose result waits here: no longer fenced by its lease.
+    update spawn_remote_jobs j
+       set state = 'result_pending', grace_until_ms = v_now + c_grace_ms
+     where j.node_id = p_node_id and j.state = 'leased'
+       and exists (select 1 from jsonb_array_elements(v_pending) r
+                    where r ->> 'job_id' = j.job_id
+                      and r ->> 'lease_epoch' = j.lease_epoch::text);
+
+    if v_new_boot then
+        -- The process that held them is gone: fenced at once, no TTL wait.
+        v_facts := v_facts || spawn_node_fence(p_node_id, v_n.name, array['leased'], null, null,
+                                               'boot_id_changed', false);
+    else
+        -- A lease granted by an earlier answer that this (later) beat does
+        -- not hold, at its epoch: the answer never arrived. Given back, the
+        -- attempt too.
+        select coalesce(array_agg(j.job_id), '{}') into v_keep
+          from spawn_remote_jobs j
+         where j.node_id = p_node_id and j.state = 'leased'
+           and exists (select 1 from jsonb_array_elements(v_held) r
+                        where r ->> 'job_id' = j.job_id
+                          and r ->> 'lease_epoch' = j.lease_epoch::text);
+        update spawn_remote_jobs j set grant_seq = null
+         where j.node_id = p_node_id and j.state = 'leased' and j.job_id = any(v_keep)
+           and j.grant_seq is not null;
+        if exists (select 1 from spawn_remote_jobs j
+                    where j.node_id = p_node_id and j.state = 'leased'
+                      and not (j.job_id = any(v_keep))) then
+            v_facts := v_facts || spawn_node_fence(p_node_id, v_n.name, array['leased'], v_keep,
+                                                   null, 'grant_lost', true);
+        end if;
+    end if;
+
+    with renewed as (
+        update spawn_remote_jobs j
+           set lease_expires_ms = v_now + c_ttl_ms
+         where j.node_id = p_node_id and j.state = 'leased'
+           and exists (select 1 from jsonb_array_elements(v_held) r
+                        where r ->> 'job_id' = j.job_id
+                          and r ->> 'lease_epoch' = j.lease_epoch::text)
+        returning j.job_id, j.lease_epoch)
+    select coalesce(jsonb_agg(jsonb_build_object('job_id', job_id, 'lease_epoch', lease_epoch)
+                              order by job_id), '[]'::jsonb)
+      into v_renewed from renewed;
+
+    -- What the node holds and the ledger does not: it must stop and drop it.
+    select coalesce(jsonb_agg(jsonb_build_object('job_id', r ->> 'job_id',
+                                                 'lease_epoch', r -> 'lease_epoch',
+                                                 'reason', 'not_held')), '[]'::jsonb)
+      into v_fenced
+      from jsonb_array_elements(v_held || v_pending) r
+     where not exists (select 1 from spawn_remote_jobs j
+                        where j.job_id = r ->> 'job_id' and j.node_id = p_node_id
+                          and j.lease_epoch::text = r ->> 'lease_epoch'
+                          and j.state in ('leased', 'result_pending', 'completed'));
+    select coalesce(jsonb_agg(jsonb_build_object('job_id', r ->> 'job_id',
+                                                 'lease_epoch', r -> 'lease_epoch')), '[]'::jsonb)
+      into v_acked
+      from jsonb_array_elements(v_pending) r
+     where exists (select 1 from spawn_remote_jobs j
+                    where j.job_id = r ->> 'job_id' and j.node_id = p_node_id
+                      and j.lease_epoch::text = r ->> 'lease_epoch' and j.state = 'completed');
+
+    v_need_spec := v_n.spec_sha256 is distinct from (p_beat ->> 'spec_sha256');
+
+    -- Grants: at most two an answer, each within what the node says is free.
+    -- SKIP LOCKED: two nodes beating at once never wait on, nor share, a job.
+    if not v_n.drained and not v_n.degraded and not v_need_spec
+       and coalesce(p_beat ->> 'state', 'idle') <> 'draining' then
+        select coalesce(jsonb_object_agg(c.key, coalesce((c.value ->> 'free')::bigint, 0)),
+                        '{}'::jsonb)
+               || jsonb_build_object('tmpfs_mb',
+                      coalesce((p_beat #>> '{tmpfs_budget_mb,free}')::bigint, 0))
+          into v_avail
+          from jsonb_each(case when jsonb_typeof(p_beat -> 'capacities') = 'object'
+                               then p_beat -> 'capacities' else '{}'::jsonb end) c;
+        for v_job in
+            select j.* from spawn_remote_jobs j
+             where j.state = 'queued' and j.cell_id = v_n.cell_id
+               and not (p_node_id = any(j.excluded_nodes))
+             order by j.priority desc, j.enqueued_at_ms
+             for update skip locked
+             limit 16
+        loop
+            exit when v_granted >= c_max_grants;
+            if not (v_job.requires <@ coalesce(v_n.spec -> 'holds', '{}'::jsonb)) then
+                -- need_registry_sync and its kin: never leased until held.
+                if v_need_sync = '{}'::jsonb then v_need_sync := v_job.requires; end if;
+                continue;
+            end if;
+            select coalesce(bool_and(coalesce((v_avail ->> c.key)::bigint, 0) >= c.value::bigint),
+                            true)
+              into v_fits from jsonb_each_text(v_job.cost) c;
+            continue when not v_fits;
+            select coalesce(jsonb_object_agg(a.key,
+                       a.value::bigint - coalesce((v_job.cost ->> a.key)::bigint, 0)), '{}'::jsonb)
+              into v_avail from jsonb_each_text(v_avail) a;
+            update spawn_remote_jobs j
+               set state = 'leased', node_id = p_node_id, boot_id = p_boot_id,
+                   lease_epoch = j.lease_epoch + 1, lease_expires_ms = v_now + c_ttl_ms,
+                   leased_at_ms = v_now, grant_seq = p_seq, attempts = j.attempts + 1,
+                   grace_until_ms = null
+             where j.job_id = v_job.job_id
+            returning j.* into v_job;
+            v_granted := v_granted + 1;
+            v_grants := v_grants || jsonb_build_object(
+                'job_id', v_job.job_id, 'lease_epoch', v_job.lease_epoch, 'kind', v_job.kind,
+                'cost', v_job.cost, 'spec', v_job.spec, 'attempt', v_job.attempts,
+                'needs_baseline', v_job.base_commit is not null
+                    and not (v_job.base_commit = any(
+                        coalesce(array(select jsonb_array_elements_text(
+                            case when jsonb_typeof(p_beat -> 'warm_bases') = 'array'
+                                 then p_beat -> 'warm_bases' else '[]'::jsonb end)), '{}'))));
+        end loop;
+    end if;
+
+    v_busy := v_granted > 0 or jsonb_array_length(v_held) > 0 or jsonb_array_length(v_pending) > 0
+              or exists (select 1 from spawn_remote_jobs j
+                          where j.state = 'queued' and j.cell_id = v_n.cell_id);
+
+    update spawn_node_state
+       set boot_id = p_boot_id,
+           boot_seen_ms = case when v_new_boot then v_now else boot_seen_ms end,
+           beat_seq = p_seq, seq_hi = greatest(seq_hi, p_seq), last_beat_ms = v_now,
+           beat = p_beat, lost_recorded = false,
+           warm_bases = coalesce(array(select jsonb_array_elements_text(
+               case when jsonb_typeof(p_beat -> 'warm_bases') = 'array'
+                    then p_beat -> 'warm_bases' else '[]'::jsonb end)), '{}')
+     where name = v_n.name;
+
+    -- Rows are done: the recorded transitions, under the append lock, last.
+    if v_n.lost_recorded then
+        v_facts := v_facts || jsonb_build_array(jsonb_build_object(
+            'name', v_n.name, 'type', 'node.back',
+            'fields', jsonb_build_object('node_id', p_node_id, 'down_ms', v_now - v_n.last_beat_ms)));
+    end if;
+    select v_facts || coalesce(jsonb_agg(jsonb_build_object(
+               'name', v_n.name, 'type', 'remote_job.leased',
+               'fields', jsonb_build_object('job_id', g ->> 'job_id', 'lease_epoch', g -> 'lease_epoch',
+                                            'kind', g ->> 'kind', 'node_id', p_node_id),
+               'key', 'remote_job:' || (g ->> 'job_id') || ':' || (g ->> 'lease_epoch') || ':leased')),
+               '[]'::jsonb)
+      into v_facts from jsonb_array_elements(v_grants) g;
+    perform spawn_node_events(v_facts);
+
+    return jsonb_build_object(
+        'ok', true, 'pubkey', v_pub, 'name', v_n.name, 'server_time_ms', v_now,
+        'next_beat_ms', case when v_busy then 5000 else 30000 end,
+        'lease_ttl_s', c_ttl_ms / 1000, 'need_spec', v_need_spec, 'need_sync', v_need_sync,
+        'renewed', v_renewed, 'fenced', v_fenced, 'acked_results', v_acked,
+        'grants', v_grants, 'drain', v_n.drained);
+end $$;
+
+-- 3 of 4. POST /node/v1/spec: the node's labels, totals and what it holds.
+create or replace function spawn_node_gw_spec(
+    p_node_id text, p_boot_id text, p_spec_sha256 text, p_spec jsonb
+) returns jsonb language plpgsql security definer as $$
+declare
+    v_now bigint := spawn_now_ms();
+    v_n spawn_node_state;
+    v_pub text;
+begin
+    select * into v_n from spawn_node_state where node_id = p_node_id for update;
+    if not found or v_n.status = 'pending' then
+        return jsonb_build_object('ok', false, 'error', 'unknown_node', 'server_time_ms', v_now);
+    end if;
+    v_pub := encode(v_n.pubkey, 'base64');
+    if v_n.status = 'revoked' then
+        return jsonb_build_object('ok', false, 'error', 'revoked', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+    if p_spec_sha256 is null or p_spec_sha256 !~ '^[0-9a-f]{64}$'
+       or jsonb_typeof(p_spec) is distinct from 'object' or octet_length(p_spec::text) > 65536 then
+        return jsonb_build_object('ok', false, 'error', 'bad_request', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+    if v_n.boot_id is distinct from p_boot_id then
+        return jsonb_build_object('ok', false, 'error', 'beat_first', 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+    if v_n.spec_sha256 is not distinct from p_spec_sha256 then
+        return jsonb_build_object('ok', true, 'changed', false, 'pubkey', v_pub,
+                                  'server_time_ms', v_now);
+    end if;
+    update spawn_node_state
+       set spec_sha256 = p_spec_sha256, spec = p_spec, spec_at_ms = v_now
+     where name = v_n.name;
+    perform spawn_node_events(jsonb_build_array(jsonb_build_object(
+        'name', v_n.name, 'type', 'node.spec_registered',
+        'fields', jsonb_build_object('node_id', p_node_id, 'spec_sha256', p_spec_sha256,
+                                     'holds', p_spec -> 'holds', 'labels', p_spec -> 'labels'),
+        'key', 'node:' || p_node_id || ':spec:' || p_spec_sha256 || ':' || v_n.boot_id)));
+    return jsonb_build_object('ok', true, 'changed', true, 'pubkey', v_pub, 'server_time_ms', v_now);
+end $$;
+
+-- 4 of 4. POST /node/v1/jobs/<job_id>/result: the fenced completion. True
+-- when this call, or an identical earlier one, completed the job. The node
+-- row is read FOR SHARE first (the lock order): a result never completes
+-- beside a revoke of its node, and waits out a beat of it.
+create or replace function spawn_node_gw_result(
+    p_node_id text, p_job_id text, p_lease_epoch bigint, p_result jsonb
+) returns boolean language plpgsql security definer as $$
+declare
+    v_now bigint := spawn_now_ms();
+    v_done boolean;
+    v_name text;
+    v_kind text;
+begin
+    if jsonb_typeof(p_result) is distinct from 'object'
+       or coalesce(p_result ->> 'result_sha256', '') !~ '^[0-9a-f]{64}$'
+       or coalesce(p_result ->> 'log_sha256', '') !~ '^[0-9a-f]{64}$'
+       or coalesce(p_result ->> 'log_bytes', '') !~ '^[0-9]{1,8}$'
+       or coalesce(p_result ->> 'exit_code', '0') !~ '^-?[0-9]{1,9}$' then
+        return false;
+    end if;
+    select n.name into v_name from spawn_node_state n
+     where n.node_id = p_node_id and n.status = 'active'
+       for share;
+    if v_name is null then
+        return false;
+    end if;
+    update spawn_remote_jobs
+       set state = 'completed', finished_at_ms = v_now,
+           exit_code = (p_result ->> 'exit_code')::integer,
+           result = p_result, result_sha256 = p_result ->> 'result_sha256',
+           log_sha256 = p_result ->> 'log_sha256', log_bytes = (p_result ->> 'log_bytes')::bigint,
+           lease_expires_ms = null, grace_until_ms = null
+     where job_id = p_job_id and lease_epoch = p_lease_epoch
+       and state in ('leased', 'result_pending')
+       and node_id = p_node_id
+    returning true, kind into v_done, v_kind;
+    if v_done then
+        perform spawn_node_events(jsonb_build_array(jsonb_build_object(
+            'name', v_name, 'type', 'remote_job.completed',
+            'fields', jsonb_build_object('job_id', p_job_id, 'lease_epoch', p_lease_epoch,
+                                         'kind', v_kind, 'node_id', p_node_id,
+                                         'exit_code', p_result -> 'exit_code',
+                                         'seconds', p_result -> 'seconds',
+                                         'result_sha256', p_result ->> 'result_sha256'),
+            'key', 'remote_job:' || p_job_id || ':' || p_lease_epoch || ':completed')));
+        return true;
+    end if;
+    return exists (select 1 from spawn_remote_jobs j
+                    where j.job_id = p_job_id and j.lease_epoch = p_lease_epoch
+                      and j.node_id = p_node_id and j.state = 'completed'
+                      and j.result_sha256 = p_result ->> 'result_sha256');
+end $$;
+
+-- Owner side (never granted to the gateway). The level-triggered sweep, run
+-- from the integrator's pass: a lease past its time waits `result_pending`
+-- for 180 s, then is fenced; a node silent for a lease's time is recorded
+-- lost, once. The nodes it acts on are locked first, in name order, as a
+-- beat locks its own node before its jobs; their jobs after; the events last.
+create or replace function spawn_node_sweep() returns jsonb
+language plpgsql security definer as $$
+declare
+    c_ttl_ms constant bigint := 90000;
+    c_grace_ms constant bigint := 180000;
+    v_now bigint := spawn_now_ms();
+    v_nodes text[];
+    v_n record;
+    v_waiting integer;
+    v_fenced integer := 0;
+    v_lost jsonb;
+    v_facts jsonb := '[]'::jsonb;
+    v_some jsonb;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner sweeps the nodes; % may not', session_user
+            using errcode = '42501';
+    end if;
+    select coalesce(array_agg(x.node_id order by x.name), '{}') into v_nodes
+      from (select n.name, n.node_id from spawn_node_state n
+             where n.node_id is not null
+               and (exists (select 1 from spawn_remote_jobs j
+                             where j.node_id = n.node_id
+                               and ((j.state = 'leased' and j.lease_expires_ms < v_now)
+                                    or (j.state = 'result_pending' and j.grace_until_ms < v_now)))
+                    or (n.status = 'active' and not n.lost_recorded
+                        and n.last_beat_ms < v_now - c_ttl_ms))
+             order by n.name
+               for update of n) x;
+    update spawn_remote_jobs
+       set state = 'result_pending', grace_until_ms = v_now + c_grace_ms
+     where state = 'leased' and lease_expires_ms < v_now and node_id = any(v_nodes);
+    get diagnostics v_waiting = row_count;
+    for v_n in
+        select n.name, n.node_id,
+               array(select j.job_id from spawn_remote_jobs j
+                      where j.node_id = n.node_id and j.state = 'result_pending'
+                        and j.grace_until_ms < v_now) as late
+          from spawn_node_state n
+         where n.node_id = any(v_nodes)
+         order by n.name
+    loop
+        continue when cardinality(v_n.late) = 0;
+        v_some := spawn_node_fence(v_n.node_id, v_n.name, array['result_pending'], null, v_n.late,
+                                   'lease_expired', false);
+        v_fenced := v_fenced + jsonb_array_length(v_some);
+        v_facts := v_facts || v_some;
+    end loop;
+    with lost as (
+        update spawn_node_state n set lost_recorded = true
+         where n.node_id = any(v_nodes) and n.status = 'active' and not n.lost_recorded
+           and n.last_beat_ms < v_now - c_ttl_ms
+        returning n.name, n.node_id, n.last_beat_ms)
+    select coalesce(jsonb_agg(jsonb_build_object(
+               'name', l.name, 'type', 'node.lost',
+               'fields', jsonb_build_object('node_id', l.node_id, 'last_seen_ms', l.last_beat_ms,
+                                            'silent_ms', v_now - l.last_beat_ms))
+               order by l.name), '[]'::jsonb)
+      into v_lost from lost l;
+    perform spawn_node_events(v_facts || v_lost);
+    return jsonb_build_object('waiting', v_waiting, 'fenced', v_fenced,
+                              'lost', jsonb_array_length(v_lost));
+end $$;
+
+-- `spawn node enroll-token <name>`: a one-time token's digest, good at most
+-- 10 minutes. Returns when it expires.
+create or replace function spawn_node_enroll_token(
+    p_name text, p_cell text, p_token_sha256 bytea, p_ttl_ms bigint
+) returns bigint language plpgsql security definer as $$
+declare
+    v_now bigint := spawn_now_ms();
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner enrolls a node; % may not', session_user
+            using errcode = '42501';
+    end if;
+    if octet_length(p_token_sha256) is distinct from 32
+       or p_ttl_ms is null or p_ttl_ms not between 1000 and 600000 then
+        raise exception 'an enrollment token is 32 bytes of SHA-256, good for at most 10 minutes'
+            using errcode = '22023';
+    end if;
+    -- A name the P1 records hold joined is another node's (spawn_node_record).
+    if exists (select 1 from spawn_node_latest('node.joined', p_name, 0) j
+                where not exists (select 1 from spawn_node_latest('node.removed', p_name, j.seq))) then
+        raise exception 'node % is joined by `spawn node add` (spawn node remove first)', p_name
+            using errcode = '23505';
+    end if;
+    insert into spawn_node_state (name, cell_id, enroll_token_sha256, enroll_expires_ms)
+    values (p_name, coalesce(p_cell, 'c0'), p_token_sha256, v_now + p_ttl_ms)
+    on conflict (name) do update
+       set enroll_token_sha256 = excluded.enroll_token_sha256,
+           enroll_expires_ms = excluded.enroll_expires_ms,
+           cell_id = excluded.cell_id
+     where spawn_node_state.status <> 'revoked';
+    if not found then
+        raise exception 'node % is revoked: enroll it under another name', p_name
+            using errcode = '55000';
+    end if;
+    return v_now + p_ttl_ms;
+end $$;
+
+-- `spawn node drain|undrain|revoke <name>` of a v1 node. An undrain also
+-- clears `degraded` and its strikes: the owner looked.
+create or replace function spawn_node_admin(p_name text, p_action text) returns boolean
+language plpgsql security definer as $$
+declare
+    v_now bigint := spawn_now_ms();
+    v_n spawn_node_state;
+    v_facts jsonb := '[]'::jsonb;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner changes a node; % may not', session_user
+            using errcode = '42501';
+    end if;
+    if p_action is null or p_action not in ('drain', 'undrain', 'revoke') then
+        raise exception 'a node is drained, undrained or revoked, not %', p_action
+            using errcode = '22023';
+    end if;
+    select * into v_n from spawn_node_state where name = p_name for update;
+    if not found then
+        raise exception 'no node is named %', p_name using errcode = 'P0002';
+    end if;
+    if p_action = 'drain' then
+        if v_n.drained then return false; end if;
+        update spawn_node_state set drained = true where name = p_name;
+    elsif p_action = 'undrain' then
+        if not v_n.drained and not v_n.degraded then return false; end if;
+        update spawn_node_state set drained = false, degraded = false, host_fault_strikes = 0
+         where name = p_name;
+    else
+        if v_n.status = 'revoked' then return false; end if;
+        update spawn_node_state
+           set status = 'revoked', revoked_at_ms = v_now, enroll_token_sha256 = null,
+               enroll_expires_ms = null
+         where name = p_name;
+        if v_n.node_id is not null then
+            v_facts := spawn_node_fence(v_n.node_id, p_name, array['leased', 'result_pending'],
+                                        null, null, 'revoked', false);
+        end if;
+    end if;
+    perform spawn_node_events(v_facts || jsonb_build_array(jsonb_build_object(
+        'name', p_name,
+        'type', case p_action when 'drain' then 'node.drained' when 'undrain' then 'node.undrained'
+                              else 'node.revoked' end,
+        'fields', jsonb_build_object('node_id', v_n.node_id))));
+    return true;
+end $$;
+
+-- The integrator's enqueue. `p_job`: {job_id, kind, cell_id?, priority?,
+-- judging_id?, mission_id?, task_id?, spec, requires, cost, base_commit?,
+-- max_attempts?, queue_wait_ms?}. Returns the job's id.
+create or replace function spawn_remote_job_enqueue(p_job jsonb) returns text
+language plpgsql security definer as $$
+declare
+    v_now bigint := spawn_now_ms();
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner queues a remote job; % may not', session_user
+            using errcode = '42501';
+    end if;
+    insert into spawn_remote_jobs (job_id, kind, cell_id, priority, judging_id, mission_id, task_id,
+                                   spec, requires, cost, base_commit, max_attempts,
+                                   enqueued_at_ms, queue_deadline_ms)
+    values (p_job ->> 'job_id', p_job ->> 'kind', coalesce(p_job ->> 'cell_id', 'c0'),
+            coalesce((p_job ->> 'priority')::integer, 0), p_job ->> 'judging_id',
+            (p_job ->> 'mission_id')::bigint, (p_job ->> 'task_id')::bigint,
+            p_job -> 'spec', coalesce(p_job -> 'requires', '{}'::jsonb),
+            coalesce(p_job -> 'cost', '{}'::jsonb), p_job ->> 'base_commit',
+            coalesce((p_job ->> 'max_attempts')::integer, 2), v_now,
+            v_now + coalesce((p_job ->> 'queue_wait_ms')::bigint, 30000));
+    return p_job ->> 'job_id';
+end $$;
+
+-- FALLBACK_LOCAL: the integrator takes back a job no node holds, at the
+-- epoch it read. The same fenced compare-and-set as a node's result: one of
+-- the two wins, never both.
+create or replace function spawn_remote_job_take_local(p_job_id text, p_lease_epoch bigint)
+returns boolean language plpgsql security definer as $$
+declare
+    v_done boolean;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner takes a remote job back; % may not', session_user
+            using errcode = '42501';
+    end if;
+    update spawn_remote_jobs
+       set state = 'fallback_local', lease_epoch = lease_epoch + 1, finished_at_ms = spawn_now_ms()
+     where job_id = p_job_id and lease_epoch = p_lease_epoch and state = 'queued'
+    returning true into v_done;
+    return coalesce(v_done, false);
+end $$;
+
+-- The integrator's reading of a completed job (spawn-cli gate.rs `decide`)
+-- when it is the node's fault: a strike, three make it degraded (no grants
+-- until `spawn node undrain`). `p_next`: 'queued' (another node, this one
+-- excluded), 'fallback_local', 'dead_letter' or 'keep' (the row stays
+-- completed). A job that faulted on two nodes is the poison, not they: the
+-- earlier nodes' strikes from it are given back and the job goes local
+-- (gate), stays (gate_shadow) or is dead-lettered. A completion is judged
+-- once: a second call for it answers ok false.
+create or replace function spawn_remote_job_fault(
+    p_job_id text, p_lease_epoch bigint, p_evidence text, p_strike boolean, p_next text
+) returns jsonb language plpgsql security definer as $$
+declare
+    v_j spawn_remote_jobs;
+    v_n spawn_node_state;
+    v_poison boolean;
+    v_strikes integer;
+    v_next text := p_next;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner judges a remote job; % may not', session_user
+            using errcode = '42501';
+    end if;
+    if p_next is null or p_next not in ('queued', 'fallback_local', 'dead_letter', 'keep') then
+        raise exception 'a faulted job is queued, fallback_local, dead_letter or kept, not %', p_next
+            using errcode = '22023';
+    end if;
+    select j.* into v_j from spawn_remote_jobs j
+     where j.job_id = p_job_id and j.lease_epoch = p_lease_epoch and j.state = 'completed';
+    if not found then
+        return jsonb_build_object('ok', false);
+    end if;
+    -- Every node the judging may change, first, in name order.
+    perform 1 from spawn_node_state n
+     where n.node_id = v_j.node_id or n.node_id = any(v_j.fault_nodes)
+     order by n.name
+       for update;
+    select * into v_n from spawn_node_state where node_id = v_j.node_id;
+    select * into v_j from spawn_remote_jobs
+     where job_id = p_job_id and lease_epoch = p_lease_epoch and state = 'completed' for update;
+    if not found or v_j.node_id = any(v_j.excluded_nodes) then
+        return jsonb_build_object('ok', false);
+    end if;
+    v_poison := coalesce(p_strike, false) and cardinality(v_j.fault_nodes) >= 1
+                and not (v_j.node_id = any(v_j.fault_nodes));
+    if v_poison then
+        update spawn_node_state n
+           set host_fault_strikes = greatest(n.host_fault_strikes - 1, 0)
+         where n.node_id = any(v_j.fault_nodes) and n.node_id <> v_j.node_id;
+        v_next := case when v_j.kind = 'gate' then 'fallback_local'
+                       when v_j.kind = 'gate_shadow' then 'keep' else 'dead_letter' end;
+    elsif coalesce(p_strike, false) and v_n.name is not null then
+        update spawn_node_state
+           set host_fault_strikes = host_fault_strikes + 1,
+               degraded = degraded or host_fault_strikes + 1 >= 3
+         where name = v_n.name
+        returning host_fault_strikes into v_strikes;
+    end if;
+    if v_next = 'queued' and v_j.attempts >= v_j.max_attempts then
+        v_next := case when v_j.kind = 'gate' then 'fallback_local'
+                       when v_j.kind = 'gate_shadow' then 'keep' else 'dead_letter' end;
+    end if;
+    update spawn_remote_jobs
+       set fault_nodes = case when coalesce(p_strike, false)
+                              then array_append(fault_nodes, v_j.node_id) else fault_nodes end,
+           excluded_nodes = array_append(excluded_nodes, v_j.node_id),
+           state = case when v_next = 'keep' then state else v_next end,
+           lease_epoch = case when v_next = 'keep' then lease_epoch else lease_epoch + 1 end,
+           node_id = case when v_next = 'queued' then null else node_id end,
+           boot_id = case when v_next = 'queued' then null else boot_id end,
+           grant_seq = null
+     where job_id = p_job_id;
+    perform spawn_node_events(jsonb_build_array(jsonb_build_object(
+        'name', coalesce(v_n.name, 'unknown'), 'type', 'remote_job.host_fault',
+        'fields', jsonb_build_object('job_id', p_job_id, 'lease_epoch', p_lease_epoch,
+                                     'kind', v_j.kind, 'node_id', v_j.node_id,
+                                     'evidence', p_evidence, 'exit_code', v_j.exit_code,
+                                     'strike', coalesce(p_strike, false) and not v_poison,
+                                     'strikes', v_strikes,
+                                     'degraded', coalesce(v_strikes, 0) >= 3, 'poison', v_poison,
+                                     'next', v_next),
+        'key', 'remote_job:' || p_job_id || ':' || p_lease_epoch || ':host_fault')));
+    return jsonb_build_object('ok', true, 'next', v_next, 'poison', v_poison,
+                              'strikes', v_strikes, 'degraded', coalesce(v_strikes, 0) >= 3);
+end $$;
+
+-- The gateway's login (`spawn-node-gateway`): this database's
+-- `spawn_node_gateway_<db>`, made without login like the others
+-- (PostgresStore::migrate gives it one, and its timeouts: statement 5 s,
+-- lock 2 s, idle in a transaction 5 s). It may connect, see the schema and
+-- execute the four spawn_node_gw_* functions; it holds no table privilege
+-- and no row of spawn_grants, and spawn_mission_caller names it nobody.
+-- Every function above is closed to public and pins its search path.
+do $$
+declare
+    v_role text := spawn_login_role('spawn_node_gateway');
+    v_function text;
+begin
+    if not exists (select 1 from pg_roles where rolname = v_role) then
+        execute format('create role %I nologin', v_role);
+    end if;
+    if coalesce(shobj_description((select oid from pg_roles where rolname = v_role),
+                                  'pg_authid'), '') !~ '^spawn login salt [0-9a-f]{64}$' then
+        execute format('comment on role %I is %L', v_role,
+                       'spawn login salt '
+                       || replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''));
+    end if;
+    if not exists (select 1 from pg_database d cross join lateral aclexplode(d.datacl) a
+                    where d.datname = current_database() and a.privilege_type = 'CONNECT'
+                      and a.grantee = (select oid from pg_roles where rolname = v_role)) then
+        execute format('grant connect on database %I to %I', current_database(), v_role);
+    end if;
+    execute format('grant usage on schema %I to %I', current_schema(), v_role);
+    foreach v_function in array array[
+        'spawn_node_event(text, text, jsonb, text)', 'spawn_node_events(jsonb)',
+        'spawn_node_fence(text, text, text[], text[], text[], text, boolean)',
+        'spawn_node_gw_enroll(bytea, bytea, text, text, jsonb)',
+        'spawn_node_gw_beat(text, text, bigint, jsonb)',
+        'spawn_node_gw_spec(text, text, text, jsonb)',
+        'spawn_node_gw_result(text, text, bigint, jsonb)',
+        'spawn_node_sweep()', 'spawn_node_enroll_token(text, text, bytea, bigint)',
+        'spawn_node_admin(text, text)', 'spawn_remote_job_enqueue(jsonb)',
+        'spawn_remote_job_take_local(text, bigint)',
+        'spawn_remote_job_fault(text, bigint, text, boolean, text)'] loop
+        execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
+        execute format('revoke execute on function %s from public', v_function);
+    end loop;
+    foreach v_function in array array[
+        'spawn_node_gw_enroll(bytea, bytea, text, text, jsonb)',
+        'spawn_node_gw_beat(text, text, bigint, jsonb)',
+        'spawn_node_gw_spec(text, text, text, jsonb)',
+        'spawn_node_gw_result(text, text, bigint, jsonb)'] loop
+        execute format('grant execute on function %s to %I', v_function, v_role);
+    end loop;
+    revoke all on spawn_node_state, spawn_remote_jobs from public;
+    execute format('revoke all on spawn_node_state, spawn_remote_jobs from %I', v_role);
+end
+$$;
+-- spawn-node v1 ledger: end (PR S1).
+
+
 
 -- The alert transitions: the loop's `alert.fired` and `alert.cleared`
 -- records (`spawn_alert_record`, owner only), each once per occurrence
