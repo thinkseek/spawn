@@ -3,9 +3,9 @@
 //!
 //! Workers that build the same code in their own workspaces write the same
 //! large files (`target/`, `node_modules/`, caches) again and again. This
-//! module walks ordinary directories, hashes every eligible file (SHA-256,
-//! the workspace's existing `sha2`), keeps one canonical read-only blob per
-//! digest under `<cas_root>/<first two hex digits>/<digest>`, and replaces
+//! module walks ordinary directories, hashes every eligible file (SHA-256),
+//! keeps one canonical read-only blob per digest in a [`spawn_cas::Store`]
+//! at `<cas_root>/objects/sha256/<first two hex digits>/<digest>`, and replaces
 //! each duplicate in place with a copy-on-write clone of that blob: the
 //! file keeps its path, mode and mtime (so `cargo`, `make` and `npm`
 //! freshness checks see nothing change), but its data extents are now
@@ -64,6 +64,19 @@
 //! its index entry. Deleting a blob never touches a workspace file: the
 //! file system refcounts the shared extents, so a pruned blob only stops
 //! being a clone source.
+//!
+//! # The store is `spawn-cas`
+//!
+//! Blobs are `spawn-cas` objects (`sha256` namespace of `objects/`): the
+//! marker, the layout, the publication of a blob (verified, mode 0444,
+//! never replacing one) and its removal go through [`spawn_cas::Store`].
+//! A CAS made before `spawn-cas` kept its blobs at `<cas_root>/<2 hex>/<64
+//! hex>`; the first pass or prune that opens it moves them to
+//! `objects/sha256/` by a rename ([`spawn_cas::Store::adopt_legacy_shards`]):
+//! nothing is rehashed, and nothing that is not such a blob is touched.
+//! The index keeps naming blobs by their 64 hex digits (all SHA-256), so an
+//! existing index stays valid. [`prune_unused`] never removes a blob that
+//! a `spawn-cas` pin names.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -73,7 +86,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
+use spawn_cas::{Algo, CasError, Publish, Store, verify_reader};
 
 use crate::cow::{
     WorkspaceLease, cow_clone_supported, directory_occupancy, hex, is_jsonl, reflink_new,
@@ -84,9 +97,7 @@ use crate::cow::{
 pub const DEFAULT_MIN_SIZE: u64 = 64 * 1024;
 
 /// The file that marks a directory as a CAS root.
-pub const CAS_MARKER: &str = ".spawn-cas";
-
-const MARKER_TEXT: &str = "spawn content-addressed store 1\n";
+pub const CAS_MARKER: &str = spawn_cas::CAS_MARKER;
 
 /// The names of the disposable build-artifact directories a pass may
 /// deduplicate ([`ArtifactRoot`]).
@@ -367,10 +378,12 @@ impl IndexEntry {
 
 /// Whether `name` is a blob name: 64 lowercase hex digits.
 fn is_hash(name: &str) -> bool {
-    name.len() == 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    spawn_cas::is_hex64(name)
+}
+
+/// The `sha256:` address of a 64-digit hash (checked by the caller).
+fn sha256_digest(hash: &str) -> io::Result<spawn_cas::Digest> {
+    spawn_cas::Digest::from_parts(Algo::Sha256, hash).map_err(io::Error::from)
 }
 
 /// Whether `name` is a temporary this module makes: `<hash>.<pid>-<n>`.
@@ -437,10 +450,6 @@ fn read_index(cas_root: &Path) -> io::Result<Vec<IndexEntry>> {
         .collect()
 }
 
-fn blob_path(cas_root: &Path, hash: &str) -> PathBuf {
-    cas_root.join(&hash[..2]).join(hash)
-}
-
 /// A file opened for reading without following a symlink at its name and
 /// without blocking on a FIFO.
 fn open_nofollow(path: &Path) -> io::Result<fs::File> {
@@ -457,16 +466,7 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 }
 
 fn sha256_reader(reader: &mut impl Read) -> io::Result<String> {
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 256 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex(&hasher.finalize()))
+    Ok(spawn_cas::sha256_reader(reader)?.hex().to_string())
 }
 
 fn same_stamp(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -509,51 +509,18 @@ fn young(meta: &fs::Metadata, min_age: Duration) -> bool {
         || at(meta.ctime(), meta.ctime_nsec()) > cutoff_ns
 }
 
-/// Make `cas_root` a CAS root (marker included), or refuse a non-empty
-/// directory that is not one.
-fn claim_cas_root(cas_root: &Path) -> Result<(), DedupError> {
-    let marker = cas_root.join(CAS_MARKER);
-    let claimed = || fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file());
-    if claimed() {
-        return Ok(());
-    }
-    match fs::symlink_metadata(cas_root) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // Built beside its name with the marker inside, then renamed
-            // into place: a CAS root is never seen without its marker.
-            let parent = cas_root.parent().unwrap_or(Path::new("."));
-            fs::create_dir_all(parent)?;
-            let name = cas_root.file_name().unwrap_or_default().to_string_lossy();
-            let claim = parent.join(format!(".{name}.claim-{}", unique_suffix()));
-            fs::create_dir(&claim)?;
-            fs::write(claim.join(CAS_MARKER), MARKER_TEXT)?;
-            if fs::rename(&claim, cas_root).is_err() {
-                // Another pass made it first.
-                fs::remove_file(claim.join(CAS_MARKER))?;
-                fs::remove_dir(&claim)?;
-            }
-        }
-        Err(error) => return Err(error.into()),
-        Ok(meta) if meta.is_dir() && fs::read_dir(cas_root)?.next().is_none() => {
-            // An empty directory: the marker is the first thing in it (a
-            // pass that loses the race finds the winner's).
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)
-            {
-                Ok(mut file) => file.write_all(MARKER_TEXT.as_bytes())?,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(_) => {}
-    }
-    if claimed() {
-        Ok(())
-    } else {
-        Err(DedupError::NotCas(cas_root.to_path_buf()))
-    }
+/// The `spawn-cas` store at `cas_root`, made (marker first) when missing
+/// or empty, its legacy `<2 hex>/<64 hex>` blobs adopted; a non-empty
+/// directory that is not one is refused ([`DedupError::NotCas`]).
+fn open_store(cas_root: &Path) -> Result<Store, DedupError> {
+    let store = Store::open(cas_root).map_err(|error| match error {
+        CasError::NotCas(root) => DedupError::NotCas(root),
+        other => DedupError::Io(other.into()),
+    })?;
+    store
+        .adopt_legacy_shards()
+        .map_err(|error| DedupError::Io(error.into()))?;
+    Ok(store)
 }
 
 /// One pass over `roots`: see the module documentation.
@@ -580,11 +547,10 @@ pub fn dedup_dirs(
         }
         uninspected.extend(found.uninspected);
     }
-    claim_cas_root(&config.cas_root)?;
-    fs::create_dir_all(config.cas_root.join("tmp"))?;
     let cas_root = crate::root::canonical_root(&config.cas_root);
+    let store = open_store(&cas_root)?;
     let mut report = DedupReport {
-        cow_supported: cow_clone_supported(&cas_root.join("tmp")),
+        cow_supported: cow_clone_supported(&store.tmp_dir()),
         uninspected,
         ..DedupReport::default()
     };
@@ -604,6 +570,7 @@ pub fn dedup_dirs(
     let mut pass = Pass {
         config,
         cas_root: &cas_root,
+        store: &store,
         known: &known,
         owner,
         report: &mut report,
@@ -638,6 +605,7 @@ pub fn dedup_dirs(
 struct Pass<'a> {
     config: &'a DedupConfig,
     cas_root: &'a Path,
+    store: &'a Store,
     known: &'a BTreeMap<(u64, u64), IndexEntry>,
     /// This user: a file of anyone else is left alone.
     owner: u32,
