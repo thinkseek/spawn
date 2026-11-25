@@ -49,7 +49,7 @@ struct ManualClock(Arc<Mutex<SystemTime>>);
 impl ManualClock {
     fn new() -> Self {
         Self(Arc::new(Mutex::new(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            SystemTime::UNIX_EPOCH + Duration::from_hours(500_000),
         )))
     }
 
@@ -323,7 +323,7 @@ fn lru_gc_keeps_pinned_objects() {
                 .put_bytes(NS_ARTIFACTS, &[b'a' + at; 100])
                 .expect("put"),
         );
-        clock.advance(Duration::from_secs(60));
+        clock.advance(Duration::from_mins(1));
     }
     let base = store.put_bytes(NS_BASE_CACHE, &[b'z'; 1000]).expect("put");
     // The two oldest are pinned (a live lease, a warm base).
@@ -338,7 +338,7 @@ fn lru_gc_keeps_pinned_objects() {
         .pin("warm", &"a".repeat(40), std::slice::from_ref(&digests[1]))
         .expect("pin");
     // Using digests[2] again makes it recent.
-    clock.advance(Duration::from_secs(60));
+    clock.advance(Duration::from_mins(1));
     store.touch(NS_ARTIFACTS, &digests[2]).expect("touch");
     let quotas = Quotas::from([
         (NS_ARTIFACTS.to_string(), 300),
@@ -432,7 +432,7 @@ fn gc_purges_stale_temporaries_by_the_store_clock() {
     fs::write(scratch.join("cas/pins/owner/.pin-1-1"), "torn").expect("torn temp");
     assert_eq!(store.gc(&default_quotas()).expect("gc").stale_tmp, 0);
     assert!(fresh.exists());
-    clock.advance(TMP_MAX_AGE + Duration::from_secs(60));
+    clock.advance(TMP_MAX_AGE + Duration::from_mins(1));
     let report = store.gc(&default_quotas()).expect("gc");
     assert_eq!(report.stale_tmp, 3, "{report:?}");
     assert_eq!(fs::read_dir(store.tmp_dir()).expect("tmp").count(), 0);
@@ -523,7 +523,7 @@ fn legacy_shards_are_adopted_in_place_without_rehashing() {
     fs::create_dir_all(root.join(&real.hex()[..2])).expect("mkdir");
     fs::write(&legacy_real, "legacy blob").expect("write");
     let report = store.adopt_legacy_shards().expect("again");
-    assert_eq!(report.duplicates, [legacy_real.clone()]);
+    assert_eq!(report.duplicates, std::slice::from_ref(&legacy_real));
     assert!(legacy_real.exists());
 }
 

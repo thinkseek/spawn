@@ -783,16 +783,7 @@ impl Pass<'_> {
         let staged = path.with_file_name(format!(".{name}.cas-{}", unique_suffix()));
         let mut clone = reflink_new(&source, &staged)?;
         let finish = (|| -> io::Result<Result<(), Skip>> {
-            match verify_reader(&mut clone, &digest) {
-                Ok(_) => {}
-                Err(CasError::Mismatch { .. }) => {
-                    return Err(io::Error::other(format!(
-                        "blob {} does not hold the content it is named for: refused",
-                        blob.display()
-                    )));
-                }
-                Err(error) => return Err(error.into()),
-            }
+            holds_its_content(&mut clone, &digest, &blob)?;
             take_owner(&clone, before, path)?;
             clone.set_permissions(fs::Permissions::from_mode(before.mode() & 0o7777))?;
             clone.set_times(
@@ -855,6 +846,23 @@ impl Pass<'_> {
             self.added.push(IndexEntry::new(digest.hex(), path, before));
         }
         Ok(published)
+    }
+}
+
+/// Refuse a clone of `blob` that does not hash to `digest`: a tampered or
+/// planted blob is never copied over a file.
+fn holds_its_content(
+    clone: &mut fs::File,
+    digest: &spawn_cas::Digest,
+    blob: &Path,
+) -> io::Result<()> {
+    match verify_reader(clone, digest) {
+        Ok(_) => Ok(()),
+        Err(CasError::Mismatch { .. }) => Err(io::Error::other(format!(
+            "blob {} does not hold the content it is named for: refused",
+            blob.display()
+        ))),
+        Err(error) => Err(error.into()),
     }
 }
 
