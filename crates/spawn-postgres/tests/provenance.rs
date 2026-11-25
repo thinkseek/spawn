@@ -14,8 +14,7 @@ mod common;
 use common::{admin, as_login, migrate_warnings, schema_url, store};
 use spawn_postgres::{
     PostgresStore, ProvAttributionSource, ProvBoundary, ProvChangeInput, ProvChangeKind,
-    ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEntryClass, ProvEntryInput, ProvLink,
-    role_url,
+    ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEntryClass, ProvEntryInput, ProvLink, role_url,
 };
 
 const TABLES: [&str; 3] = ["prov_changes", "prov_entries", "prov_edges"];
@@ -236,10 +235,7 @@ fn a_recorded_change_reads_back_every_way() {
     assert_eq!(got.task_id, Some(577));
     assert_eq!(got.preset_id.as_deref(), Some("default"));
     assert_eq!(got.model_label.as_deref(), Some("model-a"));
-    assert_eq!(
-        got.transcript_ref.as_deref(),
-        Some("transcripts/c-1.jsonl")
-    );
+    assert_eq!(got.transcript_ref.as_deref(), Some("transcripts/c-1.jsonl"));
     assert_eq!(got.attributed, ProvAttributionSource::Inferred);
     assert_eq!(got.base, first.base);
     assert_eq!(got.result, first.result);
@@ -273,7 +269,10 @@ fn a_recorded_change_reads_back_every_way() {
     assert_eq!(stored[0].at_ms, 900);
     assert_eq!(stored[1].kind, ProvEdgeKind::Includes);
     assert_eq!(stored[1].detail, json!({}));
-    assert_eq!(stored[1].at_ms, 1_000, "an edge's time defaults to its change's");
+    assert_eq!(
+        stored[1].at_ms, 1_000,
+        "an edge's time defaults to its change's"
+    );
 
     // A second revision, another agent's change and one with no execution.
     let second_rev = store
@@ -370,7 +369,10 @@ fn a_recorded_change_reads_back_every_way() {
     let revert = store
         .record_change(&change("c-3", 1, "agent_a", 3_000), &[reverted], &[])
         .expect("an origin");
-    assert_eq!(store.prov_entries(revert).expect("entries")[0].origin, Some(id));
+    assert_eq!(
+        store.prov_entries(revert).expect("entries")[0].origin,
+        Some(id)
+    );
     let mut dangling = entry("src/d.rs", "blob-d");
     dangling.origin = Some(id + 1_000);
     store
@@ -421,7 +423,10 @@ fn provenance_is_never_changed() {
         assert_eq!(count(&mut client, table), 1, "{table} kept its row");
     }
     assert_eq!(
-        store.prov_change_by_id(id).expect("read").map(|c| c.agent_id),
+        store
+            .prov_change_by_id(id)
+            .expect("read")
+            .map(|c| c.agent_id),
         Some("agent_a".to_string())
     );
 }
@@ -459,8 +464,7 @@ fn the_checks_refuse_values_outside_their_lists() {
         ("attributed", "guessed"),
         ("boundary", "commit"),
     ] {
-        let error = record(&mut client, &with(key, value), &json!([]), &json!([]))
-.expect_err(key);
+        let error = record(&mut client, &with(key, value), &json!([]), &json!([])).expect_err(key);
         assert!(error.contains("check constraint"), "{key}: {error}");
     }
     let error = record(
@@ -586,7 +590,12 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
             (b, 1, vec![a, b], ProvLink::Edge(ProvEdgeKind::Used)),
             (c, 2, vec![a, b, c], ProvLink::Edge(ProvEdgeKind::Includes)),
             (d, 3, vec![a, b, c, d], ProvLink::Origin),
-            (e, 4, vec![a, b, c, d, e], ProvLink::Edge(ProvEdgeKind::Redacts)),
+            (
+                e,
+                4,
+                vec![a, b, c, d, e],
+                ProvLink::Edge(ProvEdgeKind::Redacts)
+            ),
         ],
         "A is not reached again through B, nor C through itself"
     );
@@ -615,10 +624,7 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     let from_b = store
         .prov_blast_radius(b, ProvDirection::Backward, 32)
         .expect("backward from B");
-    assert_eq!(
-        from_b.iter().map(|node| node.id).collect::<Vec<_>>(),
-        [a]
-    );
+    assert_eq!(from_b.iter().map(|node| node.id).collect::<Vec<_>>(), [a]);
 
     // The bound.
     let near = store

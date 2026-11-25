@@ -8476,7 +8476,7 @@ begin
            with ordinality x(edge, at),
            jsonb_populate_record(null::prov_edges, x.edge) r;
     v_given := jsonb_set(v_given, '{edges}',
-                         (select coalesce(jsonb_agg(e order by e ->> 'kind', e ->> 'dst',
+                         (select coalesce(jsonb_agg(e order by e ->> 'kind', (e ->> 'dst') collate "C",
                                                     (e ->> 'at_ms')::bigint, (e -> 'detail')::text),
                                           '[]'::jsonb)
                             from jsonb_array_elements(v_edges) e));
