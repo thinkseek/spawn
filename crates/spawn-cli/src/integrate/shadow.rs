@@ -1482,4 +1482,306 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
     }
+
+    #[test]
+    fn the_node_source_is_its_own_switch_and_leaves_the_runners_alone() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+        let dirs = [
+            ("SPAWN_NODE_ARTIFACTS", "/srv/artifacts"),
+            ("SPAWN_NODE_RESULTS", "/srv/results"),
+            ("HOME", "/home/u"),
+        ];
+        assert_eq!(super::node_settings(env(&dirs)).unwrap(), None);
+        for off in ["", "0", " 0 "] {
+            let mut all = dirs.to_vec();
+            all.push((super::NODE_ENV, off));
+            assert_eq!(super::node_settings(env(&all)).unwrap(), None, "{off:?}");
+        }
+        let mut on = dirs.to_vec();
+        on.push((super::NODE_ENV, "1"));
+        on.push((super::EVERY_ENV, "3"));
+        on.push(("SPAWN_REMOTE_QUEUE_WAIT_SECS", "7"));
+        let settings = super::node_settings(env(&on)).unwrap().unwrap();
+        assert_eq!(settings.every, 3);
+        assert_eq!(settings.artifacts, PathBuf::from("/srv/artifacts"));
+        assert_eq!(settings.results, PathBuf::from("/srv/results"));
+        assert_eq!(settings.cargo_home, PathBuf::from("/home/u/.cargo"));
+        assert_eq!(settings.queue_wait, Duration::from_secs(7));
+        let mut cargo = on.clone();
+        cargo.push(("CARGO_HOME", "/opt/cargo"));
+        assert_eq!(
+            super::node_settings(env(&cargo)).unwrap().unwrap().cargo_home,
+            PathBuf::from("/opt/cargo")
+        );
+        // Refused: another value, no directories, a relative one, a bad EVERY.
+        assert!(super::node_settings(env(&[(super::NODE_ENV, "yes")])).is_err());
+        assert!(super::node_settings(env(&[(super::NODE_ENV, "1")])).is_err());
+        let mut relative = vec![(super::NODE_ENV, "1"), ("SPAWN_NODE_ARTIFACTS", "a")];
+        relative.push(("SPAWN_NODE_RESULTS", "/r"));
+        assert!(super::node_settings(env(&relative)).is_err());
+        let mut every = on.clone();
+        every.retain(|(key, _)| *key != super::EVERY_ENV);
+        every.push((super::EVERY_ENV, "0"));
+        assert!(super::node_settings(env(&every)).is_err());
+        // The runner's settings read nothing of the node source's.
+        assert_eq!(settings_of(None, Some("3")), None);
+        assert_eq!(settings_of(Some("bb"), Some("3")).unwrap().every, 3);
+    }
+
+    fn settings_of(runner: Option<&str>, every: Option<&str>) -> Option<Settings> {
+        settings(runner, every).unwrap()
+    }
+
+    /// M2 on both sources at once: one verdict offered to the runner (its
+    /// fake dispatcher) and to the node source; the node source writes the
+    /// artifacts, queues a `gate_shadow` job a node holding what it
+    /// requires is granted, reads the node's stored result, and records the
+    /// same `task.shadow_gated` the runner does (`runner` `node:<name>`).
+    /// The every-N-th rule holds for it too; a node's fault is struck on
+    /// the ledger and the job queued again, never recorded for the task;
+    /// one no node leases in time is taken back, nothing recorded.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_node_source_records_what_the_runner_records_beside_it() {
+        use super::super::remote::tests as remote;
+        let dir = Scratch::new("node-source");
+        let ctl = controller(&dir.0, "accepted");
+        std::fs::create_dir_all(ctl.join("scripts")).unwrap();
+        std::fs::write(ctl.join("scripts/gate.sh"), "exit 0\n").unwrap();
+        let scenarios = ctl.join("rsi/scenarios");
+        let (repo, base, candidate) = remote::repository(&dir.0);
+        let cargo_home = dir.0.join("cargo");
+        std::fs::create_dir_all(cargo_home.join("registry/index")).unwrap();
+        std::fs::write(cargo_home.join("registry/index/config.json"), "{}").unwrap();
+        let results = dir.0.join("results");
+        let ledger = remote::Ledger::new("shadow_node_source");
+        let marker = "0123456789abcdef0123456789abcdef01234567";
+        let primary = json!({"base": base, "candidate": candidate, "controller": marker,
+                             "scenarios_sha256": super::inputs::scenarios_sha256(&scenarios),
+                             "scenario": null});
+        let want_of = |task: i64| Want {
+            task,
+            revision: json!(1),
+            verdict: "accepted".to_string(),
+            inputs: primary.clone(),
+            env: json!({"host": "primary", "toolchain": "rustc p", "runner": null}),
+            repo: repo.clone(),
+            scenarios: scenarios.clone(),
+            judging_id: Some("0123456789ab0123456789abcdef".to_string()),
+        };
+        let mut nodes = super::NodeShadows::new(
+            super::NodeSettings {
+                every: 1,
+                artifacts: dir.0.join("artifacts"),
+                results: results.clone(),
+                cargo_home,
+                queue_wait: Duration::from_secs(60),
+            },
+            vec![
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("SPAWN_GATE_JOBS".to_string(), "8".to_string()),
+                (
+                    "SPAWN_TEST_DATABASE_URL".to_string(),
+                    ["postgres", "://", "gate@db.example/t"].concat(),
+                ),
+            ],
+            dir.0.join("node-work"),
+        );
+        let mut runner = Shadows::new(
+            Settings {
+                runner: "bb".into(),
+                every: 1,
+            },
+            dir.0.join("shadow"),
+        );
+        runner.offer(want_of(7));
+        nodes.offer(&ledger.store, want_of(7));
+        let waiting = nodes.waiting();
+        assert_eq!(waiting.len(), 1);
+        let job_id = waiting[0].clone();
+        let row = ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(row.kind, spawn_postgres::RemoteJobKind::GateShadow);
+        assert_eq!(row.judging_id.as_deref(), Some("0123456789ab0123456789abcdef"));
+        assert_eq!(row.task_id, Some(7));
+        assert_eq!(row.base_commit.as_deref(), Some(base.as_str()));
+        // The grant's environment: no node-owned variable, no database.
+        assert_eq!(row.spec["env"]["SPAWN_GATE_JOBS"], "8");
+        assert!(row.spec["env"].get("PATH").is_none());
+        assert!(row.spec["env"].get("SPAWN_TEST_DATABASE_URL").is_none());
+        assert_eq!(row.spec["inputs"]["controller"], marker);
+        assert_eq!(row.spec["inputs"]["repo"], "source");
+        // Every artifact is where the gateway serves it.
+        let roles: Vec<&str> = row.spec["artifact_urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|url| url["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["delta_bundle", "baseline_bundle", "controller_pack"]);
+        for url in row.spec["artifact_urls"].as_array().unwrap() {
+            let digest =
+                spawn_node_proto::ContentDigest::parse(url["digest"].as_str().unwrap()).unwrap();
+            let file = dir
+                .0
+                .join("artifacts/sha256")
+                .join(&digest.hex[..2])
+                .join(&digest.hex);
+            digest.verify(&std::fs::read(file).unwrap()).unwrap();
+        }
+        assert!(dir.0.join("artifacts/registry-manifest").is_file());
+        assert_eq!(row.requires["pg"], "16");
+        assert_eq!(row.requires["registry"].as_str().unwrap().len(), 64);
+        assert!(row.requires.get("web_lock").is_none());
+
+        // A node holding what it requires is granted it and runs it.
+        let node = ledger.enroll("n252", 9, &row.requires);
+        let grants = ledger.beat(&node);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].0, job_id);
+        let epoch = grants[0].1;
+        let mut given = row.spec["inputs"].clone();
+        given.as_object_mut().unwrap().remove("repo");
+        let verdict = remote::verdict_on("accepted", &base, &candidate);
+        let (meta, log) = remote::meta(
+            &job_id,
+            epoch,
+            Some(0),
+            Some(&verdict),
+            "| base cache: toolchain node-tc\n| gate ok\n",
+            "",
+            Some(&given),
+        );
+        ledger.complete(&results, &node, &meta, &log);
+
+        let written = std::cell::RefCell::new(Vec::new());
+        let write = |record: &Value| -> Result<(), String> {
+            written.borrow_mut().push(record.clone());
+            Ok(())
+        };
+        nodes.poll(&ledger.store, &write);
+        assert!(nodes.waiting().is_empty());
+        let records = written.borrow().clone();
+        assert_eq!(records.len(), 1);
+        let from_node = &records[0];
+        assert_eq!(from_node["type"], "task.shadow_gated");
+        assert_eq!(from_node["id"], 7);
+        assert_eq!(from_node["runner"], "node:n252");
+        assert_eq!(from_node["result"], "verdict");
+        assert_eq!(from_node["verdict"], "accepted");
+        assert_eq!(from_node["primary"], "accepted");
+        assert_eq!(from_node["exit"], 0);
+        assert_eq!(from_node["seconds"], 42);
+        assert_eq!(from_node["unequal"], json!([]));
+        assert_eq!(from_node["agrees"], json!(true));
+        assert_eq!(from_node["inputs"], primary);
+        assert_eq!(
+            from_node["env"],
+            json!({"host": "n252-host", "toolchain": "rustc 1.95.0 x86_64",
+                   "runner": "node:n252"})
+        );
+        assert!(from_node.get("judging").is_none());
+        // The runner's record of the same verdict: the same shape.
+        let ended = wait_ended(&mut runner);
+        let keys = |record: &Value| -> Vec<String> {
+            let mut keys: Vec<String> = record.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&ended.record), keys(from_node));
+        assert_eq!(ended.record["runner"], "bb");
+        assert_eq!(ended.record["agrees"], json!(true));
+        super::remove_tree(&ended.work);
+        assert_eq!(ledger.strikes("n252"), (0, false));
+
+        // A node's fault: struck on the ledger, queued again, nothing
+        // recorded; then no node takes it in time: taken back, nothing.
+        nodes.offer(&ledger.store, want_of(8));
+        let job_id = nodes.waiting()[0].clone();
+        let grants = ledger.beat(&node);
+        assert_eq!(grants.len(), 1);
+        let (meta, log) = remote::meta(&job_id, grants[0].1, Some(2), None, "", "boom\n", Some(&given));
+        ledger.complete(&results, &node, &meta, &log);
+        nodes.poll(&ledger.store, &write);
+        assert_eq!(nodes.waiting(), vec![job_id.clone()]);
+        assert_eq!(written.borrow().len(), 1);
+        assert_eq!(ledger.strikes("n252"), (1, false));
+        let row = ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(row.state, spawn_postgres::RemoteJobState::Queued);
+        assert_eq!(row.excluded_nodes, vec![node.clone()]);
+        nodes.settings.queue_wait = Duration::ZERO;
+        nodes.poll(&ledger.store, &write);
+        assert!(nodes.waiting().is_empty());
+        assert_eq!(written.borrow().len(), 1);
+        assert_eq!(
+            ledger.store.remote_job(&job_id).unwrap().unwrap().state,
+            spawn_postgres::RemoteJobState::FallbackLocal
+        );
+        assert!(ledger.records("task.gated").is_empty());
+
+        // Every N-th: with every 2, the first of two is skipped.
+        nodes.settings.every = 2;
+        nodes.offered = 0;
+        nodes.offer(&ledger.store, want_of(9));
+        assert!(nodes.waiting().is_empty());
+        nodes.offer(&ledger.store, want_of(10));
+        assert_eq!(nodes.waiting().len(), 1);
+    }
+
+    /// A node's verdict on other inputs than the primary's is said, but
+    /// compared with nothing; a node's fault on its last attempt is
+    /// recorded with no verdict.
+    #[test]
+    fn a_node_record_compares_only_equal_inputs() {
+        use super::super::remote::tests as remote;
+        let dir = Scratch::new("node-record");
+        let primary = primary_inputs(&dir.0, Some("3333333333333333333333333333333333333333"));
+        let wanted = want(7, "rejected", primary.clone(), &dir.0);
+        let (base, candidate) = ("5".repeat(40), "6".repeat(40));
+        let mut granted = primary.clone();
+        granted["base"] = json!(base);
+        granted["candidate"] = json!(candidate);
+        let verdict = remote::verdict_on("accepted", &base, &candidate);
+        let (meta, log) = remote::meta(
+            "gs-222222222222-abcdefgh",
+            1,
+            Some(0),
+            Some(&verdict),
+            "",
+            "",
+            Some(&granted),
+        );
+        let stored = super::remote::Stored { meta, log };
+        let judged = super::remote::judge_stored(&stored, &granted);
+        assert_eq!(judged.evidence, "accepted");
+        let record = super::node_record_of(&wanted, "node:n1", &stored, &judged);
+        assert_eq!(record["verdict"], "accepted");
+        // The primary judged other commits.
+        assert_eq!(record["unequal"], json!(["base", "candidate"]));
+        assert_eq!(record["agrees"], Value::Null);
+        let same = want(7, "rejected", granted.clone(), &dir.0);
+        let record = super::node_record_of(&same, "node:n1", &stored, &judged);
+        assert_eq!(record["unequal"], json!([]));
+        assert_eq!(record["agrees"], json!(false));
+        // A fault: no verdict, the evidence as its result.
+        let (meta, log) =
+            remote::meta("gs-222222222222-abcdefgh", 1, Some(6), None, "", "", Some(&granted));
+        let stored = super::remote::Stored { meta, log };
+        let judged = super::remote::judge_stored(&stored, &granted);
+        let record = super::node_record_of(&same, "node:n1", &stored, &judged);
+        assert_eq!(record["result"], "aborted");
+        assert_eq!(record["verdict"], Value::Null);
+        assert_eq!(record["agrees"], Value::Null);
+        assert_eq!(record["exit"], 6);
+    }
 }
