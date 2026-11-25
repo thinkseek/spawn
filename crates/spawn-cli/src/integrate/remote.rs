@@ -817,7 +817,8 @@ pub(super) struct Judged {
     /// The row's name: `accepted`, `rejected`, `aborted`, `unequal_inputs`,
     /// `no_room`, `no_room_slot`, `base_disagrees`, `host_fault`,
     /// `validator_defect`, `main_red`, `cannot_judge`, `unread_version`,
-    /// `signal`, `timed_out`, `wrapper_error`, `self_fenced`.
+    /// `signal`, `timed_out`, `wrapper_error`, `self_fenced`,
+    /// `unreadable_result`.
     pub(super) evidence: &'static str,
     /// The gate's verdict (exit 0 with its file), when the node judged the
     /// job's own inputs.
@@ -852,6 +853,13 @@ impl Judged {
             next: Some(next),
             reason: reason.into(),
         }
+    }
+
+    /// A completed job whose stored result cannot be read (missing, not
+    /// this job's, its log not the one it binds): the gateway's or this
+    /// host's trouble, not the node's; no strike, the row kept.
+    pub(super) fn unreadable(reason: impl Into<String>) -> Self {
+        Self::fault("unreadable_result", false, FaultNext::Keep, reason)
     }
 
     fn with_failure(mut self, failure: GateFailure) -> Self {

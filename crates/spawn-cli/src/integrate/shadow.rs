@@ -1104,8 +1104,8 @@ pub(super) fn node_record_of(
             } else {
                 json!(judged.evidence)
             },
-            // A verdict on other commits is said, never compared.
-            verdict: judged.stated.clone().filter(|_| believed || judged.evidence == "unequal_inputs"),
+            // A verdict on other commits or inputs is no verdict here.
+            verdict: judged.stated.clone().filter(|_| believed),
             exit,
             seconds: meta.seconds,
             host: env("host"),
