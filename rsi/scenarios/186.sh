@@ -674,6 +674,7 @@ unit_run() {
     sed -n 's/^Environment=//p' "$ur_file" | sed "s#%h#$HOME#g" |
         sed '/^SPAWN_BACKUP_SYNC_DIR=/d' >"$WORK/unit.environment"
     (
+        ur_caller_path=$PATH
         for ur_name in $(env | sed -n 's/^\(SPAWN_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(PG[A-Z]*\)=.*/\1/p'); do
             unset "$ur_name"
         done
@@ -684,6 +685,8 @@ unit_run() {
         while read -r ur_line; do
             for ur_setting in $ur_line; do export "$ur_setting"; done
         done <"$WORK/unit.environment"
+        PATH="$live_dir/bin:${ur_caller_path:+$ur_caller_path:}$PATH"
+        export PATH
         # shellcheck disable=SC2086 # ExecStart is a command line, split as systemd does
         exec $ur_exec "$@"
     )
