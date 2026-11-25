@@ -959,7 +959,7 @@ mod tests {
     }
 
     /// [`a_migration_without_the_owner_password_turns_the_logins_off`]'s check
-    /// after the passwordless migration: the three logins cannot log in, read
+    /// after the passwordless migration: the four logins cannot log in, read
     /// from `pg_roles`, which every login reads (`pg_authid` is the
     /// superuser's; the test server's login need not be one). Its `rolpassword`
     /// is a mask, so "no password is left" is shown by the refused logins, and
@@ -967,7 +967,7 @@ mod tests {
     fn assert_logins_off(name: &str, ours: &str) {
         use postgres::{Client, NoTls};
         let logins = "rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
-                              'spawn_human_' || $1)";
+                              'spawn_human_' || $1, 'spawn_node_gateway_' || $1)";
         let mut admin = Client::connect(ours, NoTls).expect("admin");
         let off: Vec<(String, bool)> = admin
             .query(
@@ -984,6 +984,7 @@ mod tests {
             off,
             [
                 (format!("spawn_human_{name}"), false),
+                (format!("spawn_node_gateway_{name}"), false),
                 (format!("spawn_reader_{name}"), false),
                 (format!("spawn_supervisor_{name}"), false),
             ]
@@ -1005,7 +1006,7 @@ mod tests {
                 )
                 .expect("the passwords")
                 .get(0);
-            assert_eq!(passwords, 3, "no password is left");
+            assert_eq!(passwords, 4, "no password is left");
         }
     }
 
