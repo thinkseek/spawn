@@ -634,7 +634,8 @@ mod tests {
     /// workspace; a resume names the conversation and repeats every flag.
     #[test]
     fn agy_launch_always_names_the_model_and_repeats_its_flags_on_a_resume() {
-        let settings = r#"{"toolPermission":"always-proceed","trustedWorkspaces":["/workspaces/agent_a"]}"#;
+        let settings =
+            r#"{"toolPermission":"always-proceed","trustedWorkspaces":["/workspaces/agent_a"]}"#;
         let flags = [
             "--model",
             "gemini-3.8-flash-low",
@@ -642,7 +643,11 @@ mod tests {
             "--settings",
             settings,
         ];
-        for (native, resume) in [(None, false), (Some("conv-1"), true), (Some("conv-1"), false)] {
+        for (native, resume) in [
+            (None, false),
+            (Some("conv-1"), true),
+            (Some("conv-1"), false),
+        ] {
             let plan = AgyDriver.launch(
                 &agy_home(),
                 &EngineLaunch {
@@ -704,7 +709,10 @@ mod tests {
         assert_eq!(ClaudeDriver.startup_answer(trust), None);
         let rule = "──────────";
         let idle = format!("{rule}\n>\n{rule}\n? for shortcuts\n");
-        assert_eq!(AgyDriver.read_screen(&idle).state, crate::screen::ScreenState::Ready);
+        assert_eq!(
+            AgyDriver.read_screen(&idle).state,
+            crate::screen::ScreenState::Ready
+        );
         assert_eq!(AgyDriver.startup_answer(&idle), None);
         let banner = "▀▀▀▀▀▀ someone@example.invalid (Pro)\nok\n";
         assert_eq!(AgyDriver.excerpt_source(banner), "ok\n");

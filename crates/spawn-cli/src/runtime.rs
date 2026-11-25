@@ -418,7 +418,11 @@ fn engines(
 ) -> Result<Vec<(String, spawn_core::driver::EngineHome)>, String> {
     let named = lookup("SPAWN_ENGINES").unwrap_or_else(|| spawn_core::driver::DEFAULT.to_string());
     let mut engines = Vec::new();
-    for name in named.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+    for name in named
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
         if spawn_core::driver::driver(name).is_none() {
             let known: Vec<&str> = spawn_core::driver::drivers()
                 .iter()
@@ -429,14 +433,16 @@ fn engines(
                 known.join(", ")
             ));
         }
-        if name == spawn_core::driver::DEFAULT
-            || engines.iter().any(|(known, _)| known == name)
-        {
+        if name == spawn_core::driver::DEFAULT || engines.iter().any(|(known, _)| known == name) {
             continue;
         }
         let home = lookup("SPAWN_AGY_HOME").unwrap_or_else(|| {
             let user = lookup("HOME").unwrap_or_else(|| "/root".to_string());
-            format!("{}/{}", user.trim_end_matches('/'), spawn_core::driver::AGY_HOME)
+            format!(
+                "{}/{}",
+                user.trim_end_matches('/'),
+                spawn_core::driver::AGY_HOME
+            )
         });
         engines.push((
             name.to_string(),
@@ -778,14 +784,21 @@ mod tests {
                     .map(|(_, value)| (*value).to_string())
             }
         };
-        assert!(engines(lookup(&[("HOME", "/home/a")])).expect("default").is_empty());
+        assert!(
+            engines(lookup(&[("HOME", "/home/a")]))
+                .expect("default")
+                .is_empty()
+        );
         assert!(
             engines(lookup(&[("SPAWN_ENGINES", "claude")]))
                 .expect("claude")
                 .is_empty()
         );
-        let agy = engines(lookup(&[("SPAWN_ENGINES", "claude, agy,agy"), ("HOME", "/home/a/")]))
-            .expect("agy");
+        let agy = engines(lookup(&[
+            ("SPAWN_ENGINES", "claude, agy,agy"),
+            ("HOME", "/home/a/"),
+        ]))
+        .expect("agy");
         assert_eq!(agy.len(), 1);
         assert_eq!(agy[0].0, "agy");
         assert_eq!(agy[0].1.program, "agy");

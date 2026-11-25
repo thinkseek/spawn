@@ -499,11 +499,9 @@ fn agy_prompt(line: &str) -> Option<&str> {
 /// agy's prompt box in the non-empty `lines`: the index of its prompt line,
 /// which a rule bounds above and below. The lowest one.
 fn agy_prompt_box(lines: &[String]) -> Option<usize> {
-    (1..lines.len().saturating_sub(1))
-        .rev()
-        .find(|&at| {
-            agy_prompt(&lines[at]).is_some() && is_rule(&lines[at - 1]) && is_rule(&lines[at + 1])
-        })
+    (1..lines.len().saturating_sub(1)).rev().find(|&at| {
+        agy_prompt(&lines[at]).is_some() && is_rule(&lines[at - 1]) && is_rule(&lines[at + 1])
+    })
 }
 
 /// Whether a footer part counts open background work: `2 tasks`,
@@ -606,8 +604,7 @@ pub fn read_agy_screen(pane: &str) -> ScreenReading {
 #[cfg(test)]
 mod agy_tests {
     use super::{
-        ScreenState, drop_agy_account_lines, is_agy_trust_dialog, is_trust_dialog,
-        read_agy_screen,
+        ScreenState, drop_agy_account_lines, is_agy_trust_dialog, is_trust_dialog, read_agy_screen,
     };
 
     const RULE: &str = "────────────────────────────────────────────────────────";
@@ -627,7 +624,10 @@ mod agy_tests {
     }
 
     fn idle_with(above: &str, prompt: &str, footer: &str, below: &str) -> String {
-        format!("{}{above}{RULE}\n{prompt}\n{RULE}\n{footer}\n{below}", banner())
+        format!(
+            "{}{above}{RULE}\n{prompt}\n{RULE}\n{footer}\n{below}",
+            banner()
+        )
     }
 
     #[test]
@@ -737,7 +737,11 @@ mod agy_tests {
     #[test]
     fn nothing_known_is_unknown() {
         for pane in ["", "\n\n", "$ ls\nCargo.toml\n", "> no box around me\n"] {
-            assert_eq!(read_agy_screen(pane).state, ScreenState::Unknown, "{pane:?}");
+            assert_eq!(
+                read_agy_screen(pane).state,
+                ScreenState::Unknown,
+                "{pane:?}"
+            );
         }
     }
 

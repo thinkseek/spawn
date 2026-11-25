@@ -597,7 +597,8 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
             manifest: None,
         })
     );
-    host.start(&session.agy_launch(&agy, "trust")).expect("start");
+    host.start(&session.agy_launch(&agy, "trust"))
+        .expect("start");
     let trust = reading_within(&host, &agy, &workspace, |reading| {
         reading.status == AgentStatus::Blocked
     });
@@ -605,16 +606,34 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
     assert_eq!(trust.rule.as_deref(), Some("trust_prompt"));
     assert!(trust.blocker_visible);
     assert!(
-        trust.manifest.as_deref().is_some_and(|manifest| !manifest.is_empty()),
+        trust
+            .manifest
+            .as_deref()
+            .is_some_and(|manifest| !manifest.is_empty()),
         "{trust:?}"
     );
     let pane = screen_with(&host, &agy, &workspace, "enter Confirm");
     assert!(spawn_core::screen::is_agy_trust_dialog(&pane), "{pane}");
     assert!(changes_name(&host, &agy), "the detection is a change");
 
-    let steps: [(&str, AgentStatus, Option<&str>, spawn_core::screen::ScreenState); 5] = [
-        ("", AgentStatus::Idle, None, spawn_core::screen::ScreenState::Ready),
-        ("tasks", AgentStatus::Idle, None, spawn_core::screen::ScreenState::Busy),
+    let steps: [(
+        &str,
+        AgentStatus,
+        Option<&str>,
+        spawn_core::screen::ScreenState,
+    ); 5] = [
+        (
+            "",
+            AgentStatus::Idle,
+            None,
+            spawn_core::screen::ScreenState::Ready,
+        ),
+        (
+            "tasks",
+            AgentStatus::Idle,
+            None,
+            spawn_core::screen::ScreenState::Busy,
+        ),
         (
             "work",
             AgentStatus::Working,
@@ -646,7 +665,11 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
             reading.seq > last.seq || reading.status == last.status,
             "{reading:?} after {last:?}"
         );
-        assert_eq!(reading.blocker_visible, status == AgentStatus::Blocked, "{typed}");
+        assert_eq!(
+            reading.blocker_visible,
+            status == AgentStatus::Blocked,
+            "{typed}"
+        );
         // The stub draws in one write: the screen is whole by now.
         std::thread::sleep(Duration::from_millis(300));
         let pane = host.capture_tail(&agy, &workspace, 50).expect("capture");
@@ -658,9 +681,13 @@ fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
     assert!(changes_name(&host, &agy), "status changes are pushed");
 
     // A plain shell: no agent there.
-    host.start(&session.launch(&shell, "exec cat")).expect("start");
+    host.start(&session.launch(&shell, "exec cat"))
+        .expect("start");
     screen_with(&host, &shell, &workspace, "");
-    let none = host.agent(&shell, &workspace).expect("agent").expect("read");
+    let none = host
+        .agent(&shell, &workspace)
+        .expect("agent")
+        .expect("read");
     assert_eq!(none.agent, None);
 
     // The stub exits: its EXIT trap turned bracketed paste off again.
@@ -689,10 +716,9 @@ fn an_agent_still_launching_refuses_input_before_anything_is_typed() {
     let bin = session.stub_agy();
     let bin = bin.parent().expect("bin").display().to_string();
     let mut launch = session.launch(&one, "echo shell-ready; exec /bin/sh -i");
-    launch.environment.push((
-        "PATH".to_string(),
-        format!("{bin}:/usr/bin:/bin"),
-    ));
+    launch
+        .environment
+        .push(("PATH".to_string(), format!("{bin}:/usr/bin:/bin")));
     host.start(&launch).expect("start");
     screen_with(&host, &one, &workspace, "shell-ready");
     std::thread::sleep(Duration::from_millis(300));
@@ -710,7 +736,9 @@ fn an_agent_still_launching_refuses_input_before_anything_is_typed() {
         .stage_text(&one, &workspace, "too soon")
         .expect_err("not ready yet");
     assert!(
-        refused.0.contains("refused before typing (agent_not_ready)"),
+        refused
+            .0
+            .contains("refused before typing (agent_not_ready)"),
         "{refused}"
     );
     let reading = host.agent(&one, &workspace).expect("agent").expect("read");
@@ -737,7 +765,8 @@ fn restored_spawn_workspaces_are_swept_once_per_server() {
     let host = session.host();
     let workspace = session.workspace();
     let kept = terminal("spawn-exec_a4");
-    host.start(&session.launch(&kept, "exec cat")).expect("start");
+    host.start(&session.launch(&kept, "exec cat"))
+        .expect("start");
     for label in ["spawn-exec_a99", "someone-elses"] {
         let created = session.call(
             "workspace.create",
@@ -751,12 +780,19 @@ fn restored_spawn_workspaces_are_swept_once_per_server() {
     }
     // The same host met this server already: nothing is swept again.
     host.agent(&kept, &workspace).expect("agent");
-    assert!(session.workspace_labels().contains(&"spawn-exec_a99".to_string()));
+    assert!(
+        session
+            .workspace_labels()
+            .contains(&"spawn-exec_a99".to_string())
+    );
     // A host that never met it (a restarted loop) sweeps.
     let fresh = session.host();
     fresh.agent(&kept, &workspace).expect("agent");
     let labels = session.workspace_labels();
-    assert!(!labels.contains(&"spawn-exec_a99".to_string()), "{labels:?}");
+    assert!(
+        !labels.contains(&"spawn-exec_a99".to_string()),
+        "{labels:?}"
+    );
     assert!(labels.contains(&"spawn-exec_a4".to_string()), "{labels:?}");
     assert!(labels.contains(&"someone-elses".to_string()), "{labels:?}");
     assert_eq!(

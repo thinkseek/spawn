@@ -2681,7 +2681,10 @@ mod agy_tests {
     }
 
     fn content(text: &str) -> String {
-        format!(r#","content":{}"#, serde_json::to_string(text).expect("json"))
+        format!(
+            r#","content":{}"#,
+            serde_json::to_string(text).expect("json")
+        )
     }
 
     fn system(step: u64, text: &str) -> String {

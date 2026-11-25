@@ -3637,7 +3637,8 @@ impl Bridge {
         // own agent readings (its session, its state): a host with none
         // (tmux) cannot run it.
         if driver.id() != crate::driver::DEFAULT {
-            let terminal = TerminalName::for_execution(&ExecutionId::for_command(claimed.command_id));
+            let terminal =
+                TerminalName::for_execution(&ExecutionId::for_command(claimed.command_id));
             if !matches!(self.terminals.agent(&terminal, &workspace), Ok(Some(_))) {
                 let why = format!(
                     "engine {} needs the herdr terminal backend (SPAWN_TERMINAL_BACKEND=herdr): \
@@ -8538,7 +8539,6 @@ mod tests {
         assert_eq!(sequence, expected, "actual:\n{sequence:#?}");
     }
 
-
     /// The memory terminal with a host's agent readings (as Herdr gives
     /// them), one for every terminal.
     struct Witnessed {
@@ -8724,9 +8724,17 @@ mod tests {
             store.clone()
         };
         let id = submit_agy_start(&store, "hello");
-        let mut bridge = Bridge::new(store.clone(), store.clone(), store.clone(), terminals, config)
-            .with_clock(clock);
-        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            terminals,
+            config,
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
         assert!(
             store.launches().is_empty(),
             "a refused engine is never launched"
@@ -8754,9 +8762,7 @@ mod tests {
     }
 
     fn records(store: &Arc<MemoryStore>) -> Vec<crate::event::EventRecord> {
-        store
-            .read_global(GlobalPosition(0), 10_000)
-            .expect("read")
+        store.read_global(GlobalPosition(0), 10_000).expect("read")
     }
 
     /// agy names its own conversation: the host reports it, and it is
@@ -8779,7 +8785,9 @@ mod tests {
             agy_config(Some("gemini-3.8-flash-low")),
         )
         .with_clock(clock.clone());
-        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
         assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
         let launch = store.launches().pop().expect("launched");
         let workspace = launch.cwd.clone();
@@ -8814,9 +8822,8 @@ mod tests {
         // then one whose prompt holds no marker of this execution's: nothing
         // is bound.
         let conversation = "0399e008-e64f-46a9-9731-b7ea467dd124";
-        let path = format!(
-            "{AGY_HOME}/brain/{conversation}/.system_generated/logs/transcript_full.jsonl"
-        );
+        let path =
+            format!("{AGY_HOME}/brain/{conversation}/.system_generated/logs/transcript_full.jsonl");
         let mut reported = agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 2);
         reported.session = Some(conversation.to_string());
         host.set(reported.clone());
@@ -8847,18 +8854,29 @@ mod tests {
         bridge.poll().expect("poll");
         assert_eq!(
             natives(&store),
-            vec![("agy".to_string(), conversation.to_string(), Some(path.clone()))]
+            vec![(
+                "agy".to_string(),
+                conversation.to_string(),
+                Some(path.clone())
+            )]
         );
         let taken = |store: &Arc<MemoryStore>| {
             records(store)
                 .into_iter()
-                .filter_map(|record| match (record.event.kind, record.event.source_event_id) {
-                    (EventKind::MessageTaken { command_id }, Some(key)) => Some((command_id, key)),
-                    _ => None,
-                })
+                .filter_map(
+                    |record| match (record.event.kind, record.event.source_event_id) {
+                        (EventKind::MessageTaken { command_id }, Some(key)) => {
+                            Some((command_id, key))
+                        }
+                        _ => None,
+                    },
+                )
                 .collect::<Vec<_>>()
         };
-        assert_eq!(taken(&store), vec![(id, format!("{conversation}:0:taken:{}", id.0))]);
+        assert_eq!(
+            taken(&store),
+            vec![(id, format!("{conversation}:0:taken:{}", id.0))]
+        );
         store.append_file(
             &path,
             "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:26:00Z\",\"model\":\"gemini-3.8-flash-low\",\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":0,\"content\":\"hi\"}\n",
@@ -8924,7 +8942,9 @@ mod tests {
             agy_config(Some("gemini-3.8-flash-low")),
         )
         .with_clock(clock.clone());
-        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
         let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
         bridge.poll().expect("poll");
         let screens = screens_with_keys(&store);
@@ -8934,7 +8954,11 @@ mod tests {
             "one agreeing capture is the fact"
         );
         store.set_pane(&terminal, &agy_working());
-        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Working, 2));
+        host.set(agy_reading(
+            Some("agy"),
+            crate::port::AgentStatus::Working,
+            2,
+        ));
         bridge.poll().expect("poll");
         clock.advance(Duration::from_secs(31));
         bridge.poll().expect("poll");
@@ -8955,7 +8979,11 @@ mod tests {
         assert_eq!(screens_with_keys(&store).len(), 3);
         // Another agent in the pane: nothing, even at a prompt.
         store.set_pane(&terminal, &agy_idle());
-        host.set(agy_reading(Some("claude"), crate::port::AgentStatus::Idle, 4));
+        host.set(agy_reading(
+            Some("claude"),
+            crate::port::AgentStatus::Idle,
+            4,
+        ));
         bridge.poll().expect("poll");
         bridge.poll().expect("poll");
         assert_eq!(screens_with_keys(&store).len(), 3);
@@ -8988,24 +9016,52 @@ mod tests {
         };
         let agrees = |state| Merged::Agrees(state, "e".to_string());
         let cases = [
-            (reading(Working, None, false), ScreenState::Busy, agrees(ScreenState::Busy)),
-            (reading(Working, None, false), ScreenState::Ready, Merged::Own),
+            (
+                reading(Working, None, false),
+                ScreenState::Busy,
+                agrees(ScreenState::Busy),
+            ),
+            (
+                reading(Working, None, false),
+                ScreenState::Ready,
+                Merged::Own,
+            ),
             (
                 reading(Blocked, Some("permission_prompt"), true),
                 ScreenState::Permission,
                 agrees(ScreenState::Permission),
             ),
-            (reading(Blocked, None, true), ScreenState::Permission, Merged::Own),
+            (
+                reading(Blocked, None, true),
+                ScreenState::Permission,
+                Merged::Own,
+            ),
             (
                 reading(Blocked, Some("permission_prompt"), false),
                 ScreenState::Unknown,
                 Merged::Own,
             ),
-            (reading(Idle, None, false), ScreenState::Ready, agrees(ScreenState::Ready)),
-            (reading(Idle, None, false), ScreenState::Error, agrees(ScreenState::Error)),
-            (reading(Idle, None, false), ScreenState::Unknown, Merged::Own),
+            (
+                reading(Idle, None, false),
+                ScreenState::Ready,
+                agrees(ScreenState::Ready),
+            ),
+            (
+                reading(Idle, None, false),
+                ScreenState::Error,
+                agrees(ScreenState::Error),
+            ),
+            (
+                reading(Idle, None, false),
+                ScreenState::Unknown,
+                Merged::Own,
+            ),
             (reading(Idle, None, false), ScreenState::Busy, Merged::Own),
-            (reading(Unknown, None, false), ScreenState::Ready, Merged::Own),
+            (
+                reading(Unknown, None, false),
+                ScreenState::Ready,
+                Merged::Own,
+            ),
         ];
         for (witness, state, merged) in cases {
             assert_eq!(
@@ -9015,7 +9071,11 @@ mod tests {
             );
         }
         assert_eq!(
-            merge_witness(driver, &reading(Working, None, false), &screen(ScreenState::Unknown)),
+            merge_witness(
+                driver,
+                &reading(Working, None, false),
+                &screen(ScreenState::Unknown)
+            ),
             Merged::Agrees(ScreenState::Busy, "herdr agy: working".to_string())
         );
         assert_eq!(
@@ -9030,7 +9090,10 @@ mod tests {
             )
         );
         let gone = agy_reading(None, Working, 1);
-        assert_eq!(merge_witness(driver, &gone, &screen(ScreenState::Busy)), Merged::Gone);
+        assert_eq!(
+            merge_witness(driver, &gone, &screen(ScreenState::Busy)),
+            Merged::Gone
+        );
         let foreign = agy_reading(Some("claude"), Working, 1);
         assert_eq!(
             merge_witness(driver, &foreign, &screen(ScreenState::Busy)),

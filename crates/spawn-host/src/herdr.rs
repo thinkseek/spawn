@@ -571,7 +571,11 @@ impl HerdrHost {
             if ours(&terminal, id) {
                 continue;
             }
-            match self.call("workspace.close", &json!({ "workspace_id": id }), CALL_LIMIT) {
+            match self.call(
+                "workspace.close",
+                &json!({ "workspace_id": id }),
+                CALL_LIMIT,
+            ) {
                 Ok(_) => {}
                 Err(call) if call.gone() => {}
                 Err(call) => return Err(call.into_error("workspace.close")),
@@ -682,11 +686,7 @@ impl HerdrHost {
                  input yet; nothing was typed"
             ))
         };
-        match self.call(
-            "agent.get",
-            &json!({ "target": record.pane }),
-            CALL_LIMIT,
-        ) {
+        match self.call("agent.get", &json!({ "target": record.pane }), CALL_LIMIT) {
             Ok(info)
                 if info["agent"]["launch_pending"].as_bool() == Some(true)
                     && AgentStatus::from_herdr(
@@ -699,7 +699,6 @@ impl HerdrHost {
             _ => Ok(()),
         }
     }
-
 
     /// The server that answers on the session's socket now: its pid (the
     /// socket's peer, `SO_PEERCRED`) and when it started. Never starts one.
@@ -1467,11 +1466,7 @@ impl TerminalHost for HerdrHost {
         };
         self.checked(record.server)?;
         self.follow_agent(&record.pane, terminal);
-        let info = match self.call(
-            "agent.get",
-            &json!({ "target": record.pane }),
-            CALL_LIMIT,
-        ) {
+        let info = match self.call("agent.get", &json!({ "target": record.pane }), CALL_LIMIT) {
             Ok(info) => info,
             Err(Call::Refused { code, .. })
                 if code == "agent_not_found" || refused_before_typing(&code) =>
@@ -1899,7 +1894,10 @@ mod tests {
         assert_eq!(reading.session, None);
         let pending = serde_json::json!({"agent_status": "unknown", "launch_pending": true});
         let reading = super::reading_of(&pending);
-        assert_eq!((reading.agent, reading.status), (None, AgentStatus::Unknown));
+        assert_eq!(
+            (reading.agent, reading.status),
+            (None, AgentStatus::Unknown)
+        );
         for (status, read) in [
             ("idle", AgentStatus::Idle),
             ("done", AgentStatus::Idle),
