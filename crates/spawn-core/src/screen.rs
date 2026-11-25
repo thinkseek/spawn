@@ -506,13 +506,40 @@ fn agy_prompt_box(lines: &[String]) -> Option<usize> {
 
 /// Whether a footer part counts open background work: `2 tasks`,
 /// `1 task`, `1 subagent`, `3 subagents`.
+/// agy 1.5.14 writes `1 subagent(s) · 2 task(s)`; `task`, `tasks`,
+/// `subagent` and `subagents` are read too.
 fn open_work_part(part: &str) -> bool {
     let mut words = part.split_whitespace();
     let (Some(count), Some(noun), None) = (words.next(), words.next(), words.next()) else {
         return false;
     };
     count.parse::<u32>().is_ok_and(|count| count > 0)
-        && matches!(noun, "task" | "tasks" | "subagent" | "subagents")
+        && matches!(
+            noun,
+            "task" | "tasks" | "task(s)" | "subagent" | "subagents" | "subagent(s)"
+        )
+}
+
+/// A line of agy's task panel, which it draws between the prompt box and
+/// its footer while background work runs: a `●` entry, a `⎿` detail, or
+/// an indented continuation.
+fn agy_panel_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    !trimmed.is_empty()
+        && (trimmed.starts_with('●') || trimmed.starts_with('⎿') || line.starts_with(' '))
+}
+
+/// agy's footer below the prompt box whose prompt line is `at`: the last
+/// non-empty line of the pane, past the box's lower rule and an optional
+/// task panel with its closing rule. Anything else between them is no
+/// layout of agy's, and there is no footer.
+fn agy_footer(lines: &[String], at: usize) -> Option<&str> {
+    let (footer, between) = lines.get(at + 2..)?.split_last()?;
+    (!is_rule(footer)
+        && between
+            .iter()
+            .all(|line| is_rule(line) || agy_panel_line(line)))
+    .then_some(footer.as_str())
 }
 
 /// A braille spinner followed by text (`⠋ Thinking`): a running turn.
@@ -544,10 +571,12 @@ fn agy_spinner(line: &str) -> bool {
 /// - the prompt box (`>` between two rules) with the `? for shortcuts`
 ///   footer: [`ScreenState::Ready`] when empty, [`ScreenState::Drafted`]
 ///   when it holds text. A banner above it (an announcement, a warning, the
-///   line of an interrupted turn) is no dialog. A footer that counts open
-///   background tasks or subagents (`· 2 tasks · /tasks`) is
-///   [`ScreenState::Busy`]: agy is at its prompt, but the turn goes on when
-///   they report back.
+///   line of an interrupted turn) is no dialog. The footer is the pane's
+///   last line, below the box and an optional task panel (`●` entries and
+///   a closing rule, [`agy_footer`]). A footer that counts open background
+///   work (`· 1 subagent(s) · 2 task(s) · /tasks`) is [`ScreenState::Busy`]:
+///   agy is at its prompt, but the turn goes on when that work reports
+///   back.
 ///
 /// The evidence never holds agy's account line ([`drop_agy_account_lines`]).
 pub fn read_agy_screen(pane: &str) -> ScreenReading {
@@ -576,7 +605,7 @@ pub fn read_agy_screen(pane: &str) -> ScreenReading {
     let Some(at) = agy_prompt_box(&lines) else {
         return ScreenReading::unknown();
     };
-    let footer = lines.get(at + 2).map_or("", String::as_str);
+    let footer = agy_footer(&lines, at).unwrap_or_default();
     if footer.trim().starts_with("esc to cancel") {
         return ScreenReading::new(ScreenState::Busy, footer);
     }
@@ -662,26 +691,61 @@ mod agy_tests {
         assert_eq!(read_agy_screen(&drafted).state, ScreenState::Drafted);
     }
 
+    /// agy 1.5.14's footer with open work, as the review of task #576
+    /// quotes a real capture (no account in it).
+    const OPEN_WORK_FOOTER: &str = "? for shortcuts            auto · Gemini 3.8 Flash · low · \
+                                    1 subagent(s) · 2 task(s) · /tasks";
+
+    /// The prompt box, then agy's task panel (`●` entries) and its closing
+    /// rule, then `footer`: the layout of agy 1.5.14 while background work
+    /// runs. The panel's entries are made up; their layout is agy's.
+    fn with_panel(footer: &str, panel: &str) -> String {
+        format!(
+            "{}⠿ earlier output\n{RULE}\n>\n{RULE}\n{panel}{RULE}\n{footer}\n",
+            banner()
+        )
+    }
+
+    const PANEL: &str = "● Start job A (sleep 25; echo JOB_A_DONE)\n\
+                         ● Start job B (sleep 40; echo JOB_B_DONE)\n\
+                         ● SSH File Counter (subagent)\n  ⎿ running\n";
+
     #[test]
     fn open_tasks_or_subagents_keep_the_turn_busy_at_the_prompt() {
         for footer in [
-            "? for shortcuts · 2 tasks · /tasks",
+            OPEN_WORK_FOOTER,
+            "? for shortcuts            auto · Gemini 3.8 Flash · low · 2 task(s) · /tasks",
+            "? for shortcuts            auto · Gemini 3.8 Flash · low · 1 subagent(s) · /tasks",
             "? for shortcuts · 1 task · /tasks",
-            "? for shortcuts · 1 subagent · 2 tasks · /tasks",
-            "? for shortcuts · 3 subagents · /tasks",
+            "? for shortcuts · 3 subagents · 2 tasks · /tasks",
         ] {
-            let pane = idle_with(
-                "",
-                ">",
-                footer,
-                "  ⎿ task-2 sleep 25; echo JOB_A_DONE\n  ⎿ task-3 sleep 40; echo JOB_B_DONE\n",
-            );
+            let pane = with_panel(footer, PANEL);
             let reading = read_agy_screen(&pane);
             assert_eq!(reading.state, ScreenState::Busy, "{footer}");
             assert_eq!(reading.evidence, footer);
+            // The panel may be gone already while the footer still counts.
+            let bare = idle_with("", ">", footer, "");
+            assert_eq!(read_agy_screen(&bare).state, ScreenState::Busy, "{footer}");
         }
-        let none = idle_with("", ">", "? for shortcuts · 0 tasks", "");
-        assert_eq!(read_agy_screen(&none).state, ScreenState::Ready);
+        // The panel drawn, the counts at 0 or not there: at the prompt.
+        for footer in [
+            "? for shortcuts            auto · Gemini 3.8 Flash · low · 0 subagent(s) · 0 task(s) · /tasks",
+            "? for shortcuts            auto · Gemini 3.8 Flash · low",
+            "? for shortcuts",
+        ] {
+            let pane = with_panel(footer, PANEL);
+            let reading = read_agy_screen(&pane);
+            assert_eq!(reading.state, ScreenState::Ready, "{footer}");
+            assert_eq!(reading.evidence, ">");
+            let empty = with_panel(footer, "");
+            assert_eq!(read_agy_screen(&empty).state, ScreenState::Ready, "{footer}");
+        }
+        // Something below the box that is no panel of agy's: unknown.
+        let odd = format!("{RULE}\n>\n{RULE}\nplain text\n{OPEN_WORK_FOOTER}\n");
+        assert_eq!(read_agy_screen(&odd).state, ScreenState::Unknown);
+        // A footer not drawn yet (the panel's rule last): unknown.
+        let unfinished = format!("{RULE}\n>\n{RULE}\n● Start job A\n{RULE}\n");
+        assert_eq!(read_agy_screen(&unfinished).state, ScreenState::Unknown);
     }
 
     #[test]
