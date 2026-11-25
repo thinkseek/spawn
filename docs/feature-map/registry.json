@@ -1842,6 +1842,8 @@
         "crates/spawn-cli/src/nodes/auth.rs",
         "crates/spawn-cli/src/nodes/commands.rs",
         "crates/spawn-cli/src/nodes/coord.rs",
+        "crates/spawn-cli/src/nodes/coord/perf_tests.rs",
+        "crates/spawn-cli/src/nodes/coord/pool.rs",
         "crates/spawn-cli/src/nodes/coord/tests.rs",
         "crates/spawn-cli/src/nodes/crypto.rs",
         "crates/spawn-cli/src/nodes/crypto/tests.rs",
@@ -1882,6 +1884,7 @@
           "0f8c968de"
         ],
         "tests": [
+          "crates/spawn-cli/src/nodes/coord/perf_tests.rs",
           "crates/spawn-cli/src/nodes/coord/tests.rs",
           "crates/spawn-cli/src/nodes/crypto/tests.rs",
           "crates/spawn-cli/src/nodes/hardening_tests.rs",

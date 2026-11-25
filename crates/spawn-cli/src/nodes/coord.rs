@@ -41,12 +41,20 @@
 //! [`HELLO_TIMEOUT`]; at most [`MAX_SESSIONS`] sessions; each session's
 //! queue holds [`QUEUE`] messages (more are dropped: a slow reader cannot
 //! grow the coordinator); a session silent for [`IDLE`] is closed.
+//!
+//! Each session's (and each client's) pump sleeps in `poll(2)` on its
+//! socket and a [`Waker`] (issue #96): what comes is taken, and what is
+//! queued sent, at once, never after a polling period (a 15 ms one made
+//! every round trip a multiple of 16 ms and a 64 KiB exchange 80 times
+//! slower than its crypto). A process probing coord nodes again and again
+//! reuses its coordinator sessions and the nodes' checked prekeys
+//! ([`pool`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -81,8 +89,18 @@ pub(crate) const QUEUE: usize = 256;
 pub(crate) const IDLE: Duration = Duration::from_secs(75);
 /// Between two pings of a client.
 const PING_EVERY: Duration = Duration::from_secs(20);
-/// A pump's wait for its connection, between two looks at its queue.
-const POLL: Duration = Duration::from_millis(15);
+/// The longest a pump sleeps between two looks at its stop and dead
+/// flags (anything queued, or anything that comes, wakes it at once: no
+/// message waits for this).
+const STOP_CHECK: Duration = Duration::from_millis(200);
+/// The most messages a pump takes in a row before it looks at its queue.
+const BATCH: usize = 64;
+/// How long a coordinator's write to a session may block (a reader that
+/// takes nothing is closed past it, never holds its session's thread).
+const WRITE_WAIT: Duration = Duration::from_secs(10);
+/// How long a pump's one read waits once its poll said there is
+/// something to read.
+const READY_WAIT: Duration = Duration::from_millis(50);
 /// A child coordinator's lease on its summary, by default.
 pub(crate) const LEASE: Duration = Duration::from_secs(30);
 /// A client's hello refused: its node id is a connected node's.
@@ -324,6 +342,155 @@ impl Channel {
             Self::Line { stream, .. } => stream.peer_addr().ok(),
         }
     }
+
+    /// The tcp stream under the channel (what a pump polls).
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Ws(ws) => ws.tcp(),
+            Self::Line { stream, .. } => stream,
+        }
+    }
+
+    /// The next whole message of what was read already, no IO (a
+    /// WebSocket's ping answered): none when there is no whole one. A line
+    /// or a frame over [`MAX_FRAME`] is refused (the session ends).
+    pub(crate) fn next_buffered(&mut self) -> Result<Option<Value>, String> {
+        match self {
+            Self::Ws(ws) => match ws.next_buffered()? {
+                None => Ok(None),
+                Some(Message::Text(text)) => parse(text.as_bytes()).map(Some),
+                Some(Message::Binary(bytes)) => parse(&bytes).map(Some),
+                Some(Message::Close) => Err("the coordinator closed".to_string()),
+            },
+            Self::Line { buffer, .. } => match buffer.iter().position(|byte| *byte == b'\n') {
+                Some(end) if end > MAX_FRAME => Err(format!("a message over {MAX_FRAME} bytes")),
+                Some(end) => {
+                    let line: Vec<u8> = buffer.drain(..=end).collect();
+                    parse(&line[..end]).map(Some)
+                }
+                None if buffer.len() > MAX_FRAME => {
+                    Err(format!("a message over {MAX_FRAME} bytes"))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// One read of what the connection holds (its poll said it is
+    /// readable), kept for [`Self::next_buffered`].
+    fn read_ready(&mut self) -> Result<(), String> {
+        match self {
+            Self::Ws(ws) => ws.read_ready(),
+            Self::Line { stream, buffer } => {
+                use std::io::Read as _;
+                stream
+                    .set_read_timeout(Some(READY_WAIT))
+                    .map_err(|error| error.to_string())?;
+                match super::ws::read_into(buffer, |spare| stream.read(spare)) {
+                    Ok(0) => Err("the connection closed".to_string()),
+                    Ok(_) => Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        }
+    }
+}
+
+/// What wakes a pump at once: a socket pair, a byte written to one end
+/// each time a message is queued (or the pump is told to stop), its other
+/// end polled beside the connection. No timer, no polling sleep.
+pub(crate) struct Waker {
+    tx: std::os::unix::net::UnixStream,
+    rx: std::os::unix::net::UnixStream,
+}
+
+impl Waker {
+    pub(crate) fn new() -> Result<Self, String> {
+        let (tx, rx) = std::os::unix::net::UnixStream::pair().map_err(|error| error.to_string())?;
+        tx.set_nonblocking(true)
+            .and_then(|()| rx.set_nonblocking(true))
+            .map_err(|error| error.to_string())?;
+        Ok(Self { tx, rx })
+    }
+
+    /// Wake the pump (a byte already waiting is enough: a full pair is no
+    /// error).
+    pub(crate) fn wake(&self) {
+        use std::io::Write as _;
+        let _ = (&self.tx).write(&[1]);
+    }
+
+    /// Take every byte written (the pump is awake).
+    fn drain(&self) {
+        use std::io::Read as _;
+        let mut bytes = [0_u8; 64];
+        while matches!((&self.rx).read(&mut bytes), Ok(count) if count > 0) {}
+    }
+}
+
+/// A session's (or a client's) outbound queue and its pump's waker: a
+/// message pushed is sent at once, never after a poll's period.
+#[derive(Clone)]
+pub(crate) struct Outbox {
+    queue: SyncSender<Value>,
+    waker: Arc<Waker>,
+}
+
+impl Outbox {
+    /// A queue of [`QUEUE`] messages, its receiving end, and its waker.
+    fn new() -> Result<(Self, Receiver<Value>, Arc<Waker>), String> {
+        let (queue, outbound) = std::sync::mpsc::sync_channel(QUEUE);
+        let waker = Arc::new(Waker::new()?);
+        Ok((
+            Self {
+                queue,
+                waker: Arc::clone(&waker),
+            },
+            outbound,
+            waker,
+        ))
+    }
+
+    /// Queue `message` and wake the pump; dropped when the queue is full
+    /// or gone (a slow reader cannot grow its sender).
+    fn push(&self, message: Value) {
+        if self.queue.try_send(message).is_ok() {
+            self.waker.wake();
+        }
+    }
+}
+
+/// Wait until `channel`'s socket is readable or `waker` woken, at most
+/// `wait`: whether the socket is (or failed: its read says how).
+fn wait_ready(channel: &Channel, waker: &Waker, wait: Duration) -> Result<bool, String> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let timeout = Timespec {
+        tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(wait.subsec_nanos()),
+    };
+    let (socket, woken) = {
+        let mut fds = [
+            PollFd::new(channel.tcp(), PollFlags::IN),
+            PollFd::new(&waker.rx, PollFlags::IN),
+        ];
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) => (fds[0].revents(), fds[1].revents()),
+            Err(rustix::io::Errno::INTR) => return Ok(false),
+            Err(error) => return Err(format!("poll: {error}")),
+        }
+    };
+    if !woken.is_empty() {
+        waker.drain();
+    }
+    Ok(socket.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR))
 }
 
 /// Who says a hello: a node (reached through the coordinator), a client
@@ -490,7 +657,7 @@ pub(crate) fn check_hello(
 struct Session {
     kind: Kind,
     record: Value,
-    queue: SyncSender<Value>,
+    queue: Outbox,
     dead: Arc<AtomicBool>,
     /// A child coordinator's summary: its peers, until when, its epoch.
     summary: Vec<Value>,
@@ -508,7 +675,7 @@ struct Directory {
 
 /// Where a message to a node id goes.
 enum Hop {
-    Local(SyncSender<Value>),
+    Local(Outbox),
     Parent,
     Nowhere,
 }
@@ -530,11 +697,10 @@ pub(crate) struct Coordinator {
     tap: Option<Arc<Mutex<Vec<String>>>>,
 }
 
-/// Send `message` on `queue`, dropped when it is full or gone.
-fn push(queue: &SyncSender<Value>, message: Value) {
-    match queue.try_send(message) {
-        Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
-    }
+/// Send `message` on `queue` (its pump woken), dropped when it is full
+/// or gone.
+fn push(queue: &Outbox, message: Value) {
+    queue.push(message);
 }
 
 impl Coordinator {
@@ -588,7 +754,7 @@ impl Coordinator {
         &self,
         kind: Kind,
         record: Value,
-        queue: SyncSender<Value>,
+        queue: Outbox,
         dead: Arc<AtomicBool>,
     ) -> Result<u64, String> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -610,6 +776,7 @@ impl Coordinator {
                 && let Some(old) = directory.sessions.remove(&old)
             {
                 old.dead.store(true, Ordering::Relaxed);
+                old.queue.waker.wake();
             }
         } else {
             directory.by_node.insert(node_id, id);
@@ -984,7 +1151,10 @@ fn session(
             return;
         }
     };
-    let (queue, outbound) = std::sync::mpsc::sync_channel(QUEUE);
+    let Ok((queue, outbound, waker)) = Outbox::new() else {
+        let _ = channel.send(&json!({"type": "error", "error": "the coordinator is full"}));
+        return;
+    };
     let dead = Arc::new(AtomicBool::new(false));
     let id = match coordinator.join(kind, record, queue, Arc::clone(&dead)) {
         Ok(id) => id,
@@ -997,7 +1167,7 @@ fn session(
     let welcome = json!({"type": "welcome", "v": PROTOCOL, "zone": coordinator.zone,
                          "coordinator": coordinator.identity.node_id(), "reflexive": reflexive});
     if channel.send(&welcome).is_ok() {
-        pump(&mut channel, &outbound, &dead, stop, |message| {
+        pump(&mut channel, &outbound, &waker, &dead, stop, |message| {
             coordinator.handle(id, message);
         });
     }
@@ -1007,31 +1177,70 @@ fn session(
 
 /// Send what `outbound` holds, take what comes (to `take`), until the
 /// connection fails, `dead` or `stop` is set, or nothing comes for
-/// [`IDLE`].
+/// [`IDLE`]: woken at once by what comes or what is queued (`waker`).
 fn pump(
     channel: &mut Channel,
     outbound: &Receiver<Value>,
+    waker: &Waker,
     dead: &AtomicBool,
     stop: &AtomicBool,
     mut take: impl FnMut(Value),
 ) {
     let mut heard = Instant::now();
     while !dead.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-        while let Ok(message) = outbound.try_recv() {
-            if channel.send(&message).is_err() {
-                return;
-            }
+        if !send_queued(channel, outbound) {
+            return;
         }
-        match channel.recv(POLL) {
-            Ok(Some(message)) => {
-                heard = Instant::now();
-                take(message);
+        let Some(more) = take_buffered(channel, &mut heard, &mut take) else {
+            return;
+        };
+        if more {
+            continue;
+        }
+        let Some(left) = IDLE.checked_sub(heard.elapsed()) else {
+            return;
+        };
+        match wait_ready(channel, waker, left.min(STOP_CHECK)) {
+            Ok(true) => {
+                if channel.read_ready().is_err() {
+                    return;
+                }
             }
-            Ok(None) if heard.elapsed() > IDLE => return,
-            Ok(None) => {}
+            Ok(false) => {}
             Err(_) => return,
         }
     }
+}
+
+/// Send all `outbound` holds: false when the connection failed.
+fn send_queued(channel: &mut Channel, outbound: &Receiver<Value>) -> bool {
+    while let Ok(message) = outbound.try_recv() {
+        if channel.send(&message).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Hand every whole message read already to `take` (at most [`BATCH`]):
+/// whether more may wait, or none when the connection failed (a frame
+/// over [`MAX_FRAME`] among them).
+fn take_buffered(
+    channel: &mut Channel,
+    heard: &mut Instant,
+    take: &mut impl FnMut(Value),
+) -> Option<bool> {
+    for _ in 0..BATCH {
+        match channel.next_buffered() {
+            Ok(Some(message)) => {
+                *heard = Instant::now();
+                take(message);
+            }
+            Ok(None) => return Some(false),
+            Err(_) => return None,
+        }
+    }
+    Some(true)
 }
 
 /// What `spawn node coord` listens on and how it behaves.
@@ -1158,6 +1367,9 @@ fn accept_loop(
                             }
                         } else {
                             let _ = stream.set_nodelay(true);
+                            if stream.set_write_timeout(Some(WRITE_WAIT)).is_err() {
+                                return;
+                            }
                             (
                                 Channel::Line {
                                     stream,
@@ -1332,7 +1544,7 @@ fn sleep_unless(stop: &AtomicBool, wait: Duration) {
 pub(crate) struct CoordClient {
     identity: Arc<NodeIdentity>,
     policy: TrustPolicy,
-    queue: SyncSender<Value>,
+    queue: Outbox,
     waiters: Arc<Mutex<HashMap<String, Sender<Value>>>>,
     incoming: Mutex<Receiver<Value>>,
     alive: Arc<AtomicBool>,
@@ -1340,6 +1552,68 @@ pub(crate) struct CoordClient {
     /// The coordinator's welcome.
     pub(crate) welcome: Value,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// When it was last asked something, and how long it may sit unasked
+    /// before its pump closes it (a pooled session's; none: never).
+    idle: Arc<IdleClock>,
+}
+
+/// A client's last use and its idle limit (0: none), in milliseconds of
+/// its own clock.
+struct IdleClock {
+    born: Instant,
+    used_ms: AtomicU64,
+    limit_ms: AtomicU64,
+    /// The asks waiting for their answers: a session is never idle while
+    /// one does (a slow answer is no idleness).
+    asking: std::sync::atomic::AtomicUsize,
+}
+
+/// One ask counted as in flight on its client's clock, until dropped.
+struct Asking<'a>(&'a IdleClock);
+
+impl<'a> Asking<'a> {
+    fn new(clock: &'a IdleClock) -> Self {
+        clock.asking.fetch_add(1, Ordering::AcqRel);
+        Self(clock)
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.asking.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl IdleClock {
+    fn new() -> Self {
+        Self {
+            born: Instant::now(),
+            used_ms: AtomicU64::new(0),
+            limit_ms: AtomicU64::new(0),
+            asking: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn touch(&self) {
+        self.used_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Whether it sat unused past its limit (nothing asked meanwhile, and
+    /// no ask waiting).
+    fn expired(&self) -> bool {
+        let limit = self.limit_ms.load(Ordering::Relaxed);
+        limit > 0
+            && self.asking.load(Ordering::Acquire) == 0
+            && self
+                .now_ms()
+                .saturating_sub(self.used_ms.load(Ordering::Relaxed))
+                > limit
+    }
 }
 
 /// What a waiter is keyed by: a lookup's id, or a sealed request's peer
@@ -1403,16 +1677,21 @@ impl CoordClient {
                 _ => {}
             }
         };
-        let (queue, outbound) = std::sync::mpsc::sync_channel(QUEUE);
+        let (queue, outbound, waker) = Outbox::new()?;
         // Bounded: a coordinator flooding a client fills its queue, never
         // its memory (more is dropped).
         let (incoming_in, incoming) = std::sync::mpsc::sync_channel(QUEUE);
         let waiters: Arc<Mutex<HashMap<String, Sender<Value>>>> = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
+        let idle = Arc::new(IdleClock::new());
         let thread = {
-            let (waiters, alive, stop) =
-                (Arc::clone(&waiters), Arc::clone(&alive), Arc::clone(&stop));
+            let (waiters, alive, stop, idle) = (
+                Arc::clone(&waiters),
+                Arc::clone(&alive),
+                Arc::clone(&stop),
+                Arc::clone(&idle),
+            );
             std::thread::Builder::new()
                 .name("coord-client".to_string())
                 .spawn(move || {
@@ -1432,7 +1711,7 @@ impl CoordClient {
                             }
                         }
                     };
-                    client_pump(&mut channel, &outbound, &stop, dispatch);
+                    client_pump(&mut channel, &outbound, &waker, &stop, &idle, dispatch);
                     alive.store(false, Ordering::Relaxed);
                     if let Channel::Ws(ws) = &mut channel {
                         ws.close();
@@ -1450,7 +1729,18 @@ impl CoordClient {
             stop,
             welcome,
             thread: Mutex::new(Some(thread)),
+            idle,
         })
+    }
+
+    /// Close the connection once it sat unasked for `limit` (a pooled
+    /// session's eviction, by its own pump).
+    pub(crate) fn close_when_idle(&self, limit: Duration) {
+        self.idle.touch();
+        self.idle.limit_ms.store(
+            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX).max(1),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn alive(&self) -> bool {
@@ -1461,8 +1751,9 @@ impl CoordClient {
         &self.identity
     }
 
-    /// Queue `message` for the coordinator.
+    /// Queue `message` for the coordinator (its pump woken at once).
     pub(crate) fn send(&self, message: Value) {
+        self.idle.touch();
         push(&self.queue, message);
     }
 
@@ -1477,6 +1768,7 @@ impl CoordClient {
 
     /// Send `message` and wait for the answer keyed `key`.
     fn ask(&self, key: &str, message: Value, timeout: Duration) -> Result<Value, String> {
+        let _asking = Asking::new(&self.idle);
         let (answer, wait) = std::sync::mpsc::channel();
         self.waiters
             .lock()
@@ -1527,7 +1819,19 @@ impl CoordClient {
         payload: &Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let (envelope, key) = seal_request(&self.identity, peer, &self.policy, &nonce(), payload)?;
+        self.request_with(&self.policy, peer, payload, timeout)
+    }
+
+    /// [`Self::request`] under `policy` (a pooled session's caller's: its
+    /// token, its revoked nodes).
+    pub(crate) fn request_with(
+        &self,
+        policy: &TrustPolicy,
+        peer: &PeerKeys,
+        payload: &Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let (envelope, key) = seal_request(&self.identity, peer, policy, &nonce(), payload)?;
         let req_nonce = envelope["req_nonce"]
             .as_str()
             .unwrap_or_default()
@@ -1550,6 +1854,7 @@ impl CoordClient {
     /// Stop the pump and wait for it.
     pub(crate) fn close(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.queue.waker.wake();
         if let Some(thread) = self
             .thread
             .lock()
@@ -1564,24 +1869,27 @@ impl CoordClient {
 impl Drop for CoordClient {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.queue.waker.wake();
     }
 }
 
 /// A client's pump: what `outbound` holds sent, a ping each
 /// [`PING_EVERY`], what comes handed to `take`, until the connection
-/// fails, `stop` is set, or nothing comes for [`IDLE`] and a ping.
+/// fails, `stop` is set, it sat unasked past its idle limit (`idle`), or
+/// nothing comes for [`IDLE`] and a ping; woken at once by what comes or
+/// what is queued (`waker`).
 fn client_pump(
     channel: &mut Channel,
     outbound: &Receiver<Value>,
+    waker: &Waker,
     stop: &AtomicBool,
+    idle: &IdleClock,
     mut take: impl FnMut(Value),
 ) {
     let (mut pinged, mut heard) = (Instant::now(), Instant::now());
-    while !stop.load(Ordering::Relaxed) {
-        while let Ok(message) = outbound.try_recv() {
-            if channel.send(&message).is_err() {
-                return;
-            }
+    while !stop.load(Ordering::Relaxed) && !idle.expired() {
+        if !send_queued(channel, outbound) {
+            return;
         }
         if pinged.elapsed() >= PING_EVERY {
             if channel.send(&json!({"type": "ping"})).is_err() {
@@ -1589,13 +1897,25 @@ fn client_pump(
             }
             pinged = Instant::now();
         }
-        match channel.recv(POLL) {
-            Ok(Some(message)) => {
-                heard = Instant::now();
-                take(message);
+        let Some(more) = take_buffered(channel, &mut heard, &mut take) else {
+            return;
+        };
+        if more {
+            continue;
+        }
+        let Some(left) = (IDLE + PING_EVERY).checked_sub(heard.elapsed()) else {
+            return;
+        };
+        let wait = left
+            .min(PING_EVERY.saturating_sub(pinged.elapsed()))
+            .min(STOP_CHECK);
+        match wait_ready(channel, waker, wait) {
+            Ok(true) => {
+                if channel.read_ready().is_err() {
+                    return;
+                }
             }
-            Ok(None) if heard.elapsed() > IDLE + PING_EVERY => return,
-            Ok(None) => {}
+            Ok(false) => {}
             Err(_) => return,
         }
     }
@@ -2148,6 +2468,31 @@ pub(crate) fn ask(
     context: &ProbeContext,
 ) -> Result<Probed, String> {
     let deadline = Instant::now() + timeout;
+    let client = connect_probe(url, timeout.min(HELLO_TIMEOUT), context)?;
+    let outcome = (|| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let info = client
+            .lookup(node_id, name, left)?
+            .ok_or_else(|| unknown_node(url))?;
+        let peer = PeerKeys::verify(&info, node_id, pinned)?;
+        ask_through(&client, info, &peer, payload, deadline, context).outcome
+    })();
+    client.close();
+    outcome
+}
+
+/// A probe's refusal of a node its coordinator does not know.
+fn unknown_node(url: &CoordUrl) -> String {
+    format!("{url} knows no such node (not connected)")
+}
+
+/// A probe's client of the coordinator at `url`, connected by `timeout`
+/// with `context`'s key and tokens.
+fn connect_probe(
+    url: &CoordUrl,
+    timeout: Duration,
+    context: &ProbeContext,
+) -> Result<CoordClient, String> {
     let fields = HelloFields {
         kind: Kind::Client,
         name: "spawn-probe".to_string(),
@@ -2162,65 +2507,98 @@ pub(crate) fn ask(
             context.policy.clone(),
             &fields,
             context.coord_token.as_deref(),
-            timeout.min(HELLO_TIMEOUT),
+            timeout,
             context.tls.clone(),
         )
     };
     // A probe's key that is a connected node's (a key file shared with a
     // connector) is refused, never takes that node's session: asked again
     // with a key of this probe's own.
-    let client = match connect(Arc::clone(&context.identity)) {
-        Err(why) if why.contains(ID_IN_USE) => connect(Arc::new(NodeIdentity::generate()?.0))?,
-        other => other?,
-    };
-    let outcome = (|| {
-        let left = || deadline.saturating_duration_since(Instant::now());
-        let info = client
-            .lookup(node_id, name, left())?
-            .ok_or_else(|| format!("{url} knows no such node (not connected)"))?;
-        let peer = PeerKeys::verify(&info, node_id, pinned)?;
-        let probe = matches!(payload["op"].as_str(), Some("inventory" | "beat"));
-        if context.punch
-            && probe
-            && let Some(reflexive) = info["udp_reflexive"]
-                .as_str()
-                .and_then(|r| r.parse::<SocketAddr>().ok())
-            && (context.allow_loopback || !forbidden(reflexive.ip()))
-        {
-            // Straight to the node's announced mapping: this reaches a
-            // node that is public, or behind a NAT that lets in datagrams
-            // to a mapping from anyone (endpoint-independent filtering).
-            // No punch is asked: this prober announces no mapping of its
-            // own for the node to open toward.
-            if let Ok(reply) = punched(&client, &peer, reflexive, payload, PUNCH_WAIT.min(left())) {
-                return Ok(Probed {
-                    reply,
-                    peer: info,
-                    mode: "hole_punch",
-                });
+    match connect(Arc::clone(&context.identity)) {
+        Err(why) if why.contains(ID_IN_USE) => connect(Arc::new(NodeIdentity::generate()?.0)),
+        other => other,
+    }
+}
+
+/// What an ask through a client gave: its outcome, and whether a punched
+/// path was tried and gave nothing (the node's mapping may be stale).
+pub(crate) struct Through {
+    pub(crate) outcome: Result<Probed, String>,
+    pub(crate) punch_missed: bool,
+}
+
+/// `payload` asked of `peer` (its record `info`) through `client`, under
+/// `context`'s policy, by `deadline`: over a punched udp path first when
+/// the node has a udp mapping (a probe only), else, or when that gives no
+/// answer within [`PUNCH_WAIT`], relayed.
+pub(crate) fn ask_through(
+    client: &CoordClient,
+    info: Value,
+    peer: &PeerKeys,
+    payload: &Value,
+    deadline: Instant,
+    context: &ProbeContext,
+) -> Through {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let probe = matches!(payload["op"].as_str(), Some("inventory" | "beat"));
+    let mut punch_missed = false;
+    if context.punch
+        && probe
+        && let Some(reflexive) = info["udp_reflexive"]
+            .as_str()
+            .and_then(|r| r.parse::<SocketAddr>().ok())
+        && (context.allow_loopback || !forbidden(reflexive.ip()))
+    {
+        // Straight to the node's announced mapping: this reaches a node
+        // that is public, or behind a NAT that lets in datagrams to a
+        // mapping from anyone (endpoint-independent filtering). No punch
+        // is asked: this prober announces no mapping of its own for the
+        // node to open toward.
+        match punched(
+            client,
+            &context.policy,
+            peer,
+            reflexive,
+            payload,
+            PUNCH_WAIT.min(left()),
+        ) {
+            Ok(reply) => {
+                return Through {
+                    outcome: Ok(Probed {
+                        reply,
+                        peer: info,
+                        mode: "hole_punch",
+                    }),
+                    punch_missed,
+                };
             }
+            Err(_) => punch_missed = true,
         }
-        let reply = client.request(&peer, payload, left())?;
-        Ok(Probed {
+    }
+    let outcome = client
+        .request_with(&context.policy, peer, payload, left())
+        .map(|reply| Probed {
             reply,
             peer: info,
             mode: "relay",
-        })
-    })();
-    client.close();
-    outcome
+        });
+    Through {
+        outcome,
+        punch_missed,
+    }
 }
 
-/// One sealed request straight to `reflexive` over udp, its reply within
-/// `wait`.
+/// One sealed request straight to `reflexive` over udp, under `policy`,
+/// its reply within `wait`.
 fn punched(
     client: &CoordClient,
+    policy: &TrustPolicy,
     peer: &PeerKeys,
     reflexive: SocketAddr,
     payload: &Value,
     wait: Duration,
 ) -> Result<Value, String> {
-    let (envelope, key) = seal_request(client.identity(), peer, &client.policy, &nonce(), payload)?;
+    let (envelope, key) = seal_request(client.identity(), peer, policy, &nonce(), payload)?;
     let socket = UdpSocket::bind(if reflexive.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -2270,7 +2648,9 @@ fn punched(
 
 /// The probe `op` of the coord node `node_id` through `url` (its key
 /// pinned to `pubkey` when its join holds one), with this host's identity
-/// and `token`: the reply.
+/// and `token`: the reply. Through this process's pool: one coordinator
+/// session (TCP, TLS, WebSocket, hello) and the node's checked prekey kept
+/// across probes, made again when they go stale.
 pub(crate) fn probe(
     url: &str,
     node_id: &str,
@@ -2281,7 +2661,8 @@ pub(crate) fn probe(
 ) -> Result<Value, String> {
     let url = CoordUrl::parse(url)?;
     let context = ProbeContext::from_env(token)?;
-    let probed = ask(
+    let probed = pool::ask_pooled(
+        pool::CoordPool::global(),
         &url,
         Some(node_id),
         None,
@@ -2293,5 +2674,9 @@ pub(crate) fn probe(
     super::transport::accepted(probed.reply)
 }
 
+pub(crate) mod pool;
+
+#[cfg(test)]
+mod perf_tests;
 #[cfg(test)]
 mod tests;

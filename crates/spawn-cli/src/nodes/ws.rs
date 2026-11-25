@@ -36,6 +36,11 @@ use super::transport::connect_happy;
 pub(crate) const MAX_FRAME: usize = 512 * 1024;
 /// The largest HTTP head of an upgrade.
 const MAX_HEAD: usize = 16 * 1024;
+/// The longest a pump's one read waits (its poll said there is
+/// something to read: a read that finds nothing is a spurious wakeup).
+const READY_WAIT: Duration = Duration::from_millis(50);
+/// What one read takes at most.
+const READ_CHUNK: usize = 64 * 1024;
 /// RFC 6455's GUID, appended to the key whose SHA-1 the server answers.
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -144,6 +149,11 @@ pub(crate) struct WsStream {
     closed: bool,
     /// A fragmented message being assembled: its opcode and bytes.
     partial: Option<(u8, Vec<u8>)>,
+    /// Why the connection ended (a TLS close_notify, an end of stream, an
+    /// error) once a pump's read saw it: said by [`Self::next_buffered`]
+    /// only when no whole message is left (what came with the end, opened
+    /// already, is still taken).
+    ended: Option<String>,
 }
 
 /// The header named `name` (any case) in an HTTP head's lines.
@@ -201,6 +211,20 @@ fn bound(tcp: &TcpStream, deadline: Instant) -> Result<(), String> {
     tcp.set_read_timeout(Some(left))
         .and_then(|()| tcp.set_write_timeout(Some(left)))
         .map_err(|error| error.to_string())
+}
+
+/// One `read` of at most [`READ_CHUNK`] bytes straight onto the end of
+/// `buffer` (no copy, no chunk on the stack): what it read.
+pub(crate) fn read_into(
+    buffer: &mut Vec<u8>,
+    read: impl FnOnce(&mut [u8]) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    let start = buffer.len();
+    buffer.resize(start + READ_CHUNK, 0);
+    let outcome = read(&mut buffer[start..]);
+    let count = *outcome.as_ref().unwrap_or(&0);
+    buffer.truncate(start + count.min(READ_CHUNK));
+    outcome
 }
 
 fn timed_out(error: &std::io::Error) -> bool {
@@ -298,6 +322,7 @@ impl WsStream {
             client: true,
             closed: false,
             partial: None,
+            ended: None,
         })
     }
 
@@ -380,6 +405,7 @@ impl WsStream {
                 client: false,
                 closed: false,
                 partial: None,
+                ended: None,
             },
             Accepted {
                 path: path.to_string(),
@@ -549,6 +575,117 @@ impl WsStream {
         }
     }
 
+    /// The tcp stream under this WebSocket (what a pump polls).
+    pub(crate) fn tcp(&self) -> &TcpStream {
+        self.conn.tcp()
+    }
+
+    /// One read of what the connection holds now (a pump calls it once
+    /// its poll said the socket is readable): at most [`READY_WAIT`]
+    /// waited, and with TLS every record that came opened, its plaintext
+    /// kept in the buffer.
+    pub(crate) fn read_ready(&mut self) -> Result<(), String> {
+        self.conn
+            .tcp()
+            .set_read_timeout(Some(READY_WAIT))
+            .map_err(|error| error.to_string())?;
+        let read = match &mut self.conn {
+            Conn::Plain(stream) => match read_into(&mut self.buffer, |spare| stream.read(spare)) {
+                Ok(0) => Err(None),
+                Ok(_) => Ok(()),
+                Err(error) if timed_out(&error) => Ok(()),
+                Err(error) => Err(Some(error.to_string())),
+            },
+            Conn::Tls(stream) => {
+                let stream = &mut **stream;
+                let outcome = match stream.conn.read_tls(&mut stream.sock) {
+                    Ok(0) => Err(None),
+                    Ok(_) => stream
+                        .conn
+                        .process_new_packets()
+                        .map(|_| ())
+                        .map_err(|error| Some(error.to_string())),
+                    Err(error) if timed_out(&error) => Ok(()),
+                    Err(error) => Err(Some(error.to_string())),
+                };
+                // What rustls has to say back (an alert, a key update).
+                while stream.conn.wants_write() {
+                    if stream.conn.write_tls(&mut stream.sock).is_err() {
+                        break;
+                    }
+                }
+                outcome
+            }
+        };
+        if let Err(why) = read {
+            self.end(why.map_or_else(
+                || "the WebSocket's connection closed".to_string(),
+                |why| format!("the WebSocket: {why}"),
+            ));
+        }
+        // What was opened before the end is still taken: the end is said by
+        // next_buffered once no whole message is left.
+        self.drain_plaintext();
+        Ok(())
+    }
+
+    /// Remember that the connection ended, and why (the first reason kept).
+    fn end(&mut self, why: String) {
+        self.ended.get_or_insert(why);
+    }
+
+    /// Move the plaintext TLS opened already into the buffer, no IO (a
+    /// record read whole with an earlier one waits there, and a poll of
+    /// the socket would never say so).
+    /// A clean close (close_notify) or an error after it is remembered, never
+    /// said here: the plaintext that came before it is in the buffer.
+    fn drain_plaintext(&mut self) {
+        let Conn::Tls(stream) = &mut self.conn else {
+            return;
+        };
+        if self.ended.is_some() {
+            return;
+        }
+        let ended = loop {
+            match read_into(&mut self.buffer, |spare| stream.conn.reader().read(spare)) {
+                Ok(0) => break Some("the WebSocket's connection closed".to_string()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break None,
+                Err(error) => break Some(format!("the WebSocket: {error}")),
+            }
+        };
+        if let Some(why) = ended {
+            self.end(why);
+        }
+    }
+
+    /// The end remembered, said now that no whole message is left.
+    fn said_end(&mut self) -> Result<Option<Message>, String> {
+        match self.ended.clone() {
+            Some(why) => {
+                self.closed = true;
+                Err(why)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The next whole message of what was read already, no IO but a ping's
+    /// pong (and a close's): none when the buffer holds no whole message.
+    /// When the connection ended (a TLS close_notify with the last
+    /// messages), its end is said once they are all taken.
+    pub(crate) fn next_buffered(&mut self) -> Result<Option<Message>, String> {
+        self.drain_plaintext();
+        loop {
+            let Some((fin, opcode, payload)) = self.parse_frame()? else {
+                return self.said_end();
+            };
+            if let Some(message) = self.take_frame(fin, opcode, payload)? {
+                return Ok(Some(message));
+            }
+        }
+    }
+
     /// The next message, waiting at most `timeout`: none when none came
     /// whole in time (what came is kept for the next call). A ping is
     /// answered, a pong dropped, a close answered and said.
@@ -556,42 +693,58 @@ impl WsStream {
         let deadline = Instant::now() + timeout;
         loop {
             let Some((fin, opcode, payload)) = self.parse_frame()? else {
+                if self.ended.is_some() {
+                    return self.said_end();
+                }
                 if self.fill(deadline)? {
                     continue;
                 }
                 return Ok(None);
             };
-            match opcode {
-                0x9 => self.send_frame(0xA, &payload)?,
-                0xA => {}
-                0x8 => {
-                    self.close();
-                    return Ok(Some(Message::Close));
-                }
-                0x0 => {
-                    let (first, mut bytes) =
-                        self.partial.take().ok_or("a continuation of no message")?;
-                    if bytes.len() + payload.len() > MAX_FRAME {
-                        return Err(format!("a message over {MAX_FRAME} bytes"));
-                    }
-                    bytes.extend_from_slice(&payload);
-                    if fin {
-                        return Self::message(first, bytes).map(Some);
-                    }
-                    self.partial = Some((first, bytes));
-                }
-                0x1 | 0x2 => {
-                    if self.partial.is_some() {
-                        return Err("a new message inside a fragmented one".to_string());
-                    }
-                    if fin {
-                        return Self::message(opcode, payload).map(Some);
-                    }
-                    self.partial = Some((opcode, payload));
-                }
-                _ => return Err(format!("an unknown opcode {opcode}")),
+            if let Some(message) = self.take_frame(fin, opcode, payload)? {
+                return Ok(Some(message));
             }
         }
+    }
+
+    /// One frame taken: the message it ends, if it ends one.
+    fn take_frame(
+        &mut self,
+        fin: bool,
+        opcode: u8,
+        payload: Vec<u8>,
+    ) -> Result<Option<Message>, String> {
+        match opcode {
+            0x9 => self.send_frame(0xA, &payload)?,
+            0xA => {}
+            0x8 => {
+                self.close();
+                return Ok(Some(Message::Close));
+            }
+            0x0 => {
+                let (first, mut bytes) =
+                    self.partial.take().ok_or("a continuation of no message")?;
+                if bytes.len() + payload.len() > MAX_FRAME {
+                    return Err(format!("a message over {MAX_FRAME} bytes"));
+                }
+                bytes.extend_from_slice(&payload);
+                if fin {
+                    return Self::message(first, bytes).map(Some);
+                }
+                self.partial = Some((first, bytes));
+            }
+            0x1 | 0x2 => {
+                if self.partial.is_some() {
+                    return Err("a new message inside a fragmented one".to_string());
+                }
+                if fin {
+                    return Self::message(opcode, payload).map(Some);
+                }
+                self.partial = Some((opcode, payload));
+            }
+            _ => return Err(format!("an unknown opcode {opcode}")),
+        }
+        Ok(None)
     }
 
     fn message(opcode: u8, bytes: Vec<u8>) -> Result<Message, String> {
@@ -620,4 +773,4 @@ impl Drop for WsStream {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
