@@ -209,6 +209,147 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     fn excerpt_source(&self, pane: &str) -> String {
         pane.to_string()
     }
+
+    /// How the run-time resolver answers `dialog`, shown by this engine
+    /// started in `workspace` ([`table_answer`] for this engine's id): a
+    /// fixed table, never a guess.
+    fn dialog_answer(&self, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
+        table_answer(self.id(), dialog, workspace)
+    }
+}
+
+/// A dialog the run-time resolver found on a pane (design section 6.3),
+/// as the terminal host's detection and Spawn's own detection
+/// (`serve/approvals.rs`, `detect`) describe it.
+#[derive(Debug, Clone, Copy)]
+pub struct Dialog<'a> {
+    /// The host's rule that read it blocked (Herdr's manifest rule id:
+    /// `trust_prompt`, `permission_prompt`, ...), when the host reads one.
+    pub rule: Option<&'a str>,
+    /// Spawn's prompt kind (`permission`, `choice`, `yes_no`, `confirm`),
+    /// or `trust` for an engine's workspace trust dialog.
+    pub kind: &'a str,
+    /// The label of the choice the dialog's cursor stands on, if drawn.
+    pub cursor: Option<&'a str>,
+    /// The labels of its choices, in order.
+    pub choices: &'a [String],
+    /// What the dialog asks to approve, one entry a line (its body), and
+    /// for a trust dialog the lines that name the folder.
+    pub body: &'a [String],
+}
+
+/// What the resolver does with a dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Press these keys (tmux names), in order, once.
+    Keys(&'static [&'static str]),
+    /// Press nothing: a person decides. The reason is said.
+    Escalate(&'static str),
+}
+
+/// Why a row that has no captured screen yet answers nothing.
+const UNCAPTURED: &str = "no captured screen of this dialog yet: a person answers it";
+
+/// The resolver's table (design section 6.3), pure. A row whose dialog
+/// was never seen working live (manifest text only, not captured, not
+/// verified) escalates: it gets keys only in a later change that adds the
+/// captured screen as a test. The table never holds an answer nobody has
+/// seen work.
+///
+/// | engine | dialog | guard | answer | evidence |
+/// |---|---|---|---|---|
+/// | agy | `trust_prompt` | the folder shown is the workspace, cursor on "Yes, I trust this folder" | Enter | probed |
+/// | agy | `permission_prompt` | — | escalate | manifest text only |
+/// | agy | `question_prompt` | — | escalate | manifest text only |
+/// | claude | trust | Spawn's `is_trust_dialog` (kind `trust`) | y, Enter | production |
+/// | claude | numbered permission | choice 1 reads "Yes" | 1 | approvals fixtures |
+/// | claude | question form, MCP elicitation, dynamic workflow | — | escalate | not captured |
+/// | codex | `trust_directory`, `startup_update`, `live_strong_blocker` | — | escalate | not verified |
+/// | opencode | `permission_required` | — | escalate | not verified |
+/// | any | no row | — | escalate | — |
+pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
+    match (engine, dialog.rule, dialog.kind) {
+        ("agy", Some("trust_prompt"), _) => {
+            let folder = workspace.path().trim_end_matches('/');
+            let shown = dialog
+                .body
+                .iter()
+                .any(|line| line.trim().trim_end_matches('/') == folder);
+            let trusting = dialog
+                .cursor
+                .is_some_and(|cursor| cursor.trim() == "Yes, I trust this folder");
+            if shown && trusting {
+                Answer::Keys(&crate::screen::AGY_TRUST_KEYS)
+            } else {
+                Answer::Escalate("agy's trust dialog names another folder, or its cursor is not on trust")
+            }
+        }
+        ("agy", Some("permission_prompt" | "question_prompt"), _) => Answer::Escalate(UNCAPTURED),
+        ("claude", _, "trust") => Answer::Keys(&crate::screen::TRUST_KEYS),
+        ("claude", None | Some("bash_permission_prompt" | "generic_permission_prompt"), "permission")
+            if dialog
+                .choices
+                .first()
+                .is_some_and(|first| first.trim() == "Yes") =>
+        {
+            Answer::Keys(&CLAUDE_YES)
+        }
+        (
+            "claude",
+            Some("live_blocked_form" | "mcp_elicitation_prompt" | "dynamic_workflow_prompt"),
+            _,
+        ) => Answer::Escalate(UNCAPTURED),
+        (
+            "codex",
+            Some("trust_directory" | "startup_update" | "live_strong_blocker"),
+            _,
+        )
+        | ("opencode", Some("permission_required"), _) => Answer::Escalate(UNCAPTURED),
+        _ => Answer::Escalate("no row of the resolver's table covers this dialog"),
+    }
+}
+
+/// Claude Code's first numbered choice ("1. Yes").
+const CLAUDE_YES: [&str; 1] = ["1"];
+
+/// Screens no key may answer: the engine cannot go on without a person
+/// (design section 6.3, "Hard blocks"). Lowercased text; every one is from
+/// the engines' own strings and docs, none captured on a live pane yet.
+const HARD_BLOCKS: [(&str, &str); 12] = [
+    ("please run /login", "login required"),
+    ("login required", "login required"),
+    ("not logged in", "login required"),
+    ("oauth token has expired", "login expired"),
+    ("authentication_error", "login expired"),
+    ("rate limit reached", "rate limit"),
+    ("rate_limit_error", "rate limit"),
+    ("usage limit reached", "quota reached"),
+    ("quota exceeded", "quota reached"),
+    ("resource_exhausted", "quota reached"),
+    ("update required", "update required"),
+    ("please update to continue", "update required"),
+];
+
+/// Why the pane's tail is a hard block, if it is one: a login required or
+/// expired, a quota or rate limit reached, an update the engine needs
+/// before it runs, or a dialog whose only choices exit. Read from the last
+/// [`crate::screen::TAIL_LINES`] lines only; the resolver escalates it at
+/// once and never presses a key.
+pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let tail = lines[lines.len().saturating_sub(crate::screen::TAIL_LINES)..]
+        .join("\n")
+        .to_lowercase();
+    if let Some((_, why)) = HARD_BLOCKS.iter().find(|(text, _)| tail.contains(text)) {
+        return Some(why);
+    }
+    let exits = |label: &String| {
+        let lower = label.to_lowercase();
+        ["exit", "quit"]
+            .iter()
+            .any(|word| lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == *word))
+    };
+    (!choices.is_empty() && choices.iter().all(exits)).then_some("only exit choices")
 }
 
 /// Claude Code, interactive in a terminal: everything it does is the
