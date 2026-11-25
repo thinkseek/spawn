@@ -717,7 +717,6 @@ dependencies = [
  "spawn-core",
  "spawn-host",
  "spawn-jev",
- "spawn-node-proto",
  "spawn-postgres",
  "tiny_http",
  "webpki-roots",
@@ -773,18 +772,6 @@ version = "0.1.0"
 dependencies = [
  "hmac",
  "sha2",
-]
-
-[[package]]
-name = "spawn-node-proto"
-version = "0.1.0"
-dependencies = [
- "base64",
- "ring",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
 ]
 
 [[package]]
