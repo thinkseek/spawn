@@ -629,3 +629,210 @@ impl PostgresStore {
         Ok(nodes)
     }
 }
+
+/// A recorded change as the indexer (`spawn prov index`) reads it back: its
+/// identity and its `result` read through the commit map (`git1:` results
+/// only; `None`: the history rewrite dropped the commit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvRecorded {
+    pub id: i64,
+    pub change_id: String,
+    pub rev: i32,
+    pub kind: ProvChangeKind,
+    pub result_now: Option<String>,
+}
+
+/// What the event log and the mission layer say of one task, for a change's
+/// attribution: its worker, and its preset with the preset's model label as
+/// they are now (copied into the change by value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvTaskFacts {
+    pub agent_id: String,
+    pub preset_id: Option<String>,
+    pub model_label: Option<String>,
+}
+
+/// The ids of a `git1:` digest's commit as recorded rows may hold it: the
+/// commit itself, the commit the map makes of it, and every old commit the
+/// map made into it. Other digests are themselves alone.
+const RESULT_NAMES: &str = "\
+with given(r) as (select $1::text),
+names(r) as (
+    select r from given
+    union
+    select 'git1:' || spawn_commit_now(substr(r, 6)) from given
+     where r like 'git1:%' and spawn_commit_now(substr(r, 6)) is not null
+    union
+    select 'git1:' || m.old from given, spawn_commit_map m
+     where r like 'git1:%' and m.new = lower(substr(r, 6))
+)";
+
+impl PostgresStore {
+    /// The changes whose `result` is `result` (`git1:<commit>` or another
+    /// digest), oldest first. A `git1:` commit is read through the commit
+    /// map both ways: a change recorded with an old commit the map renamed
+    /// answers for its new one, and the old one given answers for a change
+    /// recorded with the new one.
+    pub fn prov_changes_for_result(
+        &self,
+        result: &str,
+    ) -> Result<Vec<ProvChangeRecord>, StoreError> {
+        change_records(&self.query(
+            &format!(
+                "{RESULT_NAMES}
+                 select {CHANGE_COLUMNS} from prov_changes c
+                  where c.result in (select r from names)
+                  order by c.at_ms, c.id"
+            ),
+            &[&result],
+        )?)
+    }
+
+    /// The changes recorded for task `task_id`, oldest first.
+    pub fn prov_changes_for_task(&self, task_id: i64) -> Result<Vec<ProvChangeRecord>, StoreError> {
+        change_records(&self.query(
+            &format!(
+                "select {CHANGE_COLUMNS} from prov_changes c where c.task_id = $1
+                  order by c.at_ms, c.id"
+            ),
+            &[&task_id],
+        )?)
+    }
+
+    /// Every change recorded in `domain`, by id, each `git1:` result read
+    /// through `spawn_commit_now`.
+    pub fn prov_recorded(&self, domain: &str) -> Result<Vec<ProvRecorded>, StoreError> {
+        self.query(
+            "select c.id, c.change_id, c.rev, c.kind,
+                    case when c.result like 'git1:%'
+                         then 'git1:' || spawn_commit_now(substr(c.result, 6))
+                         else c.result end
+               from prov_changes c where c.domain = $1 order by c.id",
+            &[&domain],
+        )?
+        .iter()
+        .map(|row| {
+            Ok(ProvRecorded {
+                id: row.get(0),
+                change_id: row.get(1),
+                rev: row.get(2),
+                kind: row.get::<_, String>(3).parse()?,
+                result_now: row.get(4),
+            })
+        })
+        .collect()
+    }
+
+    /// The entries of the changes `ids`, by change and path.
+    pub fn prov_entries_of(&self, ids: &[i64]) -> Result<Vec<ProvEntryRecord>, StoreError> {
+        self.query(
+            "select change, path, before, after, size, class, origin
+               from prov_entries where change = any($1) order by change, path",
+            &[&ids],
+        )?
+        .iter()
+        .map(|row| {
+            Ok(ProvEntryRecord {
+                change: row.get(0),
+                path: row.get(1),
+                before: row.get(2),
+                after: row.get(3),
+                size: row.get(4),
+                class: row.get::<_, String>(5).parse()?,
+                origin: row.get(6),
+            })
+        })
+        .collect()
+    }
+
+    /// `path`'s history in `domain`: every change with an entry for it, or,
+    /// with `folded` (its top-level directory), a `tree` entry of that
+    /// directory, each with that entry; oldest first (`at_ms`, then id).
+    pub fn prov_path_history(
+        &self,
+        domain: &str,
+        path: &str,
+        folded: Option<&str>,
+    ) -> Result<Vec<(ProvChangeRecord, ProvEntryRecord)>, StoreError> {
+        self.query(
+            &format!(
+                "select {CHANGE_COLUMNS}, n.path, n.before, n.after, n.size, n.class, n.origin
+                   from prov_entries n join prov_changes c on c.id = n.change
+                  where c.domain = $1
+                    and (n.path = $2 or (n.class = 'tree' and n.path = $3))
+                  order by c.at_ms, c.id"
+            ),
+            &[&domain, &path, &folded],
+        )?
+        .iter()
+        .map(|row| {
+            let change = change_record(row)?;
+            let entry = ProvEntryRecord {
+                change: change.id,
+                path: row.get(16),
+                before: row.get(17),
+                after: row.get(18),
+                size: row.get(19),
+                class: row.get::<_, String>(20).parse()?,
+                origin: row.get(21),
+            };
+            Ok((change, entry))
+        })
+        .collect()
+    }
+
+    /// The agent of each execution of `ids` the event log holds (its
+    /// `execution.started`); an execution it does not hold is absent.
+    pub fn prov_execution_agents(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, String>, StoreError> {
+        Ok(self
+            .query(
+                "select distinct on (execution_id) execution_id, agent_id from spawn_events
+                  where event_name = 'execution.started' and execution_id = any($1)
+                  order by execution_id, id",
+                &[&ids],
+            )?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// The facts of each task of `ids` the mission layer holds.
+    pub fn prov_task_facts(&self, ids: &[i64]) -> Result<HashMap<i64, ProvTaskFacts>, StoreError> {
+        Ok(self
+            .query(
+                "select t.id, t.agent_id, t.preset_id, p.model_label
+                   from mission_tasks t left join grading_presets p on p.preset_id = t.preset_id
+                  where t.id = any($1)",
+                &[&ids],
+            )?
+            .iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    ProvTaskFacts {
+                        agent_id: row.get(1),
+                        preset_id: row.get(2),
+                        model_label: row.get(3),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Every task of the agents `agents`: `(agent, task, created_at_ms)`, by
+    /// agent and then creation (then id).
+    pub fn prov_agent_tasks(&self, agents: &[String]) -> Result<Vec<(String, i64, i64)>, StoreError> {
+        Ok(self
+            .query(
+                "select agent_id, id, created_at_ms from mission_tasks
+                  where agent_id = any($1) order by agent_id, created_at_ms, id",
+                &[&agents],
+            )?
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+}
