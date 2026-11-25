@@ -861,47 +861,77 @@ const MULTI_STEP_STEMS: &[&str] = &["multi-step", "end-to-end", "phase", "pipeli
 /// A generic verb or noun (`comment`, `rename`, `bump`) also names real
 /// engineering work ("add comment support", "rename it and update every
 /// caller", "bump tokio and fix whatever breaks"), so none of those is one.
+/// These count wherever they stand.
 const LOW_RISK_STEMS: &[&str] = &[
     "typo",
     "spelling",
     "formatting",
     "whitespace",
     "rustfmt",
-    "tag",
-    "label",
     "mechanical",
     "repetitive",
-    "bulk",
-    "regenerat",
 ];
 const LOW_RISK_PHRASES: &[&str] = &["cargo fmt", "registry entry"];
 
-/// Words that widen a change past a small one, authoring words (writing
-/// that needs judgement) and words naming code to build around a tag or a
-/// label: any of them cancels the low-risk rule.
+/// Tagging markers that count only as the first word of a line, the
+/// imperative that names the work ("Tag the open tasks", "Label the stale
+/// issues", "Bulk-label ..."): anywhere else they name a thing the work is
+/// about ("fix the crash in tag matching", "speed up the bulk insert").
+const LOW_RISK_LEAD_STEMS: &[&str] = &["tag", "label", "bulk"];
+
+/// `regenerat*` is a marker only when a generated artifact is named too
+/// ("regenerate the fixtures"), never for a value the code makes
+/// ("regenerate the session token on each login").
+const REGENERATE_STEM: &str = "regenerat";
+const GENERATED_ARTIFACT_STEMS: &[&str] =
+    &["fixture", "snapshot", "lockfile", "golden", "generated"];
+
+/// Words that cancel the low-risk rule: words that widen a change past a
+/// small one, authoring words (writing that needs judgement), words naming
+/// code to build, and words naming a defect, performance or behaviour.
 const BROADENING_STEMS: &[&str] = &[
+    // Widening.
     "every",
     "whatever",
     "caller",
     "implement",
     "support",
     "feature",
-    "write",
+    // Authoring.
+    "writ",
+    "rewrit",
     "draft",
     "document",
     "explain",
+    "explan",
     "describ",
     "summar",
     "clarif",
     "reword",
     "rephras",
     "comment",
+    // Code to build.
     "filter",
     "render",
     "pars",
     "endpoint",
     "api",
     "display",
+    // Defect, performance, behaviour.
+    "bug",
+    "crash",
+    "debug",
+    "hang",
+    "cause",
+    "speed",
+    "optimi",
+    "perf",
+    "slow",
+    "retry",
+    "validat",
+    "dedup",
+    "automat",
+    "handl",
 ];
 
 /// File extensions a path token ends with.
@@ -980,6 +1010,36 @@ fn named_crates(tokens: &[&str]) -> usize {
     crates.len()
 }
 
+/// The tokens of a lowercased `text`: runs of letters, digits, `_`, `-`,
+/// `.` and `/`, trimmed of `.`, `-` and `/` at either end.
+fn tokenize(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
+        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/')))
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// `tokens` split at `/`, so a keyword is read in every path segment.
+fn path_words<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
+    tokens
+        .iter()
+        .flat_map(|token| token.split('/'))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// The `low_risk` evidence: [`LOW_RISK_STEMS`] and [`LOW_RISK_PHRASES`]
+/// anywhere, [`LOW_RISK_LEAD_STEMS`] as the first word of a line, and
+/// `regenerat*` beside a [`GENERATED_ARTIFACT_STEMS`] word.
+fn low_risk_markers(words: &[&str], line_leads: &[&str], text: &str) -> Vec<String> {
+    let mut markers = matched(words, text, LOW_RISK_STEMS, LOW_RISK_PHRASES);
+    markers.extend(matched(line_leads, "", LOW_RISK_LEAD_STEMS, &[]));
+    if !matched(words, "", GENERATED_ARTIFACT_STEMS, &[]).is_empty() {
+        markers.extend(matched(words, "", &[REGENERATE_STEM], &[]));
+    }
+    markers
+}
+
 /// The difficulty a task's brief (and objective, if the caller appends
 /// it) reads as: a deterministic, integer-only rule-set over its structure
 /// and wording, every matched rule kept as evidence ([`CLASSIFIER_RULES`]).
@@ -996,15 +1056,19 @@ fn named_crates(tokens: &[&str]) -> usize {
 /// - `crate_scope` +1 from two distinct crates named (`crates/<name>` or a
 ///   `spawn-<name>` token), +2 from three;
 /// - `long_brief` +1 above 2000 characters;
-/// - `low_risk` -2: a mechanical marker (typo, spelling, formatting,
-///   whitespace, rustfmt, "cargo fmt", tag*, label*, mechanical,
-///   repetitive, bulk, regenerat*, "registry entry"), only when no
-///   `security`, `migration` or `concurrency` rule matched and no
-///   broadening word is there: a widening one (every, whatever, caller,
-///   implement, support, feature), an authoring one (write, draft,
-///   document*, explain*, describ*, summar*, clarif*, reword, rephras*,
-///   comment*) or one naming code to build (filter, render, pars*,
-///   endpoint, api, display).
+/// - `low_risk` -2: a mechanical marker (typo*, spelling*, formatting*,
+///   whitespace*, rustfmt*, mechanical*, repetitive*, "cargo fmt",
+///   "registry entry" anywhere; tag*, label*, bulk* only as the first word
+///   of a line; regenerat* only beside a generated artifact: fixture*,
+///   snapshot*, lockfile*, golden*, generated*), only when no `security`,
+///   `migration` or `concurrency` rule matched and no broadening word is
+///   there: widening (every*, whatever*, caller*, implement*, support*,
+///   feature*), authoring (writ*, rewrit*, draft*, document*, explain*,
+///   explan*, describ*, summar*, clarif*, reword*, rephras*, comment*),
+///   code to build (filter*, render*, pars*, endpoint*, api*, display*),
+///   or a defect, performance or behaviour (bug*, crash*, debug*, hang*,
+///   cause*, speed*, optimi*, perf*, slow*, retry*, validat*, dedup*,
+///   automat*, handl*). A `*` marks a prefix: every keyword is one.
 ///
 /// `l3` from [`CLASSIFY_L3_AT`]; `l1` at or below [`CLASSIFY_L1_AT`] when
 /// no risk rule matched, at most one file is named and the brief is at
@@ -1012,17 +1076,15 @@ fn named_crates(tokens: &[&str]) -> usize {
 /// brief no rule matched.
 pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
     let text = brief.to_ascii_lowercase();
-    let tokens: Vec<&str> = text
-        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
-        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/')))
-        .filter(|token| !token.is_empty())
-        .collect();
+    let tokens = tokenize(&text);
     // Keywords are read in every path segment too: `sql/schema.sql` names
     // the schema.
-    let words: Vec<&str> = tokens
-        .iter()
-        .flat_map(|token| token.split('/'))
-        .filter(|word| !word.is_empty())
+    let words = path_words(&tokens);
+    // The first word of each line: a brief's imperative, also after a
+    // title line or in a list.
+    let line_leads: Vec<&str> = text
+        .lines()
+        .filter_map(|line| path_words(&tokenize(line)).first().copied())
         .collect();
     let mut signals = Vec::new();
     let mut add = |rule: &str, points: i32, evidence: Vec<String>| {
@@ -1086,11 +1148,7 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
         vec![format!("{chars} chars")],
     );
     if !risky && matched(&words, &text, BROADENING_STEMS, &[]).is_empty() {
-        add(
-            "low_risk",
-            -2,
-            matched(&words, &text, LOW_RISK_STEMS, LOW_RISK_PHRASES),
-        );
+        add("low_risk", -2, low_risk_markers(&words, &line_leads, &text));
     }
     let score: i32 = signals.iter().map(|signal| signal.points).sum();
     let difficulty = if score >= CLASSIFY_L3_AT {
@@ -2048,6 +2106,15 @@ mod tests {
             "Fix the typo and reword the sentence in README.md",
             "Fix the typo in the comment",
             "Draft a summary of the formatting rules",
+            "Docs only change",
+            "Add docstrings",
+            "Update the readme",
+            "Update the wording",
+            "One-line fix in a.rs",
+            "Writing the bulk import guide",
+            "Written guidance for tags",
+            "Add an explanation to each tag",
+            "Rewrite the tag rules",
         ] {
             let classified = classify_difficulty(brief);
             assert_eq!(
@@ -2077,6 +2144,9 @@ mod tests {
             ),
             ("Strip the trailing whitespace", "whitespace"),
             ("Regenerate the fixtures", "regenerat"),
+            ("Regenerate the golden snapshots", "regenerat"),
+            ("Bulk-label the stale tasks", "bulk"),
+            ("Typo fix\n\nTag the open tasks with l1", "tag"),
             ("A mechanical bulk rename of the constant", "mechanical"),
             ("Fix the typo in README.md", "typo"),
         ] {
@@ -2107,6 +2177,23 @@ mod tests {
             "Display each task's tags",
             "Add a bulk delete feature",
             "Store the label in the tasks table inside one transaction",
+            // Defect, performance and behaviour work naming a tagging
+            // marker (supervisor review of task 580, F1).
+            "Fix the bug where tags vanish after a restart",
+            "Tasks lose their labels on reload; find the cause and fix it",
+            "Fix the crash in tag matching",
+            "Debug why the labeller hangs",
+            "Make tag lookup case-insensitive",
+            "Add a --tag flag to spawn task list",
+            "Validate labels before saving them",
+            "Deduplicate tags when merging tasks",
+            "Tag releases automatically from the integrator",
+            "Speed up the bulk insert path",
+            "Optimise the bulk loader in the importer",
+            "Add bulk retry to the dispatcher",
+            "Regenerate the cache when the config changes",
+            "Regenerate the session token on each login",
+            "Fix the whitespace handling in the tokenizer",
         ] {
             let classified = classify_difficulty(brief);
             assert!(
