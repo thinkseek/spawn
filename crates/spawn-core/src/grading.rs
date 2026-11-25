@@ -754,7 +754,7 @@ pub fn registered_profile(
 
 /// The version of [`classify_difficulty`]'s rules, carried on every
 /// classification so a recorded one says which rules decided it.
-pub const CLASSIFIER_RULES: &str = "brief-v1";
+pub const CLASSIFIER_RULES: &str = "brief-v2";
 
 /// A classification's score at or above which a task is `l3`.
 pub const CLASSIFY_L3_AT: i32 = 4;
@@ -854,23 +854,31 @@ const CROSS_CUTTING_PHRASES: &[&str] = &["across crates", "every crate", "backwa
 /// Multi-step markers.
 const MULTI_STEP_STEMS: &[&str] = &["multi-step", "end-to-end", "phase", "pipeline"];
 
-/// Low-risk markers: small, well-specified work.
-/// Only markers that name the change itself: a generic verb or noun
-/// (`comment`, `rename`, `bump`) also names real engineering work ("add
-/// comment support", "rename it and update every caller", "bump tokio
-/// and fix whatever breaks"), so none of those is one.
+/// Low-risk markers (`brief-v2`): mechanical, repetitive or tagging work
+/// only, where the result is decided by the request and not by judgement.
+/// Semantic writing (`wording`, `readme`, `docstring`, "docs only") is not
+/// one, and neither is `one-line`, which says nothing about determinism.
+/// A generic verb or noun (`comment`, `rename`, `bump`) also names real
+/// engineering work ("add comment support", "rename it and update every
+/// caller", "bump tokio and fix whatever breaks"), so none of those is one.
 const LOW_RISK_STEMS: &[&str] = &[
     "typo",
     "spelling",
-    "wording",
-    "readme",
-    "docstring",
     "formatting",
-    "one-line",
+    "whitespace",
+    "rustfmt",
+    "tag",
+    "label",
+    "mechanical",
+    "repetitive",
+    "bulk",
+    "regenerat",
 ];
+const LOW_RISK_PHRASES: &[&str] = &["cargo fmt", "registry entry"];
 
-/// Words that widen a change past a small one: any of them cancels the
-/// low-risk rule.
+/// Words that widen a change past a small one, authoring words (writing
+/// that needs judgement) and words naming code to build around a tag or a
+/// label: any of them cancels the low-risk rule.
 const BROADENING_STEMS: &[&str] = &[
     "every",
     "whatever",
@@ -878,6 +886,22 @@ const BROADENING_STEMS: &[&str] = &[
     "implement",
     "support",
     "feature",
+    "write",
+    "draft",
+    "document",
+    "explain",
+    "describ",
+    "summar",
+    "clarif",
+    "reword",
+    "rephras",
+    "comment",
+    "filter",
+    "render",
+    "pars",
+    "endpoint",
+    "api",
+    "display",
 ];
 
 /// File extensions a path token ends with.
@@ -972,10 +996,15 @@ fn named_crates(tokens: &[&str]) -> usize {
 /// - `crate_scope` +1 from two distinct crates named (`crates/<name>` or a
 ///   `spawn-<name>` token), +2 from three;
 /// - `long_brief` +1 above 2000 characters;
-/// - `low_risk` -2: a low-risk marker (typo, spelling, readme, docstring,
-///   ...), only when no `security`, `migration` or `concurrency` rule
-///   matched and no broadening word (every, whatever, caller, implement,
-///   support, feature) is there.
+/// - `low_risk` -2: a mechanical marker (typo, spelling, formatting,
+///   whitespace, rustfmt, "cargo fmt", tag*, label*, mechanical,
+///   repetitive, bulk, regenerat*, "registry entry"), only when no
+///   `security`, `migration` or `concurrency` rule matched and no
+///   broadening word is there: a widening one (every, whatever, caller,
+///   implement, support, feature), an authoring one (write, draft,
+///   document*, explain*, describ*, summar*, clarif*, reword, rephras*,
+///   comment*) or one naming code to build (filter, render, pars*,
+///   endpoint, api, display).
 ///
 /// `l3` from [`CLASSIFY_L3_AT`]; `l1` at or below [`CLASSIFY_L1_AT`] when
 /// no risk rule matched, at most one file is named and the brief is at
@@ -1060,7 +1089,7 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
         add(
             "low_risk",
             -2,
-            matched(&words, &text, LOW_RISK_STEMS, &["docs only", "doc only"]),
+            matched(&words, &text, LOW_RISK_STEMS, LOW_RISK_PHRASES),
         );
     }
     let score: i32 = signals.iter().map(|signal| signal.points).sum();
@@ -2006,6 +2035,89 @@ mod tests {
             classify_difficulty("Fix the spelling in the docstring").difficulty,
             TaskDifficulty::L1
         );
+    }
+
+    #[test]
+    fn brief_v2_keeps_semantic_writing_out_of_l1() {
+        for brief in [
+            "Update the README wording for the install section",
+            "Write the docstring for route_preset",
+            "Improve the wording of the error message",
+            "Docs only: explain the reprobe rule",
+            "Make the one-line change in a.rs",
+            "Fix the typo and reword the sentence in README.md",
+            "Fix the typo in the comment",
+            "Draft a summary of the formatting rules",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert_eq!(
+                classified.difficulty,
+                TaskDifficulty::L2,
+                "{brief}: {classified:?}"
+            );
+            assert!(
+                classified
+                    .signals
+                    .iter()
+                    .all(|signal| signal.rule != "low_risk"),
+                "{brief}: {classified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn brief_v2_sends_mechanical_and_tagging_work_to_l1() {
+        for (brief, evidence) in [
+            ("Tag the 40 open tasks with their capability", "tag"),
+            ("Add the registry entry for the new file", "registry entry"),
+            ("Label the stale issues", "label"),
+            ("Run cargo fmt on crates/spawn-core/src/grading.rs", "cargo fmt"),
+            ("Strip the trailing whitespace", "whitespace"),
+            ("Regenerate the fixtures", "regenerat"),
+            ("A mechanical bulk rename of the constant", "mechanical"),
+            ("Fix the typo in README.md", "typo"),
+        ] {
+            let classified = classify_difficulty(brief);
+            assert_eq!(
+                classified.difficulty,
+                TaskDifficulty::L1,
+                "{brief}: {classified:?}"
+            );
+            let low = classified
+                .signals
+                .iter()
+                .find(|signal| signal.rule == "low_risk")
+                .expect(brief);
+            assert_eq!(low.points, -2);
+            assert!(low.evidence.contains(&evidence.to_string()), "{low:?}");
+        }
+    }
+
+    #[test]
+    fn brief_v2_tags_and_labels_inside_real_work_stay_out_of_l1() {
+        for brief in [
+            "Implement label support",
+            "Add tag filtering to the task list",
+            "Render the labels on the web timeline",
+            "Parse the tag from the commit message",
+            "Add a label endpoint to the API",
+            "Display each task's tags",
+            "Add a bulk delete feature",
+            "Store the label in the tasks table inside one transaction",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert!(
+                classified.difficulty >= TaskDifficulty::L2,
+                "{brief}: {classified:?}"
+            );
+            assert!(
+                classified
+                    .signals
+                    .iter()
+                    .all(|signal| signal.rule != "low_risk"),
+                "{brief}: {classified:?}"
+            );
+        }
     }
 
     #[test]
