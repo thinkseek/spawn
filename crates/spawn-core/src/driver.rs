@@ -286,7 +286,6 @@ pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) 
                 )
             }
         }
-        ("agy", Some("permission_prompt" | "question_prompt"), _) => Answer::Escalate(UNCAPTURED),
         ("claude", _, "trust") => Answer::Keys(&crate::screen::TRUST_KEYS),
         (
             "claude",
@@ -299,12 +298,14 @@ pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) 
         {
             Answer::Keys(&CLAUDE_YES)
         }
-        (
+        // Rows whose screen nobody has captured working yet.
+        ("agy", Some("permission_prompt" | "question_prompt"), _)
+        | (
             "claude",
             Some("live_blocked_form" | "mcp_elicitation_prompt" | "dynamic_workflow_prompt"),
             _,
-        ) => Answer::Escalate(UNCAPTURED),
-        ("codex", Some("trust_directory" | "startup_update" | "live_strong_blocker"), _)
+        )
+        | ("codex", Some("trust_directory" | "startup_update" | "live_strong_blocker"), _)
         | ("opencode", Some("permission_required"), _) => Answer::Escalate(UNCAPTURED),
         _ => Answer::Escalate("no row of the resolver's table covers this dialog"),
     }
