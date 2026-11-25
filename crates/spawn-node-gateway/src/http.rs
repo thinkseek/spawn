@@ -16,14 +16,15 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The request line and headers together: at most this many bytes.
 pub const MAX_HEAD: u64 = 16 * 1024;
 /// At most this many header lines.
 pub const MAX_HEADERS: usize = 64;
-/// A connection idle (or a body stalled) this long is closed.
+/// One read that waits longer than this (a stalled body) fails.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// A peer that does not read its answer for this long is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_mins(1);
@@ -32,6 +33,78 @@ const MAX_REQUESTS_PER_CONNECTION: usize = 1000;
 /// Connections waiting for a worker, per worker; past it a new connection
 /// is closed at once.
 const BACKLOG_PER_WORKER: usize = 4;
+
+/// How long a connection may take, so that slow or idle peers cannot hold
+/// the workers: every wait is bounded by a deadline, not only per read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Between requests (and before the first): a kept-alive connection
+    /// idle this long is closed.
+    pub idle: Duration,
+    /// From a request's first byte to the end of its head.
+    pub head: Duration,
+    /// A body's deadline: this, plus its length at `body_min_rate`.
+    pub body_base: Duration,
+    /// The slowest upload taken, in bytes per second.
+    pub body_min_rate: u64,
+    /// After a refusal that left the body unread: at most this many body
+    /// bytes are read and discarded (after the answer is written), so the
+    /// client reads the answer instead of a reset...
+    pub drain_bytes: u64,
+    /// ...for at most this long.
+    pub drain_time: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(5),
+            head: Duration::from_secs(10),
+            body_base: Duration::from_secs(10),
+            body_min_rate: 256 * 1024,
+            drain_bytes: 4 * 1024 * 1024,
+            drain_time: Duration::from_secs(2),
+        }
+    }
+}
+
+impl Timeouts {
+    /// The time a body of `len` bytes may take.
+    pub fn body(&self, len: u64) -> Duration {
+        self.body_base + Duration::from_secs(len / self.body_min_rate.max(1))
+    }
+}
+
+/// The socket's read side under a deadline: each read waits at most until
+/// the deadline (and at most [`READ_TIMEOUT`]); past it, reads fail with
+/// `TimedOut`.
+pub struct TimedStream {
+    stream: TcpStream,
+    deadline: Cell<Option<Instant>>,
+}
+
+impl TimedStream {
+    fn set_deadline(&self, after: Duration) {
+        self.deadline.set(Some(Instant::now() + after));
+    }
+}
+
+impl Read for TimedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let wait = match self.deadline.get() {
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"));
+                }
+                left.min(READ_TIMEOUT)
+            }
+            None => READ_TIMEOUT,
+        };
+        self.stream.set_read_timeout(Some(wait))?;
+        self.stream.read(buf)
+    }
+}
 
 /// One request: the head parsed, the body still on the socket.
 pub struct Request<'a> {
@@ -42,7 +115,7 @@ pub struct Request<'a> {
     pub headers: Vec<(String, String)>,
     /// The TCP peer.
     pub peer: IpAddr,
-    body: io::Take<&'a mut BufReader<TcpStream>>,
+    body: io::Take<&'a mut BufReader<TimedStream>>,
     writer: &'a mut TcpStream,
     continue_pending: bool,
 }
@@ -172,7 +245,12 @@ pub trait Handler: Send {
 /// Serve `listener` with `workers` threads, each with the handler `make`
 /// gives it; returns the bound address. The threads run until the process
 /// exits.
-pub fn spawn<H, F>(listener: TcpListener, workers: usize, make: F) -> io::Result<SocketAddr>
+pub fn spawn<H, F>(
+    listener: TcpListener,
+    workers: usize,
+    timeouts: Timeouts,
+    make: F,
+) -> io::Result<SocketAddr>
 where
     H: Handler + 'static,
     F: Fn() -> H,
@@ -186,7 +264,7 @@ where
         let handler = make();
         std::thread::Builder::new()
             .name(format!("gateway-worker-{index}"))
-            .spawn(move || worker(&receiver, handler))?;
+            .spawn(move || worker(&receiver, handler, timeouts))?;
     }
     std::thread::Builder::new()
         .name("gateway-accept".into())
@@ -211,7 +289,7 @@ fn accept(listener: &TcpListener, sender: &SyncSender<TcpStream>) {
     }
 }
 
-fn worker<H: Handler>(receiver: &Mutex<Receiver<TcpStream>>, mut handler: H) {
+fn worker<H: Handler>(receiver: &Mutex<Receiver<TcpStream>>, mut handler: H, timeouts: Timeouts) {
     loop {
         let stream = {
             let receiver = receiver
@@ -220,7 +298,7 @@ fn worker<H: Handler>(receiver: &Mutex<Receiver<TcpStream>>, mut handler: H) {
             receiver.recv()
         };
         let Ok(stream) = stream else { return };
-        if let Err(error) = connection(stream, &mut handler)
+        if let Err(error) = connection(stream, &mut handler, timeouts)
             && !matches!(
                 error.kind(),
                 io::ErrorKind::BrokenPipe
@@ -249,14 +327,26 @@ enum Head {
     Malformed,
 }
 
-fn connection<H: Handler>(stream: TcpStream, handler: &mut H) -> io::Result<()> {
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+fn connection<H: Handler>(stream: TcpStream, handler: &mut H, timeouts: Timeouts) -> io::Result<()> {
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let peer = stream.peer_addr()?.ip();
     let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(TimedStream {
+        stream,
+        deadline: Cell::new(None),
+    });
     for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+        // Idle until a request's first byte, then the whole head within
+        // its deadline.
+        reader.get_ref().set_deadline(timeouts.idle);
+        match reader.fill_buf() {
+            Ok([]) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if is_idle_end(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        reader.get_ref().set_deadline(timeouts.head);
         let (method, target, headers, http10) = match read_head(&mut reader)? {
             Head::Request {
                 method,
@@ -281,6 +371,9 @@ fn connection<H: Handler>(stream: TcpStream, handler: &mut H) -> io::Result<()> 
                         .split(',')
                         .any(|token| token.trim().eq_ignore_ascii_case("close"))
             });
+        reader
+            .get_ref()
+            .set_deadline(timeouts.body(framed.unwrap_or(0)));
         let mut request = Request {
             method,
             target,
@@ -294,14 +387,31 @@ fn connection<H: Handler>(stream: TcpStream, handler: &mut H) -> io::Result<()> 
         // A body not read to its end (or a request not framed by one
         // Content-Length) leaves the stream where the next request cannot
         // be found: the connection ends with this answer.
-        let close = wants_close || framed.is_none() || request.body_remaining() > 0;
+        let unread = framed.is_none() || request.body_remaining() > 0;
+        // A client told to wait for `100 Continue` and never told sends no
+        // body: nothing to drain.
+        let body_coming = unread && !request.continue_pending;
+        let close = wants_close || unread;
         drop(request);
         write_response(&mut writer, response, close)?;
         if close {
+            if body_coming {
+                drain(&mut reader, timeouts);
+            }
             return Ok(());
         }
     }
     Ok(())
+}
+
+/// Reads and discards what the client still sends of a refused body, up to
+/// [`Timeouts::drain_bytes`] and [`Timeouts::drain_time`], after the answer
+/// is written and the write side shut: a client still writing its upload
+/// (Go's `net/http`) then reads the signed refusal instead of `broken
+/// pipe`, and a peer cannot keep the worker past the bound.
+fn drain(reader: &mut BufReader<TimedStream>, timeouts: Timeouts) {
+    reader.get_ref().set_deadline(timeouts.drain_time);
+    let _ = io::copy(&mut reader.take(timeouts.drain_bytes), &mut io::sink());
 }
 
 /// The body length of a request framed by exactly one `Content-Length` of
@@ -327,7 +437,7 @@ fn framed_length(headers: &[(String, String)]) -> Option<u64> {
     }
 }
 
-fn read_head(reader: &mut BufReader<TcpStream>) -> io::Result<Head> {
+fn read_head(reader: &mut BufReader<TimedStream>) -> io::Result<Head> {
     let mut budget = reader.by_ref().take(MAX_HEAD);
     let mut line = Vec::new();
     // Tolerate empty lines before a request line (RFC 9112 §2.2).
