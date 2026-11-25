@@ -698,6 +698,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawn-cas"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "spawn-cli"
 version = "0.1.0"
 dependencies = [
