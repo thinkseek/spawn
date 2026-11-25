@@ -65,7 +65,7 @@ A GET's signed body is empty (`e3b0c442...b855`).
 
 ### 2.3 Response signature
 
-Every response the gateway itself produces is signed, success or refusal. The one exception is an artifact or manifest body (section 3.6).
+Every response the gateway itself produces is signed, success or refusal, including `GET /node/v1/registry-manifest`. The one exception is the body of an artifact GET, `GET /node/v1/artifacts/...` (`200`, `206`, and its `416`; section 3.6).
 A signed response carries `Spawn-Primary-Key` (the primary's key id: hex SHA-256 of its raw public key) and `Spawn-Primary-Sig` (base64url). The signature covers seven lines:
 
 ```
@@ -100,9 +100,9 @@ The body is `{"v":1,"error":"<error>","server_time_ms":N}`, signed (`refusals.js
 | 409 | `lease_fenced` | a result for an epoch that moved, or another result already stored for that epoch | keep `results/<job>.<epoch>/` until GC; stop advertising it |
 | 413 | `too_large` | result metadata over 256 KiB or log over 32 MiB | truncate per section 3.5 and resend |
 | 429 | `busy` | pacing (section 2.6); a second upload of the same result at once | backoff |
-| 503 | `busy` | PostgreSQL unreachable or failing | backoff |
+| 503 | `busy` | PostgreSQL unreachable or failing; a `registry-manifest.json` that is not a manifest | backoff |
 
-Outside the table, a missing artifact or manifest is a signed `404 {"v":1,"error":"not_found",...}`. An unsatisfiable range is an unsigned `416` with `Content-Range: bytes */<len>`.
+Outside the table, a missing artifact or manifest is a signed `404 {"v":1,"error":"not_found",...}`. An artifact range that starts past the end is a `416` with `Content-Range: bytes */<len>` and an empty body. Like every artifact answer it is **unsigned**: it says nothing a node acts on beyond "fetch the whole file".
 
 #### Order of checks
 
@@ -163,6 +163,22 @@ On the wire a grant is `{"grant":"<b64u bytes>","sig":"<b64u>"}`, at most 8 KiB 
 The node verifies the signature, then parses those same bytes. It refuses a grant for another node, an expired one, or one whose `env` names a variable the node sets itself (`PATH`, `HOME`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `SPAWN_TEST_DATABASE_URL`, `SPAWN_GATE_PG_IMAGE`, `SPAWN_GATE_PG_BIN`).
 The gateway drops a lease whose grant cannot be built, and logs it. The node never holds that lease, so its next beat gives it back.
 
+### 3.2 Backoff and timeouts
+
+Every refusal whose reaction is "backoff" (section 2.4), and every transport failure (no answer, an unsigned answer, or one whose signature does not verify), is retried with **Full Jitter**: the n-th retry waits a uniformly random time in `[0, min(cap, base · 2^n))`. The daemon owns `base` and `cap` (design §3.2), and a signed success resets `n`.
+`429` and `503` are always `busy`, so a node cannot tell pacing from an outage, and backs off from both the same way.
+
+The gateway bounds every wait, so slow or idle peers cannot hold its 16 workers:
+
+| Wait | Bound |
+| --- | --- |
+| a kept-alive connection idle between requests (or before the first) | 5 s, then closed |
+| a request head, from its first byte | 10 s in all (and at most 16 KiB, 64 headers), then closed |
+| a request body | 10 s + its length at 256 KiB/s (a full 32 MiB result: about 138 s); no single read waits over 15 s |
+| a refused body still arriving | after the signed refusal is written and the write side shut, at most 4 MiB or 2 s more is read and discarded, then the connection closes. A client still writing (Go's `net/http`) reads the refusal instead of `broken pipe` |
+| a client not reading its answer | 60 s per write |
+| one ledger call | the login's `statement_timeout` 5 s, `lock_timeout` 2 s; a connect gives up after 5 s (`503 busy`) |
+
 ### 3.3 Spec
 
 `POST /node/v1/spec` (at most 64 KiB) carries `v`, `name`, `cell_id`, `labels`, `resources_total` (`cores`, `mem_mb`, `disk_mb`), `capacities_total`, `tmpfs_budget_mb`, `holds` and optionally `versions`.
@@ -174,6 +190,8 @@ The ledger takes it only from the node's current boot (`409 beat_first` otherwis
 A node's `spec.holds` and a job's `requires` are maps over `registry` (`tree_sha256_v1` of the cargo registry), `web_lock` (SHA-256 of `web/package-lock.json`), `toolchain` (the `rust-toolchain.toml` channel) and `pg` (the gate's PostgreSQL major version).
 A job is leased to a node only when `requires <@ holds`, key by key. Otherwise the answer's `need_sync` names what to fetch.
 Grants are given only when the node is not drained or degraded, needs no spec, and does not say `draining`. They go in priority order and then by age. Each grant must fit the `free` capacities and tmpfs the beat reports, after the grants before it in the same answer. Jobs are taken with `SKIP LOCKED`, so two beating nodes never share a job.
+
+A gate's inputs are fetched **delta-first**: the grant always lists the delta bundle (the candidate against its base) and the controller pack. It lists the baseline bundle only when the node needs the base. The ledger answers `needs_baseline: false` when the job's base commit is among the beat's `warm_bases`, and the gateway then leaves every `baseline_bundle` entry out of `artifact_urls` before it signs the grant.
 
 ### 3.5 Result framing
 
@@ -191,13 +209,20 @@ The gateway:
 5. syncs `log.part` and renames it to `log`, then writes `meta.json` (the line as received; synced, renamed), **before** the ledger call. The same result sent again rewrites nothing. A different result already stored for that epoch is `409 lease_fenced`, and its files are left untouched;
 6. calls `spawn_node_gw_result` with the metadata plus `result_sha256` (SHA-256 of the line). True means this call, or an identical earlier one, completed the job; the answer is `200 {"v":1,"server_time_ms":N,"job_id":"...","lease_epoch":E}`. False means the lease moved: the files this request wrote are removed, and the answer is `409 lease_fenced`.
 
+A node never sends a log over 32 MiB. It truncates each stream, stdout and stderr, to its first 4 MiB and last 4 MiB, with a marker line between them saying how much was cut, and sets `truncated: true`. `log_bytes`, `log_sha256` and `stdout_bytes` describe the bytes actually sent. A `413 too_large` (section 2.4) means the node did not truncate, and it truncates and resends.
+
 ### 3.6 Artifacts and the registry manifest
 
-`GET /node/v1/artifacts/sha256:<hex>` serves `SPAWN_NODE_ARTIFACTS/sha256/<first 2 hex>/<hex>`. `GET /node/v1/registry-manifest` serves `SPAWN_NODE_ARTIFACTS/registry-manifest.json`.
-Both require the node's cached key for its current boot (`409 beat_first` on a miss, zero database calls) and a valid signature.
-They answer with `Content-Length` and `Accept-Ranges: bytes`. One `bytes` range gets `206` with `Content-Range`. Several ranges, or a malformed range, get the whole file. A range starting past the end gets `416`.
-The bodies are **not signed**: a node believes an artifact only if it hashes to its address, and the manifest only if the registry it describes hashes to the grant's `requires.registry`.
+`GET /node/v1/artifacts/sha256:<hex>` serves `SPAWN_NODE_ARTIFACTS/sha256/<first 2 hex>/<hex>`.
+It requires the node's cached key for its current boot (`409 beat_first` on a miss, zero database calls) and a valid signature.
+It answers with `Content-Length` and `Accept-Ranges: bytes`. One `bytes` range gets `206` with `Content-Range`. Several ranges, or a malformed range, get the whole file. A range starting past the end gets `416`.
+The artifact bodies (and the `416`) are **not signed**: a node believes an artifact only if it hashes to its address.
 `blake3:` addresses parse but have no file in v1 (`400`).
+
+`GET /node/v1/registry-manifest` is not an artifact. It needs the same cached key and signature, and it answers **signed JSON**, as section 2.3 requires of every gateway answer.
+The gateway reads `SPAWN_NODE_ARTIFACTS/registry-manifest.json` (at most 1 MiB). The file must be a strict JSON object with `registry` (64 lowercase hex: the `tree_sha256_v1` of the cargo registry) and `pack` (`{"digest":"sha256:<hex>","size":N}`: the packed registry, itself fetched as an artifact).
+The answer keeps the file's members, sets `"v":1` and `"server_time_ms":N`, and is `200` with `Content-Type: application/json`, `Spawn-Primary-Key` and `Spawn-Primary-Sig`.
+A missing file is a signed `404 not_found`. A file that is not a manifest is logged and answered with a signed `503 busy`.
 
 ## Gateway configuration
 
