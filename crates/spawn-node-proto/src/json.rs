@@ -193,8 +193,10 @@ impl Scan<'_> {
                 b'u' => {
                     let high = self.hex4()?;
                     let code = if (0xd800..0xdc00).contains(&high) {
-                        self.expect(b'\\')?;
-                        self.expect(b'u')?;
+                        if !self.bytes[self.at..].starts_with(b"\\u") {
+                            return Err(Error::Json("lone surrogate"));
+                        }
+                        self.at += 2;
                         let low = self.hex4()?;
                         if !(0xdc00..0xe000).contains(&low) {
                             return Err(Error::Json("lone surrogate"));
