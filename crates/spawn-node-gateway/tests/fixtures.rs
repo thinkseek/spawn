@@ -281,9 +281,19 @@ fn artifact_misses_and_the_registry_manifest() {
     let reply = harness.get(&other_boot, "/node/v1/registry-manifest", 5, &[]);
     assert_eq!(reply.status, 409);
     reply.verify(&node_id(), &"f".repeat(32), 5);
-    // A forged GET on a cache hit.
-    let mut forged = harness.get(&stranger(), "/node/v1/registry-manifest", 6, &[]);
-    forged.headers.clear();
+    // A forged GET under the node's id, on a cache hit.
+    let envelope = stranger()
+        .sign(Method::Get, "/node/v1/registry-manifest", 6, common::now_ms(), b"")
+        .unwrap();
+    let mut headers: Vec<(String, String)> = envelope
+        .to_headers()
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    headers[0].1 = node_id();
+    harness
+        .send("GET", "/node/v1/registry-manifest", &headers, None)
+        .assert_refused(Refusal::BadSignature, 6);
     assert_eq!(harness.gateway.db_calls(), 0);
 }
 
