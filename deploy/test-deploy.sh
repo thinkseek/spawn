@@ -121,6 +121,9 @@ fake_home=$scratch/home
 mkdir -p "$fake_home/.config" "$fake_home/.cache" "$fake_home/.local/share"
 export HOME=$fake_home XDG_CACHE_HOME=$fake_home/.cache XDG_CONFIG_HOME=$fake_home/.config \
   XDG_DATA_HOME=$fake_home/.local/share
+# The value collector's copies outside $live (deploy.sh, issue 98): stand-ins in the scratch, never
+# the host's /var/tmp/spawn or /usr/local/lib/spawn/redact.
+export SPAWN_DEPLOY_SCANNER_DIR=$scratch/scanner SPAWN_DEPLOY_REDACT_DIR=$scratch/redact
 guard_home() {
   local gh_scratch gh_real gh_path gh_name
   [ -n "$scratch" ] && [ -n "$real_home" ] || {
@@ -421,8 +424,18 @@ echo "== the next deploy completes it (the model relay's unit is not installed)"
 # Main is HEAD now: the operator runs the gate again, over it.
 verdict_over "$head"
 : >"$SYSTEMCTL_LOG"
+mkdir -p "$scratch/scanner" "$scratch/redact"
+printf '# an older collector\n' >"$scratch/scanner/secret-values.py"
+printf '# an older collector\n' >"$scratch/redact/secret-values.py"
 deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "the value collector is installed beside the binary" \
+  cmp -s "$checkout/scripts/redact/secret-values.py" "$live/bin/secret-values.py"
+check "the push scan's older copy is replaced" \
+  cmp -s "$checkout/scripts/redact/secret-values.py" "$scratch/scanner/secret-values.py"
+check "the redaction's root-owned copy is only said to differ" \
+  bash -c 'grep -q "redact/secret-values.py differs from the deployed collector" "$1" && grep -qx "# an older collector" "$2"' \
+  _ "$out" "$scratch/redact/secret-values.py"
 check "released the owner's hold" [ -z "$(missions_hold)" ]
 check "says so" grep -q "released the owner's hold $held on $missions" "$out"
 check "says the relay unit is not installed" grep -q "installed model-relay.py (unit spawn-model-relay is not installed" "$out"

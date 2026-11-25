@@ -20,7 +20,10 @@ case "$*" in
   *is-active*) echo "$FAKE_ACTIVE" ;;
   *ExecMainStartTimestamp*) echo "$FAKE_STARTED" ;;
   *InvocationID*) echo "${FAKE_INV-}" ;;
-  *" cat "*) cat "$FAKE_UNIT" ;;
+  # FAKE_UNITS (unset in the first cases): a folder of spawn-* unit texts, drop-ins included, as
+  # `systemctl --user cat` shows them; any other unit is the relay's ($FAKE_UNIT).
+  *list-unit-files*) [ -n "${FAKE_UNITS-}" ] && ls "$FAKE_UNITS" ;;
+  *" cat "*) u=${!#}; if [ -n "${FAKE_UNITS-}" ] && [ -f "$FAKE_UNITS/$u" ]; then cat "$FAKE_UNITS/$u"; else cat "$FAKE_UNIT"; fi ;;
 esac
 EOF
 cat >"$bin/journalctl" <<'EOF'
@@ -114,6 +117,88 @@ printf 'made-up-test-value' >"$scratch/keep/typesafe.api-key"; chmod 600 "$scrat
 FAKE_STARTED="$(date -d '-20 min' '+%a %F %T %z')" out2=$(run)
 ! grep -q made-up-test-value <<<"$out$out2" && ! grep -q made-up-test-value "$scratch/alerts" &&
   pass "no credential value in output or records" || fail "value leaked"
+
+# --- The manifest (issue 98): several rows, unit drop-ins, a scanner's source, unit drift ---
+# A second, made-up row (demo.token: no unit, a legacy file and keys, a scanner source), beside the
+# relay's; spawn-* units as systemctl shows them in $scratch/fakeunits (one with spawn.env's
+# EnvironmentFile=, as live: no fault); deploy/systemd stand-in in $scratch/deploy.
+reset2() {
+  rm -rf "$scratch/units"/*
+  reset
+  rm -rf "$scratch/fakeunits" "$scratch/home/.config" "$scratch/deploy" "$scratch/keep/demo.token"
+  mkdir -p "$scratch/fakeunits" "$scratch/home/.config/spawn" "$scratch/deploy"
+  printf 'made-up-demo-value' >"$scratch/keep/demo.token"; chmod 600 "$scratch/keep/demo.token"
+  touch -d '-10 min' "$scratch/keep/demo.token"
+  : >"$scratch/home/.config/spawn/demo-scan.env"
+  printf '[Service]\nEnvironmentFile=%%h/.local/share/spawn-rsi/spawn.env\n' >"$scratch/fakeunits/spawn-credential-health.service"
+  { printf '# made-up rows\n\n'
+    printf 'typesafe.api-key | spawn-jev-relay.service | http://127.0.0.1:8790/healthz | jev-relay | ~/.config/spawn/typesafe.env | TYPESAFE_API_KEY | -\n'
+    printf 'demo.token|-|-|-|~/.config/spawn/demo.env|DEMO_TOKEN,DEMO_SECRET|~/.config/spawn/demo-scan.env\n'
+  } >"$scratch/manifest"
+}
+run2() { CH_MANIFEST="$scratch/manifest" FAKE_UNITS="$scratch/fakeunits" run; }
+n_fired() { local n; n=$(grep -c "\"type\":\"alert.fired\".*credential_health:$1" "$scratch/alerts" 2>/dev/null); echo "${n:-0}"; }
+expect_fired() { # expect_fired <name> <subject:class>...: exactly these alerts fired
+  local want=$# name=$1 s; shift; want=$((want - 1))
+  for s in "$@"; do [ "$(n_fired "$s:")" = 1 ] || { fail "$name"; cat "$scratch/alerts" 2>/dev/null; return; }; done
+  [ "$(n_fired "")" = "$want" ] && pass "$name" || { fail "$name"; cat "$scratch/alerts" 2>/dev/null; }
+}
+
+reset2; out=$(run2)
+[ ! -s "$scratch/alerts" ] && [ "$(grep -c '^credential-health: ok: ' <<<"$out")" = 2 ] &&
+  pass "two rows healthy, another unit's EnvironmentFile=spawn.env: no alert, an ok line each" || fail "two rows healthy"
+reset2; rm "$scratch/keep/demo.token"; run2 >/dev/null
+expect_fired "second row's Keep file gone, its scanner source there: delivery_missing on its own subject" demo.token:delivery_missing
+reset2; rm "$scratch/keep/demo.token" "$scratch/home/.config/spawn/demo-scan.env"; run2 >/dev/null
+expect_fired "scanner source and its Keep twin both gone: scanner_source too" demo.token:delivery_missing demo.token:scanner_source
+reset2; rm "$scratch/keep/demo.token" "$scratch/home/.config/spawn/demo-scan.env"; CH_UPTIME_S=300 run2 >/dev/null
+expect_fired "scanner source and Keep twin gone within the boot grace: no alert"
+reset2; : >"$scratch/home/.config/spawn/demo.env"; run2 >/dev/null
+expect_fired "second row's legacy file back: legacy_env on its subject only" demo.token:legacy_env
+reset2; printf '# /u/spawn-loop.service\n[Service]\nExecStart=x\n\n# /u/spawn-loop.service.d/env.conf\n[Service]\nEnvironmentFile=-%%h/.config/spawn/demo.env\n' \
+  >"$scratch/fakeunits/spawn-loop.service"; run2 >/dev/null
+expect_fired "a spawn-* unit's drop-in loads a legacy file (systemctl cat): legacy_env" demo.token:legacy_env
+reset2; mkdir -p "$scratch/units/spawn-serve.service.d"
+printf '[Service]\nEnvironmentFile=%%h/.config/spawn/typesafe.env\n' >"$scratch/units/spawn-serve.service.d/override.conf"; run2 >/dev/null
+expect_fired "a drop-in file in the unit folder names typesafe.env: legacy_env" typesafe.api-key:legacy_env
+reset2; printf '[Service]\nEnvironment=A=1 "DEMO_SECRET=made-up-demo-value"\n' >"$scratch/fakeunits/spawn-serve.service"; out=$(run2)
+expect_fired "a spawn-* unit sets a legacy key by Environment=: legacy_env" demo.token:legacy_env
+! grep -q made-up-demo-value <<<"$out" && ! grep -q made-up-demo-value "$scratch/alerts" &&
+  pass "the Environment= value is in no output or record" || fail "Environment= value leaked"
+reset2; printf '[Service]\nEnvironment=NOT_DEMO_SECRET=1 DEMO_TOKENS=2\n' >"$scratch/fakeunits/spawn-serve.service"; run2 >/dev/null
+expect_fired "longer names holding a legacy key's name: no alert"
+
+reset2; printf '[Unit]\n' >"$scratch/deploy/spawn-a.service"; cp "$scratch/deploy/spawn-a.service" "$scratch/units/"
+printf '[Unit]\n' >"$scratch/deploy/spawn-b.timer"; printf 'x\n' >"$scratch/units/spawn-own.service"
+CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2 >/dev/null
+expect_fired "unit drift opt-in, installed units as deployed (one not installed, one not deployed): none"
+printf '[Unit]\nDescription=edited\n' >"$scratch/units/spawn-a.service"; CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2 >/dev/null
+expect_fired "an installed unit differs from deploy/systemd: unit_drift" spawn-units:unit_drift
+key=$(sed -n 's/.*"key":"\(credential_health:spawn-units:unit_drift:[0-9]*\)".*/\1/p' "$scratch/alerts" | head -1)
+printf 'OPEN %s\n' "$key" >>"$scratch/alerts"; run2 >/dev/null
+! grep -q 'alert.cleared.*unit_drift' "$scratch/alerts" && pass "drift not opted in: its open alert left alone" || fail "drift touched without opt-in"
+cp "$scratch/deploy/spawn-a.service" "$scratch/units/"; CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2 >/dev/null
+grep -q "alert.cleared.*$key" "$scratch/alerts" && pass "drift mended: unit_drift cleared" || fail "drift cleared"
+
+reset2; printf 'demo.token|-|-|-|-|-\n' >>"$scratch/manifest"; out=$(run2); st=$?
+[ "$st" = 2 ] && [ ! -s "$scratch/alerts" ] && grep -q 'nothing checked' <<<"$out" &&
+  pass "a manifest row without 7 fields: refused (exit 2), nothing checked" || fail "bad manifest row"
+reset2; out=$(CH_MANIFEST="$scratch/none" run); st=$?
+[ "$st" = 2 ] && [ ! -s "$scratch/alerts" ] && pass "no manifest: refused (exit 2)" || fail "no manifest"
+reset2; out=$(CH_MANIFEST="$scratch/fakeunits" run 2>&1); st=$?
+[ "$st" = 2 ] && [ ! -s "$scratch/alerts" ] && grep -q 'nothing checked' <<<"$out" &&
+  pass "a folder as the manifest: refused (exit 2), nothing checked" || fail "a folder as the manifest"
+bad_row() { # bad_row <name> <row>: a manifest whose second row is <row> is refused
+  reset2; printf '%s\n' "$2" >>"$scratch/manifest"; out=$(run2 2>&1); st=$?
+  [ "$st" = 2 ] && [ ! -s "$scratch/alerts" ] && grep -q 'nothing checked' <<<"$out" && pass "$1" || fail "$1"
+}
+bad_row "the reserved id spawn-units: refused" 'spawn-units|-|-|-|-|-|-'
+bad_row "a health URL that is a curl option (-K/...): refused" 'demo.other|spawn-x.service|-K/tmp/x|-|-|-|-'
+bad_row "a legacy file ending in /: refused" 'demo.other|-|-|-|~/.config/spawn/|-|-'
+bad_row "an inline # comment in a row: refused" 'demo.other|-|-|-|-|-|~/.config/spawn/x.env # note'
+rows=$(grep -v '^[[:space:]]*\(#\|$\)' "$here/credentials.manifest")
+[ "$(wc -l <<<"$rows")" = 1 ] && [[ $rows == "typesafe.api-key "*"| spawn-jev-relay.service "*"| ~/.config/spawn/typesafe.env "* ]] &&
+  pass "the manifest holds the one live row, typesafe.api-key by spawn-jev-relay" || fail "the manifest's live row"
 
 echo "$fails failed"
 [ "$fails" -eq 0 ]

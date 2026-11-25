@@ -2146,7 +2146,10 @@
         "rsi/scenarios/check-credential-health.sh",
         "rsi/scenarios/check-credential-prints.sh",
         "scripts/keep/credential-health.sh",
+        "scripts/keep/credentials.manifest",
         "scripts/keep/test-credential-health.sh",
+        "scripts/redact/secret-values.py",
+        "scripts/redact/test-secret-values.sh",
         "scripts/rsi/check-credential-prints.py",
         "scripts/rsi/test-check-credential-prints.sh"
       ],
@@ -2177,7 +2180,9 @@
         "agents": [],
         "commits": [],
         "tests": [
-          "crates/spawn-postgres/tests/control_mask.rs"
+          "crates/spawn-postgres/tests/control_mask.rs",
+          "scripts/keep/test-credential-health.sh",
+          "scripts/redact/test-secret-values.sh"
         ],
         "deploys": [],
         "artifacts": [],

@@ -841,6 +841,33 @@ if ! cmp -s "$export_dir/scripts/storage-extents.py" "$live/bin/storage-extents.
   install -m 644 "$export_dir/scripts/storage-extents.py" "$live/bin/storage-extents.py"
   say "installed storage-extents.py"
 fi
+# The value collector (scripts/redact/secret-values.py, issue 98: Keep first): installed beside
+# the binary as above. The push scan's copy ($SPAWN_DEPLOY_SCANNER_DIR, default /var/tmp/spawn,
+# beside secret-scan.sh) is replaced by a rename when it differs, never created on a host without
+# one. The root-owned copy the redaction and the store's file scan load ($SPAWN_DEPLOY_REDACT_DIR,
+# default /usr/local/lib/spawn/redact) is only compared: a deploy runs as the owner's user, so a
+# difference is said with the command that installs it. Only the install beside the binary can
+# stop the deploy (as storage-extents.py's can); the other two are said, never fatal.
+collector=$export_dir/scripts/redact/secret-values.py
+if [ -f "$collector" ]; then
+  if ! cmp -s "$collector" "$live/bin/secret-values.py"; then
+    install -m 644 "$collector" "$live/bin/secret-values.py"
+    say "installed secret-values.py"
+  fi
+  scanner_dir=${SPAWN_DEPLOY_SCANNER_DIR-/var/tmp/spawn}
+  if [ -f "$scanner_dir/secret-values.py" ] && ! cmp -s "$collector" "$scanner_dir/secret-values.py"; then
+    if install -m 600 "$collector" "$scanner_dir/.secret-values.py.new" &&
+      mv -f "$scanner_dir/.secret-values.py.new" "$scanner_dir/secret-values.py"; then
+      say "installed secret-values.py for the push scan in $scanner_dir"
+    else
+      say "the push scan's secret-values.py in $scanner_dir was not replaced (above)"
+    fi
+  fi
+  redact_dir=${SPAWN_DEPLOY_REDACT_DIR-/usr/local/lib/spawn/redact}
+  if [ -f "$redact_dir/secret-values.py" ] && ! cmp -s "$collector" "$redact_dir/secret-values.py"; then
+    say "$redact_dir/secret-values.py differs from the deployed collector; as root: install -m 644 $live/bin/secret-values.py $redact_dir/secret-values.py"
+  fi
+fi
 # The relays run from the live bin directory too; restart one only when its
 # script changed, so a deploy does not drop engines' model calls needlessly.
 # Last, so a relay cannot stop the deploy halfway. A relay whose unit is not

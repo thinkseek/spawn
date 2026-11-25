@@ -340,5 +340,14 @@ else
   echo "-- $default is not on this host: the cases above ran against the made-up list only"
 fi
 
+# The repository's own collector (scripts/redact/secret-values.py, issue 98), which deploy.sh
+# installs: the guard reads it as it reads the host's, and scripts/ and deploy/ are clean under it.
+own=$here/scripts/redact/secret-values.py
+if [ -f "$own" ]; then
+  SPAWN_SECRET_VALUES=$own python3 -I -B "$check_py" "$here/scripts" "$here/deploy" >/dev/null 2>"$scratch/err"
+  rc=$?
+  check "with the repository's scripts/redact/secret-values.py: scripts/ and deploy/ show no credential" [ "$rc" = 0 ]
+fi
+
 echo "test-check-credential-prints: $oks ok, $fails FAIL"
 [ "$fails" = 0 ]
