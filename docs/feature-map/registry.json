@@ -818,6 +818,8 @@
         "crates/spawn-cli/src/disk.rs",
         "crates/spawn-cli/src/provenance.rs",
         "crates/spawn-cli/src/provenance/index.rs",
+        "crates/spawn-cli/src/provenance/land_tests.rs",
+        "crates/spawn-cli/src/provenance/plan.rs",
         "crates/spawn-cli/src/provenance/tests.rs",
         "crates/spawn-cli/src/scratch_owner.rs",
         "crates/spawn-cli/src/scratch_owner/tests.rs",
