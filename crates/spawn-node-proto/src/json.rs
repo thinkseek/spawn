@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn strict_json_refuses_duplicates_floats_big_integers_and_a_bom() {
-        check(br#"{"v":1,"a":[1,-2,{"b":null}],"s":"é😀"}"#).unwrap();
+        check(r#"{"v":1,"a":[1,-2,{"b":null}],"s":"é😀\ud83d\ude00"}"#.as_bytes()).unwrap();
         check(b"9007199254740991").unwrap();
         check(b"-9007199254740991").unwrap();
         for (bad, why) in [
