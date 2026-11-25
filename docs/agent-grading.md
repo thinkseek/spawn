@@ -200,7 +200,7 @@ must not see `evals/`: see `evals/onboarding/README.md`.
 Every phase-1 call, record, answer and test is unchanged: each addition is
 named only when it says something.
 
-### Difficulty classifier (`classify_difficulty`, rules `brief-v1`)
+### Difficulty classifier (`classify_difficulty`, rules `brief-v2`)
 
 An unflagged ephemeral `spawn task assign` (no `--difficulty`, `--preset`
 or `--model`; never a resident) with a non-empty catalog has its
@@ -218,7 +218,20 @@ and deterministic, and every rule that matched is kept as evidence:
 | `file_scope` | +1/+2 | 3 (6) or more distinct paths |
 | `crate_scope` | +1/+2 | 2 (3) or more distinct crates |
 | `long_brief` | +1 | above 2000 characters |
-| `low_risk` | -2 | typo, spelling, wording, readme, docstring, formatting, one-line, "docs only" (only when no risk rule matched and no broadening word is there: every, whatever, caller*, implement*, support*, feature*). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+| `low_risk` | -2 | mechanical, repetitive or tagging work only: typo, spelling, formatting, whitespace, rustfmt, "cargo fmt", tag*, label*, mechanical, repetitive, bulk, regenerat*, "registry entry". Only when no risk rule matched and no broadening word is there: a widening word (every, whatever, caller*, implement*, support*, feature*), an authoring word (write*, draft*, document*, explain*, describ*, summar*, clarif*, reword*, rephras*, comment*) or a word naming code to build (filter*, render*, pars*, endpoint*, api*, display*). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+
+L1 means deterministic, repetitive or tagging work, never semantic
+writing. `brief-v2` (replacing `brief-v1`) dropped `wording`, `readme`,
+`docstring`, `one-line` and "docs only" / "doc only" from `low_risk`: a
+README section, a docstring or wording is authored, and a one-line change
+says nothing about determinism. A typo or spelling fix stays a mechanical
+fix wherever it sits ("Fix the typo in README.md" is `l1`), while "Update
+the README wording for the install section" and "Write the docstring for
+X" are `l2`; "Tag the 40 open tasks with their capability" and "Add the
+registry entry for the new file" are `l1`; "Implement label support" or
+"Add tag filtering to the task list" are `l2`. The rule keeps its name
+`low_risk`, so recorded signals read the same, and records written under
+`brief-v1` stay readable: nothing rejects a rules name it does not know.
 
 Keywords are read per word and per path segment (`sql/schema.sql` names
 the schema). The score is `l3` from 4; `l1` at -2 or below with no risk

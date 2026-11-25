@@ -2071,7 +2071,10 @@ mod tests {
             ("Tag the 40 open tasks with their capability", "tag"),
             ("Add the registry entry for the new file", "registry entry"),
             ("Label the stale issues", "label"),
-            ("Run cargo fmt on crates/spawn-core/src/grading.rs", "cargo fmt"),
+            (
+                "Run cargo fmt on crates/spawn-core/src/grading.rs",
+                "cargo fmt",
+            ),
             ("Strip the trailing whitespace", "whitespace"),
             ("Regenerate the fixtures", "regenerat"),
             ("A mechanical bulk rename of the constant", "mechanical"),
