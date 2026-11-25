@@ -123,7 +123,7 @@ pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
 pub use remote_jobs::{
     Committed, FaultNext, FaultOutcome, NodeAction, NodeEnroll, NodeV1, RemoteJob, RemoteJobKind,
-    RemoteJobSpec, SweepOutcome,
+    RemoteJobSpec, RemoteJobState, SweepOutcome,
 };
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
