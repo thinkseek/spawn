@@ -24,7 +24,7 @@
 //!   the other. Whole Changes only: a part of a file is refused as for a
 //!   split, and a set of whole files is a split's to make first.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -580,8 +580,8 @@ pub(crate) fn compose(view: &View, onto: &str, picks: &[Pick]) -> Result<Value, 
     Err("compose names no Change".to_string())
 }
 
-/// Whether `path` is a directory this process can hold a view under.
+/// Whether `view`'s directory is still there.
 #[cfg(test)]
 pub(crate) fn exists(view: &View) -> bool {
-    Path::new(&view.dir).exists()
+    view.dir.exists()
 }
