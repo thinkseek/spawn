@@ -2624,11 +2624,17 @@ impl Bridge {
         let mut reading = active.driver.read_screen(&pane);
         // The host's own reading of the agent, when it has one (Herdr): a
         // second witness. Without one (tmux, in memory) nothing below
-        // changes.
-        let witness = self
-            .terminals
-            .agent(&active.terminal(), &active.workspace)
-            .ok()
+        // changes. Claude Code's screens under Herdr (its screen-reader
+        // layout) are not captured yet against Herdr's claude manifest
+        // (design §9.2): until they are, Claude Code goes by its own
+        // readings alone, on any host, and the host is not even asked.
+        let witness = (active.driver.id() != crate::driver::DEFAULT)
+            .then(|| {
+                self.terminals
+                    .agent(&active.terminal(), &active.workspace)
+                    .ok()
+                    .flatten()
+            })
             .flatten();
         let mut agreed = false;
         if let Some(witness) = &witness {
@@ -2734,8 +2740,12 @@ impl Bridge {
     /// ([`SessionBinding::Reported`]): the host reports it for the
     /// execution's own pane ([`TerminalHost::agent`]), as the engine's own
     /// agent's (`agent` is the driver's id), its transcript is there below
-    /// the engine's home, and a prompt in it holds a marker Spawn typed for
-    /// this execution or later (a command of its start or after). Then
+    /// the engine's home, and a prompt in it holds the marker of a command
+    /// Spawn typed into this session (its `typing` step is this session's)
+    /// for this execution or later (its start or after). A session reported
+    /// for the pane by anything else (`pane.report_agent_session` is open to
+    /// any client of the server) whose transcript quotes another session's
+    /// marker, or one never typed, is never bound. Then
     /// `session.native_started` is recorded, and the transcript is read from
     /// its start. Until then nothing is bound, and asked again next pass.
     fn bind_reported(
@@ -2770,14 +2780,20 @@ impl Bridge {
             .strip_prefix("exec_")
             .and_then(|command| command.parse::<u64>().ok())
             .unwrap_or(u64::MAX);
+        let ours = |command: &CommandId| {
+            command.0 >= first
+                && self.sessions.get(session).is_some_and(|view| {
+                    view.steps
+                        .get(command)
+                        .is_some_and(|steps| steps.typing_at.is_some())
+                })
+        };
         let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
             serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
                 value["type"] == "USER_INPUT"
-                    && value["content"].as_str().is_some_and(|content| {
-                        crate::message::markers(content)
-                            .iter()
-                            .any(|command| command.0 >= first)
-                    })
+                    && value["content"]
+                        .as_str()
+                        .is_some_and(|content| crate::message::markers(content).iter().any(ours))
             })
         });
         if !typed {
