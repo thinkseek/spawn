@@ -496,7 +496,6 @@ impl Resolver {
                     live.session,
                     age / 1000
                 );
-                self.say(&mut Vec::new(), "", String::new());
                 return Ok(self
                     .said
                     .insert(format!("{}:{dialog}:shows", live.execution))
@@ -631,4 +630,289 @@ impl World for Fleet<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::{
+        AGAIN_AFTER_MS, Decision, Ledger, Live, Mode, PRINCIPAL, Resolver, STILL_SHOWS_MS, World,
+        auto_for, decide,
+    };
+    use serde_json::json;
+    use spawn_core::command::NamedKey;
+    use spawn_core::id::WorkspaceId;
+    use spawn_core::port::{AgentReading, AgentStatus};
+    use std::cell::{Cell, RefCell};
+
+    /// Claude Code's numbered permission dialog at its prompt.
+    const PERMISSION: &str = "Bash command\n  cargo test\nDo you want to proceed?\n\
+                              ❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No\n";
+    const READY: &str = "╭────╮\n│ > │\n╰────╯\n";
+
+    fn live(session: &str, busy: bool) -> Live {
+        Live {
+            session: session.to_string(),
+            agent: session.replace("session_", "agent_"),
+            execution: format!("exec_{session}"),
+            engine: "claude".to_string(),
+            started_ms: 0,
+            busy,
+        }
+    }
+
+    /// A world in memory: panes, a clock, a command table with
+    /// `submit`'s idempotency, and every call counted.
+    struct Fake {
+        now: Cell<i64>,
+        lives: Vec<Live>,
+        pane: RefCell<String>,
+        reading: Option<AgentReading>,
+        commands: RefCell<Vec<(String, String, i64, i64)>>,
+        reads: Cell<usize>,
+    }
+
+    impl Fake {
+        fn new(lives: Vec<Live>, pane: &str) -> Self {
+            Self {
+                now: Cell::new(1_000_000),
+                lives,
+                pane: RefCell::new(pane.to_string()),
+                reading: None,
+                commands: RefCell::new(Vec::new()),
+                reads: Cell::new(0),
+            }
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.commands.borrow().iter().map(|(key, ..)| key.clone()).collect()
+        }
+    }
+
+    impl World for Fake {
+        fn now_ms(&self) -> Result<i64, String> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(self.now.get())
+        }
+        fn ledger(&self) -> Result<Ledger, String> {
+            self.reads.set(self.reads.get() + 1);
+            let commands: Vec<serde_json::Value> = self
+                .commands
+                .borrow()
+                .iter()
+                .rev()
+                .map(|(_, session, id, at)| json!({"id": id, "session_id": session, "created_at_ms": at}))
+                .collect();
+            Ok(Ledger::from_json(&json!(commands)))
+        }
+        fn live(&self) -> Result<Vec<Live>, String> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(self.lives.clone())
+        }
+        fn capture(&self, _live: &Live) -> Result<String, String> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(self.pane.borrow().clone())
+        }
+        fn pause(&self) {}
+        fn reading(&self, _live: &Live) -> Option<AgentReading> {
+            self.reading.clone()
+        }
+        fn submit(&self, live: &Live, key: &str, _named: NamedKey) -> Result<i64, String> {
+            let mut commands = self.commands.borrow_mut();
+            if let Some((_, _, id, _)) = commands.iter().find(|(known, ..)| known == key) {
+                return Ok(*id);
+            }
+            let id = i64::try_from(commands.len()).expect("small") + 1;
+            commands.push((key.to_string(), live.session.clone(), id, self.now.get()));
+            Ok(id)
+        }
+    }
+
+    #[test]
+    fn the_switch_defaults_to_startup_and_reads_three_words() {
+        assert_eq!(Mode::parse(None), Ok(Mode::Startup));
+        assert_eq!(Mode::parse(Some("")), Ok(Mode::Startup));
+        assert_eq!(Mode::parse(Some("startup")), Ok(Mode::Startup));
+        assert_eq!(Mode::parse(Some("off")), Ok(Mode::Off));
+        assert_eq!(Mode::parse(Some(" all ")), Ok(Mode::All));
+        assert!(Mode::parse(Some("yes")).is_err());
+        assert_eq!(PRINCIPAL, "spawn-resolve");
+    }
+
+    /// Landing PR 3 changes nothing: with the switch unset (or `off`, or
+    /// `startup`) the step reads nothing and submits nothing, even with a
+    /// dialog the table would answer on every pane.
+    #[test]
+    fn with_the_switch_unset_the_resolver_submits_nothing() {
+        for value in [None, Some("off"), Some("startup")] {
+            let world = Fake::new(vec![live("session_a", false)], PERMISSION);
+            let mut resolver = Resolver::new(Mode::parse(value).expect("mode"));
+            assert!(!resolver.runs());
+            assert!(resolver.step(&world).expect("step").is_empty());
+            assert!(world.keys().is_empty(), "{value:?}");
+            assert_eq!(world.reads.get(), 0, "nothing read either: {value:?}");
+        }
+    }
+
+    #[test]
+    fn under_all_a_table_row_is_answered_once_keyed_by_execution_and_dialog() {
+        let world = Fake::new(vec![live("session_a", false)], PERMISSION);
+        let mut resolver = Resolver::new(Mode::All);
+        let lines = resolver.step(&world).expect("step");
+        let keys = world.keys();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert!(keys[0].starts_with("resolve:exec_session_a:session_a:"), "{keys:?}");
+        assert!(keys[0].ends_with(":1:1"), "{keys:?}");
+        assert!(lines[0].contains("answered"), "{lines:?}");
+        // The next pass, moments later, with the dialog still there: no
+        // second answer (the log says it was answered).
+        world.now.set(world.now.get() + 1_000);
+        resolver.step(&world).expect("step");
+        assert_eq!(world.keys().len(), 1);
+    }
+
+    /// The breaker is folded from the log: a new resolver (a restarted
+    /// loop) over the same command table opens it exactly as the first.
+    #[test]
+    fn the_breaker_counts_from_the_log_and_survives_a_restart() {
+        let world = Fake::new(vec![live("session_a", false)], PERMISSION);
+        Resolver::new(Mode::All).step(&world).expect("step");
+        // Still showing after STILL_SHOWS_MS: open for that dialog, nothing
+        // pressed, said once.
+        world.now.set(world.now.get() + STILL_SHOWS_MS);
+        let mut restarted = Resolver::new(Mode::All);
+        let lines = restarted.step(&world).expect("step");
+        assert!(lines[0].contains("breaker open"), "{lines:?}");
+        assert!(restarted.step(&world).expect("step").is_empty(), "said once");
+        assert_eq!(world.keys().len(), 1);
+        // From AGAIN_AFTER_MS on: one second answer, then never a third.
+        world.now.set(world.now.get() + AGAIN_AFTER_MS);
+        Resolver::new(Mode::All).step(&world).expect("step");
+        let keys = world.keys();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[1].ends_with(":2:1"), "{keys:?}");
+        world.now.set(world.now.get() + 10 * AGAIN_AFTER_MS);
+        let lines = Resolver::new(Mode::All).step(&world).expect("step");
+        assert!(lines[0].contains("never a third"), "{lines:?}");
+        assert_eq!(world.keys().len(), 2);
+    }
+
+    #[test]
+    fn five_answers_in_an_execution_or_twenty_across_the_fleet_open_the_breaker() {
+        let now = 10_000_000;
+        let commands = |sessions: &[&str], count: i64| {
+            let rows: Vec<serde_json::Value> = sessions
+                .iter()
+                .flat_map(|session| {
+                    (0..count).map(move |n| {
+                        json!({"id": n, "session_id": session, "created_at_ms": now - 50_000 + n * 2_000})
+                    })
+                })
+                .collect();
+            Ledger::from_json(&json!(rows))
+        };
+        assert_eq!(commands(&["session_a"], 4).breaker("session_a", 0, now), None);
+        assert!(commands(&["session_a"], 5).breaker("session_a", 0, now).is_some());
+        // Only this execution's: one started after them counts none.
+        assert_eq!(commands(&["session_a"], 5).breaker("session_a", now - 1, now), None);
+        let fleet: Vec<String> = (0..10).map(|n| format!("session_{n}")).collect();
+        let names: Vec<&str> = fleet.iter().map(String::as_str).collect();
+        assert!(commands(&names, 2).breaker("session_x", 0, now).is_some());
+        assert_eq!(commands(&names[..9], 2).breaker("session_x", 0, now), None);
+        // Keys of one answer, submitted together, count once.
+        let one = Ledger::from_json(&json!([
+            {"id": 2, "session_id": "s", "created_at_ms": 1_100},
+            {"id": 1, "session_id": "s", "created_at_ms": 1_000},
+        ]));
+        assert_eq!(one.answers(Some("s"), 0), 1);
+    }
+
+    /// A person's answer in flight (any unfinished command of the session)
+    /// holds the resolver off; once the dialog is gone it presses nothing.
+    #[test]
+    fn a_session_with_a_command_in_flight_or_no_dialog_gets_nothing() {
+        let busy = Fake::new(vec![live("session_a", true)], PERMISSION);
+        Resolver::new(Mode::All).step(&busy).expect("step");
+        assert!(busy.keys().is_empty());
+        let ready = Fake::new(vec![live("session_a", false)], READY);
+        Resolver::new(Mode::All).step(&ready).expect("step");
+        assert!(ready.keys().is_empty());
+    }
+
+    #[test]
+    fn decide_needs_two_equal_reads_and_escalates_rows_without_keys() {
+        let workspace = WorkspaceId::new("agent_a:/tmp/agent_a").expect("workspace");
+        let answer = decide("s", "claude", &workspace, PERMISSION, PERMISSION, None);
+        assert!(
+            matches!(&answer, Decision::Answer { keys, .. } if keys == &vec![NamedKey::Digit1]),
+            "{answer:?}"
+        );
+        let other = PERMISSION.replace("cargo test", "rm -rf target");
+        assert_eq!(
+            decide("s", "claude", &workspace, PERMISSION, &other, None),
+            Decision::Nothing("two reads in a row show two dialogs")
+        );
+        let limited = format!("Claude usage limit reached\n{PERMISSION}");
+        assert!(matches!(
+            decide("s", "claude", &workspace, &limited, &limited, None),
+            Decision::Escalate { .. }
+        ));
+        // agy's permission prompt: blocked by its rule, still escalated
+        // (manifest text only); without the host's blocked reading, nothing.
+        let perm = "Run command?\n  cargo test\n> 1. Yes\n  2. No\n\
+                    ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel\n";
+        assert_eq!(
+            decide("s", "agy", &workspace, perm, perm, None),
+            Decision::Nothing("the host does not read the agent blocked by a named rule")
+        );
+        let blocked = AgentReading {
+            agent: Some("agy".to_string()),
+            status: AgentStatus::Blocked,
+            rule: Some("permission_prompt".to_string()),
+            blocker_visible: true,
+            session: None,
+            seq: 1,
+            manifest: Some("2026.10.05.1".to_string()),
+        };
+        assert!(matches!(
+            decide("s", "agy", &workspace, perm, perm, Some(&blocked)),
+            Decision::Escalate { .. }
+        ));
+    }
+
+    #[test]
+    fn decide_answers_agys_trust_dialog_for_its_workspace_only() {
+        let workspace = WorkspaceId::new("agent_a:/tmp/ws/agent_a").expect("workspace");
+        let trust = "Accessing workspace:\n\n/tmp/ws/agent_a\n\nDo you trust the contents of this project?\n\n\
+                     > Yes, I trust this folder\n  No, exit\n\n  ↑/↓ Navigate · enter Confirm\n";
+        let reading = AgentReading {
+            agent: Some("agy".to_string()),
+            status: AgentStatus::Blocked,
+            rule: Some("trust_prompt".to_string()),
+            blocker_visible: true,
+            session: None,
+            seq: 1,
+            manifest: None,
+        };
+        assert!(matches!(
+            decide("s", "agy", &workspace, trust, trust, Some(&reading)),
+            Decision::Answer { keys, .. } if keys == vec![NamedKey::Enter]
+        ));
+        let elsewhere = WorkspaceId::new("agent_b:/tmp/ws/agent_b").expect("workspace");
+        assert!(matches!(
+            decide("s", "agy", &elsewhere, trust, trust, Some(&reading)),
+            Decision::Escalate { .. }
+        ));
+    }
+
+    #[test]
+    fn the_approvals_item_shows_the_switch_its_answers_and_the_breaker() {
+        let ledger = Ledger::from_json(&json!([
+            {"id": 1, "session_id": "session_a", "created_at_ms": 990_000},
+        ]));
+        assert_eq!(
+            auto_for(Mode::Startup, &ledger, "session_a", 1_000_000),
+            json!({"state": "startup", "answered": 1, "breaker": "off"})
+        );
+        assert_eq!(
+            auto_for(Mode::All, &ledger, "session_b", 1_000_000),
+            json!({"state": "all", "answered": 0, "breaker": "closed"})
+        );
+    }
+}
