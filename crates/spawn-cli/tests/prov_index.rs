@@ -681,3 +681,59 @@ fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be
     drop(whole_store);
     drop(killed_store);
 }
+
+/// PV3a's commands through the binary: `blast` of a task, and the plans,
+/// which print and write nothing (no ref moves); a part of one file is
+/// refused with `granularity: file`; a plan without `--plan` is refused.
+#[test]
+fn blast_and_the_plans_answer_through_the_binary_and_write_no_ref() {
+    let schema = TestSchema::new("prov_plans");
+    let store = schema.store();
+    let scratch = Scratch::new("plans");
+    let mut work = Work::init(&scratch.0);
+    let h = history(&mut work);
+    let git_dir = work.git_dir();
+    let mut client = Client::connect(&schema_url(&schema), NoTls).expect("the owner");
+    facts(&mut client);
+    index(&schema, &git_dir);
+    let refs = work.git(&["for-each-ref"]);
+
+    let blast = spawn_json(&schema, &["prov", "blast", "11"]);
+    assert_eq!(blast["changes"].as_array().map(Vec::len), Some(4), "{blast}");
+    let plan = |verb: &str, words: &[&str]| {
+        let mut arguments = vec!["prov", verb, "--plan"];
+        arguments.extend_from_slice(words);
+        arguments.extend_from_slice(&["--source", SOURCE, "--repo", &git_dir]);
+        spawn(&schema, &arguments)
+    };
+    let reverted = plan("revert", &["11"]);
+    assert!(reverted.status.success(), "{}", String::from_utf8_lossy(&reverted.stderr));
+    let reverted: Value = serde_json::from_slice(&reverted.stdout).expect("JSON");
+    assert_eq!(reverted["plan"], "revert");
+    assert_eq!(reverted["result"], h.landing.as_str());
+    assert!(reverted["tree"].is_string(), "{reverted}");
+
+    let split = plan("split", &["11", "--paths", "src"]);
+    assert!(split.status.success(), "{}", String::from_utf8_lossy(&split.stderr));
+    let split: Value = serde_json::from_slice(&split.stdout).expect("JSON");
+    assert_eq!(split["parts"][0]["paths"], json!(["src/a.rs"]), "{split}");
+
+    let refused = plan("split", &["11", "--paths", "src/a.rs:2"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let refused: Value = serde_json::from_slice(&refused.stdout).expect("JSON");
+    assert_eq!(refused["granularity"], "file", "{refused}");
+    assert_eq!(refused["binary"], false);
+
+    let composed = plan("compose", &[&h.a1]);
+    assert!(composed.status.success(), "{}", String::from_utf8_lossy(&composed.stderr));
+    let composed: Value = serde_json::from_slice(&composed.stdout).expect("JSON");
+    assert_eq!(composed["plan"], "compose");
+
+    let unplanned = spawn(
+        &schema,
+        &["prov", "revert", "11", "--source", SOURCE, "--repo", &git_dir],
+    );
+    assert!(!unplanned.status.success());
+    assert_eq!(work.git(&["for-each-ref"]), refs, "no ref written");
+    drop(store);
+}
