@@ -114,6 +114,19 @@ These are not about process lifetime. They break when two versions meet.
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.
+9. **Herdr and agy** (issue #91 P2 PR 2). The Herdr host speaks protocol 22
+   (herdr 0.9.5) and refuses a server that speaks another, naming both. A
+   herdr upgrade is therefore cold: stop the executions on it, upgrade herdr,
+   then deploy a Spawn that speaks its protocol. The server Spawn starts reads
+   no update and no new agent manifest (`[update] version_check = false`,
+   `manifest_check = false`). The rules it reads agy's screen by stay at the
+   ones checked (2026.10.05.1) until the owner moves them, together with the
+   tests in `crates/spawn-host/tests/herdr.rs`. agy's transcript format is
+   agy's, as Claude Code's is Claude Code's (boundary 5). `agy_line` skips
+   what it does not know, and it reads `transcript_full.jsonl`; a renamed
+   field drops the events it carried. Nothing of this runs until
+   `SPAWN_ENGINES` names `agy`, which is unset (`claude`) by default. Landing
+   the change enables nothing.
 
 ## What the loop may improve by itself
 
@@ -139,6 +152,13 @@ aimed at the boundaries above: the e2e and black-box scenarios catch a break
 only where they exercise it.
 
 ## Deploying
+
+A deploy that enables agy (`SPAWN_ENGINES=claude,agy`) also needs, in the
+loop's environment, `SPAWN_TERMINAL_BACKEND=herdr` and `SPAWN_AGY_MODEL`
+(optionally `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
+0.9.5 with its antigravity-cli integration and a logged-in agy. Without them,
+an agy start is refused before launch, saying what is missing. Claude Code
+is unaffected.
 
 `deploy/deploy.sh <verdict-file>` replaces the binary of the live fleet on
 this host. It refuses unless the verdict file is the gate's, accepted, for

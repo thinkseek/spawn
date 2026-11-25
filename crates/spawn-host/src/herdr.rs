@@ -27,17 +27,37 @@
 //! recorded at start in a private directory under `$XDG_RUNTIME_DIR`
 //! ([`HerdrHost::with_runtime_under`] in a test), so every later call, from
 //! any process, finds them there.
+//!
+//! Herdr also detects the agent a pane runs and reads its state from the
+//! screen by rules of its own (its agent manifests). The host hands that
+//! reading to the Bridge as a second witness ([`TerminalHost::agent`]):
+//! `agent.get` on every reading, `agent.explain` (several KB) only when the
+//! status changed or is `blocked`. A thread of the host's subscribes to the
+//! agents' status changes (`events.subscribe`) and queues the terminals
+//! that changed ([`TerminalHost::agent_changes`]); a dropped subscription
+//! is made again, the session's snapshot asked, and every followed terminal
+//! counted as changed, since what changed meanwhile is unknown.
+//!
+//! The host speaks Herdr's protocol [`PROTOCOL`] and refuses a server that
+//! speaks another, naming both. The first time it meets a server (by its
+//! pid and start time) it closes the workspaces of Spawn's terminals that
+//! server holds and no record of this host's names on it: workspaces a
+//! restarted server restored, idle shells of a session gone with the old
+//! server, which would otherwise pile up.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use spawn_core::id::{TerminalName, WorkspaceId};
-use spawn_core::port::{Launch, Runner, ServerSeen, TerminalError, TerminalHost, TerminalServer};
+use spawn_core::port::{
+    AgentReading, AgentStatus, Launch, Runner, ServerSeen, TerminalError, TerminalHost,
+    TerminalServer,
+};
 
 use crate::process::ProcessId;
 use crate::tmux::{HANGUP_WAIT, KILL_WAIT};
@@ -66,14 +86,101 @@ const KEY_PAUSE: Duration = Duration::from_millis(200);
 
 /// What the session's server reads as its configuration when this host
 /// starts it: a plain `/bin/sh` that reads no profile in each pane (the
-/// launch script is all a pane runs), and no agent resumed by Herdr itself
-/// after a restart (a terminal of Spawn's is Spawn's to resume).
+/// launch script is all a pane runs), no agent resumed by Herdr itself
+/// after a restart (a terminal of Spawn's is Spawn's to resume), and no
+/// update of Herdr nor of its agent manifests fetched behind Spawn's back:
+/// the rules the agents' states are read by stay the ones Spawn was
+/// checked against until the owner moves them.
 const SERVER_CONFIG: &str = "[terminal]\n\
 default_shell = \"/bin/sh\"\n\
 shell_mode = \"non_login\"\n\
 \n\
 [session]\n\
-resume_agents_on_restore = false\n";
+resume_agents_on_restore = false\n\
+\n\
+[update]\n\
+version_check = false\n\
+manifest_check = false\n";
+
+/// The Herdr API protocol this host speaks (herdr 0.9.5): a server that
+/// answers `ping` with another is refused.
+pub const PROTOCOL: u64 = 22;
+
+/// How long after an agent started in a pane, or was released from it, a
+/// reading that Herdr still marks `launch_pending` is no reading: the
+/// detection has not settled.
+const LAUNCH_SETTLE: Duration = Duration::from_secs(1);
+
+/// How long the subscriber waits for an event before it looks whether its
+/// host is gone or the panes it follows changed.
+const EVENT_POLL: Duration = Duration::from_millis(500);
+
+/// Herdr's error codes that refuse input to an agent: not ready yet (it was
+/// started moments ago) or blocked on a dialog. When `agent.get` answers with
+/// one, nothing was typed, and the caller may try again. In practice
+/// `agent.get` answers neither: `agent_not_ready` and `agent_blocked` come
+/// from Herdr's agent input calls (`agent.send_keys`, `agent.prompt`), which
+/// this host does not use yet (PR 3). A blocked agent's status, read from
+/// `agent.get`, refuses nothing here: the Bridge types only into a pane its
+/// own reading accepts input on.
+const NOT_TYPED: [&str; 2] = ["agent_not_ready", "agent_blocked"];
+
+/// Whether a Herdr error code refuses input before any key went
+/// ([`NOT_TYPED`]).
+pub(crate) fn refused_before_typing(code: &str) -> bool {
+    NOT_TYPED.contains(&code)
+}
+
+/// The last `agent.explain` of a pane, kept until its status changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Explained {
+    status: AgentStatus,
+    rule: Option<String>,
+    blocker: bool,
+    manifest: Option<String>,
+}
+
+/// What the host and its subscriber thread share.
+#[derive(Debug, Default)]
+struct Agents {
+    /// Followed panes, by pane id, and the terminal each is.
+    panes: HashMap<String, TerminalName>,
+    /// Bumped whenever `panes` changes: the subscriber subscribes again.
+    generation: u64,
+    /// Terminals whose agent changed, not yet drained.
+    changed: Vec<TerminalName>,
+    /// The last explanation of each pane's status.
+    explained: HashMap<String, Explained>,
+    /// When an agent was last detected in (started), or released from, a
+    /// pane.
+    pushed: HashMap<String, Instant>,
+    /// Whether the subscriber thread runs.
+    subscribed: bool,
+    /// The server whose protocol was checked and whose restored workspaces
+    /// were swept.
+    checked: Option<TerminalServer>,
+}
+
+impl Agents {
+    fn mark(&mut self, terminal: &TerminalName) {
+        if !self.changed.contains(terminal) {
+            self.changed.push(terminal.clone());
+        }
+    }
+
+    fn mark_all(&mut self) {
+        let all: Vec<TerminalName> = self.panes.values().cloned().collect();
+        for terminal in &all {
+            self.mark(terminal);
+        }
+    }
+}
+
+fn lock(agents: &Mutex<Agents>) -> std::sync::MutexGuard<'_, Agents> {
+    agents
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Herdr host.
 pub struct HerdrHost {
@@ -88,6 +195,10 @@ pub struct HerdrHost {
     beneath: Option<crate::beneath::Beneath>,
     /// The session's API socket, once `status` said where it is.
     socket: OnceLock<PathBuf>,
+    /// The protocol a server must answer `ping` with ([`PROTOCOL`]).
+    protocol: u64,
+    /// The agents followed, shared with the subscriber thread.
+    agents: Arc<Mutex<Agents>>,
 }
 
 /// What [`HerdrHost::start`] recorded of a terminal.
@@ -256,7 +367,17 @@ impl HerdrHost {
             runtime_base: None,
             beneath: None,
             socket: OnceLock::new(),
+            protocol: PROTOCOL,
+            agents: Arc::new(Mutex::new(Agents::default())),
         })
+    }
+
+    /// The same host, expecting a server that speaks `protocol` instead of
+    /// [`PROTOCOL`]: how a test shows a server of another protocol refused.
+    #[must_use]
+    pub fn expecting_protocol(mut self, protocol: u64) -> Self {
+        self.protocol = protocol;
+        self
     }
 
     /// The same host, reading, restoring and replacing every file below
@@ -391,37 +512,199 @@ impl HerdrHost {
     /// One API call: `method` with `params`, the result, within `limit`.
     fn call(&self, method: &str, params: &Value, limit: Duration) -> Result<Value, Call> {
         let socket = self.socket().map_err(|error| Call::Failed(error.0))?;
-        let stream = match std::os::unix::net::UnixStream::connect(&socket) {
-            Ok(stream) => stream,
-            Err(error) if no_listener(&error) => return Err(Call::NoServer),
-            Err(error) => {
-                return Err(Call::Failed(format!(
-                    "connect to {}: {error}",
-                    socket.display()
-                )));
-            }
-        };
-        let failed = |error: std::io::Error| Call::Failed(format!("herdr {method}: {error}"));
-        stream.set_read_timeout(Some(limit)).map_err(failed)?;
-        stream.set_write_timeout(Some(limit)).map_err(failed)?;
-        let request =
-            json!({ "id": format!("spawn:{method}"), "method": method, "params": params });
-        let mut line = request.to_string();
-        line.push('\n');
-        (&stream).write_all(line.as_bytes()).map_err(failed)?;
-        let mut answer = String::new();
-        std::io::BufReader::new(&stream)
-            .read_line(&mut answer)
-            .map_err(failed)?;
-        let answer: Value = serde_json::from_str(&answer)
-            .map_err(|error| Call::Failed(format!("herdr {method} answered no JSON: {error}")))?;
-        if let Some(error) = answer.get("error") {
-            return Err(Call::Refused {
-                code: error["code"].as_str().unwrap_or("unknown").to_string(),
-                message: error["message"].as_str().unwrap_or_default().to_string(),
-            });
+        call_at(&socket, method, params, limit)
+    }
+
+    /// The server `server` checked once: it speaks [`Self::protocol`], and
+    /// the workspaces of Spawn's terminals it restored are closed
+    /// ([`Self::sweep`]). Asked before the first start on it and the first
+    /// agent reading from it.
+    fn checked(&self, server: TerminalServer) -> Result<(), TerminalError> {
+        if lock(&self.agents).checked == Some(server) {
+            return Ok(());
         }
-        Ok(answer["result"].clone())
+        let pong = self
+            .call("ping", &json!({}), CALL_LIMIT)
+            .map_err(|call| call.into_error("ping"))?;
+        let spoken = pong["protocol"].as_u64();
+        if spoken != Some(self.protocol) {
+            return Err(TerminalError(format!(
+                "herdr session {} speaks protocol {}, and Spawn expects protocol {} (herdr \
+                 0.9.5): install the herdr Spawn was checked against, or move Spawn to this one",
+                self.session,
+                spoken.map_or_else(|| "none".to_string(), |protocol| protocol.to_string()),
+                self.protocol
+            )));
+        }
+        self.sweep(server)?;
+        lock(&self.agents).checked = Some(server);
+        Ok(())
+    }
+
+    /// Close every workspace on `server` that is labelled as a terminal of
+    /// Spawn's (`spawn-…`) and that no record of this host's names there:
+    /// one a restarted server restored (an idle shell, its session gone
+    /// with the old server), or one left by a host whose records are gone
+    /// (a reboot empties the runtime directory). The record is read again
+    /// right before the close, so a start that recorded its terminal since
+    /// the list keeps it.
+    fn sweep(&self, server: TerminalServer) -> Result<(), TerminalError> {
+        let listed = self
+            .call("workspace.list", &json!({}), CALL_LIMIT)
+            .map_err(|call| call.into_error("workspace.list"))?;
+        let state = self.state()?;
+        let ours = |terminal: &TerminalName, workspace: &str| {
+            state
+                .as_deref()
+                .and_then(|state| Self::record_in(state, terminal).ok().flatten())
+                .is_some_and(|record| record.server == server && record.workspace == workspace)
+        };
+        for workspace in listed["workspaces"].as_array().into_iter().flatten() {
+            let (Some(label), Some(id)) = (
+                workspace["label"].as_str(),
+                workspace["workspace_id"].as_str(),
+            ) else {
+                continue;
+            };
+            let Some(terminal) = label
+                .starts_with("spawn-")
+                .then(|| TerminalName::new(label).ok())
+                .flatten()
+            else {
+                continue;
+            };
+            if ours(&terminal, id) {
+                continue;
+            }
+            match self.call(
+                "workspace.close",
+                &json!({ "workspace_id": id }),
+                CALL_LIMIT,
+            ) {
+                Ok(_) => {}
+                Err(call) if call.gone() => {}
+                Err(call) => return Err(call.into_error("workspace.close")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Follow the agent of `pane` (`terminal`): its status changes reach
+    /// [`TerminalHost::agent_changes`]. Starts the subscriber thread the
+    /// first time.
+    fn follow_agent(&self, pane: &str, terminal: &TerminalName) {
+        let start = {
+            let mut agents = lock(&self.agents);
+            if agents.panes.get(pane) != Some(terminal) {
+                agents.panes.insert(pane.to_string(), terminal.clone());
+                agents.generation = agents.generation.wrapping_add(1);
+            }
+            !std::mem::replace(&mut agents.subscribed, true)
+        };
+        if !start {
+            return;
+        }
+        let Ok(socket) = self.socket() else {
+            lock(&self.agents).subscribed = false;
+            return;
+        };
+        let agents = Arc::downgrade(&self.agents);
+        let spawned = std::thread::Builder::new()
+            .name("spawn-herdr-events".to_string())
+            .spawn(move || subscribe(&socket, &agents));
+        if spawned.is_err() {
+            lock(&self.agents).subscribed = false;
+        }
+    }
+
+    /// Stop following `terminal`'s pane.
+    fn unfollow(&self, terminal: &TerminalName) {
+        let mut agents = lock(&self.agents);
+        let panes: Vec<String> = agents
+            .panes
+            .iter()
+            .filter(|(_, known)| *known == terminal)
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for pane in &panes {
+            agents.panes.remove(pane);
+            agents.explained.remove(pane);
+            agents.pushed.remove(pane);
+        }
+        if !panes.is_empty() {
+            agents.generation = agents.generation.wrapping_add(1);
+        }
+    }
+
+    /// The explanation of `pane`'s status: kept from the last
+    /// `agent.explain` while the status is the same and not `blocked`,
+    /// asked again otherwise. An explanation that fails says nothing (no
+    /// rule, no blocker), and is asked again next time.
+    fn explain(&self, pane: &str, status: AgentStatus) -> Explained {
+        if status != AgentStatus::Blocked
+            && let Some(known) = lock(&self.agents).explained.get(pane)
+            && known.status == status
+        {
+            return known.clone();
+        }
+        let Ok(answer) = self.call("agent.explain", &json!({ "target": pane }), CALL_LIMIT) else {
+            lock(&self.agents).explained.remove(pane);
+            return Explained {
+                status,
+                rule: None,
+                blocker: false,
+                manifest: None,
+            };
+        };
+        let explained = explanation(&answer["explain"], status);
+        lock(&self.agents)
+            .explained
+            .insert(pane.to_string(), explained.clone());
+        explained
+    }
+
+    /// Whether `pane`'s agent started or was released within
+    /// [`LAUNCH_SETTLE`].
+    fn settling(&self, pane: &str) -> bool {
+        lock(&self.agents)
+            .pushed
+            .get(pane)
+            .is_some_and(|at| at.elapsed() < LAUNCH_SETTLE)
+    }
+
+    /// Before text is staged for `terminal`: whether its agent refuses
+    /// input now, as `agent.get` says: an agent started moments ago, still
+    /// `launch_pending` with no status, is refused as `agent_not_ready`, and
+    /// so is an `agent.get` that fails with one of [`NOT_TYPED`]. A `blocked`
+    /// status is not refused here (the Bridge's own reading of the pane
+    /// guards it), nor is a pane with no agent Herdr knows, or no pane: the
+    /// typing finds out.
+    fn refuses_input(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
+        let Some(record) = self.record(terminal)? else {
+            return Ok(());
+        };
+        if !matches!(self.identity(), ServerSeen::Answers(Some(server)) if server == record.server)
+        {
+            return Ok(());
+        }
+        let refused = |code: &str| {
+            TerminalError(format!(
+                "herdr refused before typing ({code}): the agent in {terminal} does not take \
+                 input yet; nothing was typed"
+            ))
+        };
+        match self.call("agent.get", &json!({ "target": record.pane }), CALL_LIMIT) {
+            Ok(info)
+                if info["agent"]["launch_pending"].as_bool() == Some(true)
+                    && AgentStatus::from_herdr(
+                        info["agent"]["agent_status"].as_str().unwrap_or_default(),
+                    ) == AgentStatus::Unknown =>
+            {
+                Err(refused("agent_not_ready"))
+            }
+            Err(Call::Refused { code, .. }) if refused_before_typing(&code) => Err(refused(&code)),
+            _ => Ok(()),
+        }
     }
 
     /// The server that answers on the session's socket now: its pid (the
@@ -653,6 +936,196 @@ impl HerdrHost {
     }
 }
 
+/// One API call on the socket at `socket`: `method` with `params`, the
+/// result, within `limit`.
+fn call_at(socket: &Path, method: &str, params: &Value, limit: Duration) -> Result<Value, Call> {
+    let stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(error) if no_listener(&error) => return Err(Call::NoServer),
+        Err(error) => {
+            return Err(Call::Failed(format!(
+                "connect to {}: {error}",
+                socket.display()
+            )));
+        }
+    };
+    let failed = |error: std::io::Error| Call::Failed(format!("herdr {method}: {error}"));
+    stream.set_read_timeout(Some(limit)).map_err(failed)?;
+    stream.set_write_timeout(Some(limit)).map_err(failed)?;
+    let request = json!({ "id": format!("spawn:{method}"), "method": method, "params": params });
+    let mut line = request.to_string();
+    line.push('\n');
+    (&stream).write_all(line.as_bytes()).map_err(failed)?;
+    let mut answer = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut answer)
+        .map_err(failed)?;
+    let answer: Value = serde_json::from_str(&answer)
+        .map_err(|error| Call::Failed(format!("herdr {method} answered no JSON: {error}")))?;
+    if let Some(error) = answer.get("error") {
+        return Err(Call::Refused {
+            code: error["code"].as_str().unwrap_or("unknown").to_string(),
+            message: error["message"].as_str().unwrap_or_default().to_string(),
+        });
+    }
+    Ok(answer["result"].clone())
+}
+
+/// The subscriber thread: subscribes to every agent detection and to the
+/// status changes of each followed pane, and queues the terminal of each
+/// change. The panes it follows changed: it subscribes again. The
+/// connection dropped (the server restarted, or stopped): it connects
+/// again, asks the session's snapshot, and counts every followed terminal
+/// as changed, since what changed meanwhile is unknown. It ends once its
+/// host is gone.
+fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
+    let mut first = true;
+    loop {
+        let Some(shared) = agents.upgrade() else {
+            return;
+        };
+        let (generation, panes) = {
+            let held = lock(&shared);
+            (
+                held.generation,
+                held.panes.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        drop(shared);
+        let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
+            std::thread::sleep(EVENT_POLL);
+            continue;
+        };
+        let mut subscriptions = vec![json!({ "type": "pane.agent_detected" })];
+        subscriptions.extend(
+            panes
+                .iter()
+                .map(|pane| json!({ "type": "pane.agent_status_changed", "pane_id": pane })),
+        );
+        let request = json!({
+            "id": "spawn:events",
+            "method": "events.subscribe",
+            "params": { "subscriptions": subscriptions },
+        });
+        let mut line = request.to_string();
+        line.push('\n');
+        if stream.set_read_timeout(Some(EVENT_POLL)).is_err()
+            || (&stream).write_all(line.as_bytes()).is_err()
+        {
+            std::thread::sleep(EVENT_POLL);
+            continue;
+        }
+        if !first {
+            // What changed while no subscription held is unknown.
+            let _ = call_at(socket, "session.snapshot", &json!({}), CALL_LIMIT);
+            if let Some(shared) = agents.upgrade() {
+                lock(&shared).mark_all();
+            }
+        }
+        first = false;
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if line.ends_with('\n') => {
+                    let Some(shared) = agents.upgrade() else {
+                        return;
+                    };
+                    pushed(&mut lock(&shared), &line);
+                    line.clear();
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    let Some(shared) = agents.upgrade() else {
+                        return;
+                    };
+                    if lock(&shared).generation != generation {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// One line the subscription pushed: a detection or a status change of a
+/// followed pane queues its terminal. A detection is an agent's start, and
+/// a status change to none its release: the readings of the next
+/// [`LAUNCH_SETTLE`] are not trusted while Herdr still marks the launch
+/// pending.
+fn pushed(agents: &mut Agents, line: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let event = value["event"].as_str().unwrap_or_default();
+    let Some(pane) = value["data"]["pane_id"].as_str() else {
+        return;
+    };
+    let detected = matches!(event, "pane_agent_detected" | "pane.agent_detected");
+    let status = event == "pane.agent_status_changed";
+    if !detected && !status {
+        return;
+    }
+    if detected || (status && value["data"]["agent_status"].is_null()) {
+        agents.pushed.insert(pane.to_string(), Instant::now());
+    }
+    if let Some(terminal) = agents.panes.get(pane).cloned() {
+        agents.mark(&terminal);
+    }
+}
+
+/// The explanation an `agent.explain` answer holds for a pane whose status
+/// is `status`: the rule that matched (none for a fallback), whether it saw
+/// a dialog, and the manifest's version.
+fn explanation(explain: &Value, status: AgentStatus) -> Explained {
+    Explained {
+        status,
+        rule: explain["matched_rule"]["id"].as_str().map(str::to_string),
+        blocker: explain["visible_blocker"].as_bool().unwrap_or(false),
+        manifest: explain["manifest_version"].as_str().map(str::to_string),
+    }
+}
+
+/// The agent an `agent.get` answer describes, as a reading: its status and
+/// session, without the explanation.
+fn reading_of(agent: &Value) -> AgentReading {
+    let session = agent["agent_session"]
+        .as_object()
+        .filter(|session| session.get("kind").and_then(Value::as_str) == Some("id"))
+        .and_then(|session| session.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    AgentReading {
+        agent: agent["agent"].as_str().map(str::to_string),
+        status: AgentStatus::from_herdr(agent["agent_status"].as_str().unwrap_or_default()),
+        rule: None,
+        blocker_visible: false,
+        session,
+        seq: agent["state_change_seq"].as_u64().unwrap_or(0),
+        manifest: None,
+    }
+}
+
+/// A reading of no agent: the pane runs none Herdr detects.
+fn no_agent() -> AgentReading {
+    AgentReading {
+        agent: None,
+        status: AgentStatus::Unknown,
+        rule: None,
+        blocker_visible: false,
+        session: None,
+        seq: 0,
+        manifest: None,
+    }
+}
+
 /// `text` in pieces of at most `limit` bytes, each whole characters.
 pub(crate) fn chunks(text: &str, limit: usize) -> Vec<&str> {
     let mut pieces = Vec::new();
@@ -765,6 +1238,7 @@ impl TerminalHost for HerdrHost {
         }
         self.forget(&launch.terminal);
         let server = self.ensure_server(&state)?;
+        self.checked(server)?;
         // The environment (a database login among it) never goes on a
         // command line, nor through the pane's screen: it is in the script,
         // which only this uid reads and which removes itself.
@@ -777,14 +1251,22 @@ impl TerminalHost for HerdrHost {
             &launch_script(launch)?,
         )?;
         let launched = self.launch(&state, launch, server, &script);
-        if launched.is_err() {
-            let _ = std::fs::remove_file(&script);
+        match &launched {
+            Ok(record) => {
+                self.unfollow(&launch.terminal);
+                self.follow_agent(&record.pane, &launch.terminal);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&script);
+            }
         }
         launched.map(|_| ())
     }
 
     /// The text goes to a private file of this host's: nothing reaches the
-    /// pane, nor Herdr.
+    /// pane. Herdr is only asked whether the pane's agent takes input now:
+    /// an agent it is still starting refuses it before anything is typed
+    /// ([`HerdrHost::refuses_input`]).
     fn stage_text(
         &self,
         terminal: &TerminalName,
@@ -792,6 +1274,7 @@ impl TerminalHost for HerdrHost {
         text: &str,
     ) -> Result<(), TerminalError> {
         let state = self.state_directory(true)?;
+        self.refuses_input(terminal)?;
         crate::process::write_private(&state.join("staged"), terminal.as_str(), text)
             .map_err(|error| TerminalError(format!("stage the text for {terminal}: {error}")))
     }
@@ -967,11 +1450,56 @@ impl TerminalHost for HerdrHost {
         }
         crate::tmux::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
         self.forget(terminal);
+        self.unfollow(terminal);
         Ok(())
     }
 
     fn terminate_waits(&self) -> bool {
         true
+    }
+
+    /// `agent.get` on the terminal's pane, and `agent.explain` only when
+    /// the status changed or is `blocked`. No pane, or no agent Herdr
+    /// detects in it, is a reading of no agent. While Herdr still marks an
+    /// agent's launch pending, within [`LAUNCH_SETTLE`] of its start or
+    /// release, the reading says nothing ([`AgentStatus::Unknown`]).
+    fn agent(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<Option<AgentReading>, TerminalError> {
+        let Some(record) = self.pane(terminal)? else {
+            return Ok(Some(no_agent()));
+        };
+        self.checked(record.server)?;
+        self.follow_agent(&record.pane, terminal);
+        let info = match self.call("agent.get", &json!({ "target": record.pane }), CALL_LIMIT) {
+            Ok(info) => info,
+            Err(Call::Refused { code, .. })
+                if code == "agent_not_found" || refused_before_typing(&code) =>
+            {
+                return Ok(Some(no_agent()));
+            }
+            Err(call) if call.gone() => return Ok(Some(no_agent())),
+            Err(call) => return Err(call.into_error("agent.get")),
+        };
+        let agent = &info["agent"];
+        let mut reading = reading_of(agent);
+        if agent["launch_pending"].as_bool() == Some(true) && self.settling(&record.pane) {
+            reading.status = AgentStatus::Unknown;
+            return Ok(Some(reading));
+        }
+        if reading.agent.is_some() {
+            let explained = self.explain(&record.pane, reading.status);
+            reading.rule = explained.rule;
+            reading.blocker_visible = explained.blocker;
+            reading.manifest = explained.manifest;
+        }
+        Ok(Some(reading))
+    }
+
+    fn agent_changes(&self) -> Vec<TerminalName> {
+        std::mem::take(&mut lock(&self.agents).changed)
     }
 
     fn read_from(
@@ -1321,5 +1849,123 @@ mod tests {
         assert_eq!(Record::parse(&record.to_text()), Some(record));
         assert_eq!(Record::parse("{}"), None);
         assert_eq!(Record::parse("not json"), None);
+    }
+
+    /// Herdr's refusals of input before typing: an agent not ready (its
+    /// first seconds after `agent.start`) and one blocked on a dialog. A
+    /// gone pane or agent is no such refusal.
+    #[test]
+    fn not_ready_and_blocked_are_refusals_before_typing() {
+        assert!(super::refused_before_typing("agent_not_ready"));
+        assert!(super::refused_before_typing("agent_blocked"));
+        for other in ["agent_not_found", "pane_not_found", "unknown", ""] {
+            assert!(!super::refused_before_typing(other), "{other}");
+        }
+    }
+
+    /// The server is started without update or manifest checks, and never
+    /// resumes agents itself.
+    #[test]
+    fn the_server_s_configuration_pins_updates_and_manifests() {
+        let config = super::SERVER_CONFIG;
+        assert!(
+            config.contains("[update]\nversion_check = false\nmanifest_check = false\n"),
+            "{config}"
+        );
+        assert!(config.contains("resume_agents_on_restore = false"));
+        assert_eq!(super::PROTOCOL, 22);
+    }
+
+    /// `agent.get` and `agent.explain` as herdr 0.9.5 answers them (live
+    /// probes): `done` is idle, the session only when reported as an id,
+    /// the fallback has no rule.
+    #[test]
+    fn readings_and_explanations_parse_as_herdr_answers() {
+        use spawn_core::port::AgentStatus;
+        let agent = serde_json::json!({
+            "terminal_id": "term_1", "agent": "agy", "agent_status": "done",
+            "pane_id": "w1:p1", "state_change_seq": 6, "launch_pending": false,
+            "agent_session": {"source": "hook", "agent": "agy", "kind": "id", "value": "conv-1"},
+        });
+        let reading = super::reading_of(&agent);
+        assert_eq!(reading.agent.as_deref(), Some("agy"));
+        assert_eq!(reading.status, AgentStatus::Idle);
+        assert_eq!(reading.seq, 6);
+        assert_eq!(reading.session.as_deref(), Some("conv-1"));
+        let by_path = serde_json::json!({
+            "agent": "agy", "agent_status": "working",
+            "agent_session": {"source": "hook", "agent": "agy", "kind": "path", "value": "/x"},
+        });
+        let reading = super::reading_of(&by_path);
+        assert_eq!(reading.status, AgentStatus::Working);
+        assert_eq!(reading.session, None);
+        let pending = serde_json::json!({"agent_status": "unknown", "launch_pending": true});
+        let reading = super::reading_of(&pending);
+        assert_eq!(
+            (reading.agent, reading.status),
+            (None, AgentStatus::Unknown)
+        );
+        for (status, read) in [
+            ("idle", AgentStatus::Idle),
+            ("done", AgentStatus::Idle),
+            ("working", AgentStatus::Working),
+            ("blocked", AgentStatus::Blocked),
+            ("unknown", AgentStatus::Unknown),
+            ("new", AgentStatus::Unknown),
+        ] {
+            assert_eq!(AgentStatus::from_herdr(status), read, "{status}");
+        }
+        let blocked = serde_json::json!({
+            "agent": "agy", "manifest_version": "2026.10.05.1", "state": "blocked",
+            "matched_rule": {"id": "permission_prompt", "priority": 300, "state": "blocked"},
+            "visible_blocker": true, "fallback_reason": null,
+        });
+        let explained = super::explanation(&blocked, AgentStatus::Blocked);
+        assert_eq!(explained.rule.as_deref(), Some("permission_prompt"));
+        assert!(explained.blocker);
+        assert_eq!(explained.manifest.as_deref(), Some("2026.10.05.1"));
+        let idle = serde_json::json!({
+            "agent": "agy", "manifest_version": "2026.10.05.1", "state": "idle",
+            "matched_rule": null, "visible_blocker": false,
+            "fallback_reason": "default_known_agent_idle_fallback",
+        });
+        let explained = super::explanation(&idle, AgentStatus::Idle);
+        assert_eq!(explained.rule, None);
+        assert!(!explained.blocker);
+    }
+
+    /// What the subscription pushes (as herdr 0.9.5 names its events): a
+    /// followed pane's detection or status change queues its terminal once;
+    /// a detection or a release (a status of none) marks the pane settling;
+    /// anything else is ignored.
+    #[test]
+    fn pushed_events_queue_their_terminal_once() {
+        let mut agents = super::Agents::default();
+        let terminal = TerminalName::new("spawn-exec_1").expect("terminal");
+        agents.panes.insert("w1:p1".to_string(), terminal.clone());
+        let status = r#"{"data":{"agent":"agy","agent_status":"working","pane_id":"w1:p1","workspace_id":"w1"},"event":"pane.agent_status_changed"}"#;
+        super::pushed(&mut agents, status);
+        super::pushed(&mut agents, status);
+        assert_eq!(agents.changed, vec![terminal.clone()]);
+        assert!(agents.pushed.is_empty(), "a status change is no start");
+        let detected = r#"{"data":{"agent":"agy","pane_id":"w1:p1","type":"pane_agent_detected","workspace_id":"w1"},"event":"pane_agent_detected"}"#;
+        super::pushed(&mut agents, detected);
+        assert!(agents.pushed.contains_key("w1:p1"));
+        agents.pushed.clear();
+        let released = r#"{"data":{"agent_status":null,"pane_id":"w1:p1"},"event":"pane.agent_status_changed"}"#;
+        super::pushed(&mut agents, released);
+        assert!(agents.pushed.contains_key("w1:p1"));
+        agents.changed.clear();
+        for other in [
+            r#"{"data":{"agent_status":"idle","pane_id":"w9:p1"},"event":"pane.agent_status_changed"}"#,
+            r#"{"data":{"pane_id":"w1:p1"},"event":"pane.output_matched"}"#,
+            r#"{"id":"spawn:events","result":{"type":"subscription_started"}}"#,
+            "not json",
+        ] {
+            super::pushed(&mut agents, other);
+        }
+        assert!(agents.changed.is_empty(), "{:?}", agents.changed);
+        agents.mark_all();
+        assert_eq!(agents.changed, vec![terminal]);
     }
 }

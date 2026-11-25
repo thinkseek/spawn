@@ -2010,6 +2010,162 @@ it per execution and prices it (objective 041;
   alerts step raises `cost_budget` once the mission's spend of the UTC day
   reaches it (§3.4).
 
+### 3.6 Engines beyond Claude Code: Herdr's second witness and agy (issue #91 P2)
+
+The Bridge stays the single state machine of every execution. What an engine
+does comes from its transcript, which the Bridge follows, and from its pane,
+which the engine's driver reads (`AgentDriver::read_screen`). On the Herdr
+terminal host (`SPAWN_TERMINAL_BACKEND=herdr`) a third reader is added: Herdr
+detects the agent a pane runs and reads its state with rules of its own (its
+agent manifests). That reading is a **second witness**
+(`TerminalHost::agent`, an `AgentReading`). It never takes over. A host
+without one (tmux, the in-memory host) answers `None`, and nothing changes:
+Claude Code on tmux records the same events, byte for byte. A test pins the
+whole sequence a2f1ab397 recorded
+(`claude_on_a_host_without_agent_readings_records_what_it_did_before`).
+
+For now the witness is asked only for engines other than Claude Code (agy).
+Claude Code's screen-reader screens have not yet been captured under Herdr
+against its claude manifest (design §9.2). Until they are, Claude Code on
+Herdr goes by its own readings, as on tmux: no merge, no keyed screen, and no
+`agent()` call (`claude_on_an_agent_host_stays_on_its_own_readings_for_now`).
+
+**The merge** (`Bridge::follow_screen`, `merge_witness`). Normally a screen
+state is recorded once two readings of the pane in a row agree. With Herdr's
+reading (H) beside the driver's (S), one capture is enough where the two
+agree:
+
+| H | S | Recorded |
+| --- | --- | --- |
+| `working` | Busy, or nothing it knows | Busy |
+| `blocked` by a known rule with a visible dialog (`visible_blocker`) | Permission, or nothing it knows | Permission |
+| `idle` (Herdr's `done` is idle too) | Ready or Error: a positive reading | S's state |
+| `idle` by Herdr's fallback rule | Unknown (a popup, an announcement) | nothing: never Ready |
+| `unknown`, or any disagreement | anything | S's own readings, two in a row |
+| no agent (`agent: None`) | anything | S's own readings, and the exit status is read next pass |
+| another agent than the driver's | anything | nothing (never `screen.observed`) |
+
+A screen recorded on H's word is keyed
+`<execution>:hs:<server pid>.<server start ms>:<seq>` (Herdr's
+`state_change_seq`), so the same reading is recorded once, by a restarted
+Bridge too. A Busy screen recorded again after `screen_refresh` is the same
+reading, so it goes unkeyed, and the log's unique keys never swallow it.
+
+**The Herdr host's agent surface** (`crates/spawn-host/src/herdr.rs`):
+
+- `agent()` calls `agent.get` on the terminal's pane. It calls
+  `agent.explain` (3 to 7 KB an answer) only when the status changed or is
+  `blocked`, never on every pass. A pane Herdr knows no agent in
+  (`agent_not_found`) is a reading of no agent.
+- A thread subscribes (`events.subscribe`) to `pane.agent_detected` and to
+  `pane.agent_status_changed` for each followed pane. It queues their
+  terminals for `agent_changes()`, which the Bridge drains once per pass, and
+  reads those panes on that pass. When the connection drops, the thread
+  connects again, asks `session.snapshot`, and counts every followed terminal
+  as changed.
+- For the first seconds after `agent.start` (about 3.4 s observed), Herdr
+  reports `launch_pending: true` with status `unknown`, and its agent input
+  calls answer `agent_not_ready`. While `agent.get` says so, staging text is
+  refused before anything is typed, as `agent_not_ready`, and so is staging
+  when `agent.get` itself fails with `agent_not_ready` or `agent_blocked`.
+  Both are refusals the Bridge retries. In practice `agent.get` returns
+  neither code: they come from Herdr's agent input calls, which PR 2 does not
+  use. A `blocked` status is not refused by the host; the Bridge's own check
+  guards it, since it types only into a pane its own reading says accepts
+  input.
+  Within 1 s of a detection or a release push, a reading still
+  `launch_pending` says nothing. Typing itself stays chunked `pane.send_text`
+  plus Enter. The `agent.prompt` rollout is PR 3.
+- The server is started with `[update] version_check = false`,
+  `manifest_check = false` (the manifests Spawn was checked against stay
+  until the owner moves them; agy's is 2026.10.05.1) and
+  `resume_agents_on_restore = false`. The host checks `ping`'s protocol
+  (22, herdr 0.9.5) and refuses another, naming both.
+- The first time a host meets a server (pid and start time), it closes every
+  `spawn-…` workspace there that none of its records names. Those are what a
+  restarted server restored: idle shells whose sessions went with the old
+  server.
+
+**agy** (`AgyDriver`, the Antigravity CLI). It is registered beside Claude
+Code, and it runs only where the host enables it: `SPAWN_ENGINES` (a comma
+list, `claude` when unset) must name it, `SPAWN_AGY_MODEL` must name its model,
+and the terminal host must read agents. A start that fails any of these is
+refused before launch, saying which (`engine agy needs the herdr terminal
+backend`). `SPAWN_AGY_PROGRAM` (default `agy`) and `SPAWN_AGY_HOME` (default
+`~/.gemini/antigravity-cli`) say where it lives, and its home is added to the
+transcript archive's mask roots.
+
+- *Launch.* The runner's launch script starts agy, never `agent.start`, with
+  `--model <label> --dangerously-skip-permissions --settings
+  '{"trustedWorkspaces":["<cwd>"],"toolPermission":"always-proceed"}'`. The
+  model is always named: agy falls back silently to its costliest default
+  model when the label is unknown or missing. A resume adds `--conversation
+  <id>` and repeats every flag. Every start gets a fresh workspace and pane:
+  an agy killed with SIGKILL leaves bracketed paste on, and a reused pane
+  could no longer be typed into.
+- *Session binding* (`SessionBinding::Reported`). agy names its own
+  conversation. Its execution's transcript is not read until the binding is
+  made: the session's last native session belongs to an earlier execution. The
+  Bridge binds the session when all of these hold:
+  - Herdr reports a session for the execution's own pane (`agent_session`,
+    an id);
+  - the reading's agent is the driver's (`agy`);
+  - the session's full transcript exists below agy's home;
+  - a `USER_INPUT` line of that transcript holds the marker of a command
+    whose `typing` step this session recorded, and that command is this
+    execution's start or later.
+
+  Any client of the server can call `pane.report_agent_session`. The marker
+  check means a forged report, whose transcript quotes another session's
+  marker or one never typed, is never bound.
+
+  Then it records `session.native_started` and reads the transcript from
+  offset 0.
+- *Transcript.* The Bridge reads
+  `<home>/brain/<id>/.system_generated/logs/transcript_full.jsonl`, never
+  the short `transcript.jsonl`, which cuts `content` at about 4 KB
+  (`truncated_fields`). `agy_line` emits only existing event kinds, keyed
+  `<conversation>:<step>:…`: `message.received` and `message.taken`,
+  `model.usage`, `tool.started` and `tool.completed` (results pair with calls
+  in order, since agy gives no call ids; a failed tool, `ERROR` with `error`,
+  completes too), `job.started` and `job.ended`, and `turn.stopped`. Steps
+  may be missing: an interrupt (Esc) writes no line.
+- *Open work.* A background job opens with a `GENERIC` `RUNNING` step naming
+  `task id: <conv>/task-<n>` (agy never updates that step). It closes with a
+  later `SYSTEM_MESSAGE` from `sender=<conv>/task-<n>`. A subagent opens with
+  a `GENERIC` step written `DONE` at once (`Created the following subagent:`
+  with its `conversationId`). It closes with a `SYSTEM_MESSAGE` from its
+  `sender=`. A `SYSTEM_MESSAGE` with no sender (a reminder) closes nothing.
+  While any job or subagent is open, no `turn.stopped` is emitted, whatever
+  Herdr says: Herdr was seen reporting `idle` or `done` mid-turn three times.
+  The screen agrees. While background work runs, agy 1.5.14 draws a task
+  panel (`●` entries) and a closing rule between the prompt box and its
+  footer. The footer then counts the open work, as in `? for shortcuts
+  auto · Gemini 3.8 Flash · low · 1 subagent(s) · 2 task(s) · /tasks`, and
+  reads Busy. The footer is the pane's last line, below the box and any
+  panel. A footer whose counts are 0 or missing reads Ready.
+- *Screen* (`read_agy_screen`). Dialogs (a permission, `↑/↓ Navigate · tab
+  Amend …`, or a question, `… esc Skip`) read Permission. The trust dialog
+  reads Unknown, and the Bridge answers it (`is_agy_trust_dialog`, Enter). A
+  running turn reads Busy (`esc to cancel` under the prompt box, or a braille
+  spinner). The prompt box (`>` between rules, `? for shortcuts`) reads
+  Ready, with any banner above it. agy's startup banner names the signed-in
+  account and plan, so every line holding an e-mail address is dropped from
+  evidence and from excerpts.
+
+**Sandbox and deploy.** The gate's `bwrap` sandbox binds no `herdr`, so the
+Herdr tests skip there. On a host with herdr,
+`SPAWN_REQUIRE_HERDR=1 cargo test -p spawn-host --test herdr` runs them
+against a stub `agy`, and fails rather than skips when herdr is missing.
+Running agy in the fleet needs, on the host:
+- herdr 0.9.5 (protocol 22) with its antigravity-cli integration installed,
+  so it reports agy's session;
+- agy logged in;
+- `SPAWN_TERMINAL_BACKEND=herdr`, `SPAWN_ENGINES=claude,agy` and
+  `SPAWN_AGY_MODEL` in the loop's environment.
+
+The SQL gateway's own command checks are unchanged by this PR.
+
 ## 4. Experience
 
 Nothing is stored outside the log. Every model judgement is an

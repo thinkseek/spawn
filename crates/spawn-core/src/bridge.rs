@@ -102,7 +102,10 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, NamedKey, Outcome};
-use crate::driver::{AgentDriver, EngineHome, EngineLaunch, LineCursor, driver_or_default};
+use crate::driver::{
+    AgentDriver, EngineHome, EngineLaunch, LineCursor, SessionBinding, driver_or_default,
+    plain_session_id,
+};
 use crate::event::{
     ARCHIVE_REASON_MAX, ArtifactRef, CheckpointReason, CommandStep, EndCause, EventKind,
     EventRecord, Fork, GlobalPosition, LaunchSummary, ModelProfile, NewEvent, Source,
@@ -112,9 +115,9 @@ use crate::id::{
 };
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, Launch, MOUNT_CANCELLED,
-    READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost, TranscriptArchive,
-    UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
+    AgentReading, AgentStatus, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch,
+    Launch, MOUNT_CANCELLED, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
+    TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
@@ -268,7 +271,9 @@ pub struct BridgeConfig {
     pub model_relay: Option<ModelRelay>,
     /// Where engines other than Claude Code live, by driver id
     /// ([`BridgeConfig::engine_home`]). Claude Code's home is always
-    /// `claude_program` and `claude_projects`, whatever this holds.
+    /// `claude_program` and `claude_projects`, whatever this holds. An
+    /// engine with no home here is not enabled on this host
+    /// (`SPAWN_ENGINES`): a start naming it is refused.
     pub engines: Vec<(String, EngineHome)>,
     /// The watch on the files the engines write (transcripts and exit
     /// statuses), when the host has one. `None` reads every live execution's
@@ -324,6 +329,7 @@ impl BridgeConfig {
             return Some(EngineHome {
                 program: self.claude_program.clone(),
                 sessions: self.claude_projects.clone(),
+                model: None,
             });
         }
         self.engines
@@ -337,6 +343,7 @@ impl BridgeConfig {
         self.engine_home(driver.id()).unwrap_or_else(|| EngineHome {
             program: self.claude_program.clone(),
             sessions: self.claude_projects.clone(),
+            model: None,
         })
     }
 }
@@ -384,9 +391,11 @@ impl Active {
             reported_end: None,
             unmounting: false,
             // The execution's lines are the ones after where the transcript
-            // ended when it started, after a restart too.
+            // ended when it started, after a restart too. A resume runs a
+            // session already named: its engine reports no new one.
             follow: Follow {
                 offset: transcript_from.unwrap_or(0),
+                binding: Binding::resumed(transcript_from.is_some()),
                 ..Follow::default()
             },
         }
@@ -396,6 +405,32 @@ impl Active {
     /// so it is derived, never stored.
     fn terminal(&self) -> TerminalName {
         TerminalName::for_execution(&self.execution_id)
+    }
+}
+
+/// Whether an execution's native session is known: named by the Bridge, or
+/// resumed, or (an engine that names its own, [`SessionBinding::Reported`])
+/// reported by the host and checked ([`Bridge::bind_reported`]). Until it
+/// is, such an engine's transcript is not read: the session's last one is
+/// another execution's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Binding {
+    /// Not known yet.
+    #[default]
+    Unbound,
+    /// Known; the native session when this Bridge bound it itself, before
+    /// the log's record of it is folded.
+    Bound(Option<String>),
+}
+
+impl Binding {
+    /// Known from the start for a resume (its session is the one resumed).
+    fn resumed(resume: bool) -> Self {
+        if resume {
+            Self::Bound(None)
+        } else {
+            Self::Unbound
+        }
     }
 }
 
@@ -444,6 +479,11 @@ struct Follow {
     seen: Option<ScreenState>,
     /// When this Bridge first followed the execution, by its own clock.
     first_seen: Option<i64>,
+    /// Whether the execution's native session is known ([`Binding`]).
+    binding: Binding,
+    /// The host's agent reading (its `seq`) a recorded screen was last
+    /// keyed by: a reading recorded once is never keyed again.
+    keyed_seq: Option<u64>,
     /// The engine's file is missing after the start grace, or unreadable;
     /// warned once.
     warned: bool,
@@ -502,6 +542,25 @@ struct Follow {
 const FOLLOW_OVERLAP: usize = 4096;
 
 impl Follow {
+    /// The log records the execution's native session: it is known, as
+    /// this Bridge bound it or not.
+    fn recorded_binding(&mut self) {
+        if self.binding == Binding::Unbound {
+            self.binding = Binding::Bound(None);
+        }
+    }
+
+    /// The driver reads the lines of `native`: its keys begin with the
+    /// session whose lines they are, so another session starts afresh.
+    fn reading(&mut self, native: &str) {
+        if self.cursor.native != native {
+            self.cursor = LineCursor {
+                native: native.to_string(),
+                ..LineCursor::default()
+            };
+        }
+    }
+
     /// How many bytes before the offset a read checks: the tail kept, or,
     /// with none (after a restart), one, which says the file still reaches
     /// the offset.
@@ -1871,6 +1930,9 @@ impl Bridge {
                     view.transcript_read = false;
                 }
                 view.native = Some(native_session_id.clone());
+                if current && let Some(active) = view.active.as_mut() {
+                    active.follow.recorded_binding();
+                }
             }
             // A merge of main is no checkpoint of the agent's work: one
             // still due stays due. Nor is a commit of an earlier execution.
@@ -1913,7 +1975,13 @@ impl Bridge {
             })
             .collect();
         let mut ended_now = Vec::new();
+        // Terminals whose agent the host saw change (a host that detects
+        // agents, Herdr): their panes are read on this pass.
+        let changed: HashSet<TerminalName> = self.terminals.agent_changes().into_iter().collect();
         for (session, agent_id, native, mut active) in running {
+            if changed.contains(&active.terminal()) {
+                active.follow.again = true;
+            }
             let ended =
                 self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
             if ended {
@@ -1981,6 +2049,8 @@ impl Bridge {
             ));
             return Ok(false);
         }
+        let bound = self.native_of(agent_id, session, native, active)?;
+        let native = bound.as_deref();
         self.register_watch(session, native, active, report);
         self.follow_output(agent_id, session, native, active, report)?;
         let end = if self.looked_at(session, active) {
@@ -2153,6 +2223,7 @@ impl Bridge {
             return Ok(());
         };
         let path = self.transcript_of(active.driver, &active.workspace, native);
+        active.follow.reading(native);
         // Read past the offset only while the file holds what was read there
         // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
         let (bytes, limit) = match self.read_followed(session, &path, active, report) {
@@ -2550,13 +2621,47 @@ impl Bridge {
         let now = self.clock.now().0;
         active.follow.last_capture = Some(now);
         active.follow.unread_since = None;
-        let reading = active.driver.read_screen(&pane);
+        let mut reading = active.driver.read_screen(&pane);
+        // The host's own reading of the agent, when it has one (Herdr): a
+        // second witness. Without one (tmux, in memory) nothing below
+        // changes. Claude Code's screens under Herdr (its screen-reader
+        // layout) are not captured yet against Herdr's claude manifest
+        // (design §9.2): until they are, Claude Code goes by its own
+        // readings alone, on any host, and the host is not even asked.
+        let witness = (active.driver.id() != crate::driver::DEFAULT)
+            .then(|| {
+                self.terminals
+                    .agent(&active.terminal(), &active.workspace)
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        let mut agreed = false;
+        if let Some(witness) = &witness {
+            match merge_witness(active.driver, witness, &reading) {
+                Merged::Agrees(state, evidence) => {
+                    reading.state = state;
+                    reading.evidence = evidence;
+                    agreed = true;
+                }
+                Merged::Own => {}
+                // The engine may have exited: its exit status is read on
+                // the next pass, and the screen goes by its own readings.
+                Merged::Gone => active.follow.watch.dirty = true,
+                // Another agent in the engine's pane: nothing is known.
+                Merged::Foreign => {
+                    active.follow.seen = None;
+                    active.follow.again = true;
+                    return Ok(());
+                }
+            }
+        }
         // A reading that accepts input is the screen showing the turn over:
         // what a turn's end in the transcript was waiting for.
         if reading.state.accepts_input() {
             active.follow.settling = None;
         }
-        let confirmed = active.follow.seen == Some(reading.state);
+        let confirmed = agreed || active.follow.seen == Some(reading.state);
         active.follow.seen = Some(reading.state);
         let due = match active.follow.screen {
             None => true,
@@ -2574,19 +2679,144 @@ impl Bridge {
         if !record {
             return Ok(());
         }
+        // Keyed by the host's reading when there is one, so a reading
+        // recorded once (by a Bridge before a restart too) is recorded once;
+        // a busy screen recorded again after `screen_refresh` is the same
+        // reading, and goes unkeyed so it is never taken for a repeat.
+        let changed = active
+            .follow
+            .screen
+            .is_none_or(|(state, _)| state != reading.state);
+        let key = match (&witness, self.terminals.server()) {
+            (Some(witness), ServerSeen::Answers(Some(server)))
+                if changed && active.follow.keyed_seq != Some(witness.seq) =>
+            {
+                active.follow.keyed_seq = Some(witness.seq);
+                Some(format!(
+                    "{}:hs:{}.{}:{}",
+                    active.execution_id, server.pid, server.started_at_ms, witness.seq
+                ))
+            }
+            _ => None,
+        };
         active.follow.screen = Some((reading.state, now));
         self.append(
             agent_id,
             session,
             Some(&active.execution_id),
             Source::Bridge,
-            None,
+            key,
             EventKind::ScreenObserved {
                 state: reading.state,
                 evidence: reading.evidence,
             },
         )?;
         Ok(())
+    }
+
+    /// The native session whose transcript the execution writes, when it is
+    /// known: the session's, for an engine the Bridge names the session of
+    /// (or a resume); for an engine that names its own
+    /// ([`SessionBinding::Reported`]) only once this execution's is bound
+    /// ([`Self::bind_reported`]), never the session's last one, which is an
+    /// earlier execution's.
+    fn native_of(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        native: Option<&str>,
+        active: &mut Active,
+    ) -> Result<Option<String>, StoreError> {
+        if active.driver.traits().session != SessionBinding::Reported {
+            return Ok(native.map(str::to_string));
+        }
+        match &active.follow.binding {
+            Binding::Bound(bound) => Ok(bound.clone().or_else(|| native.map(str::to_string))),
+            Binding::Unbound => self.bind_reported(agent_id, session, active),
+        }
+    }
+
+    /// Bind the native session an engine named itself
+    /// ([`SessionBinding::Reported`]): the host reports it for the
+    /// execution's own pane ([`TerminalHost::agent`]), as the engine's own
+    /// agent's (`agent` is the driver's id), its transcript is there below
+    /// the engine's home, and a prompt in it holds the marker of a command
+    /// Spawn typed into this session (its `typing` step is this session's)
+    /// for this execution or later (its start or after). A session reported
+    /// for the pane by anything else (`pane.report_agent_session` is open to
+    /// any client of the server) whose transcript quotes another session's
+    /// marker, or one never typed, is never bound. Then
+    /// `session.native_started` is recorded, and the transcript is read from
+    /// its start. Until then nothing is bound, and asked again next pass.
+    fn bind_reported(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &mut Active,
+    ) -> Result<Option<String>, StoreError> {
+        let Ok(Some(reading)) = self.terminals.agent(&active.terminal(), &active.workspace) else {
+            return Ok(None);
+        };
+        if reading.agent.as_deref() != Some(active.driver.id()) {
+            return Ok(None);
+        }
+        let Some(native) = reading.session.filter(|native| plain_session_id(native)) else {
+            return Ok(None);
+        };
+        let home = self.config.home_of(active.driver);
+        let path = active
+            .driver
+            .transcript_path(&home, &active.workspace, &native);
+        let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        if !path.starts_with(&root) {
+            return Ok(None);
+        }
+        let Ok(Some(bytes)) = self.terminals.read_from(&active.workspace, &path, 0) else {
+            return Ok(None);
+        };
+        let first = active
+            .execution_id
+            .as_str()
+            .strip_prefix("exec_")
+            .and_then(|command| command.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        let ours = |command: &CommandId| {
+            command.0 >= first
+                && self.sessions.get(session).is_some_and(|view| {
+                    view.steps
+                        .get(command)
+                        .is_some_and(|steps| steps.typing_at.is_some())
+                })
+        };
+        let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                value["type"] == "USER_INPUT"
+                    && value["content"]
+                        .as_str()
+                        .is_some_and(|content| crate::message::markers(content).iter().any(ours))
+            })
+        });
+        if !typed {
+            return Ok(None);
+        }
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:native", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine: active.driver.id().to_string(),
+                native_session_id: native.clone(),
+                transcript_path: Some(path),
+                engine_version: None,
+            },
+        )?;
+        active.follow.binding = Binding::Bound(Some(native.clone()));
+        active.follow.offset = 0;
+        active.follow.tail.clear();
+        active.follow.watch.dirty = true;
+        Ok(Some(native))
     }
 
     /// Kill, final checkpoint, unmount, then `execution.ended`. Returns
@@ -3445,6 +3675,9 @@ impl Bridge {
             }
             MountProgress::Failed(why) => return finished(Outcome::Failed(why)),
         };
+        if let Some(why) = self.no_agent_host(claimed, driver, &workspace) {
+            return finished(self.give_up_mount(claimed, &workspace, why));
+        }
         // A resumed session's transcript holds the earlier executions' lines:
         // this execution's are the ones after its length now.
         let transcript_from = match native
@@ -3477,7 +3710,10 @@ impl Bridge {
             checkpoint: None,
             reported_end: None,
             unmounting: false,
-            follow: Follow::default(),
+            follow: Follow {
+                binding: Binding::resumed(native.is_some()),
+                ..Follow::default()
+            },
         };
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
@@ -3516,6 +3752,29 @@ impl Bridge {
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
     }
 
+    /// Why `driver`'s engine cannot run on this terminal host: an engine
+    /// other than Claude Code is followed through the host's own agent
+    /// readings (its session, its state), which a host with none (tmux)
+    /// cannot give.
+    fn no_agent_host(
+        &self,
+        claimed: &Claimed,
+        driver: &dyn AgentDriver,
+        workspace: &WorkspaceId,
+    ) -> Option<String> {
+        if driver.id() == crate::driver::DEFAULT {
+            return None;
+        }
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(claimed.command_id));
+        (!matches!(self.terminals.agent(&terminal, workspace), Ok(Some(_)))).then(|| {
+            format!(
+                "engine {} needs the herdr terminal backend (SPAWN_TERMINAL_BACKEND=herdr): this \
+                 terminal host reads no agent",
+                driver.id()
+            )
+        })
+    }
+
     fn fail_prepared_start(&self, claimed: &Claimed, why: String) -> Outcome {
         let steps = self.recorded_steps(claimed);
         if let Some(workspace) = steps.mounted
@@ -3552,6 +3811,27 @@ impl Bridge {
     ) -> Result<Result<PreparedStart, String>, StoreError> {
         if let Some(prepared) = self.prepared.get(&claimed.command_id) {
             return Ok(Ok(prepared.clone()));
+        }
+        // Only the engines this host enables (`SPAWN_ENGINES`) start, and
+        // one other than Claude Code only with its model named: an engine
+        // left to pick its own may pick its costliest.
+        if driver.id() != crate::driver::DEFAULT {
+            match self.config.engine_home(driver.id()) {
+                None => {
+                    return Ok(Err(format!(
+                        "engine {} is not enabled on this host: SPAWN_ENGINES does not name it",
+                        driver.id()
+                    )));
+                }
+                Some(home) if home.model.is_none() => {
+                    return Ok(Err(format!(
+                        "engine {} has no model named on this host (SPAWN_{}_MODEL)",
+                        driver.id(),
+                        driver.id().to_ascii_uppercase()
+                    )));
+                }
+                Some(_) => {}
+            }
         }
         let model = model.unwrap_or_else(|| {
             self.sessions
@@ -4243,6 +4523,7 @@ impl Bridge {
                 relay: prepared.relay.as_ref(),
                 profile: prepared.model,
                 config_dir: prepared.config_dir.as_deref(),
+                cwd: Some(active.workspace.path()),
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
@@ -5297,7 +5578,7 @@ impl Bridge {
                     .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
                 {
                     Ok(pane) => {
-                        progress.last_pane = Some(pane.clone());
+                        progress.last_pane = Some(active.driver.excerpt_source(&pane));
                         pane
                     }
                     Err(error) => {
@@ -6612,6 +6893,78 @@ const PANE_SIDE_BORDERS: [char; 3] = ['\u{2502}', '\u{2503}', '\u{2551}'];
 /// Horizontal box-drawing characters (`─`, `━`, `═`): a run of more than 3
 /// of one inside a line is kept as 3.
 const PANE_RUN_CHARS: [char; 3] = ['\u{2500}', '\u{2501}', '\u{2550}'];
+
+/// What the host's agent reading ([`AgentReading`]) and the driver's own
+/// reading of the pane make together ([`Bridge::follow_screen`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Merged {
+    /// Both witnesses say this: a fact at once, without the second capture
+    /// a reading alone needs.
+    Agrees(ScreenState, String),
+    /// They do not agree, or the host cannot tell: the screen goes by the
+    /// driver's readings alone, two in a row, as without a host reading.
+    Own,
+    /// The host sees no agent in the pane: the engine may have exited (its
+    /// exit status says), and the screen goes by the driver's readings.
+    Gone,
+    /// The host sees another agent than the engine's in its pane: nothing
+    /// is known, and nothing is recorded.
+    Foreign,
+}
+
+/// The two witnesses of an engine's screen, merged. The host's reading
+/// never decides alone what the driver reads otherwise, and a state is
+/// taken at once only where both agree:
+///
+/// - `working` with the driver reading a running turn (or nothing it
+///   knows): [`ScreenState::Busy`];
+/// - `blocked` by a rule that saw a dialog on screen, with the driver
+///   reading a dialog (or nothing it knows): [`ScreenState::Permission`];
+/// - `idle` with the driver reading its prompt (a positive reading: the
+///   host's idle is often its fallback, for any screen no rule matched, so
+///   an unknown popup is never taken for a prompt): the driver's state;
+/// - anything else, `unknown` included: the driver's own readings.
+fn merge_witness(
+    driver: &dyn AgentDriver,
+    witness: &AgentReading,
+    reading: &crate::screen::ScreenReading,
+) -> Merged {
+    let Some(agent) = witness.agent.as_deref() else {
+        return Merged::Gone;
+    };
+    if agent != driver.id() {
+        return Merged::Foreign;
+    }
+    let said = |what: &str| {
+        let rule = witness
+            .rule
+            .as_deref()
+            .map_or_else(String::new, |rule| format!(" ({rule})"));
+        format!("herdr {agent}: {what}{rule}")
+    };
+    match (witness.status, reading.state) {
+        (AgentStatus::Working, ScreenState::Busy) => {
+            Merged::Agrees(ScreenState::Busy, reading.evidence.clone())
+        }
+        (AgentStatus::Working, ScreenState::Unknown) => {
+            Merged::Agrees(ScreenState::Busy, said("working"))
+        }
+        (AgentStatus::Blocked, ScreenState::Permission)
+            if witness.rule.is_some() && witness.blocker_visible =>
+        {
+            Merged::Agrees(ScreenState::Permission, reading.evidence.clone())
+        }
+        (AgentStatus::Blocked, ScreenState::Unknown)
+            if witness.rule.is_some() && witness.blocker_visible =>
+        {
+            Merged::Agrees(ScreenState::Permission, said("blocked"))
+        }
+        (AgentStatus::Idle, state) if state.accepts_input() => {
+            Merged::Agrees(state, reading.evidence.clone())
+        }
+        _ => Merged::Own,
+    }
+}
 
 /// The tail of `pane` as one bounded line for a failed ready wait's error,
 /// or `None` when it holds no text. Credentials go first
@@ -8161,6 +8514,732 @@ mod tests {
     /// Something the engine wrote during the turn (no checkpoint of a turn's
     /// end, so nothing is committed).
     const TOOL_LINE: &str = "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n";
+
+    /// What a2f1ab397 records for [`claude_on_a_host_without_agent_readings_records_what_it_did_before`].
+    const PINNED_SEQUENCE: [&str; 13] = [
+        "command.accepted Gateway - cmd_1:accepted",
+        "command.step Bridge - cmd_1:mounted",
+        "execution.started Bridge exec_1 exec_1:started",
+        "session.native_started Bridge exec_1 exec_1:native",
+        "command.finished Gateway - cmd_1:finished",
+        "screen.observed Bridge exec_1 - Ready \"❯\"",
+        "tool.started Claude exec_1 toolu_1:started",
+        "screen.observed Bridge exec_1 - Busy \"✽ Effecting… (esc to interrupt)\"",
+        "screen.observed Bridge exec_1 - Permission \"❯ 1. main\"",
+        "screen.observed Bridge exec_1 - Busy \"✽ Effecting… (esc to interrupt)\"",
+        "screen.observed Bridge exec_1 - Busy \"✽ Effecting… (esc to interrupt)\"",
+        "turn.stopped Claude exec_1 t1",
+        "screen.observed Bridge exec_1 - Ready \"❯\"",
+    ];
+
+    /// Issue #91 P2 PR 2: on a host that reads no agent (tmux, in memory),
+    /// Claude Code's execution records exactly what it did before the host's
+    /// second witness existed: every event, in order, with its source and
+    /// key, through a start, a turn that runs, a dialog, the turn's end and
+    /// a busy screen recorded again after `screen_refresh`. The expected
+    /// sequence is the one the base (a2f1ab397) records.
+    #[test]
+    fn claude_on_a_host_without_agent_readings_records_what_it_did_before() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TOOL_LINE);
+        for _ in 0..4 {
+            world.advance(600);
+            world.tick();
+        }
+        world.set_pane(DIALOG);
+        for _ in 0..3 {
+            world.advance(31_000);
+            world.tick();
+        }
+        world.set_pane(BUSY);
+        for _ in 0..3 {
+            world.advance(31_000);
+            world.tick();
+        }
+        world.engine_writes(TURN_LINE);
+        world.set_pane(READY);
+        for _ in 0..4 {
+            world.advance(600);
+            world.tick();
+        }
+        let sequence: Vec<String> = world
+            .store
+            .read_global(GlobalPosition(0), 1_000)
+            .expect("read")
+            .into_iter()
+            .map(|record| {
+                let state = match &record.event.kind {
+                    EventKind::ScreenObserved { state, evidence } => {
+                        format!(" {state:?} {evidence:?}")
+                    }
+                    _ => String::new(),
+                };
+                format!(
+                    "{} {:?} {} {}{state}",
+                    record.event.kind.name(),
+                    record.event.source,
+                    record
+                        .event
+                        .execution_id
+                        .as_ref()
+                        .map_or("-", |execution| execution.as_str()),
+                    record.event.source_event_id.as_deref().unwrap_or("-"),
+                )
+            })
+            .collect();
+        let expected: &[&str] = &PINNED_SEQUENCE;
+        assert_eq!(sequence, expected, "actual:\n{sequence:#?}");
+    }
+
+    /// The memory terminal with a host's agent readings (as Herdr gives
+    /// them), one for every terminal.
+    struct Witnessed {
+        inner: Arc<MemoryStore>,
+        reading: Mutex<Option<crate::port::AgentReading>>,
+        asked: AtomicUsize,
+    }
+
+    impl Witnessed {
+        fn over(inner: Arc<MemoryStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reading: Mutex::new(None),
+                asked: AtomicUsize::new(0),
+            })
+        }
+
+        fn set(&self, reading: crate::port::AgentReading) {
+            *self.reading.lock().expect("reading") = Some(reading);
+        }
+    }
+
+    impl TerminalHost for Witnessed {
+        fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+            self.inner.start(launch)
+        }
+        fn stage_text(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            text: &str,
+        ) -> Result<(), TerminalError> {
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
+        }
+        fn send_keys(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &[&str],
+        ) -> Result<(), TerminalError> {
+            self.inner.send_keys(terminal, workspace, keys)
+        }
+        fn is_alive(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<bool, TerminalError> {
+            self.inner.is_alive(terminal, workspace)
+        }
+        fn server(&self) -> crate::port::ServerSeen {
+            self.inner.server()
+        }
+        fn runner(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<crate::port::Runner, TerminalError> {
+            self.inner.runner(terminal, workspace)
+        }
+        fn capture_tail(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            lines: usize,
+        ) -> Result<String, TerminalError> {
+            self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn read_from(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            offset: u64,
+        ) -> Result<Option<Vec<u8>>, TerminalError> {
+            self.inner.read_from(workspace, path, offset)
+        }
+        fn write_new(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<bool, TerminalError> {
+            self.inner.write_new(workspace, path, bytes)
+        }
+        fn terminate(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.terminate(terminal, workspace)
+        }
+        fn agent(
+            &self,
+            _terminal: &TerminalName,
+            _workspace: &WorkspaceId,
+        ) -> Result<Option<crate::port::AgentReading>, TerminalError> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(self.reading.lock().expect("reading").clone())
+        }
+    }
+
+    const AGY_RULE: &str = "──────────────────────────────";
+
+    fn agy_idle() -> String {
+        format!("Antigravity CLI 1.5.14\n{AGY_RULE}\n>\n{AGY_RULE}\n? for shortcuts\n")
+    }
+
+    fn agy_working() -> String {
+        format!("⠋ Thinking\n{AGY_RULE}\n>\n{AGY_RULE}\nesc to cancel\n")
+    }
+
+    fn agy_reading(
+        agent: Option<&str>,
+        status: crate::port::AgentStatus,
+        seq: u64,
+    ) -> crate::port::AgentReading {
+        crate::port::AgentReading {
+            agent: agent.map(str::to_string),
+            status,
+            rule: None,
+            blocker_visible: false,
+            session: None,
+            seq,
+            manifest: Some("2026.10.05.1".to_string()),
+        }
+    }
+
+    const AGY_HOME: &str = "/home/agent/.gemini/antigravity-cli";
+
+    fn agy_config(model: Option<&str>) -> BridgeConfig {
+        let mut config = BridgeConfig::new("tester");
+        config.engines = vec![(
+            "agy".to_string(),
+            crate::driver::EngineHome {
+                program: "/opt/agy/bin/agy".to_string(),
+                sessions: AGY_HOME.to_string(),
+                model: model.map(str::to_string),
+            },
+        )];
+        config
+    }
+
+    fn submit_agy_start(store: &Arc<MemoryStore>, prompt: &str) -> CommandId {
+        let id = store
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_agy").expect("agent"),
+                    session_id: SessionId::new("session_agy").expect("session"),
+                    idempotency_key: IdempotencyKey::new("start-agy").expect("key"),
+                    action: CommandAction::Start {
+                        engine: "agy".to_string(),
+                        prompt: prompt.to_string(),
+                        parent_session_id: None,
+                        from: None,
+                        model: None,
+                        charter: None,
+                    },
+                },
+            )
+            .expect("submit");
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id)),
+            &agy_idle(),
+        );
+        id
+    }
+
+    fn agy_failure(config: BridgeConfig, witness: bool) -> String {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let terminals: Arc<dyn TerminalHost> = if witness {
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(None, crate::port::AgentStatus::Unknown, 0));
+            host
+        } else {
+            store.clone()
+        };
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            terminals,
+            config,
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert!(
+            store.launches().is_empty(),
+            "a refused engine is never launched"
+        );
+        match command_outcome(&store, id) {
+            Some(Outcome::Failed(why)) => why,
+            other => panic!("refused, not {other:?}"),
+        }
+    }
+
+    /// agy runs only where the host enables it (`SPAWN_ENGINES`), with its
+    /// model named, on a host that reads agents (Herdr): landing it starts
+    /// nothing anywhere else.
+    #[test]
+    fn agy_is_refused_unless_enabled_named_a_model_and_on_an_agent_host() {
+        let why = agy_failure(BridgeConfig::new("tester"), true);
+        assert!(why.contains("engine agy is not enabled"), "{why}");
+        let why = agy_failure(agy_config(None), true);
+        assert!(why.contains("SPAWN_AGY_MODEL"), "{why}");
+        let why = agy_failure(agy_config(Some("gemini-3.8-flash-low")), false);
+        assert!(
+            why.contains("engine agy needs the herdr terminal backend"),
+            "{why}"
+        );
+    }
+
+    fn records(store: &Arc<MemoryStore>) -> Vec<crate::event::EventRecord> {
+        store.read_global(GlobalPosition(0), 10_000).expect("read")
+    }
+
+    /// agy names its own conversation: the host reports it, and it is
+    /// bound only once its full transcript holds the prompt Spawn typed
+    /// (its marker); then the transcript is read from its start, and the
+    /// turn's end comes from it.
+    #[allow(clippy::too_many_lines)] // one binding, refused case by case, then bound and read
+    #[test]
+    fn agy_binds_the_session_the_host_reports_and_reads_its_full_transcript() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        // An earlier conversation of the session would be another's lines.
+        let id = submit_agy_start(&store, "hello");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let launch = store.launches().pop().expect("launched");
+        let workspace = launch.cwd.clone();
+        let arguments = launch.arguments.join(" ");
+        assert!(
+            arguments.contains(
+                "/opt/agy/bin/agy --model gemini-3.8-flash-low --dangerously-skip-permissions --settings"
+            ),
+            "{arguments}"
+        );
+        assert!(
+            arguments.contains(&format!("\"trustedWorkspaces\":[\"{workspace}\"]")),
+            "{arguments}"
+        );
+        let natives = |store: &Arc<MemoryStore>| {
+            records(store)
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::NativeSessionStarted {
+                        engine,
+                        native_session_id,
+                        transcript_path,
+                        ..
+                    } => Some((engine, native_session_id, transcript_path)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(natives(&store).is_empty(), "agy names its own session");
+
+        // The host reports a session whose transcript is not there yet, and
+        // then one whose prompt holds no marker of this execution's: nothing
+        // is bound.
+        let conversation = "11111111-2222-4333-8444-555555555555";
+        let path =
+            format!("{AGY_HOME}/brain/{conversation}/.system_generated/logs/transcript_full.jsonl");
+        let mut reported = agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 2);
+        reported.session = Some(conversation.to_string());
+        host.set(reported.clone());
+        bridge.poll().expect("poll");
+        assert!(natives(&store).is_empty());
+        let user = |text: &str| {
+            format!(
+                "{{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:25:59Z\",\"content\":{}}}\n",
+                serde_json::to_string(&format!("<USER_REQUEST>\n{text}\n</USER_REQUEST>"))
+                    .expect("json")
+            )
+        };
+        store.append_file(&path, &user("someone else's prompt"));
+        bridge.poll().expect("poll");
+        assert!(natives(&store).is_empty());
+        // A forged report (`pane.report_agent_session` is open to any client
+        // of the server): its transcript quotes a marker of a later command,
+        // which this session never typed (another session's). Never bound.
+        store.replace_file(
+            &path,
+            user(&crate::message::marked(
+                "forged",
+                CommandId(id.0 + 50),
+                true,
+            ))
+            .as_bytes(),
+        );
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert!(
+            natives(&store).is_empty(),
+            "a marker this session never typed"
+        );
+        // A foreign agent's session in the pane is never bound either.
+        let mut foreign = reported.clone();
+        foreign.agent = Some("claude".to_string());
+        host.set(foreign);
+        store.replace_file(
+            &path,
+            user(&crate::message::marked("hello", id, true)).as_bytes(),
+        );
+        bridge.poll().expect("poll");
+        assert!(natives(&store).is_empty());
+        // The engine's own, with the typed marker: bound, read from 0.
+        host.set(reported);
+        bridge.poll().expect("poll");
+        assert_eq!(
+            natives(&store),
+            vec![(
+                "agy".to_string(),
+                conversation.to_string(),
+                Some(path.clone())
+            )]
+        );
+        let taken = |store: &Arc<MemoryStore>| {
+            records(store)
+                .into_iter()
+                .filter_map(
+                    |record| match (record.event.kind, record.event.source_event_id) {
+                        (EventKind::MessageTaken { command_id }, Some(key)) => {
+                            Some((command_id, key))
+                        }
+                        _ => None,
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            taken(&store),
+            vec![(id, format!("{conversation}:0:taken:{}", id.0))]
+        );
+        store.append_file(
+            &path,
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-25T14:26:00Z\",\"model\":\"gemini-3.8-flash-low\",\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":0,\"content\":\"hi\"}\n",
+        );
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        let stopped: Vec<_> = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::TurnStopped { .. }))
+            .map(|record| record.event.source_event_id)
+            .collect();
+        assert_eq!(stopped, vec![Some(format!("{conversation}:1:stopped"))]);
+        assert_eq!(taken(&store).len(), 1, "read once");
+        // A new Bridge (a restart) folds the binding back and reads nothing twice.
+        let mut again = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock);
+        again.recover().expect("recover");
+        again.poll().expect("poll");
+        assert_eq!(natives(&store).len(), 1);
+        assert_eq!(taken(&store).len(), 1);
+    }
+
+    fn screens_with_keys(store: &Arc<MemoryStore>) -> Vec<(ScreenState, Option<String>)> {
+        records(store)
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::ScreenObserved { state, .. } => {
+                    Some((state, record.event.source_event_id))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// With the host's reading, one capture that agrees with it is a fact,
+    /// keyed by the host's server and reading; a busy screen recorded again
+    /// after `screen_refresh` is unkeyed, so the log's unique keys never
+    /// swallow it; another agent in the pane records nothing.
+    #[test]
+    fn a_host_reading_that_agrees_records_at_once_keyed_by_its_seq() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        store.set_terminal_server(crate::port::ServerSeen::Answers(Some(
+            crate::port::TerminalServer {
+                pid: 77,
+                started_at_ms: 1_700,
+            },
+        )));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start(&store, "");
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(Some("gemini-3.8-flash-low")),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        bridge.poll().expect("poll");
+        let screens = screens_with_keys(&store);
+        assert_eq!(
+            screens,
+            vec![(ScreenState::Ready, Some("exec_1:hs:77.1700:1".to_string()))],
+            "one agreeing capture is the fact"
+        );
+        store.set_pane(&terminal, &agy_working());
+        host.set(agy_reading(
+            Some("agy"),
+            crate::port::AgentStatus::Working,
+            2,
+        ));
+        bridge.poll().expect("poll");
+        clock.advance(Duration::from_secs(31));
+        bridge.poll().expect("poll");
+        let screens = screens_with_keys(&store);
+        assert_eq!(
+            screens[1..],
+            [
+                (ScreenState::Busy, Some("exec_1:hs:77.1700:2".to_string())),
+                (ScreenState::Busy, None),
+            ]
+        );
+        // The host idle by its fallback while the pane shows no prompt: no
+        // Ready, whatever the host says.
+        store.set_pane(&terminal, "╭──────╮\n│ new! │\n╰──────╯\n");
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 3));
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert_eq!(screens_with_keys(&store).len(), 3);
+        // Another agent in the pane: nothing, even at a prompt.
+        store.set_pane(&terminal, &agy_idle());
+        host.set(agy_reading(
+            Some("claude"),
+            crate::port::AgentStatus::Idle,
+            4,
+        ));
+        bridge.poll().expect("poll");
+        bridge.poll().expect("poll");
+        assert_eq!(screens_with_keys(&store).len(), 3);
+        // The engine's again, at its prompt.
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 5));
+        bridge.poll().expect("poll");
+        assert_eq!(
+            screens_with_keys(&store)[3],
+            (ScreenState::Ready, Some("exec_1:hs:77.1700:5".to_string()))
+        );
+        assert!(host.asked.load(Ordering::SeqCst) > 0);
+    }
+
+    /// Claude Code's screens under Herdr are not captured yet against
+    /// Herdr's claude manifest (design §9.2): on a host that reads agents,
+    /// Claude Code is not merged with the host's reading, nor keyed by it,
+    /// and the host is never asked. Its screen goes by two readings in a
+    /// row, as on tmux.
+    #[test]
+    fn claude_on_an_agent_host_stays_on_its_own_readings_for_now() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        store.set_terminal_server(crate::port::ServerSeen::Answers(Some(
+            crate::port::TerminalServer {
+                pid: 77,
+                started_at_ms: 1_700,
+            },
+        )));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(
+            Some("claude"),
+            crate::port::AgentStatus::Idle,
+            1,
+        ));
+        let id = submit_resumable_start(&store, 1, "", READY);
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock.clone());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        store.set_pane(&terminal, BUSY);
+        host.set(agy_reading(
+            Some("claude"),
+            crate::port::AgentStatus::Working,
+            2,
+        ));
+        bridge.poll().expect("poll");
+        let busy = |store: &Arc<MemoryStore>| {
+            screens_with_keys(store)
+                .into_iter()
+                .filter(|(state, _)| *state == ScreenState::Busy)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            busy(&store).is_empty(),
+            "one reading is no fact, whatever the host says"
+        );
+        bridge.poll().expect("poll");
+        assert_eq!(busy(&store), vec![(ScreenState::Busy, None)], "unkeyed");
+        assert!(
+            screens_with_keys(&store)
+                .iter()
+                .all(|(_, key)| key.is_none()),
+            "{:?}",
+            screens_with_keys(&store)
+        );
+        assert_eq!(
+            host.asked.load(Ordering::SeqCst),
+            0,
+            "the host is not asked"
+        );
+    }
+
+    /// The merge, case by case: a state is taken at once only where both
+    /// witnesses agree.
+    #[test]
+    fn the_witnesses_merge_only_where_they_agree() {
+        use super::{Merged, merge_witness};
+        use crate::port::AgentStatus::{Blocked, Idle, Unknown, Working};
+        use crate::screen::ScreenReading;
+        let driver = crate::driver::driver("agy").expect("agy");
+        let screen = |state: ScreenState| ScreenReading {
+            state,
+            evidence: "e".to_string(),
+        };
+        let reading = |status, rule: Option<&str>, blocker: bool| crate::port::AgentReading {
+            rule: rule.map(str::to_string),
+            blocker_visible: blocker,
+            ..agy_reading(Some("agy"), status, 9)
+        };
+        let agrees = |state| Merged::Agrees(state, "e".to_string());
+        let cases = [
+            (
+                reading(Working, None, false),
+                ScreenState::Busy,
+                agrees(ScreenState::Busy),
+            ),
+            (
+                reading(Working, None, false),
+                ScreenState::Ready,
+                Merged::Own,
+            ),
+            (
+                reading(Blocked, Some("permission_prompt"), true),
+                ScreenState::Permission,
+                agrees(ScreenState::Permission),
+            ),
+            (
+                reading(Blocked, None, true),
+                ScreenState::Permission,
+                Merged::Own,
+            ),
+            (
+                reading(Blocked, Some("permission_prompt"), false),
+                ScreenState::Unknown,
+                Merged::Own,
+            ),
+            (
+                reading(Idle, None, false),
+                ScreenState::Ready,
+                agrees(ScreenState::Ready),
+            ),
+            (
+                reading(Idle, None, false),
+                ScreenState::Error,
+                agrees(ScreenState::Error),
+            ),
+            (
+                reading(Idle, None, false),
+                ScreenState::Unknown,
+                Merged::Own,
+            ),
+            (reading(Idle, None, false), ScreenState::Busy, Merged::Own),
+            (
+                reading(Unknown, None, false),
+                ScreenState::Ready,
+                Merged::Own,
+            ),
+        ];
+        for (witness, state, merged) in cases {
+            assert_eq!(
+                merge_witness(driver, &witness, &screen(state)),
+                merged,
+                "{witness:?} {state:?}"
+            );
+        }
+        assert_eq!(
+            merge_witness(
+                driver,
+                &reading(Working, None, false),
+                &screen(ScreenState::Unknown)
+            ),
+            Merged::Agrees(ScreenState::Busy, "herdr agy: working".to_string())
+        );
+        assert_eq!(
+            merge_witness(
+                driver,
+                &reading(Blocked, Some("question_prompt"), true),
+                &screen(ScreenState::Unknown)
+            ),
+            Merged::Agrees(
+                ScreenState::Permission,
+                "herdr agy: blocked (question_prompt)".to_string()
+            )
+        );
+        let gone = agy_reading(None, Working, 1);
+        assert_eq!(
+            merge_witness(driver, &gone, &screen(ScreenState::Busy)),
+            Merged::Gone
+        );
+        let foreign = agy_reading(Some("claude"), Working, 1);
+        assert_eq!(
+            merge_witness(driver, &foreign, &screen(ScreenState::Busy)),
+            Merged::Foreign
+        );
+    }
 
     /// A session whose command is in flight (an input waiting for its turn)
     /// is captured on every pass: its screen is what the delivery waits for.
