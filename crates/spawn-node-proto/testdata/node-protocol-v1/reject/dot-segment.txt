@@ -1,0 +1,7 @@
+GET /node/v1/./registry-manifest
+Spawn-Node-Id: 56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c
+Spawn-Node-Boot: 00000000000000018796a5b4c3d2e1f0
+Spawn-Node-Seq: 3
+Spawn-Node-Ts: 1795600000000
+Spawn-Node-Sig: FRB9MDKippAqSNOAlUcm_WVTpxpARpuWSG9L2zjdFqe9fcBiyLxvu6owR8kwGCzN38VFKbiyI0xzD0s4gttlAA
+

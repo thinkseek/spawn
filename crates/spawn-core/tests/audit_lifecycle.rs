@@ -250,6 +250,13 @@ impl EventLog for Rig {
 }
 
 impl CommandQueue for Rig {
+    fn recover_worker(
+        &self,
+        worker: &str,
+    ) -> Result<(Box<dyn spawn_core::port::CommandOwnership>, usize), StoreError> {
+        self.store.recover_worker(worker)
+    }
+
     fn submit(
         &self,
         principal: &Principal,

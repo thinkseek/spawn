@@ -9,10 +9,11 @@ use spawn_core::bridge::{
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
-    ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq, Source,
+    CommandStep, ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq,
+    Source,
 };
 use spawn_core::id::{
-    AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+    AgentId, BranchName, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
 };
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{SemanticState, WaitReason};
@@ -1100,7 +1101,8 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
     }
     assert_eq!(tools_started(&store).len(), 51);
 
-    // The loop restarts: a new Bridge rebuilt from the log.
+    // The loop restarts: the old process is gone before its replacement.
+    drop(bridge);
     let mut bridge = archiving_bridge(&store);
     bridge.recover().expect("recover");
     store.append_file(&resumed, &tool_line("b2", "toolu_b2"));
@@ -1111,8 +1113,9 @@ fn a_resume_and_a_restart_follow_on_without_reading_again() {
     let started = tools_started(&store);
     assert_eq!(started.len(), 52, "{started:?}");
 
-    // A shrink is still a shrink, also found by a Bridge that has read
-    // nothing yet (only the length to check).
+    // A shrink is still a shrink, also found by a replacement that has read
+    // nothing yet (only the length to check), after the old worker is gone.
+    drop(bridge);
     let mut bridge = archiving_bridge(&store);
     bridge.recover().expect("recover");
     store.replace_file(&resumed, tool_line("c1", "toolu_c1").as_bytes());
@@ -1862,5 +1865,320 @@ fn a_rotation_between_the_mask_and_the_read_copies_nothing_that_pass() {
     assert!(
         after.contains("u2") && !after.contains(ROTATED_TWO),
         "{after}"
+    );
+}
+
+// Crash recovery of a claimed command (production lease_ttl is two minutes).
+fn submission() -> Submission {
+    Submission {
+        agent_id: AgentId::new("agent_one").expect("valid agent"),
+        session_id: SessionId::new("session_one").expect("valid session"),
+        idempotency_key: IdempotencyKey::new("crash_recovery").expect("valid key"),
+        action: CommandAction::Start {
+            engine: ENGINE.to_string(),
+            prompt: "run once".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: None,
+            charter: None,
+        },
+    }
+}
+
+#[test]
+fn sigkill_during_a_claim_recovers_without_waiting_for_the_lease_ttl() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(&principal, &submission())
+        .expect("submit succeeds");
+
+    // The old loop claimed attempt 1, then SIGKILL prevented both release and
+    // finish. No live service is involved in this isolated in-memory store.
+    let abandoned = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("claim succeeds")
+        .expect("first claim");
+    assert_eq!(abandoned.attempt, 1);
+
+    let mut restarted = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("spawn-worker"),
+    );
+    restarted.recover().expect("restart recovery succeeds");
+
+    let mut recovery_ms = None;
+    for elapsed in 0..=120_000 {
+        if let Some(reclaimed) = store
+            .claim("spawn-worker", Duration::from_mins(2))
+            .expect("claim succeeds")
+        {
+            assert_eq!(reclaimed.command_id, abandoned.command_id);
+            assert_eq!(reclaimed.attempt, 2);
+            assert!(
+                store.finish(&abandoned, &Outcome::Succeeded).is_err(),
+                "the abandoned attempt must stay fenced"
+            );
+            store
+                .finish(&reclaimed, &Outcome::Succeeded)
+                .expect("the replacement attempt finishes once");
+            recovery_ms = Some(elapsed);
+            break;
+        }
+        clock.advance(Duration::from_millis(1));
+    }
+    assert_eq!(
+        recovery_ms,
+        Some(0),
+        "crash recovery must not wait for the abandoned lease"
+    );
+}
+
+#[test]
+fn a_live_old_worker_blocks_recovery_instead_of_leaking_a_duplicate_claim() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock));
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(&principal, &submission())
+        .expect("submit succeeds");
+    let mut old = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("spawn-worker"),
+    );
+    old.recover().expect("old worker owns its name");
+    let abandoned = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("claim succeeds")
+        .expect("first claim");
+    let mut replacement = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("spawn-worker"),
+    );
+    let error = replacement
+        .recover()
+        .expect_err("a still-live old worker must refuse replacement");
+    assert!(error.to_string().contains("still owned"), "{error}");
+    assert!(
+        store
+            .claim("spawn-worker", Duration::from_mins(2))
+            .expect("claim succeeds")
+            .is_none(),
+        "failed recovery must not expire the live worker's lease"
+    );
+
+    drop(old);
+    replacement
+        .recover()
+        .expect("ownership dies with the old worker");
+    let reclaimed = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("claim succeeds")
+        .expect("recovery releases the abandoned lease");
+    assert_eq!(reclaimed.attempt, abandoned.attempt + 1);
+    assert!(store.finish(&abandoned, &Outcome::Succeeded).is_err());
+    store
+        .finish(&reclaimed, &Outcome::Succeeded)
+        .expect("one current attempt finishes");
+}
+
+#[test]
+fn a_bridge_without_worker_recovery_neither_owns_the_worker_nor_expires_live_leases() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock));
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(&principal, &submission())
+        .expect("submit succeeds");
+    // A live holder that leased without the ownership protocol (black-box
+    // `040-queue` claims with `spawn_claim` in psql).
+    let held = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("claim succeeds")
+        .expect("first claim");
+    let mut config = BridgeConfig::new("spawn-worker");
+    config.recover_worker_leases = false;
+    let mut tick = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        config,
+    );
+    tick.recover().expect("a one-shot tick recovers its view");
+    assert!(
+        store
+            .claim("spawn-worker", Duration::from_mins(2))
+            .expect("claim succeeds")
+            .is_none(),
+        "the tick must not expire the live holder's lease"
+    );
+    store
+        .finish(&held, &Outcome::Succeeded)
+        .expect("the live holder's attempt is still current");
+    // The tick, still alive, holds no ownership: the resident loop takes it.
+    let mut resident = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("spawn-worker"),
+    );
+    resident
+        .recover()
+        .expect("the loop owns the worker beside a live tick");
+    drop(tick);
+}
+
+fn finished(store: &MemoryStore) -> usize {
+    store
+        .read_global(GlobalPosition(0), 1_000)
+        .expect("read events")
+        .into_iter()
+        .filter(|record| matches!(record.event.kind, EventKind::CommandFinished { .. }))
+        .count()
+}
+
+fn drive_until_finished(bridge: &mut Bridge, store: &Arc<MemoryStore>, expected: usize) {
+    for attempt in 0..1_024 {
+        bridge.tick().expect("replacement tick succeeds");
+        if finished(store) == expected {
+            return;
+        }
+        store.expire_leases();
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    panic!("{expected} commands did not finish");
+}
+
+fn stage_crashed_mounted_start(
+    store: &Arc<MemoryStore>,
+    principal: &Principal,
+    submission: &Submission,
+) -> (CommandId, spawn_core::id::WorkspaceId) {
+    let id = store
+        .submit(principal, submission)
+        .expect("submit succeeds");
+    let branch = BranchName::for_agent(&submission.agent_id);
+    store.ensure_branch(&branch, None).expect("create branch");
+    let workspace = store.mount(&branch).expect("mount before the crash");
+    store
+        .append(NewEvent {
+            agent_id: submission.agent_id.clone(),
+            session_id: submission.session_id.clone(),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some(format!("{id}:mounted")),
+            kind: EventKind::CommandStepped {
+                command_id: id,
+                step: CommandStep::Mounted,
+                workspace: Some(workspace.clone()),
+            },
+        })
+        .expect("persist the pre-crash mount");
+    let abandoned = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("claim succeeds")
+        .expect("first claim");
+    assert_eq!(abandoned.attempt, 1);
+    let execution = ExecutionId::for_command(id);
+    store.set_pane(&TerminalName::for_execution(&execution), READY);
+    (id, workspace)
+}
+
+#[test]
+fn a_crashed_start_keeps_its_mount_events_and_executes_only_once() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock));
+    let principal = Principal::new("tester").expect("valid principal");
+    let submission = submission();
+    let (_id, workspace) = stage_crashed_mounted_start(&store, &principal, &submission);
+    let before = store
+        .read_global(GlobalPosition(0), 1_000)
+        .expect("read events");
+
+    let mut restarted = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("spawn-worker"),
+    );
+    restarted.recover().expect("recover the crashed worker");
+    assert!(
+        store.is_mounted(&workspace),
+        "an unfinished start keeps its mount"
+    );
+    drive_until_finished(&mut restarted, &store, 1);
+
+    let after = store
+        .read_global(GlobalPosition(0), 1_000)
+        .expect("read events");
+    assert_eq!(
+        &after[..before.len()],
+        before.as_slice(),
+        "no pre-crash event is lost"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|record| matches!(record.event.kind, EventKind::ExecutionStarted { .. }))
+            .count(),
+        1,
+        "one engine execution is recorded"
+    );
+    let launches = store.launches();
+    assert_eq!(launches.len(), 1, "the engine is launched once");
+    assert_eq!(
+        launches[0].workspace, workspace,
+        "the crash mount is reused"
+    );
+    assert_eq!(
+        store
+            .workspace_calls()
+            .iter()
+            .filter(|call| call.starts_with("mount "))
+            .count(),
+        1,
+        "recovery does not mount a duplicate workspace"
+    );
+    store
+        .submit(
+            &principal,
+            &Submission {
+                agent_id: submission.agent_id,
+                session_id: submission.session_id,
+                idempotency_key: IdempotencyKey::new("stop_after_recovery").expect("valid key"),
+                action: CommandAction::Stop,
+            },
+        )
+        .expect("submit stop");
+    drive_until_finished(&mut restarted, &store, 2);
+    assert!(
+        !store.is_mounted(&workspace),
+        "the final execution end releases the mount"
+    );
+    assert_eq!(
+        store
+            .workspace_calls()
+            .iter()
+            .filter(|call| *call == "unmount")
+            .count(),
+        1,
+        "orphan cleanup and normal shutdown do not double-unmount"
     );
 }

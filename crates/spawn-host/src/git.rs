@@ -1213,7 +1213,11 @@ impl GitWorkspace {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with(&prefix) && !name.starts_with(&ours) {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    } else {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
                 }
             }
         }
@@ -1223,10 +1227,41 @@ impl GitWorkspace {
         )))
     }
 
+    /// Best-effort stat cache prewarm for a freshly exported staging tree so
+    /// the first checkpoint avoids hashing the entire repository.
+    fn prewarm_index(&self, branch: &str, commit: &str, staged: &Path) -> Option<PathBuf> {
+        let staged_index = self.staging_path(branch, "index").ok()?;
+        let read_ok = self
+            .command_in(staged, &staged_index)
+            .args(["read-tree", commit])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !read_ok {
+            let _ = std::fs::remove_file(&staged_index);
+            return None;
+        }
+        let refresh_ok = self
+            .command_in(staged, &staged_index)
+            .args(["update-index", "-q", "--refresh"])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|output| matches!(output.status.code(), Some(0 | 1)));
+        if !refresh_ok || !staged_index.is_file() {
+            let _ = std::fs::remove_file(&staged_index);
+            return None;
+        }
+        Some(staged_index)
+    }
+
     /// Export `commit` into a new directory beside the workspaces,
-    /// before the workspace is touched; its path. On any error the directory
-    /// is removed.
-    fn stage_mount_commit(&self, branch: &str, commit: &str) -> Result<PathBuf, WorkspaceError> {
+    /// before the workspace is touched; its path (plus a best-effort
+    /// pre-warmed index). On any error the staging files are removed.
+    fn stage_mount_commit(
+        &self,
+        branch: &str,
+        commit: &str,
+    ) -> Result<(PathBuf, Option<PathBuf>), WorkspaceError> {
         let staged = self.staging_path(branch, "staged")?;
         let built = std::fs::create_dir(&staged)
             .map_err(|error| {
@@ -1234,7 +1269,10 @@ impl GitWorkspace {
             })
             .and_then(|()| self.export_commit(commit, &staged));
         match built {
-            Ok(()) => Ok(staged),
+            Ok(()) => {
+                let staged_index = self.prewarm_index(branch, commit, &staged);
+                Ok((staged, staged_index))
+            }
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&staged);
                 Err(error)
@@ -1347,12 +1385,13 @@ impl GitWorkspace {
     }
 
     /// Check `ready` and branch stability under the branch's lock before
-    /// touching `directory`, then install the pre-staged tree.
+    /// touching `directory`, then install the pre-staged tree and index.
     fn install_staged_mount(
         &self,
         branch: &str,
         head: &str,
         staged: &Path,
+        staged_index: Option<&Path>,
         ready: &dyn Fn() -> Result<(), String>,
     ) -> Result<WorkspaceId, WorkspaceError> {
         let _lock = self.lock_branch(branch)?;
@@ -1385,6 +1424,19 @@ impl GitWorkspace {
         // tree, so a copy that fails fails the mount like any other step.
         self.restore_main_copies(branch, staged)?;
         self.replace_workspace(branch, staged, &directory)?;
+        let index = self.index(branch);
+        if let Some(parent) = index.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        clear_dead_lock(&index);
+        if let Some(staged_idx) = staged_index {
+            if std::fs::rename(staged_idx, &index).is_err() {
+                let _ = std::fs::remove_file(staged_idx);
+                let _ = std::fs::remove_file(&index);
+            }
+        } else {
+            let _ = std::fs::remove_file(&index);
+        }
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch);
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
@@ -1656,10 +1708,19 @@ impl WorkspaceStore for GitWorkspace {
             ])
             .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
         self.refuse_files_outside_git(branch.as_str())?;
-        let staged = self.stage_mount_commit(branch.as_str(), &head)?;
-        let installed = self.install_staged_mount(branch.as_str(), &head, &staged, ready);
+        let (staged, staged_index) = self.stage_mount_commit(branch.as_str(), &head)?;
+        let installed = self.install_staged_mount(
+            branch.as_str(),
+            &head,
+            &staged,
+            staged_index.as_deref(),
+            ready,
+        );
         if installed.is_err() {
             let _ = std::fs::remove_dir_all(&staged);
+            if let Some(staged_idx) = staged_index {
+                let _ = std::fs::remove_file(staged_idx);
+            }
         }
         installed
     }
@@ -4611,6 +4672,76 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&peer_file).expect("kept"), "peer\n");
         assert!(store.is_mounted(&ws));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mount_prewarms_branch_index_and_detects_immediate_post_mount_edits() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-git-prewarm-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        let work = base.join("work");
+        std::fs::create_dir_all(&checkout).expect("create repo");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "hello\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+
+        let store = GitWorkspace::new(checkout.join(".git"), &work);
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let ws = store.mount(&branch).expect("mount");
+
+        let index_path = work.join(".index").join("agent_a");
+        assert!(index_path.is_file(), "mount should prewarm branch index");
+
+        assert!(
+            matches!(
+                store.commit(&ws, "noop").expect("noop commit"),
+                Commit::Unchanged
+            ),
+            "clean mount with prewarmed index should commit as Unchanged"
+        );
+
+        std::fs::write(Path::new(ws.path()).join("README.md"), "world\n").expect("same-len edit");
+        assert!(
+            matches!(
+                store.commit(&ws, "same-len-edit").expect("edit commit"),
+                Commit::Created(_)
+            ),
+            "same-length edit immediately after prewarm must still be committed"
+        );
+        let show = super::test_git_command()
+            .current_dir(&checkout)
+            .args(["show", "refs/heads/agent_a:README.md"])
+            .output()
+            .expect("git show");
+        assert!(show.status.success());
+        assert_eq!(String::from_utf8_lossy(&show.stdout), "world\n");
+
+        let idx_bytes_before = std::fs::read(&index_path).expect("read existing index");
+        let cancelled = store.mount_when(&branch, &|| Err("cancelled by test".to_string()));
+        assert!(
+            matches!(
+                cancelled,
+                Err(WorkspaceError::Refused { ref code, .. }) if code == spawn_core::port::MOUNT_CANCELLED
+            ),
+            "{cancelled:?}"
+        );
+        assert_eq!(
+            std::fs::read(&index_path).expect("existing index kept"),
+            idx_bytes_before,
+            "cancelled mount_when must not overwrite peer's branch index"
+        );
+        let leftover_idx = std::fs::read_dir(work.join(".mount"))
+            .expect("read .mount")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".index."));
+        assert!(
+            !leftover_idx,
+            "cancelled prewarmed index must be cleaned up"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

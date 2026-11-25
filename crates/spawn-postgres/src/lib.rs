@@ -21,7 +21,7 @@
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row};
@@ -171,7 +171,10 @@ fn backend(error: &postgres::Error) -> StoreError {
 
 /// PostgreSQL store.
 pub struct PostgresStore {
-    client: Mutex<Client>,
+    client: Arc<Mutex<Client>>,
+    /// Workers owned on this session. PostgreSQL advisory locks are
+    /// re-entrant on one session, so this set still refuses a second Bridge.
+    workers: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The password in the URL this store connected with: the owner's, when
     /// it migrates, and the key the logins' passwords are derived from.
     password: String,
@@ -231,7 +234,8 @@ impl PostgresStore {
         });
         let client = config.connect(NoTls).map_err(|error| backend(&error))?;
         Ok(Self {
-            client: Mutex::new(client),
+            client: Arc::new(Mutex::new(client)),
+            workers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             password: url_password(url),
             url: url.to_string(),
             prepared: Mutex::new(std::collections::HashMap::new()),

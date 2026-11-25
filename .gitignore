@@ -7,3 +7,4 @@ __pycache__/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 rsi/.gate-owner/
+!crates/spawn-node-proto/testdata/node-protocol-v1/result.log

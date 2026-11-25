@@ -1,0 +1,8 @@
+POST /node/v1/heartbeat
+Spawn-Node-Id: 56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c
+Spawn-Node-Boot: 00000000000000018796a5b4c3d2e1f0
+Spawn-Node-Seq: 1
+Spawn-Node-Ts: 1795600000000
+Spawn-Node-Sig: vPJKnq7QkRBD9YK5gQDRhc2grSBVEHahB48DYha2sWSAQCE9_CHu_oAurT45GsVrNWXYvuRK90ieZmkJwK47AA
+
+{"v":1,"cell_id":"c0","state":"idle","spec_sha256":"9d45101b5c0e737a0f54529ff68d874651d84e9255f90ce2f9935f15e8458960","capacities":{"gate_sandbox":{"free":4,"total":4},"batch_cpu":{"free":160,"total":160}},"tmpfs_budget_mb":{"free":262144,"total":262144},"leases":[],"lease_results_pending":[],"warm_bases":[],"edge":"boot","load1_milli":1.25}

@@ -12,7 +12,6 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 /// The prefix of the gate's toolchain line (scripts/rsi/gate.sh prints it
 /// during its setup, before any build).
@@ -44,47 +43,11 @@ pub(super) fn controller_commit(controller: &Path) -> Option<String> {
 /// The scenario set's digest: the sha256 of the lines `<sha256 of the
 /// file>  <path>\n` (sha256sum's format) of every regular file under `dir`
 /// (symbolic links are not followed), paths relative to it, sorted
-/// bytewise. None when the directory cannot be read whole.
+/// bytewise. None when the directory cannot be read whole. This is
+/// spawn-node v1's `tree_sha256_v1`, shared with the node so that a remote
+/// gate's `inputs` compare equal to a local one's.
 pub(super) fn scenarios_sha256(dir: &Path) -> Option<String> {
-    let mut files: Vec<(Vec<u8>, std::path::PathBuf)> = Vec::new();
-    walk(dir, Path::new(""), &mut files).ok()?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut all = Sha256::new();
-    for (relative, path) in files {
-        let bytes = std::fs::read(&path).ok()?;
-        all.update(hex(&Sha256::digest(&bytes)).as_bytes());
-        all.update(b"  ");
-        all.update(&relative);
-        all.update(b"\n");
-    }
-    Some(hex(&all.finalize()))
-}
-
-fn walk(
-    dir: &Path,
-    relative: &Path,
-    files: &mut Vec<(Vec<u8>, std::path::PathBuf)>,
-) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        let name = relative.join(entry.file_name());
-        if kind.is_dir() {
-            walk(&entry.path(), &name, files)?;
-        } else if kind.is_file() {
-            files.push((name.as_os_str().as_bytes().to_vec(), entry.path()));
-        }
-    }
-    Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    spawn_node_proto::scenarios_sha256(dir)
 }
 
 /// The text after `| base cache: toolchain ` on the first such line of a
@@ -215,6 +178,20 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(second, shell_digest(&dir.0));
         assert_eq!(scenarios_sha256(&dir.0.join("missing")), None);
+    }
+
+    #[test]
+    fn the_scenario_set_digest_is_the_node_protocol_tree_digest() {
+        // spawn-node v1's golden `tree/` fixture and its `tree_sha256_v1`
+        // (crates/spawn-node-proto/testdata/node-protocol-v1/vectors.json).
+        let tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../spawn-node-proto/testdata/node-protocol-v1/tree");
+        let digest = scenarios_sha256(&tree).unwrap();
+        assert_eq!(
+            digest,
+            "191e8f57890fd35474a61e33b8876130b98c63388e00d05e7b4a36f4eb4e4707"
+        );
+        assert_eq!(digest, shell_digest(&tree));
     }
 
     #[test]
