@@ -1,7 +1,7 @@
 import { PanelRight } from "lucide-react";
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 
-import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, usePoll } from "./api";
+import { fetchAlerts, fetchAttention, fetchOverview, fetchSessionTail, live, usePoll } from "./api";
 import { PAGE_EVENTS } from "./sessionWindow";
 import type { PollResult, SessionTail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
@@ -113,14 +113,18 @@ function useMinute(): number {
 }
 
 export default function App() {
-  const overview = usePoll("overview", fetchOverview);
+  // The live log (stream.ts, shared among tabs): every poll that names a
+  // topic reads again when an event of it arrives, and polls slower while
+  // the stream is live.
+  useEffect(() => live.start(), []);
+  const overview = usePoll("overview", fetchOverview, 2_000, { live: ["overview"] });
   // Both polled in every view: the sidebar shows what is escalated, which is
   // the dispatcher's view (/api/attention), never a judge's flag.
-  const fleetPoll = usePoll("fleet", fetchFleet, 3_000);
-  const attention = usePoll("attention", fetchAttention, 3_000);
+  const fleetPoll = usePoll("fleet", fetchFleet, 3_000, { live: ["fleet"] });
+  const attention = usePoll("attention", fetchAttention, 3_000, { live: ["attention"] });
   // The alerts Spawn raised, on every page: the open ones are a strip at the
   // top, and the Alerts view shows the window.
-  const alerts = usePoll("alerts", fetchAlerts, 5_000);
+  const alerts = usePoll("alerts", fetchAlerts, 5_000, { live: ["alerts"] });
   const needs = useMemo(
     () => (attention.data ? needsHuman(attention.data) : null),
     [attention.data],
@@ -154,6 +158,7 @@ export default function App() {
     "missions",
     fetchMissions,
     view === "missions" ? 5_000 : 15_000,
+    { live: ["missions"] },
   );
   const context = useMemo(() => fleetContext(missions.data), [missions.data]);
   // The Home badge counts what needs the owner's action: the home page's

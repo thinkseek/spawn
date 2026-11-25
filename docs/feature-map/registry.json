@@ -2651,10 +2651,10 @@
     },
     {
       "id": "cap-web-dashboard",
-      "title": "Dashboard Backend: Live Stream, Master Control, Approvals & Digest (issue 91 P1a)",
+      "title": "Dashboard: Live Stream, Master Control, Approvals, Digest & PWA Shell (issue 91 P1a backend, P1b web)",
       "kind": "capability",
       "parent": "domain-dashboard-web",
-      "summary": "The Rust backend of the issue 91 dashboard: `GET /api/stream` (Server-Sent Events on slots of their own, one `LISTEN spawn_events` listener, Last-Event-ID / ?after= catch-up), `POST /api/master/message` (`spawn_human_master_message`: a message to the supervisor that auto-wakes it, in auto/steer/queue/restart modes), the no-ACP approval detector `GET /api/approvals` with its one-click `POST /api/approvals/<session_id>/act` (named keys, the digits of numbered prompts included), and the token-saving `GET /api/context/digest`.",
+      "summary": "The Rust backend of the issue 91 dashboard: `GET /api/stream` (Server-Sent Events on slots of their own, one `LISTEN spawn_events` listener, Last-Event-ID / ?after= catch-up), `POST /api/master/message` (`spawn_human_master_message`: a message to the supervisor that auto-wakes it, in auto/steer/queue/restart modes), the no-ACP approval detector `GET /api/approvals` with its one-click `POST /api/approvals/<session_id>/act` (named keys, the digits of numbered prompts included), and the token-saving `GET /api/context/digest`. The web side (P1b): `web/src/stream.ts` reads `/api/stream` with fetch() and a ReadableStream (the bearer header, never a token in the URL), resumes with Last-Event-ID / ?after=, handles ready and resync, reconnects with jittered backoff, catches up when the page shows again, and is shared among tabs by a Web Lock and a BroadcastChannel (each tab alone without them); its events invalidate Home's polls. Home shows the approvals queue (`approvals.ts`, ApprovalsQueue: one click per answer with approval_id and Idempotency-Key, probed first), Master Control (`master.ts`, MasterComposer: auto/steer/queue/restart with an IndexedDB offline outbox `outbox.ts` that replays idempotently, in memory without IndexedDB) and the digest (`digest.ts`, DigestPanel). Nodes show their power and low-battery soft drain. A dependency-free PWA shell (manifest, icon and a service worker that never caches /api/* or tokens) is embedded in the binary (`serve/pwa.rs`, `web/src/pwa/`) and served by `spawn serve` itself, no-cache. Answers carry the option clicked (`choice_id`), which the server presses and no other; keys for an approval are pressed only while it shows.",
       "files": [
         "crates/spawn-cli/src/serve/approvals.rs",
         "crates/spawn-cli/src/serve/approvals/tests.rs",
@@ -2662,7 +2662,34 @@
         "crates/spawn-cli/src/serve/digest/tests.rs",
         "crates/spawn-cli/src/serve/stream.rs",
         "crates/spawn-cli/src/serve/stream/tests.rs",
-        "crates/spawn-postgres/tests/master_message.rs"
+        "crates/spawn-postgres/tests/master_message.rs",
+        "web/src/stream.ts",
+        "web/src/approvals.ts",
+        "web/src/master.ts",
+        "web/src/outbox.ts",
+        "web/src/digest.ts",
+        "web/src/components/fleet/ApprovalsQueue.tsx",
+        "web/src/components/fleet/MasterComposer.tsx",
+        "web/src/components/fleet/DigestPanel.tsx",
+        "web/test/stream.test.ts",
+        "web/test/approvals.test.ts",
+        "web/test/master.test.ts",
+        "web/test/outbox.test.ts",
+        "web/test/digest.test.ts",
+        "web/test/pwa.test.ts",
+        "web/src/nodes.ts",
+        "web/src/components/fleet/NodeRows.tsx",
+        "web/test/nodes.test.ts",
+        "web/index.html",
+        "web/src/main.tsx",
+        "web/src/api.ts",
+        "web/src/components/fleet/FleetView.tsx",
+        "crates/spawn-cli/src/serve/pwa.rs",
+        "web/src/pwa/sw.js",
+        "web/src/pwa/manifest.webmanifest",
+        "web/src/pwa/icon.svg",
+        "web/src/validated.ts",
+        "web/test/validated.test.ts"
       ],
       "relations": [
         {
@@ -2680,17 +2707,28 @@
         {
           "kind": "relates_to",
           "target": "cap-tmux-runner"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-web-fleet-board"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-web-shell-design-system"
         }
       ],
       "provenance": {
         "objectives": [
-          "issue-91/P1a"
+          "issue-91/P1a",
+          "issue-91/P1b"
         ],
         "tasks": [
-          "565"
+          "565",
+          "571"
         ],
         "agents": [
-          "agent_worker_issue91_p1a_backend_565"
+          "agent_worker_issue91_p1a_backend_565",
+          "agent_worker_issue91_p1b_web_pwa_571"
         ],
         "commits": [],
         "tests": [
@@ -2698,7 +2736,15 @@
           "crates/spawn-cli/src/serve/digest/tests.rs",
           "crates/spawn-cli/src/serve/stream/tests.rs",
           "crates/spawn-cli/src/serve.rs",
-          "crates/spawn-postgres/tests/master_message.rs"
+          "crates/spawn-postgres/tests/master_message.rs",
+          "web/test/stream.test.ts",
+          "web/test/approvals.test.ts",
+          "web/test/master.test.ts",
+          "web/test/outbox.test.ts",
+          "web/test/digest.test.ts",
+          "web/test/pwa.test.ts",
+          "web/test/nodes.test.ts",
+          "web/test/validated.test.ts"
         ],
         "deploys": [],
         "artifacts": [

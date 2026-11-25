@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Spawn">
+  <rect width="512" height="512" rx="112" fill="#18181b"/>
+  <circle cx="256" cy="256" r="58" fill="#fafafa"/>
+  <g fill="none" stroke="#fafafa" stroke-width="28" stroke-linecap="round">
+    <path d="M256 198V112"/>
+    <path d="M306 285l74 43"/>
+    <path d="M206 285l-74 43"/>
+  </g>
+  <g fill="#4ade80">
+    <circle cx="256" cy="104" r="34"/>
+    <circle cx="387" cy="332" r="34"/>
+    <circle cx="125" cy="332" r="34"/>
+  </g>
+</svg>

@@ -151,6 +151,7 @@ pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
 mod labels;
+mod pwa;
 mod storage;
 mod stream;
 
@@ -1111,6 +1112,11 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         if path == "/api/features/coverage" && mission_query(query).is_some() {
             return feature_coverage_mission_get(request, query);
         }
+    }
+    // The PWA shell is the binary's own (serve/pwa.rs), whatever the
+    // built directory holds.
+    if let Some(asset) = pwa::asset(path) {
+        return pwa::respond(request, asset);
     }
     let Some(read) = reader(path, query) else {
         return static_file(request, &shared.web, path);
@@ -3358,8 +3364,14 @@ fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// The `Content-Type` of a built file: a web app manifest as
+/// `application/manifest+json` and icons by their kind among them (the
+/// dashboard's own PWA shell is embedded, serve/pwa.rs).
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next() {
+        Some("webmanifest") => "application/manifest+json",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
@@ -3377,12 +3389,13 @@ mod tests {
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, FeatureAssociateRefusal, LogStart, MAX_IN_FLIGHT,
         MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT, ProcSocket, Shared, Slots, access_token,
-        backups, coverage_projects, coverage_registry_checked, feature_associate_at, feature_paths,
-        handle, is_json, is_loopback, keep_listening, listen_again_pause, local_exemption,
-        log_window, mission_feature_paths, mission_query, objective_json, objective_prompt,
-        open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, public_nodes,
-        rsi_objective, rsi_summary, same_origin, same_secret, serve_requests, server_hosts, stream,
-        tokenless_request, typed_text, with_activity, with_last_gates, with_objectives,
+        backups, content_type, coverage_projects, coverage_registry_checked, feature_associate_at,
+        feature_paths, handle, is_json, is_loopback, keep_listening, listen_again_pause,
+        local_exemption, log_window, mission_feature_paths, mission_query, objective_json,
+        objective_prompt, open_network_request, open_networks, owner_uid, peer_uid, proc_sockets,
+        public_nodes, rsi_objective, rsi_summary, same_origin, same_secret, serve_requests,
+        server_hosts, stream, tokenless_request, typed_text, with_activity, with_last_gates,
+        with_objectives,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -6055,6 +6068,106 @@ mod tests {
             raw_header(&asset, "Cache-Control"),
             Some("public, max-age=31536000, immutable")
         );
+    }
+
+    /// The PWA shell (issue #91 P1b) is the binary's own (serve/pwa.rs):
+    /// the manifest as `application/manifest+json`, the service worker as
+    /// JavaScript, the icon as SVG, each `no-cache` with a tag that gets
+    /// 304, served with no file of the built directory and before one of
+    /// the same name. Nothing else is answered by it, nor by the page
+    /// (there is no index.html fallback: a missing file is a 404).
+    #[test]
+    fn the_pwa_shell_is_served_with_its_types_and_never_as_the_page() {
+        let (port, web) = serving("pwa", 4);
+        std::fs::write(web.join("index.html"), "<html>spawn</html>").expect("page");
+        std::fs::write(web.join("sw.js"), "a stale worker").expect("a built worker");
+        let manifest = raw_get(port, "/manifest.webmanifest", "");
+        let worker = raw_get(port, "/sw.js", "");
+        let icon = raw_get(port, "/icon.svg", "");
+        let missing = raw_get(port, "/missing.webmanifest", "");
+        let nested = raw_get(port, "/assets/sw.js", "");
+        let queried = raw_get(port, "/sw.js?v=2", "");
+        let tag = raw_header(&worker, "ETag").expect("a tag").to_string();
+        let again = raw_get(port, "/sw.js", &format!("If-None-Match: {tag}\r\n"));
+        let _ = std::fs::remove_dir_all(&web);
+        for (answer, kind, body) in [
+            (
+                &manifest,
+                "application/manifest+json",
+                "\"start_url\": \"/\"",
+            ),
+            (
+                &worker,
+                "application/javascript; charset=utf-8",
+                "addEventListener(\"fetch\"",
+            ),
+            (&icon, "image/svg+xml", "<svg"),
+        ] {
+            assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+            assert_eq!(raw_header(answer, "Content-Type"), Some(kind));
+            assert_eq!(raw_header(answer, "Cache-Control"), Some("no-cache"));
+            assert!(answer.contains(body), "{answer}");
+            assert!(
+                !answer.contains("<html>spawn</html>"),
+                "not the page: {answer}"
+            );
+        }
+        assert!(
+            !worker.contains("a stale worker"),
+            "the embedded worker wins"
+        );
+        assert!(queried.contains("addEventListener(\"fetch\""), "{queried}");
+        assert!(again.starts_with("HTTP/1.1 304"), "{again}");
+        assert_eq!(raw_header(&again, "Cache-Control"), Some("no-cache"));
+        for answer in [&missing, &nested] {
+            assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+            assert!(
+                !answer.contains("<html>spawn</html>"),
+                "not the page: {answer}"
+            );
+        }
+    }
+
+    /// The embedded shell: exactly three paths, the worker never caching
+    /// the API, the manifest naming the icon served beside it.
+    #[test]
+    fn the_embedded_pwa_shell_is_three_files_that_agree() {
+        let paths: Vec<&str> = super::pwa::ASSETS.iter().map(|asset| asset.path).collect();
+        assert_eq!(paths, ["/sw.js", "/manifest.webmanifest", "/icon.svg"]);
+        assert!(super::pwa::asset("/sw.js").is_some());
+        assert!(super::pwa::asset("/sw.js/").is_none());
+        assert!(super::pwa::asset("/assets/sw.js").is_none());
+        let worker = super::pwa::asset("/sw.js").expect("worker").body;
+        assert!(worker.contains("url.pathname.startsWith(\"/api/\")"));
+        assert!(worker.contains("request.headers.has(\"Authorization\")"));
+        let manifest: serde_json::Value = serde_json::from_str(
+            super::pwa::asset("/manifest.webmanifest")
+                .expect("manifest")
+                .body,
+        )
+        .expect("the manifest is JSON");
+        for icon in manifest["icons"].as_array().expect("icons") {
+            let src = icon["src"].as_str().expect("src");
+            assert!(super::pwa::asset(src).is_some(), "{src} is served");
+        }
+    }
+
+    /// Each built file's type: a manifest and icons among them.
+    #[test]
+    fn built_files_are_typed_by_their_names() {
+        assert_eq!(
+            content_type("manifest.webmanifest"),
+            "application/manifest+json"
+        );
+        assert_eq!(
+            content_type("assets/index-1a2b.js"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(content_type("icon.svg"), "image/svg+xml");
+        assert_eq!(content_type("icon-192.png"), "image/png");
+        assert_eq!(content_type("favicon.ico"), "image/x-icon");
+        assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
+        assert_eq!(content_type("unknown"), "application/octet-stream");
     }
 
     /// `/api/features` is a route of its own, behind the same read guard: a

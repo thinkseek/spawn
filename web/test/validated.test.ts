@@ -6,7 +6,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  cacheControlFor,
+  FRESH,
   formatBytes,
+  markFresh,
   isCut,
   OnDemand,
   pageHidden,
@@ -161,4 +164,27 @@ test("a value read on demand is read once per key, and a failure is read again",
   await wanted.get("7/6/10", read("third"));
   assert.equal(wanted.size, 2, "past the limit the oldest goes");
   assert.equal(await wanted.get("7/4/2000", read("again")), "again", "the oldest was read again");
+});
+
+/** Review S1 (issue #91 P1b): a read the live stream asked for (its
+ * signal marked fresh) sends `Cache-Control: no-cache`, so the server
+ * computes the board after the event; a periodic poll keeps sharing the
+ * second-old answer (`max-age=1`). Every read made with a marked signal is
+ * fresh, a read awaited after another included. */
+test("a live-triggered read asks for a fresh answer, a periodic one shares", async () => {
+  const { seen, fetcher } = server([{ body: { n: 1 } }]);
+  const reads = new Validated(fetcher);
+  const periodic = options();
+  await reads.read("/api/fleet", (raw) => raw, periodic);
+  const live = { ...options(), signal: markFresh(new AbortController().signal) };
+  await reads.read("/api/fleet", (raw) => raw, live);
+  await reads.read("/api/attention", (raw) => raw, live);
+  assert.deepEqual(
+    seen.map((request) => request.headers["Cache-Control"]),
+    [SHARED_FOR, FRESH, FRESH],
+  );
+  assert.equal(FRESH, "no-cache");
+  assert.equal(SHARED_FOR, "max-age=1");
+  assert.equal(cacheControlFor(undefined), SHARED_FOR);
+  assert.equal(cacheControlFor(new AbortController().signal), SHARED_FOR);
 });

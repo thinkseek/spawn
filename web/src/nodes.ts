@@ -34,6 +34,24 @@ export interface NodeRow {
   mode: NodeMode;
   /** The hops from the primary to the node, in order; [] for none. */
   via: string[];
+  /** Its power (issue #91): null for a node with no battery and no AC
+   * sensor (a desktop, a VM), or one too old to say. */
+  power: NodePower | null;
+  /** On battery at or under the low-battery threshold: soft-drained until
+   * plugged in, its `state` and the owner's drain untouched. */
+  low_battery_drain: boolean;
+  /** Drained by the owner, or soft-drained. */
+  effective_drained: boolean;
+  /** Whether work may be placed on it; null from a server that does not say. */
+  schedulable: boolean | null;
+}
+
+/** A node's power, as its probes read it (crate nodes/power.rs). */
+export interface NodePower {
+  on_ac: boolean;
+  battery_pct: number | null;
+  charging: boolean;
+  remaining_mins: number | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -97,9 +115,50 @@ export function normalizeNodes(raw: unknown): NodeRow[] {
         sampled_ms: number(beat?.at_ms),
         lost_since_ms: number(node.lost_since_ms),
         ...reach(node),
+        power: powerOf(node.power),
+        low_battery_drain: node.low_battery_drain === true,
+        effective_drained: node.effective_drained === true || node.state === "drained",
+        schedulable: typeof node.schedulable === "boolean" ? node.schedulable : null,
       };
     })
     .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** A node's `power`, or null: not an object, or no `on_ac` said. */
+export function powerOf(raw: unknown): NodePower | null {
+  const power = object(raw);
+  if (!power || typeof power.on_ac !== "boolean") return null;
+  const pct = number(power.battery_pct);
+  const mins = number(power.remaining_mins);
+  return {
+    on_ac: power.on_ac,
+    battery_pct: pct === null ? null : Math.max(0, Math.min(100, Math.round(pct))),
+    charging: power.charging === true,
+    remaining_mins: mins === null || mins < 0 ? null : Math.round(mins),
+  };
+}
+
+/** The power as `spawn node list` says it: "battery 57% discharging
+ * 3h12m", "AC 100% charging", "AC"; null without a power. */
+export function powerText(row: Pick<NodeRow, "power">): string | null {
+  const power = row.power;
+  if (!power) return null;
+  const words = [power.on_ac ? "AC" : "battery"];
+  if (power.battery_pct !== null) words.push(`${power.battery_pct}%`);
+  if (power.charging) words.push("charging");
+  else if (!power.on_ac) words.push("discharging");
+  if (power.remaining_mins !== null) {
+    words.push(`${Math.floor(power.remaining_mins / 60)}h${String(power.remaining_mins % 60).padStart(2, "0")}m`);
+  }
+  return words.join(" ");
+}
+
+/** How the power reads at a glance: "ok" on AC or charged, "low" on
+ * battery in the soft drain, "draining" on battery otherwise. */
+export function powerTone(row: Pick<NodeRow, "power" | "low_battery_drain">): "ok" | "draining" | "low" | null {
+  if (!row.power) return null;
+  if (row.low_battery_drain) return "low";
+  return row.power.on_ac || row.power.charging ? "ok" : "draining";
 }
 
 /** How a node is reached, from its join; an old join's (or an unknown

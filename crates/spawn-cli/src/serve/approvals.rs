@@ -74,16 +74,22 @@
 //!
 //! The act, `POST /api/approvals/<session_id>/act`: `{"action": "allow" |
 //! "allow_always" | "deny" | "keys" | "text", "approval_id"?: "<item id>",
-//! "keys"?: [...], "text"?: "...", "key": "<idempotency key>"}` (the key
+//! "choice_id"?: "<option id>", "keys"?: [...], "text"?: "...", "key":
+//! "<idempotency key>"}` (the key
 //! may come in an `Idempotency-Key` header), or `{"probe": true}`, with
 //! every guard of `POST /api/sessions/<id>/input` in its order. `allow`,
 //! `allow_always` and `deny` need `approval_id`, the `id` of the item the
 //! page showed (400 without): the pane is read again now, and the keys of
 //! the answer are pressed only when the prompt showing has that id; 409,
 //! nothing pressed, when no prompt shows, another one does (a page not
-//! refreshed), or it offers no such answer. `keys` presses the named keys
-//! given (1 to [`MAX_KEYS`]), `text` types a text; neither needs an
-//! `approval_id`. Each key is its own command (idempotency key
+//! refreshed), or it offers no such answer. `choice_id`, the option's `id`,
+//! names the answer meant: that option is pressed, and it must be of the
+//! action asked (409 otherwise); without it an action several options share
+//! is ambiguous (409, nothing pressed). `keys` presses the named keys given
+//! (1 to [`MAX_KEYS`]); with an `approval_id` (needed with a `choice_id`)
+//! only while that prompt shows (409 otherwise), and with a `choice_id`
+//! they are that option's keys (any `keys` given must be the same). `text`
+//! types a text. Bare `keys` and `text` read no pane. Each key is its own command (idempotency key
 //! `<key>:<n>`), a text one (`<key>`); a retried POST makes none again.
 //! 202 `{session_id, action, command_ids, keys, text, principal}`; 404 for
 //! a session no agent has used; 409 for one that runs no execution, or a
@@ -915,6 +921,8 @@ struct ActBody {
     #[serde(default)]
     approval_id: Option<String>,
     #[serde(default)]
+    choice_id: Option<String>,
+    #[serde(default)]
     keys: Option<Vec<String>>,
     #[serde(default)]
     text: Option<String>,
@@ -931,6 +939,9 @@ pub(super) struct Asked {
     /// The `id` of the item the page showed (`GET /api/approvals`): needed
     /// for an answer of the prompt (`allow`, `allow_always`, `deny`).
     pub(super) approval_id: Option<String>,
+    /// The `id` of the option the page's button stood for (`options[].id`):
+    /// the answer pressed is that one, never another of the same action.
+    pub(super) choice_id: Option<String>,
     pub(super) keys: Option<Vec<String>>,
     pub(super) text: Option<String>,
 }
@@ -963,89 +974,191 @@ pub(super) fn act(
         .map_err(|error| error.to_string())
 }
 
+/// The prompt `session` shows now when it is approval `wanted`: 409,
+/// nothing pressed, when none shows or another does (a page not refreshed).
+fn showing(
+    session: &SessionId,
+    prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
+    wanted: &str,
+    doing: &str,
+) -> Result<Prompt, (u16, String)> {
+    let shown = prompt(session)
+        .map_err(|error| (500, error))?
+        .ok_or_else(|| {
+            (
+                409,
+                format!(
+                    "no approval prompt shows on {} now: nothing to {doing}",
+                    session.as_str()
+                ),
+            )
+        })?;
+    let now = shown.id(session.as_str());
+    if now != wanted {
+        return Err((
+            409,
+            format!(
+                "the prompt on {} is not approval {wanted} any more (now {now}): \
+                 nothing pressed; read GET /api/approvals again",
+                session.as_str()
+            ),
+        ));
+    }
+    Ok(shown)
+}
+
+/// 409 for an option `choice` the prompt on `session` does not offer (as
+/// `doing`, an action or `keys`).
+fn no_choice(session: &SessionId, choice: &str, doing: &str) -> (u16, String) {
+    (
+        409,
+        format!(
+            "the prompt on {} offers no answer {choice:?} for {doing}: nothing pressed; read \
+             GET /api/approvals again",
+            session.as_str()
+        ),
+    )
+}
+
+/// The keys of `action` (allow, allow_always, deny) on the prompt shown:
+/// the option `choice_id` names, which must be of that action, else the
+/// one option of that action (409 when there is none, or several: name
+/// the one meant).
+fn answer_keys(
+    shown: &Prompt,
+    session: &SessionId,
+    action: &str,
+    choice_id: Option<String>,
+) -> Result<Vec<NamedKey>, (u16, String)> {
+    if let Some(choice_id) = choice_id {
+        return shown
+            .choices
+            .iter()
+            .find(|choice| choice.id == choice_id && choice.action == action)
+            .map(|choice| choice.keys.clone())
+            .ok_or_else(|| no_choice(session, &choice_id, action));
+    }
+    let mut matching = shown
+        .choices
+        .iter()
+        .filter(|choice| choice.action == action);
+    let choice = matching.next().ok_or_else(|| {
+        (
+            409,
+            format!(
+                "the prompt on {} offers no {action} answer",
+                session.as_str()
+            ),
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err((
+            409,
+            format!(
+                "the prompt on {} offers more than one {action} answer: name the one meant \
+                 (\"choice_id\", the option's id from GET /api/approvals); nothing pressed",
+                session.as_str()
+            ),
+        ));
+    }
+    Ok(choice.keys.clone())
+}
+
+/// What a `keys` act sends: the named keys given, read from no pane; or,
+/// for an approval (`approval_id`, needed with a `choice_id`), only while
+/// that prompt shows, and with a `choice_id` that option's keys (any keys
+/// given must be the same).
+fn keys_to_send(
+    asked: Asked,
+    session: &SessionId,
+    prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
+) -> Result<Send, (u16, String)> {
+    let bad = |why: String| (400, format!("{BAD_REQUEST}{why}"));
+    let count = || bad(format!("keys names 1 to {MAX_KEYS} keys"));
+    if asked.text.is_some() {
+        return Err(bad("keys carries no text".to_string()));
+    }
+    let given = match &asked.keys {
+        Some(keys) if keys.is_empty() || keys.len() > MAX_KEYS => return Err(count()),
+        Some(keys) => Some(
+            keys.iter()
+                .map(|name| NamedKey::from_name(name).map_err(&bad))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => None,
+    };
+    let Some(wanted) = asked.approval_id else {
+        if asked.choice_id.is_some() {
+            return Err(bad(
+                "a choice_id names an option of an approval: give its \"approval_id\" too"
+                    .to_string(),
+            ));
+        }
+        return given.map(Send::Keys).ok_or_else(count);
+    };
+    if asked.choice_id.is_none() && given.is_none() {
+        return Err(count());
+    }
+    let shown = showing(session, prompt, &wanted, "press")?;
+    let Some(choice_id) = asked.choice_id else {
+        return given.map(Send::Keys).ok_or_else(count);
+    };
+    let choice = shown
+        .choices
+        .iter()
+        .find(|choice| choice.id == choice_id)
+        .ok_or_else(|| no_choice(session, &choice_id, "keys"))?;
+    if given.as_ref().is_some_and(|given| *given != choice.keys) {
+        return Err((
+            409,
+            format!(
+                "answer {choice_id:?} on {} is not pressed with those keys any more: nothing \
+                 pressed; read GET /api/approvals again",
+                session.as_str()
+            ),
+        ));
+    }
+    Ok(Send::Keys(choice.keys.clone()))
+}
+
 /// What `asked` sends, `prompt` reading the pane when the action names an
 /// answer of its prompt: that answer is pressed only when the prompt
 /// showing now is the item the page showed (its `approval_id`), so a click
-/// on a prompt since answered or replaced presses nothing (409).
+/// on a prompt since answered or replaced presses nothing (409). With a
+/// `choice_id` the answer is that option of the prompt, and it must be of
+/// the action asked (409 otherwise); without one, an action two options
+/// share (three "Yes" lines) is ambiguous, 409, and nothing is pressed.
+/// `keys` with an `approval_id` is guarded the same way ([`keys_to_send`]).
+/// Bare `keys` and `text` read no pane.
 pub(super) fn what_to_send(
     asked: Asked,
     session: &SessionId,
     prompt: &dyn Fn(&SessionId) -> Result<Option<Prompt>, String>,
 ) -> Result<Send, (u16, String)> {
     let bad = |why: String| (400, format!("{BAD_REQUEST}{why}"));
-    let Asked {
-        action,
-        approval_id,
-        keys,
-        text,
-    } = asked;
-    let action = action.as_str();
-    match action {
-        "allow" | "allow_always" | "deny" => {
-            if keys.is_some() || text.is_some() {
+    match asked.action.as_str() {
+        action @ ("allow" | "allow_always" | "deny") => {
+            if asked.keys.is_some() || asked.text.is_some() {
                 return Err(bad(format!("{action} carries no keys and no text")));
             }
-            let wanted = approval_id.ok_or_else(|| {
+            let wanted = asked.approval_id.as_deref().ok_or_else(|| {
                 bad(format!(
                     "{action} names the approval it answers (\"approval_id\", the item's id \
                      from GET /api/approvals)"
                 ))
             })?;
-            let shown = prompt(session)
-                .map_err(|error| (500, error))?
-                .ok_or_else(|| {
-                    (
-                        409,
-                        format!(
-                            "no approval prompt shows on {} now: nothing to {action}",
-                            session.as_str()
-                        ),
-                    )
-                })?;
-            let now = shown.id(session.as_str());
-            if now != wanted {
-                return Err((
-                    409,
-                    format!(
-                        "the prompt on {} is not approval {wanted} any more (now {now}): \
-                         nothing pressed; read GET /api/approvals again",
-                        session.as_str()
-                    ),
-                ));
-            }
-            let choice = shown
-                .choices
-                .iter()
-                .find(|choice| choice.action == action)
-                .ok_or_else(|| {
-                    (
-                        409,
-                        format!(
-                            "the prompt on {} offers no {action} answer",
-                            session.as_str()
-                        ),
-                    )
-                })?;
-            Ok(Send::Keys(choice.keys.clone()))
+            let shown = showing(session, prompt, wanted, action)?;
+            answer_keys(&shown, session, action, asked.choice_id).map(Send::Keys)
         }
-        "keys" => {
-            if text.is_some() {
-                return Err(bad("keys carries no text".to_string()));
-            }
-            let keys = keys.unwrap_or_default();
-            if keys.is_empty() || keys.len() > MAX_KEYS {
-                return Err(bad(format!("keys names 1 to {MAX_KEYS} keys")));
-            }
-            keys.iter()
-                .map(|name| NamedKey::from_name(name).map_err(&bad))
-                .collect::<Result<Vec<_>, _>>()
-                .map(Send::Keys)
-        }
+        "keys" => keys_to_send(asked, session, prompt),
         "text" => {
-            if keys.is_some() {
+            if asked.keys.is_some() {
                 return Err(bad("text carries no keys".to_string()));
             }
-            typed_text(text).map(Send::Text).map_err(bad)
+            if asked.choice_id.is_some() {
+                return Err(bad("text carries no choice_id".to_string()));
+            }
+            typed_text(asked.text).map(Send::Text).map_err(bad)
         }
         other => Err(bad(format!(
             "action {other:?} is not one of allow, allow_always, deny, keys, text"
@@ -1068,6 +1181,7 @@ pub(super) fn acted(
     if body.probe {
         if body.action.is_some()
             || body.approval_id.is_some()
+            || body.choice_id.is_some()
             || body.keys.is_some()
             || body.text.is_some()
             || body.key.is_some()
@@ -1075,7 +1189,9 @@ pub(super) fn acted(
         {
             return Err((
                 400,
-                format!("{BAD_REQUEST}a probe carries no action, keys, text or key"),
+                format!(
+                    "{BAD_REQUEST}a probe carries no action, approval, choice, keys, text or key"
+                ),
             ));
         }
         writer(shared).map_err(|error| (500, error))?;
@@ -1103,6 +1219,7 @@ pub(super) fn acted(
     let asked = Asked {
         action: action.clone(),
         approval_id: body.approval_id,
+        choice_id: body.choice_id,
         keys: body.keys,
         text: body.text,
     };

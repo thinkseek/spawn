@@ -340,9 +340,186 @@ fn ask(
     Asked {
         action: action.to_string(),
         approval_id: approval_id.map(str::to_string),
+        choice_id: None,
         keys: keys.map(|keys| keys.into_iter().map(str::to_string).collect()),
         text: text.map(str::to_string),
     }
+}
+
+/// [`ask`] naming the option the button stood for (`choice_id`).
+fn ask_choice(
+    action: &str,
+    approval_id: Option<&str>,
+    choice_id: &str,
+    keys: Option<Vec<&str>>,
+) -> Asked {
+    Asked {
+        choice_id: Some(choice_id.to_string()),
+        ..ask(action, approval_id, keys, None)
+    }
+}
+
+/// A dialog whose three answers are all "Yes" (all `allow`), drawn as
+/// Claude Code draws its numbered dialog.
+const THREE_YES: &str = "\
+╭──────────────────────────────────────────────────────────╮
+│ Bash command                                             │
+│                                                          │
+│   cargo publish                                          │
+│                                                          │
+│ Do you want to proceed?                                  │
+│ ❯ 1. Yes                                                 │
+│   2. Yes                                                 │
+│   3. Yes                                                 │
+╰──────────────────────────────────────────────────────────╯
+";
+
+/// Review B2: the option a button stood for is the one pressed. Three
+/// "Yes" answers share `allow`: option 3's click presses 3, never 1; an
+/// `allow` that names no option is ambiguous (409, nothing pressed); an
+/// option of another action, or none of that id, is 409 too.
+#[test]
+fn the_option_clicked_is_pressed_and_a_shared_action_needs_its_choice() {
+    let session = SessionId::new("session_worker_a").expect("session");
+    let prompt = detect(THREE_YES).expect("a prompt");
+    let actions: Vec<&str> = prompt.choices.iter().map(|choice| choice.action).collect();
+    assert_eq!(actions, ["allow", "allow", "allow"]);
+    let id = prompt.id(session.as_str());
+    let now = shown(Some(prompt));
+    assert_eq!(
+        what_to_send(
+            ask_choice("allow", Some(&id), "choice3", None),
+            &session,
+            &now
+        ),
+        Ok(Send::Keys(vec![NamedKey::Digit3]))
+    );
+    assert_eq!(
+        what_to_send(
+            ask_choice("allow", Some(&id), "choice2", None),
+            &session,
+            &now
+        ),
+        Ok(Send::Keys(vec![NamedKey::Digit2]))
+    );
+    let ambiguous =
+        what_to_send(ask("allow", Some(&id), None, None), &session, &now).expect_err("ambiguous");
+    assert_eq!(ambiguous.0, 409, "{ambiguous:?}");
+    assert!(ambiguous.1.contains("choice_id"), "{ambiguous:?}");
+    for (asked, why) in [
+        (
+            ask_choice("deny", Some(&id), "choice3", None),
+            "another action",
+        ),
+        (
+            ask_choice("allow", Some(&id), "choice9", None),
+            "no such option",
+        ),
+    ] {
+        let refused = what_to_send(asked, &session, &now).expect_err(why);
+        assert_eq!(refused.0, 409, "{why}: {refused:?}");
+    }
+    // Claude's dialog: each option its own action, named or not.
+    let claude = shown(detect(CLAUDE));
+    let claude_id = detect(CLAUDE).expect("a prompt").id(session.as_str());
+    assert_eq!(
+        what_to_send(
+            ask_choice("deny", Some(&claude_id), "choice3", None),
+            &session,
+            &claude
+        ),
+        Ok(Send::Keys(vec![NamedKey::Digit3]))
+    );
+    assert_eq!(
+        what_to_send(
+            ask_choice("allow", Some(&claude_id), "choice3", None),
+            &session,
+            &claude
+        )
+        .expect_err("choice3 is a deny")
+        .0,
+        409
+    );
+}
+
+/// Review B2: `keys` with the approval they answer are pressed only while
+/// that prompt shows; with its `choice_id` they are that option's keys.
+/// Bare keys read no pane, as before.
+#[test]
+fn keys_for_an_approval_are_pressed_only_while_it_shows() {
+    let session = SessionId::new("session_worker_a").expect("session");
+    let prompt = detect(THREE_YES).expect("a prompt");
+    let id = prompt.id(session.as_str());
+    let now = shown(Some(prompt));
+    let stale = shown(detect(CLAUDE));
+    let nothing = shown(None);
+    for (asked, pane, why) in [
+        (
+            ask("keys", Some(&id), Some(vec!["digit3"]), None),
+            &stale,
+            "stale approval",
+        ),
+        (
+            ask_choice("keys", Some(&id), "choice3", None),
+            &stale,
+            "stale with its choice",
+        ),
+        (
+            ask("keys", Some(&id), Some(vec!["digit3"]), None),
+            &nothing,
+            "no prompt",
+        ),
+        (
+            ask_choice("keys", Some(&id), "choice7", None),
+            &now,
+            "no such option",
+        ),
+        (
+            ask_choice("keys", Some(&id), "choice3", Some(vec!["digit1"])),
+            &now,
+            "another option's keys",
+        ),
+    ] {
+        let refused = what_to_send(asked, &session, pane).expect_err(why);
+        assert_eq!(refused.0, 409, "{why}: {refused:?}");
+    }
+    assert_eq!(
+        what_to_send(
+            ask_choice("keys", Some(&id), "choice3", None),
+            &session,
+            &now
+        ),
+        Ok(Send::Keys(vec![NamedKey::Digit3]))
+    );
+    assert_eq!(
+        what_to_send(
+            ask_choice("keys", Some(&id), "choice3", Some(vec!["digit3"])),
+            &session,
+            &now
+        ),
+        Ok(Send::Keys(vec![NamedKey::Digit3]))
+    );
+    assert_eq!(
+        what_to_send(
+            ask("keys", Some(&id), Some(vec!["enter"]), None),
+            &session,
+            &now
+        ),
+        Ok(Send::Keys(vec![NamedKey::Enter]))
+    );
+    // A choice without its approval is the caller's mistake.
+    let refused = what_to_send(ask_choice("keys", None, "choice3", None), &session, &now)
+        .expect_err("no approval");
+    assert_eq!(refused.0, 400, "{refused:?}");
+    // Bare keys read no pane: pressed even with nothing showing.
+    assert_eq!(
+        what_to_send(
+            ask("keys", None, Some(vec!["digit3"]), None),
+            &session,
+            &nothing
+        ),
+        Ok(Send::Keys(vec![NamedKey::Digit3]))
+    );
 }
 
 #[test]

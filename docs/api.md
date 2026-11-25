@@ -14,7 +14,19 @@ session id (under `/api/sessions/`) or a mission id (under
 `/api/missions/`), `<n>` a task number, `<m>/<n>` a mission id and an
 objective number. Any other path, under `/api/` or not, is looked up as a
 file of the built UI (`--web`, `SPAWN_WEB_DIR`, default `web/dist`), so an
-unknown API path is a 404. The route tables below and the alias table are
+unknown API path is a 404. The PWA shell (issue 91 P1b) is answered before
+any file: `/manifest.webmanifest` (`application/manifest+json`), `/sw.js`
+(`application/javascript; charset=utf-8`) and `/icon.svg`
+(`image/svg+xml`), each `no-cache`, embedded in the binary
+([`serve/pwa.rs`](../crates/spawn-cli/src/serve/pwa.rs)); no path is ever
+answered with `index.html`, so a missing file (`/missing.webmanifest`,
+`/assets/sw.js`) is a 404. The service worker never answers or caches
+`/api/*`, a request with an `Authorization` header or a URL with a
+token. A service worker (so installing the PWA) and Web Locks need a
+secure context, `https://` or `http://localhost` (`127.0.0.1`): on a
+plain-http address such as `http://192.168.1.5:8787` the page registers
+no worker, and each tab reads its own `/api/stream`, closed while the tab
+is hidden, instead of one stream shared among tabs. The route tables below and the alias table are
 checked against `ROUTES` and `ALIASES` by the unit test
 `serve::tests::routes_match_docs_api_md`: a route added, renamed or removed
 in one and not the other fails `cargo test`.
@@ -50,14 +62,14 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/cost` | What the model calls cost per model, mission, task, agent and execution, and per landing; `?window=24h\|7d` | – | web (Cost) |
 | GET | `/api/core-lines` | The core lines the owner steers by, each figure with its value, range and state | – | web (Home) |
 | GET | `/api/verifications` | What is landed and verified or not | `spawn verify list` (the same, ages aside) | no web page; nightly scenario 133 |
-| GET | `/api/nodes` | Every node joined and not removed, without `ssh`, `endpoint`, `note` or `pubkey` | `spawn node list --json` (which also prints those four) | web (Fleet) |
+| GET | `/api/nodes` | Every node joined and not removed, without `ssh`, `endpoint`, `note` or `pubkey` | `spawn node list --json` (which also prints those four) | web (Fleet, with each node's power and soft drain) |
 | GET | `/api/grading` | The grading catalog: every preset with every `spawn grade list --json` field plus `routing_grade`, `profile` (its execution profile, else its model profile) and `reprobe_due`; `profiles`, every profile name, sorted | `spawn grade list --json` (the presets alone, without the three added fields) | no web page yet |
 | GET | `/api/features` | The feature map of every open objective mission (a mission's `--features` file), or of `?mission=`; `?limit=` (10, at most 50) | – | web (Features) |
 | GET | `/api/features/coverage` | The feature registry's file coverage (`docs/feature-map/registry.json`): wild files, stale references, features; `?mission=<id>` for that mission's project | `spawn features scan --json` | web (Coverage) |
 | GET | `/api/features/coverage/projects` | Every project the Coverage page can read, over all open objective missions | – | web (Coverage) |
-| GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), `: keepalive` every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; on 64 slots of its own (503 when all are taken), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | not yet (the issue 91 dashboard) |
-| GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)) | – | not yet (the issue 91 dashboard) |
-| GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | not yet (the issue 91 dashboard) |
+| GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), `: keepalive` every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; on 64 slots of its own (503 when all are taken), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | web (`stream.ts`: live invalidation of Home's boards, one stream shared among tabs) |
+| GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)) | – | web (Home, `approvals.ts`: the approvals queue) |
+| GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | web (Home, `digest.ts`: the digest line and drawer) |
 
 ## Writes
 
@@ -78,8 +90,8 @@ writes nothing, so the page knows before it offers the box.
 | POST | `/api/sessions/<id>/restart` | Restarts the session's delivered task on a fresh execution, `{"reason"}` | `spawn task restart --id <task>` (by task, not by session) | web (agent detail) |
 | POST | `/api/sessions/<id>/reassign` | Moves the session's delivered task to a fresh worker, `{"reason"}` | `spawn task reassign --id <task>` (by task) | web (agent detail) |
 | POST | `/api/missions/<id>/resume` | Resumes the mission from the named halt, `{"halt", "key"}` | `spawn mission resume --id N` (which also ends a pause) | web (Home, Needs you) |
-| POST | `/api/master/message` | A person's message to the supervisor, `{"text", "mode", "key"}` (`mode` auto, steer, queue or restart; auto by default), through `spawn_human_master_message`: a stopped or stopping supervisor is woken first, the message typed when its turn ends; 202 with the command ids; the same request again answers the first call's ids, another under the key is 409 | `spawn submit --principal human --session session_supervisor --action '{"type":"input",...}'` (no wake, no mode) | not yet (the issue 91 dashboard) |
-| POST | `/api/approvals/<session_id>/act` | Answers one prompt of `/api/approvals`, `{"action", "approval_id", "keys", "text", "key"}`: `allow`, `allow_always` and `deny` need the item's `approval_id` (400 without) and press its keys only while the pane still shows that prompt (409 otherwise); `keys` presses named keys, `text` types a text; 202 with the command ids | `spawn submit --principal human --action '{"type":"key",...}'`, one per key | not yet (the issue 91 dashboard) |
+| POST | `/api/master/message` | A person's message to the supervisor, `{"text", "mode", "key"}` (`mode` auto, steer, queue or restart; auto by default), through `spawn_human_master_message`: a stopped or stopping supervisor is woken first, the message typed when its turn ends; 202 with the command ids; the same request again answers the first call's ids, another under the key is 409 | `spawn submit --principal human --session session_supervisor --action '{"type":"input",...}'` (no wake, no mode) | web (Home, `master.ts`: Master Control, with the offline outbox `outbox.ts`) |
+| POST | `/api/approvals/<session_id>/act` | Answers one prompt of `/api/approvals`, `{"action", "approval_id", "choice_id", "keys", "text", "key"}`: `allow`, `allow_always` and `deny` need the item's `approval_id` (400 without) and press its keys only while the pane still shows that prompt (409 otherwise); `choice_id`, the option's `id`, presses that option, which must be of the action (409 otherwise), and without it an action several options share is 409 (ambiguous); `keys` presses named keys, with an `approval_id` only while that prompt shows (409 otherwise) and with a `choice_id` that option's keys; `text` types a text; 202 with the command ids | `spawn submit --principal human --action '{"type":"key",...}'`, one per key | web (Home, `approvals.ts`: the approvals queue's buttons) |
 | POST | `/api/features/scan` | A fresh read-only scan of the feature registry's coverage; changes no file | `spawn features scan` | web (Coverage) |
 | POST | `/api/features/associate` | Associates one file with features and saves the registry | `spawn features associate --path <file> --feature <id>` | web (Coverage) |
 

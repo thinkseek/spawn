@@ -25,6 +25,9 @@ import { figureState } from "../../interventions.ts";
 import { INTERVENTIONS_POLL_MS, fetchInterventions } from "./Interventions";
 import { HealthStrip } from "./HealthStrip";
 import { NodeRows } from "./NodeRows";
+import { ApprovalsQueue } from "./ApprovalsQueue";
+import { DigestPanel } from "./DigestPanel";
+import { MasterComposer } from "./MasterComposer";
 import type { Liveness } from "./HealthStrip";
 
 interface FleetViewProps {
@@ -151,6 +154,11 @@ export function FleetView({
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1200px] flex-col gap-3 p-3 sm:p-4">
+            {/* Issue #91 P1b: the live digest line, the prompts to answer
+                and Master Control, above the home page. */}
+            <DigestPanel />
+            <ApprovalsQueue onOpenAgent={openAgent} />
+            <MasterComposer />
             <HomeView
               now={now}
               needs={needs}

@@ -11,6 +11,28 @@
 /** What a page polls with: the request headers of every read. */
 export const SHARED_FOR = "max-age=1";
 
+/** What a read the live stream asked for sends instead (issue #91 P1b): an
+ * event was just written, so an answer computed for another page up to a
+ * second ago may not hold it; `no-cache` has the server compute it now
+ * (answers.rs `accepted_age`). */
+export const FRESH = "no-cache";
+
+/** The signals of reads that must be fresh ([`markFresh`]). */
+const freshSignals = new WeakSet<AbortSignal>();
+
+/** Every read made with `signal` asks for a fresh answer ([`FRESH`]): a
+ * poll marks the signal of a read the live stream asked for, so each read
+ * of that tick, awaited ones included, is fresh. */
+export function markFresh(signal: AbortSignal): AbortSignal {
+  freshSignals.add(signal);
+  return signal;
+}
+
+/** The `Cache-Control` a read made with `signal` sends. */
+export function cacheControlFor(signal: AbortSignal | undefined): string {
+  return signal !== undefined && freshSignals.has(signal) ? FRESH : SHARED_FOR;
+}
+
 /** URLs kept at most; past it the oldest read goes. */
 const KEPT_URLS = 128;
 
@@ -47,7 +69,7 @@ export class Validated {
     const kept = this.kept.get(url);
     const headers: Record<string, string> = {
       ...options.headers,
-      "Cache-Control": SHARED_FOR,
+      "Cache-Control": cacheControlFor(options.signal),
     };
     if (kept) headers["If-None-Match"] = kept.etag;
     const response = await this.fetcher(url, {

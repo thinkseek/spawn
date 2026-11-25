@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { coresText, cpuLimit, gibText, normalizeNodes, reachText, viaText } from "../src/nodes.ts";
+import {
+  coresText,
+  cpuLimit,
+  gibText,
+  normalizeNodes,
+  powerOf,
+  powerText,
+  powerTone,
+  reachText,
+  viaText,
+} from "../src/nodes.ts";
 
 const GIB = 1024 ** 3;
 
@@ -56,6 +66,10 @@ test("the server's nodes become rows by name, each with its state and sample as 
       transport: "ssh",
       mode: "direct",
       via: [],
+      power: null,
+      low_battery_drain: false,
+      effective_drained: false,
+      schedulable: null,
     },
     {
       name: "runner",
@@ -71,6 +85,10 @@ test("the server's nodes become rows by name, each with its state and sample as 
       transport: "ssh",
       mode: "direct",
       via: [],
+      power: null,
+      low_battery_drain: false,
+      effective_drained: false,
+      schedulable: null,
     },
   ]);
   assert.deepEqual(normalizeNodes({ nodes: [] }), []);
@@ -128,4 +146,77 @@ test("the badge and the hops read as the row says them, as the CLI says them", (
   assert.equal(reachText({ transport: "udp", mode: "hole_punch" }), "udp/hole_punch");
   assert.equal(viaText({ via: [] }), null);
   assert.equal(viaText({ via: ["relay-hk", "edge-gw"] }), "via relay-hk → edge-gw");
+});
+
+/** Issue #91: each node's `power` and the low-battery soft drain, as
+ * `/api/nodes` sends them (serve.rs `nodes`, crate nodes/power.rs
+ * `with_soft_drain`). */
+const POWERED = {
+  nodes: [
+    {
+      name: "laptop",
+      state: "live",
+      power: { on_ac: false, battery_pct: 14, charging: false, remaining_mins: 52 },
+      low_battery_drain: true,
+      effective_drained: true,
+      schedulable: false,
+    },
+    {
+      name: "mac",
+      state: "live",
+      power: { on_ac: true, battery_pct: 88, charging: true, remaining_mins: 75 },
+      low_battery_drain: false,
+      effective_drained: false,
+      schedulable: true,
+    },
+    {
+      name: "desk",
+      state: "drained",
+      power: null,
+      low_battery_drain: false,
+      effective_drained: true,
+      schedulable: false,
+    },
+    { name: "old", state: "drained", power: { battery_pct: 50 } },
+  ],
+};
+
+test("a node's power and soft drain are read as the server says them", () => {
+  const rows = Object.fromEntries(normalizeNodes(POWERED).map((row) => [row.name, row]));
+  assert.deepEqual(rows.laptop!.power, { on_ac: false, battery_pct: 14, charging: false, remaining_mins: 52 });
+  assert.equal(rows.laptop!.low_battery_drain, true);
+  assert.equal(rows.laptop!.effective_drained, true);
+  assert.equal(rows.laptop!.schedulable, false);
+  assert.equal(rows.mac!.schedulable, true);
+  assert.equal(rows.desk!.power, null);
+  assert.equal(rows.desk!.effective_drained, true);
+  // A power without `on_ac` is none; an older server's drained node is
+  // still effectively drained, its eligibility unsaid.
+  assert.equal(rows.old!.power, null);
+  assert.equal(rows.old!.effective_drained, true);
+  assert.equal(rows.old!.schedulable, null);
+});
+
+test("the power reads as the CLI says it, with its tone", () => {
+  assert.equal(powerText({ power: null }), null);
+  assert.equal(
+    powerText({ power: { on_ac: false, battery_pct: 57, charging: false, remaining_mins: 192 } }),
+    "battery 57% discharging 3h12m",
+  );
+  assert.equal(powerText({ power: { on_ac: true, battery_pct: 100, charging: false, remaining_mins: null } }), "AC 100%");
+  assert.equal(powerText({ power: { on_ac: true, battery_pct: null, charging: false, remaining_mins: null } }), "AC");
+  assert.equal(powerText({ power: { on_ac: true, battery_pct: 40, charging: true, remaining_mins: 5 } }), "AC 40% charging 0h05m");
+  const on = (on_ac: boolean, charging = false) => ({ on_ac, battery_pct: 50, charging, remaining_mins: null });
+  assert.equal(powerTone({ power: null, low_battery_drain: false }), null);
+  assert.equal(powerTone({ power: on(false), low_battery_drain: true }), "low");
+  assert.equal(powerTone({ power: on(false), low_battery_drain: false }), "draining");
+  assert.equal(powerTone({ power: on(true), low_battery_drain: false }), "ok");
+  assert.equal(powerTone({ power: on(false, true), low_battery_drain: false }), "ok");
+  // Out of range values are clamped, not trusted.
+  assert.deepEqual(powerOf({ on_ac: false, battery_pct: 140, remaining_mins: -3 }), {
+    on_ac: false,
+    battery_pct: 100,
+    charging: false,
+    remaining_mins: null,
+  });
 });

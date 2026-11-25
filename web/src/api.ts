@@ -1,8 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { normalizeAttention, type Attention } from "./attention";
 import { chooseToken, type TokenChoice } from "./token";
-import { pageHidden, Validated } from "./validated";
+import { markFresh, pageHidden, Validated } from "./validated";
 import { readTail } from "./sessionWindow.ts";
+import type { LiveStatus, LiveTopic } from "./stream.ts";
+import { CHANNEL_NAME, LiveStream, topicsOf } from "./stream.ts";
+import type { Approvals } from "./approvals.ts";
+import { actUrl, normalizeApprovals } from "./approvals.ts";
+import type { Digest } from "./digest.ts";
+import { normalizeDigest } from "./digest.ts";
+import { MASTER_TIMEOUT_MS, MASTER_URL } from "./master.ts";
 import type { EventWindow, PageReader } from "./sessionWindow.ts";
 
 export type SessionState =
@@ -526,6 +533,7 @@ async function postJson(
   url: string,
   body: Record<string, unknown>,
   signal?: AbortSignal,
+  extra: Record<string, string> = {},
 ): Promise<{ status: number | null; body: unknown }> {
   let response: Response;
   try {
@@ -533,7 +541,7 @@ async function postJson(
       method: "POST",
       signal,
       cache: "no-store",
-      headers: { ...apiHeaders(), "Content-Type": "application/json" },
+      headers: { ...apiHeaders(), "Content-Type": "application/json", ...extra },
       body: JSON.stringify(body),
     });
   } catch (cause) {
@@ -548,6 +556,94 @@ async function postJson(
   }
   return { status: response.status, body: answer };
 }
+
+/** The same key as the body's `key`, as the `Idempotency-Key` header
+ * too (the server refuses the two when they differ). */
+function keyHeader(body: Record<string, unknown>): Record<string, string> {
+  return typeof body.key === "string" ? { "Idempotency-Key": body.key } : {};
+}
+
+/** `GET /api/approvals` (approvals.ts). */
+export async function fetchApprovals(signal: AbortSignal): Promise<Approvals> {
+  return readApi("/api/approvals", signal, normalizeApprovals);
+}
+
+/** `POST /api/approvals/<session_id>/act` with `body` (an answer with its
+ * `approval_id` and key, or `{"probe": true}`). */
+export async function postApprovalAct(
+  sessionId: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
+  return postJson(actUrl(sessionId), body, signal, keyHeader(body));
+}
+
+/** `POST /api/master/message` with `{text, mode, key}` or `{"probe": true}`
+ * (master.ts). One that waits more than `timeoutMs` is given up as not
+ * reached (status null): the outbox sends it again with its key. Aborted
+ * by `signal`, it throws. */
+export async function postMaster(
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+  timeoutMs = MASTER_TIMEOUT_MS,
+): Promise<{ status: number | null; body: unknown }> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort);
+  try {
+    return await postJson(MASTER_URL, body, controller.signal, keyHeader(body));
+  } catch (cause) {
+    if (timedOut && !signal?.aborted) {
+      return { status: null, body: { error: `No answer in ${Math.round(timeoutMs / 1000)} s.` } };
+    }
+    throw cause;
+  } finally {
+    window.clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/** `GET /api/context/digest` (digest.ts). */
+export async function fetchDigest(signal: AbortSignal): Promise<Digest> {
+  return readApi("/api/context/digest", signal, normalizeDigest);
+}
+
+/** The page's one live stream (stream.ts), shared among its tabs: started
+ * by App, read by every poll that names its topics. */
+export const live = new LiveStream({
+  fetch: (url, init) => fetch(url, init),
+  headers: apiHeaders,
+  channel: () => (typeof BroadcastChannel === "function" ? new BroadcastChannel(CHANNEL_NAME) : null),
+  locks:
+    typeof navigator !== "undefined" && "locks" in navigator && navigator.locks
+      ? {
+          request: (name: string, callback: () => Promise<void>) => navigator.locks.request(name, callback),
+        }
+      : null,
+  document: typeof document !== "undefined" ? document : null,
+  online: typeof window !== "undefined" ? window : null,
+});
+
+const subscribeStatus = (onChange: () => void) =>
+  live.subscribe((signal) => {
+    if (signal.kind === "status") onChange();
+  });
+
+/** The live stream's status, rendered again when it changes. */
+export function useLiveStatus(): LiveStatus {
+  return useSyncExternalStore(subscribeStatus, () => live.status);
+}
+
+/** A poll that names live topics polls this many times slower while the
+ * stream is live: its events say when to read again. */
+export const LIVE_STRETCH = 4;
+/** The soonest a live signal reads a poll again after its last read. */
+export const LIVE_MIN_GAP_MS = 750;
 
 /** The alerts Spawn raised: open ones and the window's transitions, the
  * array `spawn alerts --once --json` answers. */
@@ -616,6 +712,11 @@ export interface PollOptions {
   /** Keep `checkedAt`: a view that says how fresh its data is. Its owner
    * renders again on every answer, so the others do not ask. */
   checked?: boolean;
+  /** The live topics (stream.ts `topicsOf`) that make this read stale: a
+   * signal of one reads it again at once (at most every
+   * [`LIVE_MIN_GAP_MS`]), and while the stream is live the interval is
+   * [`LIVE_STRETCH`] times longer. */
+  live?: readonly LiveTopic[];
 }
 
 /** Poll a read endpoint every `intervalMs`, starting immediately. While
@@ -635,6 +736,7 @@ export function usePoll<T>(
   loadRef.current = load;
   const keyRef = useRef<string | null>(null);
   const checked = options.checked === true;
+  const liveTopics = (options.live ?? []).join(",");
 
   useEffect(() => {
     let cancelled = false;
@@ -649,10 +751,32 @@ export function usePoll<T>(
       setCheckedAt(null);
     }
 
-    const tick = async () => {
-      if (inFlight || pageHidden(document)) return;
+    const topics = liveTopics === "" ? [] : liveTopics.split(",");
+    let lastAt = 0;
+    let liveTimer: number | undefined;
+    let stale = false;
+    const tick = async (force = false, fresh = false) => {
+      if (pageHidden(document)) return;
+      if (inFlight) {
+        if (force) stale = true;
+        return;
+      }
+      // While the stream is live its events say when to read; the timer
+      // is only the backstop.
+      if (
+        !force &&
+        topics.length > 0 &&
+        live.status.state === "live" &&
+        Date.now() - lastAt < intervalMs * LIVE_STRETCH
+      ) {
+        return;
+      }
       inFlight = true;
+      lastAt = Date.now();
       controller = new AbortController();
+      // A read the live stream asked for wants the answer as it is now,
+      // not one shared from up to a second ago (validated.ts FRESH).
+      if (fresh) markFresh(controller.signal);
       try {
         const next = await loadRef.current(controller.signal);
         if (!cancelled) {
@@ -668,22 +792,44 @@ export function usePoll<T>(
         }
       } finally {
         inFlight = false;
+        if (stale && !cancelled) {
+          stale = false;
+          onLive();
+        }
       }
     };
     const onVisibility = () => {
-      if (!pageHidden(document)) void tick();
+      if (!pageHidden(document)) void tick(true);
     };
+    // A live signal of one of its topics: read again soon, once for a
+    // burst of events.
+    function onLive() {
+      if (liveTimer !== undefined) return;
+      const wait = Math.max(0, lastAt + LIVE_MIN_GAP_MS - Date.now());
+      liveTimer = window.setTimeout(() => {
+        liveTimer = undefined;
+        void tick(true, true);
+      }, wait);
+    }
+    const unsubscribe =
+      topics.length > 0
+        ? live.subscribe((signal) => {
+            if (topicsOf(signal).some((topic) => topics.includes(topic))) onLive();
+          })
+        : () => undefined;
 
-    void tick();
+    void tick(true);
     const timer = window.setInterval(() => void tick(), intervalMs);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
       controller?.abort();
       window.clearInterval(timer);
+      window.clearTimeout(liveTimer);
+      unsubscribe();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [key, intervalMs, checked]);
+  }, [key, intervalMs, checked, liveTopics]);
 
   return { data, error, checkedAt };
 }
