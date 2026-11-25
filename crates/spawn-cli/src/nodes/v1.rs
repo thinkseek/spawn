@@ -45,8 +45,9 @@ fn random_secret() -> Result<[u8; 32], String> {
 
 /// The primary's public key from its base64url text.
 fn primary_key(text: &str) -> Result<PublicKey, String> {
-    PublicKey::from_b64u(text.trim())
-        .map_err(|error| format!("the primary's public key is not 32 bytes of base64url: {error:?}"))
+    PublicKey::from_b64u(text.trim()).map_err(|error| {
+        format!("the primary's public key is not 32 bytes of base64url: {error:?}")
+    })
 }
 
 /// A fresh token for `primary` and the SHA-256 the store keeps of it.
@@ -178,7 +179,11 @@ pub(super) fn revoke_command(words: &[String]) -> Result<i32, String> {
 
 /// A drain or an undrain of `name` when it is a v1 node: its line; None
 /// when no v1 node has that name (a P1 node's, recorded as before).
-pub(super) fn drain(store: &PostgresStore, name: &str, drain: bool) -> Result<Option<String>, String> {
+pub(super) fn drain(
+    store: &PostgresStore,
+    name: &str,
+    drain: bool,
+) -> Result<Option<String>, String> {
     if store
         .node_v1(name)
         .map_err(|error| error.to_string())?
@@ -347,7 +352,9 @@ mod tests {
     fn node(name: &str) -> NodeV1 {
         NodeV1 {
             name: name.to_string(),
-            node_id: Some("56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c".into()),
+            node_id: Some(
+                "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c".into(),
+            ),
             cell_id: "c0".into(),
             status: "active".into(),
             drained: false,
@@ -466,8 +473,7 @@ mod tests {
     #[test]
     fn enroll_token_revoke_list_drain_and_undrain_on_the_ledger() {
         let schema = spawn_postgres::testing::TestSchema::new("nodes_v1_cli");
-        let store =
-            PostgresStore::connect_in_schema(schema.url(), &schema).expect("connect");
+        let store = PostgresStore::connect_in_schema(schema.url(), &schema).expect("connect");
         let primary = primary_key(PRIMARY).unwrap();
 
         let (token, expires) = enroll_token(&store, "n252", Some("c0"), &primary).unwrap();
@@ -532,15 +538,25 @@ mod tests {
             .iter()
             .filter_map(|node| node["name"].as_str())
             .collect();
-        assert!(names.contains(&"p1node") && names.contains(&"n252"), "{names:?}");
+        assert!(
+            names.contains(&"p1node") && names.contains(&"n252"),
+            "{names:?}"
+        );
         assert_eq!(
             p1.as_array().unwrap().len() + 1,
             merged.as_array().unwrap().len()
         );
 
         // Revoke: once, then already; a revoked name gets no token again.
-        assert!(revoke(&store, "n252").unwrap().contains("revoked (its leases"));
-        assert_eq!(revoke(&store, "n252").unwrap(), "node n252: revoked already");
+        assert!(
+            revoke(&store, "n252")
+                .unwrap()
+                .contains("revoked (its leases")
+        );
+        assert_eq!(
+            revoke(&store, "n252").unwrap(),
+            "node n252: revoked already"
+        );
         assert_eq!(store.node_v1("n252").unwrap().unwrap().status, "revoked");
         assert!(enroll_token(&store, "n252", None, &primary).is_err());
         assert!(revoke(&store, "nobody").is_err());

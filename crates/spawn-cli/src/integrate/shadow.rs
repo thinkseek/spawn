@@ -57,8 +57,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use spawn_postgres::PostgresStore;
 use spawn_node_proto::grant::ArtifactRole;
+use spawn_postgres::PostgresStore;
 
 use super::inputs;
 use super::remote;
@@ -737,7 +737,11 @@ pub(super) struct NodeShadows {
 }
 
 impl NodeShadows {
-    pub(super) fn new(settings: NodeSettings, gate_env: Vec<(String, String)>, work: PathBuf) -> Self {
+    pub(super) fn new(
+        settings: NodeSettings,
+        gate_env: Vec<(String, String)>,
+        work: PathBuf,
+    ) -> Self {
         let artifacts = remote::Artifacts::new(settings.artifacts.clone());
         Self {
             settings,
@@ -794,7 +798,9 @@ impl NodeShadows {
         {
             return Ok(manifest.clone());
         }
-        let manifest = self.artifacts.registry_manifest(&self.settings.cargo_home)?;
+        let manifest = self
+            .artifacts
+            .registry_manifest(&self.settings.cargo_home)?;
         self.registry = Some((Instant::now(), manifest.clone()));
         Ok(manifest)
     }
@@ -929,24 +935,22 @@ impl NodeShadows {
                     "integrate: task {task}'s node shadow {} ended {state:?}; nothing recorded",
                     job.job_id
                 ),
-                Ok(remote::Waited::Completed(row)) => {
-                    match self.completed(store, &job, &row) {
-                        Completion::Requeued => {
-                            job.since = Instant::now();
-                            kept.push(job);
-                        }
-                        Completion::Record(record) => {
-                            if let Err(error) = write(&record) {
-                                eprintln!(
-                                    "integrate: task {task}'s node shadow record: {error}; \
-                                     tried again at the next pass"
-                                );
-                                self.unrecorded.push(record);
-                            }
-                        }
-                        Completion::Nothing => {}
+                Ok(remote::Waited::Completed(row)) => match self.completed(store, &job, &row) {
+                    Completion::Requeued => {
+                        job.since = Instant::now();
+                        kept.push(job);
                     }
-                }
+                    Completion::Record(record) => {
+                        if let Err(error) = write(&record) {
+                            eprintln!(
+                                "integrate: task {task}'s node shadow record: {error}; \
+                                     tried again at the next pass"
+                            );
+                            self.unrecorded.push(record);
+                        }
+                    }
+                    Completion::Nothing => {}
+                },
                 Err(error) => {
                     eprintln!(
                         "integrate: task {task}'s node shadow {}: {error}; looked at again",
@@ -979,7 +983,10 @@ impl NodeShadows {
                 );
                 let unread = remote::Judged::unreadable(error);
                 if let Err(error) = remote::settle(store, row, &unread) {
-                    eprintln!("integrate: task {task}'s node shadow {}: {error}", row.job_id);
+                    eprintln!(
+                        "integrate: task {task}'s node shadow {}: {error}",
+                        row.job_id
+                    );
                 }
                 return Completion::Nothing;
             }
@@ -1521,7 +1528,10 @@ mod tests {
         let mut cargo = on.clone();
         cargo.push(("CARGO_HOME", "/opt/cargo"));
         assert_eq!(
-            super::node_settings(env(&cargo)).unwrap().unwrap().cargo_home,
+            super::node_settings(env(&cargo))
+                .unwrap()
+                .unwrap()
+                .cargo_home,
             PathBuf::from("/opt/cargo")
         );
         // Refused: another value, no directories, a relative one, a bad EVERY.
@@ -1612,7 +1622,10 @@ mod tests {
         let job_id = waiting[0].clone();
         let row = ledger.store.remote_job(&job_id).unwrap().unwrap();
         assert_eq!(row.kind, spawn_postgres::RemoteJobKind::GateShadow);
-        assert_eq!(row.judging_id.as_deref(), Some("0123456789ab0123456789abcdef"));
+        assert_eq!(
+            row.judging_id.as_deref(),
+            Some("0123456789ab0123456789abcdef")
+        );
         assert_eq!(row.task_id, Some(7));
         assert_eq!(row.base_commit.as_deref(), Some(base.as_str()));
         // The grant's environment: no node-owned variable, no database.
@@ -1628,7 +1641,10 @@ mod tests {
             .iter()
             .map(|url| url["role"].as_str().unwrap())
             .collect();
-        assert_eq!(roles, ["delta_bundle", "baseline_bundle", "controller_pack"]);
+        assert_eq!(
+            roles,
+            ["delta_bundle", "baseline_bundle", "controller_pack"]
+        );
         for url in row.spec["artifact_urls"].as_array().unwrap() {
             let digest =
                 spawn_node_proto::ContentDigest::parse(url["digest"].as_str().unwrap()).unwrap();
@@ -1710,7 +1726,15 @@ mod tests {
         let job_id = nodes.waiting()[0].clone();
         let grants = ledger.beat(&node);
         assert_eq!(grants.len(), 1);
-        let (meta, log) = remote::meta(&job_id, grants[0].1, Some(2), None, "", "boom\n", Some(&given));
+        let (meta, log) = remote::meta(
+            &job_id,
+            grants[0].1,
+            Some(2),
+            None,
+            "",
+            "boom\n",
+            Some(&given),
+        );
         ledger.complete(&results, &node, &meta, &log);
         nodes.poll(&ledger.store, &write);
         assert_eq!(nodes.waiting(), vec![job_id.clone()]);
@@ -1774,8 +1798,15 @@ mod tests {
         assert_eq!(record["unequal"], json!([]));
         assert_eq!(record["agrees"], json!(false));
         // A fault: no verdict, the evidence as its result.
-        let (meta, log) =
-            remote::meta("gs-222222222222-abcdefgh", 1, Some(6), None, "", "", Some(&granted));
+        let (meta, log) = remote::meta(
+            "gs-222222222222-abcdefgh",
+            1,
+            Some(6),
+            None,
+            "",
+            "",
+            Some(&granted),
+        );
         let stored = super::remote::Stored { meta, log };
         let judged = super::remote::judge_stored(&stored, &granted);
         let record = super::node_record_of(&same, "node:n1", &stored, &judged);

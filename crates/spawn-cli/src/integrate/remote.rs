@@ -251,7 +251,8 @@ impl Artifacts {
     /// Move `file` (a scratch file of this directory) into place by its
     /// digest; an artifact already there is kept (same bytes).
     pub(super) fn put_file(&self, file: &Path) -> Result<Published, String> {
-        let (hex, size) = hash_file(file).map_err(|error| format!("{}: {error}", file.display()))?;
+        let (hex, size) =
+            hash_file(file).map_err(|error| format!("{}: {error}", file.display()))?;
         let digest = ContentDigest::parse(&format!("sha256:{hex}"))
             .map_err(|error| format!("digest: {error:?}"))?;
         let target = self.path_of(&digest);
@@ -326,10 +327,11 @@ impl Artifacts {
             .map_err(|error| format!("alternates: {error}"))?;
             for (name, commit) in refs {
                 ran(
-                    Command::new("git")
-                        .arg("--git-dir")
-                        .arg(&dir)
-                        .args(["update-ref", name, commit]),
+                    Command::new("git").arg("--git-dir").arg(&dir).args([
+                        "update-ref",
+                        name,
+                        commit,
+                    ]),
                     "git update-ref",
                 )?;
             }
@@ -344,7 +346,12 @@ impl Artifacts {
         }
     }
 
-    fn bundle(&self, repo: &Path, refs: &[(&str, &str)], args: &[&str]) -> Result<Published, String> {
+    fn bundle(
+        &self,
+        repo: &Path,
+        refs: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<Published, String> {
         let dir = self.refs_repo(repo, refs)?;
         let out = self.scratch("bundle");
         let result = out.and_then(|out| {
@@ -589,7 +596,11 @@ fn walk(dir: &Path, relative: &Path, files: &mut Vec<(Vec<u8>, PathBuf)>) -> std
 pub(super) fn toolchain_channel(controller: &Path) -> Option<String> {
     let text = std::fs::read_to_string(controller.join("rust-toolchain.toml")).ok()?;
     text.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("channel")?.trim().strip_prefix('=')?;
+        let value = line
+            .trim()
+            .strip_prefix("channel")?
+            .trim()
+            .strip_prefix('=')?;
         let value = value.trim().trim_matches('"').trim();
         (!value.is_empty()).then(|| value.to_string())
     })
@@ -714,7 +725,10 @@ pub(super) fn step(
     since: Instant,
     wait: Duration,
 ) -> Result<Waited, String> {
-    let Some(job) = store.remote_job(job_id).map_err(|error| error.to_string())? else {
+    let Some(job) = store
+        .remote_job(job_id)
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(Waited::Ended(None));
     };
     Ok(match job.state {
@@ -768,7 +782,11 @@ pub(super) struct Stored {
 
 /// Read `<results>/<job_id>.<lease_epoch>/{meta.json,log}`: the metadata
 /// line (strict, for this job at this epoch) and the log it binds.
-pub(super) fn read_stored(results: &Path, job_id: &str, lease_epoch: i64) -> Result<Stored, String> {
+pub(super) fn read_stored(
+    results: &Path,
+    job_id: &str,
+    lease_epoch: i64,
+) -> Result<Stored, String> {
     let dir = results.join(format!("{job_id}.{lease_epoch}"));
     let line = std::fs::read(dir.join("meta.json"))
         .map_err(|error| format!("{}: {error}", dir.join("meta.json").display()))?;
@@ -798,7 +816,10 @@ fn exited(code: i64) -> ExitStatus {
 /// gate has no status (it died of a signal, never started, or the node
 /// said none, or one no process exits with).
 pub(super) fn run_of(stored: &Stored) -> Option<gate::Run> {
-    let code = stored.meta.exit_code.filter(|code| (0..=255).contains(code))?;
+    let code = stored
+        .meta
+        .exit_code
+        .filter(|code| (0..=255).contains(code))?;
     let (stdout, stderr) = stored.meta.streams(&stored.log).ok()?;
     Some(gate::Run {
         status: exited(code),
@@ -954,7 +975,14 @@ pub(super) fn judge_stored(stored: &Stored, inputs: &Value) -> Judged {
             let line: Value = verdict
                 .and_then(|line| serde_json::from_str(line.trim()).ok())
                 .unwrap_or(Value::Null);
-            let stated = Some(if decided.accepted { "accepted" } else { "rejected" }.to_string());
+            let stated = Some(
+                if decided.accepted {
+                    "accepted"
+                } else {
+                    "rejected"
+                }
+                .to_string(),
+            );
             let commits_differ = ["base", "candidate"]
                 .into_iter()
                 .any(|field| line[field].as_str() != inputs[field].as_str());
@@ -1127,7 +1155,6 @@ pub(super) fn settle(
         .map_err(|error| error.to_string())
 }
 
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -1266,10 +1293,16 @@ pub(super) mod tests {
         assert!(env.values().all(|value| !names_a_database(value)));
         assert!(env.values().all(|value| !value.contains("not-a-real-key")));
         // Only GATE_ENV's names, every one the node does not own.
-        assert!(env.keys().all(|name| gate::GATE_ENV.contains(&name.as_str())));
+        assert!(
+            env.keys()
+                .all(|name| gate::GATE_ENV.contains(&name.as_str()))
+        );
         assert_eq!(env["SPAWN_GATE_JOBS"], "value-of-SPAWN_GATE_JOBS");
         assert_eq!(env["SPAWN_GATE_HOST_JOBS"], "value-of-SPAWN_GATE_HOST_JOBS");
-        assert_eq!(env["SPAWN_GATE_BUILD_JOBS"], "value-of-SPAWN_GATE_BUILD_JOBS");
+        assert_eq!(
+            env["SPAWN_GATE_BUILD_JOBS"],
+            "value-of-SPAWN_GATE_BUILD_JOBS"
+        );
         assert_eq!(env["LANG"], "value-of-LANG");
         // The node's floor (F4), whatever the primary's.
         assert_eq!(env["SPAWN_GATE_MIN_FREE_GB"], NODE_MIN_FREE_GB);
@@ -1414,7 +1447,10 @@ pub(super) mod tests {
         assert_eq!(row(&none), ("aborted", true, Some(FaultNext::Queued)));
         assert!(matches!(none.failure, Some(GateFailure::Aborted { .. })));
         let two = format!("{}\n{}", verdict("accepted"), verdict("rejected"));
-        assert_eq!(row(&judge(&stored(Some(0), Some(&two), "", ""))).0, "aborted");
+        assert_eq!(
+            row(&judge(&stored(Some(0), Some(&two), "", ""))).0,
+            "aborted"
+        );
 
         // Exit 2: not a gate.sh status.
         assert_eq!(
@@ -1445,7 +1481,8 @@ pub(super) mod tests {
         );
 
         // Exit 5: the node's tmpfs (a strike), a slot wait (none).
-        let disk = r#"{"v":1,"no_room":true,"free_kb":10,"min_gb":8,"tmpdir":"/data01/spawn-node/w/0/t"}"#;
+        let disk =
+            r#"{"v":1,"no_room":true,"free_kb":10,"min_gb":8,"tmpdir":"/data01/spawn-node/w/0/t"}"#;
         let disk = judge(&stored(Some(5), Some(disk), "", ""));
         assert_eq!(row(&disk), ("no_room", true, Some(FaultNext::Queued)));
         match &disk.failure {
@@ -1461,7 +1498,8 @@ pub(super) mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let slot = r#"{"v":1,"no_room":true,"check":"host scenario slot","waited_ms":5000,"budget":32}"#;
+        let slot =
+            r#"{"v":1,"no_room":true,"check":"host scenario slot","waited_ms":5000,"budget":32}"#;
         assert_eq!(
             row(&judge(&stored(Some(5), Some(slot), "", ""))),
             ("no_room_slot", false, Some(FaultNext::Queued))
@@ -1726,7 +1764,12 @@ pub(super) mod tests {
         let whole = artifacts.path_of(&baseline.digest);
         git(
             &mirror,
-            &["fetch", "-q", &whole.to_string_lossy(), "refs/gate/base:refs/b"],
+            &[
+                "fetch",
+                "-q",
+                &whole.to_string_lossy(),
+                "refs/gate/base:refs/b",
+            ],
         );
         assert_eq!(git(&mirror, &["rev-parse", "refs/b"]), base);
         let bundle = path.to_string_lossy().to_string();
@@ -2237,10 +2280,7 @@ pub(super) mod tests {
         // no_room toward a halt or a back-off).
         let faults = ledger.records("remote_job.host_fault");
         assert_eq!(faults.len(), 5, "{faults:?}");
-        for record in faults
-            .iter()
-            .chain(&ledger.records("remote_job.completed"))
-        {
+        for record in faults.iter().chain(&ledger.records("remote_job.completed")) {
             assert!(record.get("judging").is_none(), "{record}");
             assert_eq!(record["proto"], "node-v1");
         }
@@ -2356,7 +2396,14 @@ pub(super) mod tests {
         let lost = ledger.records("node.lost");
         assert_eq!(lost.len(), 1, "{lost:?}");
         assert_eq!(lost[0]["name"], "quiet");
-        assert!(ledger.store.node_v1("quiet").unwrap().unwrap().lost_recorded);
+        assert!(
+            ledger
+                .store
+                .node_v1("quiet")
+                .unwrap()
+                .unwrap()
+                .lost_recorded
+        );
         integrator.pass_on(&ledger.store).expect("the next pass");
         assert_eq!(ledger.records("node.lost").len(), 1);
     }

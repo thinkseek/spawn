@@ -2804,8 +2804,7 @@ impl Integrator {
         work: PathBuf,
     ) -> Self {
         shadow::remove_tree(&work);
-        *self.node_shadows.borrow_mut() =
-            Some(shadow::NodeShadows::new(settings, gate_env, work));
+        *self.node_shadows.borrow_mut() = Some(shadow::NodeShadows::new(settings, gate_env, work));
         self
     }
 
