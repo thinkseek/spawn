@@ -317,7 +317,9 @@ impl Artifacts {
         let dir = self.scratch("refs")?;
         let result = (|| {
             ran(
-                crate::sources::controller_git().args(["init", "-q", "--bare"]).arg(&dir),
+                crate::sources::controller_git()
+                    .args(["init", "-q", "--bare"])
+                    .arg(&dir),
                 "git init",
             )?;
             std::fs::write(
@@ -327,11 +329,10 @@ impl Artifacts {
             .map_err(|error| format!("alternates: {error}"))?;
             for (name, commit) in refs {
                 ran(
-                    crate::sources::controller_git().arg("--git-dir").arg(&dir).args([
-                        "update-ref",
-                        name,
-                        commit,
-                    ]),
+                    crate::sources::controller_git()
+                        .arg("--git-dir")
+                        .arg(&dir)
+                        .args(["update-ref", name, commit]),
                     "git update-ref",
                 )?;
             }
