@@ -150,7 +150,11 @@ fn put_lays_out_objects_and_verifies_them() {
     // Damage on disk is caught on read; read drops the damaged object.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
     fs::write(&path, "HELLO").expect("damage");
-    assert!(store.verify(&digest).is_err_and(|error| error.is_mismatch()));
+    assert!(
+        store
+            .verify(&digest)
+            .is_err_and(|error| error.is_mismatch())
+    );
     assert!(store.has(&digest), "verify only reports");
     assert!(store.read(&digest).is_err_and(|error| error.is_mismatch()));
     assert!(!store.has(&digest), "read removed the damaged object");
@@ -253,9 +257,16 @@ fn pins_are_whole_files_of_prefixed_digests_with_checked_names() {
         .expect("pin");
     let text = fs::read_to_string(scratch.join("cas/pins/lease/gate-aaaaaaaa.1")).expect("pin");
     assert_eq!(text, format!("{one}\n{two}\n"));
-    assert_eq!(store.pin_names("lease").expect("names"), ["gate-aaaaaaaa.1"]);
     assert_eq!(
-        store.pinned().expect("pinned").into_iter().collect::<Vec<_>>(),
+        store.pin_names("lease").expect("names"),
+        ["gate-aaaaaaaa.1"]
+    );
+    assert_eq!(
+        store
+            .pinned()
+            .expect("pinned")
+            .into_iter()
+            .collect::<Vec<_>>(),
         {
             let mut both = vec![one.clone(), two.clone()];
             both.sort();
@@ -292,7 +303,9 @@ fn pins_are_whole_files_of_prefixed_digests_with_checked_names() {
         assert!(is_valid_name(good), "{good:?}");
     }
     store.unpin("lease", "gate-aaaaaaaa.1").expect("unpin");
-    store.unpin("lease", "gate-aaaaaaaa.1").expect("unpin twice");
+    store
+        .unpin("lease", "gate-aaaaaaaa.1")
+        .expect("unpin twice");
     assert!(store.pinned().expect("pinned").is_empty());
 }
 
@@ -312,12 +325,14 @@ fn lru_gc_keeps_pinned_objects() {
         );
         clock.advance(Duration::from_secs(60));
     }
-    let base = store
-        .put_bytes(NS_BASE_CACHE, &[b'z'; 1000])
-        .expect("put");
+    let base = store.put_bytes(NS_BASE_CACHE, &[b'z'; 1000]).expect("put");
     // The two oldest are pinned (a live lease, a warm base).
     store
-        .pin("lease", "gate-aaaaaaaa.1", std::slice::from_ref(&digests[0]))
+        .pin(
+            "lease",
+            "gate-aaaaaaaa.1",
+            std::slice::from_ref(&digests[0]),
+        )
         .expect("pin");
     store
         .pin("warm", &"a".repeat(40), std::slice::from_ref(&digests[1]))
@@ -332,7 +347,10 @@ fn lru_gc_keeps_pinned_objects() {
     let report = store.gc(&quotas).expect("gc");
     // 600 bytes, quota 300: oldest unpinned first: 3, 4; then 400 left
     // (0, 1 pinned; 2, 5): 5 is older than 2's new use.
-    for (at, want) in [true, true, true, false, false, false].into_iter().enumerate() {
+    for (at, want) in [true, true, true, false, false, false]
+        .into_iter()
+        .enumerate()
+    {
         assert_eq!(store.has(&digests[at]), want, "digests[{at}]");
         // Object first, record second: neither is left for an evicted one.
         assert_eq!(store.access_path(NS_ARTIFACTS, &digests[at]).exists(), want);
@@ -365,7 +383,10 @@ fn namespaces_without_a_quota_are_never_evicted_and_quotas_are_configurable() {
     assert!(!quotas.contains_key(NS_BACKUP) && !quotas.contains_key(NS_DATA));
     let backup = store.put_bytes(NS_BACKUP, &[1; 64]).expect("put");
     let data = store.put_bytes(NS_DATA, &[2; 64]).expect("put");
-    let mut tight = Quotas::from([(NS_ARTIFACTS.to_string(), 0), (NS_BASE_CACHE.to_string(), 0)]);
+    let mut tight = Quotas::from([
+        (NS_ARTIFACTS.to_string(), 0),
+        (NS_BASE_CACHE.to_string(), 0),
+    ]);
     let report = store.gc(&tight).expect("gc");
     assert!(store.has(&backup) && store.has(&data), "{report:?}");
     assert_eq!(report.namespace_use[NS_BACKUP], 64);
@@ -405,7 +426,9 @@ fn gc_purges_stale_temporaries_by_the_store_clock() {
     let (_, fresh) = store.temp_file("put").expect("temp");
     fs::create_dir_all(store.tmp_dir().join("unpacked/inner")).expect("mkdir");
     let digest = sha256_of(b"held");
-    store.pin("owner", "name", std::slice::from_ref(&digest)).expect("pin");
+    store
+        .pin("owner", "name", std::slice::from_ref(&digest))
+        .expect("pin");
     fs::write(scratch.join("cas/pins/owner/.pin-1-1"), "torn").expect("torn temp");
     assert_eq!(store.gc(&default_quotas()).expect("gc").stale_tmp, 0);
     assert!(fresh.exists());
@@ -414,7 +437,10 @@ fn gc_purges_stale_temporaries_by_the_store_clock() {
     assert_eq!(report.stale_tmp, 3, "{report:?}");
     assert_eq!(fs::read_dir(store.tmp_dir()).expect("tmp").count(), 0);
     assert!(!scratch.join("cas/pins/owner/.pin-1-1").exists());
-    assert!(scratch.join("cas/pins/owner/name").exists(), "a pin is no temporary");
+    assert!(
+        scratch.join("cas/pins/owner/name").exists(),
+        "a pin is no temporary"
+    );
 }
 
 /// The adoption of `cas_dedup`'s `<cas>/<2 hex>/<64 hex>`: renamed, never
@@ -446,8 +472,11 @@ fn legacy_shards_are_adopted_in_place_without_rehashing() {
     for path in &foreign {
         fs::write(path, "foreign").expect("write");
     }
-    std::os::unix::fs::symlink(&legacy_real, root.join("ab").join(format!("ab{}", "1".repeat(62))))
-        .expect("symlink");
+    std::os::unix::fs::symlink(
+        &legacy_real,
+        root.join("ab").join(format!("ab{}", "1".repeat(62))),
+    )
+    .expect("symlink");
 
     let store = Store::open(&root).expect("open");
     let report = store.adopt_legacy_shards().expect("adopt");
@@ -465,16 +494,28 @@ fn legacy_shards_are_adopted_in_place_without_rehashing() {
         b"not its digest",
         "adopted by name, not rehashed"
     );
-    assert!(store.verify(&unhashed).is_err_and(|error| error.is_mismatch()));
+    assert!(
+        store
+            .verify(&unhashed)
+            .is_err_and(|error| error.is_mismatch())
+    );
     for path in &foreign {
-        assert_eq!(fs::read(path).expect("kept"), b"foreign", "{}", path.display());
+        assert_eq!(
+            fs::read(path).expect("kept"),
+            b"foreign",
+            "{}",
+            path.display()
+        );
     }
     assert!(
         fs::symlink_metadata(root.join("ab").join(format!("ab{}", "1".repeat(62))))
             .expect("link")
             .is_symlink()
     );
-    assert!(!root.join(&real.hex()[..2]).exists(), "an emptied shard goes");
+    assert!(
+        !root.join(&real.hex()[..2]).exists(),
+        "an emptied shard goes"
+    );
     // Once is enough: a second run finds nothing to do.
     assert_eq!(store.adopt_legacy_shards().expect("again").adopted, 0);
 

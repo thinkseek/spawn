@@ -879,7 +879,12 @@ fn cas_dedup_adopts_a_legacy_store_without_rehashing() {
         b"not its digest"
     );
     for path in &foreign {
-        assert_eq!(fs::read(path).expect("kept"), b"foreign", "{}", path.display());
+        assert_eq!(
+            fs::read(path).expect("kept"),
+            b"foreign",
+            "{}",
+            path.display()
+        );
     }
     // The existing index still names the blob: a second pass reads nothing.
     let again = dedup(&config, &[&work]).expect("dedup");
@@ -907,7 +912,9 @@ fn prune_adopts_legacy_blobs_and_keeps_pinned_ones() {
         fs::write(cas.join(&hash[..2]).join(hash), hash.as_bytes()).expect("write");
     }
     fs::write(cas.join(CAS_MARKER), "spawn\n").expect("marker");
-    let inode = fs::metadata(cas.join("ab").join(&hash)).expect("stat").ino();
+    let inode = fs::metadata(cas.join("ab").join(&hash))
+        .expect("stat")
+        .ino();
     // Within the grace period: adopted, nothing removed.
     let pruned = prune_unused(&cas, Duration::from_secs(3600)).expect("prune");
     assert_eq!(pruned.blobs_removed, 0, "{pruned:?}");

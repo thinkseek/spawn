@@ -66,7 +66,8 @@ impl Store {
                 plain_dir(&algo.join(&shard))?;
                 match fs::hard_link(&legacy, &target) {
                     Ok(()) => {
-                        open_nofollow(&target)?.set_permissions(fs::Permissions::from_mode(0o444))?;
+                        open_nofollow(&target)?
+                            .set_permissions(fs::Permissions::from_mode(0o444))?;
                         remove_missing_ok(&legacy)?;
                         report.adopted += 1;
                     }

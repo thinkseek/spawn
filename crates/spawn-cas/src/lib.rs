@@ -57,8 +57,7 @@ pub use digest::{
     Algo, Digest, Hasher, Verified, is_hex64, sha256_of, sha256_reader, verify_reader,
 };
 pub use gc::{
-    GcReport, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_DATA, Quotas, TMP_MAX_AGE,
-    default_quotas,
+    GcReport, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_DATA, Quotas, TMP_MAX_AGE, default_quotas,
 };
 pub use legacy::AdoptReport;
 pub use store::{

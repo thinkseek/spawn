@@ -101,7 +101,9 @@ impl Digest {
             input: text.to_string(),
             reason,
         };
-        let (algo, hex) = text.split_once(':').ok_or_else(|| bad("no algorithm prefix"))?;
+        let (algo, hex) = text
+            .split_once(':')
+            .ok_or_else(|| bad("no algorithm prefix"))?;
         let algo = Algo::from_name(algo).ok_or_else(|| bad("unknown algorithm"))?;
         if hex.len() != 64 {
             return Err(bad("want 64 hex digits"));

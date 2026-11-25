@@ -232,10 +232,8 @@ mod tests {
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "spawn-cas-{tag}-{}",
-                crate::store::unique_suffix()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("spawn-cas-{tag}-{}", crate::store::unique_suffix()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).expect("scratch");
             Self(path)
@@ -280,7 +278,10 @@ mod tests {
             let result_tx = result_tx.clone();
             scope.spawn(move || {
                 let pinned = store.pin("lease", "gate-race.1", std::slice::from_ref(&digest));
-                result_tx.send((pinned.map_err(|error| error.to_string()), store.has(&digest)))
+                result_tx.send((
+                    pinned.map_err(|error| error.to_string()),
+                    store.has(&digest),
+                ))
             });
             assert!(
                 result_rx.recv_timeout(Duration::from_millis(300)).is_err(),
