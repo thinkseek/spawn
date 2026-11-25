@@ -805,6 +805,35 @@ impl NodeShadows {
         Ok(manifest)
     }
 
+    /// What a node must hold for a gate of `controller`: the registry, the
+    /// gate's PostgreSQL, the web lockfile (published for the node to fetch
+    /// by its digest) and the toolchain, when the controller names them.
+    fn requires_of(
+        &self,
+        controller: &Path,
+        registry: String,
+    ) -> Result<std::collections::BTreeMap<String, String>, String> {
+        let mut requires = std::collections::BTreeMap::from([
+            ("registry".to_string(), registry),
+            ("pg".to_string(), remote::PG_MAJOR.to_string()),
+        ]);
+        if let Some(lock) = remote::web_lock(controller) {
+            // The node installs its web dependencies from this lockfile,
+            // fetched by the digest it requires.
+            let published = self
+                .artifacts
+                .put_copy(&controller.join("web/package-lock.json"))?;
+            if published.digest.hex != lock {
+                return Err("web/package-lock.json changed while it was published".to_string());
+            }
+            requires.insert("web_lock".to_string(), lock);
+        }
+        if let Some(channel) = remote::toolchain_channel(controller) {
+            requires.insert("toolchain".to_string(), channel);
+        }
+        Ok(requires)
+    }
+
     /// Write the job's artifacts and queue it: its id and the inputs it
     /// was granted.
     fn enqueue(&mut self, store: &PostgresStore, want: &Want) -> Result<(String, Value), String> {
@@ -873,24 +902,7 @@ impl NodeShadows {
             "scenarios_sha256": scenarios_sha256,
             "scenario": null,
         });
-        let mut requires = std::collections::BTreeMap::from([
-            ("registry".to_string(), registry.registry),
-            ("pg".to_string(), remote::PG_MAJOR.to_string()),
-        ]);
-        if let Some(lock) = remote::web_lock(&controller) {
-            // The node installs its web dependencies from this lockfile,
-            // fetched by the digest it requires.
-            let published = self
-                .artifacts
-                .put_copy(&controller.join("web/package-lock.json"))?;
-            if published.digest.hex != lock {
-                return Err("web/package-lock.json changed while it was published".to_string());
-            }
-            requires.insert("web_lock".to_string(), lock);
-        }
-        if let Some(channel) = remote::toolchain_channel(&controller) {
-            requires.insert("toolchain".to_string(), channel);
-        }
+        let requires = self.requires_of(&controller, registry.registry)?;
         let repo = want
             .repo
             .file_name()
@@ -1745,9 +1757,8 @@ mod tests {
         fn new() -> Self {
             Self(std::cell::RefCell::new(Vec::new()))
         }
-        fn write(&self, record: &Value) -> Result<(), String> {
+        fn write(&self, record: &Value) {
             self.0.borrow_mut().push(record.clone());
-            Ok(())
         }
         fn all(&self) -> Vec<Value> {
             self.0.borrow().clone()
@@ -1834,7 +1845,10 @@ mod tests {
             super::super::remote::tests::verdict_on("accepted", &world.base, &world.candidate);
         world.run(&node, &row.job_id, 0, Some(&verdict));
         let written = Written::new();
-        nodes.poll(&world.ledger.store, &|record| written.write(record));
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
         assert!(nodes.waiting().is_empty());
         let records = written.all();
         assert_eq!(records.len(), 1);
@@ -1886,7 +1900,10 @@ mod tests {
         let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
         let node = world.ledger.enroll("n252", 9, &row.requires);
         world.run(&node, &job_id, 2, None);
-        nodes.poll(&world.ledger.store, &|record| written.write(record));
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
         assert_eq!(nodes.waiting(), vec![job_id.clone()]);
         assert!(written.all().is_empty());
         assert_eq!(world.ledger.strikes("n252"), (1, false));
@@ -1894,7 +1911,10 @@ mod tests {
         assert_eq!(row.state, spawn_postgres::RemoteJobState::Queued);
         assert_eq!(row.excluded_nodes, vec![node.clone()]);
         nodes.settings.queue_wait = Duration::ZERO;
-        nodes.poll(&world.ledger.store, &|record| written.write(record));
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
         assert!(nodes.waiting().is_empty());
         assert!(written.all().is_empty());
         assert_eq!(
@@ -1931,7 +1951,10 @@ mod tests {
         after.offer(&world.ledger.store, world.want(12));
         let mine = after.waiting()[0].clone();
         let written = Written::new();
-        after.poll(&world.ledger.store, &|record| written.write(record));
+        after.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
         assert_eq!(
             world
                 .ledger
@@ -1976,7 +1999,10 @@ mod tests {
         assert_eq!(world.ledger.beat(&node).len(), 1);
         std::thread::sleep(Duration::from_millis(900));
         let written = Written::new();
-        nodes.poll(&world.ledger.store, &|record| written.write(record));
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
         assert_eq!(nodes.waiting(), vec![job_id.clone()]);
         // Fenced back to the queue (as a new boot or the sweep does).
         world
@@ -1990,7 +2016,10 @@ mod tests {
                 &[&job_id],
             )
             .unwrap();
-        nodes.poll(&world.ledger.store, &|record| written.write(record));
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
         assert_eq!(nodes.waiting(), vec![job_id.clone()]);
         assert_eq!(
             world
