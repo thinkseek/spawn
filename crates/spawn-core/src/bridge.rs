@@ -8806,6 +8806,7 @@ mod tests {
     /// bound only once its full transcript holds the prompt Spawn typed
     /// (its marker); then the transcript is read from its start, and the
     /// turn's end comes from it.
+    #[allow(clippy::too_many_lines)] // one binding, refused case by case, then bound and read
     #[test]
     fn agy_binds_the_session_the_host_reports_and_reads_its_full_transcript() {
         let clock = Arc::new(ManualClock::new(Timestamp(1_000)));

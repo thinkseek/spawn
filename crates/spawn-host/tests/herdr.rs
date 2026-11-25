@@ -574,6 +574,7 @@ fn changes_name(host: &HerdrHost, terminal: &TerminalName) -> bool {
 /// Spawn's reading), a running turn, a permission and a question. Each
 /// change reaches the host's change queue; the pane's account line never
 /// reaches Spawn's reading.
+#[allow(clippy::too_many_lines)] // one stub session walked through every manifest state, in order
 #[test]
 fn the_agent_witness_reads_a_stub_agy_through_every_manifest_state() {
     let _serial = exclusive();

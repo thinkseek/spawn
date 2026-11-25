@@ -2745,6 +2745,7 @@ mod agy_tests {
     /// subagent; agy answers in prose while they run (no turn end), the
     /// subagent reports, a reminder with no sender comes, the jobs report,
     /// and only the last answer ends the turn.
+    #[allow(clippy::too_many_lines)] // one probed turn, line by line, in transcript order
     #[test]
     fn a_turn_stays_open_while_its_jobs_and_subagent_run() {
         let mut cursor = cursor();
