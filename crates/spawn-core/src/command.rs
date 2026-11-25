@@ -11,8 +11,10 @@ use crate::id::{AgentId, CommandId, IdempotencyKey, SessionId};
 pub enum CommandAction {
     /// Start a new execution with a fresh native session.
     Start {
-        /// Engine to launch: [`ENGINE`], the only one, which a command may
-        /// leave out. A command naming another engine does not parse.
+        /// Engine to launch: a registered driver's (`claude`, `agy`),
+        /// [`ENGINE`] when a command leaves it out. A command naming any
+        /// other engine does not parse; the Bridge refuses one its host does
+        /// not enable (`SPAWN_ENGINES`).
         #[serde(default = "engine", deserialize_with = "claude_only")]
         engine: String,
         /// First prompt.
