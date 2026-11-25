@@ -875,7 +875,9 @@ fn holds_its_content(
 /// blobs (`<hh>/<hash>`) are adopted into `objects/sha256/` first, without
 /// rehashing. Only names this module makes are ever removed:
 /// `objects/sha256/<hh>/<hash>` with a 64-digit lowercase hex hash in its
-/// own shard, never one a `spawn-cas` pin names, and `tmp/<hash>.<pid>-<n>`;
+/// own shard, never one a `spawn-cas` pin names or a `spawn-cas` namespace
+/// holds an access record of (`access/<ns>/sha256/<hash>`: that object is
+/// the namespace's, collected by its own GC), and `tmp/<hash>.<pid>-<n>`;
 /// anything else (a `*.jsonl` file included) is left where it is.
 ///
 /// Safe at any time: a workspace file's data is refcounted by the file
@@ -938,18 +940,35 @@ pub fn prune_unused(cas_root: &Path, grace: Duration) -> io::Result<PruneReport>
             }
         }
     }
-    // Pins are read, and blobs removed, with no pin written meanwhile.
+    // Pins and access records are read, and blobs removed, with no pin
+    // written and no GC pass meanwhile.
     let _pins = store.lock_gc().map_err(io::Error::from)?;
     let pinned = store.pinned().map_err(io::Error::from)?;
     for object in store.objects(Algo::Sha256).map_err(io::Error::from)? {
-        if referenced.contains(object.digest.hex())
+        // An object some spawn-cas namespace records (`artifacts`,
+        // `base-cache`, `backup`, `data`) is that namespace's to collect,
+        // by its own LRU GC; it is never a dedup blob to prune. One whose
+        // records cannot be read is kept, and said.
+        let namespaced = match store.namespaces_of(&object.digest) {
+            Ok(namespaces) => !namespaces.is_empty(),
+            Err(error) => {
+                report.errors.push(format!(
+                    "access records of {}: {error}",
+                    object.path.display()
+                ));
+                true
+            }
+        };
+        if namespaced
+            || referenced.contains(object.digest.hex())
             || pinned.contains(&object.digest)
             || !old_enough(&object.meta)
         {
             report.blobs_kept += 1;
             continue;
         }
-        match store.remove_object(&object.digest) {
+        // The object file only: no access record is ever removed here.
+        match store.remove_object_file(&object.digest) {
             Ok(_) => {
                 report.blobs_removed += 1;
                 report.bytes_removed += object.meta.size();

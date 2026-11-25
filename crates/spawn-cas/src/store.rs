@@ -403,6 +403,42 @@ impl Store {
         plain_dir(&algo.join(digest.shard()))
     }
 
+    /// The namespaces holding an access record of `digest`, sorted: the
+    /// users that store it (`artifacts`, `base-cache`, `backup`, `data`,
+    /// ...). An object with none belongs to no namespace's lifecycle.
+    pub fn namespaces_of(&self, digest: &Digest) -> Result<Vec<String>, CasError> {
+        let access = self.root.join("access");
+        let namespaces = match fs::read_dir(&access) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut found = Vec::new();
+        for namespace in namespaces {
+            let namespace = namespace?;
+            if !namespace.file_type()?.is_dir() {
+                continue;
+            }
+            let record = namespace
+                .path()
+                .join(digest.algo().name())
+                .join(digest.hex());
+            match fs::symlink_metadata(&record) {
+                Ok(_) => found.push(namespace.file_name().to_string_lossy().into_owned()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    /// Remove only the object file, never an access record (for an object
+    /// no namespace records). Whether it was there.
+    pub fn remove_object_file(&self, digest: &Digest) -> Result<bool, CasError> {
+        Ok(remove_missing_ok(&self.object_path(digest))?)
+    }
+
     /// Remove the object, then its access record in every namespace
     /// (crash-only: a record left behind names nothing and goes in the next
     /// GC). Whether the object was there.

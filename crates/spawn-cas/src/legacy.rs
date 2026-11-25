@@ -16,8 +16,8 @@ use crate::{Algo, CasError, Digest, Store, is_hex64};
 pub struct AdoptReport {
     /// Blobs moved to `objects/sha256/`.
     pub adopted: usize,
-    /// Legacy blobs left where they are because an object of that digest
-    /// already exists.
+    /// Legacy names removed because an object of that digest already
+    /// existed (a crash leftover of an earlier adoption, or a duplicate).
     pub duplicates: Vec<PathBuf>,
     /// Legacy shard directories removed once empty.
     pub shards_removed: usize,
@@ -30,8 +30,9 @@ impl Store {
     /// rehashed: the name is the address the old store gave it, by the
     /// same algorithm. Anything else is left exactly as it is: other names
     /// (a `*.jsonl` file among them), entries in the wrong shard,
-    /// symlinks, directories that are not shards. Only a legacy shard left
-    /// empty is removed.
+    /// symlinks, directories that are not shards. A legacy name whose
+    /// object already exists is removed (the object stays), and a legacy
+    /// shard left empty is removed.
     ///
     /// Idempotent and safe from several processes at once: each blob is
     /// linked at its new name (never replacing an object) before its old
@@ -71,8 +72,15 @@ impl Store {
                         remove_missing_ok(&legacy)?;
                         report.adopted += 1;
                     }
+                    // The object is there already: a crash between the link
+                    // and the unlink left the same inode at both names, or
+                    // the old store and a new writer both hold the address.
+                    // By the no-rehash rule the name is the content, so the
+                    // legacy name is redundant either way and goes.
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        report.duplicates.push(legacy);
+                        if remove_missing_ok(&legacy)? {
+                            report.duplicates.push(legacy);
+                        }
                     }
                     // Adopted by another opener meanwhile.
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
