@@ -535,6 +535,7 @@ fn the_checks_refuse_values_outside_their_lists() {
 /// origins; a cycle (A uses B, B uses A, and C uses itself) ends, each
 /// change once by its shortest path; the depth bound holds.
 #[test]
+#[allow(clippy::too_many_lines)] // one graph, walked every way
 fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     let (store, _schema) = store("prov_blast");
     // A uses B (not recorded yet: an edge names a change id, not a row).
