@@ -78,7 +78,7 @@ fn load(path: &Path) -> Result<SigningKey, String> {
     }
     let mut document = Zeroizing::new(Vec::new());
     File::open(path)
-        .and_then(|mut file| file.take(4096).read_to_end(&mut document))
+        .and_then(|file| file.take(4096).read_to_end(&mut document))
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     from_pkcs8(&document).map_err(|error| format!("{}: {error}", path.display()))
 }

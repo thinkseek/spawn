@@ -63,9 +63,16 @@ impl Request<'_> {
 
     /// The single value of header `name`; `None` when absent or repeated.
     pub fn header(&self, name: &str) -> Option<&str> {
-        let mut values = self.header_values(name);
-        let first = values.next();
-        if values.next().is_some() { None } else { first }
+        let mut found = None;
+        for (field, value) in &self.headers {
+            if field.eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(value.as_str());
+            }
+        }
+        found
     }
 
     /// The body, at most its framed `Content-Length` (nothing when the
