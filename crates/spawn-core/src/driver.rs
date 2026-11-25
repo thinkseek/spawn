@@ -859,4 +859,206 @@ mod tests {
         assert_eq!(AgyDriver.excerpt_source(banner), "ok\n");
         assert_eq!(ClaudeDriver.excerpt_source(banner), banner);
     }
+
+    // --- the resolver's table (design section 6.3): one test a row -------
+
+    fn dialog<'a>(
+        rule: Option<&'a str>,
+        kind: &'a str,
+        cursor: Option<&'a str>,
+        choices: &'a [String],
+        body: &'a [String],
+    ) -> super::Dialog<'a> {
+        super::Dialog {
+            rule,
+            kind,
+            cursor,
+            choices,
+            body,
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn ws() -> WorkspaceId {
+        WorkspaceId::new("agent_a:/workspaces/agent_a").expect("workspace")
+    }
+
+    #[test]
+    fn row_agy_trust_prompt_probed_answers_enter_for_the_workspace_only() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["Yes, I trust this folder", "No, exit"]);
+        let body = strings(&["Accessing workspace:", "/workspaces/agent_a"]);
+        let ours = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("Yes, I trust this folder"),
+            &choices,
+            &body,
+        );
+        assert_eq!(table_answer("agy", &ours, &ws()), Answer::Keys(&["Enter"]));
+        assert_eq!(AgyDriver.dialog_answer(&ours, &ws()), Answer::Keys(&["Enter"]));
+        let elsewhere = strings(&["Accessing workspace:", "/home/someone"]);
+        let other = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("Yes, I trust this folder"),
+            &choices,
+            &elsewhere,
+        );
+        assert!(matches!(table_answer("agy", &other, &ws()), Answer::Escalate(_)));
+        let off_cursor = dialog(Some("trust_prompt"), "trust", Some("No, exit"), &choices, &body);
+        assert!(matches!(table_answer("agy", &off_cursor, &ws()), Answer::Escalate(_)));
+    }
+
+    #[test]
+    fn row_agy_permission_prompt_manifest_text_only_escalates() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["Yes", "No"]);
+        let body = strings(&["Run command?", "cargo test"]);
+        let shown = dialog(Some("permission_prompt"), "permission", Some("Yes"), &choices, &body);
+        assert!(matches!(table_answer("agy", &shown, &ws()), Answer::Escalate(_)));
+    }
+
+    #[test]
+    fn row_agy_question_prompt_manifest_text_only_escalates() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["A", "B"]);
+        let shown = dialog(Some("question_prompt"), "choice", Some("A"), &choices, &[]);
+        assert!(matches!(table_answer("agy", &shown, &ws()), Answer::Escalate(_)));
+    }
+
+    #[test]
+    fn row_claude_trust_dialog_in_production_answers_trust_keys() {
+        use super::{Answer, table_answer};
+        let shown = dialog(None, "trust", None, &[], &[]);
+        assert_eq!(
+            table_answer("claude", &shown, &ws()),
+            Answer::Keys(&TRUST_KEYS)
+        );
+        assert_eq!(ClaudeDriver.dialog_answer(&shown, &ws()), Answer::Keys(&TRUST_KEYS));
+    }
+
+    #[test]
+    fn row_claude_numbered_permission_approvals_fixture_answers_1_when_choice_1_is_yes() {
+        use super::{Answer, table_answer};
+        let yes = strings(&["Yes", "Yes, and don't ask again", "No"]);
+        for rule in [None, Some("bash_permission_prompt"), Some("generic_permission_prompt")] {
+            let shown = dialog(rule, "permission", Some("Yes"), &yes, &[]);
+            assert_eq!(table_answer("claude", &shown, &ws()), Answer::Keys(&["1"]));
+        }
+        let no_first = strings(&["No", "Yes"]);
+        let shown = dialog(None, "permission", None, &no_first, &[]);
+        assert!(matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)));
+        let choice = dialog(None, "choice", None, &yes, &[]);
+        assert!(matches!(table_answer("claude", &choice, &ws()), Answer::Escalate(_)));
+    }
+
+    #[test]
+    fn row_claude_question_forms_not_captured_escalate() {
+        use super::{Answer, table_answer};
+        for rule in ["live_blocked_form", "mcp_elicitation_prompt", "dynamic_workflow_prompt"] {
+            let shown = dialog(Some(rule), "choice", None, &[], &[]);
+            assert!(matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)));
+        }
+    }
+
+    #[test]
+    fn row_codex_dialogs_not_verified_escalate() {
+        use super::{Answer, table_answer};
+        for rule in ["trust_directory", "startup_update", "live_strong_blocker"] {
+            let shown = dialog(Some(rule), "confirm", None, &[], &[]);
+            assert!(matches!(table_answer("codex", &shown, &ws()), Answer::Escalate(_)));
+        }
+    }
+
+    #[test]
+    fn row_opencode_permission_required_not_verified_escalates() {
+        use super::{Answer, table_answer};
+        let shown = dialog(Some("permission_required"), "permission", None, &[], &[]);
+        assert!(matches!(table_answer("opencode", &shown, &ws()), Answer::Escalate(_)));
+    }
+
+    #[test]
+    fn row_any_engine_with_no_row_escalates() {
+        use super::{Answer, table_answer};
+        let yes = strings(&["Yes", "No"]);
+        for (engine, rule, kind) in [
+            ("agy", None, "permission"),
+            ("agy", Some("idle"), "confirm"),
+            ("claude", Some("unknown_rule"), "permission"),
+            ("codex", None, "permission"),
+            ("someone", Some("trust_prompt"), "trust"),
+        ] {
+            let shown = dialog(rule, kind, Some("Yes"), &yes, &[]);
+            assert!(
+                matches!(table_answer(engine, &shown, &ws()), Answer::Escalate(_)),
+                "{engine} {rule:?} {kind}"
+            );
+        }
+    }
+
+    // --- hard blocks: every text from the engines' strings and docs, none
+    // captured on a live pane (marked `unverified` in the test's name) ----
+
+    #[test]
+    fn hard_block_login_required_texts_unverified() {
+        for pane in [
+            "Invalid API key · Please run /login",
+            "Error: login required",
+            "You are not logged in.",
+        ] {
+            assert_eq!(super::hard_block(pane, &[]), Some("login required"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn hard_block_login_expired_texts_unverified() {
+        for pane in [
+            "API Error: 401 OAuth token has expired",
+            "{\"type\":\"authentication_error\"}",
+        ] {
+            assert_eq!(super::hard_block(pane, &[]), Some("login expired"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn hard_block_rate_limit_texts_unverified() {
+        for pane in ["Rate limit reached for requests", "rate_limit_error"] {
+            assert_eq!(super::hard_block(pane, &[]), Some("rate limit"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn hard_block_quota_texts_unverified() {
+        for pane in [
+            "Claude usage limit reached. Your limit will reset at 5pm",
+            "Quota exceeded for this model",
+            "429 RESOURCE_EXHAUSTED",
+        ] {
+            assert_eq!(super::hard_block(pane, &[]), Some("quota reached"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn hard_block_update_required_texts_unverified() {
+        for pane in ["Update required: version 1.2 is too old", "Please update to continue"] {
+            assert_eq!(super::hard_block(pane, &[]), Some("update required"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn hard_block_only_exit_choices_and_none_on_ordinary_dialogs() {
+        assert_eq!(
+            super::hard_block("Something failed", &strings(&["Exit", "Quit Spawn"])),
+            Some("only exit choices")
+        );
+        assert_eq!(super::hard_block("Run command?", &strings(&["Yes", "No, exit"])), None);
+        assert_eq!(super::hard_block("Run command?", &[]), None);
+        // Only the tail counts: a limit far above it is history.
+        let old = format!("Rate limit reached\n{}", "line\n".repeat(60));
+        assert_eq!(super::hard_block(&old, &[]), None);
+    }
 }
