@@ -182,6 +182,7 @@ fn node_records(client: &mut Client) -> BTreeMap<String, i64> {
 /// stale boot, `take_local`, a strike, the sweep (level-triggered), the
 /// owner's drain and revoke.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_ledger_behaves_as_the_design_measured_it() {
     let (store, schema) = store("rj_reference");
     let mut client = admin(&schema);
@@ -656,19 +657,19 @@ fn three_strikes_degrade_a_node_and_an_undrain_clears_them() {
             .expect("a second judging");
         assert!(!again.ok, "a completion is judged once");
     }
-    let node_row = store.node_v1("nd").expect("a node").expect("the node");
-    assert!(node_row.degraded);
-    assert_eq!(node_row.host_fault_strikes, 3);
-    let none = beat_once(&store, &node, &boot(1), seq, &beat(&[], &[], 1, 0));
+    let row = store.node_v1("nd").expect("a node").expect("the node");
+    assert!(row.degraded);
+    assert_eq!(row.host_fault_strikes, 3);
+    let refused = beat_once(&store, &node, &boot(1), seq, &beat(&[], &[], 1, 0));
     seq += 1;
-    assert_eq!(grants(&none), [], "a degraded node gets no grants");
+    assert_eq!(grants(&refused), [], "a degraded node gets no grants");
     assert!(
         store
             .node_admin("nd", NodeAction::Undrain)
             .expect("undrain")
     );
-    let node_row = store.node_v1("nd").expect("a node").expect("the node");
-    assert_eq!((node_row.degraded, node_row.host_fault_strikes), (false, 0));
+    let row = store.node_v1("nd").expect("a node").expect("the node");
+    assert_eq!((row.degraded, row.host_fault_strikes), (false, 0));
     assert!(
         !store
             .node_admin("nd", NodeAction::Undrain)
@@ -701,7 +702,7 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
             .expect("enqueue");
         let read_epoch = state(&store, &id).lease_epoch;
         let start = Barrier::new(2);
-        let (uploaded, taken) = std::thread::scope(|scope| {
+        let (uploaded, took_back) = std::thread::scope(|scope| {
             let upload = scope.spawn(|| {
                 start.wait();
                 let answer =
@@ -714,15 +715,15 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
                             .answer
                 })
             });
-            let take = scope.spawn(|| {
+            let take_back = scope.spawn(|| {
                 start.wait();
                 integrator
                     .remote_job_take_local(&id, read_epoch)
                     .expect("take local")
             });
-            (upload.join().expect("upload"), take.join().expect("take"))
+            (upload.join().expect("upload"), take_back.join().expect("take"))
         });
-        assert!(uploaded != taken, "round {round}: exactly one winner");
+        assert!(uploaded != took_back, "round {round}: exactly one winner");
         let job = state(&store, &id);
         if uploaded {
             remote += 1;
@@ -748,6 +749,7 @@ fn a_result_upload_racing_take_local_has_exactly_one_winner() {
 /// grant-checked gateway, where it has no grant). It is nobody's caller,
 /// and its timeouts are its role's defaults.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_gateway_login_reaches_exactly_its_functions_and_no_table() {
     let (_store, schema) = store("rj_gateway_role");
     let mut client = admin(&schema);
@@ -959,6 +961,7 @@ fn old_schema() -> String {
 /// (and the grading fold) read none of them, and rebuild the missions and
 /// tasks exactly as the new schema's fold does.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn an_old_schema_refolds_a_log_holding_the_v1_records() {
     let (store, schema) = store("rj_old_refold");
     let mission = store
