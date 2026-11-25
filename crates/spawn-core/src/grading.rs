@@ -873,18 +873,28 @@ const LOW_RISK_STEMS: &[&str] = &[
 ];
 const LOW_RISK_PHRASES: &[&str] = &["cargo fmt", "registry entry"];
 
-/// Tagging markers that count only as the first word of a line, the
-/// imperative that names the work ("Tag the open tasks", "Label the stale
-/// issues", "Bulk-label ..."): anywhere else they name a thing the work is
-/// about ("fix the crash in tag matching", "speed up the bulk insert").
-const LOW_RISK_LEAD_STEMS: &[&str] = &["tag", "label", "bulk"];
+/// Tagging markers that count only as the brief's first word, in the
+/// imperative form that names the work: exactly `tag` or `label` ("Tag the
+/// open tasks", "Label the stale issues"), or a word starting `bulk-`
+/// ("Bulk-label ..."). A plural or a noun phrase there is the subject of a
+/// report ("Labels vanish after a restart", "Bulk import fails"), and
+/// anywhere else they name a thing the work is about ("fix the crash in
+/// tag matching"). Only the first line is read: a later line's "Tag the
+/// release" is one step of larger work.
+const LOW_RISK_LEAD_WORDS: &[&str] = &["tag", "label"];
+const LOW_RISK_LEAD_PREFIX: &str = "bulk-";
 
-/// `regenerat*` is a marker only when a generated artifact is named too
-/// ("regenerate the fixtures"), never for a value the code makes
-/// ("regenerate the session token on each login").
+/// `regenerat*` is a marker only when its object is a generated artifact
+/// ("regenerate the fixtures", "regenerate the golden snapshots"): the
+/// next word, past a determiner, starts with one of these. Never for a
+/// value the code makes ("regenerate the session token and update the
+/// snapshot test").
 const REGENERATE_STEM: &str = "regenerat";
 const GENERATED_ARTIFACT_STEMS: &[&str] =
     &["fixture", "snapshot", "lockfile", "golden", "generated"];
+const DETERMINERS: &[&str] = &[
+    "the", "a", "an", "all", "its", "their", "our", "this", "these",
+];
 
 /// Words that cancel the low-risk rule: words that widen a change past a
 /// small one, authoring words (writing that needs judgement), words naming
@@ -932,6 +942,15 @@ const BROADENING_STEMS: &[&str] = &[
     "dedup",
     "automat",
     "handl",
+    // A defect reported subject-first ("Tags are lost on reload").
+    "fail",
+    "lost",
+    "lose",
+    "wrong",
+    "missing",
+    "vanish",
+    "broke",
+    "corrupt",
 ];
 
 /// File extensions a path token ends with.
@@ -1029,13 +1048,31 @@ fn path_words<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// The `low_risk` evidence: [`LOW_RISK_STEMS`] and [`LOW_RISK_PHRASES`]
-/// anywhere, [`LOW_RISK_LEAD_STEMS`] as the first word of a line, and
-/// `regenerat*` beside a [`GENERATED_ARTIFACT_STEMS`] word.
-fn low_risk_markers(words: &[&str], line_leads: &[&str], text: &str) -> Vec<String> {
+/// anywhere, a [`LOW_RISK_LEAD_WORDS`] or [`LOW_RISK_LEAD_PREFIX`] word as
+/// the brief's first word, and `regenerat*` whose object is a
+/// [`GENERATED_ARTIFACT_STEMS`] word.
+fn low_risk_markers(words: &[&str], text: &str) -> Vec<String> {
     let mut markers = matched(words, text, LOW_RISK_STEMS, LOW_RISK_PHRASES);
-    markers.extend(matched(line_leads, "", LOW_RISK_LEAD_STEMS, &[]));
-    if !matched(words, "", GENERATED_ARTIFACT_STEMS, &[]).is_empty() {
-        markers.extend(matched(words, "", &[REGENERATE_STEM], &[]));
+    if let Some(lead) = words.first() {
+        if LOW_RISK_LEAD_WORDS.contains(lead) {
+            markers.push((*lead).to_string());
+        } else if lead.starts_with(LOW_RISK_LEAD_PREFIX) {
+            markers.push("bulk".to_string());
+        }
+    }
+    let regenerates_an_artifact = words.iter().enumerate().any(|(at, word)| {
+        word.starts_with(REGENERATE_STEM)
+            && words[at + 1..]
+                .iter()
+                .find(|next| !DETERMINERS.contains(next))
+                .is_some_and(|object| {
+                    GENERATED_ARTIFACT_STEMS
+                        .iter()
+                        .any(|stem| object.starts_with(stem))
+                })
+    });
+    if regenerates_an_artifact {
+        markers.push(REGENERATE_STEM.to_string());
     }
     markers
 }
@@ -1058,9 +1095,10 @@ fn low_risk_markers(words: &[&str], line_leads: &[&str], text: &str) -> Vec<Stri
 /// - `long_brief` +1 above 2000 characters;
 /// - `low_risk` -2: a mechanical marker (typo*, spelling*, formatting*,
 ///   whitespace*, rustfmt*, mechanical*, repetitive*, "cargo fmt",
-///   "registry entry" anywhere; tag*, label*, bulk* only as the first word
-///   of a line; regenerat* only beside a generated artifact: fixture*,
-///   snapshot*, lockfile*, golden*, generated*), only when no `security`,
+///   "registry entry" anywhere; `tag`, `label` or `bulk-*` only as the
+///   brief's first word, exactly so; regenerat* only when its object is a
+///   generated artifact: fixture*, snapshot*, lockfile*, golden*,
+///   generated*), only when no `security`,
 ///   `migration` or `concurrency` rule matched and no broadening word is
 ///   there: widening (every*, whatever*, caller*, implement*, support*,
 ///   feature*), authoring (writ*, rewrit*, draft*, document*, explain*,
@@ -1068,7 +1106,8 @@ fn low_risk_markers(words: &[&str], line_leads: &[&str], text: &str) -> Vec<Stri
 ///   code to build (filter*, render*, pars*, endpoint*, api*, display*),
 ///   or a defect, performance or behaviour (bug*, crash*, debug*, hang*,
 ///   cause*, speed*, optimi*, perf*, slow*, retry*, validat*, dedup*,
-///   automat*, handl*). A `*` marks a prefix: every keyword is one.
+///   automat*, handl*, fail*, lost*, lose*, wrong*, missing*, vanish*,
+///   broke*, corrupt*). A `*` marks a prefix: every keyword is one.
 ///
 /// `l3` from [`CLASSIFY_L3_AT`]; `l1` at or below [`CLASSIFY_L1_AT`] when
 /// no risk rule matched, at most one file is named and the brief is at
@@ -1080,12 +1119,6 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
     // Keywords are read in every path segment too: `sql/schema.sql` names
     // the schema.
     let words = path_words(&tokens);
-    // The first word of each line: a brief's imperative, also after a
-    // title line or in a list.
-    let line_leads: Vec<&str> = text
-        .lines()
-        .filter_map(|line| path_words(&tokenize(line)).first().copied())
-        .collect();
     let mut signals = Vec::new();
     let mut add = |rule: &str, points: i32, evidence: Vec<String>| {
         if points != 0 && !evidence.is_empty() {
@@ -1148,7 +1181,7 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
         vec![format!("{chars} chars")],
     );
     if !risky && matched(&words, &text, BROADENING_STEMS, &[]).is_empty() {
-        add("low_risk", -2, low_risk_markers(&words, &line_leads, &text));
+        add("low_risk", -2, low_risk_markers(&words, &text));
     }
     let score: i32 = signals.iter().map(|signal| signal.points).sum();
     let difficulty = if score >= CLASSIFY_L3_AT {
@@ -2146,7 +2179,8 @@ mod tests {
             ("Regenerate the fixtures", "regenerat"),
             ("Regenerate the golden snapshots", "regenerat"),
             ("Bulk-label the stale tasks", "bulk"),
-            ("Typo fix\n\nTag the open tasks with l1", "tag"),
+            ("Typo fix\n\nTag the open tasks with l1", "typo"),
+            ("Tag the open tasks\nwith their capability", "tag"),
             ("A mechanical bulk rename of the constant", "mechanical"),
             ("Fix the typo in README.md", "typo"),
         ] {
@@ -2194,6 +2228,19 @@ mod tests {
             "Regenerate the cache when the config changes",
             "Regenerate the session token on each login",
             "Fix the whitespace handling in the tokenizer",
+            // Subject-first reports, later-line imperatives and a
+            // regenerated value (supervisor review of task 580, F4).
+            "Labels vanish after a restart",
+            "Tags are lost on reload",
+            "Bulk import fails on empty rows",
+            "Label colours are wrong in dark mode",
+            "Tags go missing after a merge",
+            "Bulk import is broken",
+            "Label data is corrupt after an upgrade",
+            "Fix the scheduler\nTag the release afterwards",
+            "Cleanup\n- Tag the open tasks\n- Remove the dead code path",
+            "Regenerate the session token and update the snapshot test",
+            "Regenerate the signing key next to the fixtures",
         ] {
             let classified = classify_difficulty(brief);
             assert!(
