@@ -2213,7 +2213,7 @@ mod tests {
             assert!(
                 PROMPT_LINE_LIMIT * 4 <= 1024 * 1024,
                 "well under the probed 1 MiB cap"
-            )
+            );
         };
     }
 
