@@ -1,12 +1,13 @@
-//! `GET /node/v1/artifacts/<algo:hex>` and `GET /node/v1/registry-manifest`
-//! (section 3.6): files of `SPAWN_NODE_ARTIFACTS`, `<algo>/<2 hex>/<hex>`
-//! and `registry-manifest.json`, streamed with `Content-Length`,
-//! `Accept-Ranges: bytes` and one-range `206` answers. The bodies are not
-//! signed: a node believes an artifact only if it hashes to its address,
-//! and the manifest only if the registry it describes hashes to the
-//! grant's `requires.registry`.
+//! `GET /node/v1/artifacts/<algo:hex>` (section 3.6): files of
+//! `SPAWN_NODE_ARTIFACTS`, `<algo>/<2 hex>/<hex>`, streamed with
+//! `Content-Length`, `Accept-Ranges: bytes` and one-range `206` answers.
+//! Their bodies are not signed: a node believes an artifact only if it
+//! hashes to its address. `GET /node/v1/registry-manifest` is not an
+//! artifact: [`manifest_body`] builds its JSON, which the gateway signs as
+//! every other answer (design §2.3).
 
 use std::fs::File;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use spawn_node_proto::ContentDigest;
@@ -16,6 +17,61 @@ use crate::http::{Body, Response};
 
 /// The manifest's file name under `SPAWN_NODE_ARTIFACTS`.
 pub const REGISTRY_MANIFEST: &str = "registry-manifest.json";
+/// The largest manifest file served.
+pub const MAX_MANIFEST: u64 = 1024 * 1024;
+
+/// Why no manifest is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestError {
+    /// No such regular file: `404`.
+    Missing,
+    /// The file is not a manifest: the operator's fault, `503 busy`.
+    Invalid(String),
+}
+
+/// The registry manifest's answer body: the file (at most 1 MiB, strict
+/// JSON) must be an object with `registry` (64 lowercase hex, the cargo
+/// registry's `tree_sha256_v1`) and `pack` (`{digest, size}`: the packed
+/// registry's content address and length); its members are kept, with
+/// `"v": 1` and `"server_time_ms": now` set.
+pub fn manifest_body(path: &Path, now: u64) -> Result<Vec<u8>, ManifestError> {
+    let invalid = |why: &str| ManifestError::Invalid(why.to_string());
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ManifestError::Missing)?;
+    if !metadata.file_type().is_file() {
+        return Err(ManifestError::Missing);
+    }
+    if metadata.len() > MAX_MANIFEST {
+        return Err(invalid("over 1 MiB"));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(MAX_MANIFEST + 1).read_to_end(&mut bytes))
+        .map_err(|error| ManifestError::Invalid(error.to_string()))?;
+    if bytes.len() as u64 > MAX_MANIFEST {
+        return Err(invalid("over 1 MiB"));
+    }
+    let mut manifest: serde_json::Map<String, serde_json::Value> =
+        spawn_node_proto::json::parse(&bytes)
+            .map_err(|error| ManifestError::Invalid(error.to_string()))?;
+    let registry_ok = manifest
+        .get("registry")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|hex| spawn_node_proto::codec::is_lower_hex(hex, 64));
+    if !registry_ok {
+        return Err(invalid("registry is not 64 lowercase hex"));
+    }
+    let pack = manifest.get("pack").ok_or_else(|| invalid("no pack"))?;
+    let digest_ok = pack
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|digest| ContentDigest::parse(digest).is_ok());
+    if !digest_ok || pack.get("size").and_then(serde_json::Value::as_u64).is_none() {
+        return Err(invalid("pack is not {digest, size}"));
+    }
+    manifest.insert("v".to_string(), spawn_node_proto::VERSION.into());
+    manifest.insert("server_time_ms".to_string(), now.into());
+    Ok(spawn_node_proto::json::to_vec(&manifest))
+}
 
 /// Why no file is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,5 +248,45 @@ mod tests {
             artifact_path(Path::new("/a"), &blake),
             Err(Miss::Unsupported)
         );
+    }
+
+    #[test]
+    fn a_manifest_is_checked_and_stamped() {
+        let dir = std::env::temp_dir().join(format!(
+            "spawn-node-gateway-manifest-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(REGISTRY_MANIFEST);
+        assert_eq!(manifest_body(&path, 7), Err(ManifestError::Missing));
+        let digest = ContentDigest::sha256_of(b"pack");
+        let registry = "a".repeat(64);
+        std::fs::write(
+            &path,
+            format!(r#"{{"registry":"{registry}","pack":{{"digest":"{digest}","size":4}},"v":9}}"#),
+        )
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&manifest_body(&path, 7).unwrap()).unwrap();
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["server_time_ms"], 7);
+        assert_eq!(body["registry"], registry.as_str());
+        assert_eq!(body["pack"]["size"], 4);
+        for bad in [
+            r#"{"registry":"x","pack":{"digest":"sha256:00","size":1}}"#.to_string(),
+            format!(r#"{{"registry":"{registry}"}}"#),
+            format!(r#"{{"registry":"{registry}","pack":{{"digest":"{digest}","size":-1}}}}"#),
+            format!(
+                r#"{{"registry":"{registry}","registry":"{registry}","pack":{{"digest":"{digest}","size":1}}}}"#
+            ),
+            "[]".to_string(),
+        ] {
+            std::fs::write(&path, &bad).unwrap();
+            assert!(
+                matches!(manifest_body(&path, 7), Err(ManifestError::Invalid(_))),
+                "{bad}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
