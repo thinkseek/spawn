@@ -519,12 +519,61 @@ fn legacy_shards_are_adopted_in_place_without_rehashing() {
     // Once is enough: a second run finds nothing to do.
     assert_eq!(store.adopt_legacy_shards().expect("again").adopted, 0);
 
-    // A legacy duplicate of an existing object stays where it is.
+    // A legacy duplicate of an existing object: its name goes, the object
+    // and its emptied shard are as after a clean adoption.
     fs::create_dir_all(root.join(&real.hex()[..2])).expect("mkdir");
     fs::write(&legacy_real, "legacy blob").expect("write");
     let report = store.adopt_legacy_shards().expect("again");
     assert_eq!(report.duplicates, std::slice::from_ref(&legacy_real));
-    assert!(legacy_real.exists());
+    assert_eq!(report.shards_removed, 1, "{report:?}");
+    assert!(!legacy_real.exists());
+    assert!(!root.join(&real.hex()[..2]).exists());
+    assert_eq!(fs::read(&adopted).expect("object"), b"legacy blob");
+}
+
+/// A crash between the link and the unlink of an adoption leaves the same
+/// inode at the legacy name and at the object: the next adoption removes
+/// the legacy name and keeps the object.
+#[test]
+fn a_crash_mid_adoption_is_finished_by_the_next_one() {
+    let scratch = Scratch::new("legacy-crash");
+    let root = scratch.join("cas");
+    let store = Store::open(&root).expect("open");
+    let digest = sha256_of(b"half adopted");
+    let object = store.object_path(&digest);
+    fs::create_dir_all(object.parent().expect("shard")).expect("mkdir");
+    fs::write(&object, "half adopted").expect("write");
+    let legacy = root.join(digest.shard()).join(digest.hex());
+    fs::create_dir_all(legacy.parent().expect("shard")).expect("mkdir");
+    fs::hard_link(&object, &legacy).expect("link");
+    let report = store.adopt_legacy_shards().expect("adopt");
+    assert_eq!(report.adopted, 0, "{report:?}");
+    assert_eq!(report.duplicates, std::slice::from_ref(&legacy));
+    assert_eq!(report.shards_removed, 1, "{report:?}");
+    assert!(!legacy.exists());
+    assert!(!root.join(digest.shard()).exists());
+    assert_eq!(fs::read(&object).expect("object"), b"half adopted");
+    store.verify(&digest).expect("verify");
+}
+
+/// Namespace membership: the namespaces holding an access record of an
+/// object, and removing the object file alone leaves every record.
+#[test]
+fn namespaces_of_lists_access_records_and_remove_object_file_keeps_them() {
+    let scratch = Scratch::new("namespaces");
+    let store = Store::open(scratch.join("cas")).expect("open");
+    let digest = store.put_bytes(NS_DATA, b"snapshot").expect("put");
+    store.touch(NS_BACKUP, &digest).expect("touch");
+    assert_eq!(
+        store.namespaces_of(&digest).expect("namespaces"),
+        [NS_BACKUP, NS_DATA]
+    );
+    let unknown = sha256_of(b"nobody");
+    assert!(store.namespaces_of(&unknown).expect("none").is_empty());
+    assert!(store.remove_object_file(&digest).expect("remove"));
+    assert!(!store.has(&digest));
+    assert!(store.access_path(NS_DATA, &digest).exists());
+    assert!(store.access_path(NS_BACKUP, &digest).exists());
 }
 
 #[test]

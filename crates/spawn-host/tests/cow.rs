@@ -935,6 +935,84 @@ fn prune_adopts_legacy_blobs_and_keeps_pinned_ones() {
     );
 }
 
+/// Review O55 F1: a unified store holds the objects of spawn-cas
+/// namespaces (`data`, `artifacts`, ...) beside the dedup blobs. Prune
+/// removes neither those objects nor any access record, at zero grace; an
+/// un-namespaced, unreferenced, unpinned blob still goes.
+#[test]
+fn prune_keeps_namespaced_objects_and_their_access_records() {
+    let base = scratch("cow-prune-namespaced");
+    let cas = base.join("cas");
+    let store = spawn_cas::Store::open(&cas).expect("store");
+    let data = store
+        .put_bytes(spawn_cas::NS_DATA, b"a data snapshot chunk")
+        .expect("put");
+    let artifact = store
+        .put_bytes(spawn_cas::NS_ARTIFACTS, b"a controller pack")
+        .expect("put");
+    // A dedup blob: an object no namespace records and no index entry holds.
+    let orphan = spawn_cas::sha256_of(b"an orphaned dedup blob");
+    let orphan_path = store.object_path(&orphan);
+    fs::create_dir_all(orphan_path.parent().expect("shard")).expect("mkdir");
+    fs::write(&orphan_path, b"an orphaned dedup blob").expect("write");
+
+    let pruned = prune_unused(&cas, Duration::ZERO).expect("prune");
+    assert!(pruned.errors.is_empty(), "{pruned:?}");
+    assert_eq!(pruned.blobs_removed, 1, "{pruned:?}");
+    assert_eq!(pruned.blobs_kept, 2, "{pruned:?}");
+    assert!(!orphan_path.exists());
+    for (namespace, digest) in [
+        (spawn_cas::NS_DATA, &data),
+        (spawn_cas::NS_ARTIFACTS, &artifact),
+    ] {
+        assert!(store.has(digest), "{namespace}'s object was pruned");
+        assert!(
+            store.access_path(namespace, digest).is_file(),
+            "{namespace}'s access record was removed"
+        );
+        store.verify(digest).expect("intact");
+    }
+}
+
+/// Review O55 F2: legacy names left behind by a crash mid-adoption (the
+/// same inode at both names) or duplicating an object are removed by the
+/// next adoption, emptied shards with them, and a prune then sees one
+/// object per address.
+#[test]
+fn prune_finishes_a_crashed_adoption_and_drops_duplicate_legacy_names() {
+    let base = scratch("cow-prune-readopt");
+    let cas = base.join("cas");
+    let store = spawn_cas::Store::open(&cas).expect("store");
+    let crashed = spawn_cas::sha256_of(b"half adopted");
+    let duplicate = spawn_cas::sha256_of(b"held twice");
+    for (digest, bytes) in [
+        (&crashed, &b"half adopted"[..]),
+        (&duplicate, b"held twice"),
+    ] {
+        let object = store.object_path(digest);
+        fs::create_dir_all(object.parent().expect("shard")).expect("mkdir");
+        fs::write(&object, bytes).expect("write");
+        fs::create_dir_all(cas.join(digest.shard())).expect("mkdir");
+    }
+    let crashed_legacy = cas.join(crashed.shard()).join(crashed.hex());
+    fs::hard_link(store.object_path(&crashed), &crashed_legacy).expect("link");
+    let duplicate_legacy = cas.join(duplicate.shard()).join(duplicate.hex());
+    fs::write(&duplicate_legacy, b"held twice").expect("write");
+    // Within the grace period: only the adoption is done.
+    let pruned = prune_unused(&cas, Duration::from_hours(1)).expect("prune");
+    assert_eq!(pruned.blobs_removed, 0, "{pruned:?}");
+    assert_eq!(pruned.blobs_kept, 2, "{pruned:?}");
+    for (legacy, digest) in [(&crashed_legacy, &crashed), (&duplicate_legacy, &duplicate)] {
+        assert!(!legacy.exists(), "{} kept", legacy.display());
+        assert!(!cas.join(digest.shard()).exists(), "emptied shard kept");
+        assert!(store.has(digest));
+    }
+    // Unreferenced and un-namespaced: a zero-grace prune removes both.
+    let pruned = prune_unused(&cas, Duration::ZERO).expect("prune");
+    assert_eq!(pruned.blobs_removed, 2, "{pruned:?}");
+    assert!(!store.has(&crashed) && !store.has(&duplicate));
+}
+
 /// A tree object made by `git mktree` from `listing`.
 fn mktree(repo: &Path, listing: &str) -> String {
     let mut child = test_git_command()
