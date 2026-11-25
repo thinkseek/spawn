@@ -2626,7 +2626,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
 #[test]
 fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     let (_store, schema) = store("logins");
-    for base in ["spawn_supervisor", "spawn_reader", "spawn_human"] {
+    for base in common::LOGIN_BASES {
         let role = common::login(&schema, base);
         assert_ne!(role, base, "the login is this database's own");
         let fixed = format!(
@@ -2773,6 +2773,13 @@ impl Drop for Databases {
             let _ =
                 maintenance.batch_execute(&format!("drop database if exists {name} with (force)"));
             let _ = drop_logins(&mut maintenance, name, "");
+            // drop-logins.sql knows the first three logins; the node
+            // gateway's (spawn-node v1) is dropped here by its name, as
+            // spawn_login_role gives it (the long-name hash included).
+            let _ = maintenance
+                .query_one(GATEWAY_LOGIN_OF, &[&"spawn_node_gateway", name])
+                .map(|row| row.get::<_, String>(0))
+                .and_then(|role| maintenance.batch_execute(&format!("drop role if exists {role}")));
         }
         for role in &self.roles {
             // Apart: a login that is not a superuser may not `drop owned`
@@ -2783,6 +2790,13 @@ impl Drop for Databases {
         }
     }
 }
+
+/// `spawn_login_role($1)` for the database `$2`, computed where the
+/// function is not (the server's `postgres` database).
+const GATEWAY_LOGIN_OF: &str = "select case when $2 ~ '^[a-z0-9_]+$' and length($1) + 1 + length($2) <= 63
+                 then $1 || '_' || $2
+                 else left($1 || '_' || regexp_replace(lower($2), '[^a-z0-9_]+', '_', 'g'), 54)
+                      || '_' || left(md5($2), 8) end";
 
 /// A sweep of the logins of every database under `prefix` that no longer
 /// exists.
@@ -3175,10 +3189,9 @@ fn migrations_racing_on_one_server_all_succeed() {
     drop(databases);
     let left: i64 = admin
         .query_one(
-            "select count(*) from pg_roles r, unnest($1::text[]) d
-              where r.rolname in ('spawn_supervisor_' || d, 'spawn_reader_' || d,
-                                  'spawn_human_' || d)",
-            &[&names],
+            "select count(*) from pg_roles r, unnest($1::text[]) d, unnest($2::text[]) b
+              where r.rolname = b || '_' || d",
+            &[&names, &common::LOGIN_BASES.as_slice()],
         )
         .expect("the logins left")
         .get(0);

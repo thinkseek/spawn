@@ -1360,7 +1360,7 @@ fn a_database_made_again_under_its_name_is_another_store() {
     let (mut made, mut ever_made) = (false, false);
     // The logins this case may drop: those absent before its first create
     // (migrate adopts a login that exists; rev-e's R3-1), each by name.
-    let logins: Vec<String> = ["spawn_human", "spawn_reader", "spawn_supervisor"]
+    let logins: Vec<String> = common::LOGIN_BASES
         .iter()
         .map(|base| format!("{base}_{name}"))
         .filter(|login| {

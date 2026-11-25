@@ -9,7 +9,7 @@
 use postgres::{Client, NoTls};
 
 mod common;
-use common::{admin, schema_name, store, url};
+use common::{LOGIN_BASES, admin, schema_name, store, url};
 use spawn_postgres::{PostgresStore, role_url};
 
 /// The test URL taken apart: `scheme://user:password@host/database`.
@@ -83,10 +83,9 @@ impl Drop for Database {
         let mut client = admin("public");
         let logins: Vec<String> = client
             .query(
-                "select rolname::text from pg_roles
-                  where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
-                                    'spawn_human_' || $1)",
-                &[&self.name],
+                "select r.rolname::text from pg_roles r, unnest($2::text[]) b
+                  where r.rolname = b || '_' || $1",
+                &[&self.name, &LOGIN_BASES.as_slice()],
             )
             .map(|rows| rows.iter().map(|row| row.get(0)).collect())
             .unwrap_or_default();
@@ -684,6 +683,15 @@ const SUPERVISOR_FUNCTIONS: [&str; 14] = [
     "spawn_task_stages(bigint) EXECUTE",
 ];
 
+/// The functions granted to a database's spawn-node v1 gateway login
+/// (schema.sql, "spawn-node v1 ledger"): its four verbs, nothing else.
+const GATEWAY_FUNCTIONS: [&str; 4] = [
+    "spawn_node_gw_beat(text,text,bigint,jsonb) EXECUTE",
+    "spawn_node_gw_enroll(bytea,bytea,text,text,jsonb) EXECUTE",
+    "spawn_node_gw_result(text,text,bigint,jsonb) EXECUTE",
+    "spawn_node_gw_spec(text,text,text,jsonb) EXECUTE",
+];
+
 /// The relations a database's supervisor login selects by a grant of its own.
 const SUPERVISOR_SELECTS: [&str; 15] = [
     "grading_presets",
@@ -708,7 +716,7 @@ const SUPERVISOR_SELECTS: [&str; 15] = [
 /// case made for itself:
 ///
 /// - every function, relation, column and type of the schema is granted to
-///   its owner, public and the three logins alone (no `pg_monitor`, no
+///   its owner, public and the four logins alone (no `pg_monitor`, no
 ///   other role), and no column carries a grant of its own;
 /// - the schema is used by public and the logins, created in by none of
 ///   them; the database is created in by none of them, and they may
@@ -716,7 +724,7 @@ const SUPERVISOR_SELECTS: [&str; 15] = [
 /// - no default privileges are set in the database;
 /// - each login is a plain login: no superuser, createrole, createdb,
 ///   bypassrls or replication.
-fn nothing_else_is_granted(client: &mut Client, logins: [&str; 3]) {
+fn nothing_else_is_granted(client: &mut Client, logins: [&str; 4]) {
     let logins: Vec<String> = logins.iter().map(ToString::to_string).collect();
     let strangers = column(
         client,
@@ -838,6 +846,7 @@ fn each_login_holds_exactly_its_grants_and_no_more() {
     let human = format!("spawn_human_{name}");
     let reader = format!("spawn_reader_{name}");
     let supervisor = format!("spawn_supervisor_{name}");
+    let node_gateway = format!("spawn_node_gateway_{name}");
     let gateway = ["agent_commands INSERT"];
 
     let held_human = held(&mut client, &human);
@@ -866,10 +875,22 @@ fn each_login_holds_exactly_its_grants_and_no_more() {
     assert_eq!(held_supervisor.selects, SUPERVISOR_SELECTS);
     assert_eq!(held_supervisor.writes, gateway);
 
+    // The node gateway's login executes its four verbs and selects nothing;
+    // its CONNECT, USAGE and plain login are checked with the others below.
+    let held_node_gateway = held(&mut client, &node_gateway);
+    assert_eq!(held_node_gateway.functions, GATEWAY_FUNCTIONS);
+    assert!(
+        held_node_gateway.selects.is_empty(),
+        "{:?}",
+        held_node_gateway.selects
+    );
+    assert_eq!(held_node_gateway.writes, gateway);
+
     for (role, holding) in [
         (&human, &held_human),
         (&reader, &held_reader),
         (&supervisor, &held_supervisor),
+        (&node_gateway, &held_node_gateway),
     ] {
         assert!(holding.columns.is_empty(), "{role}: {:?}", holding.columns);
         assert!(
@@ -895,6 +916,7 @@ fn each_login_holds_exactly_its_grants_and_no_more() {
         human.as_str(),
         reader.as_str(),
         supervisor.as_str(),
+        node_gateway.as_str(),
     ] {
         let alerts: bool = client
             .query_one(
@@ -906,17 +928,19 @@ fn each_login_holds_exactly_its_grants_and_no_more() {
         assert!(!alerts, "{role} may record an alert");
     }
 
-    nothing_else_is_granted(&mut client, [&human, &reader, &supervisor]);
+    nothing_else_is_granted(
+        &mut client,
+        [&human, &reader, &supervisor, &node_gateway],
+    );
 
     drop(client);
     drop(database);
     let left: i64 = admin("public")
         .query_one(
             "select (select count(*) from pg_database where datname = $1)
-                  + (select count(*) from pg_roles
-                      where rolname in ('spawn_human_' || $1, 'spawn_reader_' || $1,
-                                        'spawn_supervisor_' || $1))",
-            &[&name],
+                  + (select count(*) from pg_roles r, unnest($2::text[]) b
+                      where r.rolname = b || '_' || $1)",
+            &[&name, &LOGIN_BASES.as_slice()],
         )
         .expect("what is left")
         .get(0);
