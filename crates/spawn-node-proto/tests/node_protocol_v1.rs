@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use serde_json::Value;
-use spawn_node_proto::codec::{EMPTY_SHA256, hex, sha256_hex, unhex};
+use spawn_node_proto::codec::{EMPTY_SHA256, b64u, hex, sha256_hex, unhex};
 use spawn_node_proto::enroll::EnrollToken;
 use spawn_node_proto::envelope::{NodeSigner, request_signing_input};
 use spawn_node_proto::grant::{Grant, SignedGrant, grant_signing_input};
@@ -26,8 +26,8 @@ use spawn_node_proto::{
 const BEAT_PATH: &str = "/node/v1/heartbeat";
 const SPEC_PATH: &str = "/node/v1/spec";
 const RESULT_PATH: &str = "/node/v1/jobs/gate-0123456789ab-k3x9q2ma/result";
-/// The 18-byte log of section 7 (`result.log`; kept here too because the
-/// repository's `.gitignore` names `*.log`).
+/// The 18-byte log of section 7; `result.log` must hold exactly these
+/// bytes (`.gitignore` names `*.log`, and re-admits this fixture by path).
 const RESULT_LOG: &[u8] = b"| gate ok\n\n! warn\n";
 
 fn dir() -> PathBuf {
@@ -459,6 +459,7 @@ fn p6_result_metadata_log_and_signature() {
     assert_eq!(meta.to_bytes(), meta_line);
     assert_eq!(meta.log_bytes, 18);
     assert_eq!(meta.stdout_bytes, 11);
+    assert_eq!(read("result.log"), RESULT_LOG);
     meta.check_log(RESULT_LOG).unwrap();
     let (stdout, stderr) = meta.streams(RESULT_LOG).unwrap();
     assert_eq!((stdout, stderr), (&b"| gate ok\n\n"[..], &b"! warn\n"[..]));
@@ -501,12 +502,10 @@ fn p6_result_metadata_log_and_signature() {
 
 #[test]
 fn p6_result_log_fixture_is_the_eighteen_bytes_of_section_7() {
-    // `*.log` is in the repository's .gitignore: a checkout without the
-    // file (not force-added) still runs every other check on the constant.
-    match std::fs::read(dir().join("result.log")) {
-        Ok(bytes) => assert_eq!(bytes, RESULT_LOG),
-        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}"),
-    }
+    // A missing fixture fails here: `read` panics on any error.
+    let bytes = read("result.log");
+    assert_eq!(bytes, RESULT_LOG);
+    assert_eq!(bytes.len(), 18);
     assert_eq!(
         sha256_hex(RESULT_LOG),
         "b1828b9641adff7294821e40ef30e6e73c644d8fa89e9765445a76c82d2161da"
@@ -557,6 +556,27 @@ fn p6_enroll_token_digest_and_pin() {
         Err(Error::PinMismatch)
     );
     assert_eq!(EnrollToken::new(*token.secret(), &primary), token);
+}
+
+#[test]
+fn p6_enroll_token_pin_with_its_last_byte_flipped_pins_nothing() {
+    let v = vectors();
+    let token = EnrollToken::parse(s(&v, "enroll_token")).unwrap();
+    let primary = primary().public_key();
+    assert!(token.pins(&primary));
+    // The 16th (last) byte of the 16-byte pin, flipped, in a re-spelled
+    // token: it no longer pins the primary, and its key is refused.
+    let mut pin = *token.pin();
+    pin[15] ^= 0x01;
+    let (head, _) = token.as_str().rsplit_once('.').unwrap();
+    let mutated = EnrollToken::parse(&format!("{head}.{}", b64u(&pin))).unwrap();
+    assert_eq!(mutated.pin()[..15], token.pin()[..15]);
+    assert_ne!(mutated.pin()[15], token.pin()[15]);
+    assert!(!mutated.pins(&primary));
+    assert_eq!(
+        mutated.accept_primary(s(&v, "primary_pubkey_b64u")),
+        Err(Error::PinMismatch)
+    );
 }
 
 fn reaction_of(text: &str) -> Reaction {
@@ -765,14 +785,12 @@ fn p6_manifest_lists_every_fixture_file_with_its_sha256() {
     for path in &files {
         writeln!(expected, "{}  {path}", sha256_hex(&read(path))).unwrap();
     }
-    // `result.log` may be absent from a checkout (`.gitignore`'s `*.log`).
-    let has_log = files.iter().any(|f| f == "result.log");
-    let listed: Vec<&str> = manifest
-        .lines()
-        .filter(|line| has_log || !line.ends_with("  result.log"))
-        .collect();
-    assert_eq!(listed, expected.lines().collect::<Vec<_>>());
-    assert!(manifest.ends_with('\n'));
+    // Every file the manifest lists is there, and nothing else is.
+    assert!(
+        files.iter().any(|f| f == "result.log"),
+        "result.log is missing"
+    );
+    assert_eq!(manifest, expected);
 }
 
 fn collect(root: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
