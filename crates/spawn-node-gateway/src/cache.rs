@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use spawn_node_proto::PublicKey;
 
 /// How long an entry is believed.
-pub const KEY_TTL: Duration = Duration::from_secs(120);
+pub const KEY_TTL: Duration = Duration::from_mins(2);
 /// The most entries held.
 pub const MAX_KEYS: usize = 4096;
 
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn entries_expire_evict_and_stay_under_the_cap() {
-        let cache = KeyCache::new(Duration::from_secs(60), 2);
+        let cache = KeyCache::new(Duration::from_mins(1), 2);
         cache.insert("a", key(1), "b1");
         cache.insert("b", key(2), "b2");
         cache.insert("c", key(3), "b3");

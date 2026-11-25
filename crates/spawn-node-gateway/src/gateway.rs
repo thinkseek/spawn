@@ -329,7 +329,7 @@ impl Gateway {
         }
     }
 
-    /// 5. A cache hit verifies now; a miss is verified against the
+    /// Step 5: a cache hit verifies now; a miss is verified against the
     /// ledger's key (verify-then-commit).
     fn verify_cached(&self, checked: &Checked<'_>) -> Result<(), Answer> {
         match self.keys.get(&checked.envelope.node_id) {
@@ -546,20 +546,19 @@ impl Gateway {
                 }
             })
             .collect();
-        let decode = |name: &str| -> Result<Value, String> { Ok(field(name)) };
         let ack = Ack {
             v: VERSION,
             server_time_ms: now,
             next_beat_ms: number("next_beat_ms")?,
             lease_ttl_s,
             need_spec: answer["need_spec"] == true,
-            need_sync: serde_json::from_value::<Holds>(decode("need_sync")?)
+            need_sync: serde_json::from_value::<Holds>(field("need_sync"))
                 .map_err(|error| format!("need_sync: {error}"))?,
-            renewed: serde_json::from_value::<Vec<LeaseRef>>(decode("renewed")?)
+            renewed: serde_json::from_value::<Vec<LeaseRef>>(field("renewed"))
                 .map_err(|error| format!("renewed: {error}"))?,
-            fenced: serde_json::from_value::<Vec<Fenced>>(decode("fenced")?)
+            fenced: serde_json::from_value::<Vec<Fenced>>(field("fenced"))
                 .map_err(|error| format!("fenced: {error}"))?,
-            acked_results: serde_json::from_value::<Vec<LeaseRef>>(decode("acked_results")?)
+            acked_results: serde_json::from_value::<Vec<LeaseRef>>(field("acked_results"))
                 .map_err(|error| format!("acked_results: {error}"))?,
             grants,
             drain: answer["drain"] == true,

@@ -68,10 +68,9 @@ impl Config {
             if let Some(value) = arg.strip_prefix("--public-prefix=") {
                 public_prefix = value.to_string();
             } else if arg == "--public-prefix" {
-                public_prefix = rest
-                    .next()
+                rest.next()
                     .ok_or("--public-prefix needs a value")?
-                    .clone();
+                    .clone_into(&mut public_prefix);
             } else {
                 return Err(format!("unknown argument {arg:?} (only --public-prefix)"));
             }

@@ -26,7 +26,7 @@ pub const MAX_HEADERS: usize = 64;
 /// A connection idle (or a body stalled) this long is closed.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// A peer that does not read its answer for this long is dropped.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const WRITE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Requests served on one kept-alive connection before it is closed.
 const MAX_REQUESTS_PER_CONNECTION: usize = 1000;
 /// Connections waiting for a worker, per worker; past it a new connection
@@ -216,8 +216,8 @@ fn worker<H: Handler>(receiver: &Mutex<Receiver<TcpStream>>, mut handler: H) {
             receiver.recv()
         };
         let Ok(stream) = stream else { return };
-        if let Err(error) = connection(stream, &mut handler) {
-            if !matches!(
+        if let Err(error) = connection(stream, &mut handler)
+            && !matches!(
                 error.kind(),
                 io::ErrorKind::BrokenPipe
                     | io::ErrorKind::ConnectionReset
@@ -225,9 +225,9 @@ fn worker<H: Handler>(receiver: &Mutex<Receiver<TcpStream>>, mut handler: H) {
                     | io::ErrorKind::UnexpectedEof
                     | io::ErrorKind::WouldBlock
                     | io::ErrorKind::TimedOut
-            ) {
-                eprintln!("spawn-node-gateway: connection: {error}");
-            }
+            )
+        {
+            eprintln!("spawn-node-gateway: connection: {error}");
         }
     }
 }
