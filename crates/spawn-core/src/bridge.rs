@@ -10695,6 +10695,118 @@ mod tests {
             .collect();
         assert_eq!(host.keys(), expected);
         assert!(!bridge.prompting.contains_key(&id));
+
+        // The answer is on the record (PR 3): one `key` command a key, of
+        // `spawn-resolve`, keyed by the execution, recorded pressing and
+        // pressed, then finished once the start was done, with nothing
+        // pressed again. Submitting a key again returns the same command.
+        let execution = ExecutionId::for_command(id);
+        let principal = Principal::new(RESOLVE_PRINCIPAL).expect("principal");
+        for (at, key) in crate::screen::TRUST_KEYS.iter().enumerate() {
+            let named = NamedKey::ALL
+                .iter()
+                .copied()
+                .find(|named| named.tmux() == *key)
+                .expect("a named key");
+            let command = store
+                .submit(
+                    &principal,
+                    &Submission {
+                        agent_id: resumable_agent(1),
+                        session_id: resumable_session(1),
+                        idempotency_key: IdempotencyKey::new(trust_answer_key(&execution, at + 1))
+                            .expect("key"),
+                        action: CommandAction::Key { key: named },
+                    },
+                )
+                .expect("the same command");
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, command).is_some()
+            });
+            assert_eq!(command_outcome(&store, command), Some(Outcome::Succeeded));
+            let steps: Vec<CommandStep> = store
+                .read_global(GlobalPosition(0), 100_000)
+                .expect("read")
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::CommandStepped { command_id, step, .. } if command_id == command => {
+                        Some(step)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps, vec![CommandStep::Pressing, CommandStep::Pressed]);
+        }
+        assert_eq!(host.keys(), expected, "nothing pressed twice");
+    }
+
+    /// A person and the resolver both answer one dialog (design section 8,
+    /// PR 3 pitfall 2), on the in-memory host: each key is pressed once, in
+    /// the order submitted, a resolver key never between a person's; the
+    /// resolver's key resubmitted (a restarted resolver) presses nothing
+    /// again. Inputs of `spawn-resolve` would be refused like any loop's,
+    /// but a key never waits for a turn: listing it changes no input rule.
+    #[test]
+    fn a_human_and_the_resolver_answering_one_dialog_each_press_once_in_order() {
+        const DIALOG: &str = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n";
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Counted::over(store.clone());
+        let id = submit_resumable_start(&store, 1, "work", READY);
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        store.set_pane(&terminal, DIALOG);
+        let execution = ExecutionId::for_command(id);
+        let key = |principal: &str, idempotency: String, key: NamedKey| {
+            store
+                .submit(
+                    &Principal::new(principal).expect("principal"),
+                    &Submission {
+                        agent_id: resumable_agent(1),
+                        session_id: resumable_session(1),
+                        idempotency_key: IdempotencyKey::new(idempotency).expect("key"),
+                        action: CommandAction::Key { key },
+                    },
+                )
+                .expect("submit")
+        };
+        let resolver_key = format!("resolve:{execution}:session_1:0000000000000001:1:1");
+        let human = key("human", "approve-1:1".to_string(), NamedKey::Digit1);
+        let resolver = key(RESOLVE_PRINCIPAL, resolver_key.clone(), NamedKey::Digit1);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, resolver).is_some()
+        });
+        assert_eq!(command_outcome(&store, human), Some(Outcome::Succeeded));
+        assert_eq!(command_outcome(&store, resolver), Some(Outcome::Succeeded));
+        assert_eq!(host.keys(), vec!["1".to_string(), "1".to_string()]);
+        let order: Vec<CommandId> = store
+            .read_global(GlobalPosition(0), 100_000)
+            .expect("read")
+            .into_iter()
+            .filter_map(|record| match record.event.kind {
+                EventKind::CommandStepped {
+                    command_id,
+                    step: CommandStep::Pressed,
+                    ..
+                } => Some(command_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec![human, resolver], "pressed in the order submitted");
+        assert_eq!(key(RESOLVE_PRINCIPAL, resolver_key, NamedKey::Digit1), resolver);
+        bridge.work().expect("one more claim");
+        assert_eq!(host.keys().len(), 2, "a resubmitted answer presses nothing");
+        assert!(!waits(RESOLVE_PRINCIPAL), "a loop principal");
+        assert!(waits("human"));
     }
 
     #[test]
