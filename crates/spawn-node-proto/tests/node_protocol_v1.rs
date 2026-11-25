@@ -6,6 +6,7 @@
 //! `MANIFEST.sha256`.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -53,6 +54,15 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
 
 fn seed(v: &Value, key: &str) -> [u8; 32] {
     unhex(s(v, key), 64).unwrap().try_into().unwrap()
+}
+
+/// The 32 bytes `from`, `from + 1`, …
+fn counting(from: u8) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    for (byte, value) in bytes.iter_mut().zip(from..) {
+        *byte = value;
+    }
+    bytes
 }
 
 fn node() -> SigningKey {
@@ -183,14 +193,8 @@ fn p6_keys_derive_from_the_seeds() {
     }
     assert_eq!(keys.as_object().unwrap().len(), 6);
     // The seeds are the published test seeds, bytes 00..1f and 20..3f.
-    assert_eq!(
-        seed(&v, "node_seed_hex"),
-        std::array::from_fn::<u8, 32, _>(|i| i as u8)
-    );
-    assert_eq!(
-        seed(&v, "primary_seed_hex"),
-        std::array::from_fn::<u8, 32, _>(|i| 0x20 + i as u8)
-    );
+    assert_eq!(seed(&v, "node_seed_hex"), counting(0x00));
+    assert_eq!(seed(&v, "primary_seed_hex"), counting(0x20));
 }
 
 #[test]
@@ -521,10 +525,12 @@ fn p6_tree_sha256_v1_of_the_tree_fixture() {
     // The same digest spelled out: sha256sum's lines, sorted bytewise.
     let mut lines = String::new();
     for path in ["build", "check-tests.sh", "sub/001.sh"] {
-        lines.push_str(&format!(
-            "{}  {path}\n",
+        writeln!(
+            lines,
+            "{}  {path}",
             sha256_hex(&read(&format!("tree/{path}")))
-        ));
+        )
+        .unwrap();
     }
     assert_eq!(sha256_hex(lines.as_bytes()), s(&v, "tree_sha256_v1"));
 }
@@ -539,10 +545,7 @@ fn p6_enroll_token_digest_and_pin() {
     assert_eq!(token.sha256(), s(&v, "enroll_token_sha256"));
     // Its last part is the first 16 bytes of the primary key id.
     assert_eq!(hex(token.pin()), s(&v, "primary_key_id")[..32]);
-    assert_eq!(
-        token.secret(),
-        &std::array::from_fn::<u8, 32, _>(|i| 0x40 + i as u8)
-    );
+    assert_eq!(token.secret(), &counting(0x40));
     let primary = primary().public_key();
     assert!(token.pins(&primary));
     assert_eq!(
@@ -760,15 +763,16 @@ fn p6_manifest_lists_every_fixture_file_with_its_sha256() {
     files.sort();
     let mut expected = String::new();
     for path in &files {
-        expected.push_str(&format!("{}  {path}\n", sha256_hex(&read(path))));
+        writeln!(expected, "{}  {path}", sha256_hex(&read(path))).unwrap();
     }
     // `result.log` may be absent from a checkout (`.gitignore`'s `*.log`).
-    let manifest: String = manifest
+    let has_log = files.iter().any(|f| f == "result.log");
+    let listed: Vec<&str> = manifest
         .lines()
-        .filter(|line| !line.ends_with("  result.log") || files.iter().any(|f| f == "result.log"))
-        .map(|line| format!("{line}\n"))
+        .filter(|line| has_log || !line.ends_with("  result.log"))
         .collect();
-    assert_eq!(manifest, expected);
+    assert_eq!(listed, expected.lines().collect::<Vec<_>>());
+    assert!(manifest.ends_with('\n'));
 }
 
 fn collect(root: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
