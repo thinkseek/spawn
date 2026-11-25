@@ -1937,7 +1937,7 @@ pub(super) mod tests {
     /// A ledger in a schema of its own, with nodes a test enrolls and
     /// beats for, as the gateway would.
     pub(in crate::integrate) struct Ledger {
-        pub(in crate::integrate) store: PostgresStore,
+        pub(in crate::integrate) store: std::sync::Arc<PostgresStore>,
         seqs: RefCell<HashMap<String, i64>>,
         // Dropped after the store.
         schema: spawn_postgres::testing::TestSchema,
@@ -1948,7 +1948,7 @@ pub(super) mod tests {
             let schema = spawn_postgres::testing::TestSchema::new(case);
             let store = PostgresStore::connect_in_schema(schema.url(), &schema).expect("connect");
             Self {
-                store,
+                store: std::sync::Arc::new(store),
                 seqs: RefCell::new(HashMap::new()),
                 schema,
             }
@@ -2045,14 +2045,19 @@ pub(super) mod tests {
             (node.host_fault_strikes, node.degraded)
         }
 
-        /// The records of `kind` in the log, in order.
-        pub(in crate::integrate) fn records(&self, kind: &str) -> Vec<Value> {
+        /// An owner's connection in the schema.
+        pub(in crate::integrate) fn admin(&self) -> postgres::Client {
             let mut client = postgres::Client::connect(self.schema.url(), postgres::NoTls)
                 .expect("an admin connection");
             client
                 .batch_execute(&format!("set search_path to {}", self.schema))
                 .unwrap();
             client
+        }
+
+        /// The records of `kind` in the log, in order.
+        pub(in crate::integrate) fn records(&self, kind: &str) -> Vec<Value> {
+            self.admin()
                 .query(
                     "select kind #> '{detail,record}' from spawn_events
                       where kind #>> '{detail,record,type}' = $1 order by id",
@@ -2320,5 +2325,39 @@ pub(super) mod tests {
         // The sweep runs as the owner, as the integrator's pass does.
         let swept = sweep(&ledger.store).unwrap();
         assert_eq!(swept.fenced, 0);
+    }
+
+    /// The sweep runs from the integrator's own pass: a node silent past
+    /// a lease's time is recorded lost there, once (level-triggered).
+    #[test]
+    fn the_integrators_pass_sweeps_the_nodes() {
+        let ledger = Ledger::new("remote_pass_sweeps");
+        let dir = Scratch::new("pass-sweeps");
+        ledger.enroll("quiet", 4, &json!({"pg": "16"}));
+        ledger
+            .admin()
+            .batch_execute("update spawn_node_state set last_beat_ms = 1 where name = 'quiet'")
+            .unwrap();
+        let gate = dir.0.join("gate.sh");
+        std::fs::write(&gate, "exit 0\n").unwrap();
+        let room = gate::Room::from_env(|_| None).measured_by(
+            |_| Some(u64::MAX),
+            || Some(u64::MAX),
+            |_| Ok(()),
+        );
+        let integrator = super::super::Integrator::new(
+            dir.0.join("host"),
+            gate,
+            Vec::new(),
+            room,
+            super::super::DEFAULT_GATES,
+        );
+        integrator.pass_on(&ledger.store).expect("a pass");
+        let lost = ledger.records("node.lost");
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert_eq!(lost[0]["name"], "quiet");
+        assert!(ledger.store.node_v1("quiet").unwrap().unwrap().lost_recorded);
+        integrator.pass_on(&ledger.store).expect("the next pass");
+        assert_eq!(ledger.records("node.lost").len(), 1);
     }
 }
