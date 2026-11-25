@@ -97,7 +97,11 @@ impl Request<'_> {
 pub enum Body {
     Bytes(Vec<u8>),
     /// `len` bytes of `file` from `offset`, streamed.
-    File { file: File, offset: u64, len: u64 },
+    File {
+        file: File,
+        offset: u64,
+        len: u64,
+    },
 }
 
 /// One response; `Content-Length` is always written from the body.
@@ -313,7 +317,9 @@ fn framed_length(headers: &[(String, String)]) -> Option<u64> {
     match (lengths.next(), lengths.next(), chunked) {
         (None, None, false) => Some(0),
         (Some((_, value)), None, false)
-            if !value.is_empty() && value.len() <= 19 && value.bytes().all(|b| b.is_ascii_digit()) =>
+            if !value.is_empty()
+                && value.len() <= 19
+                && value.bytes().all(|b| b.is_ascii_digit()) =>
         {
             value.parse().ok()
         }
@@ -497,7 +503,10 @@ mod tests {
     #[test]
     fn only_one_plain_content_length_frames_a_body() {
         assert_eq!(framed_length(&headers(&[])), Some(0));
-        assert_eq!(framed_length(&headers(&[("content-length", "12")])), Some(12));
+        assert_eq!(
+            framed_length(&headers(&[("content-length", "12")])),
+            Some(12)
+        );
         for bad in [
             headers(&[("Content-Length", "+1")]),
             headers(&[("Content-Length", "1 2")]),

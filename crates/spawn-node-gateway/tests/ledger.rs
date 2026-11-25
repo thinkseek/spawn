@@ -36,8 +36,8 @@ fn schema_url(schema: &TestSchema) -> String {
 fn setup(case: &str) -> (TestSchema, PostgresStore, Harness) {
     let schema = TestSchema::new(case);
     let owner = schema.store();
-    let gateway_url =
-        spawn_postgres::role_url(&schema_url(&schema), "spawn_node_gateway").expect("the login's URL");
+    let gateway_url = spawn_postgres::role_url(&schema_url(&schema), "spawn_node_gateway")
+        .expect("the login's URL");
     let harness = Harness::start(
         case,
         Arc::new(move || PostgresStore::connect(&gateway_url).map_err(|error| error.to_string())),
@@ -67,7 +67,12 @@ fn enroll(owner: &PostgresStore, harness: &Harness) -> Reply {
     owner
         .node_enroll_token("n252", None, &token_sha, 600_000)
         .expect("a token");
-    harness.post(&signer(), "/node/v1/enroll", 0, &enroll_body(&read("spec.json")))
+    harness.post(
+        &signer(),
+        "/node/v1/enroll",
+        0,
+        &enroll_body(&read("spec.json")),
+    )
 }
 
 fn beat(harness: &Harness, signer: &NodeSigner, seq: u64) -> Reply {
@@ -152,7 +157,12 @@ fn enroll_beat_grant_result_and_their_refusals() {
         "the spec's bytes as received are hashed"
     );
     // The token is good once.
-    let again = harness.post(&node, "/node/v1/enroll", 0, &enroll_body(&read("spec.json")));
+    let again = harness.post(
+        &node,
+        "/node/v1/enroll",
+        0,
+        &enroll_body(&read("spec.json")),
+    );
     again.assert_refused(Refusal::UnknownNode, 0);
 
     // A first beat: nothing queued, the spec held.
@@ -179,13 +189,24 @@ fn enroll_beat_grant_result_and_their_refusals() {
     let (_, grant) = ack.grants[0]
         .open(&primary_key().public_key(), &node_id(), now_ms())
         .expect("a grant signed by the primary, for this node, not expired");
-    assert_eq!((grant.job_id.as_str(), grant.lease_epoch, grant.kind), (JOB, 1, JobKind::Gate));
+    assert_eq!(
+        (grant.job_id.as_str(), grant.lease_epoch, grant.kind),
+        (JOB, 1, JobKind::Gate)
+    );
     assert_eq!(grant.timeout_s, Some(600));
-    assert_eq!(grant.cost.as_ref().and_then(|cost| cost.get("gate_sandbox")), Some(&1));
+    assert_eq!(
+        grant
+            .cost
+            .as_ref()
+            .and_then(|cost| cost.get("gate_sandbox")),
+        Some(&1)
+    );
     assert!(grant.expires_ms > now_ms() + 60_000);
 
     // The result: 3 MiB streamed to disk, checked, then completed.
-    let log: Vec<u8> = (0..3 * 1024 * 1024_u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let log: Vec<u8> = (0..3 * 1024 * 1024_u32)
+        .map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
     let (line, body) = result_body(JOB, 1, &log);
     let done = post_result(&harness, 4, JOB, &line, &body);
     assert_eq!(done.status, 200, "{}", done.json());
@@ -211,12 +232,19 @@ fn enroll_beat_grant_result_and_their_refusals() {
     let (line2, body2) = result_body(JOB, 2, b"other log");
     let fenced = post_result(&harness, 6, JOB, &line2, &body2);
     fenced.assert_refused(Refusal::LeaseFenced, 6);
-    assert!(!harness.results.join(format!("{JOB}.2")).exists(), "partial files removed");
+    assert!(
+        !harness.results.join(format!("{JOB}.2")).exists(),
+        "partial files removed"
+    );
     // A log that does not match its metadata.
     let (line3, mut body3) = result_body(JOB, 1, b"abc");
     *body3.last_mut().unwrap() = b'x';
     post_result(&harness, 7, JOB, &line3, &body3).assert_refused(Refusal::BadRequest, 7);
-    assert_eq!(std::fs::read(dir.join("log")).unwrap(), log, "the stored result is untouched");
+    assert_eq!(
+        std::fs::read(dir.join("log")).unwrap(),
+        log,
+        "the stored result is untouched"
+    );
 
     // Spec: the same bytes change nothing.
     let spec = harness.post(&node, "/node/v1/spec", 8, &read("spec.json"));
@@ -232,13 +260,25 @@ fn enroll_beat_grant_result_and_their_refusals() {
     std::fs::create_dir_all(&path).unwrap();
     std::fs::write(path.join(&digest.hex), &content).unwrap();
     let calls = harness.gateway.db_calls();
-    let part = harness.get(&node, &digest.artifact_path(), 9, &[("Range".into(), "bytes=15990-".into())]);
+    let part = harness.get(
+        &node,
+        &digest.artifact_path(),
+        9,
+        &[("Range".into(), "bytes=15990-".into())],
+    );
     assert_eq!(part.status, 206);
     assert_eq!(part.body, &content[15_990..]);
-    assert_eq!(part.header("Content-Range"), Some("bytes 15990-15999/16000"));
+    assert_eq!(
+        part.header("Content-Range"),
+        Some("bytes 15990-15999/16000")
+    );
     let whole = harness.get(&node, &digest.artifact_path(), 10, &[]);
     digest.verify(&whole.body).unwrap();
-    assert_eq!(harness.gateway.db_calls(), calls, "artifacts never reach the ledger");
+    assert_eq!(
+        harness.gateway.db_calls(),
+        calls,
+        "artifacts never reach the ledger"
+    );
 
     // Replay: a beat seq at or below the stored one.
     beat(&harness, &node, 3).assert_refused(Refusal::Replay, 3);
@@ -253,7 +293,10 @@ fn enroll_beat_grant_result_and_their_refusals() {
     let after = owner.node_v1("n252").unwrap().unwrap();
     assert_eq!(after.beat_seq, before.beat_seq, "rolled back");
     assert_eq!(after.last_beat_ms, before.last_beat_ms, "rolled back");
-    assert!(harness.gateway.keys().get(&node_id()).is_none(), "a forgery is not cached");
+    assert!(
+        harness.gateway.keys().get(&node_id()).is_none(),
+        "a forgery is not cached"
+    );
 
     // Revoked: refused, and the cache forgets the key.
     assert_eq!(beat(&harness, &node, 51).status, 200, "a good beat");
@@ -270,7 +313,13 @@ fn enroll_beat_grant_result_and_their_refusals() {
 fn forged_beat(harness: &Harness, seq: u64) -> Reply {
     let beat = v("beat_body");
     let envelope = stranger()
-        .sign(Method::Post, "/node/v1/heartbeat", seq, now_ms(), beat.as_bytes())
+        .sign(
+            Method::Post,
+            "/node/v1/heartbeat",
+            seq,
+            now_ms(),
+            beat.as_bytes(),
+        )
         .unwrap();
     let mut headers: Vec<(String, String)> = envelope
         .to_headers()
@@ -278,7 +327,12 @@ fn forged_beat(harness: &Harness, seq: u64) -> Reply {
         .map(|(name, value)| (name.to_string(), value))
         .collect();
     headers[0].1 = node_id();
-    harness.send("POST", "/node/v1/heartbeat", &headers, Some(beat.as_bytes()))
+    harness.send(
+        "POST",
+        "/node/v1/heartbeat",
+        &headers,
+        Some(beat.as_bytes()),
+    )
 }
 
 #[test]
@@ -286,12 +340,20 @@ fn unknown_nodes_bad_tokens_and_a_result_before_any_beat() {
     let (_schema, _owner, harness) = setup("gw_unknown");
     let unknown = NodeSigner::new(SigningKey::from_seed(&[5; 32]).unwrap(), &boot_id()).unwrap();
     let reply = beat(&harness, &unknown, 1);
-    assert_eq!((reply.status, reply.json()["error"].as_str().unwrap()), (401, "unknown_node"));
+    assert_eq!(
+        (reply.status, reply.json()["error"].as_str().unwrap()),
+        (401, "unknown_node")
+    );
     reply.verify(&unknown.node_id, &boot_id(), 1);
 
     // A token the ledger never stored.
     harness
-        .post(&signer(), "/node/v1/enroll", 0, &enroll_body(&read("spec.json")))
+        .post(
+            &signer(),
+            "/node/v1/enroll",
+            0,
+            &enroll_body(&read("spec.json")),
+        )
         .assert_refused(Refusal::UnknownNode, 0);
 
     // Proof of possession: the body's key must sign the request.

@@ -457,12 +457,14 @@ impl Gateway {
             ledger.node_gw_enroll(&call, |answer| answer["ok"] == true)
         })?;
         if !enrolled.committed {
-            return Err(match enrolled.answer["error"].as_str().unwrap_or_default() {
-                "bad_request" => BAD,
-                // Not (or no longer) a node this token may enroll.
-                "bad_token" | "key_in_use" => Refusal::UnknownNode.into(),
-                _ => Refusal::Unavailable.into(),
-            });
+            return Err(
+                match enrolled.answer["error"].as_str().unwrap_or_default() {
+                    "bad_request" => BAD,
+                    // Not (or no longer) a node this token may enroll.
+                    "bad_token" | "key_in_use" => Refusal::UnknownNode.into(),
+                    _ => Refusal::Unavailable.into(),
+                },
+            );
         }
         self.keys
             .insert(&envelope.node_id, pubkey, &envelope.boot_id);
@@ -493,25 +495,32 @@ impl Gateway {
         let mut verified = None;
         let mut built = None;
         let called = self.ledger(store, |ledger| {
-            ledger.node_gw_beat(&envelope.node_id, &envelope.boot_id, seq, &value, |answer| {
-                let Some(key) = ledger_key(answer).filter(|key| checked.verify(key).is_ok()) else {
-                    return false;
-                };
-                verified = Some(key);
-                if answer["ok"] != true {
-                    return false;
-                }
-                match self.ack(answer, &envelope.node_id, now) {
-                    Ok(body) => {
-                        built = Some(body);
-                        true
+            ledger.node_gw_beat(
+                &envelope.node_id,
+                &envelope.boot_id,
+                seq,
+                &value,
+                |answer| {
+                    let Some(key) = ledger_key(answer).filter(|key| checked.verify(key).is_ok())
+                    else {
+                        return false;
+                    };
+                    verified = Some(key);
+                    if answer["ok"] != true {
+                        return false;
                     }
-                    Err(error) => {
-                        eprintln!("spawn-node-gateway: beat answer: {error}");
-                        false
+                    match self.ack(answer, &envelope.node_id, now) {
+                        Ok(body) => {
+                            built = Some(body);
+                            true
+                        }
+                        Err(error) => {
+                            eprintln!("spawn-node-gateway: beat answer: {error}");
+                            false
+                        }
                     }
-                }
-            })
+                },
+            )
         })?;
         self.refused(&called.answer, verified.is_some(), &envelope.node_id)?;
         let (Some(key), Some(body), true) = (verified, built, called.committed) else {
@@ -628,13 +637,20 @@ impl Gateway {
         let envelope = &checked.envelope;
         let mut verified = None;
         let called = self.ledger(store, |ledger| {
-            ledger.node_gw_spec(&envelope.node_id, &envelope.boot_id, &sha, &value, |answer| {
-                let Some(key) = ledger_key(answer).filter(|key| checked.verify(key).is_ok()) else {
-                    return false;
-                };
-                verified = Some(key);
-                answer["ok"] == true
-            })
+            ledger.node_gw_spec(
+                &envelope.node_id,
+                &envelope.boot_id,
+                &sha,
+                &value,
+                |answer| {
+                    let Some(key) = ledger_key(answer).filter(|key| checked.verify(key).is_ok())
+                    else {
+                        return false;
+                    };
+                    verified = Some(key);
+                    answer["ok"] == true
+                },
+            )
         })?;
         self.refused(&called.answer, verified.is_some(), &envelope.node_id)?;
         let (Some(key), true) = (verified, called.committed) else {
@@ -726,7 +742,9 @@ impl Gateway {
             Miss::NotFound => Answer::NotFound,
         };
         let path = match &checked.verb {
-            Verb::Artifact(digest) => artifacts::artifact_path(&self.artifacts, digest).map_err(miss)?,
+            Verb::Artifact(digest) => {
+                artifacts::artifact_path(&self.artifacts, digest).map_err(miss)?
+            }
             _ => self.artifacts.join(REGISTRY_MANIFEST),
         };
         self.require_cached(checked)?;
@@ -828,7 +846,8 @@ impl http::Handler for Worker {
 
     fn malformed(&mut self, _peer: IpAddr) -> Response {
         let now = (self.gateway.clock)();
-        self.gateway.refusal(Refusal::BadRequest, &Rid::default(), now)
+        self.gateway
+            .refusal(Refusal::BadRequest, &Rid::default(), now)
     }
 }
 

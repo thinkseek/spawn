@@ -159,7 +159,10 @@ mod tests {
         assert_eq!(config.listen, DEFAULT_LISTEN.parse().unwrap());
         assert_eq!(config.cells, ["c0"]);
         assert_eq!(config.public_prefix, "");
-        assert!(!format!("{config:?}").contains("pw@"), "the URL is never printed");
+        assert!(
+            !format!("{config:?}").contains("pw@"),
+            "the URL is never printed"
+        );
 
         let mut pairs = BASE.to_vec();
         pairs.push((ENV_CELLS, "c0, c1"));

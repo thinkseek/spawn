@@ -20,4 +20,6 @@ pub mod results;
 pub mod span;
 
 pub use config::Config;
-pub use gateway::{Clock, Connector, Gateway, ResultAnswer, Rid, Settings, SpecAnswer, spawn, system_clock};
+pub use gateway::{
+    Clock, Connector, Gateway, ResultAnswer, Rid, Settings, SpecAnswer, spawn, system_clock,
+};

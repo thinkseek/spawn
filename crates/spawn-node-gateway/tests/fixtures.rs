@@ -52,7 +52,11 @@ fn every_reject_fixture_is_a_signed_bad_request_with_no_database_call() {
             .unwrap_or(0);
         assert_eq!(reply.status, 400, "{name}");
         assert_eq!(reply.json()["error"], "bad_request", "{name}");
-        assert_eq!(reply.verify(&node_id(), &boot_id(), seq), 1_795_600_000_000, "{name}");
+        assert_eq!(
+            reply.verify(&node_id(), &boot_id(), seq),
+            1_795_600_000_000,
+            "{name}"
+        );
     }
     assert_eq!(harness.gateway.db_calls(), 0);
 }
@@ -71,14 +75,25 @@ fn row(error: &str, status: u16) -> Value {
 /// The reply is the row's refusal byte for byte: body and both signature
 /// headers.
 fn assert_row(reply: &common::Reply, row: &Value) {
-    assert_eq!(u64::from(reply.status), row["status"].as_u64().unwrap(), "{row}");
+    assert_eq!(
+        u64::from(reply.status),
+        row["status"].as_u64().unwrap(),
+        "{row}"
+    );
     assert_eq!(
         String::from_utf8(reply.body.clone()).unwrap(),
         row["body"].as_str().unwrap(),
         "{row}"
     );
-    assert_eq!(reply.header(HEADER_PRIMARY_KEY), row["primary_key"].as_str());
-    assert_eq!(reply.header(HEADER_PRIMARY_SIG), row["primary_sig"].as_str(), "{row}");
+    assert_eq!(
+        reply.header(HEADER_PRIMARY_KEY),
+        row["primary_key"].as_str()
+    );
+    assert_eq!(
+        reply.header(HEADER_PRIMARY_SIG),
+        row["primary_sig"].as_str(),
+        "{row}"
+    );
 }
 
 #[test]
@@ -94,15 +109,23 @@ fn every_refusal_row_is_the_gateway_s_own_refusal_byte_for_byte() {
             boot_id: row["boot_id"].as_str().unwrap().to_string(),
             seq: row["seq"].as_u64().unwrap(),
         };
-        let response = harness
-            .gateway
-            .refusal(refusal, &rid, row["server_time_ms"].as_u64().unwrap());
+        let response =
+            harness
+                .gateway
+                .refusal(refusal, &rid, row["server_time_ms"].as_u64().unwrap());
         let spawn_node_gateway::http::Body::Bytes(body) = &response.body else {
             panic!("a refusal's body is bytes");
         };
         assert_eq!(body.as_slice(), row["body"].as_str().unwrap().as_bytes());
-        assert_eq!(response.header_value(HEADER_PRIMARY_KEY), row["primary_key"].as_str());
-        assert_eq!(response.header_value(HEADER_PRIMARY_SIG), row["primary_sig"].as_str(), "{row}");
+        assert_eq!(
+            response.header_value(HEADER_PRIMARY_KEY),
+            row["primary_key"].as_str()
+        );
+        assert_eq!(
+            response.header_value(HEADER_PRIMARY_SIG),
+            row["primary_sig"].as_str(),
+            "{row}"
+        );
     }
 }
 
@@ -114,7 +137,16 @@ fn bad_request_row_end_to_end() {
     harness.set_clock(time);
     // Signed, well-headed, but not JSON.
     let body = b"{\"v\":1,";
-    let reply = harness.signed(&signer(), Method::Post, "/node/v1/heartbeat", 10, time, body, Some(body), &[]);
+    let reply = harness.signed(
+        &signer(),
+        Method::Post,
+        "/node/v1/heartbeat",
+        10,
+        time,
+        body,
+        Some(body),
+        &[],
+    );
     assert_row(&reply, &row);
 }
 
@@ -128,7 +160,13 @@ fn bad_signature_row_on_a_cache_hit_with_no_database_call() {
     let beat = v("beat_body");
     // Signed by another key under the node's id.
     let envelope = stranger()
-        .sign(Method::Post, "/node/v1/heartbeat", 11, time, beat.as_bytes())
+        .sign(
+            Method::Post,
+            "/node/v1/heartbeat",
+            11,
+            time,
+            beat.as_bytes(),
+        )
         .unwrap();
     let mut headers: Vec<(String, String)> = envelope
         .to_headers()
@@ -136,9 +174,18 @@ fn bad_signature_row_on_a_cache_hit_with_no_database_call() {
         .map(|(name, value)| (name.to_string(), value))
         .collect();
     headers[0].1 = node_id();
-    let reply = harness.send("POST", "/node/v1/heartbeat", &headers, Some(beat.as_bytes()));
+    let reply = harness.send(
+        "POST",
+        "/node/v1/heartbeat",
+        &headers,
+        Some(beat.as_bytes()),
+    );
     assert_row(&reply, &row);
-    assert_eq!(harness.gateway.db_calls(), 0, "a cache hit refuses with no database call");
+    assert_eq!(
+        harness.gateway.db_calls(),
+        0,
+        "a cache hit refuses with no database call"
+    );
 }
 
 #[test]
@@ -166,7 +213,16 @@ fn beat_first_row_for_an_artifact_without_a_cached_key() {
     let row = row("beat_first", 409);
     let time = row["server_time_ms"].as_u64().unwrap();
     harness.set_clock(time);
-    let reply = harness.signed(&signer(), Method::Get, &v("artifact_path"), 17, time, b"", None, &[]);
+    let reply = harness.signed(
+        &signer(),
+        Method::Get,
+        &v("artifact_path"),
+        17,
+        time,
+        b"",
+        None,
+        &[],
+    );
     // The signature binds (node, boot, seq), status, time and body, not the
     // path: the row's bytes exactly.
     assert_row(&reply, &row);
@@ -180,7 +236,9 @@ fn too_large_row_for_a_result_over_its_caps_before_any_body_byte() {
     let time = row["server_time_ms"].as_u64().unwrap();
     harness.set_clock(time);
     let target = "/node/v1/jobs/gate-0123456789ab-k3x9q2ma/result";
-    let envelope = signer().sign(Method::Post, target, 19, time, b"{}").unwrap();
+    let envelope = signer()
+        .sign(Method::Post, target, 19, time, b"{}")
+        .unwrap();
     let mut head = format!("POST {target} HTTP/1.1\r\n");
     for (name, value) in envelope.to_headers() {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -200,10 +258,28 @@ fn busy_429_row_after_twenty_requests_in_ten_seconds() {
     harness.set_clock(time);
     let body = b"{\"v\":1,";
     for seq in 0..20 {
-        let reply = harness.signed(&signer(), Method::Post, "/node/v1/heartbeat", seq + 100, time, body, Some(body), &[]);
+        let reply = harness.signed(
+            &signer(),
+            Method::Post,
+            "/node/v1/heartbeat",
+            seq + 100,
+            time,
+            body,
+            Some(body),
+            &[],
+        );
         assert_eq!(reply.status, 400);
     }
-    let reply = harness.signed(&signer(), Method::Post, "/node/v1/heartbeat", 20, time, body, Some(body), &[]);
+    let reply = harness.signed(
+        &signer(),
+        Method::Post,
+        "/node/v1/heartbeat",
+        20,
+        time,
+        body,
+        Some(body),
+        &[],
+    );
     assert_row(&reply, &row);
 }
 
@@ -211,14 +287,20 @@ fn busy_429_row_after_twenty_requests_in_ten_seconds() {
 fn busy_503_row_when_the_ledger_is_unreachable() {
     let harness = Harness::start("row_503", no_database());
     harness.remember_node();
-    let row = rows()
-        .into_iter()
-        .find(|row| row["status"] == 503)
-        .unwrap();
+    let row = rows().into_iter().find(|row| row["status"] == 503).unwrap();
     let time = row["server_time_ms"].as_u64().unwrap();
     harness.set_clock(time);
     let beat = v("beat_body");
-    let reply = harness.signed(&signer(), Method::Post, "/node/v1/heartbeat", 21, time, beat.as_bytes(), Some(beat.as_bytes()), &[]);
+    let reply = harness.signed(
+        &signer(),
+        Method::Post,
+        "/node/v1/heartbeat",
+        21,
+        time,
+        beat.as_bytes(),
+        Some(beat.as_bytes()),
+        &[],
+    );
     assert_row(&reply, &row);
     assert_eq!(harness.gateway.db_calls(), 1, "one connect attempt");
 }
@@ -240,7 +322,10 @@ fn the_artifact_fixture_is_served_whole_and_by_range_unsigned() {
     assert_eq!(whole.body, content);
     assert_eq!(whole.header("Accept-Ranges"), Some("bytes"));
     assert_eq!(whole.header("Content-Length"), Some("100000"));
-    assert!(whole.header(HEADER_PRIMARY_SIG).is_none(), "artifact bodies are not signed");
+    assert!(
+        whole.header(HEADER_PRIMARY_SIG).is_none(),
+        "artifact bodies are not signed"
+    );
 
     let mut ranged = headers.clone();
     ranged.push(("Range".into(), "bytes=10-19".into()));
@@ -251,13 +336,19 @@ fn the_artifact_fixture_is_served_whole_and_by_range_unsigned() {
 
     let mut tail = headers.clone();
     tail.push(("Range".into(), "bytes=-5".into()));
-    assert_eq!(harness.send("GET", &target, &tail, None).body, &content[99_995..]);
+    assert_eq!(
+        harness.send("GET", &target, &tail, None).body,
+        &content[99_995..]
+    );
 
     let mut past = headers.clone();
     past.push(("Range".into(), "bytes=100000-".into()));
     let unsatisfiable = harness.send("GET", &target, &past, None);
     assert_eq!(unsatisfiable.status, 416);
-    assert_eq!(unsatisfiable.header("Content-Range"), Some("bytes */100000"));
+    assert_eq!(
+        unsatisfiable.header("Content-Range"),
+        Some("bytes */100000")
+    );
     assert_eq!(harness.gateway.db_calls(), 0);
 }
 
@@ -267,23 +358,41 @@ fn artifact_misses_and_the_registry_manifest() {
     harness.remember_node();
     let signer = signer();
     let missing = format!("/node/v1/artifacts/sha256:{}", "a".repeat(64));
-    harness.get(&signer, &missing, 1, &[]).assert_refused_status(404, "not_found", 1);
+    harness
+        .get(&signer, &missing, 1, &[])
+        .assert_refused_status(404, "not_found", 1);
     let blake = format!("/node/v1/artifacts/blake3:{}", "a".repeat(64));
-    harness.get(&signer, &blake, 2, &[]).assert_refused(Refusal::BadRequest, 2);
+    harness
+        .get(&signer, &blake, 2, &[])
+        .assert_refused(Refusal::BadRequest, 2);
     harness
         .get(&signer, "/node/v1/registry-manifest", 3, &[])
         .assert_refused_status(404, "not_found", 3);
-    std::fs::write(harness.artifacts.join("registry-manifest.json"), b"{\"crates\":[]}").unwrap();
+    std::fs::write(
+        harness.artifacts.join("registry-manifest.json"),
+        b"{\"crates\":[]}",
+    )
+    .unwrap();
     let manifest = harness.get(&signer, "/node/v1/registry-manifest", 4, &[]);
-    assert_eq!((manifest.status, manifest.body.as_slice()), (200, &b"{\"crates\":[]}"[..]));
+    assert_eq!(
+        (manifest.status, manifest.body.as_slice()),
+        (200, &b"{\"crates\":[]}"[..])
+    );
     // A boot the cache does not hold is not served.
-    let other_boot = spawn_node_proto::NodeSigner::new(common::node_key(), &"f".repeat(32)).unwrap();
+    let other_boot =
+        spawn_node_proto::NodeSigner::new(common::node_key(), &"f".repeat(32)).unwrap();
     let reply = harness.get(&other_boot, "/node/v1/registry-manifest", 5, &[]);
     assert_eq!(reply.status, 409);
     reply.verify(&node_id(), &"f".repeat(32), 5);
     // A forged GET under the node's id, on a cache hit.
     let envelope = stranger()
-        .sign(Method::Get, "/node/v1/registry-manifest", 6, common::now_ms(), b"")
+        .sign(
+            Method::Get,
+            "/node/v1/registry-manifest",
+            6,
+            common::now_ms(),
+            b"",
+        )
         .unwrap();
     let mut headers: Vec<(String, String)> = envelope
         .to_headers()
@@ -305,7 +414,13 @@ fn the_public_prefix_is_stripped_and_required() {
     let signer = signer();
     // The signature covers the target without the prefix.
     let envelope = signer
-        .sign(Method::Get, "/node/v1/registry-manifest", 1, common::now_ms(), b"")
+        .sign(
+            Method::Get,
+            "/node/v1/registry-manifest",
+            1,
+            common::now_ms(),
+            b"",
+        )
         .unwrap();
     let headers: Vec<(String, String)> = envelope
         .to_headers()
@@ -327,7 +442,13 @@ fn malformed_http_and_content_length_are_signed_bad_requests() {
 
     let beat = v("beat_body");
     let envelope = signer()
-        .sign(Method::Post, "/node/v1/heartbeat", 1, common::now_ms(), beat.as_bytes())
+        .sign(
+            Method::Post,
+            "/node/v1/heartbeat",
+            1,
+            common::now_ms(),
+            beat.as_bytes(),
+        )
         .unwrap();
     let mut headers: Vec<(String, String)> = envelope
         .to_headers()
@@ -345,7 +466,12 @@ fn malformed_http_and_content_length_are_signed_bad_requests() {
     // a repeated header being no value at all.
     headers.push(headers[2].clone());
     harness
-        .send("POST", "/node/v1/heartbeat", &headers, Some(beat.as_bytes()))
+        .send(
+            "POST",
+            "/node/v1/heartbeat",
+            &headers,
+            Some(beat.as_bytes()),
+        )
         .assert_refused(Refusal::BadRequest, 0);
     // A POST with no Content-Length.
     headers.pop();
@@ -361,7 +487,10 @@ trait RefusedStatus {
 
 impl RefusedStatus for common::Reply {
     fn assert_refused_status(&self, status: u16, error: &str, seq: u64) {
-        assert_eq!((self.status, self.json()["error"].as_str().unwrap()), (status, error));
+        assert_eq!(
+            (self.status, self.json()["error"].as_str().unwrap()),
+            (status, error)
+        );
         self.verify(&node_id(), &boot_id(), seq);
     }
 }

@@ -57,7 +57,10 @@ fn create(path: &Path) -> Result<(), String> {
     file.write_all(&document)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("write {}: {error}", path.display()))?;
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         File::open(parent)
             .and_then(|dir| dir.sync_all())
             .map_err(|error| format!("sync {}: {error}", parent.display()))?;
@@ -66,8 +69,8 @@ fn create(path: &Path) -> Result<(), String> {
 }
 
 fn load(path: &Path) -> Result<SigningKey, String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if !metadata.file_type().is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }

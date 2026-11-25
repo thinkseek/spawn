@@ -166,7 +166,13 @@ mod tests {
         );
         assert_eq!(parse_range(Some("bytes=10-"), 10), Range::Unsatisfiable);
         assert_eq!(parse_range(Some("bytes=-0"), 10), Range::Unsatisfiable);
-        for ignored in ["bytes=1-2,4-5", "items=1-2", "bytes=x-2", "bytes=5-2", "bytes=-"] {
+        for ignored in [
+            "bytes=1-2,4-5",
+            "items=1-2",
+            "bytes=x-2",
+            "bytes=5-2",
+            "bytes=-",
+        ] {
             assert_eq!(parse_range(Some(ignored), 10), Range::Whole, "{ignored}");
         }
     }
@@ -177,9 +183,14 @@ mod tests {
         let path = artifact_path(Path::new("/a"), &digest).unwrap();
         assert_eq!(
             path,
-            Path::new("/a/sha256").join(&digest.hex[..2]).join(&digest.hex)
+            Path::new("/a/sha256")
+                .join(&digest.hex[..2])
+                .join(&digest.hex)
         );
         let blake = ContentDigest::parse(&format!("blake3:{}", digest.hex)).unwrap();
-        assert_eq!(artifact_path(Path::new("/a"), &blake), Err(Miss::Unsupported));
+        assert_eq!(
+            artifact_path(Path::new("/a"), &blake),
+            Err(Miss::Unsupported)
+        );
     }
 }

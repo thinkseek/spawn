@@ -64,7 +64,9 @@ impl Limiter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if buckets.len() >= PRUNE_AT {
-            buckets.retain(|(class, _), bucket| refill(*class, *bucket, now) < f64::from(class.per_window()));
+            buckets.retain(|(class, _), bucket| {
+                refill(*class, *bucket, now) < f64::from(class.per_window())
+            });
         }
         take(&mut buckets, class, Subject::Source(source), now)
             && take(&mut buckets, class, Subject::Node(node_id.to_string()), now)

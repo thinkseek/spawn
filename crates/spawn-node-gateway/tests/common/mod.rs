@@ -158,7 +158,13 @@ impl Harness {
 
     /// A request with these headers (and `Content-Length` when `body` is
     /// not `None`).
-    pub fn send(&self, method: &str, target: &str, headers: &[(String, String)], body: Option<&[u8]>) -> Reply {
+    pub fn send(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Reply {
         let mut head = format!("{method} {target} HTTP/1.1\r\nHost: gateway\r\n");
         for (name, value) in headers {
             head.push_str(&format!("{name}: {value}\r\n"));
@@ -186,7 +192,9 @@ impl Harness {
         body: Option<&[u8]>,
         extra: &[(String, String)],
     ) -> Reply {
-        let envelope = signer.sign(method, target, seq, ts_ms, signed_body).unwrap();
+        let envelope = signer
+            .sign(method, target, seq, ts_ms, signed_body)
+            .unwrap();
         let mut headers: Vec<(String, String)> = envelope
             .to_headers()
             .into_iter()
@@ -197,10 +205,25 @@ impl Harness {
     }
 
     pub fn post(&self, signer: &NodeSigner, target: &str, seq: u64, body: &[u8]) -> Reply {
-        self.signed(signer, Method::Post, target, seq, now_ms(), body, Some(body), &[])
+        self.signed(
+            signer,
+            Method::Post,
+            target,
+            seq,
+            now_ms(),
+            body,
+            Some(body),
+            &[],
+        )
     }
 
-    pub fn get(&self, signer: &NodeSigner, target: &str, seq: u64, extra: &[(String, String)]) -> Reply {
+    pub fn get(
+        &self,
+        signer: &NodeSigner,
+        target: &str,
+        seq: u64,
+        extra: &[(String, String)],
+    ) -> Reply {
         self.signed(signer, Method::Get, target, seq, now_ms(), b"", None, extra)
     }
 }
@@ -257,7 +280,11 @@ impl Reply {
 
     pub fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|_| {
-            panic!("{} body {:?}", self.status, String::from_utf8_lossy(&self.body))
+            panic!(
+                "{} body {:?}",
+                self.status,
+                String::from_utf8_lossy(&self.body)
+            )
         })
     }
 
@@ -282,7 +309,10 @@ impl Reply {
     /// The node's own request was refused with `refusal`, signed.
     pub fn assert_refused(&self, refusal: Refusal, seq: u64) {
         assert_eq!(
-            (self.status, self.json()["error"].as_str().unwrap_or_default()),
+            (
+                self.status,
+                self.json()["error"].as_str().unwrap_or_default()
+            ),
             (refusal.status(), refusal.error()),
             "{:?}",
             String::from_utf8_lossy(&self.body)
