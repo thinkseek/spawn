@@ -981,6 +981,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/context/digest"),
     ("GET", "/api/prov/who"),
     ("GET", "/api/prov/change/<id>"),
+    ("GET", "/api/prov/blast"),
     ("POST", "/api/sessions/<id>/input"),
     ("POST", "/api/sessions/<id>/key"),
     ("POST", "/api/sessions/<id>/restart"),
@@ -1261,6 +1262,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/context/digest" => Box::new(digest::digest),
         "/api/prov/who" => Box::new(move || prov::who(query)),
         "/api/prov/change/<id>" => Box::new(move || prov::change(id)),
+        "/api/prov/blast" => Box::new(move || prov::blast(query)),
         "/api/features" => Box::new(move || feature_map::feature_map(query)),
         "/api/features/coverage" => Box::new(feature_coverage_get),
         "/api/features/coverage/projects" => Box::new(feature_coverage_projects),
@@ -7259,7 +7261,7 @@ mod tests {
         );
         let gets = super::ROUTES.iter().filter(|(m, _)| *m == "GET").count();
         let posts = super::ROUTES.iter().filter(|(m, _)| *m == "POST").count();
-        assert_eq!((gets, posts), (31, 9));
+        assert_eq!((gets, posts), (32, 9));
         assert!(
             doc.contains(&format!(
                 "serves {gets} GET route patterns and {posts} POST routes"
