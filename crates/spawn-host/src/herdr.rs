@@ -106,6 +106,54 @@ manifest_check = false\n";
 /// answers `ping` with another is refused.
 pub const PROTOCOL: u64 = 22;
 
+/// The agent detection manifests Spawn's readings were checked against
+/// (Herdr 0.9.5's bundled ones, which its cached remote ones equal on the
+/// VM, 2026-11-26): a server whose active version of one of them differs
+/// is refused, naming both (carry list N8). The `[update]` pin of
+/// [`SERVER_CONFIG`] holds only for a server this host started; this check
+/// holds for any. Moving a pin is a deliberate change: `herdr server
+/// update-agent-manifests`, the fixtures run again, then this list.
+pub const MANIFESTS: [(&str, &str); 2] = [("agy", "2026.10.05.1"), ("claude", "2026.10.11.1")];
+
+/// Why a `server.agent_manifests` answer (`listed`) does not hold the
+/// `pinned` manifests, naming each pinned and actual version; `None` when
+/// every pinned agent's active version is the pinned one.
+fn manifest_mismatch(
+    session: &str,
+    pinned: &[(String, String)],
+    listed: &Value,
+) -> Option<String> {
+    let active = |agent: &str| {
+        listed["manifests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|manifest| manifest["agent"].as_str() == Some(agent))
+            .and_then(|manifest| manifest["active_version"].as_str())
+            .map(str::to_string)
+    };
+    let differ: Vec<String> = pinned
+        .iter()
+        .filter_map(|(agent, version)| {
+            let actual = active(agent);
+            (actual.as_deref() != Some(version.as_str())).then(|| {
+                format!(
+                    "{agent} pinned {version}, actual {}",
+                    actual.as_deref().unwrap_or("none")
+                )
+            })
+        })
+        .collect();
+    (!differ.is_empty()).then(|| {
+        format!(
+            "herdr session {session} reads agents by other detection manifests than Spawn was \
+             checked against ({}): move the manifests back, or re-run the fixtures and move \
+             Spawn's pins",
+            differ.join("; ")
+        )
+    })
+}
+
 /// How long after an agent started in a pane, or was released from it, a
 /// reading that Herdr still marks `launch_pending` is no reading: the
 /// detection has not settled.
@@ -197,6 +245,8 @@ pub struct HerdrHost {
     socket: OnceLock<PathBuf>,
     /// The protocol a server must answer `ping` with ([`PROTOCOL`]).
     protocol: u64,
+    /// The manifests a server must have active ([`MANIFESTS`]).
+    manifests: Vec<(String, String)>,
     /// The agents followed, shared with the subscriber thread.
     agents: Arc<Mutex<Agents>>,
 }
@@ -384,6 +434,10 @@ impl HerdrHost {
             beneath: None,
             socket: OnceLock::new(),
             protocol: PROTOCOL,
+            manifests: MANIFESTS
+                .iter()
+                .map(|(agent, version)| ((*agent).to_string(), (*version).to_string()))
+                .collect(),
             agents: Arc::new(Mutex::new(Agents::default())),
         })
     }
@@ -393,6 +447,18 @@ impl HerdrHost {
     #[must_use]
     pub fn expecting_protocol(mut self, protocol: u64) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// The same host, expecting a server whose active manifests are
+    /// `manifests` (agent, version) instead of [`MANIFESTS`]: how a test
+    /// shows a server of other manifests refused.
+    #[must_use]
+    pub fn expecting_manifests(mut self, manifests: &[(&str, &str)]) -> Self {
+        self.manifests = manifests
+            .iter()
+            .map(|(agent, version)| ((*agent).to_string(), (*version).to_string()))
+            .collect();
         self
     }
 
@@ -551,6 +617,12 @@ impl HerdrHost {
                 spoken.map_or_else(|| "none".to_string(), |protocol| protocol.to_string()),
                 self.protocol
             )));
+        }
+        let listed = self
+            .call("server.agent_manifests", &json!({}), CALL_LIMIT)
+            .map_err(|call| call.into_error("server.agent_manifests"))?;
+        if let Some(refusal) = manifest_mismatch(&self.session, &self.manifests, &listed) {
+            return Err(TerminalError(refusal));
         }
         self.sweep(server)?;
         lock(&self.agents).checked = Some(server);
@@ -1044,7 +1116,10 @@ fn call_at(socket: &Path, method: &str, params: &Value, limit: Duration) -> Resu
 /// as changed, since what changed meanwhile is unknown. It ends once its
 /// host is gone.
 fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
-    let mut first = true;
+    // Whether the next subscription follows a dropped connection (what
+    // changed meanwhile is unknown), not the first one nor one made again
+    // because the followed panes changed (carry list N7).
+    let mut reconnected = false;
     loop {
         let Some(shared) = agents.upgrade() else {
             return;
@@ -1058,6 +1133,7 @@ fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
         };
         drop(shared);
         let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
+            reconnected = true;
             std::thread::sleep(EVENT_POLL);
             continue;
         };
@@ -1077,22 +1153,22 @@ fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
         if stream.set_read_timeout(Some(EVENT_POLL)).is_err()
             || (&stream).write_all(line.as_bytes()).is_err()
         {
+            reconnected = true;
             std::thread::sleep(EVENT_POLL);
             continue;
         }
-        if !first {
+        if std::mem::take(&mut reconnected) {
             // What changed while no subscription held is unknown.
             let _ = call_at(socket, "session.snapshot", &json!({}), CALL_LIMIT);
             if let Some(shared) = agents.upgrade() {
                 lock(&shared).mark_all();
             }
         }
-        first = false;
         let mut reader = std::io::BufReader::new(stream);
         let mut line = String::new();
-        loop {
+        let ended = loop {
             match reader.read_line(&mut line) {
-                Ok(0) => break,
+                Ok(0) => break Ended::Dropped,
                 Ok(_) if line.ends_with('\n') => {
                     let Some(shared) = agents.upgrade() else {
                         return;
@@ -1111,13 +1187,32 @@ fn subscribe(socket: &Path, agents: &Weak<Mutex<Agents>>) {
                         return;
                     };
                     if lock(&shared).generation != generation {
-                        break;
+                        break Ended::Moved;
                     }
                 }
-                Err(_) => break,
+                Err(_) => break Ended::Dropped,
             }
-        }
+        };
+        reconnected = resubscribes_after(ended);
     }
+}
+
+/// Why a subscription's read ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The connection dropped (the server stopped or restarted).
+    Dropped,
+    /// The followed panes changed: the same server, subscribed again.
+    Moved,
+}
+
+/// Whether the subscription made after `ended` is a real reconnect, which
+/// asks the snapshot and marks every followed terminal changed (carry list
+/// N7). A change of the followed panes is no reconnect: nothing was missed,
+/// and marking every terminal changed would make the Bridge read each pane
+/// again on every start and end.
+fn resubscribes_after(ended: Ended) -> bool {
+    ended == Ended::Dropped
 }
 
 /// One line the subscription pushed: a detection or a status change of a
