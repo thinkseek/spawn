@@ -8418,6 +8418,7 @@ language plpgsql security definer as $$
 declare
     v_change prov_changes;
     v_given jsonb;
+    v_edges jsonb;
     v_id bigint;
     v_unknown text;
 begin
@@ -8462,16 +8463,23 @@ begin
                       from (select null::bigint as change, r.path, r.before, r.after, r.size,
                                    coalesce(r.class, 'content') as class, r.origin
                               from jsonb_populate_recordset(null::prov_entries, p_entries) r) n),
-        'edges', (select coalesce(jsonb_agg(to_jsonb(e) - 'id' - 'src'
-                                            order by e.kind, e.dst, e.at_ms, e.detail::text),
-                                  '[]'::jsonb)
-                    from (select null::bigint as id, r.kind, null::bigint as src, r.dst,
-                                 coalesce(r.detail, '{}'::jsonb) as detail,
-                                 coalesce(r.at_ms, v_change.at_ms) as at_ms
-                            from jsonb_populate_recordset(
-                                     null::prov_edges,
-                                     case jsonb_typeof(p_edges) when 'array' then p_edges
-                                                                else '[]'::jsonb end) r) e));
+        'edges', '[]'::jsonb);
+    -- The edges as given (their order is their ids'), with their defaults.
+    select coalesce(jsonb_agg(jsonb_build_object('kind', r.kind, 'dst', r.dst,
+                                                 'detail', coalesce(r.detail, '{}'::jsonb),
+                                                 'at_ms', coalesce(r.at_ms, v_change.at_ms))
+                              order by x.at),
+                    '[]'::jsonb)
+      into v_edges
+      from jsonb_array_elements(case jsonb_typeof(p_edges) when 'array' then p_edges
+                                                           else '[]'::jsonb end)
+           with ordinality x(edge, at),
+           jsonb_populate_record(null::prov_edges, x.edge) r;
+    v_given := jsonb_set(v_given, '{edges}',
+                         (select coalesce(jsonb_agg(e order by e ->> 'kind', e ->> 'dst',
+                                                    (e ->> 'at_ms')::bigint, (e -> 'detail')::text),
+                                          '[]'::jsonb)
+                            from jsonb_array_elements(v_edges) e));
 
     insert into prov_changes (change_id, rev, kind, domain, agent_id, execution_id, task_id,
                               preset_id, model_label, transcript_ref, attributed, base, result,
@@ -8501,7 +8509,9 @@ begin
       from jsonb_populate_recordset(null::prov_entries, v_given -> 'entries') r;
     insert into prov_edges (kind, src, dst, detail, at_ms)
     select r.kind, v_id, r.dst, r.detail, r.at_ms
-      from jsonb_populate_recordset(null::prov_edges, v_given -> 'edges') r;
+      from jsonb_array_elements(v_edges) with ordinality x(edge, at),
+           jsonb_populate_record(null::prov_edges, x.edge) r
+     order by x.at;
     return v_id;
 end $$;
 do $$

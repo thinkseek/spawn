@@ -60,6 +60,14 @@ fn edge(kind: ProvEdgeKind, dst: &str) -> ProvEdgeInput {
     }
 }
 
+/// The server's message of a refused statement (a driver error's own
+/// text is only "db error").
+fn message(error: &postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map_or_else(|| error.to_string(), |db| db.message().to_string())
+}
+
 fn count(client: &mut Client, table: &str) -> i64 {
     client
         .query_one(&format!("select count(*) from {table}"), &[])
@@ -168,8 +176,8 @@ fn the_schema_applies_twice_and_only_the_owner_records() {
             "insert into prov_edges (kind, src, dst, at_ms) values ('used', $1, 'x', 1)",
             &[&id],
         )
-        .expect_err("the reader writes nothing")
-        .to_string();
+        .expect_err("the reader writes nothing");
+    let refused = message(&refused);
     assert!(refused.contains("permission denied"), "{refused}");
     for login in ["spawn_reader", "spawn_supervisor"] {
         let url = role_url(&schema_url(&schema), login).expect("the login's URL");
@@ -403,10 +411,7 @@ fn provenance_is_never_changed() {
         "delete from prov_edges",
         "truncate prov_edges",
     ] {
-        let refused = client
-            .batch_execute(statement)
-            .expect_err(statement)
-            .to_string();
+        let refused = message(&client.batch_execute(statement).expect_err(statement));
         assert!(
             refused.contains("append-only") || refused.contains("provenance"),
             "{statement}: {refused}"
@@ -442,6 +447,7 @@ fn the_checks_refuse_values_outside_their_lists() {
                 &[change, entries, edges],
             )
             .map(|row| row.get::<_, i64>(0))
+            .map_err(|error| message(&error))
     };
     let with = |key: &str, value: &str| {
         let mut change = good.clone();
@@ -454,8 +460,7 @@ fn the_checks_refuse_values_outside_their_lists() {
         ("boundary", "commit"),
     ] {
         let error = record(&mut client, &with(key, value), &json!([]), &json!([]))
-            .expect_err(key)
-            .to_string();
+.expect_err(key);
         assert!(error.contains("check constraint"), "{key}: {error}");
     }
     let error = record(
@@ -464,8 +469,7 @@ fn the_checks_refuse_values_outside_their_lists() {
         &json!([{"path": "a", "class": "binary"}]),
         &json!([]),
     )
-    .expect_err("class")
-    .to_string();
+    .expect_err("class");
     assert!(error.contains("check constraint"), "class: {error}");
     let error = record(
         &mut client,
@@ -473,8 +477,7 @@ fn the_checks_refuse_values_outside_their_lists() {
         &json!([]),
         &json!([{"kind": "copied", "dst": "x"}]),
     )
-    .expect_err("edge kind")
-    .to_string();
+    .expect_err("edge kind");
     assert!(error.contains("check constraint"), "edge kind: {error}");
 
     // Malformed arguments.
@@ -482,8 +485,7 @@ fn the_checks_refuse_values_outside_their_lists() {
     missing.as_object_mut().expect("object").remove("agent_id");
     record(&mut client, &missing, &json!([]), &json!([])).expect_err("a missing column");
     let error = record(&mut client, &with("id", "7"), &json!([]), &json!([]))
-        .expect_err("an id is not given")
-        .to_string();
+        .expect_err("an id is not given");
     assert!(error.contains("unknown provenance keys: id"), "{error}");
     record(&mut client, &json!([]), &json!([]), &json!([])).expect_err("not an object");
     record(&mut client, &good, &json!({}), &json!([])).expect_err("entries not an array");
@@ -501,10 +503,7 @@ fn the_checks_refuse_values_outside_their_lists() {
                                    boundary, at_ms)
          values ('d', 1, 'edit', 'code', 'a', 'nobody', 't0', 't1', 'job', 1)",
     ] {
-        let error = client
-            .batch_execute(statement)
-            .expect_err(statement)
-            .to_string();
+        let error = message(&client.batch_execute(statement).expect_err(statement));
         assert!(error.contains("check constraint"), "{error}");
     }
 
