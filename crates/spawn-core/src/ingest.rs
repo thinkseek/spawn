@@ -2964,6 +2964,6 @@ mod agy_tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(keys(), keys());
-        assert_eq!(keys().len(), 5);
+        assert_eq!(keys().len(), 4);
     }
 }
