@@ -1,0 +1,20 @@
+[package]
+name = "spawn-node-proto"
+description = "spawn-node v1 wire protocol: the signed request envelope and response, size caps, the verbs' bodies, the grant, tree_sha256_v1 and the golden fixtures shared with the Go daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Ed25519 sign/verify (ring is already linked by the node mesh).
+ring.workspace = true
+sha2.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

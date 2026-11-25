@@ -16,7 +16,11 @@
 //! - `missions`: missions, tasks and residents, and the integrator's lock.
 //! - `scorecard`: the facts `spawn scorecard` measures, read in one snapshot.
 //! - `verifications`: objectives' verifications after their landings.
+<<<<<<< 4d3c8b654005c7b30634d52352ea0267b37fd83e
+//! - `provenance`: universal file provenance, append-only, and its blast radius.
+=======
 //! - `remote_jobs`: spawn-node v1's ledger, the nodes' leases of remote jobs.
+>>>>>>> 437d143606260a5fc602f17488048e5f9df91642
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -98,6 +102,7 @@ mod host;
 mod missions;
 mod nodes;
 mod passfile;
+pub mod provenance;
 mod recovery;
 mod remote_jobs;
 mod row;
@@ -121,9 +126,16 @@ pub use grading::RoutedTask;
 pub use host::{DatabaseIdentity, database_identity, test_database_size, test_schemas};
 pub use missions::{ActivityEvent, LandingHold, PushRequest};
 pub use nodes::StoreConnector;
+<<<<<<< 4d3c8b654005c7b30634d52352ea0267b37fd83e
+pub use provenance::{
+    ProvAttributionSource, ProvBlastRadiusNode, ProvBoundary, ProvChangeInput, ProvChangeKind,
+    ProvChangeRecord, ProvDirection, ProvEdgeInput, ProvEdgeKind, ProvEdgeRecord, ProvEntryClass,
+    ProvEntryInput, ProvEntryRecord, ProvLink,
+=======
 pub use remote_jobs::{
     Committed, FaultNext, FaultOutcome, NodeAction, NodeEnroll, NodeV1, RemoteJob, RemoteJobKind,
     RemoteJobSpec, RemoteJobState, SweepOutcome,
+>>>>>>> 437d143606260a5fc602f17488048e5f9df91642
 };
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,

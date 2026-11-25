@@ -11,8 +11,10 @@ use crate::id::{AgentId, CommandId, IdempotencyKey, SessionId};
 pub enum CommandAction {
     /// Start a new execution with a fresh native session.
     Start {
-        /// Engine to launch: [`ENGINE`], the only one, which a command may
-        /// leave out. A command naming another engine does not parse.
+        /// Engine to launch: a registered driver's (`claude`, `agy`),
+        /// [`ENGINE`] when a command leaves it out. A command naming any
+        /// other engine does not parse; the Bridge refuses one its host does
+        /// not enable (`SPAWN_ENGINES`).
         #[serde(default = "engine", deserialize_with = "claude_only")]
         engine: String,
         /// First prompt.
@@ -232,16 +234,21 @@ fn engine() -> String {
     ENGINE.to_string()
 }
 
-/// The `engine` of a start: [`ENGINE`] only.
+/// The `engine` of a start: a registered driver's ([`crate::driver`]),
+/// Claude Code's ([`ENGINE`]) when it names none. Whether this host runs
+/// it is the Bridge's to say (`SPAWN_ENGINES`).
 fn claude_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     let engine = String::deserialize(deserializer)?;
-    // A registered driver (crate::driver); Claude Code is the only one, so
-    // the error still names it alone.
     if crate::driver::driver(&engine).is_some() {
         Ok(engine)
     } else {
+        let known: Vec<&str> = crate::driver::drivers()
+            .iter()
+            .map(|driver| driver.id())
+            .collect();
         Err(serde::de::Error::custom(format!(
-            "unknown engine {engine}: Claude Code ({ENGINE}) is the only engine"
+            "unknown engine {engine}: the engines are {} (Claude Code, {ENGINE}, by default)",
+            known.join(", ")
         )))
     }
 }
