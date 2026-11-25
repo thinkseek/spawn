@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -167,7 +168,7 @@ impl Harness {
     ) -> Reply {
         let mut head = format!("{method} {target} HTTP/1.1\r\nHost: gateway\r\n");
         for (name, value) in headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
+            let _ = write!(head, "{name}: {value}\r\n");
         }
         if let Some(body) = body {
             head.push_str(&format!("Content-Length: {}\r\n", body.len()));

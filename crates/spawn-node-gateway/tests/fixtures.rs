@@ -13,6 +13,7 @@ use serde_json::Value;
 use spawn_node_gateway::Rid;
 use spawn_node_proto::response::{HEADER_PRIMARY_KEY, HEADER_PRIMARY_SIG};
 use spawn_node_proto::{Limit, Method, Refusal};
+use std::fmt::Write as _;
 
 /// A request fixture: request line, `Name: value` lines, an empty line, the
 /// body.
@@ -241,10 +242,10 @@ fn too_large_row_for_a_result_over_its_caps_before_any_body_byte() {
         .unwrap();
     let mut head = format!("POST {target} HTTP/1.1\r\n");
     for (name, value) in envelope.to_headers() {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        let _ = write!(head, "{name}: {value}\r\n");
     }
     let over = Limit::ResultMeta.bytes() + 1 + Limit::ResultLog.bytes() + 1;
-    head.push_str(&format!("Content-Length: {over}\r\n\r\n"));
+    let _ = write!(head, "Content-Length: {over}\r\n\r\n");
     // Only the head is sent: the refusal comes before any body byte.
     let reply = harness.raw(head.as_bytes());
     assert_row(&reply, &row);
@@ -341,9 +342,9 @@ fn the_artifact_fixture_is_served_whole_and_by_range_unsigned() {
         &content[99_995..]
     );
 
-    let mut past = headers.clone();
-    past.push(("Range".into(), "bytes=100000-".into()));
-    let unsatisfiable = harness.send("GET", &target, &past, None);
+    let mut beyond = headers.clone();
+    beyond.push(("Range".into(), "bytes=100000-".into()));
+    let unsatisfiable = harness.send("GET", &target, &beyond, None);
     assert_eq!(unsatisfiable.status, 416);
     assert_eq!(
         unsatisfiable.header("Content-Range"),

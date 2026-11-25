@@ -219,7 +219,7 @@ fn enroll_beat_grant_result_and_their_refusals() {
     assert!(!dir.join("log.part").exists());
     let stored = owner.remote_job(JOB).unwrap().unwrap();
     assert_eq!(stored.state, RemoteJobState::Completed);
-    assert_eq!(stored.log_bytes, Some(log.len() as i64));
+    assert_eq!(stored.log_bytes, Some(i64::try_from(log.len()).unwrap()));
     assert_eq!(
         stored.result_sha256.as_deref(),
         Some(spawn_node_proto::codec::sha256_hex(&line).as_str())
