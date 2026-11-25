@@ -1,10 +1,12 @@
 //! The leased command queue port over `spawn_commands`.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use postgres::Client;
 use spawn_core::command::{Claimed, Outcome, Submission};
 use spawn_core::id::{CommandId, Principal};
-use spawn_core::port::{CommandQueue, StoreError};
+use spawn_core::port::{CommandOwnership, CommandQueue, StoreError};
 
 use crate::PostgresStore;
 use crate::row::{agent_id, bigint, command_id, corrupt, session_id};
@@ -17,7 +19,106 @@ pub(crate) const CLAIM: &str =
     "select out_id, out_attempt, out_agent, out_session, out_action, out_principal
                    from spawn_claim($1, $2)";
 
+/// Two-key advisory-lock namespace for Bridges, a key of their own: the
+/// integrator's lock (`INTEGRATOR_LOCK_KEY`, 1_399_957_336), the append lock
+/// (1_399_957_335), the landing lock (1_399_957_337) and the others in
+/// `schema.sql` never share it, so a Bridge cannot read as an integrator. The
+/// second key includes both schema and worker, so test schemas and
+/// differently named workers stay apart.
+const WORKER_LOCK_NAMESPACE: i32 = 1_399_957_338;
+const WORKER_LOCK: &str = "select pg_try_advisory_lock(
+    $1, hashtext(current_schema() || ':bridge:' || $2)) as held";
+const WORKER_UNLOCK: &str = "select pg_advisory_unlock(
+    $1, hashtext(current_schema() || ':bridge:' || $2))";
+
+/// Holds the same server session as the store, not a separate connection: if
+/// this session dies, both the ownership lock and every queue operation die
+/// together. SIGKILL therefore frees the lock without running Rust destructors.
+struct PostgresOwnership {
+    client: Arc<Mutex<Client>>,
+    workers: Arc<Mutex<std::collections::HashSet<String>>>,
+    worker: String,
+}
+
+impl CommandOwnership for PostgresOwnership {}
+
+impl Drop for PostgresOwnership {
+    fn drop(&mut self) {
+        let _ = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query(
+                WORKER_UNLOCK,
+                &[&WORKER_LOCK_NAMESPACE, &self.worker.as_str()],
+            );
+        self.workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.worker);
+    }
+}
+
 impl CommandQueue for PostgresStore {
+    fn recover_worker(
+        &self,
+        worker: &str,
+    ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        if !self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(worker.to_string())
+        {
+            return Err(StoreError::Rejected(format!(
+                "Bridge worker {worker} is still owned by a live process"
+            )));
+        }
+        let acquired = self
+            .query_one(WORKER_LOCK, &[&WORKER_LOCK_NAMESPACE, &worker])
+            .map(|row| row.get::<_, bool>("held"));
+        match acquired {
+            Ok(true) => {
+                // From here the guard rolls both the local and server-side
+                // ownership back if the recovery update fails.
+                let ownership = PostgresOwnership {
+                    client: self.client.clone(),
+                    workers: self.workers.clone(),
+                    worker: worker.to_string(),
+                };
+                // Deliberately a direct owner-only update, not a definer
+                // function a restricted queue login could use to steal leases.
+                let recovered = self.execute(
+                    "update spawn_commands
+                        set lease_until_ms = spawn_now_ms()
+                      where state <> 'finished' and lease_worker = $1
+                        and lease_until_ms > spawn_now_ms()",
+                    &[&worker],
+                )?;
+                Ok((
+                    Box::new(ownership),
+                    usize::try_from(recovered).unwrap_or(usize::MAX),
+                ))
+            }
+            Ok(false) => {
+                self.workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(worker);
+                Err(StoreError::Rejected(format!(
+                    "Bridge worker {worker} is still owned by a live process"
+                )))
+            }
+            Err(error) => {
+                self.workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(worker);
+                Err(error)
+            }
+        }
+    }
+
     fn submit(
         &self,
         principal: &Principal,

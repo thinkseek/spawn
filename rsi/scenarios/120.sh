@@ -92,7 +92,7 @@ if (cd "$WORK/web" && npm run build -- --configLoader runner --outDir "$WORK/dis
 else
     check_failed "(1) the UI does not build: $(grep -E 'error|Error' "$WORK/build.out" | head -n 5 | tr '\n' ' ' | head -c 500)"
 fi
-if (cd "$WORK/web" && node --test test/) >"$WORK/test.out" 2>&1; then
+if (cd "$WORK/web" && node --test) >"$WORK/test.out" 2>&1; then
     echo "120: (1) checked: $(sed -n 's/^. pass //p' "$WORK/test.out" | tail -n 1) web tests pass" >&2
 else
     check_failed "(1) a web test fails: $(grep -E '^. fail|not ok' "$WORK/test.out" | head -n 3 | tr '\n' ' ')"

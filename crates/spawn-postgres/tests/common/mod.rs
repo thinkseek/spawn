@@ -54,6 +54,17 @@ pub fn schema_url(schema: &str) -> String {
     format!("{url}{separator}options=-csearch_path%3D{schema}")
 }
 
+/// The base names of a database's restricted logins, as `migrate` makes
+/// them (`spawn_login_role(<base>)`): every test that lists, drops or
+/// counts a database's logins names all of them, so none is left behind on
+/// the shared server.
+pub const LOGIN_BASES: [&str; 4] = [
+    "spawn_supervisor",
+    "spawn_reader",
+    "spawn_human",
+    "spawn_node_gateway",
+];
+
 /// This database's role for a restricted login (`spawn_supervisor`,
 /// `spawn_reader`), as the migrated `schema` names it.
 pub fn login(schema: &str, base: &str) -> String {

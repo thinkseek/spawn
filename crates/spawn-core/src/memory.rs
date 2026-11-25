@@ -19,9 +19,9 @@ use crate::id::{
     TerminalName, WorkspaceId,
 };
 use crate::port::{
-    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, ForkFrom, Hold,
-    Launch, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError, TerminalHost,
-    TranscriptArchive, WatchError, WorkspaceError, WorkspaceStore,
+    ArchiveError, BaseMerge, Branch, CommandOwnership, CommandQueue, Commit, EventLog, FileWatch,
+    ForkFrom, Hold, Launch, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
+    TerminalHost, TranscriptArchive, WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -39,6 +39,7 @@ struct CommandRow {
 /// One worker holding one command.
 #[derive(Debug, Clone)]
 struct Lease {
+    worker: String,
     attempt: u32,
     expires: Timestamp,
 }
@@ -201,6 +202,8 @@ pub struct MemoryStore {
     project: String,
     clock: Arc<dyn Clock>,
     state: Mutex<State>,
+    /// Named workers owned by live Bridges over this store.
+    owners: Arc<Mutex<HashSet<String>>>,
     /// Workspaces held now ([`WorkspaceStore::hold`]).
     held: Arc<AtomicUsize>,
 }
@@ -214,6 +217,22 @@ impl Drop for Held {
     }
 }
 
+struct MemoryOwnership {
+    owners: Arc<Mutex<HashSet<String>>>,
+    worker: String,
+}
+
+impl CommandOwnership for MemoryOwnership {}
+
+impl Drop for MemoryOwnership {
+    fn drop(&mut self) {
+        self.owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.worker);
+    }
+}
+
 impl MemoryStore {
     /// Store for one project.
     pub fn new(project: &str, clock: Arc<dyn Clock>) -> Self {
@@ -221,6 +240,7 @@ impl MemoryStore {
             project: project.to_string(),
             clock,
             state: Mutex::new(State::default()),
+            owners: Arc::new(Mutex::new(HashSet::new())),
             held: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -488,6 +508,41 @@ impl EventLog for MemoryStore {
 }
 
 impl CommandQueue for MemoryStore {
+    fn recover_worker(
+        &self,
+        worker: &str,
+    ) -> Result<(Box<dyn CommandOwnership>, usize), StoreError> {
+        let ownership = {
+            let mut owners = self
+                .owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !owners.insert(worker.to_string()) {
+                return Err(StoreError::Rejected(format!(
+                    "Bridge worker {worker} is still owned by a live process"
+                )));
+            }
+            MemoryOwnership {
+                owners: self.owners.clone(),
+                worker: worker.to_string(),
+            }
+        };
+        let mut state = self.lock();
+        let now = self.clock.now();
+        let mut recovered = 0;
+        for row in &mut state.commands {
+            if !row.finished
+                && let Some(lease) = row.lease.as_mut()
+                && lease.worker == worker
+                && lease.expires > now
+            {
+                lease.expires = now;
+                recovered += 1;
+            }
+        }
+        Ok((Box::new(ownership), recovered))
+    }
+
     fn submit(
         &self,
         principal: &Principal,
@@ -524,7 +579,7 @@ impl CommandQueue for MemoryStore {
         Ok(id)
     }
 
-    fn claim(&self, _worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError> {
+    fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError> {
         let mut state = self.lock();
         let now = self.clock.now();
         let candidate = {
@@ -569,6 +624,7 @@ impl CommandQueue for MemoryStore {
         let principal = state.commands[index].principal.as_str().to_string();
         let id = state.commands[index].id;
         state.commands[index].lease = Some(Lease {
+            worker: worker.to_string(),
             attempt,
             expires: now.plus(ttl),
         });

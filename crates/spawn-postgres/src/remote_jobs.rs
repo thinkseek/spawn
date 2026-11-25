@@ -1,0 +1,504 @@
+//! spawn-node v1's ledger (issue #96; design "spawn-node v1 and
+//! host-adaptive storage" §§4–5): the v1 nodes (`spawn_node_state`) and the
+//! remote jobs they are leased (`spawn_remote_jobs`), both written only
+//! through the SQL functions of `sql/schema.sql`.
+//!
+//! Two callers, two logins:
+//!
+//! - the gateway (`spawn-node-gateway`), logged in as this database's
+//!   `spawn_node_gateway` login, calls the four `spawn_node_gw_*` functions
+//!   and nothing else. Each call runs in a transaction of its own and is
+//!   *verify-then-commit*: the function's answer carries the node's public
+//!   key, the gateway checks the request's signature against it, and the
+//!   transaction commits only when the check passes
+//!   ([`PostgresStore::node_gw_beat`] and its kin take that check as a
+//!   closure);
+//! - the owner (the integrator, `spawn node …`) enrolls, drains, sweeps,
+//!   enqueues, takes a job back and judges a node's fault.
+//!
+//! A beat is a row update and never an event; transitions are recorded as
+//! `node.recorded` records of the control session with `"proto":"node-v1"`,
+//! outside every fold.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use spawn_core::port::StoreError;
+
+use crate::{PostgresStore, backend};
+
+/// The base name of the gateway's login (`spawn_login_role` makes this
+/// database's own of it).
+pub(crate) const GATEWAY_LOGIN: &str = "spawn_node_gateway";
+
+/// The gateway login's defaults (design §4.2 step 6): one call never holds
+/// a row, or the append lock, for long.
+const GATEWAY_TIMEOUTS: [(&str, &str); 3] = [
+    ("statement_timeout", "5s"),
+    ("lock_timeout", "2s"),
+    ("idle_in_transaction_session_timeout", "5s"),
+];
+
+/// This database's gateway login, by name.
+fn gateway_role(client: &mut impl postgres::GenericClient) -> Result<String, postgres::Error> {
+    Ok(client
+        .query_one("select spawn_login_role($1)", &[&GATEWAY_LOGIN])?
+        .get(0))
+}
+
+/// A migration without the owner's password turns the gateway's login off
+/// too (`spawn_logins_off` does the other three).
+pub(crate) fn gateway_login_off(
+    client: &mut impl postgres::GenericClient,
+) -> Result<(), postgres::Error> {
+    let role = gateway_role(client)?;
+    // The role is spawn_login_role's: [a-z0-9_], nothing to quote.
+    client.batch_execute(&format!("alter role \"{role}\" with nologin password null"))
+}
+
+/// Set the gateway login's timeouts as its role defaults, on every
+/// migration (idempotent).
+pub(crate) fn gateway_login_timeouts(
+    client: &mut impl postgres::GenericClient,
+) -> Result<(), postgres::Error> {
+    let role = gateway_role(client)?;
+    for (setting, value) in GATEWAY_TIMEOUTS {
+        client.batch_execute(&format!("alter role \"{role}\" set {setting} = '{value}'"))?;
+    }
+    Ok(())
+}
+
+/// What a remote job runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteJobKind {
+    /// A gate whose verdict may be believed (M3); never dead-lettered.
+    Gate,
+    /// A gate judged again on a node, deciding nothing (M2).
+    GateShadow,
+    /// A build.
+    Build,
+    /// A batch of DE work.
+    DeBatch,
+}
+
+/// Where a remote job is (design §6.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteJobState {
+    /// Waiting for a node.
+    Queued,
+    /// Leased to a node at its `lease_epoch`.
+    Leased,
+    /// Its lease ended (finished, or past its time); a result may still come
+    /// within the grace.
+    ResultPending,
+    /// A node's result is stored.
+    Completed,
+    /// The primary runs it itself.
+    FallbackLocal,
+    /// A build or batch that ran out of attempts.
+    DeadLetter,
+    /// A shadow gate that ran out of attempts.
+    Cancelled,
+}
+
+/// A job to queue (`spawn_remote_job_enqueue`). `requires` is what a node
+/// must hold, key by key (`registry`, `web_lock`, `toolchain`, `pg`);
+/// `cost` what it takes of the node's free capacity pools and `tmpfs_mb`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RemoteJobSpec {
+    /// `^[a-z0-9][a-z0-9._-]{7,63}$`.
+    pub job_id: String,
+    /// What it runs.
+    pub kind: RemoteJobKind,
+    /// The cell (`c0` when none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    /// Higher first (0 when none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    /// The judging it serves, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judging_id: Option<String>,
+    /// The mission, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_id: Option<i64>,
+    /// The task, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<i64>,
+    /// What the node is granted (a JSON object, at most 64 KiB).
+    pub spec: Value,
+    /// What a node must hold to be leased it.
+    pub requires: BTreeMap<String, String>,
+    /// What it takes of a node.
+    pub cost: BTreeMap<String, i64>,
+    /// The base commit (40 hex), when a node may need its baseline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// Leases it may take (2 when none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<i32>,
+    /// How long it may wait for a lease (30 000 when none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<i64>,
+}
+
+/// A remote job as the ledger holds it.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct RemoteJob {
+    pub job_id: String,
+    pub cell_id: String,
+    pub kind: RemoteJobKind,
+    pub state: RemoteJobState,
+    pub priority: i32,
+    pub judging_id: Option<String>,
+    pub mission_id: Option<i64>,
+    pub task_id: Option<i64>,
+    pub spec: Value,
+    pub requires: Value,
+    pub cost: Value,
+    pub base_commit: Option<String>,
+    /// Nodes that may not be leased it again.
+    pub excluded_nodes: Vec<String>,
+    /// Nodes it faulted on.
+    pub fault_nodes: Vec<String>,
+    /// The holder, while leased or pending (and the finisher, once done).
+    pub node_id: Option<String>,
+    /// Moves at every grant and every fence: only the current epoch's
+    /// result is believed.
+    pub lease_epoch: i64,
+    pub lease_expires_ms: Option<i64>,
+    pub grace_until_ms: Option<i64>,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub enqueued_at_ms: i64,
+    pub queue_deadline_ms: Option<i64>,
+    pub leased_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+    /// The node's result metadata, as it sent it.
+    pub result: Option<Value>,
+    pub result_sha256: Option<String>,
+    pub log_sha256: Option<String>,
+    pub log_bytes: Option<i64>,
+}
+
+/// A v1 node as the ledger holds it (its key and token digest left out).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct NodeV1 {
+    pub name: String,
+    /// SHA-256 of its Ed25519 key, in hex; none before enrollment.
+    pub node_id: Option<String>,
+    pub cell_id: String,
+    /// `pending`, `active` or `revoked`.
+    pub status: String,
+    pub drained: bool,
+    /// Three strikes: no grants until an undrain.
+    pub degraded: bool,
+    pub lost_recorded: bool,
+    pub host_fault_strikes: i32,
+    pub boot_id: Option<String>,
+    pub beat_seq: i64,
+    pub last_beat_ms: Option<i64>,
+    pub spec_sha256: Option<String>,
+    pub spec: Option<Value>,
+    pub warm_bases: Vec<String>,
+}
+
+/// `POST /node/v1/enroll`'s call: the token's digest, the node's new key,
+/// its boot id and its spec (hashed by the gateway).
+#[derive(Clone, Copy, Debug)]
+pub struct NodeEnroll<'a> {
+    pub token_sha256: &'a [u8; 32],
+    pub pubkey: &'a [u8; 32],
+    pub boot_id: &'a str,
+    pub spec_sha256: &'a str,
+    pub spec: &'a Value,
+}
+
+/// A gateway call's answer, and whether its transaction committed (the
+/// caller's check of the answer passed).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Committed<T> {
+    pub answer: T,
+    pub committed: bool,
+}
+
+/// An owner's change of a v1 node (`spawn_node_admin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeAction {
+    Drain,
+    /// Also clears `degraded` and the strikes.
+    Undrain,
+    /// Fences everything it holds; the name is never enrolled again.
+    Revoke,
+}
+
+impl NodeAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Drain => "drain",
+            Self::Undrain => "undrain",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
+/// Where a job judged a node's fault goes (`spawn_remote_job_fault`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultNext {
+    /// To another node (this one excluded), while attempts remain.
+    Queued,
+    FallbackLocal,
+    DeadLetter,
+    /// The row stays completed.
+    Keep,
+}
+
+impl FaultNext {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::FallbackLocal => "fallback_local",
+            Self::DeadLetter => "dead_letter",
+            Self::Keep => "keep",
+        }
+    }
+}
+
+/// What a fault judging did: `ok` false when the job is not completed at
+/// that epoch, or was judged already.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct FaultOutcome {
+    pub ok: bool,
+    /// Where the job went (the poison rule and the attempts may override
+    /// the asked one).
+    #[serde(default)]
+    pub next: Option<FaultNext>,
+    /// The job faulted on another node before: the cause, not they.
+    #[serde(default)]
+    pub poison: Option<bool>,
+    /// The node's strikes after a strike.
+    #[serde(default)]
+    pub strikes: Option<i32>,
+    #[serde(default)]
+    pub degraded: Option<bool>,
+}
+
+/// What a sweep did: leases now waiting for a result, leases fenced after
+/// their grace, nodes recorded lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub struct SweepOutcome {
+    pub waiting: i64,
+    pub fenced: i64,
+    pub lost: i64,
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, StoreError> {
+    serde_json::from_value(value).map_err(|error| StoreError::Backend(error.to_string()))
+}
+
+impl PostgresStore {
+    /// One gateway function in a transaction of its own, verify-then-commit
+    /// (design §4.2 step 7): `commit` sees the answer; true commits, false
+    /// (a bad signature) rolls everything the call did back.
+    fn gateway_call<T>(
+        &self,
+        sql: &str,
+        params: &crate::Params<'_>,
+        commit: impl FnOnce(&T) -> bool,
+    ) -> Result<Committed<T>, StoreError>
+    where
+        T: for<'a> postgres::types::FromSql<'a>,
+    {
+        let mut client = self.lock();
+        let mut transaction = client.transaction().map_err(|error| backend(&error))?;
+        let answer: T = transaction
+            .query_one(sql, params)
+            .map_err(|error| backend(&error))?
+            .get(0);
+        let committed = commit(&answer);
+        if committed {
+            transaction.commit()
+        } else {
+            transaction.rollback()
+        }
+        .map_err(|error| backend(&error))?;
+        Ok(Committed { answer, committed })
+    }
+
+    /// `POST /node/v1/enroll` (`spawn_node_gw_enroll`): consumes the token
+    /// and pins the key. The answer: `{ok, name, node_id, cell_id,
+    /// server_time_ms}` or `{ok: false, error}` (`bad_request`,
+    /// `bad_token`, `key_in_use`).
+    pub fn node_gw_enroll(
+        &self,
+        enroll: &NodeEnroll<'_>,
+        commit: impl FnOnce(&Value) -> bool,
+    ) -> Result<Committed<Value>, StoreError> {
+        self.gateway_call(
+            "select spawn_node_gw_enroll($1, $2, $3, $4, $5)",
+            &[
+                &enroll.token_sha256.as_slice(),
+                &enroll.pubkey.as_slice(),
+                &enroll.boot_id,
+                &enroll.spec_sha256,
+                enroll.spec,
+            ],
+            commit,
+        )
+    }
+
+    /// `POST /node/v1/heartbeat` (`spawn_node_gw_beat`): renews, fences and
+    /// grants (at most two a beat). The answer carries `pubkey` (standard
+    /// base64) whenever the node is known, for the signature check.
+    pub fn node_gw_beat(
+        &self,
+        node_id: &str,
+        boot_id: &str,
+        seq: i64,
+        beat: &Value,
+        commit: impl FnOnce(&Value) -> bool,
+    ) -> Result<Committed<Value>, StoreError> {
+        self.gateway_call(
+            "select spawn_node_gw_beat($1, $2, $3, $4)",
+            &[&node_id, &boot_id, &seq, beat],
+            commit,
+        )
+    }
+
+    /// `POST /node/v1/spec` (`spawn_node_gw_spec`): `{ok, changed, pubkey}`
+    /// or `{ok: false, error}` (`beat_first` when the boot is not the
+    /// node's current one).
+    pub fn node_gw_spec(
+        &self,
+        node_id: &str,
+        boot_id: &str,
+        spec_sha256: &str,
+        spec: &Value,
+        commit: impl FnOnce(&Value) -> bool,
+    ) -> Result<Committed<Value>, StoreError> {
+        self.gateway_call(
+            "select spawn_node_gw_spec($1, $2, $3, $4)",
+            &[&node_id, &boot_id, &spec_sha256, spec],
+            commit,
+        )
+    }
+
+    /// `POST /node/v1/jobs/<job_id>/result` (`spawn_node_gw_result`): true
+    /// when this call, or an identical earlier one, completed the job at
+    /// `lease_epoch`; false when the lease moved (`409 lease_fenced`).
+    pub fn node_gw_result(
+        &self,
+        node_id: &str,
+        job_id: &str,
+        lease_epoch: i64,
+        result: &Value,
+        commit: impl FnOnce(&bool) -> bool,
+    ) -> Result<Committed<bool>, StoreError> {
+        self.gateway_call(
+            "select spawn_node_gw_result($1, $2, $3, $4)",
+            &[&node_id, &job_id, &lease_epoch, result],
+            commit,
+        )
+    }
+
+    /// `spawn node enroll-token <name>` (owner only): store a one-time
+    /// token's digest, good `ttl_ms` (1 s to 10 min). Returns when it
+    /// expires. Refused for a P1-joined or a revoked name.
+    pub fn node_enroll_token(
+        &self,
+        name: &str,
+        cell_id: Option<&str>,
+        token_sha256: &[u8; 32],
+        ttl_ms: i64,
+    ) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_node_enroll_token($1, $2, $3, $4)",
+                &[&name, &cell_id, &token_sha256.as_slice(), &ttl_ms],
+            )?
+            .get(0))
+    }
+
+    /// `spawn node drain|undrain|revoke` of a v1 node (owner only): false
+    /// when it was so already.
+    pub fn node_admin(&self, name: &str, action: NodeAction) -> Result<bool, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_node_admin($1, $2)",
+                &[&name, &action.as_str()],
+            )?
+            .get(0))
+    }
+
+    /// The level-triggered sweep (owner only), from the integrator's pass.
+    pub fn node_sweep(&self) -> Result<SweepOutcome, StoreError> {
+        decode(self.query_json("select spawn_node_sweep()", &[])?)
+    }
+
+    /// Queue a remote job (owner only). Returns its id.
+    pub fn remote_job_enqueue(&self, job: &RemoteJobSpec) -> Result<String, StoreError> {
+        let job =
+            serde_json::to_value(job).map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(self
+            .query_one("select spawn_remote_job_enqueue($1)", &[&job])?
+            .get(0))
+    }
+
+    /// `FALLBACK_LOCAL` (owner only): take back a job still queued at
+    /// `lease_epoch`. Of this and a node's grant, exactly one wins.
+    pub fn remote_job_take_local(
+        &self,
+        job_id: &str,
+        lease_epoch: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_remote_job_take_local($1, $2)",
+                &[&job_id, &lease_epoch],
+            )?
+            .get(0))
+    }
+
+    /// Judge a completed job's run the node's fault (owner only): a strike
+    /// when `strike`, three make the node degraded; the poison rule gives
+    /// strikes back. Judged once per completion.
+    pub fn remote_job_fault(
+        &self,
+        job_id: &str,
+        lease_epoch: i64,
+        evidence: &str,
+        strike: bool,
+        next: FaultNext,
+    ) -> Result<FaultOutcome, StoreError> {
+        decode(self.query_json(
+            "select spawn_remote_job_fault($1, $2, $3, $4, $5)",
+            &[&job_id, &lease_epoch, &evidence, &strike, &next.as_str()],
+        )?)
+    }
+
+    /// One remote job, or `None`.
+    pub fn remote_job(&self, job_id: &str) -> Result<Option<RemoteJob>, StoreError> {
+        self.query_opt_json(
+            "select to_jsonb(j) from spawn_remote_jobs j where j.job_id = $1",
+            &[&job_id],
+        )?
+        .map(decode)
+        .transpose()
+    }
+
+    /// One v1 node by name, or `None`.
+    pub fn node_v1(&self, name: &str) -> Result<Option<NodeV1>, StoreError> {
+        self.query_opt_json(
+            "select to_jsonb(n) - 'pubkey' - 'enroll_token_sha256'
+               from spawn_node_state n where n.name = $1",
+            &[&name],
+        )?
+        .map(decode)
+        .transpose()
+    }
+}

@@ -61,7 +61,7 @@ use crate::Flags;
 use crate::config::{
     env_value, loop_interval, open_store, spawn_program, supervised, workspace_root,
 };
-use crate::runtime::runtime;
+use crate::runtime::{runtime, tick_runtime};
 use crate::{alerts, cost, disk, dispatch, supervise};
 
 /// Most intervals a failing loop waits before its next pass.
@@ -138,7 +138,7 @@ pub(crate) const LOOP_USAGE: &str = "usage: spawn loop [--repo <bare repo>] [--r
                                      and, with SPAWN_SUPERVISOR=1, the supervisor's liveness rule)";
 
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
-    let (mut bridge, mut observer) = runtime(flags)?;
+    let (mut bridge, mut observer) = tick_runtime(flags)?;
     let report = tick_bridge(&mut bridge)?;
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
@@ -733,31 +733,43 @@ impl Fleet<'_> {
         (warnings, notes): (&mut Vec<String>, &mut Vec<String>),
         errors: &mut Vec<String>,
     ) {
-        if !self.schedule.bridge.runs(watermark, now) {
+        const MAX_WORK_ROUNDS: usize = 4;
+        if !self.schedule.bridge.runs(watermark, now) || self.running.is_none() {
             return;
         }
-        // `None`: the runtime is built again on the next pass.
-        let worked = self.running.as_mut().map(|(bridge, _)| bridge.work());
-        match worked {
-            Some(Ok((report, more))) => {
-                warnings.extend(report.warnings);
-                notes.extend(report.notes);
-                // Its own wait is the earliest lease still running, or the
-                // next pass when the claim stopped at its per-tick limit and
-                // a command may still be waiting for one.
-                let due = if more {
-                    Some(now)
-                } else {
-                    open.next_lease_ms().unwrap_or_else(|error| {
-                        Fleet::fail(errors, "bridge", &error.to_string());
-                        None
-                    })
-                };
-                self.schedule.bridge.ran(watermark, due);
+        let mut final_due = None;
+        for round in 0..MAX_WORK_ROUNDS {
+            let Some((bridge, _)) = self.running.as_mut() else {
+                return;
+            };
+            let (report, more) = match bridge.work() {
+                Ok(worked) => worked,
+                Err(error) => {
+                    Fleet::fail(errors, "bridge", &error.to_string());
+                    return;
+                }
+            };
+            warnings.extend(report.warnings);
+            notes.extend(report.notes);
+            let (next_due, lease_ok) = match open.next_lease_ms() {
+                Ok(due) => (due, true),
+                Err(error) => {
+                    Fleet::fail(errors, "bridge", &error.to_string());
+                    (None, false)
+                }
+            };
+            let due_now = next_due.is_some_and(|due_ms| due_ms <= now_ms());
+            final_due = if more && (!lease_ok || due_now) {
+                Some(now)
+            } else {
+                next_due
+            };
+            let ready_now = more && report.commands > 0 && due_now;
+            if !ready_now || round + 1 == MAX_WORK_ROUNDS {
+                break;
             }
-            Some(Err(error)) => Fleet::fail(errors, "bridge", &error.to_string()),
-            None => {}
         }
+        self.schedule.bridge.ran(watermark, final_due);
     }
 
     /// The steps whose input is the store besides the Bridge's own reads:
