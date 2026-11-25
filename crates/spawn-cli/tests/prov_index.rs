@@ -583,6 +583,30 @@ fn many(work: &mut Work, client: &mut Client, landings: i64) {
     }
 }
 
+/// Wait (at most a minute) until the server holds no session named
+/// `name`: a killed client's backend ends, and its last statement commits
+/// or rolls back, only after the client is gone.
+fn sessions_gone(client: &mut Client, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        let left: i64 = client
+            .query_one(
+                "select count(*) from pg_stat_activity where application_name = $1",
+                &[&name],
+            )
+            .expect("the sessions")
+            .get(0);
+        if left == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{left} session(s) of the killed run still open after a minute"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be() {
     let scratch = Scratch::new("killed");
@@ -620,11 +644,17 @@ fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be
     // Kill runs, each a little later, until one has recorded something (on
     // this history a kill then lands midway), then let one finish.
     let total = count(&mut whole_client, "prov_changes");
+    // The killed runs' sessions carry a name of their own (not the
+    // schema's: the guard's own connection carries that), so the test
+    // waits until the server has ended every one of them: a statement in
+    // flight when the process died may still commit after the kill.
+    let child_name = format!("prov_killed_child_{}", std::process::id());
+    let child_url = format!("{}&application_name={child_name}", schema_url(&killed));
     let mut delay = std::time::Duration::from_millis(20);
     for _ in 0..40 {
         let mut child = Command::new(env!("CARGO_BIN_EXE_spawn"))
             .args(["prov", "index", "--source", SOURCE, "--repo", &git_dir])
-            .env("SPAWN_DATABASE_URL", schema_url(&killed))
+            .env("SPAWN_DATABASE_URL", &child_url)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -632,6 +662,7 @@ fn a_run_killed_midway_is_completed_by_the_next_as_an_uninterrupted_run_would_be
         std::thread::sleep(delay);
         let _ = child.kill();
         let _ = child.wait();
+        sessions_gone(&mut killed_client, &child_name);
         if count(&mut killed_client, "prov_changes") > 0 {
             break;
         }

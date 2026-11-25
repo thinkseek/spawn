@@ -4,9 +4,9 @@
 use spawn_postgres::provenance::ProvEntryClass;
 
 use super::index::{
-    Checkpoint, RawDiff, Repo, Trailers, base32, change_id, checkpoint_execution, classify, domain_of,
-    edit_branch_key, edit_task_key, import_key, land_key, parse_commit, parse_header, parse_raw, stored_path,
-    trailers,
+    Checkpoint, RawDiff, Repo, Trailers, base32, change_id, checkpoint_execution, classify,
+    domain_of, edit_branch_key, edit_task_key, import_key, land_key, parse_commit, parse_header,
+    parse_raw, stored_path, trailers,
 };
 use super::{Target, path_and_line, target};
 
