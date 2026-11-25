@@ -25,6 +25,10 @@ use super::{Landed, Target, blast, record_land, source_change, who};
 
 const SOURCE: &str = "/srv/prov-land.git";
 
+/// A time after every commit of the history, for git commands that write a
+/// reflog.
+const LATER: i64 = 1_700_000_500;
+
 /// A directory of the test's own, removed when it ends.
 struct Scratch(PathBuf);
 
@@ -336,16 +340,16 @@ fn blast_names_later_changes_and_who_follows_a_squashed_landings_trailers() {
     let clone_path = clone.display().to_string();
     git_in(
         &scratch.0,
-        1,
+        LATER,
         &["clone", "-q", "--bare", &git_dir, &clone_path],
     );
-    let tree = git_in(&clone, 1, &["rev-parse", &format!("{landing}^{{tree}}")]);
+    let tree = git_in(&clone, LATER, &["rev-parse", &format!("{landing}^{{tree}}")]);
     let squashed = git_in(
         &clone,
         1_800_000_000,
         &["commit-tree", &tree, "-p", &import, "-m", &message],
     );
-    git_in(&clone, 1, &["update-ref", "refs/heads/main", &squashed]);
+    git_in(&clone, LATER, &["update-ref", "refs/heads/main", &squashed]);
     let repo = Repo::open(&clone_path).expect("the clone");
     let land_change = super::show(&store, &Target::Commit(landing)).expect("show")["changes"][0]
         ["change"]
@@ -392,10 +396,10 @@ fn run_commands(clone: &Path, commands: &Value) {
 fn holdings(git_dir: &str) -> (String, String) {
     let dir = Path::new(git_dir);
     (
-        git_in(dir, 1, &["--git-dir", git_dir, "for-each-ref"]),
+        git_in(dir, LATER, &["--git-dir", git_dir, "for-each-ref"]),
         git_in(
             dir,
-            1,
+            LATER,
             &[
                 "--git-dir",
                 git_dir,
@@ -436,18 +440,18 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     assert_eq!(reverted["conflicts"], json!([]), "{reverted:#}");
     let hand = scratch.0.join("hand");
     let hand_path = hand.display().to_string();
-    git_in(&scratch.0, 1, &["clone", "-q", &git_dir, &hand_path]);
-    git_in(&hand, 1, &["switch", "-q", "--detach", &own]);
-    git_in(&hand, 1, &["revert", "--no-commit", "-m", "1", &landing]);
-    assert_eq!(git_in(&hand, 1, &["write-tree"]), reverted["tree"]);
-    git_in(&hand, 1, &["reset", "-q", "--hard"]);
+    git_in(&scratch.0, LATER, &["clone", "-q", &git_dir, &hand_path]);
+    git_in(&hand, LATER, &["switch", "-q", "--detach", &own]);
+    git_in(&hand, LATER, &["revert", "--no-commit", "-m", "1", &landing]);
+    assert_eq!(git_in(&hand, LATER, &["write-tree"]), reverted["tree"]);
+    git_in(&hand, LATER, &["reset", "-q", "--hard"]);
     run_commands(&hand, &reverted["commands"]);
     // A file the landing added and main edited since: the revert
     // conflicts on it, as by hand.
     let conflicted = plan::revert(&view, &edited, &landed).expect("revert");
     assert_eq!(conflicted["tree"], Value::Null);
     assert_eq!(conflicted["conflicts"], json!(["src/a.txt"]));
-    git_in(&hand, 1, &["switch", "-q", "--detach", &edited]);
+    git_in(&hand, LATER, &["switch", "-q", "--detach", &edited]);
     let by_hand = spawn_host::test_git_command()
         .arg("-C")
         .arg(&hand)
@@ -455,21 +459,21 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
         .output()
         .expect("run git");
     assert!(!by_hand.status.success(), "by hand too");
-    git_in(&hand, 1, &["revert", "--abort"]);
+    git_in(&hand, LATER, &["revert", "--abort"]);
 
     let split = plan::split(&view, &landed, &["src".to_string()]).expect("split");
     let first = &split["parts"][0];
     assert_eq!(first["paths"], json!(["src/a.txt", "src/b.txt"]));
     assert_eq!(split["parts"][1]["paths"], json!(["bin.dat"]));
-    git_in(&hand, 1, &["switch", "-q", "--detach", &import]);
-    git_in(&hand, 1, &["checkout", &landing, "--", "src"]);
-    assert_eq!(git_in(&hand, 1, &["write-tree"]), first["tree"]);
-    git_in(&hand, 1, &["reset", "-q", "--hard"]);
+    git_in(&hand, LATER, &["switch", "-q", "--detach", &import]);
+    git_in(&hand, LATER, &["checkout", &landing, "--", "src"]);
+    assert_eq!(git_in(&hand, LATER, &["write-tree"]), first["tree"]);
+    git_in(&hand, LATER, &["reset", "-q", "--hard"]);
     run_commands(&hand, &first["commands"]);
     run_commands(&hand, &split["parts"][1]["commands"]);
     assert_eq!(
         split["parts"][1]["tree"],
-        git_in(&hand, 1, &["rev-parse", &format!("{landing}^{{tree}}")])
+        git_in(&hand, LATER, &["rev-parse", &format!("{landing}^{{tree}}")])
     );
     assert!(plan::split(&view, &landed, &["nowhere".to_string()]).is_err());
     assert!(
@@ -499,7 +503,7 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     let composed = plan::compose(&view, &import, &picks).expect("compose");
     assert_eq!(
         composed["tree"],
-        git_in(&hand, 1, &["rev-parse", &format!("{a2}^{{tree}}")])
+        git_in(&hand, LATER, &["rev-parse", &format!("{a2}^{{tree}}")])
     );
     run_commands(&hand, &composed["commands"]);
 
