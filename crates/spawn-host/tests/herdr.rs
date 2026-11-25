@@ -834,3 +834,95 @@ fn a_server_of_another_protocol_is_refused_naming_both() {
         .terminate(&one, &session.workspace())
         .expect("terminate");
 }
+
+/// Carry list N8: a server whose active detection manifests differ from
+/// the ones the host is pinned to is refused before anything starts,
+/// naming the pinned and the actual version; the host pinned to what the
+/// server has (Herdr 0.9.5's bundled manifests) starts there.
+#[test]
+fn a_server_of_other_detection_manifests_is_refused_naming_both() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session
+        .host()
+        .expecting_manifests(&[("agy", "1999.01.01.1"), ("claude", "2026.10.11.1")]);
+    let one = terminal("spawn-exec_a6");
+    let error = host
+        .start(&session.launch(&one, "exec cat"))
+        .expect_err("other manifests");
+    assert!(
+        error.0.contains("agy pinned 1999.01.01.1, actual 2026.10.05.1"),
+        "{error}"
+    );
+    let right = session.host();
+    right
+        .start(&session.launch(&one, "exec cat"))
+        .expect("start");
+    right
+        .terminate(&one, &session.workspace())
+        .expect("terminate");
+}
+
+/// A process the engine detached from its session (`setsid`, as agy's
+/// background updater does) is still beneath the workspace once the pane
+/// is closed: terminate ends it by pid before it returns.
+#[test]
+fn a_detached_daemon_beneath_the_workspace_is_ended_by_terminate() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let one = terminal("spawn-exec_a7");
+    let pidfile = session.cwd().join("daemon.pid");
+    let script = format!(
+        "setsid sh -c 'echo $$ > {}; exec sleep 60' </dev/null >/dev/null 2>&1 & echo started; exec cat",
+        pidfile.display()
+    );
+    host.start(&session.launch(&one, &script)).expect("start");
+    screen_with(&host, &one, &workspace, "started");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the daemon never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    host.terminate(&one, &workspace).expect("terminate");
+    let gone = |pid: u32| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_or(true, |stat| stat.split(") ").nth(1).is_some_and(|rest| rest.starts_with('Z')))
+    };
+    assert!(gone(pid), "the detached daemon {pid} outlived terminate");
+}
+
+/// `submit_staged` hands a staged text to the pane's detected agent (the
+/// stub agy) through `agent.prompt`, which submits it: the stub reads the
+/// line and draws the state it names. A text past the request line cap,
+/// and a pane with no agent, still arrive (chunked `pane.send_text`).
+#[test]
+fn a_staged_text_reaches_a_detected_agent_through_agent_prompt() {
+    let _serial = exclusive();
+    let Some(session) = Session::new() else {
+        return;
+    };
+    let host = session.host();
+    let workspace = session.workspace();
+    let agy = terminal("spawn-exec_a8");
+    host.start(&session.agy_launch(&agy, "idle")).expect("start");
+    reading_within(&host, &agy, &workspace, |reading| {
+        reading.agent.as_deref() == Some("agy") && reading.status == AgentStatus::Idle
+    });
+    host.stage_text(&agy, &workspace, "work").expect("stage");
+    host.submit_staged(&agy, &workspace).expect("submit");
+    screen_with(&host, &agy, &workspace, "esc to cancel");
+    host.terminate(&agy, &workspace).expect("terminate");
+}
