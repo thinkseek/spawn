@@ -195,6 +195,7 @@ fn the_schema_applies_twice_and_only_the_owner_records() {
 /// change again returns its id and writes nothing, a different one under
 /// the same key is refused and writes nothing.
 #[test]
+#[allow(clippy::too_many_lines)] // one change's life: record, read every way, record again
 fn a_recorded_change_reads_back_every_way() {
     let (store, schema) = store("prov_roundtrip");
     let mut first = change("c-1", 1, "agent_a", 1_000);
@@ -536,27 +537,27 @@ fn the_checks_refuse_values_outside_their_lists() {
 #[test]
 fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     let (store, _schema) = store("prov_blast");
-    // A uses B (not recorded yet: an edge names a change id, not a row).
-    let a = store
+    // A uses B (not recorded yet: an edge names ch_a change id, not ch_a row).
+    let ch_a = store
         .record_change(
             &change("A", 1, "agent_a", 1_000),
-            &[entry("src/a.rs", "blob-a")],
+            &[entry("src/ch_a.rs", "blob-a")],
             &[edge(ProvEdgeKind::Used, "B")],
         )
         .expect("A");
     // B uses A: the cycle A -> B -> A.
-    let b = store
+    let ch_b = store
         .record_change(
             &change("B", 1, "agent_b", 2_000),
-            &[entry("src/b.rs", "blob-b")],
+            &[entry("src/ch_b.rs", "blob-b")],
             &[edge(ProvEdgeKind::Used, "A")],
         )
         .expect("B");
-    // C includes B's content digest, and itself (a self-loop).
-    let c = store
+    // C includes B's content digest, and itself (ch_a self-loop).
+    let ch_c = store
         .record_change(
             &change("C", 1, "agent_c", 3_000),
-            &[entry("src/c.rs", "blob-c")],
+            &[entry("src/ch_c.rs", "blob-c")],
             &[
                 edge(ProvEdgeKind::Includes, "blob-b"),
                 edge(ProvEdgeKind::Supersedes, "C"),
@@ -564,12 +565,12 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
         )
         .expect("C");
     // D reverts to C's content (origin), and E uses D's tree.
-    let mut back = entry("src/c.rs", "blob-c");
-    back.origin = Some(c);
+    let mut back = entry("src/ch_c.rs", "blob-c");
+    back.origin = Some(ch_c);
     let d_change = change("D", 1, "agent_d", 4_000);
     let d_tree = d_change.result.clone();
-    let d = store.record_change(&d_change, &[back], &[]).expect("D");
-    let e = store
+    let ch_d = store.record_change(&d_change, &[back], &[]).expect("D");
+    let ch_e = store
         .record_change(
             &change("E", 1, "agent_e", 5_000),
             &[],
@@ -578,7 +579,7 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
         .expect("E");
 
     let forward = store
-        .prov_blast_radius(a, ProvDirection::Forward, 32)
+        .prov_blast_radius(ch_a, ProvDirection::Forward, 32)
         .expect("forward");
     let walked: Vec<(i64, i32, Vec<i64>, ProvLink)> = forward
         .iter()
@@ -587,13 +588,13 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     assert_eq!(
         walked,
         [
-            (b, 1, vec![a, b], ProvLink::Edge(ProvEdgeKind::Used)),
-            (c, 2, vec![a, b, c], ProvLink::Edge(ProvEdgeKind::Includes)),
-            (d, 3, vec![a, b, c, d], ProvLink::Origin),
+            (ch_b, 1, vec![ch_a, ch_b], ProvLink::Edge(ProvEdgeKind::Used)),
+            (ch_c, 2, vec![ch_a, ch_b, ch_c], ProvLink::Edge(ProvEdgeKind::Includes)),
+            (ch_d, 3, vec![ch_a, ch_b, ch_c, ch_d], ProvLink::Origin),
             (
-                e,
+                ch_e,
                 4,
-                vec![a, b, c, d, e],
+                vec![ch_a, ch_b, ch_c, ch_d, ch_e],
                 ProvLink::Edge(ProvEdgeKind::Redacts)
             ),
         ],
@@ -604,7 +605,7 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     assert_eq!(forward[0].agent_id, "agent_b");
 
     let backward = store
-        .prov_blast_radius(e, ProvDirection::Backward, 32)
+        .prov_blast_radius(ch_e, ProvDirection::Backward, 32)
         .expect("backward");
     let walked: Vec<(i64, i32, ProvLink)> = backward
         .iter()
@@ -613,33 +614,33 @@ fn the_blast_radius_walks_both_ways_and_ends_on_cycles() {
     assert_eq!(
         walked,
         [
-            (d, 1, ProvLink::Edge(ProvEdgeKind::Redacts)),
-            (c, 2, ProvLink::Origin),
-            (b, 3, ProvLink::Edge(ProvEdgeKind::Includes)),
-            (a, 4, ProvLink::Edge(ProvEdgeKind::Used)),
+            (ch_d, 1, ProvLink::Edge(ProvEdgeKind::Redacts)),
+            (ch_c, 2, ProvLink::Origin),
+            (ch_b, 3, ProvLink::Edge(ProvEdgeKind::Includes)),
+            (ch_a, 4, ProvLink::Edge(ProvEdgeKind::Used)),
         ]
     );
 
     // From inside the cycle, each way: the other, once.
     let from_b = store
-        .prov_blast_radius(b, ProvDirection::Backward, 32)
+        .prov_blast_radius(ch_b, ProvDirection::Backward, 32)
         .expect("backward from B");
-    assert_eq!(from_b.iter().map(|node| node.id).collect::<Vec<_>>(), [a]);
+    assert_eq!(from_b.iter().map(|node| node.id).collect::<Vec<_>>(), [ch_a]);
 
     // The bound.
     let near = store
-        .prov_blast_radius(a, ProvDirection::Forward, 2)
+        .prov_blast_radius(ch_a, ProvDirection::Forward, 2)
         .expect("bounded");
-    assert_eq!(near.iter().map(|node| node.id).collect::<Vec<_>>(), [b, c]);
+    assert_eq!(near.iter().map(|node| node.id).collect::<Vec<_>>(), [ch_b, ch_c]);
     assert!(
         store
-            .prov_blast_radius(a, ProvDirection::Forward, 0)
+            .prov_blast_radius(ch_a, ProvDirection::Forward, 0)
             .expect("depth 0")
             .is_empty()
     );
     assert!(
         store
-            .prov_blast_radius(a + 1_000, ProvDirection::Forward, 32)
+            .prov_blast_radius(ch_a + 1_000, ProvDirection::Forward, 32)
             .expect("unknown")
             .is_empty()
     );
