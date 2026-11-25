@@ -307,7 +307,7 @@ impl Artifacts {
     /// ids), with `refs` set; removed by the caller.
     fn refs_repo(&self, repo: &Path, refs: &[(&str, &str)]) -> Result<PathBuf, String> {
         let objects = ran(
-            Command::new("git")
+            crate::sources::controller_git()
                 .arg("--git-dir")
                 .arg(repo)
                 .args(["rev-parse", "--absolute-git-dir"]),
@@ -317,7 +317,7 @@ impl Artifacts {
         let dir = self.scratch("refs")?;
         let result = (|| {
             ran(
-                Command::new("git").args(["init", "-q", "--bare"]).arg(&dir),
+                crate::sources::controller_git().args(["init", "-q", "--bare"]).arg(&dir),
                 "git init",
             )?;
             std::fs::write(
@@ -327,7 +327,7 @@ impl Artifacts {
             .map_err(|error| format!("alternates: {error}"))?;
             for (name, commit) in refs {
                 ran(
-                    Command::new("git").arg("--git-dir").arg(&dir).args([
+                    crate::sources::controller_git().arg("--git-dir").arg(&dir).args([
                         "update-ref",
                         name,
                         commit,
@@ -356,7 +356,7 @@ impl Artifacts {
         let out = self.scratch("bundle");
         let result = out.and_then(|out| {
             ran(
-                Command::new("git")
+                crate::sources::controller_git()
                     .arg("--git-dir")
                     .arg(&dir)
                     .args(["bundle", "create", "-q"])
@@ -1695,7 +1695,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::integrate) fn git(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = spawn_host::test_git_command()
             .arg("-C")
             .arg(dir)
             .args([
@@ -1732,7 +1732,7 @@ pub(super) mod tests {
         git(&seed, &["commit", "-q", "-m", "candidate"]);
         let candidate = git(&seed, &["rev-parse", "HEAD"]);
         let repo = dir.join("source.git");
-        let output = Command::new("git")
+        let output = spawn_host::test_git_command()
             .args(["clone", "-q", "--bare"])
             .arg(&seed)
             .arg(&repo)

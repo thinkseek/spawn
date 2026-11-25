@@ -107,6 +107,8 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn node list [--json]\n       \
      spawn node add <name> --tcp <[tcp://]host:port>|--udp <[udp://]host:port>|--ssh <dest> [--via <hop>[,<hop>...]] [--mode direct|relay|hole_punch] [--note <text>]\n       \
      spawn node drain|undrain|remove <name>\n       \
+     spawn node enroll-token <name> [--cell <cell>] [--primary-pubkey <base64url> | --primary-pubkey-file <path>]\n       \
+     spawn node revoke <name>\n       \
      spawn node serve --listen <tcp://bind|udp://bind>[,...] | --tcp <bind> | --udp <bind> [--register-store] [--allow-loopback-forward] [--allow-unauthenticated]\n       \
      spawn node register --to <[tcp://|udp://]host:port> --name <name> --listen <tcp://host:port|udp://host:port> [--via <hop>[=<endpoint>][,...]] [--mode direct|relay|hole_punch] [--note <text>]\n       \
      spawn node add <name> --coord <ws://|wss://|tcp://...> --node-id <hex>|--peer <name> [--mode relay|hole_punch] [--note <text>]\n       \
