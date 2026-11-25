@@ -19,9 +19,12 @@ three append-only tables, filled from git and the event log.
   and two read-only routes, `GET /api/prov/who` and
   `GET /api/prov/change/<id>` ([`serve/prov.rs`](../crates/spawn-cli/src/serve/prov.rs),
   [docs/api.md](./api.md)).
-- PV3a (next): the landing writes its `land` Change itself, right after
-  the push, and a `Spawn-Change` trailer. Its rows must be the ones the
-  indexer writes; the indexer stays the truth.
+- PV3a (this page): the landing writes its `land` Change itself, right
+  after the push, and a `Spawn-Change` trailer; `spawn prov blast`; and
+  three planning commands, `revert --plan`, `split --plan --paths`,
+  `compose --plan` ([`provenance/plan.rs`](../crates/spawn-cli/src/provenance/plan.rs)),
+  with one more read-only route, `GET /api/prov/blast`. The hook's rows
+  are the ones the indexer writes; the indexer stays the truth.
 
 ## The model
 
@@ -49,7 +52,7 @@ three append-only tables, filled from git and the event log.
 ## Identity (decisions B2, binding)
 
 These rules are shared by the indexer and the landing hook (PV3a), so
-both write the same rows.
+both write the same rows (the hook runs the indexer's own walk).
 
 - **`change_id` is derived, never random**: `c` and the first 26
   characters of the lowercase base32 (RFC 4648, no padding) of
@@ -153,6 +156,89 @@ It prints one JSON line: the domain, how many Changes it recorded (`edit`,
   the reader login (decision D8: the reader selects the three tables). A
   line's blame needs the repository: the route refuses `line` (400).
 
+## At landing (PV3a)
+
+- **`Spawn-Change` (decision D1).** Every landing whose branch brings in
+  at least one `spawn checkpoint` commit ends with `Spawn-Change:
+  <change_id>`, its task's `edit` Change (`edit:task:<task id>` in
+  `git:<source>`), the last trailer line, after `Spawn-Task`,
+  `Spawn-Objective` and `Spawn-Head`. The integrator writes it where the
+  message becomes the commit (`landing_candidate` in
+  [`integrate/landing.rs`](../crates/spawn-cli/src/integrate/landing.rs)):
+  `landing_message` is given no source, and the mirror knows it (it was
+  cloned from it: `remote.origin.url`). A message without `Spawn-Task`,
+  a branch without a checkpoint or a mirror without an origin carries
+  none. It is the anchor that survives a squash or an export: a commit no
+  Change records is read through its trailers by `who`.
+- **The hook.** Right after the push moved main and `task.landed` is
+  recorded, `land()` calls `record_land`: the indexer's own walk, on a
+  throwaway view of the mirror (its objects by alternates, its only branch
+  `main` at the landing, removed afterwards). With every earlier commit of
+  main recorded, the only new first-parent commit is the landing: its
+  checkpoints are recorded first, then its `land` Change with its
+  `includes` edges and origins, with the rows `spawn prov index` writes
+  (tested against an indexer run in a second database). A landing whose
+  first parent is in no Change of the domain is left to the indexer
+  (main's history is not indexed yet), and so is one recorded already.
+- **It never fails or delays a landing.** It runs after the push and the
+  record; an error, or even a panic, is logged (`integrate: task N:
+  provenance not recorded ...`) and the landing stands; `spawn prov index`
+  records the same rows later (tested with the database unreachable at
+  the hook).
+
+## Blast radius
+
+`spawn prov blast <change id|task|commit>` (and `GET
+/api/prov/blast?target=<id>`, the same JSON, from the database alone on
+the reader login):
+
+- `changes`: the Changes the target names;
+- `later`: every later Change (by time, then id) with an entry on one of
+  their paths (a `tree` entry of its top-level directory counts), each
+  with those paths; a landing that `includes` one of them is listed in
+  `landed_by` instead;
+- `radius`: every Change that depends on them, by an edge (to its
+  `change_id`, its result or an entry's content) or an entry's `origin`,
+  nearest first, each with the link it was reached by and one shortest
+  path (`change_id#rev`);
+- `used`: the part of the radius reached by `used` edges alone (read along
+  the shortest path). The Git domain writes none; data snapshots (PV3b) do.
+
+## Plans
+
+`spawn prov revert --plan <target>`, `spawn prov split --plan <target>
+--paths <path>[,<path>...]`, `spawn prov compose --plan <target>...`,
+each with `--source <source> [--repo <git dir>]`, and `--onto <commit>`
+(main by default) for a revert or a compose. Each prints the exact tree
+its result has and the commands that make it, and **executes nothing**:
+no ref is written, and no object either (the merges are tried in a
+throwaway view, removed with it). A plan is carried out as an ordinary
+candidate branch: a task's workspace runs the commands (the
+`test "$(git write-tree)" = <tree>` among them checks the tree), the task
+is reported, and the gate judges and lands it. There is no second
+landing path.
+
+- **The Change a target names**: a commit's Change; a task's last `land`;
+  a Change's last revision, or, for an `edit` Change, the last landing
+  that includes it. Its result commit and the result's first parent (its
+  base) are applied, `-m 1` for a merge.
+- **revert**: the tree `git revert --no-commit [-m 1] <result>` leaves on
+  `onto`: the merge of `onto` and the base from the result, by `onto`'s
+  merge rules. A conflict names its paths, with no tree.
+- **split**: the Change in two. The first part is its base with the named
+  paths (a file, or every path the Change touched under a directory) as
+  its result holds them (`git checkout --no-overlay <result> -- <paths>`);
+  the second is its result (`git checkout --no-overlay <result> -- :/`).
+- **compose**: the Changes applied on `onto` in the order given, as
+  successive `git cherry-pick --no-commit [-m 1]`; a conflict names the
+  Change and its paths.
+- **Granularity: the file.** A part of one file (`<path>:<line>` or
+  `<path>:<from>-<to>`) is refused with `"granularity": "file"` (exit 1),
+  for a binary file always and, in this version, for a text file too
+  (decisions B4, B7); each refusal is logged on stderr, so the requests
+  can be counted. A compose takes whole Changes (split one first); a
+  revert takes no `--paths`.
+
 ## Limits
 
 - The domain is the `--source` text: index each source under the name its
@@ -160,7 +246,14 @@ It prints one JSON line: the domain, how many Changes it recorded (`edit`,
 - A landing recorded already is skipped without walking its branch: a
   landing hook that wrote the landing but not every checkpoint before it
   would leave those checkpoints out until the landing is recorded
-  afresh. The hook writes the checkpoints first.
+  afresh. The hook writes the checkpoints first (it is the indexer's walk).
+- The `Spawn-Change` trailer names the task's `edit` Change. A checkpoint
+  the indexer met earlier on an unlanded `spawn/*` branch with no task at
+  its time keeps the `edit:branch:...` Change it was recorded under: the
+  landing's `includes` edge names that one.
+- The owner's own landings (`spawn mission landing`) carry no `Spawn-Task`
+  and so no `Spawn-Change`, and the hook runs for the integrator's
+  landings only: the indexer records the others.
 - `GET /api/prov/who` counts `land` and `import` Changes only: a
   checkpoint that reached `main`'s first-parent line by a fast-forward is
   found by `spawn prov who`, which reads git.
