@@ -400,7 +400,10 @@
 //! again on that gate runner in the background, and its end is recorded
 //! beside it (`task.shadow_gated`, [`shadow`]); it never decides or delays
 //! anything, and a disagreement on equal inputs is told to the supervisor
-//! once.
+//! once. With `SPAWN_GATE_SHADOW_NODE=1` the same verdicts are judged again
+//! on spawn-node v1 too, recorded the same way (`runner` `node:<name>`;
+//! [`remote`]), and each pass runs the nodes' level-triggered sweep
+//! (`spawn_node_sweep`).
 //!
 //! Every `task.gated` also names its `class` ([`verdict_class`]: `code` for
 //! a verdict on the work, `infrastructure` for one the host could not
@@ -503,6 +506,7 @@ mod inputs;
 pub(crate) mod judging;
 mod landing;
 pub(crate) mod owner;
+mod remote;
 mod retained;
 mod shadow;
 mod verdicts;
@@ -1469,6 +1473,21 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         Ok(None) => {}
         Err(error) => eprintln!("integrate: {error}; no shadow judging"),
     }
+    // The shadow judging on spawn-node v1 (shadow.rs, remote.rs), beside
+    // the runner's when both are on.
+    match shadow::node_settings(crate::config::env_value) {
+        Ok(Some(settings)) => {
+            println!(
+                "integrate: judged verdicts are shadowed on spawn-node v1 (every {}-th)",
+                settings.every
+            );
+            let work = integrator.judge.root.join(".shadow-node");
+            let gate_env = integrator.judge.gate_env.clone();
+            integrator = integrator.with_node_shadow(settings, gate_env, work);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("integrate: {error}; no shadow judging on nodes"),
+    }
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1948,6 +1967,9 @@ struct Integrator {
     /// The shadow judging of verdicts on a gate runner ([`shadow`]); None
     /// when no runner is named (`SPAWN_GATE_SHADOW_RUNNER`).
     shadows: RefCell<Option<shadow::Shadows>>,
+    /// The shadow judging of verdicts on spawn-node v1
+    /// ([`shadow::NodeShadows`]); None unless `SPAWN_GATE_SHADOW_NODE=1`.
+    node_shadows: RefCell<Option<shadow::NodeShadows>>,
     /// While a source's main is red, how long after the last red gate or
     /// probe one more gate on it runs anyway, a probe
     /// (`SPAWN_GATE_MAIN_RED_PROBE_MS`, [`main_red_probe_ms`]).
@@ -2274,6 +2296,7 @@ impl Integrator {
             last_judged: RefCell::new(std::collections::HashMap::new()),
             warms: RefCell::new(None),
             shadows: RefCell::new(None),
+            node_shadows: RefCell::new(None),
             red_probe_ms: main_red_probe_ms(
                 crate::config::env_value("SPAWN_GATE_MAIN_RED_PROBE_MS").as_deref(),
             ),
@@ -2772,6 +2795,20 @@ impl Integrator {
         self
     }
 
+    /// This integrator shadowing judged verdicts on spawn-node v1 too
+    /// ([`shadow::NodeShadows`]), its snapshots in `work`.
+    fn with_node_shadow(
+        self,
+        settings: shadow::NodeSettings,
+        gate_env: Vec<(String, String)>,
+        work: PathBuf,
+    ) -> Self {
+        shadow::remove_tree(&work);
+        *self.node_shadows.borrow_mut() =
+            Some(shadow::NodeShadows::new(settings, gate_env, work));
+        self
+    }
+
     /// The pass's shadow, after its gates were given out: the one that
     /// ended is recorded (once: its directory is removed when the record is
     /// written, and a record that could not be written is tried again at
@@ -2785,11 +2822,7 @@ impl Integrator {
             .lock()
             .map(|mut wanted| wanted.drain(..).collect())
             .unwrap_or_default();
-        let mut shadows = self.shadows.borrow_mut();
-        let Some(shadows) = shadows.as_mut() else {
-            return;
-        };
-        shadows.record_ended(|shadowed| {
+        let write = |shadowed: &Value| -> Result<(), String> {
             record(store, shadowed)?;
             println!(
                 "integrate: task {} shadowed on {}: {} (the primary's {}), agrees {}",
@@ -2800,15 +2833,43 @@ impl Integrator {
                 shadowed["agrees"]
             );
             Ok(())
-        });
+        };
         // A drain starts no background judging: the verdicts recorded
         // meanwhile are not shadowed (one already running is recorded when
         // it ends, or ends with the integrator).
-        if self.draining() {
-            return;
+        let draining = self.draining();
+        if let Some(shadows) = self.shadows.borrow_mut().as_mut() {
+            shadows.record_ended(write);
+            if !draining {
+                for want in &wanted {
+                    shadows.offer(want.clone());
+                }
+            }
         }
-        for want in wanted {
-            shadows.offer(want);
+        // The node source, beside the runner: its jobs looked at, then the
+        // same verdicts offered.
+        if let Some(nodes) = self.node_shadows.borrow_mut().as_mut() {
+            nodes.poll(store, &write);
+            if !draining {
+                for want in wanted {
+                    nodes.offer(store, want);
+                }
+            }
+        }
+    }
+
+    /// The nodes' level-triggered sweep (`spawn_node_sweep`: leases past
+    /// their time wait for a result, then are fenced; silent nodes are
+    /// recorded lost), once a pass; never an error of the pass.
+    fn sweep_nodes(&self, store: &PostgresStore) {
+        match remote::sweep(store) {
+            Ok(swept) if swept.waiting + swept.fenced + swept.lost > 0 => println!(
+                "integrate: nodes swept: {} lease(s) waiting for a result, {} fenced, {} \
+                 node(s) lost",
+                swept.waiting, swept.fenced, swept.lost
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("integrate: the nodes' sweep: {error}"),
         }
     }
 
@@ -3010,6 +3071,7 @@ impl Integrator {
         self.stop_for(&urgent);
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm(store, steps.is_ok());
+        self.sweep_nodes(store);
         self.poll_shadow(store);
         steps
     }
