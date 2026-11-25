@@ -149,7 +149,10 @@ impl Drop for View {
 }
 
 /// `command` run with `input` on its standard input (none: null).
-fn run_with_input(command: &mut std::process::Command, input: Option<&[u8]>) -> Result<Output, String> {
+fn run_with_input(
+    command: &mut std::process::Command,
+    input: Option<&[u8]>,
+) -> Result<Output, String> {
     use std::io::Write as _;
     let Some(input) = input else {
         return command
@@ -335,7 +338,15 @@ pub(crate) fn wanted_paths(text: &str) -> Vec<Wanted> {
 fn binary(view: &View, base: &str, result: &str, path: &str) -> bool {
     let spec = format!(":(literal){path}");
     let numstat = view
-        .git(&["diff", "--numstat", "--no-renames", base, result, "--", &spec])
+        .git(&[
+            "diff",
+            "--numstat",
+            "--no-renames",
+            base,
+            result,
+            "--",
+            &spec,
+        ])
         .unwrap_or_default();
     let numstat = String::from_utf8_lossy(&numstat);
     if let Some(line) = numstat.lines().next() {
@@ -344,14 +355,7 @@ fn binary(view: &View, base: &str, result: &str, path: &str) -> bool {
     // Untouched: git's own test against the empty tree.
     for commit in [result, base] {
         let listing = view
-            .git(&[
-                "diff",
-                "--numstat",
-                index::EMPTY_TREE,
-                commit,
-                "--",
-                &spec,
-            ])
+            .git(&["diff", "--numstat", index::EMPTY_TREE, commit, "--", &spec])
             .unwrap_or_default();
         if let Some(line) = String::from_utf8_lossy(&listing).lines().next() {
             return line.starts_with("-\t-\t");

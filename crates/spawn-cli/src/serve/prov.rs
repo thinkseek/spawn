@@ -66,8 +66,7 @@ pub(super) fn blast(query: &str) -> Result<Value, String> {
     let text = parameter(query, "target")
         .filter(|text| !text.is_empty())
         .ok_or_else(|| format!("{BAD_REQUEST}?target= is required"))?;
-    let word =
-        percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad target {text}"))?;
+    let word = percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad target {text}"))?;
     let target = provenance::target(&word).map_err(|error| format!("{BAD_REQUEST}{error}"))?;
     let store = open_store()?;
     provenance::blast(&store, &target)
@@ -97,7 +96,14 @@ mod tests {
 
     #[test]
     fn a_blast_without_a_valid_target_is_refused_before_the_store_is_opened() {
-        for query in ["", "target=", "id=12", "target=abc", "target=%zz", "target=c123"] {
+        for query in [
+            "",
+            "target=",
+            "id=12",
+            "target=abc",
+            "target=%zz",
+            "target=c123",
+        ] {
             let error = blast(query).expect_err(query);
             assert!(error.starts_with(BAD_REQUEST), "{query}: {error}");
         }

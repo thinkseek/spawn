@@ -103,7 +103,6 @@ impl Work {
     }
 }
 
-
 /// The history up to the branch (no landing yet).
 fn branch(root: &Path) -> (Work, String, String, String) {
     let dir = root.join("work");
@@ -312,7 +311,12 @@ fn blast_names_later_changes_and_who_follows_a_squashed_landings_trailers() {
             .as_array()
             .expect("a list")
             .iter()
-            .map(|row| row["change"]["result"].as_str().expect("result").to_string())
+            .map(|row| {
+                row["change"]["result"]
+                    .as_str()
+                    .expect("result")
+                    .to_string()
+            })
             .collect()
     };
     assert_eq!(
@@ -343,7 +347,11 @@ fn blast_names_later_changes_and_who_follows_a_squashed_landings_trailers() {
         LATER,
         &["clone", "-q", "--bare", &git_dir, &clone_path],
     );
-    let tree = git_in(&clone, LATER, &["rev-parse", &format!("{landing}^{{tree}}")]);
+    let tree = git_in(
+        &clone,
+        LATER,
+        &["rev-parse", &format!("{landing}^{{tree}}")],
+    );
     let squashed = git_in(
         &clone,
         1_800_000_000,
@@ -351,9 +359,9 @@ fn blast_names_later_changes_and_who_follows_a_squashed_landings_trailers() {
     );
     git_in(&clone, LATER, &["update-ref", "refs/heads/main", &squashed]);
     let repo = Repo::open(&clone_path).expect("the clone");
-    let land_change = super::show(&store, &Target::Commit(landing)).expect("show")["changes"][0]
-        ["change"]
-        .clone();
+    let land_change =
+        super::show(&store, &Target::Commit(landing)).expect("show")["changes"][0]["change"]
+            .clone();
     for path in ["src/b.txt", "bin.dat"] {
         let said = who(&store, &repo, &domain(), path).expect("who");
         assert_eq!(said["commit"], squashed.as_str(), "{said:#}");
@@ -442,7 +450,11 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     let hand_path = hand.display().to_string();
     git_in(&scratch.0, LATER, &["clone", "-q", &git_dir, &hand_path]);
     git_in(&hand, LATER, &["switch", "-q", "--detach", &own]);
-    git_in(&hand, LATER, &["revert", "--no-commit", "-m", "1", &landing]);
+    git_in(
+        &hand,
+        LATER,
+        &["revert", "--no-commit", "-m", "1", &landing],
+    );
     assert_eq!(git_in(&hand, LATER, &["write-tree"]), reverted["tree"]);
     git_in(&hand, LATER, &["reset", "-q", "--hard"]);
     run_commands(&hand, &reverted["commands"]);
@@ -477,12 +489,7 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     );
     assert!(plan::split(&view, &landed, &["nowhere".to_string()]).is_err());
     assert!(
-        plan::split(
-            &view,
-            &landed,
-            &["src".to_string(), "bin.dat".to_string()]
-        )
-        .is_err(),
+        plan::split(&view, &landed, &["src".to_string(), "bin.dat".to_string()]).is_err(),
         "every path: nothing to split"
     );
 
@@ -555,7 +562,14 @@ fn a_messages_spawn_change_lines_are_read_from_its_last_paragraph() {
         "a".repeat(40)
     );
     assert_eq!(super::spawn_changes(&message), vec![id.clone()]);
-    assert_eq!(super::spawn_changes(&format!("Spawn-Change: {id}")), Vec::<String>::new());
-    assert_eq!(index::trailers(&message).task, Some(11), "the other trailers still read");
+    assert_eq!(
+        super::spawn_changes(&format!("Spawn-Change: {id}")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        index::trailers(&message).task,
+        Some(11),
+        "the other trailers still read"
+    );
     assert_eq!(id, index::change_id(&domain(), "edit:task:11"));
 }

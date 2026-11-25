@@ -112,7 +112,10 @@ pub(super) fn landing_candidate(
         };
         tree
     };
-    let message = with_change_trailers(message, &change_trailers(mirror_path, main, branch, message));
+    let message = with_change_trailers(
+        message,
+        &change_trailers(mirror_path, main, branch, message),
+    );
     commit_landing(
         mirror_path,
         &[&tree, "-p", main, "-p", branch, "-m", &message],
@@ -780,7 +783,8 @@ mod tests {
     /// message with no `Spawn-Task` or a mirror with no origin adds none.
     #[test]
     fn a_landing_ends_with_the_spawn_change_of_its_tasks_checkpoints() {
-        let base = std::env::temp_dir().join(format!("spawn-change-trailer-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("spawn-change-trailer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed");
@@ -800,7 +804,8 @@ mod tests {
         let mirror = base.join("mirror.git").to_string_lossy().to_string();
         git(&["clone", "-q", "--bare", "--", &source, &mirror]).expect("mirror");
 
-        let message = "Title (task 7)\n\nThe task's report is empty.\n\nSpawn-Task: 7\nSpawn-Head: h\n";
+        let message =
+            "Title (task 7)\n\nThe task's report is empty.\n\nSpawn-Task: 7\nSpawn-Head: h\n";
         let changes = change_trailers(&mirror, &main, &checkpoint, message);
         assert_eq!(changes, vec![crate::provenance::source_change(&source, 7)]);
         let full = with_change_trailers(message, &changes);
@@ -816,7 +821,10 @@ mod tests {
         assert_eq!(crate::provenance::spawn_changes(&full), changes);
         assert_eq!(with_change_trailers(message, &[]), message);
 
-        assert!(change_trailers(&mirror, &main, &plain, message).is_empty(), "no checkpoint");
+        assert!(
+            change_trailers(&mirror, &main, &plain, message).is_empty(),
+            "no checkpoint"
+        );
         assert!(
             change_trailers(&mirror, &main, &checkpoint, "Title\n\nno trailers\n").is_empty(),
             "no Spawn-Task"

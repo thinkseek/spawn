@@ -11053,8 +11053,15 @@ fn push_checkpoint(base: &Path, source: &str, mirror: &Path, agent: &str) -> Str
     std::fs::write(clone.join("work.txt"), "work\n").expect("write");
     super::tests::commit_in(&clone_path, "spawn checkpoint exec_p1");
     let branch = format!("refs/heads/spawn/{agent}");
-    git(&["-C", &clone_path, "push", "-q", "origin", &format!("HEAD:{branch}")])
-        .expect("push the agent's branch");
+    git(&[
+        "-C",
+        &clone_path,
+        "push",
+        "-q",
+        "origin",
+        &format!("HEAD:{branch}"),
+    ])
+    .expect("push the agent's branch");
     git(&[
         "--git-dir",
         &mirror.to_string_lossy(),
@@ -11100,7 +11107,13 @@ fn land_with_provenance(tag: &str, hook_down: bool) -> (Db, String, PathBuf, Str
     .expect("the message");
     assert_eq!(
         written.lines().last(),
-        Some(format!("Spawn-Change: {}", crate::provenance::source_change(&source, task)).as_str()),
+        Some(
+            format!(
+                "Spawn-Change: {}",
+                crate::provenance::source_change(&source, task)
+            )
+            .as_str()
+        ),
         "{written}"
     );
     db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
@@ -11129,8 +11142,15 @@ fn a_landing_records_its_land_change_right_after_the_push() {
     .expect("show");
     let change = &shown["changes"][0];
     assert_eq!(change["change"]["kind"], "land", "{shown:#}");
-    let message = git(&["--git-dir", &db_mirror(&base), "log", "-1", "--format=%B", &candidate])
-        .expect("the landed message");
+    let message = git(&[
+        "--git-dir",
+        &db_mirror(&base),
+        "log",
+        "-1",
+        "--format=%B",
+        &candidate,
+    ])
+    .expect("the landed message");
     assert_eq!(change["edges"][0]["kind"], "includes");
     assert_eq!(
         json!(crate::provenance::spawn_changes(&message)),
@@ -11163,9 +11183,8 @@ fn a_landing_whose_provenance_hook_fails_still_lands_and_the_indexer_records_it(
     let mut repo = crate::provenance::index::Repo::open(&db_mirror(&base)).expect("the source");
     let later = crate::provenance::index::index(&db.store, &mut repo, &domain).expect("index");
     assert_eq!((later.edits, later.lands), (1, 1), "{later:?}");
-    let shown =
-        crate::provenance::show(&db.store, &crate::provenance::Target::Commit(candidate))
-            .expect("show");
+    let shown = crate::provenance::show(&db.store, &crate::provenance::Target::Commit(candidate))
+        .expect("show");
     assert_eq!(shown["changes"][0]["change"]["kind"], "land");
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -33,9 +33,9 @@
 //! Every answer is JSON.
 
 pub(crate) mod index;
-pub(crate) mod plan;
 #[cfg(test)]
 mod land_tests;
+pub(crate) mod plan;
 #[cfg(test)]
 mod tests;
 
@@ -45,8 +45,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 use spawn_postgres::PostgresStore;
 use spawn_postgres::provenance::{
-    ProvChangeKind, ProvChangeRecord, ProvDirection, ProvEdgeKind, ProvEntryClass,
-    ProvEntryRecord, ProvLink,
+    ProvChangeKind, ProvChangeRecord, ProvDirection, ProvEdgeKind, ProvEntryClass, ProvEntryRecord,
+    ProvLink,
 };
 
 use crate::Flags;
@@ -401,8 +401,9 @@ pub(crate) fn who(
     // is gone, or exported): its integrator's trailers name the landing's
     // Change (`Spawn-Task` and `Spawn-Head` give its key), and its
     // `Spawn-Change` lines the source Changes it included (D1).
-    let message = String::from_utf8_lossy(&repo.git(&["log", "-1", "--format=%B", &commit, "--"])?)
-        .into_owned();
+    let message =
+        String::from_utf8_lossy(&repo.git(&["log", "-1", "--format=%B", &commit, "--"])?)
+            .into_owned();
     if change.is_none() {
         let trailers = index::trailers(&message);
         if let (Some(task), Some(head)) = (trailers.task, trailers.head) {
@@ -497,7 +498,6 @@ pub(crate) fn who_recorded(
             .collect::<Vec<_>>(),
     }))
 }
-
 
 /// The `change_id` of task `task`'s `edit` Change in the domain of `source`
 /// (decisions B2): what a landing's `Spawn-Change` trailer names (D1).
@@ -638,7 +638,10 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
     let error = |error: spawn_core::port::StoreError| error.to_string();
     let start = changes_of(store, target)?;
     let ids: HashSet<i64> = start.iter().map(|change| change.id).collect();
-    let change_ids: HashSet<&str> = start.iter().map(|change| change.change_id.as_str()).collect();
+    let change_ids: HashSet<&str> = start
+        .iter()
+        .map(|change| change.change_id.as_str())
+        .collect();
     // Each path once per domain, from the earliest start Change touching it.
     let mut paths: BTreeMap<(String, String), (i64, i64, bool)> = BTreeMap::new();
     for change in &start {
@@ -679,9 +682,13 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
     for (change, paths) in later.into_values() {
         let shown = json!({"change": change_json(&change), "paths": paths});
         let lands_it = change.kind == ProvChangeKind::Land
-            && store.prov_edges(change.id).map_err(error)?.iter().any(|edge| {
-                edge.kind == ProvEdgeKind::Includes && change_ids.contains(edge.dst.as_str())
-            });
+            && store
+                .prov_edges(change.id)
+                .map_err(error)?
+                .iter()
+                .any(|edge| {
+                    edge.kind == ProvEdgeKind::Includes && change_ids.contains(edge.dst.as_str())
+                });
         if lands_it {
             landed_by.push(shown);
         } else {
@@ -721,9 +728,11 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
                 "via": link_name(node.via),
                 "path": path,
             });
-            let by_used = node.path.iter().skip(1).all(|id| {
-                links.get(id) == Some(&ProvLink::Edge(ProvEdgeKind::Used))
-            });
+            let by_used = node
+                .path
+                .iter()
+                .skip(1)
+                .all(|id| links.get(id) == Some(&ProvLink::Edge(ProvEdgeKind::Used)));
             if by_used {
                 used.insert(node.id, shown.clone());
             } else {
@@ -738,7 +747,10 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
             .map(|(id, value)| (value["depth"].as_i64().unwrap_or_default(), id, value))
             .collect();
         values.sort_by_key(|(depth, id, _)| (*depth, *id));
-        values.into_iter().map(|(_, _, value)| value).collect::<Vec<_>>()
+        values
+            .into_iter()
+            .map(|(_, _, value)| value)
+            .collect::<Vec<_>>()
     };
     Ok(json!({
         "indexed": !start.is_empty(),
@@ -894,7 +906,10 @@ fn plan_command(verb: &str, rest: &[String]) -> Result<i32, String> {
         .unwrap_or_default();
     for wanted in &wanted {
         if let plan::Wanted::Part { path, lines } = wanted {
-            println!("{}", pretty(&plan::refusal(&view, verb, &picks[0], path, lines)));
+            println!(
+                "{}",
+                pretty(&plan::refusal(&view, verb, &picks[0], path, lines))
+            );
             return Ok(1);
         }
     }
