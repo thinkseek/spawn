@@ -1,9 +1,10 @@
 -- Spawn storage: event log, command queue, read views.
 --
 -- Times are Unix epoch milliseconds in bigint, so no client date library is
--- needed. Every append takes one transaction-level advisory lock: it makes
--- "id order equals commit order" true, which lets a global reader store its
--- last position and never skip an event.
+-- needed. Every newly inserted event gets its id under one transaction-level
+-- advisory lock: it makes "id order equals commit order" true, which lets a
+-- global reader store its last position and never skip an event. A committed
+-- idempotent repeat can be read without joining a contended lock queue.
 
 -- A connection whose search_path names a schema that does not exist yet
 -- (an isolated test run) gets it created, so everything below lands there.
@@ -283,7 +284,25 @@ declare
     -- Only the Observer's judgement is the projected state.
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
-    perform pg_advisory_xact_lock(1399957335);
+    -- Keep the uncontended path free of an extra index read. Only a caller
+    -- that would otherwise wait looks for a committed duplicate, which
+    -- allocates no id and changes no state. A racing first write is not yet
+    -- visible here; the caller takes the lock and finds that event below.
+    if not pg_try_advisory_xact_lock(1399957335) then
+        if p_source_key is not null then
+            select e.id, e.session_seq, e.recorded_at_ms into v_id, v_seq, v_at
+                from spawn_events e
+                where e.session_id = p_session
+                  and e.source = p_source
+                  and e.source_event_id = p_source_key
+                limit 1;
+            if found then
+                return query select v_id, v_seq, v_at, false;
+                return;
+            end if;
+        end if;
+        perform pg_advisory_xact_lock(1399957335);
+    end if;
 
     if p_source_key is not null and exists (
         select 1 from spawn_events e
@@ -479,8 +498,19 @@ declare
     v_id bigint;
 begin
     -- The id is taken under the append lock, which is held to commit:
-    -- commands commit in id order, the order `spawn_claim` relies on.
-    perform pg_advisory_xact_lock(1399957335);
+    -- commands commit in id order, the order `spawn_claim` relies on. Only a
+    -- caller that would wait looks for an already committed key first; a
+    -- first submission still in flight uses the conflict path below.
+    if not pg_try_advisory_xact_lock(1399957335) then
+        select c.id into v_id
+            from spawn_commands c
+            where c.principal = p_principal and c.idempotency_key = p_key;
+        if v_id is not null then
+            return query select v_id;
+            return;
+        end if;
+        perform pg_advisory_xact_lock(1399957335);
+    end if;
     insert into spawn_commands
         (principal, idempotency_key, agent_id, session_id, action, state, created_at_ms)
     values
@@ -8289,3 +8319,245 @@ begin
 end
 $$;
 
+
+-- Universal file provenance (PV1): which change made each file as it is,
+-- who made it (agent, execution, task, preset, model) and what it used.
+-- Three append-only tables:
+-- - `prov_changes`: one row per recorded change, keyed by its
+--   `(change_id, rev)`; `base` and `result` are the tree digests before and
+--   after it, `boundary` the point at which it was recorded.
+-- - `prov_entries`: the paths a change touched, each with its content digest
+--   before and after (null: absent), and `origin` the earlier change its
+--   content came from (a revert, a cherry-pick, an import).
+-- - `prov_edges`: what a change used, included, superseded or redacted;
+--   `dst` names a change by its `change_id`, a tree digest (`result`) or a
+--   content digest (`prov_entries.after`).
+-- Every value is checked once, as it is written (rows are never changed):
+-- non-empty ids, digests, domain and path, a revision from 1, a size of 0 or
+-- more and an edge's detail a JSON object.
+-- Only `spawn_prov_record_change` (owner only) writes them; every update,
+-- delete and truncate is refused by trigger. The reader selects them.
+create table if not exists prov_changes (
+    id bigint generated always as identity primary key,
+    change_id text collate "C" not null check (char_length(change_id) > 0),
+    rev integer not null check (rev >= 1),
+    kind text not null check (kind in ('edit', 'derive', 'land', 'revert', 'import')),
+    domain text not null check (char_length(domain) > 0),
+    agent_id text not null check (char_length(agent_id) > 0),
+    execution_id text,
+    task_id bigint,
+    preset_id text,
+    model_label text,
+    transcript_ref text,
+    attributed text not null default 'host' check (attributed in ('host', 'inferred', 'imported')),
+    base text collate "C" not null check (char_length(base) > 0),
+    result text collate "C" not null check (char_length(result) > 0),
+    boundary text not null check (boundary in ('checkpoint', 'submit', 'land', 'job', 'backfill')),
+    at_ms bigint not null,
+    unique (change_id, rev)
+);
+create index if not exists prov_changes_agent on prov_changes (agent_id, at_ms);
+create index if not exists prov_changes_execution on prov_changes (execution_id, at_ms)
+    where execution_id is not null;
+create index if not exists prov_changes_result on prov_changes (result);
+
+create table if not exists prov_entries (
+    change bigint not null references prov_changes (id),
+    path text collate "C" not null check (char_length(path) > 0),
+    before text collate "C",
+    after text collate "C",
+    size bigint check (size is null or size >= 0),
+    class text not null default 'content' check (class in ('content', 'mechanical', 'generated', 'tree')),
+    origin bigint references prov_changes (id),
+    primary key (change, path)
+);
+-- Which changes produced a content digest, and one path's history.
+create index if not exists prov_entries_after on prov_entries (after) where after is not null;
+create index if not exists prov_entries_path on prov_entries (path, change);
+create index if not exists prov_entries_origin on prov_entries (origin) where origin is not null;
+
+create table if not exists prov_edges (
+    id bigint generated always as identity primary key,
+    kind text not null check (kind in ('used', 'includes', 'supersedes', 'redacts')),
+    src bigint not null references prov_changes (id),
+    dst text collate "C" not null,
+    detail jsonb not null default '{}'::jsonb check (jsonb_typeof(detail) = 'object'),
+    at_ms bigint not null
+);
+create index if not exists prov_edges_dst on prov_edges (dst);
+create index if not exists prov_edges_src on prov_edges (src);
+
+revoke all on prov_changes, prov_entries, prov_edges from public;
+
+-- Provenance is never changed: what was recorded stays as recorded.
+create or replace function spawn_prov_unchanged() returns trigger
+language plpgsql as $$
+begin
+    raise exception 'provenance is append-only: % on % refused', lower(tg_op), tg_table_name
+        using errcode = '42501';
+end $$;
+revoke execute on function spawn_prov_unchanged() from public;
+drop trigger if exists prov_changes_unchanged on prov_changes;
+create trigger prov_changes_unchanged before update or delete on prov_changes
+    for each row execute function spawn_prov_unchanged();
+drop trigger if exists prov_changes_untruncated on prov_changes;
+create trigger prov_changes_untruncated before truncate on prov_changes
+    for each statement execute function spawn_prov_unchanged();
+drop trigger if exists prov_entries_unchanged on prov_entries;
+create trigger prov_entries_unchanged before update or delete on prov_entries
+    for each row execute function spawn_prov_unchanged();
+drop trigger if exists prov_entries_untruncated on prov_entries;
+create trigger prov_entries_untruncated before truncate on prov_entries
+    for each statement execute function spawn_prov_unchanged();
+drop trigger if exists prov_edges_unchanged on prov_edges;
+create trigger prov_edges_unchanged before update or delete on prov_edges
+    for each row execute function spawn_prov_unchanged();
+drop trigger if exists prov_edges_untruncated on prov_edges;
+create trigger prov_edges_untruncated before truncate on prov_edges
+    for each statement execute function spawn_prov_unchanged();
+
+-- A recorded change as `spawn_prov_record_change` compares it: the change's
+-- columns but its id, its entries by path (without `change`) and its edges
+-- in a fixed order (without `id` and `src`).
+create or replace function spawn_prov_canonical(p_id bigint) returns jsonb
+language sql stable as $$
+    select jsonb_build_object(
+        'change', (select to_jsonb(c) - 'id' from prov_changes c where c.id = p_id),
+        'entries', (select coalesce(jsonb_agg(to_jsonb(n) - 'change' order by n.path), '[]'::jsonb)
+                      from prov_entries n where n.change = p_id),
+        'edges', (select coalesce(jsonb_agg(to_jsonb(e) - 'id' - 'src'
+                                            order by e.kind, e.dst, e.at_ms, e.detail::text),
+                                  '[]'::jsonb)
+                    from prov_edges e where e.src = p_id))
+$$;
+
+-- Record one change (owner only), atomically: its `prov_changes` row from
+-- `p_change` (an object of its columns but `id`; `attributed` defaults to
+-- host), its `prov_entries` from `p_entries` (an array of objects of their
+-- columns but `change`; `class` defaults to content) and its `prov_edges`
+-- from `p_edges` (null or an array of objects of `kind`, `dst`, `detail`
+-- (default {}) and `at_ms` (default the change's); `src` is the change).
+-- Returns the change's id.
+--
+-- Idempotent: recording a `(change_id, rev)` already recorded with exactly
+-- the same change, entries and edges returns the recorded id and writes
+-- nothing; with anything different it is refused (23505, "recorded already
+-- with different content") and nothing is written. An unknown key, a value
+-- of the wrong type, a missing required column, a check's violation, a
+-- path twice and an origin that names no change are refused likewise.
+create or replace function spawn_prov_record_change(p_change jsonb, p_entries jsonb, p_edges jsonb)
+returns bigint
+language plpgsql security definer as $$
+declare
+    v_change prov_changes;
+    v_given jsonb;
+    v_edges jsonb;
+    v_id bigint;
+    v_unknown text;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner records provenance' using errcode = '42501';
+    end if;
+    if jsonb_typeof(p_change) is distinct from 'object' then
+        raise exception 'a provenance change is a JSON object of its columns' using errcode = '22023';
+    end if;
+    if jsonb_typeof(p_entries) is distinct from 'array'
+       or exists (select 1 from jsonb_array_elements(p_entries) n where jsonb_typeof(n) <> 'object') then
+        raise exception 'provenance entries are a JSON array of objects' using errcode = '22023';
+    end if;
+    if p_edges is not null and jsonb_typeof(p_edges) <> 'null'
+       and (jsonb_typeof(p_edges) <> 'array'
+            or exists (select 1 from jsonb_array_elements(p_edges) e where jsonb_typeof(e) <> 'object')) then
+        raise exception 'provenance edges are null or a JSON array of objects' using errcode = '22023';
+    end if;
+    select string_agg(k, ', ' order by k) into v_unknown
+      from (select k from jsonb_object_keys(p_change) k
+             where k not in ('change_id', 'rev', 'kind', 'domain', 'agent_id', 'execution_id',
+                             'task_id', 'preset_id', 'model_label', 'transcript_ref',
+                             'attributed', 'base', 'result', 'boundary', 'at_ms')
+            union
+            select k from jsonb_array_elements(p_entries) n, jsonb_object_keys(n) k
+             where k not in ('path', 'before', 'after', 'size', 'class', 'origin')
+            union
+            select k from jsonb_array_elements(case jsonb_typeof(p_edges) when 'array' then p_edges
+                                                                         else '[]'::jsonb end) e,
+                          jsonb_object_keys(e) k
+             where k not in ('kind', 'dst', 'detail', 'at_ms')) u;
+    if v_unknown is not null then
+        raise exception 'unknown provenance keys: %', v_unknown using errcode = '22023';
+    end if;
+
+    v_change := jsonb_populate_record(null::prov_changes, p_change);
+    v_change.id := null;
+    v_change.attributed := coalesce(v_change.attributed, 'host');
+    v_given := jsonb_build_object(
+        'change', to_jsonb(v_change) - 'id',
+        'entries', (select coalesce(jsonb_agg(to_jsonb(n) - 'change' order by n.path), '[]'::jsonb)
+                      from (select null::bigint as change, r.path, r.before, r.after, r.size,
+                                   coalesce(r.class, 'content') as class, r.origin
+                              from jsonb_populate_recordset(null::prov_entries, p_entries) r) n),
+        'edges', '[]'::jsonb);
+    -- The edges as given (their order is their ids'), with their defaults.
+    select coalesce(jsonb_agg(jsonb_build_object('kind', r.kind, 'dst', r.dst,
+                                                 'detail', coalesce(r.detail, '{}'::jsonb),
+                                                 'at_ms', coalesce(r.at_ms, v_change.at_ms))
+                              order by x.at),
+                    '[]'::jsonb)
+      into v_edges
+      from jsonb_array_elements(case jsonb_typeof(p_edges) when 'array' then p_edges
+                                                           else '[]'::jsonb end)
+           with ordinality x(edge, at),
+           jsonb_populate_record(null::prov_edges, x.edge) r;
+    v_given := jsonb_set(v_given, '{edges}',
+                         (select coalesce(jsonb_agg(e order by e ->> 'kind', (e ->> 'dst') collate "C",
+                                                    (e ->> 'at_ms')::bigint, (e -> 'detail')::text),
+                                          '[]'::jsonb)
+                            from jsonb_array_elements(v_edges) e));
+
+    insert into prov_changes (change_id, rev, kind, domain, agent_id, execution_id, task_id,
+                              preset_id, model_label, transcript_ref, attributed, base, result,
+                              boundary, at_ms)
+    values (v_change.change_id, v_change.rev, v_change.kind, v_change.domain, v_change.agent_id,
+            v_change.execution_id, v_change.task_id, v_change.preset_id, v_change.model_label,
+            v_change.transcript_ref, v_change.attributed, v_change.base, v_change.result,
+            v_change.boundary, v_change.at_ms)
+    on conflict (change_id, rev) do nothing
+    returning id into v_id;
+
+    if v_id is null then
+        -- Recorded already (by an earlier call, or one that committed while
+        -- this one waited on the key): the same content is this one.
+        select c.id into v_id from prov_changes c
+         where c.change_id = v_change.change_id and c.rev = v_change.rev;
+        if spawn_prov_canonical(v_id) is distinct from v_given then
+            raise exception 'provenance change (%, %) is recorded already with different content',
+                            v_change.change_id, v_change.rev
+                using errcode = '23505';
+        end if;
+        return v_id;
+    end if;
+
+    insert into prov_entries (change, path, before, after, size, class, origin)
+    select v_id, r.path, r.before, r.after, r.size, r.class, r.origin
+      from jsonb_populate_recordset(null::prov_entries, v_given -> 'entries') r;
+    insert into prov_edges (kind, src, dst, detail, at_ms)
+    select r.kind, v_id, r.dst, r.detail, r.at_ms
+      from jsonb_array_elements(v_edges) with ordinality x(edge, at),
+           jsonb_populate_record(null::prov_edges, x.edge) r
+     order by x.at;
+    return v_id;
+end $$;
+do $$
+begin
+    execute format('alter function spawn_prov_canonical(bigint) set search_path = %I, pg_temp',
+                   current_schema());
+    execute format('alter function spawn_prov_record_change(jsonb, jsonb, jsonb) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_prov_canonical(bigint) from public';
+    execute 'revoke execute on function spawn_prov_record_change(jsonb, jsonb, jsonb) from public';
+    -- The reader selects every relation (its parity with the rest of the
+    -- schema); only the owner records.
+    execute format('grant select on prov_changes, prov_entries, prov_edges to %I',
+                   spawn_login_role('spawn_reader'));
+end
+$$;

@@ -1,0 +1,1 @@
+{"v":1,"cell_id":"c0","state":"idle","spec_sha256":"9d45101b5c0e737a0f54529ff68d874651d84e9255f90ce2f9935f15e8458960","capacities":{"gate_sandbox":{"free":4,"total":4},"batch_cpu":{"free":160,"total":160}},"tmpfs_budget_mb":{"free":262144,"total":262144},"leases":[],"lease_results_pending":[],"warm_bases":[],"edge":"boot"}

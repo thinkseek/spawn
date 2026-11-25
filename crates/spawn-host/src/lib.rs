@@ -210,4 +210,16 @@ impl spawn_core::port::TerminalHost for LocalTerminalHost {
     fn terminate_waits(&self) -> bool {
         self.inner().terminate_waits()
     }
+
+    fn agent(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Option<spawn_core::port::AgentReading>, TerminalError> {
+        self.inner().agent(terminal, workspace)
+    }
+
+    fn agent_changes(&self) -> Vec<TerminalName> {
+        self.inner().agent_changes()
+    }
 }

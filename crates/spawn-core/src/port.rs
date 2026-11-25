@@ -551,6 +551,60 @@ pub enum Runner {
 /// writes cannot make the Bridge hold an unbounded buffer.
 pub const READ_LIMIT: usize = 8 << 20;
 
+/// What a terminal host that watches agents itself (Herdr) says an agent
+/// is doing ([`TerminalHost::agent`]). Herdr's `done` (idle after work
+/// nobody has looked at yet) is [`AgentStatus::Idle`]: whether anyone saw
+/// the work is no state of the agent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentStatus {
+    /// At its prompt, nothing running that the host can see.
+    Idle,
+    /// A turn runs.
+    Working,
+    /// A dialog of the agent's waits for an answer.
+    Blocked,
+    /// The host cannot tell (starting up, an unknown screen).
+    Unknown,
+}
+
+impl AgentStatus {
+    /// The status as Herdr names it (`idle`, `done`, `working`, `blocked`,
+    /// `unknown`); anything else is [`AgentStatus::Unknown`].
+    pub fn from_herdr(status: &str) -> Self {
+        match status {
+            "idle" | "done" => Self::Idle,
+            "working" => Self::Working,
+            "blocked" => Self::Blocked,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// One reading of the agent a terminal hosts, as the terminal host's own
+/// agent detection has it: a second witness beside the Bridge's own reading
+/// of the pane, never the state machine itself (crate::bridge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentReading {
+    /// The agent the host detected in the pane (`claude`, `agy`); `None`
+    /// when it detects none there (a shell, an engine that exited).
+    pub agent: Option<String>,
+    /// What it is doing.
+    pub status: AgentStatus,
+    /// The host's rule that decided the status (`permission_prompt`);
+    /// `None` when the status is the host's fallback (idle for a known agent
+    /// whose screen matched no rule).
+    pub rule: Option<String>,
+    /// The rule saw a dialog on screen (Herdr's `visible_blocker`).
+    pub blocker_visible: bool,
+    /// The native session the agent reported to the host, when it did.
+    pub session: Option<String>,
+    /// The host's count of the agent's status changes: the same number is
+    /// the same reading.
+    pub seq: u64,
+    /// The version of the detection rules the host read the screen with.
+    pub manifest: Option<String>,
+}
+
 /// Named interactive terminals.
 pub trait TerminalHost: Send + Sync {
     /// Start a detached terminal that runs the launch.
@@ -737,6 +791,26 @@ pub trait TerminalHost: Send + Sync {
     /// Bridge calls it in line.
     fn terminate_waits(&self) -> bool {
         false
+    }
+
+    /// What the host's own agent detection says the terminal's agent is
+    /// doing: `None` from a host that has none (tmux, in memory), which
+    /// leaves the Bridge on its own reading of the pane, exactly as before.
+    /// A host that has one answers for every terminal, a missing one too
+    /// (no agent there).
+    fn agent(
+        &self,
+        _terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<Option<AgentReading>, TerminalError> {
+        Ok(None)
+    }
+
+    /// The terminals whose agent changed since the last call, as the host
+    /// was told (never blocks): what makes the Bridge read a pane sooner
+    /// than its backstop. Empty from a host with no agent detection.
+    fn agent_changes(&self) -> Vec<TerminalName> {
+        Vec::new()
     }
 }
 

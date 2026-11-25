@@ -1,0 +1,1 @@
+{"v":1,"name":"n252","cell_id":"c0","labels":["linux","x86_64","tier:tmpfs-bwrap"],"resources_total":{"cores":192,"mem_mb":2063000,"disk_mb":3460000},"capacities_total":{"gate_sandbox":4,"batch_cpu":160},"tmpfs_budget_mb":262144,"holds":{"pg":"16"}}

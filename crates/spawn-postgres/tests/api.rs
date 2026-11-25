@@ -138,6 +138,67 @@ fn submit_is_idempotent_and_accepts_once() {
 }
 
 #[test]
+fn committed_duplicates_do_not_wait_for_the_append_lock() {
+    let (store, schema) = store("duplicate_lock");
+    let mut keyed = message(EventKind::MessageReceived);
+    keyed.source_event_id = Some("hook:prompt_1".to_string());
+    let kept = store.append(keyed).expect("append succeeds");
+    let principal = Principal::new("tester").expect("valid principal");
+    let command = store
+        .submit(&principal, &start(session(), "key_duplicate"))
+        .expect("submit succeeds");
+
+    let mut holder = admin(&schema);
+    let mut holding = holder.transaction().expect("begin");
+    holding
+        .execute("select pg_advisory_xact_lock(1399957335)", &[])
+        .expect("hold the append lock");
+
+    let worker_schema = schema.to_string();
+    let worker = std::thread::spawn(move || -> Result<_, postgres::Error> {
+        let mut client = admin(&worker_schema);
+        // A regression waits here and fails instead of hanging the test.
+        client.execute("set lock_timeout = '1s'", &[])?;
+        let event = client.query_one(
+            "select out_id, out_seq, out_inserted from spawn_append(
+                 'agent_one', 'session_one', null, 'observer', 'hook:prompt_1',
+                 '{\"name\":\"message.received\",\"detail\":{}}'::jsonb)",
+            &[],
+        )?;
+        let repeated = client.query_one(
+            "select out_id from spawn_submit(
+                 'tester', 'key_duplicate', 'agent_one', 'session_one',
+                 '{\"type\":\"stop\"}'::jsonb)",
+            &[],
+        )?;
+        Ok((
+            event.get::<_, i64>("out_id"),
+            event.get::<_, i64>("out_seq"),
+            event.get::<_, bool>("out_inserted"),
+            repeated.get::<_, i64>("out_id"),
+        ))
+    });
+    let result = worker.join();
+    holding.commit().expect("release the append lock");
+    let (event_id, session_seq, inserted, command_id) = result
+        .expect("the duplicate reader does not panic")
+        .expect("committed duplicates do not wait for the lock");
+    assert_eq!(
+        u64::try_from(event_id).expect("event_id fits in u64"),
+        kept.record.position.0
+    );
+    assert_eq!(
+        u64::try_from(session_seq).expect("session_seq fits in u64"),
+        kept.record.session_seq.0
+    );
+    assert!(!inserted);
+    assert_eq!(
+        u64::try_from(command_id).expect("command_id fits in u64"),
+        command.0
+    );
+}
+
+#[test]
 fn one_session_runs_one_command_at_a_time() {
     let (store, _schema) = store("serial");
     let principal = Principal::new("tester").expect("valid principal");

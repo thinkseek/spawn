@@ -2,7 +2,7 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
-结论：Spawn 用 7 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
+结论：Spawn 用 8 个 Rust crate（`spawn-core`、`spawn-postgres`、`spawn-host`、`spawn-jev`、`spawn-kdf`、`spawn-codegraph`、`spawn-node-proto`、`spawn-cli`）连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件、对外提供 SQL 视图并以 `LISTEN/NOTIFY` 发出变更提示，Jev 判定语义状态，`spawn` 二进制做装配并提供 Thin Web + PWA 控制面（`spawn serve`）。Spawn 自己的源码全部同步阻塞，不写 async（见第 10 节：`postgres` 驱动内部链接了 `tokio`）。
 
 ## 1. 能力与边界
 
@@ -30,6 +30,7 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译） | sha2、hmac |
 | `spawn-codegraph` | 能力图的代码依赖事实：从仓库文件抽取代码图 | spawn-core、syn、proc-macro2 |
+| `spawn-node-proto` | spawn-node v1 线协议：签名请求信封与响应、大小上限、严格 JSON、heartbeat/spec/grant/result/enroll 报文、`tree_sha256_v1`（即 `scenarios_sha256`），以及与 Go 守护进程共用的 golden fixtures（`testdata/node-protocol-v1/`） | ring、sha2、base64、serde、serde_json、thiserror |
 | `spawn-cli` | 二进制 `spawn`，装配上述实现；`spawn serve` 的 HTTP 服务、节点网格 | 上述全部，以及 tiny_http、rustix、ring、rustls 等 |
 
 ```mermaid
@@ -40,6 +41,7 @@ flowchart LR
   jev[spawn-jev]
   host[spawn-host]
   graph[spawn-codegraph]
+  proto[spawn-node-proto]
   cli[spawn-cli]
   pg --> core
   pg --> kdf
@@ -50,6 +52,7 @@ flowchart LR
   cli --> jev
   cli --> host
   cli --> graph
+  cli --> proto
 ```
 
 依赖单向：只有 `spawn-cli` 同时依赖各实现层；实现层之间唯一的依赖是 `spawn-postgres` 用 `spawn-kdf` 派生登录口令。
