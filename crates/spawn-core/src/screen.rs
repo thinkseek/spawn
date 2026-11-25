@@ -842,6 +842,36 @@ mod agy_tests {
         let plain = drop_agy_account_lines("cargo@1.95 a@b\n@scope/pkg\n");
         assert_eq!(plain, "cargo@1.95 a@b\n@scope/pkg\n");
     }
+
+    /// Carry list N11: a draft longer than the box is wide wraps onto the
+    /// lines under the prompt line, and still reads `Drafted`, never
+    /// `Unknown` or `Ready`. Footer and open-work rules are unchanged.
+    #[test]
+    fn a_wrapped_draft_reads_drafted() {
+        let wrapped = idle_with(
+            "",
+            "> a long draft that agy wrapped because it is wider than the\n  box it is typed in, onto a second line",
+            "? for shortcuts",
+            "",
+        );
+        let reading = read_agy_screen(&wrapped);
+        assert_eq!(reading.state, ScreenState::Drafted, "{wrapped}");
+        assert!(reading.evidence.starts_with("> a long draft"), "{reading:?}");
+        // The first line may wrap to nothing but the marker.
+        let first_empty = idle_with("", ">\n  wrapped text", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&first_empty).state, ScreenState::Drafted);
+        // One line still reads as before.
+        let one = idle_with("", "> short", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&one).state, ScreenState::Drafted);
+        let empty = idle_with("", ">", "? for shortcuts", "");
+        assert_eq!(read_agy_screen(&empty).state, ScreenState::Ready);
+        // A wrapped draft while a turn runs is still busy.
+        let busy = idle_with("", "> queued\n  more", "esc to cancel", "");
+        assert_eq!(read_agy_screen(&busy).state, ScreenState::Busy);
+        // No lower rule within reach: no box.
+        let unbounded = format!("{RULE}\n> text\n{}? for shortcuts\n", "  more\n".repeat(12));
+        assert_eq!(read_agy_screen(&unbounded).state, ScreenState::Unknown);
+    }
 }
 
 #[cfg(test)]
