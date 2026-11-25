@@ -856,7 +856,10 @@ mod agy_tests {
         );
         let reading = read_agy_screen(&wrapped);
         assert_eq!(reading.state, ScreenState::Drafted, "{wrapped}");
-        assert!(reading.evidence.starts_with("> a long draft"), "{reading:?}");
+        assert!(
+            reading.evidence.starts_with("> a long draft"),
+            "{reading:?}"
+        );
         // The first line may wrap to nothing but the marker.
         let first_empty = idle_with("", ">\n  wrapped text", "? for shortcuts", "");
         assert_eq!(read_agy_screen(&first_empty).state, ScreenState::Drafted);

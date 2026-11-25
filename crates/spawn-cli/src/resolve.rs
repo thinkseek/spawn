@@ -193,10 +193,7 @@ impl Ledger {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Decision {
     /// Press `keys` for the dialog `dialog`.
-    Answer {
-        dialog: String,
-        keys: Vec<NamedKey>,
-    },
+    Answer { dialog: String, keys: Vec<NamedKey> },
     /// A person decides `dialog`: why.
     Escalate { dialog: String, why: String },
     /// Nothing to do (no dialog, a guard does not hold): why.
@@ -217,7 +214,10 @@ fn bottom_id(session: &str, rule: &str, pane: &str) -> String {
 
 /// A tmux key name as a key command's key.
 fn named(key: &str) -> Option<NamedKey> {
-    NamedKey::ALL.iter().copied().find(|named| named.tmux() == key)
+    NamedKey::ALL
+        .iter()
+        .copied()
+        .find(|named| named.tmux() == key)
 }
 
 /// What one pane, read twice (`first`, then `second`), calls for: pure.
@@ -241,9 +241,13 @@ pub(crate) fn decide(
     }
     let prompts: (Option<Prompt>, Option<Prompt>) = (detect(first), detect(second));
     let (dialog, prompt) = match prompts {
-        (Some(one), Some(two)) if one.id(session) == two.id(session) => (two.id(session), Some(two)),
-        (None, None) if trust_rule && bottom_id(session, "trust_prompt", first)
-            == bottom_id(session, "trust_prompt", second) =>
+        (Some(one), Some(two)) if one.id(session) == two.id(session) => {
+            (two.id(session), Some(two))
+        }
+        (None, None)
+            if trust_rule
+                && bottom_id(session, "trust_prompt", first)
+                    == bottom_id(session, "trust_prompt", second) =>
         {
             (bottom_id(session, "trust_prompt", second), None)
         }
@@ -269,11 +273,22 @@ pub(crate) fn decide(
         || {
             second
                 .lines()
-                .map(|line| line.trim().trim_start_matches(['>', '❯']).trim().to_string())
+                .map(|line| {
+                    line.trim()
+                        .trim_start_matches(['>', '❯'])
+                        .trim()
+                        .to_string()
+                })
                 .filter(|line| line.starts_with("Yes, I trust") || line.starts_with("No, exit"))
                 .collect()
         },
-        |prompt| prompt.choices.iter().map(|choice| choice.label.clone()).collect(),
+        |prompt| {
+            prompt
+                .choices
+                .iter()
+                .map(|choice| choice.label.clone())
+                .collect()
+        },
     );
     if let Some(why) = hard_block(second, &choices) {
         return Decision::Escalate {
@@ -283,9 +298,11 @@ pub(crate) fn decide(
     }
     let cursor: Option<String> = prompt.as_ref().map_or_else(
         || {
-            second
-                .lines()
-                .find_map(|line| line.trim().strip_prefix('>').map(|rest| rest.trim().to_string()))
+            second.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix('>')
+                    .map(|rest| rest.trim().to_string())
+            })
         },
         |prompt| {
             prompt.cursor.as_ref().and_then(|id| {
@@ -439,7 +456,8 @@ impl Resolver {
                         self.say(&mut lines, &format!("{}:open", live.execution), line);
                         continue;
                     }
-                    if let Some(line) = self.answer(world, &mut ledger, &live, &dialog, &keys, now)?
+                    if let Some(line) =
+                        self.answer(world, &mut ledger, &live, &dialog, &keys, now)?
                     {
                         lines.push(line);
                     }
@@ -483,7 +501,10 @@ impl Resolver {
                     pressed.join(" ")
                 )));
             }
-            let age = now - ledger.get(first).map_or(now, |answered| answered.created_at_ms);
+            let age = now
+                - ledger
+                    .get(first)
+                    .map_or(now, |answered| answered.created_at_ms);
             if n == 2 {
                 break;
             }
@@ -558,7 +579,10 @@ impl World for Fleet<'_> {
     }
 
     fn live(&self) -> Result<Vec<Live>, String> {
-        let board = self.store.fleet_board().map_err(|error| error.to_string())?;
+        let board = self
+            .store
+            .fleet_board()
+            .map_err(|error| error.to_string())?;
         let mut out = Vec::new();
         for row in board.as_array().into_iter().flatten() {
             let (Some(session), Some(agent), Some(execution)) = (
@@ -681,7 +705,11 @@ mod tests {
         }
 
         fn keys(&self) -> Vec<String> {
-            self.commands.borrow().iter().map(|(key, ..)| key.clone()).collect()
+            self.commands
+                .borrow()
+                .iter()
+                .map(|(key, ..)| key.clone())
+                .collect()
         }
     }
 
@@ -757,7 +785,10 @@ mod tests {
         let lines = resolver.step(&world).expect("step");
         let keys = world.keys();
         assert_eq!(keys.len(), 1, "{keys:?}");
-        assert!(keys[0].starts_with("resolve:exec_session_a:session_a:"), "{keys:?}");
+        assert!(
+            keys[0].starts_with("resolve:exec_session_a:session_a:"),
+            "{keys:?}"
+        );
         assert!(keys[0].ends_with(":1:1"), "{keys:?}");
         assert!(lines[0].contains("answered"), "{lines:?}");
         // The next pass, moments later, with the dialog still there: no
@@ -779,7 +810,10 @@ mod tests {
         let mut restarted = Resolver::new(Mode::All);
         let lines = restarted.step(&world).expect("step");
         assert!(lines[0].contains("breaker open"), "{lines:?}");
-        assert!(restarted.step(&world).expect("step").is_empty(), "said once");
+        assert!(
+            restarted.step(&world).expect("step").is_empty(),
+            "said once"
+        );
         assert_eq!(world.keys().len(), 1);
         // From AGAIN_AFTER_MS on: one second answer, then never a third.
         world.now.set(world.now.get() + AGAIN_AFTER_MS);
@@ -807,10 +841,20 @@ mod tests {
                 .collect();
             Ledger::from_json(&json!(rows))
         };
-        assert_eq!(commands(&["session_a"], 4).breaker("session_a", 0, now), None);
-        assert!(commands(&["session_a"], 5).breaker("session_a", 0, now).is_some());
+        assert_eq!(
+            commands(&["session_a"], 4).breaker("session_a", 0, now),
+            None
+        );
+        assert!(
+            commands(&["session_a"], 5)
+                .breaker("session_a", 0, now)
+                .is_some()
+        );
         // Only this execution's: one started after them counts none.
-        assert_eq!(commands(&["session_a"], 5).breaker("session_a", now - 1, now), None);
+        assert_eq!(
+            commands(&["session_a"], 5).breaker("session_a", now - 1, now),
+            None
+        );
         let fleet: Vec<String> = (0..10).map(|n| format!("session_{n}")).collect();
         let names: Vec<&str> = fleet.iter().map(String::as_str).collect();
         assert!(commands(&names, 2).breaker("session_x", 0, now).is_some());

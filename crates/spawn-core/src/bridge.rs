@@ -6075,7 +6075,12 @@ impl Bridge {
     ) -> Result<Result<(), TerminalError>, StoreError> {
         let named: Option<Vec<NamedKey>> = keys
             .iter()
-            .map(|key| NamedKey::ALL.iter().copied().find(|named| named.tmux() == *key))
+            .map(|key| {
+                NamedKey::ALL
+                    .iter()
+                    .copied()
+                    .find(|named| named.tmux() == *key)
+            })
             .collect();
         let Some(named) = named else {
             return Ok(self
@@ -6086,8 +6091,9 @@ impl Bridge {
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         let mut audited = Vec::with_capacity(named.len());
         for (at, key) in named.iter().enumerate() {
-            let idempotency_key = IdempotencyKey::new(trust_answer_key(&active.execution_id, at + 1))
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            let idempotency_key =
+                IdempotencyKey::new(trust_answer_key(&active.execution_id, at + 1))
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
             let command_id = self.queue.submit(
                 &principal,
                 &Submission {
@@ -7723,9 +7729,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    use super::{
-        Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits,
-    };
+    use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
@@ -10734,9 +10738,9 @@ mod tests {
                 .expect("read")
                 .into_iter()
                 .filter_map(|record| match record.event.kind {
-                    EventKind::CommandStepped { command_id, step, .. } if command_id == command => {
-                        Some(step)
-                    }
+                    EventKind::CommandStepped {
+                        command_id, step, ..
+                    } if command_id == command => Some(step),
                     _ => None,
                 })
                 .collect();
@@ -10767,7 +10771,9 @@ mod tests {
             BridgeConfig::new("tester"),
         )
         .with_clock(clock);
-        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
         assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
         store.set_pane(&terminal, DIALOG);
         let execution = ExecutionId::for_command(id);
@@ -10806,8 +10812,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(order, vec![human, resolver], "pressed in the order submitted");
-        assert_eq!(key(RESOLVE_PRINCIPAL, resolver_key, NamedKey::Digit1), resolver);
+        assert_eq!(
+            order,
+            vec![human, resolver],
+            "pressed in the order submitted"
+        );
+        assert_eq!(
+            key(RESOLVE_PRINCIPAL, resolver_key, NamedKey::Digit1),
+            resolver
+        );
         bridge.work().expect("one more claim");
         assert_eq!(host.keys().len(), 2, "a resubmitted answer presses nothing");
         assert!(!waits(RESOLVE_PRINCIPAL), "a loop principal");

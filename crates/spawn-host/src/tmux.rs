@@ -1809,7 +1809,14 @@ mod tests {
     /// Never a directory too broad to be one workspace.
     #[test]
     fn only_a_narrow_directory_is_swept() {
-        for broad in ["/", "/tmp", "/tmp/a", "/home/someone", "relative/a/b", "/a/../b/c"] {
+        for broad in [
+            "/",
+            "/tmp",
+            "/tmp/a",
+            "/home/someone",
+            "relative/a/b",
+            "/a/../b/c",
+        ] {
             assert!(!sweepable(std::path::Path::new(broad)), "{broad}");
         }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -1819,7 +1826,9 @@ mod tests {
         }
         let here = std::env::current_dir().expect("cwd");
         assert!(!sweepable(&here));
-        assert!(sweepable(std::path::Path::new("/workspaces/agents/agent_a")));
+        assert!(sweepable(std::path::Path::new(
+            "/workspaces/agents/agent_a"
+        )));
     }
 
     /// A process the test starts with its working directory below a
@@ -1834,7 +1843,10 @@ mod tests {
         let elsewhere = scratch.join("other");
         std::fs::create_dir_all(&elsewhere).expect("dirs");
         if !sweepable(&workspace) {
-            eprintln!("skipped: the scratch {} is not sweepable", workspace.display());
+            eprintln!(
+                "skipped: the scratch {} is not sweepable",
+                workspace.display()
+            );
             return;
         }
         let mut inside = std::process::Command::new("sleep")

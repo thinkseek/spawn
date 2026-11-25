@@ -281,16 +281,21 @@ pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) 
             if shown && trusting {
                 Answer::Keys(&crate::screen::AGY_TRUST_KEYS)
             } else {
-                Answer::Escalate("agy's trust dialog names another folder, or its cursor is not on trust")
+                Answer::Escalate(
+                    "agy's trust dialog names another folder, or its cursor is not on trust",
+                )
             }
         }
         ("agy", Some("permission_prompt" | "question_prompt"), _) => Answer::Escalate(UNCAPTURED),
         ("claude", _, "trust") => Answer::Keys(&crate::screen::TRUST_KEYS),
-        ("claude", None | Some("bash_permission_prompt" | "generic_permission_prompt"), "permission")
-            if dialog
-                .choices
-                .first()
-                .is_some_and(|first| first.trim() == "Yes") =>
+        (
+            "claude",
+            None | Some("bash_permission_prompt" | "generic_permission_prompt"),
+            "permission",
+        ) if dialog
+            .choices
+            .first()
+            .is_some_and(|first| first.trim() == "Yes") =>
         {
             Answer::Keys(&CLAUDE_YES)
         }
@@ -299,11 +304,7 @@ pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) 
             Some("live_blocked_form" | "mcp_elicitation_prompt" | "dynamic_workflow_prompt"),
             _,
         ) => Answer::Escalate(UNCAPTURED),
-        (
-            "codex",
-            Some("trust_directory" | "startup_update" | "live_strong_blocker"),
-            _,
-        )
+        ("codex", Some("trust_directory" | "startup_update" | "live_strong_blocker"), _)
         | ("opencode", Some("permission_required"), _) => Answer::Escalate(UNCAPTURED),
         _ => Answer::Escalate("no row of the resolver's table covers this dialog"),
     }
@@ -345,9 +346,11 @@ pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
     }
     let exits = |label: &String| {
         let lower = label.to_lowercase();
-        ["exit", "quit"]
-            .iter()
-            .any(|word| lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == *word))
+        ["exit", "quit"].iter().any(|word| {
+            lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == *word)
+        })
     };
     (!choices.is_empty() && choices.iter().all(exits)).then_some("only exit choices")
 }
@@ -899,7 +902,10 @@ mod tests {
             &body,
         );
         assert_eq!(table_answer("agy", &ours, &ws()), Answer::Keys(&["Enter"]));
-        assert_eq!(AgyDriver.dialog_answer(&ours, &ws()), Answer::Keys(&["Enter"]));
+        assert_eq!(
+            AgyDriver.dialog_answer(&ours, &ws()),
+            Answer::Keys(&["Enter"])
+        );
         let elsewhere = strings(&["Accessing workspace:", "/home/someone"]);
         let other = dialog(
             Some("trust_prompt"),
@@ -908,9 +914,21 @@ mod tests {
             &choices,
             &elsewhere,
         );
-        assert!(matches!(table_answer("agy", &other, &ws()), Answer::Escalate(_)));
-        let off_cursor = dialog(Some("trust_prompt"), "trust", Some("No, exit"), &choices, &body);
-        assert!(matches!(table_answer("agy", &off_cursor, &ws()), Answer::Escalate(_)));
+        assert!(matches!(
+            table_answer("agy", &other, &ws()),
+            Answer::Escalate(_)
+        ));
+        let off_cursor = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("No, exit"),
+            &choices,
+            &body,
+        );
+        assert!(matches!(
+            table_answer("agy", &off_cursor, &ws()),
+            Answer::Escalate(_)
+        ));
     }
 
     #[test]
@@ -918,8 +936,17 @@ mod tests {
         use super::{Answer, table_answer};
         let choices = strings(&["Yes", "No"]);
         let body = strings(&["Run command?", "cargo test"]);
-        let shown = dialog(Some("permission_prompt"), "permission", Some("Yes"), &choices, &body);
-        assert!(matches!(table_answer("agy", &shown, &ws()), Answer::Escalate(_)));
+        let shown = dialog(
+            Some("permission_prompt"),
+            "permission",
+            Some("Yes"),
+            &choices,
+            &body,
+        );
+        assert!(matches!(
+            table_answer("agy", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
     }
 
     #[test]
@@ -927,7 +954,10 @@ mod tests {
         use super::{Answer, table_answer};
         let choices = strings(&["A", "B"]);
         let shown = dialog(Some("question_prompt"), "choice", Some("A"), &choices, &[]);
-        assert!(matches!(table_answer("agy", &shown, &ws()), Answer::Escalate(_)));
+        assert!(matches!(
+            table_answer("agy", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
     }
 
     #[test]
@@ -938,30 +968,50 @@ mod tests {
             table_answer("claude", &shown, &ws()),
             Answer::Keys(&TRUST_KEYS)
         );
-        assert_eq!(ClaudeDriver.dialog_answer(&shown, &ws()), Answer::Keys(&TRUST_KEYS));
+        assert_eq!(
+            ClaudeDriver.dialog_answer(&shown, &ws()),
+            Answer::Keys(&TRUST_KEYS)
+        );
     }
 
     #[test]
     fn row_claude_numbered_permission_approvals_fixture_answers_1_when_choice_1_is_yes() {
         use super::{Answer, table_answer};
         let yes = strings(&["Yes", "Yes, and don't ask again", "No"]);
-        for rule in [None, Some("bash_permission_prompt"), Some("generic_permission_prompt")] {
+        for rule in [
+            None,
+            Some("bash_permission_prompt"),
+            Some("generic_permission_prompt"),
+        ] {
             let shown = dialog(rule, "permission", Some("Yes"), &yes, &[]);
             assert_eq!(table_answer("claude", &shown, &ws()), Answer::Keys(&["1"]));
         }
         let no_first = strings(&["No", "Yes"]);
         let shown = dialog(None, "permission", None, &no_first, &[]);
-        assert!(matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)));
+        assert!(matches!(
+            table_answer("claude", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
         let choice = dialog(None, "choice", None, &yes, &[]);
-        assert!(matches!(table_answer("claude", &choice, &ws()), Answer::Escalate(_)));
+        assert!(matches!(
+            table_answer("claude", &choice, &ws()),
+            Answer::Escalate(_)
+        ));
     }
 
     #[test]
     fn row_claude_question_forms_not_captured_escalate() {
         use super::{Answer, table_answer};
-        for rule in ["live_blocked_form", "mcp_elicitation_prompt", "dynamic_workflow_prompt"] {
+        for rule in [
+            "live_blocked_form",
+            "mcp_elicitation_prompt",
+            "dynamic_workflow_prompt",
+        ] {
             let shown = dialog(Some(rule), "choice", None, &[], &[]);
-            assert!(matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)));
+            assert!(matches!(
+                table_answer("claude", &shown, &ws()),
+                Answer::Escalate(_)
+            ));
         }
     }
 
@@ -970,7 +1020,10 @@ mod tests {
         use super::{Answer, table_answer};
         for rule in ["trust_directory", "startup_update", "live_strong_blocker"] {
             let shown = dialog(Some(rule), "confirm", None, &[], &[]);
-            assert!(matches!(table_answer("codex", &shown, &ws()), Answer::Escalate(_)));
+            assert!(matches!(
+                table_answer("codex", &shown, &ws()),
+                Answer::Escalate(_)
+            ));
         }
     }
 
@@ -978,7 +1031,10 @@ mod tests {
     fn row_opencode_permission_required_not_verified_escalates() {
         use super::{Answer, table_answer};
         let shown = dialog(Some("permission_required"), "permission", None, &[], &[]);
-        assert!(matches!(table_answer("opencode", &shown, &ws()), Answer::Escalate(_)));
+        assert!(matches!(
+            table_answer("opencode", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
     }
 
     #[test]
@@ -1010,7 +1066,11 @@ mod tests {
             "Error: login required",
             "You are not logged in.",
         ] {
-            assert_eq!(super::hard_block(pane, &[]), Some("login required"), "{pane}");
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("login required"),
+                "{pane}"
+            );
         }
     }
 
@@ -1020,7 +1080,11 @@ mod tests {
             "API Error: 401 OAuth token has expired",
             "{\"type\":\"authentication_error\"}",
         ] {
-            assert_eq!(super::hard_block(pane, &[]), Some("login expired"), "{pane}");
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("login expired"),
+                "{pane}"
+            );
         }
     }
 
@@ -1038,14 +1102,25 @@ mod tests {
             "Quota exceeded for this model",
             "429 RESOURCE_EXHAUSTED",
         ] {
-            assert_eq!(super::hard_block(pane, &[]), Some("quota reached"), "{pane}");
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("quota reached"),
+                "{pane}"
+            );
         }
     }
 
     #[test]
     fn hard_block_update_required_texts_unverified() {
-        for pane in ["Update required: version 1.2 is too old", "Please update to continue"] {
-            assert_eq!(super::hard_block(pane, &[]), Some("update required"), "{pane}");
+        for pane in [
+            "Update required: version 1.2 is too old",
+            "Please update to continue",
+        ] {
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("update required"),
+                "{pane}"
+            );
         }
     }
 
@@ -1055,7 +1130,10 @@ mod tests {
             super::hard_block("Something failed", &strings(&["Exit", "Quit Spawn"])),
             Some("only exit choices")
         );
-        assert_eq!(super::hard_block("Run command?", &strings(&["Yes", "No, exit"])), None);
+        assert_eq!(
+            super::hard_block("Run command?", &strings(&["Yes", "No, exit"])),
+            None
+        );
         assert_eq!(super::hard_block("Run command?", &[]), None);
         // Only the tail counts: a limit far above it is history.
         let old = format!("Rate limit reached\n{}", "line\n".repeat(60));

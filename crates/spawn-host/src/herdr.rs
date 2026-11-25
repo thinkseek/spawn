@@ -118,11 +118,7 @@ pub const MANIFESTS: [(&str, &str); 2] = [("agy", "2026.10.05.1"), ("claude", "2
 /// Why a `server.agent_manifests` answer (`listed`) does not hold the
 /// `pinned` manifests, naming each pinned and actual version; `None` when
 /// every pinned agent's active version is the pinned one.
-fn manifest_mismatch(
-    session: &str,
-    pinned: &[(String, String)],
-    listed: &Value,
-) -> Option<String> {
+fn manifest_mismatch(session: &str, pinned: &[(String, String)], listed: &Value) -> Option<String> {
     let active = |agent: &str| {
         listed["manifests"]
             .as_array()
@@ -947,7 +943,11 @@ impl HerdrHost {
             let Some(id) = workspace["workspace_id"].as_str() else {
                 continue;
             };
-            match self.call("workspace.close", &json!({ "workspace_id": id }), CALL_LIMIT) {
+            match self.call(
+                "workspace.close",
+                &json!({ "workspace_id": id }),
+                CALL_LIMIT,
+            ) {
                 Ok(_) => {}
                 Err(call) if call.gone() => {}
                 Err(call) => return Err(call.into_error("workspace.close")),
@@ -2209,7 +2209,10 @@ mod tests {
         // control bytes is 360 KiB.
         assert!(prompt_fits("w1:p1", &"\"".repeat(60 * 1024)));
         assert!(!prompt_fits("w1:p1", &"\u{1}".repeat(60 * 1024)));
-        assert!(PROMPT_LINE_LIMIT * 4 <= 1024 * 1024, "well under the probed 1 MiB cap");
+        assert!(
+            PROMPT_LINE_LIMIT * 4 <= 1024 * 1024,
+            "well under the probed 1 MiB cap"
+        );
     }
 
     /// Carry list N8: a server whose active manifest of a pinned agent
@@ -2227,7 +2230,10 @@ mod tests {
                 { "agent": "agy", "source": "bundled", "active_version": agy },
             ]})
         };
-        assert_eq!(manifest_mismatch("s", &pinned, &listed("2026.10.05.1")), None);
+        assert_eq!(
+            manifest_mismatch("s", &pinned, &listed("2026.10.05.1")),
+            None
+        );
         let refused = manifest_mismatch("s", &pinned, &listed("2026.11.01.1")).expect("refused");
         assert!(
             refused.contains("agy pinned 2026.10.05.1, actual 2026.11.01.1"),
@@ -2236,8 +2242,14 @@ mod tests {
         assert!(!refused.contains("claude pinned"), "{refused}");
         let none = manifest_mismatch("s", &pinned, &serde_json::json!({ "manifests": [] }))
             .expect("refused");
-        assert!(none.contains("claude pinned 2026.10.11.1, actual none"), "{none}");
-        assert!(none.contains("agy pinned 2026.10.05.1, actual none"), "{none}");
+        assert!(
+            none.contains("claude pinned 2026.10.11.1, actual none"),
+            "{none}"
+        );
+        assert!(
+            none.contains("agy pinned 2026.10.05.1, actual none"),
+            "{none}"
+        );
     }
 
     /// Carry list N7: only a dropped connection makes the next subscription

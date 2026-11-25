@@ -881,7 +881,9 @@ fn a_server_of_other_detection_manifests_is_refused_naming_both() {
         .start(&session.launch(&one, "exec cat"))
         .expect_err("other manifests");
     assert!(
-        error.0.contains("agy pinned 1999.01.01.1, actual 2026.10.05.1"),
+        error
+            .0
+            .contains("agy pinned 1999.01.01.1, actual 2026.10.05.1"),
         "{error}"
     );
     let right = session.host();
@@ -926,8 +928,11 @@ fn a_detached_daemon_beneath_the_workspace_is_ended_by_terminate() {
     assert!(Path::new(&format!("/proc/{pid}")).exists());
     host.terminate(&one, &workspace).expect("terminate");
     let gone = |pid: u32| {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .map_or(true, |stat| stat.split(") ").nth(1).is_some_and(|rest| rest.starts_with('Z')))
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.split(") ")
+                .nth(1)
+                .is_some_and(|rest| rest.starts_with('Z'))
+        })
     };
     assert!(gone(pid), "the detached daemon {pid} outlived terminate");
 }
@@ -945,7 +950,8 @@ fn a_staged_text_reaches_a_detected_agent_through_agent_prompt() {
     let host = session.host();
     let workspace = session.workspace();
     let agy = terminal("spawn-exec_a8");
-    host.start(&session.agy_launch(&agy, "idle")).expect("start");
+    host.start(&session.agy_launch(&agy, "idle"))
+        .expect("start");
     reading_within(&host, &agy, &workspace, |reading| {
         reading.agent.as_deref() == Some("agy") && reading.status == AgentStatus::Idle
     });
