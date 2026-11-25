@@ -2024,6 +2024,12 @@ Claude Code on tmux records the same events, byte for byte. A test pins the
 whole sequence a2f1ab397 recorded
 (`claude_on_a_host_without_agent_readings_records_what_it_did_before`).
 
+For now the witness is asked only for engines other than Claude Code (agy).
+Claude Code's screen-reader screens have not yet been captured under Herdr
+against its claude manifest (design §9.2). Until they are, Claude Code on
+Herdr goes by its own readings, as on tmux: no merge, no keyed screen, and no
+`agent()` call (`claude_on_an_agent_host_stays_on_its_own_readings_for_now`).
+
 **The merge** (`Bridge::follow_screen`, `merge_witness`). Normally a screen
 state is recorded once two readings of the pane in a row agree. With Herdr's
 reading (H) beside the driver's (S), one capture is enough where the two
@@ -2058,9 +2064,15 @@ reading, so it goes unkeyed, and the log's unique keys never swallow it.
   connects again, asks `session.snapshot`, and counts every followed terminal
   as changed.
 - For the first seconds after `agent.start` (about 3.4 s observed), Herdr
-  reports `launch_pending: true` with status `unknown` and answers
-  `agent_not_ready`. Staging text then is refused before anything is typed,
-  and so is staging on `agent_blocked`: both are refusals the Bridge retries.
+  reports `launch_pending: true` with status `unknown`, and its agent input
+  calls answer `agent_not_ready`. While `agent.get` says so, staging text is
+  refused before anything is typed, as `agent_not_ready`, and so is staging
+  when `agent.get` itself fails with `agent_not_ready` or `agent_blocked`.
+  Both are refusals the Bridge retries. In practice `agent.get` returns
+  neither code: they come from Herdr's agent input calls, which PR 2 does not
+  use. A `blocked` status is not refused by the host; the Bridge's own check
+  guards it, since it types only into a pane its own reading says accepts
+  input.
   Within 1 s of a detection or a release push, a reading still
   `launch_pending` says nothing. Typing itself stays chunked `pane.send_text`
   plus Enter. The `agent.prompt` rollout is PR 3.
@@ -2099,8 +2111,13 @@ transcript archive's mask roots.
     an id);
   - the reading's agent is the driver's (`agy`);
   - the session's full transcript exists below agy's home;
-  - a `USER_INPUT` line of that transcript holds a marker Spawn typed for
-    this execution or later.
+  - a `USER_INPUT` line of that transcript holds the marker of a command
+    whose `typing` step this session recorded, and that command is this
+    execution's start or later.
+
+  Any client of the server can call `pane.report_agent_session`. The marker
+  check means a forged report, whose transcript quotes another session's
+  marker or one never typed, is never bound.
 
   Then it records `session.native_started` and reads the transcript from
   offset 0.
