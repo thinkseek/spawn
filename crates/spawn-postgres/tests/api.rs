@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use postgres::{Client, NoTls};
 use spawn_core::bridge::{Bridge, BridgeConfig};
-use spawn_core::command::{CommandAction, Outcome, Submission};
+use spawn_core::command::{Claimed, CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
     ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile,
@@ -366,6 +366,273 @@ fn an_expired_lease_is_taken_again_with_a_new_attempt() {
     store
         .finish(&second, &Outcome::Succeeded)
         .expect("the current attempt finishes");
+}
+
+#[test]
+fn worker_ownership_is_not_reentrant_on_one_store() {
+    let (store, _schema) = store("worker_ownership");
+    let (ownership, recovered) = store
+        .recover_worker("spawn-worker")
+        .expect("the first worker owns its name");
+    assert_eq!(recovered, 0);
+    let error = store
+        .recover_worker("spawn-worker")
+        .err()
+        .expect("PostgreSQL session locks are re-entrant, but workers are not");
+    assert!(error.to_string().contains("still owned"), "{error}");
+    drop(ownership);
+    let (_replacement, _) = store
+        .recover_worker("spawn-worker")
+        .expect("dropping the owner releases the name on the same store");
+}
+
+/// A one-shot `spawn tick` (`recover_worker_leases` off) beside a live holder
+/// that leased without the ownership protocol, as black-box `040-queue` does
+/// with `spawn_claim` in psql: the lease stays live, and the tick holds the
+/// worker's name neither in its process nor in the server.
+#[test]
+fn a_bridge_without_worker_recovery_takes_no_ownership_and_keeps_live_leases() {
+    let (store, schema) = store("tick_no_recovery");
+    let store = Arc::new(store);
+    let principal = Principal::new("tester").expect("valid principal");
+    let id = store
+        .submit(&principal, &start(session(), "key_tick"))
+        .expect("submit succeeds");
+    let held = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("claim succeeds")
+        .expect("the live holder leases the start");
+    let host = Arc::new(MemoryStore::new("tick", Arc::new(SystemClock)));
+    let mut config = BridgeConfig::new("spawn-worker");
+    config.recover_worker_leases = false;
+    let mut tick = Bridge::new(store.clone(), store.clone(), host.clone(), host, config);
+    tick.recover().expect("a tick recovers its view");
+    tick.recover().expect("and again, still without the worker");
+
+    let row = admin(&schema)
+        .query_one(
+            "select lease_attempt, lease_until_ms > spawn_now_ms() as live
+               from spawn_commands where id = $1",
+            &[&id.0.cast_signed()],
+        )
+        .expect("the command row");
+    assert_eq!(row.get::<_, i32>("lease_attempt"), 1);
+    assert!(row.get::<_, bool>("live"), "the live lease is not expired");
+    assert!(
+        store
+            .claim("spawn-worker", Duration::from_mins(2))
+            .expect("claim succeeds")
+            .is_none(),
+        "nothing is claimable while the holder's lease lives"
+    );
+    store
+        .finish(&held, &Outcome::Succeeded)
+        .expect("the holder's attempt is still current");
+
+    // With the tick still alive, a resident loop takes the worker on another
+    // server session (no advisory lock held) and on the tick's own store (no
+    // local claim).
+    let loop_store = PostgresStore::connect_in_schema(&url(), schema.name()).expect("loop store");
+    let (loop_owner, recovered) = loop_store
+        .recover_worker("spawn-worker")
+        .expect("the tick holds no server-side ownership");
+    assert_eq!(recovered, 0);
+    drop(loop_owner);
+    let (_same_store, _) = store
+        .recover_worker("spawn-worker")
+        .expect("the tick holds no ownership in its own store");
+    drop(tick);
+}
+
+#[cfg(unix)]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Child half of `sigkill_recovers_a_claim_without_waiting_for_its_ttl`.
+/// Normal test runs have no helper environment and do nothing.
+#[test]
+#[cfg(unix)]
+fn sigkill_claim_helper() {
+    if std::env::var("SPAWN_SIGKILL_CLAIM_HELPER").as_deref() != Ok("1") {
+        return;
+    }
+    let schema = std::env::var("SPAWN_SIGKILL_CLAIM_SCHEMA").expect("helper schema");
+    let store = Arc::new(PostgresStore::connect_in_schema(&url(), &schema).expect("helper store"));
+    let host = Arc::new(MemoryStore::new("crash-helper", Arc::new(SystemClock)));
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        host.clone(),
+        host,
+        BridgeConfig::new("spawn-worker"),
+    );
+    bridge.recover().expect("helper owns the worker");
+    let claimed = store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("helper claim succeeds")
+        .expect("the submitted start is claimed");
+    assert_eq!(claimed.attempt, 1);
+    // The parent waits for that row, then sends this process SIGKILL. No
+    // destructor, release, finish, or cleanup runs on this path.
+    loop {
+        std::thread::sleep(Duration::from_mins(1));
+    }
+}
+
+#[cfg(unix)]
+fn new_postgres_bridge(schema: &str, host_name: &str) -> (Arc<PostgresStore>, Bridge) {
+    let store = Arc::new(PostgresStore::connect_in_schema(&url(), schema).expect("bridge store"));
+    let host = Arc::new(MemoryStore::new(host_name, Arc::new(SystemClock)));
+    let bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        host.clone(),
+        host,
+        BridgeConfig::new("spawn-worker"),
+    );
+    (store, bridge)
+}
+
+#[cfg(unix)]
+fn spawn_sigkill_helper_and_wait_for_claim(
+    schema: &str,
+    client: &mut Client,
+    command_id: CommandId,
+) -> KillOnDrop {
+    use std::process::{Command, Stdio};
+
+    let mut child = KillOnDrop(
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args(["sigkill_claim_helper", "--exact", "--nocapture"])
+            .env("SPAWN_SIGKILL_CLAIM_HELPER", "1")
+            .env("SPAWN_SIGKILL_CLAIM_SCHEMA", schema)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the isolated loop child"),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if client
+            .query_opt(
+                "select lease_attempt from spawn_commands
+                  where id = $1 and lease_worker = 'spawn-worker'
+                    and lease_until_ms > spawn_now_ms()",
+                &[&command_id.0.cast_signed()],
+            )
+            .expect("read the child claim")
+            .is_some()
+        {
+            return child;
+        }
+        if let Some(status) = child.0.try_wait().expect("inspect the child") {
+            panic!("the claim helper exited before its claim: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child claimed in time"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn sigkill_recovers_a_claim_without_waiting_for_its_ttl() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (store, schema) = store("sigkill_recovery");
+    let store = Arc::new(store);
+    let principal = Principal::new("tester").expect("valid principal");
+    let submission = start(session(), "key_sigkill");
+    let id = store
+        .submit(&principal, &submission)
+        .expect("submit succeeds");
+    let abandoned = Claimed {
+        command_id: id,
+        attempt: 1,
+        agent_id: submission.agent_id.clone(),
+        session_id: submission.session_id.clone(),
+        principal: principal.as_str().to_string(),
+        action: serde_json::to_value(&submission.action).expect("action json"),
+    };
+    let mut client = admin(&schema);
+    let mut child = spawn_sigkill_helper_and_wait_for_claim(schema.name(), &mut client, id);
+
+    // A genuinely live predecessor must be refused, not have its lease taken.
+    let (_live_store, mut blocked) = new_postgres_bridge(schema.name(), "live-peer");
+    let error = blocked
+        .recover()
+        .expect_err("the live child's ownership refuses a replacement");
+    assert!(error.to_string().contains("still owned"), "{error}");
+    assert_eq!(
+        client
+            .query_one(
+                "select lease_attempt from spawn_commands where id = $1",
+                &[&id.0.cast_signed()],
+            )
+            .expect("the live lease remains")
+            .get::<_, i32>(0),
+        1
+    );
+    drop(blocked);
+
+    child.0.kill().expect("SIGKILL only the isolated helper");
+    let status = child.0.wait().expect("wait for the helper");
+    assert_eq!(status.signal(), Some(9), "the helper died by SIGKILL");
+    let recovery_started = std::time::Instant::now();
+
+    // The server can take a moment to observe the dead socket. Retry only the
+    // ownership acquisition; no command is touched while the old lock lives.
+    let (recovered_store, mut replacement) = new_postgres_bridge(schema.name(), "recovered");
+    loop {
+        match replacement.recover() {
+            Ok(()) => break,
+            Err(error)
+                if error.to_string().contains("still owned")
+                    && recovery_started.elapsed() < Duration::from_secs(10) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("replacement recovery failed: {error}"),
+        }
+    }
+    let reclaimed = recovered_store
+        .claim("spawn-worker", Duration::from_mins(2))
+        .expect("replacement claim succeeds")
+        .expect("SIGKILL released ownership and recovery released the lease");
+    let recovery = recovery_started.elapsed();
+    eprintln!("SIGKILL_RECOVERY_MS={}", recovery.as_millis());
+    assert!(
+        recovery < Duration::from_secs(5),
+        "recovery stays far below 120 s"
+    );
+    assert_eq!(reclaimed.command_id, id);
+    assert_eq!(reclaimed.attempt, 2);
+    assert!(
+        recovered_store
+            .finish(&abandoned, &Outcome::Succeeded)
+            .is_err(),
+        "the killed process's attempt remains fenced"
+    );
+    recovered_store
+        .finish(&reclaimed, &Outcome::Succeeded)
+        .expect("the replacement finishes once");
+    assert_eq!(
+        client
+            .query_one("select count(*) from spawn_events", &[])
+            .expect("count events")
+            .get::<_, i64>(0),
+        2,
+        "accepted and finished are both retained, with no duplicate events"
+    );
 }
 
 #[test]

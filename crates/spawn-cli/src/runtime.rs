@@ -19,7 +19,22 @@ use crate::{context, sources, supervise};
 /// Both keep the event-log cursor in memory, so the resident loop builds
 /// them once. Rebuilding them per step would replay the whole log on every
 /// tick, and that cost grows with the log.
+///
+/// The resident loop's Bridge owns its worker and makes its previous
+/// process's unfinished leases claimable at once
+/// ([`BridgeConfig::recover_worker_leases`]).
 pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
+    runtime_with(flags, true)
+}
+
+/// The runtime of one `spawn tick`: its Bridge takes no ownership of the
+/// worker and expires no lease, so a tick beside a live holder (a loop, or a
+/// claim made without the ownership protocol) leaves that lease to run out.
+pub(crate) fn tick_runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
+    runtime_with(flags, false)
+}
+
+fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, Observer), String> {
     // The Bridge merges main into branches with `git --attr-source`.
     crate::config::require_git()?;
     let store = Arc::new(open_store()?);
@@ -47,7 +62,8 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         eprintln!("sources: {error}; a push lost with the last process waits for its next");
     }
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
-    let config = bridge_config()?;
+    let mut config = bridge_config()?;
+    config.recover_worker_leases = recover_worker_leases;
     // The transcript archive's credential mask (objective 175): the
     // installed collector's places, or a stand-in honoured only in a gate's
     // sandbox and only for roots outside the account's home, said in one
