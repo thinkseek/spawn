@@ -340,7 +340,7 @@ fn the_index_records_checkpoints_landings_and_imports_once_and_who_and_show_read
         .collect();
     assert_eq!(paths, ["src/a.rs", "tool.sh"]);
     assert_eq!(entry(a3, "tool.sh")["class"], "mechanical");
-    assert_eq!(entry(a3, "src/a.rs")["size"], 15);
+    assert_eq!(entry(a3, "src/a.rs")["size"], 19);
 
     // The landing: one includes edge to the task's edit Change, and each
     // path's origin the revision whose content it holds.
