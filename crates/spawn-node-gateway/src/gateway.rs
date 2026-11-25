@@ -30,7 +30,7 @@ use serde_json::Value;
 use spawn_node_proto::codec::{parse_decimal, sha256, sha256_hex};
 use spawn_node_proto::enroll::{EnrollAnswer, EnrollRequest};
 use spawn_node_proto::envelope::{REQUEST_HEADERS, is_clock_skewed, strip_public_prefix};
-use spawn_node_proto::grant::{ArtifactUrl, Grant, GrantInputs, JobKind, SignedGrant};
+use spawn_node_proto::grant::{ArtifactRole, ArtifactUrl, Grant, GrantInputs, JobKind, SignedGrant};
 use spawn_node_proto::heartbeat::{Ack, Beat, Fenced, LeaseRef};
 use spawn_node_proto::json::{self, OrderedMap};
 use spawn_node_proto::response::{
@@ -145,6 +145,14 @@ impl From<Refusal> for Answer {
 
 type Flow = Result<Response, Answer>;
 
+/// A checked request, the time it is answered at and what the answer binds.
+#[derive(Clone, Copy)]
+struct Call<'c, 'a> {
+    checked: &'c Checked<'a>,
+    now: u64,
+    rid: &'c Rid,
+}
+
 const BAD: Answer = Answer::Refuse(Refusal::BadRequest);
 
 /// `POST /node/v1/spec`'s answer.
@@ -177,6 +185,11 @@ struct LedgerGrant {
     attempt: Option<u64>,
     #[serde(default)]
     spec: Value,
+    /// False when the node holds the job's base commit warm (it is among
+    /// the beat's `warm_bases`): the baseline bundle is then left out of
+    /// the grant (design §3.1). Absent: needed.
+    #[serde(default)]
+    needs_baseline: Option<bool>,
 }
 
 /// The grant fields a job's `spec` may carry.
@@ -324,8 +337,12 @@ impl Gateway {
             Verb::Enroll => self.enroll(store, &checked, now, rid),
             Verb::Heartbeat => self.beat(store, &checked, now, rid),
             Verb::Spec => self.spec(store, &checked, now, rid),
-            Verb::Result { job_id } => self.result(store, request, &checked, len, job_id, now, rid),
-            Verb::Artifact(_) | Verb::RegistryManifest => self.artifact(request, &checked),
+            Verb::Result { job_id } => {
+                let call = Call { checked: &checked, now, rid };
+                self.result(store, request, &call, len, job_id)
+            }
+            Verb::Artifact(_) => self.artifact(request, &checked),
+            Verb::RegistryManifest => self.manifest(&checked, now, rid),
         }
     }
 
@@ -578,43 +595,7 @@ impl Gateway {
     /// One grant's exact bytes, signed with the primary key over
     /// `spawn-node-grant-v1\n` + hex(SHA-256(bytes)) + `\n`.
     fn grant(&self, grant: &Value, node_id: &str, expires_ms: u64) -> Result<SignedGrant, String> {
-        let ledger: LedgerGrant = serde_json::from_value(grant.clone())
-            .map_err(|error| format!("ledger grant: {error}"))?;
-        let job: JobSpec = if ledger.spec.is_object() {
-            serde_json::from_value(ledger.spec.clone())
-                .map_err(|error| format!("{}: job spec: {error}", ledger.job_id))?
-        } else {
-            JobSpec::default()
-        };
-        let kind = match ledger.kind.as_str() {
-            // A shadow gate runs as a gate; the ledger alone knows it decides nothing.
-            "gate" | "gate_shadow" => JobKind::Gate,
-            "build" => JobKind::Build,
-            "de_batch" => JobKind::DeBatch,
-            other => return Err(format!("{}: kind {other}", ledger.job_id)),
-        };
-        let grant = Grant {
-            v: VERSION,
-            job_id: ledger.job_id,
-            lease_epoch: ledger.lease_epoch,
-            node_id: node_id.to_string(),
-            kind,
-            expires_ms,
-            attempt: ledger.attempt,
-            cost: ledger.cost.filter(|cost| !cost.is_empty()),
-            timeout_s: job.timeout_s,
-            inputs: job.inputs,
-            env: job.env,
-            requires: job.requires.filter(|requires| !requires.is_empty()),
-            artifact_urls: job.artifact_urls,
-        };
-        grant
-            .validate()
-            .map_err(|error| format!("{}: {error}", grant.job_id))?;
-        let bytes = grant.to_bytes();
-        if bytes.len() > Limit::Grant.bytes() {
-            return Err(format!("{}: {} bytes", grant.job_id, bytes.len()));
-        }
+        let bytes = build_grant(grant, node_id, expires_ms)?;
         Ok(SignedGrant::sign(&self.primary, &bytes))
     }
 
@@ -667,17 +648,15 @@ impl Gateway {
 
     /// `POST /node/v1/jobs/<job_id>/result`: the log streamed to disk and
     /// checked, the files in place, then the fenced completion.
-    #[allow(clippy::too_many_arguments)]
     fn result(
         &self,
         store: &mut Option<PostgresStore>,
         request: &mut Request<'_>,
-        checked: &Checked<'_>,
+        call: &Call<'_, '_>,
         len: u64,
         job_id: &str,
-        now: u64,
-        rid: &Rid,
     ) -> Flow {
+        let Call { checked, now, rid } = *call;
         self.require_cached(checked)?;
         let meta_line = checked.signed_body;
         let meta = ResultMeta::parse(meta_line).map_err(|error| Answer::Refuse(error.refusal()))?;
@@ -734,22 +713,88 @@ impl Gateway {
         Ok(self.signed(200, rid, now, json::to_vec(&answer)))
     }
 
-    /// `GET /node/v1/artifacts/<algo:hex>` and the registry manifest: no
-    /// ledger call; the cached key required.
+    /// `GET /node/v1/artifacts/<algo:hex>`: no ledger call; the cached key
+    /// required; the body unsigned (its address verifies it).
     fn artifact(&self, request: &Request<'_>, checked: &Checked<'_>) -> Flow {
         let miss = |miss: Miss| match miss {
             Miss::Unsupported => BAD,
             Miss::NotFound => Answer::NotFound,
         };
-        let path = match &checked.verb {
-            Verb::Artifact(digest) => {
-                artifacts::artifact_path(&self.artifacts, digest).map_err(miss)?
-            }
-            _ => self.artifacts.join(REGISTRY_MANIFEST),
+        let Verb::Artifact(digest) = &checked.verb else {
+            return Err(BAD);
         };
+        let path = artifacts::artifact_path(&self.artifacts, digest).map_err(miss)?;
         self.require_cached(checked)?;
         artifacts::serve(&path, request.header("Range")).map_err(miss)
     }
+
+    /// `GET /node/v1/registry-manifest`: no ledger call; the cached key
+    /// required; a signed JSON answer like every other (design §2.3), the
+    /// manifest file's members with `v` and `server_time_ms` set.
+    fn manifest(&self, checked: &Checked<'_>, now: u64, rid: &Rid) -> Flow {
+        self.require_cached(checked)?;
+        let path = self.artifacts.join(REGISTRY_MANIFEST);
+        let body = match artifacts::manifest_body(&path, now) {
+            Ok(body) => body,
+            Err(artifacts::ManifestError::Missing) => return Err(Answer::NotFound),
+            Err(artifacts::ManifestError::Invalid(why)) => {
+                eprintln!("spawn-node-gateway: {}: {why}", path.display());
+                return Err(Refusal::Unavailable.into());
+            }
+        };
+        Ok(self.signed(200, rid, now, body))
+    }
+}
+
+/// A grant's exact bytes from a lease `spawn_node_gw_beat` returned: the
+/// job's kind, epoch, attempt and cost, and the grant fields of its spec
+/// (without the baseline bundle when the ledger says `needs_baseline:
+/// false`); validated, within 8 KiB.
+pub fn build_grant(grant: &Value, node_id: &str, expires_ms: u64) -> Result<Vec<u8>, String> {
+    let ledger: LedgerGrant =
+        serde_json::from_value(grant.clone()).map_err(|error| format!("ledger grant: {error}"))?;
+    let job: JobSpec = if ledger.spec.is_object() {
+        serde_json::from_value(ledger.spec.clone())
+            .map_err(|error| format!("{}: job spec: {error}", ledger.job_id))?
+    } else {
+        JobSpec::default()
+    };
+    let kind = match ledger.kind.as_str() {
+        // A shadow gate runs as a gate; the ledger alone knows it decides nothing.
+        "gate" | "gate_shadow" => JobKind::Gate,
+        "build" => JobKind::Build,
+        "de_batch" => JobKind::DeBatch,
+        other => return Err(format!("{}: kind {other}", ledger.job_id)),
+    };
+    let mut artifact_urls = job.artifact_urls;
+    if ledger.needs_baseline == Some(false)
+        && let Some(urls) = artifact_urls.as_mut()
+    {
+        urls.retain(|url| url.role != ArtifactRole::BaselineBundle);
+    }
+    let grant = Grant {
+        v: VERSION,
+        job_id: ledger.job_id,
+        lease_epoch: ledger.lease_epoch,
+        node_id: node_id.to_string(),
+        kind,
+        expires_ms,
+        attempt: ledger.attempt,
+        cost: ledger.cost.filter(|cost| !cost.is_empty()),
+        timeout_s: job.timeout_s,
+        inputs: job.inputs,
+        env: job.env,
+        requires: job.requires.filter(|requires| !requires.is_empty()),
+        artifact_urls,
+    };
+    grant
+        .validate()
+        .map_err(|error| format!("{}: {error}", grant.job_id))?;
+    let bytes = grant.to_bytes();
+    if bytes.len() > Limit::Grant.bytes() {
+        return Err(format!("{}: {} bytes", grant.job_id, bytes.len()));
+    }
+    Ok(bytes)
 }
 
 /// The node's key in a ledger answer (standard base64, PostgreSQL's
@@ -857,7 +902,17 @@ pub fn spawn(
     gateway: &Arc<Gateway>,
     workers: usize,
 ) -> std::io::Result<std::net::SocketAddr> {
-    http::spawn(listener, workers, || Worker {
+    spawn_with(listener, gateway, workers, http::Timeouts::default())
+}
+
+/// [`spawn`] with other connection deadlines.
+pub fn spawn_with(
+    listener: TcpListener,
+    gateway: &Arc<Gateway>,
+    workers: usize,
+    timeouts: http::Timeouts,
+) -> std::io::Result<std::net::SocketAddr> {
+    http::spawn(listener, workers, timeouts, || Worker {
         gateway: Arc::clone(gateway),
         store: None,
     })
