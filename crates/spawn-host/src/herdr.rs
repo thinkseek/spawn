@@ -1425,7 +1425,7 @@ impl TerminalHost for HerdrHost {
     fn terminate(
         &self,
         terminal: &TerminalName,
-        _workspace: &WorkspaceId,
+        workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         let Some(record) = self.record(terminal)? else {
             return Ok(());
@@ -1449,6 +1449,9 @@ impl TerminalHost for HerdrHost {
             );
         }
         crate::tmux::wait_sessions_gone(terminal, &leaders, self.waits, "pane.close")?;
+        // What the engine detached from its session, still beneath the
+        // workspace: ended by pid before the caller's final checkpoint.
+        crate::tmux::end_stragglers(workspace.path(), self.waits)?;
         self.forget(terminal);
         self.unfollow(terminal);
         Ok(())

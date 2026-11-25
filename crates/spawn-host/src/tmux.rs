@@ -1086,7 +1086,7 @@ impl TerminalHost for TmuxHost {
     fn terminate(
         &self,
         terminal: &TerminalName,
-        _workspace: &WorkspaceId,
+        workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         // Read before the kill: the session's processes are told by it.
         // With the leader recorded at start: a session that vanished on its
@@ -1114,7 +1114,7 @@ impl TerminalHost for TmuxHost {
         self.wait_gone(terminal, &leaders)?;
         // What the engine detached from its session, still beneath the
         // workspace: ended by pid before the caller's final checkpoint.
-        end_stragglers(_workspace.path(), self.waits())?;
+        end_stragglers(workspace.path(), self.waits)?;
         self.forget_leader(terminal);
         Ok(())
     }
