@@ -479,12 +479,23 @@ mod tests {
         enroll_token(&store, "n252", None, &primary).unwrap();
 
         // A P1-joined name is refused by the store.
-        store
-            .node_record(&json!({"type": "node.joined", "name": "p1node",
-                                "transport": "ssh", "destination": "p1node",
-                                "arch": "x86_64", "os": "GNU/Linux", "kernel": "6",
-                                "cores": 4, "mem_total": 1, "disk_free": 1}))
-            .expect("a P1 join");
+        let mut joined = super::super::inventory(
+            "@arch\nx86_64\n@os\nGNU/Linux\n@kernel\n6.1\n@cores\n4\n@meminfo\n\
+             MemTotal: 1024 kB\nMemAvailable: 512 kB\n@df\n\
+             Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+             /dev/x 100 50 50 50% /\n@gpu\n@end\n",
+        )
+        .expect("an inventory");
+        for (key, value) in [
+            ("type", json!("node.joined")),
+            ("name", json!("p1node")),
+            ("ssh", json!("p1node")),
+            ("note", Value::Null),
+            ("exit_country", Value::Null),
+        ] {
+            joined[key] = value;
+        }
+        store.node_record(&joined).expect("a P1 join");
         assert!(enroll_token(&store, "p1node", None, &primary).is_err());
 
         // Drain and undrain: a v1 node through the ledger, twice each.
