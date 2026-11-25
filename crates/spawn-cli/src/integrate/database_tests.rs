@@ -11043,3 +11043,129 @@ fn a_fresh_task_after_a_yield_is_routed_afresh() {
     assert!(record.get("quality_rejections").is_none(), "{record}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `agent`'s checkpoint on `source`'s main, pushed as `spawn/<agent>` and
+/// fetched into `mirror`: the pushed commit.
+fn push_checkpoint(base: &Path, source: &str, mirror: &Path, agent: &str) -> String {
+    let clone = base.join(format!("checkpoint-{agent}"));
+    let clone_path = clone.to_string_lossy().to_string();
+    git(&["clone", "-q", source, &clone_path]).expect("clone");
+    std::fs::write(clone.join("work.txt"), "work\n").expect("write");
+    super::tests::commit_in(&clone_path, "spawn checkpoint exec_p1");
+    let branch = format!("refs/heads/spawn/{agent}");
+    git(&["-C", &clone_path, "push", "-q", "origin", &format!("HEAD:{branch}")])
+        .expect("push the agent's branch");
+    git(&[
+        "--git-dir",
+        &mirror.to_string_lossy(),
+        "fetch",
+        "-q",
+        source,
+        &format!("+{branch}:refs/prov-test/head"),
+    ])
+    .expect("fetch into the mirror");
+    git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work")
+}
+
+/// A landing of task work whose source's main is indexed, through
+/// `land()`: its candidate's last trailer is its `Spawn-Change`, and with
+/// `hook_down` the database is unreachable at the landing hook. Returns
+/// the candidate, after checking the landing succeeded.
+fn land_with_provenance(tag: &str, hook_down: bool) -> (Db, String, PathBuf, String) {
+    let (base, source, scenarios, integrator) = world(tag, "exit 1\n");
+    let db = Db::new(&tag.replace('-', "_"));
+    let b0 = source_main(&source);
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = db.reported_task(mission, "l");
+    let mirror =
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
+    let domain = crate::provenance::index::domain_of(&source);
+    let mut repo =
+        crate::provenance::index::Repo::open(&mirror.to_string_lossy()).expect("the mirror");
+    crate::provenance::index::index(&db.store, &mut repo, &domain).expect("main indexed");
+    drop(repo);
+    let head = push_checkpoint(&base, &source, &mirror, &agent_of(&db, mission, task));
+    let message = super::landing_message(&ready_task(&db, task), &head);
+    let candidate = super::landing_candidate(&mirror.to_string_lossy(), &b0, &head, &message)
+        .expect("a landing")
+        .expect("no conflict");
+    let written = git(&[
+        "--git-dir",
+        &mirror.to_string_lossy(),
+        "log",
+        "-1",
+        "--format=%B",
+        &candidate,
+    ])
+    .expect("the message");
+    assert_eq!(
+        written.lines().last(),
+        Some(format!("Spawn-Change: {}", crate::provenance::source_change(&source, task)).as_str()),
+        "{written}"
+    );
+    db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                      "verdict": "accepted", "base": b0, "candidate": candidate}));
+    let landing = ready_task(&db, task);
+    crate::provenance::HOOK_UNREACHABLE.with(|down| down.set(hook_down));
+    let landed = super::land(&db.store, &mirror, &source, &landing);
+    crate::provenance::HOOK_UNREACHABLE.with(|down| down.set(false));
+    assert_eq!(landed, Ok(super::Landing::Landed));
+    assert_eq!(source_main(&source), candidate, "the push moved main");
+    assert_eq!(task_records(&db, "task.landed", task).len(), 1);
+    (db, candidate, base, domain)
+}
+
+/// Decisions B4 (verification 1, in a test): the landing's `land` Change
+/// is in `spawn prov show` as soon as `land()` returns, with no indexer
+/// run, including the Change its `Spawn-Change` names; a following index
+/// run records nothing.
+#[test]
+fn a_landing_records_its_land_change_right_after_the_push() {
+    let (db, candidate, base, domain) = land_with_provenance("prov-land-hook", false);
+    let shown = crate::provenance::show(
+        &db.store,
+        &crate::provenance::Target::Commit(candidate.clone()),
+    )
+    .expect("show");
+    let change = &shown["changes"][0];
+    assert_eq!(change["change"]["kind"], "land", "{shown:#}");
+    let message = git(&["--git-dir", &db_mirror(&base), "log", "-1", "--format=%B", &candidate])
+        .expect("the landed message");
+    assert_eq!(change["edges"][0]["kind"], "includes");
+    assert_eq!(
+        json!(crate::provenance::spawn_changes(&message)),
+        json!([change["edges"][0]["dst"]]),
+        "the trailer names the included Change"
+    );
+    let mut repo = crate::provenance::index::Repo::open(&db_mirror(&base)).expect("the source");
+    let again = crate::provenance::index::index(&db.store, &mut repo, &domain).expect("index");
+    assert_eq!(again.recorded(), 0, "{again:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The source's bare repository under a test's `base`.
+fn db_mirror(base: &Path) -> String {
+    format!("{}/source.git", base.display())
+}
+
+/// Decisions B4 (verification 2): with the database unreachable at the
+/// hook, the landing still succeeds (pushed, recorded `task.landed`), and
+/// a later `spawn prov index` records the landing and its checkpoint.
+#[test]
+fn a_landing_whose_provenance_hook_fails_still_lands_and_the_indexer_records_it() {
+    let (db, candidate, base, domain) = land_with_provenance("prov-land-down", true);
+    let shown = crate::provenance::show(
+        &db.store,
+        &crate::provenance::Target::Commit(candidate.clone()),
+    )
+    .expect("show");
+    assert_eq!(shown["changes"], json!([]), "the hook recorded nothing");
+    let mut repo = crate::provenance::index::Repo::open(&db_mirror(&base)).expect("the source");
+    let later = crate::provenance::index::index(&db.store, &mut repo, &domain).expect("index");
+    assert_eq!((later.edits, later.lands), (1, 1), "{later:?}");
+    let shown =
+        crate::provenance::show(&db.store, &crate::provenance::Target::Commit(candidate))
+            .expect("show");
+    assert_eq!(shown["changes"][0]["change"]["kind"], "land");
+    let _ = std::fs::remove_dir_all(&base);
+}
