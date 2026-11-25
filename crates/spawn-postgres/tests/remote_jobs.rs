@@ -864,17 +864,19 @@ fn the_gateway_login_reaches_exactly_its_functions_and_no_table() {
 }
 
 /// Everything a migration says about the ledger and the schema: functions
-/// (body, settings, rights), relations and their rights, columns,
+/// (body, settings, rights; a NULL ACL read as the default it means, which
+/// some existing objects spell out on a second migration), relations and their rights, columns,
 /// constraints, indexes, the gateway login, and the ledger's rows.
 fn catalog(client: &mut Client) -> Vec<String> {
     client
         .query(
             "select 'fn ' || p.oid::regprocedure::text || ' ' || md5(p.prosrc) || ' '
                     || coalesce(array_to_string(p.proconfig, ','), '') || ' '
-                    || coalesce(p.proacl::text, '')
+                    || coalesce(p.proacl, acldefault('f', p.proowner))::text
                from pg_proc p where p.pronamespace = current_schema()::regnamespace
              union all
-             select 'rel ' || c.relname || ' ' || c.relkind::text || ' ' || coalesce(c.relacl::text, '')
+             select 'rel ' || c.relname || ' ' || c.relkind::text || ' ' || coalesce(c.relacl,
+                             acldefault(case c.relkind when 'S' then 's' else 'r' end::"char", c.relowner))::text
                     || ' ' || coalesce(array_to_string(c.reloptions, ','), '')
                from pg_class c where c.relnamespace = current_schema()::regnamespace
              union all
