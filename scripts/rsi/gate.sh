@@ -1113,7 +1113,7 @@ gate_scripts=$(cd "$(dirname "$0")/.." && pwd)
 # where PATH found it), and the controller's `scripts` and
 # `web/node_modules`, which the checks use. Nothing else of $HOME is
 # visible: not ~/.gitconfig, not ~/.claude.json.backup, not shell history.
-home_tools="node npm npx"
+home_tools="node npm npx herdr"
 home_binds=""
 home_links=""
 under_home() {
