@@ -6,6 +6,11 @@
 //! Claude Code's session transcript, one JSON object per line
 //! ([`claude_line`]).
 //!
+//! The Antigravity CLI's (`agy`) full transcript
+//! (`brain/<conversation>/.system_generated/logs/transcript_full.jsonl`),
+//! one step per line ([`agy_line`]), keyed by the conversation and the
+//! step.
+//!
 //! Lines that carry no Spawn meaning give nothing, so a new engine release
 //! adds no failure mode. Events carry a key the engine made unique (the
 //! line's `uuid`, the `tool_use_id`, a background job's id with the call
@@ -2377,5 +2382,618 @@ mod tests {
                 "other programs keep their words"
             );
         }
+    }
+}
+
+/// What one agy transcript line opens a job with: the `task id:` a
+/// backgrounded command's step names (`<conversation>/task-<n>`).
+fn agy_task_id(text: &str) -> Option<&str> {
+    let at = text.find("task id: ")? + "task id: ".len();
+    let id = text[at..].split_whitespace().next()?;
+    agy_job_id(id).filter(|id| {
+        id.rsplit_once("/task-").is_some_and(|(_, number)| {
+            !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+        })
+    })
+}
+
+/// An agy job or subagent id: letters, digits, `-`, `_` and `/`, at most
+/// [`MAX_JOB_ID`] + 64 characters (a conversation id and a task number).
+fn agy_job_id(id: &str) -> Option<&str> {
+    (!id.is_empty()
+        && id.len() <= MAX_JOB_ID + 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/')))
+    .then_some(id)
+}
+
+/// The sender a `SYSTEM_MESSAGE` names (`sender=<id>`): a job or a subagent
+/// that reported back. A system message with none (a reminder of the
+/// engine's own) ends nothing.
+fn agy_sender(text: &str) -> Option<&str> {
+    let at = text.find("sender=")? + "sender=".len();
+    agy_job_id(text[at..].split_whitespace().next()?)
+}
+
+/// The subagent a step created: `Created the following subagent:` and the
+/// JSON after it, whose `conversationId` names it.
+fn agy_subagent(text: &str) -> Option<String> {
+    let at = text.find("Created the following subagent:")?;
+    let rest = &text[at..];
+    let key = rest.find("\"conversationId\"")? + "\"conversationId\"".len();
+    let rest = rest[key..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let id = &rest[..rest.find('"')?];
+    agy_job_id(id).map(str::to_string)
+}
+
+/// How a job's report says it finished: `Command exited with code N`.
+fn agy_job_end(text: &str) -> JobEnd {
+    let Some(at) = text.find("Command exited with code ") else {
+        return JobEnd::Ended;
+    };
+    let code: String = text[at + "Command exited with code ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    match code.parse::<i64>() {
+        Ok(0) => JobEnd::Completed,
+        Ok(_) => JobEnd::Failed,
+        Err(_) => JobEnd::Ended,
+    }
+}
+
+/// The summary of an agy tool call: a command's as a Bash command's
+/// ([`tool_summary`]), nothing for the others.
+fn agy_summary(name: &str, args: Option<&Value>) -> (Option<String>, bool) {
+    let command = args
+        .and_then(|args| args.get("CommandLine"))
+        .and_then(Value::as_str);
+    match (name, command) {
+        ("run_command", Some(command)) => {
+            let input = serde_json::json!({ "command": command });
+            (
+                tool_summary("Bash", Some(&input)),
+                tool_summary_whole("Bash", Some(&input)),
+            )
+        }
+        _ => (None, false),
+    }
+}
+
+/// The calls of `cursor` still waiting for a result, ended now: a new
+/// prompt, or an answer with no call, comes after them (an interrupt cut
+/// them, and Esc writes no line).
+fn agy_finish_pending(cursor: &mut crate::driver::LineCursor) -> Vec<Normalized> {
+    let native = cursor.native.clone();
+    cursor
+        .pending_tools
+        .drain(..)
+        .map(|(made, index)| agy_completed(&native, made, index))
+        .collect()
+}
+
+/// The end of the agy tool call `index` of step `made`.
+fn agy_completed(native: &str, made: u64, index: usize) -> Normalized {
+    let id = format!("{native}:{made}:{index}");
+    keyed(
+        EventKind::ToolCompleted {
+            tool_use_id: id.clone(),
+            duration_ms: None,
+        },
+        format!("{id}:completed"),
+    )
+}
+
+/// The events in one line of agy's full transcript, read through `cursor`
+/// (which holds what the earlier lines opened). Every event is keyed
+/// `<conversation>:<step>:…`, so a line read again appends nothing. A line
+/// is one step (`step_index`, `type`, `status` of `DONE`, `RUNNING` or
+/// `ERROR`, and optional `error` and `truncated_fields`); a line that is no
+/// step gives nothing, and nothing is ever refused.
+///
+/// - `USER_INPUT`: a prompt (`message.received`), taking the messages whose
+///   markers it holds (`message.taken`); a tool call still without a result
+///   (an interrupt cut it, and Esc writes no line) ends here;
+/// - `PLANNER_RESPONSE`: a model call (`model.usage`, first); each of its
+///   `tool_calls` starts a tool (`tool.started`). One with no call ends the
+///   turn (`turn.stopped`) unless background work is open;
+/// - `GENERIC`: the result of the oldest call waiting for one
+///   (`tool.completed`, a failed one included: `ERROR` with its `error`,
+///   or a command that exited non-zero). A `RUNNING` one that names a
+///   `task id:` started a background job, and one that says `Created the
+///   following subagent:` (written `DONE` at once) a subagent
+///   (`job.started`; agy never updates the `RUNNING` step);
+/// - `SYSTEM_MESSAGE` with a `sender=` that is an open job or subagent: it
+///   finished (`job.ended`). One with no sender ends nothing.
+///
+/// Steps may be missing (an interrupt leaves a gap): nothing waits on a
+/// step number.
+pub fn agy_line(line: &str, cursor: &mut crate::driver::LineCursor) -> Vec<Normalized> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    let Some(step) = value.get("step_index").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    let native = cursor.native.clone();
+    let key = |rest: &str| format!("{native}:{step}:{rest}");
+    cursor.last_step = Some(step);
+    let content = field("content").unwrap_or_default();
+    match field("type") {
+        Some("USER_INPUT") => {
+            let mut events = agy_finish_pending(cursor);
+            events.push(keyed(EventKind::MessageReceived, key("received")));
+            events.extend(
+                crate::message::markers(content)
+                    .into_iter()
+                    .map(|command_id| {
+                        keyed(
+                            EventKind::MessageTaken { command_id },
+                            key(&format!("taken:{}", command_id.0)),
+                        )
+                    }),
+            );
+            events
+        }
+        Some("PLANNER_RESPONSE") => agy_planner(&value, step, cursor),
+        Some("GENERIC") => agy_generic(&value, step, cursor),
+        Some("SYSTEM_MESSAGE") => {
+            let Some(sender) = agy_sender(content) else {
+                return Vec::new();
+            };
+            let how = if cursor.open_jobs.remove(sender) {
+                agy_job_end(content)
+            } else if cursor.open_subagents.remove(sender) {
+                JobEnd::Completed
+            } else {
+                return Vec::new();
+            };
+            vec![keyed(
+                EventKind::JobEnded {
+                    job_id: sender.to_string(),
+                    how,
+                },
+                key(&format!("job:{sender}:ended")),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// An agy `PLANNER_RESPONSE` step ([`agy_line`]): its model call's usage,
+/// then a tool started per call, or, with no call, the turn's end unless
+/// background work is open.
+fn agy_planner(
+    value: &Value,
+    step: u64,
+    cursor: &mut crate::driver::LineCursor,
+) -> Vec<Normalized> {
+    let native = cursor.native.clone();
+    let key = |rest: &str| format!("{native}:{step}:{rest}");
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    let mut events = Vec::new();
+    let count = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let (input, output, cache_read) = (
+        count("input_tokens"),
+        count("output_tokens"),
+        count("cache_read_tokens"),
+    );
+    if (input, output, cache_read) != (0, 0, 0)
+        && let Some(at_ms) = field("created_at").and_then(utc_ms)
+    {
+        let model = field("model")
+            .filter(|model| !model.is_empty())
+            .unwrap_or("unknown");
+        events.push(keyed(
+            EventKind::ModelUsage {
+                message_id: format!("{native}:{step}"),
+                model: model.to_string(),
+                at_ms,
+                input_tokens: input,
+                output_tokens: output,
+                cache_write_tokens: 0,
+                cache_read_tokens: cache_read,
+            },
+            key("usage"),
+        ));
+    }
+    let calls = value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if calls.is_empty() {
+        events.extend(agy_finish_pending(cursor));
+        if !cursor.work_open() {
+            events.push(keyed(
+                EventKind::TurnStopped {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+                key("stopped"),
+            ));
+        }
+        return events;
+    }
+    for (index, call) in calls.iter().enumerate() {
+        let name = call
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown");
+        let (summary, summary_whole) = agy_summary(name, call.get("args"));
+        events.push(keyed(
+            EventKind::ToolStarted {
+                tool_name: name.to_string(),
+                tool_use_id: format!("{native}:{step}:{index}"),
+                summary,
+                summary_whole,
+            },
+            key(&format!("{index}:started")),
+        ));
+        cursor.pending_tools.push((step, index));
+    }
+    events
+}
+
+/// An agy `GENERIC` step ([`agy_line`]): the result of the oldest call
+/// waiting for one, and the background job or subagent it started.
+fn agy_generic(
+    value: &Value,
+    step: u64,
+    cursor: &mut crate::driver::LineCursor,
+) -> Vec<Normalized> {
+    let native = cursor.native.clone();
+    let key = |rest: &str| format!("{native}:{step}:{rest}");
+    let content = value
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    if !cursor.pending_tools.is_empty() {
+        let (made, index) = cursor.pending_tools.remove(0);
+        events.push(agy_completed(&native, made, index));
+    }
+    if value.get("status").and_then(Value::as_str) == Some("RUNNING")
+        && let Some(id) = agy_task_id(content)
+        && cursor.open_jobs.insert(id.to_string())
+    {
+        events.push(keyed(
+            EventKind::JobStarted {
+                job_id: id.to_string(),
+                kind: JobKind::Bash,
+            },
+            key(&format!("job:{id}:started")),
+        ));
+    }
+    if let Some(id) = agy_subagent(content)
+        && cursor.open_subagents.insert(id.clone())
+    {
+        events.push(keyed(
+            EventKind::JobStarted {
+                job_id: id.clone(),
+                kind: JobKind::Agent,
+            },
+            key(&format!("job:{id}:started")),
+        ));
+    }
+    events
+}
+
+#[cfg(test)]
+mod agy_tests {
+    use super::{Normalized, agy_line};
+    use crate::driver::LineCursor;
+    use crate::event::{EventKind, JobEnd, JobKind};
+    use crate::id::CommandId;
+
+    const CONV: &str = "11111111-2222-4333-8444-555555555555";
+    const SUB: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+    fn cursor() -> LineCursor {
+        LineCursor {
+            native: CONV.to_string(),
+            ..LineCursor::default()
+        }
+    }
+
+    fn line(step: u64, kind: &str, status: &str, rest: &str) -> String {
+        format!(
+            r#"{{"step_index":{step},"source":"MODEL","type":"{kind}","status":"{status}","created_at":"2026-11-25T14:26:03Z"{rest}}}"#
+        )
+    }
+
+    fn content(text: &str) -> String {
+        format!(
+            r#","content":{}"#,
+            serde_json::to_string(text).expect("json")
+        )
+    }
+
+    fn system(step: u64, text: &str) -> String {
+        format!(
+            r#"{{"step_index":{step},"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-25T14:26:20Z","content":{}}}"#,
+            serde_json::to_string(text).expect("json")
+        )
+    }
+
+    fn kinds(events: &[Normalized]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|event| match event.kind {
+                EventKind::MessageReceived => "received",
+                EventKind::MessageTaken { .. } => "taken",
+                EventKind::ModelUsage { .. } => "usage",
+                EventKind::ToolStarted { .. } => "tool.started",
+                EventKind::ToolCompleted { .. } => "tool.completed",
+                EventKind::JobStarted { .. } => "job.started",
+                EventKind::JobEnded { .. } => "job.ended",
+                EventKind::TurnStopped { .. } => "turn.stopped",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    fn key(event: &Normalized) -> &str {
+        event.source_event_id.as_deref().expect("keyed")
+    }
+
+    /// The probe's turn (agy 1.5.14): two background commands and a
+    /// subagent; agy answers in prose while they run (no turn end), the
+    /// subagent reports, a reminder with no sender comes, the jobs report,
+    /// and only the last answer ends the turn.
+    #[allow(clippy::too_many_lines)] // one probed turn, line by line, in transcript order
+    #[test]
+    fn a_turn_stays_open_while_its_jobs_and_subagent_run() {
+        let mut cursor = cursor();
+        let prompt = crate::message::marked("do it", CommandId(42), true);
+        let user = format!(
+            r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-25T14:25:59Z","content":{}}}"#,
+            serde_json::to_string(&format!("<USER_REQUEST>\n{prompt}\n</USER_REQUEST>"))
+                .expect("json")
+        );
+        let events = agy_line(&user, &mut cursor);
+        assert_eq!(kinds(&events), ["received", "taken"]);
+        assert_eq!(key(&events[0]), format!("{CONV}:0:received"));
+        assert_eq!(
+            events[1].kind,
+            EventKind::MessageTaken {
+                command_id: CommandId(42)
+            }
+        );
+        assert_eq!(key(&events[1]), format!("{CONV}:0:taken:42"));
+
+        let calls = line(
+            1,
+            "PLANNER_RESPONSE",
+            "DONE",
+            r#","model":"gemini-3.8-flash-low","input_tokens":8874,"cache_read_tokens":0,"output_tokens":134,"tool_calls":[{"name":"run_command","args":{"CommandLine":"sleep 25; echo JOB_A_DONE"}},{"name":"run_command","args":{"CommandLine":"sleep 40"}},{"name":"invoke_subagent","args":{"Prompt":"count"}}]"#,
+        );
+        let events = agy_line(&calls, &mut cursor);
+        assert_eq!(
+            kinds(&events),
+            ["usage", "tool.started", "tool.started", "tool.started"]
+        );
+        let EventKind::ModelUsage {
+            message_id,
+            model,
+            input_tokens,
+            output_tokens,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("usage first");
+        };
+        assert_eq!(message_id, &format!("{CONV}:1"));
+        assert_eq!(model, "gemini-3.8-flash-low");
+        assert_eq!((*input_tokens, *output_tokens), (8874, 134));
+        let EventKind::ToolStarted {
+            tool_name,
+            tool_use_id,
+            summary,
+            ..
+        } = &events[1].kind
+        else {
+            panic!("a tool");
+        };
+        assert_eq!(tool_name, "run_command");
+        assert_eq!(tool_use_id, &format!("{CONV}:1:0"));
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|summary| summary.starts_with("sleep")),
+            "{summary:?}"
+        );
+
+        for task in [2, 3] {
+            let running = line(
+                task,
+                "GENERIC",
+                "RUNNING",
+                &content(&format!(
+                    "Created At: x\nTool is running as a background task with task id: \
+                     {CONV}/task-{task}\nTask Description: sleep"
+                )),
+            );
+            let events = agy_line(&running, &mut cursor);
+            assert_eq!(kinds(&events), ["tool.completed", "job.started"]);
+            assert_eq!(
+                events[1].kind,
+                EventKind::JobStarted {
+                    job_id: format!("{CONV}/task-{task}"),
+                    kind: JobKind::Bash
+                }
+            );
+        }
+        // The subagent's step is written DONE at once.
+        let created = line(
+            4,
+            "GENERIC",
+            "DONE",
+            &content(&format!(
+                "Created At: x\nCreated the following subagent:\n{{\n  \"conversationId\": \
+                 \"{SUB}\",\n  \"logAbsoluteUri\": \"file:///x\"\n}}\nThe subagent will send"
+            )),
+        );
+        let events = agy_line(&created, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed", "job.started"]);
+        assert_eq!(
+            events[1].kind,
+            EventKind::JobStarted {
+                job_id: SUB.to_string(),
+                kind: JobKind::Agent
+            }
+        );
+        assert!(cursor.pending_tools.is_empty());
+
+        // Prose while the work runs: no turn end.
+        let waiting = line(
+            5,
+            "PLANNER_RESPONSE",
+            "DONE",
+            &format!(
+                r#","model":"m","input_tokens":1,"output_tokens":2,"cache_read_tokens":3{}"#,
+                content("Waiting.")
+            ),
+        );
+        assert_eq!(kinds(&agy_line(&waiting, &mut cursor)), ["usage"]);
+
+        let reported = system(
+            6,
+            &format!(
+                "<SYSTEM_MESSAGE>\n[Message] timestamp=x sender={SUB} priority=HIGH \
+                 content=1\n</SYSTEM_MESSAGE>"
+            ),
+        );
+        let events = agy_line(&reported, &mut cursor);
+        assert_eq!(
+            events[0].kind,
+            EventKind::JobEnded {
+                job_id: SUB.to_string(),
+                how: JobEnd::Completed
+            }
+        );
+        assert_eq!(key(&events[0]), format!("{CONV}:6:job:{SUB}:ended"));
+        // A reminder with no sender ends nothing.
+        let reminder = system(
+            7,
+            "<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>",
+        );
+        assert!(agy_line(&reminder, &mut cursor).is_empty());
+        let still = line(8, "PLANNER_RESPONSE", "DONE", &content("Job A next."));
+        assert!(agy_line(&still, &mut cursor).is_empty());
+
+        let job = |step: u64, task: u64, code: i32| {
+            system(
+                step,
+                &format!(
+                    "[Message] timestamp=x sender={CONV}/task-{task} priority=HIGH \
+                     content=Task id \"{CONV}/task-{task}\" finished with result:\nCommand \
+                     exited with code {code}.\n"
+                ),
+            )
+        };
+        let events = agy_line(&job(10, 2, 0), &mut cursor);
+        assert_eq!(
+            events[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-2"),
+                how: JobEnd::Completed
+            }
+        );
+        // Step 11 is a gap: nothing waits for it.
+        let events = agy_line(&job(12, 3, 1), &mut cursor);
+        assert_eq!(
+            events[0].kind,
+            EventKind::JobEnded {
+                job_id: format!("{CONV}/task-3"),
+                how: JobEnd::Failed
+            }
+        );
+        assert!(!cursor.work_open());
+        let done = line(13, "PLANNER_RESPONSE", "DONE", &content("ALL_DONE 1"));
+        let events = agy_line(&done, &mut cursor);
+        assert_eq!(kinds(&events), ["turn.stopped"]);
+        assert_eq!(key(&events[0]), format!("{CONV}:13:stopped"));
+        // A second report of a job already ended adds nothing.
+        assert!(agy_line(&job(14, 2, 0), &mut cursor).is_empty());
+    }
+
+    /// A failed tool (`ERROR` with `error`), a command that exited non-zero
+    /// (`DONE`), a truncated line and an unknown status: all read, none
+    /// refused; an interrupt's gap ends its call at the next prompt.
+    #[test]
+    fn failures_truncations_and_gaps_are_read() {
+        let mut cursor = cursor();
+        let call = |step: u64| {
+            line(
+                step,
+                "PLANNER_RESPONSE",
+                "DONE",
+                r#","tool_calls":[{"name":"read_file","args":{}}]"#,
+            )
+        };
+        assert_eq!(kinds(&agy_line(&call(1), &mut cursor)), ["tool.started"]);
+        let failed = line(
+            2,
+            "GENERIC",
+            "ERROR",
+            &format!(
+                r#","error":"file does not exist"{}"#,
+                content("Encountered error in step execution: file does not exist")
+            ),
+        );
+        assert_eq!(kinds(&agy_line(&failed, &mut cursor)), ["tool.completed"]);
+        assert_eq!(kinds(&agy_line(&call(3), &mut cursor)), ["tool.started"]);
+        let exited = line(
+            4,
+            "GENERIC",
+            "DONE",
+            &format!(
+                r#","truncated_fields":["content"]{}"#,
+                content("Command exited with code 1.")
+            ),
+        );
+        assert_eq!(kinds(&agy_line(&exited, &mut cursor)), ["tool.completed"]);
+        let odd = line(5, "GENERIC", "SOMETHING_NEW", "");
+        assert!(agy_line(&odd, &mut cursor).is_empty());
+        assert_eq!(kinds(&agy_line(&call(6), &mut cursor)), ["tool.started"]);
+        let user = r#"{"step_index":9,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-25T14:30:00Z","content":"again"}"#;
+        let events = agy_line(user, &mut cursor);
+        assert_eq!(kinds(&events), ["tool.completed", "received"]);
+        assert_eq!(key(&events[0]), format!("{CONV}:6:0:completed"));
+        assert_eq!(cursor.last_step, Some(9));
+        for junk in ["", "not json", "{}", r#"{"type":"USER_INPUT"}"#] {
+            assert!(agy_line(junk, &mut cursor).is_empty(), "{junk}");
+        }
+    }
+
+    /// The same lines read again through a fresh cursor give the same keys.
+    #[test]
+    fn reading_again_gives_the_same_keys() {
+        let lines = [
+            r#"{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"hi"}"#.to_string(),
+            line(
+                1,
+                "PLANNER_RESPONSE",
+                "DONE",
+                r#","tool_calls":[{"name":"run_command","args":{"CommandLine":"ls"}}]"#,
+            ),
+            line(2, "GENERIC", "DONE", &content("ok")),
+            line(3, "PLANNER_RESPONSE", "DONE", &content("done")),
+        ];
+        let keys = || {
+            let mut cursor = cursor();
+            lines
+                .iter()
+                .flat_map(|line| agy_line(line, &mut cursor))
+                .map(|event| event.source_event_id.expect("keyed"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(), keys());
+        assert_eq!(keys().len(), 4);
     }
 }
