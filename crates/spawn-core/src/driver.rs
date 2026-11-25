@@ -682,10 +682,10 @@ mod tests {
     fn agy_transcript_is_the_full_one_below_its_home() {
         let workspace = WorkspaceId::new("3:/workspaces/agent_a").expect("workspace");
         assert_eq!(
-            AgyDriver.transcript_path(&agy_home(), &workspace, "0399e008-e64f"),
-            "/home/a/.gemini/antigravity-cli/brain/0399e008-e64f/.system_generated/logs/transcript_full.jsonl"
+            AgyDriver.transcript_path(&agy_home(), &workspace, "11111111-2222"),
+            "/home/a/.gemini/antigravity-cli/brain/11111111-2222/.system_generated/logs/transcript_full.jsonl"
         );
-        assert!(plain_session_id("0399e008-e64f-46a9-9731-b7ea467dd124"));
+        assert!(plain_session_id("11111111-2222-4333-8444-555555555555"));
         for bad in ["", "../x", "a/b", "a b", &"x".repeat(129)] {
             assert!(!plain_session_id(bad), "{bad:?}");
         }

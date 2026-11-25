@@ -2690,8 +2690,8 @@ mod agy_tests {
     use crate::event::{EventKind, JobEnd, JobKind};
     use crate::id::CommandId;
 
-    const CONV: &str = "0399e008-e64f-46a9-9731-b7ea467dd124";
-    const SUB: &str = "9297b2d9-a7fc-4f21-a619-dd859d007821";
+    const CONV: &str = "11111111-2222-4333-8444-555555555555";
+    const SUB: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 
     fn cursor() -> LineCursor {
         LineCursor {

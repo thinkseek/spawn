@@ -8859,7 +8859,7 @@ mod tests {
         // The host reports a session whose transcript is not there yet, and
         // then one whose prompt holds no marker of this execution's: nothing
         // is bound.
-        let conversation = "0399e008-e64f-46a9-9731-b7ea467dd124";
+        let conversation = "11111111-2222-4333-8444-555555555555";
         let path =
             format!("{AGY_HOME}/brain/{conversation}/.system_generated/logs/transcript_full.jsonl");
         let mut reported = agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 2);
