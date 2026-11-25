@@ -391,7 +391,7 @@ fn check_who(schema: &str, git_dir: &str, h: &History) {
     // who: a line's blame names the checkpoint that wrote it; a file names
     // the landing and the revision its content came from.
     let line = spawn_json(
-        &schema,
+        schema,
         &[
             "prov",
             "who",
@@ -399,7 +399,7 @@ fn check_who(schema: &str, git_dir: &str, h: &History) {
             "--source",
             SOURCE,
             "--repo",
-            &git_dir,
+            git_dir,
         ],
     );
     assert_eq!(line["commit"], h.a2.as_str(), "{line}");
@@ -408,7 +408,7 @@ fn check_who(schema: &str, git_dir: &str, h: &History) {
     assert_eq!(line["agent_id"], "agent_a");
     assert_eq!(line["task_id"], 11);
     let readme = spawn_json(
-        &schema,
+        schema,
         &[
             "prov",
             "who",
@@ -416,14 +416,14 @@ fn check_who(schema: &str, git_dir: &str, h: &History) {
             "--source",
             SOURCE,
             "--repo",
-            &git_dir,
+            git_dir,
         ],
     );
     assert_eq!(readme["attributed"], "imported");
     let file = spawn_json(
-        &schema,
+        schema,
         &[
-            "prov", "who", "src/a.rs", "--source", SOURCE, "--repo", &git_dir,
+            "prov", "who", "src/a.rs", "--source", SOURCE, "--repo", git_dir,
         ],
     );
     assert_eq!(file["granularity"], "file");
