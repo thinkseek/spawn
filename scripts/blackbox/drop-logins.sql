@@ -1,6 +1,6 @@
 -- The restricted logins a test database leaves on its server, and the one
--- rule that drops them. init-db makes three logins per database,
--- spawn_supervisor_<db>, spawn_reader_<db> and spawn_human_<db> (named by
+-- rule that drops them. init-db makes four logins per database,
+-- spawn_supervisor_<db>, spawn_reader_<db>, spawn_human_<db> and spawn_node_gateway_<db> (named by
 -- spawn_login_role, crates/spawn-postgres/sql/schema.sql), and roles belong
 -- to the whole server: dropping the database leaves them. Run by
 -- scripts/blackbox/scenario-db.sh (every scenario's cleanup and start) and
@@ -8,7 +8,7 @@
 --
 -- Connected to the server's `postgres` database, after setting, for the
 -- session (set_config(name, value, false)):
---   spawn_logins.database  a database name: that database's three logins
+--   spawn_logins.database  a database name: that database's four logins
 --                          (run after dropping it); or empty, and
 --   spawn_logins.prefix    the logins of every database whose name starts
 --                          with it (a sweep; empty: every database).
@@ -16,7 +16,7 @@
 -- scope, by name), or `skipped: <why>`.
 --
 -- A login is dropped only when all of these hold:
---   - its name has the shape spawn_(supervisor|reader|human)_[a-z0-9_]+;
+--   - its name has the shape spawn_(supervisor|reader|human|node_gateway)_[a-z0-9_]+;
 --   - no database on the server has it as one of its logins (the name
 --     spawn_login_role gives, the long-name hash included);
 --   - it holds no privilege and owns nothing anywhere on the server
@@ -53,7 +53,8 @@ begin
         return;
     end if;
     for v_login in
-        with bases(base) as (values ('spawn_supervisor'), ('spawn_reader'), ('spawn_human')),
+        with bases(base) as (values ('spawn_supervisor'), ('spawn_reader'), ('spawn_human'),
+                          ('spawn_node_gateway')),
              databases(d, present) as (
                  select datname::text, true from pg_database
                  union all
@@ -80,10 +81,10 @@ begin
                and not exists (select 1 from pg_stat_activity a where a.usesysid = r.oid)
                    as droppable
           from pg_roles r
-         where r.rolname ~ '^spawn_(supervisor|reader|human)_[a-z0-9_]+$'
+         where r.rolname ~ '^spawn_(supervisor|reader|human|node_gateway)_[a-z0-9_]+$'
            and case when v_database <> ''
                     then exists (select 1 from logins l where not l.present and l.rolname = r.rolname)
-                    else starts_with(regexp_replace(r.rolname, '^spawn_(supervisor|reader|human)_', ''),
+                    else starts_with(regexp_replace(r.rolname, '^spawn_(supervisor|reader|human|node_gateway)_', ''),
                                      v_prefix) end
          order by r.rolname
     loop
