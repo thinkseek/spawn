@@ -7601,6 +7601,25 @@ mod tests {
         );
     }
 
+    /// Block until every mount worker the Bridge started has returned (over
+    /// a store that never gates a mount), so the next pass finds each one
+    /// finished whatever the load. No clock advances while it waits; the
+    /// real-time bound only turns a hang into a failure.
+    fn finish_mount_workers(bridge: &Bridge) {
+        let deadline = std::time::Instant::now() + Duration::from_mins(2);
+        while bridge
+            .mounting
+            .values()
+            .any(|pending| !pending.handle.is_finished())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a mount worker never returned"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     type UnmountHook = Box<dyn FnOnce() + Send>;
 
     /// A workspace store whose selected mounts wait at a test gate. It also
@@ -7665,6 +7684,9 @@ mod tests {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(active, Ordering::SeqCst);
             let mut held = self.held.lock().expect("held");
+            // Under the gate's lock, so a test waiting on the counters
+            // cannot miss this call reaching the gate.
+            self.moved.notify_all();
             while held.contains(branch) {
                 held = self.moved.wait(held).expect("held");
             }
@@ -7673,8 +7695,7 @@ mod tests {
                 && let Some(ready) = ready
                 && let Err(why) = ready()
             {
-                self.active.fetch_sub(1, Ordering::SeqCst);
-                self.completed.fetch_add(1, Ordering::SeqCst);
+                self.finished();
                 return Err(WorkspaceError::Refused {
                     code: crate::port::MOUNT_CANCELLED.to_string(),
                     message: why,
@@ -7686,9 +7707,36 @@ mod tests {
                 .expect("preset")
                 .remove(branch)
                 .map_or_else(|| self.inner.mount(branch), Ok);
+            self.finished();
+            mounted
+        }
+
+        /// A mount call left the gate: counted, and any test waiting on the
+        /// counters told, under the gate's lock.
+        fn finished(&self) {
+            let _held = self.held.lock().expect("held");
             self.active.fetch_sub(1, Ordering::SeqCst);
             self.completed.fetch_add(1, Ordering::SeqCst);
-            mounted
+            self.moved.notify_all();
+        }
+
+        /// Block until the mount workers' counters (`calls` at the gate,
+        /// `completed` past it) read as `until` says: a condvar wait on the
+        /// workers themselves, never on the clock or a number of passes.
+        /// The real-time bound only turns a hang into a failure.
+        fn wait_for(&self, what: &str, until: impl Fn(&Self) -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_mins(2);
+            let mut held = self.held.lock().expect("held");
+            while !until(self) {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    // Unlocked first: a panic holding the gate would poison
+                    // it, and `ReleaseMounts`' drop would panic again.
+                    drop(held);
+                    panic!("the mount workers never reached: {what}");
+                }
+                held = self.moved.wait_timeout(held, left).expect("held").0;
+            }
         }
 
         fn preset_mount(&self, branch: BranchName, workspace: WorkspaceId) {
@@ -7936,6 +7984,10 @@ mod tests {
                     break path;
                 }
                 first.extend(bridge.tick().expect("the start's tick").warnings);
+                // The mount runs on a worker thread: wait for it before the
+                // next pass, so the number of passes, and so the clock this
+                // world starts at, do not depend on how soon the thread ran.
+                finish_mount_workers(&bridge);
                 clock.advance(super::MOUNT_POLL_RETRY);
             };
             let mut world = Self {
@@ -9100,12 +9152,23 @@ mod tests {
         )
         .with_clock(clock);
         let _release = ReleaseMounts(&mounts);
+        // One pass claims both starts and gives each its mount worker; then
+        // wait on the workers, not on time: A's is at its gate, B's done.
+        bridge.work().expect("work");
+        mounts.wait_for("A held at the gate, B mounted", |mounts| {
+            mounts.calls.load(Ordering::SeqCst) == 2
+                && mounts.active.load(Ordering::SeqCst) == 1
+                && mounts.completed.load(Ordering::SeqCst) == 1
+        });
         drive_work(&mut bridge, &store, || command_outcome(&store, b).is_some());
         assert_eq!(command_outcome(&store, b), Some(Outcome::Succeeded));
         assert_eq!(command_outcome(&store, a), None);
         assert_eq!(mounts.calls.load(Ordering::SeqCst), 2);
         assert_eq!(mounts.active.load(Ordering::SeqCst), 1);
         mounts.release(&a_branch);
+        mounts.wait_for("A mounted once released", |mounts| {
+            mounts.completed.load(Ordering::SeqCst) == 2
+        });
         drive_work(&mut bridge, &store, || command_outcome(&store, a).is_some());
         assert_eq!(command_outcome(&store, a), Some(Outcome::Succeeded));
     }
