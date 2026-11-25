@@ -71,7 +71,7 @@ impl Request<'_> {
     /// The body, at most its framed `Content-Length` (nothing when the
     /// request is not framed by exactly one canonical `Content-Length`).
     /// The first call answers an `Expect: 100-continue`.
-    pub fn body(&mut self) -> &mut impl Read {
+    pub fn body(&mut self) -> &mut impl BufRead {
         if self.continue_pending {
             self.continue_pending = false;
             // A failure shows when the body is read.
