@@ -395,7 +395,7 @@ impl Active {
             // session already named: its engine reports no new one.
             follow: Follow {
                 offset: transcript_from.unwrap_or(0),
-                bound: transcript_from.is_some(),
+                binding: Binding::resumed(transcript_from.is_some()),
                 ..Follow::default()
             },
         }
@@ -405,6 +405,32 @@ impl Active {
     /// so it is derived, never stored.
     fn terminal(&self) -> TerminalName {
         TerminalName::for_execution(&self.execution_id)
+    }
+}
+
+/// Whether an execution's native session is known: named by the Bridge, or
+/// resumed, or (an engine that names its own, [`SessionBinding::Reported`])
+/// reported by the host and checked ([`Bridge::bind_reported`]). Until it
+/// is, such an engine's transcript is not read: the session's last one is
+/// another execution's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Binding {
+    /// Not known yet.
+    #[default]
+    Unbound,
+    /// Known; the native session when this Bridge bound it itself, before
+    /// the log's record of it is folded.
+    Bound(Option<String>),
+}
+
+impl Binding {
+    /// Known from the start for a resume (its session is the one resumed).
+    fn resumed(resume: bool) -> Self {
+        if resume {
+            Self::Bound(None)
+        } else {
+            Self::Unbound
+        }
     }
 }
 
@@ -453,16 +479,8 @@ struct Follow {
     seen: Option<ScreenState>,
     /// When this Bridge first followed the execution, by its own clock.
     first_seen: Option<i64>,
-    /// The execution's native session is known: named by the Bridge, or
-    /// resumed, or (an engine that names its own,
-    /// [`SessionBinding::Reported`]) reported by the host and checked
-    /// ([`Bridge::bind_reported`]). Until it is, such an engine's
-    /// transcript is not read: the session's last one is another
-    /// execution's.
-    bound: bool,
-    /// The native session bound by this Bridge ([`Bridge::bind_reported`])
-    /// before the log's record of it is folded.
-    native: Option<String>,
+    /// Whether the execution's native session is known ([`Binding`]).
+    binding: Binding,
     /// The host's agent reading (its `seq`) a recorded screen was last
     /// keyed by: a reading recorded once is never keyed again.
     keyed_seq: Option<u64>,
@@ -524,6 +542,17 @@ struct Follow {
 const FOLLOW_OVERLAP: usize = 4096;
 
 impl Follow {
+    /// The driver reads the lines of `native`: its keys begin with the
+    /// session whose lines they are, so another session starts afresh.
+    fn reading(&mut self, native: &str) {
+        if self.cursor.native != native {
+            self.cursor = LineCursor {
+                native: native.to_string(),
+                ..LineCursor::default()
+            };
+        }
+    }
+
     /// How many bytes before the offset a read checks: the tail kept, or,
     /// with none (after a restart), one, which says the file still reaches
     /// the offset.
@@ -1893,8 +1922,11 @@ impl Bridge {
                     view.transcript_read = false;
                 }
                 view.native = Some(native_session_id.clone());
-                if current && let Some(active) = view.active.as_mut() {
-                    active.follow.bound = true;
+                if current
+                    && let Some(active) = view.active.as_mut()
+                    && active.follow.binding == Binding::Unbound
+                {
+                    active.follow.binding = Binding::Bound(None);
                 }
             }
             // A merge of main is no checkpoint of the agent's work: one
@@ -2186,13 +2218,7 @@ impl Bridge {
             return Ok(());
         };
         let path = self.transcript_of(active.driver, &active.workspace, native);
-        // The driver's keys begin with the session whose lines it reads.
-        if active.follow.cursor.native != native {
-            active.follow.cursor = LineCursor {
-                native: native.to_string(),
-                ..LineCursor::default()
-            };
-        }
+        active.follow.reading(native);
         // Read past the offset only while the file holds what was read there
         // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
         let (bytes, limit) = match self.read_followed(session, &path, active, report) {
@@ -2693,14 +2719,10 @@ impl Bridge {
         if active.driver.traits().session != SessionBinding::Reported {
             return Ok(native.map(str::to_string));
         }
-        if active.follow.bound {
-            return Ok(active
-                .follow
-                .native
-                .clone()
-                .or_else(|| native.map(str::to_string)));
+        match &active.follow.binding {
+            Binding::Bound(bound) => Ok(bound.clone().or_else(|| native.map(str::to_string))),
+            Binding::Unbound => self.bind_reported(agent_id, session, active),
         }
-        self.bind_reported(agent_id, session, active)
     }
 
     /// Bind the native session an engine named itself
@@ -2769,8 +2791,7 @@ impl Bridge {
                 engine_version: None,
             },
         )?;
-        active.follow.bound = true;
-        active.follow.native = Some(native.clone());
+        active.follow.binding = Binding::Bound(Some(native.clone()));
         active.follow.offset = 0;
         active.follow.tail.clear();
         active.follow.watch.dirty = true;
@@ -3633,20 +3654,8 @@ impl Bridge {
             }
             MountProgress::Failed(why) => return finished(Outcome::Failed(why)),
         };
-        // An engine other than Claude Code is followed through the host's
-        // own agent readings (its session, its state): a host with none
-        // (tmux) cannot run it.
-        if driver.id() != crate::driver::DEFAULT {
-            let terminal =
-                TerminalName::for_execution(&ExecutionId::for_command(claimed.command_id));
-            if !matches!(self.terminals.agent(&terminal, &workspace), Ok(Some(_))) {
-                let why = format!(
-                    "engine {} needs the herdr terminal backend (SPAWN_TERMINAL_BACKEND=herdr): \
-                     this terminal host reads no agent",
-                    driver.id()
-                );
-                return finished(self.give_up_mount(claimed, &workspace, why));
-            }
+        if let Some(why) = self.no_agent_host(claimed, driver, &workspace) {
+            return finished(self.give_up_mount(claimed, &workspace, why));
         }
         // A resumed session's transcript holds the earlier executions' lines:
         // this execution's are the ones after its length now.
@@ -3681,7 +3690,7 @@ impl Bridge {
             reported_end: None,
             unmounting: false,
             follow: Follow {
-                bound: native.is_some(),
+                binding: Binding::resumed(native.is_some()),
                 ..Follow::default()
             },
         };
@@ -3720,6 +3729,29 @@ impl Bridge {
         }
         self.prepared.remove(&claimed.command_id);
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
+    }
+
+    /// Why `driver`'s engine cannot run on this terminal host: an engine
+    /// other than Claude Code is followed through the host's own agent
+    /// readings (its session, its state), which a host with none (tmux)
+    /// cannot give.
+    fn no_agent_host(
+        &self,
+        claimed: &Claimed,
+        driver: &dyn AgentDriver,
+        workspace: &WorkspaceId,
+    ) -> Option<String> {
+        if driver.id() == crate::driver::DEFAULT {
+            return None;
+        }
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(claimed.command_id));
+        (!matches!(self.terminals.agent(&terminal, workspace), Ok(Some(_)))).then(|| {
+            format!(
+                "engine {} needs the herdr terminal backend (SPAWN_TERMINAL_BACKEND=herdr): this \
+                 terminal host reads no agent",
+                driver.id()
+            )
+        })
     }
 
     fn fail_prepared_start(&self, claimed: &Claimed, why: String) -> Outcome {

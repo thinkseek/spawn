@@ -2538,102 +2538,8 @@ pub fn agy_line(line: &str, cursor: &mut crate::driver::LineCursor) -> Vec<Norma
             );
             events
         }
-        Some("PLANNER_RESPONSE") => {
-            let mut events = Vec::new();
-            let count = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
-            let (input, output, cache_read) = (
-                count("input_tokens"),
-                count("output_tokens"),
-                count("cache_read_tokens"),
-            );
-            if (input, output, cache_read) != (0, 0, 0)
-                && let Some(at_ms) = field("created_at").and_then(utc_ms)
-            {
-                let model = field("model")
-                    .filter(|model| !model.is_empty())
-                    .unwrap_or("unknown");
-                events.push(keyed(
-                    EventKind::ModelUsage {
-                        message_id: format!("{native}:{step}"),
-                        model: model.to_string(),
-                        at_ms,
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_write_tokens: 0,
-                        cache_read_tokens: cache_read,
-                    },
-                    key("usage"),
-                ));
-            }
-            let calls = value
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if calls.is_empty() {
-                events.extend(agy_finish_pending(cursor));
-                if !cursor.work_open() {
-                    events.push(keyed(
-                        EventKind::TurnStopped {
-                            input_tokens: None,
-                            output_tokens: None,
-                        },
-                        key("stopped"),
-                    ));
-                }
-                return events;
-            }
-            for (index, call) in calls.iter().enumerate() {
-                let name = call
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("unknown");
-                let (summary, summary_whole) = agy_summary(name, call.get("args"));
-                events.push(keyed(
-                    EventKind::ToolStarted {
-                        tool_name: name.to_string(),
-                        tool_use_id: format!("{native}:{step}:{index}"),
-                        summary,
-                        summary_whole,
-                    },
-                    key(&format!("{index}:started")),
-                ));
-                cursor.pending_tools.push((step, index));
-            }
-            events
-        }
-        Some("GENERIC") => {
-            let mut events = Vec::new();
-            if !cursor.pending_tools.is_empty() {
-                let (made, index) = cursor.pending_tools.remove(0);
-                events.push(agy_completed(&native, made, index));
-            }
-            if field("status") == Some("RUNNING")
-                && let Some(id) = agy_task_id(content)
-                && cursor.open_jobs.insert(id.to_string())
-            {
-                events.push(keyed(
-                    EventKind::JobStarted {
-                        job_id: id.to_string(),
-                        kind: JobKind::Bash,
-                    },
-                    key(&format!("job:{id}:started")),
-                ));
-            }
-            if let Some(id) = agy_subagent(content)
-                && cursor.open_subagents.insert(id.clone())
-            {
-                events.push(keyed(
-                    EventKind::JobStarted {
-                        job_id: id.clone(),
-                        kind: JobKind::Agent,
-                    },
-                    key(&format!("job:{id}:started")),
-                ));
-            }
-            events
-        }
+        Some("PLANNER_RESPONSE") => agy_planner(&value, step, cursor),
+        Some("GENERIC") => agy_generic(&value, step, cursor),
         Some("SYSTEM_MESSAGE") => {
             let Some(sender) = agy_sender(content) else {
                 return Vec::new();
@@ -2655,6 +2561,126 @@ pub fn agy_line(line: &str, cursor: &mut crate::driver::LineCursor) -> Vec<Norma
         }
         _ => Vec::new(),
     }
+}
+
+/// An agy `PLANNER_RESPONSE` step ([`agy_line`]): its model call's usage,
+/// then a tool started per call, or, with no call, the turn's end unless
+/// background work is open.
+fn agy_planner(
+    value: &Value,
+    step: u64,
+    cursor: &mut crate::driver::LineCursor,
+) -> Vec<Normalized> {
+    let native = cursor.native.clone();
+    let key = |rest: &str| format!("{native}:{step}:{rest}");
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    let mut events = Vec::new();
+    let count = |name: &str| value.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let (input, output, cache_read) = (
+        count("input_tokens"),
+        count("output_tokens"),
+        count("cache_read_tokens"),
+    );
+    if (input, output, cache_read) != (0, 0, 0)
+        && let Some(at_ms) = field("created_at").and_then(utc_ms)
+    {
+        let model = field("model")
+            .filter(|model| !model.is_empty())
+            .unwrap_or("unknown");
+        events.push(keyed(
+            EventKind::ModelUsage {
+                message_id: format!("{native}:{step}"),
+                model: model.to_string(),
+                at_ms,
+                input_tokens: input,
+                output_tokens: output,
+                cache_write_tokens: 0,
+                cache_read_tokens: cache_read,
+            },
+            key("usage"),
+        ));
+    }
+    let calls = value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if calls.is_empty() {
+        events.extend(agy_finish_pending(cursor));
+        if !cursor.work_open() {
+            events.push(keyed(
+                EventKind::TurnStopped {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+                key("stopped"),
+            ));
+        }
+        return events;
+    }
+    for (index, call) in calls.iter().enumerate() {
+        let name = call
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown");
+        let (summary, summary_whole) = agy_summary(name, call.get("args"));
+        events.push(keyed(
+            EventKind::ToolStarted {
+                tool_name: name.to_string(),
+                tool_use_id: format!("{native}:{step}:{index}"),
+                summary,
+                summary_whole,
+            },
+            key(&format!("{index}:started")),
+        ));
+        cursor.pending_tools.push((step, index));
+    }
+    events
+}
+
+/// An agy `GENERIC` step ([`agy_line`]): the result of the oldest call
+/// waiting for one, and the background job or subagent it started.
+fn agy_generic(
+    value: &Value,
+    step: u64,
+    cursor: &mut crate::driver::LineCursor,
+) -> Vec<Normalized> {
+    let native = cursor.native.clone();
+    let key = |rest: &str| format!("{native}:{step}:{rest}");
+    let content = value
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    if !cursor.pending_tools.is_empty() {
+        let (made, index) = cursor.pending_tools.remove(0);
+        events.push(agy_completed(&native, made, index));
+    }
+    if value.get("status").and_then(Value::as_str) == Some("RUNNING")
+        && let Some(id) = agy_task_id(content)
+        && cursor.open_jobs.insert(id.to_string())
+    {
+        events.push(keyed(
+            EventKind::JobStarted {
+                job_id: id.to_string(),
+                kind: JobKind::Bash,
+            },
+            key(&format!("job:{id}:started")),
+        ));
+    }
+    if let Some(id) = agy_subagent(content)
+        && cursor.open_subagents.insert(id.clone())
+    {
+        events.push(keyed(
+            EventKind::JobStarted {
+                job_id: id.clone(),
+                kind: JobKind::Agent,
+            },
+            key(&format!("job:{id}:started")),
+        ));
+    }
+    events
 }
 
 #[cfg(test)]
