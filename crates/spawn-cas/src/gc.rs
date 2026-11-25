@@ -32,7 +32,7 @@ pub fn default_quotas() -> Quotas {
 
 /// How long an abandoned file in `tmp/` (an interrupted write, a partial
 /// download nobody resumed) is kept.
-pub const TMP_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const TMP_MAX_AGE: Duration = Duration::from_hours(7 * 24);
 
 /// What one [`Store::gc`] pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

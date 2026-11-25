@@ -492,7 +492,11 @@ impl Store {
     pub fn pin(&self, owner: &str, name: &str, digests: &[Digest]) -> Result<(), CasError> {
         check_name("pin owner", owner)?;
         check_name("pin name", name)?;
-        let text: String = digests.iter().map(|digest| format!("{digest}\n")).collect();
+        let text = digests.iter().fold(String::new(), |mut text, digest| {
+            text.push_str(&digest.to_string());
+            text.push('\n');
+            text
+        });
         let _lock = self.lock_gc()?;
         let directory = self.root.join("pins").join(owner);
         plain_dir(&directory)?;
