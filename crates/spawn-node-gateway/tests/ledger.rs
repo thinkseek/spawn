@@ -232,10 +232,10 @@ fn enroll_beat_grant_result_and_their_refusals() {
     std::fs::create_dir_all(&path).unwrap();
     std::fs::write(path.join(&digest.hex), &content).unwrap();
     let calls = harness.gateway.db_calls();
-    let part = harness.get(&node, &digest.artifact_path(), 9, &[("Range".into(), "bytes=16000-".into())]);
+    let part = harness.get(&node, &digest.artifact_path(), 9, &[("Range".into(), "bytes=15990-".into())]);
     assert_eq!(part.status, 206);
-    assert_eq!(part.body, &content[16_000..]);
-    assert_eq!(part.header("Content-Range"), Some("bytes 16000-15999/16000").filter(|_| false).or(part.header("Content-Range")));
+    assert_eq!(part.body, &content[15_990..]);
+    assert_eq!(part.header("Content-Range"), Some("bytes 15990-15999/16000"));
     let whole = harness.get(&node, &digest.artifact_path(), 10, &[]);
     digest.verify(&whole.body).unwrap();
     assert_eq!(harness.gateway.db_calls(), calls, "artifacts never reach the ledger");
@@ -256,7 +256,7 @@ fn enroll_beat_grant_result_and_their_refusals() {
     assert!(harness.gateway.keys().get(&node_id()).is_none(), "a forgery is not cached");
 
     // Revoked: refused, and the cache forgets the key.
-    beat(&harness, &node, 51).status.eq(&200).then_some(()).expect("a good beat");
+    assert_eq!(beat(&harness, &node, 51).status, 200, "a good beat");
     assert!(harness.gateway.keys().get(&node_id()).is_some());
     assert!(owner.node_admin("n252", NodeAction::Revoke).unwrap());
     beat(&harness, &node, 52).assert_refused(Refusal::Revoked, 52);
