@@ -218,7 +218,7 @@ and deterministic, and every rule that matched is kept as evidence:
 | `file_scope` | +1/+2 | 3 (6) or more distinct paths |
 | `crate_scope` | +1/+2 | 2 (3) or more distinct crates |
 | `long_brief` | +1 | above 2000 characters |
-| `low_risk` | -2 | mechanical, repetitive or tagging work only: typo\*, spelling\*, formatting\*, whitespace\*, rustfmt\*, mechanical\*, repetitive\*, "cargo fmt", "registry entry" anywhere; tag\*, label\*, bulk\* only as the first word of a line ("Tag the open tasks", "Bulk-label ..."); regenerat\* only beside a generated artifact (fixture\*, snapshot\*, lockfile\*, golden\*, generated\*). Only when no risk rule matched and no broadening word is there: widening (every\*, whatever\*, caller\*, implement\*, support\*, feature\*), authoring (writ\*, rewrit\*, draft\*, document\*, explain\*, explan\*, describ\*, summar\*, clarif\*, reword\*, rephras\*, comment\*), code to build (filter\*, render\*, pars\*, endpoint\*, api\*, display\*), or a defect, performance or behaviour (bug\*, crash\*, debug\*, hang\*, cause\*, speed\*, optimi\*, perf\*, slow\*, retry\*, validat\*, dedup\*, automat\*, handl\*). Every keyword here is a prefix (`*`). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
+| `low_risk` | -2 | mechanical, repetitive or tagging work only: typo\*, spelling\*, formatting\*, whitespace\*, rustfmt\*, mechanical\*, repetitive\*, "cargo fmt", "registry entry" anywhere; `tag`, `label` or `bulk-*` only as the brief's first word, exactly so ("Tag the open tasks", "Bulk-label ...", never "Tags ..." or "Bulk import ..."); regenerat\* only when its object, past a determiner, is a generated artifact (fixture\*, snapshot\*, lockfile\*, golden\*, generated\*). Only when no risk rule matched and no broadening word is there: widening (every\*, whatever\*, caller\*, implement\*, support\*, feature\*), authoring (writ\*, rewrit\*, draft\*, document\*, explain\*, explan\*, describ\*, summar\*, clarif\*, reword\*, rephras\*, comment\*), code to build (filter\*, render\*, pars\*, endpoint\*, api\*, display\*), or a defect, performance or behaviour (bug\*, crash\*, debug\*, hang\*, cause\*, speed\*, optimi\*, perf\*, slow\*, retry\*, validat\*, dedup\*, automat\*, handl\*, fail\*, lost\*, lose\*, wrong\*, missing\*, vanish\*, broke\*, corrupt\*). Every keyword here is a prefix (`*`). Generic words such as comment, rename and bump are deliberately not markers: "add comment support", "rename X and update every caller" and "bump tokio and fix whatever breaks" are real work |
 
 L1 means deterministic, repetitive or tagging work, never semantic
 writing. `brief-v2` (replacing `brief-v1`) dropped `wording`, `readme`,
@@ -230,10 +230,12 @@ the README wording for the install section" and "Write the docstring for
 X" are `l2`; "Tag the 40 open tasks with their capability" and "Add the
 registry entry for the new file" are `l1`; "Implement label support" or
 "Add tag filtering to the task list" are `l2`. A tagging word that is
-not the brief's imperative names a thing the work is about, not the work:
-"Fix the crash in tag matching", "Speed up the bulk insert path" and
-"Regenerate the session token on each login" are `l2`, while "Regenerate
-the fixtures" is `l1`. The rule keeps its name
+not the brief's opening imperative names a thing the work is about, not
+the work: "Fix the crash in tag matching", "Speed up the bulk insert
+path", "Labels vanish after a restart", "Bulk import fails on empty rows"
+and "Fix the scheduler" followed by a line "Tag the release afterwards"
+are `l2`. "Regenerate the fixtures" is `l1`; "Regenerate the session
+token and update the snapshot test" is `l2`. The rule keeps its name
 `low_risk`, so recorded signals read the same, and records written under
 `brief-v1` stay readable: nothing rejects a rules name it does not know.
 
