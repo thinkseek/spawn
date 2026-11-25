@@ -4,8 +4,8 @@
 # usage: sh scripts/blackbox/scenario-db.sh drop <database>
 #        sh scripts/blackbox/scenario-db.sh sweep <prefix>
 #
-# drop   drops the database (`with (force)`), then its three logins
-#        (spawn_supervisor_/spawn_reader_/spawn_human_<database>): roles
+# drop   drops the database (`with (force)`), then its four logins
+#        (spawn_supervisor_/spawn_reader_/spawn_human_/spawn_node_gateway_<database>): roles
 #        belong to the whole server, so dropping the database leaves them.
 #        Every scenario's cleanup (rsi/scenarios) and the black-box runner
 #        (scripts/blackbox/run-scenarios.sh) drop their database this way.

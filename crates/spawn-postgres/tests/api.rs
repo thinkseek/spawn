@@ -3158,8 +3158,8 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
     assert_eq!(logins(&mut maintenance, &format!("{prefix}.*")).len(), 10);
 
     // One database's logins, while it still exists: none go.
-    assert_eq!(drop_logins(&mut maintenance, &kept, ""), "dropped 0 of 3");
-    assert_eq!(sweep(&mut maintenance, &prefix), "dropped 6 of 10");
+    assert_eq!(drop_logins(&mut maintenance, &kept, ""), "dropped 0 of 4");
+    assert_eq!(sweep(&mut maintenance, &prefix), "dropped 7 of 12");
     let left = logins(&mut maintenance, &format!("{prefix}.*"));
     assert_eq!(
         left,
