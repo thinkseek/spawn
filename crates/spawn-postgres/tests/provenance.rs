@@ -538,6 +538,7 @@ fn the_checks_refuse_values_outside_their_lists() {
 /// written directly: an empty id, domain, agent, digest or path, a revision
 /// below 1, a negative size and an edge's detail that is not an object.
 #[test]
+#[allow(clippy::too_many_lines)] // every check, through the function and written directly
 fn the_checks_refuse_empty_and_out_of_range_values() {
     let (store, schema) = store("prov_values");
     let mut client = admin(&schema);
