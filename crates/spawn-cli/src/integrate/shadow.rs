@@ -1159,6 +1159,7 @@ mod tests {
             env: json!({"host": "primary", "toolchain": "rustc p", "runner": null}),
             repo: PathBuf::from("/nonexistent/repo.git"),
             scenarios: scenarios.to_path_buf(),
+            judging_id: None,
         }
     }
 

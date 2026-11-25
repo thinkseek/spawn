@@ -394,7 +394,8 @@ mod tests {
 
     #[test]
     fn enroll_token_takes_a_name_a_cell_and_one_key_source() {
-        let parsed = enroll_words(&words("n252 --cell c1 --primary-pubkey k")).unwrap();
+        let given = words("n252 --cell c1 --primary-pubkey k");
+        let parsed = enroll_words(&given).unwrap();
         assert_eq!(
             parsed,
             EnrollWords {
