@@ -62,6 +62,8 @@ spawn tail --session session_demo
 
 ## 命令
 
+`spawn --help` 列出全部命令；`spawn <命令> --help`（或 `spawn help <命令>`）打印该命令的动词与参数，不打开数据库。
+
 | 命令 | 作用 |
 | --- | --- |
 | `init-db` | 安装或更新 SQL schema，可重复执行 |
@@ -75,7 +77,7 @@ spawn tail --session session_demo
 | `scorecard` | 只读记录，一次量出全队、每个 mission、每天的八个维度（吞吐、前导时间、一次通过率、返工、自主、可靠、成本、门禁耗时），带 n、方向、上一窗口与趋势；不足 3 次落地时写 `not enough data`（docs/design.md §15） |
 | `mission`、`task`、`resident` | 任务层：添加、配置、关闭、恢复任务；分派、验收、退回子任务；提议、批准、退役常驻 worker。每条命令输出 JSON |
 | `run` | 在终端内运行引擎，把退出状态写入文件供 Bridge 读取。由 Spawn 配置，无需手动调用 |
-| `version` | 打印 `spawn <版本>` |
+| `version` | 打印 `spawn <版本>`；`spawn --version` 与 `spawn -V` 相同 |
 
 `--action` 的取值：
 

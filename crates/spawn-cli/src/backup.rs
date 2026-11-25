@@ -133,7 +133,8 @@ const DEFAULT_ALERT_MB: u64 = 8_000;
 /// A byte count per `SPAWN_BACKUP_R2_*` megabyte.
 const MB: u64 = 1_000_000;
 
-const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions|controllers|transcripts]\n       spawn backup cas snapshot|restore|verify|key-of [...]";
+/// The usage of `spawn backup`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn backup dump|bundle|verify [--root <dir>]\n       spawn backup restore-drill [--root <dir>] [--into <dir>] [--keep] [--only missions|controllers|transcripts|sync]\n       spawn backup cas snapshot|restore|verify|key-of [...]";
 
 /// One `postgres://` URL, read the way libpq reads it (scripts/pg-url.sh):
 /// user and password percent-decoded, an IPv6 host in brackets, a socket
@@ -1149,7 +1150,13 @@ fn output(mut command: Command, what: &str) -> Result<(bool, String, String), St
     ))
 }
 
-/// `spawn store put|get|list|verify` (the off-host copy's layer,
+/// The usage of `spawn backup cas` ([`recoverable`]), for main's help.
+pub(crate) const CAS_USAGE: &str = recoverable::CAS_USAGE;
+
+/// The usage of `spawn store` ([`store`]), for main's help.
+pub(crate) const STORE_USAGE: &str = store::USAGE;
+
+/// `spawn store put|plan|get|list|verify` (the off-host copy's layer,
 /// [`store`]).
 pub(crate) fn store_command(arguments: &[String]) -> Result<i32, String> {
     store::command(arguments)

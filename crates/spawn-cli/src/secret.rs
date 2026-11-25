@@ -47,8 +47,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// The usage, printed for `get` and every verb that is not one.
-const USAGE: &str = "usage: spawn secret set NAME [--tier 1]   (the value from a pipe, or typed at a terminal, not echoed)\n       spawn secret generate NAME --bytes N   (N random bytes, 16..1024, made inside the store)\n       spawn secret rotate NAME [--generate --bytes N]   (the new value as set reads it or generate makes it; the previous one is kept, retired)\n       spawn secret list\nThere is no get: no command prints a value, current or retired.";
+/// The usage, printed for `get` and every verb that is not one (main's
+/// help reads it too).
+pub(crate) const USAGE: &str = "usage: spawn secret set NAME [--tier 1]   (the value from a pipe, or typed at a terminal, not echoed)\n       spawn secret generate NAME --bytes N   (N random bytes, 16..1024, made inside the store)\n       spawn secret rotate NAME [--generate --bytes N]   (the new value as set reads it or generate makes it; the previous one is kept, retired)\n       spawn secret list\nThere is no get: no command prints a value, current or retired.";
 
 /// The store's fingerprint key: 32 random bytes, mode 600.
 const KEY_FILE: &str = ".fingerprint.key";

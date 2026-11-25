@@ -109,7 +109,7 @@ fn values_flag(arguments: &[String], usage: &str) -> Result<String, String> {
 }
 
 /// `spawn mask`'s usage, with what it does not catch.
-const MASK_USAGE: &str = "usage: spawn mask --values <file>\n\
+pub(crate) const MASK_USAGE: &str = "usage: spawn mask --values <file>\n\
     stdin to stdout with every known form of each value (plain, JSON-escaped, URL-encoded,\n\
     base64, hex) replaced by [SECRET:NAME]. Not masked: a value transformed another way,\n\
     such as base64 wrapped across lines (MIME, 76 columns), reversed, split or encrypted.";
@@ -187,10 +187,13 @@ fn hook_reply(path: &Path, input: std::io::Result<Vec<u8>>) -> Option<String> {
     (masked != *response).then(|| hook_answer(&masked))
 }
 
+/// `spawn mask-hook`'s usage.
+pub(crate) const HOOK_USAGE: &str = "usage: spawn mask-hook --values <file>";
+
 /// `spawn mask-hook --values <file>`: always exits 0 once its arguments are
 /// right; what it prints is the hook's answer.
 pub(crate) fn hook_command(arguments: &[String]) -> Result<i32, String> {
-    let path = values_flag(arguments, "usage: spawn mask-hook --values <file>")?;
+    let path = values_flag(arguments, HOOK_USAGE)?;
     let mut input = Vec::new();
     let read = std::io::stdin()
         .lock()

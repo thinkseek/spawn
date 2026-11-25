@@ -5371,7 +5371,8 @@ fn lines(alerts: &[Value]) -> Vec<String> {
         .collect()
 }
 
-const USAGE: &str = "usage: spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]";
+/// The usage of `spawn alerts`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]";
 
 /// `spawn alerts`: the alerts now, or each transition as it is recorded.
 pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
@@ -5427,7 +5428,8 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
 /// need, objective 148).
 pub(crate) const VERDICTS: [&str; 4] = ["right", "false", "stale", "duplicate"];
 
-const JUDGE_USAGE: &str = "usage: spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       \
+/// The usage of `spawn alert`, the only copy (main's help reads it).
+pub(crate) const JUDGE_USAGE: &str = "usage: spawn alert judge <key> [<key>...] right|false|stale|duplicate\n       \
                            spawn alert record < <one alert.fired or alert.cleared JSON object>";
 
 /// What `spawn alert record` takes, as its refusals name it.

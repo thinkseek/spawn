@@ -17,7 +17,8 @@ use std::process::Stdio;
 
 use crate::Flags;
 
-const USAGE: &str = "usage: spawn commit-map load <file> --source <git dir>";
+/// The usage of `spawn commit-map`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn commit-map load <file> --source <git dir>";
 
 /// The new commit filter-repo writes for a commit the rewrite dropped.
 const DROPPED: &str = "0000000000000000000000000000000000000000";

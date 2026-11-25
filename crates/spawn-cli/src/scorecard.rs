@@ -47,7 +47,8 @@ const DEFAULT_SPAN_MS: i64 = 7 * DAY_MS;
 /// The longest window a scorecard measures, so one request stays bounded.
 const MAX_WINDOW_DAYS: i64 = 400;
 
-const USAGE: &str = "usage: spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
+/// The usage of `spawn scorecard`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
 
 /// What a scorecard is asked: the flags of `spawn scorecard`, the
 /// parameters of `/api/scorecard`.

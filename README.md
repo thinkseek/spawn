@@ -63,6 +63,8 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 
 ## Commands
 
+`spawn --help` lists every command; `spawn <command> --help` (or `spawn help <command>`) prints that command's verbs and flags, opening no store.
+
 | Command | What it does |
 | --- | --- |
 | `init-db` | Installs or updates the SQL schema. Safe to run again. |
@@ -77,7 +79,7 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
 | `task stages --id N` | A task's stages from the control stream, oldest first: `[{stage, verdict, at_ms, took_ms}]`, `took_ms` the time since the task's previous stage. `mission list` and the dashboard's missions page carry the same list on every task. |
 | `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
-| `version` | Prints `spawn <version>`. |
+| `version` | Prints `spawn <version>`; so do `spawn --version` and `spawn -V`. |
 
 Actions for `--action`:
 

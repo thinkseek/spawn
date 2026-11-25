@@ -1160,7 +1160,8 @@ fn assign(
     Ok(assigned)
 }
 
-const RETIRE_USAGE: &str = "usage: spawn objective retire --mission <m> --objective <n> \
+/// The usage of `spawn objective`, the only copy (main's help reads it).
+pub(crate) const RETIRE_USAGE: &str = "usage: spawn objective retire --mission <m> --objective <n> \
                             --kind on-main|renumbered|obsolete --by <name> --reason <text>";
 
 /// `spawn objective retire --mission <m> --objective <n> --kind

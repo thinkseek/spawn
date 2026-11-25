@@ -165,6 +165,12 @@ const MAX_INPUT_BODY: usize = 16 * 1024;
 /// (schema.sql) holds the same bound.
 const MAX_INPUT_TEXT: usize = 8 * 1024;
 
+/// The usage of `spawn serve`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn serve [--address <host:port>] [--web <dir>]\n      \
+                                (the dashboard and the HTTP API, docs/api.md; --address or\n       \
+                                SPAWN_SERVE_ADDRESS, default 127.0.0.1:8787; --web or SPAWN_WEB_DIR,\n       \
+                                default web/dist; off loopback it needs SPAWN_SERVE_TOKEN)";
+
 /// Serve the API and the built UI until the process is killed.
 pub fn serve(flags: &Flags) -> Result<i32, String> {
     let address = flags

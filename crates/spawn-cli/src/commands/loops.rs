@@ -127,6 +127,16 @@ fn tick_bridge(
     Ok(report)
 }
 
+/// The usage of `spawn tick`, the only copy (main's help reads it).
+pub(crate) const TICK_USAGE: &str = "usage: spawn tick [--repo <bare repo>] [--root <workspace root>] [--judge-url <url>]\n      \
+                                     (one Bridge and Observer pass; --repo or SPAWN_GIT_REPO,\n       \
+                                     --root or SPAWN_WORKSPACE_ROOT)";
+
+/// The usage of `spawn loop`, the only copy (main's help reads it).
+pub(crate) const LOOP_USAGE: &str = "usage: spawn loop [--repo <bare repo>] [--root <workspace root>] [--judge-url <url>]\n      \
+                                     (the fleet until SIGTERM or SIGINT: Bridge, Observer, dispatcher\n       \
+                                     and, with SPAWN_SUPERVISOR=1, the supervisor's liveness rule)";
+
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     let (mut bridge, mut observer) = runtime(flags)?;
     let report = tick_bridge(&mut bridge)?;

@@ -17,6 +17,12 @@ use std::os::unix::process::ExitStatusExt;
 
 use crate::config::env_value;
 
+/// The usage of `spawn run`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn run -- <program> [<argument>...]\n      \
+                                (starts the engine inside its terminal, writes its exit status to\n       \
+                                SPAWN_EXIT_FILE and forwards its exit code; Spawn configures this,\n       \
+                                you do not call it)";
+
 /// `spawn run -- <program> [args]`: start the engine, write its exit status
 /// to `SPAWN_EXIT_FILE` (and the signal that killed it to
 /// `SPAWN_EXIT_FILE.signal`), and forward its exit code. The engine's

@@ -26,7 +26,8 @@ const A_DAY_MS: i64 = 24 * 3_600_000;
 /// landing or mission: a deploy record names neither).
 const DEPLOYS: &str = "Spawn's own deploys (deploy/deploy.sh)";
 
-const USAGE: &str = "usage: spawn verify <mission>/<objective> --by <name> --how <text> \
+/// The usage of `spawn verify`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn verify <mission>/<objective> --by <name> --how <text> \
                      --result pass|fail\n       spawn verify list";
 
 /// `spawn verify ...`: record one verification (prints `{event,

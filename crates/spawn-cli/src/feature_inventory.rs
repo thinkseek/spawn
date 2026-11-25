@@ -503,13 +503,15 @@ fn build_api_payload(
     })
 }
 
+/// The usage of `spawn features`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn features scan|check [--root <dir>] [--registry <file>] [--json]\n       \
+                                spawn features associate --path <file> --feature <id> [--feature <id>]... \
+                                [--root <dir>] [--registry <file>] [--json]";
+
 /// Entrypoint for `spawn features <scan|associate|check>`.
 pub fn command(args: &[String]) -> Result<i32, String> {
     let Some((sub, rest)) = args.split_first() else {
-        return Err(
-            "usage: spawn features <scan|associate|check> [--root <dir>] [--registry <file>] [--json]"
-                .to_string(),
-        );
+        return Err(USAGE.to_string());
     };
     match sub.as_str() {
         "scan" => cmd_scan(rest, false),

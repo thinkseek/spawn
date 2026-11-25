@@ -99,7 +99,9 @@ use super::{Key, Lock, Scratch, Settings, Stamp, hex, random_hex};
 use crate::Flags;
 use crate::config::env_value;
 
-const USAGE: &str = "usage: spawn store put --area transcripts|sessions [--from <dir>] [--root <dir>]\n       \
+/// The usage of `spawn store`, the only copy (main's help reads it as
+/// [`super::STORE_USAGE`]).
+pub(super) const USAGE: &str = "usage: spawn store put --area transcripts|sessions [--from <dir>] [--root <dir>]\n       \
 spawn store plan --area <area> [--from <dir>] [--root <dir>] [--list <file>]\n       \
 spawn store get --area <area> --path <file> --into <dir> [--root <dir>]\n       \
 spawn store list|verify --area <area> [--root <dir>]\n\

@@ -726,7 +726,9 @@ const PUSH_POLL: Duration = Duration::from_millis(500);
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
 
-const USAGE: &str = "usage: spawn integrate [--once | --drain] [--root <dir>] [--gates <n>]";
+/// The usage of `spawn integrate`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str =
+    "usage: spawn integrate [--once | --drain] [--root <dir>] [--gates <n>]";
 
 /// Gates that run at once, across missions, unless `--gates` or
 /// `SPAWN_INTEGRATE_GATES` says otherwise. One: concurrent gates share one

@@ -7,6 +7,12 @@ use spawn_core::port::CommandQueue;
 use crate::Flags;
 use crate::config::{env_value, open_store};
 
+/// The usage of `spawn submit`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn submit --agent <agent id> --session <session id> --key <idempotency key> \
+                                --action <command action JSON> [--principal <name>]\n      \
+                                (prints command=<id>; the principal is spawn unless named; the\n       \
+                                actions: start, input, resume, stop, key, as the README lists them)";
+
 /// `spawn submit`: write one command to the queue.
 pub(crate) fn submit(flags: &Flags) -> Result<i32, String> {
     let store = open_store()?;

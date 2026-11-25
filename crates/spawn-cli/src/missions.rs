@@ -18,7 +18,9 @@ use spawn_core::grading::{
 
 use crate::{Flags, open_store};
 
-const USAGE: &str = "usage:
+/// The usage of `spawn mission`, `spawn task` and `spawn resident`, the only
+/// copy: main's help shows each command its own lines of it.
+pub(crate) const USAGE: &str = "usage:
   spawn mission add --text <mission> [--source <git repo path or URL>] [<settings>]
   spawn mission configure --id N [<settings>] [<clearing switches>]   (owner only)
       changes only the settings it is given and keeps every other as the mission has it;

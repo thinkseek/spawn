@@ -39,7 +39,8 @@ const HOUR_MS: i64 = 3_600_000;
 const LEASE_HOURS: i64 = 24;
 const MOST_HOURS: i64 = 168;
 
-const USAGE: &str = "usage: spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> \
+/// The usage of `spawn scratch`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn scratch claim <dir> --agent <name> --objective <mission>/<objective> \
                      [--build <path>]... [--lease-hours <h>]\n       \
                      spawn scratch renew <dir> [--lease-hours <h>]\n       \
                      spawn scratch release <dir>\n       \

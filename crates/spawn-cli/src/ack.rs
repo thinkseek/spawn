@@ -37,7 +37,8 @@ const ACK_LIMIT: u64 = 64 * 1024;
 /// The longest why recorded, in characters.
 const WHY_CHARS: usize = 2000;
 
-const USAGE: &str = "usage: spawn ack <command id> done|declined [<why>]";
+/// The usage of `spawn ack`, the only copy (main's help reads it).
+pub(crate) const USAGE: &str = "usage: spawn ack <command id> done|declined [<why>]";
 
 /// One ack, as `spawn ack` writes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

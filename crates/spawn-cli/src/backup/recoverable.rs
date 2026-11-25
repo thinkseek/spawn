@@ -52,7 +52,9 @@ const PREFIX_LOGICAL: &str = "fm-cas/v1/logical/sha256/";
 const PREFIX_FM_GRAPH: &str = "fm-cas/v1/fm-graph/sha256/";
 const PREFIX_SNAPSHOT: &str = "fm-cas/v1/snapshot/sha256/";
 
-const CAS_USAGE: &str = "\
+/// The usage of `spawn backup cas`, the only copy (main's help reads it
+/// as [`super::CAS_USAGE`]).
+pub(super) const CAS_USAGE: &str = "\
 usage: spawn backup cas snapshot --source <dir> --store <dir> [--fm-graph <file>] [--parent <snapshot-key>] [--json]
        spawn backup cas restore --store <dir> --snapshot <snapshot-key> --into <dir> [--restore-fm <file>] [--json]
        spawn backup cas verify --store <dir> --snapshot <snapshot-key> [--json]

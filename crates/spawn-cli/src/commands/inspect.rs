@@ -5,6 +5,15 @@ use spawn_core::id::SessionId;
 use crate::Flags;
 use crate::config::open_store;
 
+/// The usage of `spawn fleet`, the only copy (main's help reads it).
+pub(crate) const FLEET_USAGE: &str = "usage: spawn fleet\n      \
+                                      (every session the login may read, with its judgement, as JSON)";
+
+/// The usage of `spawn tail`, the only copy (main's help reads it).
+pub(crate) const TAIL_USAGE: &str = "usage: spawn tail --session <session id> [--events N]\n      \
+                                     (one session's latest judgement, newest events, judgements and\n       \
+                                     commands, as JSON; --events: 1 to 200, default 20)";
+
 /// The fleet as JSON: one object per session the login may read.
 pub(crate) fn fleet() -> Result<i32, String> {
     let store = open_store()?;
