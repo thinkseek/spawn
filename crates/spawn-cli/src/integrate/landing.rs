@@ -112,11 +112,81 @@ pub(super) fn landing_candidate(
         };
         tree
     };
+    let message = with_change_trailers(message, &change_trailers(mirror_path, main, branch, message));
     commit_landing(
         mirror_path,
-        &[&tree, "-p", main, "-p", branch, "-m", message],
+        &[&tree, "-p", main, "-p", branch, "-m", &message],
     )
     .map(Some)
+}
+
+/// The `Spawn-Change` trailer lines of the landing of `branch` on `main`
+/// whose message is `message` (decision D1): one `change_id` per source
+/// Change the landing includes. A landing includes its task's `edit`
+/// Change when its branch brings in at least one `spawn checkpoint`
+/// commit: the indexer records each such checkpoint under the landing's
+/// `Spawn-Task` (docs/provenance.md). The domain is `git:<source>`, the
+/// source as the mission names it, which the mirror was cloned from
+/// (`remote.origin.url`, as [`sources::ensure_mirror`] gave it to git):
+/// [`landing_message`] is given no source, so the lines are added here,
+/// where the message becomes the commit. None for a message without a
+/// `Spawn-Task`, a mirror with no origin, or a git that fails: a trailer is
+/// never a reason not to land.
+pub(super) fn change_trailers(
+    mirror_path: &str,
+    main: &str,
+    branch: &str,
+    message: &str,
+) -> Vec<String> {
+    let Some(task) = crate::provenance::index::trailers(message).task else {
+        return Vec::new();
+    };
+    let Ok(source) = git(&[
+        "--git-dir",
+        mirror_path,
+        "config",
+        "--get",
+        "remote.origin.url",
+    ]) else {
+        return Vec::new();
+    };
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let Ok(subjects) = git(&[
+        "--git-dir",
+        mirror_path,
+        "log",
+        "--format=%s",
+        branch,
+        &format!("^{main}"),
+        "--",
+    ]) else {
+        return Vec::new();
+    };
+    if subjects
+        .lines()
+        .any(|subject| crate::provenance::index::checkpoint_execution(subject).is_some())
+    {
+        vec![crate::provenance::source_change(&source, task)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `message` (a [`landing_message`], its trailers last) with one
+/// `Spawn-Change: <change_id>` line for each of `changes` after its last
+/// trailer, so the last trailer line is a `Spawn-Change` (D1).
+pub(crate) fn with_change_trailers(message: &str, changes: &[String]) -> String {
+    if changes.is_empty() {
+        return message.to_string();
+    }
+    let mut message = message.trim_end_matches('\n').to_string();
+    message.push('\n');
+    for change in changes {
+        let _ = writeln!(message, "Spawn-Change: {change}");
+    }
+    message
 }
 
 /// Characters of a report's summary a landing's message holds at most.
@@ -132,7 +202,9 @@ pub(super) const TITLE_CHARS: usize = 100;
 /// first non-empty line and the task. After a blank line, the report's
 /// `## What changed` section (the whole report when it has none), bounded,
 /// with every line that could read as a `Spawn-` trailer indented. Last, the
-/// integrator's own trailers.
+/// integrator's own trailers. The `Spawn-Change` lines, which need the
+/// source, follow them as the last trailer lines: [`landing_candidate`]
+/// adds them ([`change_trailers`], [`with_change_trailers`]).
 pub(crate) fn landing_message(task: &Task, head: &str) -> String {
     let first = task
         .brief
@@ -415,6 +487,10 @@ pub(super) fn land(
         &json!({"type": "task.landed", "id": task.id, "from": base, "to": candidate}),
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
+    // Provenance (PV3a), only now that the push moved main and the landing
+    // is recorded: it never fails or delays a landing. What goes wrong is
+    // logged, and `spawn prov index` records the same rows later.
+    crate::provenance::record_land_logged(store, mirror, source, task.id, candidate);
     Ok(Landing::Landed)
 }
 
