@@ -381,30 +381,29 @@ pub(crate) fn who_recorded(
     domain: Option<&str>,
     path: &str,
 ) -> Result<Value, String> {
-    let history = match domain {
-        Some(domain) => store
+    let history = if let Some(domain) = domain {
+        store
             .prov_path_history(domain, path, folded(path))
-            .map_err(|error| error.to_string())?,
-        None => {
-            let mut domains: Vec<String> = store
-                .prov_changes_for_path(path)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|change| change.domain)
-                .collect();
-            domains.sort();
-            domains.dedup();
-            let mut all = Vec::new();
-            for domain in domains {
-                all.extend(
-                    store
-                        .prov_path_history(&domain, path, folded(path))
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            all.sort_by_key(|(change, _)| (change.at_ms, change.id));
-            all
+            .map_err(|error| error.to_string())?
+    } else {
+        let mut domains: Vec<String> = store
+            .prov_changes_for_path(path)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|change| change.domain)
+            .collect();
+        domains.sort();
+        domains.dedup();
+        let mut all = Vec::new();
+        for domain in domains {
+            all.extend(
+                store
+                    .prov_path_history(&domain, path, folded(path))
+                    .map_err(|error| error.to_string())?,
+            );
         }
+        all.sort_by_key(|(change, _)| (change.at_ms, change.id));
+        all
     };
     let last = history
         .iter()

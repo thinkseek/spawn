@@ -4,7 +4,7 @@
 use spawn_postgres::provenance::ProvEntryClass;
 
 use super::index::{
-    RawDiff, Trailers, base32, change_id, checkpoint_execution, classify, domain_of,
+    Checkpoint, RawDiff, Trailers, base32, change_id, checkpoint_execution, classify, domain_of,
     edit_branch_key, edit_task_key, import_key, land_key, parse_commit, parse_raw, stored_path,
     trailers,
 };
@@ -70,11 +70,13 @@ fn a_path_is_stored_as_git_holds_it_unless_it_must_be_quoted() {
 fn only_a_checkpoints_subject_names_its_execution() {
     assert_eq!(
         checkpoint_execution("spawn checkpoint exec_12\n"),
-        Some(Some("exec_12".to_string()))
+        Some(Checkpoint {
+            execution: Some("exec_12".to_string())
+        })
     );
     assert_eq!(
         checkpoint_execution("spawn checkpoint\n\nSpawn-Large: aa"),
-        Some(None)
+        Some(Checkpoint { execution: None })
     );
     for other in [
         "spawn: merge main abc into agent_a",

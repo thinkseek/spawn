@@ -29,7 +29,8 @@
 //! message is read as trailers.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Read, Write as _};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use serde_json::json;
@@ -157,14 +158,14 @@ pub(crate) fn stored_path(bytes: &[u8]) -> String {
                 '\t' => out.push_str("\\t"),
                 '\n' => out.push_str("\\n"),
                 control if control.is_control() && u32::from(control) < 0x100 => {
-                    out.push_str(&format!("\\{:03o}", u32::from(control)));
+                    let _ = write!(out, "\\{:03o}", u32::from(control));
                 }
                 other => out.push(other),
             }
         }
         match bad.split_first() {
             Some((byte, after)) => {
-                out.push_str(&format!("\\{byte:03o}"));
+                let _ = write!(out, "\\{byte:03o}");
                 rest = after;
             }
             None => rest = &[],
@@ -174,17 +175,25 @@ pub(crate) fn stored_path(bytes: &[u8]) -> String {
     out
 }
 
-/// The execution a checkpoint's subject names: `Some(None)` for a
-/// checkpoint that names none (`spawn checkpoint`), `None` for a commit
-/// that is no checkpoint.
-pub(crate) fn checkpoint_execution(message: &str) -> Option<Option<String>> {
+/// A checkpoint commit, as its subject says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Checkpoint {
+    /// The execution it names (`None`: a bare `spawn checkpoint`).
+    pub(crate) execution: Option<String>,
+}
+
+/// The checkpoint `message`'s subject makes of its commit, `None` for a
+/// commit that is no checkpoint.
+pub(crate) fn checkpoint_execution(message: &str) -> Option<Checkpoint> {
     let subject = message.lines().next().unwrap_or_default().trim_end();
     if subject == "spawn checkpoint" {
-        return Some(None);
+        return Some(Checkpoint { execution: None });
     }
     let rest = subject.strip_prefix("spawn checkpoint ")?;
     let execution = rest.split_whitespace().next()?;
-    Some(Some(execution.to_string()))
+    Some(Checkpoint {
+        execution: Some(execution.to_string()),
+    })
 }
 
 /// The integrator's trailers of a message: `Spawn-Task` and `Spawn-Head`,
@@ -781,7 +790,7 @@ fn plan(repo: &mut Repo, known: &Known, summary: &mut Summary) -> Result<Vec<Ite
             continue;
         }
         let commit = repo.commit(&id)?;
-        if let Some(execution) = checkpoint_execution(&commit.message) {
+        if let Some(Checkpoint { execution }) = checkpoint_execution(&commit.message) {
             planned.insert(id);
             items.push(Item::Checkpoint {
                 commit,
@@ -797,7 +806,7 @@ fn plan(repo: &mut Repo, known: &Known, summary: &mut Summary) -> Result<Vec<Ite
                 let merge_base = repo.merge_base(first, other).unwrap_or_default();
                 for brought in repo.only_in(other, first)? {
                     let info = repo.commit(&brought)?;
-                    let Some(execution) = checkpoint_execution(&info.message) else {
+                    let Some(Checkpoint { execution }) = checkpoint_execution(&info.message) else {
                         continue;
                     };
                     checkpoints.push(brought.clone());
@@ -832,7 +841,7 @@ fn plan(repo: &mut Repo, known: &Known, summary: &mut Summary) -> Result<Vec<Ite
                 continue;
             }
             let commit = repo.commit(&id)?;
-            let Some(execution) = checkpoint_execution(&commit.message) else {
+            let Some(Checkpoint { execution }) = checkpoint_execution(&commit.message) else {
                 continue;
             };
             planned.insert(id);
