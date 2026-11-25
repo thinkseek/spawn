@@ -85,7 +85,7 @@ impl Mode {
     /// The mode `value` names: unset or empty is [`Mode::Startup`].
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
-            None | Some("") | Some("startup") => Ok(Self::Startup),
+            None | Some("" | "startup") => Ok(Self::Startup),
             Some("off") => Ok(Self::Off),
             Some("all") => Ok(Self::All),
             Some(other) => Err(format!(
@@ -220,6 +220,59 @@ fn named(key: &str) -> Option<NamedKey> {
         .find(|named| named.tmux() == key)
 }
 
+/// A dialog's choices, the label its cursor stands on, and its body: from
+/// the approvals page's prompt, or from the pane itself for a dialog it
+/// reads no prompt on (agy's trust dialog).
+fn dialog_parts(
+    prompt: Option<&Prompt>,
+    second: &str,
+) -> (Vec<String>, Option<String>, Vec<String>) {
+    let choices: Vec<String> = prompt.map_or_else(
+        || {
+            second
+                .lines()
+                .map(|line| {
+                    line.trim()
+                        .trim_start_matches(['>', '❯'])
+                        .trim()
+                        .to_string()
+                })
+                .filter(|line| line.starts_with("Yes, I trust") || line.starts_with("No, exit"))
+                .collect()
+        },
+        |prompt| {
+            prompt
+                .choices
+                .iter()
+                .map(|choice| choice.label.clone())
+                .collect()
+        },
+    );
+    let cursor: Option<String> = prompt.map_or_else(
+        || {
+            second.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix('>')
+                    .map(|rest| rest.trim().to_string())
+            })
+        },
+        |prompt| {
+            prompt.cursor.as_ref().and_then(|id| {
+                prompt
+                    .choices
+                    .iter()
+                    .find(|choice| &choice.id == id)
+                    .map(|choice| choice.label.clone())
+            })
+        },
+    );
+    let body: Vec<String> = prompt.map_or_else(
+        || second.lines().map(|line| line.trim().to_string()).collect(),
+        |prompt| prompt.body.clone(),
+    );
+    (choices, cursor, body)
+}
+
 /// What one pane, read twice (`first`, then `second`), calls for: pure.
 /// `reading` is the host's own reading of the agent (none on tmux).
 pub(crate) fn decide(
@@ -269,55 +322,13 @@ pub(crate) fn decide(
             return Decision::Nothing("the host does not read the agent blocked by a named rule");
         }
     }
-    let choices: Vec<String> = prompt.as_ref().map_or_else(
-        || {
-            second
-                .lines()
-                .map(|line| {
-                    line.trim()
-                        .trim_start_matches(['>', '❯'])
-                        .trim()
-                        .to_string()
-                })
-                .filter(|line| line.starts_with("Yes, I trust") || line.starts_with("No, exit"))
-                .collect()
-        },
-        |prompt| {
-            prompt
-                .choices
-                .iter()
-                .map(|choice| choice.label.clone())
-                .collect()
-        },
-    );
+    let (choices, cursor, body) = dialog_parts(prompt.as_ref(), second);
     if let Some(why) = hard_block(second, &choices) {
         return Decision::Escalate {
             dialog,
             why: format!("a hard block ({why})"),
         };
     }
-    let cursor: Option<String> = prompt.as_ref().map_or_else(
-        || {
-            second.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix('>')
-                    .map(|rest| rest.trim().to_string())
-            })
-        },
-        |prompt| {
-            prompt.cursor.as_ref().and_then(|id| {
-                prompt
-                    .choices
-                    .iter()
-                    .find(|choice| &choice.id == id)
-                    .map(|choice| choice.label.clone())
-            })
-        },
-    );
-    let body: Vec<String> = prompt.as_ref().map_or_else(
-        || second.lines().map(|line| line.trim().to_string()).collect(),
-        |prompt| prompt.body.clone(),
-    );
     let kind = if trust_rule {
         "trust"
     } else {
@@ -512,7 +523,7 @@ impl Resolver {
                 return Ok(None);
             }
             if age < AGAIN_AFTER_MS {
-                let line = format!(
+                let message = format!(
                     "resolve: {} breaker open for {dialog}: it still shows {} s after its answer",
                     live.session,
                     age / 1000
@@ -520,17 +531,17 @@ impl Resolver {
                 return Ok(self
                     .said
                     .insert(format!("{}:{dialog}:shows", live.execution))
-                    .then_some(line));
+                    .then_some(message));
             }
         }
-        let line = format!(
+        let message = format!(
             "resolve: {} breaker open for {dialog}: answered twice already, never a third time",
             live.session
         );
         Ok(self
             .said
             .insert(format!("{}:{dialog}:third", live.execution))
-            .then_some(line))
+            .then_some(message))
     }
 }
 

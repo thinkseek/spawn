@@ -899,11 +899,13 @@ pub(super) fn approvals() -> Result<Value, String> {
     let (mode, _) = crate::resolve::Mode::from_env();
     let ledger = store
         .commands_by(crate::resolve::PRINCIPAL, 500)
-        .map(|commands| crate::resolve::Ledger::from_json(&commands))
-        .unwrap_or_else(|error| {
-            warnings.push(format!("approvals: the resolver's commands: {error}"));
-            crate::resolve::Ledger::default()
-        });
+        .map_or_else(
+            |error| {
+                warnings.push(format!("approvals: the resolver's commands: {error}"));
+                crate::resolve::Ledger::default()
+            },
+            |commands| crate::resolve::Ledger::from_json(&commands),
+        );
     let clock = store.now_ms().unwrap_or(now);
     for item in &mut listed {
         if let Some(session) = item["session_id"].as_str().map(str::to_string) {

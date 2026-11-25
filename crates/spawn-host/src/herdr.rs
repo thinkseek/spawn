@@ -2209,10 +2209,12 @@ mod tests {
         // control bytes is 360 KiB.
         assert!(prompt_fits("w1:p1", &"\"".repeat(60 * 1024)));
         assert!(!prompt_fits("w1:p1", &"\u{1}".repeat(60 * 1024)));
-        assert!(
-            PROMPT_LINE_LIMIT * 4 <= 1024 * 1024,
-            "well under the probed 1 MiB cap"
-        );
+        const {
+            assert!(
+                PROMPT_LINE_LIMIT * 4 <= 1024 * 1024,
+                "well under the probed 1 MiB cap"
+            )
+        };
     }
 
     /// Carry list N8: a server whose active manifest of a pinned agent
