@@ -37,11 +37,17 @@ pub(super) fn who(query: &str) -> Result<Value, String> {
     let path = decoded("path")?
         .filter(|path| !path.is_empty())
         .ok_or_else(|| format!("{BAD_REQUEST}?path= is required"))?;
-    let domain = decoded("source")?
-        .filter(|source| !source.is_empty())
-        .map(|source| provenance::index::domain_of(&source));
+    let domain = domain(decoded("source")?);
     let store = open_store()?;
     provenance::who_recorded(&store, domain.as_deref(), &path)
+}
+
+/// The domain `?source=` names: `None` (every domain) when it is absent
+/// or empty.
+fn domain(source: Option<String>) -> Option<String> {
+    source
+        .filter(|source| !source.is_empty())
+        .map(|source| provenance::index::domain_of(&source))
 }
 
 /// `/api/prov/change/<id>`.
@@ -53,7 +59,7 @@ pub(super) fn change(id: &str) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BAD_REQUEST, change, who};
+    use super::{BAD_REQUEST, change, domain, who};
 
     #[test]
     fn a_bad_request_is_refused_before_the_store_is_opened() {
@@ -71,5 +77,15 @@ mod tests {
             let error = change(id).expect_err(id);
             assert!(error.starts_with(BAD_REQUEST), "{id}: {error}");
         }
+    }
+
+    #[test]
+    fn an_empty_source_is_every_domain() {
+        assert_eq!(domain(None), None);
+        assert_eq!(domain(Some(String::new())), None);
+        assert_eq!(
+            domain(Some("/srv/a.git".to_string())),
+            Some("git:/srv/a.git".to_string())
+        );
     }
 }
