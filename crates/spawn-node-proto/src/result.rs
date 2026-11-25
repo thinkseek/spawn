@@ -173,7 +173,10 @@ mod tests {
     fn the_body_splits_at_the_first_newline_and_enforces_both_caps() {
         let (meta, log) = split_body(b"{}\nab\ncd").unwrap();
         assert_eq!((meta, log), (&b"{}"[..], &b"ab\ncd"[..]));
-        assert_eq!(split_body(b"{}"), Err(Error::Body("result has no metadata line")));
+        assert_eq!(
+            split_body(b"{}"),
+            Err(Error::Body("result has no metadata line"))
+        );
 
         let long_meta = vec![b' '; Limit::ResultMeta.bytes() + 1];
         let err = split_body(&long_meta).unwrap_err();
@@ -185,7 +188,13 @@ mod tests {
         let mut big_log = b"{}\n".to_vec();
         big_log.resize(3 + Limit::ResultLog.bytes() + 1, b'x');
         let err = split_body(&big_log).unwrap_err();
-        assert!(matches!(err, Error::TooLarge { limit: Limit::ResultLog, .. }));
+        assert!(matches!(
+            err,
+            Error::TooLarge {
+                limit: Limit::ResultLog,
+                ..
+            }
+        ));
         assert_eq!(err.refusal(), Refusal::TooLarge);
     }
 }

@@ -120,7 +120,9 @@ impl Beat {
         if !is_lower_hex(&self.spec_sha256, 64) {
             return Err(Error::Body("spec_sha256"));
         }
-        if self.warm_bases.len() > MAX_WARM_BASES || !self.warm_bases.iter().all(|base| is_lower_hex(base, 40)) {
+        if self.warm_bases.len() > MAX_WARM_BASES
+            || !self.warm_bases.iter().all(|base| is_lower_hex(base, 40))
+        {
             return Err(Error::Body("warm_bases"));
         }
         let ids = self
@@ -216,7 +218,9 @@ mod tests {
             cell_id: "c0".into(),
             state: NodeState::Active,
             spec_sha256: "0".repeat(64),
-            capacities: [("gate_sandbox", Pool { free: 1, total: 4 })].into_iter().collect(),
+            capacities: [("gate_sandbox", Pool { free: 1, total: 4 })]
+                .into_iter()
+                .collect(),
             tmpfs_budget_mb: Pool { free: 1, total: 2 },
             leases: (0..leases)
                 .map(|n| Lease {
@@ -247,7 +251,10 @@ mod tests {
 
         assert!(matches!(
             beat(200).to_bytes(),
-            Err(Error::TooLarge { limit: Limit::Beat, .. })
+            Err(Error::TooLarge {
+                limit: Limit::Beat,
+                ..
+            })
         ));
     }
 
@@ -265,6 +272,9 @@ mod tests {
         let bytes = String::from_utf8(beat(0).to_bytes().unwrap())
             .unwrap()
             .replace("\"timer\"", "\"sometime\"");
-        assert!(matches!(Beat::parse(bytes.as_bytes()), Err(Error::Shape(_))));
+        assert!(matches!(
+            Beat::parse(bytes.as_bytes()),
+            Err(Error::Shape(_))
+        ));
     }
 }

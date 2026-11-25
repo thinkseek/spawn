@@ -257,7 +257,10 @@ impl<V> Default for OrderedMap<V> {
 impl<V> OrderedMap<V> {
     /// The value of `key`.
     pub fn get(&self, key: &str) -> Option<&V> {
-        self.0.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+        self.0
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
     }
 
     /// The keys, in order.
@@ -342,7 +345,12 @@ mod tests {
             (b"tru", "bad literal"),
             (b"", "unexpected end"),
         ] {
-            assert_eq!(check(bad), Err(Error::Json(why)), "{}", String::from_utf8_lossy(bad));
+            assert_eq!(
+                check(bad),
+                Err(Error::Json(why)),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
         }
         let deep = "[".repeat(40) + &"]".repeat(40);
         assert_eq!(check(deep.as_bytes()), Err(Error::Json("nested too deep")));
@@ -352,7 +360,10 @@ mod tests {
     fn an_ordered_map_keeps_its_key_order_both_ways() {
         let text = br#"{"gate_sandbox":4,"batch_cpu":160}"#;
         let map: OrderedMap<u64> = parse(text).unwrap();
-        assert_eq!(map.keys().collect::<Vec<_>>(), ["gate_sandbox", "batch_cpu"]);
+        assert_eq!(
+            map.keys().collect::<Vec<_>>(),
+            ["gate_sandbox", "batch_cpu"]
+        );
         assert_eq!(map.get("batch_cpu"), Some(&160));
         assert_eq!(to_vec(&map), text);
     }

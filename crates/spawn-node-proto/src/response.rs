@@ -36,7 +36,12 @@ impl Envelope {
 }
 
 /// The seven signed lines of a response, each ended by `\n`.
-pub fn response_signing_input(status: u16, request: RequestId<'_>, server_time_ms: u64, body: &[u8]) -> Vec<u8> {
+pub fn response_signing_input(
+    status: u16,
+    request: RequestId<'_>,
+    server_time_ms: u64,
+    body: &[u8],
+) -> Vec<u8> {
     format!(
         "{RESPONSE_PREFIX}\n{status}\n{}\n{}\n{}\n{server_time_ms}\n{}\n",
         request.node_id,
@@ -76,7 +81,12 @@ pub fn sign_response(
 ) -> ResponseSignature {
     ResponseSignature {
         primary_key: primary.public_key().key_id(),
-        sig: primary.sign_b64u(&response_signing_input(status, request, server_time_ms, body)),
+        sig: primary.sign_b64u(&response_signing_input(
+            status,
+            request,
+            server_time_ms,
+            body,
+        )),
     }
 }
 
@@ -102,7 +112,10 @@ pub fn verify_response(
     }
     let sig = decode_signature(sig_header)?;
     let ServerTime { server_time_ms } = json::parse(body)?;
-    primary.verify(&response_signing_input(status, request, server_time_ms, body), &sig)?;
+    primary.verify(
+        &response_signing_input(status, request, server_time_ms, body),
+        &sig,
+    )?;
     Ok(server_time_ms)
 }
 

@@ -39,7 +39,8 @@ impl EnrollToken {
     /// A token line, exactly (no whitespace).
     pub fn parse(text: &str) -> Result<Self, Error> {
         let mut parts = text.split('.');
-        let (Some(TOKEN_PREFIX), Some(secret), Some(pin), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+        let (Some(TOKEN_PREFIX), Some(secret), Some(pin), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return Err(Error::Token);
         };
@@ -153,7 +154,10 @@ mod tests {
         assert!(parsed.pins(&primary));
         assert!(!parsed.pins(&other));
         assert_eq!(parsed.accept_primary(&primary.to_b64u()).unwrap(), primary);
-        assert_eq!(parsed.accept_primary(&other.to_b64u()), Err(Error::PinMismatch));
+        assert_eq!(
+            parsed.accept_primary(&other.to_b64u()),
+            Err(Error::PinMismatch)
+        );
         assert!(!format!("{parsed:?}").contains(&b64u(&[9; 32])));
         for bad in [
             "",

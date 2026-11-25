@@ -106,7 +106,17 @@ mod tests {
         assert_eq!(parse_decimal("0").unwrap(), 0);
         assert_eq!(parse_decimal("1795600000000").unwrap(), 1_795_600_000_000);
         assert_eq!(parse_decimal("9007199254740991").unwrap(), MAX_SAFE - 1);
-        for bad in ["", "01", "+1", "-1", " 1", "1 ", "1.0", "9007199254740992", "1e3"] {
+        for bad in [
+            "",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1.0",
+            "9007199254740992",
+            "1e3",
+        ] {
             assert!(parse_decimal(bad).is_err(), "{bad:?}");
         }
     }

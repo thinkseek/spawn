@@ -75,7 +75,11 @@ impl Refusal {
         match self {
             Self::BadRequest => 400,
             Self::BadSignature | Self::UnknownNode | Self::Revoked => 401,
-            Self::ClockSkew | Self::Replay | Self::StaleBoot | Self::BeatFirst | Self::LeaseFenced => 409,
+            Self::ClockSkew
+            | Self::Replay
+            | Self::StaleBoot
+            | Self::BeatFirst
+            | Self::LeaseFenced => 409,
             Self::TooLarge => 413,
             Self::RateLimited => 429,
             Self::Unavailable => 503,
@@ -110,7 +114,9 @@ impl Refusal {
     pub fn reaction(self) -> Reaction {
         match self {
             Self::BadRequest => Reaction::DropRequest,
-            Self::BadSignature | Self::UnknownNode | Self::RateLimited | Self::Unavailable => Reaction::Backoff,
+            Self::BadSignature | Self::UnknownNode | Self::RateLimited | Self::Unavailable => {
+                Reaction::Backoff
+            }
             Self::Revoked => Reaction::ExitRevoked,
             Self::ClockSkew => Reaction::AdoptServerClock,
             Self::Replay => Reaction::BumpSeq,
@@ -129,7 +135,10 @@ mod tests {
     #[test]
     fn every_refusal_round_trips_through_its_status_and_error() {
         for refusal in Refusal::ALL {
-            assert_eq!(Refusal::from_wire(refusal.status(), refusal.error()), Some(refusal));
+            assert_eq!(
+                Refusal::from_wire(refusal.status(), refusal.error()),
+                Some(refusal)
+            );
         }
         assert_eq!(Refusal::from_wire(409, "bad_request"), None);
         assert_eq!(Refusal::from_wire(200, "busy"), None);

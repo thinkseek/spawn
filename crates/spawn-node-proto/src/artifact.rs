@@ -4,9 +4,9 @@
 
 use std::fmt;
 
+use crate::Error;
 use crate::codec::{is_lower_hex, sha256_hex};
 use crate::envelope::PATH_PREFIX;
-use crate::Error;
 
 /// A digest's algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

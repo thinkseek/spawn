@@ -24,7 +24,13 @@ pub const HEADER_SEQ: &str = "Spawn-Node-Seq";
 pub const HEADER_TS: &str = "Spawn-Node-Ts";
 pub const HEADER_SIG: &str = "Spawn-Node-Sig";
 /// The five request headers, in the order a client writes them.
-pub const REQUEST_HEADERS: [&str; 5] = [HEADER_NODE_ID, HEADER_BOOT, HEADER_SEQ, HEADER_TS, HEADER_SIG];
+pub const REQUEST_HEADERS: [&str; 5] = [
+    HEADER_NODE_ID,
+    HEADER_BOOT,
+    HEADER_SEQ,
+    HEADER_TS,
+    HEADER_SIG,
+];
 
 /// The two methods v1 has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +79,9 @@ pub fn check_target(target: &str) -> Result<(), Error> {
     // The prefix ends in `/`, so a tail starting with `/` makes a `//`.
     let segments_ok = !path.starts_with('/')
         && !path.contains("//")
-        && path.split('/').all(|segment| segment != "." && segment != "..");
+        && path
+            .split('/')
+            .all(|segment| segment != "." && segment != "..");
     if path_ok && query_ok && segments_ok {
         Ok(())
     } else {
@@ -88,7 +96,9 @@ pub fn strip_public_prefix<'a>(target: &'a str, prefix: &str) -> Option<&'a str>
     if prefix.is_empty() {
         return Some(target);
     }
-    target.strip_prefix(prefix).filter(|rest| rest.starts_with('/'))
+    target
+        .strip_prefix(prefix)
+        .filter(|rest| rest.starts_with('/'))
 }
 
 /// What a request asks for, from its method and target.
@@ -239,7 +249,13 @@ impl Envelope {
 
     /// Verifies the signature against `key`, which must also be the key
     /// `node_id` names.
-    pub fn verify(&self, key: &PublicKey, method: Method, target: &str, signed_body: &[u8]) -> Result<(), Error> {
+    pub fn verify(
+        &self,
+        key: &PublicKey,
+        method: Method,
+        target: &str,
+        signed_body: &[u8],
+    ) -> Result<(), Error> {
         if key.key_id() != self.node_id {
             return Err(Error::Signature);
         }
@@ -288,7 +304,14 @@ impl NodeSigner {
 
     /// The envelope of one request. `signed_body` is the whole body, or the
     /// metadata line of a result (rule 5).
-    pub fn sign(&self, method: Method, target: &str, seq: u64, ts_ms: u64, signed_body: &[u8]) -> Result<Envelope, Error> {
+    pub fn sign(
+        &self,
+        method: Method,
+        target: &str,
+        seq: u64,
+        ts_ms: u64,
+        signed_body: &[u8],
+    ) -> Result<Envelope, Error> {
         check_target(target)?;
         let mut envelope = Envelope {
             node_id: self.node_id.clone(),
@@ -423,31 +446,58 @@ mod tests {
         ] {
             assert_eq!(check_target(bad), Err(Error::Target), "{bad}");
         }
-        assert_eq!(check_target(&format!("/node/v1/{}", "a".repeat(220))), Ok(()));
+        assert_eq!(
+            check_target(&format!("/node/v1/{}", "a".repeat(220))),
+            Ok(())
+        );
     }
 
     #[test]
     fn routes_bind_their_method_and_job_ids_are_one_segment() {
-        assert_eq!(Verb::route(Method::Post, "/node/v1/heartbeat").unwrap(), Verb::Heartbeat);
-        assert_eq!(Verb::route(Method::Get, "/node/v1/heartbeat"), Err(Error::Method));
+        assert_eq!(
+            Verb::route(Method::Post, "/node/v1/heartbeat").unwrap(),
+            Verb::Heartbeat
+        );
+        assert_eq!(
+            Verb::route(Method::Get, "/node/v1/heartbeat"),
+            Err(Error::Method)
+        );
         assert_eq!(
             Verb::route(Method::Post, "/node/v1/jobs/gate-1/result").unwrap(),
             Verb::Result {
                 job_id: "gate-1".into()
             }
         );
-        assert_eq!(Verb::route(Method::Post, "/node/v1/jobs/a/b/result"), Err(Error::Target));
-        assert_eq!(Verb::route(Method::Get, "/node/v1/artifacts/sha256:00"), Err(Error::Target));
-        assert_eq!(Verb::route(Method::Get, "/node/v1/unknown"), Err(Error::Target));
+        assert_eq!(
+            Verb::route(Method::Post, "/node/v1/jobs/a/b/result"),
+            Err(Error::Target)
+        );
+        assert_eq!(
+            Verb::route(Method::Get, "/node/v1/artifacts/sha256:00"),
+            Err(Error::Target)
+        );
+        assert_eq!(
+            Verb::route(Method::Get, "/node/v1/unknown"),
+            Err(Error::Target)
+        );
         assert_eq!(Method::parse("get"), Err(Error::Method));
     }
 
     #[test]
     fn the_public_prefix_is_stripped_only_whole() {
-        assert_eq!(strip_public_prefix("/x/node/v1/spec", "/x"), Some("/node/v1/spec"));
-        assert_eq!(strip_public_prefix("/x/node/v1/spec", "/x/"), Some("/node/v1/spec"));
+        assert_eq!(
+            strip_public_prefix("/x/node/v1/spec", "/x"),
+            Some("/node/v1/spec")
+        );
+        assert_eq!(
+            strip_public_prefix("/x/node/v1/spec", "/x/"),
+            Some("/node/v1/spec")
+        );
         assert_eq!(strip_public_prefix("/xy/node/v1/spec", "/x"), None);
-        assert_eq!(strip_public_prefix("/node/v1/spec", ""), Some("/node/v1/spec"));
+        assert_eq!(
+            strip_public_prefix("/node/v1/spec", ""),
+            Some("/node/v1/spec")
+        );
     }
 
     #[test]

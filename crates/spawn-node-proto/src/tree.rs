@@ -43,14 +43,23 @@ pub fn registry_sha256(dir: &Path) -> std::io::Result<String> {
     tree_sha256_v1(dir, &TREE_SKIP_REGISTRY)
 }
 
-fn walk(dir: &Path, relative: &Path, skip: &[&str], files: &mut Vec<(Vec<u8>, PathBuf)>) -> std::io::Result<()> {
+fn walk(
+    dir: &Path,
+    relative: &Path,
+    skip: &[&str],
+    files: &mut Vec<(Vec<u8>, PathBuf)>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let name = relative.join(entry.file_name());
         if kind.is_dir() {
             walk(&entry.path(), &name, skip, files)?;
-        } else if kind.is_file() && !skip.iter().any(|s| entry.file_name().as_bytes() == s.as_bytes()) {
+        } else if kind.is_file()
+            && !skip
+                .iter()
+                .any(|s| entry.file_name().as_bytes() == s.as_bytes())
+        {
             files.push((name.as_os_str().as_bytes().to_vec(), entry.path()));
         }
     }

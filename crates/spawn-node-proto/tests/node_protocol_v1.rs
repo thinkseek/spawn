@@ -18,8 +18,8 @@ use spawn_node_proto::response::{RefusalBody, RequestId, sign_response, verify_r
 use spawn_node_proto::result::{ResultMeta, build_body};
 use spawn_node_proto::spec::{NodeSpec, spec_sha256};
 use spawn_node_proto::{
-    ContentDigest, Error, Limit, Method, PublicKey, Reaction, Refusal, SigningKey, Verb, check_request,
-    scenarios_sha256, tree_sha256_v1,
+    ContentDigest, Error, Limit, Method, PublicKey, Reaction, Refusal, SigningKey, Verb,
+    check_request, scenarios_sha256, tree_sha256_v1,
 };
 
 const BEAT_PATH: &str = "/node/v1/heartbeat";
@@ -46,7 +46,9 @@ fn vectors() -> Value {
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
-    v[key].as_str().unwrap_or_else(|| panic!("{key} is not a string"))
+    v[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("{key} is not a string"))
 }
 
 fn seed(v: &Value, key: &str) -> [u8; 32] {
@@ -76,7 +78,10 @@ struct RawRequest {
 
 impl RawRequest {
     fn parse(bytes: &[u8]) -> Self {
-        let split = bytes.windows(2).position(|w| w == b"\n\n").expect("an empty line");
+        let split = bytes
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .expect("an empty line");
         let head = std::str::from_utf8(&bytes[..split]).unwrap();
         let body = bytes[split + 2..].to_vec();
         let mut lines = head.split('\n');
@@ -96,14 +101,22 @@ impl RawRequest {
     }
 
     fn header(&self, name: &str) -> Option<&str> {
-        let mut found = self.headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name));
+        let mut found = self
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name));
         let first = found.next().map(|(_, value)| value.as_str());
         assert!(found.next().is_none(), "{name} twice");
         first
     }
 
     fn check(&self) -> Result<spawn_node_proto::Checked<'_>, Error> {
-        check_request(&self.method, &self.target, |name| self.header(name), &self.body)
+        check_request(
+            &self.method,
+            &self.target,
+            |name| self.header(name),
+            &self.body,
+        )
     }
 }
 
@@ -159,7 +172,10 @@ fn p6_keys_derive_from_the_seeds() {
     assert_eq!(node.key_id(), s(&v, "node_id"));
     assert_eq!(primary.to_b64u(), s(&v, "primary_pubkey_b64u"));
     assert_eq!(primary.key_id(), s(&v, "primary_key_id"));
-    assert_eq!(PublicKey::from_b64u(s(&v, "node_pubkey_b64u")).unwrap(), node);
+    assert_eq!(
+        PublicKey::from_b64u(s(&v, "node_pubkey_b64u")).unwrap(),
+        node
+    );
     // keys.json carries the same six values.
     let keys = json_file("keys.json");
     for key in keys.as_object().unwrap().keys() {
@@ -167,7 +183,10 @@ fn p6_keys_derive_from_the_seeds() {
     }
     assert_eq!(keys.as_object().unwrap().len(), 6);
     // The seeds are the published test seeds, bytes 00..1f and 20..3f.
-    assert_eq!(seed(&v, "node_seed_hex"), std::array::from_fn::<u8, 32, _>(|i| i as u8));
+    assert_eq!(
+        seed(&v, "node_seed_hex"),
+        std::array::from_fn::<u8, 32, _>(|i| i as u8)
+    );
     assert_eq!(
         seed(&v, "primary_seed_hex"),
         std::array::from_fn::<u8, 32, _>(|i| 0x20 + i as u8)
@@ -177,7 +196,10 @@ fn p6_keys_derive_from_the_seeds() {
 #[test]
 fn p6_boot_id_file_and_counter() {
     let v = vectors();
-    assert_eq!(read("boot_id.txt"), format!("{}\n", s(&v, "boot_id")).into_bytes());
+    assert_eq!(
+        read("boot_id.txt"),
+        format!("{}\n", s(&v, "boot_id")).into_bytes()
+    );
     let boot = s(&v, "boot_id");
     assert_eq!(u64::from_str_radix(&boot[..16], 16).unwrap(), 1);
     assert!(boot < "00000000000000020000000000000000");
@@ -201,7 +223,10 @@ fn p6_spec_bytes_digest_signature_and_model() {
     let spec = NodeSpec::parse(&body).unwrap();
     assert_eq!(spec.to_bytes(), body);
     assert_eq!(spec.name, "n252");
-    assert_eq!(spec.capacities_total.keys().collect::<Vec<_>>(), ["gate_sandbox", "batch_cpu"]);
+    assert_eq!(
+        spec.capacities_total.keys().collect::<Vec<_>>(),
+        ["gate_sandbox", "batch_cpu"]
+    );
     assert_eq!(spec.holds.pg.as_deref(), Some("16"));
 }
 
@@ -249,7 +274,12 @@ fn p6_heartbeat_bytes_signing_input_signature_and_model() {
         .sign(Method::Post, BEAT_PATH, 1, 1_795_600_000_000, &body)
         .unwrap();
     let headers = envelope.to_headers();
-    let header = |name: &str| headers.iter().find(|(n, _)| *n == name).map(|(_, value)| value.as_str());
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| value.as_str())
+    };
     let checked = check_request("POST", BEAT_PATH, header, &body).unwrap();
     assert_eq!(checked.verb, Verb::Heartbeat);
     checked.verify(&node().public_key()).unwrap();
@@ -281,24 +311,52 @@ fn p6_heartbeat_answer_bytes_and_response_signature() {
     assert_eq!(signature.primary_key, s(&v, "primary_key_id"));
     let primary = primary().public_key();
     assert_eq!(
-        verify_response(&primary, 200, request, &signature.primary_key, &signature.sig, &body),
+        verify_response(
+            &primary,
+            200,
+            request,
+            &signature.primary_key,
+            &signature.sig,
+            &body
+        ),
         Ok(1_795_600_000_120)
     );
     // Bound to the status and to the request: another seq, another boot or
     // another status is not this answer.
     let replayed = RequestId { seq: 2, ..request };
     assert_eq!(
-        verify_response(&primary, 200, replayed, &signature.primary_key, &signature.sig, &body),
+        verify_response(
+            &primary,
+            200,
+            replayed,
+            &signature.primary_key,
+            &signature.sig,
+            &body
+        ),
         Err(Error::Signature)
     );
     assert_eq!(
-        verify_response(&primary, 409, request, &signature.primary_key, &signature.sig, &body),
+        verify_response(
+            &primary,
+            409,
+            request,
+            &signature.primary_key,
+            &signature.sig,
+            &body
+        ),
         Err(Error::Signature)
     );
     // Signed by anyone but the pinned primary: a transport failure.
     let node = node().public_key();
     assert_eq!(
-        verify_response(&node, 200, request, &signature.primary_key, &signature.sig, &body),
+        verify_response(
+            &node,
+            200,
+            request,
+            &signature.primary_key,
+            &signature.sig,
+            &body
+        ),
         Err(Error::Signature)
     );
 
@@ -321,7 +379,13 @@ fn p6_artifact_get_request_and_signature() {
     assert_eq!(digest.artifact_path(), s(&v, "artifact_path"));
 
     let envelope = signer()
-        .sign(Method::Get, s(&v, "artifact_path"), 3, 1_795_600_005_000, b"")
+        .sign(
+            Method::Get,
+            s(&v, "artifact_path"),
+            3,
+            1_795_600_005_000,
+            b"",
+        )
         .unwrap();
     let sent: Vec<(String, String)> = envelope
         .to_headers()
@@ -329,7 +393,10 @@ fn p6_artifact_get_request_and_signature() {
         .map(|(name, value)| (name.to_string(), value))
         .collect();
     assert_eq!(sent, raw.headers, "the fixture's headers, in order");
-    assert_eq!(raw.header("Spawn-Node-Sig"), Some(s(&v, "artifact_get_sig")));
+    assert_eq!(
+        raw.header("Spawn-Node-Sig"),
+        Some(s(&v, "artifact_get_sig"))
+    );
 
     let checked = raw.check().unwrap();
     assert_eq!(checked.verb, Verb::Artifact(digest));
@@ -391,7 +458,12 @@ fn p6_result_metadata_log_and_signature() {
     meta.check_log(RESULT_LOG).unwrap();
     let (stdout, stderr) = meta.streams(RESULT_LOG).unwrap();
     assert_eq!((stdout, stderr), (&b"| gate ok\n\n"[..], &b"! warn\n"[..]));
-    assert!(meta.verdict_raw.as_deref().unwrap().contains("\"accepted\""));
+    assert!(
+        meta.verdict_raw
+            .as_deref()
+            .unwrap()
+            .contains("\"accepted\"")
+    );
 
     // The signed body is the metadata line alone (rule 5).
     let envelope = signer()
@@ -401,7 +473,12 @@ fn p6_result_metadata_log_and_signature() {
 
     let body = build_body(&meta_line, RESULT_LOG);
     let headers = envelope.to_headers();
-    let header = |name: &str| headers.iter().find(|(n, _)| *n == name).map(|(_, value)| value.as_str());
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| value.as_str())
+    };
     let checked = check_request("POST", RESULT_PATH, header, &body).unwrap();
     assert_eq!(
         checked.verb,
@@ -437,11 +514,17 @@ fn p6_tree_sha256_v1_of_the_tree_fixture() {
     let v = vectors();
     let tree = dir().join("tree");
     assert_eq!(tree_sha256_v1(&tree, &[]).unwrap(), s(&v, "tree_sha256_v1"));
-    assert_eq!(scenarios_sha256(&tree).as_deref(), Some(s(&v, "tree_sha256_v1")));
+    assert_eq!(
+        scenarios_sha256(&tree).as_deref(),
+        Some(s(&v, "tree_sha256_v1"))
+    );
     // The same digest spelled out: sha256sum's lines, sorted bytewise.
     let mut lines = String::new();
     for path in ["build", "check-tests.sh", "sub/001.sh"] {
-        lines.push_str(&format!("{}  {path}\n", sha256_hex(&read(&format!("tree/{path}")))));
+        lines.push_str(&format!(
+            "{}  {path}\n",
+            sha256_hex(&read(&format!("tree/{path}")))
+        ));
     }
     assert_eq!(sha256_hex(lines.as_bytes()), s(&v, "tree_sha256_v1"));
 }
@@ -456,10 +539,16 @@ fn p6_enroll_token_digest_and_pin() {
     assert_eq!(token.sha256(), s(&v, "enroll_token_sha256"));
     // Its last part is the first 16 bytes of the primary key id.
     assert_eq!(hex(token.pin()), s(&v, "primary_key_id")[..32]);
-    assert_eq!(token.secret(), &std::array::from_fn::<u8, 32, _>(|i| 0x40 + i as u8));
+    assert_eq!(
+        token.secret(),
+        &std::array::from_fn::<u8, 32, _>(|i| 0x40 + i as u8)
+    );
     let primary = primary().public_key();
     assert!(token.pins(&primary));
-    assert_eq!(token.accept_primary(s(&v, "primary_pubkey_b64u")).unwrap(), primary);
+    assert_eq!(
+        token.accept_primary(s(&v, "primary_pubkey_b64u")).unwrap(),
+        primary
+    );
     assert_eq!(
         token.accept_primary(s(&v, "node_pubkey_b64u")),
         Err(Error::PinMismatch)
@@ -472,7 +561,9 @@ fn reaction_of(text: &str) -> Reaction {
         "log; do not resend the same bytes" => Reaction::DropRequest,
         "full jitter backoff" => Reaction::Backoff,
         "stop every job; exit 78; no restart loop" => Reaction::ExitRevoked,
-        "offset_ms = server_time_ms - local_now_ms; retry at once, once" => Reaction::AdoptServerClock,
+        "offset_ms = server_time_ms - local_now_ms; retry at once, once" => {
+            Reaction::AdoptServerClock
+        }
         "seq = max(seq, local) + 1; retry" => Reaction::BumpSeq,
         "exit non-zero: another process owns the identity" => Reaction::ExitStaleBoot,
         "send a heartbeat now, then retry" => Reaction::BeatThenRetry,
@@ -492,15 +583,25 @@ fn p6_every_refusal_body_and_signature() {
     for row in rows {
         let status = u16::try_from(row["status"].as_u64().unwrap()).unwrap();
         let error = s(row, "error");
-        let refusal = Refusal::from_wire(status, error).unwrap_or_else(|| panic!("{status} {error}"));
+        let refusal =
+            Refusal::from_wire(status, error).unwrap_or_else(|| panic!("{status} {error}"));
         seen.insert(format!("{refusal:?}"));
-        assert_eq!(refusal.reaction(), reaction_of(s(row, "reaction")), "{error}");
+        assert_eq!(
+            refusal.reaction(),
+            reaction_of(s(row, "reaction")),
+            "{error}"
+        );
 
         let server_time_ms = row["server_time_ms"].as_u64().unwrap();
         let body = RefusalBody::new(refusal, server_time_ms).to_bytes();
         assert_eq!(body, s(row, "body").as_bytes(), "{error}");
         assert_eq!(sha256_hex(&body), s(row, "body_sha256"));
-        assert_eq!(serde_json::from_slice::<RefusalBody>(&body).unwrap().refusal(status), Some(refusal));
+        assert_eq!(
+            serde_json::from_slice::<RefusalBody>(&body)
+                .unwrap()
+                .refusal(status),
+            Some(refusal)
+        );
 
         // The request it answers is a legal one.
         let method = Method::parse(s(row, "method")).unwrap();
@@ -514,13 +615,27 @@ fn p6_every_refusal_body_and_signature() {
         assert_eq!(signature.primary_key, s(row, "primary_key"));
         assert_eq!(signature.sig, s(row, "primary_sig"), "{error}");
         assert_eq!(
-            verify_response(&primary, status, request, s(row, "primary_key"), s(row, "primary_sig"), &body),
+            verify_response(
+                &primary,
+                status,
+                request,
+                s(row, "primary_key"),
+                s(row, "primary_sig"),
+                &body
+            ),
             Ok(server_time_ms),
             "{error}"
         );
         // Under another status the same signature does not verify.
         assert_eq!(
-            verify_response(&primary, 200, request, s(row, "primary_key"), s(row, "primary_sig"), &body),
+            verify_response(
+                &primary,
+                200,
+                request,
+                s(row, "primary_key"),
+                s(row, "primary_sig"),
+                &body
+            ),
             Err(Error::Signature)
         );
     }
@@ -537,7 +652,9 @@ fn expected_reject(name: &str) -> Error {
             limit: Limit::Beat,
             size: 4097,
         },
-        "dot-segment.txt" | "dotdot-segment.txt" | "double-slash.txt" | "pct-in-path.txt" => Error::Target,
+        "dot-segment.txt" | "dotdot-segment.txt" | "double-slash.txt" | "pct-in-path.txt" => {
+            Error::Target
+        }
         "duplicate-json-key.txt" => Error::Json("duplicate key"),
         "float.txt" => Error::Json("float"),
         "padded-signature.txt" => Error::Header("signature"),
@@ -584,9 +701,18 @@ fn p6_reject_fixtures_are_refused_for_their_rule_not_their_signature() {
         let method = Method::parse(&raw.method).unwrap();
         let seq: u64 = raw.header("Spawn-Node-Seq").unwrap().parse().unwrap();
         let ts: u64 = raw.header("Spawn-Node-Ts").unwrap().parse().unwrap();
-        let input = request_signing_input(method, &raw.target, &signer.node_id, &signer.boot_id, seq, ts, &raw.body);
+        let input = request_signing_input(
+            method,
+            &raw.target,
+            &signer.node_id,
+            &signer.boot_id,
+            seq,
+            ts,
+            &raw.body,
+        );
         let sig = raw.header("Spawn-Node-Sig").unwrap().trim_end_matches('=');
-        key.verify_b64u(&input, sig).unwrap_or_else(|e| panic!("{name}: {e}"));
+        key.verify_b64u(&input, sig)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
         // The signer itself refuses to make a target that breaks rule 3.
         if spawn_node_proto::check_target(&raw.target).is_err() {
             assert_eq!(
@@ -608,7 +734,12 @@ fn p6_seq_zero_is_for_enroll_only() {
         .sign(Method::Post, BEAT_PATH, 0, 1_795_600_000_000, &body)
         .unwrap();
     let headers = envelope.to_headers();
-    let header = |name: &str| headers.iter().find(|(n, _)| *n == name).map(|(_, value)| value.as_str());
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| value.as_str())
+    };
     assert_eq!(
         check_request("POST", BEAT_PATH, header, &body).unwrap_err(),
         Error::Header("Spawn-Node-Seq")

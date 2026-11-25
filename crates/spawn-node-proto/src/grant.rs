@@ -133,7 +133,9 @@ impl Grant {
             return Err(Error::ForbiddenEnv(name.to_string()));
         }
         for artifact in self.artifact_urls.iter().flatten() {
-            artifact.digest().map_err(|_| Error::Grant("artifact digest"))?;
+            artifact
+                .digest()
+                .map_err(|_| Error::Grant("artifact digest"))?;
             let url_ok = if artifact.is_gateway_path() {
                 check_target(&artifact.url).is_ok()
             } else {
@@ -176,7 +178,12 @@ impl SignedGrant {
 
     /// The node's side: verify, then parse those same bytes, then refuse a
     /// grant for another node or one that has expired at `now_ms`.
-    pub fn open(&self, primary: &PublicKey, own_node_id: &str, now_ms: u64) -> Result<(Vec<u8>, Grant), Error> {
+    pub fn open(
+        &self,
+        primary: &PublicKey,
+        own_node_id: &str,
+        now_ms: u64,
+    ) -> Result<(Vec<u8>, Grant), Error> {
         let bytes = self.bytes()?;
         let grant = open_grant(primary, &bytes, &self.sig, own_node_id, now_ms)?;
         Ok((bytes, grant))
@@ -185,7 +192,13 @@ impl SignedGrant {
 
 /// Verifies stored grant bytes and their signature (base64url), then
 /// parses and checks them as [`SignedGrant::open`] does.
-pub fn open_grant(primary: &PublicKey, bytes: &[u8], sig: &str, own_node_id: &str, now_ms: u64) -> Result<Grant, Error> {
+pub fn open_grant(
+    primary: &PublicKey,
+    bytes: &[u8],
+    sig: &str,
+    own_node_id: &str,
+    now_ms: u64,
+) -> Result<Grant, Error> {
     if bytes.len() > Limit::Grant.bytes() {
         return Err(Error::TooLarge {
             limit: Limit::Grant,
@@ -242,7 +255,11 @@ mod tests {
             kind: JobKind::Gate,
             expires_ms: 1_000,
             attempt: Some(1),
-            cost: Some([("gate_sandbox", 1), ("tmpfs_mb", 20480)].into_iter().collect()),
+            cost: Some(
+                [("gate_sandbox", 1), ("tmpfs_mb", 20480)]
+                    .into_iter()
+                    .collect(),
+            ),
             timeout_s: Some(7200),
             inputs: Some(GrantInputs {
                 repo: "spawn".into(),
@@ -279,14 +296,22 @@ mod tests {
             Error::Grant("expired")
         );
         assert_eq!(
-            signed.open(&key.public_key(), &"0".repeat(64), 0).unwrap_err(),
+            signed
+                .open(&key.public_key(), &"0".repeat(64), 0)
+                .unwrap_err(),
             Error::Grant("node_id is not this node's")
         );
         let other = SigningKey::from_seed(&[8; 32]).unwrap();
-        assert_eq!(signed.open(&other.public_key(), NODE, 0).unwrap_err(), Error::Signature);
+        assert_eq!(
+            signed.open(&other.public_key(), NODE, 0).unwrap_err(),
+            Error::Signature
+        );
         let mut tampered = signed.clone();
         tampered.grant = b64u(&grant().to_bytes()[..bytes.len() - 1]);
-        assert_eq!(tampered.open(&key.public_key(), NODE, 0).unwrap_err(), Error::Signature);
+        assert_eq!(
+            tampered.open(&key.public_key(), NODE, 0).unwrap_err(),
+            Error::Signature
+        );
     }
 
     #[test]
@@ -316,11 +341,18 @@ mod tests {
     fn a_grant_over_eight_kilobytes_is_refused_before_its_signature() {
         let key = primary();
         let mut big = grant();
-        big.env = Some([("SPAWN_GATE_JOBS", "x".repeat(9000))].into_iter().collect());
+        big.env = Some(
+            [("SPAWN_GATE_JOBS", "x".repeat(9000))]
+                .into_iter()
+                .collect(),
+        );
         let signed = SignedGrant::sign(&key, &big.to_bytes());
         assert!(matches!(
             signed.open(&key.public_key(), NODE, 0),
-            Err(Error::TooLarge { limit: Limit::Grant, .. })
+            Err(Error::TooLarge {
+                limit: Limit::Grant,
+                ..
+            })
         ));
         let bad = SignedGrant {
             grant: "A".into(),
