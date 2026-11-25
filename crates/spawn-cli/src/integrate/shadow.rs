@@ -26,6 +26,21 @@
 //! two verdicts only when every `inputs` field is equal (`unequal` empty):
 //! two verdicts on different inputs are no comparison.
 //!
+//! A second source, beside the runner and independent of it (both may run
+//! at once, each recording its own `task.shadow_gated`): with
+//! `SPAWN_GATE_SHADOW_NODE=1` ([`NODE_ENV`]) the same verdicts, every N-th
+//! of them by the same `SPAWN_GATE_SHADOW_EVERY`, are queued as
+//! `gate_shadow` jobs for spawn-node v1 ([`NodeShadows`], design §12.4 M2):
+//! the artifacts are written for the gateway and the job is queued
+//! ([`super::remote`]); each pass looks at the jobs in flight, takes back
+//! one no node leased within `SPAWN_REMOTE_QUEUE_WAIT_SECS`, and reads a
+//! node's stored result into the very record a runner's end makes
+//! ([`node_record_of`]: `runner` is `node:<name>`, `inputs` what the node
+//! says it judged). A node's fault is judged on the ledger
+//! ([`super::remote::settle`]: strikes, exclusion, re-queue), never on a
+//! task. Nothing waits for it: the primary's verdict was recorded before
+//! it was offered.
+//!
 //! Like the base warm ([`super::warm`]) it cannot outlive the integrator
 //! unaccounted for: started from the main thread under `setpriv --pdeathsig
 //! TERM`, in its own process group in the integrator's tree, its pid and
@@ -42,7 +57,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use spawn_postgres::PostgresStore;
+use spawn_node_proto::grant::ArtifactRole;
+
 use super::inputs;
+use super::remote;
 use super::warm::{exited_unreaped, setpriv_available, signal_group, start_ticks};
 
 /// The runner's name for the transport; unset or empty: no shadow.
@@ -50,6 +69,18 @@ pub(super) const RUNNER_ENV: &str = "SPAWN_GATE_SHADOW_RUNNER";
 
 /// Shadow every N-th verdict (a whole number from 1; default 1).
 pub(super) const EVERY_ENV: &str = "SPAWN_GATE_SHADOW_EVERY";
+
+/// `1`: shadow on spawn-node v1 too ([`NodeShadows`]); unset, empty or
+/// `0`: not.
+pub(super) const NODE_ENV: &str = "SPAWN_GATE_SHADOW_NODE";
+
+/// Node shadows in flight at most: a verdict offered beyond is skipped,
+/// never queued.
+const NODE_IN_FLIGHT: usize = 4;
+
+/// How long the registry's manifest is reused before it is read again (it
+/// hashes the whole cargo registry).
+const REGISTRY_EVERY: Duration = Duration::from_secs(3600);
 
 /// The shadow's pid file, in the shadow directory.
 pub(super) const PID_FILE: &str = "shadow.pid";
@@ -80,17 +111,67 @@ pub(super) fn settings(
     let Some(runner) = runner.map(str::trim).filter(|runner| !runner.is_empty()) else {
         return Ok(None);
     };
-    let every = match every.map(str::trim).filter(|every| !every.is_empty()) {
-        None => 1,
+    Ok(Some(Settings {
+        runner: runner.to_string(),
+        every: every_of(every)?,
+    }))
+}
+
+/// [`EVERY_ENV`]'s text: unset or empty is 1.
+fn every_of(every: Option<&str>) -> Result<u64, String> {
+    match every.map(str::trim).filter(|every| !every.is_empty()) {
+        None => Ok(1),
         Some(text) => text
             .parse::<u64>()
             .ok()
             .filter(|every| *every >= 1)
-            .ok_or_else(|| format!("{EVERY_ENV} is a whole number from 1, not {text:?}"))?,
+            .ok_or_else(|| format!("{EVERY_ENV} is a whole number from 1, not {text:?}")),
+    }
+}
+
+/// How the node source shadows: how often, the directories it shares with
+/// the gateway, the cargo home whose registry nodes must hold, and how
+/// long a job waits for a lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct NodeSettings {
+    pub(super) every: u64,
+    pub(super) artifacts: PathBuf,
+    pub(super) results: PathBuf,
+    pub(super) cargo_home: PathBuf,
+    pub(super) queue_wait: Duration,
+}
+
+/// The node source's settings from the environment (`lookup`): None unless
+/// [`NODE_ENV`] is `1`; an error for another value, an EVERY that is not a
+/// whole number from 1, or no artifact or results directory.
+pub(super) fn node_settings(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<NodeSettings>, String> {
+    match lookup(NODE_ENV).as_deref().map(str::trim) {
+        None | Some("" | "0") => return Ok(None),
+        Some("1") => {}
+        Some(other) => return Err(format!("{NODE_ENV} is 1 or 0, not {other:?}")),
+    }
+    let every = every_of(lookup(EVERY_ENV).as_deref())?;
+    let directory = |name: &str| -> Result<PathBuf, String> {
+        lookup(name)
+            .map(|text| PathBuf::from(text.trim()))
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| format!("{NODE_ENV}=1 needs {name}, an absolute directory"))
     };
-    Ok(Some(Settings {
-        runner: runner.to_string(),
+    let artifacts = directory(remote::ARTIFACTS_ENV)?;
+    let results = directory(remote::RESULTS_ENV)?;
+    let cargo_home = lookup("CARGO_HOME")
+        .filter(|text| !text.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| lookup("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .ok_or_else(|| format!("{NODE_ENV}=1 needs CARGO_HOME or HOME"))?;
+    Ok(Some(NodeSettings {
         every,
+        artifacts,
+        results,
+        cargo_home,
+        queue_wait: remote::queue_wait(lookup(remote::QUEUE_WAIT_ENV).as_deref()),
     }))
 }
 
@@ -107,6 +188,9 @@ pub(super) struct Want {
     /// The gate's repository (its first argument) and the gate directory.
     pub(super) repo: PathBuf,
     pub(super) scenarios: PathBuf,
+    /// The judging that gave the verdict, when one did (a node's job names
+    /// it `judging_id`).
+    pub(super) judging_id: Option<String>,
 }
 
 impl Want {
@@ -129,6 +213,7 @@ impl Want {
             env: record["env"].clone(),
             repo: repo.to_path_buf(),
             scenarios: scenarios.to_path_buf(),
+            judging_id: super::judging::current_id(),
         })
     }
 }
@@ -561,6 +646,41 @@ pub(super) fn record_of(
     let host = placed
         .as_ref()
         .and_then(|placed| placed["host"].as_str().map(str::to_string));
+    shadow_record(
+        want,
+        runner,
+        given,
+        Ended2 {
+            result,
+            verdict,
+            exit,
+            seconds,
+            host,
+            toolchain,
+        },
+    )
+}
+
+/// How a shadow ended, whatever judged it: the record's own fields.
+struct Ended2 {
+    result: Value,
+    verdict: Option<String>,
+    exit: i64,
+    seconds: u64,
+    host: Option<String>,
+    toolchain: Option<String>,
+}
+
+/// The one shape of `task.shadow_gated`, for a runner's end and a node's.
+fn shadow_record(want: &Want, runner: &str, given: &Value, ended: Ended2) -> Value {
+    let Ended2 {
+        result,
+        verdict,
+        exit,
+        seconds,
+        host,
+        toolchain,
+    } = ended;
     let unequal = inputs::unequal(given, &want.inputs);
     let agrees = match &verdict {
         Some(verdict)
