@@ -163,17 +163,17 @@ On the wire a grant is `{"grant":"<b64u bytes>","sig":"<b64u>"}`, at most 8 KiB 
 The node verifies the signature, then parses those same bytes. It refuses a grant for another node, an expired one, or one whose `env` names a variable the node sets itself (`PATH`, `HOME`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `SPAWN_TEST_DATABASE_URL`, `SPAWN_GATE_PG_IMAGE`, `SPAWN_GATE_PG_BIN`).
 The gateway drops a lease whose grant cannot be built, and logs it. The node never holds that lease, so its next beat gives it back.
 
-### 3.2 Holds and scheduling
-
-A node's `spec.holds` and a job's `requires` are maps over `registry` (`tree_sha256_v1` of the cargo registry), `web_lock` (SHA-256 of `web/package-lock.json`), `toolchain` (the `rust-toolchain.toml` channel) and `pg` (the gate's PostgreSQL major version).
-A job is leased to a node only when `requires <@ holds`, key by key. Otherwise the answer's `need_sync` names what to fetch.
-Grants are given only when the node is not drained or degraded, needs no spec, and does not say `draining`. They go in priority order and then by age. Each grant must fit the `free` capacities and tmpfs the beat reports, after the grants before it in the same answer. Jobs are taken with `SKIP LOCKED`, so two beating nodes never share a job.
-
 ### 3.3 Spec
 
 `POST /node/v1/spec` (at most 64 KiB) carries `v`, `name`, `cell_id`, `labels`, `resources_total` (`cores`, `mem_mb`, `disk_mb`), `capacities_total`, `tmpfs_budget_mb`, `holds` and optionally `versions`.
 The gateway hashes the body itself and never takes the node's word for `spec_sha256`.
 The ledger takes it only from the node's current boot (`409 beat_first` otherwise). The answer is `200 {"v":1,"server_time_ms":N,"changed":bool}`.
+
+### 3.4 Holds and scheduling
+
+A node's `spec.holds` and a job's `requires` are maps over `registry` (`tree_sha256_v1` of the cargo registry), `web_lock` (SHA-256 of `web/package-lock.json`), `toolchain` (the `rust-toolchain.toml` channel) and `pg` (the gate's PostgreSQL major version).
+A job is leased to a node only when `requires <@ holds`, key by key. Otherwise the answer's `need_sync` names what to fetch.
+Grants are given only when the node is not drained or degraded, needs no spec, and does not say `draining`. They go in priority order and then by age. Each grant must fit the `free` capacities and tmpfs the beat reports, after the grants before it in the same answer. Jobs are taken with `SKIP LOCKED`, so two beating nodes never share a job.
 
 ### 3.5 Result framing
 
@@ -190,8 +190,6 @@ The gateway:
 4. streams the log to `SPAWN_NODE_RESULTS/<job>.<epoch>/log.part`, hashing and counting as it goes and reading at most 32 MiB + 1. The log is never held in memory. A mismatch is `400` and removes the partial file;
 5. syncs `log.part` and renames it to `log`, then writes `meta.json` (the line as received; synced, renamed), **before** the ledger call. The same result sent again rewrites nothing. A different result already stored for that epoch is `409 lease_fenced`, and its files are left untouched;
 6. calls `spawn_node_gw_result` with the metadata plus `result_sha256` (SHA-256 of the line). True means this call, or an identical earlier one, completed the job; the answer is `200 {"v":1,"server_time_ms":N,"job_id":"...","lease_epoch":E}`. False means the lease moved: the files this request wrote are removed, and the answer is `409 lease_fenced`.
-
-A log over 32 MiB is truncated by the node before sending (it keeps the head and the tail, and sets `truncated: true`).
 
 ### 3.6 Artifacts and the registry manifest
 
