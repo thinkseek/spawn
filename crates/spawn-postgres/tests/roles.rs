@@ -928,10 +928,7 @@ fn each_login_holds_exactly_its_grants_and_no_more() {
         assert!(!alerts, "{role} may record an alert");
     }
 
-    nothing_else_is_granted(
-        &mut client,
-        [&human, &reader, &supervisor, &node_gateway],
-    );
+    nothing_else_is_granted(&mut client, [&human, &reader, &supervisor, &node_gateway]);
 
     drop(client);
     drop(database);

@@ -1330,7 +1330,7 @@ fn a_store_restored_in_place_leaves_no_kept_fact_behind() {
 /// name is made here for this run (`spawn_test_<pid>_<nanos>_oid`, every
 /// nanosecond since the epoch),
 /// never read from the environment or from the URL's own database, and
-/// every drop names that literal (and the three logins migrate made for
+/// every drop names that literal (and the four logins migrate made for
 /// it, `<login>_<name>`), nothing by pattern. The drops are this case's
 /// own lines, not a helper shared with other tests. After a failed
 /// assertion the database may be left behind (the reviewed reaper's
@@ -1349,7 +1349,12 @@ fn a_database_made_again_under_its_name_is_another_store() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let name = format!("spawn_test_{}_{nanos:x}_oid", std::process::id());
-    assert!("spawn_supervisor_".len() + name.len() <= 63, "{name}");
+    assert!(
+        common::LOGIN_BASES
+            .iter()
+            .all(|base| base.len() + 1 + name.len() <= 63),
+        "{name}"
+    );
     let ours = url
         .rsplit_once('/')
         .map_or(url.clone(), |(server, _)| format!("{server}/{name}"));

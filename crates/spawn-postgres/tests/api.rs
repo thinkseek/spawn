@@ -2793,7 +2793,8 @@ impl Drop for Databases {
 
 /// `spawn_login_role($1)` for the database `$2`, computed where the
 /// function is not (the server's `postgres` database).
-const GATEWAY_LOGIN_OF: &str = "select case when $2 ~ '^[a-z0-9_]+$' and length($1) + 1 + length($2) <= 63
+const GATEWAY_LOGIN_OF: &str =
+    "select case when $2 ~ '^[a-z0-9_]+$' and length($1) + 1 + length($2) <= 63
                  then $1 || '_' || $2
                  else left($1 || '_' || regexp_replace(lower($2), '[^a-z0-9_]+', '_', 'g'), 54)
                       || '_' || left(md5($2), 8) end";
