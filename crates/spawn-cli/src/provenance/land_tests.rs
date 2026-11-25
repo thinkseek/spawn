@@ -495,7 +495,8 @@ fn plans_print_the_tree_their_commands_make_and_write_nothing() {
     run_commands(&hand, &composed["commands"]);
 
     for (word, binary) in [("bin.dat:1-2", true), ("src/a.txt:2", false)] {
-        let [Wanted::Part { path, lines }] = plan::wanted_paths(word).as_slice() else {
+        let wanted = plan::wanted_paths(word);
+        let [Wanted::Part { path, lines }] = wanted.as_slice() else {
             panic!("{word} is a part of a file");
         };
         let refused = plan::refusal(&view, "split", &landed, path, lines);

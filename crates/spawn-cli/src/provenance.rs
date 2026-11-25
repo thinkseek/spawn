@@ -35,6 +35,8 @@
 pub(crate) mod index;
 pub(crate) mod plan;
 #[cfg(test)]
+mod land_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
