@@ -2415,7 +2415,11 @@
         "scripts/maintenance.sh",
         "scripts/sandbox.sh",
         "scripts/stage.sh",
-        "scripts/test-maintenance.sh"
+        "scripts/test-maintenance.sh",
+        "deploy/sync-units.sh",
+        "deploy/test-sync-units.sh",
+        "deploy/systemd/host-local",
+        "rsi/scenarios/check-sync-units.sh"
       ],
       "relations": [
         {
@@ -2426,7 +2430,8 @@
       "provenance": {
         "objectives": [
           "4/149",
-          "4/186"
+          "4/186",
+          "issue-98"
         ],
         "tasks": [],
         "agents": [],
@@ -2437,7 +2442,9 @@
         "tests": [
           "deploy/test-deploy.sh",
           "deploy/test-on-landing.sh",
-          "scripts/test-web-install.sh"
+          "scripts/test-web-install.sh",
+          "deploy/test-sync-units.sh",
+          "rsi/scenarios/check-sync-units.sh"
         ],
         "deploys": [],
         "artifacts": [
@@ -3410,6 +3417,7 @@
         "docs/feature-map/coverage-spec.md",
         "docs/feature-map/library-extraction-analysis.md",
         "docs/feature-map/registry.json",
+        "rsi/scenarios/check-features.sh",
         "web/src/App.tsx",
         "web/src/components/Sidebar.tsx",
         "web/src/components/features/CoveragePage.tsx",
@@ -3435,7 +3443,8 @@
       "provenance": {
         "objectives": [
           "t559u",
-          "t565u"
+          "t565u",
+          "issue-98"
         ],
         "tasks": [
           "slice-b"
@@ -3451,7 +3460,8 @@
         "tests": [
           "crates/spawn-core/tests/feature_coverage.rs",
           "crates/spawn-cli/src/feature_inventory.rs",
-          "web/test/featureCoverage.test.ts"
+          "web/test/featureCoverage.test.ts",
+          "rsi/scenarios/check-features.sh"
         ],
         "deploys": [],
         "artifacts": [
@@ -3477,6 +3487,7 @@
         "crates/spawn-core/src/feature_coverage.rs",
         "crates/spawn-core/tests/feature_coverage.rs",
         "docs/feature-map/coverage-spec.md",
+        "rsi/scenarios/check-features.sh",
         "web/src/components/features/CoveragePage.tsx",
         "web/src/components/features/WildFileScanPanel.tsx",
         "web/src/featureCoverage.ts",
@@ -3492,7 +3503,8 @@
       "provenance": {
         "objectives": [
           "t565u",
-          "t559u"
+          "t559u",
+          "issue-98"
         ],
         "tasks": [
           "slice-b"
@@ -3501,7 +3513,8 @@
         "commits": [],
         "tests": [
           "crates/spawn-core/tests/feature_coverage.rs",
-          "web/test/featureCoverage.test.ts"
+          "web/test/featureCoverage.test.ts",
+          "rsi/scenarios/check-features.sh"
         ],
         "deploys": [],
         "artifacts": [

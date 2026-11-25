@@ -108,12 +108,22 @@
 #      every gated mission whose baseline was the old main takes the new one
 #      (so the deploy is not mistaken for a push outside the gate), and
 #      deploy.pending is removed;
-#   7. the services restart; the base cache is warmed for the new main in
+#   7. every systemd user unit this host installed is made the same as the
+#      deployed controller's deploy/systemd (deploy/sync-units.sh --apply:
+#      changed files installed, one daemon-reload, a changed timer or path
+#      unit try-restarted; a unit not installed is named, never installed;
+#      a host-local unit or drop-in is left alone, and named when
+#      deploy/systemd/host-local does not list it). Before this step no
+#      deploy installed a unit, so a unit's change on main never went live
+#      (spawn-maintenance kept a scratch age main had removed, issue #98).
+#      A unit that cannot be written fails the deploy, live at HEAD, with
+#      the services restarted;
+#   8. the services restart; the base cache is warmed for the new main in
 #      the background (see warm_base_cache); then each relay whose script
-#      changed gets it and a try-restart; a relay unit that is not installed
-#      is skipped, any other relay failure is reported after the deploy is
-#      live;
-#   8. with SPAWN_DEPLOY_MIRROR set, the deployed main is published to the
+#      or unit changed gets it and a try-restart; a relay unit that is not
+#      installed is skipped, any other relay failure is reported after the
+#      deploy is live;
+#   9. with SPAWN_DEPLOY_MIRROR set, the deployed main is published to the
 #      mirror (below, "The mirror"): the one step that never stops the
 #      deploy, or fails it.
 # Any failure after the integrator stopped completes a pending deploy (when
@@ -708,6 +718,13 @@ if [ "$old" != "$head" ]; then
   rm -f "$pending"
   say "main $old -> $head; $(printf '%s' "$moved" | jq -r '.missions') mission(s) took it as baseline"
 fi
+# The units (step 7), from the controller just switched to HEAD's, before
+# the services restart on them.
+units_status=0
+units_out=$(bash "$repo/deploy/sync-units.sh" --apply "$live/controllers/spawn/deploy/systemd") || units_status=$?
+[ -z "$units_out" ] || printf '%s\n' "$units_out" | sed 's/^/deploy: /'
+[ "$units_status" = 0 ] ||
+  die "the deploy is live at $head, but its systemd units are not all installed (above): deploy/sync-units.sh --check"
 restart
 stopped=0
 say "restarted; live at $head"
@@ -869,21 +886,27 @@ if [ -f "$collector" ]; then
   fi
 fi
 # The relays run from the live bin directory too; restart one only when its
-# script changed, so a deploy does not drop engines' model calls needlessly.
+# script or its unit (step 7) changed, so a deploy does not drop engines'
+# model calls needlessly.
 # Last, so a relay cannot stop the deploy halfway. A relay whose unit is not
 # installed (systemctl exit 5) gets its script and nothing else.
 relays_failed=0
 for relay in jev-relay model-relay; do
-  cmp -s "$export_dir/scripts/$relay.py" "$live/bin/$relay.py" && continue
-  install -m 755 "$export_dir/scripts/$relay.py" "$live/bin/$relay.py"
+  what=$relay.py
+  if cmp -s "$export_dir/scripts/$relay.py" "$live/bin/$relay.py"; then
+    grep -qxF "units: installed spawn-$relay.service" <<<"$units_out" || continue
+    what="its unit spawn-$relay.service"
+  else
+    install -m 755 "$export_dir/scripts/$relay.py" "$live/bin/$relay.py"
+  fi
   relay_status=0
   systemctl --user try-restart "spawn-$relay" || relay_status=$?
   case $relay_status in
-  0) say "installed $relay.py" ;;
-  5) say "installed $relay.py (unit spawn-$relay is not installed: nothing restarted)" ;;
+  0) say "installed $what" ;;
+  5) say "installed $what (unit spawn-$relay is not installed: nothing restarted)" ;;
   *)
     printf 'deploy: installed %s, but restarting spawn-%s failed (exit %s): systemctl --user status spawn-%s\n' \
-      "$relay" "$relay" "$relay_status" "$relay" >&2
+      "$what" "$relay" "$relay_status" "$relay" >&2
     relays_failed=1
     ;;
   esac

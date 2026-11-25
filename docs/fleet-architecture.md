@@ -1398,7 +1398,7 @@ DeepSeek's Anthropic-compatible endpoint with `x-api-key:
 $DEEPSEEK_API_KEY` in place of the engine's credentials; anything else goes
 unchanged to the gateway of Claude Code's own settings, with the engine's own
 auth header. The DeepSeek key lives only in the relay's process (from
-`~/.hermes/.env`); the gateway token only in `~/.claude/settings.json`.
+`~/.config/spawn/model-relay.env`); the gateway token only in `~/.claude/settings.json`.
 Spawn's environment, the engine's environment, the event log and the panes
 hold neither.
 

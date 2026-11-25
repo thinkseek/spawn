@@ -3,11 +3,11 @@ Description=Spawn: local relay from the engines to their model APIs (DeepSeek, t
 After=network-online.target
 
 [Service]
-# DEEPSEEK_API_KEY. The key stays in this process.
-EnvironmentFile=%h/.hermes/.env
-# Both upstreams go through the local proxy, as Claude Code's own calls do.
-Environment=http_proxy=http://127.0.0.1:10801 https_proxy=http://127.0.0.1:10801
-Environment=no_proxy=127.0.0.1,localhost
+# DEEPSEEK_API_KEY (0600, under ~/.config/spawn, which engines may not read:
+# CREDENTIAL_DENY). The key stays in this process. Until Keep delivers it
+# (/run/keep, LoadCredential, as spawn-jev-relay), this file is the source.
+EnvironmentFile=%h/.config/spawn/model-relay.env
+# Both upstreams are reached directly from this host: no local proxy.
 Environment=MODEL_RELAY_ADDRESS=127.0.0.1:8791
 # The gateway every non-DeepSeek model goes to: by default the
 # env.ANTHROPIC_BASE_URL of ~/.claude/settings.json, read at start.

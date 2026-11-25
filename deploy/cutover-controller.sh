@@ -18,11 +18,17 @@
 #      main of missions/supply-pa.git: each built and switched unless it
 #      already is current;
 #   3. the units spawn-integrate, spawn-maintenance, spawn-loop and
-#      spawn-serve from the controller's deploy/systemd, installed into
-#      ~/.config/systemd/user where they differ, then daemon-reload. Only
-#      spawn-integrate is restarted (step 5); spawn-loop and spawn-serve take
-#      their new working directory at their next restart (a deploy), and
-#      read nothing from it;
+#      spawn-serve from the live commit's deploy/systemd, installed into
+#      ~/.config/systemd/user where missing; then every unit installed there
+#      made the same as that deploy/systemd (deploy/sync-units.sh, which
+#      deploy/deploy.sh runs on every deploy too), and daemon-reload. Only
+#      spawn-integrate is restarted (step 5), and only when one of the four
+#      changed; spawn-loop and spawn-serve take their new working directory
+#      at their next restart (a deploy), and read nothing from it. This step
+#      used to install only those four, once per host, and nothing else
+#      installed a unit after it: a unit's change on main never went live
+#      (spawn-maintenance kept SPAWN_MAINTENANCE_SCRATCH_AGE_MIN, removed
+#      by 6d852b3a6, issue #98);
 #   4. missions 4 (Spawn's RSI) and 6 (Supply PA) are read from
 #      `spawn mission list`; each must have as gate either its owner checkout
 #      path or already the controller's. The scenario and backlog files that
@@ -144,42 +150,50 @@ for check in "$spawn_git $spawn_main rsi/scenarios" "$spawn_git $spawn_main rsi/
 done
 say "the controllers' commits hold rsi/scenarios, rsi/backlog, scripts/rsi/gate.sh, scripts/maintenance.sh (Spawn) and gate/scenarios, gate/backlog (Supply PA)"
 
-# 3. The units: the controller's (the deployed commit's), or in a dry run
-# before the deploy, this checkout's.
-unit_source() {
-  if [ -f "$controllers/spawn/.controller" ] && [ "$(cat "$controllers/spawn/.controller")" = "$spawn_main" ] &&
-    [ -f "$controllers/spawn/deploy/systemd/$1" ]; then
-    cat "$controllers/spawn/deploy/systemd/$1"
-  elif git --git-dir="$spawn_git" cat-file -e "$spawn_main:deploy/controller.sh" 2>/dev/null; then
-    git --git-dir="$spawn_git" show "$spawn_main:deploy/systemd/$1"
-  else
-    cat "$repo/deploy/systemd/$1"
-  fi
-}
-git --git-dir="$spawn_git" cat-file -e "$spawn_main:deploy/controller.sh" 2>/dev/null ||
+# 3. The units: the live commit's deploy/systemd (the controller's, once it
+# is current), or in a dry run before the deploy, this checkout's.
+unit_tmp=$(mktemp -d)
+trap 'rm -rf "$unit_tmp"' EXIT
+if git --git-dir="$spawn_git" cat-file -e "$spawn_main:deploy/controller.sh" 2>/dev/null; then
+  git --git-dir="$spawn_git" archive "$spawn_main" deploy/systemd | tar -x -C "$unit_tmp"
+else
   say "units below are this checkout's ($repo), the live commit has none for the controller"
-reload=0
+  mkdir -p "$unit_tmp/deploy"
+  cp -R "$repo/deploy/systemd" "$unit_tmp/deploy/"
+fi
+unit_src=$unit_tmp/deploy/systemd
 for unit in $units; do
-  new=$(unit_source "$unit")
-  if printf '%s\n' "$new" | grep -q 'projects/Spawn'; then
-    die "the new $unit still names projects/Spawn"
-  fi
-  if [ -f "$unit_dir/$unit" ] && [ "$(cat "$unit_dir/$unit")" = "$new" ]; then
-    say "$unit is installed as it should be"
-    continue
-  fi
-  reload=1
+  [ -f "$unit_src/$unit" ] || die "no $unit in $unit_src"
+done
+named=$(grep -l 'projects/Spawn' "$unit_src"/spawn-* 2>/dev/null | sed 's|.*/||' | tr '\n' ' ') || true
+[ -z "$named" ] || die "the new units still name projects/Spawn: $named"
+reload=0 # one of the four is new or changed: spawn-integrate restarts (step 5)
+added=0
+for unit in $units; do
+  [ -e "$unit_dir/$unit" ] && continue
+  reload=1 added=1
   if [ "$dry" = 1 ]; then
-    would "install $unit_dir/$unit:"
-    diff -u --label "installed $unit" --label "new $unit" "$unit_dir/$unit" <(printf '%s\n' "$new") | sed 's/^/    /' || true
+    would "install $unit_dir/$unit (not installed yet)"
   else
-    printf '%s\n' "$new" >"$unit_dir/.$unit.new"
-    chmod 644 "$unit_dir/.$unit.new"
-    mv "$unit_dir/.$unit.new" "$unit_dir/$unit"
+    install -m 644 "$unit_src/$unit" "$unit_dir/$unit"
     say "installed $unit"
   fi
 done
-if [ "$reload" = 1 ]; then
+sync_status=0
+if [ "$dry" = 1 ]; then
+  sync_out=$(SPAWN_UNIT_DIR="$unit_dir" bash "$repo/deploy/sync-units.sh" --check "$unit_src") || sync_status=$?
+  [ "$sync_status" -le 1 ] || die "deploy/sync-units.sh --check failed (exit $sync_status)"
+  # Its diff hint names this run's copy, removed on exit: the name alone here.
+  sync_out=$(printf '%s\n' "$sync_out" | sed 's/^units: differs: \([^ ]*\) (diff -u .*)$/units: [dry run] would install: \1/')
+else
+  sync_out=$(SPAWN_UNIT_DIR="$unit_dir" bash "$repo/deploy/sync-units.sh" --apply "$unit_src") || sync_status=$?
+  [ "$sync_status" = 0 ] || die "deploy/sync-units.sh --apply failed (exit $sync_status): $sync_out"
+fi
+printf '%s\n' "$sync_out" | sed 's/^/cutover: /'
+for unit in $units; do
+  if grep -qE "^units: (installed|\[dry run\] would install:) $unit( |\$)" <<<"$sync_out"; then reload=1; fi
+done
+if [ "$added" = 1 ]; then
   if [ "$dry" = 1 ]; then would "systemctl --user daemon-reload"; else
     systemctl --user daemon-reload
     say "daemon-reload"
@@ -297,6 +311,7 @@ done
 say "no gate runs in spawn-integrate (waited ${waited}s); stopping it"
 started=0
 on_exit() {
+  rm -rf "$unit_tmp"
   [ "$started" = 1 ] && return
   systemctl --user start spawn-integrate || printf 'cutover: starting spawn-integrate failed: systemctl --user status spawn-integrate\n' >&2
 }

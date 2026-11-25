@@ -14,7 +14,7 @@ ExecStart=/bin/sh %h/.local/share/spawn-rsi/controllers/spawn/scripts/maintenanc
 # TMPDIR (the integrator's, so the gate's scratch is found), SPAWN_BACKUP_DIR,
 # SPAWN_GATE_WALL_CLOCK_MINUTES and any SPAWN_MAINTENANCE_*.
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # No scratch age here. A gate's scratch goes when the gate that made it is
 # gone (its record in the scratch: pid, start time, boot), whatever its age,
 # and stays while that gate runs, however long: this unit used to set

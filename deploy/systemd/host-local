@@ -1,0 +1,23 @@
+# Installed spawn-* user units and drop-ins that are this host's own, not
+# deploy/systemd's (deploy/sync-units.sh). One name a line, relative to
+# ~/.config/systemd/user, then its reason; `#` starts a comment. The sync
+# never changes these and names any installed spawn-* unit or drop-in that
+# is neither in deploy/systemd nor here. Keep it short: a unit the fleet
+# needs on every host belongs in deploy/systemd, not here.
+
+# The review sessions' own PostgreSQL (/data/tmp/ccd-pg): a test server of
+# the owner's tooling, never the live or the fleet test server.
+spawn-ccd-pg.service
+
+# t482u effective metrics: they run /var/tmp/spawn/sync/tools/effort-*, the
+# sync notes' tools, which are not in this repository.
+spawn-effort-sample.service
+spawn-effort-sample.timer
+spawn-effort-report.service
+spawn-effort-report.timer
+
+# The shadow gate (multi-host nodes, owner decision 2026-11-23): which
+# runner this host's integrator shadows its verdicts to, and how often
+# (SPAWN_GATE_SHADOW_RUNNER, SPAWN_GATE_SHADOW_EVERY;
+# crates/spawn-cli/src/integrate/shadow.rs). A runner's name is the host's.
+spawn-integrate.service.d/50-shadow-gate.conf
