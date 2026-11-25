@@ -37,7 +37,9 @@ pub(super) fn who(query: &str) -> Result<Value, String> {
     let path = decoded("path")?
         .filter(|path| !path.is_empty())
         .ok_or_else(|| format!("{BAD_REQUEST}?path= is required"))?;
-    let domain = decoded("source")?.map(|source| provenance::index::domain_of(&source));
+    let domain = decoded("source")?
+        .filter(|source| !source.is_empty())
+        .map(|source| provenance::index::domain_of(&source));
     let store = open_store()?;
     provenance::who_recorded(&store, domain.as_deref(), &path)
 }

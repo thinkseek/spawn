@@ -333,6 +333,29 @@ pub(crate) fn parse_commit(id: &str, body: &[u8]) -> Result<CommitInfo, String> 
     })
 }
 
+/// One header line of `git cat-file --batch-command`: `<oid> <type>
+/// <size>`, or `<object> missing` / `<object> ambiguous` (`None`). The
+/// object named may hold spaces (`<commit>:<a dir>`), so the answer is read
+/// from its end: the last word says missing or ambiguous before anything
+/// else.
+pub(crate) fn parse_header(line: &str) -> Result<Option<(String, String, u64)>, String> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.ends_with(" missing") || line.ends_with(" ambiguous") {
+        return Ok(None);
+    }
+    let mut words = line.rsplitn(3, ' ');
+    let (Some(size), Some(kind), Some(oid)) = (words.next(), words.next(), words.next()) else {
+        return Err(format!("git cat-file answered {line:?}"));
+    };
+    if oid.is_empty() || oid.contains(' ') {
+        return Err(format!("git cat-file answered {line:?}"));
+    }
+    let size = size
+        .parse()
+        .map_err(|_| format!("git cat-file answered {line:?}"))?;
+    Ok(Some((oid.to_string(), kind.to_string(), size)))
+}
+
 /// A read of one object by a long-lived `git cat-file --batch-command`.
 pub(crate) struct Objects {
     child: Child,
@@ -371,17 +394,7 @@ impl Objects {
         self.output
             .read_line(&mut line)
             .map_err(|error| format!("read git cat-file: {error}"))?;
-        let words: Vec<&str> = line.trim_end().split(' ').collect();
-        match words[..] {
-            [oid, kind, size] => Ok(Some((
-                oid.to_string(),
-                kind.to_string(),
-                size.parse()
-                    .map_err(|_| format!("git cat-file answered {line:?}"))?,
-            ))),
-            [_, "missing" | "ambiguous"] => Ok(None),
-            _ => Err(format!("git cat-file answered {line:?}")),
-        }
+        parse_header(&line)
     }
 
     /// The type and size of `object`, `None` when missing.
