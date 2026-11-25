@@ -162,3 +162,63 @@ challenge when a token is set, 403 otherwise. The built UI's static files
 are served without the token. The full rules, and the reasons for each, are
 the opening comment of
 [`crates/spawn-cli/src/serve.rs`](../crates/spawn-cli/src/serve.rs).
+
+## Automatic answers (`spawn-resolve`)
+
+A dialog an engine shows can be answered without a person by
+[`crates/spawn-cli/src/resolve.rs`](../crates/spawn-cli/src/resolve.rs), a
+step of `spawn loop` (Herdr PR 3, design section 6.3). Every answer is an
+ordinary `key` command of the principal `spawn-resolve`, pressed by the
+Bridge as a person's is. For each answer the record shows:
+`screen.observed permission`, `command.accepted` (principal `spawn-resolve`,
+idempotency key `resolve:<execution>:<dialog id>:<n>:<k>`: the dialog's
+approvals id, its `n`-th answer, the answer's `k`-th key),
+`command.step pressing`, `pressed`, `command.finished`, then the next
+`screen.observed`. The Bridge's own answer to an engine's startup trust
+dialog takes the same path, keyed `resolve:<execution>:trust:1:<k>`. Its
+keys are recorded `pressing` and `pressed` while the start waits, finished
+once the start is done, and never pressed twice.
+
+- **Switch:** `SPAWN_AUTO_APPROVE = off | startup | all`, default `startup`.
+  Only `all` makes the resolver read panes and submit. `startup` is the
+  Bridge's startup trust answer alone, as before. An unknown value is warned
+  about and read as `startup`.
+- **Table** (`spawn_core::driver::table_answer`):
+  - agy's `trust_prompt` for the execution's own workspace, cursor on trust:
+    Enter (probed);
+  - Claude Code's trust dialog: `y` Enter (in production);
+  - Claude Code's numbered permission whose first choice is "Yes": `1`
+    (approvals fixtures).
+
+  Every other row escalates, and so does any dialog no row covers: agy's
+  permission and question prompts, Claude Code's question forms, Codex,
+  OpenCode. Nothing is pressed for them until a later change adds the
+  captured screen as a test.
+- **Hard blocks** (`spawn_core::driver::hard_block`): a login required or
+  expired, a quota or rate limit, an update the engine needs, or exit-only
+  choices. Each is escalated at once and never pressed. Their texts come from
+  the engines' strings and docs; none is captured yet.
+- **Guards:** every one must hold before a key goes.
+  - Two pane reads in a row show the same dialog id.
+  - On Herdr, for an engine other than Claude Code, the agent reads
+    `blocked` by a named rule, with the blocker visible.
+  - The driver reads the pane as `Permission`.
+  - The row's own guard holds.
+  - No command of the session is unfinished: a person's answer in flight
+    holds the resolver off.
+  - The breaker is closed.
+- **Breaker:** folded from the log, so a restart keeps it. The counts come
+  from the commands of `spawn-resolve`; the per-dialog count comes from
+  `submit`'s idempotency. It opens:
+  - for a dialog that still shows 5 s to 30 s after its answer;
+  - for a dialog on its third answer (a second answer comes only 30 s after
+    the first);
+  - for an execution after 5 answers within 10 minutes;
+  - for the host after 20 answers across the fleet within a minute.
+
+  Open means no more keys there and one line in the loop's log. The item
+  stays in `/api/approvals` for a person.
+- **`auto` on an approvals item:** `state` is the switch (`off`, `startup`,
+  `all`). `answered` is the resolver's answers in the session within 10
+  minutes. `breaker` is `open` or `closed`, or `off` unless the switch is
+  `all`.
