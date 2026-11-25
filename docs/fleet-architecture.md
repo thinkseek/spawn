@@ -2138,8 +2138,12 @@ transcript archive's mask roots.
   `sender=`. A `SYSTEM_MESSAGE` with no sender (a reminder) closes nothing.
   While any job or subagent is open, no `turn.stopped` is emitted, whatever
   Herdr says: Herdr was seen reporting `idle` or `done` mid-turn three times.
-  The screen agrees: agy's prompt with a `· N task(s)` or `· N subagent(s)`
-  footer reads Busy.
+  The screen agrees. While background work runs, agy 1.5.14 draws a task
+  panel (`●` entries) and a closing rule between the prompt box and its
+  footer. The footer then counts the open work, as in `? for shortcuts
+  auto · Gemini 3.8 Flash · low · 1 subagent(s) · 2 task(s) · /tasks`, and
+  reads Busy. The footer is the pane's last line, below the box and any
+  panel. A footer whose counts are 0 or missing reads Ready.
 - *Screen* (`read_agy_screen`). Dialogs (a permission, `↑/↓ Navigate · tab
   Amend …`, or a question, `… esc Skip`) read Permission. The trust dialog
   reads Unknown, and the Bridge answers it (`is_agy_trust_dialog`, Enter). A

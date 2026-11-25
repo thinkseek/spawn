@@ -394,7 +394,9 @@ fn herdr_required() -> bool {
 
 /// A stand-in for the Antigravity CLI, named `agy` so Herdr detects it as
 /// agy (by the process's name) and reads its screen by agy's manifest. It
-/// draws each state agy draws (as agy 1.5.14 does, CR LF line ends), reads
+/// draws each state agy draws (as agy 1.5.14 does, CR LF line ends; open
+/// work as its task panel of `●` entries and a closing rule between the
+/// prompt box and a footer counting `subagent(s)` and `task(s)`), reads
 /// a line per state change (bash `read -t`, Enter as CR or LF), turns
 /// bracketed paste on as agy does and off again when it exits (`EXIT`
 /// trap), so the pane is left clean. The banner names a made-up account.
@@ -412,8 +414,10 @@ draw() {
   idle)
     banner; rule; printf '>\r\n'; rule; printf '? for shortcuts\r\n' ;;
   tasks)
-    banner; rule; printf '>\r\n'; rule; printf '? for shortcuts · 2 tasks · /tasks\r\n'
-    printf '  ⎿ task-2 sleep 25\r\n  ⎿ task-3 sleep 40\r\n' ;;
+    banner; rule; printf '>\r\n'; rule
+    printf '● Start job A (sleep 25)\r\n● Start job B (sleep 40)\r\n● File counter (subagent)\r\n'
+    rule
+    printf '? for shortcuts            auto · Gemini 3.8 Flash · low · 1 subagent(s) · 2 task(s) · /tasks\r\n' ;;
   work)
     banner; printf '⠋ Thinking about it\r\n'; rule; printf '>\r\n'; rule; printf 'esc to cancel\r\n' ;;
   perm)
