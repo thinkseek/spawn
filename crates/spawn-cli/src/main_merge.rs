@@ -233,16 +233,10 @@ pub(crate) fn merge_main(
         Ok(mirror) => mirror,
         Err(error) => return Merge::Failed(error.to_string()),
     };
-    let factory: sources::Factory = {
-        let root = root.to_path_buf();
-        Arc::new(move |repo: &Path| GitWorkspace::new(repo, &root))
+    let workspaces = match crate::config::WorkspaceSettings::from_env(root) {
+        Ok(settings) => settings.one_shot(&mirror, root, Arc::clone(store)),
+        Err(error) => return Merge::Failed(error),
     };
-    let workspaces = sources::MissionWorkspaces::one_shot(
-        GitWorkspace::new(&mirror, root),
-        root,
-        Arc::clone(store),
-        factory,
-    );
     let project = workspaces.project().to_string();
     // A merge whose record failed (here, or the Bridge's at a start) is
     // recorded from the branch now; one already recorded is a no-op.
@@ -338,16 +332,9 @@ pub(crate) fn fork_from_prior(
     if changed.trim().is_empty() {
         return Ok(Fork::NoWork);
     }
-    let factory: sources::Factory = {
-        let root = root.to_path_buf();
-        Arc::new(move |repo: &Path| GitWorkspace::new(repo, &root))
-    };
-    let workspaces = sources::MissionWorkspaces::one_shot(
-        GitWorkspace::new(&mirror, root),
-        root,
-        Arc::clone(store),
-        factory,
-    );
+    let workspaces = crate::config::WorkspaceSettings::from_env(root)
+        .map_err(|e| error("the workspace backend", &e))?
+        .one_shot(&mirror, root, Arc::clone(store));
     let project = workspaces.project().to_string();
     let branch = BranchName::new(agent).map_err(|e| error("branch", &e))?;
     workspaces

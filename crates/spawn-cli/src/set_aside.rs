@@ -47,7 +47,7 @@ use std::sync::Arc;
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
 use spawn_core::port::{EventLog, SetAside, WorkspaceError, WorkspaceStore};
-use spawn_host::{GitWorkspace, SET_ASIDE_FILES, SET_ASIDE_WAITS};
+use spawn_host::{SET_ASIDE_FILES, SET_ASIDE_WAITS};
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::Cancelled;
@@ -103,7 +103,7 @@ pub(crate) fn set_aside(
 /// Set the work of `cancelled`'s task aside as `set_aside` does, only while
 /// `ready` says the resident is idle: asked under the branch's lock right
 /// before the set-aside would write
-/// ([`GitWorkspace::set_aside_when`]), and, where nothing is to be written
+/// ([`spawn_host::LocalWorkspaceStore::set_aside_when`]), and, where nothing is to be written
 /// (no branch here, or the set-aside already recorded), before this
 /// returns. When `ready` refuses, nothing changes and the error says the
 /// notice waits ([`waits`]).
@@ -134,15 +134,10 @@ pub(crate) fn set_aside_when(
             kept,
         });
     }
-    let factory: sources::Factory = {
-        let root = root.to_path_buf();
-        Arc::new(move |repo: &Path| GitWorkspace::new(repo, &root))
-    };
-    let workspaces = sources::MissionWorkspaces::one_shot(
-        GitWorkspace::new(&mirror, root),
+    let workspaces = crate::config::WorkspaceSettings::from_env(root)?.one_shot(
+        &mirror,
         root,
         Arc::clone(store),
-        factory,
     );
     let branch = BranchName::new(agent).map_err(|error| error.to_string())?;
     let start = start_after_rewrite(store, &mirror, cancelled)?;

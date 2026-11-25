@@ -506,6 +506,11 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         eprintln!("spawn loop warning: {warning}");
     }
     let root = workspace_root(flags).map(std::path::PathBuf::from);
+    if let Some(root) = &root {
+        let settings = crate::config::WorkspaceSettings::from_env(root)?;
+        eprintln!("spawn loop: {}", settings.said(root));
+        settings.servable()?;
+    }
     // What only the transcript archive holds, counted beside the passes.
     cost::archive::start(root.as_deref(), &prices);
     // The other Claude Code sessions on this host, counted apart from the

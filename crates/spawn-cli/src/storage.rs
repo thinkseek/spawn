@@ -87,14 +87,15 @@ pub(crate) fn archive(root: &Path) -> Sizes {
 pub(crate) const TEST_SCHEMAS_SEEN: &str = "test-schemas-seen.json";
 
 /// The workspaces: everything under `root` outside the archive and its
-/// progress directory, and the test schemas' first sights (and the file
-/// it is written through).
+/// progress directory, the workspace engine marker (issue #95), and the
+/// test schemas' first sights (and the file it is written through).
 pub(crate) fn workspaces(root: &Path) -> Sizes {
     walk(
         root,
         &[
             root.join(ARCHIVE),
             root.join(PROGRESS),
+            root.join(spawn_host::workspace::BACKEND_MARKER),
             root.join(TEST_SCHEMAS_SEEN),
             root.join(format!("{TEST_SCHEMAS_SEEN}.partial")),
         ],
@@ -294,8 +295,10 @@ pub(crate) mod tests {
         // A link is not followed, nor counted.
         std::os::unix::fs::symlink(root.join(".transcripts"), root.join("agent_c/link"))
             .expect("a link");
-        // The Core lines reader's first sights (objective 094) are no
-        // workspace, nor the file they are written through.
+        // The workspace engine marker (issue #95) and the Core lines
+        // reader's first sights (objective 094) are no workspace, nor
+        // the file they are written through.
+        file(&root.join(spawn_host::workspace::BACKEND_MARKER), 4);
         file(&root.join(super::TEST_SCHEMAS_SEEN), 2558);
         file(
             &root.join(format!("{}.partial", super::TEST_SCHEMAS_SEEN)),

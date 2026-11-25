@@ -576,7 +576,7 @@ fn show(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, S
         Err(spawn_core::port::StoreError::Rejected(_)) => None,
         Err(error) => return Err(error.to_string()),
     };
-    mission_view(
+    let mut view = mission_view(
         &mission,
         std::path::Path::new(&root),
         &runner,
@@ -585,7 +585,10 @@ fn show(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, S
             .map(|(rows, work)| (rows.as_slice(), work)),
         last_gates.as_ref(),
         Clock::now(&SystemClock).0,
-    )
+    )?;
+    // Read, never written: no root made, no probe tried (a read command).
+    view["workspace_backend"] = crate::config::WorkspaceSettings::peek(std::path::Path::new(&root));
+    Ok(view)
 }
 
 fn print(value: &Value) {
@@ -1804,6 +1807,52 @@ mod tests {
         withdrawn,
     };
     use crate::Flags;
+
+    /// `spawn mission show` names the engine from the root's marker, and
+    /// reading it makes nothing: no root, no probe file, no probe mount.
+    #[test]
+    fn mission_show_names_the_workspace_backend_without_writing_anything() {
+        use crate::config::WorkspaceSettings;
+        let base = std::env::temp_dir().join(format!(
+            "spawn-show-backend-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let missing = base.join("never-made");
+        let view = WorkspaceSettings::peek(&missing);
+        assert!(
+            view.get("error").is_some() || view.get("configured").is_some(),
+            "{view}"
+        );
+        assert!(!missing.exists(), "a read made the root");
+        assert!(!base.exists());
+
+        std::fs::create_dir_all(&base).expect("root");
+        spawn_host::claim_root(&base, spawn_host::WorkspaceBackend::Cow).expect("claimed");
+        let before: Vec<_> = std::fs::read_dir(&base)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        let marked = spawn_host::root_backend(&base).map_err(|error| error.to_string());
+        let view = WorkspaceSettings::peek_with(
+            Ok(crate::config::WorkspaceBackend::Auto),
+            Ok(true),
+            marked,
+        );
+        assert_eq!(
+            view,
+            json!({"configured": "auto", "active": "cow", "root": "cow", "cas_dedup": "on",
+                   "servable": true})
+        );
+        let _ = WorkspaceSettings::peek(&base);
+        let after: Vec<_> = std::fs::read_dir(&base)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(before, after, "a read wrote under the root");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn configure_sends_only_the_settings_it_is_given() {

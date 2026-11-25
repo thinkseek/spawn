@@ -1,6 +1,6 @@
-//! Host adapters: tmux terminals, the git workspace store, the opt-in
-//! copy-on-write workspace store and artifact deduplicator, and the local
-//! transcript archive.
+//! Host adapters: tmux terminals, the workspace stores (Git, the opt-in
+//! copy-on-write and overlay stores, behind one [`LocalWorkspaceStore`]),
+//! the artifact deduplicator, and the local transcript archive.
 //!
 //! The tmux and git adapters call an external program and read its exit
 //! code, so they share the same failure rules as the programs they wrap.
@@ -32,6 +32,7 @@ pub mod tmux;
 pub mod transcripts;
 pub mod tree_path;
 pub mod watch;
+pub mod workspace;
 
 #[cfg(test)]
 mod audit;
@@ -52,7 +53,7 @@ pub use git::{
 };
 pub use herdr::HerdrHost;
 #[cfg(target_os = "linux")]
-pub use overlay::{OverlayWorkspace, overlay_supported, overlay_supported_in};
+pub use overlay::{OverlayWorkspace, Swept, overlay_supported, overlay_supported_in, sweep_probes};
 pub use process::{current_uid, undumpable};
 pub use root::canonical_root;
 #[cfg(any(test, feature = "testing"))]
@@ -60,6 +61,9 @@ pub use scratch::Scratch;
 pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
+pub use workspace::{
+    BACKEND_MARKER, CAS_DIRECTORY, LocalWorkspaceStore, WorkspaceBackend, claim_root, root_backend,
+};
 
 /// The terminal host of this machine Spawn runs on: tmux (the default) or
 /// Herdr (`SPAWN_TERMINAL_BACKEND=herdr`), told apart only here.

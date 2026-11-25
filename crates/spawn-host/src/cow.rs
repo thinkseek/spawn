@@ -87,7 +87,8 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    Branch, Commit, Hold, MOUNT_CANCELLED, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+    Branch, Commit, Hold, MOUNT_CANCELLED, SetAside, WORKSPACE_STALE, WorkspaceError,
+    WorkspaceStore,
 };
 
 use crate::git::{GitWorkspace, report};
@@ -1209,14 +1210,17 @@ pub struct CowStats {
 /// copy-on-write clones of one read-only baseline per commit (see the
 /// module documentation).
 ///
-/// The default store stays [`crate::GitWorkspace`]; this one is opt-in,
-/// on a root of its own (never the Git store's live root). Its git
-/// plumbing, branch creation and resolution are the Git store's
-/// ([`GitWorkspace`] on the same repository), and so are the rules of what
-/// a checkpoint takes: git's ignore rules, the engine's runtime files and
-/// the size cap with its notices (`GitWorkspace::checkpoint_paths`).
-/// Not implemented here (the trait's defaults answer): merging `main` into
-/// a workspace, and set-aside.
+/// The default store stays [`crate::GitWorkspace`]; this one is opt-in
+/// (`SPAWN_WORKSPACE_BACKEND=cow` or `auto` on a file system that clones,
+/// through [`crate::LocalWorkspaceStore`]), on a root of its own: a root
+/// runs one engine ([`crate::claim_root`]). Its git plumbing, branch
+/// creation and resolution are the Git store's ([`GitWorkspace`] on the same
+/// repository), and so are the rules of what a checkpoint takes: git's
+/// ignore rules, the engine's runtime files and the size cap
+/// (`SPAWN_MAX_FILE_MB`) with its notices (`GitWorkspace::checkpoint_paths`).
+/// Its set-aside is the Git store's rule, moving the workspace in place
+/// ([`CowWorkspace::set_aside_when`]). Not implemented here (the trait's
+/// defaults answer `Current`): merging `main` into a workspace.
 #[derive(Debug)]
 pub struct CowWorkspace {
     git: GitWorkspace,
@@ -1378,6 +1382,293 @@ impl Swap {
 /// Whether `meta` is the directory the mount of `state` installed.
 fn is_generation(meta: &fs::Metadata, state: &State) -> bool {
     meta.is_dir() && (meta.dev(), meta.ino()) == state.mounted
+}
+
+// ---------------------------------------------------------------------------
+// Set-aside: a workspace moved in place
+// ---------------------------------------------------------------------------
+
+/// The refusal code of a set-aside whose workspace cannot be moved to the
+/// start's tree as it is (a file no checkpoint took where the start needs a
+/// directory, a file that changed since the checkpoint): nothing was
+/// changed, neither the directory nor the branch, as the Git store's
+/// `read-tree -m -u` refusal.
+pub const WORKSPACE_DIFFERS: &str = "WorkspaceDiffers";
+
+fn differs(message: String) -> WorkspaceError {
+    WorkspaceError::Refused {
+        code: WORKSPACE_DIFFERS.to_string(),
+        message,
+    }
+}
+
+/// A tree path's mode and blob.
+pub(crate) type TreeEntries = BTreeMap<Vec<u8>, (u32, String)>;
+
+/// The paths a move takes away, each with its old mode and blob.
+pub(crate) type Going = [(Vec<u8>, u32, String)];
+
+/// What checks, before a move writes anything, that every path it takes
+/// away is still the checkpoint's ([`apply_move`]).
+pub(crate) type Verify<'a> = dyn Fn(&Going) -> Result<(), WorkspaceError> + 'a;
+
+/// What moving a workspace from one tree to another takes ([`plan_move`]),
+/// checked before anything is written.
+#[derive(Debug, Default)]
+pub(crate) struct MovePlan {
+    /// Paths of the old tree that go (or change), with their old mode and
+    /// blob, deepest first.
+    pub(crate) remove: Vec<(Vec<u8>, u32, String)>,
+    /// Entries of the new tree that are written.
+    pub(crate) write: Vec<(u32, String, Vec<u8>)>,
+}
+
+/// What [`apply_move`] did to a workspace, by tree path.
+#[derive(Debug, Default)]
+pub(crate) struct Moved {
+    /// Paths written from the new tree (files, links, gitlink directories).
+    pub(crate) written: std::collections::HashSet<Vec<u8>>,
+    /// Paths of the old tree removed.
+    pub(crate) removed: Vec<Vec<u8>>,
+    /// Paths in the way of the new tree (no file of the old tree), moved,
+    /// bytes untouched, under the `aside` prefix.
+    pub(crate) aside: Vec<Vec<u8>>,
+}
+
+/// Whether `name` exists in `directory`, never through a link.
+fn stat_at(directory: &impl AsFd, name: &OsStr) -> io::Result<Option<rustix::fs::Stat>> {
+    match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_directory(stat: &rustix::fs::Stat) -> bool {
+    rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+}
+
+/// The proper prefixes of a tree path, shortest first (`a`, `a/b` of
+/// `a/b/c`).
+fn prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(|(at, _)| &path[..at])
+}
+
+/// Check, without writing anything, that the workspace `workspace`, whose
+/// committed tree is `old`, can be moved in place to the tree `new`, and
+/// say what that takes. Refused ([`WORKSPACE_DIFFERS`]) when something no
+/// checkpoint took (a file over the size cap, a special file, an ignored
+/// file) is where `new` needs a directory, or when `.spawn/set-aside`
+/// (where what is in the way of a file goes) is not a directory: the move
+/// would stop half way. Something at the very path of a file of `new` is
+/// not a refusal: [`apply_move`] moves it aside.
+pub(crate) fn plan_move(
+    workspace: &Path,
+    old: &TreeEntries,
+    new: &[(u32, String, Vec<u8>)],
+) -> Result<MovePlan, WorkspaceError> {
+    check_tree(new)?;
+    let to = DirFd::open(workspace).map_err(io_error("open", workspace))?;
+    let wanted: std::collections::HashMap<&[u8], (u32, &str)> = new
+        .iter()
+        .map(|(mode, sha, path)| (path.as_slice(), (*mode, sha.as_str())))
+        .collect();
+    let mut plan = MovePlan::default();
+    for (path, (mode, sha)) in old.iter().rev() {
+        if wanted.get(path.as_slice()) != Some(&(*mode, sha.as_str())) {
+            plan.remove.push((path.clone(), *mode, sha.clone()));
+        }
+    }
+    let removed: std::collections::HashSet<&[u8]> = plan
+        .remove
+        .iter()
+        .map(|(path, _, _)| path.as_slice())
+        .collect();
+    let mut checked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let shown = |path: &[u8]| workspace.join(OsStr::from_bytes(path));
+    for (mode, sha, path) in new {
+        if old.get(path) == Some(&(*mode, sha.clone())) {
+            continue;
+        }
+        plan.write.push((*mode, sha.clone(), path.clone()));
+        for prefix in prefixes(path) {
+            if !checked.insert(prefix) || removed.contains(prefix) {
+                continue;
+            }
+            let (directory, leaf) = match to.parent(prefix, false) {
+                Ok(found) => found,
+                // A missing directory is made; one under a file is caught
+                // at that file.
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(io_error("open", &shown(prefix))(error)),
+            };
+            match stat_at(&directory, leaf).map_err(io_error("stat", &shown(prefix)))? {
+                None => break,
+                Some(there) if is_directory(&there) => {}
+                Some(_) => {
+                    return Err(differs(format!(
+                        "{} is a file no checkpoint took, where {} needs a directory: \
+                         nothing was changed",
+                        shown(prefix).display(),
+                        String::from_utf8_lossy(path)
+                    )));
+                }
+            }
+        }
+    }
+    for prefix in [&b".spawn"[..], b".spawn/set-aside"] {
+        if let Ok((directory, leaf)) = to.parent(prefix, false)
+            && let Some(there) =
+                stat_at(&directory, leaf).map_err(io_error("stat", &shown(prefix)))?
+            && !is_directory(&there)
+        {
+            return Err(differs(format!(
+                "{} is not a directory, so nothing in the way can be set aside there: \
+                 nothing was changed",
+                shown(prefix).display()
+            )));
+        }
+    }
+    Ok(plan)
+}
+
+/// Move `name` of `from` to `name` of `into`, never over something there.
+fn rename_no_replace(
+    from: &impl AsFd,
+    leaf: &OsStr,
+    into: &impl AsFd,
+    name: &OsStr,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+    {
+        rustix::fs::renameat_with(from, leaf, into, name, rustix::fs::RenameFlags::NOREPLACE)
+            .map_err(Into::into)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+    {
+        if stat_at(into, name)?.is_some() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        rustix::fs::renameat(from, leaf, into, name).map_err(Into::into)
+    }
+}
+
+/// Carry out `plan` ([`plan_move`]) in the workspace `workspace`: `verify`
+/// is asked first, with every path that goes (its old mode and blob), and
+/// refuses unless each is still the checkpoint's (nothing is written
+/// then); then the old paths go, deepest first, with the directories that
+/// empties, and the new tree's files are written from `source`, a
+/// read-only checkout of it (a Cow baseline, an overlay snapshot layer),
+/// cloned copy-on-write where the file system can. Something at such a
+/// path that the old tree did not hold (a file no checkpoint took) is
+/// never deleted: it makes way, moved (never over anything) to its path
+/// under `aside`. Every name is opened relative to a directory descriptor,
+/// one component at a time, never through a link.
+///
+/// The set-aside of [`CowWorkspace`] and `OverlayWorkspace` (through the
+/// holder's view of its merged directory) write their workspace this way,
+/// the two-tree move the Git store makes with `read-tree -m -u`.
+pub(crate) fn apply_move(
+    workspace: &Path,
+    source: &Path,
+    plan: &MovePlan,
+    aside: &[u8],
+    verify: &Verify<'_>,
+) -> Result<Moved, WorkspaceError> {
+    verify(&plan.remove)?;
+    let to = DirFd::open(workspace).map_err(io_error("open", workspace))?;
+    let from = DirFd::open(source).map_err(io_error("open", source))?;
+    let shown = |path: &[u8]| workspace.join(OsStr::from_bytes(path));
+    let mut moved = Moved::default();
+
+    for (path, mode, _) in &plan.remove {
+        let (directory, leaf) = match to.parent(path, false) {
+            Ok(found) => found,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+                continue;
+            }
+            Err(error) => return Err(io_error("open", &shown(path))(error)),
+        };
+        let flags = if *mode == 0o160_000 {
+            rustix::fs::AtFlags::REMOVEDIR
+        } else {
+            rustix::fs::AtFlags::empty()
+        };
+        match rustix::fs::unlinkat(&directory, leaf, flags) {
+            // A gitlink directory with something in it stays.
+            Ok(()) | Err(Errno::NOENT | Errno::NOTEMPTY | Errno::EXIST) => {}
+            Err(error) => return Err(io_error("remove", &shown(path))(error.into())),
+        }
+        moved.removed.push(path.clone());
+        // Directories the removal emptied go too; one with anything left
+        // in it (an ignored file, a build output) stays.
+        let mut parent = split_leaf(path).0;
+        while !parent.is_empty() {
+            let Ok((directory, leaf)) = to.parent(parent, false) else {
+                break;
+            };
+            if rustix::fs::unlinkat(&directory, leaf, rustix::fs::AtFlags::REMOVEDIR).is_err() {
+                break;
+            }
+            parent = split_leaf(parent).0;
+        }
+    }
+
+    for (mode, _, path) in &plan.write {
+        let (directory, leaf) = to
+            .parent(path, true)
+            .map_err(io_error("create", &shown(path)))?;
+        if let Some(there) = stat_at(&directory, leaf).map_err(io_error("stat", &shown(path)))? {
+            if is_directory(&there) && *mode == 0o160_000 {
+                moved.written.insert(path.clone());
+                continue;
+            }
+            let emptied = is_directory(&there)
+                && rustix::fs::unlinkat(&directory, leaf, rustix::fs::AtFlags::REMOVEDIR).is_ok();
+            if !emptied {
+                let mut kept = aside.to_vec();
+                kept.push(b'/');
+                kept.extend_from_slice(path);
+                let (into, name) = to
+                    .parent(&kept, true)
+                    .map_err(io_error("create", &shown(&kept)))?;
+                rename_no_replace(&directory, leaf, &into, name)
+                    .map_err(io_error("move aside", &shown(path)))?;
+                moved.aside.push(path.clone());
+            }
+        }
+        match *mode {
+            0o160_000 => rustix::fs::mkdirat(&directory, leaf, DIRECTORY_MODE)
+                .map_err(|error| io_error("create", &shown(path))(error.into()))?,
+            0o120_000 => {
+                let link = from
+                    .read_link(path)
+                    .map_err(io_error("read", &shown(path)))?;
+                rustix::fs::symlinkat(OsStr::from_bytes(&link), &directory, leaf)
+                    .map_err(|error| io_error("symlink", &shown(path))(error.into()))?;
+            }
+            _ => {
+                let file = from
+                    .open_file(path)
+                    .map_err(io_error("read", &shown(path)))?;
+                let (written, _) = clone_at(&file, &directory, leaf, true)
+                    .map_err(io_error("clone", &shown(path)))?;
+                let bits = if *mode == 0o100_755 { 0o755 } else { 0o644 };
+                written
+                    .set_permissions(fs::Permissions::from_mode(bits))
+                    .map_err(io_error("chmod", &shown(path)))?;
+            }
+        }
+        moved.written.insert(path.clone());
+    }
+    Ok(moved)
 }
 
 impl CowWorkspace {
@@ -2658,6 +2949,216 @@ impl CowWorkspace {
         Ok(())
     }
 
+    /// Commit the workspace (the [`WorkspaceStore::commit`] of this store),
+    /// asking `take_back` first when its branch is gone, as
+    /// [`GitWorkspace::commit_or_take_back`] does: under the branch's lock,
+    /// so whether the branch is there is read where it is used. Made by
+    /// `take_back`, the commit goes on it (refused [`WORKSPACE_STALE`] when
+    /// it is not the head the workspace was made on); still absent, the
+    /// branch is made again from the workspace ([`Commit::Recreated`]). An
+    /// error from `take_back` is the commit's, and nothing is written.
+    pub fn commit_or_take_back(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+        take_back: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<Commit, WorkspaceError> {
+        let _lock = self.lock_branch(workspace.sandbox())?;
+        self.clear_diagnostics();
+        if self
+            .commit_of(&format!("refs/heads/{}", workspace.sandbox()))
+            .is_none()
+        {
+            take_back()?;
+        }
+        self.commit_locked(workspace, message)
+    }
+
+    /// [`WorkspaceStore::set_aside`] of this store, only while `ready` says
+    /// the agent is idle, asked under the branch's lock before anything is
+    /// read or written, as [`GitWorkspace::set_aside_when`] asks it (the
+    /// Bridge types under the same lock: [`WorkspaceStore::hold`]). When
+    /// `ready` refuses, nothing changes: the refusal is
+    /// [`crate::SET_ASIDE_WAITS`] with `ready`'s reason.
+    ///
+    /// The Git store's rule, step for step: `start` must be an ancestor of
+    /// the head (`None`: where the branch forked from `main`); a mounted
+    /// workspace's work no checkpoint took is committed first (a checkpoint
+    /// of this store, so the manifest stays exact); a new commit with
+    /// `start`'s tree goes on top of the head; asked again with the same
+    /// `message` while the head is that set-aside, the same answer comes
+    /// back and nothing is written. The workspace follows in place, never
+    /// replaced, so an engine idle in it keeps its directory: only the
+    /// paths that differ are written, cloned from `start`'s baseline, and a
+    /// file no checkpoint took that is in the way of one is moved, bytes
+    /// untouched, under [`crate::SET_ASIDE_FILES`]`/<kept>/`. The branch
+    /// moves last, by compare-and-swap; the manifest records the move
+    /// before it (its `next`), so a state that cannot be saved after it is
+    /// still followed.
+    ///
+    /// Checked before anything is written, the work's checkpoint included:
+    /// a directory this store did not mount is refused
+    /// ([`WORKSPACE_NOT_OWNED`]), and so is a workspace that cannot reach
+    /// `start`'s tree in place ([`WORKSPACE_DIFFERS`]: a file no checkpoint
+    /// takes, such as one over the size cap, where `start` needs a
+    /// directory). A file goes only while its `lstat` stamp is still the
+    /// checkpoint's. A refused set-aside changes neither the directory nor
+    /// the branch, and is asked again as it was.
+    pub fn set_aside_when(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<SetAside, WorkspaceError> {
+        let branch = branch.as_str();
+        let _lock = self.lock_branch(branch)?;
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: crate::git::SET_ASIDE_WAITS.to_string(),
+            message: why,
+        })?;
+        self.clear_diagnostics();
+        let reference = format!("refs/heads/{branch}");
+        let head = self.git.commit_id_of(&reference)?;
+        let start = self.git.set_aside_start(branch, &head, start)?;
+        let directory = self.root.join(branch);
+        let Some(meta) = present(&directory)? else {
+            let head = self.git.commit_id_of(&reference)?;
+            return match self.git.set_aside_plan(&head, &start, message)? {
+                Ok(plan) => {
+                    let commit = self.git.set_aside_commit(&plan, message)?;
+                    self.git.move_to_set_aside(branch, &plan, &commit)
+                }
+                Err(done) => Ok(done),
+            };
+        };
+        // A directory this store did not mount is never written.
+        let state = self
+            .settled_state(branch)?
+            .ok_or_else(|| Self::not_owned(&directory, "no mount of this store made it"))?;
+        Self::owned(&directory, &meta, &state)?;
+        // The baselines' lock, shared, from the start's baseline to the
+        // last file cloned from it: a prune (exclusive) waits, so the
+        // baseline the move reads is never removed under it.
+        let baselines = self
+            .open_lock("baselines")
+            .map_err(lock_error(&self.cow_dir()))?;
+        baselines
+            .lock_shared()
+            .map_err(lock_error(&self.cow_dir()))?;
+        let new = self.ensure_baseline(&start)?;
+        // Checked before anything moves: what a checkpoint would take now
+        // (no commit, no ref), and whether the workspace can go to the
+        // start's tree from there. A refusal changes neither the directory
+        // nor the branch.
+        let mut tally = CowStats::default();
+        let (now, _, _) = self.snapshot(branch, &directory, &state, &mut tally)?;
+        let taken =
+            parse_ls_tree(
+                &self
+                    .git
+                    .git_listing(&["ls-tree", "-r", "-z", "--full-tree", &now])?,
+            )?
+            .into_iter()
+            .map(|(mode, sha, path)| (path, (mode, sha)))
+            .collect();
+        plan_move(&directory, &taken, &new)?;
+
+        let workspace = WorkspaceId::new(format!("{branch}:{}", directory.display()))
+            .map_err(|error| unavailable(error.to_string()))?;
+        self.commit_locked(&workspace, &crate::git::set_aside_kept_message(branch))?;
+        let head = self.git.commit_id_of(&reference)?;
+        let plan = match self.git.set_aside_plan(&head, &start, message)? {
+            Ok(plan) => plan,
+            Err(done) => return Ok(done),
+        };
+        let commit = self.git.set_aside_commit(&plan, message)?;
+        let mut state = self
+            .settled_state(branch)?
+            .ok_or_else(|| unavailable(format!("{branch} is not mounted by this store")))?;
+        let old: TreeEntries = state
+            .entries
+            .iter()
+            .map(|(path, entry)| (path.clone(), (entry.mode, entry.sha.clone())))
+            .collect();
+        let steps = plan_move(&directory, &old, &new)?;
+        let aside = format!("{}/{}", crate::git::SET_ASIDE_FILES, plan.head);
+        let moved = apply_move(
+            &directory,
+            &self.baseline_path(&start),
+            &steps,
+            aside.as_bytes(),
+            &|going: &Going| Self::verify_stamps(&directory, &state, going),
+        )?;
+        drop(baselines);
+        Self::follow_move(&directory, &mut state, new, &moved)?;
+        // The stamps just taken are at or past the fence, so the next
+        // checkpoint reads those files again: racy, never trusted.
+        state.next = Some(commit.clone());
+        self.save_state(branch, &state)?;
+        let made = self.git.move_to_set_aside(branch, &plan, &commit);
+        if made.is_ok() {
+            state.head = commit;
+        }
+        state.next = None;
+        self.save_state(branch, &state)?;
+        made
+    }
+
+    /// Refused ([`WORKSPACE_DIFFERS`]) unless every path of `going` is
+    /// still the file the checkpoint took: its `lstat` stamp is the
+    /// manifest's.
+    fn verify_stamps(directory: &Path, state: &State, going: &Going) -> Result<(), WorkspaceError> {
+        for (path, mode, _) in going {
+            if *mode == 0o160_000 {
+                continue;
+            }
+            let shown = directory.join(OsStr::from_bytes(path));
+            let same = fs::symlink_metadata(&shown).is_ok_and(|meta| {
+                state
+                    .entries
+                    .get(path)
+                    .is_some_and(|entry| entry.stamp == Stamp::of(&meta))
+            });
+            if !same {
+                return Err(differs(format!(
+                    "{} changed since the checkpoint: nothing was changed",
+                    shown.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The manifest of `state` after `moved`: what went is forgotten, what
+    /// was written recorded with its new stamp.
+    fn follow_move(
+        directory: &Path,
+        state: &mut State,
+        new: Vec<(u32, String, Vec<u8>)>,
+        moved: &Moved,
+    ) -> Result<(), WorkspaceError> {
+        for path in &moved.removed {
+            state.entries.remove(path);
+        }
+        for (mode, sha, path) in new {
+            if !moved.written.contains(&path) {
+                continue;
+            }
+            let shown = directory.join(OsStr::from_bytes(&path));
+            let meta = fs::symlink_metadata(&shown).map_err(io_error("stat", &shown))?;
+            state.entries.insert(
+                path,
+                Entry {
+                    mode,
+                    sha,
+                    stamp: Stamp::of(&meta),
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Where a kept `.transcripts/` of `branch` went, oldest first.
     pub fn kept_transcripts(&self, branch: &str) -> Vec<PathBuf> {
         let mut kept: Vec<PathBuf> = fs::read_dir(self.cow_dir().join("kept"))
@@ -2681,7 +3182,7 @@ impl CowWorkspace {
 
 /// `git ls-tree -r -z` output as `(mode, id, path)`; a record that does not
 /// parse is an error, never skipped.
-fn parse_ls_tree(listing: &[u8]) -> Result<Vec<(u32, String, Vec<u8>)>, WorkspaceError> {
+pub(crate) fn parse_ls_tree(listing: &[u8]) -> Result<Vec<(u32, String, Vec<u8>)>, WorkspaceError> {
     listing
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -2810,6 +3311,16 @@ impl WorkspaceStore for CowWorkspace {
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         self.git.branch_head(branch)
     }
+
+    /// [`CowWorkspace::set_aside_when`] with nothing to wait for.
+    fn set_aside(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        self.set_aside_when(branch, start, message, &|| Ok(()))
+    }
 }
 
 #[cfg(test)]
@@ -2845,6 +3356,133 @@ mod tests {
         assert_eq!(parsed.recorded, state.recorded);
         assert_eq!(parsed.mounted, state.mounted);
         assert_eq!(parsed.entries, state.entries);
+    }
+
+    fn entry(mode: u32, sha: &str, path: &str) -> (u32, String, Vec<u8>) {
+        (mode, sha.repeat(40), path.as_bytes().to_vec())
+    }
+
+    fn tree(entries: &[(u32, String, Vec<u8>)]) -> TreeEntries {
+        entries
+            .iter()
+            .map(|(mode, sha, path)| (path.clone(), (*mode, sha.clone())))
+            .collect()
+    }
+
+    fn refused_code<T: std::fmt::Debug>(result: Result<T, WorkspaceError>) -> String {
+        match result {
+            Err(WorkspaceError::Refused { code, .. }) => code,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_no_checkpoint_took_where_a_directory_is_needed_refuses_the_plan() {
+        let scratch = Scratch::new("cow-plan-collision");
+        let workspace = scratch.join("w");
+        fs::create_dir_all(&workspace).unwrap();
+        // Untaken (not in `old`): an over-cap or special file at `src`.
+        fs::write(workspace.join("src"), "over the cap").unwrap();
+        let new = [entry(0o100_644, "a", "src/lib.rs")];
+        let code = refused_code(plan_move(&workspace, &BTreeMap::new(), &new));
+        assert_eq!(code, WORKSPACE_DIFFERS);
+        assert_eq!(
+            fs::read_to_string(workspace.join("src")).unwrap(),
+            "over the cap"
+        );
+
+        // The same file taken by the checkpoint goes first: no refusal.
+        let old = tree(&[entry(0o100_644, "b", "src")]);
+        let plan = plan_move(&workspace, &old, &new).expect("planned");
+        assert_eq!(plan.remove.len(), 1);
+        assert_eq!(plan.write.len(), 1);
+
+        // A file at the exact path of a new file is moved aside, no refusal.
+        let exact = [entry(0o100_644, "a", "src")];
+        assert!(plan_move(&workspace, &BTreeMap::new(), &exact).is_ok());
+
+        // `.spawn` as a file: nothing could be set aside, refused up front.
+        fs::write(workspace.join(".spawn"), "x").unwrap();
+        let code = refused_code(plan_move(&workspace, &old, &new));
+        assert_eq!(code, WORKSPACE_DIFFERS);
+    }
+
+    #[test]
+    fn a_move_whose_files_changed_since_the_checkpoint_writes_nothing() {
+        let scratch = Scratch::new("cow-apply-verify");
+        let workspace = scratch.join("w");
+        let source = scratch.join("s");
+        fs::create_dir_all(workspace.join("dir")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(workspace.join("dir/old.txt"), "old").unwrap();
+        fs::write(source.join("new.txt"), "new").unwrap();
+        let old = tree(&[entry(0o100_644, "a", "dir/old.txt")]);
+        let new = [entry(0o100_644, "b", "new.txt")];
+        let plan = plan_move(&workspace, &old, &new).unwrap();
+        let refused = apply_move(&workspace, &source, &plan, b".spawn/set-aside/k", &|_| {
+            Err(differs("changed".to_string()))
+        });
+        assert_eq!(refused_code(refused), WORKSPACE_DIFFERS);
+        assert_eq!(
+            fs::read_to_string(workspace.join("dir/old.txt")).unwrap(),
+            "old"
+        );
+        assert!(!workspace.join("new.txt").exists());
+
+        // Asked again with the files as the checkpoint took them: done, the
+        // emptied directory gone.
+        let moved = apply_move(&workspace, &source, &plan, b".spawn/set-aside/k", &|_| {
+            Ok(())
+        })
+        .unwrap();
+        assert!(moved.written.contains(b"new.txt".as_slice()));
+        assert_eq!(
+            fs::read_to_string(workspace.join("new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!workspace.join("dir").exists());
+    }
+
+    #[test]
+    fn what_is_in_the_way_is_moved_aside_never_over_anything() {
+        let scratch = Scratch::new("cow-apply-aside");
+        let workspace = scratch.join("w");
+        let source = scratch.join("s");
+        fs::create_dir_all(workspace.join(".spawn/set-aside/k")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.txt"), "start").unwrap();
+        fs::write(workspace.join("a.txt"), "untaken").unwrap();
+        // Something already where it would be set aside: never replaced.
+        fs::write(workspace.join(".spawn/set-aside/k/a.txt"), "earlier").unwrap();
+        let new = [entry(0o100_644, "a", "a.txt")];
+        let plan = plan_move(&workspace, &BTreeMap::new(), &new).unwrap();
+        assert!(
+            apply_move(&workspace, &source, &plan, b".spawn/set-aside/k", &|_| Ok(
+                ()
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "untaken"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(".spawn/set-aside/k/a.txt")).unwrap(),
+            "earlier"
+        );
+        let moved = apply_move(&workspace, &source, &plan, b".spawn/set-aside/j", &|_| {
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(moved.aside, [b"a.txt".to_vec()]);
+        assert_eq!(
+            fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "start"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(".spawn/set-aside/j/a.txt")).unwrap(),
+            "untaken"
+        );
     }
 
     #[test]

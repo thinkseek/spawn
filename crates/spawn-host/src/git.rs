@@ -372,6 +372,22 @@ struct Pending {
     files: Vec<TreePath>,
 }
 
+/// The commit message of the checkpoint a set-aside takes first of a
+/// mounted workspace's work no checkpoint took, in every store.
+pub(crate) fn set_aside_kept_message(branch: &str) -> String {
+    format!("spawn: the workspace of {branch} as it was, kept before its work is set aside")
+}
+
+/// A set-aside with something to write ([`GitWorkspace::set_aside_plan`]):
+/// the kept head, its tree, the start's tree, and the files that differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetAsidePlan {
+    pub(crate) head: String,
+    pub(crate) head_tree: String,
+    pub(crate) start_tree: String,
+    pub(crate) files: Vec<String>,
+}
+
 /// Workspace store backed by a bare git repository.
 #[derive(Debug, Clone)]
 pub struct GitWorkspace {
@@ -394,6 +410,11 @@ impl GitWorkspace {
             git: "git".to_string(),
             max_file_bytes: max_file_bytes(std::env::var("SPAWN_MAX_FILE_MB").ok().as_deref()),
         }
+    }
+
+    /// The resolved root workspaces live under.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// The same store with a size cap of `bytes` for one file in a
@@ -1990,18 +2011,7 @@ impl GitWorkspace {
         self.refuse_stale(branch)?;
         let reference = format!("refs/heads/{branch}");
         let mut head = self.commit_id_of(&reference)?;
-        let start = if let Some(start) = start {
-            self.commit_id_of(&format!("{start}^{{commit}}"))?
-        } else {
-            let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
-            self.git_output(&["merge-base", &main, &head])?
-        };
-        if !self.is_ancestor(&start, &head)? {
-            return Err(WorkspaceError::Refused {
-                code: "NotAncestor".to_string(),
-                message: format!("{start} is not a commit of branch {branch} (head {head})"),
-            });
-        }
+        let start = self.set_aside_start(branch, &head, start)?;
         let directory = self.root.join(branch);
         let mounted = directory.is_dir();
         if mounted {
@@ -2018,9 +2028,7 @@ impl GitWorkspace {
             let (tree, oversized) = tree?;
             let special = self.special_files_at(&directory, &[&start])?;
             if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
-                let kept_message = format!(
-                    "spawn: the workspace of {branch} as it was, kept before its work is set aside"
-                );
+                let kept_message = set_aside_kept_message(branch);
                 let kept =
                     self.git_output(&["commit-tree", &tree, "-p", &head, "-m", &kept_message])?;
                 self.git_output(&["update-ref", &reference, &kept, &head])
@@ -2034,32 +2042,17 @@ impl GitWorkspace {
             // Everything else the directory held is committed now.
             self.make_way_for_start(branch, &directory, &start, &head, &oversized, &special)?;
         }
-        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
-        let start_tree = self.git_output(&["rev-parse", &format!("{start}^{{tree}}")])?;
-        if head_tree == start_tree {
-            if head != start
-                && let Some(made) = self.set_aside_made(&head, &start_tree, message)?
-            {
-                return Ok(made);
-            }
-            return Ok(SetAside::Unchanged);
-        }
-        let changed = self.git_listing(&[
-            "diff-tree",
-            "-r",
-            "--name-only",
-            "-z",
-            &head_tree,
-            &start_tree,
-        ])?;
-        let files = shown_paths(&listed_paths(&changed));
+        let plan = match self.set_aside_plan(&head, &start, message)? {
+            Ok(plan) => plan,
+            Err(done) => return Ok(done),
+        };
         if mounted {
-            self.update_directory(branch, &directory, &head_tree, &start_tree)?;
+            self.update_directory(branch, &directory, &plan.head_tree, &plan.start_tree)?;
         }
-        let commit = self.git_output(&["commit-tree", &start_tree, "-p", &head, "-m", message])?;
+        let commit = self.set_aside_commit(&plan, message)?;
         if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
             if mounted {
-                return Err(self.follow_moved_branch(branch, &directory, &start_tree, &error));
+                return Err(self.follow_moved_branch(branch, &directory, &plan.start_tree, &error));
             }
             return Err(WorkspaceError::Unavailable(format!(
                 "{error} (branch moved under the set-aside)"
@@ -2072,7 +2065,109 @@ impl GitWorkspace {
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
             kept: CommitId::new(head)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
-            files,
+            files: plan.files,
+        })
+    }
+
+    /// The commit a set-aside of `branch` (at `head`) goes back to: `start`
+    /// resolved, or where the branch forked from `main` when `None`. A
+    /// commit that is not an ancestor of `head` is refused (`NotAncestor`):
+    /// no foreign tree is ever written. Shared by every store with branches
+    /// ([`crate::CowWorkspace`], `OverlayWorkspace`), so the rule is one.
+    pub(crate) fn set_aside_start(
+        &self,
+        branch: &str,
+        head: &str,
+        start: Option<&str>,
+    ) -> Result<String, WorkspaceError> {
+        let start = if let Some(start) = start {
+            self.commit_id_of(&format!("{start}^{{commit}}"))?
+        } else {
+            let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
+            self.git_output(&["merge-base", &main, head])?
+        };
+        if !self.is_ancestor(&start, head)? {
+            return Err(WorkspaceError::Refused {
+                code: "NotAncestor".to_string(),
+                message: format!("{start} is not a commit of branch {branch} (head {head})"),
+            });
+        }
+        Ok(start)
+    }
+
+    /// What a set-aside from `head` (the work already kept) back to `start`
+    /// changes: `Err` with the answer when nothing is to be written (the
+    /// trees are equal: [`SetAside::Unchanged`], or the same answer as the
+    /// earlier call with `message` that made `head`, [`Self::set_aside_made`]),
+    /// else the trees and the files the move changes.
+    pub(crate) fn set_aside_plan(
+        &self,
+        head: &str,
+        start: &str,
+        message: &str,
+    ) -> Result<Result<SetAsidePlan, SetAside>, WorkspaceError> {
+        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        let start_tree = self.git_output(&["rev-parse", &format!("{start}^{{tree}}")])?;
+        if head_tree == start_tree {
+            if head != start
+                && let Some(made) = self.set_aside_made(head, &start_tree, message)?
+            {
+                return Ok(Err(made));
+            }
+            return Ok(Err(SetAside::Unchanged));
+        }
+        let changed = self.git_listing(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &head_tree,
+            &start_tree,
+        ])?;
+        Ok(Ok(SetAsidePlan {
+            head: head.to_string(),
+            head_tree,
+            start_tree,
+            files: shown_paths(&listed_paths(&changed)),
+        }))
+    }
+
+    /// The set-aside commit of `plan`, not on any branch yet.
+    pub(crate) fn set_aside_commit(
+        &self,
+        plan: &SetAsidePlan,
+        message: &str,
+    ) -> Result<String, WorkspaceError> {
+        self.git_output(&[
+            "commit-tree",
+            &plan.start_tree,
+            "-p",
+            &plan.head,
+            "-m",
+            message,
+        ])
+    }
+
+    /// Move `branch` from `plan`'s head to `commit` (compare-and-swap).
+    pub(crate) fn move_to_set_aside(
+        &self,
+        branch: &str,
+        plan: &SetAsidePlan,
+        commit: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        let reference = format!("refs/heads/{branch}");
+        self.git_output(&["update-ref", &reference, commit, &plan.head])
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("{error} (branch moved under the set-aside)"))
+            })?;
+        let id = |text: &str| {
+            CommitId::new(text.to_string())
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+        };
+        Ok(SetAside::Created {
+            commit: id(commit)?,
+            kept: id(&plan.head)?,
+            files: plan.files.clone(),
         })
     }
 

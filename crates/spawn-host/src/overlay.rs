@@ -2,7 +2,8 @@
 //! files through an unprivileged Linux `overlayfs` instead of a full
 //! working copy (see `docs/layerfs-v2-overlay.md`). Nothing selects it by
 //! default: it is a [`WorkspaceStore`] of its own, over a root of its own,
-//! and `spawn-cli` still builds [`crate::GitWorkspace`].
+//! reached through [`crate::LocalWorkspaceStore`] when asked for
+//! (`SPAWN_WORKSPACE_BACKEND=overlay`, docs/storage.md, "Workspace backends").
 //!
 //! Durable state never lives in an overlay. Refs and commits stay in the
 //! backing bare repository, and transcripts are filed outside the store
@@ -51,7 +52,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    Branch, Commit, Hold, MOUNT_CANCELLED, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+    Branch, Commit, Hold, MOUNT_CANCELLED, SetAside, WORKSPACE_STALE, WorkspaceError,
+    WorkspaceStore,
 };
 
 use crate::git::{GitWorkspace, git_command, pathspec_batches, report, report_listing};
@@ -143,13 +145,63 @@ pub fn overlay_supported() -> Result<(), String> {
 /// xattrs), so probe where the store keeps its state.
 pub fn overlay_supported_in(parent: &Path) -> Result<(), String> {
     let probe = parent.join(format!(
-        ".spawn-overlay-probe-{}-{}",
+        "{PROBE_PREFIX}{}-{}",
         std::process::id(),
         next_ordinal()
     ));
     let result = probe_in(&probe);
     let _ = remove_state(&probe);
     result
+}
+
+/// The prefix of the directories [`overlay_supported_in`] probes in.
+const PROBE_PREFIX: &str = ".spawn-overlay-probe-";
+
+/// What [`sweep_probes`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// Dead probes removed.
+    pub removed: usize,
+    /// Dead probes that could not be removed (one holding a `*.jsonl`,
+    /// which is never deleted, or one the walk could not read), with why:
+    /// kept as they are, and the sweep went on.
+    pub kept: Vec<(PathBuf, String)>,
+}
+
+/// Remove the probe directories under `parent` that a process killed
+/// mid-probe left ([`overlay_supported_in`] removes its own): one whose
+/// pid (in its name) runs no process any more. A probe of a live process,
+/// this one's included, is never touched. One that cannot be removed is
+/// kept and said ([`Swept::kept`]); the others still go. An error is only
+/// a `parent` that cannot be listed.
+pub fn sweep_probes(parent: &Path) -> std::io::Result<Swept> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Swept::default()),
+        Err(error) => return Err(error),
+    };
+    let mut swept = Swept::default();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(PROBE_PREFIX))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let live = pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists();
+        if live || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        match remove_state(&entry.path()) {
+            Ok(()) => swept.removed += 1,
+            Err(error) => swept.kept.push((entry.path(), error.to_string())),
+        }
+    }
+    Ok(swept)
 }
 
 fn probe_in(probe: &Path) -> Result<(), String> {
@@ -1139,9 +1191,13 @@ exec sleep infinity"#;
                     mode,
                     source: FileOrigin::File(full),
                 });
+            } else {
+                // Sockets, fifos and devices other than whiteouts are no
+                // files of git's, but they hide whatever the lower layers
+                // hold at their path: that path is gone from the tree, as
+                // it is gone from the merged view.
+                diff.removed.push(path);
             }
-            // Sockets, fifos and devices other than whiteouts are no
-            // files of git's.
         }
         Ok(())
     }
@@ -1462,67 +1518,8 @@ impl WorkspaceStore for OverlayWorkspace {
     /// (`pending`) before the ref moves, so a publication whose `head` was
     /// not written is settled on the next commit or mount.
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
-        let state = self.state_dir(workspace)?;
-        let branch = workspace.sandbox();
-        let _lock = self.lock_workspace(branch)?;
-        let reference = format!("refs/heads/{branch}");
-        let lower = read_line(&state.join("lower"))?;
-        let published = self.published_head(&state, &reference)?;
-        let diff = self.walk_upper(&state.join("upper"), &lower)?;
-        let tree = self.write_tree(&state, &lower, &diff)?;
-        let head = self.lookup(&reference)?;
-        if let Some(head) = &head {
-            if *head != published {
-                return Err(WorkspaceError::Refused {
-                    code: WORKSPACE_STALE.to_string(),
-                    message: format!(
-                        "branch {branch} moved from {published} to {head} under the workspace"
-                    ),
-                });
-            }
-            if self.run(&["rev-parse", &format!("{head}^{{tree}}")], None)? == tree {
-                return Ok(Commit::Unchanged);
-            }
-        }
-        let parent = match &head {
-            Some(head) => head.clone(),
-            None if self.lookup(&published)?.is_some() => published.clone(),
-            None => lower.clone(),
-        };
-        let commit = self.run(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?;
-        let old = head.clone().unwrap_or_default();
-        write_atomic(
-            &state.join("pending"),
-            format!("{} {commit}\n", head.as_deref().unwrap_or("-")).as_bytes(),
-        )?;
-        self.hook("commit:update-ref");
-        // Compare-and-swap: a writer that moved (or made) the branch since
-        // it was read wins, and this commit is refused as stale.
-        if let Err(error) = self.run(&["update-ref", &reference, &commit, &old], None) {
-            let now = self.lookup(&reference)?;
-            if now != head {
-                return Err(WorkspaceError::Refused {
-                    code: WORKSPACE_STALE.to_string(),
-                    message: format!(
-                        "branch {branch} moved from {} to {} under the commit",
-                        head.as_deref().unwrap_or("nothing"),
-                        now.as_deref().unwrap_or("nothing")
-                    ),
-                });
-            }
-            return Err(error);
-        }
-        self.hook("commit:published");
-        write_atomic(&state.join("head"), format!("{commit}\n").as_bytes())?;
-        let _ = std::fs::remove_file(state.join("pending"));
-        if head.is_some() {
-            Ok(Commit::Created(Self::commit_id(&commit)?))
-        } else {
-            Ok(Commit::Recreated {
-                commit: Self::commit_id(&commit)?,
-                parent: Some(Self::commit_id(&parent)?),
-            })
-        }
+        let _lock = self.lock_workspace(workspace.sandbox())?;
+        self.commit_locked(workspace, message)
     }
 
     /// Tear the workspace down, all under the workspace lock:
@@ -1621,9 +1618,86 @@ impl WorkspaceStore for OverlayWorkspace {
             .map(|commit| Self::commit_id(&commit))
             .transpose()
     }
+    /// [`OverlayWorkspace::set_aside_when`] with nothing to wait for.
+    fn set_aside(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        self.set_aside_when(branch, start, message, &|| Ok(()))
+    }
 }
 
 impl OverlayWorkspace {
+    /// [`WorkspaceStore::commit`] under the workspace lock the caller holds.
+    fn commit_locked(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+    ) -> Result<Commit, WorkspaceError> {
+        let state = self.state_dir(workspace)?;
+        let branch = workspace.sandbox();
+        let reference = format!("refs/heads/{branch}");
+        let lower = read_line(&state.join("lower"))?;
+        let published = self.published_head(&state, &reference)?;
+        let diff = self.walk_upper(&state.join("upper"), &lower)?;
+        let tree = self.write_tree(&state, &lower, &diff)?;
+        let head = self.lookup(&reference)?;
+        if let Some(head) = &head {
+            if *head != published {
+                return Err(WorkspaceError::Refused {
+                    code: WORKSPACE_STALE.to_string(),
+                    message: format!(
+                        "branch {branch} moved from {published} to {head} under the workspace"
+                    ),
+                });
+            }
+            if self.run(&["rev-parse", &format!("{head}^{{tree}}")], None)? == tree {
+                return Ok(Commit::Unchanged);
+            }
+        }
+        let parent = match &head {
+            Some(head) => head.clone(),
+            None if self.lookup(&published)?.is_some() => published.clone(),
+            None => lower.clone(),
+        };
+        let commit = self.run(&["commit-tree", &tree, "-p", &parent, "-m", message], None)?;
+        let old = head.clone().unwrap_or_default();
+        write_atomic(
+            &state.join("pending"),
+            format!("{} {commit}\n", head.as_deref().unwrap_or("-")).as_bytes(),
+        )?;
+        self.hook("commit:update-ref");
+        // Compare-and-swap: a writer that moved (or made) the branch since
+        // it was read wins, and this commit is refused as stale.
+        if let Err(error) = self.run(&["update-ref", &reference, &commit, &old], None) {
+            let now = self.lookup(&reference)?;
+            if now != head {
+                return Err(WorkspaceError::Refused {
+                    code: WORKSPACE_STALE.to_string(),
+                    message: format!(
+                        "branch {branch} moved from {} to {} under the commit",
+                        head.as_deref().unwrap_or("nothing"),
+                        now.as_deref().unwrap_or("nothing")
+                    ),
+                });
+            }
+            return Err(error);
+        }
+        self.hook("commit:published");
+        write_atomic(&state.join("head"), format!("{commit}\n").as_bytes())?;
+        let _ = std::fs::remove_file(state.join("pending"));
+        if head.is_some() {
+            Ok(Commit::Created(Self::commit_id(&commit)?))
+        } else {
+            Ok(Commit::Recreated {
+                commit: Self::commit_id(&commit)?,
+                parent: Some(Self::commit_id(&parent)?),
+            })
+        }
+    }
+
     /// Mount the overlay of `state` over `layer` (and the pre-warmed
     /// layers) at `merged`.
     fn start(&self, state: &Path, layer: PathBuf, merged: &Path) -> Result<(), WorkspaceError> {
@@ -1633,6 +1707,219 @@ impl OverlayWorkspace {
         let mut lowers = vec![layer];
         lowers.extend(self.lower_layers.iter().cloned());
         self.start_holder(state, &lowers, merged).map(drop)
+    }
+
+    /// Commit the workspace (the [`WorkspaceStore::commit`] of this store),
+    /// asking `take_back` first when its branch is gone, as
+    /// [`GitWorkspace::commit_or_take_back`] does: under the workspace
+    /// lock, so whether the branch is there is read where it is used. Made
+    /// by `take_back`, the commit goes on it (refused [`WORKSPACE_STALE`]
+    /// when it is not the head this workspace last published); still
+    /// absent, the branch is made again ([`Commit::Recreated`]). An error
+    /// from `take_back` is the commit's, and nothing is written.
+    pub fn commit_or_take_back(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+        take_back: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<Commit, WorkspaceError> {
+        let _lock = self.lock_workspace(workspace.sandbox())?;
+        if self
+            .lookup(&format!("refs/heads/{}", workspace.sandbox()))?
+            .is_none()
+        {
+            take_back()?;
+        }
+        self.commit_locked(workspace, message)
+    }
+
+    /// [`WorkspaceStore::set_aside`] of this store, only while `ready` says
+    /// the agent is idle, asked under the workspace lock (the one
+    /// [`WorkspaceStore::hold`] takes) before anything is read or written,
+    /// as [`GitWorkspace::set_aside_when`] asks it. When `ready` refuses,
+    /// nothing changes: the refusal is [`crate::SET_ASIDE_WAITS`] with
+    /// `ready`'s reason.
+    ///
+    /// The Git store's rule, step for step: `start` must be an ancestor of
+    /// the head (`None`: where the branch forked from `main`); a mounted
+    /// workspace's work no checkpoint took is committed first; a new commit
+    /// with `start`'s tree goes on top of the head; asked again with the
+    /// same `message` while the head is that set-aside, the same answer
+    /// comes back and nothing is written. A mounted workspace follows in
+    /// place, through the holder's view of its merged directory
+    /// ([`Self::host_path`]), so an engine idle in it keeps its directory:
+    /// only the paths that differ are written, read from `start`'s snapshot
+    /// layer, and a file no checkpoint took that is in the way of one is
+    /// moved, bytes untouched, under [`crate::SET_ASIDE_FILES`]`/<kept>/`.
+    /// The branch moves last, by compare-and-swap, recorded (`pending`)
+    /// before it moves as a checkpoint's publication is. A state whose
+    /// holder is gone cannot be written and is refused, nothing changed.
+    ///
+    /// Checked before anything is written, the work's checkpoint included:
+    /// a non-empty `<root>/<branch>` with no overlay state (another engine's
+    /// workspace) is refused ([`crate::cow::WORKSPACE_NOT_OWNED`]), and so
+    /// is a workspace that cannot reach `start`'s tree in place
+    /// ([`crate::cow::WORKSPACE_DIFFERS`]: a file no checkpoint takes, such
+    /// as one under a derived directory, where `start` needs a directory).
+    /// A file goes only while it still hashes to the checkpoint's blob. A
+    /// refused set-aside changes neither the directory nor the branch.
+    pub fn set_aside_when(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<SetAside, WorkspaceError> {
+        if branch.as_str().starts_with('.') {
+            return Err(WorkspaceError::Unavailable(format!(
+                "branch {branch} starts with '.'"
+            )));
+        }
+        let name = branch.as_str();
+        let merged = self.root.join(name);
+        let workspace = WorkspaceId::new(format!("{branch}:{}", merged.display()))
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
+        let state = self.state_dir(&workspace)?;
+        // The order a mount takes them in: the store, then the workspace.
+        let _store = self.lock_store(false)?;
+        let _lock = self.lock_workspace(name)?;
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: crate::git::SET_ASIDE_WAITS.to_string(),
+            message: why,
+        })?;
+        let reference = format!("refs/heads/{branch}");
+        let head = self.git.commit_id_of(&reference)?;
+        let start = self.git.set_aside_start(name, &head, start)?;
+        let mounted = match std::fs::symlink_metadata(&state) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(WorkspaceError::Unavailable(format!(
+                    "read {}: {error}",
+                    state.display()
+                )));
+            }
+        };
+        if !mounted {
+            // A directory there that no overlay of this store made (another
+            // engine's workspace) is never taken for one set aside.
+            let foreign =
+                std::fs::read_dir(&merged).is_ok_and(|mut entries| entries.next().is_some());
+            if foreign {
+                return Err(WorkspaceError::Refused {
+                    code: crate::cow::WORKSPACE_NOT_OWNED.to_string(),
+                    message: format!(
+                        "{} is not a workspace this store mounted (no overlay state); \
+                         nothing changed",
+                        merged.display()
+                    ),
+                });
+            }
+            let head = self.git.commit_id_of(&reference)?;
+            return match self.git.set_aside_plan(&head, &start, message)? {
+                Ok(plan) => {
+                    let commit = self.git.set_aside_commit(&plan, message)?;
+                    self.git.move_to_set_aside(name, &plan, &commit)
+                }
+                Err(done) => Ok(done),
+            };
+        }
+        let view = self.host_path(&workspace)?;
+        let tree = |commit: &str| -> Result<crate::cow::TreeEntries, WorkspaceError> {
+            let listing = self
+                .git
+                .git_listing(&["ls-tree", "-r", "-z", "--full-tree", commit])?;
+            Ok(crate::cow::parse_ls_tree(&listing)?
+                .into_iter()
+                .map(|(mode, sha, path)| (path, (mode, sha)))
+                .collect())
+        };
+        let new: Vec<(u32, String, Vec<u8>)> = tree(&start)?
+            .into_iter()
+            .map(|(path, (mode, sha))| (mode, sha, path))
+            .collect();
+        // Checked before anything moves: what a checkpoint would take now
+        // (a tree, no commit, no ref), and whether the workspace can go to
+        // the start's tree from there. A refusal changes neither the
+        // directory nor the branch.
+        let lower = read_line(&state.join("lower"))?;
+        let diff = self.walk_upper(&state.join("upper"), &lower)?;
+        let now = self.write_tree(&state, &lower, &diff)?;
+        crate::cow::plan_move(&view, &tree(&now)?, &new)?;
+
+        self.commit_locked(&workspace, &crate::git::set_aside_kept_message(name))?;
+        let head = self.git.commit_id_of(&reference)?;
+        let plan = match self.git.set_aside_plan(&head, &start, message)? {
+            Ok(plan) => plan,
+            Err(done) => return Ok(done),
+        };
+        let commit = self.git.set_aside_commit(&plan, message)?;
+        let moves = crate::cow::plan_move(&view, &tree(&plan.head)?, &new)?;
+        let layer = self.ensure_layer(&start)?;
+        let aside = format!("{}/{}", crate::git::SET_ASIDE_FILES, plan.head);
+        let verify = |going: &crate::cow::Going| self.verify_taken(&view, going);
+        crate::cow::apply_move(&view, &layer, &moves, aside.as_bytes(), &verify)?;
+        write_atomic(
+            &state.join("pending"),
+            format!("{} {commit}\n", plan.head).as_bytes(),
+        )?;
+        let made = self.git.move_to_set_aside(name, &plan, &commit)?;
+        write_atomic(&state.join("head"), format!("{commit}\n").as_bytes())?;
+        let _ = std::fs::remove_file(state.join("pending"));
+        Ok(made)
+    }
+
+    /// Refused ([`crate::cow::WORKSPACE_DIFFERS`]) unless every path of
+    /// `going` in the merged view `view` is still the blob the checkpoint
+    /// took: a regular file hashes to it, a link's target is its bytes.
+    fn verify_taken(&self, view: &Path, going: &crate::cow::Going) -> Result<(), WorkspaceError> {
+        let differs = |path: &Path| WorkspaceError::Refused {
+            code: crate::cow::WORKSPACE_DIFFERS.to_string(),
+            message: format!(
+                "{} changed since the checkpoint: nothing was changed",
+                path.display()
+            ),
+        };
+        let mut files = Vec::new();
+        for (path, mode, sha) in going {
+            let shown = view.join(OsStr::from_bytes(path));
+            match *mode {
+                0o160_000 => {}
+                0o120_000 => {
+                    let target = std::fs::read_link(&shown).map_err(|_| differs(&shown))?;
+                    let blob = self.git.git_listing(&["cat-file", "blob", sha])?;
+                    if target.as_os_str().as_bytes() != blob.as_slice() {
+                        return Err(differs(&shown));
+                    }
+                }
+                _ => {
+                    if !std::fs::symlink_metadata(&shown).is_ok_and(|meta| meta.is_file()) {
+                        return Err(differs(&shown));
+                    }
+                    files.push((shown, sha));
+                }
+            }
+        }
+        for chunk in files.chunks(256) {
+            let mut command = self.git.command();
+            command
+                .args(["hash-object", "--no-filters", "--"])
+                .args(chunk.iter().map(|(path, _)| path.as_os_str()))
+                .stdin(Stdio::null());
+            let hashed = crate::git::report(command.output(), "hash-object")?;
+            let hashed: Vec<&str> = hashed.lines().collect();
+            if hashed.len() != chunk.len() {
+                return Err(WorkspaceError::Unavailable(
+                    "git hash-object answered a short list".to_string(),
+                ));
+            }
+            for ((path, sha), id) in chunk.iter().zip(hashed) {
+                if id != sha.as_str() {
+                    return Err(differs(path));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

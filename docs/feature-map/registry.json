@@ -1281,6 +1281,56 @@
       }
     },
     {
+      "id": "cap-workspace-storage",
+      "title": "Unified Local Workspace Store & Backend Selection",
+      "kind": "capability",
+      "parent": "domain-host-execution",
+      "summary": "LocalWorkspaceStore: the Git, Cow and opt-in overlay engines behind one WorkspaceStore, each passing the shared contract, with one set-aside rule (pre-checked, no change when refused); SPAWN_WORKSPACE_BACKEND (git default, cow, auto = Cow else Git, overlay by name only and refused by spawn loop until served) chosen in one place and claimed per root (.spawn-workspace-backend); baseline/layer/probe pruning after unmounts; opt-in Cow CAS dedup of target/ and node_modules/ (SPAWN_CAS_DEDUP=1) (Issue #95 part 1).",
+      "files": [
+        "README.md",
+        "crates/spawn-cli/src/config.rs",
+        "crates/spawn-cli/src/missions.rs",
+        "crates/spawn-cli/src/runtime.rs",
+        "crates/spawn-cli/src/sources.rs",
+        "crates/spawn-host/src/workspace.rs",
+        "crates/spawn-host/tests/local_workspace.rs",
+        "docs/architecture.md",
+        "docs/storage.md"
+      ],
+      "relations": [
+        {
+          "kind": "depends_on",
+          "target": "cap-git-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-cow-cas-workspaces"
+        },
+        {
+          "kind": "depends_on",
+          "target": "cap-overlay-workspaces"
+        },
+        {
+          "kind": "relates_to",
+          "target": "cap-mission-dispatch"
+        }
+      ],
+      "provenance": {
+        "objectives": [],
+        "tasks": [],
+        "agents": [],
+        "commits": [],
+        "tests": [
+          "crates/spawn-host/tests/local_workspace.rs"
+        ],
+        "deploys": [],
+        "artifacts": [
+          "docs/storage.md"
+        ],
+        "discussions": []
+      }
+    },
+    {
       "id": "cap-semantic-observer",
       "title": "Semantic Observer, Tail-Screen Parser & Shadow Context",
       "kind": "capability",

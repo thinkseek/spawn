@@ -184,6 +184,341 @@ pub(crate) fn loop_interval() -> std::time::Duration {
     )
 }
 
+/// What `SPAWN_WORKSPACE_BACKEND` asks for (docs/storage.md, "Workspace
+/// backends"): an engine by name, or `auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceBackend {
+    /// Git working copies: the default.
+    Git,
+    /// Copy-on-write clones of a per-commit baseline.
+    Cow,
+    /// An unprivileged overlay per workspace (Linux): by name only.
+    Overlay,
+    /// The cheapest engine the root supports that the loop serves
+    /// ([`spawn_host::WorkspaceBackend::auto_with`]), chosen once at start.
+    Auto,
+}
+
+impl WorkspaceBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Cow => "cow",
+            Self::Overlay => "overlay",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// The backend `value` (`SPAWN_WORKSPACE_BACKEND`) names: git when it is
+/// unset or empty; anything it does not name is refused, never read as git.
+pub(crate) fn workspace_backend(value: Option<&str>) -> Result<WorkspaceBackend, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(WorkspaceBackend::Git),
+        Some("auto") => Ok(WorkspaceBackend::Auto),
+        Some(name) => match spawn_host::WorkspaceBackend::parse(name) {
+            Some(spawn_host::WorkspaceBackend::Git) => Ok(WorkspaceBackend::Git),
+            Some(spawn_host::WorkspaceBackend::Cow) => Ok(WorkspaceBackend::Cow),
+            Some(spawn_host::WorkspaceBackend::Overlay) => Ok(WorkspaceBackend::Overlay),
+            None => Err(format!(
+                "SPAWN_WORKSPACE_BACKEND={name:?} names no workspace backend: use git (the \
+                 default), cow, overlay or auto"
+            )),
+        },
+    }
+}
+
+/// Whether `value` (`SPAWN_CAS_DEDUP`) turns the deduplication of build
+/// artifacts on: `1` does, unset, empty or `0` does not; anything else is
+/// refused.
+pub(crate) fn cas_dedup(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "SPAWN_CAS_DEDUP={other:?} is neither 1 (deduplicate build artifacts) nor 0"
+        )),
+    }
+}
+
+/// How the engines' support of a root is asked (the kernel and the file
+/// system in production, fixed answers in a test).
+pub(crate) struct Probes<'a> {
+    /// Whether an unprivileged overlay mounts under the root
+    /// ([`spawn_host::overlay_supported_in`]); `Err` with the reason. Asked
+    /// only when the overlay is asked for by name.
+    pub(crate) overlay: &'a dyn Fn(&std::path::Path) -> Result<(), String>,
+    /// Whether the root's file system clones copy-on-write
+    /// ([`spawn_host::cow_clone_supported`]). Asked only for `auto` on a
+    /// root no engine has yet.
+    pub(crate) cow: &'a dyn Fn(&std::path::Path) -> bool,
+    /// The engine the root already is ([`spawn_host::root_backend`]: its
+    /// marker, else what it holds), read and never written. Asked only for
+    /// `auto`, which follows it.
+    pub(crate) marked:
+        &'a dyn Fn(&std::path::Path) -> Result<Option<spawn_host::WorkspaceBackend>, String>,
+}
+
+impl Probes<'static> {
+    /// The host's own answers. Both write under the root (a probe file, a
+    /// probe mount): only a process that runs workspaces asks them, never
+    /// a read like `spawn mission show` ([`WorkspaceSettings::peek`]).
+    pub(crate) fn host() -> Self {
+        #[cfg(target_os = "linux")]
+        fn overlay(root: &std::path::Path) -> Result<(), String> {
+            let _ = std::fs::create_dir_all(root);
+            spawn_host::overlay_supported_in(root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn overlay(_root: &std::path::Path) -> Result<(), String> {
+            Err("the overlay workspace store needs Linux".to_string())
+        }
+        fn cow(root: &std::path::Path) -> bool {
+            spawn_host::WorkspaceBackend::auto(root) == spawn_host::WorkspaceBackend::Cow
+        }
+        fn marked(root: &std::path::Path) -> Result<Option<spawn_host::WorkspaceBackend>, String> {
+            spawn_host::root_backend(root).map_err(|error| error.to_string())
+        }
+        Self {
+            overlay: &overlay,
+            cow: &cow,
+            marked: &marked,
+        }
+    }
+}
+
+/// The engine the workspaces under one root run on, chosen once: every
+/// store of the process (the default repository's, every mission's, the
+/// one-shot stores of a merge or a set-aside) is that engine, and the root
+/// is claimed for it ([`spawn_host::claim_root`]), so no two engines ever
+/// share a root, whatever process asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceSettings {
+    /// `SPAWN_WORKSPACE_BACKEND` as given (`git` when unset).
+    pub(crate) configured: WorkspaceBackend,
+    /// The engine.
+    pub(crate) active: spawn_host::WorkspaceBackend,
+    /// `SPAWN_CAS_DEDUP=1`: build artifacts deduplicated (Cow only).
+    pub(crate) cas_dedup: bool,
+}
+
+impl WorkspaceSettings {
+    /// The engine `configured` is under `root`. `overlay` asked for where
+    /// the kernel mounts none (not Linux, no user namespaces, a file system
+    /// it refuses) is refused with the kernel's reason, never run as
+    /// another engine. `auto` follows the engine the root already is (its
+    /// marker, else what it holds: a root with workspaces and no marker is
+    /// Git's), so it starts where `spawn mission show` says it would; on a
+    /// root no engine has, it is spawn-host's own rule
+    /// ([`spawn_host::WorkspaceBackend::auto_with`]): Cow where the file
+    /// system clones, else Git; never the overlay.
+    pub(crate) fn resolve(
+        configured: WorkspaceBackend,
+        cas_dedup: bool,
+        root: &std::path::Path,
+        probes: &Probes<'_>,
+    ) -> Result<Self, String> {
+        let active = match configured {
+            WorkspaceBackend::Git => spawn_host::WorkspaceBackend::Git,
+            WorkspaceBackend::Cow => spawn_host::WorkspaceBackend::Cow,
+            WorkspaceBackend::Overlay => {
+                (probes.overlay)(root).map_err(|why| {
+                    format!(
+                        "SPAWN_WORKSPACE_BACKEND=overlay: no unprivileged overlay under {}: \
+                         {why}; use git, cow or auto",
+                        root.display()
+                    )
+                })?;
+                spawn_host::WorkspaceBackend::Overlay
+            }
+            WorkspaceBackend::Auto => match (probes.marked)(root)? {
+                Some(there) => there,
+                None => spawn_host::WorkspaceBackend::auto_with((probes.cow)(root)),
+            },
+        };
+        Ok(Self {
+            configured,
+            active,
+            cas_dedup,
+        })
+    }
+
+    /// The settings the environment gives for `root`
+    /// (`SPAWN_WORKSPACE_BACKEND`, `SPAWN_CAS_DEDUP`), resolved on the host
+    /// and the root claimed for the engine ([`spawn_host::claim_root`]: a
+    /// root another engine runs on is refused), once per root and process.
+    /// For a process that runs workspaces only: it writes under the root.
+    pub(crate) fn from_env(root: &std::path::Path) -> Result<Self, String> {
+        static RESOLVED: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<PathBuf, Result<WorkspaceSettings, String>>>,
+        > = std::sync::OnceLock::new();
+        let configured = workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref())?;
+        let cas = cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref())?;
+        let mut resolved = RESOLVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolved
+            .entry(root.to_path_buf())
+            .or_insert_with(|| {
+                let settings = Self::resolve(configured, cas, root, &Probes::host())?;
+                settings.claim(root)?;
+                Ok(settings)
+            })
+            .clone()
+    }
+
+    /// Claim `root` for this engine ([`spawn_host::claim_root`]), only once
+    /// the loop can serve it ([`Self::servable`]): a start refused for the
+    /// overlay writes no marker, so the root stays free for another engine.
+    pub(crate) fn claim(&self, root: &std::path::Path) -> Result<(), String> {
+        self.servable()?;
+        spawn_host::claim_root(root, self.active)
+    }
+
+    /// What `spawn mission show` says of the engine of `root`, read and
+    /// never written: no root is made, no probe file or mount tried. The
+    /// engine is the one the root's marker names
+    /// ([`spawn_host::root_backend`]) or the one asked for by name; `auto`
+    /// on a root no loop claimed yet is undecided (`active: null`).
+    pub(crate) fn peek(root: &std::path::Path) -> serde_json::Value {
+        Self::peek_with(
+            workspace_backend(env_value("SPAWN_WORKSPACE_BACKEND").as_deref()),
+            cas_dedup(env_value("SPAWN_CAS_DEDUP").as_deref()),
+            spawn_host::root_backend(root).map_err(|error| error.to_string()),
+        )
+    }
+
+    /// [`Self::peek`] of the environment's answers and the root's marker.
+    pub(crate) fn peek_with(
+        configured: Result<WorkspaceBackend, String>,
+        cas: Result<bool, String>,
+        marked: Result<Option<spawn_host::WorkspaceBackend>, String>,
+    ) -> serde_json::Value {
+        let (configured, cas, marked) = match (configured, cas, marked) {
+            (Ok(configured), Ok(cas), Ok(marked)) => (configured, cas, marked),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                return serde_json::json!({ "error": error });
+            }
+        };
+        let named = match configured {
+            WorkspaceBackend::Git => Some(spawn_host::WorkspaceBackend::Git),
+            WorkspaceBackend::Cow => Some(spawn_host::WorkspaceBackend::Cow),
+            WorkspaceBackend::Overlay => Some(spawn_host::WorkspaceBackend::Overlay),
+            WorkspaceBackend::Auto => None,
+        };
+        if let (Some(named), Some(marked)) = (named, marked)
+            && named != marked
+        {
+            return serde_json::json!({
+                "error": format!(
+                    "SPAWN_WORKSPACE_BACKEND={} but the root is the {} engine's: spawn loop \
+                     refuses to start",
+                    named.name(),
+                    marked.name()
+                ),
+                "root": marked.name(),
+            });
+        }
+        let active = marked.or(named);
+        let settings = active.map(|active| Self {
+            configured,
+            active,
+            cas_dedup: cas,
+        });
+        serde_json::json!({
+            "configured": configured.name(),
+            "active": active.map(spawn_host::WorkspaceBackend::name),
+            "root": marked.map(spawn_host::WorkspaceBackend::name),
+            "cas_dedup": settings.as_ref().map_or(if cas { "on" } else { "off" }, Self::cas_state),
+            "servable": settings.as_ref().is_none_or(|settings| settings.servable().is_ok()),
+        })
+    }
+
+    /// The store of this engine over the bare repository `repo`,
+    /// workspaces under `root`.
+    pub(crate) fn store(
+        &self,
+        repo: &std::path::Path,
+        root: &std::path::Path,
+    ) -> spawn_host::LocalWorkspaceStore {
+        match self.active {
+            spawn_host::WorkspaceBackend::Cow => spawn_host::LocalWorkspaceStore::cow(repo, root),
+            #[cfg(target_os = "linux")]
+            // Supported: [`Self::resolve`] asked the kernel.
+            spawn_host::WorkspaceBackend::Overlay => spawn_host::LocalWorkspaceStore::Overlay(
+                spawn_host::OverlayWorkspace::new(repo, root),
+            ),
+            _ => spawn_host::LocalWorkspaceStore::git(repo, root),
+        }
+    }
+
+    /// Builds this engine's store for any repository, workspaces under
+    /// `root` ([`crate::sources::Factory`]).
+    pub(crate) fn factory(&self, root: &std::path::Path) -> crate::sources::Factory {
+        let settings = self.clone();
+        let root = root.to_path_buf();
+        std::sync::Arc::new(move |repo: &std::path::Path| settings.store(repo, &root))
+    }
+
+    /// The mission store over `repo` and `root` with this engine, for a
+    /// one-shot change (a merge of main, a set-aside:
+    /// [`crate::sources::MissionWorkspaces::one_shot`]).
+    pub(crate) fn one_shot(
+        &self,
+        repo: &std::path::Path,
+        root: &std::path::Path,
+        store: std::sync::Arc<PostgresStore>,
+    ) -> crate::sources::MissionWorkspaces {
+        crate::sources::MissionWorkspaces::one_shot(
+            self.store(repo, root),
+            root,
+            store,
+            self.factory(root),
+        )
+        .with_cas_dedup(self.cas_dedup)
+    }
+
+    /// What the cas deduplication does with this engine: `"on"`, `"off"`,
+    /// or `"inactive"` (asked for, but only Cow workspaces deduplicate).
+    pub(crate) fn cas_state(&self) -> &'static str {
+        match (self.cas_dedup, self.active) {
+            (false, _) => "off",
+            (true, spawn_host::WorkspaceBackend::Cow) => "on",
+            (true, _) => "inactive",
+        }
+    }
+
+    /// Refused where engines run (`spawn loop`, `spawn tick`) for an engine
+    /// they cannot serve yet: an overlay workspace is seen only inside its
+    /// holder's mount namespace, while the Bridge starts an engine in the
+    /// workspace's host path and the loop reads its reports, acks and exit
+    /// files there. Never run half-served. (`auto` never chooses it.)
+    pub(crate) fn servable(&self) -> Result<(), String> {
+        if self.active == spawn_host::WorkspaceBackend::Overlay {
+            return Err(
+                "SPAWN_WORKSPACE_BACKEND=overlay: spawn loop does not serve overlay workspaces \
+                 to engines yet (an engine would start in the empty host mount point, and its \
+                 report, acks and exit file would not be read); use SPAWN_WORKSPACE_BACKEND=cow, \
+                 git or auto"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The line `spawn loop` says at start.
+    pub(crate) fn said(&self, root: &std::path::Path) -> String {
+        format!(
+            "workspace backend {} under {} (SPAWN_WORKSPACE_BACKEND={}); cas dedup {}",
+            self.active.name(),
+            root.display(),
+            self.configured.name(),
+            self.cas_state()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -437,4 +772,290 @@ pub(crate) fn terminal_host() -> Result<spawn_host::LocalTerminalHost, String> {
             ),
         },
     )
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::{Probes, WorkspaceBackend, WorkspaceSettings, cas_dedup, workspace_backend};
+    use serde_json::json;
+    use spawn_host::WorkspaceBackend as Engine;
+    use std::path::Path;
+
+    #[allow(clippy::unnecessary_wraps)] // the probe's signature
+    fn unmarked(_: &Path) -> Result<Option<Engine>, String> {
+        Ok(None)
+    }
+
+    fn probes<'a>(
+        overlay: &'a dyn Fn(&Path) -> Result<(), String>,
+        cow: &'a dyn Fn(&Path) -> bool,
+    ) -> Probes<'a> {
+        Probes {
+            overlay,
+            cow,
+            marked: &unmarked,
+        }
+    }
+
+    #[test]
+    fn the_workspace_backend_is_git_unless_another_is_named() {
+        assert_eq!(workspace_backend(None), Ok(WorkspaceBackend::Git));
+        assert_eq!(workspace_backend(Some("")), Ok(WorkspaceBackend::Git));
+        assert_eq!(workspace_backend(Some("git")), Ok(WorkspaceBackend::Git));
+        assert_eq!(workspace_backend(Some(" cow ")), Ok(WorkspaceBackend::Cow));
+        assert_eq!(
+            workspace_backend(Some("overlay")),
+            Ok(WorkspaceBackend::Overlay)
+        );
+        assert_eq!(workspace_backend(Some("auto")), Ok(WorkspaceBackend::Auto));
+        for unknown in ["Git", "COW", "btrfs", "zfs", "overlayfs", "1"] {
+            let error = workspace_backend(Some(unknown)).expect_err(unknown);
+            assert!(error.contains("SPAWN_WORKSPACE_BACKEND"), "{error}");
+            assert!(
+                error.contains("git (the default), cow, overlay or auto"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cas_dedup_is_off_unless_one_and_refuses_anything_else() {
+        assert_eq!(cas_dedup(None), Ok(false));
+        assert_eq!(cas_dedup(Some("")), Ok(false));
+        assert_eq!(cas_dedup(Some("0")), Ok(false));
+        assert_eq!(cas_dedup(Some("1")), Ok(true));
+        for unknown in ["yes", "true", "2", "on"] {
+            let error = cas_dedup(Some(unknown)).expect_err(unknown);
+            assert!(error.contains("SPAWN_CAS_DEDUP"), "{error}");
+        }
+    }
+
+    #[test]
+    fn overlay_asked_for_where_none_mounts_is_refused_never_run_as_another() {
+        let root = Path::new("/srv/work");
+        let none = |_: &Path| Err("user namespaces are off".to_string());
+        let clones = |_: &Path| true;
+        let error = WorkspaceSettings::resolve(
+            WorkspaceBackend::Overlay,
+            false,
+            root,
+            &probes(&none, &clones),
+        )
+        .expect_err("refused");
+        assert!(error.contains("SPAWN_WORKSPACE_BACKEND=overlay"), "{error}");
+        assert!(error.contains("user namespaces are off"), "{error}");
+        assert!(error.contains("/srv/work"), "{error}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            WorkspaceSettings::resolve(WorkspaceBackend::Overlay, false, root, &Probes::host())
+                .is_err()
+        );
+    }
+
+    /// `auto` is spawn-host's rule: Cow where clones work, else Git, and
+    /// never the overlay, which the loop would refuse.
+    #[test]
+    fn auto_takes_cow_then_git_and_never_the_overlay() {
+        let root = Path::new("/srv/work");
+        let mounts = |_: &Path| Ok(());
+        let never = |_: &Path| -> Result<(), String> { panic!("auto asks no overlay probe") };
+        let clones = |_: &Path| true;
+        let copies = |_: &Path| false;
+        let active = |overlay: &dyn Fn(&Path) -> Result<(), String>,
+                      cow: &dyn Fn(&Path) -> bool| {
+            WorkspaceSettings::resolve(WorkspaceBackend::Auto, false, root, &probes(overlay, cow))
+                .unwrap()
+        };
+        assert_eq!(active(&never, &clones).active, Engine::Cow);
+        assert_eq!(active(&never, &copies).active, Engine::Git);
+        for cow in [true, false] {
+            let probe = move |_: &Path| cow;
+            let settings = active(&mounts, &probe);
+            assert_eq!(settings.active, Engine::auto_with(cow), "one rule");
+            assert!(settings.servable().is_ok(), "auto always starts the loop");
+        }
+        // Asked for by name, git and cow need no probe.
+        let never_cow = |_: &Path| -> bool { panic!("no probe for a named engine") };
+        for (configured, engine) in [
+            (WorkspaceBackend::Git, Engine::Git),
+            (WorkspaceBackend::Cow, Engine::Cow),
+        ] {
+            let settings =
+                WorkspaceSettings::resolve(configured, true, root, &probes(&never, &never_cow))
+                    .unwrap();
+            assert_eq!(settings.active, engine);
+        }
+    }
+
+    #[test]
+    fn the_settings_are_said_with_the_cas_state_and_overlay_is_not_served() {
+        let root = Path::new("/srv/work");
+        let mounts = |_: &Path| Ok(());
+        let clones = |_: &Path| true;
+        let auto = WorkspaceSettings::resolve(
+            WorkspaceBackend::Auto,
+            true,
+            root,
+            &probes(&mounts, &clones),
+        )
+        .unwrap();
+        assert_eq!(
+            auto.said(root),
+            "workspace backend cow under /srv/work (SPAWN_WORKSPACE_BACKEND=auto); cas dedup on"
+        );
+        let git = WorkspaceSettings::resolve(
+            WorkspaceBackend::Git,
+            true,
+            root,
+            &probes(&mounts, &clones),
+        )
+        .unwrap();
+        assert_eq!(git.cas_state(), "inactive");
+        assert!(git.servable().is_ok() && auto.servable().is_ok());
+        assert_eq!(git.store(Path::new("/r.git"), root).backend_name(), "git");
+        assert_eq!(auto.store(Path::new("/r.git"), root).backend_name(), "cow");
+        let overlay = WorkspaceSettings::resolve(
+            WorkspaceBackend::Overlay,
+            false,
+            root,
+            &probes(&mounts, &clones),
+        )
+        .unwrap();
+        assert_eq!(overlay.active, Engine::Overlay);
+        assert_eq!(overlay.cas_state(), "off");
+        let refused = overlay.servable().expect_err("not served");
+        assert!(
+            refused.contains("SPAWN_WORKSPACE_BACKEND=overlay"),
+            "{refused}"
+        );
+        assert!(refused.contains("cow, git or auto"), "{refused}");
+    }
+
+    /// A read of the settings: from the environment and the root's marker
+    /// alone, a conflict said as the loop would refuse it.
+    #[test]
+    fn a_peek_reads_the_marker_and_names_a_conflict() {
+        let peek = WorkspaceSettings::peek_with;
+        assert_eq!(
+            peek(Ok(WorkspaceBackend::Git), Ok(false), Ok(None)),
+            json!({"configured": "git", "active": "git", "root": null, "cas_dedup": "off",
+                   "servable": true})
+        );
+        assert_eq!(
+            peek(Ok(WorkspaceBackend::Auto), Ok(true), Ok(None)),
+            json!({"configured": "auto", "active": null, "root": null, "cas_dedup": "on",
+                   "servable": true})
+        );
+        assert_eq!(
+            peek(Ok(WorkspaceBackend::Auto), Ok(true), Ok(Some(Engine::Cow))),
+            json!({"configured": "auto", "active": "cow", "root": "cow", "cas_dedup": "on",
+                   "servable": true})
+        );
+        assert_eq!(
+            peek(Ok(WorkspaceBackend::Overlay), Ok(false), Ok(None)),
+            json!({"configured": "overlay", "active": "overlay", "root": null,
+                   "cas_dedup": "off", "servable": false})
+        );
+        let conflict = peek(Ok(WorkspaceBackend::Cow), Ok(false), Ok(Some(Engine::Git)));
+        assert!(
+            conflict["error"].as_str().unwrap().contains("git engine's"),
+            "{conflict}"
+        );
+        let bad = peek(
+            Err("SPAWN_WORKSPACE_BACKEND=\"x\" ...".to_string()),
+            Ok(false),
+            Ok(None),
+        );
+        assert_eq!(bad.as_object().map(serde_json::Map::len), Some(1));
+    }
+
+    /// `auto` on a root that already is an engine's follows it, even where
+    /// the file system clones: a Git-shaped root with no marker (its
+    /// workspaces, `.transcripts/`) stays Git's, as `spawn mission show`
+    /// says, instead of being refused as Cow at the claim.
+    #[test]
+    fn auto_follows_an_existing_roots_engine() {
+        let base = std::env::temp_dir().join(format!(
+            "spawn-auto-existing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("owner-gates")).expect("a workspace");
+        std::fs::create_dir_all(base.join(".transcripts")).expect("transcripts");
+        let clones = |_: &Path| true;
+        let never = |_: &Path| -> Result<(), String> { panic!("no overlay probe for auto") };
+        let host = Probes::host();
+        let probes = Probes {
+            overlay: &never,
+            cow: &clones,
+            marked: host.marked,
+        };
+        let settings =
+            WorkspaceSettings::resolve(WorkspaceBackend::Auto, false, &base, &probes).unwrap();
+        assert_eq!(settings.active, Engine::Git);
+        settings.claim(&base).expect("Git's root claimed for Git");
+        let peek = WorkspaceSettings::peek_with(
+            Ok(WorkspaceBackend::Auto),
+            Ok(false),
+            spawn_host::root_backend(&base).map_err(|error| error.to_string()),
+        );
+        assert_eq!(peek["active"], "git", "{peek}");
+        assert_eq!(peek["servable"], true, "{peek}");
+
+        // A claimed Cow root: auto follows the marker.
+        let cow = base.join("cow-root");
+        spawn_host::claim_root(&cow, Engine::Cow).unwrap();
+        let copies = |_: &Path| false;
+        let probes = Probes {
+            overlay: &never,
+            cow: &copies,
+            marked: host.marked,
+        };
+        let settings =
+            WorkspaceSettings::resolve(WorkspaceBackend::Auto, false, &cow, &probes).unwrap();
+        assert_eq!(settings.active, Engine::Cow);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A start refused for the overlay claims nothing: the fresh root stays
+    /// free, and a later start as Cow, Git or auto claims it.
+    #[test]
+    fn a_refused_overlay_start_leaves_a_fresh_root_unclaimed() {
+        let root = std::env::temp_dir().join(format!(
+            "spawn-overlay-refused-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mounts = |_: &Path| Ok(());
+        let clones = |_: &Path| true;
+        let overlay = WorkspaceSettings::resolve(
+            WorkspaceBackend::Overlay,
+            false,
+            &root,
+            &probes(&mounts, &clones),
+        )
+        .unwrap();
+        let refused = overlay.claim(&root).expect_err("not served");
+        assert!(
+            refused.contains("SPAWN_WORKSPACE_BACKEND=overlay"),
+            "{refused}"
+        );
+        assert!(
+            !root.join(spawn_host::BACKEND_MARKER).exists(),
+            "a refused start claimed the root"
+        );
+        assert_eq!(spawn_host::root_backend(&root).unwrap(), None);
+        let cow = WorkspaceSettings::resolve(
+            WorkspaceBackend::Cow,
+            false,
+            &root,
+            &probes(&mounts, &clones),
+        )
+        .unwrap();
+        cow.claim(&root).expect("the root is free");
+        assert_eq!(spawn_host::root_backend(&root).unwrap(), Some(Engine::Cow));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

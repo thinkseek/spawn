@@ -179,7 +179,9 @@ Layout under the store's root:
   retried for up to a second. Users outside the managed lifecycle (an
   IDE, a shell) must be stopped first; the process-table look below only
   adds a snapshot of them. Wiring the lease into the launcher is not part
-  of this change (`spawn-cli` still constructs `GitWorkspace`).
+  of this change. `spawn-cli` runs this store when asked
+  (`SPAWN_WORKSPACE_BACKEND=cow`, or `auto` where the file system clones:
+  docs/storage.md, "Workspace backends").
 
 - **Layer 0.** The first mount of a commit writes its blobs once, with
   their exact bytes (`git cat-file --batch`, no checkout filters), as

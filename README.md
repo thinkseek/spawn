@@ -119,7 +119,9 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
 | `SPAWN_CLAUDE_PROJECTS` | `$SPAWN_CLAUDE_CONFIG_DIR/projects`, else `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts |
 | `SPAWN_CLAUDE_CONFIG_DIR` | unset | Opt-in Claude Code directory (an absolute path; anything else stops `spawn loop`) for engines (their `CLAUDE_CONFIG_DIR`); its `settings.json` must hold the gateway token. Unset, engines use `~/.claude` as before |
-| `SPAWN_MAX_FILE_MB` | `100` | Largest file a checkpoint commits, in MiB; a larger one is left out of the checkpoint and the agent is told once |
+| `SPAWN_MAX_FILE_MB` | `100` | Largest file a Git or Cow checkpoint commits, in MiB; a larger one is left out of the checkpoint and the agent is told once (an overlay checkpoint has no cap) |
+| `SPAWN_WORKSPACE_BACKEND` | `git` | Workspace engine for every store under the root: `git`, `cow` (copy-on-write clones), `auto` (Cow where the file system clones, else Git) or `overlay` (opt-in, Linux; `spawn loop` refuses it until it serves overlay workspaces). Anything else, or a root another engine claimed (`<root>/.spawn-workspace-backend`), stops `spawn loop` (docs/storage.md, "Workspace backends") |
+| `SPAWN_CAS_DEDUP` | unset | `1`: deduplicate a Cow workspace's `target/` and `node_modules/` against `<root>/.cas` at each mount (never a transcript), pruned after unmounts; `0` or unset: off; anything else stops `spawn loop` |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |

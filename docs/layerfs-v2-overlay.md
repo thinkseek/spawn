@@ -4,8 +4,10 @@ Status: opt-in MVP (task #508, 2026-11-23; in-use and prune fixes from
 reviews #512, 516 and 539, tasks 516, 539 and 546; minimized in task 556).
 `GitWorkspace` is still the default store. `OverlayWorkspace`
 (`crates/spawn-host/src/overlay.rs`) implements the same
-`spawn_core::port::WorkspaceStore` port over a root of its own and is not
-yet wired into `spawn-cli`. It is compiled on Linux only
+`spawn_core::port::WorkspaceStore` port over a root of its own. `spawn-cli`
+reaches it only by name (`SPAWN_WORKSPACE_BACKEND=overlay`, never `auto`),
+and `spawn loop` and `spawn tick` refuse it at start until the launch below
+is wired (docs/storage.md, "Workspace backends"). It is compiled on Linux only
 (`#[cfg(target_os = "linux")]` on the module, its re-export and its
 integration test): pidfds and overlayfs exist nowhere else, and
 `spawn-host` builds on macOS without it.
@@ -342,8 +344,11 @@ the holder and tearing down its namespace). Profiling it is left open.
 - **Moving base.** `merge_main_clean` / `merge_base` answer `Current`. An
   upperdir is a diff against a fixed lower commit, so main reaching a
   mounted overlay needs a rebase of the upperdir onto a new layer.
-- **`set_aside`.** Uses the port's default.
-- **Large-file cap and notices.** None yet.
+- **`set_aside`.** `OverlayWorkspace::set_aside_when`: the Git store's rule,
+  checked before anything is written, writing the merged view in place
+  through the holder.
+- **Large-file cap and notices.** None yet: `SPAWN_MAX_FILE_MB` applies to
+  Git and Cow checkpoints only.
 - **Wiring into `spawn-cli` and the tmux launch.** This needs the terminal
   host to prefix launches with the whole `launch_arguments` (which takes
   the lease first), and a store root of its own.

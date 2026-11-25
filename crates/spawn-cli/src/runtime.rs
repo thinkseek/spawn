@@ -6,11 +6,12 @@ use std::sync::Arc;
 use spawn_core::bridge::{Bridge, BridgeConfig, LaunchEnvironment, ModelRelay};
 use spawn_core::observe::{Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
-use spawn_host::GitWorkspace;
 use spawn_jev::{JevConfig, JevJudge};
 
 use crate::Flags;
-use crate::config::{env_or, env_value, open_store, required_env, spawn_program, workspace_root};
+use crate::config::{
+    WorkspaceSettings, env_or, env_value, open_store, required_env, spawn_program, workspace_root,
+};
 use crate::{context, sources, supervise};
 
 /// Build the Bridge and the Observer over one store.
@@ -29,17 +30,18 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     let root = workspace_root(flags)
         .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
     // Every agent's workspace comes from its mission's source; agents no
-    // mission owns use the default repository.
-    let factory: sources::Factory = {
-        let root = root.clone();
-        Arc::new(move |repo: &std::path::Path| GitWorkspace::new(repo, &root))
-    };
+    // mission owns use the default repository. Every store is the one
+    // engine `SPAWN_WORKSPACE_BACKEND` chose for the root.
+    let settings = WorkspaceSettings::from_env(std::path::Path::new(&root))?;
+    settings.servable()?;
+    let factory = settings.factory(std::path::Path::new(&root));
     let missions = sources::MissionWorkspaces::new(
         factory(std::path::Path::new(&repo)),
         std::path::Path::new(&root),
         store.clone(),
         factory,
-    );
+    )
+    .with_cas_dedup(settings.cas_dedup);
     // A push queued by the last process and lost with it is made now.
     if let Err(error) = missions.republish() {
         eprintln!("sources: {error}; a push lost with the last process waits for its next");

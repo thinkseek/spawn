@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
-use spawn_host::GitWorkspace;
+use spawn_host::LocalWorkspaceStore;
 use spawn_postgres::PostgresStore;
 
 use crate::push::{Pushed, Pusher, pushed_ref};
@@ -52,12 +52,22 @@ use crate::push::{Pushed, Pusher, pushed_ref};
 /// Least time between two refreshes of one mirror's `main` at turn ends.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(30);
 
-/// Builds a store for one bare repository.
-pub(crate) type Factory = Arc<dyn Fn(&Path) -> GitWorkspace + Send + Sync>;
+/// Least time between two prunes after unmounts: the trees no mounted
+/// workspace uses (Cow baselines, overlay layers, stale overlay probes) and,
+/// with [`MissionWorkspaces::with_cas_dedup`], the CAS.
+pub(crate) const PRUNE_EVERY: Duration = Duration::from_mins(10);
+
+/// How old a CAS blob nothing uses must be before a prune drops it.
+pub(crate) const CAS_GRACE: Duration = Duration::from_hours(1);
+
+/// Builds a store for one bare repository: every store of a process is
+/// the one engine `SPAWN_WORKSPACE_BACKEND` chose for the root
+/// ([`crate::config::WorkspaceSettings`]).
+pub(crate) type Factory = Arc<dyn Fn(&Path) -> LocalWorkspaceStore + Send + Sync>;
 
 /// Workspace store that routes every agent to its mission's source.
 pub(crate) struct MissionWorkspaces {
-    default: Arc<GitWorkspace>,
+    default: Arc<LocalWorkspaceStore>,
     root: PathBuf,
     store: Arc<PostgresStore>,
     factory: Factory,
@@ -67,13 +77,18 @@ pub(crate) struct MissionWorkspaces {
     /// A store for one change ([`Self::one_shot`]): it queues no push and
     /// flushes nothing when dropped; its caller publishes what it changed.
     one_shot: bool,
+    /// `SPAWN_CAS_DEDUP=1`: a workspace's build artifacts are deduplicated
+    /// when it is mounted, and the CAS pruned after unmounts.
+    cas_dedup: bool,
+    /// When the store was last pruned ([`PRUNE_EVERY`]).
+    pruned: Mutex<Option<Instant>>,
 }
 
 /// One agent's store and, for a mission with a source, where its mirror
 /// lives and what it mirrors.
 #[derive(Clone)]
 struct Routed {
-    store: Arc<GitWorkspace>,
+    store: Arc<LocalWorkspaceStore>,
     mirror: Option<(PathBuf, String)>,
 }
 
@@ -364,7 +379,7 @@ pub(crate) fn mirror_path(root: &Path, source: Option<&str>) -> Result<PathBuf, 
 
 impl MissionWorkspaces {
     pub(crate) fn new(
-        default: GitWorkspace,
+        default: LocalWorkspaceStore,
         root: &Path,
         store: Arc<PostgresStore>,
         factory: Factory,
@@ -377,6 +392,77 @@ impl MissionWorkspaces {
             mirrors: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
             one_shot: false,
+            cas_dedup: false,
+            pruned: Mutex::new(None),
+        }
+    }
+
+    /// The same store deduplicating build artifacts when `on`
+    /// (`SPAWN_CAS_DEDUP=1`): each workspace mounted has its `target/` and
+    /// `node_modules/` cloned against `<root>/.cas` while it is offline,
+    /// before any engine starts in it
+    /// ([`LocalWorkspaceStore::dedup_artifacts`]: Cow workspaces only;
+    /// never a `*.jsonl` file or a `.transcripts/` directory), and the CAS
+    /// is pruned of blobs nothing uses after an unmount, at most every
+    /// [`PRUNE_EVERY`]. Neither ever fails the mount or the unmount:
+    /// what goes wrong is said on stderr.
+    #[must_use]
+    pub(crate) fn with_cas_dedup(mut self, on: bool) -> Self {
+        self.cas_dedup = on;
+        self
+    }
+
+    /// After a mount: the workspace's artifacts deduplicated, when asked.
+    fn mounted(&self, store: &LocalWorkspaceStore, workspace: &WorkspaceId) {
+        if !self.cas_dedup {
+            return;
+        }
+        match store.dedup_artifacts(workspace) {
+            Ok(Some(report)) => {
+                for error in &report.errors {
+                    eprintln!("cas: {workspace}: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("cas: {workspace}: nothing deduplicated: {error}"),
+        }
+    }
+
+    /// After an unmount, at most every [`PRUNE_EVERY`]: the trees no
+    /// mounted workspace uses any more ([`LocalWorkspaceStore::prune_unused`]),
+    /// and the CAS, when asked. Never fails the unmount: what goes wrong is
+    /// said on stderr.
+    fn unmounted(&self, store: &LocalWorkspaceStore) {
+        {
+            let mut pruned = self
+                .pruned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            if pruned.is_some_and(|at| now.duration_since(at) < PRUNE_EVERY) {
+                return;
+            }
+            *pruned = Some(now);
+        }
+        match store.prune_unused() {
+            Ok((_, warnings)) => {
+                for warning in warnings {
+                    eprintln!("workspaces: prune: {warning}");
+                }
+            }
+            Err(error) => eprintln!("workspaces: prune: {error}"),
+        }
+        if !self.cas_dedup {
+            return;
+        }
+        match store.prune_cas(CAS_GRACE) {
+            Ok(Some(report)) => {
+                for error in &report.errors {
+                    eprintln!("cas: prune: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("cas: prune: {error}"),
         }
     }
 
@@ -386,7 +472,7 @@ impl MissionWorkspaces {
     /// publishes it ([`publish`], through the process's pusher for the
     /// source), and dropping the store pushes nothing.
     pub(crate) fn one_shot(
-        default: GitWorkspace,
+        default: LocalWorkspaceStore,
         root: &Path,
         store: Arc<PostgresStore>,
         factory: Factory,
@@ -398,7 +484,8 @@ impl MissionWorkspaces {
 
     /// [`WorkspaceStore::set_aside`] through the routed store, only while
     /// `ready` says the agent is idle, asked under the branch's lock
-    /// ([`GitWorkspace::set_aside_when`]).
+    /// ([`LocalWorkspaceStore::set_aside_when`], the same rule in every
+    /// engine).
     pub(crate) fn set_aside_when(
         &self,
         branch: &BranchName,
@@ -943,15 +1030,20 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
-        self.route(branch.as_str())?.store.mount(branch)
+        self.mount_when(branch, &|| Ok(()))
     }
 
+    /// The routed store's mount; then, with [`Self::with_cas_dedup`], the
+    /// workspace's artifacts deduplicated before any engine starts in it.
     fn mount_when(
         &self,
         branch: &BranchName,
         ready: &dyn Fn() -> Result<(), String>,
     ) -> Result<WorkspaceId, WorkspaceError> {
-        self.route(branch.as_str())?.store.mount_when(branch, ready)
+        let routed = self.route(branch.as_str())?;
+        let workspace = routed.store.mount_when(branch, ready)?;
+        self.mounted(&routed.store, &workspace);
+        Ok(workspace)
     }
 
     /// Every mission's store keeps its workspaces under the one root, so
@@ -978,17 +1070,20 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
-        self.route(workspace.sandbox())?.store.unmount(workspace)
+        self.unmount_when(workspace, &|| Ok(()))
     }
 
+    /// The routed store's unmount; then, with [`Self::with_cas_dedup`], a
+    /// bounded prune of the CAS.
     fn unmount_when(
         &self,
         workspace: &WorkspaceId,
         ready: &dyn Fn() -> Result<(), WorkspaceError>,
     ) -> Result<(), WorkspaceError> {
-        self.route(workspace.sandbox())?
-            .store
-            .unmount_when(workspace, ready)
+        let routed = self.route(workspace.sandbox())?;
+        routed.store.unmount_when(workspace, ready)?;
+        self.unmounted(&routed.store);
+        Ok(())
     }
 
     fn is_mounted(&self, workspace: &WorkspaceId) -> bool {
@@ -1955,7 +2050,7 @@ mod tests {
     /// `source` is.
     fn routed_x(mirror: &Path, root: &Path, source: &str) -> Routed {
         Routed {
-            store: std::sync::Arc::new(GitWorkspace::new(mirror, root)),
+            store: std::sync::Arc::new(GitWorkspace::new(mirror, root).into()),
             mirror: Some((mirror.to_path_buf(), source.to_string())),
         }
     }
@@ -2127,6 +2222,269 @@ mod tests {
             Some(commit.as_str().to_string())
         );
         host.unmount(&workspace).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A bare repository whose `main` holds a README and a source file.
+    fn engine_repo(base: &Path) -> std::path::PathBuf {
+        let seed = base.join("seed");
+        std::fs::create_dir_all(seed.join("src")).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        std::fs::write(seed.join("src/lib.rs"), "fn lib() {}\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&["-C", &seed_path, "commit", "-qm", "base"]).expect("commit");
+        let repo = base.join("default.git");
+        git(&["clone", "-q", "--bare", &seed_path, &repo.to_string_lossy()]).expect("bare");
+        repo
+    }
+
+    /// Every engine through [`MissionWorkspaces`], for an agent no mission
+    /// owns (routed to the default store): the same mount, cancelled mount,
+    /// hold, checkpoint, set-aside (waiting, then made, then the same
+    /// answer again) and unmount, with the CAS helper on. Cow and the
+    /// overlay run for real where this host supports them.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one engine's whole run, step by step
+    fn every_engine_runs_alike_through_the_mission_store() {
+        use crate::config::{Probes, WorkspaceBackend, WorkspaceSettings};
+        use spawn_core::port::{MOUNT_CANCELLED, SetAside, UNMOUNT_IN_USE};
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("engines");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+                .expect("connect and migrate"),
+        );
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-engines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = engine_repo(&base);
+        let main = git(&["--git-dir", &repo.to_string_lossy(), "rev-parse", "main"]).expect("main");
+        let mut ran = Vec::new();
+        for configured in [
+            WorkspaceBackend::Git,
+            WorkspaceBackend::Cow,
+            WorkspaceBackend::Overlay,
+        ] {
+            let root = base.join(format!("{configured:?}").to_lowercase());
+            let settings =
+                match WorkspaceSettings::resolve(configured, true, &root, &Probes::host()) {
+                    Ok(settings) => settings,
+                    Err(why) => {
+                        eprintln!("skipped: {why}");
+                        continue;
+                    }
+                };
+            let name = settings.active.name();
+            ran.push(name);
+            let workspaces = settings.one_shot(&repo, &root, store.clone());
+            let agent = format!("agent_engine_{name}");
+            let branch = BranchName::new(agent.as_str()).expect("branch");
+            workspaces.ensure_branch(&branch, None).expect("branch");
+            let cancelled = workspaces.mount_when(&branch, &|| Err("not now".to_string()));
+            assert!(
+                matches!(&cancelled, Err(WorkspaceError::Refused { code, .. }) if code == MOUNT_CANCELLED),
+                "{name}: {cancelled:?}"
+            );
+            let workspace = workspaces.mount_when(&branch, &|| Ok(())).expect("mount");
+            assert!(workspaces.is_mounted(&workspace), "{name}");
+            assert!(workspaces.hold(&workspace).is_some(), "{name}");
+            let routed = workspaces.route(&agent).expect("routed");
+            assert_eq!(routed.store.backend_name(), name);
+            assert!(routed.mirror.is_none(), "no mission: the default store");
+            let view = routed.store.host_path(&workspace).expect("view");
+            std::fs::write(view.join("README.md"), "changed\n").expect("write");
+            std::fs::create_dir_all(view.join("target/.transcripts")).expect("target");
+            std::fs::write(view.join("target/.transcripts/t.jsonl"), "{}\n").expect("write");
+            assert!(matches!(
+                workspaces.commit(&workspace, "work").expect("commit"),
+                Commit::Created(_)
+            ));
+            // Mounted again (an execution after the last one ended): with
+            // the CAS helper on, a Cow workspace's build output is shared
+            // through `<root>/.cas`, its transcripts never. (A Git mount
+            // installs a fresh checkout each time: nothing to reuse.)
+            if name != "git" {
+                let blob = vec![7_u8; 192 * 1024];
+                for path in ["target/debug/a.bin", "target/release/a.bin"] {
+                    std::fs::create_dir_all(view.join(path).parent().expect("parent"))
+                        .expect("dir");
+                    std::fs::write(view.join(path), &blob).expect("write");
+                }
+                let transcript = |view: &Path| {
+                    let path = view.join("target/.transcripts/t.jsonl");
+                    let meta = std::fs::metadata(&path)
+                        .unwrap_or_else(|error| panic!("{name}: {}: {error}", path.display()));
+                    std::os::unix::fs::MetadataExt::ino(&meta)
+                };
+                let before = transcript(&view);
+                std::thread::sleep(std::time::Duration::from_millis(2_200));
+                assert_eq!(
+                    workspaces.mount_when(&branch, &|| Ok(())).expect("again"),
+                    workspace,
+                    "{name}"
+                );
+                assert_eq!(
+                    transcript(&view),
+                    before,
+                    "{name}: a transcript is never replaced"
+                );
+                let cas = routed
+                    .store
+                    .cas_root()
+                    .join(spawn_host::cas_dedup::CAS_MARKER);
+                assert_eq!(
+                    cas.is_file(),
+                    name == "cow" && spawn_host::cow_clone_supported(&root),
+                    "{name}: {}",
+                    cas.display()
+                );
+            }
+            std::fs::write(view.join("loose.txt"), "loose\n").expect("write");
+
+            let waits = workspaces.set_aside_when(&branch, None, "spawn: set aside #1", &|| {
+                Err("a turn runs".to_string())
+            });
+            assert!(
+                matches!(&waits, Err(WorkspaceError::Refused { code, .. }) if code == spawn_host::SET_ASIDE_WAITS),
+                "{name}: {waits:?}"
+            );
+            assert!(view.join("loose.txt").is_file(), "{name}: nothing changed");
+            let made = workspaces
+                .set_aside_when(&branch, None, "spawn: set aside #1", &|| Ok(()))
+                .expect("set aside");
+            let SetAside::Created { commit, files, .. } = &made else {
+                panic!("{name}: {made:?}");
+            };
+            assert_eq!(files, &["README.md", "loose.txt"], "{name}");
+            let tree = |commit: &str| {
+                git(&[
+                    "--git-dir",
+                    &repo.to_string_lossy(),
+                    "rev-parse",
+                    &format!("{commit}^{{tree}}"),
+                ])
+                .expect("tree")
+            };
+            assert_eq!(tree(commit.as_str()), tree(&main), "{name}");
+            assert_eq!(
+                std::fs::read_to_string(view.join("README.md")).expect("read"),
+                "base\n",
+                "{name}"
+            );
+            assert!(!view.join("loose.txt").exists(), "{name}");
+            // The transcript under the build output is never touched.
+            assert!(view.join("target/.transcripts/t.jsonl").is_file(), "{name}");
+            assert_eq!(
+                workspaces
+                    .set_aside_when(&branch, None, "spawn: set aside #1", &|| Ok(()))
+                    .expect("again"),
+                made,
+                "{name}"
+            );
+            assert_eq!(
+                workspaces.commit(&workspace, "idle").expect("commit"),
+                Commit::Unchanged,
+                "{name}"
+            );
+            let busy = workspaces.unmount_when(&workspace, &|| {
+                Err(WorkspaceError::Refused {
+                    code: UNMOUNT_IN_USE.to_string(),
+                    message: "in use".to_string(),
+                })
+            });
+            assert!(busy.is_err() && workspaces.is_mounted(&workspace), "{name}");
+            // A transcript keeps the overlay's upperdir and a Cow
+            // workspace's `.transcripts/` is kept aside: out of the way first.
+            std::fs::remove_dir_all(view.join("target")).expect("clean");
+            workspaces
+                .unmount_when(&workspace, &|| Ok(()))
+                .expect("unmount");
+            assert!(!workspaces.is_mounted(&workspace), "{name}");
+            // The unmount pruned what no mounted workspace uses: no
+            // baseline or snapshot layer is left behind.
+            let trees = match name {
+                "cow" => Some(root.join(".cow/baselines")),
+                "overlay" => Some(root.join(".layers")),
+                _ => None,
+            };
+            if let Some(trees) = trees {
+                let left: Vec<_> = std::fs::read_dir(&trees)
+                    .map(|entries| {
+                        entries
+                            .map(|entry| entry.expect("entry").file_name())
+                            .filter(|name| !name.to_string_lossy().starts_with('.'))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    left.is_empty(),
+                    "{name}: {left:?} left in {}",
+                    trees.display()
+                );
+            }
+        }
+        assert!(ran.starts_with(&["git", "cow"]), "{ran:?}");
+        #[cfg(target_os = "linux")]
+        if spawn_host::overlay_supported_in(&base).is_ok() {
+            assert_eq!(ran, ["git", "cow", "overlay"], "the overlay engine ran");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The commit of a mission's agent runs through the routed store's
+    /// commit-or-take-back in every engine: a branch gone under the
+    /// mounted workspace is taken back (or made again) under its lock.
+    #[test]
+    fn a_gone_branch_is_made_again_by_every_engine_through_the_routed_commit() {
+        use crate::config::{Probes, WorkspaceBackend, WorkspaceSettings};
+        let base = std::env::temp_dir().join(format!("spawn-sources-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = engine_repo(&base);
+        for configured in [WorkspaceBackend::Cow, WorkspaceBackend::Overlay] {
+            let root = base.join(format!("{configured:?}").to_lowercase());
+            let Ok(settings) =
+                WorkspaceSettings::resolve(configured, false, &root, &Probes::host())
+            else {
+                continue;
+            };
+            let routed = Routed {
+                store: std::sync::Arc::new(settings.store(&repo, &root)),
+                // A source elsewhere: nothing to take back from this host.
+                mirror: Some((repo.clone(), "https://example.invalid/r.git".to_string())),
+            };
+            let branch = BranchName::new("agent_gone").expect("branch");
+            routed.store.ensure_branch(&branch, None).expect("branch");
+            let workspace = routed.store.mount(&branch).expect("mount");
+            let view = routed.store.host_path(&workspace).expect("view");
+            std::fs::write(view.join("new.txt"), "new\n").expect("write");
+            git(&[
+                "--git-dir",
+                &repo.to_string_lossy(),
+                "update-ref",
+                "-d",
+                "refs/heads/agent_gone",
+            ])
+            .expect("delete the branch");
+            let commit = commit_routed(&routed, &workspace, "work").expect("commit");
+            assert!(
+                matches!(commit, Commit::Recreated { .. }),
+                "{}: {commit:?}",
+                settings.active.name()
+            );
+            routed.store.unmount(&workspace).expect("unmount");
+            git(&[
+                "--git-dir",
+                &repo.to_string_lossy(),
+                "update-ref",
+                "-d",
+                "refs/heads/agent_gone",
+            ])
+            .expect("clean up");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }
