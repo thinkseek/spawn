@@ -323,6 +323,125 @@ pub(crate) fn wait_sessions_gone(
     )))
 }
 
+/// End the processes left beneath a terminated terminal's workspace (a
+/// daemon the engine detached: agy's `--bg-updater`, a `nohup` server) by
+/// pid, before the caller's final checkpoint (design section 5.4): every
+/// live process of this user whose working directory is `directory` or
+/// below it, read from `/proc/<pid>/cwd` (an exact link, never an argument
+/// pattern), gets SIGTERM, and SIGKILL after `waits.0`; one left after
+/// `waits.1` more is an error naming it. A signal goes through a pidfd
+/// opened while the process's directory still matched, so a reused pid is
+/// never signalled. Never this process; never a directory too broad to be
+/// one workspace ([`sweepable`]).
+pub(crate) fn end_stragglers(
+    directory: &str,
+    waits: (Duration, Duration),
+) -> Result<(), TerminalError> {
+    let directory = std::path::Path::new(directory);
+    if !sweepable(directory) {
+        return Ok(());
+    }
+    for (signal, wait) in [
+        (rustix::process::Signal::TERM, waits.0),
+        (rustix::process::Signal::KILL, waits.1),
+    ] {
+        let found = stragglers_beneath(directory);
+        if found.is_empty() {
+            return Ok(());
+        }
+        for pid in &found {
+            signal_beneath(*pid, directory, signal);
+        }
+        let deadline = Instant::now() + wait;
+        while !stragglers_beneath(directory).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(GONE_POLL);
+        }
+    }
+    let left = stragglers_beneath(directory);
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(TerminalError(format!(
+        "{} process(es) left beneath {} outlived SIGTERM and SIGKILL: {left:?}",
+        left.len(),
+        directory.display()
+    )))
+}
+
+/// Whether `directory` may be swept: an absolute path of at least three
+/// parts (`/tmp/a` and `/home/user` are never one workspace), that is not
+/// this process's working directory, the home directory or the temporary
+/// directory, nor above any of them.
+pub(crate) fn sweepable(directory: &std::path::Path) -> bool {
+    use std::path::Component;
+    if !directory.is_absolute()
+        || directory
+            .components()
+            .filter(|part| matches!(part, Component::Normal(_)))
+            .count()
+            < 3
+        || directory
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let shared = [
+        std::env::current_dir().ok(),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        Some(std::env::temp_dir()),
+    ];
+    !shared
+        .into_iter()
+        .flatten()
+        .any(|shared| shared.starts_with(directory))
+}
+
+/// The live processes of this user, this one excepted, whose working
+/// directory is `directory` or below it, by `/proc/<pid>/cwd`.
+pub(crate) fn stragglers_beneath(directory: &std::path::Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let uid = crate::process::current_uid();
+    let own = std::process::id();
+    let mut found: Vec<u32> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != own)
+        .filter(|pid| {
+            std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|meta| meta.uid() == uid)
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| session_of(&stat))
+                    .is_some_and(|(state, _)| state != 'Z')
+                && cwd_beneath(*pid, directory)
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// Whether `/proc/<pid>/cwd` is `directory` or below it.
+fn cwd_beneath(pid: u32, directory: &std::path::Path) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(directory))
+}
+
+/// `signal` to `pid` through a pidfd, only while its working directory is
+/// still beneath `directory` once the pidfd holds it.
+fn signal_beneath(pid: u32, directory: &std::path::Path, signal: rustix::process::Signal) {
+    let Some(raw) = rustix::process::Pid::from_raw(pid.cast_signed()) else {
+        return;
+    };
+    let Ok(pidfd) = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) else {
+        return;
+    };
+    if cwd_beneath(pid, directory) {
+        let _ = rustix::process::pidfd_send_signal(&pidfd, signal);
+    }
+}
+
 /// The processes still in the sessions `leaders` lead once none is left or
 /// `limit` passes.
 fn until_gone(leaders: &[u32], limit: Duration) -> Vec<u32> {
@@ -993,6 +1112,9 @@ impl TerminalHost for TmuxHost {
             )));
         }
         self.wait_gone(terminal, &leaders)?;
+        // What the engine detached from its session, still beneath the
+        // workspace: ended by pid before the caller's final checkpoint.
+        end_stragglers(_workspace.path(), self.waits())?;
         self.forget_leader(terminal);
         Ok(())
     }
