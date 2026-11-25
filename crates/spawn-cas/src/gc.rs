@@ -217,3 +217,89 @@ fn read_dir_or_empty(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
         Err(error) => Err(error),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A fresh directory under the temporary directory, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "spawn-cas-{tag}-{}",
+                crate::store::unique_suffix()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("scratch");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// NB5 (Go `cas/gcrace_test.go`): a pin written while a GC pass runs
+    /// (between its read of the pins and its evictions) never returns with
+    /// its object present and then loses it to that pass. Pin waits for the
+    /// pass: when it returns, the object is either kept or already gone
+    /// (and the caller fetches it), and every later pass keeps it.
+    #[test]
+    fn pin_during_gc_never_loses_a_present_object() {
+        let scratch = Scratch::new("gcrace");
+        let mut store = Store::open(scratch.0.join("cas")).expect("open");
+        let content = b"a baseline bundle";
+        let digest = store.put_bytes(NS_ARTIFACTS, content).expect("put");
+        let (read_tx, read_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let fired = AtomicBool::new(false);
+        store.after_pinned = Some(Box::new(move || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                read_tx.send(()).expect("signal");
+                resume_rx.lock().expect("lock").recv().expect("resume");
+            }
+        }));
+        let quotas = Quotas::from([(NS_ARTIFACTS.to_string(), 0)]);
+        let store = &store;
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let pass = scope.spawn(|| store.gc(&quotas).expect("gc"));
+            read_rx.recv().expect("the pass read the pins");
+            // A grant accepted right now pins its inputs.
+            let digest = digest.clone();
+            let result_tx = result_tx.clone();
+            scope.spawn(move || {
+                let pinned = store.pin("lease", "gate-race.1", std::slice::from_ref(&digest));
+                result_tx.send((pinned.map_err(|error| error.to_string()), store.has(&digest)))
+            });
+            assert!(
+                result_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "Pin returned while a GC pass was between reading the pins and evicting"
+            );
+            resume_tx.send(()).expect("resume");
+            pass.join().expect("gc thread");
+        });
+        let (pinned, present) = result_rx.recv().expect("pin result");
+        pinned.expect("pin");
+        assert!(
+            !present || store.has(&digest),
+            "present when Pin returned, then evicted by the pass"
+        );
+        // The job finds it missing and fetches it again; from now on it stays.
+        if !store.has(&digest) {
+            store.put_bytes(NS_ARTIFACTS, content).expect("put again");
+        }
+        store.gc(&quotas).expect("gc");
+        assert!(store.has(&digest), "a pinned object was evicted");
+    }
+}
