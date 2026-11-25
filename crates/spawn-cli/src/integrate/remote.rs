@@ -2054,6 +2054,20 @@ pub(super) mod tests {
 
         /// One beat of `node`, holding nothing: the grants it got.
         pub(in crate::integrate) fn beat(&self, node: &str) -> Vec<(String, i64)> {
+            self.beat_grants(node)
+                .iter()
+                .map(|grant| {
+                    (
+                        grant["job_id"].as_str().unwrap().to_string(),
+                        grant["lease_epoch"].as_i64().unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        /// One beat of `node`, holding nothing: the grants as the ledger
+        /// gives them to the gateway.
+        pub(in crate::integrate) fn beat_grants(&self, node: &str) -> Vec<Value> {
             let seq = {
                 let mut seqs = self.seqs.borrow_mut();
                 let seq = seqs.entry(node.to_string()).or_insert(0);
@@ -2070,17 +2084,7 @@ pub(super) mod tests {
                 .node_gw_beat(node, Self::boot(), seq, &body, |_| true)
                 .expect("a beat")
                 .answer;
-            answer["grants"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|grant| {
-                    (
-                        grant["job_id"].as_str().unwrap().to_string(),
-                        grant["lease_epoch"].as_i64().unwrap(),
-                    )
-                })
-                .collect()
+            answer["grants"].as_array().unwrap().clone()
         }
 
         /// `node`'s result, stored and completed as the gateway does it.
