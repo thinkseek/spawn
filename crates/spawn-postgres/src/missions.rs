@@ -1961,10 +1961,46 @@ impl PostgresStore {
         brief: &str,
         continues: Option<i64>,
     ) -> Result<i64, StoreError> {
+        self.objective_assign_classified(
+            mission, objective, scenario, brief, continues, "default", 2, None, None,
+        )
+    }
+
+    /// As [`Self::objective_assign_continuing`], through agent grading
+    /// (docs/agent-grading.md), as `task_assign_classified` assigns: on the
+    /// model profile `model`, at `difficulty` (1 to 3, `l1` to `l3`), on
+    /// the graded preset `preset` the integrator routed it to (`model` its
+    /// model profile) or on none, recording the difficulty classifier's
+    /// decision (`classification`) when there is one. With `"default"`, 2,
+    /// no preset and no classification it is
+    /// [`Self::objective_assign_continuing`], record for record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn objective_assign_classified(
+        &self,
+        mission: i64,
+        objective: i32,
+        scenario: Option<&str>,
+        brief: &str,
+        continues: Option<i64>,
+        model: &str,
+        difficulty: i32,
+        preset: Option<&str>,
+        classification: Option<&Value>,
+    ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
-                "select spawn_objective_assign($1, $2, $3, $4, $5)",
-                &[&mission, &objective, &scenario, &masked(brief), &continues],
+                "select spawn_objective_assign($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &mission,
+                    &objective,
+                    &scenario,
+                    &masked(brief),
+                    &continues,
+                    &model,
+                    &difficulty,
+                    &preset,
+                    &classification,
+                ],
             )?
             .get(0))
     }

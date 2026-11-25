@@ -1334,3 +1334,628 @@ fn a_gates_rejection_and_its_reroute_are_recorded_both_or_neither() {
     );
     assert_eq!(gates(&mut client), 1);
 }
+
+/// An objective mission with an approved resident and `workers` slots.
+fn objective_mission(store: &PostgresStore, name: &str, workers: u32) -> i64 {
+    let mission = store
+        .mission_add(name, &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .resident_propose(name, "Pursues objectives")
+        .expect("propose");
+    store.resident_approve(name).expect("approve");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/scenarios"),
+            "gate",
+            None,
+            Some(&json!({"backlog": "/controller/backlog", "resident": name,
+                         "workers": workers})),
+        )
+        .expect("configure");
+    mission
+}
+
+/// Issue #99 item 4: `spawn_objective_assign` takes agent grading's
+/// placement as `spawn_task_assign` does. The five arguments the gate's
+/// scenarios give (`..., null`), and four, record exactly what they did
+/// (no model, difficulty, preset, profile or classification; the task on
+/// the default profile at `l2`, no preset); the nine record and fold each
+/// of them, checked as `spawn_task_assign` checks them; a refusal records
+/// nothing; the supervisor may not call it; the refold restores the tasks.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_objective_assignment_carries_its_grading_and_the_old_calls_record_as_before() {
+    let (store, schema) = store("grading_objective_assign");
+    let mut client = admin(&schema);
+    let mission = objective_mission(&store, "graded", 6);
+    store
+        .grading_record(&json!({"type": "preset.registered", "preset_id": "qwen",
+                                "engine_label": "local", "model_label": "qwen",
+                                "model_profile": "cheap", "cost_rank": 0,
+                                "execution_profile": "local-qwen"}))
+        .expect("register");
+    onboard(&store, "qwen", "unexamined", "l1");
+    register(&store, "waiting", "default", 1);
+    register(&store, "mid", "default", 2);
+    onboard(&store, "mid", "unexamined", "l2");
+
+    // The scenarios' call, five arguments with a null continuation.
+    let five: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 1, '/controller/scenarios/001.sh',
+                                           'Objective 1', null)",
+            &[&mission],
+        )
+        .expect("five arguments")
+        .get(0);
+    let four: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 2, null, 'Objective 2')",
+            &[&mission],
+        )
+        .expect("four arguments")
+        .get(0);
+    let plain = store
+        .objective_assign_continuing(mission, 3, None, "Objective 3", None)
+        .expect("the store's old call");
+    for task in [five, four, plain] {
+        let record = assigned_record(&mut client, task);
+        let mut keys: Vec<&str> = record
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "agent_id",
+            "brief",
+            "created_by",
+            "id",
+            "kind",
+            "mission_id",
+            "objective",
+            "scenario",
+            "session_id",
+            "type",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "{record}");
+        assert_eq!(
+            task_row(&mut client, task),
+            (2, None, None, 0, "default".to_string())
+        );
+    }
+
+    // Through the catalog: model, difficulty, preset, profile and
+    // classification recorded and folded.
+    let classification = json!({"difficulty": "l1", "score": -2, "rules": "brief-v1",
+                                "signals": [{"rule": "low_risk", "points": -2,
+                                             "evidence": ["typo"]}],
+                                "rationale": "l1 (score -2: low_risk -2 [typo])"});
+    let routed = store
+        .objective_assign_classified(
+            mission,
+            4,
+            Some("/controller/scenarios/004.sh"),
+            "Objective 4: fix the typo",
+            None,
+            "cheap",
+            1,
+            Some("qwen"),
+            Some(&classification),
+        )
+        .expect("assign through the catalog");
+    let record = assigned_record(&mut client, routed);
+    assert_eq!(record["model"], json!("cheap"));
+    assert_eq!(record["difficulty"], json!("l1"));
+    assert_eq!(record["preset_id"], json!("qwen"));
+    assert_eq!(record["execution_profile"], json!("local-qwen"));
+    assert_eq!(record["classification"], classification);
+    assert_eq!(record["objective"], json!(4));
+    assert_eq!(record["created_by"], json!("spawn-integrate"));
+    assert_eq!(
+        task_row(&mut client, routed),
+        (
+            1,
+            Some("qwen".to_string()),
+            Some("qwen".to_string()),
+            0,
+            "cheap".to_string()
+        )
+    );
+    // On the default profile with no profile of its own: neither is named.
+    let mid = store
+        .objective_assign_classified(
+            mission,
+            5,
+            None,
+            "Objective 5",
+            None,
+            "default",
+            2,
+            Some("mid"),
+            None,
+        )
+        .expect("assign on mid");
+    let record = assigned_record(&mut client, mid);
+    assert!(record.get("model").is_none(), "{record}");
+    assert!(record.get("execution_profile").is_none(), "{record}");
+    assert!(record.get("classification").is_none(), "{record}");
+    assert_eq!(record["difficulty"], json!("l2"));
+    assert_eq!(record["preset_id"], json!("mid"));
+    assert_eq!(
+        task_row(&mut client, mid),
+        (
+            2,
+            Some("mid".to_string()),
+            Some("mid".to_string()),
+            0,
+            "default".to_string()
+        )
+    );
+
+    // Refused, recording nothing: as `spawn_task_assign` refuses.
+    let controls = |client: &mut Client| {
+        count(
+            client,
+            "select count(*) from spawn_events where event_name = 'control.recorded'",
+        )
+    };
+    let before = controls(&mut client);
+    let bad = json!({"difficulty": "l9", "signals": []});
+    for (model, difficulty, preset, classification, says) in [
+        (
+            "turbo",
+            2,
+            None,
+            None,
+            "default or cheap model profile, not turbo",
+        ),
+        ("default", 4, None, None, "difficulty is 1, 2 or 3"),
+        ("default", 0, None, None, "difficulty is 1, 2 or 3"),
+        (
+            "default",
+            2,
+            Some("nobody"),
+            None,
+            "not in the grading catalog",
+        ),
+        ("default", 2, Some("waiting"), None, "is unexamined"),
+        (
+            "cheap",
+            2,
+            Some("qwen"),
+            None,
+            "is graded l1, below the l2 task",
+        ),
+        (
+            "default",
+            1,
+            Some("qwen"),
+            None,
+            "runs on the cheap model profile",
+        ),
+        (
+            "default",
+            2,
+            None,
+            Some(&bad),
+            "a classification is an object",
+        ),
+    ] {
+        let error = store
+            .objective_assign_classified(
+                mission,
+                6,
+                None,
+                "refused",
+                None,
+                model,
+                difficulty,
+                preset,
+                classification,
+            )
+            .expect_err("refused");
+        assert!(error.to_string().contains(says), "{says}: {error}");
+    }
+    assert_eq!(controls(&mut client), before);
+    // Still owner only: the supervisor's login may not call it.
+    let error = as_login(&schema, "spawn_supervisor")
+        .query_one(
+            "select spawn_objective_assign($1, 6, null, 'refused', null, 'default', 2,
+                                           null, null)",
+            &[&mission],
+        )
+        .expect_err("owner only");
+    assert!(
+        error
+            .as_db_error()
+            .is_some_and(|db| db.code().code() == "42501"),
+        "{error}"
+    );
+    assert_eq!(controls(&mut client), before);
+
+    let before = tasks(&mut client);
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold");
+    assert_eq!(tasks(&mut client), before);
+}
+
+/// The record keys of an objective task assigned as before agent grading.
+fn plain_objective_keys(continues: bool) -> Vec<&'static str> {
+    let mut keys = vec![
+        "agent_id",
+        "brief",
+        "created_by",
+        "id",
+        "kind",
+        "mission_id",
+        "objective",
+        "scenario",
+        "session_id",
+        "type",
+    ];
+    if continues {
+        keys.push("continues");
+    }
+    keys.sort_unstable();
+    keys
+}
+
+fn record_keys(record: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Issue #99 item 4, review F1: a budget overrun's continuation
+/// (`p_continues`) of a routed objective task keeps its grading as a
+/// re-issue does. An `l1` task on `small` stepped up to `mid` by a gate's
+/// rejection, then over budget, continues on `mid` (the default model) at
+/// `l1`, `first_preset_id` `small`, one quality rejection, from the
+/// scenarios' five arguments as from the integrator's nine, whatever fresh
+/// route those name; a preset that does not take its rework is refused,
+/// recording nothing; a stronger one named is taken. With every preset
+/// that takes it gone, the continuation is assigned as before, and a
+/// continuation of an unrouted task records exactly what it did. The
+/// refold restores every task.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_objective_continuation_keeps_its_stepped_up_grading() {
+    let (store, schema) = store("grading_objective_continues");
+    let mut client = admin(&schema);
+    let mission = objective_mission(&store, "carried", 3);
+    register(&store, "small", "cheap", 0);
+    onboard(&store, "small", "unexamined", "l1");
+    register(&store, "mid", "default", 1);
+    onboard(&store, "mid", "unexamined", "l2");
+    register(&store, "strong", "default", 2);
+    onboard(&store, "strong", "unexamined", "l3");
+    let classification = json!({"difficulty": "l1", "score": -2, "rules": "brief-v1",
+                                "signals": [], "rationale": "l1"});
+    let first = store
+        .objective_assign_classified(
+            mission,
+            1,
+            None,
+            "Objective 1",
+            None,
+            "cheap",
+            1,
+            Some("small"),
+            Some(&classification),
+        )
+        .expect("routed");
+    store.task_delivered(first, 1).expect("delivered");
+    assert!(store.task_reported(first, "done").expect("reported"));
+    store
+        .integrator_record_rerouted(
+            &json!({"type": "task.gated", "id": first, "revision": 0, "verdict": "rejected",
+                    "base": "b", "note": "a check failed"}),
+            "mid",
+            1,
+            TaskDifficulty::L2,
+        )
+        .expect("stepped up");
+    store.task_delivered(first, 2).expect("delivered again");
+    let over = |store: &PostgresStore, task: i64| {
+        store
+            .integrator_record(&json!({"type": "task.over_budget", "id": task,
+                                       "reason": "the task made more than 5 tool calls",
+                                       "tool_calls": 6, "elapsed_ms": 1_000,
+                                       "budget": {"tool_calls": 5}}))
+            .expect("the overrun");
+    };
+    over(&store, first);
+    assert_eq!(
+        task_row(&mut client, first),
+        (
+            1,
+            Some("mid".to_string()),
+            Some("small".to_string()),
+            1,
+            "default".to_string()
+        )
+    );
+    let carried = (
+        1,
+        Some("mid".to_string()),
+        Some("small".to_string()),
+        1,
+        "default".to_string(),
+    );
+
+    // A fresh route's preset that does not take the rework: refused.
+    let controls = |client: &mut Client| {
+        count(
+            client,
+            "select count(*) from spawn_events where event_name = 'control.recorded'",
+        )
+    };
+    let before = controls(&mut client);
+    let error = store
+        .objective_assign_classified(
+            mission,
+            1,
+            None,
+            "Objective 1, continued",
+            Some(first),
+            "cheap",
+            1,
+            Some("small"),
+            Some(&classification),
+        )
+        .expect_err("small does not take the rework");
+    assert!(
+        error
+            .to_string()
+            .contains("does not take the continuation of task"),
+        "{error}"
+    );
+    assert_eq!(controls(&mut client), before);
+
+    // The scenarios' five arguments: the grading carried.
+    let five: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 1, null, 'Objective 1, continued', $2)",
+            &[&mission, &first],
+        )
+        .expect("five arguments")
+        .get(0);
+    assert_eq!(task_row(&mut client, five), carried);
+    let record = assigned_record(&mut client, five);
+    assert_eq!(record["difficulty"], json!("l1"));
+    assert_eq!(record["preset_id"], json!("mid"));
+    assert_eq!(record["first_preset_id"], json!("small"));
+    assert_eq!(record["quality_rejections"], json!(1));
+    assert_eq!(record["continues"], json!(first));
+    assert!(record.get("model").is_none(), "default: {record}");
+    assert!(record.get("classification").is_none(), "{record}");
+    store.task_cancel(five).expect("cancel");
+
+    // The integrator's nine, naming the preset the rework holds: the same.
+    let nine = store
+        .objective_assign_classified(
+            mission,
+            1,
+            None,
+            "Objective 1, continued",
+            Some(first),
+            "default",
+            1,
+            Some("mid"),
+            None,
+        )
+        .expect("nine arguments");
+    assert_eq!(task_row(&mut client, nine), carried);
+    store.task_cancel(nine).expect("cancel");
+    // A stronger preset named: taken, the rest carried.
+    let stronger = store
+        .objective_assign_classified(
+            mission,
+            1,
+            None,
+            "Objective 1, continued",
+            Some(first),
+            "default",
+            3,
+            Some("strong"),
+            None,
+        )
+        .expect("a stronger preset");
+    assert_eq!(
+        task_row(&mut client, stronger),
+        (
+            1,
+            Some("strong".to_string()),
+            Some("small".to_string()),
+            1,
+            "default".to_string()
+        )
+    );
+    store.task_cancel(stronger).expect("cancel");
+
+    // Every preset graded for the rework disabled: assigned as before.
+    for id in ["mid", "strong"] {
+        store
+            .grading_record(&json!({"type": "preset.state_changed", "preset_id": id,
+                                    "from_state": "active", "to_state": "disabled"}))
+            .expect("disable");
+    }
+    let fallen: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 1, null, 'Objective 1, continued', $2)",
+            &[&mission, &first],
+        )
+        .expect("five arguments, nothing to carry onto")
+        .get(0);
+    assert_eq!(
+        task_row(&mut client, fallen),
+        (2, None, None, 0, "default".to_string())
+    );
+    assert_eq!(
+        record_keys(&assigned_record(&mut client, fallen)),
+        plain_objective_keys(true)
+    );
+
+    // A continuation of an unrouted task: as before, byte for byte.
+    let plain = store
+        .objective_assign(mission, 2, None, "Objective 2")
+        .expect("unrouted");
+    store.task_delivered(plain, 3).expect("delivered");
+    over(&store, plain);
+    let continued: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 2, null, 'Objective 2, continued', $2)",
+            &[&mission, &plain],
+        )
+        .expect("five arguments")
+        .get(0);
+    assert_eq!(
+        task_row(&mut client, continued),
+        (2, None, None, 0, "default".to_string())
+    );
+    assert_eq!(
+        record_keys(&assigned_record(&mut client, continued)),
+        plain_objective_keys(true)
+    );
+
+    let before = tasks(&mut client);
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("refold");
+    assert_eq!(tasks(&mut client), before);
+}
+
+/// Review F3: calibration counts one piece of work once. (a) A routed
+/// objective task rejected once (stepped up to `mid`), cancelled over
+/// budget and continued with its grading carried, the continuation then
+/// accepted, is one sample of `small` (the continuation, not first pass),
+/// not two. (b) A continuation that carried nothing (every preset taking
+/// the rework disabled: no first preset) leaves its overrun predecessor
+/// counted.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_carried_continuation_replaces_its_overrun_in_calibration() {
+    let (store, schema) = store("grading_continuation_window");
+    let mut client = admin(&schema);
+    let mission = objective_mission(&store, "window", 3);
+    register(&store, "small", "cheap", 0);
+    onboard(&store, "small", "unexamined", "l1");
+    register(&store, "mid", "default", 1);
+    onboard(&store, "mid", "unexamined", "l2");
+    let mut command = 0;
+    let mut next = || {
+        command += 1;
+        command
+    };
+    // On small, rejected once (rerouted to mid), delivered and over budget.
+    let mut overrun = |objective: i32| {
+        let task = store
+            .objective_assign_classified(
+                mission,
+                objective,
+                None,
+                &format!("Objective {objective}"),
+                None,
+                "cheap",
+                1,
+                Some("small"),
+                None,
+            )
+            .expect("routed");
+        store.task_delivered(task, next()).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store
+            .integrator_record_rerouted(
+                &json!({"type": "task.gated", "id": task, "revision": 0,
+                        "verdict": "rejected", "base": "b", "note": "a check failed"}),
+                "mid",
+                1,
+                TaskDifficulty::L2,
+            )
+            .expect("stepped up");
+        store.task_delivered(task, next()).expect("delivered again");
+        store
+            .integrator_record(&json!({"type": "task.over_budget", "id": task,
+                                       "reason": "the task made more than 5 tool calls",
+                                       "tool_calls": 6, "elapsed_ms": 1_000,
+                                       "budget": {"tool_calls": 5}}))
+            .expect("the overrun");
+        task
+    };
+    let window = |store: &PostgresStore| -> Vec<(i64, bool)> {
+        store
+            .grading_outcomes("small", TaskDifficulty::L1, 0)
+            .expect("the window")
+            .iter()
+            .map(|sample| (sample.task_id, sample.first_pass))
+            .collect()
+    };
+
+    // (a) Carried: the overrun alone is one sample until its continuation
+    // closes, then the continuation is, alone.
+    let first = overrun(1);
+    assert_eq!(window(&store), vec![(first, false)]);
+    let carried: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 1, null, 'Objective 1, continued', $2)",
+            &[&mission, &first],
+        )
+        .expect("a carried continuation")
+        .get(0);
+    assert_eq!(task_row(&mut client, carried).2.as_deref(), Some("small"));
+    assert_eq!(window(&store), Vec::<(i64, bool)>::new(), "carried on");
+    store.task_delivered(carried, 100).expect("delivered");
+    assert!(store.task_reported(carried, "done").expect("reported"));
+    gated(&mut client, carried, "accepted", 0);
+    client
+        .execute(
+            "select spawn_control_record($1)",
+            &[&json!({"type": "task.landed", "id": carried})],
+        )
+        .expect("landed");
+    assert_eq!(
+        store
+            .routed_task(carried)
+            .expect("read")
+            .expect("task")
+            .state,
+        "landed"
+    );
+    assert_eq!(
+        window(&store),
+        vec![(carried, false)],
+        "one sample, its rejection carried"
+    );
+
+    // (b) Uncarried: nothing takes the rework, the continuation has no
+    // first preset, and the overrun stays a sample of small.
+    let second = overrun(2);
+    store
+        .grading_record(&json!({"type": "preset.state_changed", "preset_id": "mid",
+                                "from_state": "active", "to_state": "disabled"}))
+        .expect("disable");
+    let uncarried: i64 = client
+        .query_one(
+            "select spawn_objective_assign($1, 2, null, 'Objective 2, continued', $2)",
+            &[&mission, &second],
+        )
+        .expect("an uncarried continuation")
+        .get(0);
+    assert_eq!(task_row(&mut client, uncarried).2, None);
+    assert_eq!(
+        window(&store),
+        vec![(second, false), (carried, false)],
+        "the overrun still counts"
+    );
+}

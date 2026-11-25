@@ -98,6 +98,15 @@
 //! `spawn_objective_assign` checks both limits again under the append lock.
 //! With N = 1 this is one task at a time on the resident.
 //!
+//! Agent grading (docs/agent-grading.md) places every objective task as an
+//! unflagged `spawn task assign` places an ephemeral one
+//! (`crate::missions::route_unflagged`): its difficulty classified from the
+//! objective's own title and prompt ([`grading_text`]), routed through the
+//! grading catalog with the anti-starvation re-probe, and on the default
+//! model profile at `l2`, as before, when the catalog is empty or covers
+//! neither. A routed task's gate rejection steps its rework up as any
+//! routed task's does (`crate::integrate::record_gated`).
+//!
 //! A one-shot objective is solved once a task for it lands, or once its
 //! scenario passes at a base commit main already holds (`objective.solved`,
 //! read as a landing: the work could change nothing); a recurring one
@@ -113,6 +122,7 @@ use serde::Deserialize;
 use spawn_postgres::PostgresStore;
 
 use serde_json::json;
+use spawn_core::grading::{DifficultyClassification, RoutingDecision, TaskDifficulty};
 use spawn_core::mission::TaskState;
 
 use crate::integrate::Mission;
@@ -1130,15 +1140,53 @@ fn assign(
         &history,
         continues,
     );
+    let route = match continues {
+        Some(overrun) => match continued_route(store, task, overrun.task) {
+            Carried::Route(decision) => Some((decision, None)),
+            Carried::Unrouted => None,
+            Carried::Afresh => grading_route(store, task).map(|(d, c)| (d, Some(c))),
+        },
+        None => grading_route(store, task).map(|(d, c)| (d, Some(c))),
+    };
+    let (model, difficulty, preset, classification) = match &route {
+        Some((decision, classified)) => (
+            decision.model_profile.as_str(),
+            i32::from(decision.difficulty.rank()),
+            Some(decision.preset_id.as_str()),
+            classified
+                .as_ref()
+                .map(|classified| crate::grading::classification_record(classified, decision)),
+        ),
+        None => (
+            "default",
+            i32::from(TaskDifficulty::default().rank()),
+            None,
+            None,
+        ),
+    };
     let assigned = store
-        .objective_assign_continuing(
+        .objective_assign_classified(
             mission.id,
             id,
             scenario.as_deref(),
             &text,
             continues.map(|overrun| overrun.task),
+            model,
+            difficulty,
+            preset,
+            classification.as_ref(),
         )
         .map_err(|error| error.to_string())?;
+    if let Some((decision, classified)) = &route {
+        say_route(
+            mission.id,
+            task.id,
+            assigned,
+            decision,
+            classified.as_ref(),
+            continues,
+        );
+    }
     match continues {
         Some(overrun) => println!(
             "integrate: mission {} objective {} -> task {assigned}, continuing task #{} on {} \
@@ -1158,6 +1206,126 @@ fn assign(
         ),
     }
     Ok(assigned)
+}
+
+/// The text agent grading classifies an objective's difficulty from: its
+/// own specification, its title and prompt, and nothing the brief adds
+/// around them (the standing rules, earlier tasks' reports, gate history,
+/// a continuation note), whose words would move the classifier whatever
+/// the objective asks.
+pub(crate) fn grading_text(task: &Task) -> String {
+    format!("{}\n\n{}", task.title, task.prompt)
+}
+
+/// Say where agent grading put objective `objective`'s task `assigned`:
+/// its preset, difficulty and model, and whether it is a re-probe or a
+/// continuation's carried grading (stdout), with the classifier's and the
+/// re-probe's notes (stderr).
+fn say_route(
+    mission: i64,
+    objective: u32,
+    assigned: i64,
+    decision: &RoutingDecision,
+    classified: Option<&DifficultyClassification>,
+    continues: Option<&Overrun>,
+) {
+    println!(
+        "integrate: mission {} objective {} -> task {assigned}: agent grading routed it to \
+         preset {} at {} ({}){}",
+        mission,
+        objective,
+        decision.preset_id,
+        decision.difficulty,
+        decision.model_profile.as_str(),
+        match (classified, continues) {
+            (None, Some(overrun)) => format!(
+                ", the grading of task #{} carried (routed at {})",
+                overrun.task, decision.routed_difficulty
+            ),
+            _ if decision.reprobe => ", a re-probe".to_string(),
+            _ => String::new(),
+        }
+    );
+    for note in crate::missions::route_notes(&format!("task {assigned}"), decision, classified) {
+        eprintln!("integrate: agent grading: {note}");
+    }
+}
+
+/// How a budget overrun's continuation is graded ([`continued_route`]).
+enum Carried {
+    /// On the continued task's grading: this preset, which takes its
+    /// stepped-up rework (`spawn_objective_assign` carries its difficulty,
+    /// first preset and quality rejections).
+    Route(RoutingDecision),
+    /// The continued task was routed, but no preset takes its rework now:
+    /// assigned without the catalog, as before agent grading.
+    Unrouted,
+    /// The continued task was not routed: classified and routed afresh.
+    Afresh,
+}
+
+/// The grading of objective `task`'s continuation of the overrun task
+/// `continued` (docs/agent-grading.md): a routed task's continuation keeps
+/// its stepped-up grading ([`crate::missions::continuation_route`]),
+/// never routed afresh onto a weaker preset; anything that fails is said
+/// and the continuation assigned without the catalog.
+fn continued_route(store: &PostgresStore, task: &Task, continued: i64) -> Carried {
+    match crate::missions::continuation_route(store, continued) {
+        Ok(None) => Carried::Afresh,
+        Ok(Some(Ok(decision))) => Carried::Route(decision),
+        Ok(Some(Err(error))) => {
+            eprintln!(
+                "integrate: objective {}: agent grading: the continuation of task {continued} \
+                 keeps no preset ({error}): assigned on the default model profile, as without \
+                 the catalog",
+                task.id
+            );
+            Carried::Unrouted
+        }
+        Err(error) => {
+            eprintln!(
+                "integrate: objective {}: agent grading not used for the continuation of task \
+                 {continued} ({error}): assigned on the default model profile, as without the \
+                 catalog",
+                task.id
+            );
+            Carried::Unrouted
+        }
+    }
+}
+
+/// Where agent grading routes objective `task` (docs/agent-grading.md):
+/// [`crate::missions::route_unflagged`] on [`grading_text`], the rule an
+/// unflagged `spawn task assign` follows, re-probe included. None (the
+/// task is assigned as before agent grading: the default model profile,
+/// `l2`, no preset) when the catalog is empty, covers neither its
+/// classified difficulty nor `l2`, or cannot be read or routed: the
+/// objective is assigned all the same, and anything but an empty catalog
+/// is said.
+fn grading_route(
+    store: &PostgresStore,
+    task: &Task,
+) -> Option<(RoutingDecision, DifficultyClassification)> {
+    match crate::missions::route_unflagged(store, &grading_text(task), "the default model profile")
+    {
+        Ok(crate::missions::CatalogRoute::Routed(decision, classified)) => {
+            Some((decision, classified))
+        }
+        Ok(crate::missions::CatalogRoute::Unrouted { fallback }) => {
+            if let Some(why) = fallback {
+                println!("integrate: objective {}: agent grading: {why}", task.id);
+            }
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "integrate: objective {}: agent grading not used ({error}): assigned on the \
+                 default model profile, as without the catalog",
+                task.id
+            );
+            None
+        }
+    }
 }
 
 /// The usage of `spawn objective`, the only copy (main's help reads it).
@@ -1235,12 +1403,49 @@ fn retire_record(flags: &crate::Flags) -> Result<serde_json::Value, String> {
 mod tests {
     use super::{
         ACTIVE_MEASURE, Attempts, Landing, Outcome, PriorWork, Task, attempt_limit, attempts,
-        brief, choose, holds, is_open, load_backlog, metric_lines, next_open, order_problems,
-        overruns, recurring, workers, yields,
+        brief, choose, grading_text, holds, is_open, load_backlog, metric_lines, next_open,
+        order_problems, overruns, recurring, workers, yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
+
+    /// Agent grading classifies an objective by its own title and prompt
+    /// alone: the standing rules and an earlier task's report, which the
+    /// brief carries, would move the classifier whatever the objective
+    /// asks (a typo fix read as `l3` for a report's word about a migration).
+    #[test]
+    fn grading_classifies_the_objectives_own_text_not_its_brief() {
+        use spawn_core::grading::{TaskDifficulty, classify_difficulty};
+        let mut typo = objective(7, false);
+        typo.title = "Typo".to_string();
+        typo.prompt = "Fix the typo in README.md".to_string();
+        assert_eq!(grading_text(&typo), "Typo\n\nFix the typo in README.md");
+        assert_eq!(
+            classify_difficulty(&grading_text(&typo)).difficulty,
+            TaskDifficulty::L1
+        );
+        let prior = [PriorWork {
+            task: 3,
+            outcome: Some("rejected".to_string()),
+            reason: Some("the schema migration failed: ALTER TABLE on schema.sql".to_string()),
+            commit: None,
+            report: Some("Tried the SQL injection fix in the authentication path".to_string()),
+        }];
+        let whole = brief(&typo, None, &prior, &[], None);
+        assert!(whole.contains("ALTER TABLE"), "{whole}");
+        assert_ne!(
+            classify_difficulty(&whole).difficulty,
+            TaskDifficulty::L1,
+            "the whole brief would not read as the typo fix it is"
+        );
+        let mut hard = objective(8, false);
+        hard.prompt = "Harden authentication: stop the SQL injection".to_string();
+        assert_eq!(
+            classify_difficulty(&grading_text(&hard)).difficulty,
+            TaskDifficulty::L3
+        );
+    }
 
     fn untried() -> BTreeMap<u32, Attempts> {
         BTreeMap::new()

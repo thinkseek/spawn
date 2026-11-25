@@ -48,7 +48,13 @@ const ACTIVITY: &str = "select first_preset_id, difficulty, max(created_at_ms)
 ///
 /// Closed: landed or accepted; or cancelled after at least one quality
 /// rejection, unless a re-issue or reassign carried its work (and its
-/// rejections) on to a successor, which counts instead. A cancel with no
+/// rejections) on to a successor, which counts instead, or a budget
+/// overrun's continuation (`continues`) carried its grading on: the
+/// continuation names the same first preset (`spawn_objective_assign`
+/// carries `first_preset_id` and `quality_rejections`) and counts
+/// instead, so the one piece of work is one sample. A continuation that
+/// carried nothing (no first preset, the catalog had nothing to take its
+/// rework) leaves the overrun counted. A cancel with no
 /// quality rejection (a re-issue, a reassign, over budget, aborted, its
 /// mission closed, its resident retired, a person's clean cancel) says
 /// nothing of the preset and is left out. First pass: landed or accepted
@@ -63,7 +69,9 @@ select k.id, (k.state in ('landed', 'accepted') and k.quality_rejections = 0) as
    and (k.state in ('landed', 'accepted')
         or (k.state = 'cancelled' and k.quality_rejections > 0
             and not exists (select 1 from mission_tasks s
-                             where s.reissue_of = k.id or s.reassign_of = k.id)))
+                             where s.reissue_of = k.id or s.reassign_of = k.id
+                                or (s.continues = k.id
+                                    and s.first_preset_id = k.first_preset_id))))
  order by k.updated_at_ms desc, k.id desc
  limit $4";
 

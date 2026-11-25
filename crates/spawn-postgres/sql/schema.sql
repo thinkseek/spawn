@@ -4960,13 +4960,43 @@ end $$;
 -- by the dispatcher once its task lands or is cancelled.
 drop function if exists spawn_objective_assign(bigint, integer, text, text);
 
+drop function if exists spawn_objective_assign(bigint, integer, text, text, bigint);
+
 -- An objective's task, assigned by the integrator (owner only). `p_continues`
 -- names the overrun task whose work this one keeps (`task.over_budget`): the
 -- record says so, and the task's workspace starts from that work
 -- (`OBJECTIVE_FORK`). Returns the task's id.
+-- Agent grading (docs/agent-grading.md), as `spawn_task_assign` takes it:
+-- `p_model` (`default` or `cheap`), `p_difficulty` (1 to 3, `l2` by
+-- default), `p_preset`, the graded preset the integrator routed the task to
+-- (`spawn_core::grading::route_with_reprobe`), or null, and
+-- `p_classification`, the difficulty classifier's decision on the
+-- objective's own text. Checked as `spawn_task_assign` checks them. The
+-- record names `model` when it is not `default`, `difficulty` and
+-- `preset_id` when a preset is named or the difficulty is not the default,
+-- the preset's `execution_profile` when it has one and `classification`
+-- when there is one: called with the defaults (the five arguments the
+-- scenarios give), the record is exactly what it was.
+-- A continuation (`p_continues`) of a task routed through the catalog
+-- keeps its grading, as a re-issue or reassign does: its difficulty, its
+-- first preset (the one calibration counts it for) and its quality
+-- rejections, on `p_preset` when the integrator names one, else on the
+-- continued task's preset, with that preset's model and execution profile;
+-- never the caller's difficulty, model or classification, which are a
+-- fresh route's. The preset must still be routable and graded for the
+-- continued task's rework difficulty (`TaskDifficulty::for_rework`, as
+-- `spawn_task_reroute` steps it up): a named one that is not is refused;
+-- when none is named and the continued task's own no longer is (disabled
+-- or demoted since), the continuation is assigned as the caller's
+-- arguments say, the old grading not carried. A continuation of a task
+-- assigned without the catalog is as before.
 create or replace function spawn_objective_assign(p_mission bigint, p_objective integer,
                                                   p_scenario text, p_brief text,
-                                                  p_continues bigint)
+                                                  p_continues bigint default null,
+                                                  p_model text default 'default',
+                                                  p_difficulty integer default 2,
+                                                  p_preset text default null,
+                                                  p_classification jsonb default null)
 returns bigint language plpgsql security definer as $$
 declare
     v_id bigint;
@@ -4975,11 +5005,81 @@ declare
     v_kind text := 'resident';
     v_workers integer;
     v_open integer;
+    v_preset grading_presets%rowtype;
+    v_old mission_tasks%rowtype;
+    v_model text := p_model;
+    v_difficulty integer := p_difficulty;
+    v_preset_id text := p_preset;
+    v_classification jsonb := p_classification;
+    v_first text;
+    v_rejections integer;
+    v_needed integer;
+    v_carried boolean := false;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not assign objectives', session_user using errcode = '42501';
+    end if;
+    if p_model is null or p_model not in ('default', 'cheap') then
+        raise exception 'a task runs on the default or cheap model profile, not %', p_model;
+    end if;
+    if p_difficulty is null or p_difficulty not in (1, 2, 3) then
+        raise exception 'a task''s difficulty is 1, 2 or 3 (l1, l2 or l3), not %', p_difficulty;
+    end if;
+    if p_classification is not null
+       and (jsonb_typeof(p_classification) <> 'object'
+            or spawn_grade_wire(p_classification -> 'difficulty') is null
+            or jsonb_typeof(p_classification -> 'signals') is distinct from 'array') then
+        raise exception 'a classification is an object naming its difficulty and signals, not %',
+            p_classification;
+    end if;
+    if p_continues is not null then
+        select * into v_old from mission_tasks where id = p_continues;
+    end if;
+    if v_old.preset_id is not null then
+        -- `TaskDifficulty::for_rework`, the same thresholds.
+        v_needed := case when v_old.difficulty = 1 and v_old.quality_rejections >= 3 then 3
+                         when v_old.difficulty = 1 and v_old.quality_rejections >= 1 then 2
+                         when v_old.difficulty = 2 and v_old.quality_rejections >= 2 then 3
+                         else v_old.difficulty end;
+        select * into v_preset from grading_presets
+         where preset_id = coalesce(p_preset, v_old.preset_id);
+        if v_preset.preset_id is not null and v_preset.state in ('active', 'demoted')
+           and coalesce(v_preset.locked_grade, v_preset.calibrated_grade, 0) >= v_needed then
+            v_carried := true;
+            v_preset_id := v_preset.preset_id;
+            v_model := v_preset.model_profile;
+            v_difficulty := v_old.difficulty;
+            v_first := coalesce(v_old.first_preset_id, v_old.preset_id);
+            v_rejections := v_old.quality_rejections;
+            v_classification := null;
+        elsif p_preset is not null then
+            raise exception 'preset % does not take the continuation of task % (l% after % quality rejections, needing l%): only an active or demoted preset graded for it does',
+                p_preset, p_continues, v_old.difficulty, v_old.quality_rejections, v_needed;
+        else
+            v_preset := null;
+        end if;
+    end if;
+    if p_preset is not null and not v_carried then
+        select * into v_preset from grading_presets where preset_id = p_preset;
+        if v_preset.preset_id is null then
+            raise exception 'preset % is not in the grading catalog', p_preset;
+        end if;
+        if v_preset.state not in ('active', 'demoted') then
+            raise exception 'preset % is %: only an active or demoted preset is routed',
+                p_preset, v_preset.state;
+        end if;
+        if coalesce(v_preset.locked_grade, v_preset.calibrated_grade, 0) < p_difficulty then
+            raise exception 'preset % is graded %, below the l% task it is assigned', p_preset,
+                coalesce('l' || coalesce(v_preset.locked_grade, v_preset.calibrated_grade),
+                         'nothing'),
+                p_difficulty;
+        end if;
+        if v_preset.model_profile <> p_model then
+            raise exception 'preset % runs on the % model profile, not %', p_preset,
+                v_preset.model_profile, p_model;
+        end if;
     end if;
     select r.agent_id, r.session_id, coalesce((m.objectives ->> 'workers')::numeric::integer, 1)
       into v_agent, v_session, v_workers
@@ -5021,7 +5121,24 @@ begin
         'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', v_kind,
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief,
         'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario)
-        || jsonb_strip_nulls(jsonb_build_object('continues', p_continues)));
+        || jsonb_strip_nulls(jsonb_build_object('continues', p_continues))
+        || case when v_model <> 'default'
+                then jsonb_build_object('model', v_model) else '{}'::jsonb end
+        || case when v_preset_id is not null or v_difficulty <> 2
+                then jsonb_strip_nulls(jsonb_build_object('difficulty', 'l' || v_difficulty,
+                                                          'preset_id', v_preset_id))
+                else '{}'::jsonb end
+        || case when v_carried
+                then jsonb_strip_nulls(jsonb_build_object(
+                         'first_preset_id', nullif(v_first, v_preset_id),
+                         'quality_rejections', nullif(v_rejections, 0)))
+                else '{}'::jsonb end
+        || case when v_preset.execution_profile is not null
+                then jsonb_build_object('execution_profile', v_preset.execution_profile)
+                else '{}'::jsonb end
+        || case when v_classification is not null
+                then jsonb_build_object('classification', v_classification)
+                else '{}'::jsonb end);
     return v_id;
 end $$;
 
@@ -8104,7 +8221,8 @@ begin
         'spawn_cost_usd(jsonb, bigint, bigint, bigint, bigint)',
         'spawn_cost_archive_record(jsonb, jsonb)',
         'spawn_cost_session_record(jsonb, jsonb, jsonb)',
-        'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
+        'spawn_objective_assign(bigint, integer, text, text, bigint, text, integer, text, jsonb)',
+        'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',

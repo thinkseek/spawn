@@ -702,21 +702,15 @@ pub(crate) fn assign(
     if let Some(profile) = &decision.execution_profile {
         answer["execution_profile"] = json!(profile);
     }
+    for note in route_notes(&format!("task {task}"), &decision, classified.as_ref()) {
+        eprintln!("spawn: agent grading: {note}");
+    }
     if let (Some(classified), Some(record)) = (&classified, classification)
         && classified.has_signal()
     {
-        eprintln!(
-            "spawn: agent grading: task {task}: classified {}",
-            classified.rationale()
-        );
         answer["classification"] = record;
     }
     if decision.reprobe {
-        eprintln!(
-            "spawn: agent grading: task {task}: a re-probe of preset {}, which had no {} task \
-             for the re-probe interval",
-            decision.preset_id, decision.difficulty
-        );
         answer["reprobe"] = json!(true);
     }
     Ok(answer)
@@ -762,8 +756,8 @@ fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Pla
     if !explicit && flags.get("kind").as_deref() == Some("resident") {
         return Ok(Placement::Model { fallback: None });
     }
-    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
     if explicit {
+        let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
         return route_preset(
             difficulty.unwrap_or_default(),
             0,
@@ -773,26 +767,62 @@ fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Pla
         .map(|decision| Placement::Routed(decision, None))
         .map_err(|error| format!("agent grading: {error}"));
     }
+    Ok(
+        match route_unflagged(
+            store,
+            &flags.get("brief").unwrap_or_default(),
+            "--model default",
+        )? {
+            CatalogRoute::Routed(decision, classified) => {
+                Placement::Routed(decision, Some(classified))
+            }
+            CatalogRoute::Unrouted { fallback } => Placement::Model { fallback },
+        },
+    )
+}
+
+/// Where agent grading places a task its assigner named neither a
+/// difficulty nor a preset for ([`route_unflagged`]).
+pub(crate) enum CatalogRoute {
+    /// Through the catalog, with the classifier's decision on its text.
+    Routed(RoutingDecision, DifficultyClassification),
+    /// Not through the catalog, as before agent grading. `fallback`: why,
+    /// when the catalog holds presets (none when it is empty: nothing to
+    /// say).
+    Unrouted { fallback: Option<String> },
+}
+
+/// The route of an unflagged task (`spawn task assign` without
+/// `--difficulty`, `--preset` or `--model` for an ephemeral worker, and
+/// every objective the integrator assigns, `crate::objectives`), the one
+/// rule for both: its difficulty classified from `text`
+/// ([`classify_difficulty`]) and routed through the catalog at it when
+/// some routable preset is graded for it, else at `l2` when some is graded
+/// `l2` or above, with the anti-starvation re-probe
+/// ([`route_with_reprobe`]); otherwise unrouted, on `unrouted_as` (what the
+/// fallback reason names it), and when the catalog holds presets, saying
+/// why. An empty catalog is never an error.
+pub(crate) fn route_unflagged(
+    store: &spawn_postgres::PostgresStore,
+    text: &str,
+    unrouted_as: &str,
+) -> Result<CatalogRoute, String> {
+    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
     if catalog.is_empty() {
-        return Ok(Placement::Model { fallback: None });
+        return Ok(CatalogRoute::Unrouted { fallback: None });
     }
     // Classified first: an `l1` task reaches an `l1` preset (a demoted one
     // included, refilling its window) even when nothing covers `l2`.
-    let classified = classify_difficulty(&flags.get("brief").unwrap_or_default());
-    let default = TaskDifficulty::default();
-    // A classified difficulty the catalog cannot take is routed at the
-    // default, as phase 1 routed every unflagged task: the record keeps
-    // what the classifier said beside the difficulty it ran at.
-    let target = if catalog_covers(&catalog, classified.difficulty) {
-        classified.difficulty
-    } else if catalog_covers(&catalog, default) {
-        default
-    } else {
-        return Ok(Placement::Model {
+    let classified = classify_difficulty(text);
+    let Some(target) = routed_difficulty(&catalog, classified.difficulty) else {
+        return Ok(CatalogRoute::Unrouted {
             fallback: Some(format!(
                 "no routable preset in the grading catalog is graded {} or above: \
-                 assigned on --model default, as without the catalog",
-                classified.difficulty.max(default).required_grade()
+                 assigned on {unrouted_as}, as without the catalog",
+                classified
+                    .difficulty
+                    .max(TaskDifficulty::default())
+                    .required_grade()
             )),
         });
     };
@@ -806,8 +836,49 @@ fn placement(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Pla
         crate::grading::now_ms(),
         crate::grading::reprobe_interval_ms(),
     )
-    .map(|decision| Placement::Routed(decision, Some(classified)))
+    .map(|decision| CatalogRoute::Routed(decision, classified))
     .map_err(|error| format!("agent grading: {error}"))
+}
+
+/// The difficulty an unflagged task `classified` at is routed at: its own
+/// when the catalog covers it, else the default (`l2`) when that is
+/// covered, as phase 1 routed every unflagged task (the record keeps what
+/// the classifier said beside the difficulty it ran at); none when neither
+/// is.
+fn routed_difficulty(
+    catalog: &[GradedPreset],
+    classified: TaskDifficulty,
+) -> Option<TaskDifficulty> {
+    let default = TaskDifficulty::default();
+    if catalog_covers(catalog, classified) {
+        Some(classified)
+    } else if catalog_covers(catalog, default) {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+/// What a routed assignment says of its route on stderr (`subject`: `task
+/// 7`, ...): the classifier's rationale when it found a signal, and a
+/// re-probe when it is one. Shared by `spawn task assign` and the
+/// integrator's objective assignment.
+pub(crate) fn route_notes(
+    subject: &str,
+    decision: &RoutingDecision,
+    classified: Option<&DifficultyClassification>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(classified) = classified.filter(|classified| classified.has_signal()) {
+        notes.push(format!("{subject}: classified {}", classified.rationale()));
+    }
+    if decision.reprobe {
+        notes.push(format!(
+            "{subject}: a re-probe of preset {}, which had no {} task for the re-probe interval",
+            decision.preset_id, decision.difficulty
+        ));
+    }
+    notes
 }
 
 /// `spawn task reject`: send the task back, rerouting its rework when it
@@ -916,6 +987,34 @@ pub(crate) fn quality_reroute(
         revision: routed.revisions.saturating_add(1),
         model: routed.model,
     }))
+}
+
+/// Where the continuation of `task` (an objective's budget overrun,
+/// `crate::objectives`) runs when `task` was routed through the catalog:
+/// on `task`'s own preset while it still takes `task`'s rework (routable
+/// and graded for its difficulty stepped up for its quality rejections),
+/// else on the minimum-sufficient preset at that stepped-up difficulty, so
+/// a continuation never falls back below where its rework had stepped up.
+/// `spawn_objective_assign` carries `task`'s difficulty, first preset and
+/// quality rejections with it. None when `task` was not routed (or does
+/// not exist): the continuation is routed afresh; Some(Err) when no preset
+/// takes it.
+pub(crate) fn continuation_route(
+    store: &spawn_postgres::PostgresStore,
+    task: i64,
+) -> Result<Option<Result<RoutingDecision, RoutingError>>, String> {
+    let Some(routed) = store.routed_task(task).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let Some(current) = routed.preset_id.as_deref() else {
+        return Ok(None);
+    };
+    let rejections = u32::try_from(routed.quality_rejections).unwrap_or(0);
+    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
+    Ok(Some(
+        route_preset(routed.difficulty, rejections, Some(current), &catalog)
+            .or_else(|_| route_preset(routed.difficulty, rejections, None, &catalog)),
+    ))
 }
 
 /// Whether the preset `current` still takes a task of `difficulty` after

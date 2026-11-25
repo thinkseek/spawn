@@ -10639,3 +10639,407 @@ fn the_store_takes_an_integrator_start_and_refuses_each_bad_field() {
         .get(0);
     assert_eq!(count, 2);
 }
+
+/// A graded preset in the catalog, onboarded active at `grade`.
+fn graded_preset(db: &Db, id: &str, model: &str, rank: u32, grade: &str) {
+    db.store
+        .grading_record(&json!({"type": "preset.registered", "preset_id": id,
+                                "engine_label": "claude", "model_label": id,
+                                "model_profile": model, "cost_rank": rank}))
+        .expect("register");
+    db.store
+        .grading_record(&json!({"type": "preset.onboarded", "preset_id": id,
+                                "from_state": "unexamined", "to_state": "active",
+                                "to_grade": grade, "passed": 1, "total": 1,
+                                "failed_cases": [], "suite": "s"}))
+        .expect("onboard");
+}
+
+/// An objective mission whose backlog holds `objectives` (id, prompt).
+fn prompted_mission(db: &Db, base: &Path, name: &str, objectives: &[(u32, &str)]) -> i64 {
+    let ids: Vec<u32> = objectives.iter().map(|(id, _)| *id).collect();
+    let workers = u32::try_from(objectives.len()).expect("few");
+    let mission = backlog_mission(db, base, name, &ids, workers, None);
+    for (id, prompt) in objectives {
+        std::fs::write(
+            base.join("backlog").join(format!("{id:03}.json")),
+            json!({"id": id, "title": format!("Objective {id}"), "prompt": prompt}).to_string(),
+        )
+        .expect("objective");
+    }
+    mission
+}
+
+/// An objective task's grading as the store keeps it: (difficulty,
+/// preset, first preset, model, kind).
+fn grading_of(db: &Db, task: i64) -> (i16, Option<String>, Option<String>, String, String) {
+    let row = db
+        .admin()
+        .query_one(
+            "select difficulty, preset_id, first_preset_id, model, kind
+               from mission_tasks where id = $1",
+            &[&task],
+        )
+        .expect("the task");
+    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+}
+
+/// The `task.assigned` record of `task`.
+fn assigned_record(db: &Db, task: i64) -> Value {
+    db.admin()
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'task.assigned'
+                and kind -> 'detail' -> 'record' ->> 'id' = $1::bigint::text",
+            &[&task],
+        )
+        .expect("the record")
+        .get(0)
+}
+
+/// Issue #99 item 4: with the grading catalog empty an objective's task
+/// is assigned as before agent grading (default model, `l2`, no preset,
+/// a record naming none of them); with a catalog that covers neither its
+/// classified difficulty nor `l2` it falls back the same way, never
+/// failing the assignment.
+#[test]
+fn an_objective_without_a_catalog_that_takes_it_is_assigned_as_before() {
+    let base = std::env::temp_dir().join(format!("spawn-db-obj-ungraded-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let db = Db::new("objective_ungraded");
+    let mission = prompted_mission(&db, &base, "ru", &[(1, "Do it."), (2, "Do that.")]);
+    let none = std::collections::BTreeSet::new();
+    let first =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(first.len(), 2, "both assigned on an empty catalog");
+    for task in &first {
+        let record = assigned_record(&db, *task);
+        for key in [
+            "model",
+            "difficulty",
+            "preset_id",
+            "execution_profile",
+            "classification",
+        ] {
+            assert!(record.get(key).is_none(), "{key}: {record}");
+        }
+        let (difficulty, preset, first_preset, model, _) = grading_of(&db, *task);
+        assert_eq!(
+            (difficulty, preset, first_preset, model.as_str()),
+            (2, None, None, "default")
+        );
+    }
+
+    // A catalog that takes only l1: an l2 objective falls back, assigned.
+    let base_l1 = base.join("l1");
+    let db = Db::new("objective_uncovered");
+    graded_preset(&db, "small", "cheap", 0, "l1");
+    let mission = prompted_mission(&db, &base_l1, "rv", &[(3, "Do it.")]);
+    let assigned =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(assigned.len(), 1);
+    assert_eq!(
+        grading_of(&db, assigned[0]),
+        (2, None, None, "default".to_string(), "resident".to_string())
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Issue #99 item 4: an objective's task is classified from the
+/// objective's own text and routed through the catalog, resident and
+/// per-task worker alike: a typo fix to the cheap `l1` preset, a security
+/// fix to the `l3` one, each with its model, difficulty, preset and
+/// classification recorded; an `l2` preset's starved twin gets the next
+/// `l2` objective once (the anti-starvation re-probe), then routing is as
+/// before.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_objective_is_classified_and_routed_through_the_catalog() {
+    let base = std::env::temp_dir().join(format!("spawn-db-obj-graded-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let db = Db::new("objective_graded");
+    graded_preset(&db, "small", "cheap", 0, "l1");
+    graded_preset(&db, "mid", "default", 1, "l2");
+    graded_preset(&db, "mid-dear", "default", 3, "l2");
+    graded_preset(&db, "strong", "default", 2, "l3");
+    let mission = prompted_mission(
+        &db,
+        &base,
+        "rg",
+        &[
+            (1, "Fix the typo in README.md"),
+            (2, "Harden authentication: stop the SQL injection"),
+        ],
+    );
+    let none = std::collections::BTreeSet::new();
+    let assigned =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(assigned.len(), 2);
+    let (typo, security) = (
+        objective_task(&db, mission, 1).id,
+        objective_task(&db, mission, 2).id,
+    );
+    assert_eq!(
+        grading_of(&db, typo),
+        (
+            1,
+            Some("small".to_string()),
+            Some("small".to_string()),
+            "cheap".to_string(),
+            "resident".to_string()
+        )
+    );
+    assert_eq!(
+        grading_of(&db, security),
+        (
+            3,
+            Some("strong".to_string()),
+            Some("strong".to_string()),
+            "default".to_string(),
+            "ephemeral".to_string()
+        )
+    );
+    // The board the dispatcher delivers from names each task's model.
+    let board = db.mission(mission);
+    let model_of = |task: i64| {
+        board["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == task)
+            .map(|row| row["model"].clone())
+    };
+    assert_eq!(model_of(typo), Some(json!("cheap")));
+    assert_eq!(model_of(security), Some(json!("default")));
+    let record = assigned_record(&db, typo);
+    assert_eq!(record["model"], json!("cheap"));
+    assert_eq!(record["difficulty"], json!("l1"));
+    assert_eq!(record["preset_id"], json!("small"));
+    assert_eq!(record["classification"]["difficulty"], json!("l1"));
+    // Classified from the objective's text alone: the brief's standing
+    // rules are in the brief, not in the evidence.
+    assert!(
+        record["brief"]
+            .as_str()
+            .is_some_and(|brief| brief.contains("Work only inside this workspace")),
+        "{record}"
+    );
+    let evidence = record["classification"]["signals"].to_string();
+    assert!(!evidence.contains("Cargo.toml"), "{evidence}");
+    assert!(!evidence.contains("e2e"), "{evidence}");
+    let record = assigned_record(&db, security);
+    assert_eq!(record["difficulty"], json!("l3"));
+    assert_eq!(record["classification"]["difficulty"], json!("l3"));
+    assert!(
+        record.get("model").is_none(),
+        "default is not named: {record}"
+    );
+
+    // The re-probe: every preset's window long past, the next l2
+    // objective goes once to mid-dear (mid is the cheapest), then to mid.
+    db.admin()
+        .batch_execute("update grading_presets set window_start_ms = 0")
+        .expect("starve the presets");
+    let base_l2 = base.join("l2");
+    let mission = prompted_mission(&db, &base_l2, "rp", &[(5, "Do it.")]);
+    let probed =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(
+        grading_of(&db, probed[0]).1.as_deref(),
+        Some("mid-dear"),
+        "the starved l2 preset is re-probed"
+    );
+    db.store.task_cancel(probed[0]).expect("cancel");
+    let next =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(
+        grading_of(&db, next[0]).1.as_deref(),
+        Some("mid"),
+        "re-probed once, then the minimum-sufficient preset"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Issue #99 item 4: a routed objective task the gate rejects steps its
+/// rework up in the verdict's own statement (`record_gated`), as any
+/// routed task's does: the `l1` typo fix on `small` is rerouted to `mid`
+/// (`l2`, the default model), its first preset kept; the board's model,
+/// which the dispatcher runs the rework on, moves with it.
+#[test]
+fn a_routed_objectives_gate_rejection_steps_its_rework_up() {
+    let base = std::env::temp_dir().join(format!("spawn-db-obj-stepup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let db = Db::new("objective_step_up");
+    graded_preset(&db, "small", "cheap", 0, "l1");
+    graded_preset(&db, "mid", "default", 1, "l2");
+    graded_preset(&db, "strong", "default", 2, "l3");
+    let mission = prompted_mission(&db, &base, "rs", &[(1, "Fix the typo in README.md")]);
+    let none = std::collections::BTreeSet::new();
+    let assigned =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    let task = assigned[0];
+    assert_eq!(grading_of(&db, task).1.as_deref(), Some("small"));
+    db.store.task_delivered(task, 1).expect("delivered");
+    assert!(db.store.task_reported(task, "done").expect("reported"));
+    let rerouted = super::record_gated(
+        &db.store,
+        &json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "rejected",
+                "base": "b", "note": "a check failed"}),
+    )
+    .expect("recorded")
+    .expect("rerouted");
+    assert_eq!(
+        rerouted,
+        json!({"type": "task.rerouted", "id": task, "preset_id": "mid", "model": "default",
+               "from_preset_id": "small", "revision": 1, "routed_difficulty": "l2"})
+    );
+    assert_eq!(task_state(&db, mission, task), "revise");
+    assert_eq!(
+        grading_of(&db, task),
+        (
+            1,
+            Some("mid".to_string()),
+            Some("small".to_string()),
+            "default".to_string(),
+            "resident".to_string()
+        )
+    );
+    let board = db.mission(mission);
+    let row = board["tasks"]
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .find(|row| row["id"] == task)
+        .cloned()
+        .expect("the task");
+    assert_eq!(row["model"], json!("default"));
+    // A third rejection (two more) steps it up to l3.
+    for revision in 1..3 {
+        db.store.task_delivered(task, 1).expect("delivered");
+        assert!(db.store.task_reported(task, "done").expect("reported"));
+        let _ = super::record_gated(
+            &db.store,
+            &json!({"type": "task.gated", "id": task, "revision": revision,
+                    "verdict": "rejected", "base": "b", "note": "a check failed"}),
+        )
+        .expect("recorded");
+    }
+    assert_eq!(grading_of(&db, task).1.as_deref(), Some("strong"));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `task`, delivered and reported at `revision`, rejected by the gate as
+/// the integrator records it (`record_gated`, its step-up included).
+fn gate_rejected(db: &Db, task: i64, revision: i32) {
+    db.store.task_delivered(task, 1).expect("delivered");
+    assert!(db.store.task_reported(task, "done").expect("reported"));
+    super::record_gated(
+        &db.store,
+        &json!({"type": "task.gated", "id": task, "revision": revision,
+                "verdict": "rejected", "base": "b", "note": "a check failed"}),
+    )
+    .expect("recorded");
+}
+
+/// Issue #99 item 4, review F1: a routed objective task stepped up by the
+/// gate (`small` to `mid`, one quality rejection) that then overruns its
+/// budget continues on `mid` (the default model) at its own `l1`, its
+/// first preset `small` and its rejection carried: never routed afresh
+/// onto `small` with its rejections forgotten.
+#[test]
+fn an_overrun_continuation_keeps_the_stepped_up_grading() {
+    let base = std::env::temp_dir().join(format!("spawn-db-obj-carry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let db = Db::new("objective_carry");
+    graded_preset(&db, "small", "cheap", 0, "l1");
+    graded_preset(&db, "mid", "default", 1, "l2");
+    graded_preset(&db, "strong", "default", 2, "l3");
+    let mission = prompted_mission(&db, &base, "rc", &[(1, "Fix the typo in README.md")]);
+    let none = std::collections::BTreeSet::new();
+    let first = crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+        .expect("a pass")[0];
+    gate_rejected(&db, first, 0);
+    assert_eq!(grading_of(&db, first).1.as_deref(), Some("mid"));
+    db.store.task_delivered(first, 2).expect("delivered again");
+    db.record(&json!({"type": "task.over_budget", "id": first,
+                      "reason": "the task made more than 5 tool calls",
+                      "tool_calls": 6, "elapsed_ms": 1_000, "budget": {"tool_calls": 5}}));
+    let next =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(next.len(), 1);
+    let continuation = next[0];
+    assert_eq!(continues_of(&db, continuation), Some(first));
+    assert_eq!(
+        grading_of(&db, continuation),
+        (
+            1,
+            Some("mid".to_string()),
+            Some("small".to_string()),
+            "default".to_string(),
+            "ephemeral".to_string()
+        )
+    );
+    let rejections: i32 = db
+        .admin()
+        .query_one(
+            "select quality_rejections from mission_tasks where id = $1",
+            &[&continuation],
+        )
+        .expect("the task")
+        .get(0);
+    assert_eq!(rejections, 1);
+    let record = assigned_record(&db, continuation);
+    assert!(record.get("classification").is_none(), "{record}");
+    assert_eq!(record["quality_rejections"], json!(1));
+    // Its next rejection steps it on as the first task's would have: l3.
+    gate_rejected(&db, continuation, 0);
+    assert_eq!(grading_of(&db, continuation).1.as_deref(), Some("mid"));
+    gate_rejected(&db, continuation, 1);
+    assert_eq!(grading_of(&db, continuation).1.as_deref(), Some("strong"));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Issue #99 item 4, review F1: an objective whose task yields after three
+/// gate rejections (stepped up to `strong` on the way) gets a fresh task,
+/// classified and routed afresh: back on `small` at `l1`, no rejection
+/// carried. At the default limit of three attempts an `l1` objective never
+/// runs at `l3` across a yield.
+#[test]
+fn a_fresh_task_after_a_yield_is_routed_afresh() {
+    let base = std::env::temp_dir().join(format!("spawn-db-obj-yield-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let db = Db::new("objective_routed_yield");
+    graded_preset(&db, "small", "cheap", 0, "l1");
+    graded_preset(&db, "mid", "default", 1, "l2");
+    graded_preset(&db, "strong", "default", 2, "l3");
+    let mission = prompted_mission(&db, &base, "ry", &[(1, "Fix the typo in README.md")]);
+    let none = std::collections::BTreeSet::new();
+    let first = crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+        .expect("a pass")[0];
+    for revision in 0..3 {
+        gate_rejected(&db, first, revision);
+    }
+    assert_eq!(grading_of(&db, first).1.as_deref(), Some("strong"));
+    let next =
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none).expect("a pass");
+    assert_eq!(task_state(&db, mission, first), "cancelled", "yielded");
+    assert_eq!(next.len(), 1);
+    let fresh = next[0];
+    assert_ne!(fresh, first);
+    assert_eq!(continues_of(&db, fresh), None);
+    assert_eq!(
+        grading_of(&db, fresh),
+        (
+            1,
+            Some("small".to_string()),
+            Some("small".to_string()),
+            "cheap".to_string(),
+            "resident".to_string()
+        )
+    );
+    let record = assigned_record(&db, fresh);
+    assert_eq!(record["classification"]["difficulty"], json!("l1"));
+    assert!(record.get("quality_rejections").is_none(), "{record}");
+    let _ = std::fs::remove_dir_all(&base);
+}

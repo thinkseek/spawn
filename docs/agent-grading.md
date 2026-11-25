@@ -161,7 +161,12 @@ phase 1 only a review did.
   difficulty of its calibrated grade, assigned since `window_start_ms`,
   newest 10 by `updated_at_ms`. In it: tasks `landed` or `accepted`, and
   tasks `cancelled` after at least one quality rejection unless a re-issue
-  or reassign carried them on (the successor counts instead). Left out: a
+  or reassign carried them on (the successor counts instead). A budget
+  overrun's continuation that carried the overrun's grading (same
+  `first_preset_id`, its `quality_rejections` with it: "Known limits")
+  replaces its cancelled predecessor the same way, so one piece of work is
+  one sample; a continuation that carried nothing (`first_preset_id` null:
+  no preset took its rework) leaves the predecessor counted. Left out: a
   cancel with no quality rejection (re-issue, reassign, over budget,
   aborted, mission closed, resident retired, a person's clean cancel).
   First pass: `landed` or `accepted` with no quality rejection.
@@ -301,14 +306,49 @@ the API now tell apart as many profiles as presets name.
 
 ## Known limits
 
-- **Only an unflagged ephemeral `spawn task assign` is classified and
-  routed.** A task made from an objective (the SQL function
-  `spawn_objective_assign`, which the integrator and the objective
-  missions use to assign by objective, such as Mission #4) carries no difficulty and no preset. It is never
-  classified or routed through the catalog, and has no gate step-up,
-  since a task without a preset is never rerouted. It runs on `--model
-  default` as before. The same holds for a resident task without
-  `--difficulty` or `--preset`.
+- **Objective tasks are routed like an unflagged ephemeral task.** A
+  task made from an objective (the integrator's `objectives::assign`, the
+  SQL function `spawn_objective_assign`, which objective missions such as
+  Mission #4 assign by) is classified from the objective's own title and
+  prompt (never the brief's standing rules, earlier tasks' reports or gate
+  history, whose words would move the classifier), routed through the
+  catalog by the same rule as `spawn task assign` (its classified
+  difficulty, else `l2`, with the anti-starvation re-probe:
+  `missions::route_unflagged`), and recorded with its `model`,
+  `difficulty`, `preset_id`, `execution_profile` and `classification`.
+  Its gate rejections step its rework up as any routed task's do, within
+  the task. Across tasks of one objective:
+  - A budget overrun's continuation (`continues`, `p_continues`) keeps the
+    continued task's grading, as a re-issue does: its difficulty,
+    `first_preset_id` and `quality_rejections`, on its stepped-up
+    `preset_id` (and that preset's `model` and execution profile) while
+    that preset still takes its rework, else on the minimum-sufficient
+    preset that does (`missions::continuation_route`). It is not
+    classified again. When no routable preset takes its rework any more,
+    it is assigned without the catalog. A continuation of a task assigned
+    without the catalog is routed afresh by the integrator, and records
+    exactly what it did before from the five-argument SQL call.
+  - A fresh task after the objective **yields** (its attempt limit,
+    `SPAWN_OBJECTIVE_ATTEMPTS`, 3 by default) is classified and routed
+    afresh: nothing of the yielded task's step-up is carried, so at the
+    default limit an `l1` objective never runs at `l3` across a yield.
+
+  When the catalog is empty, covers neither its difficulty nor `l2`, or
+  cannot be read, it is assigned as before (`default`, `l2`, no preset; an
+  uncovered catalog or a read failure is logged). Grading never makes the
+  integrator skip an objective, with one narrow race: a preset disabled
+  (or regraded) between the integrator's catalog read and its
+  `spawn_objective_assign` call is refused by the SQL's checks; the
+  refusal is logged, nothing is recorded, and the next pass routes the
+  objective on the catalog as it is then. `spawn_objective_assign` called
+  with its five arguments (the gate's scenarios do) records exactly what
+  it did before, unless it continues a routed task. Unlike
+  `spawn task assign`, this holds for the mission's resident too: a
+  resident whose next objective routes to another model profile is
+  stopped and resumed on it (`deliver`'s model switch).
+- A resident task of `spawn task assign` without `--difficulty` or
+  `--preset` is not classified or routed: it runs on `--model default` as
+  before.
 - **Item 4 of issue #99 is name-only.** `execution_profile` is carried by
   the catalog, routing, the records, `spawn grade` and `/api/grading`, but
   the dispatcher still runs every worker on `model_profile` (`default` or
