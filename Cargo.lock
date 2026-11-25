@@ -761,7 +761,7 @@ dependencies = [
  "libc",
  "rustix",
  "serde_json",
- "sha2",
+ "spawn-cas",
  "spawn-core",
  "spawn-host",
  "spawn-postgres",
