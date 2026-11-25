@@ -1,4 +1,4 @@
-//! HTTP API and static files for the observer UI: 29 GET route patterns
+//! HTTP API and static files for the observer UI: 31 GET route patterns
 //! (`GET /api/stream` among them) and nine POST routes. Seven are a
 //! person's writes: an input to a session, a key, a restart or a reassign
 //! of a stalled worker, the resume of a halted mission, a message to the
