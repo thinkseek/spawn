@@ -506,8 +506,8 @@ impl PostgresStore {
     /// back the shadows a predecessor queued and no longer waits for
     /// (PR S4).
     pub fn remote_jobs_queued(&self, kind: RemoteJobKind) -> Result<Vec<RemoteJob>, StoreError> {
-        let kind = serde_json::to_value(kind)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let kind =
+            serde_json::to_value(kind).map_err(|error| StoreError::Backend(error.to_string()))?;
         let kind = kind.as_str().unwrap_or_default().to_string();
         decode(self.query_json(
             "select coalesce(jsonb_agg(to_jsonb(j) order by j.enqueued_at_ms, j.job_id),

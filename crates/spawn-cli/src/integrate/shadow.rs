@@ -1623,8 +1623,11 @@ mod tests {
             std::fs::create_dir_all(ctl.join("scripts")).unwrap();
             std::fs::write(ctl.join("scripts/gate.sh"), "exit 0\n").unwrap();
             std::fs::create_dir_all(ctl.join("web")).unwrap();
-            std::fs::write(ctl.join("web/package-lock.json"), "{\"lockfileVersion\":3}\n")
-                .unwrap();
+            std::fs::write(
+                ctl.join("web/package-lock.json"),
+                "{\"lockfileVersion\":3}\n",
+            )
+            .unwrap();
             let scenarios = ctl.join("rsi/scenarios");
             let (repo, base, candidate) = remote::repository(&dir.0);
             let cargo_home = dir.0.join("cargo");
@@ -1656,6 +1659,20 @@ mod tests {
                 scenarios: self.scenarios.clone(),
                 judging_id: Some(JUDGING.to_string()),
             }
+        }
+
+        /// A real task (the record's writer refuses one it does not hold).
+        fn task(&self) -> i64 {
+            let source = self.repo.to_string_lossy().to_string();
+            let mission = self
+                .ledger
+                .store
+                .mission_add("gated", &json!([source]), "human")
+                .expect("a mission");
+            self.ledger
+                .store
+                .task_assign(mission, "ephemeral", "worker", "brief", "default")
+                .expect("a task")
         }
 
         fn results(&self) -> PathBuf {
@@ -1769,7 +1786,13 @@ mod tests {
                 .verify(&std::fs::read(world.artifact(&digest)).unwrap())
                 .unwrap();
         }
-        assert!(world.dir.0.join("artifacts/registry-manifest.json").is_file());
+        assert!(
+            world
+                .dir
+                .0
+                .join("artifacts/registry-manifest.json")
+                .is_file()
+        );
         assert_eq!(row.requires["pg"], "16");
         assert_eq!(row.requires["registry"].as_str().unwrap().len(), 64);
         assert_eq!(row.requires["toolchain"], json!(null));
@@ -1799,12 +1822,13 @@ mod tests {
             },
             world.dir.0.join("shadow"),
         );
-        runner.offer(world.want(7));
-        nodes.offer(&world.ledger.store, world.want(7));
+        let task = world.task();
+        runner.offer(world.want(task));
+        nodes.offer(&world.ledger.store, world.want(task));
         let waiting = nodes.waiting();
         assert_eq!(waiting.len(), 1);
         let row = queued_and_published(&world, &waiting[0]);
-        assert_eq!(row.task_id, Some(7));
+        assert_eq!(row.task_id, Some(task));
         let node = world.ledger.enroll("n252", 9, &row.requires);
         let verdict =
             super::super::remote::tests::verdict_on("accepted", &world.base, &world.candidate);
@@ -1816,7 +1840,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         let from_node = &records[0];
         assert_eq!(from_node["type"], "task.shadow_gated");
-        assert_eq!(from_node["id"], 7);
+        assert_eq!(from_node["id"], task);
         assert_eq!(from_node["runner"], "node:n252");
         assert_eq!(from_node["result"], "verdict");
         assert_eq!(from_node["verdict"], "accepted");
@@ -1874,7 +1898,13 @@ mod tests {
         assert!(nodes.waiting().is_empty());
         assert!(written.all().is_empty());
         assert_eq!(
-            world.ledger.store.remote_job(&job_id).unwrap().unwrap().state,
+            world
+                .ledger
+                .store
+                .remote_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .state,
             spawn_postgres::RemoteJobState::FallbackLocal
         );
         assert!(world.ledger.records("task.gated").is_empty());
@@ -1903,7 +1933,13 @@ mod tests {
         let written = Written::new();
         after.poll(&world.ledger.store, &|record| written.write(record));
         assert_eq!(
-            world.ledger.store.remote_job(&orphan).unwrap().unwrap().state,
+            world
+                .ledger
+                .store
+                .remote_job(&orphan)
+                .unwrap()
+                .unwrap()
+                .state,
             spawn_postgres::RemoteJobState::FallbackLocal
         );
         assert_eq!(
@@ -1917,7 +1953,10 @@ mod tests {
             .remote_jobs_queued(spawn_postgres::RemoteJobKind::GateShadow)
             .unwrap();
         assert_eq!(
-            queued.iter().map(|job| job.job_id.as_str()).collect::<Vec<_>>(),
+            queued
+                .iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
             [mine.as_str()]
         );
         assert!(written.all().is_empty());
@@ -1954,7 +1993,13 @@ mod tests {
         nodes.poll(&world.ledger.store, &|record| written.write(record));
         assert_eq!(nodes.waiting(), vec![job_id.clone()]);
         assert_eq!(
-            world.ledger.store.remote_job(&job_id).unwrap().unwrap().state,
+            world
+                .ledger
+                .store
+                .remote_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .state,
             spawn_postgres::RemoteJobState::Queued
         );
     }
@@ -1968,7 +2013,7 @@ mod tests {
         let (meta, log) = remote::meta("gs-222222222222-abcdefgh", 1, Some(2), None, "", "", None);
         let stored = super::remote::Stored { meta, log };
         let judged = super::remote::judge_stored(&stored, &world.primary);
-        let record = super::node_record_of(&world.want(14), "node:n1", &stored, &judged);
+        let record = super::node_record_of(&world.want(world.task()), "node:n1", &stored, &judged);
         assert_eq!(record["inputs"], json!({}));
         assert_eq!(record["agrees"], Value::Null);
         assert!(!record["unequal"].as_array().unwrap().is_empty());
