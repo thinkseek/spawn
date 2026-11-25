@@ -115,9 +115,14 @@ const LAUNCH_SETTLE: Duration = Duration::from_secs(1);
 /// host is gone or the panes it follows changed.
 const EVENT_POLL: Duration = Duration::from_millis(500);
 
-/// Herdr's error codes for an agent that is not ready for input yet (it was
-/// started moments ago) or is blocked on a dialog: refusals before anything
-/// is typed, which the caller may try again.
+/// Herdr's error codes that refuse input to an agent: not ready yet (it was
+/// started moments ago) or blocked on a dialog. When `agent.get` answers with
+/// one, nothing was typed, and the caller may try again. In practice
+/// `agent.get` answers neither: `agent_not_ready` and `agent_blocked` come
+/// from Herdr's agent input calls (`agent.send_keys`, `agent.prompt`), which
+/// this host does not use yet (PR 3). A blocked agent's status, read from
+/// `agent.get`, refuses nothing here: the Bridge types only into a pane its
+/// own reading accepts input on.
 const NOT_TYPED: [&str; 2] = ["agent_not_ready", "agent_blocked"];
 
 /// Whether a Herdr error code refuses input before any key went
@@ -668,10 +673,12 @@ impl HerdrHost {
     }
 
     /// Before text is staged for `terminal`: whether its agent refuses
-    /// input now, as Herdr says (an agent started moments ago, still
-    /// `launch_pending` with no status, or Herdr's `agent_not_ready` and
-    /// `agent_blocked`). A pane with no agent Herdr knows, or no pane, is
-    /// not refused here: the typing finds out.
+    /// input now, as `agent.get` says: an agent started moments ago, still
+    /// `launch_pending` with no status, is refused as `agent_not_ready`, and
+    /// so is an `agent.get` that fails with one of [`NOT_TYPED`]. A `blocked`
+    /// status is not refused here (the Bridge's own reading of the pane
+    /// guards it), nor is a pane with no agent Herdr knows, or no pane: the
+    /// typing finds out.
     fn refuses_input(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
         let Some(record) = self.record(terminal)? else {
             return Ok(());
@@ -1257,9 +1264,9 @@ impl TerminalHost for HerdrHost {
     }
 
     /// The text goes to a private file of this host's: nothing reaches the
-    /// pane. Herdr is only asked whether the pane's agent takes input now
-    /// (an agent it is still starting, or one it says is not ready or
-    /// blocked, refuses it before anything is typed).
+    /// pane. Herdr is only asked whether the pane's agent takes input now:
+    /// an agent it is still starting refuses it before anything is typed
+    /// ([`HerdrHost::refuses_input`]).
     fn stage_text(
         &self,
         terminal: &TerminalName,
