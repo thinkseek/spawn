@@ -491,6 +491,17 @@ impl PostgresStore {
         .transpose()
     }
 
+    /// Every v1 node, by name (their keys and token digests left out):
+    /// `spawn node list` beside the P1 nodes (PR S4).
+    pub fn nodes_v1(&self) -> Result<Vec<NodeV1>, StoreError> {
+        decode(self.query_json(
+            "select coalesce(jsonb_agg(to_jsonb(n) - 'pubkey' - 'enroll_token_sha256'
+                                       order by n.name), '[]'::jsonb)
+               from spawn_node_state n",
+            &[],
+        )?)
+    }
+
     /// One v1 node by name, or `None`.
     pub fn node_v1(&self, name: &str) -> Result<Option<NodeV1>, StoreError> {
         self.query_opt_json(
