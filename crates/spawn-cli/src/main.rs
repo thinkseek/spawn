@@ -74,6 +74,7 @@ mod nodes;
 mod objectives;
 mod push;
 mod recover;
+mod resolve;
 mod rewrite_guard;
 mod runtime;
 mod scorecard;

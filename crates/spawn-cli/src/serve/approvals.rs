@@ -119,28 +119,28 @@ pub(super) const ATTENTION_NEEDS_HUMAN: f64 = 0.7;
 
 /// One answer a prompt offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Choice {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) keys: Vec<NamedKey>,
-    pub(super) danger: bool,
+pub(crate) struct Choice {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) keys: Vec<NamedKey>,
+    pub(crate) danger: bool,
     /// `allow`, `allow_always`, `deny`, or `keys` for any other.
-    pub(super) action: &'static str,
+    pub(crate) action: &'static str,
 }
 
 /// A prompt found on a pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Prompt {
-    pub(super) kind: &'static str,
-    pub(super) label: String,
-    pub(super) summary: Option<String>,
-    pub(super) choices: Vec<Choice>,
+pub(crate) struct Prompt {
+    pub(crate) kind: &'static str,
+    pub(crate) label: String,
+    pub(crate) summary: Option<String>,
+    pub(crate) choices: Vec<Choice>,
     /// The choice the prompt's cursor stands on (its id), when one is drawn.
-    pub(super) cursor: Option<String>,
+    pub(crate) cursor: Option<String>,
     /// The dialog's body, normalized, one entry a line ([`dialog_body`]):
     /// what it asks to approve (the command, the file, the tool's input),
     /// which its id holds.
-    pub(super) body: Vec<String>,
+    pub(crate) body: Vec<String>,
 }
 
 impl Choice {
@@ -155,7 +155,7 @@ impl Choice {
 
 /// FNV-1a, 64 bits: a hash that is the same in every build and process
 /// (`DefaultHasher` promises neither), for ids a page sends back.
-pub(super) fn fnv1a(text: &str) -> u64 {
+pub(crate) fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
@@ -165,7 +165,7 @@ pub(super) fn fnv1a(text: &str) -> u64 {
 /// kept because it can be the whole difference between two commands
 /// (`git branch -D main` and `git branch -d main`), and a pane does not
 /// change a line's case while the same prompt shows.
-fn normalized(text: &str) -> String {
+pub(crate) fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -176,7 +176,7 @@ impl Prompt {
     /// timer, output above the dialog, where its cursor stands) does not
     /// move it; another prompt, or the same question over another command,
     /// has another.
-    pub(super) fn id(&self, session: &str) -> String {
+    pub(crate) fn id(&self, session: &str) -> String {
         let mut basis = vec![self.kind.to_string()];
         basis.push(normalized(self.summary.as_deref().unwrap_or(&self.label)));
         basis.push(format!("body {}", self.body.len()));
@@ -434,7 +434,7 @@ fn question_at(lines: &[&str], before: usize) -> Option<usize> {
 }
 
 /// The prompt a pane's text shows at its bottom, if any (module doc).
-pub(super) fn detect(text: &str) -> Option<Prompt> {
+pub(crate) fn detect(text: &str) -> Option<Prompt> {
     let all: Vec<&str> = text.lines().collect();
     let mut end = all.len();
     while end > 0 && bare(all[end - 1]).is_empty() {
@@ -699,13 +699,13 @@ pub(super) fn excerpt(text: &str) -> String {
 
 /// What one live session shows, as [`items`] reads it.
 #[derive(Debug, Clone, Default)]
-pub(super) struct Pane {
-    pub(super) session_id: String,
-    pub(super) agent_id: String,
-    pub(super) backend: Option<&'static str>,
-    pub(super) text: String,
+pub(crate) struct Pane {
+    pub(crate) session_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) backend: Option<&'static str>,
+    pub(crate) text: String,
     /// `{state, needs_human, attention}` of its judgement, or null.
-    pub(super) judgement: Value,
+    pub(crate) judgement: Value,
 }
 
 /// An attention item's id: the session and a hash of the judge's reason.
@@ -802,7 +802,7 @@ fn backend(host: &spawn_host::LocalTerminalHost) -> &'static str {
 
 /// The pane tail of execution `execution` of `agent`, as `/api/sessions/<id>/pane`
 /// reads it (nothing when it cannot be captured).
-fn capture(
+pub(crate) fn capture(
     host: &spawn_host::LocalTerminalHost,
     execution: &spawn_core::id::ExecutionId,
     agent: &str,
@@ -836,7 +836,7 @@ fn live_tail(
 
 /// The live panes: the fleet board's live sessions (one read), each pane
 /// captured through the terminal host.
-fn panes(
+pub(crate) fn panes(
     store: &spawn_postgres::PostgresStore,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<Pane>, String> {
@@ -893,8 +893,25 @@ pub(super) fn approvals() -> Result<Value, String> {
         Value::Null
     });
     let now = now_ms();
+    let mut listed = items(&panes, &board, now);
+    // What the resolver did and may do on each session's item (additive):
+    // `{state, answered, breaker}` (`crate::resolve::auto_for`).
+    let (mode, _) = crate::resolve::Mode::from_env();
+    let ledger = store
+        .commands_by(crate::resolve::PRINCIPAL, 500)
+        .map(|commands| crate::resolve::Ledger::from_json(&commands))
+        .unwrap_or_else(|error| {
+            warnings.push(format!("approvals: the resolver's commands: {error}"));
+            crate::resolve::Ledger::default()
+        });
+    let clock = store.now_ms().unwrap_or(now);
+    for item in &mut listed {
+        if let Some(session) = item["session_id"].as_str().map(str::to_string) {
+            item["auto"] = crate::resolve::auto_for(mode, &ledger, &session, clock);
+        }
+    }
     Ok(json!({
-        "items": items(&panes, &board, now),
+        "items": listed,
         "generated_at_ms": now,
         "warnings": warnings,
     }))
