@@ -933,7 +933,7 @@ impl PostgresStore {
 
 /// One `supersedes` edge of a `land` change (PV4), as `spawn prov
 /// durability` reads it: the edge, and the change it leaves from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProvSupersedes {
     pub edge: ProvEdgeRecord,
     pub src: ProvChangeRecord,
