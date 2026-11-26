@@ -54,7 +54,7 @@ import {
 } from "./bits";
 import { DoingIcon, doingNow } from "./FleetBoard";
 import { InputBox, useWritable } from "./InputBox";
-import { moveAnswer, newKey, sendAnswer } from "../../input";
+import { moveAnswer, sendAnswer } from "../../input";
 import { keyLabel } from "../../keys";
 import type { KeyName } from "../../keys";
 

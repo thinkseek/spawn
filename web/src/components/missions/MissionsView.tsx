@@ -45,6 +45,8 @@ import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { TaskActivityLine } from "./TaskActivity";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
+import { Badge } from "../ui/badge";
+import { gradeTone, taskGradingSummary } from "../../grading.ts";
 import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
 import { TaskText, useTaskTexts } from "./TaskTexts";
@@ -671,6 +673,7 @@ function TaskRow({
   group: TaskGroup<MissionTask>;
 }) {
   const title = taskTitle(task, { missionName });
+  const grading = taskGradingSummary(task);
   // The board sends the texts' first lines; the whole is read when asked
   // (the brief opened, a "show the whole" pressed), one GET for the three.
   const texts = useTaskTexts(task, false);
@@ -715,6 +718,42 @@ function TaskRow({
         )}
         {task.model === "cheap" && (
           <Pill className="bg-muted text-muted-foreground">cheap model</Pill>
+        )}
+        {grading?.difficulty && (
+          <Badge
+            tone={gradeTone(grading.difficulty)}
+            title={
+              grading.tierRole
+                ? `Difficulty ${grading.difficulty} · tier ${grading.tierRole}`
+                : `Difficulty ${grading.difficulty}`
+            }
+          >
+            {grading.difficulty}
+            {grading.tierRole ? ` · ${grading.tierRole}` : ""}
+          </Badge>
+        )}
+        {grading?.presetId && (
+          <Badge
+            tone={grading.rerouted ? "warning" : "neutral"}
+            title={
+              grading.rerouted
+                ? `Rerouted ${grading.firstPresetId} -> ${grading.presetId}`
+                : grading.executionProfile
+                  ? `Preset ${grading.presetId} (${grading.executionProfile})`
+                  : `Preset ${grading.presetId}`
+            }
+          >
+            <span className="font-mono">
+              {grading.rerouted
+                ? `${grading.firstPresetId} → ${grading.presetId}`
+                : grading.presetId}
+            </span>
+          </Badge>
+        )}
+        {grading && grading.qualityRejections > 0 && (
+          <Badge tone="warning" title="Quality-rejection rework count">
+            {grading.qualityRejections} quality rej
+          </Badge>
         )}
         <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
         <span className="tnum ml-auto text-micro text-faint-foreground">

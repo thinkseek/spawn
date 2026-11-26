@@ -1858,7 +1858,7 @@
       "title": "Agent Grading: grading catalog, onboarding exams, routing & calibration",
       "kind": "capability",
       "parent": "domain-missions-fleet",
-      "summary": "Top-down 3-tier agent grading (`T3` `claude-fable-5-2` `l3` top-decision & fallback, `T2` `gemini-pro-orchestrator-neon` `l2` mainline default, optional `T1` `deepseek-v4` / `deepseek-v4.1-flash` / `kimi` `l1` deterministic mechanical offload) seeded idempotently by `spawn grade init-topdown [--with-l1] [--l1-model <label>]`; `brief-v3` multilingual/architecture/destructive-blocker classifier; upward-only fallback (`l1` -> `l2` when uncovered, never downgrading `l3` -> `l2`), `Active`-over-`Demoted` routing preference, `engine_label`/`model_label` propagation on `RoutingDecision`/`task assign`, opt-in re-probe (off by default via `SPAWN_GRADING_REPROBE_SECS`), `tier_role` on `/api/grading`, quality-rejection rework step-up, calibration over `mission_tasks`, and `--brief-file` / `--brief -` stdin dispatch (#119).",
+      "summary": "Top-down 3-tier agent grading (`T3` `claude-fable-5-2` `l3` top-decision & fallback, `T2` `gemini-pro-orchestrator-neon` `l2` mainline default, optional `T1` `deepseek-v4` / `deepseek-v4.1-flash` / `kimi` `l1` deterministic mechanical offload) seeded idempotently by `spawn grade init-topdown [--with-l1] [--l1-model <label>]`; `brief-v3` multilingual/architecture/destructive-blocker classifier; upward-only fallback (`l1` -> `l2` when uncovered, never downgrading `l3` -> `l2`), `Active`-over-`Demoted` routing preference, `engine_label`/`model_label` propagation on `RoutingDecision`/`task assign`, opt-in re-probe (off by default via `SPAWN_GRADING_REPROBE_SECS`), `tier_role` on `/api/grading`, quality-rejection rework step-up, calibration over `mission_tasks`, `--brief-file` / `--brief -` stdin dispatch (#119), `spawn mission list` grading & step-up history surfacing, and read-only `#/grading` web catalog + Mission/Task grading badges.",
       "files": [
         "crates/spawn-cli/src/grading.rs",
         "crates/spawn-cli/src/missions.rs",
@@ -1898,7 +1898,11 @@
         "evals/onboarding/l3-toposort/cases/07.out",
         "evals/onboarding/l3-toposort/check.sh",
         "evals/onboarding/l3-toposort/reference/toposort.sh",
-        "evals/onboarding/l3-toposort/spec.md"
+        "evals/onboarding/l3-toposort/spec.md",
+        "web/src/components/grading/GradingView.tsx",
+        "web/src/grading.ts",
+        "web/src/gradingApi.ts",
+        "web/test/grading.test.ts"
       ],
       "relations": [
         {
@@ -1916,7 +1920,8 @@
         "agents": [],
         "commits": [],
         "tests": [
-          "crates/spawn-postgres/tests/grading.rs"
+          "crates/spawn-postgres/tests/grading.rs",
+          "web/test/grading.test.ts"
         ],
         "deploys": [],
         "artifacts": [

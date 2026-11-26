@@ -14,6 +14,7 @@ import { CostView } from "./components/cost/CostView";
 import { CoveragePage } from "./components/features/CoveragePage";
 import { FeatureMapView } from "./components/features/FeatureMapView";
 import { FleetView } from "./components/fleet/FleetView";
+import { GradingView } from "./components/grading/GradingView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
 import { ScorecardView } from "./components/scorecard/ScorecardView";
@@ -34,6 +35,7 @@ const ShowView = lazy(() =>
 export type View =
   | "fleet"
   | "missions"
+  | "grading"
   | "features"
   | "coverage"
   | "rsi"
@@ -53,6 +55,7 @@ function routeFromHash(): Route {
   const hash = window.location.hash;
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
+  if (hash.startsWith("#/grading")) return { view: "grading", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
   if (hash.startsWith("#/features")) return { view: "features", agent: null };
   if (hash.startsWith("#/coverage")) return { view: "coverage", agent: null };
@@ -79,6 +82,7 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "missions") return "#/missions";
+  if (route.view === "grading") return "#/grading";
   if (route.view === "features") return "#/features";
   if (route.view === "coverage") return "#/coverage";
   if (route.view === "alerts") return "#/alerts";
@@ -266,6 +270,7 @@ export default function App() {
         openAlerts={openAlerts}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
+        onShowGrading={() => setView("grading")}
         onShowFeatures={() => setView("features")}
         onShowCoverage={() => setView("coverage")}
         onShowRsi={() => setView("rsi")}
@@ -286,6 +291,7 @@ export default function App() {
         attention={humanCount}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
+        onShowGrading={() => setView("grading")}
         onShowFeatures={() => setView("features")}
         onShowCoverage={() => setView("coverage")}
         onShowRsi={() => setView("rsi")}
@@ -320,6 +326,8 @@ export default function App() {
         />
       ) : view === "missions" ? (
         <MissionsView missions={missions} />
+      ) : view === "grading" ? (
+        <GradingView />
       ) : view === "features" ? (
         <FeatureMapView
           onOpenSession={openTimeline}

@@ -9,6 +9,8 @@ import { stageStep } from "../../missions";
 import { taskTitle } from "../../ordering";
 import { VerdictBadge } from "../rsi/Phase";
 import { cx } from "../ui";
+import { Badge } from "../ui/badge";
+import { gradeTone, taskGradingSummary } from "../../grading.ts";
 import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
 import { TaskActivityLine } from "./TaskActivity";
@@ -40,6 +42,7 @@ export function TaskPanel({
   onZoom: () => void;
 }) {
   const task = bar.task;
+  const grading = taskGradingSummary(task);
   // Opened, the task's texts are read in full (the board sends their first
   // lines).
   const texts = useTaskTexts(task, true);
@@ -140,6 +143,37 @@ export function TaskPanel({
             </Field>
           )}
           {task.model === "cheap" && <Field label="Model">cheap (DeepSeek)</Field>}
+          {grading?.difficulty && (
+            <Field label="Difficulty">
+              <span className="inline-flex flex-wrap items-center gap-1.5">
+                <Badge tone={gradeTone(grading.difficulty)}>{grading.difficulty}</Badge>
+                {grading.tierRole && (
+                  <span className="font-mono text-caption text-muted-foreground">
+                    {grading.tierRole}
+                  </span>
+                )}
+              </span>
+            </Field>
+          )}
+          {grading?.presetId && (
+            <Field label="Preset">
+              <span className="font-mono text-caption">
+                {grading.rerouted
+                  ? `${grading.firstPresetId} → ${grading.presetId}`
+                  : grading.presetId}
+              </span>
+              {grading.executionProfile && (
+                <span className="ml-1.5 text-caption text-muted-foreground">
+                  ({grading.executionProfile})
+                </span>
+              )}
+            </Field>
+          )}
+          {grading && grading.qualityRejections > 0 && (
+            <Field label="Quality rej">
+              <Badge tone="warning">{grading.qualityRejections}</Badge>
+            </Field>
+          )}
         </dl>
 
         {lastVerdict && (

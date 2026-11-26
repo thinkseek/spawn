@@ -251,6 +251,7 @@ spawn grade lock-grade <preset_id> --grade l1|l2|l3  |  unlock-grade <preset_id>
 spawn grade enable|disable <preset_id>
 spawn grade calibrate [--apply] [--json]
 spawn grade upkeep [--apply] [--json]
+spawn mission list [--limit N] [--json | --table]        # --json default; enriches tasks with grading & rework_step_up
 spawn task assign ... (--brief <text|-> | --brief-file <path>) [--difficulty l1|l2|l3] [--preset <preset_id>]
 spawn task reassign --id N [--reason <text|-> | --reason-file <path>]
 spawn task reject --id N --note <text>        # reroutes stepped-up rework in the same statement
@@ -406,7 +407,16 @@ the API now tell apart as many profiles as presets name.
   `execution_profile`, and `task.assigned` / `task.rerouted` carry it when
   the preset has one.
 - `GET /api/grading`: `{presets: [... every catalog field, routing_grade,
-  profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names]}`, read-only.
+  profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names]}`,
+  read-only, rendered by the web UI's `#/grading` view (`GradingView`).
+- `spawn mission list [--limit N] [--json | --table]`: enriches each mission's
+  tasks with `difficulty`, `routed_difficulty`, `preset_id`, `first_preset_id`,
+  `tier_role`, `quality_rejections`, `engine_label`, `model_label`,
+  `execution_profile`, and `rework_step_up` (`{quality_rejections,
+  from_difficulty, routed_difficulty, stepped_up, first_preset_id, preset_id}`)
+  from `grading_presets` and `mission_tasks` (via `PostgresStore::routed_task`),
+  keeping `--json` as the default for existing callers and adding `--table` for
+  terminal review.
 
 ## Known limits
 
@@ -453,12 +463,16 @@ the API now tell apart as many profiles as presets name.
 - A resident task of `spawn task assign` without `--difficulty` or
   `--preset` is not classified or routed: it runs on `--model default` as
   before.
-- **Item 4 of issue #99 is name-only.** `execution_profile` is carried by
-  the catalog, routing, the records, `spawn grade` and `/api/grading`, but
+- **Item 4 of issue #99 is still name-only at dispatch.** `execution_profile`
+  is carried by the catalog, routing, the records, `spawn grade`,
+  `spawn mission list`, and `/api/grading` (and shown in `#/grading`), but
   the dispatcher still runs every worker on `model_profile` (`default` or
-  `cheap`). `spawn mission list` and the web UI do not yet show a task's
-  difficulty, preset, classification or step-up history, and no page
-  reads `/api/grading`. This change does not close issue #99 on its own.
+  `cheap`). The web UI (`#/grading`, `MissionsView`, `TaskPanel`) now displays
+  the `/api/grading` catalog by Top-Down tier and renders optional task grading
+  badges when present, while the `MISSION_BOARD` SQL backing `GET /api/missions`
+  does not yet project `mission_tasks` grading columns (`spawn mission list`
+  supplies them via CLI enrichment; web task badges degrade gracefully when
+  omitted). This change does not close issue #99 on its own.
 - The classifier reads only the brief's words and structure. Under `brief-v3`,
   destructive verbs such as `delete`, `remove`, `drop`, `replace`, and `change`
   (along with Chinese equivalents `删除`, `修改`, `修复`, `设计`, etc.) cancel
@@ -493,6 +507,9 @@ the API now tell apart as many profiles as presets name.
 - A re-issued or reassigned task keeps its preset without checking that it
   is still routable.
 - The suite's default path is relative to the working directory.
-- No page shows the catalog; `spawn grade list` does (phase 2:
-  `/api/grading` serves it; no page reads it yet). `spawn mission list`
-  shows a task's `model`, not its difficulty or preset.
+- `#/grading` now displays the `/api/grading` catalog grouped by Top-Down tier
+  (`spawn grade list` shows the same in the CLI); `spawn mission list` shows
+  task difficulty, preset, `tier_role`, and `rework_step_up` history, while
+  `GET /api/missions` still awaits SQL projection of task grading columns in
+  `spawn-postgres` (the web `MissionsView` and `TaskPanel` render those badges
+  whenever provided).

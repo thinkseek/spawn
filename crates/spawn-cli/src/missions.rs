@@ -10,11 +10,13 @@
 //! lock and records the whole result; a setting is cleared only by its own
 //! `--no-<setting>` switch.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 use spawn_core::event::ModelProfile;
 use spawn_core::grading::{
     DifficultyClassification, GradedPreset, RoutingDecision, RoutingError, TaskDifficulty,
-    classify_difficulty, route_preset, route_with_reprobe,
+    classify_difficulty, route_preset, route_with_reprobe, tier_role,
 };
 
 use crate::{Flags, open_store};
@@ -112,7 +114,7 @@ pub(crate) const USAGE: &str = "usage:
       source renews it. Prints the hold and the main it was taken at: gate against that main)
   spawn mission release --source <path>   (owner: the waiting tasks land at the next pass; with
       no hold it records nothing and prints `released` null)
-  spawn mission list [--limit N]   (every task with its stages)
+  spawn mission list [--limit N] [--json | --table]   (every task with its stages and grading: JSON by default, --table for a readable summary)
   spawn mission show --id N [--root <workspace root>]
       (one mission by id, including one outside list's window: its resolved source and mirror,
       actual landing repository, gate and backlog paths, per-open-task delivery/report/gate
@@ -1205,6 +1207,8 @@ fn split_mission(rest: &[String]) -> Result<(&str, Flags), String> {
         &CLEARING.map(|(switch, _, _)| switch)
     } else if verb == "push" {
         &["gated", "urgent"]
+    } else if verb == "list" {
+        &["json", "table"]
     } else {
         &[]
     };
@@ -1546,6 +1550,195 @@ fn objectives_row(mission: &Value) -> Value {
     })
 }
 
+/// Read the mission board (`store.mission_board(limit)`) and enrich each
+/// task with grading metadata (`difficulty`, `routed_difficulty`, `preset_id`,
+/// `first_preset_id`, `tier_role`, `quality_rejections`, and
+/// `rework_step_up` when stepped up/reworked) while preserving all existing
+/// board fields for backward compatibility.
+pub(crate) fn list_board(
+    store: &spawn_postgres::PostgresStore,
+    limit: i64,
+) -> Result<Value, String> {
+    let mut board = store
+        .mission_board(limit)
+        .map_err(|error| error.to_string())?;
+    let catalog = store.grading_catalog().unwrap_or_default();
+    enrich_board_grading(&mut board, &catalog, |task_id| {
+        store.routed_task(task_id).ok().flatten()
+    });
+    Ok(board)
+}
+
+fn enrich_board_grading(
+    board: &mut Value,
+    catalog: &[GradedPreset],
+    lookup: impl Fn(i64) -> Option<spawn_postgres::RoutedTask>,
+) {
+    let by_id: HashMap<&str, &GradedPreset> = catalog
+        .iter()
+        .map(|preset| (preset.preset_id.as_str(), preset))
+        .collect();
+    let Some(missions) = board
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("missions"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for mission in missions {
+        let Some(tasks) = mission
+            .as_object_mut()
+            .and_then(|obj| obj.get_mut("tasks"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for task in tasks {
+            let Some(task_obj) = task.as_object_mut() else {
+                continue;
+            };
+            let Some(task_id) = task_obj.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            let Some(routed) = lookup(task_id) else {
+                continue;
+            };
+            let rejections_u32 = u32::try_from(routed.quality_rejections.max(0)).unwrap_or(0);
+            let routed_difficulty = routed.difficulty.for_rework(rejections_u32);
+            let preset = routed
+                .preset_id
+                .as_deref()
+                .and_then(|preset_id| by_id.get(preset_id).copied());
+            let role = tier_role(
+                preset
+                    .and_then(GradedPreset::routing_grade)
+                    .or_else(|| Some(routed_difficulty.required_grade())),
+            );
+            task_obj.insert("difficulty".to_string(), json!(routed.difficulty));
+            task_obj.insert("routed_difficulty".to_string(), json!(routed_difficulty));
+            task_obj.insert(
+                "quality_rejections".to_string(),
+                json!(routed.quality_rejections),
+            );
+            if let Some(role) = role {
+                task_obj.insert("tier_role".to_string(), json!(role));
+            }
+            if let Some(preset_id) = &routed.preset_id {
+                task_obj.insert("preset_id".to_string(), json!(preset_id));
+            }
+            if let Some(first_preset_id) = &routed.first_preset_id {
+                task_obj.insert("first_preset_id".to_string(), json!(first_preset_id));
+            }
+            if let Some(preset) = preset {
+                if !preset.engine_label.is_empty() {
+                    task_obj.insert("engine_label".to_string(), json!(preset.engine_label));
+                }
+                if !preset.model_label.is_empty() {
+                    task_obj.insert("model_label".to_string(), json!(preset.model_label));
+                }
+                if let Some(profile) = &preset.execution_profile {
+                    task_obj.insert("execution_profile".to_string(), json!(profile));
+                }
+            }
+            if routed.quality_rejections > 0
+                || routed.first_preset_id != routed.preset_id
+                || routed_difficulty != routed.difficulty
+            {
+                task_obj.insert(
+                    "rework_step_up".to_string(),
+                    json!({
+                        "quality_rejections": routed.quality_rejections,
+                        "from_difficulty": routed.difficulty,
+                        "routed_difficulty": routed_difficulty,
+                        "stepped_up": routed_difficulty != routed.difficulty,
+                        "first_preset_id": routed.first_preset_id,
+                        "preset_id": routed.preset_id,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+fn mission_summary_line(mission: &Value) -> &str {
+    mission["text"]
+        .as_str()
+        .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or("(untitled)")
+}
+
+/// Human-readable `spawn mission list --table` view showing missions,
+/// tasks, grading (`difficulty`, `tier_role`, `preset_id`) and rework step-up history.
+fn format_mission_board_table(board: &Value) -> String {
+    let missions = board["missions"].as_array().map_or(&[][..], Vec::as_slice);
+    if missions.is_empty() {
+        return "(no missions)".to_string();
+    }
+    let mut lines = Vec::new();
+    for (idx, mission) in missions.iter().enumerate() {
+        if idx > 0 {
+            lines.push(String::new());
+        }
+        let mission_id = mission["id"]
+            .as_i64()
+            .map_or_else(|| "?".to_string(), |id| id.to_string());
+        let state = mission["state"].as_str().unwrap_or("-");
+        lines.push(format!(
+            "Mission #{mission_id} [{state}] {}",
+            mission_summary_line(mission)
+        ));
+        let tasks = mission["tasks"].as_array().map_or(&[][..], Vec::as_slice);
+        if tasks.is_empty() {
+            lines.push("  (no tasks)".to_string());
+            continue;
+        }
+        lines.push(format!(
+            "  {:<6} {:<10} {:<7} {:<4} {:<18} {:<24} {}",
+            "TASK", "STATE", "MODEL", "DIFF", "TIER", "PRESET", "REWORK / AGENT"
+        ));
+        for task in tasks {
+            let task_id = task["id"]
+                .as_i64()
+                .map_or_else(|| "T?".to_string(), |id| format!("T{id}"));
+            let t_state = task["state"].as_str().unwrap_or("-");
+            let model = task["model"].as_str().unwrap_or("-");
+            let diff = task["difficulty"].as_str().unwrap_or("-");
+            let tier = task["tier_role"].as_str().unwrap_or("-");
+            let preset = task["preset_id"].as_str().unwrap_or("-");
+            let rework = task["rework_step_up"].as_object().map(|step| {
+                let from_d = step
+                    .get("from_difficulty")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let to_d = step
+                    .get("routed_difficulty")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let rej = step
+                    .get("quality_rejections")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let from_p = step
+                    .get("first_preset_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let to_p = step.get("preset_id").and_then(Value::as_str).unwrap_or("-");
+                format!("step-up {from_d}->{to_d}, {rej} rej, {from_p}->{to_p}")
+            });
+            let detail = match (rework, task["agent_id"].as_str()) {
+                (Some(rw), Some(agent)) if !agent.is_empty() => format!("{rw} ({agent})"),
+                (Some(rw), _) => rw,
+                (None, Some(agent)) if !agent.is_empty() => agent.to_string(),
+                _ => "-".to_string(),
+            };
+            lines.push(format!(
+                "  {task_id:<6} {t_state:<10} {model:<7} {diff:<4} {tier:<18} {preset:<24} {detail}"
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let (verb, flags) = split_mission(rest)?;
     let store = open_store()?;
@@ -1577,11 +1770,19 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         "objectives" => print(&list_objectives(&store, &flags)?),
         "show" => print(&show(&store, &flags)?),
         "list" => {
+            if flags.switch("json") && flags.switch("table") {
+                return Err("use either --json or --table, not both".to_string());
+            }
             let limit = flags
                 .get("limit")
                 .and_then(|text| text.parse().ok())
                 .unwrap_or(20);
-            print(&store.mission_board(limit).map_err(err)?);
+            let board = list_board(&store, limit)?;
+            if flags.switch("table") {
+                println!("{}", format_mission_board_table(&board));
+            } else {
+                print(&board);
+            }
         }
         "close" => {
             let mission = id(&flags, "id")?;
@@ -3306,6 +3507,111 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn mission_list_flags_and_table_formatting_show_grading_and_rework_step_up() {
+        let table_args = [
+            "list".to_string(),
+            "--table".to_string(),
+            "--limit".to_string(),
+            "5".to_string(),
+        ];
+        let (verb, parsed_table) = split_mission(&table_args).unwrap();
+        assert_eq!(verb, "list");
+        assert!(parsed_table.switch("table"));
+        assert!(!parsed_table.switch("json"));
+        assert_eq!(parsed_table.get("limit").as_deref(), Some("5"));
+
+        let json_args = ["list".to_string(), "--json".to_string()];
+        let (_, parsed_json) = split_mission(&json_args).unwrap();
+        assert!(parsed_json.switch("json"));
+
+        assert_eq!(
+            super::format_mission_board_table(&json!({ "missions": [] })),
+            "(no missions)"
+        );
+
+        let catalog = vec![spawn_core::grading::GradedPreset {
+            preset_id: spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string(),
+            engine_label: "agy".to_string(),
+            model_label: "gemini-pro-orchestrator-neon".to_string(),
+            model_profile: ModelProfile::Default,
+            execution_profile: Some(
+                spawn_core::grading::ExecutionProfile::parse("neon-mainline").unwrap(),
+            ),
+            cost_rank: 20,
+            state: spawn_core::grading::PresetState::Active,
+            onboarded_grade: None,
+            calibrated_grade: None,
+            locked_grade: Some(spawn_core::grading::SkillGrade::L2),
+            window_start_ms: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_event: 0,
+        }];
+
+        let mut board = json!({
+            "missions": [{
+                "id": 42,
+                "state": "open",
+                "text": "Top-down rollout\nSecond line",
+                "tasks": [
+                    {
+                        "id": 101,
+                        "state": "revise",
+                        "model": "default",
+                        "agent_id": "agent_w1"
+                    },
+                    {
+                        "id": 102,
+                        "state": "assigned",
+                        "model": "default",
+                        "agent_id": "agent_w2"
+                    }
+                ]
+            }]
+        });
+
+        super::enrich_board_grading(&mut board, &catalog, |id| match id {
+            101 => Some(spawn_postgres::RoutedTask {
+                task: 101,
+                state: "revise".to_string(),
+                revisions: 1,
+                quality_rejections: 1,
+                difficulty: spawn_core::grading::TaskDifficulty::L1,
+                preset_id: Some(spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string()),
+                first_preset_id: Some(spawn_core::grading::TOPDOWN_L1_PRESET_ID.to_string()),
+                model: "default".to_string(),
+            }),
+            _ => None,
+        });
+
+        let tasks = board["missions"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["difficulty"], json!("l1"));
+        assert_eq!(tasks[0]["routed_difficulty"], json!("l2"));
+        assert_eq!(tasks[0]["tier_role"], json!("mainline"));
+        assert_eq!(
+            tasks[0]["preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+        );
+        assert_eq!(tasks[0]["rework_step_up"]["stepped_up"], json!(true));
+        // Unrouted task 102 stays untouched and valid.
+        assert!(tasks[1].get("difficulty").is_none());
+
+        let table = super::format_mission_board_table(&board);
+        assert!(
+            table.contains("Mission #42 [open] Top-down rollout"),
+            "{table}"
+        );
+        assert!(table.contains("T101"), "{table}");
+        assert!(table.contains("mainline"), "{table}");
+        assert!(table.contains("topdown-l2-neon"), "{table}");
+        assert!(
+            table.contains("step-up l1->l2, 1 rej, topdown-l1-mechanical->topdown-l2-neon"),
+            "{table}"
+        );
+        assert!(table.contains("T102"), "{table}");
+    }
 }
 
 #[cfg(test)]
@@ -3496,5 +3802,116 @@ mod database_tests {
                 .contains("refusing to downgrade l3 to l2"),
             "{l3_no_downgrade}"
         );
+    }
+
+    #[test]
+    fn mission_list_enriches_tasks_with_grading_and_rework_step_up_history() {
+        let schema = TestSchema::new("cli_missions_list_grading");
+        let store = schema.store();
+        let mission = store
+            .mission_add("Grading Board Visibility", &json!([]), "human")
+            .unwrap();
+        let mission_id = mission.to_string();
+
+        crate::grading::init_topdown(&store, true, Some("deepseek-v4.1-flash")).unwrap();
+
+        let t1 = super::assign(
+            &store,
+            &flags(&[
+                "--mission",
+                &mission_id,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w-l1",
+                "--brief",
+                "Fix the typo in README.md",
+            ]),
+        )
+        .unwrap()["task"]
+            .as_i64()
+            .unwrap();
+        let _t2 = super::assign(
+            &store,
+            &flags(&[
+                "--mission",
+                &mission_id,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w-l2",
+                "--brief",
+                "Adjust button spacing in dashboard panel",
+            ]),
+        )
+        .unwrap();
+        let _t3 = super::assign(
+            &store,
+            &flags(&[
+                "--mission",
+                &mission_id,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w-l3",
+                "--brief",
+                "Harden authentication against SQL injection",
+            ]),
+        )
+        .unwrap();
+
+        // Deliver & report t1, then send back once for quality so L1 steps up to L2 Neon.
+        store.task_delivered(t1, 1).unwrap();
+        assert!(store.task_reported(t1, "done").unwrap());
+        let t1_str = t1.to_string();
+        super::reject(
+            &store,
+            &flags(&["--id", &t1_str, "--note", "fix edge case"]),
+        )
+        .unwrap();
+
+        let board = super::list_board(&store, 20).unwrap();
+        let tasks = board["missions"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 3);
+
+        // Task 1: L1 stepped up to L2 Neon with rework_step_up metadata.
+        assert_eq!(tasks[0]["difficulty"], json!("l1"));
+        assert_eq!(tasks[0]["routed_difficulty"], json!("l2"));
+        assert_eq!(tasks[0]["quality_rejections"], json!(1));
+        assert_eq!(
+            tasks[0]["first_preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L1_PRESET_ID)
+        );
+        assert_eq!(
+            tasks[0]["preset_id"],
+            json!(spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+        );
+        assert_eq!(tasks[0]["tier_role"], json!("mainline"));
+        assert_eq!(tasks[0]["rework_step_up"]["stepped_up"], json!(true));
+        assert_eq!(tasks[0]["rework_step_up"]["from_difficulty"], json!("l1"));
+        assert_eq!(tasks[0]["rework_step_up"]["routed_difficulty"], json!("l2"));
+
+        // Task 2: L2 Neon mainline.
+        assert_eq!(tasks[1]["difficulty"], json!("l2"));
+        assert_eq!(tasks[1]["tier_role"], json!("mainline"));
+        assert_eq!(tasks[1]["engine_label"], json!("agy"));
+        assert_eq!(
+            tasks[1]["model_label"],
+            json!("gemini-pro-orchestrator-neon")
+        );
+        assert_eq!(tasks[1]["execution_profile"], json!("neon-mainline"));
+        assert!(tasks[1].get("rework_step_up").is_none(), "{}", tasks[1]);
+
+        // Task 3: L3 Fable top-decision.
+        assert_eq!(tasks[2]["difficulty"], json!("l3"));
+        assert_eq!(tasks[2]["tier_role"], json!("top-decision"));
+        assert_eq!(tasks[2]["model_label"], json!("claude-fable-5-2"));
+
+        let table = super::format_mission_board_table(&board);
+        assert!(table.contains("Mission #"), "{table}");
+        assert!(table.contains("topdown-l2-neon"), "{table}");
+        assert!(table.contains("topdown-l3-fable"), "{table}");
+        assert!(table.contains("top-decision"), "{table}");
+        assert!(table.contains("step-up l1->l2, 1 rej"), "{table}");
     }
 }
