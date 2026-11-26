@@ -693,7 +693,7 @@ const GATEWAY_FUNCTIONS: [&str; 4] = [
 ];
 
 /// The relations a database's supervisor login selects by a grant of its own.
-const SUPERVISOR_SELECTS: [&str; 15] = [
+const SUPERVISOR_SELECTS: [&str; 18] = [
     "grading_presets",
     "mission_missions",
     "mission_residents",
@@ -709,6 +709,9 @@ const SUPERVISOR_SELECTS: [&str; 15] = [
     "spawn_human_intents",
     "spawn_interventions",
     "spawn_outcomes",
+    "spawn_ref_log",
+    "spawn_refs",
+    "spawn_snapshots",
 ];
 
 /// Issue #98's review (M1): no grant reaches the schema, its database or

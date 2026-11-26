@@ -83,6 +83,9 @@ impl Store {
                 .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > TMP_MAX_AGE))
         };
         for entry in read_dir_or_empty(&self.tmp_dir())? {
+            if entry.file_name().to_string_lossy() == crate::gc_fence::GC_UNREACH_STATE_FILE {
+                continue;
+            }
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
@@ -191,7 +194,7 @@ impl Store {
     /// All digests referenced in D6 persistent namespaces (`tree`, `blob`),
     /// read under the exclusive GC lock so ephemeral LRU eviction never deletes
     /// shared backing objects.
-    fn persistent_digests(&self) -> Result<BTreeSet<Digest>, CasError> {
+    pub(crate) fn persistent_digests(&self) -> Result<BTreeSet<Digest>, CasError> {
         let mut persistent = BTreeSet::new();
         for name in [NS_TREE, NS_BLOB] {
             let namespace = self.root().join("access").join(name);
@@ -259,7 +262,7 @@ impl Store {
     }
 }
 
-fn read_dir_or_empty(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
+pub(crate) fn read_dir_or_empty(directory: &Path) -> io::Result<Vec<fs::DirEntry>> {
     match fs::read_dir(directory) {
         Ok(entries) => entries.collect(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),

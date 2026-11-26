@@ -89,6 +89,7 @@ mod command_queue;
 mod commit_map;
 pub mod control_mask;
 mod cost;
+pub mod d6_refs;
 mod event_log;
 mod experience;
 mod features;
@@ -115,6 +116,7 @@ pub use control_mask::stored_text as control_stored_text;
 pub use cost::{
     ArchiveCounted, ArchiveFile, ArchivedMessage, SessionCounted, SessionFile, SessionMessage,
 };
+pub use d6_refs::{DbIdentity, RefKind, RefLogRow, RefRow, SnapshotRow, SnapshotState};
 pub use gateway::{
     HumanInput, HumanKey, HumanMaster, HumanResume, HumanTask, HumanWrite, MAX_MASTER_KEY_BYTES,
     MasterMessageMode,

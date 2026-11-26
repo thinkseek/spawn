@@ -327,25 +327,7 @@ impl Store {
                 max: CHUNK_MAX,
             });
         }
-        let (mut temp, staged) = self.temp_file("cidx")?;
-        let write_result = temp
-            .write_all(&encoded)
-            .and_then(|()| temp.flush())
-            .and_then(|()| temp.set_permissions(fs::Permissions::from_mode(0o444)));
-        drop(temp);
-        if let Err(error) = write_result {
-            remove_missing_ok(&staged)?;
-            return Err(error.into());
-        }
-        self.chunk_index_dir(&file_id)?;
-        let target = self.chunk_index_path(&file_id);
-        let link_result = fs::hard_link(&staged, &target);
-        let _ = remove_missing_ok(&staged);
-        match link_result {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
+        self.write_chunk_index(namespace, &file_id, &encoded)?;
         let chunk_count = index.chunks.len();
         Ok(StoredBlob {
             digest: file_id,
@@ -353,6 +335,47 @@ impl Store {
             chunked: true,
             chunk_count,
         })
+    }
+
+    fn write_chunk_index(
+        &self,
+        namespace: &str,
+        file_id: &Digest,
+        encoded: &[u8],
+    ) -> Result<(), CasError> {
+        let persistent = crate::gc::is_persistent_namespace(namespace);
+        let _gc_guard = persistent.then(|| self.lock_gc_shared()).transpose()?;
+        let (mut temp, staged) = self.temp_file("cidx")?;
+        let now = self.now();
+        let write_result = temp
+            .write_all(encoded)
+            .and_then(|()| temp.flush())
+            .and_then(|()| {
+                if persistent {
+                    temp.set_times(fs::FileTimes::new().set_accessed(now).set_modified(now))?;
+                }
+                Ok(())
+            })
+            .and_then(|()| temp.set_permissions(fs::Permissions::from_mode(0o444)));
+        drop(temp);
+        if let Err(error) = write_result {
+            remove_missing_ok(&staged)?;
+            return Err(error.into());
+        }
+        self.chunk_index_dir(file_id)?;
+        let target = self.chunk_index_path(file_id);
+        let link_result = fs::hard_link(&staged, &target);
+        let _ = remove_missing_ok(&staged);
+        match link_result {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if persistent {
+                    self.refresh_file_mtime(&target)?;
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     /// Read and validate the [`ChunkIndex`] for a chunked blob `file_digest`.
