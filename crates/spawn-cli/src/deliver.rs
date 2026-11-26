@@ -5062,14 +5062,56 @@ mod tests {
     /// The time of the passes below.
     const NOW: i64 = 10_000_000;
 
+    /// Create a minimal bare git repository with an initial commit on
+    /// `main` under `root` so delivery/report tests never depend on a
+    /// pre-existing `/tmp/source.git` on the host.
+    fn temp_bare_source(root: &std::path::Path) -> std::path::PathBuf {
+        let seed = root.join("seed");
+        let source = root.join("source.git");
+        let _ = std::fs::remove_dir_all(&seed);
+        let _ = std::fs::remove_dir_all(&source);
+        std::fs::create_dir_all(&seed).expect("seed dir");
+        let seed_str = seed.to_string_lossy().to_string();
+        let source_str = source.to_string_lossy().to_string();
+        crate::sources::test_git(&["init", "-q", "--initial-branch=main", &seed_str])
+            .expect("git init");
+        std::fs::write(seed.join("README.md"), "fixture\n").expect("write fixture file");
+        crate::sources::test_git(&["-C", &seed_str, "add", "."]).expect("git add");
+        crate::sources::test_git(&[
+            "-C",
+            &seed_str,
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ])
+        .expect("git commit");
+        crate::sources::test_git(&["clone", "-q", "--bare", &seed_str, &source_str])
+            .expect("git clone bare");
+        let _ = std::fs::remove_dir_all(&seed);
+        source
+    }
+
     /// A task of `db` delivered to an ephemeral worker whose turn ended at
     /// its prompt (its report is due), with checkpoint `c1`: the task's row,
     /// the worker's facts, and the root its workspace is under, with
     /// `.spawn/` and no report yet.
     fn delivered_task(db: &Db, label: &str) -> (TaskRow, Facts, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "spawn-unfinished-{label}-{}-{}",
+            std::process::id(),
+            db.schema
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let source = temp_bare_source(&root);
         let mission = db
             .store
-            .mission_add("Payouts", &json!(["/tmp/source.git"]), "human")
+            .mission_add("Payouts", &json!([source.to_string_lossy()]), "human")
             .expect("mission");
         let id = db
             .store
@@ -5094,12 +5136,6 @@ mod tests {
         facts.session_id.clone_from(&row_task.session_id);
         facts.checkpoint = Some("c1".to_string());
         assert!(facts.report_due(), "the report is due");
-        let root = std::env::temp_dir().join(format!(
-            "spawn-unfinished-{label}-{}-{}",
-            std::process::id(),
-            db.schema
-        ));
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(&row_task.agent_id).join(".spawn")).expect("workspace");
         (row_task, facts, root)
     }
@@ -5336,18 +5372,22 @@ PENDING_ISSUES\n";
         use spawn_core::id::{AgentId, ExecutionId, SessionId};
         use spawn_core::port::{CommandQueue, EventLog};
         let db = Db::new("report_lifecycle");
+        let root = std::env::temp_dir().join(format!(
+            "spawn-report-lifecycle-{}-{}",
+            std::process::id(),
+            db.schema
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let source = temp_bare_source(&root);
         let mission = db
             .store
-            .mission_add("Lifecycle", &json!(["/tmp/source.git"]), "human")
+            .mission_add("Lifecycle", &json!([source.to_string_lossy()]), "human")
             .expect("mission");
         let task = db
             .store
             .task_assign(mission, "ephemeral", "lifecycle", "brief", "default")
             .expect("task");
-        let root =
-            std::env::temp_dir().join(format!("spawn-report-lifecycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("root");
         let pass = || {
             crate::dispatch::step(
                 &db.store,
