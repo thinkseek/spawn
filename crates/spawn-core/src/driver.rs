@@ -201,6 +201,17 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     /// own ([`SessionBinding::Reported`]).
     fn reported_session(&self, line: &str) -> Option<String>;
 
+    /// The directory below the engine's home whose subdirectories are its
+    /// conversations, one per native session, when the engine names its own
+    /// ([`SessionBinding::Reported`]) and the Bridge may look for the one an
+    /// execution started there itself (agy's `<home>/brain`): the fallback
+    /// when the terminal host reports no session (agy's hooks and the
+    /// host's socket masked inside its filesystem view). `None` for an
+    /// engine whose sessions are not found that way.
+    fn session_scan_dir(&self, _home: &EngineHome) -> Option<String> {
+        None
+    }
+
     /// What one transcript line says.
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts;
 
@@ -535,6 +546,11 @@ impl AgentDriver for AgyDriver {
     /// agy's lines never name its conversation: the host reports it.
     fn reported_session(&self, _line: &str) -> Option<String> {
         None
+    }
+
+    /// `<home>/brain`: one directory per conversation.
+    fn session_scan_dir(&self, home: &EngineHome) -> Option<String> {
+        Some(format!("{}/brain", home.sessions.trim_end_matches('/')))
     }
 
     fn read_line(&self, line: &str, cursor: &mut LineCursor) -> LineFacts {
