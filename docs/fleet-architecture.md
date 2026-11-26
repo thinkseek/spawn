@@ -2381,8 +2381,10 @@ exec bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent --unshare-pid
     spawn run -- agy <args>
 ```
 
-The runner stays the engine's parent and writes the exit status into the
-workspace. Binding rules, from the probe under herdr 0.9.5 and bwrap 0.9.0:
+`<TMPDIR>` is the engine's own, `<engine home>/.spawn-tmp` (0700): never
+the loop's shared `TMPDIR` (`/var/tmp/spawn` on a fleet host, where other
+host jobs keep scratch), which is masked whole. The runner stays the
+engine's parent and writes the exit status into the workspace. Binding rules, from the probe under herdr 0.9.5 and bwrap 0.9.0:
 **never `--new-session`** (`setsid` takes the engine out of the pane's
 foreground process group, and Herdr's `agent.get` answers
 `agent_not_found`); **always `--unshare-pid`** (no `kill(2)` of a host
@@ -2397,15 +2399,21 @@ resolves to:
 
 - directories, each an empty `--tmpfs`: `/run/keep`, `/run/keep-test`, the
   whole `$XDG_RUNTIME_DIR` (else `/run/user/<uid>`), the whole `/tmp` (the
-  fleet's tmux sockets), the Herdr session directory
+  fleet's tmux sockets), the loop's shared `TMPDIR`, the Herdr session
+  directory
   (`$XDG_CONFIG_HOME/herdr` and `~/.config/herdr`), `~/.claude`, the other
   engines' homes (`~/.gemini` but for agy's own home below it, re-bound
   writable into the mask's tmpfs; `~/.config/antigravity`, `~/.codex`,
   `~/.hermes`), `~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.aws`,
   `~/.config/anthropic`, `~/.config/spawn`, `~/.config/cloudflare`,
-  `~/.config/observe3-private`;
+  `~/.config/observe3-private` (each `~/.config/<x>` also below a
+  customized `$XDG_CONFIG_HOME`);
 - regular files, each read-only bound over by one private empty 0444 file
-  (never `/dev/null`, whose bind answers `EACCES` instead of reading empty):
+  (never `/dev/null`, whose bind answers `EACCES` instead of reading empty),
+  kept in `$XDG_RUNTIME_DIR/spawn-engine-view-<uid>` (0700, checked to be
+  this user's alone; made with `create_new` and renamed into place), which
+  the runtime directory's mask hides: the engine can neither rewrite nor
+  swap it between launches:
   `~/.local/share/spawn-rsi/spawn.env` and every other `*.env*` and `env.sh`
   in that directory, `~/.claude.json`, `~/.pgpass`, `~/.netrc`,
   `~/.git-credentials`;
@@ -2419,10 +2427,17 @@ outside the view and read the masked files through it; the same holds for
 the tmux sockets in `/tmp`. Both are masked, so the engine's own Herdr
 calls are none: Herdr detects it from outside. The network stays.
 
-A workspace whose bind would uncover a mask (it holds a masked path) is
-refused, as is an engine home that holds the user's home or a masked path;
-a `TMPDIR` that would is passed over for `<engine home>/.spawn-tmp`
-(made 0700), said. **Known residual:** a target missing at a launch that
+**No writable bind overlaps a mask or the private directory.** A workspace
+that holds or lies in a masked path, or reaches the private directory, is
+refused. So is an engine home that holds the user's home, is or holds a
+masked path, or reaches the private directory: a misconfigured
+`SPAWN_AGY_HOME` of `~/.gemini` (which would show `oauth_creds.json`),
+`~/.claude`, `~/.ssh`, `/run/keep`, `$XDG_RUNTIME_DIR`, `/tmp` or
+`~/.config/herdr` is refused, never silently unmasked. The one exception is
+an engine home below another engine's masked home (`~/.gemini`,
+`~/.config/antigravity`, `~/.codex`, `~/.hermes`): agy's default
+`~/.gemini/antigravity-cli` is bound back into the empty tmpfs of
+`~/.gemini`. **Known residual:** a target missing at a launch that
 appears later is visible to the engine already running (`--ro-bind / /` is
 live); the next launch masks it.
 

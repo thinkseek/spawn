@@ -170,7 +170,10 @@ These are not about process lifetime. They break when two versions meet.
     in the start's outcome) and Claude Code runs on. `SPAWN_ENGINE_VIEW=off`
     restores the old behaviour, on the owner's explicit choice. Inside the
     view `~/.gemini` holds only agy's home (`SPAWN_AGY_HOME`): anything agy
-    reads elsewhere below `~/.gemini` is gone for it. The view is resolved
+    reads elsewhere below `~/.gemini` is gone for it. agy's `TMPDIR` is
+    `<agy home>/.spawn-tmp`, not the loop's (`/var/tmp/spawn` is masked).
+    A `SPAWN_AGY_HOME` that is, or holds, a masked path (`~/.gemini`
+    itself, `~/.claude`, `/run/keep`, …) refuses every agy start. The view is resolved
     at each launch, so an agy already running keeps the view it started
     with; and a masked path missing at its launch that appears later is
     visible to it (`--ro-bind / /` is live) until its next launch. A
