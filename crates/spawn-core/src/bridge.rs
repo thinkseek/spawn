@@ -293,6 +293,12 @@ pub struct BridgeConfig {
     /// expires a lease a live holder (a loop, or a claim made without the
     /// ownership protocol) still has: those wait out their TTL, as before.
     pub recover_worker_leases: bool,
+    /// Whether the Bridge answers an engine's startup trust dialog itself
+    /// (audited, as `key` commands of [`RESOLVE_PRINCIPAL`]). `true` by
+    /// default; `false` under `SPAWN_AUTO_APPROVE=off`, where nothing is
+    /// answered automatically: a start that shows the dialog waits for a
+    /// person and fails its wait naming the dialog and the switch.
+    pub auto_trust: bool,
 }
 
 /// Environment an engine gets only when it is safe at its launch (see
@@ -327,6 +333,7 @@ impl BridgeConfig {
             watch: None,
             launch_environment: None,
             recover_worker_leases: true,
+            auto_trust: true,
         }
     }
 
@@ -6056,6 +6063,14 @@ impl Bridge {
             // whether the session is fresh or resumed. Answer once (a second
             // answer would land in the input box), and only the dialog itself:
             // on two equal reads, before any prompt.
+            if !self.config.auto_trust
+                && !progress.prompt_seen
+                && active.driver.startup_answer(&pane).is_some()
+            {
+                // SPAWN_AUTO_APPROVE=off: nothing answers it but a person.
+                progress.transient = Some(TRUST_OFF.to_string());
+                return Ok(self.prompt_retry(&progress));
+            }
             if !progress.answered_trust
                 && !progress.prompt_seen
                 && let Some(keys) = active.driver.startup_answer(&pane)
@@ -6639,6 +6654,11 @@ pub const LOOP_PRINCIPALS: [&str; 4] = [
 /// Bridge's own answer to a startup trust dialog, each a `key` command on
 /// the record (design section 6.3, "What the audit shows").
 pub const RESOLVE_PRINCIPAL: &str = "spawn-resolve";
+
+/// Why a start's wait for its prompt did not end under
+/// `SPAWN_AUTO_APPROVE=off` ([`BridgeConfig::auto_trust`]).
+pub const TRUST_OFF: &str = "the engine shows its startup trust dialog and SPAWN_AUTO_APPROVE=off: \
+     nothing answers it automatically; answer it from the agent page";
 
 /// How a resolver's key ends when the dialog it answered is gone, or a
 /// person (or another command) acted on the pane since it was submitted:
@@ -10932,6 +10952,61 @@ mod tests {
             assert_eq!(steps, vec![CommandStep::Pressing, CommandStep::Pressed]);
         }
         assert_eq!(host.keys(), expected, "nothing pressed twice");
+    }
+
+    /// `SPAWN_AUTO_APPROVE=off` (`auto_trust = false`): the trust dialog is
+    /// not answered, no command is submitted for it, and the wait fails
+    /// naming the dialog and the switch; once a person answers it (the pane
+    /// ready), the prompt is typed.
+    #[test]
+    fn with_auto_trust_off_the_trust_dialog_is_left_to_a_person() {
+        const TRUST: &str = "Quick safety check: Is this a project you created or one you trust?\n\
+                             y. Yes, I trust this folder\n\
+                             n. No, exit\n\
+                             Enter y/n:\n\
+                             Enter to confirm · Esc to cancel\n";
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Counted::over(store.clone());
+        let id = submit_resumable_start(&store, 1, "work", TRUST);
+        let terminal = TerminalName::for_execution(&ExecutionId::for_command(id));
+        let mut config = BridgeConfig::new("tester");
+        config.auto_trust = false;
+        config.ready_attempts = 6;
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            config,
+        )
+        .with_clock(clock.clone());
+        for _ in 0..3 {
+            bridge.work().expect("work");
+            store.expire_leases();
+        }
+        assert!(host.keys().is_empty(), "nothing pressed");
+        assert_eq!(command_outcome(&store, id), None, "still waiting");
+        store.set_pane(&terminal, READY);
+        drive_work(&mut bridge, &store, || command_outcome(&store, id).is_some());
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        assert!(host.keys().is_empty(), "still nothing pressed");
+        let resolver_commands = records(&store)
+            .into_iter()
+            .filter(|record| matches!(record.event.kind, EventKind::CommandAccepted { .. }))
+            .count();
+        assert_eq!(resolver_commands, 1, "the start alone: no key command");
+
+        // Never answered: the wait fails naming the dialog and the switch.
+        let other = submit_resumable_start(&store, 2, "work", TRUST);
+        drive_work(&mut bridge, &store, || command_outcome(&store, other).is_some());
+        match command_outcome(&store, other) {
+            Some(Outcome::Failed(why)) => {
+                assert!(why.contains("trust dialog") && why.contains("SPAWN_AUTO_APPROVE=off"), "{why}");
+            }
+            outcome => panic!("a failed wait, not {outcome:?}"),
+        }
+        assert!(host.keys().is_empty());
     }
 
     /// A person and the resolver both answer one dialog (design section 8,
