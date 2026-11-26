@@ -28,6 +28,7 @@ pub mod herdr;
 pub mod herdr_core;
 pub mod herdr_witness;
 pub mod home;
+pub mod merkle_merge;
 #[cfg(target_os = "linux")]
 pub mod overlay;
 pub mod process;
@@ -66,6 +67,13 @@ pub use git::{
 pub use git_border::{BorderRefTarget, ExportReport, GitBorderAdapter, ImportReport, ImportedRef};
 pub use herdr::{HerdrHost, HerdrPool};
 pub use herdr_core::HerdrCoreHost;
+pub use merkle_merge::{
+    BuiltMergeSnapshot, ConflictKind, ConflictLabels, EolAttr, GitAttributes, MergeBaseError,
+    MergeConflict, MergeDriver, MergeOptions, MergeReport, MergeShadowOutcome, MergeSnapshotSpec,
+    PathAttributes, ShadowBlockerReason, ShadowOracleSummary, TextAttr, TextMergeResult,
+    build_merge_snapshot, classify_shadow_merge, find_merge_bases, find_single_merge_base,
+    is_binary_buffer, merge_snapshots, merge_text_3way, merge_trees, validate_single_merge_base,
+};
 #[cfg(target_os = "linux")]
 pub use overlay::{OverlayWorkspace, Swept, overlay_supported, overlay_supported_in, sweep_probes};
 pub use process::{current_uid, undumpable};
