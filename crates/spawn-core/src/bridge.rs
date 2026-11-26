@@ -830,6 +830,12 @@ struct SessionView {
     last_message: Option<(ExecutionId, GlobalPosition)>,
     /// What the log says about the session's inputs ([`Inputs`]).
     inputs: Inputs,
+    /// Where each unfinished command's `command.accepted` is in the log.
+    accepted_at: HashMap<CommandId, GlobalPosition>,
+    /// Where the session's latest `pressed` or `typed` step is: what a
+    /// resolver's key checks nothing reached the pane after its own
+    /// acceptance ([`Bridge::press`]).
+    last_effect: Option<GlobalPosition>,
 }
 
 /// What the log says about a session's inputs: which wait for their turn,
@@ -936,6 +942,8 @@ impl SessionView {
             steps: HashMap::new(),
             last_message: None,
             inputs: Inputs::default(),
+            accepted_at: HashMap::new(),
+            last_effect: None,
         }
     }
 
@@ -963,6 +971,7 @@ impl SessionView {
                     CommandStep::Typing => steps.typing_at = Some(record.position),
                     CommandStep::Typed => {
                         steps.typed = true;
+                        self.last_effect = Some(record.position);
                         if let Some(execution) = event.execution_id.clone() {
                             self.inputs.typed = Some((execution, record.position));
                         }
@@ -979,15 +988,20 @@ impl SessionView {
                             steps.press = Press::Pressing;
                         }
                     }
-                    CommandStep::Pressed => steps.press = Press::Pressed,
+                    CommandStep::Pressed => {
+                        steps.press = Press::Pressed;
+                        self.last_effect = Some(record.position);
+                    }
                 }
             }
             EventKind::CommandFinished { command_id, .. } => {
                 self.unfinished.remove(command_id);
                 self.inputs.waiting.remove(command_id);
+                self.accepted_at.remove(command_id);
             }
             EventKind::CommandAccepted { command_id } => {
                 self.unfinished.insert(*command_id);
+                self.accepted_at.insert(*command_id, record.position);
             }
             EventKind::ScreenObserved {
                 state: ScreenState::Ready,
@@ -4775,6 +4789,12 @@ impl Bridge {
                 claimed.session_id
             )));
         };
+        if claimed.principal == RESOLVE_PRINCIPAL
+            && self.recorded_steps(claimed).press == Press::Due
+            && !self.answer_still_due(claimed, &active)
+        {
+            return Ok(Outcome::Failed(GONE_DIALOG.to_string()));
+        }
         match self.recorded_steps(claimed).press {
             Press::Due => {}
             Press::Pressed => return Ok(Outcome::Succeeded),
@@ -4817,6 +4837,32 @@ impl Bridge {
                 )))
             }
         }
+    }
+
+    /// Whether a resolver's key may still go (design section 8, PR 3
+    /// pitfall 2: a person and the resolver may both answer one dialog):
+    /// the pane, read now, still shows a dialog to the engine's driver
+    /// (`Permission`, or its startup trust dialog), and no other command of
+    /// the session was recorded `pressed` or `typed` since this one was
+    /// accepted. A pane that cannot be read is no dialog.
+    fn answer_still_due(&self, claimed: &Claimed, active: &Active) -> bool {
+        let Ok(pane) = self
+            .terminals
+            .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
+        else {
+            return false;
+        };
+        let shows = active.driver.read_screen(&pane).state == ScreenState::Permission
+            || active.driver.startup_answer(&pane).is_some();
+        let view = self.sessions.get(&claimed.session_id);
+        let accepted = view.and_then(|view| view.accepted_at.get(&claimed.command_id));
+        let moved = match (accepted, view.and_then(|view| view.last_effect)) {
+            (Some(accepted), Some(effect)) => effect > *accepted,
+            (Some(_), None) => false,
+            // Not seen accepted: whether anything went since cannot be told.
+            (None, _) => true,
+        };
+        shows && !moved
     }
 
     /// Text into the engine's input box, at most once, ending with the
@@ -6593,6 +6639,11 @@ pub const LOOP_PRINCIPALS: [&str; 4] = [
 /// Bridge's own answer to a startup trust dialog, each a `key` command on
 /// the record (design section 6.3, "What the audit shows").
 pub const RESOLVE_PRINCIPAL: &str = "spawn-resolve";
+
+/// How a resolver's key ends when the dialog it answered is gone, or a
+/// person (or another command) acted on the pane since it was submitted:
+/// nothing pressed, no `pressing` recorded ([`Bridge::press`]).
+pub const GONE_DIALOG: &str = "the dialog this answer was for is gone: nothing pressed";
 
 /// The idempotency key of the `n`-th key (from 1) of the Bridge's answer
 /// to the startup trust dialog of `execution`: `resolve:<execution>:trust:1:<n>`,
