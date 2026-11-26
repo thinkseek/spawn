@@ -209,11 +209,16 @@ impl Manifest {
     pub fn subtree(&self, top: &[u8]) -> Self {
         let mut prefix = top.to_vec();
         prefix.push(b'/');
+        // Sorted bytewise, the paths under `top/` are one run: found by a
+        // binary search, so every directory's subtree together costs one
+        // pass over the manifest (O(log N + k) each).
+        let from = self
+            .entries
+            .partition_point(|entry| entry.path.as_slice() < prefix.as_slice());
         Self {
-            entries: self
-                .entries
+            entries: self.entries[from..]
                 .iter()
-                .filter_map(|entry| {
+                .map_while(|entry| {
                     entry
                         .path
                         .strip_prefix(prefix.as_slice())
@@ -251,6 +256,36 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
+/// `path` as the kernel resolves it: its longest existing prefix through
+/// every link (`canonicalize`), the rest by text. A link loop resolves to
+/// nothing and is outside.
+fn resolved(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match fs::canonicalize(&existing) {
+            Ok(real) => {
+                let mut out = real;
+                for part in rest.iter().rev() {
+                    out.push(part);
+                }
+                return lexical(&out);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return PathBuf::new(),
+            Err(_) => {
+                let Some(name) = existing.file_name().map(OsStr::to_os_string) else {
+                    // `..` or the root: fall back to the text.
+                    return lexical(path);
+                };
+                rest.push(name);
+                if !existing.pop() {
+                    return lexical(path);
+                }
+            }
+        }
+    }
+}
+
 fn walk(
     root: &Path,
     directory: &Path,
@@ -269,7 +304,10 @@ fn walk(
         relative.extend_from_slice(name.as_bytes());
         if kind.is_symlink() {
             let target = fs::read_link(&path)?;
-            if !lexical(&directory.join(&target)).starts_with(root) {
+            let pointed = directory.join(&target);
+            // By text, and as the kernel would resolve it (through the
+            // links on the way, `dirlink/../outside` included).
+            if !lexical(&pointed).starts_with(root) || !resolved(&pointed).starts_with(root) {
                 return Err(CasError::SymlinkEscape {
                     link: PathBuf::from(OsStr::from_bytes(relative)),
                     target,
