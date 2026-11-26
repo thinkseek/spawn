@@ -597,7 +597,7 @@ fn find_program(program: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mask, ViewConfig};
+    use super::ViewConfig;
     use std::path::PathBuf;
 
     fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
@@ -668,9 +668,5 @@ mod tests {
             PathBuf::from(format!("/run/user/{}", crate::current_uid()))
         );
         assert_eq!(config.xdg_config_home, None);
-        assert!(matches!(
-            Mask::Directory(PathBuf::from("/x")),
-            Mask::Directory(_)
-        ));
     }
 }
