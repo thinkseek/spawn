@@ -1110,3 +1110,153 @@ mod background_shell_tests {
         assert!(!shows_background_shells(&reading.evidence));
     }
 }
+
+/// Claude Code 2.1.330 in the screen-reader layout, under tmux and Herdr
+/// (PR H3-screen-fix, R2–R4 of the C2 capture gate). The panes are
+/// sanitized captures: paths, models and the drafted text made up.
+#[cfg(test)]
+mod claude_2_1_330_tests {
+    use super::{
+        ScreenState, activity_region, is_choice_footer, is_trust_dialog, prompt_body,
+        read_claude_screen, spinner_word,
+    };
+
+    const STATUS: &str = "deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 318 tok/s";
+    const MODE: &str = "bypass permissions on (shift+tab to cycle)";
+
+    /// R2: a draft is `$`, a no-break space, a space, then the text.
+    #[test]
+    fn a_draft_after_a_no_break_space_reads_drafted() {
+        assert_eq!(prompt_body("$\u{a0} fix the tests"), Some("fix the tests"));
+        assert_eq!(prompt_body("❯\u{a0} fix the tests"), Some("fix the tests"));
+        assert_eq!(prompt_body("$\u{a0}"), Some(""));
+        // Still no prompt: a shell variable.
+        assert_eq!(prompt_body("$HOME/bin"), None);
+        for pane in [
+            format!("{STATUS}\n{MODE}\n$\u{a0} fix the tests"),
+            format!("you: hi\nclaude: hello\n{STATUS}\n$\u{a0} fix the tests\n{MODE}\n"),
+        ] {
+            let reading = read_claude_screen(&pane);
+            assert_eq!(reading.state, ScreenState::Drafted, "{pane:?}");
+            assert!(reading.evidence.ends_with("fix the tests"), "{reading:?}");
+        }
+        let empty = format!("{STATUS}\n{MODE}\n$\u{a0}");
+        assert_eq!(read_claude_screen(&empty).state, ScreenState::Ready);
+    }
+
+    /// R3: a question (`AskUserQuestion`) at the bottom of the pane.
+    const QUESTION: &str = "claude: I need a choice.\n\
+                            Which database should the service use?\n\
+                            1. PostgreSQL\n\
+                            2. SQLite\n\
+                            3. Type something.\n\
+                            Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n";
+
+    /// R3: a tool-permission dialog at the bottom of the pane.
+    const TOOL: &str = "Bash command\n\
+                        rm -rf target/tmp\n\
+                        Do you want to proceed?\n\
+                        1. Yes\n\
+                        2. Yes, and don't ask again for rm commands\n\
+                        3. No, and tell Claude what to do differently\n\
+                        Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n\
+                        Esc to cancel\n";
+
+    #[test]
+    fn a_question_or_tool_dialog_footer_is_a_permission() {
+        for pane in [
+            QUESTION.to_string(),
+            TOOL.to_string(),
+            format!("{QUESTION}\n\n\n"),
+            "Select with numbers [1-2]. Then Enter to submit or Escape to cancel: Esc to cancel\n"
+                .to_string(),
+        ] {
+            assert!(is_choice_footer(&pane), "{pane:?}");
+            assert!(!is_trust_dialog(&pane), "{pane:?}");
+            let reading = read_claude_screen(&pane);
+            assert_eq!(reading.state, ScreenState::Permission, "{pane:?}");
+            assert!(
+                reading.evidence.starts_with("Select with numbers ["),
+                "{reading:?}"
+            );
+            assert!(!reading.state.accepts_input());
+        }
+    }
+
+    #[test]
+    fn the_footers_words_elsewhere_are_no_permission() {
+        // Quoted in the transcript, the input box drawn below: history.
+        let quoted = format!(
+            "claude: It ends with Select with numbers [1-3]. Then Enter to submit or Escape \
+             to cancel:\nSelect with numbers [1-3]. Then Enter to submit or Escape to cancel:\n\
+             {STATUS}\n{MODE}\n$ "
+        );
+        assert!(!is_choice_footer(&quoted));
+        assert_eq!(read_claude_screen(&quoted).state, ScreenState::Ready);
+        // Ordinary prose as the last line.
+        for prose in [
+            "Select with numbers or letters, then press Enter.\n",
+            "claude: Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n",
+            "Select with numbers []. Then Enter to submit or Escape to cancel:\n",
+            "Select with numbers [1-3]. Then Enter to submit or Escape to cancel: and more\n",
+            "Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\nplain text\n",
+        ] {
+            assert!(!is_choice_footer(prose), "{prose:?}");
+            assert_ne!(
+                read_claude_screen(prose).state,
+                ScreenState::Permission,
+                "{prose:?}"
+            );
+        }
+        // The trust dialog is no question.
+        let trust = "Quick safety check: Is this a project you created or one you trust?\n\
+                     y. Yes, I trust this folder\nn. No, exit\nEnter y/n:\n\
+                     Enter to confirm · Esc to cancel\n";
+        assert!(is_trust_dialog(trust));
+        assert!(!is_choice_footer(trust));
+        assert_eq!(read_claude_screen(trust).state, ScreenState::Unknown);
+    }
+
+    /// R4: spinner words with an apostrophe or a hyphen.
+    #[test]
+    fn spinner_words_may_hold_an_apostrophe_or_a_hyphen() {
+        for line in [
+            "Beboppin'…",
+            "Beboppin'… (12s)",
+            "Beboppin’…",
+            "Topsy-turvying…",
+            "Nucleating…",
+        ] {
+            assert!(spinner_word(line), "{line}");
+        }
+        for line in ["'…", "-…", "…", "two words…", "Beboppin'… and more", "1st…"] {
+            assert!(!spinner_word(line), "{line}");
+        }
+    }
+
+    /// R4: under Herdr the `esc to interrupt` hint sits on a status line
+    /// right above the prompt, no `tmux focus-events off` line between them.
+    #[test]
+    fn an_interrupt_hint_on_a_status_line_is_a_running_turn() {
+        let herdr = format!(
+            "you: run the tests\nBeboppin'… (12s)\n{STATUS}\n\
+             bypass permissions on · esc to interrupt\n$ "
+        );
+        let tail: Vec<&str> = herdr.lines().collect();
+        let region = activity_region(&tail, tail.len() - 1);
+        assert_eq!(region.first(), Some(&"bypass permissions on · esc to interrupt"));
+        assert_eq!(region.len(), 2, "{region:?}");
+        let reading = read_claude_screen(&herdr);
+        assert_eq!(reading.state, ScreenState::Busy, "{reading:?}");
+        assert!(!reading.state.accepts_input());
+        // The hint alone, no spinner line: still running.
+        let hint = format!("you: run the tests\n{STATUS}\nbypass permissions on · esc to interrupt\n$ ");
+        assert_eq!(read_claude_screen(&hint).state, ScreenState::Busy);
+        // The spinner alone, no hint: running.
+        let spinner = format!("you: run the tests\nBeboppin'…\n{STATUS}\n{MODE}\n$ ");
+        assert_eq!(read_claude_screen(&spinner).state, ScreenState::Busy);
+        // The turn done, the hint gone: ready.
+        let done = format!("you: run the tests\n✻ Bebopped for 12s · done 9:20 PM\n{STATUS}\n{MODE}\n$ ");
+        assert_eq!(read_claude_screen(&done).state, ScreenState::Ready);
+    }
+}
