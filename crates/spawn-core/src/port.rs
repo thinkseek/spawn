@@ -878,17 +878,17 @@ pub struct ViewedLaunch<'a> {
     pub engine: &'a str,
     /// The workspace the engine runs in, bound writable.
     pub workspace: &'a str,
-    /// The engine's own home (its transcripts), bound writable.
+    /// The engine's own home (its transcripts), bound writable. The
+    /// engine's `TMPDIR` is a directory of its own below it, never the
+    /// loop's shared one.
     pub engine_home: &'a str,
-    /// The `TMPDIR` the launch's environment names, if any.
-    pub tmpdir: Option<&'a str>,
 }
 
 /// The filesystem view an engine with no deny rules of its own
 /// ([`crate::driver::Guard::Sandbox`]) runs in (decision C2, N6): the host's
 /// filesystem read-only, its credentials, the other engines' homes and the
 /// terminal servers' sockets masked, and only the workspace, the engine's
-/// home and `TMPDIR` writable. The host's is `bwrap`
+/// home and its own `TMPDIR` writable. The host's is `bwrap`
 /// (`spawn_host::engine_view`).
 pub trait EngineView: Send + Sync + std::fmt::Debug {
     /// Its mechanism's name (`bwrap`).

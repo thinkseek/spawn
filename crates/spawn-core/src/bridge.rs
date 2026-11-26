@@ -6121,17 +6121,11 @@ impl Bridge {
                     ));
                 }
                 EngineViewPolicy::Required(Ok(view)) => {
-                    let tmpdir = environment
-                        .iter()
-                        .rev()
-                        .find(|(name, _)| name == "TMPDIR")
-                        .map(|(_, value)| value.as_str());
                     let words = view
                         .wrap(&ViewedLaunch {
                             engine: active.driver.id(),
                             workspace: active.workspace.path(),
                             engine_home: &home.sessions,
-                            tmpdir,
                         })
                         .map_err(|why| {
                             format!(

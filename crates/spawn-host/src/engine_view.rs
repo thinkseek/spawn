@@ -391,6 +391,7 @@ impl BwrapView {
     /// engine home equal to, or holding, a target is refused
     /// ([`BwrapView::plan`]).
     fn targets(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
+        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
         let mut skipped = Vec::new();
         let mut directories: Vec<PathBuf> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
@@ -401,6 +402,11 @@ impl BwrapView {
             .chain(self.config.file_targets());
         for target in targets {
             match resolve(&target) {
+                // A directory holding the home (a host TMPDIR of `/`) would
+                // hide everything: said, not masked.
+                Ok(Resolved::Directory(path)) if home.starts_with(&path) => {
+                    skipped.push((target, "holds the user's home".to_string()));
+                }
                 Ok(Resolved::Directory(path)) => {
                     if !directories.contains(&path) {
                         directories.push(path);
