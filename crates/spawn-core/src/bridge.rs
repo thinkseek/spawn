@@ -3201,6 +3201,16 @@ impl Bridge {
     /// another session's marker, or one never typed, is never bound. Then
     /// `session.native_started` is recorded, and the transcript is read from
     /// its start. Until then nothing is bound, and asked again next pass.
+    ///
+    /// A marker is only a store-local command id, so another store's or an
+    /// older run's conversation in the same shared home may quote the same
+    /// one (D1). Three guards keep those out: the prompt that holds the
+    /// marker must be no older than the execution's `execution.started`
+    /// (its `created_at`, less [`BIND_SKEW_MS`]; missing or unreadable
+    /// binds nothing); a conversation that was below the home before a
+    /// fresh start launched the engine ([`Active::preexisting_natives`]) is
+    /// never scanned into; and a native session any execution in the store
+    /// was already bound to is never bound again.
     fn bind_reported(
         &self,
         agent_id: &AgentId,
@@ -3241,9 +3251,20 @@ impl Bridge {
         let workspace = active.workspace.clone();
         let home = self.config.home_of(driver);
         let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        let not_before = active.started_at.saturating_sub(BIND_SKEW_MS);
+        // Bound already, by any execution of any session in the store.
+        let taken = |native: &str| {
+            self.sessions
+                .values()
+                .any(|view| view.natives.contains(native))
+        };
         // The transcript of `native`, when it is below the engine's home and
-        // a prompt in it holds a marker typed into this execution.
+        // a prompt in it, written since this execution started, holds a
+        // marker typed into this execution.
         let proven = |native: &str| -> Option<String> {
+            if taken(native) {
+                return None;
+            }
             let path = driver.transcript_path(&home, &workspace, native);
             if !path.starts_with(&root) {
                 return None;
@@ -3254,6 +3275,10 @@ impl Bridge {
             let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
                 serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
                     value["type"] == "USER_INPUT"
+                        && value["created_at"]
+                            .as_str()
+                            .and_then(rfc3339_ms)
+                            .is_some_and(|created| created >= not_before)
                         && value["content"].as_str().is_some_and(|content| {
                             crate::message::markers(content).iter().any(ours)
                         })
@@ -3283,6 +3308,7 @@ impl Bridge {
                 .iter()
                 .filter(|native| plain_session_id(native))
                 .filter(|native| reported.as_deref() != Some(native.as_str()))
+                .filter(|native| !active.preexisting_natives.contains(native.as_str()))
                 .take(crate::port::LIST_DIRS_LIMIT)
                 .find_map(|native| proven(native).map(|path| (native.clone(), path)));
         }
