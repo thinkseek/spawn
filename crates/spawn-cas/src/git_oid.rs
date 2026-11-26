@@ -72,6 +72,19 @@ impl FromStr for GitOid {
     }
 }
 
+impl serde::Serialize for GitOid {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GitOid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse_hex(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Deterministic boundary pointer content for files strictly larger than
 /// [`GIT_POINTER_THRESHOLD`] (`100 MiB`).
 pub fn git_pointer_bytes(digest: &Digest, size: u64) -> Vec<u8> {

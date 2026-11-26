@@ -44,7 +44,9 @@
 mod chunker;
 mod digest;
 mod gc;
+mod gc_fence;
 mod git_oid;
+mod journal;
 mod legacy;
 mod manifest;
 mod merkle;
@@ -65,10 +67,15 @@ pub use gc::{
     GcReport, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_BLOB, NS_DATA, NS_TREE, Quotas,
     TMP_MAX_AGE, default_quotas,
 };
+pub use gc_fence::{
+    DEFAULT_PERSISTENT_GC_GRACE, GC_FENCE_FILE, GC_UNREACH_STATE_FILE, GcFenceBinding,
+    PersistentGcReport, bind_gc_fence, verify_gc_fence,
+};
 pub use git_oid::{
     GIT_POINTER_THRESHOLD, GitOid, GitOidCache, git_blob_oid_of_bytes, git_pointer_bytes,
     project_blob_oid, project_snapshot_oid, project_tree_oid,
 };
+pub use journal::{JournalEntry, REFS_JOURNAL, RefJournal};
 pub use legacy::AdoptReport;
 pub use manifest::{
     KEEP_SNAPSHOTS, KeepReport, MANIFEST_V1, Manifest, ManifestEntry, PROV_PIN_OWNER,
@@ -157,6 +164,27 @@ pub enum CasError {
         /// Reason for rejection.
         reason: &'static str,
     },
+    /// `.gc-fence` is missing from the CAS root, refusing persistent GC.
+    #[error("missing GC fence at {}: bind CAS root before running persistent GC", .0.display())]
+    GcFenceMissing(PathBuf),
+    /// `.gc-fence` binding does not match the live PostgreSQL cluster/db/schema.
+    #[error("GC fence mismatch: CAS bound to {expected}, live DB is {actual}")]
+    GcFenceMismatch {
+        /// Expected binding from `.gc-fence`.
+        expected: String,
+        /// Live PostgreSQL binding.
+        actual: String,
+    },
+    /// Live PostgreSQL `spawn_ref_log` trails `refs.journal`; reconcile before GC.
+    #[error(
+        "PG ref log ({pg_latest_ref_seq}) trails refs.journal ({journal_latest_seq}): reconcile before GC"
+    )]
+    GcFenceBehindJournal {
+        /// Latest `seq` in PostgreSQL `spawn_ref_log`.
+        pg_latest_ref_seq: u64,
+        /// Latest `seq` in `refs.journal`.
+        journal_latest_seq: u64,
+    },
     /// The file system said no.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -187,7 +215,11 @@ impl From<CasError> for io::Error {
             | CasError::BadManifest { .. }
             | CasError::BadFormat(_)
             | CasError::CorruptIndex { .. } => io::Error::new(io::ErrorKind::InvalidData, error),
-            CasError::NotPlain(_) | CasError::SymlinkEscape { .. } => io::Error::other(error),
+            CasError::NotPlain(_)
+            | CasError::SymlinkEscape { .. }
+            | CasError::GcFenceMissing(_)
+            | CasError::GcFenceMismatch { .. }
+            | CasError::GcFenceBehindJournal { .. } => io::Error::other(error),
         }
     }
 }

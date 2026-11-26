@@ -9565,3 +9565,429 @@ begin
                    spawn_login_role('spawn_reader'));
 end
 $$;
+
+-- D6 Phase 4 Step 1 (Issue #113 Fine Item 7.2): CAS snapshot ledger, atomic
+-- ref CAS (`spawn_refs`), append-only ref history (`spawn_ref_log`), and
+-- owner-only SECURITY DEFINER writers.
+
+create or replace function spawn_d6_valid_parents(p_parents text[]) returns boolean
+language sql immutable strict set search_path = pg_catalog, pg_temp as $$
+    select coalesce(array_ndims(p_parents), 0) <= 1
+       and not exists (
+           select 1 from unnest(p_parents) as p(v)
+            where v is null or v !~ '^sha256:[0-9a-f]{64}$'
+       )
+$$;
+revoke execute on function spawn_d6_valid_parents(text[]) from public;
+
+create table if not exists spawn_snapshots (
+    id text collate "C" primary key check (id ~ '^sha256:[0-9a-f]{64}$'),
+    git_oid text collate "C" not null unique check (git_oid ~ '^[0-9a-f]{40}$'),
+    tree text collate "C" not null check (tree ~ '^sha256:[0-9a-f]{64}$'),
+    parents text[] not null default '{}' check (spawn_d6_valid_parents(parents)),
+    project text not null check (length(btrim(project)) > 0),
+    state text not null default 'live' check (state in ('live', 'collected')),
+    created_at_ms bigint not null
+);
+create index if not exists spawn_snapshots_project_state
+    on spawn_snapshots (project, state, created_at_ms);
+
+create table if not exists spawn_refs (
+    project text not null check (length(btrim(project)) > 0),
+    name text collate "C" not null check (length(btrim(name)) > 0),
+    kind text not null check (kind in ('main', 'branch', 'wip', 'tag')),
+    snapshot text collate "C" not null references spawn_snapshots (id),
+    updated_at_ms bigint not null,
+    primary key (project, name)
+);
+create index if not exists spawn_refs_snapshot on spawn_refs (snapshot);
+
+create table if not exists spawn_ref_log (
+    seq bigint generated always as identity primary key,
+    project text not null check (length(btrim(project)) > 0),
+    name text collate "C" not null check (length(btrim(name)) > 0),
+    kind text not null check (kind in ('main', 'branch', 'wip', 'tag')),
+    old_snapshot text collate "C" references spawn_snapshots (id),
+    new_snapshot text collate "C" not null references spawn_snapshots (id),
+    reason text not null default '',
+    at_ms bigint not null
+);
+create index if not exists spawn_ref_log_project_name
+    on spawn_ref_log (project, name, seq);
+
+revoke all on spawn_snapshots, spawn_refs, spawn_ref_log from public;
+
+-- Snapshot rows are immutable except for marking an unreferenced live snapshot
+-- as collected (`live` -> `collected`). Deletes and truncates are forbidden.
+create or replace function spawn_snapshots_guard() returns trigger
+language plpgsql as $$
+begin
+    if tg_op = 'UPDATE' then
+        if old.state = 'live' and new.state = 'collected'
+           and new.id = old.id
+           and new.git_oid = old.git_oid
+           and new.tree = old.tree
+           and new.parents is not distinct from old.parents
+           and new.project = old.project
+           and new.created_at_ms = old.created_at_ms then
+            return new;
+        end if;
+        raise exception 'spawn_snapshots only allows live -> collected state transition'
+            using errcode = '42501';
+    end if;
+    raise exception 'spawn_snapshots forbids %', lower(tg_op)
+        using errcode = '42501';
+end $$;
+revoke execute on function spawn_snapshots_guard() from public;
+drop trigger if exists spawn_snapshots_guard_row on spawn_snapshots;
+create trigger spawn_snapshots_guard_row
+    before update or delete on spawn_snapshots
+    for each row execute function spawn_snapshots_guard();
+drop trigger if exists spawn_snapshots_guard_truncate on spawn_snapshots;
+create trigger spawn_snapshots_guard_truncate
+    before truncate on spawn_snapshots
+    for each statement execute function spawn_snapshots_guard();
+
+-- `spawn_ref_log` is strictly append-only.
+create or replace function spawn_ref_log_unchanged() returns trigger
+language plpgsql as $$
+begin
+    raise exception 'spawn_ref_log is append-only: % refused', lower(tg_op)
+        using errcode = '42501';
+end $$;
+revoke execute on function spawn_ref_log_unchanged() from public;
+drop trigger if exists spawn_ref_log_unchanged on spawn_ref_log;
+create trigger spawn_ref_log_unchanged
+    before update or delete on spawn_ref_log
+    for each row execute function spawn_ref_log_unchanged();
+drop trigger if exists spawn_ref_log_untruncated on spawn_ref_log;
+create trigger spawn_ref_log_untruncated
+    before truncate on spawn_ref_log
+    for each statement execute function spawn_ref_log_unchanged();
+
+-- Record a snapshot idempotently (owner only). Returns `p_id` when newly
+-- inserted or already recorded with identical `(git_oid, tree, parents,
+-- project, created_at_ms)`; raises `23505` if `p_id` exists with different
+-- metadata or `p_git_oid` collides with another snapshot.
+create or replace function spawn_snapshot_record(
+    p_id text,
+    p_git_oid text,
+    p_tree text,
+    p_parents text[],
+    p_project text,
+    p_created_at_ms bigint
+) returns text
+language plpgsql security definer as $$
+declare
+    v_parents text[] := coalesce(p_parents, '{}'::text[]);
+    v_inserted text;
+    v_existing spawn_snapshots%rowtype;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner records snapshots' using errcode = '42501';
+    end if;
+    if p_id is null or p_git_oid is null or p_tree is null
+       or p_project is null or p_created_at_ms is null then
+        raise exception 'snapshot fields must not be null' using errcode = '22023';
+    end if;
+
+    insert into spawn_snapshots (id, git_oid, tree, parents, project, state, created_at_ms)
+    values (p_id, p_git_oid, p_tree, v_parents, p_project, 'live', p_created_at_ms)
+    on conflict (id) do nothing
+    returning id into v_inserted;
+
+    if v_inserted is not null then
+        return v_inserted;
+    end if;
+
+    select * into v_existing from spawn_snapshots where id = p_id;
+    if v_existing.git_oid = p_git_oid
+       and v_existing.tree = p_tree
+       and v_existing.parents is not distinct from v_parents
+       and v_existing.project = p_project
+       and v_existing.created_at_ms = p_created_at_ms then
+        return v_existing.id;
+    end if;
+
+    raise exception 'snapshot % is recorded already with different content', p_id
+        using errcode = '23505';
+end $$;
+
+-- Compare-and-swap a non-main ref (`branch`, `wip`, `tag`) and append a
+-- `spawn_ref_log` entry in the same transaction (owner only). Rejects `main`
+-- refs (`42501`), which must advance through `spawn_ref_land_main`.
+create or replace function spawn_ref_cas(
+    p_project text,
+    p_name text,
+    p_kind text,
+    p_expected text,
+    p_new text,
+    p_reason text default ''
+) returns bigint
+language plpgsql security definer as $$
+declare
+    v_new_state text;
+    v_existing spawn_refs%rowtype;
+    v_has_existing boolean := false;
+    v_now bigint;
+    v_updated integer;
+    v_seq bigint;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner moves refs' using errcode = '42501';
+    end if;
+    if p_kind = 'main' then
+        raise exception 'main refs must advance through spawn_ref_land_main'
+            using errcode = '42501';
+    end if;
+    if p_kind is null or p_kind not in ('branch', 'wip', 'tag') then
+        raise exception 'invalid ref kind %', p_kind using errcode = '22023';
+    end if;
+    if p_project is null or length(btrim(p_project)) = 0
+       or p_name is null or length(btrim(p_name)) = 0
+       or p_new is null then
+        raise exception 'project, name and new snapshot must be non-empty'
+            using errcode = '22023';
+    end if;
+
+    perform pg_advisory_xact_lock(1399957360);
+
+    select state into v_new_state from spawn_snapshots where id = p_new;
+    if not found then
+        raise exception 'snapshot % does not exist', p_new using errcode = '23503';
+    end if;
+    if v_new_state <> 'live' then
+        raise exception 'snapshot % is %, not live', p_new, v_new_state using errcode = '55000';
+    end if;
+
+    select * into v_existing
+      from spawn_refs
+     where project = p_project and name = p_name
+       for update;
+    v_has_existing := found;
+    if v_has_existing and v_existing.kind = 'main' then
+        raise exception 'existing main ref (%, %) must advance through spawn_ref_land_main',
+                        p_project, p_name
+            using errcode = '42501';
+    end if;
+
+    v_now := spawn_now_ms();
+    if p_expected is null then
+        if v_has_existing then
+            raise exception 'ref CAS mismatch on (%, %): expected absent, found %',
+                            p_project, p_name, v_existing.snapshot
+                using errcode = '23P01';
+        end if;
+        insert into spawn_refs (project, name, kind, snapshot, updated_at_ms)
+        values (p_project, p_name, p_kind, p_new, v_now);
+    else
+        if not v_has_existing then
+            raise exception 'ref CAS mismatch on (%, %): expected %, ref does not exist',
+                            p_project, p_name, p_expected
+                using errcode = '23P01';
+        end if;
+        if v_existing.kind <> p_kind then
+            raise exception 'ref kind mismatch on (%, %): existing %, requested %',
+                            p_project, p_name, v_existing.kind, p_kind
+                using errcode = '22023';
+        end if;
+        update spawn_refs
+           set snapshot = p_new, updated_at_ms = v_now
+         where project = p_project
+           and name = p_name
+           and kind = p_kind
+           and kind <> 'main'
+           and snapshot = p_expected;
+        get diagnostics v_updated = row_count;
+        if v_updated <> 1 then
+            raise exception 'ref CAS mismatch on (%, %): expected %, found %',
+                            p_project, p_name, p_expected, v_existing.snapshot
+                using errcode = '23P01';
+        end if;
+    end if;
+
+    insert into spawn_ref_log (project, name, kind, old_snapshot, new_snapshot, reason, at_ms)
+    values (p_project, p_name, p_kind, p_expected, p_new, coalesce(p_reason, ''), v_now)
+    returning seq into v_seq;
+    return v_seq;
+end $$;
+
+-- Advance or bootstrap a `kind = 'main'` ref (owner only). Initial bootstrap
+-- accepts `p_expected_base is null and p_task_id is null` only when no ref
+-- exists yet; any advancement from `p_expected_base` requires a `landing` task
+-- in `mission_tasks` and a matching accepted `task.gated` verdict in
+-- `spawn_events` with exact `base` (`git_oid` of `p_expected_base`) and
+-- `candidate` (`git_oid` of `p_new_snapshot`).
+create or replace function spawn_ref_land_main(
+    p_project text,
+    p_name text,
+    p_expected_base text,
+    p_new_snapshot text,
+    p_task_id bigint,
+    p_reason text default 'land'
+) returns bigint
+language plpgsql security definer as $$
+declare
+    v_new_snap spawn_snapshots%rowtype;
+    v_base_snap spawn_snapshots%rowtype;
+    v_existing spawn_refs%rowtype;
+    v_has_existing boolean := false;
+    v_task mission_tasks%rowtype;
+    v_now bigint;
+    v_updated integer;
+    v_seq bigint;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner lands main refs' using errcode = '42501';
+    end if;
+    if p_project is null or length(btrim(p_project)) = 0
+       or p_name is null or length(btrim(p_name)) = 0
+       or p_new_snapshot is null then
+        raise exception 'project, name and new snapshot must be non-empty'
+            using errcode = '22023';
+    end if;
+
+    perform pg_advisory_xact_lock(1399957360);
+
+    select * into v_new_snap from spawn_snapshots where id = p_new_snapshot;
+    if not found then
+        raise exception 'new snapshot % does not exist', p_new_snapshot using errcode = '23503';
+    end if;
+    if v_new_snap.state <> 'live' then
+        raise exception 'new snapshot % is %, not live', p_new_snapshot, v_new_snap.state
+            using errcode = '55000';
+    end if;
+
+    select * into v_existing
+      from spawn_refs
+     where project = p_project and name = p_name
+       for update;
+    v_has_existing := found;
+
+    v_now := spawn_now_ms();
+    if p_expected_base is null then
+        if p_task_id is not null then
+            raise exception 'bootstrapping main ref requires null task_id'
+                using errcode = '22023';
+        end if;
+        if v_has_existing then
+            raise exception 'main ref (%, %) already exists at %',
+                            p_project, p_name, v_existing.snapshot
+                using errcode = '23P01';
+        end if;
+        insert into spawn_refs (project, name, kind, snapshot, updated_at_ms)
+        values (p_project, p_name, 'main', p_new_snapshot, v_now);
+    else
+        if p_task_id is null then
+            raise exception 'advancing main ref (%, %) requires an accepted task_id',
+                            p_project, p_name
+                using errcode = '42501';
+        end if;
+        select * into v_base_snap from spawn_snapshots where id = p_expected_base;
+        if not found then
+            raise exception 'expected base snapshot % does not exist', p_expected_base
+                using errcode = '23503';
+        end if;
+        if not v_has_existing then
+            raise exception 'main ref (%, %) does not exist', p_project, p_name
+                using errcode = '23P01';
+        end if;
+        if v_existing.kind <> 'main' then
+            raise exception 'ref (%, %) has kind %, not main',
+                            p_project, p_name, v_existing.kind
+                using errcode = '42501';
+        end if;
+        if v_existing.snapshot <> p_expected_base then
+            raise exception 'main ref CAS mismatch on (%, %): expected %, found %',
+                            p_project, p_name, p_expected_base, v_existing.snapshot
+                using errcode = '23P01';
+        end if;
+
+        select * into v_task from mission_tasks where id = p_task_id;
+        if not found
+           or v_task.state <> 'landing'
+           or v_task.base is distinct from v_base_snap.git_oid
+           or v_task.candidate is distinct from v_new_snap.git_oid
+           or not exists (
+               select 1
+                 from spawn_events e
+                cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+                where e.session_id = 'session_control'
+                  and e.event_name = 'control.recorded'
+                  and x.r ->> 'type' = 'task.gated'
+                  and x.r ->> 'id' = p_task_id::text
+                  and x.r ->> 'verdict' = 'accepted'
+                  and x.r ->> 'base' = v_base_snap.git_oid
+                  and x.r ->> 'candidate' = v_new_snap.git_oid
+                  and (x.r ->> 'revision' is null
+                       or (x.r ->> 'revision')::integer = v_task.revisions)
+           ) then
+            raise exception 'task % has no accepted gate verdict matching base % and candidate %',
+                            p_task_id, v_base_snap.git_oid, v_new_snap.git_oid
+                using errcode = '42501';
+        end if;
+
+        update spawn_refs
+           set snapshot = p_new_snapshot, updated_at_ms = v_now
+         where project = p_project
+           and name = p_name
+           and kind = 'main'
+           and snapshot = p_expected_base;
+        get diagnostics v_updated = row_count;
+        if v_updated <> 1 then
+            raise exception 'main ref CAS mismatch on (%, %)', p_project, p_name
+                using errcode = '23P01';
+        end if;
+    end if;
+
+    insert into spawn_ref_log (project, name, kind, old_snapshot, new_snapshot, reason, at_ms)
+    values (p_project, p_name, 'main', p_expected_base, p_new_snapshot,
+            coalesce(p_reason, 'land'), v_now)
+    returning seq into v_seq;
+    return v_seq;
+end $$;
+
+-- Mark unreferenced `live` snapshots as `collected` (owner only). Never
+-- collects a snapshot currently referenced by any row in `spawn_refs`.
+create or replace function spawn_snapshot_mark_collected(p_ids text[]) returns integer
+language plpgsql security definer as $$
+declare
+    v_count integer;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner marks snapshots collected' using errcode = '42501';
+    end if;
+    if p_ids is null or coalesce(cardinality(p_ids), 0) = 0 then
+        return 0;
+    end if;
+
+    perform pg_advisory_xact_lock(1399957360);
+
+    update spawn_snapshots s
+       set state = 'collected'
+     where s.id = any(p_ids)
+       and s.state = 'live'
+       and not exists (select 1 from spawn_refs r where r.snapshot = s.id);
+    get diagnostics v_count = row_count;
+    return v_count;
+end $$;
+
+do $$
+declare
+    v_function text;
+begin
+    foreach v_function in array array[
+        'spawn_snapshot_record(text, text, text, text[], text, bigint)',
+        'spawn_ref_cas(text, text, text, text, text, text)',
+        'spawn_ref_land_main(text, text, text, text, bigint, text)',
+        'spawn_snapshot_mark_collected(text[])'
+    ] loop
+        execute format('alter function %s set search_path = %I, pg_temp',
+                       v_function, current_schema());
+        execute format('revoke execute on function %s from public', v_function);
+    end loop;
+
+    execute format('grant select on spawn_snapshots, spawn_refs, spawn_ref_log to %I, %I',
+                   spawn_login_role('spawn_reader'), spawn_login_role('spawn_supervisor'));
+end
+$$;

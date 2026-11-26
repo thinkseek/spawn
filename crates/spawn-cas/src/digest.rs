@@ -196,6 +196,19 @@ impl FromStr for Digest {
     }
 }
 
+impl serde::Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The SHA-256 digest of `bytes`.
 pub fn sha256_of(bytes: &[u8]) -> Digest {
     Digest::from_raw_sha256(Sha256::digest(bytes).into())

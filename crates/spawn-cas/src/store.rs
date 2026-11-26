@@ -364,6 +364,7 @@ impl Store {
         staged: &Path,
         want: &Digest,
     ) -> Result<PathBuf, CasError> {
+        let persistent = crate::gc::is_persistent_namespace(namespace);
         let verified = (|| {
             let mut file = open_nofollow(staged)?;
             if !file.metadata()?.is_file() {
@@ -380,6 +381,9 @@ impl Store {
         let target = self.object_path(want);
         self.object_dir(want)?;
         fs::rename(staged, &target)?;
+        if persistent {
+            self.refresh_file_mtime(&target)?;
+        }
         self.touch(namespace, want)?;
         Ok(target)
     }
@@ -394,10 +398,12 @@ impl Store {
         want: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
-        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
-            .then(|| self.lock_gc_shared())
-            .transpose()?;
+        let persistent = crate::gc::is_persistent_namespace(namespace);
+        let _gc_guard = persistent.then(|| self.lock_gc_shared()).transpose()?;
         if self.has(want) {
+            if persistent {
+                self.refresh_file_mtime(&self.object_path(want))?;
+            }
             self.touch(namespace, want)?;
             return Ok(self.object_path(want));
         }
@@ -470,17 +476,26 @@ impl Store {
         digest: &Digest,
     ) -> Result<PathBuf, CasError> {
         check_name("namespace", namespace)?;
-        let _gc_guard = crate::gc::is_persistent_namespace(namespace)
-            .then(|| self.lock_gc_shared())
-            .transpose()?;
+        let persistent = crate::gc::is_persistent_namespace(namespace);
+        let _gc_guard = persistent.then(|| self.lock_gc_shared()).transpose()?;
         if self.has(digest) {
+            if persistent {
+                self.refresh_file_mtime(&self.object_path(digest))?;
+            }
             self.touch(namespace, digest)?;
             return Ok(self.object_path(digest));
         }
         let (mut file, staged) = self.temp_file("obj")?;
+        let now = self.now();
         let write_result = file
             .write_all(bytes)
             .and_then(|()| file.flush())
+            .and_then(|()| {
+                if persistent {
+                    file.set_times(fs::FileTimes::new().set_accessed(now).set_modified(now))?;
+                }
+                Ok(())
+            })
             .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o444)));
         drop(file);
         if let Err(error) = write_result {
@@ -493,11 +508,61 @@ impl Store {
         let _ = remove_missing_ok(&staged);
         match link_result {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if persistent {
+                    self.refresh_file_mtime(&target)?;
+                }
+            }
             Err(error) => return Err(error.into()),
         }
         self.touch(namespace, digest)?;
         Ok(target)
+    }
+
+    /// Refresh an immutable regular file's access/modification timestamps to
+    /// [`Store::now`], refusing symlinks and special files.
+    pub(crate) fn refresh_file_mtime(&self, path: &Path) -> Result<(), CasError> {
+        let file = open_nofollow(path).map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                CasError::NotPlain(path.to_path_buf())
+            } else {
+                error.into()
+            }
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(CasError::NotPlain(path.to_path_buf()));
+        }
+        let now = self.now();
+        let times = fs::FileTimes::new().set_accessed(now).set_modified(now);
+        match file.set_times(times) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                let elapsed = now
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
+                let nsec = i64::from(elapsed.subsec_nanos());
+                let ts = rustix::fs::Timestamps {
+                    last_access: rustix::fs::Timespec {
+                        tv_sec: secs,
+                        tv_nsec: nsec,
+                    },
+                    last_modification: rustix::fs::Timespec {
+                        tv_sec: secs,
+                        tv_nsec: nsec,
+                    },
+                };
+                rustix::fs::utimensat(
+                    rustix::fs::CWD,
+                    path,
+                    &ts,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(io::Error::from)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Read a file safely from `path` without following symlinks and verifying
