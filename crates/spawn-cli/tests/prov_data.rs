@@ -563,7 +563,14 @@ fn the_pin_keeps_three_snapshots_and_a_rollback_to_the_fourth_is_refused() {
         .iter()
         .map(ToString::to_string)
         .collect();
-    assert_eq!(kept, [&snapshots[3], &snapshots[2], &snapshots[1]]);
+    assert_eq!(
+        kept,
+        [
+            snapshots[3].clone(),
+            snapshots[2].clone(),
+            snapshots[1].clone()
+        ]
+    );
     let first = spawn_cas::Digest::parse(&snapshots[0]).expect("digest");
     assert!(!cas.has(&first), "the fourth newest is dropped");
     assert!(!cas.has(&sha256_of(b"version 1")));
