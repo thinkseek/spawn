@@ -62,13 +62,15 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql jq od sed grep curl head git tmux awk; do
+for tool in psql jq od sed grep curl head git awk python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 [ -d "$WORK" ] || harness "mktemp gave no directory"
 trap 'rm -rf "$WORK"' EXIT
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "182"
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_182_lines_$run"
 SPAWN_PSQL=psql
@@ -92,9 +94,8 @@ stop_loop() {
         wait "$loop_pid" 2>/dev/null || true
         loop_pid=""
     fi
-    [ -n "${SPAWN_TMUX_SOCKET-}" ] || return 0
-    server=$(tmux -L "$SPAWN_TMUX_SOCKET" list-sessions -F '#{pid}' 2>/dev/null | head -n 1 || true)
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    server=$(herdr_server_pid)
+    herdr_kill_server
     i=0
     while [ -n "$server" ] && kill -0 "$server" 2>/dev/null && [ "$i" -lt 50 ]; do
         i=$((i + 1))
@@ -110,6 +111,7 @@ stop_serve() {
 cleanup() {
     stop_serve
     stop_loop
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -312,18 +314,13 @@ git init -q "$WORK/seed" && printf 'base\n' >"$WORK/seed/README.md" &&
     git -C "$WORK/seed" add -A &&
     git -C "$WORK/seed" -c user.name=bb -c user.email=bb@localhost -c commit.gpgsign=false commit -qm base &&
     git -C "$WORK/seed" push -q "$WORK/repo.git" HEAD:main || harness "seeding the repository failed"
-SPAWN_TMUX_SOCKET="bb-182-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$TMUX_TMPDIR"
-printf '#!/bin/sh\nexec tmux -L %s "$@"\n' "$SPAWN_TMUX_SOCKET" >"$WORK/tmux"
 printf '#!/bin/sh\nexit 1\n' >"$WORK/claude"
-chmod 755 "$WORK/tmux" "$WORK/claude"
+chmod 755 "$WORK/claude"
 before=$(q "select coalesce(max(id), 0) from spawn_events where kind -> 'detail' -> 'record' ->> 'type' = 'host.core_lines'")
 env -u SPAWN_SUPERVISOR -u SPAWN_DISPATCH -u SPAWN_GATE -u SPAWN_MODEL_RELAY -u SPAWN_JUDGE_URL \
     -u SPAWN_JUDGE_MODEL -u SPAWN_PROGRAM -u CLAUDE_CONFIG_DIR \
-    TMUX_TMPDIR="$TMUX_TMPDIR" SPAWN_GIT_REPO="$WORK/repo.git" SPAWN_CLAUDE_PROGRAM="$WORK/claude" \
-    SPAWN_TMUX_PROGRAM="$WORK/tmux" SPAWN_WORKER=worker-bb SPAWN_LOOP_INTERVAL_MS=300 \
+    SPAWN_GIT_REPO="$WORK/repo.git" SPAWN_CLAUDE_PROGRAM="$WORK/claude" \
+    SPAWN_WORKER=worker-bb SPAWN_LOOP_INTERVAL_MS=300 \
     SPAWN_MISSION_FILE="$WORK/mission.md" SPAWN_DISK_WARN_GB=0 SPAWN_DISK_FLOOR_GB=0 \
     SPAWN_TEST_DATABASE_URL="$server_url/$TEST_DB_NAME" \
     "$SPAWN_BIN" loop --repo "$WORK/repo.git" --root "$SPAWN_WORKSPACE_ROOT" >"$WORK/loop.log" 2>&1 &

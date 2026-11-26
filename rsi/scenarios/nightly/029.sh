@@ -162,7 +162,7 @@ MEASURE=${BB_029_MEASURE-}
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed awk sha256sum python3 systemctl; do
+for tool in psql git jq od bash sed awk sha256sum python3 systemctl; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -182,14 +182,13 @@ grep -qw memory "/sys/fs/cgroup$manager_cg/cgroup.subtree_control" 2>/dev/null |
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -198,20 +197,17 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 # Digits and `_` only: a `-` in a slice's name nests it in another slice.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_029_envelope_$run"
-SPAWN_TMUX_SOCKET="bb-029-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "029"
 SPAWN_PSQL=psql
 stem="bb029_$run"
 slice="$stem.slice"
 slice_dir="/sys/fs/cgroup$manager_cg/$slice"
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -226,7 +222,7 @@ cleanup() {
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     # This run's units only: its slice (and every scope left in it), failed
     # scopes of its stem, and the slice's runtime drop-ins.
     systemctl --user stop "$slice" >/dev/null 2>&1 || true
@@ -437,8 +433,8 @@ native=
 start=new
 while [ $# -gt 0 ]; do
   case "$1" in
-  --resume) native=$2 start=resume ;;
-  --session-id) native=$2 ;;
+  --resume) native=$2 start=resume;;
+  --session-id) native=$2;;
   esac
   shift
 done
@@ -500,7 +496,7 @@ while :; do
       line '"type":"user","message":{"role":"user","content":"prompt"}'
     fi
     pending=1
-    case "$typed" in *"BB:WRITE"*) job=write ;; esac
+    case "$typed" in *"BB:WRITE"*) job=write;; esac
   elif [ "$pending" = 1 ]; then
     if [ "$name" = hog ] && [ ! -f work.txt ]; then
       tool work write_work
@@ -527,11 +523,6 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS \
@@ -551,7 +542,6 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_DISK_WARN_GB=0
@@ -583,7 +573,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_ENVELOPE \
     SPAWN_SLICE SPAWN_SLICE_MEMORY_HIGH SPAWN_SLICE_MEMORY_MAX SPAWN_EXECUTION_MEMORY_HIGH \
     SPAWN_EXECUTION_MEMORY_MAX SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_GATE_MEMORY_HIGH \
@@ -765,11 +755,11 @@ case "$(field "$allocated" 4)" in
 "no cap"*)
     measured_fail "(2) hog's tool found no memory cap ($(field "$allocated" 4)): nothing bounds what an execution and its children allocate"
     killed_by=""
-    ;;
+;;
 survived*)
     measured_fail "(2) hog's tool allocated past its envelope and was not killed ($(field "$allocated" 4)): the envelope does not hold"
     killed_by=""
-    ;;
+;;
 esac
 if [ -z "$killed_by" ] && [ -n "$MEASURE" ] && alive "$hog_pid"; then
     # Only to show today's handling of a killed execution: the pid the
@@ -779,7 +769,7 @@ if [ -z "$killed_by" ] && [ -n "$MEASURE" ] && alive "$hog_pid"; then
         kill -9 "$hog_pid"
         killed_by=measure
         echo "029: (measure) no envelope to kill hog's tool: hog's engine (pid $hog_pid) killed with SIGKILL instead"
-        ;;
+;;
     esac
 fi
 [ -n "$killed_by" ] || fail "(2) hog's execution was not killed; nothing more to judge"
@@ -912,8 +902,8 @@ gate_scope_n() {
     "$manager_cg/$slice/$stem-gate-$task-"*.scope)
         n=${1#*"$stem-gate-$task-"}
         n=${n%%.scope*}
-        case "$n" in '' | *[!0-9]*) ;; *) echo "$n" ;; esac
-        ;;
+        case "$n" in '' | *[!0-9]*);; *) echo "$n";; esac
+;;
     esac
 }
 
@@ -991,8 +981,8 @@ ran2=$(field "$judged2" 1)
 n2=$(gate_scope_n "$(field "$judged2" 2)")
 echo "029: task #$task's gate ran again $((ran2 - g1_at)) ms after its first judging was recorded, in $(field "$judged2" 2)"
 case "$due" in
-'' | *[!0-9]*) measured_fail "(6) task #$task's gate ran again $((ran2 - g1_at)) ms after its first judging, with no due time to wait for" ;;
-*) [ "$ran2" -ge "$due" ] || measured_fail "(6) task #$task's gate ran again at $ran2 ms, before its host fault's due time $due ms" ;;
+'' | *[!0-9]*) measured_fail "(6) task #$task's gate ran again $((ran2 - g1_at)) ms after its first judging, with no due time to wait for";;
+*) [ "$ran2" -ge "$due" ] || measured_fail "(6) task #$task's gate ran again at $ran2 ms, before its host fault's due time $due ms";;
 esac
 if [ -n "$n1" ]; then
     [ -n "$n2" ] && [ "$n2" -gt "$n1" ] ||

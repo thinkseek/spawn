@@ -24,7 +24,7 @@
 # again 5 s after it exits), runs two ephemeral workers of one mission,
 # `first` and `second`, each with a delivered task, on the fake engine below
 # (it appends `work <n>` to work.txt in its workspace each second, and logs
-# each turn it starts). Spawn calls tmux through SPAWN_TMUX_PROGRAM, a
+# each turn it starts). Spawn drives terminals via herdr-core (spawn-hc); a
 # wrapper on the scenario's private socket. While `hold` exists the wrapper
 # answers, for the terminal it names, what a server that cannot answer would:
 # exit 3 for any call naming that terminal, and for `list-panes -a` (the
@@ -103,22 +103,20 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed awk; do
+for tool in psql git jq od bash sed awk python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
-real_tmux=$(command -v tmux)
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -127,16 +125,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "044"
 SPAWN_DB_NAME="bb_044_restart_$run"
-SPAWN_TMUX_SOCKET="bb-044-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -164,9 +159,11 @@ stop_loop() {
     wait "$wrapper_pid" 2>/dev/null || true
     wrapper_pid=""
 }
+second_ws=""
 cleanup() {
+    [ -z "$second_ws" ] || chmod 755 "$second_ws" 2>/dev/null || true
     stop_loop
-    "$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -327,43 +324,8 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# Spawn's tmux, on the private socket. While `slow-start` exists, a
-# `new-session` while no server answers waits 3.5 s first. While `hold` names a terminal, a call
-# that names it (as a target `=<terminal>:`, `=<terminal>`, or its paste
-# buffer `spawn-<terminal>`) and `list-panes -a` exit 3, as a server that
-# cannot answer: the Bridge leaves that execution as it is.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-if [ -f '$WORK/slow-start' ]; then
-    for arg in "\$@"; do
-        if [ "\$arg" = new-session ] && ! '$real_tmux' -L '$SPAWN_TMUX_SOCKET' list-sessions >/dev/null 2>&1; then
-            sleep 3.5
-            break
-        fi
-    done
-fi
-if [ -s '$WORK/hold' ]; then
-    held=\$(cat '$WORK/hold')
-    all=""
-    panes=""
-    for arg in "\$@"; do
-        case "\$arg" in
-        "=\$held:" | "=\$held" | "\$held" | "\$held:"* | "spawn-\$held")
-            echo "bb hold: \$held does not answer" >&2
-            exit 3
-            ;;
-        list-panes) panes=1 ;;
-        -a) all=1 ;;
-        esac
-    done
-    if [ -n "\$panes" ] && [ -n "\$all" ]; then
-        echo "bb hold: list-panes -a does not answer" >&2
-        exit 3
-    fi
-fi
-exec '$real_tmux' -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+# While `slow-start` exists, `spawn-hc server start` sleeps 3.5 s first.
+herdr_use_slow_wrapper "$WORK" "$WORK/slow-start" 3.5
 
 # `spawn loop` as systemd runs spawn-loop.service: started again 5 s after
 # it exits (Restart=always, RestartSec=5). Each start and exit is logged.
@@ -398,13 +360,8 @@ SPAWN_CLAUDE_PROJECTS=$WORK/projects
 CLAUDE_CONFIG_DIR=$WORK/claude-config
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_RECOVER_BACKOFF_SECS=2
-# The loop's own runtime directory, emptied at the restart as a reboot does.
-XDG_RUNTIME_DIR=$WORK/run
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # No stall is under test.
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_DELIVERY_SECS=1800
@@ -414,7 +371,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL BB_REPO SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS CLAUDE_CONFIG_DIR BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_RECOVER_BACKOFF_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS \
     SPAWN_STALL_HALTED_SECS
@@ -503,7 +460,7 @@ snapshot() {
         order by e.id desc limit 1")"
     put "$1" fault "$(now_ms)"
 }
-server_answers() { "$real_tmux" -L "$SPAWN_TMUX_SOCKET" list-sessions >/dev/null 2>&1; }
+server_answers() { herdr_server_alive; }
 
 # `<check> <label> <cause> <terminal_server gone: yes|no>`: the agent's
 # execution (snapshot) was interrupted with that cause, path resume, its
@@ -586,9 +543,12 @@ restart=$(now_ms)
 # As systemd stops the host: the loop gets SIGTERM and finishes its pass,
 # then the terminal server dies with every engine in it.
 stop_loop
-printf 'spawn-%s\n' "$(get second exec)" >"$WORK/hold"
+second_ws="$SPAWN_WORKSPACE_ROOT/$(get second agent)"
+[ -d "$second_ws" ] || harness "no workspace directory for second: $second_ws"
+chmod 000 "$second_ws"
+[ ! -r "$second_ws" ] || harness "chmod 000 did not hold $second_ws unreadable"
 : >"$WORK/slow-start"
-"$real_tmux" -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+herdr_kill_server
 find "$XDG_RUNTIME_DIR" -mindepth 1 -delete
 [ -z "$(ls -A "$XDG_RUNTIME_DIR")" ] || harness "the runtime directory is not empty after the restart"
 sleep 2
@@ -609,15 +569,19 @@ rm -f "$WORK/slow-start"
 # record of the execution it runs (first's resumed one).
 resumed_exec=$(live_exec "$(get first session)")
 resumed_at=$(q "select started_at_ms from agent_executions where execution_id = '$resumed_exec'")
-server_at=$("$real_tmux" -L "$SPAWN_TMUX_SOCKET" display-message -p '#{start_time}' 2>/dev/null || true)
-[ -n "$resumed_at" ] && [ -n "$server_at" ] && [ "$((server_at * 1000))" -gt "$((resumed_at + 2000))" ] ||
-    harness "the new server (start ${server_at:-?} s) is not more than 2 s younger than $resumed_exec's record (${resumed_at:-?} ms): the slow launch did not hold"
-note "(1) the new server started $(secs $((server_at * 1000 - resumed_at))) s (whole seconds) after $resumed_exec's record"
+server_at_ms=$(herdr_server_start_ms || true)
+[ -n "$resumed_at" ] && [ -n "$server_at_ms" ] && [ "$server_at_ms" -gt "$((resumed_at + 2000))" ] ||
+    harness "the new server (start ${server_at_ms:-?} ms) is not more than 2 s younger than $resumed_exec's record (${resumed_at:-?} ms): the slow launch did not hold"
+note "(1) the new server started $(secs $((server_at_ms - resumed_at))) s after $resumed_exec's record"
 
 # --- (2) the second end, with a new server up ---------------------------------------------
 
+stop_loop
+chmod 755 "$second_ws"
+second_ws=""
 released=$(now_ms)
-rm -f "$WORK/hold"
+start_loop
+server_answers || harness "the new terminal server did not stay up across the loop restart"
 check_worked 2 second "$released" 20000
 check_interrupted 2 second host_restart yes
 note "(2) second: host_restart, resumed, working again $(secs $(($(get second back) - released))) s after the hold's end"

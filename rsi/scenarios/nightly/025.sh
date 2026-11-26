@@ -73,7 +73,7 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed grep awk; do
+for tool in psql git jq od bash sed grep awk python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -88,14 +88,13 @@ LEASE_MS=120000
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -104,16 +103,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "025"
 SPAWN_DB_NAME="bb_025_follow_$run"
-SPAWN_TMUX_SOCKET="bb-025-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -128,7 +124,7 @@ cleanup() {
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -267,19 +263,9 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-# tmux on the private socket, every call noted (`<ms> <subcommand>`), each
-# capture-pane CAPTURE_DELAY_MS slower.
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-sub=other
-for argument in "\$@"; do
-  [ "\$argument" != capture-pane ] || sub=capture-pane
-done
-printf '%s %s\n' "\$(date +%s%3N)" "\$sub" >>'$WORK/tmux.log'
-[ "\$sub" != capture-pane ] || sleep $(printf '0.%03d' "$CAPTURE_DELAY_MS")
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
+# herdr-core proxy: every RPC call noted (`<ms> <method>`), with `terminal.read`
+# logged as `capture-pane` and delayed by CAPTURE_DELAY_MS.
+herdr_use_fault_proxy "$WORK" --log "$WORK/tmux.log" --read-delay-ms "$CAPTURE_DELAY_MS"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS \
@@ -295,12 +281,11 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB
 mkdir -p "$SPAWN_WORKSPACE_ROOT"
 : >"$WORK/engine.log"
@@ -350,7 +335,7 @@ settle() {
     while :; do
         sleep 1
         latest=$(q "select coalesce(max(id), 0) from spawn_events")
-        open=$(q "select count(*) from spawn_commands where state <> 'finished'")
+        open=$(q "select count(*) from spawn_commands where state not in ('finished', 'failed', 'cancelled')")
         if [ "$latest" != "$last_seen" ] || [ "$open" -ne 0 ]; then
             last_seen=$latest
             quiet_since=$(now)

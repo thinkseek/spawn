@@ -114,21 +114,20 @@ done
 pg_bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1)
 [ -n "$pg_bin" ] && [ -x "$pg_bin/postgres" ] ||
     harness "no PostgreSQL programs (/usr/lib/postgresql/*/bin): the runner's setup needs a private server named"
-for tool in psql tmux git jq od bash sed grep awk date sha256sum sort find uname tar gzip timeout nice bwrap nproc; do
+for tool in psql git jq od bash sed grep awk date sha256sum sort find uname tar gzip timeout nice bwrap nproc; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -137,16 +136,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_036_shadow_$run"
-SPAWN_TMUX_SOCKET="bb-036-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "036"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 # The runner's root: on the disk, out of /tmp, /run and /var/tmp (setup.sh
 # refuses those: the gate's sandbox empties them), short (its jobs' scratch
 # is under it), and never in the real home (cc-rules (a)). Run by hand with
@@ -159,8 +155,8 @@ case $WORK/ in
     [ -n "$real_home" ] && [ "$(stat -f -c %T -- "$real_home" 2>/dev/null)" = tmpfs ] ||
         harness "WORK $WORK is under /tmp, /run or /var/tmp, and ${real_home:-the home} is no sandbox's empty tmpfs: the runner's root has no place (run by hand with TMPDIR on the disk)"
     runner_parent=$real_home
-    ;;
-*) runner_parent=$HOME ;;
+;;
+*) runner_parent=$HOME;;
 esac
 runner_root="$runner_parent/.bb036-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"
 TEST_URL=$SPAWN_TEST_DATABASE_URL
@@ -185,7 +181,7 @@ cleanup() {
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -375,9 +371,9 @@ cat >"$WORK/ssh" <<SSH
 #!/bin/sh
 while [ \$# -gt 0 ]; do
     case \$1 in
-    -o) shift 2 ;;
-    -*) shift ;;
-    *) break ;;
+    -o) shift 2;;
+    -*) shift;;
+    *) break;;
     esac
 done
 [ \$# -gt 1 ] || exit 255
@@ -401,7 +397,7 @@ bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=$2 ;; esac
+  case "$1" in --resume | --session-id) native=$2;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -435,7 +431,7 @@ while :; do
     *"BB:WRITE:"*)
       job=${typed#*BB:WRITE:}
       job=${job%%[!a-z]*}
-      ;;
+;;
     esac
   elif [ "$pending" = 1 ]; then
     if [ -n "$job" ]; then
@@ -460,11 +456,6 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
@@ -485,7 +476,6 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_DISK_WARN_GB=0
@@ -504,7 +494,7 @@ SPAWN_STALL_HALTED_SECS=1800
 SPAWN_INTEGRATE_WARM=0
 BACKOFF_SECS=2
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_SUPERVISOR \
     SPAWN_MISSION_FILE SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
@@ -658,7 +648,7 @@ check_shadow() {
     expect_eq "$(path "$s" verdict)" "$5" "$label the shadow's verdict (the runner's gate)"
     expect_eq "$(path "$s" primary)" "$6" "$label the shadow's primary verdict"
     case "$(path "$s" seconds)" in
-    '' | absent | null | *[!0-9]*) fail "$label the shadow's seconds: expected a whole number, got [$(path "$s" seconds)]" ;;
+    '' | absent | null | *[!0-9]*) fail "$label the shadow's seconds: expected a whole number, got [$(path "$s" seconds)]";;
     esac
     [ -n "$(run_field runner.log "$4" 3)" ] || fail "$label the runner's gate never ran for $4"
     expect_eq "$(path "$s" base)" "$(path "$p" inputs,base)" "$label the shadow's base (the primary's inputs.base)"
@@ -808,7 +798,7 @@ expect_eq "$(run_field runner.log task-d 5)" "$(digest_of "$gate")" "(3) the set
 if [ "$unequal_want" = "[]" ]; then
     expect_eq "$(path "$sd" agrees)" true "(3) the shadow's agrees (the same inputs)"
 else
-    case "$unequal_want" in *scenarios_sha256*) ;; *) fail "(3) the inputs differ, but not in scenarios_sha256: $unequal_want" ;; esac
+    case "$unequal_want" in *scenarios_sha256*);; *) fail "(3) the inputs differ, but not in scenarios_sha256: $unequal_want";; esac
     expect_eq "$(path "$sd" agrees)" null "(3) the shadow's agrees on unequal inputs ($unequal_want)"
 fi
 echo "036: task #$task_d: the primary judged the set $(path "$ed" inputs,scenarios_sha256 | cut -c1-12) (before $(printf '%s' "$digest_before" | cut -c1-12)), the runner $(path "$sd" inputs,scenarios_sha256 | cut -c1-12); unequal $unequal_want"

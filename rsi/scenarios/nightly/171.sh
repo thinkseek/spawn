@@ -39,19 +39,6 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
-SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
-if [ -z "$SPAWN_HC" ]; then
-    spawn_dir=$(dirname "$SPAWN_BIN")
-    if [ -x "$spawn_dir/spawn-hc" ]; then
-        SPAWN_HC=$spawn_dir/spawn-hc
-    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
-        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
-    elif command -v spawn-hc >/dev/null 2>&1; then
-        SPAWN_HC=$(command -v spawn-hc)
-    fi
-fi
-[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
-    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
@@ -64,27 +51,22 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 trap 'rm -rf "$WORK"' EXIT
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 SPAWN_DB_NAME="bb_171_text_$run"
-SPAWN_HERDR_SESSION="bb-171-$hc_id"
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "171"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 HOME=$WORK/home
 SPAWN_CLAUDE_PROJECTS=$WORK/home/projects
 export HOME SPAWN_CLAUDE_PROJECTS
 mkdir -p "$SPAWN_CLAUDE_PROJECTS" || harness "mkdir $SPAWN_CLAUDE_PROJECTS failed"
 [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/r
-XDG_STATE_HOME=$WORK/state
-XDG_CONFIG_HOME=$WORK/config
-mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
-export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -94,30 +76,11 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 : >"$WORK/pids"
-hc() {
-    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
-        HC_SESSION="$SPAWN_HERDR_SESSION" \
-        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
-        "$SPAWN_HC" "$@"
-}
-stop_herdr() {
-    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
-    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
-        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
-        hc kill "$addr" >/dev/null 2>&1 || true
-    done
-    hc server stop >/dev/null 2>&1 || true
-    hc_wait=0
-    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
-        hc_wait=$((hc_wait + 1))
-        sleep 0.1
-    done
-}
 cleanup() {
     while read -r pid; do
         kill -KILL "$pid" 2>/dev/null || true
     done <"$WORK/pids"
-    stop_herdr
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -161,9 +124,7 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_SERVE_TOKEN SPAWN_SERVE_DATABASE_URL \
     SPAWN_GATE_MIN_FREE_GB SPAWN_GATE_JOBS SPAWN_GATE_WORKER_CORES SPAWN_GATE_MIN_FREE_MEMORY_MB \
     SPAWN_INTEGRATE_GATES SPAWN_TEST_DATABASE_LOG SPAWN_INTEGRATE_DRAIN_SECS SPAWN_GATE_ENV_FILE \
-    SPAWN_INTEGRATE_WARM SPAWN_INTEGRATE_SHADOW SPAWN_GATE_RUNNER SPAWN_TERMINAL_BACKEND \
-    SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET SPAWN_TMUX_PROGRAM \
-    TMUX TMUX_PANE TMUX_TMPDIR; do
+    SPAWN_INTEGRATE_WARM SPAWN_INTEGRATE_SHADOW SPAWN_GATE_RUNNER; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -186,7 +147,7 @@ q() { scalar "$1"; }
 TOKEN=ghp_171madeup0123456789abcdefghijklmnopq
 PASSWORD=hunter171hunter171
 SECRET="curl -H 'Authorization: Bearer $TOKEN' and PGPASSWORD=$PASSWORD psql"
-leaks() { case $1 in *"$TOKEN"* | *"$PASSWORD"*) return 0 ;; esac; return 1; }
+leaks() { case $1 in *"$TOKEN"* | *"$PASSWORD"*) return 0;; esac; return 1; }
 masked_ok() { # <what> <text>
     if leaks "$2"; then check_failed "$1 holds a credential unmasked: [$(printf '%s' "$2" | head -c 200 | tr '\n' ' ')]"
     elif [ "${2#*\[redacted\]}" = "$2" ]; then check_failed "$1 holds no [redacted]: [$(printf '%s' "$2" | head -c 200 | tr '\n' ' ')]"
@@ -222,7 +183,7 @@ else
     length=$(q "select coalesce(length(kind -> 'detail' -> 'record' ->> 'reason'), 0) from spawn_events
                  where kind -> 'detail' -> 'record' ->> 'type' = 'mission.paused' order by id desc limit 1")
     [ "$length" -le 500 ] || check_failed "(3) the stored pause reason is $length chars, over 500"
-    case $got in *"PWD=x"*) check_failed "(3) the stored pause reason holds the secret" ;; esac
+    case $got in *"PWD=x"*) check_failed "(3) the stored pause reason holds the secret";; esac
 fi
 note "(3) checked: a reason at its limit is taken, masked, within it"
 
@@ -230,7 +191,7 @@ url="https://user:$TOKEN@git.example.org/acme/r.git"
 capture "$SPAWN_BIN" mission add --text "171 remote" --source "$url"
 said="$(cat "$WORK/out.txt" "$WORK/err.txt")"
 [ "$status" -ne 0 ] || check_failed "(4) a source URL carrying a token was taken (exit 0)"
-case $said in *"carries credentials"*) ;; *) check_failed "(4) the refusal does not say the URL carries credentials: [$(printf '%s' "$said" | head -c 300 | tr '\n' ' ')]" ;; esac
+case $said in *"carries credentials"*);; *) check_failed "(4) the refusal does not say the URL carries credentials: [$(printf '%s' "$said" | head -c 300 | tr '\n' ' ')]";; esac
 if leaks "$said"; then check_failed "(4) the refusal repeats the token: [$(printf '%s' "$said" | head -c 300 | tr '\n' ' ')]"; fi
 [ "$(q "select count(*) from mission_missions where sources::text like '%git.example.org%'")" = 0 ] ||
     check_failed "(4) a mission names the source with the token"
@@ -292,7 +253,7 @@ for case in "https://$OPAQUE@git.example.org/acme/r.git|$OPAQUE|an opaque token 
     capture "$SPAWN_BIN" mission add --text "171 remote A76" --source "$src"
     said="$(cat "$WORK/out.txt" "$WORK/err.txt")"
     [ "$status" -ne 0 ] || check_failed "(4) a source with $what was taken (exit 0)"
-    case $said in *"$secret"*) check_failed "(4) the refusal of a source with $what repeats it: [$(printf '%s' "$said" | head -c 300 | tr '\n' ' ')]" ;; esac
+    case $said in *"$secret"*) check_failed "(4) the refusal of a source with $what repeats it: [$(printf '%s' "$said" | head -c 300 | tr '\n' ' ')]";; esac
 done
 [ "$(q "select count(*) from mission_missions where sources::text like '%git.example.org%'")" = 0 ] ||
     check_failed "(4) a mission names a source with a credential"
@@ -312,10 +273,9 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # turn_duration line, then the prompt.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
-[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
-  case "$1" in --resume | --session-id) native=$2 ;; esac
+  case "$1" in --resume | --session-id) native=$2;; esac
   shift
 done
 dir=$BB_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
@@ -336,7 +296,7 @@ while :; do
     printf 'you: %s\n' "$typed"
     [ "$pending" = 1 ] || line '"type":"user","message":{"role":"user","content":"prompt"}'
     pending=1
-    case "$typed" in *"BB:WORK"*) work=1 ;; esac
+    case "$typed" in *"BB:WORK"*) work=1;; esac
   elif [ "$pending" = 1 ]; then
     if [ -n "$work" ]; then
       mkdir -p .spawn
@@ -370,8 +330,7 @@ capture "$SPAWN_BIN" submit --principal bb-harness --agent agent_resident_core -
 [ "$status" -eq 0 ] || harness "submit of the resident's start failed: $(err)"
 (
     export SPAWN_GIT_REPO="$repo" SPAWN_CLAUDE_PROGRAM="$WORK/claude" SPAWN_CLAUDE_PROJECTS="$WORK/projects" \
-        BB_PROJECTS="$WORK/projects" BB_WORK="$WORK" BB_SECRET="$SECRET" BB_PATH="$PATH" \
-        SPAWN_HERDR_CORE_PROGRAM="$SPAWN_HC" \
+        BB_PROJECTS="$WORK/projects" BB_WORK="$WORK" BB_SECRET="$SECRET" \
         SPAWN_WORKER=worker-bb SPAWN_LOOP_INTERVAL_MS=300 SPAWN_DISK_WARN_GB=0 SPAWN_DISK_FLOOR_GB=0
     exec "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT"
 ) >>"$WORK/loop.log" 2>&1 &
@@ -395,7 +354,7 @@ for got in "task.reported record's report:$rec" "task's report:$row"; do
     text=${got#*:}
     [ -n "$text" ] || { check_failed "(5) the $what is empty"; continue; }
     if leaks "$text"; then check_failed "(5) the $what holds a credential unmasked: [$(printf '%s' "$text" | head -c 200)]"; fi
-    case $text in *"[redacted]"*) ;; *) check_failed "(5) the $what holds no [redacted]: [$(printf '%s' "$text" | head -c 200)]" ;; esac
+    case $text in *"[redacted]"*);; *) check_failed "(5) the $what holds no [redacted]: [$(printf '%s' "$text" | head -c 200)]";; esac
 done
 note "(5) checked: a worker's report is stored masked"
 

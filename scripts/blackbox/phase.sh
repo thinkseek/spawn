@@ -1,11 +1,11 @@
 # The preamble every black-box scenario (rsi/scenarios/0xx.sh) repeated:
-# its exit contract, its own database and tmux socket, its cleanup, and the
+# its exit contract, its own database and herdr-core session, its cleanup, and the
 # assertions. Sourced right after `set -eu`, with:
 #
 #   PHASE=011             the scenario's number: its messages' prefix, and
-#                         its database's and socket's names
+#                         its database's and session's names
 #   PHASE_DB=covered      the database name's word (bb_<PHASE>_<word>_<run>)
-#   PHASE_TOOLS="..."     programs it needs beyond psql tmux git jq od bash sed
+#   PHASE_TOOLS="..."     programs it needs beyond psql git jq od bash sed
 #   PHASE_LOOP_TAIL=15    lines of $WORK/loop.log shown on a failure (10)
 #
 # A scenario may define, before or after sourcing (they are called at exit):
@@ -33,39 +33,35 @@ harness() {
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed ${PHASE_TOOLS-}; do
+for tool in psql git jq od bash sed ${PHASE_TOOLS-}; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor is
+# left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
+mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
-# launch's environment file, its terminals' leaders) stays in WORK, never
-# in the real one. systemd's user manager stays reachable by its bus.
+# launch's environment file, its terminals' leaders) stays in WORK (or a
+# short private runtime dir if sun_path requires), never in the user's own.
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "p$PHASE"
 SPAWN_DB_NAME="bb_${PHASE}_${PHASE_DB:?PHASE_DB is not set}_$run"
-SPAWN_TMUX_SOCKET="bb-$PHASE-$run"
 SPAWN_PSQL=psql
-export WORK SPAWN_TERMINAL_BACKEND SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -81,7 +77,7 @@ phase_teardown() {
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true

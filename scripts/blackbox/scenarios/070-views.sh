@@ -75,8 +75,8 @@ assert_not_contains "$(err)" "spawn tick warning" "tick reported no warning"
 
 # The rejected start is visible as a finished, failed command; it created no
 # execution.
-assert_eq "$(scalar "select state from agent_tasks where command_id=$rejected_id")" "finished" \
-    "rejected command is finished"
+assert_eq "$(scalar "select state from agent_tasks where command_id=$rejected_id")" "failed" \
+    "rejected command is failed"
 assert_eq "$(scalar "select succeeded from agent_tasks where command_id=$rejected_id")" "f" \
     "rejected command did not succeed"
 assert_contains "$(sql "select error from agent_tasks where command_id=$rejected_id")" \

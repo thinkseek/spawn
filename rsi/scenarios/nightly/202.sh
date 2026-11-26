@@ -44,7 +44,7 @@ tree=$(pwd)
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux jq od sed grep head cp sync python3 nice; do
+for tool in psql jq od sed grep head cp sync python3 nice; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -53,13 +53,10 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 trap 'rm -rf "$WORK"' EXIT
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_202_storage_why_$run"
-SPAWN_TMUX_SOCKET="bb-202-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$TMUX_TMPDIR"
-export TMUX_TMPDIR
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "202"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -77,7 +74,7 @@ stop_loop() {
 }
 cleanup() {
     stop_loop
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
@@ -155,11 +152,6 @@ while :; do
 done
 ENGINE
 chmod 755 "$WORK/claude"
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
@@ -173,17 +165,13 @@ HOME=$WORK/home
 export HOME
 mkdir -p "$HOME"
 [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
 
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_GIT_REPO=$repo
 SPAWN_WORKSPACE_ROOT=$WORK/ws
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_DISPATCH=0
 SPAWN_LOOP_INTERVAL_MS=300
@@ -194,7 +182,7 @@ SPAWN_CORE_LINES_FILE=$WORK/core-lines.json
 quiet=$WORK/owner-gate.state
 SPAWN_STORAGE_EXTENTS=$WORK/extents-standin.py
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_DISPATCH SPAWN_LOOP_INTERVAL_MS \
+    SPAWN_CLAUDE_PROJECTS SPAWN_WORKER SPAWN_DISPATCH SPAWN_LOOP_INTERVAL_MS \
     SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_CORE_LINES_FILE \
     SPAWN_STORAGE_EXTENTS
 mkdir -p "$SPAWN_WORKSPACE_ROOT"

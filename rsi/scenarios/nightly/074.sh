@@ -67,7 +67,7 @@ controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
 [ -f "$tree/web/src/home.ts" ] || harness "no web/src/home.ts under $tree (run from the candidate's tree)"
-for tool in psql tmux git jq od bash sed grep awk curl node; do
+for tool in psql git jq od bash sed grep awk curl node; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
@@ -75,17 +75,14 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_074_dbsize_$run"
-SPAWN_TMUX_SOCKET="bb-074-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "074"
 SPAWN_PSQL=psql
 TEST_DB="bb_074_testdb_$run"
 FLEET_DB="bb_074_fleetdb_$run"
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 # The tmux server's socket lives in WORK, so the cleanup removes nothing
 # outside it (cc-rules (a), 2026-11-12).
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$TMUX_TMPDIR"
-export TMUX_TMPDIR
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -104,7 +101,7 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     if [ -n "$test_db_made" ]; then
         psql -d postgres -tAq -c "drop database if exists $TEST_DB" >/dev/null 2>&1 || true
     fi
@@ -192,11 +189,6 @@ while :; do
 done
 ENGINE
 chmod 755 "$WORK/claude"
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_CHEAP_MODEL SPAWN_SMALL_MODEL \
@@ -213,7 +205,6 @@ real_home=$HOME
 HOME=$WORK/home
 mkdir -p "$HOME" "$SPAWN_CLAUDE_PROJECTS"
 [ "$HOME" != "$real_home" ] && [ "${HOME#"$WORK"/}" != "$HOME" ] || harness "HOME is not a scratch directory under WORK: $HOME"
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 # The alert step reads every 2 s (default 30 s).
@@ -233,7 +224,7 @@ SPAWN_MISSION_FILE=$WORK/mission.md
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 export HOME SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
+    SPAWN_CLAUDE_PROJECTS SPAWN_WORKER SPAWN_LOOP_INTERVAL_MS \
     SPAWN_ALERT_CHECK_SECS SPAWN_ALERT_DATABASE_SECS SPAWN_ALERT_DATABASE_RATIO SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_DELIVERY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_MISSION_FILE \
@@ -268,7 +259,7 @@ wait_until() { # <seconds> <command...>
 
 record() { # <JSON>: written as the integrator writes it; prints the event id
     id=$(psql -d "$SPAWN_DB_NAME" -tA -v ON_ERROR_STOP=1 -c "select spawn_control_record('$1'::jsonb)" 2>"$WORK/rec.err" | head -n 1)
-    case "$id" in '' | *[!0-9]*) harness "writing $1 failed: $(head -c 300 "$WORK/rec.err")" ;; esac
+    case "$id" in '' | *[!0-9]*) harness "writing $1 failed: $(head -c 300 "$WORK/rec.err")";; esac
     echo "$id"
 }
 

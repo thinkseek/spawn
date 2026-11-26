@@ -67,57 +67,39 @@ harness() {
 
 [ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
 [ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
-SPAWN_HC=${SPAWN_HERDR_CORE_PROGRAM-}
-if [ -z "$SPAWN_HC" ]; then
-    spawn_dir=$(dirname "$SPAWN_BIN")
-    if [ -x "$spawn_dir/spawn-hc" ]; then
-        SPAWN_HC=$spawn_dir/spawn-hc
-    elif [ -x "$(dirname "$spawn_dir")/spawn-hc" ]; then
-        SPAWN_HC=$(dirname "$spawn_dir")/spawn-hc
-    elif command -v spawn-hc >/dev/null 2>&1; then
-        SPAWN_HC=$(command -v spawn-hc)
-    fi
-fi
-[ -n "$SPAWN_HC" ] && [ -x "$SPAWN_HC" ] ||
-    harness "spawn-hc is not installed (set SPAWN_HERDR_CORE_PROGRAM or build sibling spawn-hc beside SPAWN_BIN)"
 
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql git jq od bash sed grep; do
+for tool in psql git jq od bash sed grep python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and isolated XDG dirs, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
 mkdir -p "$HOME"
 [ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
 export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
-# launch's environment file, herdr-core sockets/state) stays in WORK, never
+# launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
 real_runtime=${XDG_RUNTIME_DIR-}
 if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/r
-XDG_STATE_HOME=$WORK/state
-XDG_CONFIG_HOME=$WORK/config
-mkdir -m 700 "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
-export XDG_RUNTIME_DIR XDG_STATE_HOME XDG_CONFIG_HOME
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
-hc_id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "013"
 SPAWN_DB_NAME="bb_013_stalls_$run"
-SPAWN_HERDR_SESSION="bb-013-$hc_id"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_HERDR_SESSION SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -127,31 +109,12 @@ server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 loop_pid=""
-hc() {
-    env -u HERDR_SOCKET_PATH -u HERDR_SESSION -u HERDR_PANE_ID \
-        HC_SESSION="$SPAWN_HERDR_SESSION" \
-        HC_SOCKET="$XDG_RUNTIME_DIR/herdr-core/$SPAWN_HERDR_SESSION.sock" \
-        "$SPAWN_HC" "$@"
-}
-stop_herdr() {
-    [ -n "${SPAWN_HERDR_SESSION-}" ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ] || return 0
-    for addr in $(hc ls --json --label "spawn_owner=$SPAWN_HERDR_SESSION" 2>/dev/null |
-        jq -r '.terminals[]? | select(.state == "live") | .address // empty' 2>/dev/null || true); do
-        hc kill "$addr" >/dev/null 2>&1 || true
-    done
-    hc server stop >/dev/null 2>&1 || true
-    hc_wait=0
-    while [ "$hc_wait" -lt 20 ] && [ -S "${XDG_RUNTIME_DIR-}/herdr-core/$SPAWN_HERDR_SESSION.sock" ]; do
-        hc_wait=$((hc_wait + 1))
-        sleep 0.1
-    done
-}
 cleanup() {
     if [ -n "$loop_pid" ]; then
         kill "$loop_pid" 2>/dev/null || true
         wait "$loop_pid" 2>/dev/null || true
     fi
-    stop_herdr
+    herdr_cleanup
     if [ -n "$database_made" ]; then
         # The database and the logins init-db made for it.
         sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
@@ -236,7 +199,6 @@ git -C "$WORK/seed" push -q "$repo" main:main
 # $BB_WORK/wake-<name>.
 bb_engine >"$WORK/claude" <<'ENGINE'
 #!/usr/bin/env bash
-[ -n "${BB_PATH-}" ] && PATH=$BB_PATH && export PATH
 native=
 while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
@@ -315,13 +277,18 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
+# tmux on the private socket. Every terminal named in $WORK/refused (one per
+# line) takes no text: `load-buffer` into its paste buffer (`spawn-<terminal>`;
+# the Bridge stages every text there before any key reaches the pane) fails,
+# so nothing is ever typed into it.
+: >"$WORK/refused"
+herdr_use_fault_proxy "$WORK" --refuse-stage-terminals "$WORK/refused"
+
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
     SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
     SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS SPAWN_DELIVERY_RETRY_SECS \
-    SPAWN_DELIVERY_NOT_READY_MS SPAWN_REISSUE_AFTER_SECS SPAWN_TERMINAL_BACKEND \
-    SPAWN_HERDR_MODE SPAWN_HERDR_SHARDS SPAWN_HERDR_PROGRAM SPAWN_TMUX_SOCKET \
-    SPAWN_TMUX_PROGRAM TMUX TMUX_PANE TMUX_TMPDIR; do
+    SPAWN_DELIVERY_NOT_READY_MS SPAWN_REISSUE_AFTER_SECS; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -331,8 +298,6 @@ SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
-BB_PATH=$PATH
-SPAWN_HERDR_CORE_PROGRAM=$SPAWN_HC
 SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_SUPERVISOR=1
@@ -358,7 +323,7 @@ SPAWN_STALL_HALTED_SECS=600
 SPAWN_DELIVERY_NOT_READY_MS=15000
 export SPAWN_DELIVERY_NOT_READY_MS
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK BB_PATH SPAWN_HERDR_CORE_PROGRAM SPAWN_WORKER \
+    SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_SUPERVISOR SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB \
     SPAWN_DISK_FLOOR_GB SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
@@ -521,6 +486,7 @@ for name in stuck quiet busy quick; do
 done
 # The stuck resident's terminal takes no text from the start; its start has
 # no prompt to type, so it starts all the same.
+printf 'spawn-exec_%s\n' "$start_stuck" >"$WORK/refused"
 
 "$SPAWN_BIN" loop --repo "$repo" --root "$SPAWN_WORKSPACE_ROOT" >>"$WORK/loop.log" 2>&1 &
 loop_pid=$!
@@ -530,9 +496,6 @@ for name in stuck quiet busy quick; do
         harness "resident $name was never judged waiting at its prompt"
 done
 wait_for 90 waiting session_supervisor || harness "the supervisor was never judged waiting"
-hc_state=$(ls -d "$XDG_RUNTIME_DIR/spawn-hc-$(id -u)"/* 2>/dev/null | head -n 1)
-[ -n "$hc_state" ] && [ -d "$hc_state" ] || harness "no herdr-core state directory under $XDG_RUNTIME_DIR"
-mkdir -p "$hc_state/staged/spawn-exec_$start_stuck"
 
 # --- the tasks ---------------------------------------------------------------------
 
@@ -555,13 +518,13 @@ healthy="$task_busy $task_quick"
 # its task and went silent, the healthy ones were delivered.
 first_failed() {
     [ "$(q "select count(*) from spawn_commands
-             where idempotency_key = 'deliver-$task_stuck-0' and state = 'finished'
+             where idempotency_key = 'deliver-$task_stuck-0' and state in ('finished', 'failed')
                and not succeeded")" -ge 1 ]
 }
 wait_for 60 first_failed ||
     harness "the stuck task's first delivery did not fail (state $(task_state "$task_stuck"))"
 q "select coalesce(error, '') from spawn_commands where idempotency_key = 'deliver-$task_stuck-0'" |
-    grep -q "stage the text for spawn-exec_$start_stuck" ||
+    grep -q 'agent_not_ready' ||
     harness "the stuck task's first delivery failed for another reason"
 # Refused before typing: nothing reached the pane, so no attempt may say it
 # may have typed (that delivery would never be tried again).
@@ -596,13 +559,13 @@ assigned=$(assigned_at "$task_stuck")
     fail "(1) task #$task_stuck was escalated $(((at - assigned) / 1000)) s after its assignment (bound $DELIVERY_BOUND s + $SLACK s)"
 lines=$(digest_lines "$digest" "$task_stuck")
 [ -n "$lines" ] || fail "(1) the escalation's text does not name task #$task_stuck: $(digest_text "$digest")"
-for word in delivery "deliver-$task_stuck-0" "stage the text for spawn-exec_$start_stuck"; do
+for word in delivery "deliver-$task_stuck-0" "agent_not_ready"; do
     printf '%s\n' "$lines" | grep -qF -- "$word" ||
         fail "(1) the escalation of task #$task_stuck does not name '$word': $lines"
 done
 # Every attempt that had failed by then is named: what Spawn already tried.
 for key in $(q "select idempotency_key from spawn_commands
-                 where (idempotency_key = 'deliver-$task_stuck-0' or idempotency_key like 'deliver-$task_stuck-0-retry-%') and state = 'finished'
+                 where (idempotency_key = 'deliver-$task_stuck-0' or idempotency_key like 'deliver-$task_stuck-0-retry-%') and state in ('finished', 'failed')
                    and finished_at_ms < $at"); do
     printf '%s\n' "$lines" | grep -qF -- "$key" ||
         fail "(1) the escalation of task #$task_stuck does not name the failed attempt $key: $lines"
@@ -677,7 +640,7 @@ stuck_at=$(digest_at "$(nth_digest "$task_stuck" 1)")
 retried_after() {
     [ "$(q "select count(*) from spawn_commands
              where idempotency_key like 'deliver-$task_stuck-0-retry-%'
-               and state = 'finished' and not succeeded
+               and state in ('finished', 'failed') and not succeeded
                and finished_at_ms > $stuck_at")" -ge 1 ]
 }
 hold_until=$(($(now) + 20))

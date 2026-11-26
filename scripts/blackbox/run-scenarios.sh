@@ -11,12 +11,14 @@
 #                SPAWN_TIMING_OUT keeps each scenario's perturbation log there
 #
 # Every scenario gets its own database, its own bare repository, its own
-# workspace root and its own tmux socket, so no scenario can see another.
+# workspace root and its own herdr-core session, so no scenario can see another.
 set -uo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source=scripts/stage.sh
 . "$root/scripts/stage.sh"
+# shellcheck source=scripts/blackbox/lib-herdr.sh
+. "$root/scripts/blackbox/lib-herdr.sh"
 bin=${SPAWN_BIN:-${CARGO_TARGET_DIR:-$root/target}/debug/spawn}
 pattern=${1:-*.sh}
 
@@ -49,11 +51,7 @@ cleanup() {
     if [ -n "${db:-}" ]; then
         drop_database "$db"
     fi
-    # Only a socket this runner made: an inherited SPAWN_TMUX_SOCKET may be
-    # a live fleet's.
-    if [ -n "${own_socket:-}" ]; then
-        tmux -L "$own_socket" kill-server >/dev/null 2>&1
-    fi
+    herdr_cleanup
     return 0
 }
 trap cleanup EXIT
@@ -112,13 +110,13 @@ FAKE
     SPAWN_GIT_REPO=$repo
     SPAWN_WORKSPACE_ROOT=$work/ws
     SPAWN_CLAUDE_PROGRAM=$work/claude
-    SPAWN_TERMINAL_BACKEND=tmux
-    SPAWN_TMUX_SOCKET="bb-$slug-$run"
-    own_socket=$SPAWN_TMUX_SOCKET
+    SPAWN_CLAUDE_PROJECTS=$work/projects
+    mkdir -p "$SPAWN_CLAUDE_PROJECTS"
+    herdr_setup "$work" "$slug"
     SPAWN_WORKER=worker-bb
     WORK=$work
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
-        SPAWN_CLAUDE_PROGRAM SPAWN_TERMINAL_BACKEND SPAWN_TMUX_SOCKET SPAWN_WORKER WORK
+        SPAWN_CLAUDE_PROGRAM SPAWN_CLAUDE_PROJECTS SPAWN_WORKER WORK
     # The archive's location tool, as the gate's sandbox gives it (objective
     # 175): an empty stand-in that places no credential value, so a run
     # never depends on the host's installed collector; a scenario may name
@@ -158,8 +156,7 @@ FAKE
     fi
 
     [ -n "$timing_out" ] && timing_report "$timing_out"
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
+    herdr_cleanup
     drop_database "$db"
     rm -rf "$work"
 done

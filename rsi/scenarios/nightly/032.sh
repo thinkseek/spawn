@@ -140,9 +140,9 @@ MEASURE=${BB_032_MEASURE-}
 SEED=${BB_032_SEED:-32}
 DURATION=${BB_032_DURATION_SECS:-180}
 ENVELOPE=${BB_032_ENVELOPE:-auto}
-case "$SEED" in '' | *[!0-9]*) harness "BB_032_SEED must be a whole number" ;; esac
-case "$DURATION" in '' | *[!0-9]*) harness "BB_032_DURATION_SECS must be a whole number of seconds" ;; esac
-case "$ENVELOPE" in auto | systemd | stand-in) ;; *) harness "BB_032_ENVELOPE is auto, systemd or stand-in" ;; esac
+case "$SEED" in '' | *[!0-9]*) harness "BB_032_SEED must be a whole number";; esac
+case "$DURATION" in '' | *[!0-9]*) harness "BB_032_DURATION_SECS must be a whole number of seconds";; esac
+case "$ENVELOPE" in auto | systemd | stand-in);; *) harness "BB_032_ENVELOPE is auto, systemd or stand-in";; esac
 
 # The thresholds (the gate's contract; not settings).
 RESUME_P90_MS=15000 # the p90 of the times to resume
@@ -153,7 +153,7 @@ GAP_MS=5000         # a gap in durable progress longer than this is downtime
 controller=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$controller/scripts/blackbox/assertions.sh" ] ||
     harness "no $controller/scripts/blackbox/assertions.sh"
-for tool in psql tmux git jq od bash sed awk sort comm curl python3; do
+for tool in psql git jq od bash sed awk sort comm curl python3; do
     command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 real_df=$(command -v df) || harness "df is not installed"
@@ -161,14 +161,13 @@ real_df=$(command -v df) || harness "df is not installed"
 WORK=$(mktemp -d) || harness "mktemp failed"
 # Gone again if a check below refuses, before the cleanup is set.
 trap 'rm -rf "$WORK"' EXIT
-# A scratch HOME, and the tmux server's socket, in WORK: nothing here reads
-# or writes the real home, nor is left outside it (cc-rules (a), 2026-11-12).
+# A scratch HOME in WORK: nothing here reads or writes the real home, nor
+# is left outside it (cc-rules (a), 2026-11-12).
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
 HOME=$WORK/home
-TMUX_TMPDIR=$WORK/tmux-sock
-mkdir -p "$HOME" "$TMUX_TMPDIR"
-[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home" ;; esac
-export HOME TMUX_TMPDIR
+mkdir -p "$HOME"
+[ -z "$real_home" ] || case $HOME/ in "$real_home"/*) harness "HOME $HOME is in the real home $real_home";; esac
+export HOME
 # The runtime directory too (backlog S20): what Spawn keeps there (a
 # launch's environment file, its terminals' leaders) stays in WORK, never
 # in the real one. systemd's user manager stays reachable by its bus.
@@ -177,16 +176,13 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "$real_runtime/bus" ]; then
     DBUS_SESSION_BUS_ADDRESS=unix:path=$real_runtime/bus
     export DBUS_SESSION_BUS_ADDRESS
 fi
-XDG_RUNTIME_DIR=$WORK/runtime
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-export XDG_RUNTIME_DIR
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_032_soak_$run"
-SPAWN_TMUX_SOCKET="bb-032-$run"
-export SPAWN_TERMINAL_BACKEND=tmux
+. "$controller/scripts/blackbox/lib-herdr.sh"
+herdr_setup "$WORK" "032"
 SPAWN_PSQL=psql
-export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
+export WORK SPAWN_DB_NAME SPAWN_PSQL
 
 # shellcheck source=scripts/pg-url.sh
 . "$controller/scripts/pg-url.sh"
@@ -196,8 +192,8 @@ pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
     harness "SPAWN_TEST_DATABASE_URL is not a single-host postgres:// URL"
 server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 case "$pg_url_host" in
-/*) db_target="$pg_url_host/.s.PGSQL.$pg_url_port" ;;
-*) db_target="$pg_url_host:$pg_url_port" ;;
+/*) db_target="$pg_url_host/.s.PGSQL.$pg_url_port";;
+*) db_target="$pg_url_host:$pg_url_port";;
 esac
 # The loop reaches the database through a forwarder the scenario cuts to
 # restart the database (a Unix socket in $WORK/pg); everything the scenario
@@ -224,7 +220,7 @@ cleanup() {
     if [ -f "$WORK/loop.pid" ]; then stop_pid "$(cat "$WORK/loop.pid")"; fi
     stop_pid "$supervisor_pid"
     if [ -f "$WORK/loop.pid" ]; then stop_pid "$(cat "$WORK/loop.pid")"; fi
-    tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    herdr_cleanup
     stop_pid "$relay_pid"
     stop_pid "$forwarder_pid"
     if [ -n "$slice" ]; then
@@ -351,9 +347,9 @@ settings=
 resumed=
 while [ $# -gt 0 ]; do
   case "$1" in
-  --resume) native=$2; resumed=resume ;;
-  --session-id) native=$2 ;;
-  --settings) settings=$2 ;;
+  --resume) native=$2; resumed=resume;;
+  --session-id) native=$2;;
+  --settings) settings=$2;;
   esac
   shift
 done
@@ -387,20 +383,20 @@ api_error() {
     kind=overloaded
     text='API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
     json='API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}'
-    ;;
+;;
   401 | 403)
     kind=authentication_failed
     text="Please run /login · API Error: $1 Request not allowed"
     json=$text
-    ;;
+;;
   *)
     kind=server_error
     text="API Error: $1 the model relay did not answer"
     json=$text
-    ;;
+;;
   esac
   status=$1
-  case "$status" in '' | *[!0-9]*) status=null ;; esac
+  case "$status" in '' | *[!0-9]*) status=null;; esac
   line "\"type\":\"assistant\",\"isApiErrorMessage\":true,\"error\":\"$kind\",\"apiErrorStatus\":$status,\"message\":{\"model\":\"<synthetic>\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"$json\"}]}"
   printf '%s api-error %s %s\n' "$(stamp)" "$SPAWN_EXECUTION_ID" "$1" >>"$BB_WORK/engine.log"
   printf '\n%s\n\n❯ ' "$text"
@@ -453,7 +449,7 @@ while :; do
       line '"type":"user","message":{"role":"user","content":"prompt"}'
     fi
     pending=1
-    case "$typed" in *"BB:SOAK"*) : >soak.task ;; esac
+    case "$typed" in *"BB:SOAK"*) : >soak.task;; esac
   elif [ "$pending" = 1 ]; then
     pending=0
     rc=0
@@ -470,11 +466,6 @@ done
 ENGINE
 chmod 755 "$WORK/claude"
 
-cat >"$WORK/tmux" <<EOF
-#!/bin/sh
-exec tmux -L '$SPAWN_TMUX_SOCKET' "\$@"
-EOF
-chmod 755 "$WORK/tmux"
 
 # `df` as the loop runs it (`df -Pk -- <path>`): 1 GiB available on every
 # path while $WORK/disk-full exists, the real `df` otherwise.
@@ -667,7 +658,6 @@ SPAWN_MODEL_RELAY=$relay_url
 BB_PROJECTS=$SPAWN_CLAUDE_PROJECTS
 BB_WORK=$WORK
 BB_RELAY=$relay_url
-SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
 SPAWN_MISSION_FILE=$WORK/mission.md
 # The loop's interval is production's default (500 ms). The disk floor is
@@ -689,7 +679,7 @@ SPAWN_STALL_LANDING_SECS=1800
 SPAWN_STALL_STOP_SECS=1800
 SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
-    SPAWN_CLAUDE_PROJECTS SPAWN_MODEL_RELAY BB_PROJECTS BB_WORK BB_RELAY SPAWN_TMUX_PROGRAM \
+    SPAWN_CLAUDE_PROJECTS SPAWN_MODEL_RELAY BB_PROJECTS BB_WORK BB_RELAY \
     SPAWN_WORKER SPAWN_MISSION_FILE SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB \
     SPAWN_RECOVER_BACKOFF_SECS SPAWN_RECOVER_MODEL_BACKOFF_SECS SPAWN_RECOVER_AUTH_RETRY_SECS \
     SPAWN_RECOVER_PROBE_SECS \
@@ -873,9 +863,9 @@ while :; do
         rand 3000
         inject=$((at + r))
         case "$kind" in
-        relay | disk) rand 5001; outage=$((5000 + r)) ;;
-        database) rand 12001; outage=$((8000 + r)) ;;
-        *) outage=0 ;;
+        relay | disk) rand 5001; outage=$((5000 + r));;
+        database) rand 12001; outage=$((8000 + r));;
+        *) outage=0;;
         esac
         at=$((inject + outage + WINDOW_MS))
         lines="$lines$kind $inject $outage
@@ -930,7 +920,7 @@ while read -r kind inject outage; do
         else
             note="no engine running: not injected"
         fi
-        ;;
+;;
     memory)
         if [ "$ENVELOPE" = systemd ]; then
             : >"$WORK/fault-alloc"
@@ -945,19 +935,19 @@ while read -r kind inject outage; do
         else
             note="no engine running: not injected"
         fi
-        ;;
-    relay) : >"$WORK/relay-down" ;;
-    database) : >"$WORK/db-down" ;;
-    disk) : >"$WORK/disk-full" ;;
+;;
+    relay) : >"$WORK/relay-down";;
+    database) : >"$WORK/db-down";;
+    disk) : >"$WORK/disk-full";;
     esac
     reference=$injected
     cleared=""
     if [ "$outage" -gt 0 ]; then
         wait_until_ms $((injected + outage))
         case "$kind" in
-        relay) rm -f "$WORK/relay-down" ;;
-        database) rm -f "$WORK/db-down" ;;
-        disk) rm -f "$WORK/disk-full" ;;
+        relay) rm -f "$WORK/relay-down";;
+        database) rm -f "$WORK/db-down";;
+        disk) rm -f "$WORK/disk-full";;
         esac
         cleared=$(now_ms)
         reference=$cleared
@@ -1009,11 +999,11 @@ while read -r kind inject outage; do
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$number" "$kind" "$injected" "${cleared:--}" \
         "${took:--}" "$causes" "$restarts" "$outage" "$note" >>"$WORK/results"
     case "$kind" in
-    kill) what="an engine kill" ;;
-    memory) what="a memory-limit kill" ;;
-    relay) what="a model relay outage of $(secs "$outage") s" ;;
-    database) what="a database restart of $(secs "$outage") s" ;;
-    disk) what="a disk-full episode of $(secs "$outage") s" ;;
+    kill) what="an engine kill";;
+    memory) what="a memory-limit kill";;
+    relay) what="a model relay outage of $(secs "$outage") s";;
+    database) what="a database restart of $(secs "$outage") s";;
+    disk) what="a disk-full episode of $(secs "$outage") s";;
     esac
     from="the fault"
     [ -z "$cleared" ] || from="its clearing"
@@ -1026,7 +1016,7 @@ while read -r kind inject outage; do
     fi
     case "$note" in *"NOT DELIVERED"*)
         measured_fail "(1) fault $number/$faults (memory): the tool allocated 256 MiB past SPAWN_EXECUTION_MEMORY_MAX=128M and no execution of the resident ended within 15 s: no envelope confined it (objective 029)"
-        ;;
+;;
     esac
 done <"$WORK/schedule"
 
@@ -1118,7 +1108,7 @@ while IFS='|' read -r number kind injected cleared took causes restarts outage n
     [ "$cleared" = - ] || from=clearing
     printf '032: %s | %s | %s | %s | %s | %s | %s | %s | %s | %s\n' "$number" "$kind" \
         "$(secs $((injected - start)))" "$(secs "$outage")" \
-        "$(case "$took:$note" in -:*"NOT DELIVERED"*) echo "not delivered" ;; -:*) echo never ;; *) secs "$took" ;; esac)" "$from" "${lostn:-0}" "$causes" \
+        "$(case "$took:$note" in -:*"NOT DELIVERED"*) echo "not delivered";; -:*) echo never;; *) secs "$took";; esac)" "$from" "${lostn:-0}" "$causes" \
         "$restarts" "${note:--}"
 done <"$WORK/results"
 endlost=$(awk '$1 == "end" { print $2 }' "$WORK/lost-by-fault")
