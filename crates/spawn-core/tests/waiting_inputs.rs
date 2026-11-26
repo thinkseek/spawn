@@ -692,3 +692,176 @@ fn a_key_for_a_stopped_session_fails_with_the_reason() {
     assert!(rig.steps(3).is_empty());
     assert!(rig.keys().is_empty());
 }
+
+/// Issue #145 Part 1: when an input is ingested mid-turn (or on a ready pane
+/// whose brief Busy state was missed between scrapes), structured completion
+/// signals (`message.taken`, `message.acted` with `execution_id: None`, or
+/// `turn.stopped`) clear the unanswered-input latch even with zero
+/// `screen.observed(Busy)` events, while an earlier command's `acted` or a
+/// lack of any post-typing completion signal keeps the anti-double-send guard
+/// intact.
+#[test]
+fn structured_completion_without_busy_screen_unlocks_next_input() {
+    let mut rig = Rig::new(Duration::ZERO);
+    let exec = ExecutionId::for_command(CommandId(1));
+    rig.pane(READY);
+
+    // 1. First dispatcher input succeeds on the ready pane (command 2).
+    rig.say("spawn-dispatch", "dispatch-digest-1", "first digest");
+    rig.tick();
+    assert_eq!(rig.finished(2), Some((true, String::new())));
+    assert_eq!(rig.typed(), ["first digest"]);
+
+    // 2. Before any busy screen or completion signal arrives, the next
+    // dispatcher input (command 3) is refused to avoid double-typing into
+    // the same ready reading.
+    rig.say("spawn-dispatch", "dispatch-digest-2", "too early");
+    rig.tick();
+    let (ok, err) = rig.finished(3).expect("refused at once");
+    assert!(!ok);
+    assert!(err.contains(PANE_NOT_READY), "{err}");
+    assert!(err.contains("has not been answered yet"), "{err}");
+
+    // 3. A late `message.acted` for an earlier command (command 1, as in
+    // #145) does NOT clear command 2's unanswered-input guard.
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some("1:acted".to_string()),
+            kind: EventKind::MessageActed {
+                command_id: CommandId(1),
+                outcome: "done".to_string(),
+                why: None,
+            },
+        })
+        .expect("append earlier acted");
+    rig.say("spawn-dispatch", "dispatch-digest-3", "still too early");
+    rig.tick();
+    let (ok, err) = rig.finished(4).expect("still refused");
+    assert!(!ok);
+    assert!(err.contains("has not been answered yet"), "{err}");
+
+    // 4. Exact #145 completion sequence with ZERO `ScreenObserved(Busy)` and
+    // ZERO `MessageReceived`: `message.taken(2)` -> `message.acted(2)`
+    // (`execution_id: None`) -> `turn.stopped`.
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: Some(exec.clone()),
+            source: Source::Claude,
+            source_event_id: Some("taken-2".to_string()),
+            kind: EventKind::MessageTaken {
+                command_id: CommandId(2),
+            },
+        })
+        .expect("append taken");
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some("2:acted".to_string()),
+            kind: EventKind::MessageActed {
+                command_id: CommandId(2),
+                outcome: "done".to_string(),
+                why: None,
+            },
+        })
+        .expect("append acted");
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: Some(exec),
+            source: Source::Claude,
+            source_event_id: Some("turn-stop-2".to_string()),
+            kind: EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        })
+        .expect("append turn stopped");
+
+    // 5. Next dispatcher input delivers immediately without waiting for Busy.
+    rig.say("spawn-dispatch", "dispatch-digest-4", "second digest");
+    rig.tick();
+    assert_eq!(rig.finished(5), Some((true, String::new())));
+    assert_eq!(rig.typed(), ["first digest", "second digest"]);
+}
+
+/// Each structured signal (`message.taken(cmd)`, `message.acted(cmd)` with
+/// `execution_id: None`, and `turn.stopped` after typing) independently unlocks
+/// the next input without any `screen.observed(Busy)` event and survives a
+/// Bridge restart rebuilt from the event log.
+#[test]
+fn individual_completion_signals_unlock_and_survive_bridge_restart() {
+    let mut rig = Rig::new(Duration::ZERO);
+    let exec = ExecutionId::for_command(CommandId(1));
+    rig.pane(READY);
+
+    // Case A: `message.taken(2)` alone + Bridge restart.
+    rig.say("spawn-dispatch", "k-a1", "msg a1");
+    rig.tick();
+    assert_eq!(rig.finished(2), Some((true, String::new())));
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: Some(exec.clone()),
+            source: Source::Claude,
+            source_event_id: Some("taken-only-2".to_string()),
+            kind: EventKind::MessageTaken {
+                command_id: CommandId(2),
+            },
+        })
+        .expect("taken 2");
+    rig.restart();
+    rig.say("spawn-dispatch", "k-b1", "msg b1");
+    rig.tick();
+    assert_eq!(rig.finished(3), Some((true, String::new())));
+
+    // Case B: `message.acted(3)` with `execution_id: None` alone + Bridge restart.
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some("3:acted".to_string()),
+            kind: EventKind::MessageActed {
+                command_id: CommandId(3),
+                outcome: "done".to_string(),
+                why: None,
+            },
+        })
+        .expect("acted 3");
+    rig.restart();
+    rig.say("spawn-dispatch", "k-c1", "msg c1");
+    rig.tick();
+    assert_eq!(rig.finished(4), Some((true, String::new())));
+
+    // Case C: `turn.stopped` alone (zero MessageReceived) + Bridge restart.
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("agent"),
+            session_id: SessionId::new("session_one").expect("session"),
+            execution_id: Some(exec),
+            source: Source::Claude,
+            source_event_id: Some("stop-only-4".to_string()),
+            kind: EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        })
+        .expect("turn stop 4");
+    rig.restart();
+    rig.say("spawn-dispatch", "k-d1", "msg d1");
+    rig.tick();
+    assert_eq!(rig.finished(5), Some((true, String::new())));
+    assert_eq!(rig.typed(), ["msg a1", "msg b1", "msg c1", "msg d1"]);
+}

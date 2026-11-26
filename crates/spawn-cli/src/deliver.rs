@@ -201,6 +201,10 @@ const NOT_READY_MIN_MS: i64 = 100;
 /// prompt still ends in an escalation.
 const NOT_READY_FREE: usize = 10;
 
+/// Consecutive `PANE_NOT_READY` refusals before emitting a structured
+/// diagnostic/escalation warning.
+pub(crate) const NOT_READY_WARN_THRESHOLD: usize = 5;
+
 /// Longest wait between two retries.
 const RETRY_MAX_MS: i64 = 30 * 60_000;
 
@@ -217,6 +221,109 @@ fn backoff(base_ms: i64, failures: usize) -> i64 {
         .unwrap_or(u32::MAX)
         .min(20);
     base_ms.saturating_mul(1_i64 << doublings).min(RETRY_MAX_MS)
+}
+
+/// Parse `SPAWN_DELIVERY_NOT_READY_MS`, returning the effective interval and an
+/// optional warning when the value is invalid or below [`NOT_READY_MIN_MS`].
+fn parse_not_ready_ms(raw: Option<&str>) -> (i64, Option<String>) {
+    let Some(text) = raw else {
+        return (NOT_READY_RETRY_MS, None);
+    };
+    match text.trim().parse::<i64>() {
+        Ok(ms) if ms >= NOT_READY_MIN_MS => (ms, None),
+        _ => (
+            NOT_READY_RETRY_MS,
+            Some(format!(
+                "SPAWN_DELIVERY_NOT_READY_MS={text:?} is not a whole number of \
+                 milliseconds from {NOT_READY_MIN_MS}; using {NOT_READY_RETRY_MS}"
+            )),
+        ),
+    }
+}
+
+/// Read `SPAWN_DELIVERY_NOT_READY_MS` from the process environment, falling back
+/// to [`NOT_READY_RETRY_MS`] when unset or invalid.
+pub(crate) fn env_not_ready_ms() -> i64 {
+    let raw = crate::config::env_value("SPAWN_DELIVERY_NOT_READY_MS");
+    parse_not_ready_ms(raw.as_deref()).0
+}
+
+/// Summary of a trailing streak of consecutive [`PANE_NOT_READY`] refusals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotReadyStreak<'a> {
+    pub(crate) consecutive: usize,
+    pub(crate) same_cause: usize,
+    pub(crate) last_finished_ms: i64,
+    pub(crate) last_command_id: Option<i64>,
+    pub(crate) last_key: &'a str,
+    pub(crate) last_error: &'a str,
+    pub(crate) ready_pane_stall: bool,
+}
+
+/// Summarize a trailing streak of consecutive [`PANE_NOT_READY`] refusals from
+/// oldest-to-newest `sent` items. Returns `None` unless the latest item failed
+/// with [`PANE_NOT_READY`].
+pub(crate) fn trailing_not_ready_streak<'a>(
+    sent: impl DoubleEndedIterator<Item = &'a Sent>,
+) -> Option<NotReadyStreak<'a>> {
+    let mut consecutive = 0_usize;
+    let mut same_cause = 0_usize;
+    let mut same_cause_open = true;
+    let mut latest: Option<(i64, Option<i64>, &'a str, &'a str)> = None;
+    for item in sent.rev() {
+        let Some(error) = item
+            .error
+            .as_deref()
+            .filter(|err| item.succeeded == Some(false) && err.contains(PANE_NOT_READY))
+        else {
+            break;
+        };
+        consecutive += 1;
+        match latest {
+            None => {
+                latest = Some((
+                    item.finished_at_ms.unwrap_or(item.created_at_ms),
+                    item.id,
+                    item.key.as_str(),
+                    error,
+                ));
+                same_cause = 1;
+            }
+            Some((_, _, _, first_error)) => {
+                if same_cause_open && error.trim() == first_error.trim() {
+                    same_cause += 1;
+                } else {
+                    same_cause_open = false;
+                }
+            }
+        }
+    }
+    let (last_finished_ms, last_command_id, last_key, last_error) = latest?;
+    Some(NotReadyStreak {
+        consecutive,
+        same_cause,
+        last_finished_ms,
+        last_command_id,
+        last_key,
+        last_error,
+        ready_pane_stall: last_error.contains("pane state Ready"),
+    })
+}
+
+/// Format a structured diagnostic warning when `sent` ends in at least
+/// [`NOT_READY_WARN_THRESHOLD`] consecutive [`PANE_NOT_READY`] failures.
+pub(crate) fn not_ready_streak_diagnostic(session_id: &str, sent: &[&Sent]) -> Option<String> {
+    let streak = trailing_not_ready_streak(sent.iter().copied())?;
+    (streak.consecutive >= NOT_READY_WARN_THRESHOLD).then(|| {
+        format!(
+            "warning=pane_not_ready_streak session={session_id} consecutive={} same_cause={} \
+             ready_pane_stall={} cause=\"{}\"",
+            streak.consecutive,
+            streak.same_cause,
+            streak.ready_pane_stall,
+            one_line(streak.last_error, 200)
+        )
+    })
 }
 
 /// The dispatcher's three delivery waits, settings `spawn loop` reads from
@@ -284,19 +391,9 @@ impl Waits {
         let retry_ms = millis("SPAWN_DELIVERY_RETRY_SECS", RETRY_MS);
         let reissue_after_ms = millis("SPAWN_REISSUE_AFTER_SECS", REISSUE_AFTER_MS);
         // In milliseconds: a pane is often ready in well under a second.
-        let not_ready_ms = match lookup("SPAWN_DELIVERY_NOT_READY_MS") {
-            None => NOT_READY_RETRY_MS,
-            Some(text) => match text.trim().parse::<i64>() {
-                Ok(ms) if ms >= NOT_READY_MIN_MS => ms,
-                _ => {
-                    warnings.push(format!(
-                        "SPAWN_DELIVERY_NOT_READY_MS={text:?} is not a whole number of \
-                         milliseconds from {NOT_READY_MIN_MS}; using {NOT_READY_RETRY_MS}"
-                    ));
-                    NOT_READY_RETRY_MS
-                }
-            },
-        };
+        let (not_ready_ms, warning) =
+            parse_not_ready_ms(lookup("SPAWN_DELIVERY_NOT_READY_MS").as_deref());
+        warnings.extend(warning);
         let waits = Self {
             retry_ms,
             reissue_after_ms,
@@ -1604,10 +1701,12 @@ pub(crate) fn delivery_status(
             format!("not tried again: it {why} (escalated as delivery failed)")
         }
     };
-    DeliveryStatus {
-        given_up,
-        line: format!("{tried}; {next}"),
+    let mut line = format!("{tried}; {next}");
+    if !given_up && let Some(diag) = not_ready_streak_diagnostic(&task.session_id, &sent) {
+        line.push_str("; ");
+        line.push_str(&diag);
     }
+    DeliveryStatus { given_up, line }
 }
 
 /// Where each waiting task's delivery stands, with the task and its
@@ -2659,10 +2758,21 @@ fn refuse_unfinished(
             return Ok(None);
         };
         send_note(store, task, &retry, unfinished_note(task.id, markers))?;
-        return Ok(Some(format!(
+        let note_retry_prefix = format!("{key}-retry-");
+        let note_attempts: Vec<&Sent> = facts
+            .dispatched
+            .iter()
+            .filter(|sent| sent.key == key || sent.key.starts_with(&note_retry_prefix))
+            .collect();
+        let mut line = format!(
             "deliver: task #{}'s report is still unfinished; its note goes again ({retry})",
             task.id
-        )));
+        );
+        if let Some(diag) = not_ready_streak_diagnostic(&task.session_id, &note_attempts) {
+            line.push_str("; ");
+            line.push_str(&diag);
+        }
+        return Ok(Some(line));
     }
     let command = send_note(store, task, &key, unfinished_note(task.id, markers))?;
     let records = markers.iter().map(unfinished::Marker::record).collect();
@@ -6097,5 +6207,90 @@ PENDING_ISSUES\n";
         assert_eq!(waits.not_ready_wait_ms(4), 40_000);
         assert_eq!(waits.not_ready_wait_ms(5), 60_000);
         assert_eq!(waits.not_ready_wait_ms(9), 60_000);
+    }
+
+    #[test]
+    fn parse_not_ready_ms_honors_short_intervals_and_rejects_typos() {
+        assert_eq!(super::parse_not_ready_ms(None), (NOT_READY_RETRY_MS, None));
+        assert_eq!(super::parse_not_ready_ms(Some(" 500 ")), (500, None));
+        assert_eq!(super::parse_not_ready_ms(Some("100")), (100, None));
+        let (fallback, warn) = super::parse_not_ready_ms(Some("5"));
+        assert_eq!(fallback, NOT_READY_RETRY_MS);
+        assert!(warn.is_some());
+    }
+
+    #[test]
+    fn not_ready_streak_diagnostic_fires_at_threshold_and_flags_ready_pane_stalls() {
+        let ready_err = "pane state Ready does not accept input: the input typed last has not \
+                         been answered yet";
+        let busy_err = "pane state Busy does not accept input";
+        let four: Vec<Sent> = (0..4)
+            .map(|i| {
+                sent(
+                    i + 1,
+                    &format!("deliver-9-0-r{i}"),
+                    1_000 + i,
+                    Some(ready_err),
+                )
+            })
+            .collect();
+        let four_refs: Vec<&Sent> = four.iter().collect();
+        assert_eq!(
+            super::not_ready_streak_diagnostic("session_resident_core", &four_refs),
+            None
+        );
+
+        let mut five = four;
+        five.push(sent(5, "deliver-9-0-r4", 1_010, Some(ready_err)));
+        let five_refs: Vec<&Sent> = five.iter().collect();
+        let diag = super::not_ready_streak_diagnostic("session_resident_core", &five_refs)
+            .expect("threshold hit");
+        assert!(diag.contains("warning=pane_not_ready_streak"), "{diag}");
+        assert!(diag.contains("consecutive=5 same_cause=5"), "{diag}");
+        assert!(diag.contains("ready_pane_stall=true"), "{diag}");
+
+        // Delivery status surfaces the streak warning before giving up.
+        let mut facts = worker(true, true);
+        facts.dispatched = five
+            .into_iter()
+            .enumerate()
+            .map(|(idx, mut s)| {
+                s.key = if idx == 0 {
+                    "deliver-9-0".to_string()
+                } else {
+                    format!("deliver-9-0-retry-{idx}")
+                };
+                s
+            })
+            .collect();
+        let work = with(vec![task(9, TaskState::Assigned, "resident")], None);
+        let status = super::delivery_status(&work, &work.tasks[0], Some(&facts), 2_000);
+        assert!(!status.given_up);
+        assert!(
+            status.line.contains("warning=pane_not_ready_streak"),
+            "{}",
+            status.line
+        );
+        assert!(
+            status.line.contains("ready_pane_stall=true"),
+            "{}",
+            status.line
+        );
+
+        // Busy failures set ready_pane_stall=false.
+        let busy: Vec<Sent> = (0..5)
+            .map(|i| {
+                sent(
+                    i + 1,
+                    &format!("deliver-9-0-b{i}"),
+                    1_000 + i,
+                    Some(busy_err),
+                )
+            })
+            .collect();
+        let busy_refs: Vec<&Sent> = busy.iter().collect();
+        let busy_diag =
+            super::not_ready_streak_diagnostic("session_resident_core", &busy_refs).expect("diag");
+        assert!(busy_diag.contains("ready_pane_stall=false"), "{busy_diag}");
     }
 }

@@ -979,62 +979,144 @@ fn text(lines: &[Line<'_>], spawn: &str) -> String {
     text
 }
 
-/// Backoff wait `(last_finished_ms, wait_ms)` after trailing `PANE_NOT_READY`
-/// failures on `dispatch-digest-*` commands.
-fn busy_retry_wait_ms(supervisor: &Facts) -> Option<(i64, i64)> {
-    let mut consecutive = 0_usize;
-    let mut last_finished_ms: Option<i64> = None;
-    for sent in supervisor.dispatched.iter().rev() {
-        if !sent.key.starts_with("dispatch-digest-") {
-            continue;
-        }
-        let not_ready = sent.succeeded == Some(false)
-            && sent
-                .error
-                .as_deref()
-                .is_some_and(|err| err.contains(spawn_core::bridge::PANE_NOT_READY));
-        if not_ready {
-            consecutive += 1;
-            if last_finished_ms.is_none() {
-                last_finished_ms = Some(sent.finished_at_ms.unwrap_or(sent.created_at_ms));
-            }
-        } else {
-            break;
-        }
+/// First-tier ceiling (ms) for consecutive `dispatch-digest-*` `PANE_NOT_READY`
+/// backoffs (streaks 1..=6 double up to 60s), preserving the short initial
+/// schedule before escalating to second-tier delays.
+const SUPERVISOR_NOT_READY_TIER1_CAP_MS: i64 = 60_000;
+
+/// Streak length after which second-tier exponential backoff kicks in past 60s.
+const SUPERVISOR_NOT_READY_TIER1_STREAK: usize = 6;
+
+/// Number of doublings used to compute the wait at [`SUPERVISOR_NOT_READY_TIER1_STREAK`].
+const SUPERVISOR_NOT_READY_TIER1_DOUBLINGS: u32 = 5;
+
+/// Second-tier ceiling (15 minutes) for chronic `dispatch-digest-*`
+/// `PANE_NOT_READY` failures so a stuck supervisor never produces an unbounded
+/// retry storm.
+const SUPERVISOR_NOT_READY_MAX_MS: i64 = 15 * 60_000;
+
+/// Deduplicates per-streak supervisor `PANE_NOT_READY` diagnostic logs by
+/// `(last_command_key, consecutive_count)` so an unchanged failure does not spam
+/// stderr on every tick.
+static LAST_NOT_READY_DIAG: std::sync::Mutex<Option<(String, usize)>> = std::sync::Mutex::new(None);
+
+/// Exponential backoff wait (ms) for trailing `dispatch-digest-*`
+/// `PANE_NOT_READY` failures starting from `base_ms`:
+/// - Streaks 1..=6 double up to `max(base_ms, 60_000)` (`5s..=60s` at default);
+/// - Streaks 7+ continue doubling past 60s up to `max(base_ms, 900_000)`.
+fn not_ready_wait_ms(consecutive: usize, base_ms: i64) -> i64 {
+    let base = base_ms.max(1);
+    let tier1_cap = base.max(SUPERVISOR_NOT_READY_TIER1_CAP_MS);
+    if consecutive <= SUPERVISOR_NOT_READY_TIER1_STREAK {
+        let doublings = u32::try_from(consecutive.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(6);
+        return base.saturating_mul(1_i64 << doublings).min(tier1_cap);
     }
-    let last_ms = last_finished_ms?;
-    let doublings = u32::try_from(consecutive.saturating_sub(1))
+    let at_tier1_end = base
+        .saturating_mul(1_i64 << SUPERVISOR_NOT_READY_TIER1_DOUBLINGS)
+        .min(tier1_cap);
+    let extra = u32::try_from(consecutive - SUPERVISOR_NOT_READY_TIER1_STREAK)
         .unwrap_or(u32::MAX)
-        .min(6);
-    let wait_ms = 5_000_i64.saturating_mul(1_i64 << doublings).min(60_000);
-    Some((last_ms, wait_ms))
+        .min(10);
+    let max_cap = base.max(SUPERVISOR_NOT_READY_MAX_MS);
+    at_tier1_end.saturating_mul(1_i64 << extra).min(max_cap)
+}
+
+/// Trailing `PANE_NOT_READY` streak on `dispatch-digest-*` commands paired with
+/// its effective backoff duration in milliseconds.
+fn not_ready_streak(
+    supervisor: &Facts,
+    base_ms: i64,
+) -> Option<(crate::deliver::NotReadyStreak<'_>, i64)> {
+    let streak = crate::deliver::trailing_not_ready_streak(
+        supervisor
+            .dispatched
+            .iter()
+            .filter(|sent| sent.key.starts_with("dispatch-digest-")),
+    )?;
+    let wait_ms = not_ready_wait_ms(streak.consecutive, base_ms);
+    Some((streak, wait_ms))
+}
+
+/// Structured escalation diagnostic emitted once per streak step once a
+/// `dispatch-digest-*` command hits [`crate::deliver::NOT_READY_WARN_THRESHOLD`]
+/// consecutive `PANE_NOT_READY` failures.
+fn not_ready_diagnostic(
+    streak: &crate::deliver::NotReadyStreak<'_>,
+    wait_ms: i64,
+    pending_count: usize,
+) -> Option<String> {
+    (streak.consecutive >= crate::deliver::NOT_READY_WARN_THRESHOLD).then(|| {
+        format!(
+            "dispatch: escalation=supervisor_digest_not_ready session={SUPERVISOR_SESSION} \
+             consecutive={} same_cause={} ready_pane_stall={} pending={pending_count} \
+             backoff_ms={wait_ms} last_command_id={} last_key={} cause=\"{}\"",
+            streak.consecutive,
+            streak.same_cause,
+            streak.ready_pane_stall,
+            streak
+                .last_command_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string()),
+            streak.last_key,
+            one_line(streak.last_error, 200),
+        )
+    })
+}
+
+fn log_not_ready_diagnostic(
+    streak: &crate::deliver::NotReadyStreak<'_>,
+    wait_ms: i64,
+    pending_count: usize,
+) {
+    let Some(diag) = not_ready_diagnostic(streak, wait_ms, pending_count) else {
+        return;
+    };
+    let key = (streak.last_key.to_string(), streak.consecutive);
+    if let Ok(mut last) = LAST_NOT_READY_DIAG.lock() {
+        if last.as_ref() == Some(&key) {
+            return;
+        }
+        *last = Some(key);
+    }
+    eprintln!("{diag}");
+}
+
+/// Remaining backoff duration in milliseconds using an explicit `base_ms`.
+fn due_in_with(supervisor: &Facts, base_ms: i64, now_ms: i64) -> Option<i64> {
+    if !supervisor_idle(supervisor) {
+        return None;
+    }
+    let (streak, wait_ms) = not_ready_streak(supervisor, base_ms)?;
+    let left = streak
+        .last_finished_ms
+        .saturating_add(wait_ms)
+        .saturating_sub(now_ms);
+    (left > 0).then_some(left)
 }
 
 /// Remaining backoff duration in milliseconds if the supervisor digest is
 /// currently cooled down by prior `PANE_NOT_READY` failures.
 pub(super) fn due_in(supervisor: &Facts, now_ms: i64) -> Option<i64> {
-    if !supervisor_idle(supervisor) {
-        return None;
-    }
-    let (last_ms, wait_ms) = busy_retry_wait_ms(supervisor)?;
-    let left = last_ms.saturating_add(wait_ms).saturating_sub(now_ms);
-    (left > 0).then_some(left)
+    due_in_with(supervisor, crate::deliver::env_not_ready_ms(), now_ms)
 }
 
-/// Time-aware digest order: applies bounded exponential backoff when recent
-/// `dispatch-digest-*` commands failed with `PANE_NOT_READY`.
-pub(super) fn order_at(
+/// Time-aware digest order using an explicit `base_ms` for `PANE_NOT_READY`
+/// exponential backoff.
+fn order_at_with(
     supervisor: &Facts,
     pending: &[Escalation],
     spawn: &str,
+    base_ms: i64,
     now_ms: i64,
 ) -> Option<Order> {
     if pending.is_empty() || !supervisor_idle(supervisor) {
         return None;
     }
-    if let Some((last_ms, wait_ms)) = busy_retry_wait_ms(supervisor)
-        && now_ms < last_ms.saturating_add(wait_ms)
+    if let Some((streak, wait_ms)) = not_ready_streak(supervisor, base_ms)
+        && now_ms < streak.last_finished_ms.saturating_add(wait_ms)
     {
+        log_not_ready_diagnostic(&streak, wait_ms, pending.len());
         return None;
     }
     let (lines, tags): (Vec<Line<'_>>, Vec<Vec<String>>) =
@@ -1055,6 +1137,23 @@ pub(super) fn order_at(
         },
         task: None,
     })
+}
+
+/// Time-aware digest order: applies bounded exponential backoff when recent
+/// `dispatch-digest-*` commands failed with `PANE_NOT_READY`.
+pub(super) fn order_at(
+    supervisor: &Facts,
+    pending: &[Escalation],
+    spawn: &str,
+    now_ms: i64,
+) -> Option<Order> {
+    order_at_with(
+        supervisor,
+        pending,
+        spawn,
+        crate::deliver::env_not_ready_ms(),
+        now_ms,
+    )
 }
 
 /// The digest items for `records`, the recovery's final model records that
@@ -1158,5 +1257,167 @@ mod tests {
             news[2].line
         );
         assert!(Why::SourceAway.is_news() && Why::SourceBack.is_news());
+    }
+
+    fn idle_supervisor_facts(dispatched: Vec<crate::dispatch::Sent>) -> Facts {
+        let mut observation = spawn_core::observation::Observation::basic(
+            SemanticState::Waiting,
+            None,
+            spawn_core::event::SessionSeq(9),
+            spawn_core::observation::Confidence::new(0.9).expect("confidence"),
+            "rules",
+        );
+        observation.ambiguity = Some(spawn_core::observation::Ambiguity::TurnStoppedIdle);
+        let mut facts: Facts = serde_json::from_value(json!({
+            "session_id": SUPERVISOR_SESSION,
+            "agent_id": SUPERVISOR_AGENT,
+            "live": true,
+            "turn_ended": true,
+            "evidence_seq": 9,
+            "observation_event_id": 99
+        }))
+        .expect("supervisor facts");
+        facts.observation = Some(observation);
+        facts.dispatched = dispatched;
+        facts
+    }
+
+    fn failed_digest_sent(
+        id: i64,
+        idx: usize,
+        finished_ms: i64,
+        err: &str,
+    ) -> crate::dispatch::Sent {
+        crate::dispatch::Sent {
+            id: Some(id),
+            key: format!("dispatch-digest-99-{idx:016x}"),
+            text: None,
+            created_at_ms: finished_ms - 50,
+            finished_at_ms: Some(finished_ms),
+            succeeded: Some(false),
+            error: Some(err.to_string()),
+        }
+    }
+
+    #[test]
+    fn supervisor_digest_escalates_past_six_failures_to_bounded_cap_and_emits_diagnostic() {
+        let report_esc = Escalation {
+            session_id: "session_worker_x".to_string(),
+            id: "report-42-1".to_string(),
+            why: Why::Report,
+            line: "report ready".to_string(),
+            since_ms: None,
+        };
+        let ready_err = format!(
+            "pane state Ready {}: the input typed last has not been answered yet",
+            spawn_core::bridge::PANE_NOT_READY
+        );
+        let expected_waits = [
+            5_000_i64, 10_000, 20_000, 40_000, 60_000, 60_000, 120_000, 240_000, 480_000, 900_000,
+            900_000, 900_000,
+        ];
+        let mut sup = idle_supervisor_facts(Vec::new());
+        let mut t = 1_000_000_i64;
+        for (idx, wait) in expected_waits.into_iter().enumerate() {
+            sup.dispatched.push(failed_digest_sent(
+                i64::try_from(idx + 1).expect("small"),
+                idx,
+                t,
+                &ready_err,
+            ));
+            assert_eq!(due_in(&sup, t), Some(wait), "streak {}", idx + 1);
+            assert!(
+                order_at(
+                    &sup,
+                    std::slice::from_ref(&report_esc),
+                    "spawn",
+                    t + wait - 1
+                )
+                .is_none()
+            );
+            assert!(order_at(&sup, std::slice::from_ref(&report_esc), "spawn", t + wait).is_some());
+            let (streak, computed_wait) = not_ready_streak(&sup, 5_000).expect("streak");
+            assert_eq!(computed_wait, wait);
+            if idx + 1 < crate::deliver::NOT_READY_WARN_THRESHOLD {
+                assert_eq!(not_ready_diagnostic(&streak, computed_wait, 1), None);
+            } else {
+                let diag = not_ready_diagnostic(&streak, computed_wait, 1).expect("diagnostic");
+                assert!(
+                    diag.contains("escalation=supervisor_digest_not_ready"),
+                    "{diag}"
+                );
+                assert!(diag.contains("ready_pane_stall=true"), "{diag}");
+                assert!(diag.contains(&format!("consecutive={}", idx + 1)), "{diag}");
+                assert!(diag.contains(&format!("same_cause={}", idx + 1)), "{diag}");
+                assert!(diag.contains(&format!("backoff_ms={wait}")), "{diag}");
+            }
+            t += wait + 100;
+        }
+
+        // A subsequent successful digest clears the trailing streak immediately.
+        sup.dispatched.push(crate::dispatch::Sent {
+            id: Some(99),
+            key: "dispatch-digest-99-delivered".to_string(),
+            text: None,
+            created_at_ms: t,
+            finished_at_ms: Some(t + 10),
+            succeeded: Some(true),
+            error: None,
+        });
+        assert_eq!(due_in(&sup, t + 10), None);
+        assert!(order_at(&sup, &[report_esc], "spawn", t + 10).is_some());
+    }
+
+    #[test]
+    fn supervisor_digest_backoff_honors_short_base_ms_and_caps_at_fifteen_minutes() {
+        let report_esc = Escalation {
+            session_id: "session_worker_y".to_string(),
+            id: "report-7-0".to_string(),
+            why: Why::Report,
+            line: "report ready".to_string(),
+            since_ms: None,
+        };
+        let busy_err = format!("pane state Busy {}", spawn_core::bridge::PANE_NOT_READY);
+        let expected_short = [
+            500_i64, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000,
+            900_000, 900_000,
+        ];
+        let mut sup = idle_supervisor_facts(Vec::new());
+        let mut t = 2_000_000_i64;
+        for (idx, wait) in expected_short.into_iter().enumerate() {
+            sup.dispatched.push(failed_digest_sent(
+                i64::try_from(idx + 1).expect("small"),
+                idx,
+                t,
+                &busy_err,
+            ));
+            assert_eq!(
+                due_in_with(&sup, 500, t),
+                Some(wait),
+                "short base streak {}",
+                idx + 1
+            );
+            assert!(
+                order_at_with(
+                    &sup,
+                    std::slice::from_ref(&report_esc),
+                    "spawn",
+                    500,
+                    t + wait - 1
+                )
+                .is_none()
+            );
+            assert!(
+                order_at_with(
+                    &sup,
+                    std::slice::from_ref(&report_esc),
+                    "spawn",
+                    500,
+                    t + wait
+                )
+                .is_some()
+            );
+            t += wait + 50;
+        }
     }
 }

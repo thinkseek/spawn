@@ -1081,12 +1081,42 @@ struct Inputs {
     waiting: BTreeMap<CommandId, Option<ExecutionId>>,
     /// How each ended execution of the session ended.
     ended: HashMap<ExecutionId, EndCause>,
-    /// The latest `typed` step (a prompt's or an input's).
-    typed: Option<(ExecutionId, GlobalPosition)>,
+    /// The latest `typed` step (a prompt's or an input's), together with its
+    /// command id so per-command completion signals (`message.taken` /
+    /// `message.acted`) match only the last typed command.
+    typed: Option<(ExecutionId, GlobalPosition, CommandId)>,
     /// The latest screen the Bridge recorded as ready.
     ready: Option<(ExecutionId, GlobalPosition)>,
     /// The latest end of a turn in the engine's transcript.
     turn_end: Option<(ExecutionId, GlobalPosition)>,
+    /// Per-command structured completion signals (`message.taken` or
+    /// `message.acted`), paired with the `execution_id` recorded on the
+    /// event (`None` for session-scoped `message.acted` records).
+    command_completed: HashMap<CommandId, Option<ExecutionId>>,
+}
+
+impl Inputs {
+    /// Record a per-command completion signal (`message.taken` or
+    /// `message.acted`) unless it belongs to an older command than `typed`.
+    fn record_command_completed(
+        &mut self,
+        command_id: CommandId,
+        execution_id: Option<&ExecutionId>,
+    ) {
+        if self
+            .typed
+            .as_ref()
+            .is_some_and(|(_, _, typed_cmd)| command_id < *typed_cmd)
+        {
+            return;
+        }
+        let slot = self.command_completed.entry(command_id).or_insert(None);
+        if slot.is_none()
+            && let Some(exec) = execution_id
+        {
+            *slot = Some(exec.clone());
+        }
+    }
 }
 
 /// `at` is later than `than` in the same execution.
@@ -1245,7 +1275,10 @@ impl SessionView {
                         steps.typed = true;
                         self.last_effect = Some(record.position);
                         if let Some(execution) = event.execution_id.clone() {
-                            self.inputs.typed = Some((execution, record.position));
+                            self.inputs.typed = Some((execution, record.position, *command_id));
+                            self.inputs
+                                .command_completed
+                                .retain(|cmd, _| *cmd >= *command_id);
                         }
                     }
                     CommandStep::Waiting => {
@@ -1301,6 +1334,10 @@ impl SessionView {
                     self.last_message = Some((execution, record.position));
                 }
             }
+            EventKind::MessageTaken { command_id } | EventKind::MessageActed { command_id, .. } => {
+                self.inputs
+                    .record_command_completed(*command_id, event.execution_id.as_ref());
+            }
             _ => {}
         }
     }
@@ -1330,12 +1367,13 @@ impl SessionView {
 
     /// Whether the input typed last into `execution` has been answered, so
     /// another may be typed: nothing was typed into it yet, or since the
-    /// last `typed` the Bridge recorded a ready screen, or the engine
-    /// received a prompt and ended its turn. A ready screen read before a
-    /// typing is consumed by it (the rule the Observer's snapshot applies),
-    /// so two inputs never land in one prompt.
+    /// last `typed` the Bridge recorded a ready screen, the last typed
+    /// command was taken or acted (`message.taken` / `message.acted`), or the
+    /// engine ended a turn (`turn.stopped` / `turn.failed`) in `execution`. A
+    /// ready screen read before a typing is consumed by it (the rule the
+    /// Observer's snapshot applies), so two inputs never land in one prompt.
     fn answered(&self, execution: &ExecutionId) -> bool {
-        let Some((typed_in, typed_at)) = &self.inputs.typed else {
+        let Some((typed_in, typed_at, typed_cmd)) = &self.inputs.typed else {
             return true;
         };
         if typed_in != execution {
@@ -1344,10 +1382,15 @@ impl SessionView {
         if after(self.inputs.ready.as_ref(), execution, *typed_at) {
             return true;
         }
-        self.last_message
-            .as_ref()
-            .filter(|(seen, position)| seen == execution && *position > *typed_at)
-            .is_some_and(|(_, message)| after(self.inputs.turn_end.as_ref(), execution, *message))
+        if self
+            .inputs
+            .command_completed
+            .get(typed_cmd)
+            .is_some_and(|seen_in| seen_in.as_ref().is_none_or(|seen| seen == execution))
+        {
+            return true;
+        }
+        after(self.inputs.turn_end.as_ref(), execution, *typed_at)
     }
 
     /// Fold what recovery needs to compare the agent's branch with the log:
@@ -2193,9 +2236,13 @@ impl Bridge {
             .unwrap_or_default();
         // One call for the fleet's liveness, its end detection included: a
         // terminal killed from outside ends its execution as lost on the
-        // next pass, as before, without a tmux call per agent.
+        // next pass, as before, without a tmux call per agent. Scope `runners`
+        // strictly to this `poll()` pass so a terminal started in a subsequent
+        // `work()` pass is never checked against a stale snapshot.
         self.runners = self.fleet_runners();
-        self.act(&mut report)?;
+        let acted = self.act(&mut report);
+        self.runners = None;
+        acted?;
         report.notes.append(&mut self.stray_notes);
         Ok(report)
     }
@@ -5506,6 +5553,9 @@ impl Bridge {
             return self
                 .abandon(claimed, active, format!("start terminal: {error}"), true)
                 .map(Handled::Finished);
+        }
+        if let Some(runners) = self.runners.as_mut() {
+            runners.insert(active.terminal(), Runner::Running);
         }
         self.record_terminal_server(claimed, active, report);
         if prompt.is_empty() {
@@ -15348,6 +15398,289 @@ mod tests {
             Some(Outcome::Failed(
                 "cancelled: suppressed during liveness recovery cooldown".into()
             ))
+        );
+    }
+
+    fn answered_event(
+        seq: &mut u64,
+        agent: &AgentId,
+        session: &SessionId,
+        execution_id: Option<ExecutionId>,
+        source: Source,
+        kind: EventKind,
+    ) -> crate::event::EventRecord {
+        *seq += 1;
+        let current = *seq;
+        crate::event::EventRecord {
+            position: GlobalPosition(current),
+            session_seq: crate::event::SessionSeq(current),
+            recorded_at: Timestamp(1_000 + i64::try_from(current).expect("small")),
+            event: NewEvent {
+                agent_id: agent.clone(),
+                session_id: session.clone(),
+                execution_id,
+                source,
+                source_event_id: Some(format!("evt-{current}")),
+                kind,
+            },
+        }
+    }
+
+    fn typed_step(command_id: u64) -> EventKind {
+        EventKind::CommandStepped {
+            command_id: CommandId(command_id),
+            step: CommandStep::Typed,
+            workspace: None,
+        }
+    }
+
+    fn acted_event(command_id: u64) -> EventKind {
+        EventKind::MessageActed {
+            command_id: CommandId(command_id),
+            outcome: "done".to_string(),
+            why: None,
+        }
+    }
+
+    #[test]
+    fn session_view_answered_clears_on_taken_acted_or_turn_stopped_without_busy_screen() {
+        let agent = AgentId::new("agent_supervisor").expect("agent");
+        let session = SessionId::new("session_supervisor").expect("session");
+        let exec = ExecutionId::for_command(CommandId(700));
+        let mut seq = 0_u64;
+        let ready = answered_event(
+            &mut seq,
+            &agent,
+            &session,
+            Some(exec.clone()),
+            Source::Bridge,
+            EventKind::ScreenObserved {
+                state: ScreenState::Ready,
+                evidence: "❯".to_string(),
+            },
+        );
+        let mut view = super::SessionView::from_event(&ready.event);
+        view.fold_steps(&ready);
+        assert!(view.answered(&exec));
+
+        let fold = |view: &mut super::SessionView,
+                    seq: &mut u64,
+                    exec_id: Option<ExecutionId>,
+                    src: Source,
+                    kind: EventKind| {
+            let rec = answered_event(seq, &agent, &session, exec_id, src, kind);
+            view.fold_steps(&rec);
+        };
+
+        // Typing cmd_756 arms the latch; an earlier cmd_755 `message.acted` cannot clear it.
+        fold(
+            &mut view,
+            &mut seq,
+            Some(exec.clone()),
+            Source::Bridge,
+            typed_step(756),
+        );
+        assert!(!view.answered(&exec), "must hold before completion signal");
+        fold(&mut view, &mut seq, None, Source::Bridge, acted_event(755));
+        assert!(!view.answered(&exec), "older acted must not unlock");
+
+        // `message.taken(756)` unlocks with zero Busy screens.
+        let taken_756 = EventKind::MessageTaken {
+            command_id: CommandId(756),
+        };
+        fold(
+            &mut view,
+            &mut seq,
+            Some(exec.clone()),
+            Source::Claude,
+            taken_756,
+        );
+        assert!(view.answered(&exec), "message.taken(756) must unlock");
+
+        // `message.acted(757)` with `execution_id: None` unlocks cmd_757.
+        fold(
+            &mut view,
+            &mut seq,
+            Some(exec.clone()),
+            Source::Bridge,
+            typed_step(757),
+        );
+        assert!(!view.answered(&exec));
+        fold(&mut view, &mut seq, None, Source::Bridge, acted_event(757));
+        assert!(
+            view.answered(&exec),
+            "session-scoped message.acted must unlock"
+        );
+
+        // `turn.stopped` unlocks cmd_758 even without `message.received`.
+        fold(
+            &mut view,
+            &mut seq,
+            Some(exec.clone()),
+            Source::Bridge,
+            typed_step(758),
+        );
+        assert!(!view.answered(&exec));
+        let stop = EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        };
+        fold(
+            &mut view,
+            &mut seq,
+            Some(exec.clone()),
+            Source::Claude,
+            stop,
+        );
+        assert!(view.answered(&exec), "turn.stopped after typed must unlock");
+    }
+
+    fn watched_bridge(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Bridge {
+        let mut config = BridgeConfig::new("tester");
+        config.watch = Some(Arc::new(MemoryWatch::new()));
+        config.ready_interval = Duration::ZERO;
+        Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock.clone())
+    }
+
+    fn submit_dispatch_input(
+        store: &Arc<MemoryStore>,
+        number: u64,
+        key: &str,
+        text: &str,
+    ) -> CommandId {
+        store
+            .submit(
+                &Principal::new("spawn-dispatch").expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(number),
+                    session_id: resumable_session(number),
+                    idempotency_key: IdempotencyKey::new(key).expect("key"),
+                    action: CommandAction::Input {
+                        text: text.to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit input")
+    }
+
+    #[test]
+    fn poll_clears_stale_runners_before_work_starts_session() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mut bridge = watched_bridge(&store, &clock);
+
+        // Poll with 0 active sessions must clear `self.runners` instead of leaking `Some({})`.
+        bridge.poll().expect("initial poll");
+        assert!(bridge.runners.is_none());
+
+        let start_id = submit_resumable_start(&store, 7, "", READY);
+        let input_id = submit_dispatch_input(&store, 7, "immediate-input-1", "hello after start");
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, start_id).is_some()
+                && command_outcome(&store, input_id).is_some()
+        });
+        assert_eq!(command_outcome(&store, start_id), Some(Outcome::Succeeded));
+        assert_eq!(command_outcome(&store, input_id), Some(Outcome::Succeeded));
+
+        let lost_events: Vec<_> = store
+            .read_global(GlobalPosition(0), 1_000)
+            .expect("read")
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event.kind,
+                    EventKind::ExecutionEnded {
+                        cause: crate::event::EndCause::Lost,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            lost_events.is_empty(),
+            "must never kill as lost: {lost_events:?}"
+        );
+    }
+
+    #[test]
+    fn launch_updates_runners_on_resume_with_stale_snapshot() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let mut bridge = watched_bridge(&store, &clock);
+
+        let start_id = submit_resumable_start(&store, 8, "", READY);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, start_id).is_some()
+        });
+        assert_eq!(command_outcome(&store, start_id), Some(Outcome::Succeeded));
+
+        let stop_id = store
+            .submit(
+                &Principal::new("human").expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(8),
+                    session_id: resumable_session(8),
+                    idempotency_key: IdempotencyKey::new("stop-before-resume").expect("key"),
+                    action: CommandAction::Stop,
+                },
+            )
+            .expect("submit stop");
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, stop_id).is_some()
+        });
+        bridge.poll().expect("poll after stop");
+        assert!(bridge.runners.is_none());
+
+        // Even if a caller leaves a pre-populated stale runners map, `launch_and_prompt`
+        // inserts the resumed terminal so an immediate follow-up command stays alive.
+        bridge.runners = Some(HashMap::new());
+        let resume_id = store
+            .submit(
+                &Principal::new("human").expect("principal"),
+                &Submission {
+                    agent_id: resumable_agent(8),
+                    session_id: resumable_session(8),
+                    idempotency_key: IdempotencyKey::new("resume-8").expect("key"),
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                },
+            )
+            .expect("submit resume");
+        let resumed_exec = ExecutionId::for_command(resume_id);
+        let resumed_term = TerminalName::for_execution(&resumed_exec);
+        store.set_pane(&resumed_term, READY);
+        let follow_up_id =
+            submit_dispatch_input(&store, 8, "immediate-input-2", "hello after resume");
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, resume_id).is_some()
+                && command_outcome(&store, follow_up_id).is_some()
+        });
+        assert_eq!(command_outcome(&store, resume_id), Some(Outcome::Succeeded));
+        assert_eq!(
+            command_outcome(&store, follow_up_id),
+            Some(Outcome::Succeeded)
+        );
+        let active = bridge
+            .sessions
+            .get(&resumable_session(8))
+            .and_then(|view| view.active.as_ref())
+            .expect("resumed execution still active");
+        assert_eq!(active.execution_id, resumed_exec);
+        assert_eq!(
+            store
+                .runner(&resumed_term, &active.workspace)
+                .expect("runner"),
+            crate::port::Runner::Running
         );
     }
 }
