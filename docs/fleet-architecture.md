@@ -2486,6 +2486,26 @@ pane. Whichever way a conversation is found, it binds only when
 at or after this execution's start: the anti-forgery check of §3.6 (N2) is
 unchanged.
 
+**Anti-collision (D1, O55 C3 step 3 re-test).** A marker `[spawn message #N]`
+is only a store-local command id, and `~/.gemini/antigravity-cli/brain/` is
+shared: another store's or an older run's conversation can quote the same
+`#N`. Bound, it would count foreign usage and a `resume` would type into the
+wrong conversation. Three more guards in `Bridge::bind_reported`, each
+failing closed:
+
+- **Fresh prompt.** The `USER_INPUT` line holding the marker must say it was
+  written (`created_at`, RFC 3339 with `Z` or `±HH:MM`, read by a small
+  stdlib parser) no earlier than the execution's `execution.started` record
+  time less 5 s of clock skew (`Active::started_at`, the same after a
+  restart). No `created_at`, or one that does not parse, binds nothing.
+- **Pre-existing conversations.** A fresh start (not a resume) lists
+  `brain/` before it launches agy (`Active::preexisting_natives`); the scan
+  never binds one of those. A restarted Bridge has no such list and relies
+  on the other two guards.
+- **One binding per native session.** A conversation that any execution of
+  any session in the store was already bound to (`session.native_started`)
+  is never bound again, whether Herdr reports it or the scan finds it.
+
 ## 4. Experience
 
 Nothing is stored outside the log. Every model judgement is an
