@@ -79,6 +79,7 @@ spawn-node-resp-v1
 ```
 
 Every signed body is JSON with `"server_time_ms"`, and that value equals line 6.
+Every gateway answer, signed or not (artifacts included), carries `Cache-Control: no-store, no-transform`: no cache may keep a refusal or a grant, and no proxy may rewrite a signed body.
 The daemon believes nothing unsigned. It checks the key id against the key it pinned at enroll and verifies the signature. Any failure is a transport failure, with no state change.
 `server_time_ms` is the only clock a node adapts to.
 A response to a request whose headers were malformed binds the headers that were well formed. A malformed one (or a repeated one) binds `""`, or `0` for the seq.
