@@ -476,6 +476,22 @@ pub fn drop_agy_account_lines(pane: &str) -> String {
     kept
 }
 
+/// What agy prints when `--model` names a model it does not know (it then
+/// goes on, silently, on its own default, which may be its costliest).
+pub const AGY_UNKNOWN_MODEL: &str = "is not recognized as a known model";
+
+/// agy's unknown-model warning line ([`AGY_UNKNOWN_MODEL`]), trimmed and
+/// cut to 200 characters, when the pane shows one: the start that shows it
+/// fails, never runs on a model nobody chose. Never an account line
+/// ([`drop_agy_account_lines`]).
+pub fn agy_unknown_model(pane: &str) -> Option<String> {
+    drop_agy_account_lines(pane)
+        .lines()
+        .map(strip_ansi)
+        .find(|line| line.to_lowercase().contains(AGY_UNKNOWN_MODEL))
+        .map(|line| line.trim().chars().take(200).collect())
+}
+
 /// Whether the pane shows agy's workspace trust dialog: its question, its
 /// trusting choice and its key row, in its last lines (as Herdr's manifest
 /// reads it, `bottom_non_empty_lines(8)`). A prompt box drawn after it is
@@ -652,8 +668,23 @@ pub fn read_agy_screen(pane: &str) -> ScreenReading {
 #[cfg(test)]
 mod agy_tests {
     use super::{
-        ScreenState, drop_agy_account_lines, is_agy_trust_dialog, is_trust_dialog, read_agy_screen,
+        ScreenState, agy_unknown_model, drop_agy_account_lines, is_agy_trust_dialog,
+        is_trust_dialog, read_agy_screen,
     };
+
+    #[test]
+    fn agys_unknown_model_warning_is_found_and_names_no_account() {
+        let pane = "▀▀▀▀▀▀ someone@example.invalid (Pro)\n\u{1b}[33mWarning: model \"gemini-9\" \
+                    is not recognized as a known model; using the default\u{1b}[0m\n>\n";
+        let line = agy_unknown_model(pane).expect("the warning");
+        assert_eq!(
+            line,
+            "Warning: model \"gemini-9\" is not recognized as a known model; using the default"
+        );
+        assert!(!line.contains('@'));
+        assert_eq!(agy_unknown_model("──\n>\n──\n? for shortcuts\n"), None);
+        assert_eq!(agy_unknown_model(""), None);
+    }
 
     const RULE: &str = "────────────────────────────────────────────────────────";
 
