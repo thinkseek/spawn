@@ -1,6 +1,9 @@
 //! Shared OS-level terminal host support: environment scrubbing, private
 //! launch files, process-tree cleanup, and workspace/transcript file I/O.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
@@ -21,9 +24,9 @@ pub(crate) fn scrub(name: &std::ffi::OsStr) -> bool {
 }
 
 /// How long [`spawn_core::port::TerminalHost::terminate`] waits for a killed
-/// terminal's processes to exit after closing hangs their terminal up, and
-/// again after it sends the survivors SIGKILL.
+/// terminal's processes to exit after closing hangs their terminal up.
 pub(crate) const HANGUP_WAIT: Duration = Duration::from_secs(5);
+/// How long [`spawn_core::port::TerminalHost::terminate`] waits after sending survivors SIGKILL.
 pub(crate) const KILL_WAIT: Duration = Duration::from_secs(2);
 
 /// How often that wait looks.
@@ -113,7 +116,7 @@ pub(crate) fn end_stragglers(
 /// parts (`/tmp/a` and `/home/user` are never one workspace), that is not
 /// this process's working directory, the home directory or the temporary
 /// directory, nor above any of them.
-pub(crate) fn sweepable(directory: &std::path::Path) -> bool {
+fn sweepable(directory: &std::path::Path) -> bool {
     use std::path::Component;
     if !directory.is_absolute()
         || directory
@@ -140,7 +143,7 @@ pub(crate) fn sweepable(directory: &std::path::Path) -> bool {
 
 /// The live processes of this user, this one excepted, whose working
 /// directory is `directory` or below it, by `/proc/<pid>/cwd`.
-pub(crate) fn stragglers_beneath(directory: &std::path::Path) -> Vec<u32> {
+fn stragglers_beneath(directory: &std::path::Path) -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();

@@ -13,7 +13,7 @@
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
 | 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时只用规则） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
-| 终端 | herdr（默认），或显式选择的 tmux（`SPAWN_TERMINAL_BACKEND=tmux`） | 建会话、输入文本、抓取屏尾 |
+| 终端 | Herdr（默认嵌入式 `herdr-core` `spawn-hc`，或 `SPAWN_HERDR_MODE=legacy` 选择外置 `herdr`；已移除并显式拒绝 `tmux`） | 建会话、输入文本、抓取屏尾 |
 | 变更提示 | PostgreSQL `LISTEN/NOTIFY` | 每次追加事件 `pg_notify('spawn_events', <id>)`；`spawn loop` 和 `GET /api/stream` 收到即读，提示丢了也照读记录 |
 
 Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。
@@ -26,7 +26,7 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | --- | --- | --- |
 | `spawn-core` | 类型、端口、强类型 `ControlRecord`（67 变体）/ `GradingRecord` ADT（`control.rs`）、任务 episode 回放、Bridge、Observer、能力图与依赖纯度引擎（`feature_deps`）；内存实现与一致性套件在 `testing` feature 后。零 IO；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | serde、serde_json、sha2、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue + RefLedger 的 PG 实现、`sql/schema.sql`、只读与 episode 校验方法、`LISTEN spawn_events` 连接（`wake.rs`）；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | spawn-core、spawn-kdf、postgres、postgres-protocol、fallible-iterator、serde、serde_json、whoami |
-| `spawn-host` | 终端（`TerminalHost`：`HerdrCoreHost` 默认通过进程外 `spawn-hc` 运行，`HerdrPool` 按分片路由到 `<session>-s0..N`，`HerdrHost` 由 `SPAWN_HERDR_MODE=legacy` 选择，`TmuxHost` 由 `SPAWN_TERMINAL_BACKEND=tmux` 显式选择；`herdr_witness` 宿主机第二证人；`BwrapView` 沙箱隔离）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 与 opt-in `d6-shadow` 双轨对照 / 纯 Rust 无 `git` 子进程的 `d6` `D6Workspace` 五种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
+| `spawn-host` | 终端（`TerminalHost`：`HerdrCoreHost` 默认通过进程外 `spawn-hc` 运行，`HerdrPool` 按分片路由到 `<session>-s0..N`，`HerdrHost` 由 `SPAWN_HERDR_MODE=legacy` 选择，共享 OS 辅助位于 `terminal_support`，`tmux` 后端已移除并显式拒绝；`herdr_witness` 宿主机第二证人；`BwrapView`/`ContainerView` 沙箱隔离）、工作区存储（`LocalWorkspaceStore`：`git`、`cow`、`overlay` 与 opt-in `d6-shadow` 双轨对照 / 纯 Rust 无 `git` 子进程的 `d6` `D6Workspace` 五种引擎加 `auto` 选择，同一 `WorkspaceStore` 契约；`cas_dedup` 对 Cow 工作区的 `target/`、`node_modules/` 去重，块存于 `spawn-cas`）、transcript 归档、inotify | spawn-core、spawn-cas、libc、rustix、serde_json |
 | `spawn-cas` | 统一内容寻址存储：带算法前缀的摘要（`sha256:<64 hex>`）、`objects/<algo>/<2 hex>/<hex>`（0444）、`pins/<owner>/<name>`、D6 Merkle 树/日志存储、按命名空间的 LRU GC（`access/<ns>/`）、`tmp/` 暂存；crash-only，不 fsync；与 Go `spawn-node/cas` 同一磁盘布局；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | sha2、thiserror、libc |
 | `spawn-jev` | 判定 HTTP 客户端（支持直连 HTTP/1.1 与 `SPAWN_OUT_SOCK` 本地 `out.sock` UDS 通道及 `validate_out_sock` 安全校验），端口在 core，实现在此；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | spawn-core、serde、serde_json |
 | `spawn-kdf` | 受限登录口令的 PBKDF2-HMAC-SHA256 派生（单独一个 crate，开发构建也以 `opt-level = 3` 编译）；声明 `#![forbid(unsafe_code)]` 与 `#![warn(missing_docs)]` | sha2、hmac |
@@ -76,9 +76,9 @@ spawn_submit(principal, key, agent, session, action)
   → command.accepted          PG 事务，幂等
   → spawn_claim(worker, ttl)  单会话串行，租约 fencing
   → git branch / archive 导出工作树
-  → tmux new-session          运行 spawn run -- claude --ax-screen-reader --session-id <uuid>
-  → 屏尾判定 Ready            capture-pane 尾行解析
-  → tmux send-keys            投递提示
+  → spawn-hc / herdr 创建终端  运行 spawn run -- claude --ax-screen-reader --session-id <uuid>
+  → 屏尾判定 Ready             终端 read / agent.get 尾行解析
+  → agent.prompt / send-keys   投递提示
   → Claude transcript         Bridge 每轮读 <projects>/<工作区解析后的路径>/<uuid>.jsonl，claude_line 归一为统一事件
   → 屏幕                      Bridge 每轮抓屏，两次读数一致才写 screen.observed
   → 退出文件                  spawn run 把退出码写入 .spawn/exit-<execution>，Bridge 读到后写 execution.ended
@@ -92,9 +92,9 @@ spawn_submit(principal, key, agent, session, action)
 
 worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。
 
-工作区只有一个名字，即引擎进程看到的那个。tmux 用 `-c` 在工作区启动窗格，内核沿途解析所有符号链接，引擎的工作目录（`getcwd`、`pwd -P`）是解析后的路径，Claude Code 把 transcript 写在这个路径（除 ASCII 字母和数字外的字符都换成 `-`）对应的项目目录下。所以工作区根在配置处解析一次（`spawn_host::canonical_root`：`spawn-cli` 的 `workspace_root`，以及铸造工作区 id 的 `GitWorkspace::new`），mount、窗格的 `-c`、`WorkspaceId`、runner 的退出文件和 transcript 路径都出自这一个 id，不会分叉。根经由符号链接到达的主机（`/home -> /data00/home`；macOS 的 `/tmp`、`/var` 指向 `/private/...`）以前会让 Bridge 盯着一个永远收不到数据的目录（issue #15）。旧版本按配置原样记录的 id 仍指向同一目录：`WorkspaceStore::canonical` 把它映射到解析后的根下，Bridge 读日志里每个执行的工作区都经过它，`GitWorkspace` 的路径检查也接受它（docs/storage.md「Workspace identity」）。
+工作区只有一个名字，即引擎进程看到的那个。Herdr 在工作区目录启动终端进程，内核沿途解析所有符号链接，引擎的工作目录（`getcwd`、`pwd -P`）是解析后的路径，Claude Code 把 transcript 写在这个路径（除 ASCII 字母和数字外的字符都换成 `-`）对应的项目目录下。所以工作区根在配置处解析一次（`spawn_host::canonical_root`：`spawn-cli` 的 `workspace_root`，以及铸造工作区 id 的 `GitWorkspace::new`），mount、终端启动工作目录、`WorkspaceId`、runner 的退出文件和 transcript 路径都出自这一个 id，不会分叉。根经由符号链接到达的主机（`/home -> /data00/home`；macOS 的 `/tmp`、`/var` 指向 `/private/...`）以前会让 Bridge 盯着一个永远收不到数据的目录（issue #15）。旧版本按配置原样记录的 id 仍指向同一目录：`WorkspaceStore::canonical` 把它映射到解析后的根下，Bridge 读日志里每个执行的工作区都经过它，`GitWorkspace` 的路径检查也接受它（docs/storage.md「Workspace identity」）。
 
-一个执行何时算结束：runner 写了退出文件（`exited`）；或者没有 Bridge 自己启动的 runner 在跑它（`lost`）：终端不在了，或者终端还在但不托管那个 runner（窗格已死、`remain-on-exit`，或重启后终端管理器恢复出来、停在 shell 提示符的同名会话）。tmux 适配器用 `list-panes` 读 `pane_dead` 和 `pane_start_command`，后者必须带上本次启动的环境文件名（`spawn-launch-<终端>-`）。`lost` 的 `execution.ended` 带 `evidence`，记下主机看到了什么。start、resume、input 在动手前先处理这种执行（`Bridge::settle`）：照常走结束流程（最终 checkpoint、杀终端、卸载、写结束事件）后，start/resume 继续，input 失败一次并提示 resume；stop 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 对“谁在运行”的视图只随折叠日志改变；视图为空时向日志查询该会话未结束的执行（`EventLog::open_execution`，与 `spawn_append_trusted` 的守卫同一规则），所以视图与日志即便分叉也会收敛。不会静默收编不受跟踪的引擎：它会被结束，终端被杀。
+一个执行何时算结束：runner 写了退出文件（`exited`）；或者没有 Bridge 自己启动的 runner 在跑它（`lost`）：终端不在了，或者终端还在但不托管那个 runner（或重启后仅余未关联本机记录与 leader PID 的同名终端）。`HerdrCoreHost` / `HerdrHost` 通过守护进程终端列表、私有记录文件中的服务器与会话 leader 身份以及本次启动的环境文件名（`spawn-launch-<终端>-`）核验 runner 归属。`lost` 的 `execution.ended` 带 `evidence`，记下主机看到了什么。start、resume、input 在动手前先处理这种执行（`Bridge::settle`）：照常走结束流程（最终 checkpoint、杀终端、卸载、写结束事件）后，start/resume 继续，input 失败一次并提示 resume；stop 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 对“谁在运行”的视图只随折叠日志改变；视图为空时向日志查询该会话未结束的执行（`EventLog::open_execution`，与 `spawn_append_trusted` 的守卫同一规则），所以视图与日志即便分叉也会收敛。不会静默收编不受跟踪的引擎：它会被结束，终端被杀。
 
 ## 4. 终端接入：尾行解析
 
@@ -183,14 +183,12 @@ spawn fleet
 | `SPAWN_D6_TMPFS_BUDGET_MB` | `2048` | L1 `tmpfs` 硬预算（MiB；设 `SPAWN_D6_TMPFS_ROOT` 时生效） |
 | `SPAWN_D6_STRICT_FAIL_CLOSED` | `0` | `1`/`true` 时，若 `d6-shadow` 发生 `TrackedSetLeak` 则 fail-closed 拒绝 checkpoint |
 | `SPAWN_CAS_DEDUP` | 未设 | `1`：每次挂载 Cow 工作区时把 `target/`、`node_modules/` 对 `<root>/.cas` 去重（从不碰 transcript），卸载后修剪；`0` 或未设：关闭；其他取值 `spawn loop` 启动即退出 |
-| `SPAWN_TERMINAL_BACKEND` | `herdr` | 终端后端：`herdr`（默认，经 `SPAWN_HERDR_MODE=core` 路由到内置 `spawn-hc`）或 `tmux`（显式回退） |
+| `SPAWN_TERMINAL_BACKEND` | `herdr` | 唯一终端后端：`herdr`（默认，经 `SPAWN_HERDR_MODE=core` 路由到内置 `spawn-hc`）；`tmux` 已移除并在环境变量与 `spawn.toml` 中显式拒绝 |
 | `SPAWN_HERDR_MODE` | `core` | herdr 后端模式：`core`（默认，使用同目录 `spawn-hc`）或 `legacy`（外置 legacy `herdr`） |
 | `SPAWN_HERDR_CORE_PROGRAM` | 同目录 `spawn-hc` | 内嵌 `herdr-core` 模式的可执行文件覆写路径 |
 | `SPAWN_HERDR_SHARDS` | `1` | Herdr 服务分片数（`1..=64`；大于 1 时按终端名确定性路由到 `<session>-s0..N`） |
 | `SPAWN_HERDR_PROGRAM` | `herdr` | legacy `herdr` 可执行文件（`SPAWN_HERDR_MODE=legacy` 时） |
 | `SPAWN_HERDR_SESSION` | `spawn` | `spawn-hc` / legacy `herdr` 私有会话名 |
-| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
-| `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket（`SPAWN_TERMINAL_BACKEND=tmux` 时） |
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址（直连 HTTP/1.1），与 `SPAWN_OUT_SOCK` 均未设时只用内置规则 |
 | `SPAWN_OUT_SOCK` | 未设 | 本地 `out.sock` UDS 路径（`spawn-node-out.service` `%t/spawn/out.sock`，走 `POST /out/v1/jev/call`；连接前校验属主、非符号链接及 `0600`） |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |

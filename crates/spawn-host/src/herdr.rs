@@ -45,6 +45,9 @@
 //! restarted server restored, idle shells of a session gone with the old
 //! server, which would otherwise pile up.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -110,7 +113,7 @@ pub const PROTOCOL: u64 = 22;
 /// (Herdr 0.9.5's bundled ones, which its cached remote ones equal on the
 /// VM, 2026-11-26): a server whose active version of one of them differs
 /// is refused, naming both (carry list N8). The `[update]` pin of
-/// [`SERVER_CONFIG`] holds only for a server this host started; this check
+/// `SERVER_CONFIG` holds only for a server this host started; this check
 /// holds for any. Moving a pin is a deliberate change: `herdr server
 /// update-agent-manifests`, the fixtures run again, then this list.
 pub const MANIFESTS: [(&str, &str); 2] = [("agy", "2026.10.05.1"), ("claude", "2026.10.11.1")];
@@ -194,7 +197,7 @@ const PROMPT_LINE_LIMIT: usize = 256 * 1024;
 
 /// Whether `text` goes to `pane`'s agent in one `agent.prompt`: its request
 /// line, as [`call_at`] writes it, is at most [`PROMPT_LINE_LIMIT`].
-pub(crate) fn prompt_fits(pane: &str, text: &str) -> bool {
+fn prompt_fits(pane: &str, text: &str) -> bool {
     let request = json!({
         "id": "spawn:agent.prompt",
         "method": "agent.prompt",
@@ -218,7 +221,7 @@ const NOT_TYPED: [&str; 2] = ["agent_not_ready", "agent_blocked"];
 
 /// Whether a Herdr error code refuses input before any key went
 /// ([`NOT_TYPED`]).
-pub(crate) fn refused_before_typing(code: &str) -> bool {
+fn refused_before_typing(code: &str) -> bool {
     NOT_TYPED.contains(&code)
 }
 
@@ -379,7 +382,7 @@ impl Call {
 /// A key as Herdr takes it: a logical key name (`enter`, `ctrl+c`), or a
 /// character typed as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Press {
+enum Press {
     Key(String),
     Text(String),
 }
@@ -392,7 +395,7 @@ pub(crate) enum Press {
 /// `NamedKey::Digit1` to `Digit9`, tmux `1` to `9`) are single characters,
 /// typed as text below, exactly as a person's keyboard sends them: Claude Code, Codex
 /// CLI, AGY CLI and OpenCode pick the numbered choice on that byte.
-pub(crate) fn herdr_key(key: &str) -> Result<Press, TerminalError> {
+fn herdr_key(key: &str) -> Result<Press, TerminalError> {
     let named = match key {
         "Enter" | "KPEnter" => Some("enter"),
         "Escape" => Some("esc"),
@@ -1425,7 +1428,7 @@ fn no_agent() -> AgentReading {
 }
 
 /// `text` in pieces of at most `limit` bytes, each whole characters.
-pub(crate) fn chunks(text: &str, limit: usize) -> Vec<&str> {
+fn chunks(text: &str, limit: usize) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
@@ -1443,7 +1446,7 @@ pub(crate) fn chunks(text: &str, limit: usize) -> Vec<&str> {
 /// Whether the pane text `text` still shows the line that ran the launch
 /// script named `name`: its name (looked for in the lines joined, since a
 /// long path wraps), or the command itself.
-pub(crate) fn launch_echo_shown(text: &str, name: &str) -> bool {
+fn launch_echo_shown(text: &str, name: &str) -> bool {
     let joined: String = text.lines().collect();
     (!name.is_empty() && joined.contains(name)) || text.contains("exec /bin/sh ")
 }
@@ -1455,7 +1458,7 @@ pub(crate) fn launch_echo_shown(text: &str, name: &str) -> bool {
 /// prompt holding text (`Drafted`), so a trust dialog the engine draws
 /// before its input box went unanswered. Cleared, the pane holds only what
 /// the program drew.
-pub(crate) const CLEAR_SCREEN: &str = "printf '\\033[H\\033[2J\\033[3J'\n";
+const CLEAR_SCREEN: &str = "printf '\\033[H\\033[2J\\033[3J'\n";
 
 /// The launch as a script for `/bin/sh`: the screen cleared of the line
 /// that ran it ([`CLEAR_SCREEN`]), the environment exported, the script
@@ -1585,7 +1588,7 @@ impl TerminalHost for HerdrHost {
     /// The text goes to a private file of this host's: nothing reaches the
     /// pane. Herdr is only asked whether the pane's agent takes input now:
     /// an agent it is still starting refuses it before anything is typed
-    /// ([`HerdrHost::refuses_input`]).
+    /// (`HerdrHost::refuses_input`).
     fn stage_text(
         &self,
         terminal: &TerminalName,
@@ -1824,7 +1827,7 @@ impl TerminalHost for HerdrHost {
     /// `agent.get` on the terminal's pane, and `agent.explain` only when
     /// the status changed or is `blocked`. No pane, or no agent Herdr
     /// detects in it, is a reading of no agent. While Herdr still marks an
-    /// agent's launch pending, within [`LAUNCH_SETTLE`] of its start or
+    /// agent's launch pending, within `LAUNCH_SETTLE` of its start or
     /// release, the reading says nothing ([`AgentStatus::Unknown`]).
     fn agent(
         &self,

@@ -8,6 +8,9 @@
 //! independently of `spawn-loop`, killing or restarting `spawn-loop` leaves live
 //! Agent PTYs and screens intact.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -27,9 +30,6 @@ use crate::herdr::{launch_script, no_listener, peer_server, private, scrub, vali
 use crate::herdr_witness;
 use crate::process::ProcessId;
 use crate::terminal_support::{HANGUP_WAIT, KILL_WAIT};
-
-/// Default session name used when `SPAWN_HERDR_SESSION` is unset.
-pub const DEFAULT_SESSION: &str = "spawn";
 
 /// OpenRPC / wire generation expected from `spawn-hc`.
 pub const EXPECTED_GENERATION: u32 = 1;
@@ -1217,8 +1217,8 @@ fn await_script_removed(script: &Path) {
     }
 }
 
-/// Translates a Spawn/tmux key name into a `herdr-core` `terminal.keys` key name.
-pub fn hc_key(key: &str) -> Result<String, TerminalError> {
+/// Translates a Spawn key name into a `herdr-core` `terminal.keys` key name.
+fn hc_key(key: &str) -> Result<String, TerminalError> {
     let named = match key {
         "Enter" | "KPEnter" => Some("enter"),
         "Escape" => Some("esc"),
