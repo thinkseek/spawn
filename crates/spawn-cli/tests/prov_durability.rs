@@ -258,6 +258,8 @@ fn oversized(root: &Path, agent: &str, files: &[(&str, &[u8])]) {
 #[test]
 fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_defects() {
     let schema = TestSchema::new("prov_durability");
+    // The store makes the schema's tables.
+    let store = schema.store();
     let scratch = Scratch::new("brief");
     let mut work = Work::init(&scratch.0);
     work.write("src/a.rs", "one\n");
@@ -484,4 +486,5 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
             count(&mut client, "prov_edges"),
         )
     );
+    drop(store);
 }
