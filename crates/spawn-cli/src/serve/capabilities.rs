@@ -122,7 +122,7 @@ pub(crate) enum Boxed {
     /// binds, is removed when this is dropped, after the probe's runs.
     Inside {
         words: Vec<String>,
-        scratch: Option<Scratch>,
+        _scratch: Option<Scratch>,
     },
     /// No view: the engine is down, and its program is never run.
     Unavailable(String),
@@ -227,7 +227,7 @@ pub(crate) fn view_with(
             Ok(words) if words.len() > 1 && words.last().is_some_and(|word| word == "--") => {
                 return Boxed::Inside {
                     words,
-                    scratch: Some(scratch),
+                    _scratch: Some(scratch),
                 };
             }
             Ok(_) => why = "its words do not end in --".to_string(),
