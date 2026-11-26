@@ -116,9 +116,10 @@ use crate::id::{
 };
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    AgentReading, AgentStatus, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch,
-    Launch, MOUNT_CANCELLED, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
-    TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, WatchError, WorkspaceError, WorkspaceStore,
+    AgentReading, AgentStatus, BaseMerge, Branch, CommandQueue, Commit, EngineView, EventLog,
+    FileWatch, Launch, MOUNT_CANCELLED, READ_LIMIT, Runner, ServerSeen, StoreError, TerminalError,
+    TerminalHost, TranscriptArchive, UNMOUNT_IN_USE, ViewedLaunch, WatchError, WorkspaceError,
+    WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES};
 use crate::time::{Clock, SystemClock};
