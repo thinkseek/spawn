@@ -2500,6 +2500,8 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
     }
 
     let storage_probes = probe_storage(&workspaces_or_root);
+    let (model_endpoints, model_warnings) = probe_model_endpoints();
+    warnings.extend(model_warnings);
 
     let report = json!({
         "ok": git["ok"].as_bool().unwrap_or(false) && kernel["ok"].as_bool().unwrap_or(false),
@@ -2526,6 +2528,7 @@ pub fn doctor_command(global_config: Option<&str>, rest: &[String]) -> Result<i3
             "other_mounts": other_mounts,
         },
         "storage_probes": storage_probes,
+        "model_endpoints": model_endpoints,
         "warnings": warnings,
     });
 
@@ -2807,11 +2810,270 @@ fn print_doctor_human(report: &Value) {
         report["storage_probes"]["cow_clone_supported"],
         report["storage_probes"]["overlay_supported"],
     );
+    let endpoints = &report["model_endpoints"];
+    println!(
+        "model_endpoints: preflight={}",
+        endpoints["preflight_mode"].as_str().unwrap_or("warn")
+    );
+    for slot in ["model_relay", "judge"] {
+        let entry = &endpoints[slot];
+        let status = entry["status"].as_str().unwrap_or("not_configured");
+        match status {
+            "not_configured" => println!("  {slot}: not_configured"),
+            "ok" => println!(
+                "  {slot}: ok (target={}, latency_ms={})",
+                entry["target"].as_str().unwrap_or("unknown"),
+                entry["latency_ms"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_string(), |ms| ms.to_string()),
+            ),
+            _ => {
+                println!(
+                    "  {slot}: {status} (target={}, latency_ms={}, detail={})",
+                    entry["target"].as_str().unwrap_or("<invalid-endpoint>"),
+                    entry["latency_ms"]
+                        .as_u64()
+                        .map_or_else(|| "unknown".to_string(), |ms| ms.to_string()),
+                    entry["detail"].as_str().unwrap_or("unreachable"),
+                );
+                if let Some(hint) = entry["remediation"].as_str() {
+                    println!("    remediation: {hint}");
+                }
+            }
+        }
+    }
+    let slots = &endpoints["model_slots"];
+    println!(
+        "  model_slots: default={}, cheap={}, small={}",
+        slots["default"].as_str().unwrap_or("<unset>"),
+        slots["cheap"].as_str().unwrap_or("<unset>"),
+        slots["small"].as_str().unwrap_or("<unset>"),
+    );
     if let Some(warnings) = report["warnings"].as_array() {
         for warning in warnings {
             if let Some(text) = warning.as_str() {
                 eprintln!("warning: {text}");
             }
+        }
+    }
+}
+
+fn is_disabled_endpoint_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("stub")
+}
+
+fn sanitize_model_slot_name(raw: Option<String>) -> Option<String> {
+    let trimmed = raw
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.contains("://")
+        || trimmed.contains('@')
+        || lower.contains("token=")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("secret=")
+        || lower.contains("password=")
+    {
+        return Some(REDACTED.to_string());
+    }
+    Some(trimmed)
+}
+
+fn probe_single_model_endpoint(
+    slot: &str,
+    env_var: &str,
+    raw_url: Option<String>,
+    probe: &dyn Fn(&str, std::time::Duration) -> spawn_jev::EndpointHealth,
+) -> (Value, Option<String>) {
+    let Some(url) = raw_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !is_disabled_endpoint_value(s))
+    else {
+        return (
+            json!({
+                "env_var": env_var,
+                "status": "not_configured",
+                "target": null,
+                "http_status": null,
+                "latency_ms": null,
+                "detail": null,
+                "remediation": null,
+            }),
+            None,
+        );
+    };
+
+    let health = probe(&url, spawn_jev::DEFAULT_PROBE_TIMEOUT);
+    if health.status.is_ok() {
+        return (
+            json!({
+                "env_var": env_var,
+                "status": "ok",
+                "target": health.target,
+                "http_status": health.http_status,
+                "latency_ms": health.latency_ms,
+                "detail": null,
+                "remediation": null,
+            }),
+            None,
+        );
+    }
+
+    let detail = health
+        .detail
+        .clone()
+        .unwrap_or_else(|| "endpoint unreachable".to_string());
+    let remediation = match slot {
+        "model_relay" => format!(
+            "Start spawn-model-relay on {} or set {env_var}=off if engines do not require the relay; \
+             if SPAWN_CHEAP_MODEL uses this relay, startup preflight falls back to the direct/default path unless SPAWN_MODEL_PREFLIGHT=strict.",
+            health.target
+        ),
+        _ => format!(
+            "Start spawn-jev-relay on {} or set {env_var}=off to run the Observer with deterministic rules only.",
+            health.target
+        ),
+    };
+    let warning = format!(
+        "model endpoint {slot} ({env_var}) at {} is unreachable: {detail}",
+        health.target
+    );
+    (
+        json!({
+            "env_var": env_var,
+            "status": "unreachable",
+            "target": health.target,
+            "http_status": health.http_status,
+            "latency_ms": health.latency_ms,
+            "detail": detail,
+            "remediation": remediation,
+        }),
+        Some(warning),
+    )
+}
+
+fn probe_model_endpoints() -> (Value, Vec<String>) {
+    probe_model_endpoints_with(
+        &|name| std::env::var(name).ok(),
+        &spawn_jev::probe_http_endpoint,
+    )
+}
+
+fn probe_model_endpoints_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    probe: &dyn Fn(&str, std::time::Duration) -> spawn_jev::EndpointHealth,
+) -> (Value, Vec<String>) {
+    let raw_relay = lookup("SPAWN_MODEL_RELAY");
+    let relay_configured = raw_relay
+        .as_deref()
+        .is_some_and(|raw| !is_disabled_endpoint_value(raw));
+    let (relay_report, relay_warning) =
+        probe_single_model_endpoint("model_relay", "SPAWN_MODEL_RELAY", raw_relay, probe);
+
+    let raw_judge = lookup("SPAWN_JUDGE_URL");
+    let (judge_report, judge_warning) =
+        probe_single_model_endpoint("judge", "SPAWN_JUDGE_URL", raw_judge, probe);
+
+    let mut warnings = Vec::new();
+    if let Some(w) = relay_warning {
+        warnings.push(w);
+    }
+    if let Some(w) = judge_warning {
+        warnings.push(w);
+    }
+
+    let preflight_mode = lookup("SPAWN_MODEL_PREFLIGHT")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "warn".to_string());
+
+    let default_slot = sanitize_model_slot_name(lookup("SPAWN_DEFAULT_MODEL"));
+    let cheap_slot = sanitize_model_slot_name(lookup("SPAWN_CHEAP_MODEL"))
+        .or_else(|| relay_configured.then(|| "deepseek-flash".to_string()));
+    let small_slot = sanitize_model_slot_name(lookup("SPAWN_SMALL_MODEL"))
+        .or_else(|| relay_configured.then(|| "deepseek-flash".to_string()));
+    let judge_slot = sanitize_model_slot_name(lookup("SPAWN_JUDGE_MODEL"));
+
+    let value = json!({
+        "preflight_mode": preflight_mode,
+        "model_relay": relay_report,
+        "judge": judge_report,
+        "model_slots": {
+            "default": default_slot,
+            "cheap": cheap_slot,
+            "small": small_slot,
+            "judge": judge_slot,
+        },
+    });
+    (value, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_model_endpoints_with;
+
+    #[test]
+    fn probe_model_endpoints_reports_not_configured_ok_and_redacted_unreachable() {
+        let ok_probe = |url: &str, _timeout: std::time::Duration| spawn_jev::EndpointHealth {
+            status: spawn_jev::EndpointStatus::Ok,
+            target: spawn_jev::sanitize_endpoint_target(url),
+            http_status: Some(200),
+            latency_ms: 3,
+            detail: None,
+        };
+        let (unconfigured, warnings) = probe_model_endpoints_with(&|_| None, &ok_probe);
+        assert!(warnings.is_empty());
+        assert_eq!(unconfigured["model_relay"]["status"], "not_configured");
+        assert_eq!(unconfigured["judge"]["status"], "not_configured");
+
+        let lookup_ok = |key: &str| match key {
+            "SPAWN_MODEL_RELAY" => Some("http://127.0.0.1:8791".to_string()),
+            "SPAWN_JUDGE_URL" => Some("http://127.0.0.1:8790".to_string()),
+            "SPAWN_DEFAULT_MODEL" => Some("claude-opus-5-5".to_string()),
+            "SPAWN_CHEAP_MODEL" => Some("deepseek-v4-pro".to_string()),
+            _ => None,
+        };
+        let (healthy, warnings) = probe_model_endpoints_with(&lookup_ok, &ok_probe);
+        assert!(warnings.is_empty());
+        assert_eq!(healthy["model_relay"]["status"], "ok");
+        assert_eq!(healthy["model_relay"]["latency_ms"], 3);
+        assert_eq!(healthy["judge"]["status"], "ok");
+        assert_eq!(healthy["model_slots"]["default"], "claude-opus-5-5");
+        assert_eq!(healthy["model_slots"]["cheap"], "deepseek-v4-pro");
+        assert_eq!(healthy["model_slots"]["small"], "deepseek-flash");
+
+        let down_probe = |url: &str, _timeout: std::time::Duration| spawn_jev::EndpointHealth {
+            status: spawn_jev::EndpointStatus::Unreachable,
+            target: spawn_jev::sanitize_endpoint_target(url),
+            http_status: None,
+            latency_ms: 7,
+            detail: Some(format!(
+                "connect {}: connection refused",
+                spawn_jev::sanitize_endpoint_target(url)
+            )),
+        };
+        let lookup_down = |key: &str| match key {
+            "SPAWN_MODEL_RELAY" => {
+                Some("http://u:RelayPass55@127.0.0.1:8791?api_key=RelayTok66".to_string())
+            }
+            "SPAWN_JUDGE_URL" => {
+                Some("http://j:JudgePass77@127.0.0.1:8790?token=JudgeTok88".to_string())
+            }
+            _ => None,
+        };
+        let (unreachable, warnings) = probe_model_endpoints_with(&lookup_down, &down_probe);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(unreachable["model_relay"]["status"], "unreachable");
+        assert_eq!(unreachable["model_relay"]["target"], "127.0.0.1:8791");
+        assert!(unreachable["model_relay"]["remediation"].is_string());
+        assert_eq!(unreachable["judge"]["status"], "unreachable");
+        let combined = format!("{unreachable}\n{}", warnings.join("\n"));
+        for secret in ["RelayPass55", "RelayTok66", "JudgePass77", "JudgeTok88"] {
+            assert!(!combined.contains(secret), "secret leaked: {combined}");
         }
     }
 }
