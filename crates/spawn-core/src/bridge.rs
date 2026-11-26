@@ -8014,6 +8014,7 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::{Bridge, BridgeConfig, RESOLVE_PRINCIPAL, mounted_key, trust_answer_key, waits};
+    use super::{ENGINE_UNAVAILABLE, EngineViewPolicy, ViewedLaunch};
     use crate::command::{CommandAction, NamedKey, Outcome, Submission};
     use crate::event::{CommandStep, ENGINE, EventKind, GlobalPosition, NewEvent, Source};
     use crate::id::{
