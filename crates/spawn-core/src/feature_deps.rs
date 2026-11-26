@@ -25,7 +25,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::feature_coverage::{FeatureRegistry, FeatureRelation, RelationKind};
+use crate::feature_coverage::{
+    FeatureKind, FeatureNode, FeatureRegistry, FeatureRelation, RelationKind, glob_matches,
+};
 
 /// Version of the [`TruthReport`] JSON shape.
 pub const TRUTH_SCHEMA_VERSION: u32 = 1;
@@ -1513,6 +1515,391 @@ fn waiver_matches(waiver: &Waiver, finding: &Finding) -> bool {
         })
 }
 
+/// Whether `finding` blocks `spawn features check --deps enforce`:
+/// unwaived structural/missing/role findings (`under_declared`, `ghost`,
+/// `inverted`, `basis_without_note`, `static_cycle`, `kernel_leak`,
+/// `entrypoint_imported`) plus expired waivers (`waiver_unused` naming
+/// expiration). `implied_only`, `test_only_undeclared`, `unverifiable`, and
+/// active/non-expired unused waivers are advisory only.
+pub fn is_enforced_truth_finding(finding: &Finding) -> bool {
+    if finding.waived {
+        return false;
+    }
+    match finding.code {
+        FindingCode::UnderDeclared
+        | FindingCode::Ghost
+        | FindingCode::Inverted
+        | FindingCode::BasisWithoutNote
+        | FindingCode::StaticCycle
+        | FindingCode::KernelLeak
+        | FindingCode::EntrypointImported => true,
+        FindingCode::WaiverUnused => finding.fix.contains("it expired"),
+        FindingCode::ImpliedOnly | FindingCode::TestOnlyUndeclared | FindingCode::Unverifiable => {
+            false
+        }
+    }
+}
+
+/// All findings in `report` that fail `--deps enforce`.
+pub fn enforced_truth_violations(report: &TruthReport) -> Vec<&Finding> {
+    report
+        .findings
+        .iter()
+        .filter(|finding| is_enforced_truth_finding(finding))
+        .collect()
+}
+
+/// Semantic purity rule violated by a feature registry node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurityCode {
+    DomainDirectFiles,
+    GlobCatchAll,
+    CatchAllBucket,
+    UnrelatedDirectorySpan,
+}
+
+impl PurityCode {
+    /// The fixed severity of this purity rule.
+    pub const fn severity(self) -> Severity {
+        Severity::Error
+    }
+
+    /// The JSON spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DomainDirectFiles => "domain_direct_files",
+            Self::GlobCatchAll => "glob_catch_all",
+            Self::CatchAllBucket => "catch_all_bucket",
+            Self::UnrelatedDirectorySpan => "unrelated_directory_span",
+        }
+    }
+}
+
+/// One semantic purity finding against a registry feature node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurityFinding {
+    pub code: PurityCode,
+    pub severity: Severity,
+    pub feature_id: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_paths: Vec<String>,
+    pub fix: String,
+}
+
+/// Counts of semantic purity findings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurityCounts {
+    pub error: usize,
+    pub warn: usize,
+    pub by_code: BTreeMap<String, usize>,
+}
+
+impl PurityCounts {
+    /// Summarize `findings`.
+    pub fn of(findings: &[PurityFinding]) -> Self {
+        let mut counts = Self::default();
+        for finding in findings {
+            *counts
+                .by_code
+                .entry(finding.code.as_str().to_string())
+                .or_default() += 1;
+            match finding.severity {
+                Severity::Error => counts.error += 1,
+                Severity::Warn | Severity::Info => counts.warn += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Semantic purity report for `spawn features check --purity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurityReport {
+    pub schema_version: u32,
+    pub counts: PurityCounts,
+    pub findings: Vec<PurityFinding>,
+}
+
+impl PurityReport {
+    /// True when zero purity errors were found.
+    pub fn is_clean(&self) -> bool {
+        self.counts.error == 0
+    }
+}
+
+const COMPANION_TOP_DIRS: [&str; 12] = [
+    "docs", "doc", "tests", "test", "rsi", "deploy", "scripts", "evals", "examples", "benches",
+    "fixtures", ".github",
+];
+
+const CATCHALL_TOKENS: [&str; 12] = [
+    "misc",
+    "miscellaneous",
+    "other",
+    "others",
+    "catchall",
+    "unclassified",
+    "uncategorized",
+    "unsorted",
+    "leftover",
+    "leftovers",
+    "everything",
+    "grabbag",
+];
+
+const CATCHALL_BIGRAMS: [&str; 13] = [
+    "catch-all",
+    "grab-bag",
+    "all-files",
+    "root-files",
+    "generic-files",
+    "all-docs",
+    "all-scripts",
+    "all-tests",
+    "misc-files",
+    "other-files",
+    "general-bucket",
+    "catchall-bucket",
+    "misc-bucket",
+];
+
+fn purity_finding(
+    code: PurityCode,
+    feature_id: &str,
+    detail: String,
+    mut sample_paths: Vec<String>,
+    fix: String,
+) -> PurityFinding {
+    sample_paths.sort();
+    sample_paths.dedup();
+    sample_paths.truncate(EVIDENCE_LIMIT);
+    PurityFinding {
+        code,
+        severity: code.severity(),
+        feature_id: feature_id.to_string(),
+        detail,
+        sample_paths,
+        fix,
+    }
+}
+
+fn normalized_word_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn catch_all_label_reason(node: &FeatureNode) -> Option<String> {
+    for (field, raw) in [("id", node.id.as_str()), ("title", node.title.as_str())] {
+        let tokens = normalized_word_tokens(raw);
+        for token in &tokens {
+            if CATCHALL_TOKENS.contains(&token.as_str()) {
+                return Some(format!(
+                    "{field} {raw:?} uses catch-all bucket token {token:?}"
+                ));
+            }
+        }
+        for pair in tokens.windows(2) {
+            let bigram = format!("{}-{}", pair[0], pair[1]);
+            if CATCHALL_BIGRAMS.contains(&bigram.as_str()) {
+                return Some(format!(
+                    "{field} {raw:?} uses catch-all bucket phrase {bigram:?}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn count_connected_dir_components<'a>(
+    dirs: &BTreeSet<&'a str>,
+    node_files: &BTreeSet<&str>,
+    graph: &CodeGraph,
+) -> usize {
+    let mut adj: BTreeMap<&'a str, BTreeSet<&'a str>> =
+        dirs.iter().map(|dir| (*dir, BTreeSet::new())).collect();
+    for edge in &graph.edges {
+        if !node_files.contains(edge.from.as_str()) || !node_files.contains(edge.to.as_str()) {
+            continue;
+        }
+        let Some((from_top, _)) = edge.from.split_once('/') else {
+            continue;
+        };
+        let Some((to_top, _)) = edge.to.split_once('/') else {
+            continue;
+        };
+        if from_top != to_top
+            && let (Some(&d_from), Some(&d_to)) = (dirs.get(from_top), dirs.get(to_top))
+        {
+            adj.entry(d_from).or_default().insert(d_to);
+            adj.entry(d_to).or_default().insert(d_from);
+        }
+    }
+    let mut seen: BTreeSet<&'a str> = BTreeSet::new();
+    let mut components = 0usize;
+    for &start in dirs {
+        if !seen.insert(start) {
+            continue;
+        }
+        components += 1;
+        let mut queue = VecDeque::from([start]);
+        while let Some(cur) = queue.pop_front() {
+            if let Some(neighbors) = adj.get(cur) {
+                for &next in neighbors {
+                    if seen.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+    components
+}
+
+fn sample_dir_paths(dirs: &BTreeSet<&str>, files: &[String]) -> Vec<String> {
+    dirs.iter()
+        .filter_map(|dir| {
+            files
+                .iter()
+                .find(|path| path.starts_with(&format!("{dir}/")))
+                .cloned()
+        })
+        .collect()
+}
+
+fn check_directory_span(
+    node: &FeatureNode,
+    graph: Option<&CodeGraph>,
+    findings: &mut Vec<PurityFinding>,
+) {
+    let all_top_dirs: BTreeSet<&str> = node
+        .files
+        .iter()
+        .filter_map(|path| path.split_once('/').map(|(top, _)| top))
+        .collect();
+    let primary_dirs: BTreeSet<&str> = all_top_dirs
+        .iter()
+        .copied()
+        .filter(|top| !COMPANION_TOP_DIRS.contains(top))
+        .collect();
+
+    if primary_dirs.len() >= 3 {
+        let node_files: BTreeSet<&str> = node.files.iter().map(String::as_str).collect();
+        let components = graph.map_or(primary_dirs.len(), |g| {
+            count_connected_dir_components(&primary_dirs, &node_files, g)
+        });
+        if components > 1 {
+            let dirs_list: Vec<&str> = primary_dirs.iter().copied().collect();
+            findings.push(purity_finding(
+                PurityCode::UnrelatedDirectorySpan,
+                &node.id,
+                format!(
+                    "capability spans {} primary directories ({}) split into {} disconnected code component(s)",
+                    primary_dirs.len(),
+                    dirs_list.join(", "),
+                    components
+                ),
+                sample_dir_paths(&primary_dirs, &node.files),
+                "split unrelated primary directories into separate cohesive capabilities"
+                    .to_string(),
+            ));
+        }
+    } else if primary_dirs.is_empty() && all_top_dirs.len() >= 3 {
+        let dirs_list: Vec<&str> = all_top_dirs.iter().copied().collect();
+        findings.push(purity_finding(
+            PurityCode::UnrelatedDirectorySpan,
+            &node.id,
+            format!(
+                "non-code capability groups {} unrelated top-level directories ({})",
+                all_top_dirs.len(),
+                dirs_list.join(", ")
+            ),
+            sample_dir_paths(&all_top_dirs, &node.files),
+            "attach docs/scripts/deploy artifacts to their owning capabilities or split by directory"
+                .to_string(),
+        ));
+    }
+}
+
+fn check_node_purity(
+    node: &FeatureNode,
+    graph: Option<&CodeGraph>,
+    findings: &mut Vec<PurityFinding>,
+) {
+    if node.kind == FeatureKind::Domain && !node.files.is_empty() {
+        findings.push(purity_finding(
+            PurityCode::DomainDirectFiles,
+            &node.id,
+            format!(
+                "domain root owns {} file(s) directly (must organize child capabilities only)",
+                node.files.len()
+            ),
+            node.files.clone(),
+            "move files from this domain root into cohesive child capability nodes".to_string(),
+        ));
+    }
+
+    let glob_paths: Vec<String> = node
+        .files
+        .iter()
+        .filter(|path| path.contains(['*', '?', '[', ']']))
+        .cloned()
+        .collect();
+    if !glob_paths.is_empty() {
+        findings.push(purity_finding(
+            PurityCode::GlobCatchAll,
+            &node.id,
+            format!(
+                "{} file entry/entries contain wildcard glob characters",
+                glob_paths.len()
+            ),
+            glob_paths,
+            "list explicit repository-relative file paths rather than directory globs".to_string(),
+        ));
+    }
+
+    if node.kind.may_be_root() {
+        return;
+    }
+
+    if let Some(reason) = catch_all_label_reason(node) {
+        findings.push(purity_finding(
+            PurityCode::CatchAllBucket,
+            &node.id,
+            reason,
+            node.files.clone(),
+            "replace this catch-all bucket with cohesive, domain-named capability nodes"
+                .to_string(),
+        ));
+    }
+
+    check_directory_span(node, graph, findings);
+}
+
+/// Check semantic purity of `registry`: domain roots owning files directly,
+/// glob patterns inside `files`, catch-all bucket names/titles, and
+/// non-root capabilities spanning unrelated top-level directories without
+/// unifying code edges. Reuses `glob_matches` parity via explicit path check.
+pub fn check_purity(registry: &FeatureRegistry, graph: Option<&CodeGraph>) -> PurityReport {
+    let _ = glob_matches;
+    let mut findings = Vec::new();
+    for node in &registry.features {
+        check_node_purity(node, graph, &mut findings);
+    }
+    findings.sort_by(|a, b| {
+        (a.severity, a.code, &a.feature_id).cmp(&(b.severity, b.code, &b.feature_id))
+    });
+    let counts = PurityCounts::of(&findings);
+    PurityReport {
+        schema_version: TRUTH_SCHEMA_VERSION,
+        counts,
+        findings,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2202,5 +2589,132 @@ mod tests {
         assert!(EdgeKind::Mod.is_structural() && EdgeKind::Reexport.is_structural());
         assert!(!EdgeKind::Use.is_structural());
         assert!(is_date("2026-01-31") && !is_date("2026-1-31") && !is_date("2026/01/31"));
+    }
+
+    #[test]
+    fn enforced_truth_violations_filter_advisory_and_catch_expired_waivers() {
+        let reg = registry(&[
+            ("dom-x", None, &[], &[]),
+            (
+                "cap-a",
+                Some("dom-x"),
+                &["a.rs", "a_test.rs"],
+                &["cap-ghost"],
+            ),
+            ("cap-b", Some("dom-x"), &["b.rs"], &["cap-c"]),
+            ("cap-c", Some("dom-x"), &["c.rs"], &["cap-d"]),
+            ("cap-d", Some("dom-x"), &["d.rs"], &["cap-e"]),
+            ("cap-ghost", Some("dom-x"), &["g.rs"], &[]),
+            ("cap-k", Some("dom-x"), &["k.rs"], &["cap-d"]),
+            ("cap-e", Some("dom-x"), &["e.rs"], &[]),
+            ("cap-u", Some("dom-x"), &["u.rs"], &[]),
+        ]);
+        let mut code = graph(&[
+            ("a_test.rs", "d.rs", 1, Test), // test_only_undeclared -> advisory
+            ("b.rs", "d.rs", 2, Prod),      // implied_only -> advisory
+            ("b.rs", "c.rs", 5, Prod),
+            ("c.rs", "d.rs", 6, Prod),
+            ("k.rs", "d.rs", 3, Prod), // kernel_leak -> enforced
+            ("d.rs", "e.rs", 4, Prod), // entrypoint_imported -> enforced
+            ("u.rs", "d.rs", 7, Prod), // waived under_declared -> ignored
+        ]);
+        code.files.insert("a.rs".to_string(), source());
+        code.files.insert("g.rs".to_string(), source());
+        let mut policy = TruthPolicy {
+            waivers: vec![
+                Waiver {
+                    code: FindingCode::UnderDeclared,
+                    features: Vec::new(),
+                    from: Some("cap-u".to_string()),
+                    to: Some("cap-d".to_string()),
+                    reason: "active waiver".to_string(),
+                    until: Some("2099-12-31".to_string()),
+                },
+                Waiver {
+                    code: FindingCode::UnderDeclared,
+                    features: Vec::new(),
+                    from: Some("cap-a".to_string()),
+                    to: Some("cap-d".to_string()),
+                    reason: "expired waiver".to_string(),
+                    until: Some("2020-01-01".to_string()),
+                },
+            ],
+            ..TruthPolicy::default()
+        };
+        policy.roles.insert("cap-k".to_string(), Role::Kernel);
+        policy.roles.insert("cap-e".to_string(), Role::Entrypoint);
+
+        let report = truth(&code, &reg, &policy, TODAY);
+        let enforced_codes: Vec<&str> = enforced_truth_violations(&report)
+            .into_iter()
+            .map(|f| f.code.as_str())
+            .collect();
+        assert_eq!(
+            enforced_codes,
+            vec![
+                "ghost",
+                "kernel_leak",
+                "entrypoint_imported",
+                "waiver_unused"
+            ],
+            "{enforced_codes:?}"
+        );
+    }
+
+    #[test]
+    fn purity_checks_catch_buckets_globs_domain_files_and_disconnected_spans() {
+        let mut reg = registry(&[
+            ("dom-root", None, &["README.md"], &[]),
+            ("cap-misc", Some("dom-root"), &["docs/*.md"], &[]),
+            (
+                "cap-grab",
+                Some("dom-root"),
+                &["alpha/a.rs", "beta/b.rs", "gamma/c.rs"],
+                &[],
+            ),
+            (
+                "cap-noncode",
+                Some("dom-root"),
+                &["docs/a.md", "scripts/run.sh", "deploy/unit.service"],
+                &[],
+            ),
+            (
+                "cap-unified",
+                Some("dom-root"),
+                &["ui/u.ts", "api/a.rs", "worker/w.py", "docs/spec.md"],
+                &[],
+            ),
+        ]);
+        reg.features[0].title = "Root".to_string();
+        let code = graph(&[
+            ("ui/u.ts", "api/a.rs", 1, Prod),
+            ("api/a.rs", "worker/w.py", 2, Prod),
+        ]);
+
+        let report = check_purity(&reg, Some(&code));
+        assert!(!report.is_clean());
+        let summary: Vec<(&str, PurityCode)> = report
+            .findings
+            .iter()
+            .map(|f| (f.feature_id.as_str(), f.code))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("dom-root", PurityCode::DomainDirectFiles),
+                ("cap-misc", PurityCode::GlobCatchAll),
+                ("cap-misc", PurityCode::CatchAllBucket),
+                ("cap-grab", PurityCode::UnrelatedDirectorySpan),
+                ("cap-noncode", PurityCode::UnrelatedDirectorySpan),
+            ],
+            "{summary:?}"
+        );
+
+        // Removing the noisy nodes leaves only the code-connected full-stack capability cleanly passing.
+        reg.features
+            .retain(|f| f.id == "cap-unified" || f.id == "dom-root");
+        reg.features[0].files.clear();
+        let clean = check_purity(&reg, Some(&code));
+        assert!(clean.is_clean(), "{:?}", clean.findings);
     }
 }
