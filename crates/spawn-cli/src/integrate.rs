@@ -5036,7 +5036,7 @@ impl Judge {
         // green again. Such a gate is judged here.
         if let Some((_, check)) = gate_env
             .iter()
-            .find(|(name, _)| name == "SPAWN_GATE_BASE_CHECK")
+            .find(|(name, _)| name == "SPAWN_GATE_BASE_CHECK_DISABLED")
         {
             println!(
                 "integrate: task {}: judged on this host (fallback_local): main is red on \
