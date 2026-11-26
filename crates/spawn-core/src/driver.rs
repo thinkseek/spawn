@@ -209,6 +209,148 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     fn excerpt_source(&self, pane: &str) -> String {
         pane.to_string()
     }
+
+    /// How the run-time resolver answers `dialog`, shown by this engine
+    /// started in `workspace` ([`table_answer`] for this engine's id): a
+    /// fixed table, never a guess.
+    fn dialog_answer(&self, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
+        table_answer(self.id(), dialog, workspace)
+    }
+}
+
+/// A dialog the run-time resolver found on a pane (design section 6.3),
+/// as the terminal host's detection and Spawn's own detection
+/// (`serve/approvals.rs`, `detect`) describe it.
+#[derive(Debug, Clone, Copy)]
+pub struct Dialog<'a> {
+    /// The host's rule that read it blocked (Herdr's manifest rule id:
+    /// `trust_prompt`, `permission_prompt`, ...), when the host reads one.
+    pub rule: Option<&'a str>,
+    /// Spawn's prompt kind (`permission`, `choice`, `yes_no`, `confirm`),
+    /// or `trust` for an engine's workspace trust dialog.
+    pub kind: &'a str,
+    /// The label of the choice the dialog's cursor stands on, if drawn.
+    pub cursor: Option<&'a str>,
+    /// The labels of its choices, in order.
+    pub choices: &'a [String],
+    /// What the dialog asks to approve, one entry a line (its body), and
+    /// for a trust dialog the lines that name the folder.
+    pub body: &'a [String],
+}
+
+/// What the resolver does with a dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Press these keys (tmux names), in order, once.
+    Keys(&'static [&'static str]),
+    /// Press nothing: a person decides. The reason is said.
+    Escalate(&'static str),
+}
+
+/// Why a row that has no captured screen yet answers nothing.
+const UNCAPTURED: &str = "no captured screen of this dialog yet: a person answers it";
+
+/// The resolver's table (design section 6.3), pure. A row whose dialog
+/// was never seen working live (manifest text only, not captured, not
+/// verified) escalates: it gets keys only in a later change that adds the
+/// captured screen as a test. The table never holds an answer nobody has
+/// seen work. Every keyed row is one key: the Bridge presses a resolver's
+/// key only while its dialog shows and nothing else went to the pane since,
+/// so a second key of the same answer would find the first already pressed.
+///
+/// | engine | dialog | guard | answer | evidence |
+/// |---|---|---|---|---|
+/// | agy | `trust_prompt` | the folder shown is the workspace, cursor on "Yes, I trust this folder" | Enter | probed |
+/// | agy | `permission_prompt` | — | escalate | manifest text only |
+/// | agy | `question_prompt` | — | escalate | manifest text only |
+/// | claude | trust | — | escalate (the Bridge's startup answer, `y` Enter) | production, at startup |
+/// | claude | numbered permission | — | escalate | approvals fixtures only (hand-written) |
+/// | claude | question form, MCP elicitation, dynamic workflow | — | escalate | not captured |
+/// | codex | `trust_directory`, `startup_update`, `live_strong_blocker` | — | escalate | not verified |
+/// | opencode | `permission_required` | — | escalate | not verified |
+/// | any | no row | — | escalate | — |
+pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
+    match (engine, dialog.rule, dialog.kind) {
+        ("agy", Some("trust_prompt"), _) => {
+            let folder = workspace.path().trim_end_matches('/');
+            let shown = dialog
+                .body
+                .iter()
+                .any(|line| line.trim().trim_end_matches('/') == folder);
+            let trusting = dialog
+                .cursor
+                .is_some_and(|cursor| cursor.trim() == "Yes, I trust this folder");
+            if shown && trusting {
+                Answer::Keys(&crate::screen::AGY_TRUST_KEYS)
+            } else {
+                Answer::Escalate(
+                    "agy's trust dialog names another folder, or its cursor is not on trust",
+                )
+            }
+        }
+        // The Bridge answers it before the first prompt (two keys, audited);
+        // at run time the resolver leaves it to a person.
+        ("claude", _, "trust") => Answer::Escalate(
+            "Claude Code's trust dialog is the Bridge's startup answer: a person answers it later",
+        ),
+        // Rows whose screen nobody has captured working yet.
+        (
+            "claude",
+            None | Some("bash_permission_prompt" | "generic_permission_prompt"),
+            "permission",
+        )
+        | ("agy", Some("permission_prompt" | "question_prompt"), _)
+        | (
+            "claude",
+            Some("live_blocked_form" | "mcp_elicitation_prompt" | "dynamic_workflow_prompt"),
+            _,
+        )
+        | ("codex", Some("trust_directory" | "startup_update" | "live_strong_blocker"), _)
+        | ("opencode", Some("permission_required"), _) => Answer::Escalate(UNCAPTURED),
+        _ => Answer::Escalate("no row of the resolver's table covers this dialog"),
+    }
+}
+
+/// Screens no key may answer: the engine cannot go on without a person
+/// (design section 6.3, "Hard blocks"). Lowercased text; every one is from
+/// the engines' own strings and docs, none captured on a live pane yet.
+const HARD_BLOCKS: [(&str, &str); 12] = [
+    ("please run /login", "login required"),
+    ("login required", "login required"),
+    ("not logged in", "login required"),
+    ("oauth token has expired", "login expired"),
+    ("authentication_error", "login expired"),
+    ("rate limit reached", "rate limit"),
+    ("rate_limit_error", "rate limit"),
+    ("usage limit reached", "quota reached"),
+    ("quota exceeded", "quota reached"),
+    ("resource_exhausted", "quota reached"),
+    ("update required", "update required"),
+    ("please update to continue", "update required"),
+];
+
+/// Why the pane's tail is a hard block, if it is one: a login required or
+/// expired, a quota or rate limit reached, an update the engine needs
+/// before it runs, or a dialog whose only choices exit. Read from the last
+/// [`crate::screen::TAIL_LINES`] lines only; the resolver escalates it at
+/// once and never presses a key.
+pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let tail = lines[lines.len().saturating_sub(crate::screen::TAIL_LINES)..]
+        .join("\n")
+        .to_lowercase();
+    if let Some((_, why)) = HARD_BLOCKS.iter().find(|(text, _)| tail.contains(text)) {
+        return Some(why);
+    }
+    let exits = |label: &String| {
+        let lower = label.to_lowercase();
+        ["exit", "quit"].iter().any(|word| {
+            lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == *word)
+        })
+    };
+    (!choices.is_empty() && choices.iter().all(exits)).then_some("only exit choices")
 }
 
 /// Claude Code, interactive in a terminal: everything it does is the
@@ -717,5 +859,311 @@ mod tests {
         let banner = "▀▀▀▀▀▀ someone@example.invalid (Pro)\nok\n";
         assert_eq!(AgyDriver.excerpt_source(banner), "ok\n");
         assert_eq!(ClaudeDriver.excerpt_source(banner), banner);
+    }
+
+    // --- the resolver's table (design section 6.3): one test a row -------
+
+    fn dialog<'a>(
+        rule: Option<&'a str>,
+        kind: &'a str,
+        cursor: Option<&'a str>,
+        choices: &'a [String],
+        body: &'a [String],
+    ) -> super::Dialog<'a> {
+        super::Dialog {
+            rule,
+            kind,
+            cursor,
+            choices,
+            body,
+        }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn ws() -> WorkspaceId {
+        WorkspaceId::new("agent_a:/workspaces/agent_a").expect("workspace")
+    }
+
+    #[test]
+    fn row_agy_trust_prompt_probed_answers_enter_for_the_workspace_only() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["Yes, I trust this folder", "No, exit"]);
+        let body = strings(&["Accessing workspace:", "/workspaces/agent_a"]);
+        let ours = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("Yes, I trust this folder"),
+            &choices,
+            &body,
+        );
+        assert_eq!(table_answer("agy", &ours, &ws()), Answer::Keys(&["Enter"]));
+        assert_eq!(
+            AgyDriver.dialog_answer(&ours, &ws()),
+            Answer::Keys(&["Enter"])
+        );
+        let elsewhere = strings(&["Accessing workspace:", "/home/someone"]);
+        let other = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("Yes, I trust this folder"),
+            &choices,
+            &elsewhere,
+        );
+        assert!(matches!(
+            table_answer("agy", &other, &ws()),
+            Answer::Escalate(_)
+        ));
+        let off_cursor = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("No, exit"),
+            &choices,
+            &body,
+        );
+        assert!(matches!(
+            table_answer("agy", &off_cursor, &ws()),
+            Answer::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn row_agy_permission_prompt_manifest_text_only_escalates() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["Yes", "No"]);
+        let body = strings(&["Run command?", "cargo test"]);
+        let shown = dialog(
+            Some("permission_prompt"),
+            "permission",
+            Some("Yes"),
+            &choices,
+            &body,
+        );
+        assert!(matches!(
+            table_answer("agy", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn row_agy_question_prompt_manifest_text_only_escalates() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["A", "B"]);
+        let shown = dialog(Some("question_prompt"), "choice", Some("A"), &choices, &[]);
+        assert!(matches!(
+            table_answer("agy", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn row_claude_trust_dialog_is_the_bridges_startup_answer_and_escalates_at_run_time() {
+        use super::{Answer, table_answer};
+        let shown = dialog(None, "trust", None, &[], &[]);
+        assert!(matches!(
+            table_answer("claude", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
+        assert!(matches!(
+            ClaudeDriver.dialog_answer(&shown, &ws()),
+            Answer::Escalate(_)
+        ));
+        // The Bridge's own startup answer is unchanged.
+        let trust = "Do you trust the files in this folder?\n\ny. Yes, I trust this folder\n\
+                     n. No, exit\nEnter y/n:\nEnter to confirm · Esc to cancel\n";
+        assert_eq!(ClaudeDriver.startup_answer(trust), Some(&TRUST_KEYS[..]));
+    }
+
+    #[test]
+    fn row_claude_numbered_permission_not_captured_escalates() {
+        use super::{Answer, table_answer};
+        let yes = strings(&["Yes", "Yes, and don't ask again", "No"]);
+        for rule in [
+            None,
+            Some("bash_permission_prompt"),
+            Some("generic_permission_prompt"),
+        ] {
+            let shown = dialog(rule, "permission", Some("Yes"), &yes, &[]);
+            assert!(
+                matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)),
+                "{rule:?}"
+            );
+        }
+    }
+
+    /// Every row that answers with keys answers with one key.
+    #[test]
+    fn every_keyed_row_of_the_table_is_one_key() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["Yes, I trust this folder", "No, exit", "Yes", "No"]);
+        let body = strings(&["Accessing workspace:", "/workspaces/agent_a"]);
+        let mut keyed = 0;
+        for engine in ["agy", "claude", "codex", "opencode", "other"] {
+            for rule in [
+                None,
+                Some("trust_prompt"),
+                Some("permission_prompt"),
+                Some("question_prompt"),
+                Some("bash_permission_prompt"),
+                Some("generic_permission_prompt"),
+                Some("live_blocked_form"),
+                Some("trust_directory"),
+                Some("permission_required"),
+            ] {
+                for kind in ["trust", "permission", "choice", "yes_no", "confirm"] {
+                    for cursor in [None, Some("Yes, I trust this folder"), Some("Yes")] {
+                        let shown = dialog(rule, kind, cursor, &choices, &body);
+                        if let Answer::Keys(keys) = table_answer(engine, &shown, &ws()) {
+                            keyed += 1;
+                            assert_eq!(keys.len(), 1, "{engine} {rule:?} {kind}: {keys:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(keyed > 0, "the agy trust row answers");
+    }
+
+    #[test]
+    fn row_claude_question_forms_not_captured_escalate() {
+        use super::{Answer, table_answer};
+        for rule in [
+            "live_blocked_form",
+            "mcp_elicitation_prompt",
+            "dynamic_workflow_prompt",
+        ] {
+            let shown = dialog(Some(rule), "choice", None, &[], &[]);
+            assert!(matches!(
+                table_answer("claude", &shown, &ws()),
+                Answer::Escalate(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn row_codex_dialogs_not_verified_escalate() {
+        use super::{Answer, table_answer};
+        for rule in ["trust_directory", "startup_update", "live_strong_blocker"] {
+            let shown = dialog(Some(rule), "confirm", None, &[], &[]);
+            assert!(matches!(
+                table_answer("codex", &shown, &ws()),
+                Answer::Escalate(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn row_opencode_permission_required_not_verified_escalates() {
+        use super::{Answer, table_answer};
+        let shown = dialog(Some("permission_required"), "permission", None, &[], &[]);
+        assert!(matches!(
+            table_answer("opencode", &shown, &ws()),
+            Answer::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn row_any_engine_with_no_row_escalates() {
+        use super::{Answer, table_answer};
+        let yes = strings(&["Yes", "No"]);
+        for (engine, rule, kind) in [
+            ("agy", None, "permission"),
+            ("agy", Some("idle"), "confirm"),
+            ("claude", Some("unknown_rule"), "permission"),
+            ("codex", None, "permission"),
+            ("someone", Some("trust_prompt"), "trust"),
+        ] {
+            let shown = dialog(rule, kind, Some("Yes"), &yes, &[]);
+            assert!(
+                matches!(table_answer(engine, &shown, &ws()), Answer::Escalate(_)),
+                "{engine} {rule:?} {kind}"
+            );
+        }
+    }
+
+    // --- hard blocks: every text from the engines' strings and docs, none
+    // captured on a live pane (marked `unverified` in the test's name) ----
+
+    #[test]
+    fn hard_block_login_required_texts_unverified() {
+        for pane in [
+            "Invalid API key · Please run /login",
+            "Error: login required",
+            "You are not logged in.",
+        ] {
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("login required"),
+                "{pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_block_login_expired_texts_unverified() {
+        for pane in [
+            "API Error: 401 OAuth token has expired",
+            "{\"type\":\"authentication_error\"}",
+        ] {
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("login expired"),
+                "{pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_block_rate_limit_texts_unverified() {
+        for pane in ["Rate limit reached for requests", "rate_limit_error"] {
+            assert_eq!(super::hard_block(pane, &[]), Some("rate limit"), "{pane}");
+        }
+    }
+
+    #[test]
+    fn hard_block_quota_texts_unverified() {
+        for pane in [
+            "Claude usage limit reached. Your limit will reset at 5pm",
+            "Quota exceeded for this model",
+            "429 RESOURCE_EXHAUSTED",
+        ] {
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("quota reached"),
+                "{pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_block_update_required_texts_unverified() {
+        for pane in [
+            "Update required: version 1.2 is too old",
+            "Please update to continue",
+        ] {
+            assert_eq!(
+                super::hard_block(pane, &[]),
+                Some("update required"),
+                "{pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_block_only_exit_choices_and_none_on_ordinary_dialogs() {
+        assert_eq!(
+            super::hard_block("Something failed", &strings(&["Exit", "Quit Spawn"])),
+            Some("only exit choices")
+        );
+        assert_eq!(
+            super::hard_block("Run command?", &strings(&["Yes", "No, exit"])),
+            None
+        );
+        assert_eq!(super::hard_block("Run command?", &[]), None);
+        // Only the tail counts: a limit far above it is history.
+        let old = format!("Rate limit reached\n{}", "line\n".repeat(60));
+        assert_eq!(super::hard_block(&old, &[]), None);
     }
 }

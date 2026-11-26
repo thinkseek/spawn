@@ -323,6 +323,125 @@ pub(crate) fn wait_sessions_gone(
     )))
 }
 
+/// End the processes left beneath a terminated terminal's workspace (a
+/// daemon the engine detached: agy's `--bg-updater`, a `nohup` server) by
+/// pid, before the caller's final checkpoint (design section 5.4): every
+/// live process of this user whose working directory is `directory` or
+/// below it, read from `/proc/<pid>/cwd` (an exact link, never an argument
+/// pattern), gets SIGTERM, and SIGKILL after `waits.0`; one left after
+/// `waits.1` more is an error naming it. A signal goes through a pidfd
+/// opened while the process's directory still matched, so a reused pid is
+/// never signalled. Never this process; never a directory too broad to be
+/// one workspace ([`sweepable`]).
+pub(crate) fn end_stragglers(
+    directory: &str,
+    waits: (Duration, Duration),
+) -> Result<(), TerminalError> {
+    let directory = std::path::Path::new(directory);
+    if !sweepable(directory) {
+        return Ok(());
+    }
+    for (signal, wait) in [
+        (rustix::process::Signal::TERM, waits.0),
+        (rustix::process::Signal::KILL, waits.1),
+    ] {
+        let found = stragglers_beneath(directory);
+        if found.is_empty() {
+            return Ok(());
+        }
+        for pid in &found {
+            signal_beneath(*pid, directory, signal);
+        }
+        let deadline = Instant::now() + wait;
+        while !stragglers_beneath(directory).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(GONE_POLL);
+        }
+    }
+    let left = stragglers_beneath(directory);
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(TerminalError(format!(
+        "{} process(es) left beneath {} outlived SIGTERM and SIGKILL: {left:?}",
+        left.len(),
+        directory.display()
+    )))
+}
+
+/// Whether `directory` may be swept: an absolute path of at least three
+/// parts (`/tmp/a` and `/home/user` are never one workspace), that is not
+/// this process's working directory, the home directory or the temporary
+/// directory, nor above any of them.
+pub(crate) fn sweepable(directory: &std::path::Path) -> bool {
+    use std::path::Component;
+    if !directory.is_absolute()
+        || directory
+            .components()
+            .filter(|part| matches!(part, Component::Normal(_)))
+            .count()
+            < 3
+        || directory
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return false;
+    }
+    let shared = [
+        std::env::current_dir().ok(),
+        std::env::var_os("HOME").map(std::path::PathBuf::from),
+        Some(std::env::temp_dir()),
+    ];
+    !shared
+        .into_iter()
+        .flatten()
+        .any(|shared| shared.starts_with(directory))
+}
+
+/// The live processes of this user, this one excepted, whose working
+/// directory is `directory` or below it, by `/proc/<pid>/cwd`.
+pub(crate) fn stragglers_beneath(directory: &std::path::Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let uid = crate::process::current_uid();
+    let own = std::process::id();
+    let mut found: Vec<u32> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != own)
+        .filter(|pid| {
+            std::fs::metadata(format!("/proc/{pid}")).is_ok_and(|meta| meta.uid() == uid)
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| session_of(&stat))
+                    .is_some_and(|(state, _)| state != 'Z')
+                && cwd_beneath(*pid, directory)
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// Whether `/proc/<pid>/cwd` is `directory` or below it.
+fn cwd_beneath(pid: u32, directory: &std::path::Path) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(directory))
+}
+
+/// `signal` to `pid` through a pidfd, only while its working directory is
+/// still beneath `directory` once the pidfd holds it.
+fn signal_beneath(pid: u32, directory: &std::path::Path, signal: rustix::process::Signal) {
+    let Some(raw) = rustix::process::Pid::from_raw(pid.cast_signed()) else {
+        return;
+    };
+    let Ok(pidfd) = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) else {
+        return;
+    };
+    if cwd_beneath(pid, directory) {
+        let _ = rustix::process::pidfd_send_signal(&pidfd, signal);
+    }
+}
+
 /// The processes still in the sessions `leaders` lead once none is left or
 /// `limit` passes.
 fn until_gone(leaders: &[u32], limit: Duration) -> Vec<u32> {
@@ -967,7 +1086,7 @@ impl TerminalHost for TmuxHost {
     fn terminate(
         &self,
         terminal: &TerminalName,
-        _workspace: &WorkspaceId,
+        workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         // Read before the kill: the session's processes are told by it.
         // With the leader recorded at start: a session that vanished on its
@@ -993,6 +1112,9 @@ impl TerminalHost for TmuxHost {
             )));
         }
         self.wait_gone(terminal, &leaders)?;
+        // What the engine detached from its session, still beneath the
+        // workspace: ended by pid before the caller's final checkpoint.
+        end_stragglers(workspace.path(), self.waits)?;
         self.forget_leader(terminal);
         Ok(())
     }
@@ -1308,7 +1430,10 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_LIMIT, read_in_workspace, read_local, replace_local, runner_of};
+    use super::{
+        READ_LIMIT, end_stragglers, read_in_workspace, read_local, replace_local, runner_of,
+        stragglers_beneath, sweepable,
+    };
     use spawn_core::id::TerminalName;
     use spawn_core::port::Runner;
     use std::time::{Duration, Instant};
@@ -1679,5 +1804,78 @@ mod tests {
         assert_eq!(super::server_identity(" \n"), None);
         assert_eq!(super::server_identity("2283540\n"), None);
         assert_eq!(super::server_identity("#{pid} #{start_time}\n"), None);
+    }
+
+    /// Never a directory too broad to be one workspace.
+    #[test]
+    fn only_a_narrow_directory_is_swept() {
+        for broad in [
+            "/",
+            "/tmp",
+            "/tmp/a",
+            "/home/someone",
+            "relative/a/b",
+            "/a/../b/c",
+        ] {
+            assert!(!sweepable(std::path::Path::new(broad)), "{broad}");
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if let Some(home) = home {
+            assert!(!sweepable(&home));
+            assert!(home.parent().is_none_or(|parent| !sweepable(parent)));
+        }
+        let here = std::env::current_dir().expect("cwd");
+        assert!(!sweepable(&here));
+        assert!(sweepable(std::path::Path::new(
+            "/workspaces/agents/agent_a"
+        )));
+    }
+
+    /// A process the test starts with its working directory below a
+    /// workspace, detached from any session, is found by pid and ended;
+    /// one elsewhere is left alone.
+    #[test]
+    fn a_detached_process_beneath_the_workspace_is_ended_by_pid() {
+        let scratch = crate::Scratch::new("spawn-straggler-test");
+        let workspace = scratch.join("ws");
+        let nested = workspace.join("deep");
+        std::fs::create_dir_all(&nested).expect("dirs");
+        let elsewhere = scratch.join("other");
+        std::fs::create_dir_all(&elsewhere).expect("dirs");
+        if !sweepable(&workspace) {
+            eprintln!(
+                "skipped: the scratch {} is not sweepable",
+                workspace.display()
+            );
+            return;
+        }
+        let mut inside = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&nested)
+            .spawn()
+            .expect("sleep");
+        let mut outside = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&elsewhere)
+            .spawn()
+            .expect("sleep");
+        assert_eq!(stragglers_beneath(&workspace), vec![inside.id()]);
+        // The child is reaped here so that it is gone, not a zombie.
+        let reaper = std::thread::spawn(move || inside.wait());
+        end_stragglers(
+            &workspace.display().to_string(),
+            (Duration::from_secs(2), Duration::from_secs(2)),
+        )
+        .expect("ended");
+        let status = reaper.join().expect("joined").expect("waited");
+        assert!(!status.success(), "ended by a signal: {status:?}");
+        assert!(stragglers_beneath(&workspace).is_empty());
+        assert_eq!(outside.try_wait().expect("try_wait"), None, "left alone");
+        let _ = outside.kill();
+        let _ = outside.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && !stragglers_beneath(&elsewhere).is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

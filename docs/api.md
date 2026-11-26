@@ -68,7 +68,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/features/coverage` | The feature registry's file coverage (`docs/feature-map/registry.json`): wild files, stale references, features; `?mission=<id>` for that mission's project | `spawn features scan --json` | web (Coverage) |
 | GET | `/api/features/coverage/projects` | Every project the Coverage page can read, over all open objective missions | – | web (Coverage) |
 | GET | `/api/stream` | The log as Server-Sent Events, live: `event: ready`, then one frame per event (its `/api/events` row), a comment probe `:` every 500 ms of quiet (a page gone, a reset included, frees its slot within a few probes) and `: keepalive` in its place every 15 s; catch-up of at most 500 events after `Last-Event-ID` or `?after=<id>`, else `event: resync`; on 64 slots of its own, at most 16 per client address that is not loopback (503 when all are taken, or that address's are), no `ETag` ([`serve/stream.rs`](../crates/spawn-cli/src/serve/stream.rs)) | – | web (`stream.ts`: live invalidation of Home's boards, one stream shared among tabs) |
-| GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)) | – | web (Home, `approvals.ts`: the approvals queue) |
+| GET | `/api/approvals` | The prompts a person must answer, read from the live panes (numbered choices, permission buttons, yes/no, confirm), sessions whose judgement asks for a person, and halted missions; each item's `id` is its `approval_id` ([`serve/approvals.rs`](../crates/spawn-cli/src/serve/approvals.rs)); a session's item also carries `auto: {state, answered, breaker}`, what the run-time resolver did and may do there ("Automatic answers" below) | – | web (Home, `approvals.ts`: the approvals queue) |
 | GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | web (Home, `digest.ts`: the digest line and drawer) |
 | GET | `/api/prov/who` | Who made a file as the last recorded first-parent commit of `main` that touched it left it: that `land` or `import` Change, its entry, the `edit` revision the content came from (`origin`) and the path's history, oldest first; `?path=` (required), `?source=` (the domain `git:<source>`; every domain when empty); a `line` is 400 (a line's blame needs the repository) ([`serve/prov.rs`](../crates/spawn-cli/src/serve/prov.rs), [provenance](./provenance.md)) | `spawn prov who <path>[:<line>] --source <source>` (file-level from git's `main`, and a line's blame) | no web page yet |
 | GET | `/api/prov/change/<id>` | Every revision of a Change (`<id>` its `change_id`), every Change of a task (digits) or the Change recorded for a commit (40 hex characters, read through the commit map both ways), each with its entries and edges; `{changes: []}` when none is recorded | `spawn prov show <id>`: the same JSON | no web page yet |
@@ -165,3 +165,81 @@ challenge when a token is set, 403 otherwise. The built UI's static files
 are served without the token. The full rules, and the reasons for each, are
 the opening comment of
 [`crates/spawn-cli/src/serve.rs`](../crates/spawn-cli/src/serve.rs).
+
+## Automatic answers (`spawn-resolve`)
+
+A dialog an engine shows can be answered without a person by
+[`crates/spawn-cli/src/resolve.rs`](../crates/spawn-cli/src/resolve.rs), a
+step of `spawn loop` (Herdr PR 3, design section 6.3). Every answer is an
+ordinary `key` command of the principal `spawn-resolve`, pressed by the
+Bridge as a person's is. For each answer the record shows `command.accepted`
+(principal `spawn-resolve`, idempotency key
+`resolve:<execution>:<dialog id>:1:1`, the dialog's approvals id), then
+`command.step pressing`, `pressed`, `command.finished`, then the next
+`screen.observed`.
+
+The Bridge records `screen.observed permission` on its own pass, normally
+before the answer. The resolver does not wait for that record: it reads the
+pane twice itself.
+
+The Bridge's own answer to an engine's startup trust dialog takes the same
+path, keyed `resolve:<execution>:trust:1:<k>`. Its keys are recorded
+`pressing` and `pressed` while the start waits, finished once the start is
+done, and never pressed twice.
+
+- **Switch:** `SPAWN_AUTO_APPROVE = off | startup | all`, default `startup`.
+  - `all`: the resolver reads panes and submits.
+  - `startup`: only the Bridge's startup trust answer, as before.
+  - `off`: no automatic answer at all, the startup trust dialog included. A
+    start that shows it waits, until its readiness limit, for someone to
+    answer it in the engine's terminal itself (a key sent through Spawn
+    queues behind the start); if nobody does, the start fails naming the
+    dialog and the switch.
+
+  An unknown value is warned about and read as `startup`.
+- **Table** (`spawn_core::driver::table_answer`): only answers someone has
+  seen work, each one key. Today that is one row: agy's `trust_prompt` for
+  the execution's own workspace, cursor on trust → Enter (probed).
+  Everything else escalates, and nothing is pressed for it until a later
+  change adds the captured screen as a test:
+  - Claude Code's numbered permission, whose only screens are hand-written
+    approvals fixtures;
+  - Claude Code's trust dialog, which the Bridge answers at startup;
+  - agy's permission and question prompts, Claude Code's question forms,
+    Codex, OpenCode, and any dialog no row covers.
+- **Hard blocks** (`spawn_core::driver::hard_block`): a login required or
+  expired, a quota or rate limit, an update the engine needs, or exit-only
+  choices. Each is escalated at once and never pressed. Their texts come from
+  the engines' strings and docs; none is captured yet.
+- **Guards:** every one must hold before a key is submitted.
+  - Two pane reads in a row show the same dialog id.
+  - On Herdr, for an engine other than Claude Code, the agent reads
+    `blocked` by a named rule, with the blocker visible.
+  - The driver's own reading of both panes shows the dialog: `Permission`,
+    or, for `trust_prompt`, its startup trust dialog.
+  - The row's own guard holds.
+  - No command of the session is unfinished: a person's answer in flight
+    holds the resolver off.
+  - The breaker is closed.
+- **The Bridge checks again before it presses** a key of `spawn-resolve`:
+  - the driver still reads the dialog on the pane;
+  - no other command of the session was recorded `pressed` or `typed` since
+    this key was accepted.
+
+  Otherwise the command ends `Failed` ("the dialog this answer was for is
+  gone: nothing pressed"), with no `pressing` step.
+- **Breaker:** folded from the log, so a restart keeps it. The counts come
+  from the commands of `spawn-resolve`; the per-dialog count comes from
+  `submit`'s idempotency.
+  - A dialog gets at most one automatic answer per execution. If it still
+    shows 5 s after its answer, it is escalated once and never pressed
+    again.
+  - An execution with 5 answers within 10 minutes gets no more.
+  - The host gets no more after 20 answers across the fleet within a minute.
+
+  Open means no more keys there and one line in the loop's log. The item
+  stays in `/api/approvals` for a person.
+- **`auto` on an approvals item:** `state` is the switch (`off`, `startup`,
+  `all`). `answered` is the resolver's answers in the session within 10
+  minutes. `breaker` is `open` or `closed`, or `off` unless the switch is
+  `all`.

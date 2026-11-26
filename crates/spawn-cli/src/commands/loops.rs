@@ -28,6 +28,8 @@
 //!   counted once at start, beside the passes: [`cost::archive::start`];
 //!   the other Claude Code sessions' transcripts, apart from the engines'
 //!   record, at start and hourly: [`cost::sessions::start`]);
+//! - the resolver ([`crate::resolve::Resolver::step`]), each pass, inert
+//!   unless `SPAWN_AUTO_APPROVE=all`;
 //! - the alerts ([`alerts::Monitor::check`]), which waits for its next host
 //!   reading (`SPAWN_ALERT_CHECK_SECS`, 30 s) or a bound's due time.
 //!
@@ -499,6 +501,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     warnings.extend(more);
     let (grading, more) = crate::grading::Upkeep::from_env();
     warnings.extend(more);
+    let (approve, more) = crate::resolve::Mode::from_env();
+    warnings.extend(more);
     // A price the loop cannot read would record every cost wrong: it stops
     // here, naming the setting.
     let prices = cost::Prices::from_env()?;
@@ -545,6 +549,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         prices,
         interval: loop_interval(),
         steps_at: None,
+        resolver: crate::resolve::Resolver::new(approve),
     };
     loop {
         fleet.pass()?;
@@ -620,6 +625,10 @@ struct Fleet<'a> {
     /// (`SPAWN_MODEL_PRICES`, read once at start).
     prices: cost::Prices,
     interval: Duration,
+    /// The run-time resolver (`SPAWN_AUTO_APPROVE`, [`crate::resolve`]):
+    /// a step each pass, which reads and submits nothing unless the switch
+    /// is `all`.
+    resolver: crate::resolve::Resolver,
     /// When the steps last ran over the store. They run at most once a pass
     /// interval, which is the resolution the loop always had: a burst of
     /// notifications inside one interval is one pass's work, not one run per
@@ -693,6 +702,22 @@ impl Fleet<'_> {
                     notes.extend(report.notes);
                 }
                 Err(error) => Fleet::fail(&mut errors, "bridge", &error.to_string()),
+            }
+        }
+        // The resolver, each pass, after the Bridge has read the screens: a
+        // dialog the table answers gets its keys as commands of
+        // `spawn-resolve`, which the Bridge presses at its next work. It
+        // never fails a pass: an error is said and tried next pass.
+        if self.resolver.runs()
+            && let Some(open) = self.store.clone()
+        {
+            let world = crate::resolve::Fleet {
+                store: &open,
+                host: &self.terminals,
+            };
+            match self.resolver.step(&world) {
+                Ok(more) => lines.extend(more),
+                Err(error) => lines.push(format!("resolve: {error}")),
             }
         }
         for warning in &warnings {

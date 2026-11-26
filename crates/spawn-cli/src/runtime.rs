@@ -137,6 +137,12 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
     Ok((bridge, observer))
 }
 
+/// Whether the Bridge answers an engine's startup trust dialog itself
+/// under `mode` (`SPAWN_AUTO_APPROVE`): under every mode but `off`.
+fn auto_trust(mode: crate::resolve::Mode) -> bool {
+    mode != crate::resolve::Mode::Off
+}
+
 /// Programs and environment the Bridge puts into every terminal it starts.
 fn bridge_config() -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
@@ -145,6 +151,9 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_projects = claude_projects();
     config.engines = engines(env_value)?;
     config.model_relay = model_relay();
+    // SPAWN_AUTO_APPROVE=off: not even the startup trust dialog is answered
+    // automatically (`crate::resolve`).
+    config.auto_trust = auto_trust(crate::resolve::Mode::from_env().0);
     config.screen_quiet = std::time::Duration::from_millis(
         env_value("SPAWN_SCREEN_QUIET_MS")
             .and_then(|text| text.parse().ok())
@@ -516,9 +525,29 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FleetTestDatabase, claude_config_env, engines, resolve_claude_projects,
+        FleetTestDatabase, auto_trust, claude_config_env, engines, resolve_claude_projects,
         resolve_model_relay, supply_pa_env,
     };
+
+    /// `SPAWN_AUTO_APPROVE=off` turns the Bridge's startup trust answer off;
+    /// unset, `startup` and `all` keep it.
+    #[test]
+    fn only_auto_approve_off_turns_the_startup_trust_answer_off() {
+        use crate::resolve::Mode;
+        for (value, answers) in [
+            (None, true),
+            (Some("startup"), true),
+            (Some("all"), true),
+            (Some("off"), false),
+        ] {
+            let mode = Mode::parse(value).expect("mode");
+            assert_eq!(auto_trust(mode), answers, "{value:?}");
+        }
+        assert!(
+            spawn_core::bridge::BridgeConfig::new("w").auto_trust,
+            "on by default"
+        );
+    }
     use spawn_core::bridge::LaunchEnvironment;
 
     fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
