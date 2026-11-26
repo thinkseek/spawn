@@ -62,7 +62,7 @@
 //! visible to the engine already running (`--ro-bind / /` is live); the
 //! next launch masks it.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -76,7 +76,13 @@ const CHECK_LIMIT: Duration = Duration::from_secs(10);
 /// no usable one is given.
 pub const TMP_FALLBACK: &str = ".spawn-tmp";
 
-/// The directories masked below the user's home, as written.
+/// The engines' homes masked below the user's home: the only masked
+/// directories an engine's own home may lie below (re-bound writable into
+/// the mask's tmpfs, `~/.gemini/antigravity-cli`), never equal to.
+pub const ENGINE_HOMES: &[&str] = &[".gemini", ".config/antigravity", ".codex", ".hermes"];
+
+/// The directories masked below the user's home, as written (a
+/// `.config/<x>` one also below `$XDG_CONFIG_HOME` when that is set).
 pub const HOME_DIRECTORIES: &[&str] = &[
     ".claude",
     ".gemini",
@@ -120,11 +126,14 @@ pub struct ViewConfig {
     /// More regular files to mask (the loop's environment file when it
     /// lies elsewhere).
     pub extra_files: Vec<PathBuf>,
-    /// The `TMPDIR` the loop runs with, the engine's when its launch names
-    /// none.
-    pub tmpdir: Option<PathBuf>,
-    /// A directory only this user enters, where the empty file a regular
-    /// file is masked by is kept.
+    /// The `TMPDIR` the loop runs with (shared host scratch, which other
+    /// host jobs write to): masked whole, never bound. The engine gets a
+    /// `TMPDIR` of its own ([`TMP_FALLBACK`]).
+    pub host_tmpdir: Option<PathBuf>,
+    /// A directory only this user enters, inside the masked runtime
+    /// directory (`$XDG_RUNTIME_DIR/spawn-engine-view-<uid>`), where the
+    /// empty file a regular file is masked by is kept. No writable bind
+    /// may reach it.
     pub private_dir: PathBuf,
 }
 
@@ -140,7 +149,7 @@ impl ViewConfig {
         let runtime_dir = lookup("XDG_RUNTIME_DIR")
             .filter(|dir| dir.starts_with('/'))
             .map_or_else(|| PathBuf::from(format!("/run/user/{uid}")), PathBuf::from);
-        let private_dir = std::env::temp_dir().join(format!("spawn-engine-view-{uid}"));
+        let private_dir = runtime_dir.join(format!("spawn-engine-view-{uid}"));
         Self {
             xdg_config_home: lookup("XDG_CONFIG_HOME")
                 .filter(|dir| dir.starts_with('/'))
@@ -148,7 +157,7 @@ impl ViewConfig {
             host_directories: HOST_DIRECTORIES.iter().map(PathBuf::from).collect(),
             loop_dirs: vec![home.join(LOOP_DIRECTORY)],
             extra_files: Vec::new(),
-            tmpdir: lookup("TMPDIR")
+            host_tmpdir: lookup("TMPDIR")
                 .filter(|dir| dir.starts_with('/'))
                 .map(PathBuf::from),
             private_dir,
@@ -161,12 +170,31 @@ impl ViewConfig {
     fn directory_targets(&self) -> Vec<PathBuf> {
         let mut targets = self.host_directories.clone();
         targets.push(self.runtime_dir.clone());
+        targets.push(self.private_dir.clone());
+        if let Some(tmpdir) = &self.host_tmpdir {
+            targets.push(tmpdir.clone());
+        }
         targets.push(self.home.join(".config/herdr"));
         if let Some(config) = &self.xdg_config_home {
             targets.push(config.join("herdr"));
         }
-        targets.extend(HOME_DIRECTORIES.iter().map(|dir| self.home.join(dir)));
+        for dir in HOME_DIRECTORIES {
+            targets.extend(self.below_home(dir));
+        }
         targets
+    }
+
+    /// `dir` below the home, and below `$XDG_CONFIG_HOME` too for a
+    /// `.config/<x>` one when that is set elsewhere.
+    fn below_home(&self, dir: &str) -> Vec<PathBuf> {
+        let mut paths = vec![self.home.join(dir)];
+        if let (Some(config), Some(rest)) = (&self.xdg_config_home, dir.strip_prefix(".config/")) {
+            let other = config.join(rest);
+            if !paths.contains(&other) {
+                paths.push(other);
+            }
+        }
+        paths
     }
 
     /// The regular-file targets, as written: the fixed ones and every
@@ -236,7 +264,8 @@ impl BwrapView {
         let program = find_program(program)
             .ok_or_else(|| format!("{program} is not installed (not found on PATH)"))?;
         let view = Self { program, config };
-        view.check()?;
+        let private = view.private_dir()?;
+        view.check(&private)?;
         Ok(view)
     }
 
@@ -250,16 +279,16 @@ impl BwrapView {
         &self.config
     }
 
-    fn check(&self) -> Result<(), String> {
-        let probe = std::env::temp_dir();
-        let probe = std::fs::canonicalize(&probe).unwrap_or(probe);
+    /// Run `/bin/true` in a view of the same kind, binding `probe` (the
+    /// view's private directory, which exists by now) writable.
+    fn check(&self, probe: &Path) -> Result<(), String> {
         let mut command = Command::new(&self.program);
         command
             .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
             .args(["--die-with-parent", "--unshare-pid", "--tmpfs", "/tmp"])
             .arg("--bind")
-            .arg(&probe)
-            .arg(&probe)
+            .arg(probe)
+            .arg(probe)
             .args(["--", "/bin/true"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -299,15 +328,15 @@ impl BwrapView {
         }
     }
 
-    /// The private empty file a regular file is masked by: 0444, empty,
-    /// in a directory only this user enters, made again when it is not so.
-    fn empty_file(&self) -> Result<PathBuf, String> {
+    /// The view's private directory, canonical: made 0700 (never more)
+    /// when missing, then checked to be a directory of this user's that no
+    /// one else may enter.
+    fn private_dir(&self) -> Result<PathBuf, String> {
         let dir = &self.config.private_dir;
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)
-                .map_err(|error| format!("create {}: {error}", dir.display()))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| format!("chmod {}: {error}", dir.display()))?;
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("create {}: {error}", dir.display())),
         }
         if !crate::process::private_to_us(dir) {
             return Err(format!(
@@ -315,32 +344,53 @@ impl BwrapView {
                 dir.display()
             ));
         }
+        std::fs::canonicalize(dir).map_err(|error| format!("{}: {error}", dir.display()))
+    }
+
+    /// The private empty file a regular file is masked by: 0444, empty,
+    /// this user's, in the view's private directory. When it is not so, a
+    /// fresh one is made (`create_new`, 0444 from the start) and renamed
+    /// over it, never removed first.
+    fn empty_file(&self) -> Result<PathBuf, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = self.private_dir()?;
         let file = dir.join("empty");
-        let sound = std::fs::symlink_metadata(&file).is_ok_and(|meta| {
-            meta.is_file()
-                && meta.len() == 0
-                && meta.mode() & 0o777 == 0o444
-                && meta.uid() == crate::current_uid()
-        });
-        if !sound {
-            let _ = std::fs::remove_file(&file);
-            let partial = dir.join(format!("empty.{}", std::process::id()));
-            let _ = std::fs::remove_file(&partial);
-            std::fs::write(&partial, b"")
-                .map_err(|error| format!("write {}: {error}", partial.display()))?;
-            std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o444))
-                .map_err(|error| format!("chmod {}: {error}", partial.display()))?;
-            std::fs::rename(&partial, &file)
-                .map_err(|error| format!("rename to {}: {error}", file.display()))?;
+        let sound = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| {
+                meta.is_file()
+                    && meta.len() == 0
+                    && meta.mode() & 0o7777 == 0o444
+                    && meta.uid() == crate::current_uid()
+            })
+        };
+        if sound(&file) {
+            return Ok(file);
         }
-        Ok(file)
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let partial = dir.join(format!("empty.{}.{ordinal}", std::process::id()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&partial)
+            .map_err(|error| format!("create {}: {error}", partial.display()))?;
+        if let Err(error) = std::fs::rename(&partial, &file) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(format!("rename to {}: {error}", file.display()));
+        }
+        if sound(&file) {
+            Ok(file)
+        } else {
+            Err(format!("{} is not a private empty 0444 file", file.display()))
+        }
     }
 
     /// Every target resolved now: the directories and the regular files to
-    /// mask, and what was skipped and why. The engine's own home is never
-    /// masked (it is bound back writable), and a target inside a masked
-    /// directory goes with it.
-    fn targets(&self, engine_home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    /// mask, and what was skipped and why. A target inside a masked
+    /// directory goes with it. Nothing is dropped for the engine's sake: an
+    /// engine home equal to, or holding, a target is refused
+    /// ([`BwrapView::plan`]).
+    fn targets(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
         let mut skipped = Vec::new();
         let mut directories: Vec<PathBuf> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
@@ -364,7 +414,6 @@ impl BwrapView {
                 Err(why) => skipped.push((target, why)),
             }
         }
-        directories.retain(|dir| dir != engine_home);
         let inside_other = |path: &Path, all: &[PathBuf]| {
             all.iter()
                 .any(|dir| dir.as_path() != path && path.starts_with(dir))
@@ -385,13 +434,30 @@ impl BwrapView {
         let engine_home =
             canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
         let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
+        let private = self.private_dir()?;
 
-        let (directories, files, mut skipped) = self.targets(&engine_home);
+        let (directories, files, skipped) = self.targets();
         let masked: Vec<&PathBuf> = directories.iter().chain(files.iter()).collect();
-        let uncovers = |bound: &Path| masked.iter().find(|target| target.starts_with(bound));
-        if let Some(target) = uncovers(&workspace) {
+        // A writable bind may hold no mask (its bind would uncover it) and
+        // lie in none (it would open a hole in it), nor reach the view's
+        // private directory either way.
+        let overlap = |bound: &Path| {
+            masked
+                .iter()
+                .find(|target| target.starts_with(bound) || bound.starts_with(target))
+        };
+        let reaches_private =
+            |bound: &Path| private.starts_with(bound) || bound.starts_with(&private);
+        if reaches_private(&workspace) {
             return Err(format!(
-                "the workspace {} holds {}, which the view masks",
+                "the workspace {} overlaps the view's private directory {}",
+                workspace.display(),
+                private.display()
+            ));
+        }
+        if let Some(target) = overlap(&workspace) {
+            return Err(format!(
+                "the workspace {} overlaps {}, which the view masks",
                 workspace.display(),
                 target.display()
             ));
@@ -402,14 +468,33 @@ impl BwrapView {
                 engine_home.display()
             ));
         }
-        if let Some(target) = uncovers(&engine_home) {
+        if reaches_private(&engine_home) {
             return Err(format!(
-                "the engine's home {} holds {}, which the view masks",
+                "the engine's home {} overlaps the view's private directory {}",
+                engine_home.display(),
+                private.display()
+            ));
+        }
+        // The engine's home may lie below another engine's masked home
+        // (`~/.gemini/antigravity-cli` below `~/.gemini`), and nowhere else
+        // a mask covers; it may never be a masked path, nor hold one.
+        let engine_homes: Vec<PathBuf> = ENGINE_HOMES
+            .iter()
+            .flat_map(|dir| self.config.below_home(dir))
+            .filter_map(|dir| std::fs::canonicalize(dir).ok())
+            .collect();
+        let refused = masked.iter().find(|target| {
+            target.starts_with(&engine_home)
+                || (engine_home.starts_with(target) && !engine_homes.iter().any(|dir| dir == **target))
+        });
+        if let Some(target) = refused {
+            return Err(format!(
+                "the engine's home {} overlaps {}, which the view masks",
                 engine_home.display(),
                 target.display()
             ));
         }
-        let tmpdir = self.tmpdir(launch, &engine_home, &masked, &mut skipped)?;
+        let tmpdir = engine_tmpdir(&engine_home)?;
 
         let mut words = vec![
             self.program.display().to_string(),
@@ -458,45 +543,6 @@ impl BwrapView {
             skipped,
         })
     }
-
-    /// The engine's `TMPDIR`: its launch's, else the loop's, when it is a
-    /// directory whose bind uncovers no mask; else [`TMP_FALLBACK`] below
-    /// the engine's home, made 0700 (what was passed over is said).
-    fn tmpdir(
-        &self,
-        launch: &ViewedLaunch<'_>,
-        engine_home: &Path,
-        masked: &[&PathBuf],
-        skipped: &mut Vec<(PathBuf, String)>,
-    ) -> Result<PathBuf, String> {
-        let given = launch
-            .tmpdir
-            .map(PathBuf::from)
-            .or_else(|| self.config.tmpdir.clone());
-        if let Some(given) = given {
-            match std::fs::canonicalize(&given) {
-                Ok(path) if !path.is_dir() => {
-                    skipped.push((given, "TMPDIR is not a directory".to_string()));
-                }
-                Ok(path) => match masked.iter().find(|target| target.starts_with(&path)) {
-                    Some(target) => skipped.push((
-                        given,
-                        format!("TMPDIR holds {}, which the view masks", target.display()),
-                    )),
-                    None => return Ok(path),
-                },
-                Err(error) => skipped.push((given, format!("TMPDIR: {error}"))),
-            }
-        }
-        let fallback = engine_home.join(TMP_FALLBACK);
-        if !fallback.is_dir() {
-            std::fs::create_dir_all(&fallback)
-                .map_err(|error| format!("create {}: {error}", fallback.display()))?;
-            std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| format!("chmod {}: {error}", fallback.display()))?;
-        }
-        Ok(fallback)
-    }
 }
 
 impl EngineView for BwrapView {
@@ -525,6 +571,29 @@ impl EngineView for BwrapView {
             );
         }
         Ok(plan.words)
+    }
+}
+
+/// The engine's own `TMPDIR`: [`TMP_FALLBACK`] below its home, made 0700
+/// when missing, and still below that home once resolved (a link out of
+/// it is refused). Never the loop's shared `TMPDIR`.
+fn engine_tmpdir(engine_home: &Path) -> Result<PathBuf, String> {
+    let dir = engine_home.join(TMP_FALLBACK);
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("create {}: {error}", dir.display())),
+    }
+    let canonical =
+        std::fs::canonicalize(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    if canonical.is_dir() && canonical.starts_with(engine_home) && canonical != engine_home {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "the engine's TMPDIR {} leaves its home {}",
+            dir.display(),
+            engine_home.display()
+        ))
     }
 }
 
