@@ -11,6 +11,7 @@
 //! visible `manifest_unsupported` diagnostic, never a guess.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// One TOML value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1045,6 +1046,9 @@ pub fn read_package_json(text: &str) -> Result<PackageJson, String> {
     })
 }
 
+/// One `compilerOptions.paths` entry: pattern and its ordered target list.
+pub type TsPathEntry = (String, Vec<String>);
+
 /// What the resolver needs from one `tsconfig.json` / `jsconfig.json`,
 /// before its `extends` chain is merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1053,8 +1057,9 @@ pub struct TsConfig {
     pub extends: Vec<String>,
     pub base_url: Option<String>,
     /// `compilerOptions.paths`: pattern to targets, in written order;
-    /// `None` when the file does not set it.
-    pub paths: Option<Vec<(String, Vec<String>)>>,
+    /// `None` when the file does not set it. Shared via [`Arc`] so deep
+    /// `extends` chains do not clone inherited path maps per level.
+    pub paths: Option<Arc<[TsPathEntry]>>,
 }
 
 /// Read a `tsconfig.json` or `jsconfig.json` (comments and trailing commas
@@ -1075,8 +1080,8 @@ pub fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
     let options = value.get("compilerOptions");
     let base_url = options.and_then(|options| json_string(options, "baseUrl"));
     let paths = match options.and_then(|options| options.get("paths")) {
-        Some(Json::Obj(entries)) => Some(
-            entries
+        Some(Json::Obj(entries)) => {
+            let collected: Vec<(String, Vec<String>)> = entries
                 .iter()
                 .map(|(pattern, targets)| {
                     let targets = match targets {
@@ -1089,8 +1094,9 @@ pub fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
                     };
                     (pattern.clone(), targets)
                 })
-                .collect(),
-        ),
+                .collect();
+            Some(Arc::from(collected))
+        }
         _ => None,
     };
     Ok(TsConfig {
@@ -1098,6 +1104,328 @@ pub fn read_tsconfig(text: &str) -> Result<TsConfig, String> {
         base_url,
         paths,
     })
+}
+
+// ---------------------------------------------------------------------
+// Python manifests: `pyproject.toml`, read with the built-in strict TOML
+// subset parser above (`parse_toml`).
+
+/// What the resolver needs from one `pyproject.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PyProjectManifest {
+    /// PEP 503 normalized package name (`[project].name`, else `[tool.poetry].name`).
+    pub name: Option<String>,
+    /// Candidate source roots relative to the manifest directory (e.g. `"src"`).
+    pub source_roots: Vec<String>,
+    /// Explicit package-name to directory overrides (`pkg` -> `"custom/pkg"`).
+    pub package_dirs: Vec<(String, String)>,
+    /// Entry-point module paths named by `[project.scripts]`,
+    /// `[project.gui-scripts]`, and `[tool.poetry.scripts]`.
+    pub script_modules: Vec<String>,
+    /// PEP 503 normalized dependency distribution names.
+    pub dependencies: Vec<String>,
+}
+
+/// Normalize a Python distribution name per PEP 503: lowercase ASCII and
+/// collapse runs of `[-_.]` to a single `-`.
+pub fn normalize_py_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+    for ch in raw.trim().chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !out.is_empty() && !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn pep508_dep_name(spec: &str) -> Option<String> {
+    let trimmed = spec.trim();
+    let end = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .unwrap_or(trimmed.len());
+    let name = normalize_py_name(&trimmed[..end]);
+    (!name.is_empty()).then_some(name)
+}
+
+fn push_unique_str(list: &mut Vec<String>, item: String) {
+    if !list.contains(&item) {
+        list.push(item);
+    }
+}
+
+fn push_script_targets(table: &Table, out: &mut Vec<String>) {
+    for val in table.values() {
+        let target = match val {
+            Value::Str(s) => Some(s.as_str()),
+            Value::Table(inner) => inner.get("callable").and_then(|v| match v {
+                Value::Str(s) => Some(s.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        if let Some(target) = target {
+            let module = target.split(':').next().unwrap_or(target).trim();
+            if !module.is_empty() {
+                push_unique_str(out, module.to_string());
+            }
+        }
+    }
+}
+
+fn push_pep508_array(items: &[Value], out: &mut Vec<String>) {
+    for item in items {
+        if let Value::Str(spec) = item
+            && let Some(name) = pep508_dep_name(spec)
+        {
+            push_unique_str(out, name);
+        }
+    }
+}
+
+fn clean_rel_dir(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed == "." {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn read_pyproject_project(root: &Table, manifest: &mut PyProjectManifest) {
+    if let Some(Value::Table(project)) = root.get("project") {
+        if let Some(Value::Str(name)) = project.get("name") {
+            let norm = normalize_py_name(name);
+            if !norm.is_empty() {
+                manifest.name = Some(norm);
+            }
+        }
+        if let Some(Value::Array(deps)) = project.get("dependencies") {
+            push_pep508_array(deps, &mut manifest.dependencies);
+        }
+        if let Some(Value::Table(opt)) = project.get("optional-dependencies") {
+            for val in opt.values() {
+                if let Value::Array(deps) = val {
+                    push_pep508_array(deps, &mut manifest.dependencies);
+                }
+            }
+        }
+        for key in ["scripts", "gui-scripts"] {
+            if let Some(Value::Table(scripts)) = project.get(key) {
+                push_script_targets(scripts, &mut manifest.script_modules);
+            }
+        }
+    }
+
+    if let Some(Value::Table(groups)) = root.get("dependency-groups") {
+        for val in groups.values() {
+            if let Value::Array(items) = val {
+                push_pep508_array(items, &mut manifest.dependencies);
+            }
+        }
+    }
+}
+
+fn read_pyproject_setuptools(tool: &Table, manifest: &mut PyProjectManifest) {
+    let Some(Value::Table(setuptools)) = tool.get("setuptools") else {
+        return;
+    };
+    if let Some(Value::Table(pkg_dir)) = setuptools.get("package-dir") {
+        for (pkg, dir_val) in pkg_dir {
+            let Value::Str(dir_str) = dir_val else {
+                continue;
+            };
+            let cleaned = clean_rel_dir(dir_str);
+            if pkg.is_empty() || pkg == "." {
+                if !cleaned.is_empty() {
+                    push_unique_str(&mut manifest.source_roots, cleaned);
+                }
+            } else if !cleaned.is_empty() {
+                manifest.package_dirs.push((pkg.clone(), cleaned));
+            }
+        }
+    }
+    if let Some(Value::Table(packages)) = setuptools.get("packages")
+        && let Some(Value::Table(find)) = packages.get("find")
+    {
+        match find.get("where") {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Value::Str(dir_str) = item {
+                        let cleaned = clean_rel_dir(dir_str);
+                        if !cleaned.is_empty() {
+                            push_unique_str(&mut manifest.source_roots, cleaned);
+                        }
+                    }
+                }
+            }
+            Some(Value::Str(dir_str)) => {
+                let cleaned = clean_rel_dir(dir_str);
+                if !cleaned.is_empty() {
+                    push_unique_str(&mut manifest.source_roots, cleaned);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_pyproject_poetry(tool: &Table, manifest: &mut PyProjectManifest) {
+    let Some(Value::Table(poetry)) = tool.get("poetry") else {
+        return;
+    };
+    if manifest.name.is_none()
+        && let Some(Value::Str(name)) = poetry.get("name")
+    {
+        let norm = normalize_py_name(name);
+        if !norm.is_empty() {
+            manifest.name = Some(norm);
+        }
+    }
+    if let Some(Value::Array(packages)) = poetry.get("packages") {
+        for pkg in packages {
+            let Value::Table(entry) = pkg else {
+                continue;
+            };
+            let from_dir = entry
+                .get("from")
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(clean_rel_dir(s)),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty());
+            if let Some(ref from_dir) = from_dir {
+                push_unique_str(&mut manifest.source_roots, from_dir.clone());
+            }
+            if let Some(Value::Str(inc)) = entry.get("include")
+                && !inc.contains('*')
+                && !inc.contains('?')
+            {
+                let cleaned_inc = clean_rel_dir(inc);
+                if !cleaned_inc.is_empty() {
+                    let pkg_name = cleaned_inc.replace('/', ".");
+                    let rel_dir = match from_dir {
+                        Some(from_dir) => format!("{from_dir}/{cleaned_inc}"),
+                        None => cleaned_inc,
+                    };
+                    manifest.package_dirs.push((pkg_name, rel_dir));
+                }
+            }
+        }
+    }
+    for key in ["dependencies", "dev-dependencies"] {
+        if let Some(Value::Table(deps)) = poetry.get(key) {
+            for dep_key in deps.keys() {
+                let norm = normalize_py_name(dep_key);
+                if !norm.is_empty() && norm != "python" {
+                    push_unique_str(&mut manifest.dependencies, norm);
+                }
+            }
+        }
+    }
+    if let Some(Value::Table(groups)) = poetry.get("group") {
+        for group in groups.values() {
+            if let Value::Table(g_table) = group
+                && let Some(Value::Table(deps)) = g_table.get("dependencies")
+            {
+                for dep_key in deps.keys() {
+                    let norm = normalize_py_name(dep_key);
+                    if !norm.is_empty() && norm != "python" {
+                        push_unique_str(&mut manifest.dependencies, norm);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(Value::Table(scripts)) = poetry.get("scripts") {
+        push_script_targets(scripts, &mut manifest.script_modules);
+    }
+}
+
+fn read_hatch_sources(table: &Table, manifest: &mut PyProjectManifest) {
+    match table.get("sources") {
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Value::Str(s) = item {
+                    let cleaned = clean_rel_dir(s);
+                    if !cleaned.is_empty() {
+                        push_unique_str(&mut manifest.source_roots, cleaned);
+                    }
+                }
+            }
+        }
+        Some(Value::Table(map)) => {
+            for (src_dir, dst_pkg) in map {
+                let cleaned_src = clean_rel_dir(src_dir);
+                let Value::Str(dst_str) = dst_pkg else {
+                    continue;
+                };
+                let cleaned_dst = clean_rel_dir(dst_str);
+                if cleaned_dst.is_empty() && !cleaned_src.is_empty() {
+                    push_unique_str(&mut manifest.source_roots, cleaned_src);
+                } else if !cleaned_dst.is_empty() && !cleaned_src.is_empty() {
+                    manifest
+                        .package_dirs
+                        .push((cleaned_dst.replace('/', "."), cleaned_src));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn read_pyproject_hatch(tool: &Table, manifest: &mut PyProjectManifest) {
+    let Some(Value::Table(hatch)) = tool.get("hatch") else {
+        return;
+    };
+    let Some(Value::Table(build)) = hatch.get("build") else {
+        return;
+    };
+    read_hatch_sources(build, manifest);
+    if let Some(Value::Table(targets)) = build.get("targets")
+        && let Some(Value::Table(wheel)) = targets.get("wheel")
+    {
+        read_hatch_sources(wheel, manifest);
+        if let Some(Value::Array(packages)) = wheel.get("packages") {
+            for item in packages {
+                if let Value::Str(p) = item {
+                    let cleaned = clean_rel_dir(p);
+                    if !cleaned.is_empty()
+                        && let Some((parent, pkg)) = cleaned.rsplit_once('/')
+                    {
+                        if !parent.is_empty() {
+                            push_unique_str(&mut manifest.source_roots, parent.to_string());
+                        }
+                        manifest.package_dirs.push((pkg.to_string(), cleaned));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read a `pyproject.toml`.
+pub fn read_pyproject(text: &str) -> Result<PyProjectManifest, TomlError> {
+    let root = parse_toml(text)?;
+    let mut manifest = PyProjectManifest::default();
+    read_pyproject_project(&root, &mut manifest);
+    if let Some(Value::Table(tool)) = root.get("tool") {
+        read_pyproject_setuptools(tool, &mut manifest);
+        read_pyproject_poetry(tool, &mut manifest);
+        read_pyproject_hatch(tool, &mut manifest);
+    }
+    manifest.dependencies.sort();
+    manifest.dependencies.dedup();
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -1313,16 +1641,103 @@ fx-test = { path = "../test" }
         assert_eq!(config.extends, vec!["./a", "pkg/tsconfig"]);
         assert_eq!(config.base_url.as_deref(), Some("src"));
         assert_eq!(
-            config.paths,
-            Some(vec![
-                (
-                    "@/*".to_string(),
-                    vec!["x/*".to_string(), "y/*".to_string()]
-                ),
-                ("one".to_string(), vec!["z".to_string()]),
-            ])
+            config.paths.as_deref(),
+            Some(
+                [
+                    (
+                        "@/*".to_string(),
+                        vec!["x/*".to_string(), "y/*".to_string()]
+                    ),
+                    ("one".to_string(), vec!["z".to_string()]),
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(read_tsconfig("{}").expect("empty"), TsConfig::default());
+    }
+
+    #[test]
+    fn pyproject_reads_pep621_setuptools_poetry_and_hatch() {
+        let setuptools = read_pyproject(
+            r#"
+[project]
+name = "My_App.Core"
+dependencies = [
+    "fx_domain[fast]>=1.0; python_version >= '3.10'",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+myapp = "my_app.cli:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+extra = "vendor/extra"
+
+[tool.setuptools.packages.find]
+where = ["src", "lib"]
+"#,
+        )
+        .expect("setuptools pyproject");
+        assert_eq!(setuptools.name.as_deref(), Some("my-app-core"));
+        assert_eq!(setuptools.source_roots, vec!["src", "lib"]);
+        assert_eq!(
+            setuptools.package_dirs,
+            vec![("extra".to_string(), "vendor/extra".to_string())]
+        );
+        assert_eq!(setuptools.script_modules, vec!["my_app.cli"]);
+        assert_eq!(
+            setuptools.dependencies,
+            vec!["fx-domain", "pytest", "requests"]
+        );
+
+        let poetry = read_pyproject(
+            r#"
+[tool.poetry]
+name = "Poetry_Svc"
+packages = [{ include = "svc", from = "python" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+shared_pkg = { path = "../shared" }
+
+[tool.poetry.group.test.dependencies]
+pytest = "^8"
+
+[tool.poetry.scripts]
+run = "svc.app:run"
+"#,
+        )
+        .expect("poetry pyproject");
+        assert_eq!(poetry.name.as_deref(), Some("poetry-svc"));
+        assert_eq!(poetry.source_roots, vec!["python"]);
+        assert_eq!(
+            poetry.package_dirs,
+            vec![("svc".to_string(), "python/svc".to_string())]
+        );
+        assert_eq!(poetry.script_modules, vec!["svc.app"]);
+        assert_eq!(poetry.dependencies, vec!["pytest", "shared-pkg"]);
+
+        let hatch = read_pyproject(
+            r#"
+[project]
+name = "hatch-pkg"
+
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+packages = ["src/hatch_pkg"]
+"#,
+        )
+        .expect("hatch pyproject");
+        assert_eq!(hatch.name.as_deref(), Some("hatch-pkg"));
+        assert_eq!(hatch.source_roots, vec!["src"]);
+        assert_eq!(
+            hatch.package_dirs,
+            vec![("hatch_pkg".to_string(), "src/hatch_pkg".to_string())]
+        );
     }
 
     #[test]
