@@ -14,6 +14,12 @@
 //! it (forward) or that it depends on (backward), up to a depth, each
 //! expanded once (a breadth-first walk), so diamonds, cliques and cycles
 //! cost what they hold, not their paths.
+//!
+//! Data refs (PV3b, `spawn prov snapshot`): a ref is the domain
+//! `data:<ref>` of the same tables, and its head the domain's newest
+//! revision ([`PostgresStore::prov_head`], [`PostgresStore::prov_heads`]);
+//! [`PostgresStore::prov_changes_using`] reads the edges that name a commit
+//! or a snapshot directly. No table, column or event is added.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -837,5 +843,90 @@ impl PostgresStore {
             .iter()
             .map(|row| (row.get(0), row.get(1), row.get(2)))
             .collect())
+    }
+}
+
+/// A data ref's head (PV3b): the newest revision recorded in its domain
+/// (`data:<ref>`), with how many revisions the domain holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvHead {
+    pub head: ProvChangeRecord,
+    pub revisions: i64,
+}
+
+impl PostgresStore {
+    /// Every change recorded in `domain`, newest first (by revision, then
+    /// id): the first is the domain's head.
+    pub fn prov_domain_changes(&self, domain: &str) -> Result<Vec<ProvChangeRecord>, StoreError> {
+        change_records(&self.query(
+            &format!(
+                "select {CHANGE_COLUMNS} from prov_changes c where c.domain = $1
+                  order by c.rev desc, c.id desc"
+            ),
+            &[&domain],
+        )?)
+    }
+
+    /// The head of `domain`: its newest change (by revision, then id), if
+    /// it holds any.
+    pub fn prov_head(&self, domain: &str) -> Result<Option<ProvChangeRecord>, StoreError> {
+        self.query_opt(
+            &format!(
+                "select {CHANGE_COLUMNS} from prov_changes c where c.domain = $1
+                  order by c.rev desc, c.id desc limit 1"
+            ),
+            &[&domain],
+        )?
+        .as_ref()
+        .map(change_record)
+        .transpose()
+    }
+
+    /// The head of every domain whose name starts with `prefix` (`data:`:
+    /// every data ref), by domain.
+    pub fn prov_heads(&self, prefix: &str) -> Result<Vec<ProvHead>, StoreError> {
+        self.query(
+            &format!(
+                "select {CHANGE_COLUMNS}, n.revisions
+                   from (select distinct on (domain) id, domain from prov_changes
+                          where starts_with(domain, $1)
+                          order by domain, rev desc, id desc) h
+                   join prov_changes c on c.id = h.id
+                   join (select domain, count(*) as revisions from prov_changes
+                          where starts_with(domain, $1) group by domain) n
+                     on n.domain = c.domain
+                  order by c.domain collate \"C\""
+            ),
+            &[&prefix],
+        )?
+        .iter()
+        .map(|row| {
+            Ok(ProvHead {
+                head: change_record(row)?,
+                revisions: row.get(16),
+            })
+        })
+        .collect()
+    }
+
+    /// The changes with an edge to `dst` (a commit `git1:<oid>`, a snapshot
+    /// or a content digest), each with that edge's kind, oldest first (one
+    /// row per change and kind).
+    pub fn prov_changes_using(
+        &self,
+        dst: &str,
+    ) -> Result<Vec<(ProvChangeRecord, ProvEdgeKind)>, StoreError> {
+        self.query(
+            &format!(
+                "select {CHANGE_COLUMNS}, e.kind
+                   from (select distinct src, kind from prov_edges where dst = $1) e
+                   join prov_changes c on c.id = e.src
+                  order by c.at_ms, c.id, e.kind"
+            ),
+            &[&dst],
+        )?
+        .iter()
+        .map(|row| Ok((change_record(row)?, row.get::<_, String>(16).parse()?)))
+        .collect()
     }
 }

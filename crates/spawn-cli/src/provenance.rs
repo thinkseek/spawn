@@ -30,8 +30,14 @@
 //! - `revert --plan`, `split --plan --paths`, `compose --plan`
 //!   ([`plan`]): the exact result tree and the commands; nothing written.
 //!
+//! PV3b adds the data domain ([`data`]): `snapshot`, `refs` and
+//! `rollback [--plan]` for directories that are not in Git, stored in
+//! spawn-cas; and `blast` follows `used` edges across data snapshots and
+//! from code commits into them.
+//!
 //! Every answer is JSON.
 
+pub(crate) mod data;
 pub(crate) mod index;
 #[cfg(test)]
 mod land_tests;
@@ -65,7 +71,15 @@ pub(crate) const USAGE: &str = "usage: spawn prov index --source <source> [--rep
      spawn prov compose --plan <change id|task|commit>... --source <source> [--repo <git dir>] \
      [--onto <commit>]\n       \
      (a plan prints the result tree and the commands and writes nothing: it is carried out as \
-     a task's candidate, through the gate)";
+     a task's candidate, through the gate)\n       \
+     spawn prov snapshot <dir> --ref <name> [--cas <dir>] [--input <ref|sha256:<hex>>]... \
+     [--code <commit>]... [--config <file>]... [--task N] [--digest-only]\n       \
+     (a data directory outside every workspace: its manifest-v1 into spawn-cas, one revision \
+     of data:<name>; the 3 newest snapshots keep their bytes, every manifest stays)\n       \
+     spawn prov refs [--cas <dir>]\n       \
+     spawn prov rollback [--plan] <ref> <snapshot> [--cas <dir>] [--task N]\n       \
+     (moves the ref's head back to a snapshot it still keeps, as a revert revision; --plan \
+     writes nothing)";
 
 /// `spawn prov <verb> ...`.
 pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
@@ -139,6 +153,46 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "revert" | "split" | "compose" => plan_command(verb, &rest[1..]),
+        "snapshot" | "refs" | "rollback" => data_command(verb, &rest[1..]),
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+/// `spawn prov snapshot|refs|rollback ...` (PV3b, [`data`]).
+fn data_command(verb: &str, rest: &[String]) -> Result<i32, String> {
+    match verb {
+        "snapshot" => {
+            let args = data::snapshot_args(rest)?;
+            let store = crate::open_store()?;
+            println!("{}", pretty(&data::snapshot(&store, &args)?));
+            Ok(0)
+        }
+        "refs" => {
+            let flags = Flags::parse(rest)?;
+            let cas = match flags.get("cas") {
+                Some(dir) => Some(spawn_cas::Store::open(dir).map_err(|error| error.to_string())?),
+                None => None,
+            };
+            let store = crate::open_store()?;
+            println!("{}", pretty(&data::refs(&store, cas.as_ref())?));
+            Ok(0)
+        }
+        "rollback" => {
+            let (words, planned, flags) = plan_arguments(rest)?;
+            let [name, snapshot] = words.as_slice() else {
+                return Err(USAGE.to_string());
+            };
+            let task = flags
+                .get("task")
+                .map(|task| task.parse::<i64>().map_err(|_| format!("bad task {task}")))
+                .transpose()?;
+            let cas = spawn_cas::Store::open(data::cas_dir(flags.get("cas").as_deref())?)
+                .map_err(|error| error.to_string())?;
+            let store = crate::open_store()?;
+            let (code, answer) = data::rollback(&store, &cas, name, snapshot, planned, task)?;
+            println!("{}", pretty(&answer));
+            Ok(code)
+        }
         _ => Err(USAGE.to_string()),
     }
 }
@@ -164,11 +218,28 @@ pub(crate) enum Target {
     Task(i64),
     /// The Change recorded for a commit (a full id).
     Commit(String),
+    /// The Changes whose result is a snapshot (`sha256:<hex>`, a data
+    /// snapshot).
+    Snapshot(String),
 }
 
 /// The target `word` names: a `change_id` (`c` and 26 base32 characters),
-/// a task (digits), or a full commit id (40 hex characters, any case).
+/// a task (digits), a full commit id (40 hex characters, any case), a data
+/// ref (`data:<ref>`, its Change) or a snapshot (`sha256:<hex>`; an
+/// unprefixed digest is refused).
 pub(crate) fn target(word: &str) -> Result<Target, String> {
+    if let Some(name) = word.strip_prefix(data::DOMAIN_PREFIX) {
+        data::check_ref(name)?;
+        return Ok(Target::Change(data::change_id_of(name)));
+    }
+    if word.contains(':') {
+        return data::parse_digest(word).map(|digest| Target::Snapshot(digest.to_string()));
+    }
+    if spawn_cas::is_hex64(&word.to_ascii_lowercase()) {
+        return Err(data::parse_digest(word)
+            .err()
+            .unwrap_or_else(|| format!("{word}: an unprefixed digest")));
+    }
     let base32 = |text: &str| {
         text.bytes()
             .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
@@ -186,7 +257,8 @@ pub(crate) fn target(word: &str) -> Result<Target, String> {
         return Ok(Target::Commit(word.to_ascii_lowercase()));
     }
     Err(format!(
-        "{word:?} is no change id (c and 26 base32 characters), task number or full commit id"
+        "{word:?} is no change id (c and 26 base32 characters), task number, full commit id, \
+         data:<ref> or sha256:<hex> snapshot"
     ))
 }
 
@@ -269,6 +341,7 @@ pub(crate) fn changes_of(
         Target::Commit(commit) => store
             .prov_changes_for_result(&index::git1(commit))
             .map_err(error)?,
+        Target::Snapshot(snapshot) => store.prov_changes_for_result(snapshot).map_err(error)?,
     })
 }
 
@@ -633,11 +706,55 @@ fn link_name(link: ProvLink) -> &'static str {
 ///   includes one of them is in `landed_by` instead;
 /// - `radius`: every Change that depends on them, by an edge or an entry's
 ///   `origin`, nearest first, each with its link and one shortest path;
-/// - `used`: the part of the radius reached by `used` edges alone.
+/// - `used`: the part of the radius reached by `used` edges alone;
+/// - `snapshots`: the data snapshots among the Changes and their radius
+///   (PV3b), each with its ref, nearest first.
+///
+/// A commit or a snapshot that no recorded Change is is followed through
+/// the edges that name it directly (`--code <commit>`, `--input
+/// sha256:<hex>`), so a code commit reaches the data snapshots made with
+/// it even when no Git domain records it.
 pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, String> {
     let start = changes_of(store, target)?;
     let (after, landed_by) = later_on_paths(store, &start)?;
-    let (radius, used) = dependents(store, &start)?;
+    let named = match target {
+        Target::Commit(commit) => Some(index::git1(commit)),
+        Target::Snapshot(snapshot) => Some(snapshot.clone()),
+        Target::Change(_) | Target::Task(_) => None,
+    };
+    // Only when no recorded Change is the target: a Change's own walk
+    // already follows the edges to its result (a Git commit's `land`, a
+    // snapshot's revisions), so this would walk them twice.
+    let users = match &named {
+        Some(digest) if start.is_empty() => store
+            .prov_changes_using(digest)
+            .map_err(|error| error.to_string())?,
+        _ => Vec::new(),
+    };
+    let (radius, used) = dependents(store, &start, &users, named.as_deref().unwrap_or_default())?;
+    let mut order: Vec<(i64, i64, &'static str)> = start
+        .iter()
+        .map(|change| (change.id, 0, "target"))
+        .collect();
+    let mut reached: Vec<(i64, i64, &'static str)> = radius
+        .iter()
+        .map(|(id, value)| {
+            let via = match value["via"].as_str() {
+                Some("used") => "used",
+                Some("includes") => "includes",
+                Some("supersedes") => "supersedes",
+                Some("redacts") => "redacts",
+                _ => "origin",
+            };
+            (*id, value["depth"].as_i64().unwrap_or_default(), via)
+        })
+        .collect();
+    reached.sort_by_key(|(id, depth, _)| (*depth, *id));
+    order.extend(reached);
+    let snapshots = data::snapshot_rows(
+        &changes_by_id(store, order.iter().map(|(id, ..)| *id))?,
+        &order,
+    );
     let by_depth = |map: BTreeMap<i64, Value>| {
         let mut values: Vec<(i64, i64, Value)> = map
             .into_iter()
@@ -656,6 +773,7 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
         "landed_by": landed_by,
         "radius": by_depth(radius),
         "used": by_depth(used),
+        "snapshots": snapshots,
     }))
 }
 
@@ -727,22 +845,80 @@ fn later_on_paths(
     Ok((after, landed_by))
 }
 
-/// [`blast`]'s `radius` and `used`, by id.
+/// The radius [`dependents`] builds: each Change once, at its least depth.
+#[derive(Default)]
+struct Radius {
+    /// The start Changes, never in their own radius.
+    start: HashSet<i64>,
+    nodes: BTreeMap<i64, Value>,
+    depths: HashMap<i64, i64>,
+    used: BTreeMap<i64, Value>,
+}
+
+impl Radius {
+    fn add(&mut self, id: i64, depth: i64, shown: Value, by_used: bool) {
+        if self.start.contains(&id) || self.depths.get(&id).is_some_and(|d| *d <= depth) {
+            return;
+        }
+        self.depths.insert(id, depth);
+        if by_used {
+            self.used.insert(id, shown.clone());
+        } else {
+            self.used.remove(&id);
+        }
+        self.nodes.insert(id, shown);
+    }
+}
+
+/// [`blast`]'s `radius` and `used`, by id: every Change that depends on
+/// one of `start`, and every Change of `users` (they name `label`, a commit
+/// or a snapshot, by an edge) at depth 1 with everything that depends on
+/// it.
 #[allow(clippy::type_complexity)]
 fn dependents(
     store: &PostgresStore,
     start: &[ProvChangeRecord],
+    users: &[(ProvChangeRecord, ProvEdgeKind)],
+    label: &str,
 ) -> Result<(BTreeMap<i64, Value>, BTreeMap<i64, Value>), String> {
     let error = |error: spawn_core::port::StoreError| error.to_string();
-    let ids: HashSet<i64> = start.iter().map(|change| change.id).collect();
     let mut names: HashMap<i64, String> = start
         .iter()
         .map(|change| (change.id, format!("{}#{}", change.change_id, change.rev)))
         .collect();
-    let mut radius: BTreeMap<i64, Value> = BTreeMap::new();
-    let mut depths: HashMap<i64, i32> = HashMap::new();
-    let mut used: BTreeMap<i64, Value> = BTreeMap::new();
-    for change in start {
+    let mut found = Radius {
+        start: start.iter().map(|change| change.id).collect(),
+        ..Radius::default()
+    };
+    // Each walk: from a Change, at a depth, after a path, used all along.
+    let mut walks: Vec<(&ProvChangeRecord, i64, Vec<String>, bool)> = start
+        .iter()
+        .map(|change| (change, 0, Vec::new(), true))
+        .collect();
+    for (user, kind) in users {
+        let name = format!("{}#{}", user.change_id, user.rev);
+        names.insert(user.id, name.clone());
+        found.add(
+            user.id,
+            1,
+            json!({
+                "change_id": user.change_id,
+                "rev": user.rev,
+                "agent_id": user.agent_id,
+                "depth": 1,
+                "via": kind.as_str(),
+                "path": [label, name],
+            }),
+            *kind == ProvEdgeKind::Used,
+        );
+        walks.push((
+            user,
+            1,
+            vec![label.to_string()],
+            *kind == ProvEdgeKind::Used,
+        ));
+    }
+    for (change, offset, prefix, prefix_used) in walks {
         let nodes = store
             .prov_blast_radius(change.id, ProvDirection::Forward, BLAST_DEPTH)
             .map_err(error)?;
@@ -751,37 +927,31 @@ fn dependents(
             names.insert(node.id, format!("{}#{}", node.change_id, node.rev));
         }
         for node in nodes {
-            if ids.contains(&node.id) || depths.get(&node.id).is_some_and(|d| *d <= node.depth) {
-                continue;
-            }
-            depths.insert(node.id, node.depth);
-            let path: Vec<String> = node
-                .path
-                .iter()
-                .map(|id| names.get(id).cloned().unwrap_or_else(|| id.to_string()))
-                .collect();
+            let depth = i64::from(node.depth) + offset;
+            let mut path = prefix.clone();
+            path.extend(
+                node.path
+                    .iter()
+                    .map(|id| names.get(id).cloned().unwrap_or_else(|| id.to_string())),
+            );
             let shown = json!({
                 "change_id": node.change_id,
                 "rev": node.rev,
                 "agent_id": node.agent_id,
-                "depth": node.depth,
+                "depth": depth,
                 "via": link_name(node.via),
                 "path": path,
             });
-            let by_used = node
-                .path
-                .iter()
-                .skip(1)
-                .all(|id| links.get(id) == Some(&ProvLink::Edge(ProvEdgeKind::Used)));
-            if by_used {
-                used.insert(node.id, shown.clone());
-            } else {
-                used.remove(&node.id);
-            }
-            radius.insert(node.id, shown);
+            let by_used = prefix_used
+                && node
+                    .path
+                    .iter()
+                    .skip(1)
+                    .all(|id| links.get(id) == Some(&ProvLink::Edge(ProvEdgeKind::Used)));
+            found.add(node.id, depth, shown, by_used);
         }
     }
-    Ok((radius, used))
+    Ok((found.nodes, found.used))
 }
 
 /// The arguments of a plan: its words, whether `--plan` was given, and
@@ -819,6 +989,10 @@ fn planned_change(
     let error = |error: spawn_core::port::StoreError| error.to_string();
     let in_domain = |change: &ProvChangeRecord| change.domain == domain;
     match target {
+        Target::Snapshot(snapshot) => Err(format!(
+            "{snapshot} is a data snapshot: a Git plan applies commits (spawn prov rollback \
+             --plan <ref> <snapshot> plans a data ref's)"
+        )),
         Target::Commit(commit) => change_for_commit(store, domain, commit)?.ok_or_else(|| {
             format!("{commit} has no Change in {domain} (spawn prov index records it)")
         }),

@@ -41,6 +41,15 @@
 //!   by a pass or is written after it, so a pin that returned with its
 //!   object present never loses it to that pass, or to any later one.
 //!
+//! # Data snapshots
+//!
+//! [`Manifest`] is manifest-v1, a data snapshot's manifest: the
+//! `tree_sha256_v1` line list of a directory; the snapshot's identity is
+//! `sha256:<tree_sha256_v1>`. [`Store::put_snapshot`] stores one in the
+//! `data` namespace and [`Store::keep_snapshots`] keeps the file bytes of
+//! the [`KEEP_SNAPSHOTS`] newest of a data ref, and every manifest it ever
+//! had, pinned (`pins/prov/<ref>`), crash-only like the rest (`spawn prov snapshot`, docs/provenance.md).
+//!
 //! The store's previous incarnation (`spawn-host`'s `cas_dedup`, objects
 //! at `<cas>/<2 hex>/<64 hex>`) is adopted in place by
 //! [`Store::adopt_legacy_shards`]: a rename, nothing rehashed.
@@ -48,6 +57,7 @@
 mod digest;
 mod gc;
 mod legacy;
+mod manifest;
 mod store;
 
 use std::io;
@@ -60,6 +70,9 @@ pub use gc::{
     GcReport, NS_ARTIFACTS, NS_BACKUP, NS_BASE_CACHE, NS_DATA, Quotas, TMP_MAX_AGE, default_quotas,
 };
 pub use legacy::AdoptReport;
+pub use manifest::{
+    KEEP_SNAPSHOTS, KeepReport, MANIFEST_V1, Manifest, ManifestEntry, PROV_PIN_OWNER,
+};
 pub use store::{
     CAS_MARKER, Clock, GcLock, ObjectEntry, Publish, Store, is_valid_name, system_clock,
 };
@@ -101,6 +114,22 @@ pub enum CasError {
     /// A symlink, or not the kind of file the layout puts there.
     #[error("{} is a symlink or not a plain file or directory: refused", .0.display())]
     NotPlain(PathBuf),
+    /// A symbolic link under a snapshot's root that points outside it.
+    #[error("{} points outside the snapshot's root ({}): refused", .link.display(), .target.display())]
+    SymlinkEscape {
+        /// The link, relative to the root.
+        link: PathBuf,
+        /// Where it points, as it says.
+        target: PathBuf,
+    },
+    /// Bytes that are not a manifest-v1.
+    #[error("not a manifest-v1, line {line}: {reason}")]
+    BadManifest {
+        /// The line (from 1).
+        line: usize,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// The file system said no.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -125,9 +154,11 @@ impl From<CasError> for io::Error {
             CasError::NotCas(_) | CasError::BadDigest { .. } | CasError::BadName { .. } => {
                 io::Error::new(io::ErrorKind::InvalidInput, error)
             }
-            CasError::Mismatch { .. } => io::Error::new(io::ErrorKind::InvalidData, error),
+            CasError::Mismatch { .. } | CasError::BadManifest { .. } => {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            }
             CasError::AlgoUnavailable(_) => io::Error::new(io::ErrorKind::Unsupported, error),
-            CasError::NotPlain(_) => io::Error::other(error),
+            CasError::NotPlain(_) | CasError::SymlinkEscape { .. } => io::Error::other(error),
         }
     }
 }

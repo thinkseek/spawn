@@ -813,10 +813,13 @@
       "parent": "domain-storage-postgres",
       "summary": "Disk budget enforcement, btrfs extent inspection, commit-map provenance, schema vacuum/sweep, Core-lines storage metrics, and leased scratch directory cleanup.",
       "files": [
+        "crates/spawn-cas/src/manifest.rs",
+        "crates/spawn-cas/tests/manifest.rs",
         "crates/spawn-cli/src/backup/recoverable.rs",
         "crates/spawn-cli/src/commit_map.rs",
         "crates/spawn-cli/src/disk.rs",
         "crates/spawn-cli/src/provenance.rs",
+        "crates/spawn-cli/src/provenance/data.rs",
         "crates/spawn-cli/src/provenance/index.rs",
         "crates/spawn-cli/src/provenance/land_tests.rs",
         "crates/spawn-cli/src/provenance/plan.rs",
@@ -835,6 +838,7 @@
         "crates/spawn-cli/src/storage.rs",
         "crates/spawn-cli/src/storage_bytes.rs",
         "crates/spawn-cli/src/storage_bytes/tests.rs",
+        "crates/spawn-cli/tests/prov_data.rs",
         "crates/spawn-cli/tests/prov_index.rs",
         "crates/spawn-host/src/scratch.rs",
         "crates/spawn-postgres/src/commit_map.rs",
@@ -956,7 +960,9 @@
         "agents": [],
         "commits": [],
         "tests": [
+          "crates/spawn-cas/tests/manifest.rs",
           "crates/spawn-cli/src/scratch_sweep/tests.rs",
+          "crates/spawn-cli/tests/prov_data.rs",
           "scripts/test-storage-extents.py"
         ],
         "deploys": [],

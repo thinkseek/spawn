@@ -25,6 +25,14 @@ three append-only tables, filled from git and the event log.
   `compose --plan` ([`provenance/plan.rs`](../crates/spawn-cli/src/provenance/plan.rs)),
   with one more read-only route, `GET /api/prov/blast`. The hook's rows
   are the ones the indexer writes; the indexer stays the truth.
+- PV3b (this page): the data domain, directories that are not in Git
+  (datasets, shards, model outputs): `spawn prov snapshot`, `spawn prov
+  refs`, `spawn prov rollback [--plan]`, and `blast` across data
+  snapshots ([`provenance/data.rs`](../crates/spawn-cli/src/provenance/data.rs)).
+  The bytes go to spawn-cas: manifest-v1 and the snapshot pins are
+  [`crates/spawn-cas/src/manifest.rs`](../crates/spawn-cas/src/manifest.rs).
+  No table, column or event is added: a data ref is a domain of the same
+  three tables.
 
 ## The model
 
@@ -69,7 +77,7 @@ both write the same rows (the hook runs the indexer's own walk).
     the merge's second parent when it has none);
   - `import:<commit>` for an imported commit (PV2's own: B2 names no
     key for it);
-  - `data:<ref>` for a data ref (PV3b).
+  - `data:<ref>` for a data ref (PV3b), in the domain `data:<ref>`.
 - **`rev`** is `max(rev) + 1` of the Change for each commit not yet
   recorded, in the walk's order. The idempotency key is
   `(change_id, result)`; the indexer is stricter: a commit already
@@ -239,6 +247,178 @@ landing path.
   can be counted. A compose takes whole Changes (split one first); a
   revert takes no `--paths`.
 
+## Data snapshots (PV3b)
+
+A data ref (`--ref <name>`, `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`, never
+64 hex digits) is a named directory whose successive states are recorded
+like a branch's checkpoints: one Change, `change_id` derived from the
+domain and key `data:<ref>` (B2), one revision (`max(rev) + 1`) per state.
+Its **head** is the newest revision of the domain `data:<ref>`
+(`PostgresStore::prov_head`): the database is the pointer, so moving it is
+one atomic insert.
+
+### manifest-v1 and the snapshot's identity
+
+manifest-v1 **is** the `tree_sha256_v1` line list of spawn-node v1
+(section 7, [docs/node-protocol-v1.md](./node-protocol-v1.md)): one line
+`<64 hex SHA-256 of the file>  <path>\n` per regular file under the root,
+sorted bytewise by path. Symbolic links are never followed (one inside the
+root is left out, one that points outside it is refused, by its text and
+as the kernel would resolve it through other links, so `dirlink/../x` with
+`dirlink -> .` is refused too), and other
+special files are left out. The snapshot is `sha256:<tree_sha256_v1>`, the
+SHA-256 of those bytes, algorithm-prefixed (D2): an unprefixed digest is
+refused everywhere (`--input`, `rollback`, `blast`, `show`). File sizes are
+not part of the identity; they go in the entries (`prov_entries.size`).
+spawn-node v1's shared fixture
+`crates/spawn-node-proto/testdata/node-protocol-v1/tree/` is
+`sha256:191e8f57890fd35474a61e33b8876130b98c63388e00d05e7b4a36f4eb4e4707`
+(tested in both crates). The empty directory is `sha256:e3b0c442...`, the
+SHA-256 of nothing: the `base` of a ref's first revision.
+
+### `spawn prov snapshot`
+
+`spawn prov snapshot <dir> --ref <name> [--cas <dir>] [--input <ref or
+digest>]... [--code <commit>]... [--config <file>]... [--task N]
+[--digest-only]`:
+
+1. **The root is checked first (D5)** and nothing is written when it is
+   refused: a root inside the workspace root (`SPAWN_WORKSPACE_ROOT`, or
+   any directory above it that holds the transcript archive
+   `.transcripts`), a root that holds the workspace root, a root holding a
+   transcript directory (`.transcripts`, `.transcripts-progress`,
+   `.transcripts-sources`) at its top or anywhere below it, so a `*.jsonl`
+   transcript is never copied into a store, a root outside
+   `SPAWN_DATA_ROOT` when that is set, a store (`--cas`) inside the root,
+   and a symbolic link that leaves the root.
+2. Its manifest is built and its objects stored in spawn-cas, namespace
+   `data` (`NS_DATA`), each verified on the way in (a file that changed
+   meanwhile fails the run: snapshot again). `--digest-only` stores the
+   manifest alone. The store is `--cas`, else `<SPAWN_WORKSPACE_ROOT>/.cas`.
+3. When the snapshot differs from the head, one revision is recorded:
+   `derive` when an `--input` is given, else `import`; boundary `job`;
+   `base` the head (or the empty snapshot), `result` the snapshot; entries
+   the paths that differ from the head's manifest (`before`/`after`
+   `sha256:` digests, `size` the file's), folded past 10,000 entries into
+   one `tree` row per top-level directory (its digests the directory's own
+   manifest-v1 digest; a top-level file stays a row) as in the Git domain,
+   and, when even those rows are over 10,000 (a flat directory, or more
+   than 10,000 top-level directories), into **one `tree` row of the root,
+   path `.`**, its digests the two snapshots (absent for the empty one): a
+   Change never holds more than 10,000 entries. A directory's manifest is
+   found by one binary search in the sorted manifest, so folding is one
+   pass, not one scan per directory;
+   and one `used` edge per `--input` (a ref: its head snapshot, the detail
+   naming the ref, its `change_id` and `rev`; a digest: itself), `--code`
+   (`git1:<commit>`, a full id) and `--config` (the file's `sha256:`, the
+   detail its path). With `--task N` the revision is the task's agent,
+   preset and model, `inferred` (the flag is the caller's word); without,
+   an import is `imported` and anything else `unknown`.
+4. **A directory equal to the head records nothing** (`"recorded":
+   false`), whatever its flags: the idempotency of `(change_id, result)`
+   is held against the head. A result equal to an older revision is a new
+   revision (that is what a rollback, or an edit undone, is).
+5. `pins/prov/<ref>` is rewritten to keep the file bytes of the **3
+   newest distinct snapshots** of the ref (`KEEP_SNAPSHOTS`): for each, a
+   `# snapshot <digest>` line, its manifest's digest and its files'. Then
+   a `# manifests` line and the manifest of every snapshot the ref ever
+   had: **manifests are pinned forever** (decision D3, class A; a
+   `--digest-only` snapshot's manifest too), only file bytes are capped
+   (class B). The file objects of a snapshot that leaves the newest 3,
+   which no pin names any more and which no namespace but `data` records,
+   are removed at once (`"dropped"`); its manifest stays readable, and no
+   GC pass (a `data` quota of 0 included) removes it.
+
+It prints one JSON object: the ref, its domain and `change_id`, the
+snapshot, files and bytes, whether a revision was recorded (with its
+`rev`, `kind`, entry count and whether they folded), the `used` edges,
+and the snapshots kept and dropped.
+
+**Class B, crash-only.** Nothing is fsynced. An object is renamed into
+place whole after it was verified, a pin file is replaced whole (temporary
+file and `rename`) under the pin/GC lock, and the head is one atomic
+database insert recorded after the bytes are stored and before the pin is
+rewritten. A run killed at any instant (SIGKILL included, tested) leaves
+whole objects, the old pin or the new one, and the old head or the new
+one; running it again completes it (the head equals the snapshot, so it
+records nothing and rewrites the pin). At worst a killed run leaves
+objects no pin names, which a `data` quota collects (`Store::gc`).
+One snapshot of a ref at a time: a concurrent one that takes the same
+revision is refused by the store ("recorded already with different
+content"), and running it again records it.
+
+### `spawn prov refs` and `spawn prov rollback`
+
+- `spawn prov refs [--cas <dir>]`: every `data:<ref>` domain, its head
+  (`snapshot`, `rev`, `kind`, `at_ms`), its revision count and, with a
+  store, the snapshots its pin keeps.
+- `spawn prov rollback --plan <ref> <snapshot> [--cas <dir>]` prints the
+  rollback (from, to, the revision it would record and its entries) and
+  **writes nothing**; a rollback that would be refused prints why and
+  exits 1.
+- `spawn prov rollback <ref> <snapshot> [--cas <dir>] [--task N]` moves
+  the head: a `revert` revision of the ref's Change, `base` the head,
+  `result` the snapshot, its entries the paths that differ, each with
+  `origin` the newest revision that held the snapshot; then the pin keeps
+  it as newest. The directory itself is not touched. It is refused, with a
+  plain message and nothing recorded, when the snapshot was never one of
+  the ref's, or when its bytes are no longer pinned and present (a snapshot
+  past the 3 newest, whose file bytes were dropped though its manifest is
+  kept, or a `--digest-only` one). A rollback to the head records nothing.
+
+### Blast across data snapshots
+
+`spawn prov blast` takes two more targets: `data:<ref>` (its Change, every
+revision) and a snapshot `sha256:<hex>` (the revisions whose result it
+is). A recorded Change's walk already follows the edges to its result;
+a commit or a snapshot that no recorded Change is gets followed through
+the edges that name it directly, so `blast <commit>` reaches every data
+snapshot made with `--code <commit>` even when no Git domain indexes the
+commit.
+Through `used` edges the walk goes from a snapshot to what read it (its
+result, or the content of one of its entries, `--input sha256:<file>`),
+and on. The answer gains `snapshots`: the data snapshots among the
+targets and their radius, nearest first, each with its ref, snapshot,
+`change_id`, `rev`, kind, depth and link. With the merge of a pipeline
+recording one ref per output, each with the digests of the shards it read
+as inputs, a corrupted shard's snapshot names exactly the outputs that
+read it (`crates/spawn-cli/tests/prov_data.rs`).
+
+### Why no chunk store (decision D7)
+
+Spawn once had a large-file chunk store, `Spawn-Large`:
+
+- `9e39dd8c` (2026-11-04, docs/storage.md) made a workspace snapshot "a
+  git commit plus the large-file manifest its trailer names": files over
+  a size went to FastCDC chunks (zstd objects under `<root>`), and the
+  checkpoint commit carried a `Spawn-Large` trailer naming the manifest
+  that put them back; landing stayed text-only.
+- `d4e58273` (storage phase 2, the last change to it) kept the head's
+  `Spawn-Large` trailer across merges of main into an agent's branch.
+- `198cf5de` (2026-11-05) removed it, the owner's decision (CUTS.md): it
+  was local only (the chunks lived on the disk of the host that made
+  them) and unused live (no `Spawn-Large` commit existed), and a commit
+  whose files were partly outside Git was not a whole workspace by
+  itself. With it went
+  `spawn_host::chunks`, chunk GC and `spawn chunks gc`, the stat cache, the
+  `ChunkStore` port, `SPAWN_CHUNK_STORE` and the blake3, zstd and rustix
+  dependencies. A large file is now an ordinary git blob up to
+  `SPAWN_MAX_FILE_MB`; a bigger one is left out of the checkpoint and
+  reported, and a branch whose head still names a `Spawn-Large` manifest
+  is refused at mount (`FilesOutsideGit`).
+
+What that teaches PV3b, and how it is held: **a Git commit stays
+self-contained.** Data snapshots never put a trailer, a manifest or any
+other pointer into a checkpoint or a landing, and nothing in a commit
+needs a store to be the whole tree; a commit's tree is the code alone, as
+`main` holds it. The link goes the other way: a data snapshot names the
+commit it was made with (a `used` edge to `git1:<commit>`), in the
+provenance tables. The bytes live in spawn-cas, the one store already
+shared with spawn-node, as content-addressed objects with explicit pins
+and no separate chunk format, GC or port of their own; and a data root is
+never inside a workspace, so no checkpoint ever holds, or leaves out,
+data. Losing the store loses data bytes, never a commit.
+
 ## Limits
 
 - The domain is the `--source` text: index each source under the name its
@@ -259,3 +439,12 @@ landing path.
   found by `spawn prov who`, which reads git.
 - Large files left out of a checkpoint (`SPAWN_MAX_FILE_MB`) are in no
   commit and so in no entry (decision D6, PV4).
+- Data snapshots: no route answers `refs` yet (the commands do, and `GET
+  /api/prov/blast` and `/api/prov/change/<id>` read data Changes like
+  any other). A rollback moves the head and does not rewrite the
+  directory. Paths with a newline cannot be in a manifest-v1 (one line per
+  file) and are refused. A blast follows a snapshot's own result and its
+  entries' contents: an output recorded as one ref for many inputs is
+  affected as a whole, so record one ref per output to get the exact ones.
+  The 3 kept snapshots are per ref; older file bytes are gone once
+  dropped (their manifests stay, so what they held is still known).
