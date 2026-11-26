@@ -11188,3 +11188,57 @@ fn a_landing_whose_provenance_hook_fails_still_lands_and_the_indexer_records_it(
     assert_eq!(shown["changes"][0]["change"]["kind"], "land");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn integrator_own_landing_is_not_external_main_advance_but_external_push_after_is() {
+    let gate = "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+    let (base, source, scenarios, integrator) = world("ext-main-integrate", gate);
+    let db = Db::new("ext_main_integrate");
+    let mission = db.gated_mission(&source, &scenarios);
+    let task = db.reported_task(mission, "w");
+    let agent = agent_of(&db, mission, task);
+    let pushed = push_work(&base, &source, &agent, "task.txt");
+
+    integrator.pass_on(&db.store).expect("start gate");
+    integrator.settle();
+    assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+    let c1 = source_main(&source);
+    assert_eq!(parent(&[&source], &c1, 2), pushed);
+
+    // Next integrator pass records the landing checkpoint silently (0 external advances).
+    integrator.pass_on(&db.store).expect("post-land pass");
+    let adv_rows = || -> Vec<Value> {
+        db.admin()
+            .query(
+                "select evidence from spawn_alerts where kind = $1 order by fired_event_id",
+                &[&crate::dispatch::digest::SOURCE_MAIN_ADVANCED_KIND],
+            )
+            .expect("query spawn_alerts")
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    };
+    assert!(adv_rows().is_empty(), "own landing is never external");
+
+    // External direct push onto refs/heads/main after spawn integrate landed c1.
+    let c2 = main_moves(&base, &source, "external.txt");
+    integrator.pass_on(&db.store).expect("detect external push");
+    let rows = adv_rows();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["from"], c1);
+    assert_eq!(rows[0]["to"], c2);
+    assert_eq!(rows[0]["update_kind"], "fast_forward");
+    assert_eq!(rows[0]["ahead"], 1);
+    let subjects = rows[0]["subjects"].as_array().expect("subjects");
+    assert!(
+        subjects
+            .iter()
+            .any(|s| s.as_str().is_some_and(|line| line.contains("main moves"))),
+        "{subjects:?}"
+    );
+
+    // Re-running passes without further main changes stays deduplicated.
+    integrator.pass_on(&db.store).expect("dedup pass");
+    assert_eq!(adv_rows().len(), 1);
+    let _ = std::fs::remove_dir_all(&base);
+}

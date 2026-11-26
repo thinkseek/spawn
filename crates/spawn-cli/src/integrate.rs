@@ -3177,6 +3177,11 @@ impl Integrator {
             remote::Primary::reclaim_orphans(store);
         }
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
+        let mut sync_lines = Vec::new();
+        crate::dispatch::digest::sync_external_main(store, "integrate", &mut sync_lines);
+        for line in sync_lines {
+            println!("{line}");
+        }
         self.poll_warm(store, steps.is_ok());
         Self::sweep_nodes(store);
         self.poll_shadow(store);

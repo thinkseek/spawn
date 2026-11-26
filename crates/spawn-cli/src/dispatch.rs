@@ -524,6 +524,10 @@ pub(crate) enum Why {
     /// `engine_unavailable`): no command is made, and the task waits. A
     /// condition while the engine stays unavailable.
     EngineUnavailable,
+    /// A watched mission source's `refs/heads/main` advanced outside
+    /// `spawn integrate`'s own landing path ([`digest::main_advanced_news`],
+    /// told once).
+    MainAdvanced,
 }
 
 impl Why {
@@ -534,7 +538,8 @@ impl Why {
     /// their own), an objective closed solved on the base (nothing is
     /// assigned for it again) and an expired drain (its gates run again
     /// under the next integrator) are news, as is a final model record (the
-    /// recovery decided; the supervisor acts on it or not). Every other item is a
+    /// recovery decided; the supervisor acts on it or not) or an external
+    /// `main` advancement notice. Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
@@ -555,6 +560,7 @@ impl Why {
                 | Self::ObjectiveSolved
                 | Self::DrainExpired
                 | Self::ModelFinal
+                | Self::MainAdvanced
         )
     }
 }
@@ -878,6 +884,14 @@ fn record_items(store: &PostgresStore) -> Result<Vec<Escalation>, String> {
         store.model_finals(),
         "final model records",
     )?));
+    match store.alert_rows() {
+        Ok(value) => {
+            let rows = value["rows"].as_array().map_or(&[][..], Vec::as_slice);
+            host.extend(digest::main_advanced_news(rows));
+        }
+        Err(spawn_core::port::StoreError::Rejected(_)) => {}
+        Err(error) => return Err(format!("alert rows: {error}")),
+    }
     Ok(host)
 }
 
@@ -1104,6 +1118,7 @@ pub(crate) fn step(
     if cancel_stale_continue_nudges(store, &work, &rows, now_ms(), &mut lines) {
         (rows, work) = load(store, waits)?;
     }
+    let watched_sources = digest::sync_external_main(store, "dispatch", &mut lines);
     let Reading {
         work,
         mut plan,
@@ -1140,6 +1155,12 @@ pub(crate) fn step(
             due.min(at.saturating_add(left))
         })),
         _ => due_ms,
+    };
+    let due_ms = if watched_sources > 0 {
+        let poll_at = at.saturating_add(digest::external_main_poll_ms());
+        Some(due_ms.map_or(poll_at, |due| due.min(poll_at)))
+    } else {
+        due_ms
     };
     Ok((lines, due_ms))
 }
@@ -3345,5 +3366,344 @@ mod tests {
             );
             t += wait + 100;
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn external_main_advance_notifies_supervisor_once_and_survives_restart() {
+        use spawn_core::command::Outcome;
+        use spawn_core::event::{ENGINE, EventKind, NewEvent, Source};
+        use spawn_core::id::{AgentId, ExecutionId, IdempotencyKey, Principal, SessionId};
+        use spawn_core::port::{CommandQueue, EventLog};
+
+        let schema = spawn_postgres::testing::TestSchema::new("ext_main_dispatch");
+        let url = schema.url().to_string();
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let admin = || {
+            let mut c = postgres::Client::connect(&url, postgres::NoTls).expect("client");
+            c.batch_execute(&format!("set search_path to {schema}"))
+                .expect("schema");
+            c
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "spawn-ext-main-pg-{}-{}",
+            std::process::id(),
+            schema
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        let bare = root.join("source.git");
+        std::fs::create_dir_all(&work).expect("work");
+        let work_str = work.to_string_lossy().to_string();
+        let bare_str = bare.to_string_lossy().to_string();
+
+        crate::sources::test_git(&["init", "-q", "--initial-branch=main", &work_str])
+            .expect("init");
+        let commit_work = |file: &str, msg: &str| {
+            std::fs::write(work.join(file), format!("{msg}\n")).expect("write");
+            crate::sources::test_git(&["-C", &work_str, "add", "."]).expect("add");
+            crate::sources::test_git(&[
+                "-C",
+                &work_str,
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@localhost",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .expect("commit");
+            crate::sources::test_git(&["-C", &work_str, "rev-parse", "HEAD"]).expect("rev-parse")
+        };
+        let c0 = commit_work("a.txt", "c0 initial");
+        crate::sources::test_git(&["clone", "-q", "--bare", &work_str, &bare_str]).expect("bare");
+
+        let mission = store
+            .mission_add(
+                "External main sync",
+                &serde_json::json!([bare_str]),
+                "human",
+            )
+            .expect("mission");
+
+        // Start supervisor on the deployed charter so charter::give does not intercept digests.
+        let sup_agent = crate::supervise::SUPERVISOR_AGENT;
+        let sup_session = crate::supervise::SUPERVISOR_SESSION;
+        let deployed = crate::supervise::Charter::deployed("spawn");
+        let start_cmd = store
+            .submit(
+                &Principal::new("spawn-liveness").expect("principal"),
+                &spawn_core::command::Submission {
+                    agent_id: AgentId::new(sup_agent).expect("agent"),
+                    session_id: SessionId::new(sup_session).expect("session"),
+                    idempotency_key: IdempotencyKey::new("sup-start-1").expect("key"),
+                    action: CommandAction::Start {
+                        engine: ENGINE.to_string(),
+                        prompt: "supervise".to_string(),
+                        parent_session_id: None,
+                        from: None,
+                        model: None,
+                        charter: Some(deployed.hash),
+                        model_label: None,
+                    },
+                },
+            )
+            .expect("submit start");
+        let claimed_start = store
+            .claim("ext-main-test", std::time::Duration::from_mins(1))
+            .expect("claim start")
+            .expect("start cmd");
+        store
+            .finish(&claimed_start, &Outcome::Succeeded)
+            .expect("finish start");
+
+        let exec_id = "exec_sup_ext_main";
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new(sup_agent).expect("agent"),
+                session_id: SessionId::new(sup_session).expect("session"),
+                execution_id: Some(ExecutionId::new(exec_id).expect("exec")),
+                source: Source::Bridge,
+                source_event_id: Some("sup-native-1".to_string()),
+                kind: EventKind::NativeSessionStarted {
+                    engine: ENGINE.to_string(),
+                    native_session_id: "native_sup_1".to_string(),
+                    transcript_path: None,
+                    engine_version: None,
+                },
+            })
+            .expect("native started");
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new(sup_agent).expect("agent"),
+                session_id: SessionId::new(sup_session).expect("session"),
+                execution_id: Some(ExecutionId::new(exec_id).expect("exec")),
+                source: Source::Bridge,
+                source_event_id: Some("sup-exec-1".to_string()),
+                kind: EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: spawn_core::id::WorkspaceId::new(
+                        "agent_supervisor:/workspaces/agent_supervisor",
+                    )
+                    .expect("ws"),
+                    command_id: start_cmd,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                    launch: None,
+                },
+            })
+            .expect("exec started");
+        let set_supervisor_state =
+            |seq_id: &str, state: SemanticState, ambig: Option<Ambiguity>| {
+                let latest_seq: i64 = admin()
+                    .query_one(
+                        "select coalesce(max(session_seq), 1) from spawn_events
+                          where session_id = $1 and source <> 'observer'",
+                        &[&sup_session],
+                    )
+                    .expect("latest seq")
+                    .get(0);
+                let mut obs = Observation::basic(
+                    state,
+                    None,
+                    SessionSeq(latest_seq.cast_unsigned()),
+                    Confidence::new(0.95).expect("conf"),
+                    "rules",
+                );
+                obs.ambiguity = ambig;
+                store
+                    .append(NewEvent {
+                        agent_id: AgentId::new(sup_agent).expect("agent"),
+                        session_id: SessionId::new(sup_session).expect("session"),
+                        execution_id: Some(ExecutionId::new(exec_id).expect("exec")),
+                        source: Source::Observer,
+                        source_event_id: Some(seq_id.to_string()),
+                        kind: EventKind::ObservationRecorded { observation: obs },
+                    })
+                    .expect("obs");
+            };
+        set_supervisor_state(
+            "sup-obs-idle-1",
+            SemanticState::Waiting,
+            Some(Ambiguity::TurnStoppedIdle),
+        );
+
+        let pass = || {
+            super::step(
+                &store,
+                true,
+                "spawn",
+                None,
+                &crate::disk::Monitor::new(None),
+                &super::Bounds::default(),
+                crate::deliver::Waits::default(),
+            )
+            .expect("dispatch pass")
+        };
+
+        // Pass 1 & 2: baseline init is silent for main; drain any initial
+        // Why::Mission digest, then verify unchanged main produces no spam.
+        let (lines1, due1) = pass();
+        assert!(due1.is_some(), "local mission source schedules polling");
+        assert!(
+            !lines1.iter().any(|l| l.contains("external main advance")),
+            "{lines1:?}"
+        );
+        if let Some(init_digest) = store
+            .claim("ext-main-test", std::time::Duration::from_mins(1))
+            .expect("claim init digest")
+        {
+            let text = init_digest.action["text"].as_str().unwrap_or_default();
+            assert!(
+                !text.contains("refs/heads/main moved"),
+                "baseline init must not notify main advance: {text}"
+            );
+            store
+                .finish(&init_digest, &Outcome::Succeeded)
+                .expect("finish init digest");
+            set_supervisor_state(
+                "sup-obs-idle-after-init",
+                SemanticState::Waiting,
+                Some(Ambiguity::TurnStoppedIdle),
+            );
+        }
+        let (lines2, _) = pass();
+        assert!(lines2.is_empty(), "{lines2:?}");
+        let adv_count = || -> i64 {
+            admin()
+                .query_one(
+                    "select count(*) from spawn_alerts where kind = $1",
+                    &[&super::digest::SOURCE_MAIN_ADVANCED_KIND],
+                )
+                .expect("adv count")
+                .get(0)
+        };
+        let digest_rows = || -> Vec<(i64, String, String, Option<bool>)> {
+            admin()
+                .query(
+                    "select id, idempotency_key, action ->> 'text', succeeded from spawn_commands
+                      where session_id = $1
+                        and idempotency_key like 'dispatch-digest-%'
+                        and action ->> 'text' like '%refs/heads/main moved%'
+                      order by id",
+                    &[&sup_session],
+                )
+                .expect("digests")
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+                .collect()
+        };
+        assert_eq!(adv_count(), 0);
+        assert!(digest_rows().is_empty());
+
+        // External fast-forward push c0 -> c1 -> c2.
+        let _c1 = commit_work("b.txt", "c1 external fix");
+        let c2 = commit_work("c.txt", "c2 external feature");
+        crate::sources::test_git(&["-C", &work_str, "push", "-q", &bare_str, "main"])
+            .expect("push ff");
+
+        let (lines3, _) = pass();
+        assert!(
+            lines3
+                .iter()
+                .any(|l| l.contains("external main advance") && l.contains("fast_forward")),
+            "{lines3:?}"
+        );
+        assert_eq!(adv_count(), 1);
+        let digests1 = digest_rows();
+        assert_eq!(digests1.len(), 1, "{digests1:?}");
+        let digest1_text = &digests1[0].2;
+        assert!(digest1_text.contains(&bare_str), "{digest1_text}");
+        assert!(
+            digest1_text.contains(&format!("mission #{mission}")),
+            "{digest1_text}"
+        );
+        assert!(digest1_text.contains(&c0[..12]), "{digest1_text}");
+        assert!(digest1_text.contains(&c2[..12]), "{digest1_text}");
+        assert!(
+            digest1_text.contains("c2 external feature"),
+            "{digest1_text}"
+        );
+
+        let claimed_d1 = store
+            .claim("ext-main-test", std::time::Duration::from_mins(1))
+            .expect("claim d1")
+            .expect("d1");
+        store
+            .finish(&claimed_d1, &Outcome::Succeeded)
+            .expect("finish d1");
+        set_supervisor_state(
+            "sup-obs-idle-after-d1",
+            SemanticState::Waiting,
+            Some(Ambiguity::TurnStoppedIdle),
+        );
+
+        // Fresh passes (simulating process restart reading only DB state): no duplicates!
+        for _ in 0..2 {
+            let (lines_after, _) = pass();
+            assert!(lines_after.is_empty(), "{lines_after:?}");
+        }
+        assert_eq!(adv_count(), 1);
+        assert_eq!(digest_rows().len(), 1);
+
+        // External rebase/force-push while supervisor is temporarily busy (Working).
+        set_supervisor_state("sup-obs-busy", SemanticState::Working, None);
+        crate::sources::test_git(&["-C", &work_str, "reset", "--hard", &c0]).expect("reset");
+        let c3 = commit_work("d.txt", "c3 rebased override");
+        crate::sources::test_git(&["-C", &work_str, "push", "-q", "--force", &bare_str, "main"])
+            .expect("force push");
+
+        let (lines4, _) = pass();
+        assert!(
+            lines4
+                .iter()
+                .any(|l| l.contains("external main advance") && l.contains("non_fast_forward")),
+            "{lines4:?}"
+        );
+        assert_eq!(adv_count(), 2);
+        assert_eq!(digest_rows().len(), 1, "busy supervisor waits");
+
+        // Supervisor becomes idle again (after restart): persisted notice is delivered once.
+        set_supervisor_state(
+            "sup-obs-idle-2",
+            SemanticState::Waiting,
+            Some(Ambiguity::TurnStoppedIdle),
+        );
+        pass();
+        let digests2 = digest_rows();
+        assert_eq!(digests2.len(), 2, "{digests2:?}");
+        assert!(digests2[1].2.contains(&c2[..12]), "{}", digests2[1].2);
+        assert!(digests2[1].2.contains(&c3[..12]), "{}", digests2[1].2);
+        assert!(
+            digests2[1].2.contains("c3 rebased override"),
+            "{}",
+            digests2[1].2
+        );
+
+        let claimed_d2 = store
+            .claim("ext-main-test", std::time::Duration::from_mins(1))
+            .expect("claim d2")
+            .expect("d2");
+        store
+            .finish(&claimed_d2, &Outcome::Succeeded)
+            .expect("finish d2");
+        set_supervisor_state(
+            "sup-obs-idle-after-d2",
+            SemanticState::Waiting,
+            Some(Ambiguity::TurnStoppedIdle),
+        );
+
+        // Extra pass with no movement produces zero duplicates.
+        pass();
+        assert_eq!(adv_count(), 2);
+        assert_eq!(digest_rows().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

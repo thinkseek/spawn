@@ -3,12 +3,14 @@
 //! was already told is read back from the tags delivered digests filed on
 //! their commands, never from their text: that quotes workers' reports.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use spawn_core::command::CommandAction;
 use spawn_core::observation::SemanticState;
+use spawn_postgres::PostgresStore;
 
 use super::{Escalation, Facts, Order, Why};
 use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
@@ -90,6 +92,9 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::EngineUnavailable => {
             "a task's engine or model label is not available on this host (no start is made)"
         }
+        Why::MainAdvanced => {
+            "a mission source's main advanced outside spawn integrate (refresh your view of main)"
+        }
     }
 }
 
@@ -119,6 +124,7 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
                 && item.why != Why::ObjectiveSolved
                 && item.why != Why::ObjectiveOrder
                 && item.why != Why::ModelFinal
+                && item.why != Why::MainAdvanced
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -1209,6 +1215,631 @@ pub(crate) fn model_finals(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
+/// Durable baseline/landing checkpoint kind written as a notice so restarts
+/// track the last seen `refs/heads/main` without notifying the supervisor.
+pub(crate) const SOURCE_MAIN_SYNCED_KIND: &str = "source_main_synced";
+
+/// Durable notice kind recorded when a watched mission source's
+/// `refs/heads/main` advances outside `spawn integrate`'s own landing path.
+pub(crate) const SOURCE_MAIN_ADVANCED_KIND: &str = "source_main_advanced";
+
+const EXTERNAL_MAIN_SUBJECT_LIMIT: usize = 5;
+const EXTERNAL_MAIN_SUBJECT_CHARS: usize = 120;
+const EXTERNAL_MAIN_POLL_DEFAULT_SECS: i64 = 15;
+const EXTERNAL_MAIN_POLL_MAX_SECS: i64 = 3600;
+const EXTERNAL_MAIN_POLL_ENV: &str = "SPAWN_EXTERNAL_MAIN_POLL_SECS";
+
+/// Bounded git diff summary between an anchor `old_sha` and `new_sha` on a
+/// mission source's `refs/heads/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalMainDiff {
+    pub(crate) update_kind: &'static str,
+    pub(crate) old_reachable: bool,
+    pub(crate) ahead: u64,
+    pub(crate) behind: u64,
+    pub(crate) subjects: Vec<String>,
+}
+
+/// Polling interval (ms) for checking local mission sources' `refs/heads/main`
+/// when no database event moved the log watermark.
+pub(crate) fn external_main_poll_ms() -> i64 {
+    let raw = crate::config::env_value(EXTERNAL_MAIN_POLL_ENV);
+    parse_external_main_poll_ms(raw.as_deref())
+}
+
+fn parse_external_main_poll_ms(raw: Option<&str>) -> i64 {
+    let secs = raw
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|secs| (1..=EXTERNAL_MAIN_POLL_MAX_SECS).contains(secs))
+        .unwrap_or(EXTERNAL_MAIN_POLL_DEFAULT_SECS);
+    secs.saturating_mul(1_000)
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+fn read_local_main(source: &str) -> Result<Option<String>, String> {
+    if source.contains("://") || !Path::new(source).is_absolute() || !Path::new(source).is_dir() {
+        return Ok(None);
+    }
+    let parsed = crate::sources::MissionSource::parse(source)?;
+    let Ok(sha) = crate::sources::git(&[
+        "-C",
+        parsed.as_str(),
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "refs/heads/main^{commit}",
+    ]) else {
+        return Ok(None);
+    };
+    let trimmed = sha.trim();
+    if trimmed.len() >= 40 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn git_count(source: &str, rev_expr: &str) -> u64 {
+    crate::sources::git(&["-C", source, "rev-list", "--count", rev_expr])
+        .ok()
+        .and_then(|out| out.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn git_subjects(source: &str, rev_expr: &str, limit: usize) -> Vec<String> {
+    let max_arg = format!("-n{limit}");
+    let Ok(out) = crate::sources::git(&[
+        "-C",
+        source,
+        "log",
+        "--no-decorate",
+        &max_arg,
+        "--format=%h %s",
+        rev_expr,
+    ]) else {
+        return Vec::new();
+    };
+    out.lines()
+        .map(|line| one_line(line, EXTERNAL_MAIN_SUBJECT_CHARS))
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Summarize how `refs/heads/main` moved from `old_sha` to `new_sha` in the
+/// local repository `source`.
+pub(crate) fn summarize_main_move(source: &str, old_sha: &str, new_sha: &str) -> ExternalMainDiff {
+    let old_object = format!("{old_sha}^{{commit}}");
+    let old_reachable = crate::sources::git(&["-C", source, "cat-file", "-e", &old_object]).is_ok();
+    if !old_reachable {
+        return ExternalMainDiff {
+            update_kind: "non_fast_forward",
+            old_reachable: false,
+            ahead: 0,
+            behind: 0,
+            subjects: git_subjects(source, new_sha, EXTERNAL_MAIN_SUBJECT_LIMIT),
+        };
+    }
+    let is_ff = crate::sources::git(&[
+        "-C",
+        source,
+        "merge-base",
+        "--is-ancestor",
+        old_sha,
+        new_sha,
+    ])
+    .is_ok();
+    let range_ahead = format!("{old_sha}..{new_sha}");
+    let range_behind = format!("{new_sha}..{old_sha}");
+    let ahead = git_count(source, &range_ahead);
+    let behind = if is_ff {
+        0
+    } else {
+        git_count(source, &range_behind)
+    };
+    let update_kind = if is_ff {
+        "fast_forward"
+    } else if ahead == 0 && behind > 0 {
+        "rewound"
+    } else {
+        "non_fast_forward"
+    };
+    let subjects = if ahead > 0 {
+        git_subjects(source, &range_ahead, EXTERNAL_MAIN_SUBJECT_LIMIT)
+    } else {
+        git_subjects(source, new_sha, 1)
+    };
+    ExternalMainDiff {
+        update_kind,
+        old_reachable: true,
+        ahead,
+        behind,
+        subjects,
+    }
+}
+
+fn watched_local_sources(store: &PostgresStore) -> Result<BTreeMap<String, Vec<i64>>, String> {
+    let rows = store
+        .alert_mission_sources()
+        .map_err(|error| format!("alert mission sources: {error}"))?;
+    let mut watched: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for entry in rows.as_array().into_iter().flatten() {
+        let Some(mission_id) = entry["mission"].as_i64() else {
+            continue;
+        };
+        for source in entry["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !source.contains("://")
+                && Path::new(source).is_absolute()
+                && Path::new(source).is_dir()
+            {
+                watched
+                    .entry(source.to_string())
+                    .or_default()
+                    .push(mission_id);
+            }
+        }
+    }
+    for missions in watched.values_mut() {
+        missions.sort_unstable();
+        missions.dedup();
+    }
+    Ok(watched)
+}
+
+fn latest_sync_anchors(alert_rows: &[Value]) -> BTreeMap<String, (i64, String)> {
+    let mut anchors: BTreeMap<String, (i64, String)> = BTreeMap::new();
+    for row in alert_rows {
+        let Some(kind) = row["kind"].as_str() else {
+            continue;
+        };
+        if kind != SOURCE_MAIN_SYNCED_KIND && kind != SOURCE_MAIN_ADVANCED_KIND {
+            continue;
+        }
+        let Some(event_id) = row["fired_event_id"].as_i64() else {
+            continue;
+        };
+        let Some(source) = row["evidence"]["source"]
+            .as_str()
+            .or_else(|| row["subject"].as_str())
+        else {
+            continue;
+        };
+        let Some(head) = row["evidence"]["to"]
+            .as_str()
+            .or_else(|| row["evidence"]["head"].as_str())
+        else {
+            continue;
+        };
+        let replace = anchors
+            .get(source)
+            .is_none_or(|(existing_id, _)| event_id >= *existing_id);
+        if replace {
+            anchors.insert(source.to_string(), (event_id, head.to_string()));
+        }
+    }
+    anchors
+}
+
+#[derive(Default)]
+struct GatedSourceState {
+    baselines: Vec<String>,
+    in_flight_candidates: Vec<String>,
+}
+
+fn gated_source_states(store: &PostgresStore) -> BTreeMap<String, GatedSourceState> {
+    let Ok(raw) = store.gated_missions() else {
+        return BTreeMap::new();
+    };
+    let mut non_halted: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+    let mut halted: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+    for mission in raw.as_array().into_iter().flatten() {
+        let Some(source) = mission["source"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let baseline = mission["baseline"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let candidates: Vec<String> = mission["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|task| matches!(task["state"].as_str(), Some("accepted" | "landing")))
+            .filter_map(|task| task["candidate"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let entry = (source.to_string(), baseline, candidates);
+        if mission["halted"].is_null() {
+            non_halted.push(entry);
+        } else {
+            halted.push(entry);
+        }
+    }
+    let mut by_source: BTreeMap<String, GatedSourceState> = BTreeMap::new();
+    for (source, baseline, candidates) in non_halted.into_iter().chain(halted) {
+        let state = by_source.entry(source).or_default();
+        if let Some(sha) = baseline
+            && !state.baselines.contains(&sha)
+        {
+            state.baselines.push(sha);
+        }
+        for sha in candidates {
+            if !state.in_flight_candidates.contains(&sha) {
+                state.in_flight_candidates.push(sha);
+            }
+        }
+    }
+    by_source
+}
+
+fn main_landing_info(
+    store: &PostgresStore,
+    source: &str,
+    sha: &str,
+) -> Option<(Option<(i64, String)>, bool)> {
+    let value = store.main_landing(source, sha, None).ok()?;
+    let landing = value["landing"].as_object().and_then(|obj| {
+        let event = obj.get("event")?.as_i64()?;
+        let record = obj.get("record")?.as_str()?.to_string();
+        Some((event, record))
+    });
+    let pending_owner_match = value["owner_requests"]
+        .as_array()
+        .is_some_and(|reqs| reqs.iter().any(|req| req["commit"].as_str() == Some(sha)));
+    Some((landing, pending_owner_match))
+}
+
+fn owner_request_move_after(
+    store: &PostgresStore,
+    after_event: i64,
+    source: &str,
+    target_sha: &str,
+) -> Option<(i64, String)> {
+    let mut cursor = after_event;
+    loop {
+        let Ok(page) = store.alert_control(cursor, 500) else {
+            return None;
+        };
+        let records = page["records"].as_array()?;
+        for entry in records {
+            let Some(event_id) = entry["event_id"].as_i64() else {
+                continue;
+            };
+            let record = &entry["record"];
+            if event_id > after_event
+                && record["type"].as_str() == Some("source.moved")
+                && record["source"].as_str() == Some(source)
+                && record["to"].as_str() == Some(target_sha)
+                && record.get("request").is_some_and(|req| !req.is_null())
+            {
+                return Some((event_id, "source.moved".to_string()));
+            }
+        }
+        let next = page["next"].as_i64().unwrap_or(cursor);
+        if records.is_empty() || next <= cursor {
+            return None;
+        }
+        cursor = next;
+    }
+}
+
+fn effective_anchor(
+    store: &PostgresStore,
+    source: &str,
+    gated_states: &BTreeMap<String, GatedSourceState>,
+    notice_anchor: Option<&(i64, String)>,
+) -> (i64, Option<String>) {
+    let mut best = notice_anchor.map_or((0_i64, None), |(eid, sha)| (*eid, Some(sha.clone())));
+    let Some(state) = gated_states.get(source) else {
+        return best;
+    };
+    for baseline in &state.baselines {
+        if let Some((Some((landing_event, _)), _)) = main_landing_info(store, source, baseline)
+            && landing_event > best.0
+        {
+            best = (landing_event, Some(baseline.clone()));
+            continue;
+        }
+        if best.1.is_none() {
+            best = (0, Some(baseline.clone()));
+        }
+    }
+    best
+}
+
+fn record_notice_idempotent(store: &PostgresStore, record: &Value) -> Result<Option<i64>, String> {
+    match store.alert_record(record) {
+        Ok(event_id) => Ok(Some(event_id)),
+        Err(error) if error.to_string().contains("was already fired") => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Detect external `refs/heads/main` movements across open/active local mission
+/// repositories outside `spawn integrate`'s own landing path and record
+/// deduplicated durable notices for the supervisor digest. Returns the count of
+/// watched local sources.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn sync_external_main(
+    store: &PostgresStore,
+    caller: &str,
+    lines: &mut Vec<String>,
+) -> usize {
+    let watched = match watched_local_sources(store) {
+        Ok(watched) => watched,
+        Err(error) => {
+            lines.push(format!("{caller}: external main sync: {error}"));
+            return 0;
+        }
+    };
+    if watched.is_empty() {
+        return 0;
+    }
+    let alert_rows_val = match store.alert_rows() {
+        Ok(rows) => rows,
+        Err(error) => {
+            lines.push(format!("{caller}: external main sync: alert_rows: {error}"));
+            return watched.len();
+        }
+    };
+    let rows = alert_rows_val["rows"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let anchors = latest_sync_anchors(rows);
+    let gated_states = gated_source_states(store);
+
+    for (source, missions) in &watched {
+        let current_head = match read_local_main(source) {
+            Ok(Some(sha)) => sha,
+            Ok(None) => continue,
+            Err(error) => {
+                lines.push(format!("{caller}: external main sync {source}: {error}"));
+                continue;
+            }
+        };
+        let (anchor_event, anchor_sha) =
+            effective_anchor(store, source, &gated_states, anchors.get(source));
+        let source_hash = crate::sources::fnv(source);
+        let Some(old_sha) = anchor_sha else {
+            let init_record = json!({
+                "type": "alert.fired",
+                "key": format!("source_main_synced:{source_hash:016x}:init"),
+                "kind": SOURCE_MAIN_SYNCED_KIND,
+                "subject": source,
+                "notice": true,
+                "text": format!(
+                    "initialized main tracking on {source} at {}",
+                    short_sha(&current_head)
+                ),
+                "evidence": {
+                    "source": source,
+                    "ref": "refs/heads/main",
+                    "head": current_head,
+                    "reason": "baseline",
+                    "missions": missions,
+                },
+            });
+            if let Err(error) = record_notice_idempotent(store, &init_record) {
+                lines.push(format!("{caller}: external main sync {source}: {error}"));
+            }
+            continue;
+        };
+        if old_sha == current_head {
+            continue;
+        }
+        let candidate_in_flight = gated_states.get(source).is_some_and(|state| {
+            state
+                .in_flight_candidates
+                .iter()
+                .any(|cand| cand == &current_head)
+        });
+        if candidate_in_flight {
+            continue;
+        }
+        if let Some((landing, pending_owner_match)) =
+            main_landing_info(store, source, &current_head)
+        {
+            if pending_owner_match {
+                continue;
+            }
+            if let Some((landing_event, record_type)) = landing
+                && landing_event > anchor_event
+            {
+                let synced_record = json!({
+                    "type": "alert.fired",
+                    "key": format!("source_main_synced:{source_hash:016x}:landed:{landing_event}"),
+                    "kind": SOURCE_MAIN_SYNCED_KIND,
+                    "subject": source,
+                    "notice": true,
+                    "text": format!(
+                        "recorded integrate landing on {source} ({}..{}, {record_type})",
+                        short_sha(&old_sha),
+                        short_sha(&current_head)
+                    ),
+                    "evidence": {
+                        "source": source,
+                        "ref": "refs/heads/main",
+                        "from": old_sha,
+                        "head": current_head,
+                        "reason": record_type,
+                        "landing_event_id": landing_event,
+                        "missions": missions,
+                    },
+                });
+                if let Err(error) = record_notice_idempotent(store, &synced_record) {
+                    lines.push(format!("{caller}: external main sync {source}: {error}"));
+                }
+                continue;
+            }
+        }
+        if let Some((landing_event, record_type)) =
+            owner_request_move_after(store, anchor_event, source, &current_head)
+        {
+            let synced_record = json!({
+                "type": "alert.fired",
+                "key": format!("source_main_synced:{source_hash:016x}:landed:{landing_event}"),
+                "kind": SOURCE_MAIN_SYNCED_KIND,
+                "subject": source,
+                "notice": true,
+                "text": format!(
+                    "recorded integrate owner push on {source} ({}..{}, {record_type})",
+                    short_sha(&old_sha),
+                    short_sha(&current_head)
+                ),
+                "evidence": {
+                    "source": source,
+                    "ref": "refs/heads/main",
+                    "from": old_sha,
+                    "head": current_head,
+                    "reason": record_type,
+                    "landing_event_id": landing_event,
+                    "missions": missions,
+                },
+            });
+            if let Err(error) = record_notice_idempotent(store, &synced_record) {
+                lines.push(format!("{caller}: external main sync {source}: {error}"));
+            }
+            continue;
+        }
+
+        let diff = summarize_main_move(source, &old_sha, &current_head);
+        let range_hash = crate::sources::fnv(&format!("{old_sha}..{current_head}"));
+        let key =
+            format!("source_main_advanced:{source_hash:016x}:{anchor_event}:{range_hash:016x}");
+        let adv_record = json!({
+            "type": "alert.fired",
+            "key": key,
+            "kind": SOURCE_MAIN_ADVANCED_KIND,
+            "subject": source,
+            "notice": true,
+            "text": format!(
+                "{source} refs/heads/main moved externally {}..{} ({})",
+                short_sha(&old_sha),
+                short_sha(&current_head),
+                diff.update_kind
+            ),
+            "evidence": {
+                "source": source,
+                "ref": "refs/heads/main",
+                "from": old_sha,
+                "to": current_head,
+                "update_kind": diff.update_kind,
+                "old_reachable": diff.old_reachable,
+                "ahead": diff.ahead,
+                "behind": diff.behind,
+                "subjects": diff.subjects,
+                "missions": missions,
+            },
+        });
+        match record_notice_idempotent(store, &adv_record) {
+            Ok(Some(event_id)) => lines.push(format!(
+                "{caller}: external main advance on {source} ({}..{}, {}): recorded event \
+                 #{event_id}",
+                short_sha(&old_sha),
+                short_sha(&current_head),
+                diff.update_kind
+            )),
+            Ok(None) => {}
+            Err(error) => lines.push(format!(
+                "{caller}: external main advance on {source}: {error}"
+            )),
+        }
+    }
+
+    watched.len()
+}
+
+/// Digest news items for external `refs/heads/main` movements stored in
+/// `spawn_alerts` (`SOURCE_MAIN_ADVANCED_KIND`) and not yet told to the
+/// supervisor (`missions main-advanced-<event_id>`).
+pub(crate) fn main_advanced_news(alert_rows: &[Value]) -> Vec<Escalation> {
+    alert_rows
+        .iter()
+        .filter(|row| row["kind"].as_str() == Some(SOURCE_MAIN_ADVANCED_KIND))
+        .filter_map(|row| {
+            let id = row["fired_event_id"].as_i64()?;
+            let evidence = &row["evidence"];
+            let source = evidence["source"]
+                .as_str()
+                .or_else(|| row["subject"].as_str())?;
+            let from = short_sha(evidence["from"].as_str().unwrap_or("?"));
+            let to = short_sha(evidence["to"].as_str().unwrap_or("?"));
+            let update_kind = evidence["update_kind"].as_str().unwrap_or("updated");
+            let old_reachable = evidence["old_reachable"].as_bool().unwrap_or(true);
+            let ahead = evidence["ahead"].as_u64().unwrap_or(0);
+            let behind = evidence["behind"].as_u64().unwrap_or(0);
+            let missions: Vec<String> = evidence["missions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .map(|m| format!("#{m}"))
+                .collect();
+            let mission_phrase = if missions.is_empty() {
+                String::new()
+            } else {
+                let noun = if missions.len() == 1 {
+                    "mission"
+                } else {
+                    "missions"
+                };
+                format!(" ({noun} {})", missions.join(", "))
+            };
+            let delta = match update_kind {
+                "fast_forward" => format!(
+                    "fast-forward, +{ahead} commit{}",
+                    if ahead == 1 { "" } else { "s" }
+                ),
+                "rewound" => format!(
+                    "rewound, -{behind} commit{}",
+                    if behind == 1 { "" } else { "s" }
+                ),
+                "non_fast_forward" if !old_reachable => {
+                    "non-fast-forward, previous commit unreachable".to_string()
+                }
+                _ => format!("non-fast-forward / rebase, +{ahead}/-{behind}"),
+            };
+            let subjects: Vec<&str> = evidence["subjects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let shown_count = u64::try_from(subjects.len()).unwrap_or(u64::MAX);
+            let summary = if subjects.is_empty() {
+                String::new()
+            } else if old_reachable && ahead > shown_count {
+                format!(
+                    " — {}; (+{} more)",
+                    subjects.join("; "),
+                    ahead - shown_count
+                )
+            } else {
+                format!(" — {}", subjects.join("; "))
+            };
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("main-advanced-{id}"),
+                why: Why::MainAdvanced,
+                line: format!(
+                    "{source}{mission_phrase} refs/heads/main moved {from}..{to} ({delta}){summary}. \
+                     Refresh your view of main before assigning new tasks to avoid duplicating \
+                     already-merged work."
+                ),
+                since_ms: row["fired_at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1419,5 +2050,253 @@ mod tests {
             );
             t += wait + 50;
         }
+    }
+
+    #[test]
+    fn summarize_main_move_fast_forward_bounds_subjects() {
+        let root = std::env::temp_dir().join(format!("spawn-ext-main-ff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        let bare = root.join("source.git");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let work_str = work.to_string_lossy().to_string();
+        let bare_str = bare.to_string_lossy().to_string();
+        crate::sources::test_git(&["init", "-q", "--initial-branch=main", &work_str])
+            .expect("init");
+        let commit_file = |name: &str, msg: &str| {
+            std::fs::write(work.join(name), format!("{msg}\n")).expect("write");
+            crate::sources::test_git(&["-C", &work_str, "add", "."]).expect("add");
+            crate::sources::test_git(&[
+                "-C",
+                &work_str,
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@localhost",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .expect("commit");
+            crate::sources::test_git(&["-C", &work_str, "rev-parse", "HEAD"]).expect("rev-parse")
+        };
+        let old_sha = commit_file("f0.txt", "c0 base");
+        for idx in 1..=7 {
+            commit_file(&format!("f{idx}.txt"), &format!("c{idx} external feature"));
+        }
+        crate::sources::test_git(&["clone", "-q", "--bare", &work_str, &bare_str]).expect("bare");
+        let new_sha = crate::sources::test_git(&["-C", &bare_str, "rev-parse", "refs/heads/main"])
+            .expect("head");
+
+        let diff = summarize_main_move(&bare_str, &old_sha, &new_sha);
+        assert_eq!(diff.update_kind, "fast_forward");
+        assert!(diff.old_reachable);
+        assert_eq!(diff.ahead, 7);
+        assert_eq!(diff.behind, 0);
+        assert_eq!(diff.subjects.len(), 5, "{:?}", diff.subjects);
+        assert!(diff.subjects[0].contains("c7 external feature"));
+
+        let items = main_advanced_news(&[json!({
+            "kind": SOURCE_MAIN_ADVANCED_KIND,
+            "subject": bare_str,
+            "fired_event_id": 41,
+            "fired_at_ms": 1_000_i64,
+            "evidence": {
+                "source": bare_str,
+                "from": old_sha,
+                "to": new_sha,
+                "update_kind": diff.update_kind,
+                "old_reachable": diff.old_reachable,
+                "ahead": diff.ahead,
+                "behind": diff.behind,
+                "subjects": diff.subjects,
+                "missions": [2, 5],
+            }
+        })]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::MainAdvanced);
+        assert_eq!(items[0].id, "main-advanced-41");
+        assert!(
+            items[0].line.contains("(missions #2, #5)"),
+            "{}",
+            items[0].line
+        );
+        assert!(
+            items[0].line.contains("fast-forward, +7 commits"),
+            "{}",
+            items[0].line
+        );
+        assert!(items[0].line.contains("(+2 more)"), "{}", items[0].line);
+        assert!(
+            items[0]
+                .line
+                .contains("Refresh your view of main before assigning new tasks"),
+            "{}",
+            items[0].line
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn summarize_main_move_handles_rebase_rewind_and_unreachable_old_sha() {
+        let root =
+            std::env::temp_dir().join(format!("spawn-ext-main-rebase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        let bare = root.join("source.git");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let work_str = work.to_string_lossy().to_string();
+        let bare_str = bare.to_string_lossy().to_string();
+        crate::sources::test_git(&["init", "-q", "--initial-branch=main", &work_str])
+            .expect("init");
+        let commit_file = |name: &str, msg: &str| {
+            std::fs::write(work.join(name), format!("{msg}\n")).expect("write");
+            crate::sources::test_git(&["-C", &work_str, "add", "."]).expect("add");
+            crate::sources::test_git(&[
+                "-C",
+                &work_str,
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@localhost",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .expect("commit");
+            crate::sources::test_git(&["-C", &work_str, "rev-parse", "HEAD"]).expect("rev-parse")
+        };
+        let c0 = commit_file("f0.txt", "c0 root");
+        let c1 = commit_file("f1.txt", "c1 old branch");
+        crate::sources::test_git(&["-C", &work_str, "branch", "keep-old", &c1]).expect("keep old");
+        crate::sources::test_git(&["-C", &work_str, "reset", "--hard", &c0]).expect("reset");
+        let c2 = commit_file("f2.txt", "c2 rebased commit");
+        crate::sources::test_git(&["clone", "-q", "--bare", &work_str, &bare_str]).expect("bare");
+        crate::sources::test_git(&[
+            "-C",
+            &work_str,
+            "push",
+            "-q",
+            &bare_str,
+            &format!("{c1}:refs/heads/keep-old"),
+        ])
+        .expect("push keep-old");
+
+        let rebased = summarize_main_move(&bare_str, &c1, &c2);
+        assert_eq!(rebased.update_kind, "non_fast_forward");
+        assert!(rebased.old_reachable);
+        assert_eq!((rebased.ahead, rebased.behind), (1, 1));
+        assert_eq!(rebased.subjects.len(), 1);
+        assert!(rebased.subjects[0].contains("c2 rebased commit"));
+
+        let rewound = summarize_main_move(&bare_str, &c2, &c0);
+        assert_eq!(rewound.update_kind, "rewound");
+        assert!(rewound.old_reachable);
+        assert_eq!((rewound.ahead, rewound.behind), (0, 1));
+        assert_eq!(rewound.subjects.len(), 1);
+        assert!(rewound.subjects[0].contains("c0 root"));
+
+        let missing_sha = "deadbeef".repeat(5);
+        let pruned = summarize_main_move(&bare_str, &missing_sha, &c2);
+        assert_eq!(pruned.update_kind, "non_fast_forward");
+        assert!(!pruned.old_reachable);
+        assert!(!pruned.subjects.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_main_poll_ms_bounds() {
+        assert_eq!(parse_external_main_poll_ms(None), 15_000);
+        assert_eq!(parse_external_main_poll_ms(Some("0")), 15_000);
+        assert_eq!(parse_external_main_poll_ms(Some("99999")), 15_000);
+        assert_eq!(parse_external_main_poll_ms(Some("bad")), 15_000);
+        assert_eq!(parse_external_main_poll_ms(Some(" 42 ")), 42_000);
+    }
+
+    #[test]
+    fn main_advanced_news_is_told_once_and_keeps_distinct_lines() {
+        assert!(Why::MainAdvanced.is_news());
+        let records = [
+            json!({
+                "kind": SOURCE_MAIN_ADVANCED_KIND,
+                "subject": "/srv/a.git",
+                "fired_event_id": 10,
+                "fired_at_ms": 100,
+                "evidence": {
+                    "source": "/srv/a.git",
+                    "from": "aaaaaaaaaaaaaaaaaaaa11111111111111111111",
+                    "to": "bbbbbbbbbbbbbbbbbbbb22222222222222222222",
+                    "update_kind": "fast_forward",
+                    "old_reachable": true,
+                    "ahead": 1,
+                    "behind": 0,
+                    "subjects": ["bbbbbbb fix auth"],
+                    "missions": [1],
+                }
+            }),
+            json!({
+                "kind": SOURCE_MAIN_ADVANCED_KIND,
+                "subject": "/srv/b.git",
+                "fired_event_id": 11,
+                "fired_at_ms": 105,
+                "evidence": {
+                    "source": "/srv/b.git",
+                    "from": "cccccccccccccccccccc33333333333333333333",
+                    "to": "dddddddddddddddddddd44444444444444444444",
+                    "update_kind": "non_fast_forward",
+                    "old_reachable": false,
+                    "ahead": 0,
+                    "behind": 0,
+                    "subjects": ["ddddddd force reset"],
+                    "missions": [],
+                }
+            }),
+            json!({
+                "kind": SOURCE_MAIN_SYNCED_KIND,
+                "subject": "/srv/c.git",
+                "fired_event_id": 12,
+                "fired_at_ms": 110,
+                "evidence": {"source": "/srv/c.git", "head": "eeee"}
+            }),
+        ];
+        let news = main_advanced_news(&records);
+        assert_eq!(news.len(), 2);
+        let mut sup = idle_supervisor_facts(Vec::new());
+        let plan = crate::dispatch::decide_with(
+            std::slice::from_ref(&sup),
+            &crate::deliver::Work::default(),
+            &news,
+            true,
+            1_000,
+            "spawn",
+        );
+        assert_eq!(plan.orders.len(), 1);
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("expected digest input: {:?}", plan.orders[0].action);
+        };
+        assert!(text.contains("2 updates for you"), "{text}");
+        assert!(text.contains("/srv/a.git"), "{text}");
+        assert!(text.contains("/srv/b.git"), "{text}");
+        assert_eq!(
+            tags,
+            &["missions main-advanced-10", "missions main-advanced-11"]
+        );
+
+        for tag in tags {
+            sup.told.insert(tag.clone());
+        }
+        let after = crate::dispatch::decide_with(
+            &[sup],
+            &crate::deliver::Work::default(),
+            &news,
+            true,
+            2_000,
+            "spawn",
+        );
+        assert!(after.orders.is_empty());
+        assert!(after.pending.is_empty());
+        assert!(after.told.is_empty());
     }
 }
