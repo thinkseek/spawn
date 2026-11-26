@@ -1473,9 +1473,9 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         Ok(None) => {}
         Err(error) => eprintln!("integrate: {error}; no shadow judging"),
     }
-    // The shadow judging on spawn-node v1 (shadow.rs, remote.rs), beside
-    // the runner's when both are on.
-    integrator = integrator.with_node_shadow_from_env();
+    // The shadow judging on spawn-node v1 (shadow.rs, remote.rs) beside the
+    // runner's, and the candidates' gates on a node first (remote.rs).
+    integrator = integrator.with_nodes_from_env();
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -1969,6 +1969,10 @@ struct Integrator {
     /// it again), failed, or was not visited. A drain ends only after a
     /// pass with none.
     unlanded: std::cell::Cell<bool>,
+    /// Whether the queued `gate` jobs a predecessor left were taken back
+    /// (once, at the first pass, before any judging of this integrator
+    /// starts; only with the primary path on).
+    remote_reclaimed: std::cell::Cell<bool>,
 }
 
 /// A drain: no gate, owner judging or base warm starts any more; the
@@ -2034,6 +2038,20 @@ struct Judge {
     /// The judging this clone takes over from an earlier integrator (D5,
     /// [`Integrator::adopt`]); None for one it starts.
     adopted: Option<Adopted>,
+    /// The candidates' gates judged on spawn-node v1 first
+    /// (`SPAWN_GATE_REMOTE=node`, [`remote::Primary`]); None (unset, empty
+    /// or `local`) judges every gate on this host, as before.
+    remote: Option<Arc<remote::Primary>>,
+}
+
+/// What the primary path gives the judging in place of a local run of the
+/// candidate's gate ([`Judge::remote_primary`]): the outcome to judge, and
+/// what was judged where. Never a red check's pass on the base: a gate on a
+/// red main is judged here.
+struct RemoteJudged {
+    judged: Result<gate::Verdict, GateFailure>,
+    given: Value,
+    env: Value,
 }
 
 /// What an adopted judging judges, as its `judging.json` says: the
@@ -2271,6 +2289,7 @@ impl Integrator {
                 stop: None,
                 units: false,
                 adopted: None,
+                remote: None,
             },
             gates,
             cpu: None,
@@ -2290,6 +2309,7 @@ impl Integrator {
             ),
             drain: RefCell::new(None),
             unlanded: std::cell::Cell::new(false),
+            remote_reclaimed: std::cell::Cell::new(false),
         }
     }
 
@@ -2805,6 +2825,51 @@ impl Integrator {
         }
     }
 
+    /// What this integrator does with spawn-node v1, from the environment:
+    /// its node shadows ([`Self::with_node_shadow_from_env`]) and the
+    /// primary path ([`Self::with_remote_primary_from_env`]), each its own
+    /// switch.
+    fn with_nodes_from_env(self) -> Self {
+        self.with_node_shadow_from_env()
+            .with_remote_primary_from_env()
+    }
+
+    /// This integrator judging the candidates' gates on spawn-node v1 first
+    /// when `SPAWN_GATE_REMOTE=node` ([`remote::primary_settings`]). Unset,
+    /// empty or `local` changes nothing; any other value, or a setting it
+    /// needs that is missing, is said and changes nothing either.
+    fn with_remote_primary_from_env(self) -> Self {
+        match remote::primary_settings(crate::config::env_value) {
+            Ok(Some(settings)) => {
+                println!(
+                    "integrate: the candidates' gates are judged on spawn-node v1 first ({}), \
+                     a lease awaited {} s",
+                    if settings.believe_reject {
+                        "M3b: a node's acceptance or rejection is believed"
+                    } else {
+                        "M3a: a node's acceptance is believed"
+                    },
+                    settings.queue_wait.as_secs()
+                );
+                let work = self.judge.root.join(".remote-node");
+                self.with_remote_primary(settings, work)
+            }
+            Ok(None) => self,
+            Err(error) => {
+                eprintln!("integrate: {error}; every gate is judged on this host");
+                self
+            }
+        }
+    }
+
+    /// This integrator judging the candidates' gates on spawn-node v1 first
+    /// ([`remote::Primary`]), its snapshots in `work`.
+    fn with_remote_primary(mut self, settings: remote::PrimarySettings, work: PathBuf) -> Self {
+        shadow::remove_tree(&work);
+        self.judge.remote = Some(Arc::new(remote::Primary::new(settings, work)));
+        self
+    }
+
     /// This integrator shadowing judged verdicts on spawn-node v1 too
     /// ([`shadow::NodeShadows`]), its snapshots in `work`.
     fn with_node_shadow(
@@ -3078,6 +3143,11 @@ impl Integrator {
             &mut urgent,
         )?;
         self.stop_for(&urgent);
+        // The primary path's jobs a predecessor queued and nobody waits for
+        // any more, taken back before this integrator's first judging.
+        if self.judge.remote.is_some() && !self.remote_reclaimed.replace(true) {
+            remote::Primary::reclaim_orphans(store);
+        }
         let steps = self.steps(store, &pending, &owner_moved, owner_judge);
         self.poll_warm(store, steps.is_ok());
         Self::sweep_nodes(store);
@@ -4593,18 +4663,38 @@ impl Judge {
             .map_or_else(now_ms, |adopted| adopted.started_ms);
         let given = inputs::read(main, &candidate, scenarios, scenario.as_deref());
         bound.replace(Some((given.clone(), Value::Null)));
-        let (judged, base_check) = gate::judge_seeing_base_check(
-            &gate_path,
+        // SPAWN_GATE_REMOTE=node: the candidate's gate on a node first, its
+        // verdict believed by M3a or M3b; anything else is judged here, as
+        // without it ([`Judge::remote_primary`]).
+        let remote = self.remote_primary(
+            store,
             mirror,
             main,
             &candidate,
             scenarios,
             scenario.as_deref(),
             &gate_env,
-            gate_wall_clock(),
+            task,
+            test_database,
         );
+        let (judged, base_check) = if let Some(remote) = remote {
+            bound.replace(Some((remote.given, remote.env)));
+            (remote.judged, None)
+        } else {
+            let (judged, base_check) = gate::judge_seeing_base_check(
+                &gate_path,
+                mirror,
+                main,
+                &candidate,
+                scenarios,
+                scenario.as_deref(),
+                &gate_env,
+                gate_wall_clock(),
+            );
+            bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
+            (judged, base_check)
+        };
         let ended = now_ms();
-        bound.replace(Some((given, inputs::env_here(gate_log(&judged)))));
         // The candidate's gate has ended: any gate this judging runs after
         // it (a rejection's head re-judging) is not the candidate's, and a
         // later integrator must not adopt it as that (rev-e G1): it
@@ -4910,6 +5000,114 @@ impl Judge {
 }
 
 impl Judge {
+    /// The primary path for a task's candidate (`SPAWN_GATE_REMOTE=node`,
+    /// design §12.2 S5): None, and the gate runs here as ever, when it is
+    /// off, for an adopted judging (its gate already runs here), and
+    /// whenever the node's run is not believed (fallback_local: no lease
+    /// in time and the take-back won, the node's fault or skew, settled on
+    /// the ledger alone, or a rejection M3a judges again). A believed
+    /// verdict (M3a: an acceptance on the job's own inputs; M3b,
+    /// `SPAWN_GATE_REMOTE_BELIEVE_REJECT=1`: a rejection too) is judged as a
+    /// local run's is, except a rejection whose every failure reads as the
+    /// node's test database, which is judged again here rather than become
+    /// a host fault of the task. A judging stopped while it waits (an
+    /// owner's urgent landing) ends as a stopped gate does: discarded.
+    #[allow(clippy::too_many_arguments)]
+    fn remote_primary(
+        &self,
+        store: &PostgresStore,
+        mirror: &Path,
+        main: &str,
+        candidate: &str,
+        scenarios: &Path,
+        scenario: Option<&Path>,
+        gate_env: &[(String, String)],
+        task: &Task,
+        test_database: bool,
+    ) -> Option<RemoteJudged> {
+        let primary = self.remote.as_ref()?;
+        if self.adopted.is_some() {
+            return None;
+        }
+        // A red main's check runs on the base before the candidate
+        // (SPAWN_GATE_BASE_CHECK): a grant cannot carry it (it is not in
+        // GATE_ENV, and a node refuses it), so a node would judge the
+        // candidate as if main were green, and nothing would say main is
+        // green again. Such a gate is judged here.
+        if let Some((_, check)) = gate_env
+            .iter()
+            .find(|(name, _)| name == "SPAWN_GATE_BASE_CHECK")
+        {
+            println!(
+                "integrate: task {}: judged on this host (fallback_local): main is red on \
+                 {check}; the base check runs here",
+                task.id
+            );
+            return None;
+        }
+        let request = remote::PrimaryRequest {
+            task: task.id,
+            judging_id: judging::current_id(),
+            repo: mirror,
+            base: main,
+            candidate,
+            scenarios,
+            scenario,
+            gate_env,
+        };
+        let stopped = || self.stop.as_ref().is_some_and(|stop| stop.by().is_some());
+        match primary.judge(store, &request, &stopped) {
+            remote::PrimaryOutcome::Believed(believed) => {
+                let remote::Believed {
+                    verdict,
+                    given,
+                    env,
+                    job_id,
+                    belief,
+                } = *believed;
+                // A rejection with no failure of the work's (connection or
+                // database errors only) is judged here: the crash window
+                // the host-fault rule reads is this host's test server's,
+                // which says nothing of the node's, so the sentinel stands
+                // for "maybe the node's server crashed".
+                if !verdict.accepted
+                    && test_database
+                    && host::host_fault(&verdict.reason, &verdict.output, || {
+                        vec!["the node's test server (not this host's log)".to_string()]
+                    })
+                    .is_some()
+                {
+                    println!(
+                        "integrate: task {}: the node's rejection on {job_id} names no failure \
+                         of the work's ({belief} not applied): judged on this host",
+                        task.id
+                    );
+                    return None;
+                }
+                Some(RemoteJudged {
+                    judged: Ok(verdict),
+                    given,
+                    env,
+                })
+            }
+            remote::PrimaryOutcome::Local { why } => {
+                println!(
+                    "integrate: task {}: judged on this host (fallback_local): {why}",
+                    task.id
+                );
+                None
+            }
+            remote::PrimaryOutcome::Stopped => Some(RemoteJudged {
+                judged: Err(GateFailure::Aborted {
+                    reason: gate::STOPPED.to_string(),
+                    log: String::new(),
+                }),
+                given: inputs::known(Some(main), Some(candidate)),
+                env: Value::Null,
+            }),
+        }
+    }
+
     /// The record of a host fault the gate itself reported
     /// ([`GateFailure::HostFault`]) for `task`: the mission's next in a row,
     /// with its backoff, said on stdout as the other host faults are.
@@ -5680,3 +5878,9 @@ mod cannot_judge_tests;
 /// sources and a stub gate.
 #[cfg(test)]
 mod database_tests;
+
+/// spawn-node v1 PR S5: the candidates' gates judged on a node first
+/// (`SPAWN_GATE_REMOTE=node`), M3a and M3b, and the outcomes of section 6.2
+/// on the ledger alone, against the test database.
+#[cfg(test)]
+mod remote_primary_tests;

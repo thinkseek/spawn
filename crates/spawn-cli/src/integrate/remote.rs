@@ -769,11 +769,12 @@ pub(super) fn step(
 
 /// Wait for job `job_id` to be leased, up to `wait` from now, looking every
 /// `every`; past it, take it back ([`step`]). Returns the first state that
-/// is not `Queued`. The primary path's wait (`SPAWN_GATE_REMOTE=node`, PR
-/// S5); the shadows look once a pass instead ([`step`]), never waiting.
+/// is not `Queued`. The primary path (`SPAWN_GATE_REMOTE=node`, PR S5)
+/// follows its job with [`Primary::follow`] instead, which also sees a stop
+/// and a completion; the shadows look once a pass ([`step`]), never waiting.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the primary path's wait, PR S5; tested here")
+    expect(dead_code, reason = "a plain wait for a lease, tested here")
 )]
 pub(super) fn wait_for_lease(
     store: &PostgresStore,
@@ -1176,6 +1177,658 @@ pub(super) fn settle(
         )
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+/// Where a task's candidate gate is judged (design §12.2 S5): unset, empty
+/// or `local`, on this host as ever; `node`, on spawn-node v1 first
+/// ([`Primary`]). Any other value is refused, and the gates stay local.
+pub(super) const GATE_REMOTE_ENV: &str = "SPAWN_GATE_REMOTE";
+
+/// `1` beside `SPAWN_GATE_REMOTE=node`: a node's rejection on the job's own
+/// inputs is believed too (M3b). Unset, empty or `0`: only an acceptance is
+/// (M3a), and a node's rejection is judged again here.
+pub(super) const BELIEVE_REJECT_ENV: &str = "SPAWN_GATE_REMOTE_BELIEVE_REJECT";
+
+/// How often the primary path looks at its job while it waits.
+const PRIMARY_EVERY: Duration = Duration::from_secs(1);
+
+/// How long past a remote gate's own wall clock ([`GATE_TIMEOUT_S`]) the
+/// primary path waits for a leased job's result before it judges here
+/// (the sweep fences a silent lease long before).
+const PRIMARY_GRACE: Duration = Duration::from_mins(15);
+
+/// Ledger reads that may fail in a row before the primary path gives the
+/// job up and judges here.
+const PRIMARY_READ_FAILURES: u32 = 5;
+
+/// How long the registry's manifest is reused before it is read again (it
+/// hashes the whole cargo registry).
+const PRIMARY_REGISTRY_EVERY: Duration = Duration::from_hours(1);
+
+/// How the primary path runs: what it believes (M3a, or M3b too), the
+/// directories it shares with the gateway, the cargo home whose registry a
+/// node must hold, how long a job waits for a lease, how often it is looked
+/// at, and how long a leased job may take in all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PrimarySettings {
+    pub(super) believe_reject: bool,
+    pub(super) artifacts: PathBuf,
+    pub(super) results: PathBuf,
+    pub(super) cargo_home: PathBuf,
+    pub(super) queue_wait: Duration,
+    pub(super) every: Duration,
+    pub(super) limit: Duration,
+}
+
+/// The primary path's settings from the environment (`lookup`): None
+/// unless [`GATE_REMOTE_ENV`] is `node` (unset, empty and `local` are this
+/// host's gate, unchanged); an error, and no remote judging, for another
+/// value of it or of [`BELIEVE_REJECT_ENV`], or without an artifact or
+/// results directory.
+pub(super) fn primary_settings(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<PrimarySettings>, String> {
+    match lookup(GATE_REMOTE_ENV).as_deref().map(str::trim) {
+        None | Some("" | "local") => return Ok(None),
+        Some("node") => {}
+        Some(other) => {
+            return Err(format!("{GATE_REMOTE_ENV} is local or node, not {other:?}"));
+        }
+    }
+    let believe_reject = match lookup(BELIEVE_REJECT_ENV).as_deref().map(str::trim) {
+        None | Some("" | "0") => false,
+        Some("1") => true,
+        Some(other) => {
+            return Err(format!("{BELIEVE_REJECT_ENV} is 1 or 0, not {other:?}"));
+        }
+    };
+    let directory = |name: &str| -> Result<PathBuf, String> {
+        lookup(name)
+            .map(|text| PathBuf::from(text.trim()))
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| format!("{GATE_REMOTE_ENV}=node needs {name}, an absolute directory"))
+    };
+    let artifacts = directory(ARTIFACTS_ENV)?;
+    let results = directory(RESULTS_ENV)?;
+    let cargo_home = lookup("CARGO_HOME")
+        .filter(|text| !text.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| lookup("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .ok_or_else(|| format!("{GATE_REMOTE_ENV}=node needs CARGO_HOME or HOME"))?;
+    Ok(Some(PrimarySettings {
+        believe_reject,
+        artifacts,
+        results,
+        cargo_home,
+        queue_wait: queue_wait(lookup(QUEUE_WAIT_ENV).as_deref()),
+        every: PRIMARY_EVERY,
+        limit: Duration::from_secs(GATE_TIMEOUT_S) + PRIMARY_GRACE,
+    }))
+}
+
+/// One candidate's gate to judge on a node: the task, the judging it
+/// serves, the mirror holding both commits, the gate directory and the
+/// task's scenario, and the gate's environment for this judging.
+pub(super) struct PrimaryRequest<'a> {
+    pub(super) task: i64,
+    pub(super) judging_id: Option<String>,
+    pub(super) repo: &'a Path,
+    pub(super) base: &'a str,
+    pub(super) candidate: &'a str,
+    pub(super) scenarios: &'a Path,
+    pub(super) scenario: Option<&'a Path>,
+    pub(super) gate_env: &'a [(String, String)],
+}
+
+/// What the primary path came to.
+#[derive(Debug)]
+pub(super) enum PrimaryOutcome {
+    /// A node's verdict on the job's own inputs, believed (M3a: an
+    /// acceptance; M3b: a rejection too): judged as a local run's verdict
+    /// is.
+    Believed(Box<Believed>),
+    /// Judged here instead (fallback_local), for `why`: no node leased the
+    /// job in time and the primary took it back, the node's run was its
+    /// fault or skew, a rejection M3a does not believe, or the job could
+    /// not be queued. Nothing is recorded for the task by this path.
+    Local { why: String },
+    /// The judging was stopped (an owner's urgent landing) while it
+    /// waited: a job still queued is taken back, a leased one's result is
+    /// never read.
+    Stopped,
+}
+
+/// A node's verdict the primary path believed: `given` is what the node
+/// judged, `env` where (`runner` `node:<name>`), `belief` the rule (`M3a`,
+/// `M3b`). No red check is ever run on a node (a grant cannot carry
+/// `SPAWN_GATE_BASE_CHECK`): a gate on a red main is judged here
+/// (integrate.rs `Judge::remote_primary`).
+#[derive(Debug)]
+pub(super) struct Believed {
+    pub(super) job_id: String,
+    pub(super) verdict: gate::Verdict,
+    pub(super) given: Value,
+    pub(super) env: Value,
+    pub(super) belief: &'static str,
+}
+
+/// Where one look at a job leaves it ([`look`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Look {
+    /// Still queued, within its wait.
+    Queued,
+    /// A node holds it (leased, or its result is pending).
+    Leased(i64),
+    /// Its wait was over, but a node was granted it between the read and
+    /// the take-back: read it again (the node keeps it).
+    Raced,
+    /// The primary took it back (`spawn_remote_job_take_local`).
+    TakenLocal,
+    /// A node's result is stored.
+    Completed,
+    /// It ended otherwise.
+    Ended(RemoteJobState),
+}
+
+/// One look at `row`, read just before, queued `since` and allowed to wait
+/// `wait` for a lease: past the wait a job still queued is taken back at
+/// the epoch read, the fenced compare-and-set a node's grant also goes
+/// through. Only the take-back's win is [`Look::TakenLocal`]; a node that
+/// won is [`Look::Raced`], never a local judging.
+pub(super) fn look(
+    store: &PostgresStore,
+    row: &RemoteJob,
+    since: Instant,
+    wait: Duration,
+) -> Result<Look, String> {
+    Ok(match row.state {
+        RemoteJobState::Queued if since.elapsed() < wait => Look::Queued,
+        RemoteJobState::Queued => {
+            if store
+                .remote_job_take_local(&row.job_id, row.lease_epoch)
+                .map_err(|error| error.to_string())?
+            {
+                Look::TakenLocal
+            } else {
+                Look::Raced
+            }
+        }
+        RemoteJobState::Leased | RemoteJobState::ResultPending => Look::Leased(row.lease_epoch),
+        RemoteJobState::Completed => Look::Completed,
+        other => Look::Ended(other),
+    })
+}
+
+/// The name of the node that ran `row`: the ledger's, else what the node
+/// said, else its id's first 12 digits.
+pub(super) fn node_name_of(store: &PostgresStore, row: &RemoteJob, stored: &Stored) -> String {
+    let id = row.node_id.clone().unwrap_or_default();
+    store
+        .nodes_v1()
+        .ok()
+        .and_then(|nodes| {
+            nodes
+                .into_iter()
+                .find(|node| node.node_id.as_deref() == Some(id.as_str()))
+        })
+        .map(|node| node.name)
+        .or_else(|| {
+            stored
+                .meta
+                .env
+                .as_ref()
+                .and_then(|env| env.get("node").cloned())
+        })
+        .unwrap_or_else(|| id.chars().take(12).collect())
+}
+
+/// The `env` of a node's run: its host and toolchain as it said them (the
+/// toolchain line of its log otherwise), on runner `node:<name>`.
+fn node_env(stored: &Stored, node: &str) -> Value {
+    let meta = &stored.meta;
+    let said = |name: &str| meta.env.as_ref().and_then(|env| env.get(name).cloned());
+    let toolchain = said("toolchain").or_else(|| {
+        meta.streams(&stored.log)
+            .ok()
+            .and_then(|(stdout, _)| super::inputs::toolchain_of(&String::from_utf8_lossy(stdout)))
+    });
+    json!({"host": said("host"), "toolchain": toolchain, "runner": format!("node:{node}")})
+}
+
+/// What one completed run leaves the primary path ([`Primary::completed`]).
+#[derive(Debug)]
+pub(super) enum Settled {
+    /// Believed: the outcome to return.
+    Believed(PrimaryOutcome),
+    /// Back in the queue for another node (this one excluded): waited for
+    /// again.
+    Requeued,
+    /// Judged here, for this reason.
+    Local(String),
+}
+
+/// What M3a or M3b makes of a node's judged run when it gave a verdict:
+/// the rule that believes it, or None (M3a's rejection: a valid run,
+/// judged again here, nothing recorded for the task).
+pub(super) fn belief(judged: &Judged, believe_reject: bool) -> Option<&'static str> {
+    let verdict = judged.verdict.as_ref()?;
+    if verdict.accepted {
+        Some("M3a")
+    } else if believe_reject {
+        Some("M3b")
+    } else {
+        None
+    }
+}
+
+/// The primary path (design §12.2 S5, §12.4 M3a/M3b): a task's candidate
+/// gate queued as a `gate` job for spawn-node v1, its artifacts published
+/// for the gateway, waited for, and its node's verdict believed by the
+/// rules of M3a (an acceptance on the job's own inputs) or M3b (a
+/// rejection too); every other outcome is judged here, and a node's fault
+/// is settled on the ledger alone (`spawn_remote_job_fault`), never on
+/// the task, its halts or its back-offs. Shared by the judging threads.
+pub(super) struct Primary {
+    pub(super) settings: PrimarySettings,
+    artifacts: Artifacts,
+    /// Snapshots of gate directories, while their pack is made.
+    work: PathBuf,
+    registry: std::sync::Mutex<Option<(Instant, RegistryManifest)>>,
+}
+
+impl Primary {
+    pub(super) fn new(settings: PrimarySettings, work: PathBuf) -> Self {
+        let artifacts = Artifacts::new(settings.artifacts.clone());
+        Self {
+            settings,
+            artifacts,
+            work,
+            registry: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The registry's manifest (and [`REGISTRY_MANIFEST`] written), read
+    /// again after [`PRIMARY_REGISTRY_EVERY`].
+    fn registry(&self) -> Result<RegistryManifest, String> {
+        let mut cached = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((read, manifest)) = cached.as_ref()
+            && read.elapsed() < PRIMARY_REGISTRY_EVERY
+        {
+            return Ok(manifest.clone());
+        }
+        let manifest = self
+            .artifacts
+            .registry_manifest(&self.settings.cargo_home)?;
+        *cached = Some((Instant::now(), manifest.clone()));
+        Ok(manifest)
+    }
+
+    /// What a node must hold for a gate of `controller`: the registry, the
+    /// gate's PostgreSQL, the web lockfile (published for the node to
+    /// fetch by its digest) and the toolchain, when the controller names
+    /// them.
+    fn requires_of(
+        &self,
+        controller: &Path,
+        registry: String,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let mut requires = BTreeMap::from([
+            ("registry".to_string(), registry),
+            ("pg".to_string(), PG_MAJOR.to_string()),
+        ]);
+        if let Some(lock) = web_lock(controller) {
+            let published = self
+                .artifacts
+                .put_copy(&controller.join("web/package-lock.json"))?;
+            if published.digest.hex != lock {
+                return Err("web/package-lock.json changed while it was published".to_string());
+            }
+            requires.insert("web_lock".to_string(), lock);
+        }
+        if let Some(channel) = toolchain_channel(controller) {
+            requires.insert("toolchain".to_string(), channel);
+        }
+        Ok(requires)
+    }
+
+    /// The job for `request`, its artifacts written: the delta and the
+    /// baseline bundles, the controller pack of a snapshot of the gate
+    /// directory (so `scenarios_sha256` is the set the node receives), the
+    /// registry's pack and manifest; its inputs the five a verdict binds.
+    pub(super) fn publish(&self, request: &PrimaryRequest<'_>) -> Result<GateJob, String> {
+        let scenarios = request.scenarios;
+        let controller = super::inputs::controller_of(scenarios)
+            .ok_or_else(|| format!("{} has no controller above it", scenarios.display()))?;
+        let controller_commit = super::inputs::controller_commit(&controller).ok_or_else(|| {
+            format!(
+                "{} names no controller commit: a node could not say what it judged",
+                controller.join(".controller").display()
+            )
+        })?;
+        let scenarios_at = scenarios
+            .strip_prefix(&controller)
+            .map_err(|_| format!("{} is not inside its controller", scenarios.display()))?
+            .to_path_buf();
+        let registry = self.registry()?;
+        std::fs::create_dir_all(&self.work)
+            .map_err(|error| format!("{}: {error}", self.work.display()))?;
+        let snapshot = self.work.join(unique(&format!("task-{}", request.task)));
+        let copied = ran(
+            Command::new("cp")
+                .arg("-R")
+                .arg("--")
+                .arg(scenarios)
+                .arg(&snapshot),
+            "cp",
+        );
+        if let Err(error) = copied {
+            super::shadow::remove_tree(&snapshot);
+            return Err(format!("cannot copy {}: {error}", scenarios.display()));
+        }
+        let scenarios_sha256 = super::inputs::scenarios_sha256(&snapshot);
+        let pack = self.artifacts.controller_pack(
+            &controller,
+            &snapshot,
+            &scenarios_at,
+            scenarios_sha256
+                .as_deref()
+                .map(|digest| format!("{controller_commit}-{digest}"))
+                .as_deref(),
+        );
+        super::shadow::remove_tree(&snapshot);
+        let pack = pack?;
+        let scenarios_sha256 = scenarios_sha256
+            .ok_or_else(|| format!("{} cannot be read whole", scenarios.display()))?;
+        let delta = self
+            .artifacts
+            .delta_bundle(request.repo, request.base, request.candidate)?;
+        let baseline = self.artifacts.baseline_bundle(request.repo, request.base)?;
+        let inputs = json!({
+            "base": request.base,
+            "candidate": request.candidate,
+            "controller": controller_commit,
+            "scenarios_sha256": scenarios_sha256,
+            "scenario": request
+                .scenario
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().to_string()),
+        });
+        let requires = self.requires_of(&controller, registry.registry)?;
+        let repo = request
+            .repo
+            .file_name()
+            .map(|name| name.to_string_lossy().trim_end_matches(".git").to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "repo".to_string());
+        Ok(GateJob {
+            kind: RemoteJobKind::Gate,
+            job_id: job_id("gate", request.candidate),
+            judging_id: request.judging_id.clone(),
+            task_id: Some(request.task),
+            repo,
+            inputs,
+            env: grant_env(request.gate_env),
+            artifacts: vec![
+                delta.url(ArtifactRole::DeltaBundle),
+                baseline.url(ArtifactRole::BaselineBundle),
+                pack.url(ArtifactRole::ControllerPack),
+            ],
+            requires,
+        })
+    }
+
+    /// Judge `request` on a node: publish and queue its job, then follow it
+    /// ([`Self::follow`]). `stopped` says whether the judging was stopped.
+    pub(super) fn judge(
+        &self,
+        store: &PostgresStore,
+        request: &PrimaryRequest<'_>,
+        stopped: &dyn Fn() -> bool,
+    ) -> PrimaryOutcome {
+        let task = request.task;
+        let job = match self.publish(request) {
+            Ok(job) => job,
+            Err(error) => {
+                return PrimaryOutcome::Local {
+                    why: format!("not queued for a node: {error}"),
+                };
+            }
+        };
+        let job_id = match enqueue(store, &job) {
+            Ok(job_id) => job_id,
+            Err(error) => {
+                return PrimaryOutcome::Local {
+                    why: format!("not queued for a node: {error}"),
+                };
+            }
+        };
+        println!(
+            "integrate: task {task}: its gate queued for a node as {job_id} (a lease within {} s)",
+            self.settings.queue_wait.as_secs()
+        );
+        self.follow(store, task, &job_id, &job.inputs, stopped)
+    }
+
+    /// Follow queued job `job_id` (granted `given`) to its end: a job no
+    /// node leased within the queue wait is taken back and judged here
+    /// (only when the take-back wins: a node granted it meanwhile keeps
+    /// it, and its result is waited for); a lease fenced back to the queue
+    /// gets a whole wait again; a completed run is judged ([`Self::completed`]).
+    /// The nodes' sweep is the integrator pass's own, never run here.
+    pub(super) fn follow(
+        &self,
+        store: &PostgresStore,
+        task: i64,
+        job_id: &str,
+        given: &Value,
+        stopped: &dyn Fn() -> bool,
+    ) -> PrimaryOutcome {
+        let started = Instant::now();
+        let mut since = Instant::now();
+        let mut failures = 0u32;
+        loop {
+            if stopped() {
+                Self::abandon(store, job_id);
+                return PrimaryOutcome::Stopped;
+            }
+            if started.elapsed() >= self.settings.limit {
+                Self::abandon(store, job_id);
+                return PrimaryOutcome::Local {
+                    why: format!(
+                        "no node's result for {job_id} within {} s",
+                        self.settings.limit.as_secs()
+                    ),
+                };
+            }
+            let looked = store
+                .remote_job(job_id)
+                .map_err(|error| error.to_string())
+                .and_then(|row| match row {
+                    Some(row) => look(store, &row, since, self.settings.queue_wait)
+                        .map(|looked| Some((looked, row))),
+                    None => Ok(None),
+                });
+            let (looked, row) = match looked {
+                Ok(Some(looked)) => {
+                    failures = 0;
+                    looked
+                }
+                Ok(None) => {
+                    return PrimaryOutcome::Local {
+                        why: format!("{job_id} is gone from the ledger"),
+                    };
+                }
+                Err(error) => {
+                    failures += 1;
+                    eprintln!("integrate: task {task}'s node gate {job_id}: {error}");
+                    if failures >= PRIMARY_READ_FAILURES {
+                        Self::abandon(store, job_id);
+                        return PrimaryOutcome::Local {
+                            why: format!("the ledger cannot be read: {error}"),
+                        };
+                    }
+                    std::thread::sleep(self.settings.every);
+                    continue;
+                }
+            };
+            match looked {
+                Look::Queued => std::thread::sleep(self.settings.every),
+                Look::Leased(_) => {
+                    since = Instant::now();
+                    std::thread::sleep(self.settings.every);
+                }
+                Look::Raced => {
+                    println!(
+                        "integrate: task {task}'s node gate {job_id}: a node leased it as it \
+                         was taken back; its result is waited for"
+                    );
+                    since = Instant::now();
+                }
+                Look::TakenLocal => {
+                    return PrimaryOutcome::Local {
+                        why: format!(
+                            "no node leased {job_id} within {} s: taken back (fallback_local)",
+                            self.settings.queue_wait.as_secs()
+                        ),
+                    };
+                }
+                Look::Completed => match self.completed(store, task, &row, given) {
+                    Settled::Believed(outcome) => return outcome,
+                    Settled::Requeued => since = Instant::now(),
+                    Settled::Local(why) => return PrimaryOutcome::Local { why },
+                },
+                Look::Ended(state) => {
+                    return PrimaryOutcome::Local {
+                        why: format!("{job_id} ended {state:?}"),
+                    };
+                }
+            }
+        }
+    }
+
+    /// A job this judging no longer waits for: taken back while still
+    /// queued, so no node runs it for nothing (a node that won the race
+    /// keeps it, and its result is never read).
+    fn abandon(store: &PostgresStore, job_id: &str) {
+        if let Ok(Some(row)) = store.remote_job(job_id)
+            && row.state == RemoteJobState::Queued
+        {
+            let _ = store.remote_job_take_local(job_id, row.lease_epoch);
+        }
+    }
+
+    /// A completed run of `row`: its stored result judged (§6.2). A verdict
+    /// on the job's own inputs is believed by M3a or M3b; a rejection M3a
+    /// does not believe is a valid run, judged again here; anything else
+    /// is settled on the ledger (strike, exclusion, poison pill) and
+    /// either waits for another node or is judged here.
+    pub(super) fn completed(
+        &self,
+        store: &PostgresStore,
+        task: i64,
+        row: &RemoteJob,
+        given: &Value,
+    ) -> Settled {
+        let job_id = &row.job_id;
+        let stored = match read_stored(&self.settings.results, job_id, row.lease_epoch) {
+            Ok(stored) => stored,
+            Err(error) => {
+                let unread = Judged::unreadable(error.clone());
+                if let Err(error) = settle(store, row, &unread) {
+                    eprintln!("integrate: task {task}'s node gate {job_id}: {error}");
+                }
+                return Settled::Local(format!("{job_id}'s result cannot be read: {error}"));
+            }
+        };
+        let judged = judge_stored(&stored, given);
+        let node = node_name_of(store, row, &stored);
+        if let Some(verdict) = judged.verdict.clone() {
+            let word = if verdict.accepted {
+                "accepted"
+            } else {
+                "rejected"
+            };
+            return match belief(&judged, self.settings.believe_reject) {
+                Some(rule) => {
+                    println!(
+                        "integrate: task {task}: node {node}'s verdict on {job_id} believed \
+                         ({rule}): {word}"
+                    );
+                    Settled::Believed(PrimaryOutcome::Believed(Box::new(Believed {
+                        job_id: job_id.clone(),
+                        env: node_env(&stored, &node),
+                        given: given.clone(),
+                        verdict,
+                        belief: rule,
+                    })))
+                }
+                None => Settled::Local(format!(
+                    "node {node} rejected it on {job_id}, a valid run (M3a believes only an \
+                     acceptance): judged again here"
+                )),
+            };
+        }
+        let settled = settle(store, row, &judged);
+        match &settled {
+            Ok(Some(outcome)) => println!(
+                "integrate: task {task}'s node gate {job_id} on {node}: {} ({}): strike {}, \
+                 next {:?}{}",
+                judged.evidence,
+                judged.reason,
+                judged.strike,
+                outcome.next,
+                if outcome.poison == Some(true) {
+                    ", the job is the poison"
+                } else {
+                    ""
+                }
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "integrate: task {task}'s node gate {job_id}: its fault not judged: {error}"
+            ),
+        }
+        match settled {
+            Ok(Some(outcome)) if outcome.ok && outcome.next == Some(FaultNext::Queued) => {
+                Settled::Requeued
+            }
+            _ => Settled::Local(format!(
+                "node {node} gave no verdict to believe on {job_id}: {} ({})",
+                judged.evidence, judged.reason
+            )),
+        }
+    }
+
+    /// Take back every queued `gate` job no judging of this integrator
+    /// waits for (a predecessor's, left by a restart): nobody would read
+    /// its result. A node that won the race keeps it. Run before any
+    /// judging of this integrator starts.
+    pub(super) fn reclaim_orphans(store: &PostgresStore) {
+        let queued = match store.remote_jobs_queued(RemoteJobKind::Gate) {
+            Ok(queued) => queued,
+            Err(error) => {
+                eprintln!("integrate: the queued node gates not read: {error}");
+                return;
+            }
+        };
+        for orphan in queued {
+            match store.remote_job_take_local(&orphan.job_id, orphan.lease_epoch) {
+                Ok(true) => println!(
+                    "integrate: node gate {} (task {:?}) queued by an earlier integrator: taken \
+                     back",
+                    orphan.job_id, orphan.task_id
+                ),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "integrate: node gate {} not taken back: {error}",
+                    orphan.job_id
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
