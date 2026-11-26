@@ -946,3 +946,214 @@ fn each_login_holds_exactly_its_grants_and_no_more() {
         .get(0);
     assert_eq!(left, 0, "the database and its logins are dropped");
 }
+
+const HUMAN_ALLOWED_SIGNATURES: [&str; 5] = [
+    "spawn_human_input(text, text, text)",
+    "spawn_human_key(text, text, text)",
+    "spawn_human_master_message(text, text, text)",
+    "spawn_human_task(text, text, text, text)",
+    "spawn_human_resume(bigint, bigint, text)",
+];
+
+const ALL_HUMAN_SIGNATURES: [&str; 6] = [
+    "spawn_human_replay(bigint, text, text, jsonb)",
+    "spawn_human_input(text, text, text)",
+    "spawn_human_key(text, text, text)",
+    "spawn_human_master_message(text, text, text)",
+    "spawn_human_task(text, text, text, text)",
+    "spawn_human_resume(bigint, bigint, text)",
+];
+
+const OWNER_ONLY_SIGNATURES: [&str; 6] = [
+    "spawn_human_replay(bigint, text, text, jsonb)",
+    "spawn_control_record(jsonb)",
+    "spawn_control_apply(jsonb, bigint, bigint)",
+    "spawn_control_refold()",
+    "spawn_finish(bigint, integer, boolean, text)",
+    "spawn_alert_record(jsonb)",
+];
+
+const OWNER_ONLY_CALLS: [&str; 6] = [
+    "select spawn_human_replay(1, 'k', 's', '{}'::jsonb)",
+    "select spawn_control_record('{\"type\":\"noop\"}'::jsonb)",
+    "select spawn_control_apply('{\"type\":\"noop\"}'::jsonb, 0, 1)",
+    "select spawn_control_refold()",
+    "select spawn_finish(1, 1, true, null)",
+    "select spawn_alert_record('{\"type\":\"alert.fired\"}'::jsonb)",
+];
+
+const READER_WRITE_LOCKED_TABLES: [&str; 3] = ["spawn_events", "mission_tasks", "grading_presets"];
+
+fn assert_catalog_function_matrix(
+    owner: &mut Client,
+    role: &str,
+    allowed: &[&str],
+    denied: &[&str],
+) {
+    for sig in allowed {
+        let can_exec: bool = owner
+            .query_one(
+                "select has_function_privilege($1::text, $2::text, 'execute')",
+                &[&role, sig],
+            )
+            .expect("has_function_privilege")
+            .get(0);
+        assert!(can_exec, "{role} must hold EXECUTE on {sig}");
+    }
+    for sig in denied {
+        let can_exec: bool = owner
+            .query_one(
+                "select has_function_privilege($1::text, $2::text, 'execute')",
+                &[&role, sig],
+            )
+            .expect("has_function_privilege")
+            .get(0);
+        assert!(!can_exec, "{role} must NOT hold EXECUTE on {sig}");
+    }
+}
+
+fn assert_live_calls_insufficient_privilege(client: &mut Client, calls: &[&str], label: &str) {
+    for sql in calls {
+        let err = client
+            .batch_execute(sql)
+            .expect_err(&format!("{label} must fail with 42501 on: {sql}"));
+        assert_eq!(
+            err.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{label} unexpected error on {sql}: {err}"
+        );
+    }
+}
+
+fn assert_human_live_entrypoints(human: &mut Client) {
+    let input_res: Option<i64> = human
+        .query_one(
+            "select spawn_human_input('session_missing_contract', 'contract-input-1', 'hello')",
+            &[],
+        )
+        .expect("spawn_human executes spawn_human_input")
+        .get(0);
+    assert_eq!(input_res, None);
+
+    let key_res: Option<i64> = human
+        .query_one(
+            "select spawn_human_key('session_missing_contract', 'contract-key-1', 'enter')",
+            &[],
+        )
+        .expect("spawn_human executes spawn_human_key")
+        .get(0);
+    assert_eq!(key_res, None);
+
+    for (sql, expected_state) in [
+        (
+            "select spawn_human_master_message('contract-master-1', '   ', 'auto')",
+            postgres::error::SqlState::INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "select spawn_human_task('session_missing_contract', 'restart', 'contract check', 'contract-task-1')",
+            postgres::error::SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        ),
+        (
+            "select spawn_human_resume(999999, 999999, 'contract-resume-1')",
+            postgres::error::SqlState::NO_DATA_FOUND,
+        ),
+    ] {
+        let err = human
+            .query_one(sql, &[])
+            .expect_err(&format!("expected domain validation inside {sql}"));
+        assert_ne!(
+            err.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "spawn_human was blocked by privilege check on {sql}: {err}"
+        );
+        assert_eq!(
+            err.code(),
+            Some(&expected_state),
+            "unexpected SQLSTATE inside {sql}: {err}"
+        );
+    }
+}
+
+fn assert_reader_table_writes_denied(owner: &mut Client, reader: &mut Client, reader_role: &str) {
+    for table in READER_WRITE_LOCKED_TABLES {
+        for privilege in ["INSERT", "UPDATE", "DELETE"] {
+            let allowed: bool = owner
+                .query_one(
+                    "select has_table_privilege($1::text, $2::text, $3::text)",
+                    &[&reader_role, &table, &privilege],
+                )
+                .expect("has_table_privilege")
+                .get(0);
+            assert!(
+                !allowed,
+                "{reader_role} must NOT have {privilege} privilege on {table}"
+            );
+        }
+    }
+
+    let dml_probes = [
+        "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms) \
+         values ('a', 's', 'test', '{}'::jsonb, 1, 0)",
+        "update spawn_events set session_seq = session_seq where false",
+        "delete from spawn_events where false",
+        "insert into mission_tasks (mission_id, kind, agent_id, session_id, brief, state, created_by, created_at_ms, updated_at_ms) \
+         values (1, 'ephemeral', 'a', 's', 'b', 'assigned', 'test', 0, 0)",
+        "update mission_tasks set state = state where false",
+        "delete from mission_tasks where false",
+        "insert into grading_presets (preset_id, engine_label, model_label, model_profile, cost_rank, state, window_start_ms, created_at_ms, updated_at_ms, last_event) \
+         values ('p', 'e', 'm', 'default', 0, 'active', 0, 0, 0, 1)",
+        "update grading_presets set state = state where false",
+        "delete from grading_presets where false",
+    ];
+    assert_live_calls_insufficient_privilege(reader, &dml_probes, "spawn_reader DML");
+}
+
+/// Issue #98 Item 2: explicit least-privilege matrix for `spawn_human` and
+/// `spawn_reader` verified both via catalog privileges and live sessions.
+#[test]
+fn human_and_reader_least_privilege_contract_matrix() {
+    let (store_guard, schema) = store("roles_least_privilege");
+    let mut owner = admin(&schema);
+    let human_role = common::login(&schema, "spawn_human");
+    let reader_role = common::login(&schema, "spawn_reader");
+
+    assert_catalog_function_matrix(
+        &mut owner,
+        &human_role,
+        &HUMAN_ALLOWED_SIGNATURES,
+        &OWNER_ONLY_SIGNATURES,
+    );
+
+    let mut reader_denied: Vec<&str> = Vec::with_capacity(ALL_HUMAN_SIGNATURES.len() + 4);
+    reader_denied.extend_from_slice(&ALL_HUMAN_SIGNATURES);
+    reader_denied.extend_from_slice(&[
+        "spawn_control_record(jsonb)",
+        "spawn_control_apply(jsonb, bigint, bigint)",
+        "spawn_control_refold()",
+        "spawn_finish(bigint, integer, boolean, text)",
+        "spawn_alert_record(jsonb)",
+    ]);
+    assert_catalog_function_matrix(&mut owner, &reader_role, &[], &reader_denied);
+
+    let mut human = common::as_login(&schema, "spawn_human");
+    assert_human_live_entrypoints(&mut human);
+    assert_live_calls_insufficient_privilege(&mut human, &OWNER_ONLY_CALLS, "spawn_human");
+    drop(human);
+
+    let mut reader = common::as_login(&schema, "spawn_reader");
+    let reader_human_calls = [
+        "select spawn_human_input('s', 'k', 'hi')",
+        "select spawn_human_key('s', 'k', 'enter')",
+        "select spawn_human_master_message('k', 'hi', 'auto')",
+        "select spawn_human_task('s', 'restart', 'r', 'k')",
+        "select spawn_human_resume(1, 1, 'k')",
+    ];
+    assert_live_calls_insufficient_privilege(&mut reader, &reader_human_calls, "spawn_reader");
+    assert_live_calls_insufficient_privilege(&mut reader, &OWNER_ONLY_CALLS, "spawn_reader");
+    assert_reader_table_writes_denied(&mut owner, &mut reader, &reader_role);
+
+    drop(reader);
+    drop(owner);
+    drop(store_guard);
+    drop(schema);
+}
