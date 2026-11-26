@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 # The wire: envelope, response signature, refusals, bodies, grants.
+spawn-cas.workspace = true
+spawn-core.workspace = true
 spawn-node-proto.workspace = true
 # The four spawn_node_gw_* calls, verify-then-commit.
 spawn-postgres.workspace = true

@@ -63,8 +63,9 @@
 //!
 //! A person may also restart or reassign a stalled worker from its agent
 //! page: `POST /api/sessions/<id>/restart` and `POST
-//! /api/sessions/<id>/reassign` with `{"reason": "..."}` (at most
-//! [`MAX_REASON`] bytes, no control character), through `spawn_human_task`
+//! /api/sessions/<id>/reassign` with `{"reason": "...", "key": "<idempotency key>"}`
+//! (the key may come in an `Idempotency-Key` header; optional reason of at
+//! most [`MAX_REASON`] bytes, no control character), through `spawn_human_task`
 //! (the `spawn_human` login's third function), with the input's guards. The
 //! session's delivered task is restarted (`task.restarted`, the dispatcher
 //! stops the running execution and resumes its native session) or reassigned
@@ -1548,13 +1549,15 @@ fn moved(
         .map_err(|error| error.to_string())
 }
 
-/// The body of `POST /api/sessions/<id>/restart` and `/reassign`: why, and
-/// nothing else.
+/// The body of `POST /api/sessions/<id>/restart` and `/reassign`: why and the
+/// idempotency key (`key`, or the `Idempotency-Key` header).
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MoveBody {
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 /// Longest reason a person gives for a restart or a reassign, in bytes
@@ -1563,9 +1566,10 @@ const MAX_REASON: usize = 2000;
 
 /// The checks of a person's restart or reassign after its method, then the
 /// record: `(202, {task, session_id, agent_id, principal})` of the task and
-/// worker that now carry the work, or `(status, why)` when refused. A
-/// session that holds no delivered task is 409 with the store's reason, and
-/// nothing is recorded.
+/// worker that now carry the work (replaying the same answer when the same
+/// key is sent again with the same session, action and reason), or
+/// `(status, why)` when refused (409 when no delivered task or the key was
+/// already used for another move).
 fn move_task(
     request: &mut Request,
     id: &str,
@@ -1578,10 +1582,11 @@ fn move_task(
     } else {
         "a reassign"
     };
-    let (body, _) = write_body(request, access, shared, what)?;
+    let (body, header_key) = write_body(request, access, shared, what)?;
     let body: MoveBody = serde_json::from_slice(&body)
         .map_err(|error| (400, format!("{BAD_REQUEST}the body is not {what}: {error}")))?;
     let session = session_id(id).map_err(|error| (400, error))?;
+    let key = idempotency(body.key, header_key, what)?;
     let reason = body
         .reason
         .map(|reason| reason.trim().to_string())
@@ -1604,7 +1609,7 @@ fn move_task(
         }
     }
     let store = writer(shared).map_err(|error| (500, error))?;
-    match store.human_task(&session, action, reason.as_deref()) {
+    match store.human_task(&session, action, reason.as_deref(), &key) {
         Ok(spawn_postgres::HumanTask::Moved(mut moved)) => {
             if let Some(fields) = moved.as_object_mut() {
                 fields.insert("principal".to_string(), json!("human"));
@@ -4024,9 +4029,10 @@ mod tests {
     }
 
     /// The restart and reassign paths have the input's guards (POST only,
-    /// the page's Origin without the token, JSON), and a body of a reason
-    /// alone, at most 2000 bytes with no control character. Past every
-    /// guard each reaches the database (here none: 500).
+    /// the page's Origin without the token, JSON), an idempotency key (via
+    /// `"key"` and/or `Idempotency-Key` header, matching when both), and an
+    /// optional reason of at most 2000 bytes with no control character. Past
+    /// every guard each reaches the database (here none: 500).
     #[test]
     fn the_restart_and_reassign_paths_have_the_inputs_guards_and_a_reason_alone() {
         for path in [
@@ -4043,7 +4049,7 @@ mod tests {
                 ),
             );
             refused(&get, 405, "GET");
-            let body = r#"{"reason":"stalled on a hung tool"}"#;
+            let body = r#"{"reason":"stalled on a hung tool","key":"move-1"}"#;
             let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
             refused(
                 &post(None, "", None, path, named, body),
@@ -4057,19 +4063,48 @@ mod tests {
                 415,
                 "not JSON",
             );
-            let long = format!(r#"{{"reason":"{}"}}"#, "x".repeat(2001));
+            let long = format!(r#"{{"reason":"{}","key":"k"}}"#, "x".repeat(2001));
+            let long_key = format!(r#"{{"reason":"x","key":"{}"}}"#, "k".repeat(257));
             for (bad, why) in [
                 ("not json", "not JSON"),
-                (r#"{"reason":"x","task":7}"#, "a task"),
-                (r#"{"reason":"x","type":"stop"}"#, "an action type"),
-                (r#"{"reason":"a\u001bb"}"#, "a control character"),
+                (r#"{"reason":"stalled on a hung tool"}"#, "missing key"),
+                (r#"{"reason":"x","key":""}"#, "empty key"),
+                (r#"{"reason":"x","key":"k\u0007"}"#, "control char in key"),
+                (long_key.as_str(), "key too long"),
+                (r#"{"reason":"x","key":"k","task":7}"#, "a task"),
+                (
+                    r#"{"reason":"x","key":"k","type":"stop"}"#,
+                    "an action type",
+                ),
+                (r#"{"reason":"a\u001bb","key":"k"}"#, "a control character"),
                 (long.as_str(), "too long"),
             ] {
                 refused(&post(Some("secret"), "", None, path, SCRIPT, bad), 400, why);
             }
+            let with_other_header = format!("{SCRIPT}Idempotency-Key: other-key\r\n");
+            refused(
+                &post(Some("secret"), "", None, path, &with_other_header, body),
+                400,
+                "mismatched body key and Idempotency-Key header",
+            );
             let reached = post(Some("secret"), "", None, path, SCRIPT, body);
             assert_eq!(reached.status, 500, "{reached:?}");
             assert_eq!(reached.body["error"], "SPAWN_DATABASE_URL is not set");
+
+            let with_same_header = format!("{SCRIPT}Idempotency-Key: move-1\r\n");
+            let reached_both = post(Some("secret"), "", None, path, &with_same_header, body);
+            assert_eq!(reached_both.status, 500, "{reached_both:?}");
+
+            let header_only = format!("{SCRIPT}Idempotency-Key: header-move-1\r\n");
+            let reached_header = post(
+                Some("secret"),
+                "",
+                None,
+                path,
+                &header_only,
+                r#"{"reason":"stalled"}"#,
+            );
+            assert_eq!(reached_header.status, 500, "{reached_header:?}");
         }
     }
 

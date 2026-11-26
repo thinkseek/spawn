@@ -132,6 +132,7 @@ pub use remote_jobs::{
     Committed, FaultNext, FaultOutcome, NodeAction, NodeEnroll, NodeV1, RemoteJob, RemoteJobKind,
     RemoteJobSpec, RemoteJobState, SweepOutcome,
 };
+pub use row::RETIRED_EVENTS;
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };

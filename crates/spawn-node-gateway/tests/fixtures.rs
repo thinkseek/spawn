@@ -436,7 +436,7 @@ fn artifact_misses_and_the_registry_manifest() {
 }
 
 fn write_manifest(harness: &Harness) {
-    let digest = spawn_node_proto::ContentDigest::sha256_of(b"pack");
+    let digest = spawn_cas::sha256_of(b"pack");
     std::fs::write(
         harness.artifacts.join("registry-manifest.json"),
         format!(
@@ -702,16 +702,16 @@ fn every_answer_says_no_store_no_transform() {
 
     // An artifact, whole and by range.
     let content = b"artifact bytes".repeat(10);
-    let digest = spawn_node_proto::ContentDigest::sha256_of(&content);
-    let dir = harness.artifacts.join("sha256").join(&digest.hex[..2]);
+    let digest = spawn_cas::sha256_of(&content);
+    let dir = harness.artifacts.join("sha256").join(digest.shard());
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join(&digest.hex), &content).unwrap();
-    let whole = harness.get(&signer, &digest.artifact_path(), 3, &[]);
+    std::fs::write(dir.join(digest.hex()), &content).unwrap();
+    let whole = harness.get(&signer, &spawn_node_proto::artifact_path(&digest), 3, &[]);
     assert_eq!(whole.status, 200);
     assert_eq!(whole.header("Cache-Control"), expected, "artifact 200");
     let part = harness.get(
         &signer,
-        &digest.artifact_path(),
+        &spawn_node_proto::artifact_path(&digest),
         4,
         &[("Range".into(), "bytes=0-3".into())],
     );

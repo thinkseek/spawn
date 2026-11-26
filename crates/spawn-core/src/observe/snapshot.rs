@@ -164,9 +164,6 @@ impl Snapshot {
                 self.last_error = Some(error.clone());
                 self.open_tools.clear();
             }
-            EventKind::NotificationReceived { notification_type } => {
-                self.permission_pending = notification_type.contains("permission");
-            }
             EventKind::ScreenObserved { state, .. } => {
                 self.screen = Some(*state);
                 self.screen_at = Some(record.recorded_at);

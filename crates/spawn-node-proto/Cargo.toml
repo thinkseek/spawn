@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+spawn-cas.workspace = true
+spawn-core.workspace = true
 # Ed25519 sign/verify (ring is already linked by the node mesh).
 ring.workspace = true
 sha2.workspace = true

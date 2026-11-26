@@ -723,13 +723,12 @@ impl Gateway {
     /// required; the body unsigned (its address verifies it).
     fn artifact(&self, request: &Request<'_>, checked: &Checked<'_>) -> Flow {
         let miss = |miss: Miss| match miss {
-            Miss::Unsupported => BAD,
             Miss::NotFound => Answer::NotFound,
         };
         let Verb::Artifact(digest) = &checked.verb else {
             return Err(BAD);
         };
-        let path = artifacts::artifact_path(&self.artifacts, digest).map_err(miss)?;
+        let path = artifacts::artifact_path(&self.artifacts, digest);
         self.require_cached(checked)?;
         artifacts::serve(&path, request.header("Range")).map_err(miss)
     }

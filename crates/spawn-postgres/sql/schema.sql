@@ -4480,7 +4480,8 @@ end $$;
 -- Stop: its final checkpoint kept) and, once its end is recorded, resumes
 -- the same native session (`restart-<task>-<n>`). The recovery records that
 -- end `restarted`, `final`.
-create or replace function spawn_task_restart_as(p_task bigint, p_reason text, p_by text)
+drop function if exists spawn_task_restart_as(bigint, text, text);
+create or replace function spawn_task_restart_as(p_task bigint, p_reason text, p_by text, p_key text default null)
 returns jsonb language plpgsql security definer as $$
 declare
     v_task mission_tasks%rowtype;
@@ -4505,10 +4506,12 @@ begin
      where e.session_id = 'session_control' and e.event_name = 'control.recorded'
        and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.restarted'
        and e.kind -> 'detail' -> 'record' ->> 'task' = p_task::text;
-    perform spawn_control_record(jsonb_build_object(
-        'type', 'task.restarted', 'task', p_task, 'session_id', v_task.session_id,
-        'agent_id', v_task.agent_id, 'execution_id', v_execution, 'by', p_by,
-        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'n', v_n));
+    perform spawn_control_record(
+        jsonb_build_object(
+            'type', 'task.restarted', 'task', p_task, 'session_id', v_task.session_id,
+            'agent_id', v_task.agent_id, 'execution_id', v_execution, 'by', p_by,
+            'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'n', v_n)
+        || case when p_key is not null then jsonb_build_object('key', p_key) else '{}'::jsonb end);
     return jsonb_build_object('task', p_task, 'session_id', v_task.session_id,
                               'agent_id', v_task.agent_id);
 end $$;
@@ -4522,7 +4525,8 @@ end $$;
 -- label). The dispatcher stops the old worker (`reassign-<task>-stop`, its
 -- final checkpoint kept), delivers the new task once it has ended, and its
 -- branch starts from the old worker's last checkpoint (OBJECTIVE_FORK).
-create or replace function spawn_task_reassign_as(p_task bigint, p_reason text, p_by text)
+drop function if exists spawn_task_reassign_as(bigint, text, text);
+create or replace function spawn_task_reassign_as(p_task bigint, p_reason text, p_by text, p_key text default null)
 returns jsonb language plpgsql security definer as $$
 declare
     v_old mission_tasks%rowtype;
@@ -4558,7 +4562,8 @@ begin
     v_session := format('session_worker_%s_%s', v_label, v_id);
     perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
         'type', 'task.cancelled', 'id', p_task, 'by', p_by,
-        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'reassigned_as', v_id)));
+        'reason', nullif(btrim(coalesce(p_reason, '')), ''), 'reassigned_as', v_id,
+        'key', p_key)));
     perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
         'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
         'kind', 'ephemeral', 'agent_id', v_agent, 'session_id', v_session,
@@ -4599,10 +4604,15 @@ end $$;
 -- `spawn_human` login may call it, beside `spawn_human_input` and
 -- `spawn_human_key`; it may call no other mission function. `p_action` is
 -- `restart` or `reassign`; the reason is at most 2000 bytes.
-create or replace function spawn_human_task(p_session text, p_action text, p_reason text)
+drop function if exists spawn_human_task(text, text, text);
+create or replace function spawn_human_task(p_session text, p_action text, p_reason text, p_key text)
 returns jsonb language plpgsql security definer as $$
 declare
     v_task bigint;
+    v_first record;
+    v_norm_reason text;
+    v_old_session text;
+    v_new record;
 begin
     if spawn_principal() is distinct from 'human' then
         raise exception '% may not restart or reassign as a person (only the spawn_human login does)',
@@ -4616,6 +4626,56 @@ begin
         raise exception 'a reason is at most 2000 bytes, not %', octet_length(p_reason)
             using errcode = '22023';
     end if;
+    if coalesce(p_key, '') = '' or octet_length(p_key) > 256 or p_key ~ '[[:cntrl:]]' then
+        raise exception 'a restart or reassign needs an idempotency key of 1 to 256 bytes, no control character'
+            using errcode = '22023';
+    end if;
+    v_norm_reason := nullif(btrim(coalesce(p_reason, '')), '');
+    -- Check and record under the append lock, so no other change interleaves
+    -- (two first uses of one key that race are one move).
+    perform pg_advisory_xact_lock(1399957335);
+    select e.id, e.kind -> 'detail' -> 'record' as r into v_first
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'by' = 'human'
+       and e.kind -> 'detail' -> 'record' ->> 'key' = p_key
+       and (
+           e.kind -> 'detail' -> 'record' ->> 'type' = 'task.restarted'
+           or (
+               e.kind -> 'detail' -> 'record' ->> 'type' = 'task.cancelled'
+               and e.kind -> 'detail' -> 'record' ? 'reassigned_as'
+           )
+       )
+     order by e.id limit 1;
+    if v_first.id is not null then
+        if v_first.r ->> 'type' = 'task.restarted' then
+            if p_action <> 'restart'
+               or v_first.r ->> 'session_id' is distinct from p_session
+               or (v_first.r ->> 'reason') is distinct from v_norm_reason then
+                raise exception 'idempotency key % was already used for another restart or reassign: send this one with a new key',
+                    quote_literal(p_key) using errcode = '23505';
+            end if;
+            return jsonb_build_object(
+                'task', (v_first.r ->> 'task')::bigint,
+                'session_id', v_first.r ->> 'session_id',
+                'agent_id', v_first.r ->> 'agent_id');
+        else
+            select t.session_id into v_old_session
+              from mission_tasks t where t.id = (v_first.r ->> 'id')::bigint;
+            select t.id, t.session_id, t.agent_id into v_new
+              from mission_tasks t where t.id = (v_first.r ->> 'reassigned_as')::bigint;
+            if p_action <> 'reassign'
+               or v_old_session is distinct from p_session
+               or (v_first.r ->> 'reason') is distinct from v_norm_reason then
+                raise exception 'idempotency key % was already used for another restart or reassign: send this one with a new key',
+                    quote_literal(p_key) using errcode = '23505';
+            end if;
+            return jsonb_build_object(
+                'task', v_new.id,
+                'session_id', v_new.session_id,
+                'agent_id', v_new.agent_id);
+        end if;
+    end if;
     select k.id into v_task from mission_tasks k
      where k.session_id = p_session and k.state = 'delivered'
      order by k.id desc limit 1;
@@ -4624,17 +4684,17 @@ begin
             using errcode = '55000';
     end if;
     if p_action = 'restart' then
-        return spawn_task_restart_as(v_task, p_reason, 'human');
+        return spawn_task_restart_as(v_task, p_reason, 'human', p_key);
     end if;
-    return spawn_task_reassign_as(v_task, p_reason, 'human');
+    return spawn_task_reassign_as(v_task, p_reason, 'human', p_key);
 end $$;
 
 do $$
 begin
-    execute format('alter function spawn_human_task(text, text, text) set search_path = %I, pg_temp',
+    execute format('alter function spawn_human_task(text, text, text, text) set search_path = %I, pg_temp',
                    current_schema());
-    execute 'revoke execute on function spawn_human_task(text, text, text) from public';
-    execute format('grant execute on function spawn_human_task(text, text, text) to %I',
+    execute 'revoke execute on function spawn_human_task(text, text, text, text) from public';
+    execute format('grant execute on function spawn_human_task(text, text, text, text) to %I',
                    spawn_login_role('spawn_human'));
 end
 $$;
@@ -9173,7 +9233,7 @@ begin
         'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
         'spawn_task_restart(bigint, text)', 'spawn_task_reassign(bigint, text)',
-        'spawn_task_restart_as(bigint, text, text)', 'spawn_task_reassign_as(bigint, text, text)',
+        'spawn_task_restart_as(bigint, text, text, text)', 'spawn_task_reassign_as(bigint, text, text, text)',
         'spawn_resident_propose(text, text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_steal(bigint, text, text, text)', 'spawn_cancel_notice_untold(text)',

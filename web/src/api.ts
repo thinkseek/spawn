@@ -490,16 +490,18 @@ export async function postKey(
   return postWrite(sessionId, "key", body, signal);
 }
 
-/** `POST /api/sessions/<id>/restart` or `/reassign` with `{reason}`: a
+/** `POST /api/sessions/<id>/restart` or `/reassign` with `{reason, key}`: a
  * person restarts the session's delivered task (a fresh execution of its
  * own session, its work kept) or reassigns it to a fresh worker whose
  * branch starts from this one's work. 202 with `{task, session_id,
- * agent_id, principal}`, the task and worker that now carry the work; 409
- * with the reason when the session holds no delivered task. */
+ * agent_id, principal}`, the task and worker that now carry the work (and
+ * the same answer when the same key is sent again); 409 with the reason
+ * when the session holds no delivered task or the key was already used for
+ * another move. */
 export async function postTaskMove(
   sessionId: string,
   action: "restart" | "reassign",
-  body: { reason: string },
+  body: { reason: string; key: string },
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
   return postWrite(sessionId, action, body, signal);
@@ -524,7 +526,12 @@ async function postWrite(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<{ status: number | null; body: unknown }> {
-  return postJson(`/api/sessions/${encodeURIComponent(sessionId)}/${path}`, body, signal);
+  return postJson(
+    `/api/sessions/${encodeURIComponent(sessionId)}/${path}`,
+    body,
+    signal,
+    keyHeader(body),
+  );
 }
 
 /** POST `body` as JSON to `url` with the page's headers: the HTTP status,

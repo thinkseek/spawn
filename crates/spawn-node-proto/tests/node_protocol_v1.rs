@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use serde_json::Value;
+use spawn_cas::{Digest, scenarios_sha256, tree_sha256_v1};
 use spawn_node_proto::codec::{EMPTY_SHA256, b64u, hex, sha256_hex, unhex};
 use spawn_node_proto::enroll::EnrollToken;
 use spawn_node_proto::envelope::{NodeSigner, request_signing_input};
@@ -19,8 +20,8 @@ use spawn_node_proto::response::{RefusalBody, RequestId, sign_response, verify_r
 use spawn_node_proto::result::{ResultMeta, build_body};
 use spawn_node_proto::spec::{NodeSpec, spec_sha256};
 use spawn_node_proto::{
-    ContentDigest, Error, Limit, Method, PublicKey, Reaction, Refusal, SigningKey, Verb,
-    check_request, scenarios_sha256, tree_sha256_v1,
+    Error, Limit, Method, PublicKey, Reaction, Refusal, SigningKey, Verb, artifact_path,
+    check_request,
 };
 
 const BEAT_PATH: &str = "/node/v1/heartbeat";
@@ -379,8 +380,8 @@ fn p6_artifact_get_request_and_signature() {
     assert!(raw.body.is_empty());
     assert_eq!(sha256_hex(&raw.body), s(&v, "empty_sha256"));
     assert_eq!(EMPTY_SHA256, s(&v, "empty_sha256"));
-    let digest = ContentDigest::parse(s(&v, "artifact_path").rsplit('/').next().unwrap()).unwrap();
-    assert_eq!(digest.artifact_path(), s(&v, "artifact_path"));
+    let digest = Digest::parse(s(&v, "artifact_path").rsplit('/').next().unwrap()).unwrap();
+    assert_eq!(artifact_path(&digest), s(&v, "artifact_path"));
 
     let envelope = signer()
         .sign(

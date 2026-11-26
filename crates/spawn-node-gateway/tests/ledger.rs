@@ -270,7 +270,7 @@ fn results(owner: &PostgresStore, harness: &Harness) {
 
 /// Spec, and ranged artifact GETs on the cached key; the artifact's
 /// address.
-fn spec_and_artifacts(harness: &Harness) -> spawn_node_proto::ContentDigest {
+fn spec_and_artifacts(harness: &Harness) -> spawn_cas::Digest {
     let node = signer();
     // Spec: the same bytes change nothing.
     let spec = harness.post(&node, "/node/v1/spec", 8, &read("spec.json"));
@@ -281,14 +281,14 @@ fn spec_and_artifacts(harness: &Harness) -> spawn_node_proto::ContentDigest {
 
     // Range GET of an artifact on the cached key.
     let content = b"0123456789abcdef".repeat(1000);
-    let digest = spawn_node_proto::ContentDigest::sha256_of(&content);
-    let path = harness.artifacts.join("sha256").join(&digest.hex[..2]);
+    let digest = spawn_cas::sha256_of(&content);
+    let path = harness.artifacts.join("sha256").join(digest.shard());
     std::fs::create_dir_all(&path).unwrap();
-    std::fs::write(path.join(&digest.hex), &content).unwrap();
+    std::fs::write(path.join(digest.hex()), &content).unwrap();
     let calls = harness.gateway.db_calls();
     let part = harness.get(
         &node,
-        &digest.artifact_path(),
+        &spawn_node_proto::artifact_path(&digest),
         9,
         &[("Range".into(), "bytes=15990-".into())],
     );
@@ -298,8 +298,8 @@ fn spec_and_artifacts(harness: &Harness) -> spawn_node_proto::ContentDigest {
         part.header("Content-Range"),
         Some("bytes 15990-15999/16000")
     );
-    let whole = harness.get(&node, &digest.artifact_path(), 10, &[]);
-    digest.verify(&whole.body).unwrap();
+    let whole = harness.get(&node, &spawn_node_proto::artifact_path(&digest), 10, &[]);
+    spawn_cas::verify_reader(&mut whole.body.as_slice(), &digest).unwrap();
     assert_eq!(
         harness.gateway.db_calls(),
         calls,
@@ -312,7 +312,7 @@ fn spec_and_artifacts(harness: &Harness) -> spawn_node_proto::ContentDigest {
 fn replay_rollback_and_revoke(
     owner: &PostgresStore,
     harness: &Harness,
-    digest: &spawn_node_proto::ContentDigest,
+    digest: &spawn_cas::Digest,
 ) {
     let node = signer();
     // Replay: a beat seq at or below the stored one.
@@ -340,7 +340,7 @@ fn replay_rollback_and_revoke(
     beat(harness, &node, 52).assert_refused(Refusal::Revoked, 52);
     assert!(harness.gateway.keys().get(&node_id()).is_none(), "evicted");
     harness
-        .get(&node, &digest.artifact_path(), 53, &[])
+        .get(&node, &spawn_node_proto::artifact_path(digest), 53, &[])
         .assert_refused(Refusal::BeatFirst, 53);
 }
 

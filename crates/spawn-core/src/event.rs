@@ -379,12 +379,6 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         engine_version: Option<String>,
     },
-    /// A native engine session ended.
-    #[serde(rename = "session.native_ended")]
-    NativeSessionEnded {
-        /// Engine-reported reason.
-        reason: Option<String>,
-    },
     /// The session became a child of another session.
     #[serde(rename = "session.linked")]
     SessionLinked {
@@ -394,20 +388,6 @@ pub enum EventKind {
     /// A prompt reached the engine.
     #[serde(rename = "message.received")]
     MessageReceived,
-    /// Read only, in records written before main stopped being merged into
-    /// running workspaces: nothing writes it, and folds ignore it. The
-    /// Bridge typed a prompt that opened with a merge notice, telling of
-    /// the merges up to and including the event at `through`.
-    #[serde(rename = "notice.typed")]
-    NoticeTyped {
-        /// The last merge event the typed notice told of.
-        through: GlobalPosition,
-    },
-    /// Read only, like [`EventKind::NoticeTyped`]: nothing writes it, and
-    /// folds ignore it. A prompt that opened with the merge notice reached
-    /// the engine: the notice the Bridge typed last was delivered.
-    #[serde(rename = "notice.received")]
-    NoticeReceived,
     /// The Bridge typed a command's text with its marker
     /// ([`crate::bridge::message_marker`]): the command is a message whose
     /// taking the transcript says. Written after the text is staged and
@@ -441,12 +421,6 @@ pub enum EventKind {
         outcome: String,
         /// Why, required for `declined`; none for a plain `done`.
         why: Option<String>,
-    },
-    /// The engine asked for attention, for example a permission prompt.
-    #[serde(rename = "notification.received")]
-    NotificationReceived {
-        /// Engine notification type, for example `permission_prompt`.
-        notification_type: String,
     },
     /// A tool call started.
     #[serde(rename = "tool.started")]
@@ -791,20 +765,52 @@ pub enum EventKind {
     },
 }
 
+/// Every active dotted wire name emitted by [`EventKind::name`].
+pub const ACTIVE_EVENT_NAMES: &[&str] = &[
+    "session.native_started",
+    "session.linked",
+    "message.received",
+    "message.typed",
+    "message.taken",
+    "message.acted",
+    "tool.started",
+    "tool.completed",
+    "tool.failed",
+    "turn.stopped",
+    "model.usage",
+    "turn.failed",
+    "job.started",
+    "job.ended",
+    "execution.started",
+    "execution.terminal_started",
+    "execution.ended",
+    "execution.end_stalled",
+    "execution.unmounting",
+    "command.step",
+    "artifact.committed",
+    "artifact.branch_recreated",
+    "merge.conflicted",
+    "archive.failed",
+    "archive.resumed",
+    "command.accepted",
+    "command.finished",
+    "screen.observed",
+    "observation.recorded",
+    "control.recorded",
+    "node.recorded",
+    "grading.recorded",
+];
+
 impl EventKind {
     /// Stable dotted wire name.
     pub fn name(&self) -> &'static str {
         match self {
             Self::NativeSessionStarted { .. } => "session.native_started",
-            Self::NativeSessionEnded { .. } => "session.native_ended",
             Self::SessionLinked { .. } => "session.linked",
             Self::MessageReceived => "message.received",
-            Self::NoticeTyped { .. } => "notice.typed",
-            Self::NoticeReceived => "notice.received",
             Self::MessageTyped { .. } => "message.typed",
             Self::MessageTaken { .. } => "message.taken",
             Self::MessageActed { .. } => "message.acted",
-            Self::NotificationReceived { .. } => "notification.received",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolCompleted { .. } => "tool.completed",
             Self::ToolFailed { .. } => "tool.failed",
@@ -929,5 +935,30 @@ mod tests {
         assert!(kind.is_control());
         assert!(kind.checkpoint_reason().is_none());
         assert_eq!(serde_json::to_value(&kind).expect("encodes"), wire);
+    }
+
+    #[test]
+    fn active_event_names_excludes_retired_events_and_is_unique() {
+        let retired = [
+            "session.native_ended",
+            "notice.typed",
+            "notice.received",
+            "notification.received",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for name in super::ACTIVE_EVENT_NAMES {
+            assert!(
+                !retired.contains(name),
+                "ACTIVE_EVENT_NAMES must not contain retired event {name}"
+            );
+            assert!(seen.insert(*name), "duplicate active event name {name}");
+        }
+        for name in retired {
+            let wire = json!({"name": name, "detail": {}});
+            assert!(
+                serde_json::from_value::<EventKind>(wire).is_err(),
+                "retired event {name} must not decode as EventKind"
+            );
+        }
     }
 }

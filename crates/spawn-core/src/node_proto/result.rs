@@ -4,16 +4,18 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{is_lower_hex, sha256_hex};
-use crate::envelope::is_job_id;
-use crate::json::{self, OrderedMap};
-use crate::{Error, Limit, VERSION};
+use super::codec::{is_lower_hex, sha256_hex};
+use super::json::{self, OrderedMap};
+use super::target::is_job_id;
+use super::{Error, Limit, VERSION};
 
 /// The signal a gate died of: a number, or a name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Signal {
+    /// Numeric signal.
     Number(u64),
+    /// Symbolic signal name.
     Name(String),
 }
 
@@ -21,10 +23,15 @@ pub enum Signal {
 /// primary's, as `shadow.rs` does).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultInputs {
+    /// Base commit.
     pub base: Option<String>,
+    /// Candidate commit.
     pub candidate: Option<String>,
+    /// Controller commit.
     pub controller: Option<String>,
+    /// Scenario tree digest.
     pub scenarios_sha256: Option<String>,
+    /// Selected scenario name.
     pub scenario: Option<String>,
 }
 
@@ -33,25 +40,37 @@ pub struct ResultInputs {
 /// written only when set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultMeta {
+    /// Protocol version.
     pub v: u64,
+    /// Job identifier.
     pub job_id: String,
+    /// Monotonic lease epoch.
     pub lease_epoch: u64,
     /// The gate's own status; null when it died of a signal or never ran.
     pub exit_code: Option<i64>,
+    /// Signal that terminated the job, if any.
     pub signal: Option<Signal>,
+    /// Whether execution timed out.
     pub timed_out: bool,
+    /// Whether the node fenced itself before running or reporting.
     pub self_fenced: bool,
+    /// Elapsed runtime in whole seconds.
     pub seconds: u64,
     /// The verdict file's bytes (at most 64 KiB), or null.
     pub verdict_raw: Option<String>,
     /// Where stdout ends in the log (stderr follows).
     pub stdout_bytes: u64,
+    /// Total log bytes.
     pub log_bytes: u64,
+    /// Lowercase SHA-256 hex digest of the full log.
     pub log_sha256: String,
+    /// Whether the log was truncated to fit [`Limit::ResultLog`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    /// Gate inputs recorded by the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<ResultInputs>,
+    /// Environment summary recorded by the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<OrderedMap<String>>,
     /// Set when the gate never started: a node fault by definition.
@@ -73,6 +92,7 @@ impl ResultMeta {
         Ok(meta)
     }
 
+    /// Validate version, identifiers, digests and size bounds.
     pub fn validate(&self) -> Result<(), Error> {
         if self.v != VERSION {
             return Err(Error::Body("v"));
@@ -166,8 +186,8 @@ pub fn split_body(body: &[u8]) -> Result<(&[u8], &[u8]), Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Refusal;
     use super::*;
-    use crate::Refusal;
 
     #[test]
     fn the_body_splits_at_the_first_newline_and_enforces_both_caps() {

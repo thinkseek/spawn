@@ -54,9 +54,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use spawn_node_proto::ContentDigest;
-use spawn_node_proto::grant::{ArtifactRole, ArtifactUrl, NODE_OWNED_ENV};
-use spawn_node_proto::result::{ResultMeta, Signal};
+use spawn_cas::{Digest, TREE_SKIP_REGISTRY};
+use spawn_core::node_proto::artifact_path;
+use spawn_core::node_proto::grant::{ArtifactRole, ArtifactUrl, NODE_OWNED_ENV};
+use spawn_core::node_proto::result::{ResultMeta, Signal};
 use spawn_postgres::{
     FaultNext, FaultOutcome, PostgresStore, RemoteJob, RemoteJobKind, RemoteJobSpec,
     RemoteJobState, SweepOutcome,
@@ -136,7 +137,7 @@ pub(super) fn grant_env(gate_env: &[(String, String)]) -> BTreeMap<String, Strin
 /// An artifact written into the artifact directory: its digest and size.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Published {
-    pub(super) digest: ContentDigest,
+    pub(super) digest: Digest,
     pub(super) size: u64,
 }
 
@@ -147,7 +148,7 @@ impl Published {
             role,
             digest: self.digest.to_string(),
             size: self.size,
-            url: self.digest.artifact_path(),
+            url: artifact_path(&self.digest),
         }
     }
 }
@@ -235,11 +236,11 @@ impl Artifacts {
     }
 
     /// Where the artifact of `digest` lives: `<root>/<algo>/<2 hex>/<hex>`.
-    pub(super) fn path_of(&self, digest: &ContentDigest) -> PathBuf {
+    pub(super) fn path_of(&self, digest: &Digest) -> PathBuf {
         self.root
-            .join(digest.algo.as_str())
-            .join(&digest.hex[..2])
-            .join(&digest.hex)
+            .join(digest.algo().name())
+            .join(digest.shard())
+            .join(digest.hex())
     }
 
     /// A scratch path inside the directory (same filesystem: a rename
@@ -255,7 +256,7 @@ impl Artifacts {
     pub(super) fn put_file(&self, file: &Path) -> Result<Published, String> {
         let (hex, size) =
             hash_file(file).map_err(|error| format!("{}: {error}", file.display()))?;
-        let digest = ContentDigest::parse(&format!("sha256:{hex}"))
+        let digest = Digest::parse(&format!("sha256:{hex}"))
             .map_err(|error| format!("digest: {error:?}"))?;
         let target = self.path_of(&digest);
         if target.is_file() {
@@ -291,7 +292,7 @@ impl Artifacts {
     fn cached(&self, kind: &str, key: &str) -> Option<Published> {
         let text = std::fs::read_to_string(self.cache_path(kind, key)).ok()?;
         let mut words = text.split_whitespace();
-        let digest = ContentDigest::parse(words.next()?).ok()?;
+        let digest = Digest::parse(words.next()?).ok()?;
         let size: u64 = words.next()?.parse().ok()?;
         let present = std::fs::metadata(self.path_of(&digest)).ok()?.len();
         (present == size).then_some(Published { digest, size })
@@ -567,7 +568,7 @@ impl Artifacts {
 
 /// `tree_sha256_v1` (design §7) over `$CARGO_HOME/registry` and
 /// `$CARGO_HOME/git` together, paths relative to `$CARGO_HOME`, cargo's
-/// lock files ([`spawn_node_proto::TREE_SKIP_REGISTRY`]) skipped: the digest
+/// lock files ([`TREE_SKIP_REGISTRY`]) skipped: the digest
 /// a node computes over the `cargo-homes/<registry>/` it unpacked the pack
 /// into. A missing one of the two adds nothing.
 pub(super) fn registry_sha256(cargo_home: &Path) -> std::io::Result<String> {
@@ -598,7 +599,7 @@ fn walk(dir: &Path, relative: &Path, files: &mut Vec<(Vec<u8>, PathBuf)>) -> std
         if kind.is_dir() {
             walk(&entry.path(), &name, files)?;
         } else if kind.is_file()
-            && !spawn_node_proto::TREE_SKIP_REGISTRY
+            && !TREE_SKIP_REGISTRY
                 .iter()
                 .any(|skip| entry.file_name().as_bytes() == skip.as_bytes())
         {
@@ -638,7 +639,7 @@ pub(super) fn web_lock(controller: &Path) -> Option<String> {
 /// absent marked as such), a digest of the `scenarios` tree (kinds, modes,
 /// contents and link targets), and the mode, size and sha256 of
 /// `web/package-lock.json` (absent marked as such). Cargo lockfiles listed
-/// in [`spawn_node_proto::TREE_SKIP_REGISTRY`] are skipped to match
+/// in [`TREE_SKIP_REGISTRY`] are skipped to match
 /// `tar --exclude`. An entry that cannot be read is an error: the caller
 /// packs uncached then.
 pub(super) fn controller_pack_key(
@@ -694,7 +695,7 @@ pub(super) fn controller_pack_key(
 /// one length-prefixed record per entry, sorted bytewise by relative path,
 /// of its kind, its permission bits and its content's sha256 (a file),
 /// its target (a link) or nothing more (a directory), skipping cargo lock
-/// files in [`spawn_node_proto::TREE_SKIP_REGISTRY`] to match `tar --exclude`.
+/// files in [`TREE_SKIP_REGISTRY`] to match `tar --exclude`.
 /// Any other kind of entry, or one that cannot be read, is an error.
 fn pack_tree_digest(root: &Path, label: &Path) -> Result<String, String> {
     fn collect(
@@ -731,7 +732,7 @@ fn pack_tree_digest(root: &Path, label: &Path) -> Result<String, String> {
             for entry in std::fs::read_dir(path).map_err(fail)? {
                 let entry = entry.map_err(fail)?;
                 let name = entry.file_name();
-                if spawn_node_proto::TREE_SKIP_REGISTRY
+                if TREE_SKIP_REGISTRY
                     .iter()
                     .any(|skip| name.as_bytes() == skip.as_bytes())
                 {
@@ -1639,7 +1640,7 @@ impl Primary {
             let published = self
                 .artifacts
                 .put_copy(&controller.join("web/package-lock.json"))?;
-            if published.digest.hex != lock {
+            if published.digest.hex() != lock {
                 return Err("web/package-lock.json changed while it was published".to_string());
             }
             requires.insert("web_lock".to_string(), lock);
@@ -2019,8 +2020,11 @@ impl Primary {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use spawn_node_proto::json::OrderedMap;
-    use spawn_node_proto::result::ResultInputs;
+    use spawn_core::node_proto::codec::sha256_hex as core_sha256_hex;
+    use spawn_core::node_proto::grant::{Grant, JobKind};
+    use spawn_core::node_proto::json::OrderedMap;
+    use spawn_core::node_proto::result::ResultInputs;
+    use spawn_core::node_proto::{check_target, is_job_id};
     use spawn_postgres::NodeEnroll;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -2086,7 +2090,7 @@ pub(super) mod tests {
             verdict_raw: verdict.map(|line| format!("{line}\n")),
             stdout_bytes: stdout.len() as u64,
             log_bytes: log.len() as u64,
-            log_sha256: spawn_node_proto::codec::sha256_hex(&log),
+            log_sha256: core_sha256_hex(&log),
             truncated: None,
             inputs: inputs.map(result_inputs),
             env: Some(OrderedMap(vec![
@@ -2168,12 +2172,12 @@ pub(super) mod tests {
         // The node's floor (F4), whatever the primary's.
         assert_eq!(env["SPAWN_GATE_MIN_FREE_GB"], NODE_MIN_FREE_GB);
         // A grant of it is one the node takes (its own refusal list).
-        let grant = spawn_node_proto::grant::Grant {
+        let grant = Grant {
             v: 1,
             job_id: "gate-0123456789ab-k3x9q2ma".into(),
             lease_epoch: 1,
             node_id: "a".repeat(64),
-            kind: spawn_node_proto::grant::JobKind::Gate,
+            kind: JobKind::Gate,
             expires_ms: 1,
             attempt: None,
             cost: None,
@@ -2211,7 +2215,7 @@ pub(super) mod tests {
             env: grant_env(&[("SPAWN_GATE_JOBS".into(), "8".into())]),
             artifacts: vec![
                 Published {
-                    digest: ContentDigest::sha256_of(b"delta"),
+                    digest: spawn_cas::sha256_of(b"delta"),
                     size: 5,
                 }
                 .url(ArtifactRole::DeltaBundle),
@@ -2219,7 +2223,7 @@ pub(super) mod tests {
             requires: BTreeMap::from([("pg".to_string(), "16".to_string())]),
         };
         assert!(job.job_id.starts_with("gs-222222222222-"), "{}", job.job_id);
-        assert!(spawn_node_proto::envelope::is_job_id(&job.job_id));
+        assert!(is_job_id(&job.job_id));
         let spec = job.spec();
         let value = serde_json::to_value(&spec).unwrap();
         // F11: `judging_id`, never `judging`.
@@ -2236,7 +2240,7 @@ pub(super) mod tests {
         assert_eq!(value["spec"]["artifact_urls"][0]["role"], "delta_bundle");
         let url = value["spec"]["artifact_urls"][0]["url"].as_str().unwrap();
         assert!(url.starts_with("/node/v1/artifacts/sha256:"), "{url}");
-        spawn_node_proto::check_target(url).unwrap();
+        check_target(url).unwrap();
     }
 
     /// Section 6.2, row by row, as `gate::decide` reads a stored result:
@@ -2631,7 +2635,8 @@ pub(super) mod tests {
         let path = artifacts.path_of(&delta.digest);
         assert!(path.starts_with(dir.0.join("artifacts/sha256")));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), delta.size);
-        delta.digest.verify(&std::fs::read(&path).unwrap()).unwrap();
+        spawn_cas::verify_reader(&mut std::fs::read(&path).unwrap().as_slice(), &delta.digest)
+            .unwrap();
         // Its prerequisite is the base; its one head the candidate.
         let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
         assert!(text.contains(&format!("-{base}")));
@@ -3043,7 +3048,7 @@ pub(super) mod tests {
                 .unwrap();
             assert!(copied.success());
         }
-        assert_eq!(digest, spawn_node_proto::registry_sha256(&only).unwrap());
+        assert_eq!(digest, spawn_cas::registry_sha256(&only).unwrap());
         // Cargo's lock files never move it; a crate does.
         std::fs::write(home.join("registry/.package-cache"), "other").unwrap();
         std::fs::write(home.join("registry/.package-cache-mutate"), "x").unwrap();
@@ -3177,7 +3182,7 @@ pub(super) mod tests {
             store_result(results, meta, log);
             let line = meta.to_bytes();
             let mut result = serde_json::to_value(meta).unwrap();
-            result["result_sha256"] = json!(spawn_node_proto::codec::sha256_hex(&line));
+            result["result_sha256"] = json!(core_sha256_hex(&line));
             result["log_bytes"] = json!(meta.log_bytes.to_string());
             let done = self
                 .store

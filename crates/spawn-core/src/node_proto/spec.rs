@@ -4,9 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::sha256_hex;
-use crate::json::{self, OrderedMap};
-use crate::{Error, Limit, VERSION};
+use super::codec::sha256_hex;
+use super::json::{self, OrderedMap};
+use super::{Error, Limit, VERSION};
 
 /// What a node holds (`spec.holds`), what a job requires
 /// (`grant.requires`) and what an answer says to sync (`need_sync`).
@@ -46,6 +46,7 @@ impl Holds {
             .all(|((_, held), (_, wanted))| wanted.is_none() || held == wanted)
     }
 
+    /// True when no hold key is set.
     pub fn is_empty(&self) -> bool {
         self.pairs().iter().all(|(_, value)| value.is_none())
     }
@@ -54,23 +55,34 @@ impl Holds {
 /// `resources_total`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
+    /// CPU cores.
     pub cores: u64,
+    /// Memory in MiB.
     pub mem_mb: u64,
+    /// Disk space in MiB.
     pub disk_mb: u64,
 }
 
 /// A spec body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSpec {
+    /// Protocol version.
     pub v: u64,
+    /// Node name.
     pub name: String,
+    /// Cell identifier.
     pub cell_id: String,
+    /// Scheduling labels.
     pub labels: Vec<String>,
+    /// Total hardware resources.
     pub resources_total: Resources,
     /// Pool name → total slots, in the node's order.
     pub capacities_total: OrderedMap<u64>,
+    /// Tmpfs budget in MiB.
     pub tmpfs_budget_mb: u64,
+    /// Cached environment digests and tool versions.
     pub holds: Holds,
+    /// Reported component versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub versions: Option<OrderedMap<String>>,
 }
@@ -89,6 +101,7 @@ impl NodeSpec {
         Ok(spec)
     }
 
+    /// Validate version and required non-empty fields.
     pub fn validate(&self) -> Result<(), Error> {
         if self.v != VERSION {
             return Err(Error::Body("v"));

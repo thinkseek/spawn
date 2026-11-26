@@ -8,11 +8,12 @@ import {
   Send,
   Sparkles,
 } from "lucide-react";
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
 import { fetchSessionTail, postKey, postTaskMove, usePoll } from "../../api";
 import type { SessionDetail } from "../../api";
+import { keepsKey, newKey } from "../../input";
 import type {
   CommandRecord,
   FleetAgent,
@@ -245,20 +246,27 @@ function WorkerMoves({
   const [asking, setAsking] = useState<Move | null>(null);
   const [reason, setReason] = useState("");
   const [sending, setSending] = useState(false);
+  const keyRef = useRef<string | null>(null);
   const [last, setLast] = useState<
     { ok: true; move: Move; task: number; session_id: string } | { ok: false; text: string } | null
   >(null);
   const send = (move: Move) => {
     if (sending) return;
+    const key = keyRef.current ?? newKey();
+    keyRef.current = key;
     setSending(true);
-    void postTaskMove(sessionId, move, { reason: reason.trim() }).then((reply) => {
+    void postTaskMove(sessionId, move, { reason: reason.trim(), key }).then((reply) => {
       const answer = moveAnswer(reply.status, reply.body);
       setSending(false);
       if (answer.ok) {
+        keyRef.current = null;
         setLast({ ok: true, move, task: answer.task, session_id: answer.session_id });
         setAsking(null);
         setReason("");
       } else {
+        if (!keepsKey(reply.status)) {
+          keyRef.current = null;
+        }
         setLast({ ok: false, text: answer.error });
       }
     });
@@ -271,6 +279,7 @@ function WorkerMoves({
           <Button
             key={move}
             onClick={() => {
+              keyRef.current = null;
               setAsking(asking === move ? null : move);
               setLast(null);
             }}
@@ -315,7 +324,10 @@ function WorkerMoves({
             value={reason}
             maxLength={2000}
             autoFocus
-            onChange={(event) => setReason(event.target.value)}
+            onChange={(event) => {
+              keyRef.current = null;
+              setReason(event.target.value);
+            }}
             placeholder="The reason, recorded with it"
             className={cx(
               "h-7 min-w-0 flex-1 rounded-control bg-surface px-2 text-caption text-foreground shadow-hairline",
@@ -329,7 +341,14 @@ function WorkerMoves({
           >
             {sending ? "Sending…" : MOVE_WORDS[asking].button}
           </button>
-          <Button onClick={() => setAsking(null)}>Cancel</Button>
+          <Button
+            onClick={() => {
+              keyRef.current = null;
+              setAsking(null);
+            }}
+          >
+            Cancel
+          </Button>
         </form>
       )}
     </div>
