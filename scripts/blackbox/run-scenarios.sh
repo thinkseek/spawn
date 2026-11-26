@@ -112,12 +112,13 @@ FAKE
     SPAWN_GIT_REPO=$repo
     SPAWN_WORKSPACE_ROOT=$work/ws
     SPAWN_CLAUDE_PROGRAM=$work/claude
+    SPAWN_TERMINAL_BACKEND=tmux
     SPAWN_TMUX_SOCKET="bb-$slug-$run"
     own_socket=$SPAWN_TMUX_SOCKET
     SPAWN_WORKER=worker-bb
     WORK=$work
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
-        SPAWN_CLAUDE_PROGRAM SPAWN_TMUX_SOCKET SPAWN_WORKER WORK
+        SPAWN_CLAUDE_PROGRAM SPAWN_TERMINAL_BACKEND SPAWN_TMUX_SOCKET SPAWN_WORKER WORK
     # The archive's location tool, as the gate's sandbox gives it (objective
     # 175): an empty stand-in that places no credential value, so a run
     # never depends on the host's installed collector; a scenario may name

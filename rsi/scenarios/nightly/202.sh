@@ -54,6 +54,7 @@ trap 'rm -rf "$WORK"' EXIT
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_202_storage_why_$run"
 SPAWN_TMUX_SOCKET="bb-202-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 TMUX_TMPDIR=$WORK/tmux-sock
 mkdir -p "$TMUX_TMPDIR"
 export TMUX_TMPDIR

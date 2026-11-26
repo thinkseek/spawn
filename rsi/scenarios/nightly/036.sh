@@ -144,6 +144,7 @@ export XDG_RUNTIME_DIR
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_036_shadow_$run"
 SPAWN_TMUX_SOCKET="bb-036-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 # The runner's root: on the disk, out of /tmp, /run and /var/tmp (setup.sh

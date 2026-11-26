@@ -80,6 +80,7 @@ export XDG_RUNTIME_DIR
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_113_runs_$run"
 SPAWN_TMUX_SOCKET="bb-113-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 

@@ -81,6 +81,7 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_064_runs_$run"
 SPAWN_TMUX_SOCKET="bb-064-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 # The tmux server's socket lives in WORK, so the cleanup removes nothing
 # outside it (cc-rules (a), 2026-11-12).
 TMUX_TMPDIR=$WORK/tmux-sock

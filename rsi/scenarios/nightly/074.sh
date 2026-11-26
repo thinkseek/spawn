@@ -76,6 +76,7 @@ WORK=$(mktemp -d) || harness "mktemp failed"
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_074_dbsize_$run"
 SPAWN_TMUX_SOCKET="bb-074-$run"
+export SPAWN_TERMINAL_BACKEND=tmux
 SPAWN_PSQL=psql
 TEST_DB="bb_074_testdb_$run"
 FLEET_DB="bb_074_fleetdb_$run"
