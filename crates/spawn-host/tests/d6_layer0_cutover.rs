@@ -20,13 +20,18 @@ use std::time::{Duration, SystemTime};
 use serde_json::json;
 use spawn_cas::{
     DEFAULT_PERSISTENT_GC_GRACE, Digest, GIT_POINTER_THRESHOLD, GitOid, JournalEntry, NS_BLOB,
-    Snapshot, Store, Tree, TreeEntry,
+    Snapshot, Store, Tree, TreeEntry, TreeEntryKind, TreeMutation,
 };
+use spawn_core::id::BranchName;
+use spawn_core::port::{BaseMerge, Commit, SetAside, WorkspaceStore};
+use spawn_host::d6_workspace::L1TmpfsPolicy;
+use spawn_host::workspace::{D6ShadowOptions, D6StoreOptions, DynRefLedger};
 use spawn_host::{
     CasMerkleStore, CutoverPhase, D6RefKind, D6StoreError, ExistingDestPolicy, GitBorderAdapter,
-    Layer0Options, LedgerRef, LedgerSnapshot, ProjectCutover, ProjectStorageMode, PublishRequest,
-    RefLedger, assert_zero_pending_merges, audit_export_attributes, bind_store_gc_fence,
-    check_gc_fence, format_commit_body, materialize_layer0, materialize_workspace_from_tree,
+    Layer0Options, LedgerRef, LedgerSnapshot, LocalWorkspaceStore, ProjectCutover,
+    ProjectStorageMode, PublishRequest, RefLedger, assert_zero_pending_merges,
+    audit_export_attributes, bind_store_gc_fence, canonical_root, check_gc_fence,
+    format_commit_body, materialize_layer0, materialize_workspace_from_tree,
     reconcile_refs_journal, run_persistent_gc_for_ledger, test_git_command,
     verify_bundle_snapshot_roundtrip, verify_cutover_parity, verify_zero_pending_merges,
 };
@@ -1537,4 +1542,488 @@ fn pg_r2_git_bundle_drill_recomputes_all_snapshots_and_reports_local_only_large_
     );
     assert!(clean_drill.local_only_large_files.is_empty());
     assert!(clean_drill.missing_local_only_large_files.is_empty());
+}
+
+struct DevShmGuard(PathBuf);
+
+impl DevShmGuard {
+    fn new(tag: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = PathBuf::from("/dev/shm").join(format!(
+            "spawn-d6-step8-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create /dev/shm dir");
+        Self(dir)
+    }
+}
+
+impl Drop for DevShmGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+#[expect(clippy::too_many_lines)]
+fn pg_reversible_cutover_shadow_d6_l1_and_border_roundtrip_drill() {
+    let scratch = Scratch::new("reversible_drill");
+    let adapter = GitBorderAdapter::new();
+
+    let mut big_payload = vec![0x5Au8; 4_500_000];
+    for (idx, byte) in big_payload.iter_mut().enumerate().step_by(4096) {
+        *byte = u8::try_from(idx % 251).expect("byte");
+    }
+
+    let work = scratch.join("work");
+    fs::create_dir_all(work.join("src")).expect("mkdir src");
+    fs::create_dir_all(work.join("bin")).expect("mkdir bin");
+    fs::create_dir_all(work.join("assets")).expect("mkdir assets");
+
+    git_in(&work, &["init", "-b", "main"]);
+    fs::write(work.join(".gitignore"), "*.local.log\nbuild_tmp/\n").expect("write gitignore");
+    fs::write(work.join("README.md"), "# Reversible Cutover Drill\n").expect("write readme");
+    fs::write(work.join("src/lib.rs"), "pub fn drill() -> u32 { 7 }\n").expect("write lib");
+    fs::write(work.join("bin/check.sh"), "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(work.join("bin/check.sh"), fs::Permissions::from_mode(0o755))
+        .expect("chmod script");
+    std::os::unix::fs::symlink("README.md", work.join("README.link")).expect("symlink");
+    fs::write(work.join("assets/model_weights.bin"), &big_payload).expect("write big bin");
+    git_in(&work, &["add", "-A"]);
+    git_in(&work, &["commit", "-m", "initial main"]);
+    git_in(&work, &["tag", "v0.1.0"]);
+
+    git_in(&work, &["checkout", "-b", "agent_alpha"]);
+    fs::write(
+        work.join("README.md"),
+        "# Reversible Cutover Drill\nalpha work\n",
+    )
+    .expect("edit alpha readme");
+    fs::write(work.join("alpha.txt"), "alpha branch\n").expect("write alpha");
+    git_in(&work, &["add", "-A"]);
+    git_in(&work, &["commit", "-m", "alpha work"]);
+
+    git_in(&work, &["checkout", "-b", "agent_beta", "main"]);
+    fs::write(work.join("beta.txt"), "beta branch\n").expect("write beta");
+    git_in(&work, &["add", "-A"]);
+    git_in(&work, &["commit", "-m", "beta work"]);
+    git_in(&work, &["checkout", "main"]);
+
+    let bare_repo = scratch.join("origin.git");
+    git_in(
+        &scratch.0,
+        &[
+            "clone",
+            "--bare",
+            work.to_str().expect("utf8"),
+            bare_repo.to_str().expect("utf8"),
+        ],
+    );
+    git_in(
+        &work,
+        &["remote", "add", "origin", bare_repo.to_str().expect("utf8")],
+    );
+
+    // Stage 1: Dual-track d6-shadow parity with zero divergences and FastCDC >4 MiB ingestion.
+    let shadow_cas =
+        Arc::new(CasMerkleStore::open(scratch.join("shadow-cas")).expect("shadow cas"));
+    let shadow_ledger = Arc::new(PgRefLedger::connect_isolated("drill_shadow"));
+    let shadow_dyn: DynRefLedger = shadow_ledger.clone();
+    let shadow_opts = D6ShadowOptions::new(
+        scratch.join("shadow-d6-work"),
+        shadow_cas.clone(),
+        shadow_dyn,
+    )
+    .with_strict_fail_closed(true);
+    let shadow_store =
+        LocalWorkspaceStore::d6_shadow(&bare_repo, scratch.join("shadow-git-root"), shadow_opts);
+
+    let branch_alpha = BranchName::new("agent_alpha").expect("branch_alpha");
+    let branch_beta = BranchName::new("agent_beta").expect("branch_beta");
+    shadow_store
+        .ensure_branch(&branch_alpha, None)
+        .expect("shadow ensure_branch");
+    let shadow_ws = shadow_store.mount(&branch_alpha).expect("shadow mount");
+    let shadow_dir = PathBuf::from(shadow_ws.path());
+    fs::create_dir_all(shadow_dir.join("build_tmp")).expect("mkdir build_tmp");
+    fs::write(shadow_dir.join("scratch.local.log"), "ignored\n").expect("ignored log");
+    fs::write(shadow_dir.join("build_tmp/out.bin"), b"ignored build").expect("ignored bin");
+    fs::write(shadow_dir.join("shadow_step.txt"), "from d6-shadow\n").expect("shadow step");
+    assert!(matches!(
+        shadow_store
+            .checkpoint(&shadow_ws, "shadow checkpoint")
+            .expect("shadow checkpoint"),
+        Commit::Created(_)
+    ));
+
+    git_in(&work, &["checkout", "main"]);
+    fs::write(
+        work.join("upstream_pre_cutover.txt"),
+        "upstream main before cutover\n",
+    )
+    .expect("upstream pre");
+    git_in(&work, &["add", "upstream_pre_cutover.txt"]);
+    git_in(&work, &["commit", "-m", "upstream pre-cutover"]);
+    git_in(&work, &["push", "origin", "main"]);
+
+    assert!(matches!(
+        shadow_store
+            .merge_base(&shadow_ws)
+            .expect("shadow merge_base"),
+        BaseMerge::Merged { .. }
+    ));
+    let shadow_oracle = shadow_store
+        .d6_shadow_workspace()
+        .expect("shadow oracle accessor");
+    let shadow_snap = shadow_oracle
+        .shadow()
+        .branch_snapshot("agent_alpha")
+        .expect("shadow snap")
+        .expect("present");
+    let shadow_flat = shadow_cas.flatten_tree(&shadow_snap.tree).expect("flatten");
+    let big_entry = shadow_flat
+        .get(b"assets/model_weights.bin".as_slice())
+        .expect("big asset in shadow tree");
+    let big_digest = big_entry.digest().expect("big digest");
+    assert!(
+        shadow_cas.cas().chunk_index_path(&big_digest).is_file(),
+        ">4 MiB asset must trigger FastCDC chunking in shadow CAS"
+    );
+    shadow_store.unmount(&shadow_ws).expect("shadow unmount");
+    let metrics = shadow_store.shadow_metrics().expect("shadow metrics");
+    assert!(metrics.checkpoints_agreed >= 1, "{metrics:?}");
+    assert_eq!(metrics.merge_summary.agree_clean, 1, "{metrics:?}");
+    assert_eq!(metrics.tree_mismatches, 0, "{metrics:?}");
+    assert_eq!(metrics.tracked_set_leaks, 0, "{metrics:?}");
+    assert_eq!(metrics.shadow_errors, 0, "{metrics:?}");
+    assert!(!metrics.has_divergences(), "{metrics:?}");
+
+    // Stage 2: 7-step ProjectCutover to D6Cas on isolated production CAS + PG.
+    let prod_cas = Arc::new(CasMerkleStore::open(scratch.join("prod-cas")).expect("prod cas"));
+    let prod_pg = Arc::new(PgRefLedger::connect_isolated("drill_cutover_prod"));
+    let cutover_ws_root = scratch.join("cutover-workspaces");
+    fs::create_dir_all(&cutover_ws_root).expect("mkdir cutover root");
+    let mut cutover = ProjectCutover::new("cutover-drill", &bare_repo, &cutover_ws_root);
+    cutover
+        .step1_backfill_history(&prod_cas, prod_pg.as_ref())
+        .expect("step1");
+    cutover
+        .step2_pause_dispatch_and_verify_clean(&prod_cas)
+        .expect("step2");
+    cutover
+        .step3_import_tail_commits(&prod_cas, prod_pg.as_ref())
+        .expect("step3");
+    cutover
+        .step4_commit_refs_and_flip_mode(&prod_cas, prod_pg.as_ref(), &adapter, "cutover-drill")
+        .expect("step4");
+    cutover
+        .step5_verify_parity(&prod_cas, prod_pg.as_ref())
+        .expect("step5");
+    cutover
+        .step6_configure_readonly_border(&adapter)
+        .expect("step6");
+    cutover.step7_resume_dispatch().expect("step7");
+    assert_eq!(cutover.storage_mode(), ProjectStorageMode::D6Cas);
+    assert_eq!(cutover.phase(), CutoverPhase::Resumed);
+    assert!(
+        prod_cas.cas().chunk_index_path(&big_digest).is_file(),
+        ">4 MiB asset must be chunked during backfill into prod CAS"
+    );
+
+    let push_while_locked = test_git_command()
+        .current_dir(&work)
+        .args(["push", "origin", "HEAD:refs/heads/bypass"])
+        .output()
+        .expect("push while locked");
+    assert!(!push_while_locked.status.success());
+
+    // Stage 3: Native LocalWorkspaceStore::D6 full lifecycle on L1 tmpfs (zero git subprocesses).
+    let tmpfs_guard = DevShmGuard::new("cutover-drill");
+    let prod_dyn: DynRefLedger = prod_pg.clone();
+    let d6_opts = D6StoreOptions::new(prod_cas.clone(), prod_dyn)
+        .with_l1_policy(L1TmpfsPolicy::new(&tmpfs_guard.0, 128));
+    let d6_store = LocalWorkspaceStore::d6("cutover-drill", scratch.join("d6-disk"), d6_opts);
+    assert_eq!(d6_store.backend_name(), "d6");
+
+    let ws_alpha = d6_store.mount(&branch_alpha).expect("d6 mount alpha");
+    let ws_alpha_dir = PathBuf::from(ws_alpha.path());
+    assert!(ws_alpha_dir.starts_with(canonical_root(&tmpfs_guard.0)));
+    assert!(!ws_alpha_dir.join(".git").exists());
+    assert_eq!(
+        fs::read(ws_alpha_dir.join("assets/model_weights.bin")).expect("read big asset"),
+        big_payload
+    );
+    assert_eq!(
+        fs::symlink_metadata(ws_alpha_dir.join("bin/check.sh"))
+            .expect("script meta")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_link(ws_alpha_dir.join("README.link")).expect("readlink"),
+        Path::new("README.md")
+    );
+
+    fs::write(ws_alpha_dir.join("ignored.local.log"), "never tracked\n").expect("write ignored");
+    fs::write(
+        ws_alpha_dir.join("d6_edit.rs"),
+        "pub fn after_cutover() -> bool { true }\n",
+    )
+    .expect("write d6_edit");
+    assert!(matches!(
+        d6_store
+            .checkpoint(&ws_alpha, "native d6 edit")
+            .expect("d6 checkpoint"),
+        Commit::Created(_)
+    ));
+    assert_eq!(
+        d6_store.checkpoint(&ws_alpha, "d6 noop").expect("d6 noop"),
+        Commit::Unchanged
+    );
+
+    let d6_inner = d6_store.d6_workspace().expect("d6 inner");
+    let alpha_after_ckpt = d6_inner
+        .branch_snapshot("agent_alpha")
+        .expect("alpha snap")
+        .expect("present");
+    let alpha_flat = prod_cas
+        .flatten_tree(&alpha_after_ckpt.tree)
+        .expect("flatten alpha");
+    assert!(alpha_flat.contains_key(b"d6_edit.rs".as_slice()));
+    assert!(!alpha_flat.contains_key(b"ignored.local.log".as_slice()));
+
+    // Land a native commit on main via setup_accepted_task + land_main_snapshot.
+    let main_now = d6_inner
+        .main_snapshot()
+        .expect("main snap")
+        .expect("present");
+    let (land_blob_id, land_blob_sz) = prod_cas
+        .put_bytes_blob(b"landed natively in D6\n")
+        .expect("land blob");
+    let next_main_tree = prod_cas
+        .apply_mutations(
+            &main_now.tree,
+            &[TreeMutation::Upsert {
+                path: vec![b"LANDED_IN_D6.md".to_vec()],
+                kind: TreeEntryKind::File,
+                id: land_blob_id.as_bytes(),
+                size: land_blob_sz,
+            }],
+        )
+        .expect("next main tree");
+    let land_draft = Snapshot {
+        tree: next_main_tree.clone(),
+        parents: vec![main_now.id.clone()],
+        commit_body: format_commit_body(
+            "D6 Gate <gate@spawn.local> 1700003000 +0000",
+            "D6 Gate <gate@spawn.local> 1700003000 +0000",
+            "Land native D6 update\n\nSpawn-Task: 1\n",
+        ),
+    };
+    let cand_oid = prod_cas
+        .project_snapshot_oid(&land_draft, &[main_now.git_oid])
+        .expect("cand oid");
+    let task_id = setup_accepted_task(
+        &prod_pg.pg,
+        bare_repo.to_str().expect("utf8"),
+        &main_now.git_oid,
+        &cand_oid,
+    );
+    let land_body = format_commit_body(
+        "D6 Gate <gate@spawn.local> 1700003000 +0000",
+        "D6 Gate <gate@spawn.local> 1700003000 +0000",
+        &format!("Land native D6 update\n\nSpawn-Task: {task_id}\n"),
+    );
+    let next_main_snap = Snapshot {
+        tree: next_main_tree.clone(),
+        parents: vec![main_now.id.clone()],
+        commit_body: land_body,
+    };
+    let next_main_digest = prod_cas
+        .cas()
+        .put_merkle_snapshot(&next_main_snap)
+        .expect("put main snap");
+    let next_main_git_oid = prod_cas
+        .project_snapshot_oid(&next_main_snap, &[main_now.git_oid])
+        .expect("next main oid");
+    prod_pg
+        .pg
+        .record_snapshot(
+            &next_main_digest.to_string(),
+            &next_main_git_oid.to_hex(),
+            &next_main_tree.to_string(),
+            &[main_now.id.to_string()],
+            "cutover-drill",
+            1_700_003_000_000,
+        )
+        .expect("record next main");
+    d6_inner
+        .land_main_snapshot(
+            Some(&main_now.id),
+            &next_main_digest,
+            Some(task_id),
+            "drill land main",
+        )
+        .expect("land main snapshot");
+
+    assert!(matches!(
+        d6_store.merge_base(&ws_alpha).expect("d6 merge_base"),
+        BaseMerge::Merged { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(ws_alpha_dir.join("LANDED_IN_D6.md")).expect("landed file"),
+        "landed natively in D6\n"
+    );
+    d6_store.unmount(&ws_alpha).expect("unmount alpha");
+    assert_eq!(d6_store.d6_l1_reserved_bytes(), Some(0));
+
+    let ws_beta = d6_store.mount(&branch_beta).expect("mount beta");
+    fs::write(Path::new(ws_beta.path()).join("loose_beta.txt"), "loose\n").expect("loose beta");
+    assert!(matches!(
+        d6_store
+            .set_aside_when(&branch_beta, None, "d6 pause beta", &|| Ok(()))
+            .expect("set_aside beta"),
+        SetAside::Created { .. }
+    ));
+    d6_store.unmount(&ws_beta).expect("unmount beta");
+    assert!(!d6_store.is_mounted(&ws_beta));
+    assert_eq!(d6_store.d6_l1_reserved_bytes(), Some(0));
+
+    // Stage 4: Export via GitBorderAdapter into clean external bare Git repo + verify parity + fsck + rollback.
+    let external_bare = scratch.join("external-export.git");
+    let export = adapter
+        .export_project(&prod_cas, prod_pg.as_ref(), "cutover-drill", &external_bare)
+        .expect("export to external bare");
+    assert_eq!(export.refs.len(), 4);
+
+    let ext_parity =
+        verify_cutover_parity(&prod_cas, prod_pg.as_ref(), "cutover-drill", &external_bare)
+            .expect("verify external border parity");
+    assert_eq!(ext_parity.refs.len(), 4);
+
+    for (git_ref, entry) in &ext_parity.refs {
+        let rev_commit = String::from_utf8(git_in(
+            &scratch.0,
+            &[
+                "--git-dir",
+                external_bare.to_str().expect("utf8"),
+                "rev-parse",
+                &format!("{git_ref}^{{commit}}"),
+            ],
+        ))
+        .expect("utf8")
+        .trim()
+        .to_string();
+        assert_eq!(
+            rev_commit,
+            entry.git_oid.to_hex(),
+            "commit OID for {git_ref}"
+        );
+
+        let rev_tree = String::from_utf8(git_in(
+            &scratch.0,
+            &[
+                "--git-dir",
+                external_bare.to_str().expect("utf8"),
+                "rev-parse",
+                &format!("{git_ref}^{{tree}}"),
+            ],
+        ))
+        .expect("utf8")
+        .trim()
+        .to_string();
+        let snap = prod_cas
+            .cas()
+            .read_merkle_snapshot(&entry.snapshot)
+            .expect("read snap");
+        let expected_tree = prod_cas
+            .project_tree_oid(&snap.tree)
+            .expect("project tree oid")
+            .to_hex();
+        assert_eq!(rev_tree, expected_tree, "tree OID for {git_ref}");
+    }
+
+    let verify_checkout = scratch.join("verify-checkout");
+    git_in(
+        &scratch.0,
+        &[
+            "clone",
+            "--branch",
+            "agent_alpha",
+            external_bare.to_str().expect("utf8"),
+            verify_checkout.to_str().expect("utf8"),
+        ],
+    );
+    assert_eq!(
+        fs::read(verify_checkout.join("assets/model_weights.bin")).expect("read ext big"),
+        big_payload
+    );
+    assert_eq!(
+        fs::read_to_string(verify_checkout.join("d6_edit.rs")).expect("read ext d6_edit"),
+        "pub fn after_cutover() -> bool { true }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(verify_checkout.join("LANDED_IN_D6.md")).expect("read ext landed"),
+        "landed natively in D6\n"
+    );
+    assert_eq!(
+        fs::symlink_metadata(verify_checkout.join("bin/check.sh"))
+            .expect("ext script meta")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_link(verify_checkout.join("README.link")).expect("ext symlink"),
+        Path::new("README.md")
+    );
+    assert!(!verify_checkout.join("ignored.local.log").exists());
+
+    let fsck_ext = test_git_command()
+        .arg("--git-dir")
+        .arg(&external_bare)
+        .args(["fsck", "--full", "--strict"])
+        .output()
+        .expect("ext fsck");
+    assert!(
+        fsck_ext.status.success(),
+        "ext fsck stderr: {}",
+        String::from_utf8_lossy(&fsck_ext.stderr)
+    );
+
+    // Lossless rollback restores bare_repo + writable push capability and passes fsck.
+    let rollback = cutover
+        .rollback_to_git(&prod_cas, prod_pg.as_ref(), &adapter)
+        .expect("lossless rollback");
+    assert_eq!(cutover.phase(), CutoverPhase::RolledBack);
+    assert_eq!(cutover.storage_mode(), ProjectStorageMode::Git);
+    assert_eq!(rollback.exported_refs, 4);
+
+    let fsck_bare = test_git_command()
+        .arg("--git-dir")
+        .arg(&bare_repo)
+        .args(["fsck", "--full", "--strict"])
+        .output()
+        .expect("bare fsck");
+    assert!(
+        fsck_bare.status.success(),
+        "bare fsck stderr: {}",
+        String::from_utf8_lossy(&fsck_bare.stderr)
+    );
+
+    git_in(&work, &["fetch", "origin", "main"]);
+    git_in(&work, &["checkout", "-B", "post-rollback", "FETCH_HEAD"]);
+    assert_eq!(
+        fs::read_to_string(work.join("LANDED_IN_D6.md")).expect("landed after rollback"),
+        "landed natively in D6\n"
+    );
+    fs::write(work.join("AFTER_ROLLBACK.txt"), "ok\n").expect("after rollback");
+    git_in(&work, &["add", "AFTER_ROLLBACK.txt"]);
+    git_in(&work, &["commit", "-m", "post rollback commit"]);
+    git_in(&work, &["push", "origin", "HEAD:refs/heads/post-rollback"]);
 }

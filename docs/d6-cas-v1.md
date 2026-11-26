@@ -1,6 +1,6 @@
 # D6 CAS Format Contract (`d6-cas-v1`)
 
-> **Status**: Phase 0 Frozen Contract (Master Issue [#113](https://github.com/thinkseek/spawn/issues/113) Decision D6, Fine Item 7, and Comment #6 Layout Erratum).
+> **Status**: Phase 0 Frozen Contract (Master Issue [#113](https://github.com/thinkseek/spawn/issues/113) Decision D6, Fine Item 7, and Comment #6 Layout Erratum) + Phase 4 Runtime Wiring & Reversible Cutover (PRs #123–#153).
 > **Reference Implementation & Golden Vectors**: [`crates/spawn-cas/`](../crates/spawn-cas/) and [`crates/spawn-cas/testdata/d6-cas-v1/`](../crates/spawn-cas/testdata/d6-cas-v1/) (landed in PR #115 at commit `9754ad18`).
 > Where this document and `crates/spawn-cas/testdata/d6-cas-v1/` disagree, the golden fixtures win.
 
@@ -194,3 +194,65 @@ Spawn maintains strict physical and domain separation across all storage subsyst
 2. **`fm-cas/v1` Recoverable Backup CAS (`crates/spawn-cli/src/backup/recoverable.rs`, [`docs/recoverable-storage-keys.md`](./recoverable-storage-keys.md))**: Strictly namespaced under `<store_root>/fm-cas/v1/` with `spawn.cas.v1.*` domain tags and its own `.cas.lock` / `snapshots.json`. Never overlaps runtime host CAS roots; future incompatible backup versions must advance to `fm-cas/v2`.
 3. **`spawn store` Off-Host Transcript & Session Segments (`crates/spawn-cli/src/backup/store/`)**: Upload-only encrypted backup store (`transcripts/`, `sessions/`) keyed by HMAC-SHA256 of plain segments under `.json.gpg` manifests. Completely independent of D6 runtime CAS.
 4. **Tombstoned `Spawn-Large` Git Trailer (`crates/spawn-host/src/git.rs::LARGE_FILE_TRAILER`, [`docs/provenance.md`](./provenance.md))**: Permanently tombstoned. D6 snapshots and commits must **never** reintroduce or interpret `Spawn-Large` commit trailers (large files live transparently in D6 `spawn-chunks-v1` + `chunk-index/`, projected at Git borders via `spawn-pointer-v1`).
+
+---
+
+## 9. Runtime Configuration, Backend Compatibility & Bounded L1 `tmpfs` Tier
+
+D6 backends are **strictly opt-in** in both [`spawn-host`](../crates/spawn-host/src/workspace.rs) and [`spawn-cli`](../crates/spawn-cli/src/config.rs). Leaving `SPAWN_WORKSPACE_BACKEND` unset or set to `auto` resolves only `cow` (when CoW reflinks are supported) or `git` — never `overlay`, `d6-shadow`, or `d6`.
+
+### Environment Contract (`crates/spawn-cli/src/config.rs`)
+
+| Environment Variable | Accepted Values / Type | Default | Semantics |
+| --- | --- | --- | --- |
+| `SPAWN_WORKSPACE_BACKEND` | `git`, `cow`, `overlay`, `d6-shadow`, `d6`, `auto` | `git` (via `config`) | Selects `LocalWorkspaceStore` backend; `d6-shadow` runs dual-track oracle over `GitWorkspace`, `d6` runs pure-Rust `D6Workspace` with zero `git` subprocesses or `.sources/*.git` mirror clones |
+| `SPAWN_D6_CAS_DIR` | Absolute directory path | `<root>/.d6/cas` (`d6`), `<root>/.d6-shadow/cas` (`d6-shadow`) | Overrides CAS Merkle + `refs.journal` root (`CasMerkleStore::open`) |
+| `SPAWN_D6_TMPFS_ROOT` | Absolute directory path | `None` (disk-only Layer 0) | Opts into bounded L1 `tmpfs` upperdir mounting (`<tmpfs_root>/<branch>`) |
+| `SPAWN_D6_TMPFS_BUDGET_MB` | Positive integer (`u64 > 0`) | `2048` MiB when `SPAWN_D6_TMPFS_ROOT` is set | Hard host-wide L1 RAM ceiling across admitted active branches |
+| `SPAWN_D6_STRICT_FAIL_CLOSED` | `0`, `false`, `1`, `true` | `false` | When `true` under `d6-shadow`, `TrackedSetLeak` ALSO returns `WorkspaceError::Refused { code: "TrackedSetLeak" }` instead of recording only shadow metrics/aborting shadow writes |
+
+Invalid paths (relative `SPAWN_D6_CAS_DIR` or `SPAWN_D6_TMPFS_ROOT`), non-positive `SPAWN_D6_TMPFS_BUDGET_MB`, or unrecognized `SPAWN_D6_STRICT_FAIL_CLOSED` values fail closed during startup (`WorkspaceSettings::from_env` / `WorkspaceSettings::peek`).
+
+### Root Backend Compatibility Matrix (`backends_compatible`)
+
+[`claim_root` / `root_backend` / `backends_compatible`](../crates/spawn-host/src/workspace.rs) and `WorkspaceSettings::from_env` enforce strict isolation before opening or creating `.d6/cas`:
+
+| Existing Root Marker | Requested Backend | Outcome | Notes |
+| --- | --- | --- | --- |
+| `git` (`.spawn-workspace-backend` or existing workspaces) | `d6-shadow` | **Allowed** | Wraps authoritative `GitWorkspace` root in dual-track oracle mode |
+| `d6-shadow` | `git` | **Allowed** | Safe toggle back to authoritative `GitWorkspace` |
+| `git`, `cow`, `overlay`, or `d6-shadow` | `d6` | **Refused** | Pure `d6` cannot share a root with Git/CoW/Overlay/Shadow without explicit cutover (`WorkspaceSettings::from_env` refuses before creating `.d6/cas`) |
+| `d6` | `git`, `cow`, `overlay`, `d6-shadow` | **Refused** | Pure `d6` root cannot be claimed by another backend without lossless rollback |
+
+### Bounded L1 `tmpfs` Admission & Pressure Policy (`crates/spawn-host/src/d6_workspace.rs`)
+
+When `L1TmpfsPolicy` is active (`SPAWN_D6_TMPFS_ROOT` set):
+
+- **Host Memory Reserve Floor**: `max(64 GiB, 15% total RAM)` (`DEFAULT_L1_MIN_HOST_RESERVE_BYTES = 64 GiB`, `DEFAULT_L1_HOST_RESERVE_PCT = 15`).
+- **Deterministic Disk Fallback (`L1Admission::FallbackDisk`)**: Mounts transparently under disk `<root>/<branch>` instead of `tmpfs` on `Disabled`, `HostMemoryBelowReserve`, `BudgetExceeded` (over global or per-workspace quota), `TmpfsFreeSpaceInsufficient` (`statvfs`), or runtime `TmpfsUnavailable`.
+- **Pressure & Periodic Flush**:
+  - `usage_pct >= 80%` (`DEFAULT_L1_FLUSH_THRESHOLD_PCT = 80`) or elapsed `>= 60_000 ms` (`DEFAULT_L1_FLUSH_INTERVAL_MS = 60s`) triggers `flush_l1_workspace` into CAS Merkle + PostgreSQL `RefLedger`.
+  - Usage pressure (`UsageThreshold`) demotes the mounted branch back to disk and reclaims its L1 RAM quota; `unmount` and `discard` also release reserved L1 bytes back to `0`.
+
+---
+
+## 10. Reversible Cutover, Border Mirror & Crash-Recovery Runbook
+
+1. **Pre-Cutover Shadow Validation (`d6-shadow`)**:
+   - Deploy `SPAWN_WORKSPACE_BACKEND=d6-shadow` (optionally with `SPAWN_D6_STRICT_FAIL_CLOSED=1`) over the existing `git` root.
+   - Verify `ShadowOracleMetrics` stays at `tree_mismatches == 0`, `tracked_set_leaks == 0`, `shadow_errors == 0`, and `merge_summary.blockers == 0` across active missions.
+2. **7-Step Lossless Project Cutover (`crates/spawn-host/src/d6_cutover.rs::ProjectCutover`)**:
+   - **Step 1 (`step1_backfill_history`)**: Import commit DAG, trees, FastCDC chunks, and blobs into CAS + `spawn_snapshots` (`spawn_refs` untouched).
+   - **Step 2 (`step2_pause_dispatch_and_verify_clean`)**: Pause dispatch, fail closed if any `.merge/*` or pending markers remain (`assert_zero_pending_merges`), and audit `.gitattributes` (`export-ignore`, `export-subst`, `eol`) via `audit_export_attributes`.
+   - **Step 3 (`step3_import_tail_commits`)**: Import tail commits landed during drain.
+   - **Step 4 (`step4_commit_refs_and_flip_mode`)**: Commit non-WIP refs (`main`, branches, tags) to `spawn_refs`, append `refs.journal`, and switch project mode to `ProjectStorageMode::D6Cas`.
+   - **Step 5 (`step5_verify_parity`)**: Prove `RefLedger git_oid == CAS projection == git rev-parse` for every ref (`verify_cutover_parity`).
+   - **Step 6 (`step6_configure_readonly_border`)**: Install `receive.deny*` configs and `hooks/pre-receive` on the bare Git border mirror so direct Git pushes fail closed.
+   - **Step 7 (`step7_resume_dispatch`)**: Resume mission dispatch on native `d6` (`ProjectStorageMode::D6Cas`).
+3. **External Export & Lossless Rollback (`GitBorderAdapter` & `rollback_to_git`)**:
+   - At any time after cutover, `GitBorderAdapter::export_project` materializes all live `spawn_refs` (`<= 100 MiB` blobs streamed directly, `> 100 MiB` via `spawn-pointer-v1`) into an external bare repository with byte-exact tree/commit OID parity verified by `git fsck --full --strict`.
+   - `ProjectCutover::rollback_to_git` exports all post-cutover D6 refs back to the project's bare repo, lifts read-only receive locks, verifies `verify_cutover_parity`, and restores `ProjectStorageMode::Git` cleanly.
+4. **GC Fence & `refs.journal` Crash Recovery**:
+   - Bind each persistent CAS root once via `bind_store_gc_fence` (`.gc-fence` records `db_system_id`, `db_oid`, `schema_name`).
+   - Restore-drill or scratch databases fail closed with `CasError::GcFenceMismatch`; lagging PostgreSQL restores fail closed with `CasError::GcFenceBehindJournal`.
+   - After restoring PostgreSQL from backup, run `reconcile_refs_journal` to idempotently fast-forward missing `spawn_ref_cas` / `spawn_ref_land_main` transitions (ignoring any torn trailing JSON line) until `pg_latest_ref_seq >= journal_latest_seq`, then allow 2-round / `> 24h` persistent GC (`run_persistent_gc_for_ledger`).

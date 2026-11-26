@@ -616,6 +616,18 @@ impl<W: WorkspaceStore, L: RefLedger + Send + Sync> ShadowD6Workspace<W, L> {
         if self.shadow.main_snapshot()?.is_none() {
             let _ = self.sync_main_from_git(None)?;
         }
+        if self.shadow.branch_snapshot(branch.as_str())?.is_some() {
+            return Ok(());
+        }
+        if let Some(repo) = &self.git_repo
+            && let Some(branch_oid) = rev_parse_optional(repo, &format!("refs/heads/{branch}"))?
+        {
+            let snap = self.import_git_commit_graph(repo, branch_oid)?;
+            let _ = self
+                .shadow
+                .ensure_branch(branch, Some(&snap.git_oid.to_hex()))?;
+            return Ok(());
+        }
         if let (Some(spec), Some(repo)) = (from, &self.git_repo)
             && let Ok(oid) = GitOid::parse_hex(spec)
             && self

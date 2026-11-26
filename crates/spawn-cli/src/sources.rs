@@ -2280,8 +2280,12 @@ mod tests {
         fn names_git(code: &str) -> bool {
             let needle = concat!(":", ":git");
             let path = code.match_indices(needle).any(|(at, _)| {
-                !code[at + needle.len()..]
-                    .starts_with(|next: char| next.is_alphanumeric() || next == '_')
+                let rest = &code[at + needle.len()..];
+                let is_host_git_ref_helper = code[..at].ends_with("spawn_host")
+                    && (rest.starts_with("::worker_head_ref")
+                        || rest.starts_with("::task_head_ref"));
+                !is_host_git_ref_helper
+                    && !rest.starts_with(|next: char| next.is_alphanumeric() || next == '_')
             });
             let listed = code.match_indices("use ").any(|(at, _)| {
                 let line = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
@@ -2331,6 +2335,8 @@ mod tests {
             "    use crate::sources::{ensure_mirror, test_git as git};"
         ));
         assert!(!names_git("let git = crate::sources::test_git;"));
+        assert!(!names_git("spawn_host::git::worker_head_ref(\"a\")"));
+        assert!(!names_git("spawn_host::git::task_head_ref(1, \"head\")"));
         let own = include_str!("sources.rs");
         let code = own.split("#[cfg(test)]\nmod ").next().unwrap_or(own);
         assert_eq!(code.matches("spawn_host::git_command(\"git\")").count(), 1);

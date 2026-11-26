@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde_json::json;
-use spawn_cas::{Digest, GitOid, Snapshot, Tree, TreeEntry, TreeEntryKind, TreeMutation};
+use spawn_cas::{
+    CasError, DEFAULT_PERSISTENT_GC_GRACE, Digest, GcFenceBinding, GitOid, Snapshot, Tree,
+    TreeEntry, TreeEntryKind, TreeMutation,
+};
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
     BaseMerge, Branch, Commit, MERGE_WAITS, MOUNT_CANCELLED, SetAside, UNMOUNT_IN_USE,
@@ -32,7 +35,8 @@ use spawn_host::workspace::{D6ShadowOptions, D6StoreOptions, DynRefLedger};
 use spawn_host::{
     CasMerkleStore, D6RefKind, D6StoreError, D6Workspace, GitWorkspace, LedgerRef, LedgerSnapshot,
     LocalWorkspaceStore, RefLedger, SET_ASIDE_WAITS, ShadowCheckpointOutcome, ShadowD6Workspace,
-    ShadowTrackedSetMode, format_commit_body, test_git_command,
+    ShadowTrackedSetMode, bind_store_gc_fence, check_gc_fence, format_commit_body,
+    reconcile_refs_journal, run_persistent_gc_for_ledger, test_git_command,
 };
 use spawn_postgres::{PostgresStore, RefKind};
 
@@ -1762,4 +1766,295 @@ fn local_workspace_store_d6_native_lifecycle_and_l1_tmpfs() {
         .list_refs(Some("proj-local-d6"))
         .expect("list_refs");
     assert!(refs.iter().any(|r| r.name == "agent_local_d6"));
+}
+
+fn copy_cas_dir_excluding_fence_and_journal(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("mkdir dst");
+    for entry in fs::read_dir(src).expect("read src") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        if name == ".gc-fence" || name == "refs.journal" || name == ".lock" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ft = entry.file_type().expect("file type");
+        if ft.is_dir() {
+            copy_cas_dir_excluding_fence_and_journal(&from, &to);
+        } else if ft.is_file() {
+            fs::copy(&from, &to).expect("copy cas entry");
+            let mode = fs::metadata(&from).expect("meta").permissions().mode() & 0o777;
+            fs::set_permissions(&to, fs::Permissions::from_mode(mode)).expect("chmod copy");
+        }
+    }
+}
+
+fn binding_from_pg(pg: &PostgresStore) -> GcFenceBinding {
+    let ident = pg.database_identity().expect("database_identity");
+    GcFenceBinding {
+        db_system_id: ident.db_system_id,
+        db_oid: ident.db_oid,
+        schema_name: ident.schema_name,
+    }
+}
+
+#[test]
+#[expect(clippy::too_many_lines)]
+fn d6_workspace_pg_host_and_pg_restart_recovery_with_gc_fence_and_journal() {
+    let scratch = Scratch::new("host_pg_restart");
+    let cas_dir = scratch.join("cas");
+    let cas = Arc::new(CasMerkleStore::open(&cas_dir).expect("open cas"));
+    let live_pg = Arc::new(PgRefLedger::connect_isolated("host_pg_restart_live"));
+    let live_binding = binding_from_pg(&live_pg.pg);
+    bind_store_gc_fence(&cas, &live_binding).expect("bind live gc fence");
+
+    let live_dyn: DynRefLedger = live_pg.clone();
+    let store = LocalWorkspaceStore::d6(
+        "restart-proj",
+        scratch.join("disk-work"),
+        D6StoreOptions::new(cas.clone(), live_dyn),
+    );
+    let d6 = store.d6_workspace().expect("d6 inner");
+
+    // Seed initial main (seq=1) deterministically so backup restore drill can match seq=1.
+    let (base_id, base_sz) = cas.put_bytes_blob(b"base v0\n").expect("base blob");
+    let main0_tree = cas
+        .put_tree_cached(
+            &Tree::from_entries(vec![TreeEntry::file(
+                b"README.md".to_vec(),
+                &base_id,
+                base_sz,
+            )])
+            .expect("main0 tree"),
+        )
+        .expect("store main0 tree");
+    let main0_snap = Snapshot {
+        tree: main0_tree.clone(),
+        parents: Vec::new(),
+        commit_body: format_commit_body(
+            "Spawn <spawn@localhost> 1700000100 +0000",
+            "Spawn <spawn@localhost> 1700000100 +0000",
+            "Bootstrap main\n",
+        ),
+    };
+    let main0_digest = cas
+        .cas()
+        .put_merkle_snapshot(&main0_snap)
+        .expect("put main0");
+    let main0_git_oid = cas
+        .project_snapshot_oid(&main0_snap, &[])
+        .expect("main0 oid");
+    cas.cas().sync_store().expect("sync main0");
+    let seq1 = d6
+        .land_main_snapshot(None, &main0_digest, None, "bootstrap main")
+        .expect("bootstrap main");
+    assert_eq!(seq1, 1);
+
+    let branch = BranchName::new("agent_rec").expect("branch");
+    store.ensure_branch(&branch, None).expect("ensure_branch");
+    let ws = store.mount(&branch).expect("mount");
+    let dir = PathBuf::from(ws.path());
+    fs::write(dir.join("state.txt"), "v1\n").expect("write v1");
+    assert!(matches!(
+        store.checkpoint(&ws, "ckpt v1").expect("ckpt v1"),
+        Commit::Created(_)
+    ));
+    fs::write(dir.join("state.txt"), "v2\n").expect("write v2");
+    fs::write(dir.join("extra.txt"), "persisted\n").expect("write extra");
+    assert!(matches!(
+        store.checkpoint(&ws, "ckpt v2").expect("ckpt v2"),
+        Commit::Created(_)
+    ));
+
+    // Advance main cleanly (with Spawn-Task trailer for journal replay verification).
+    let (land_blob_id, land_blob_sz) = cas.put_bytes_blob(b"upstream restart\n").expect("land");
+    let main1_tree = cas
+        .apply_mutations(
+            &main0_tree,
+            &[TreeMutation::Upsert {
+                path: vec![b"UPSTREAM.md".to_vec()],
+                kind: TreeEntryKind::File,
+                id: land_blob_id.as_bytes(),
+                size: land_blob_sz,
+            }],
+        )
+        .expect("main1 tree");
+    let draft_body = format_commit_body(
+        "Gate <gate@spawn.local> 1700000200 +0000",
+        "Gate <gate@spawn.local> 1700000200 +0000",
+        "Land upstream\n\nSpawn-Task: 1\n",
+    );
+    let main1_draft = Snapshot {
+        tree: main1_tree.clone(),
+        parents: vec![main0_digest.clone()],
+        commit_body: draft_body,
+    };
+    let main1_git_oid = cas
+        .project_snapshot_oid(&main1_draft, &[main0_git_oid])
+        .expect("main1 oid");
+    let live_task = setup_accepted_task(
+        &live_pg.pg,
+        "/tmp/restart-proj.git",
+        &main0_git_oid,
+        &main1_git_oid,
+    );
+    assert_eq!(live_task, 1);
+    let main1_snap = Snapshot {
+        tree: main1_tree.clone(),
+        parents: vec![main0_digest.clone()],
+        commit_body: format_commit_body(
+            "Gate <gate@spawn.local> 1700000200 +0000",
+            "Gate <gate@spawn.local> 1700000200 +0000",
+            &format!("Land upstream\n\nSpawn-Task: {live_task}\n"),
+        ),
+    };
+    let main1_digest = cas
+        .cas()
+        .put_merkle_snapshot(&main1_snap)
+        .expect("put main1");
+    cas.cas().sync_store().expect("sync main1");
+    d6.land_main_snapshot(
+        Some(&main0_digest),
+        &main1_digest,
+        Some(live_task),
+        "land upstream",
+    )
+    .expect("land upstream");
+    store.unmount(&ws).expect("unmount");
+
+    let live_seq = live_pg.pg.latest_ref_log_seq().expect("live seq");
+    assert!(live_seq >= 5);
+
+    // Host restart: drop handles, reopen CAS + store, verify GC Fence & mounted workspace contents.
+    drop(store);
+    drop(cas);
+    let reopened_cas = Arc::new(CasMerkleStore::open(&cas_dir).expect("reopen cas"));
+    let status =
+        check_gc_fence(&reopened_cas, &live_binding, live_seq).expect("gc fence post-restart");
+    assert_eq!(status.pg_latest_ref_seq, live_seq);
+    assert_eq!(status.journal_latest_seq, live_seq);
+
+    let reopened_store = LocalWorkspaceStore::d6(
+        "restart-proj",
+        scratch.join("disk-work"),
+        D6StoreOptions::new(reopened_cas.clone(), live_pg.clone()),
+    );
+    let ws2 = reopened_store.mount(&branch).expect("remount");
+    assert_eq!(
+        fs::read_to_string(Path::new(ws2.path()).join("state.txt")).expect("state v2"),
+        "v2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(ws2.path()).join("extra.txt")).expect("extra"),
+        "persisted\n"
+    );
+    reopened_store.unmount(&ws2).expect("unmount reopened");
+
+    // Drill schema must fail closed against live CAS .gc-fence on both check and GC.
+    let drill_pg = Arc::new(PgRefLedger::connect_isolated("host_pg_restart_drill"));
+    let drill_binding = binding_from_pg(&drill_pg.pg);
+    assert!(matches!(
+        check_gc_fence(&reopened_cas, &drill_binding, 0),
+        Err(D6StoreError::Cas(CasError::GcFenceMismatch { .. }))
+    ));
+    assert!(matches!(
+        run_persistent_gc_for_ledger(
+            &reopened_cas,
+            drill_pg.as_ref(),
+            &drill_binding,
+            0,
+            DEFAULT_PERSISTENT_GC_GRACE,
+        ),
+        Err(D6StoreError::Cas(CasError::GcFenceMismatch { .. }))
+    ));
+
+    // Simulated PG crash/restore lag at seq=1 + torn partial tail line in refs.journal.
+    let restored_cas_dir = scratch.join("cas-restored");
+    copy_cas_dir_excluding_fence_and_journal(&cas_dir, &restored_cas_dir);
+    let mut journal_bytes =
+        fs::read(reopened_cas.cas().refs_journal_path()).expect("read refs.journal");
+    journal_bytes.extend_from_slice(b"{\"seq\":999,\"torn\":");
+    fs::write(restored_cas_dir.join("refs.journal"), &journal_bytes)
+        .expect("write restored journal");
+    let restored_cas =
+        Arc::new(CasMerkleStore::open(&restored_cas_dir).expect("open restored cas"));
+
+    let restored_pg = Arc::new(PgRefLedger::connect_isolated("host_pg_restart_backup"));
+    let restored_binding = binding_from_pg(&restored_pg.pg);
+    bind_store_gc_fence(&restored_cas, &restored_binding).expect("bind restored fence");
+
+    let backup_task = setup_accepted_task(
+        &restored_pg.pg,
+        "/tmp/restart-proj.git",
+        &main0_git_oid,
+        &main1_git_oid,
+    );
+    assert_eq!(backup_task, live_task);
+    restored_pg
+        .record_snapshot(
+            &main0_digest,
+            &main0_git_oid,
+            &main0_tree,
+            &[],
+            "restart-proj",
+            1_700_000_100_000,
+        )
+        .expect("record backup main0");
+    assert_eq!(
+        restored_pg
+            .land_main_ref(
+                "restart-proj",
+                "main",
+                None,
+                &main0_digest,
+                None,
+                "backup init"
+            )
+            .expect("land backup main0"),
+        1
+    );
+
+    assert!(matches!(
+        check_gc_fence(&restored_cas, &restored_binding, 1),
+        Err(D6StoreError::Cas(CasError::GcFenceBehindJournal {
+            pg_latest_ref_seq: 1,
+            ..
+        }))
+    ));
+
+    let rep1 = reconcile_refs_journal(&restored_cas, restored_pg.as_ref(), 1, "host_pg_restart")
+        .expect("reconcile suffix");
+    assert!(rep1.entries_replayed >= 4, "{rep1:?}");
+    assert_eq!(rep1.last_ledger_seq, live_seq);
+
+    let rep2 = reconcile_refs_journal(
+        &restored_cas,
+        restored_pg.as_ref(),
+        live_seq,
+        "host_pg_restart",
+    )
+    .expect("idempotent second reconcile");
+    assert_eq!(rep2.entries_considered, 0);
+    assert_eq!(rep2.entries_replayed, 0);
+
+    let new_seq = restored_pg.pg.latest_ref_log_seq().expect("restored seq");
+    assert_eq!(new_seq, live_seq);
+    check_gc_fence(&restored_cas, &restored_binding, new_seq)
+        .expect("gc fence passes after reconcile");
+
+    let restored_store = LocalWorkspaceStore::d6(
+        "restart-proj",
+        scratch.join("restored-disk-work"),
+        D6StoreOptions::new(restored_cas, restored_pg),
+    );
+    let ws3 = restored_store.mount(&branch).expect("mount restored");
+    assert_eq!(
+        fs::read_to_string(Path::new(ws3.path()).join("state.txt")).expect("restored state v2"),
+        "v2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(Path::new(ws3.path()).join("extra.txt")).expect("restored extra"),
+        "persisted\n"
+    );
+    restored_store.unmount(&ws3).expect("unmount restored");
 }
