@@ -722,6 +722,7 @@ dependencies = [
  "sha1",
  "sha2",
  "signal-hook",
+ "spawn-cas",
  "spawn-codegraph",
  "spawn-core",
  "spawn-host",

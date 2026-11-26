@@ -20,6 +20,8 @@ spawn-jev.workspace = true
 spawn-codegraph.workspace = true
 # spawn-node v1's protocol: `scenarios_sha256` is its `tree_sha256_v1`.
 spawn-node-proto.workspace = true
+# Data snapshots (PV3b): manifest-v1, the `data` namespace and its pins.
+spawn-cas.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The backups' sha256, computed as a record spells it.
