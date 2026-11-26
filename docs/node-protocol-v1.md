@@ -136,7 +136,7 @@ If the file is missing, the gateway makes it on first start (mode `0600`, writte
 Pacing uses token buckets **per source address and per `node_id`**: 20 requests per 10 s for the API verbs, and 200 per 10 s for artifact and manifest GETs. Over either bucket the answer is `429 busy`.
 The source address is the TCP peer. When the peer is loopback (a reverse proxy on this host), it is the last `X-Forwarded-For` entry, the one that proxy appended.
 
-`next_beat_ms` is 5 000 while the node holds a lease or a pending result, was just granted one, or its cell has a queued job. Otherwise it is 30 000.
+The primary currently answers `next_beat_ms` = 5 000 whether the node is busy or idle, so work queued just after an idle beat is leased well inside the 30 s default queue wait (an idle 30 000, with ±20% node jitter, slept up to 36 s). The wire protocol still accepts any bounded `next_beat_ms`, and the frozen P6 wire vectors keep their example values.
 A node coalesces edges closer than 500 ms into one beat. A lease lives 90 s (`lease_ttl_s`) and is renewed by every beat that lists it.
 
 ## 3. The verbs
