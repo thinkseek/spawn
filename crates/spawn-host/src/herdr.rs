@@ -1366,11 +1366,22 @@ pub(crate) fn chunks(text: &str, limit: usize) -> Vec<&str> {
     pieces
 }
 
-/// The launch as a script for `/bin/sh`: the environment exported, the
-/// script removed, then the program `exec`ed with its arguments, none of
-/// them read by a shell.
+/// What the launch script prints first: cursor home, clear the screen and
+/// its scrollback. Herdr's pane shell echoes the line that runs the script
+/// (`$ exec /bin/sh '<script>'`), and that echo stays on the screen above
+/// whatever the program draws; read with the program's tail, it is a
+/// prompt holding text (`Drafted`), so a trust dialog the engine draws
+/// before its input box went unanswered. Cleared, the pane holds only what
+/// the program drew.
+pub(crate) const CLEAR_SCREEN: &str = "printf '\\033[H\\033[2J\\033[3J'\n";
+
+/// The launch as a script for `/bin/sh`: the screen cleared of the line
+/// that ran it ([`CLEAR_SCREEN`]), the environment exported, the script
+/// removed, then the program `exec`ed with its arguments, none of them read
+/// by a shell.
 pub(crate) fn launch_script(launch: &Launch) -> Result<String, TerminalError> {
-    let mut script = String::from("set -a\n");
+    let mut script = String::from(CLEAR_SCREEN);
+    script.push_str("set -a\n");
     script.push_str(&crate::tmux::environment_text(&launch.environment)?);
     script.push_str("set +a\nrm -f -- \"$0\"\nexec ");
     let mut words = vec![launch.program.clone()];
@@ -2074,9 +2085,12 @@ mod tests {
         let script = launch_script(&launch).expect("script");
         assert_eq!(
             script,
-            "set -a\nSPAWN_AGENT='a'\\''b'\nset +a\nrm -f -- \"$0\"\n\
+            "printf '\\033[H\\033[2J\\033[3J'\n\
+             set -a\nSPAWN_AGENT='a'\\''b'\nset +a\nrm -f -- \"$0\"\n\
              exec '/bin/spawn' 'run' '--' 'it'\\''s $HOME'\n"
         );
+        // The screen is cleared first, before anything else runs.
+        assert!(script.starts_with(super::CLEAR_SCREEN), "{script}");
         let bad = Launch {
             environment: vec![("A B".into(), "x".into())],
             ..launch
