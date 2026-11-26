@@ -46,6 +46,7 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -419,7 +420,8 @@ impl Artifacts {
     /// owner and group 0) of the controller's `scripts/`, the scenario set
     /// `scenarios` under its place in the controller `scenarios_at` (e.g.
     /// `rsi/scenarios`), and `web/package-lock.json`. Cached under `key`
-    /// when one is given (the controller's commit and the set's digest).
+    /// when one is given (built by [`controller_pack_key`] from every
+    /// packed input).
     pub(super) fn controller_pack(
         &self,
         controller: &Path,
@@ -633,12 +635,16 @@ pub(super) fn web_lock(controller: &Path) -> Option<String> {
 /// length-prefixed: the controller's commit, `scenarios_at`, the set's
 /// `scenarios_sha256`, a digest of the controller's `scripts/` (kinds,
 /// modes, contents and link targets, walked in bytewise path order;
-/// absent marked as such) and the sha256 of `web/package-lock.json`
-/// (absent marked as such). An entry that cannot be read is an error:
-/// the caller packs uncached then.
+/// absent marked as such), a digest of the `scenarios` tree (kinds, modes,
+/// contents and link targets), and the mode, size and sha256 of
+/// `web/package-lock.json` (absent marked as such). Cargo lockfiles listed
+/// in [`spawn_node_proto::TREE_SKIP_REGISTRY`] are skipped to match
+/// `tar --exclude`. An entry that cannot be read is an error: the caller
+/// packs uncached then.
 pub(super) fn controller_pack_key(
     controller: &Path,
     controller_commit: &str,
+    scenarios: &Path,
     scenarios_at: &Path,
     scenarios_sha256: &str,
 ) -> Result<String, String> {
@@ -656,29 +662,41 @@ pub(super) fn controller_pack_key(
     // directory.
     if scripts.is_dir() {
         field(&mut key, b"scripts:present");
-        field(&mut key, scripts_digest(&scripts)?.as_bytes());
+        field(
+            &mut key,
+            pack_tree_digest(&scripts, Path::new("scripts"))?.as_bytes(),
+        );
     } else {
         field(&mut key, b"scripts:absent");
     }
+    field(&mut key, b"scenarios:present");
+    field(
+        &mut key,
+        pack_tree_digest(scenarios, Path::new("scenarios"))?.as_bytes(),
+    );
     let lock = controller.join("web/package-lock.json");
     if lock.is_file() {
-        let (digest, _) =
+        let mode = std::fs::metadata(&lock)
+            .map_err(|error| format!("{}: {error}", lock.display()))?
+            .mode()
+            & 0o7777;
+        let (digest, size) =
             hash_file(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
         field(&mut key, b"web-lock:present");
-        field(&mut key, digest.as_bytes());
+        field(&mut key, format!("{mode:o}\0{size}\0{digest}").as_bytes());
     } else {
         field(&mut key, b"web-lock:absent");
     }
     Ok(hex(&key.finalize()))
 }
 
-/// A deterministic digest of the tree at `scripts` (not following links):
+/// A deterministic digest of the packed tree at `root` (not following links):
 /// one length-prefixed record per entry, sorted bytewise by relative path,
 /// of its kind, its permission bits and its content's sha256 (a file),
-/// its target (a link) or nothing more (a directory). Any other kind of
-/// entry, or one that cannot be read, is an error.
-fn scripts_digest(scripts: &Path) -> Result<String, String> {
-    use std::os::unix::fs::PermissionsExt as _;
+/// its target (a link) or nothing more (a directory), skipping cargo lock
+/// files in [`spawn_node_proto::TREE_SKIP_REGISTRY`] to match `tar --exclude`.
+/// Any other kind of entry, or one that cannot be read, is an error.
+fn pack_tree_digest(root: &Path, label: &Path) -> Result<String, String> {
     fn collect(
         path: &Path,
         relative: &Path,
@@ -687,7 +705,7 @@ fn scripts_digest(scripts: &Path) -> Result<String, String> {
         let fail = |error: std::io::Error| format!("{}: {error}", path.display());
         let meta = std::fs::symlink_metadata(path).map_err(fail)?;
         let kind = meta.file_type();
-        let mode = meta.permissions().mode() & 0o7777;
+        let mode = meta.mode() & 0o7777;
         let mut record = Vec::new();
         if kind.is_symlink() {
             record.extend_from_slice(b"link\0");
@@ -712,13 +730,20 @@ fn scripts_digest(scripts: &Path) -> Result<String, String> {
         if kind.is_dir() {
             for entry in std::fs::read_dir(path).map_err(fail)? {
                 let entry = entry.map_err(fail)?;
-                collect(&entry.path(), &relative.join(entry.file_name()), out)?;
+                let name = entry.file_name();
+                if spawn_node_proto::TREE_SKIP_REGISTRY
+                    .iter()
+                    .any(|skip| name.as_bytes() == skip.as_bytes())
+                {
+                    continue;
+                }
+                collect(&entry.path(), &relative.join(&name), out)?;
             }
         }
         Ok(())
     }
     let mut entries = Vec::new();
-    collect(scripts, Path::new("scripts"), &mut entries)?;
+    collect(root, label, &mut entries)?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut all = Sha256::new();
     for (relative, record) in entries {
@@ -1667,7 +1692,14 @@ impl Primary {
             scenarios_sha256
                 .as_deref()
                 .and_then(|digest| {
-                    controller_pack_key(&controller, &controller_commit, &scenarios_at, digest).ok()
+                    controller_pack_key(
+                        &controller,
+                        &controller_commit,
+                        &snapshot,
+                        &scenarios_at,
+                        digest,
+                    )
+                    .ok()
                 })
                 .as_deref(),
         );
@@ -2760,12 +2792,12 @@ pub(super) mod tests {
         assert_eq!(web_lock(&dir.0), None);
     }
 
-    /// Pack `ctl` keyed as `Primary::publish` and `NodeShadows::publish`
+    /// Pack `ctl` keyed as `Primary::publish` and `NodeShadows::enqueue`
     /// key it; the key and what was served.
     fn keyed_pack(artifacts: &Artifacts, ctl: &Path, at: &Path) -> (String, Published) {
         let scenarios = ctl.join("rsi/scenarios");
         let digest = super::super::inputs::scenarios_sha256(&scenarios).unwrap();
-        let key = controller_pack_key(ctl, CONTROLLER, at, &digest).unwrap();
+        let key = controller_pack_key(ctl, CONTROLLER, &scenarios, at, &digest).unwrap();
         let published = artifacts
             .controller_pack(ctl, &scenarios, at, Some(&key))
             .unwrap();
@@ -2784,6 +2816,8 @@ pub(super) mod tests {
                 .unwrap();
         };
         chmod("scripts/rsi/gate.sh", 0o644);
+        chmod("rsi/scenarios/check-ok.sh", 0o644);
+        chmod("web/package-lock.json", 0o644);
         std::os::unix::fs::symlink("gate.sh", ctl.join("scripts/rsi/link")).unwrap();
         // The same inputs: the same key, a cache hit (the cache entry is
         // what serves it: a planted entry is returned as is).
@@ -2815,6 +2849,17 @@ pub(super) mod tests {
         std::fs::remove_file(ctl.join("scripts/rsi/link")).unwrap();
         std::os::unix::fs::symlink("other.sh", ctl.join("scripts/rsi/link")).unwrap();
         changed("a link's target (and a new script)", at);
+        // Scenarios mode and symlink changes invalidate even when file contents stay the same.
+        chmod("rsi/scenarios/check-ok.sh", 0o755);
+        changed("scenario executable bit", at);
+        std::os::unix::fs::symlink("check-ok.sh", ctl.join("rsi/scenarios/link")).unwrap();
+        changed("scenario symlink added", at);
+        std::fs::remove_file(ctl.join("rsi/scenarios/link")).unwrap();
+        std::os::unix::fs::symlink("sub/001.sh", ctl.join("rsi/scenarios/link")).unwrap();
+        changed("scenario symlink retargeted", at);
+        // Web lockfile mode and contents changes invalidate.
+        chmod("web/package-lock.json", 0o755);
+        changed("the web lock's mode", at);
         std::fs::write(
             ctl.join("web/package-lock.json"),
             "{\"lockfileVersion\":2}\n",
@@ -2826,29 +2871,35 @@ pub(super) mod tests {
         std::fs::write(ctl.join("web/package-lock.json"), "{}\n").unwrap();
         changed("the web lock added", at);
         changed("the scenarios' place", Path::new("rsi/elsewhere"));
+        // Excluded cargo lockfiles under scripts/ match `tar --exclude` and do not change the key.
+        let before_skip = keyed_pack(&artifacts, &ctl, at).0;
+        std::fs::write(ctl.join("scripts/.package-cache"), "lock").unwrap();
+        assert_eq!(keyed_pack(&artifacts, &ctl, at).0, before_skip);
 
         // No scripts at all: a key of its own too.
         let bare = dir.0.join("bare");
         std::fs::create_dir_all(bare.join("rsi/scenarios")).unwrap();
-        std::fs::write(bare.join("rsi/scenarios/check-ok.sh"), "exit 0\n").unwrap();
-        let with = controller_pack_key(&ctl, CONTROLLER, at, "d").unwrap();
-        let without = controller_pack_key(&bare, CONTROLLER, at, "d").unwrap();
+        let bare_scenarios = bare.join("rsi/scenarios");
+        std::fs::write(bare_scenarios.join("check-ok.sh"), "exit 0\n").unwrap();
+        let ctl_scenarios = ctl.join("rsi/scenarios");
+        let with = controller_pack_key(&ctl, CONTROLLER, &ctl_scenarios, at, "d").unwrap();
+        let without = controller_pack_key(&bare, CONTROLLER, &bare_scenarios, at, "d").unwrap();
         assert_ne!(with, without);
         // Fields cannot run into each other.
         assert_ne!(
-            controller_pack_key(&bare, "ab", Path::new("c"), "d").unwrap(),
-            controller_pack_key(&bare, "a", Path::new("bc"), "d").unwrap()
+            controller_pack_key(&bare, "ab", &bare_scenarios, Path::new("c"), "d").unwrap(),
+            controller_pack_key(&bare, "a", &bare_scenarios, Path::new("bc"), "d").unwrap()
         );
         // An entry that cannot be read: no key (packed uncached), not a
         // stale hit.
         let fifo = ctl.join("scripts/fifo");
         let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(made.success());
-        assert!(controller_pack_key(&ctl, CONTROLLER, at, "d").is_err());
+        assert!(controller_pack_key(&ctl, CONTROLLER, &ctl_scenarios, at, "d").is_err());
         std::fs::remove_file(&fifo).unwrap();
         if !nix_is_root() {
             chmod("scripts/rsi/gate.sh", 0o000);
-            assert!(controller_pack_key(&ctl, CONTROLLER, at, "d").is_err());
+            assert!(controller_pack_key(&ctl, CONTROLLER, &ctl_scenarios, at, "d").is_err());
             chmod("scripts/rsi/gate.sh", 0o644);
         }
     }
@@ -2859,6 +2910,108 @@ pub(super) mod tests {
             .arg("-u")
             .output()
             .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+    }
+
+    #[test]
+    fn the_controller_pack_key_invalidates_when_scripts_modes_lockfile_or_path_change() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = Scratch::new("pack-key-invalidates");
+        let ctl = controller(&dir.0);
+        let scenarios = ctl.join("rsi/scenarios");
+        let at = Path::new("rsi/scenarios");
+        let gate = ctl.join("scripts/rsi/gate.sh");
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let scenarios_digest = super::super::inputs::scenarios_sha256(&scenarios).unwrap();
+
+        let key1 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key1");
+        assert_eq!(key1.len(), 64);
+        assert_eq!(
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).as_deref(),
+            Ok(key1.as_str())
+        );
+
+        let artifacts = Artifacts::new(dir.0.join("artifacts"));
+        let pack1 = artifacts
+            .controller_pack(&ctl, &scenarios, at, Some(&key1))
+            .unwrap();
+        let pack1_again = artifacts
+            .controller_pack(&ctl, &scenarios, at, Some(&key1))
+            .unwrap();
+        assert_eq!(pack1, pack1_again);
+
+        // Editing scripts/rsi/gate.sh without touching .controller or scenarios changes the key and repacks.
+        let v2_gate = "#!/bin/sh\necho gate-v2\nexit 0\n";
+        std::fs::write(&gate, v2_gate).unwrap();
+        let key2 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key2");
+        assert_ne!(key2, key1);
+        let pack2 = artifacts
+            .controller_pack(&ctl, &scenarios, at, Some(&key2))
+            .unwrap();
+        assert_ne!(pack2, pack1);
+        let extracted = Command::new("tar")
+            .args(["-xOf"])
+            .arg(artifacts.path_of(&pack2.digest))
+            .arg("scripts/rsi/gate.sh")
+            .output()
+            .unwrap();
+        assert!(extracted.status.success());
+        assert_eq!(String::from_utf8_lossy(&extracted.stdout), v2_gate);
+
+        // Changing script mode (e.g. chmod +x) invalidates the key.
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key3 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key3");
+        assert_ne!(key3, key2);
+
+        // Adding or repointing a symlink inside scripts/ invalidates the key.
+        let link = ctl.join("scripts/rsi/link");
+        std::os::unix::fs::symlink("gate.sh", &link).unwrap();
+        let key4 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key4");
+        assert_ne!(key4, key3);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("other.sh", &link).unwrap();
+        let key5 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key5");
+        assert_ne!(key5, key4);
+
+        // Editing or removing web/package-lock.json invalidates the key.
+        let lock = ctl.join("web/package-lock.json");
+        std::fs::write(&lock, "{\"lockfileVersion\":4}\n").unwrap();
+        let key6 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key6");
+        assert_ne!(key6, key5);
+        std::fs::remove_file(&lock).unwrap();
+        let key7 =
+            controller_pack_key(&ctl, CONTROLLER, &scenarios, at, &scenarios_digest).expect("key7");
+        assert_ne!(key7, key6);
+
+        // Changing scenarios_at invalidates the key.
+        let key8 = controller_pack_key(
+            &ctl,
+            CONTROLLER,
+            &scenarios,
+            Path::new("rsi/other"),
+            &scenarios_digest,
+        )
+        .expect("key8");
+        assert_ne!(key8, key7);
+
+        // Editing scenarios invalidates the key.
+        std::fs::write(scenarios.join("check-ok.sh"), "exit 1\n").unwrap();
+        let scenarios_digest2 = super::super::inputs::scenarios_sha256(&scenarios).unwrap();
+        let key9 = controller_pack_key(
+            &ctl,
+            CONTROLLER,
+            &scenarios,
+            Path::new("rsi/other"),
+            &scenarios_digest2,
+        )
+        .expect("key9");
+        assert_ne!(key9, key8);
     }
 
     #[test]
