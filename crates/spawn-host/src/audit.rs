@@ -3,6 +3,9 @@
 //! files an agent can swap are opened the safe way, and a git that died
 //! mid-checkpoint wedges nothing.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;

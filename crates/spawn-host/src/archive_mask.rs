@@ -3,7 +3,7 @@
 //! may not pass through a file, a pipe or an argument, cc-astra A51).
 //!
 //! [`CollectorMask`] runs `python3 -I -B <tool>` (the installed
-//! [`INSTALLED_TOOL`]; [`TOOL_LIMIT`]) and reads its JSON: per source a
+//! `INSTALLED_TOOL`; `TOOL_LIMIT`) and reads its JSON: per source a
 //! path and the stamp of the descriptor the collector read it through
 //! (`size`, `mtime_ns`, `dev`, `ino`, `ctime_ns`, every field required, so an
 //! older collector's answer is refused); per value a path, a line (the file
@@ -25,7 +25,7 @@
 //! source, every accepted-missing path (`accepted_paths`), every watched
 //! directory (`watch`, by mtime) and every probed path (`probe`, by
 //! existence), and runs the tool again when one differs, the last run is
-//! [`REBUILD_AFTER`] old, or the last call failed. [`ArchiveMask::current`]
+//! `REBUILD_AFTER` old, or the last call failed. [`ArchiveMask::current`]
 //! is true only for the mask kept now while none of these changed.
 //!
 //! A stand-in tool (`SPAWN_ARCHIVE_LOCATIONS_TOOL`) is honoured only in a
@@ -37,6 +37,9 @@
 //! copied. The guarantee covers live roots inside the account's home; a
 //! launcher with root, or one that binds the live tree elsewhere, is
 //! privileged tampering, which this does not stand against.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -53,13 +56,11 @@ use spawn_core::transcripts::ARCHIVE_MARKER;
 use crate::home::Home;
 
 /// The default directory where the lead installs redaction helpers.
-pub const INSTALLED_DIR: &str = "/usr/local/lib/spawn/redact";
+const INSTALLED_DIR: &str = "/usr/local/lib/spawn/redact";
 
 /// The value collector's location tool, installed by the lead.
-pub const INSTALLED_TOOL: &str = "/usr/local/lib/spawn/redact/emit-locations.py";
-
-/// The standalone collector module used as a fallback when `emit-locations.py` is absent.
-pub const INSTALLED_COLLECTOR: &str = "/usr/local/lib/spawn/redact/secret-values.py";
+#[cfg(test)]
+const INSTALLED_TOOL: &str = "/usr/local/lib/spawn/redact/emit-locations.py";
 
 /// Inline loader invoked only when `secret-values.py` is present without `emit-locations.py`.
 const COLLECTOR_LOADER: &str = "import importlib.util, json, os, sys\n\
@@ -69,19 +70,21 @@ spec.loader.exec_module(mod)\n\
 print(json.dumps(mod.locate(os.path.expanduser('~'))))\n";
 
 /// How long one run of the tool may take.
-pub const TOOL_LIMIT: Duration = Duration::from_secs(30);
+const TOOL_LIMIT: Duration = Duration::from_secs(30);
 
 /// How old a kept mask may be before an archive attempt builds it again.
-pub const REBUILD_AFTER: Duration = Duration::from_mins(10);
+const REBUILD_AFTER: Duration = Duration::from_mins(10);
 
 /// Why a named stand-in is refused outside a gate's sandbox.
-pub const SANDBOX_ONLY: &str = "SPAWN_ARCHIVE_LOCATIONS_TOOL is honoured only in a gate's \
+const SANDBOX_ONLY: &str = "SPAWN_ARCHIVE_LOCATIONS_TOOL is honoured only in a gate's \
     sandbox (SPAWN_GATE_SANDBOX=1): no location tool is run";
 
 /// A stand-in tool accepted, and the roots it masks for: said by the loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandIn {
+    /// Path to the stand-in location tool executable.
     pub tool: PathBuf,
+    /// Canonicalized workspace/projects roots this stand-in masks for.
     pub roots: Vec<PathBuf>,
 }
 
@@ -232,7 +235,7 @@ impl CollectorMask {
     /// The mask as `tool` (`SPAWN_ARCHIVE_LOCATIONS_TOOL`) and `sandbox`
     /// (`SPAWN_GATE_SANDBOX`) configure it, for `roots`, against `home`.
     #[must_use]
-    pub fn configured(
+    fn configured(
         tool: Option<PathBuf>,
         sandbox: Option<&str>,
         roots: &[PathBuf],
@@ -251,7 +254,7 @@ impl CollectorMask {
     /// Like [`Self::configured`], with explicit `installed_dir` and `exe_dir`
     /// fallback search roots.
     #[must_use]
-    pub fn configured_with_dirs(
+    fn configured_with_dirs(
         tool: Option<PathBuf>,
         sandbox: Option<&str>,
         roots: &[PathBuf],
@@ -292,7 +295,7 @@ impl CollectorMask {
 
     /// The mask `tool`'s places give.
     #[must_use]
-    pub fn with_tool(tool: PathBuf) -> Self {
+    fn with_tool(tool: PathBuf) -> Self {
         Self {
             tool: Tool::Run(tool),
             kept: Mutex::new(None),
@@ -301,8 +304,9 @@ impl CollectorMask {
 
     /// The mask a standalone `secret-values.py` collector module gives by
     /// invoking `locate(os.path.expanduser("~"))` in-process.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_collector(collector: PathBuf) -> Self {
+    fn with_collector(collector: PathBuf) -> Self {
         Self {
             tool: Tool::Collector(collector),
             kept: Mutex::new(None),
@@ -411,11 +415,13 @@ impl ArchiveMask for CollectorMask {
 /// the workspace root is walked unpinned and the projects root is read as
 /// before (the user's own links are theirs).
 pub struct LoopRoots {
+    /// Root covering agent workspaces (`<workspace root>`), pinned when using a stand-in.
     pub workspace: crate::beneath::Beneath,
+    /// Optional projects root (`<projects>`), pinned when using a stand-in.
     pub projects: Option<crate::beneath::Beneath>,
 }
 
-/// [`LoopRoots`] for `stand_in` (the one [`CollectorMask::configured`]
+/// [`LoopRoots`] for `stand_in` (the one `CollectorMask::configured`
 /// accepted, if any).
 ///
 /// # Errors
@@ -643,7 +649,7 @@ fn read_stamped(path: &Path, stamp: Stamp) -> Result<Vec<u8>, String> {
 /// `bytes` split as the collector's read() splits a file: at `\r\n`, a
 /// lone `\r`, `\n` and NUL.
 #[must_use]
-pub fn lines(bytes: &[u8]) -> Vec<&[u8]> {
+fn lines(bytes: &[u8]) -> Vec<&[u8]> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut at = 0;
@@ -723,7 +729,7 @@ fn span<'a>(text: &'a [u8], place: &Value, path: &Path) -> Result<&'a [u8], Stri
 /// `%XX` of two hex digits a byte, anything else as it is, the result read
 /// as UTF-8 with each invalid sequence replaced.
 #[must_use]
-pub fn unquote(text: &[u8]) -> Vec<u8> {
+fn unquote(text: &[u8]) -> Vec<u8> {
     let hex = |byte: u8| char::from(byte).to_digit(16);
     let mut out = Vec::with_capacity(text.len());
     let mut at = 0;

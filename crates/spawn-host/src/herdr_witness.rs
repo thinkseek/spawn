@@ -7,6 +7,9 @@
 //!    (`drop_agy_account_lines`, preserving `N4`);
 //! 3. Optional OSC 7501 status corroboration when the agent emits structured status.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -18,18 +21,24 @@ use spawn_core::screen::{
 
 /// Host-decoded subset of `herdr-core` OSC 7501 agent status metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OscStatus {
+pub(crate) struct OscStatus {
+    /// Reported agent activity state string (for example `busy`, `idle`, `waiting`).
     pub state: String,
+    /// Optional structured wait or notification kind.
     pub kind: Option<String>,
+    /// Optional numeric progress percentage (`0..=100`).
     pub progress: Option<u8>,
+    /// Emitting application identifier.
     pub app: String,
+    /// Optional status title shown alongside the agent state.
     pub title: String,
+    /// Detailed status message body.
     pub msg: String,
 }
 
 impl OscStatus {
     /// Parses OSC 7501 status JSON returned in `terminal.get`'s `status` field.
-    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+    pub(crate) fn from_json(value: &serde_json::Value) -> Option<Self> {
         let state = value.get("state")?.as_str()?.to_string();
         let kind = value
             .get("kind")
@@ -66,10 +75,10 @@ impl OscStatus {
 }
 
 /// Manifest version tag reported by the host-side `agy` witness.
-pub const AGY_MANIFEST: &str = "host-witness:agy-2026.10.05.1";
+const AGY_MANIFEST: &str = "host-witness:agy-2026.10.05.1";
 
 /// Manifest version tag reported by the host-side Claude Code witness.
-pub const CLAUDE_MANIFEST: &str = "host-witness:claude-1";
+const CLAUDE_MANIFEST: &str = "host-witness:claude-1";
 
 /// Interpreters whose first non-flag script argument names the executed agent
 /// (when not invoked via `-c` / `-e` inline shell snippets).
@@ -79,14 +88,16 @@ const INTERPRETERS: [&str; 11] = [
 
 /// Supported coding-agent engines identifiable in the host process tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectedAgent {
+enum DetectedAgent {
+    /// Antigravity CLI (`agy`) process.
     Agy,
+    /// Anthropic Claude Code (`claude`) process.
     Claude,
 }
 
 impl DetectedAgent {
     /// Canonical Spawn agent identifier.
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Agy => "agy",
             Self::Claude => "claude",
@@ -94,7 +105,7 @@ impl DetectedAgent {
     }
 
     /// Host witness manifest version string.
-    pub const fn manifest(self) -> &'static str {
+    const fn manifest(self) -> &'static str {
         match self {
             Self::Agy => AGY_MANIFEST,
             Self::Claude => CLAUDE_MANIFEST,
@@ -103,7 +114,7 @@ impl DetectedAgent {
 }
 
 /// Reading returned when no supported coding agent runs in the terminal.
-pub fn no_agent() -> AgentReading {
+pub(crate) fn no_agent() -> AgentReading {
     AgentReading {
         agent: None,
         status: AgentStatus::Unknown,
@@ -119,7 +130,7 @@ pub fn no_agent() -> AgentReading {
 ///
 /// Inline shell snippets (`sh -c "agy ..."`) are explicitly ignored so a plain shell
 /// running commands named after an agent never counts as an agent (`N2`).
-pub fn classify_process(comm: &str, argv: &[String]) -> Option<DetectedAgent> {
+fn classify_process(comm: &str, argv: &[String]) -> Option<DetectedAgent> {
     if let Some(agent) = match_binary_name(comm) {
         return Some(agent);
     }
@@ -172,7 +183,7 @@ fn interpreter_target(argv: &[String]) -> Option<&str> {
 
 /// Walks the live `/proc` process tree rooted at `leader_pid` and detects
 /// the first live `agy` or `claude` descendant (or the leader itself).
-pub fn detect_agent_in_tree(leader_pid: u32) -> Option<DetectedAgent> {
+fn detect_agent_in_tree(leader_pid: u32) -> Option<DetectedAgent> {
     if leader_pid <= 1 {
         return None;
     }
@@ -242,7 +253,7 @@ fn inspect_pid(pid: u32) -> Option<DetectedAgent> {
 }
 
 /// Combines `/proc` process verification with screen and optional OSC 7501 observation.
-pub fn observe(
+pub(crate) fn observe(
     leader_pid: Option<u32>,
     raw_screen: &str,
     osc_status: Option<&OscStatus>,
@@ -254,7 +265,7 @@ pub fn observe(
 }
 
 /// Evaluates `raw_screen` and optional `osc_status` for a verified `agent`.
-pub fn witness_screen(
+fn witness_screen(
     agent: DetectedAgent,
     raw_screen: &str,
     osc_status: Option<&OscStatus>,

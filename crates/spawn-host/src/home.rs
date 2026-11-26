@@ -4,6 +4,9 @@
 //! this process's mounts (a gate's sandbox, where nothing live under it can
 //! be read).
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::path::{Path, PathBuf};
 
 /// The account's home and whether it is a tmpfs here. `path` is `None`
@@ -11,7 +14,9 @@ use std::path::{Path, PathBuf};
 /// taken as inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
+    /// Canonical home directory path from `/etc/passwd`, or `None` if unavailable.
     pub path: Option<PathBuf>,
+    /// Whether the home directory resides on a `tmpfs` mount (such as a gate sandbox).
     pub tmpfs: bool,
 }
 
@@ -41,7 +46,7 @@ impl Home {
     /// flag is true, else `/proc/mounts`) mounts a tmpfs at it or above it,
     /// the deepest mount holding it being the one that counts.
     #[must_use]
-    pub fn from_parts(passwd: &str, uid: u32, mounts: Option<(&str, bool)>) -> Self {
+    pub(crate) fn from_parts(passwd: &str, uid: u32, mounts: Option<(&str, bool)>) -> Self {
         let uid = uid.to_string();
         let path = passwd.lines().find_map(|line| {
             let fields: Vec<&str> = line.split(':').collect();
@@ -59,14 +64,14 @@ impl Home {
     /// Whether `path` (canonical) is inside the home, the home itself
     /// included. An unknown home holds everything.
     #[must_use]
-    pub fn holds(&self, path: &Path) -> bool {
+    pub(crate) fn holds(&self, path: &Path) -> bool {
         self.path.as_ref().is_none_or(|home| path.starts_with(home))
     }
 
     /// Why a stand-in may not serve `root` (canonical): `None` when it may
     /// (outside the home, or the home is a tmpfs here).
     #[must_use]
-    pub fn refuses(&self, root: &Path, shown: &Path) -> Option<String> {
+    pub(crate) fn refuses(&self, root: &Path, shown: &Path) -> Option<String> {
         if self.tmpfs && self.path.is_some() {
             return None;
         }

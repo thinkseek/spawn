@@ -9,13 +9,13 @@
 //! elsewhere raced the resolution) is tried again up to 32 times. A link
 //! met is an error "… goes through a link or leaves its root: not
 //! followed". A regular file with more than one hard link is refused the
-//! same way, before a byte is read or written ("<path> has <n> hard links:
+//! same way, before a byte is read or written ("`<path>` has `<n>` hard links:
 //! not followed": `cp -al` of a live archive into scratch makes every copy
 //! share its inode with live). Nothing below a root is opened with
 //! `O_TRUNC`, and a temporary file is made new (`O_EXCL`) after removing
 //! any entry at its name.
 //!
-//! A root may be pinned ([`Beneath::pinned`], a loop masked by a stand-in
+//! A root may be pinned (`Beneath::pinned`, a loop masked by a stand-in
 //! location tool): its deepest existing directory is opened, its canonical
 //! path must name that same directory and lie outside the account's home
 //! (unless the home is a tmpfs here, a gate's sandbox); its device and inode
@@ -32,6 +32,9 @@
 //! directory it starts from. Its refusals read the same. No other platform
 //! has an open here, so the crate does not build for one.
 //! Not stood against: a bind mount below a root, and privileged tampering.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -66,7 +69,7 @@ pub struct Beneath {
 }
 
 /// One opened directory below the root, and how to name it in an error.
-pub struct Directory {
+pub(crate) struct Directory {
     fd: OwnedFd,
     shown: PathBuf,
 }
@@ -74,7 +77,7 @@ pub struct Directory {
 impl Directory {
     /// The directory's descriptor.
     #[must_use]
-    pub fn descriptor(&self) -> &OwnedFd {
+    pub(crate) fn descriptor(&self) -> &OwnedFd {
         &self.fd
     }
 
@@ -83,7 +86,7 @@ impl Directory {
     /// # Errors
     ///
     /// The sync's failure, naming the directory.
-    pub fn sync(&self) -> Result<(), String> {
+    pub(crate) fn sync(&self) -> Result<(), String> {
         rustix::fs::fsync(&self.fd)
             .map_err(|error| format!("sync {}: {error}", self.shown.display()))
     }
@@ -196,7 +199,7 @@ fn one_link(file: &File, shown: &Path) -> Result<(), String> {
 impl Beneath {
     /// Files below `root`, its own path followed as it is at each call.
     #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             pin: None,
@@ -210,7 +213,7 @@ impl Beneath {
     /// # Errors
     ///
     /// Why the root may not be pinned: paths only.
-    pub fn pinned(root: impl Into<PathBuf>, home: &Home) -> Result<Self, String> {
+    pub(crate) fn pinned(root: impl Into<PathBuf>, home: &Home) -> Result<Self, String> {
         let root = root.into();
         let mut base = root.clone();
         let mut rest = Vec::new();
@@ -263,20 +266,21 @@ impl Beneath {
 
     /// The root as configured.
     #[must_use]
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
     /// Whether the root is pinned.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_pinned(&self) -> bool {
+    fn is_pinned(&self) -> bool {
         self.pin.is_some()
     }
 
     /// `path`, below the root, as a path relative to it; `None` when it is
     /// not below it.
     #[must_use]
-    pub fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+    pub(crate) fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         path.strip_prefix(&self.root)
             .ok()
             .filter(|relative| !relative.as_os_str().is_empty())
@@ -331,7 +335,7 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, or another failure, naming the path.
-    pub fn open_dir(&self, relative: &Path) -> Result<Option<Directory>, String> {
+    pub(crate) fn open_dir(&self, relative: &Path) -> Result<Option<Directory>, String> {
         plain(relative)?;
         let shown = self.shown(relative);
         let Some((base, rest)) = self.base()? else {
@@ -359,7 +363,7 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, or another failure, naming the path.
-    pub fn make_dir(&self, relative: &Path) -> Result<Directory, String> {
+    pub(crate) fn make_dir(&self, relative: &Path) -> Result<Directory, String> {
         plain(relative)?;
         let shown = self.shown(relative);
         let base = if let Some((base, rest)) = self.base()? {
@@ -402,7 +406,7 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, a second hard link, or another failure, naming the path.
-    pub fn open_read(&self, relative: &Path) -> Result<Option<File>, String> {
+    pub(crate) fn open_read(&self, relative: &Path) -> Result<Option<File>, String> {
         plain(relative)?;
         let shown = self.shown(relative);
         let Some((base, rest)) = self.base()? else {
@@ -430,7 +434,7 @@ impl Beneath {
     /// # Errors
     ///
     /// As [`Self::open_read`], and a failed read.
-    pub fn read(&self, relative: &Path) -> Result<Option<Vec<u8>>, String> {
+    pub(crate) fn read(&self, relative: &Path) -> Result<Option<Vec<u8>>, String> {
         let Some(mut file) = self.open_read(relative)? else {
             return Ok(None);
         };
@@ -447,7 +451,8 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, a second hard link, or another failure, naming the path.
-    pub fn open_append(
+    #[allow(clippy::unused_self)] // Retain method receiver on Beneath so callers stay uniform.
+    pub(crate) fn open_append(
         &self,
         dir: &Directory,
         name: &str,
@@ -486,7 +491,7 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, or another failure, naming the path.
-    pub fn list(&self, relative: &Path) -> Result<Vec<(String, bool)>, String> {
+    pub(crate) fn list(&self, relative: &Path) -> Result<Vec<(String, bool)>, String> {
         let Some(dir) = self.open_dir(relative)? else {
             return Ok(Vec::new());
         };
@@ -566,7 +571,8 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, or another failure, naming the path.
-    pub fn replace_whole(
+    #[allow(clippy::unused_self)] // Retain method receiver on Beneath so callers stay uniform.
+    pub(crate) fn replace_whole(
         &self,
         dir: &Directory,
         name: &str,
@@ -591,7 +597,7 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, or another failure, naming the path.
-    pub fn write_new(&self, relative: &Path, bytes: &[u8]) -> Result<bool, String> {
+    pub(crate) fn write_new(&self, relative: &Path, bytes: &[u8]) -> Result<bool, String> {
         let (parent, name) = split(relative)?;
         let dir = self.make_dir(parent)?;
         let temporary = Self::temporary(&dir, &name, "spawn-write", bytes, None)?;
@@ -621,7 +627,7 @@ impl Beneath {
     /// # Errors
     ///
     /// A link met, a second hard link, or another failure, naming the path.
-    pub fn replace_grown(
+    pub(crate) fn replace_grown(
         &self,
         relative: &Path,
         bytes: &[u8],

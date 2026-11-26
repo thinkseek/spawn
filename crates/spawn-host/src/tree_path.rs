@@ -5,6 +5,9 @@
 //! its way back to git (a pathspec, `<tree>:<path>`) and to the file system
 //! (a workspace file); it is converted, lossily, only to be shown.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -51,7 +54,7 @@ impl TreePath {
     }
 
     /// `<tree>:<path>`, the object at this path of a tree or commit.
-    pub fn in_tree(&self, tree: &str) -> OsString {
+    pub(crate) fn in_tree(&self, tree: &str) -> OsString {
         let mut name = format!("{tree}:").into_bytes();
         name.extend_from_slice(&self.0);
         OsString::from_vec(name)
@@ -82,7 +85,7 @@ impl TreePath {
     /// A relative path of real names only: not empty, no NUL, no empty
     /// component (a leading, doubled or trailing `/`), no `.`, `..` or
     /// `.git` component. Anything else never reaches a workspace.
-    pub fn is_safe(&self) -> bool {
+    pub(crate) fn is_safe(&self) -> bool {
         !self.0.is_empty()
             && !self.0.contains(&0)
             && self
@@ -110,7 +113,7 @@ impl fmt::Display for TreePath {
 }
 
 /// The fields of a NUL-separated (`-z`) listing, the empty end dropped.
-pub fn nul_fields(listing: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn nul_fields(listing: &[u8]) -> impl Iterator<Item = &[u8]> {
     listing
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty())
