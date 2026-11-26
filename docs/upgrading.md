@@ -161,6 +161,21 @@ These are not about process lifetime. They break when two versions meet.
     Spawn cannot read reads `Unknown`, which types nothing. After checking
     its screens and transcript, add its `major.minor` to `AGY_TESTED`.
 
+12. **The filesystem view of agy** (H5, decision C2 N6;
+    docs/fleet-architecture.md §3.9). From this version an engine with no
+    deny rules of its own (agy) starts only inside a `bwrap` view
+    (`SPAWN_ENGINE_VIEW=required`, the default). A host that enables agy
+    needs `bwrap` (bubblewrap 0.9.0 was checked) on the loop's `PATH`;
+    without a working one every agy start is refused (`engine_unavailable:`
+    in the start's outcome) and Claude Code runs on. `SPAWN_ENGINE_VIEW=off`
+    restores the old behaviour, on the owner's explicit choice. Inside the
+    view `~/.gemini` holds only agy's home (`SPAWN_AGY_HOME`): anything agy
+    reads elsewhere below `~/.gemini` is gone for it. The view is resolved
+    at each launch, so an agy already running keeps the view it started
+    with; and a masked path missing at its launch that appears later is
+    visible to it (`--ro-bind / /` is live) until its next launch. A
+    rollback to a Spawn without the view simply starts agy without one.
+
 ## What the loop may improve by itself
 
 - Integrator and dispatcher logic.

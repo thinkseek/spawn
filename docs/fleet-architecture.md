@@ -2364,6 +2364,82 @@ start at once (`AgentDriver::start_refusal`). An agy `major.minor` outside
 present, agy's known models, and the terminal backend (Herdr's version,
 protocol and manifests).
 
+### 3.9 The filesystem view of an engine without deny rules (decision C2, N6; H5)
+
+Claude Code is kept off the host's credentials by the deny rules it is
+handed at launch (`Guard::Settings`). agy has none (`Guard::Sandbox`), so
+**the Bridge starts it only inside a filesystem view**:
+`crates/spawn-host/src/engine_view.rs` (`BwrapView`) behind the port
+`EngineView` (`crates/spawn-core/src/port.rs`), handed to the Bridge as
+`BridgeConfig::engine_view` (`crates/spawn-cli/src/runtime.rs`). Claude
+Code never runs in it. The launch script Herdr's pane runs ends in
+
+```text
+exec bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent --unshare-pid \
+    <masks> --bind <ws> <ws> --bind <engine home> <engine home> \
+    --bind <TMPDIR> <TMPDIR> --setenv TMPDIR <TMPDIR> --chdir <ws> -- \
+    spawn run -- agy <args>
+```
+
+The runner stays the engine's parent and writes the exit status into the
+workspace. Binding rules, from the probe under herdr 0.9.5 and bwrap 0.9.0:
+**never `--new-session`** (`setsid` takes the engine out of the pane's
+foreground process group, and Herdr's `agent.get` answers
+`agent_not_found`); **always `--unshare-pid`** (no `kill(2)` of a host
+process; Herdr still detects the engine); never `--unshare-net`,
+`--unshare-all` nor `--as-pid-1`. **Masks first, writable binds last**, each
+bind at its own exact path, so the Bridge reads the transcripts on the host
+where the engine writes them.
+
+The masks, resolved again at every launch. Each target is canonicalized
+(`--tmpfs` over a symbolic link aborts `bwrap`) and masked by what it
+resolves to:
+
+- directories, each an empty `--tmpfs`: `/run/keep`, `/run/keep-test`, the
+  whole `$XDG_RUNTIME_DIR` (else `/run/user/<uid>`), the whole `/tmp` (the
+  fleet's tmux sockets), the Herdr session directory
+  (`$XDG_CONFIG_HOME/herdr` and `~/.config/herdr`), `~/.claude`, the other
+  engines' homes (`~/.gemini` but for agy's own home below it, re-bound
+  writable into the mask's tmpfs; `~/.config/antigravity`, `~/.codex`,
+  `~/.hermes`), `~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.aws`,
+  `~/.config/anthropic`, `~/.config/spawn`, `~/.config/cloudflare`,
+  `~/.config/observe3-private`;
+- regular files, each read-only bound over by one private empty 0444 file
+  (never `/dev/null`, whose bind answers `EACCES` instead of reading empty):
+  `~/.local/share/spawn-rsi/spawn.env` and every other `*.env*` and `env.sh`
+  in that directory, `~/.claude.json`, `~/.pgpass`, `~/.netrc`,
+  `~/.git-credentials`;
+- a target that is missing, or of another type (a socket, a fifo, a
+  device), is skipped and said on the loop's standard error, one line per
+  launch (one missing target would abort `bwrap`).
+
+**Herdr's socket and `/tmp` are not kept.** A probe canary showed that a
+client inside the view could connect to Herdr's Unix socket, open a pane
+outside the view and read the masked files through it; the same holds for
+the tmux sockets in `/tmp`. Both are masked, so the engine's own Herdr
+calls are none: Herdr detects it from outside. The network stays.
+
+A workspace whose bind would uncover a mask (it holds a masked path) is
+refused, as is an engine home that holds the user's home or a masked path;
+a `TMPDIR` that would is passed over for `<engine home>/.spawn-tmp`
+(made 0700), said. **Known residual:** a target missing at a launch that
+appears later is visible to the engine already running (`--ro-bind / /` is
+live); the next launch masks it.
+
+**Policy** (`SPAWN_ENGINE_VIEW`): `required`, the default (unset or empty
+too), starts a `Guard::Sandbox` engine only inside the view. The view is
+made at the loop's start, and only when such an engine is enabled
+(`SPAWN_ENGINES`): `bwrap` found on `PATH` and shown to work (a view of the
+same kind running `/bin/true`). A host where it cannot be made refuses every
+start of agy, before anything is mounted, with an outcome beginning
+`engine_unavailable:` that says why; a view that cannot be made for one
+launch fails that start the same way and starts no terminal. Claude Code is
+never affected. `off` is the owner's explicit opt-out: agy runs with no
+view, as before H5, said once at the loop's start. Any other value is read
+as `required`, said once. Tested against a real `bwrap` and a real Herdr in
+`crates/spawn-host/tests/engine_view.rs` (no engine is run there: never
+agy; the Herdr agent is a shell stub named `claude`).
+
 ## 4. Experience
 
 Nothing is stored outside the log. Every model judgement is an
