@@ -89,9 +89,10 @@ from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
          k.revisions, k.review_note, k.delivered_at_ms, k.model, k.reissue_of,
          k.reassign_of, k.pinned,
-         -- The graded preset the task runs on, and the engine and model it
-         -- names: delivery starts the worker on them (design 7.1).
-         k.preset_id, gp.engine_label as preset_engine, gp.model_label as preset_model_label,
+         -- The graded preset or direct engine/model override the task runs on:
+         -- delivery starts the worker on them (design 7.1).
+         k.preset_id, coalesce(k.engine, gp.engine_label) as preset_engine,
+         coalesce(k.model_label, gp.model_label) as preset_model_label,
          (select o.session_id from mission_tasks o where o.id = k.reassign_of)
            as reassign_from_session,
          (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
@@ -2501,6 +2502,38 @@ impl PostgresStore {
                 &model,
                 &again,
                 &pin,
+            ],
+        )?;
+        Ok(row.get(0))
+    }
+
+    /// As [`Self::task_assign_with`], specifying a direct engine (`claude`, `agy`)
+    /// and optional engine-native model label without requiring a grading preset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_assign_direct(
+        &self,
+        mission: i64,
+        kind: &str,
+        worker: &str,
+        brief: &str,
+        model: &str,
+        again: bool,
+        pin: bool,
+        engine: Option<&str>,
+        model_label: Option<&str>,
+    ) -> Result<i64, StoreError> {
+        let row = self.query_one(
+            "select spawn_task_assign($1, $2, $3, $4, $5, $6, $7, 2, null, null, $8, $9)",
+            &[
+                &mission,
+                &kind,
+                &worker,
+                &masked(brief),
+                &model,
+                &again,
+                &pin,
+                &engine,
+                &model_label,
             ],
         )?;
         Ok(row.get(0))

@@ -2,7 +2,7 @@
 //! backlog (`rsi/backlog/*.json`, in its checkout) turned into tasks.
 //!
 //! The integrator keeps up to N of the mission's tasks in flight, N being its
-//! worker limit (`objectives ->> 'workers'`, 1 to 16, default 1). A task is
+//! worker limit (`objectives ->> 'workers'`, 1 to 128, default 1). A task is
 //! in flight from `task.assigned` until it lands or is cancelled. Each pass
 //! fills the free slots with the open objectives that have no task in flight
 //! (an objective never has two), fewest attempts first: those that yielded

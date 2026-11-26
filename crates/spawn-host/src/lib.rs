@@ -54,7 +54,7 @@ pub use git::{
     SET_ASIDE_FILES, SET_ASIDE_WAITS, git_command, has_conflict_block, has_conflict_block_sized,
     max_file_bytes, names_files_outside_git,
 };
-pub use herdr::HerdrHost;
+pub use herdr::{HerdrHost, HerdrPool};
 #[cfg(target_os = "linux")]
 pub use overlay::{OverlayWorkspace, Swept, overlay_supported, overlay_supported_in, sweep_probes};
 pub use process::{current_uid, undumpable};
@@ -73,6 +73,7 @@ pub use workspace::{
 pub enum LocalTerminalHost {
     Tmux(TmuxHost),
     Herdr(HerdrHost),
+    HerdrPool(HerdrPool),
 }
 
 impl LocalTerminalHost {
@@ -83,6 +84,7 @@ impl LocalTerminalHost {
         match self {
             Self::Tmux(host) => Self::Tmux(host.with_files_beneath(projects)),
             Self::Herdr(host) => Self::Herdr(host.with_files_beneath(projects)),
+            Self::HerdrPool(pool) => Self::HerdrPool(pool.with_files_beneath(projects)),
         }
     }
 
@@ -90,6 +92,7 @@ impl LocalTerminalHost {
         match self {
             Self::Tmux(host) => host,
             Self::Herdr(host) => host,
+            Self::HerdrPool(pool) => pool,
         }
     }
 }

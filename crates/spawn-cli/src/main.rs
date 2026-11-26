@@ -69,6 +69,7 @@ mod grading;
 mod integrate;
 mod judge_watch;
 mod main_merge;
+mod managed_sources;
 mod mask;
 mod memory;
 mod missions;
@@ -146,7 +147,8 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn features associate --path <file> --feature <id> [--feature <id>]... [--root <dir>] [--registry <file>] [--json]\n       \
      spawn features graph [--root <dir>] [--registry <file>] [--level file|unit|feature] [--from <id|path>] [--to <id|path>] [--feature <id>] [--json]\n       \
      spawn grade register|list|exam|onboard|lock-grade|unlock-grade|enable|disable|calibrate|upkeep ...   (the grading catalog: spawn grade --help for each verb's flags)\n       \
-     spawn prov index|who|show|blast|revert|split|compose|snapshot|refs|rollback|durability ...   (file provenance: spawn prov --help for each verb's flags)";
+     spawn prov index|who|show|blast|revert|split|compose|snapshot|refs|rollback|durability ...   (file provenance: spawn prov --help for each verb's flags)\n       \
+     spawn source init|list|show|sync|export ...   (internal source and metadata store: spawn source --help for each verb's flags)";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =
@@ -343,6 +345,12 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[provenance::USAGE],
         run: provenance::command,
+    },
+    Command {
+        name: "source",
+        aliases: &[],
+        usage: &[managed_sources::USAGE],
+        run: managed_sources::command,
     },
     Command {
         name: "scratch",
@@ -841,7 +849,7 @@ mod tests {
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 30, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 31, "the commands: {words:?}");
     }
 
     #[test]

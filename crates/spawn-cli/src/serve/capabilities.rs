@@ -585,13 +585,21 @@ pub(crate) fn cached() -> Probe {
 
 /// What delivery may start, from the latest probe; before any probe, no
 /// engine besides Claude Code is known (a task on another one waits).
+/// Applies `SPAWN_DEFAULT_ENGINE` and `SPAWN_DEFAULT_MODEL_LABEL` when set.
 pub(crate) fn current_engines() -> Engines {
-    CACHE
+    let mut engines = CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .map(|(_, probe)| engines(probe))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    engines.default_engine = crate::config::env_value("SPAWN_DEFAULT_ENGINE")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    engines.default_model_label = crate::config::env_value("SPAWN_DEFAULT_MODEL_LABEL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    engines
 }
 
 /// Probe at once and then hourly, on a thread of its own, for as long as
@@ -678,6 +686,35 @@ pub(crate) fn alert_untested(store: &spawn_postgres::PostgresStore) -> Option<St
 /// program's version (`herdr --version`, bounded) and its running server's
 /// protocol and manifests ([`spawn_host::HerdrHost::server_facts`]), or why
 /// they could not be read.
+fn herdr_backend(herdr: &spawn_host::HerdrHost, shards: Option<usize>) -> Value {
+    let version = run_bounded(herdr.program(), &["--version"], VERSION_LIMIT);
+    let mut answer = json!({
+        "backend": "herdr",
+        "program": herdr.program(),
+        "session": herdr.session(),
+        "version": version.as_ref().ok().map(|text| text.trim().to_string()),
+        "version_error": version.err(),
+        "expected_protocol": spawn_host::herdr::PROTOCOL,
+        "pinned_manifests": spawn_host::herdr::MANIFESTS
+            .iter()
+            .map(|(agent, version)| json!({ "agent": agent, "version": version }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(count) = shards {
+        answer["shards"] = json!(count);
+    }
+    match herdr.server_facts() {
+        Ok(facts) => {
+            answer["server"] = facts;
+        }
+        Err(error) => {
+            answer["server"] = Value::Null;
+            answer["server_error"] = json!(error.0);
+        }
+    }
+    answer
+}
+
 fn terminal_backend() -> Value {
     let host = match crate::config::terminal_host() {
         Ok(host) => host,
@@ -685,30 +722,9 @@ fn terminal_backend() -> Value {
     };
     match host {
         spawn_host::LocalTerminalHost::Tmux(_) => json!({ "backend": "tmux" }),
-        spawn_host::LocalTerminalHost::Herdr(herdr) => {
-            let version = run_bounded(herdr.program(), &["--version"], VERSION_LIMIT);
-            let mut answer = json!({
-                "backend": "herdr",
-                "program": herdr.program(),
-                "session": herdr.session(),
-                "version": version.as_ref().ok().map(|text| text.trim().to_string()),
-                "version_error": version.err(),
-                "expected_protocol": spawn_host::herdr::PROTOCOL,
-                "pinned_manifests": spawn_host::herdr::MANIFESTS
-                    .iter()
-                    .map(|(agent, version)| json!({ "agent": agent, "version": version }))
-                    .collect::<Vec<_>>(),
-            });
-            match herdr.server_facts() {
-                Ok(facts) => {
-                    answer["server"] = facts;
-                }
-                Err(error) => {
-                    answer["server"] = Value::Null;
-                    answer["server_error"] = json!(error.0);
-                }
-            }
-            answer
+        spawn_host::LocalTerminalHost::Herdr(herdr) => herdr_backend(&herdr, None),
+        spawn_host::LocalTerminalHost::HerdrPool(pool) => {
+            herdr_backend(pool.primary(), Some(pool.shard_count()))
         }
     }
 }
@@ -1141,6 +1157,7 @@ mod tests {
             program: "agy".to_string(),
             sessions: "/home/a/.gemini/antigravity-cli".to_string(),
             model: None,
+            data_dir: None,
         };
         let base = std::env::temp_dir().join(format!("spawn-cap-view-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);

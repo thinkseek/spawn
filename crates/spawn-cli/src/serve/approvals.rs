@@ -796,7 +796,9 @@ pub(super) fn items(panes: &[Pane], board: &Value, now: i64) -> Vec<Value> {
 fn backend(host: &spawn_host::LocalTerminalHost) -> &'static str {
     match host {
         spawn_host::LocalTerminalHost::Tmux(_) => "tmux",
-        spawn_host::LocalTerminalHost::Herdr(_) => "herdr",
+        spawn_host::LocalTerminalHost::Herdr(_) | spawn_host::LocalTerminalHost::HerdrPool(_) => {
+            "herdr"
+        }
     }
 }
 

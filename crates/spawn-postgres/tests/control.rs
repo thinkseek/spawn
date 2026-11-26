@@ -817,7 +817,7 @@ fn a_mission_is_configured_with_one_to_sixteen_workers() {
         .mission_add("Improve", &json!(["/tmp/source.git"]), "human")
         .expect("add");
     let with = |workers: serde_json::Value| json!({"backlog": "/controller/rsi/backlog", "resident": "r", "workers": workers});
-    for refused in [json!(0), json!(17), json!(2.5), json!("3"), json!(-1)] {
+    for refused in [json!(0), json!(129), json!(2.5), json!("3"), json!(-1)] {
         let error = refusal(store.mission_configure(
             mission,
             Some("/scenarios"),
@@ -825,9 +825,9 @@ fn a_mission_is_configured_with_one_to_sixteen_workers() {
             None,
             Some(&with(refused.clone())),
         ));
-        assert!(error.contains("from 1 to 16"), "{refused}: {error}");
+        assert!(error.contains("from 1 to 128"), "{refused}: {error}");
     }
-    for accepted in [1, 16] {
+    for accepted in [1, 16, 128] {
         store
             .mission_configure(
                 mission,
