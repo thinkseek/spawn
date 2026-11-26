@@ -117,6 +117,93 @@ fn only_the_dialogs_own_footer_is_the_dialog() {
     )));
 }
 
+/// Claude Code 2.1.330 (PR H3-screen-fix, R1–R4 of the C2 capture gate),
+/// sanitized: paths, models and texts made up, the layout as captured.
+mod claude_2_1_330 {
+    use spawn_core::driver::{AgentDriver, ClaudeDriver};
+    use spawn_core::screen::{
+        ScreenState, TRUST_KEYS, is_choice_footer, is_trust_dialog, read_claude_screen,
+    };
+
+    const TRUST: &str = "[Screen Reader Mode: on via flag]\n\
+                         Permission Required: Accessing workspace:\n\
+                         /tmp/ws/agent_rsi\n\
+                         Quick safety check: Is this a project you created or one you trust?\n\
+                         y. Yes, I trust this folder\n\
+                         n. No, exit\n\
+                         Enter y/n:\n\
+                         Enter to confirm · Esc to cancel\n";
+
+    /// R1: Herdr's pane shell echoed the line that ran the launch script
+    /// above the dialog; read as a drafted prompt, the Bridge took it for
+    /// the input box and never answered the dialog. The launch script now
+    /// clears it: the pane holds the dialog alone, which reads as nothing
+    /// yet and gets the trust keys.
+    #[test]
+    fn herdrs_launch_echo_cleared_leaves_the_trust_dialog_answered() {
+        let echoed = format!("$ exec /bin/sh '/tmp/run/spawn-exec_1.launch.sh'\n{TRUST}");
+        assert_eq!(read_claude_screen(&echoed).state, ScreenState::Drafted);
+        let cleared = format!("{TRUST}\n\n\n");
+        assert!(is_trust_dialog(&cleared));
+        assert_eq!(read_claude_screen(&cleared).state, ScreenState::Unknown);
+        assert_eq!(
+            ClaudeDriver.startup_answer(&cleared),
+            Some(&TRUST_KEYS[..])
+        );
+    }
+
+    /// R2: a draft drawn with a no-break space after `$`.
+    #[test]
+    fn a_draft_with_a_no_break_space_reads_drafted() {
+        let pane = "deepseek-ai/DeepSeek-V4.1-Flash · 余量未知\n\
+                    bypass permissions on (shift+tab to cycle)\n$\u{a0} summarize the log";
+        let reading = read_claude_screen(pane);
+        assert_eq!(reading.state, ScreenState::Drafted);
+        assert!(!reading.state.accepts_input());
+    }
+
+    /// R3: `AskUserQuestion` and a tool-permission dialog draw no `$ 1.`
+    /// line; their footer, at the bottom of the pane, is a permission.
+    #[test]
+    fn question_and_tool_footers_are_permissions() {
+        let question = "Which branch should I merge into?\n1. main\n2. release\n\
+                        3. Type something.\n\
+                        Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n";
+        let tool = "Edit file\nsrc/lib.rs\nDo you want to make this edit to lib.rs?\n1. Yes\n\
+                    2. Yes, allow all edits during this session\n3. No\n\
+                    Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\n\
+                    Esc to cancel\n";
+        for pane in [question, tool] {
+            assert!(is_choice_footer(pane), "{pane}");
+            assert_eq!(read_claude_screen(pane).state, ScreenState::Permission);
+            assert_eq!(ClaudeDriver.startup_answer(pane), None);
+        }
+        // Quoted by the model, the input box below it: history.
+        let quoted = super::idle_after(
+            "claude: The dialog said: Select with numbers [1-3]. Then Enter to submit or \
+             Escape to cancel:\nCrunched for 2s · done 9:20 PM",
+        );
+        assert_eq!(read_claude_screen(&quoted).state, ScreenState::Ready);
+    }
+
+    /// R4: `Beboppin'…` and the `esc to interrupt` status line right above
+    /// the prompt, without tmux's `tmux focus-events off` line: running.
+    #[test]
+    fn a_running_turn_under_herdr_is_busy() {
+        let pane = "you: run the suite\n\
+                    Beboppin'… (41s)\n\
+                    deepseek-ai/DeepSeek-V4.1-Flash · 余量未知\n\
+                    bypass permissions on · esc to interrupt\n\
+                    $ ";
+        let reading = read_claude_screen(pane);
+        assert_eq!(reading.state, ScreenState::Busy, "{reading:?}");
+        assert!(!reading.state.accepts_input());
+        let spinner_only = "you: run the suite\nBeboppin'…\n\
+                            bypass permissions on (shift+tab to cycle)\n$ ";
+        assert_eq!(read_claude_screen(spinner_only).state, ScreenState::Busy);
+    }
+}
+
 mod bridge {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
