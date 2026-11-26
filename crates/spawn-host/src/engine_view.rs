@@ -336,16 +336,11 @@ impl BwrapView {
         Ok(file)
     }
 
-    /// The view of one launch: every target resolved now, the masks first
-    /// and the writable binds last. Refused (an error) when the workspace
-    /// or the engine's home cannot be bound without uncovering a mask, or
-    /// cannot be made.
-    pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
-        let workspace = canonical_directory(Path::new(launch.workspace), "the workspace", false)?;
-        let engine_home =
-            canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
-        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
-
+    /// Every target resolved now: the directories and the regular files to
+    /// mask, and what was skipped and why. The engine's own home is never
+    /// masked (it is bound back writable), and a target inside a masked
+    /// directory goes with it.
+    fn targets(&self, engine_home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, String)>) {
         let mut skipped = Vec::new();
         let mut directories: Vec<PathBuf> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
@@ -369,9 +364,7 @@ impl BwrapView {
                 Err(why) => skipped.push((target, why)),
             }
         }
-        // The engine's own home is never masked: it is bound back writable.
-        directories.retain(|dir| *dir != engine_home);
-        // A target inside a masked directory is gone with it.
+        directories.retain(|dir| dir != engine_home);
         let inside_other = |path: &Path, all: &[PathBuf]| {
             all.iter()
                 .any(|dir| dir.as_path() != path && path.starts_with(dir))
@@ -380,6 +373,20 @@ impl BwrapView {
         directories.retain(|dir| !inside_other(dir, &all_directories));
         files.retain(|file| !inside_other(file, &directories));
 
+        (directories, files, skipped)
+    }
+
+    /// The view of one launch: every target resolved now, the masks first
+    /// and the writable binds last. Refused (an error) when the workspace
+    /// or the engine's home cannot be bound without uncovering a mask, or
+    /// cannot be made.
+    pub fn plan(&self, launch: &ViewedLaunch<'_>) -> Result<Plan, String> {
+        let workspace = canonical_directory(Path::new(launch.workspace), "the workspace", false)?;
+        let engine_home =
+            canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
+        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
+
+        let (directories, files, mut skipped) = self.targets(&engine_home);
         let masked: Vec<&PathBuf> = directories.iter().chain(files.iter()).collect();
         let uncovers = |bound: &Path| masked.iter().find(|target| target.starts_with(bound));
         if let Some(target) = uncovers(&workspace) {
