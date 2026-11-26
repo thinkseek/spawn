@@ -523,6 +523,33 @@ fn open_store(cas_root: &Path) -> Result<Store, DedupError> {
     Ok(store)
 }
 
+fn check_cas_root_claimable(cas_root: &Path) -> Result<(), DedupError> {
+    if fs::symlink_metadata(cas_root.join(CAS_MARKER)).is_ok_and(|meta| meta.is_file()) {
+        return Ok(());
+    }
+    match fs::symlink_metadata(cas_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DedupError::Io(error)),
+        Ok(meta) if meta.is_dir() && fs::read_dir(cas_root)?.next().is_none() => Ok(()),
+        Ok(_) => Err(DedupError::NotCas(cas_root.to_path_buf())),
+    }
+}
+
+fn cow_probe_dir(cas_root: &Path) -> PathBuf {
+    let tmp = cas_root.join("tmp");
+    if tmp.is_dir() {
+        return tmp;
+    }
+    let mut current = Some(cas_root);
+    while let Some(dir) = current {
+        if dir.is_dir() {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+    PathBuf::from(".")
+}
+
 /// One pass over `roots`: see the module documentation.
 ///
 /// Refused whole, before anything is written, when a process is seen
@@ -548,6 +575,14 @@ pub fn dedup_dirs(
         uninspected.extend(found.uninspected);
     }
     let cas_root = crate::root::canonical_root(&config.cas_root);
+    check_cas_root_claimable(&cas_root)?;
+    if !cow_clone_supported(&cow_probe_dir(&cas_root)) {
+        return Ok(DedupReport {
+            cow_supported: false,
+            uninspected,
+            ..DedupReport::default()
+        });
+    }
     let store = open_store(&cas_root)?;
     let mut report = DedupReport {
         cow_supported: cow_clone_supported(&store.tmp_dir()),
@@ -1156,5 +1191,29 @@ mod tests {
                 .expect("prune");
             assert_eq!(removed, 1);
         });
+    }
+
+    #[test]
+    fn dedup_dirs_probes_cow_before_creating_marker_and_still_refuses_foreign_root() {
+        let scratch = crate::scratch::Scratch::new("cas-cow-probe-order");
+
+        let foreign = scratch.join("foreign");
+        fs::create_dir_all(&foreign).expect("mkdir foreign");
+        fs::write(foreign.join("note.txt"), b"keep me").expect("write foreign file");
+        let err = dedup_dirs(&DedupConfig::new(&foreign), &[])
+            .expect_err("non-empty dir without CAS marker must return NotCas");
+        assert!(matches!(err, DedupError::NotCas(_)), "{err:?}");
+        assert!(!foreign.join(CAS_MARKER).exists());
+
+        let uncreated_cas = scratch.join("uncreated/.cas");
+        let report = dedup_dirs(&DedupConfig::new(&uncreated_cas), &[]).expect("dedup_dirs");
+        if !cow_clone_supported(scratch.path()) {
+            assert!(!report.cow_supported);
+            assert!(
+                !uncreated_cas.exists(),
+                "non-CoW filesystems must not create .cas directory eagerly"
+            );
+            assert!(!uncreated_cas.join(CAS_MARKER).exists());
+        }
     }
 }

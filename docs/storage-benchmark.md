@@ -106,6 +106,52 @@ For a local isolated cluster, use PostgreSQL with no TCP listener, a private
 Unix socket directory and its normal durable settings. Do not copy the test
 clusters' `fsync=off` setting into a durability benchmark.
 
+The benchmark also supports D6 native and dual-track shadow backends (implemented in
+[`crates/spawn-host/examples/storage_benchmark.rs`](../crates/spawn-host/examples/storage_benchmark.rs))
+and cross-backend comparison in `scripts/storage-benchmark-compare.py`:
+
+- `--backend <git|d6|shadow>`: storage backend to measure (`git` default; `d6` and `shadow` require `SPAWN_BENCH_DATABASE_URL`).
+- `--concurrency <n>`: concurrent branch worker threads (`1` default).
+- `--tmpfs-root <directory>`: enable bounded L1 `tmpfs` upperdir mounting for `d6`/`shadow`.
+- `--tmpfs-budget-mb <n>`: L1 `tmpfs` budget in MiB when `--tmpfs-root` is set (default `2048`).
+- `python3 -I scripts/storage-benchmark-compare.py --allow-cross-backend ...`: compares repeated `--release` reports across `git`, `d6`, and `d6` L1 `tmpfs`.
+
+## D6 vs Git `--release` Measured Results (PR #146, Isolated PostgreSQL 16)
+
+Measured in [`PR #146`](https://github.com/thinkseek/spawn/pull/146) against an isolated temporary PostgreSQL 16 instance (`40` iterations, `4` edits per cycle):
+
+### Case A: 512 files (`c=1`) and Shadow Oracle Verification
+
+| Config | Wall (ms) | Agg (cyc/s) | ck p50 / p95 (ms) | noop p50 / p95 (ms) | merge p50 / p95 (ms) | cycle p50 / p95 (ms) | Disk (B) | Amp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `git` | 2799.0 | 14.29 | 23.00 / 35.83 | 18.36 / 22.85 | 45.07 / 54.83 | 52.46 / 66.40 | 3,014,023 | 1.437 |
+| `d6` (disk) | 2373.5 | 16.85 | 26.37 / 28.54 | 8.28 / 8.52 | 20.23 / 35.89 | 45.68 / 47.87 | 3,876,695 | 1.849 |
+| `d6` (L1 `tmpfs`) | 1900.1 | 21.05 | 21.64 / 27.68 | 6.01 / 8.46 | 22.26 / 22.81 | 38.99 / 46.92 | 3,876,695 (`l1_reserved=2,097,178`) | 1.849 |
+| `shadow` | 9402.7 | 4.25 | 103.67 / 107.97 | 81.51 / 86.27 | 73.77 / 84.75 | 195.23 / 204.07 | 4,058,207 | 1.935 |
+
+Shadow oracle telemetry for Case A: `checkpoints_agreed=91`, `merge_agree_clean=4`, `merge_agree_conflict=0`, `tree_mismatches=0`, `tracked_set_leaks=0`, `shadow_errors=0`, `merge_blockers=0`, `has_divergences=false`.
+
+### Case B: 2,048 files (`c=1` and `c=8`)
+
+| Config | Wall (ms) | Agg (cyc/s) | ck p50 / p95 (ms) | noop p50 / p95 (ms) | merge p50 / p95 (ms) | cycle p50 / p95 (ms) | Disk (B) | Amp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `git` (`c=1`) | 6004.6 | 6.66 | 58.19 / 89.45 | 44.81 / 76.90 | 70.81 / 74.95 | 114.94 / 151.90 | 9,477,007 | 1.130 |
+| `d6` (`c=1`, disk) | 3103.4 | 12.89 | 34.04 / 37.89 | 15.56 / 17.97 | 35.84 / 37.47 | 60.12 / 67.81 | 10,707,479 | 1.276 |
+| `git` (`c=8`) | 7595.1 | 42.13 | 69.31 / 100.30 | 54.51 / 92.01 | 84.67 / 109.79 | 144.52 / 197.00 | 74,677,638 | 1.113 |
+| `d6` (`c=8`, disk) | 4706.0 | 68.00 | 52.15 / 85.46 | 20.34 / 31.06 | 37.38 / 45.90 | 99.20 / 147.54 | 74,805,486 (`cas=1,797,660`) | 1.115 |
+| `d6` (`c=8`, L1 `tmpfs`) | 4166.2 | 76.81 | 39.67 / 66.50 | 17.56 / 26.83 | 40.40 / 44.54 | 74.34 / 113.16 | 74,815,813 (`l1_reserved=67,109,072`, `cas=1,807,987`) | 1.115 |
+
+Cross-backend comparison (`2048` files × `c=8`, `d6 L1 tmpfs` vs `git`): throughput `+85.8%`, `checkpoint_changed` p50 `-42.8%`, `checkpoint_noop` p50 `-67.8%`, `merge_base` p50 `-52.3%`.
+
+### Case C: Oversized 110 MiB Asset (`--files 512 --iterations 10 --edits 4 --oversized-file-bytes 110000000`)
+
+| Config | Wall (ms) | Agg (cyc/s) | ck p50 / p95 (ms) | noop p50 / p95 (ms) | merge p50 / p95 (ms) | `oversized_ingested` | `oversized_chunked` | Disk (B) | Amp |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: |
+| `git` | 1168.2 | 8.56 | 27.52 / 34.97 | 20.32 / 25.77 | 43.87 / 46.53 | `false` | `—` | 112,452,571 | 1.003 |
+| `d6` | 844.7 | 11.84 | 25.60 / 30.56 | 7.55 / 11.20 | 22.84 / 25.43 | `true` | `true` | 117,860,047 (`cas=5,516,985`) | 1.051 |
+
+(Case C uses a uniform synthetic `oversized.bin` payload of `110,000,000` bytes so FastCDC deduplicates repeating chunks inside `<cas>/chunks` to ~5.5 MiB CAS overhead beside the checked-out workspace copy.)
+
 ## Interpreting the report
 
 This is a warm-cache, single-writer workload with deterministic, compressible
