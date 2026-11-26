@@ -152,6 +152,7 @@ pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
+mod ipc;
 mod labels;
 mod prov;
 mod pwa;
@@ -180,10 +181,10 @@ use crate::objectives::{
 use crate::{Flags, env_or, env_value};
 
 /// Prefix of an error that answers 400.
-const BAD_REQUEST: &str = "bad request: ";
+pub(super) const BAD_REQUEST: &str = "bad request: ";
 
 /// A session id from a URL, or a 400.
-fn session_id(id: &str) -> Result<SessionId, String> {
+pub(super) fn session_id(id: &str) -> Result<SessionId, String> {
     SessionId::new(id).map_err(|error| format!("{BAD_REQUEST}{error}"))
 }
 
@@ -205,16 +206,20 @@ const MAX_INPUT_BODY: usize = 16 * 1024;
 
 /// Longest text a person types from the page, in bytes. `spawn_human_input`
 /// (schema.sql) holds the same bound.
-const MAX_INPUT_TEXT: usize = 8 * 1024;
+pub(super) const MAX_INPUT_TEXT: usize = 8 * 1024;
 
 /// The usage of `spawn serve`, the only copy (main's help reads it).
-pub(crate) const USAGE: &str = "usage: spawn serve [--address <host:port>] [--web <dir>]\n      \
+pub(crate) const USAGE: &str = "usage: spawn serve [--address <host:port>] [--web <dir>] [--ipc [--ipc-sock <path>] [--cas <dir>]]\n      \
                                 (the dashboard and the HTTP API, docs/api.md; --address or\n       \
                                 SPAWN_SERVE_ADDRESS, default 127.0.0.1:8787; --web or SPAWN_WEB_DIR,\n       \
-                                default web/dist; off loopback it needs SPAWN_SERVE_TOKEN)";
+                                default web/dist; off loopback it needs SPAWN_SERVE_TOKEN;\n       \
+                                --ipc serves HTTP/1.1-over-UDS at $XDG_RUNTIME_DIR/spawn/core.sock)";
 
 /// Serve the API and the built UI until the process is killed.
 pub fn serve(flags: &Flags) -> Result<i32, String> {
+    if flags.switch("ipc") || flags.get("ipc-sock").is_some() {
+        return ipc::run(flags);
+    }
     let address = flags
         .get("address")
         .or_else(|| env_value("SPAWN_SERVE_ADDRESS"))
@@ -356,7 +361,7 @@ fn listen_again_pause(stops: u32) -> std::time::Duration {
 const MAX_IN_FLIGHT: usize = 16;
 
 /// Longest one dashboard statement runs on the reader's connection.
-const STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What every request's handler reads.
 struct Shared {
@@ -897,14 +902,37 @@ fn same_secret(given: &[u8], expected: &[u8]) -> bool {
             == 0
 }
 
+std::thread_local! {
+    static READER_URL_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with an explicit `spawn_reader` database URL override (used by `serve::ipc`
+/// so worker threads never read `SPAWN_DATABASE_URL`).
+pub(super) fn with_reader_url<T>(url: &str, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<String>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            READER_URL_OVERRIDE.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = READER_URL_OVERRIDE.with(|slot| slot.borrow_mut().replace(url.to_string()));
+    let _reset = Reset(prev);
+    f()
+}
+
 /// The dashboard's connection: the read-only `spawn_reader` login, never the
 /// controller's.
 fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
-    let controller = env_value("SPAWN_DATABASE_URL")
-        .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
-    let url = match env_value("SPAWN_SERVE_DATABASE_URL") {
-        Some(url) => url,
-        None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+    let overridden = READER_URL_OVERRIDE.with(|slot| slot.borrow().clone());
+    let url = if let Some(url) = overridden {
+        url
+    } else {
+        let controller = env_value("SPAWN_DATABASE_URL")
+            .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
+        match env_value("SPAWN_SERVE_DATABASE_URL") {
+            Some(url) => url,
+            None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+        }
     };
     spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
         .map_err(|error| error.to_string())
@@ -951,7 +979,7 @@ fn access(request: &Request, query: &str, shared: &Shared) -> Access {
 /// segment that is not empty. `handle()` and `reader()` dispatch on these
 /// patterns only, and the test `routes_match_docs_api_md` keeps
 /// docs/api.md's tables equal to this one. No two patterns fit one path.
-const ROUTES: &[(&str, &str)] = &[
+pub(super) const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/overview"),
     ("GET", "/api/fleet"),
     ("GET", "/api/attention"),
@@ -1043,7 +1071,7 @@ fn fit<'a>(pattern: &str, path: &'a str) -> Option<Vec<&'a str>> {
 
 /// The route `path` names: its method, pattern and the values of the
 /// pattern's `<name>`s.
-fn route(path: &str) -> Option<(&'static str, &'static str, Vec<&str>)> {
+pub(super) fn route(path: &str) -> Option<(&'static str, &'static str, Vec<&str>)> {
     ROUTES
         .iter()
         .find_map(|(method, pattern)| fit(pattern, path).map(|values| (*method, *pattern, values)))
@@ -1234,7 +1262,7 @@ type Read<'a> = Box<dyn FnOnce() -> Result<Value, String> + 'a>;
 
 /// The read at canonical `path` with `query`, or `None` when `path` is no
 /// API read (a static file, or a 404).
-fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
+pub(super) fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
     let (method, pattern, values) = route(path)?;
     if method != "GET" {
         return None;
@@ -1379,7 +1407,7 @@ fn write_body(
 
 /// A write's idempotency key, from its body or its `Idempotency-Key`
 /// header (the same when both), so a retried POST makes one command.
-fn idempotency(
+pub(super) fn idempotency(
     body: Option<String>,
     header: Option<String>,
     what: &str,
@@ -1408,7 +1436,19 @@ fn typed(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "an input")?;
-    let body: InputBody = serde_json::from_slice(&body).map_err(|error| {
+    apply_input_body(&body, id, header_key, false, &|| {
+        writer(shared).map(WriterConn::Owned)
+    })
+}
+
+pub(super) fn apply_input_body<'a>(
+    raw_body: &[u8],
+    id: &str,
+    header_key: Option<String>,
+    allow_header_key_on_probe: bool,
+    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+) -> Result<(u16, Value), (u16, String)> {
+    let body: InputBody = serde_json::from_slice(raw_body).map_err(|error| {
         (
             400,
             format!("{BAD_REQUEST}the body is not an input: {error}"),
@@ -1416,13 +1456,16 @@ fn typed(
     })?;
     let session = session_id(id).map_err(|error| (400, error))?;
     if body.probe {
-        if body.text.is_some() || body.key.is_some() || header_key.is_some() {
+        if body.text.is_some()
+            || body.key.is_some()
+            || (!allow_header_key_on_probe && header_key.is_some())
+        {
             return Err((
                 400,
                 format!("{BAD_REQUEST}a probe carries no text and no key"),
             ));
         }
-        writer(shared).map_err(|error| (500, error))?;
+        open_writer().map_err(|error| (500, error))?;
         return Ok((
             200,
             json!({ "writable": true, "session_id": session.as_str(),
@@ -1431,7 +1474,7 @@ fn typed(
     }
     let key = idempotency(body.key, header_key, "an input")?;
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    let store = writer(shared).map_err(|error| (500, error))?;
+    let store = open_writer().map_err(|error| (500, error))?;
     match store.submit_human_input(&session, &key, &text) {
         Ok(spawn_postgres::HumanInput::Submitted(command)) => Ok((
             202,
@@ -1495,7 +1538,18 @@ fn pressed(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a key")?;
-    let body: KeyBody = serde_json::from_slice(&body)
+    apply_key_body(&body, id, header_key, &|| {
+        writer(shared).map(WriterConn::Owned)
+    })
+}
+
+pub(super) fn apply_key_body<'a>(
+    raw_body: &[u8],
+    id: &str,
+    header_key: Option<String>,
+    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+) -> Result<(u16, Value), (u16, String)> {
+    let body: KeyBody = serde_json::from_slice(raw_body)
         .map_err(|error| (400, format!("{BAD_REQUEST}the body is not a key: {error}")))?;
     let session = session_id(id).map_err(|error| (400, error))?;
     let key = idempotency(body.key, header_key, "a key")?;
@@ -1504,7 +1558,7 @@ fn pressed(
         .ok_or_else(|| (400, format!("{BAD_REQUEST}a key needs a name")))?;
     let name =
         NamedKey::from_name(&name).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    let store = writer(shared).map_err(|error| (500, error))?;
+    let store = open_writer().map_err(|error| (500, error))?;
     match store.submit_human_key(&session, &key, name) {
         Ok(spawn_postgres::HumanKey::Submitted(command)) => Ok((
             202,
@@ -1583,7 +1637,24 @@ fn move_task(
         "a reassign"
     };
     let (body, header_key) = write_body(request, access, shared, what)?;
-    let body: MoveBody = serde_json::from_slice(&body)
+    apply_move_body(&body, id, action, header_key, &|| {
+        writer(shared).map(WriterConn::Owned)
+    })
+}
+
+pub(super) fn apply_move_body<'a>(
+    raw_body: &[u8],
+    id: &str,
+    action: &str,
+    header_key: Option<String>,
+    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+) -> Result<(u16, Value), (u16, String)> {
+    let what = if action == "restart" {
+        "a restart"
+    } else {
+        "a reassign"
+    };
+    let body: MoveBody = serde_json::from_slice(raw_body)
         .map_err(|error| (400, format!("{BAD_REQUEST}the body is not {what}: {error}")))?;
     let session = session_id(id).map_err(|error| (400, error))?;
     let key = idempotency(body.key, header_key, what)?;
@@ -1608,7 +1679,7 @@ fn move_task(
             ));
         }
     }
-    let store = writer(shared).map_err(|error| (500, error))?;
+    let store = open_writer().map_err(|error| (500, error))?;
     match store.human_task(&session, action, reason.as_deref(), &key) {
         Ok(spawn_postgres::HumanTask::Moved(mut moved)) => {
             if let Some(fields) = moved.as_object_mut() {
@@ -1667,21 +1738,35 @@ fn messaged(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a message")?;
-    let body: MasterBody = serde_json::from_slice(&body).map_err(|error| {
+    apply_master_body(&body, header_key, false, &|| {
+        writer(shared).map(WriterConn::Owned)
+    })
+}
+
+pub(super) fn apply_master_body<'a>(
+    raw_body: &[u8],
+    header_key: Option<String>,
+    allow_header_key_on_probe: bool,
+    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+) -> Result<(u16, Value), (u16, String)> {
+    let body: MasterBody = serde_json::from_slice(raw_body).map_err(|error| {
         (
             400,
             format!("{BAD_REQUEST}the body is not a message: {error}"),
         )
     })?;
     if body.probe {
-        if body.text.is_some() || body.key.is_some() || body.mode.is_some() || header_key.is_some()
+        if body.text.is_some()
+            || body.key.is_some()
+            || body.mode.is_some()
+            || (!allow_header_key_on_probe && header_key.is_some())
         {
             return Err((
                 400,
                 format!("{BAD_REQUEST}a probe carries no text, no mode and no key"),
             ));
         }
-        writer(shared).map_err(|error| (500, error))?;
+        open_writer().map_err(|error| (500, error))?;
         return Ok((
             200,
             json!({ "writable": true, "session_id": crate::supervise::SUPERVISOR_SESSION,
@@ -1706,7 +1791,7 @@ fn messaged(
         ));
     }
     let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
-    let store = writer(shared).map_err(|error| (500, error))?;
+    let store = open_writer().map_err(|error| (500, error))?;
     match store.human_master_message(&key, &text, mode) {
         Ok(spawn_postgres::HumanMaster::Submitted(answer)) => Ok((202, answer)),
         Ok(spawn_postgres::HumanMaster::KeyUsed(why)) => Err((409, why)),
@@ -1755,7 +1840,19 @@ fn resumed(
     shared: &Shared,
 ) -> Result<(u16, Value), (u16, String)> {
     let (body, header_key) = write_body(request, access, shared, "a resume")?;
-    let body: ResumeBody = serde_json::from_slice(&body).map_err(|error| {
+    apply_resume_body(&body, id, header_key, false, &|| {
+        writer(shared).map(WriterConn::Owned)
+    })
+}
+
+pub(super) fn apply_resume_body<'a>(
+    raw_body: &[u8],
+    id: &str,
+    header_key: Option<String>,
+    allow_header_key_on_probe: bool,
+    open_writer: &dyn Fn() -> Result<WriterConn<'a>, String>,
+) -> Result<(u16, Value), (u16, String)> {
+    let body: ResumeBody = serde_json::from_slice(raw_body).map_err(|error| {
         (
             400,
             format!("{BAD_REQUEST}the body is not a resume: {error}"),
@@ -1767,13 +1864,16 @@ fn resumed(
         .filter(|mission| *mission > 0)
         .ok_or_else(|| (400, format!("{BAD_REQUEST}bad mission {id}")))?;
     if body.probe {
-        if body.halt.is_some() || body.key.is_some() || header_key.is_some() {
+        if body.halt.is_some()
+            || body.key.is_some()
+            || (!allow_header_key_on_probe && header_key.is_some())
+        {
             return Err((
                 400,
                 format!("{BAD_REQUEST}a probe carries no halt and no key"),
             ));
         }
-        writer(shared).map_err(|error| (500, error))?;
+        open_writer().map_err(|error| (500, error))?;
         return Ok((200, json!({ "writable": true, "mission": mission })));
     }
     let key = idempotency(body.key, header_key, "a resume")?;
@@ -1786,7 +1886,7 @@ fn resumed(
             ),
         )
     })?;
-    let store = writer(shared).map_err(|error| (500, error))?;
+    let store = open_writer().map_err(|error| (500, error))?;
     match store.human_resume(mission, halt, &key) {
         Ok(spawn_postgres::HumanResume::Resumed(event)) => Ok((
             202,
@@ -1806,10 +1906,8 @@ fn feature_coverage_get() -> Result<Value, String> {
     crate::feature_inventory::api_coverage_payload(&root, &registry)
 }
 
-/// `GET /api/features/coverage?mission=<id>`: [`feature_coverage_get`] for
-/// that mission's project ([`feature_paths`]), its refusals structured.
-fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), String> {
-    let (status, body) = match feature_paths(query) {
+pub(super) fn feature_coverage_for_query(query: &str) -> (u16, Value) {
+    match feature_paths(query) {
         Ok((root, registry)) => {
             match crate::feature_inventory::api_coverage_payload(&root, &registry) {
                 Ok(payload) => (200, payload),
@@ -1817,7 +1915,13 @@ fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), Str
             }
         }
         Err(refusal) => refusal,
-    };
+    }
+}
+
+/// `GET /api/features/coverage?mission=<id>`: [`feature_coverage_get`] for
+/// that mission's project ([`feature_paths`]), its refusals structured.
+fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), String> {
+    let (status, body) = feature_coverage_for_query(query);
     request
         .respond(json_response(status, &body))
         .map_err(|error| error.to_string())
@@ -1828,7 +1932,7 @@ fn feature_coverage_mission_get(request: Request, query: &str) -> Result<(), Str
 /// directory; `SPAWN_FEATURE_REGISTRY`, else the root's registry); with it,
 /// the open objective mission's `--features` file and the project root it
 /// belongs to ([`mission_feature_paths`]).
-fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
+pub(super) fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
     let Some(text) = mission_query(query) else {
         let root = crate::feature_inventory::default_root();
         let registry = crate::feature_inventory::default_registry_path(&root);
@@ -1852,7 +1956,7 @@ fn feature_paths(query: &str) -> Result<(PathBuf, PathBuf), (u16, Value)> {
 /// query names none, `Some("")` for a bare `mission` or an empty
 /// `mission=` (refused as a bad mission, never read as the default
 /// project).
-fn mission_query(query: &str) -> Option<&str> {
+pub(super) fn mission_query(query: &str) -> Option<&str> {
     query
         .split('&')
         .find_map(|pair| match pair.split_once('=') {
@@ -2038,7 +2142,7 @@ fn feature_associate_post(
 /// message)` answered as `{"error": message}`, or a complete JSON body (the
 /// read-only registry refusal carries its own fields).
 #[derive(Debug)]
-enum FeatureAssociateRefusal {
+pub(super) enum FeatureAssociateRefusal {
     Plain((u16, String)),
     Structured((u16, Value)),
 }
@@ -2063,7 +2167,7 @@ fn feature_associate_checked(
 /// The association itself, against an explicit project root and registry
 /// path: parse the body, refuse a read-only registry with a structured 409
 /// before anything is attempted, then validate and save.
-fn feature_associate_at(
+pub(super) fn feature_associate_at(
     root: &std::path::Path,
     registry: &std::path::Path,
     raw_body: &[u8],
@@ -2185,6 +2289,24 @@ fn typed_text(text: Option<String>) -> Result<String, String> {
         );
     }
     Ok(text)
+}
+
+/// A connection checked out either ad-hoc (`Owned`, TCP `serve`) or from a
+/// bounded role pool (`Pooled`, UDS `serve::ipc`), auto-returned on drop.
+pub(super) enum WriterConn<'a> {
+    Owned(spawn_postgres::PostgresStore),
+    Pooled(ipc::CheckedOutConn<'a>),
+}
+
+impl std::ops::Deref for WriterConn<'_> {
+    type Target = spawn_postgres::PostgresStore;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(store) => store,
+            Self::Pooled(conn) => conn,
+        }
+    }
 }
 
 /// A connection as the `spawn_human` login, derived from the owner's URL:
