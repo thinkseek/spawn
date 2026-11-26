@@ -871,6 +871,37 @@ pub trait FileWatch: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// One engine launch a filesystem view is asked to wrap ([`EngineView`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ViewedLaunch<'a> {
+    /// The engine's driver id (`agy`).
+    pub engine: &'a str,
+    /// The workspace the engine runs in, bound writable.
+    pub workspace: &'a str,
+    /// The engine's own home (its transcripts), bound writable.
+    pub engine_home: &'a str,
+    /// The `TMPDIR` the launch's environment names, if any.
+    pub tmpdir: Option<&'a str>,
+}
+
+/// The filesystem view an engine with no deny rules of its own
+/// ([`crate::driver::Guard::Sandbox`]) runs in (decision C2, N6): the host's
+/// filesystem read-only, its credentials, the other engines' homes and the
+/// terminal servers' sockets masked, and only the workspace, the engine's
+/// home and `TMPDIR` writable. The host's is `bwrap`
+/// (`spawn_host::engine_view`).
+pub trait EngineView: Send + Sync + std::fmt::Debug {
+    /// Its mechanism's name (`bwrap`).
+    fn name(&self) -> &'static str;
+
+    /// The words that run a program inside the view for `launch`: the
+    /// view's program and its arguments, ending in `--`, after which the
+    /// launch's own program and arguments go. Resolved again at every
+    /// launch. An error says why this launch cannot have its view: the
+    /// engine is not started.
+    fn wrap(&self, launch: &ViewedLaunch<'_>) -> Result<Vec<String>, String>;
+}
+
 /// Transcript archive failure.
 #[derive(Debug, Error)]
 #[error("transcript archive: {0}")]
