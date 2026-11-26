@@ -2317,6 +2317,45 @@ lines under the prompt line, which moves the lower rule down.
 `read_agy_screen` reads it as `Drafted`, for up to 8 wrapped lines, never as
 `Unknown` or `Ready`.
 
+### 3.8 Routing by preset, masking and capabilities (issue #91, PR 4)
+
+**The engine comes from the task's preset** (design 7.1;
+docs/agent-grading.md, "The engine a preset runs"). Delivery starts a
+worker on its preset's driver, with the preset's `model_label` for agy
+(`start {model_label}`, agy's `--model`). The lifecycle layer never reads a
+grade: it receives an engine and a model in the start and runs them. An
+ephemeral worker changes engine by a stop and then a start; a resident keeps
+one engine. An engine the host cannot run, or a label `agy models` does not
+list, makes no start: the task waits and `engine_unavailable` is escalated,
+never a fall back to Claude Code. The Master Control wake of a supervisor
+with no native session starts it on the engine, model and model label of its
+newest start (`spawn_human_master_message`), Claude Code when there is none.
+
+**Every raw pane is masked where it leaves the host** (decision C2, N4).
+There are three such places: the judge's terminal tail
+(`HostContext::screen_tail`, `crates/spawn-cli/src/context.rs`, which the
+Observer stores as evidence and the attention view reads back), the agent
+page's pane (`/api/sessions/<id>/pane`) and the approvals' capture
+(`serve/approvals.rs`, which the resolver reads too). Each looks up the
+engine of the session's newest `start` (`PostgresStore::latest_engine`) and
+applies `spawn_core::driver::excerpt_for`: the pane stays byte for byte only
+when that engine is positively `claude`. agy's pane, an unknown engine's,
+and any pane whose lookup fails or finds no start lose every line that holds
+an e-mail address (`drop_agy_account_lines`).
+
+**The capability probe** (N5, `crates/spawn-cli/src/serve/capabilities.rs`).
+`spawn loop` probes at its start and then hourly, on a thread of its own.
+For each engine it runs `<program> --version` and, for an enabled agy,
+`agy models`, read by `AgyDriver::known_models`. Each run is bounded, takes
+no shell and has its standard input closed. Login files are only `stat`ed.
+A failure takes down agy alone, never Claude Code. agy's
+"is not recognized as a known model" line on a starting pane fails that
+start at once (`AgentDriver::start_refusal`). An agy `major.minor` outside
+`AGY_TESTED` raises the notice `agy_version_untested` and refuses nothing.
+`GET /api/capabilities` shows the probe: engines, versions, login files
+present, agy's known models, and the terminal backend (Herdr's version,
+protocol and manifests).
+
 ## 4. Experience
 
 Nothing is stored outside the log. Every model judgement is an
