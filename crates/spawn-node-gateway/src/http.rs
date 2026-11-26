@@ -28,6 +28,10 @@ pub const MAX_HEADERS: usize = 64;
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// A peer that does not read its answer for this long is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_mins(1);
+/// What every answer carries unless it says otherwise: no cache and no
+/// proxy keeps or rewrites a gateway answer (signed bodies would no longer
+/// match their signature, and refusals and grants are for one request).
+pub const DEFAULT_CACHE_CONTROL: &str = "no-store, no-transform";
 /// Requests served on one kept-alive connection before it is closed.
 const MAX_REQUESTS_PER_CONNECTION: usize = 1000;
 /// Connections waiting for a worker, per worker; past it a new connection
@@ -568,6 +572,11 @@ fn write_response(stream: &mut TcpStream, response: Response, close: bool) -> io
         head.push_str(name);
         head.push_str(": ");
         head.push_str(value);
+        head.push_str("\r\n");
+    }
+    if response.header_value("Cache-Control").is_none() {
+        head.push_str("Cache-Control: ");
+        head.push_str(DEFAULT_CACHE_CONTROL);
         head.push_str("\r\n");
     }
     if close {

@@ -6,6 +6,8 @@
 //! `server_time_ms`; plus artifacts and their ranges, the public prefix,
 //! and malformed HTTP.
 
+// Each test binary uses part of the shared helpers.
+#[allow(dead_code)]
 mod common;
 
 use common::{Harness, Req, boot_id, no_database, node_id, read, signer, stranger, v};
@@ -677,5 +679,50 @@ fn a_body_trickled_too_slowly_is_cut_off_at_its_deadline() {
     assert!(
         closed >= Duration::from_millis(1400) && closed < Duration::from_secs(5),
         "closed after {closed:?}, the body deadline is 1.5 s"
+    );
+}
+
+#[test]
+fn every_answer_says_no_store_no_transform() {
+    let harness = Harness::start("cache_control", no_database());
+    harness.remember_node();
+    let signer = signer();
+    let expected = Some("no-store, no-transform");
+
+    // A signed JSON 200.
+    write_manifest(&harness);
+    let manifest = harness.get(&signer, "/node/v1/registry-manifest", 1, &[]);
+    assert_eq!(manifest.status, 200);
+    assert_eq!(manifest.header("Cache-Control"), expected, "JSON 200");
+
+    // A signed 4xx refusal.
+    let refused = harness.get(&signer, "/node/v1/artifacts/blake3:00", 2, &[]);
+    assert_eq!(refused.status, 400);
+    assert_eq!(refused.header("Cache-Control"), expected, "refusal");
+
+    // An artifact, whole and by range.
+    let content = b"artifact bytes".repeat(10);
+    let digest = spawn_node_proto::ContentDigest::sha256_of(&content);
+    let dir = harness.artifacts.join("sha256").join(&digest.hex[..2]);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&digest.hex), &content).unwrap();
+    let whole = harness.get(&signer, &digest.artifact_path(), 3, &[]);
+    assert_eq!(whole.status, 200);
+    assert_eq!(whole.header("Cache-Control"), expected, "artifact 200");
+    let part = harness.get(
+        &signer,
+        &digest.artifact_path(),
+        4,
+        &[("Range".into(), "bytes=0-3".into())],
+    );
+    assert_eq!(part.status, 206);
+    assert_eq!(part.header("Cache-Control"), expected, "artifact 206");
+    assert_eq!(
+        part.headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("Cache-Control"))
+            .count(),
+        1,
+        "written once"
     );
 }

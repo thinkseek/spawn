@@ -2,8 +2,6 @@
 //! `spawn-node-proto`, a gateway served in-process on `127.0.0.1:0`, and a
 //! raw HTTP/1.1 client (so every byte on the wire is the test's).
 
-#![allow(dead_code)]
-
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

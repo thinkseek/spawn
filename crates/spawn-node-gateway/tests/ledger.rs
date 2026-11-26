@@ -6,6 +6,8 @@
 //! files are removed), spec, replay, verify-then-commit's rollback, a
 //! cache hit's zero database calls, range GETs, revoke and an unknown node.
 
+// Each test binary uses part of the shared helpers.
+#[allow(dead_code)]
 mod common;
 
 use std::collections::BTreeMap;
