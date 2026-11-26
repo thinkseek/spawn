@@ -481,6 +481,18 @@ impl PostgresStore {
         )?)
     }
 
+    /// Judge a completed job's run valid (owner only): the node's strikes
+    /// go back to 0, `degraded` stays (only an undrain clears it). Judged
+    /// once per completion: false when the job is not completed at
+    /// `lease_epoch`, was judged already, or its node was excluded.
+    pub fn remote_job_valid(&self, job_id: &str, lease_epoch: i64) -> Result<bool, StoreError> {
+        let outcome = self.query_json(
+            "select spawn_remote_job_valid($1, $2)",
+            &[&job_id, &lease_epoch],
+        )?;
+        Ok(outcome.get("ok").and_then(Value::as_bool).unwrap_or(false))
+    }
+
     /// One remote job, or `None`.
     pub fn remote_job(&self, job_id: &str) -> Result<Option<RemoteJob>, StoreError> {
         self.query_opt_json(
