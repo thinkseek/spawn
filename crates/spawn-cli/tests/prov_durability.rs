@@ -232,7 +232,7 @@ fn supersedes(shown: &Value) -> Vec<(String, Value)> {
             )
         })
         .collect();
-    edges.sort_by(|a, b| a.1.to_string().cmp(&b.1.to_string()));
+    edges.sort_by_key(|edge| edge.1.to_string());
     edges
 }
 
@@ -301,6 +301,43 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
     let first = index(&schema);
     assert_eq!(first["land"], 4, "{first}");
 
+    check_edges_and_oversized(&schema, &work, &big);
+
+    // A second run records nothing.
+    let rows = (
+        count(&mut client, "prov_changes"),
+        count(&mut client, "prov_entries"),
+        count(&mut client, "prov_edges"),
+    );
+    let second = index(&schema);
+    assert_eq!(second["recorded"], 0, "{second}");
+    assert_eq!(
+        rows,
+        (
+            count(&mut client, "prov_changes"),
+            count(&mut client, "prov_entries"),
+            count(&mut client, "prov_edges"),
+        )
+    );
+
+    check_report(&schema);
+
+    // The report writes nothing.
+    assert_eq!(
+        rows,
+        (
+            count(&mut client, "prov_changes"),
+            count(&mut client, "prov_entries"),
+            count(&mut client, "prov_edges"),
+        )
+    );
+    drop(store);
+}
+
+/// The edges the four landings got from their briefs, and the newest
+/// landing's file over the cap.
+fn check_edges_and_oversized(schema: &str, work: &Work, big: &[u8]) {
+    let schema = schema.to_string();
     let l11 = land_of(&schema, 11);
     let l13 = land_of(&schema, 13);
     let id11 = l11["change"]["change_id"]
@@ -368,7 +405,7 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
         .iter()
         .find(|entry| entry["path"] == "data/model.bin")
         .unwrap_or_else(|| panic!("no oversized entry: {l14}"));
-    assert_eq!(model["after"], sha256(&big));
+    assert_eq!(model["after"], sha256(big));
     assert_eq!(model["before"], Value::Null);
     assert_eq!(model["size"], 4096);
     assert_eq!(model["class"], "content");
@@ -385,24 +422,11 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
             .git(&["ls-tree", "-r", "--name-only", "main"])
             .contains("model.bin")
     );
+}
 
-    // A second run records nothing.
-    let rows = (
-        count(&mut client, "prov_changes"),
-        count(&mut client, "prov_entries"),
-        count(&mut client, "prov_edges"),
-    );
-    let second = index(&schema);
-    assert_eq!(second["recorded"], 0, "{second}");
-    assert_eq!(
-        rows,
-        (
-            count(&mut client, "prov_changes"),
-            count(&mut client, "prov_entries"),
-            count(&mut client, "prov_edges"),
-        )
-    );
-
+/// The shadow report of the history, by flag.
+fn check_report(schema: &str) {
+    let schema = schema.to_string();
     // The shadow report.
     let report = spawn_json(&schema, &["prov", "durability", "--json"]);
     assert_eq!(report["shadow"], true);
@@ -477,14 +501,4 @@ fn landings_supersede_by_the_dispatchers_brief_and_durability_charges_confirmed_
     ] {
         assert!(!spawn(&schema, bad).status.success(), "{bad:?}");
     }
-    // The report writes nothing.
-    assert_eq!(
-        rows,
-        (
-            count(&mut client, "prov_changes"),
-            count(&mut client, "prov_entries"),
-            count(&mut client, "prov_edges"),
-        )
-    );
-    drop(store);
 }
