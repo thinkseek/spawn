@@ -1,13 +1,18 @@
 //! What this host can run: the capability probe (decision C2, N5) and
 //! `GET /api/capabilities` (design PR 4).
 //!
-//! The probe asks each registered engine's program for its version
-//! (`<program> --version`) and, for an engine `SPAWN_ENGINES` enables that
-//! is told its model at launch (agy), for the models it knows (`agy
-//! models`, read by [`AgyDriver::known_models`]). Each run is bounded
-//! ([`VERSION_LIMIT`], [`MODELS_LIMIT`]), runs the program itself (never a
-//! shell) with nothing on its standard input, and is killed with its whole
-//! process group when its bound passes. The engines' login files are
+//! The probe asks Claude Code's program, and the program of each other
+//! engine `SPAWN_ENGINES` enables, for its version (`<program> --version`),
+//! and an enabled agy for the models it knows (`agy models`, read by
+//! [`AgyDriver::known_models`]). **An engine besides Claude Code that
+//! `SPAWN_ENGINES` does not name runs no process at all** (decision C3:
+//! agy runs nowhere before its enabling step): it is reported not enabled,
+//! its install and version unknown. Each run is bounded ([`VERSION_LIMIT`],
+//! [`MODELS_LIMIT`]), its output included: a run whose output a detached
+//! process still holds open past the bound fails, as one that does not
+//! exit does ([`run_bounded`]). It runs the program itself (never a shell)
+//! with nothing on its standard input, and its process group is killed
+//! when the run ends. The engines' login files are
 //! `stat`ed, never opened ([`login_files`]). The answer is cached for the
 //! process: `spawn loop` probes at its start and then hourly on a thread
 //! of its own ([`start`]), so no pass waits on an engine's program;
@@ -69,8 +74,9 @@ pub(crate) struct EngineProbe {
     pub(crate) program: String,
     /// `SPAWN_ENGINES` names it (Claude Code: always).
     pub(crate) enabled: bool,
-    /// Its program answered `--version`.
-    pub(crate) installed: bool,
+    /// Its program answered `--version`; null for an engine not enabled,
+    /// whose program is never run.
+    pub(crate) installed: Option<bool>,
     pub(crate) version: Option<String>,
     /// Whether its `major.minor` is one Spawn was checked against: agy
     /// only, null for an engine with no such list or no version.
@@ -151,6 +157,33 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
         };
         let model = configured.and_then(|(_, home)| home.model.clone());
         let is_enabled = id == DEFAULT || configured.is_some();
+        let login = login_files(id, host.lookup)
+            .into_iter()
+            .map(|path| LoginFile {
+                present: (host.exists)(&path),
+                path: path.display().to_string(),
+            })
+            .collect();
+        if !is_enabled {
+            // Decision C3: an engine the host does not enable is never run,
+            // not even for its version.
+            engines.push(EngineProbe {
+                engine: id.to_string(),
+                title: driver.title().to_string(),
+                program,
+                enabled: false,
+                installed: None,
+                version: None,
+                version_tested: None,
+                login,
+                known_models: None,
+                model,
+                unavailable: Some(format!(
+                    "SPAWN_ENGINES does not name {id}: it is not enabled on this host"
+                )),
+            });
+            continue;
+        }
         let answer = (host.run)(&program, &["--version"], VERSION_LIMIT);
         let version = answer
             .as_ref()
@@ -164,7 +197,7 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             .then(|| version.as_deref().map(AgyDriver::version_tested))
             .flatten();
         let mut known_models = None;
-        if id == "agy" && is_enabled && unavailable.is_none() {
+        if id == "agy" && unavailable.is_none() {
             match (host.run)(&program, &["models"], MODELS_LIMIT) {
                 Ok(listing) => {
                     let known = AgyDriver::known_models(&listing);
@@ -176,19 +209,12 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
                 Err(why) => unavailable = Some(format!("{program} models: {why}")),
             }
         }
-        let login = login_files(id, host.lookup)
-            .into_iter()
-            .map(|path| LoginFile {
-                present: (host.exists)(&path),
-                path: path.display().to_string(),
-            })
-            .collect();
         engines.push(EngineProbe {
             engine: id.to_string(),
             title: driver.title().to_string(),
             program,
-            enabled: is_enabled,
-            installed: answer.is_ok(),
+            enabled: true,
+            installed: Some(answer.is_ok()),
             version,
             version_tested,
             login,
@@ -239,9 +265,13 @@ pub(crate) fn engines(probe: &Probe) -> Engines {
 }
 
 /// Run `program` with `arguments` (no shell, standard input closed) within
-/// `limit`: its standard output when it exits 0, else why not. The program
-/// leads a process group of its own, killed whole when the run ends,
-/// however it ends.
+/// `limit`: its standard output when it exits 0 and its output closes in
+/// time, else why not. The program leads a process group of its own,
+/// killed whole when the run ends, however it ends. Its output is read on a
+/// thread and waited for only until the same deadline: a process that left
+/// the group (`setsid`, as agy's background updater does) and still holds
+/// the output open fails the run at the bound, and the reading thread is
+/// left to end when that process closes it.
 fn run_bounded(program: &str, arguments: &[&str], limit: Duration) -> Result<String, String> {
     use std::os::unix::process::CommandExt as _;
     let deadline = Instant::now() + limit;
@@ -255,12 +285,13 @@ fn run_bounded(program: &str, arguments: &[&str], limit: Duration) -> Result<Str
         .map_err(|error| format!("not started: {error}"))?;
     let group = rustix::process::Pid::from_child(&child);
     let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut text = Vec::new();
         if let Some(out) = stdout {
             let _ = out.take(OUTPUT_LIMIT).read_to_end(&mut text);
         }
-        text
+        let _ = send.send(text);
     });
     let ended = loop {
         match child.try_wait() {
@@ -272,11 +303,22 @@ fn run_bounded(program: &str, arguments: &[&str], limit: Duration) -> Result<Str
             Err(error) => break Err(error.to_string()),
         }
     };
+    let text = match &ended {
+        Ok(_) => receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| {
+                format!(
+                    "its output was still held open {} s on (a detached process keeps it)",
+                    limit.as_secs()
+                )
+            }),
+        Err(why) => Err(why.clone()),
+    };
     let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     let _ = child.kill();
     let _ = child.wait();
     let status = ended?;
-    let text = reader.join().unwrap_or_default();
+    let text = text?;
     if !status.success() {
         return Err(format!("exited with {status}"));
     }
@@ -474,7 +516,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Host, engines, probe_with, untested_notice};
+    use super::{Host, engines, probe_with, run_bounded, untested_notice};
     use crate::deliver::Runs;
 
     struct Fake {
@@ -564,7 +606,8 @@ mod tests {
         );
         let agy = &probe.engines[1];
         assert_eq!(agy.engine, "agy");
-        assert!(agy.enabled && agy.installed);
+        assert!(agy.enabled);
+        assert_eq!(agy.installed, Some(true));
         assert_eq!(agy.version.as_deref(), Some("1.5.17"));
         assert_eq!(agy.version_tested, Some(true));
         assert_eq!(
@@ -630,17 +673,72 @@ mod tests {
                 other => panic!("{said}: {other:?}"),
             }
         }
-        let host = fake(Vec::new(), vec![("agy --version", Ok("1.6.2"))]);
+        // Decision C3: a disabled agy runs no process at all, not even
+        // `--version`; only Claude Code's program is asked.
+        let host = fake(
+            vec![("HOME", "/home/a")],
+            vec![
+                ("claude --version", Ok("2.1.0")),
+                ("agy --version", Ok("1.6.2")),
+            ],
+        );
         let probe = host.probe();
-        assert!(!host.runs.borrow().iter().any(|run| run.ends_with("models")));
-        assert!(!probe.engines[1].enabled);
+        assert_eq!(*host.runs.borrow(), ["claude --version"]);
+        let agy = &probe.engines[1];
+        assert!(!agy.enabled);
+        assert_eq!(agy.installed, None);
+        assert_eq!(agy.version, None);
+        assert_eq!(agy.known_models, None);
+        assert_eq!(agy.login.len(), 2, "its login files are only stated");
         assert!(matches!(
             engines(&probe).runs("agy", Some("x-1")),
             Runs::Unavailable(why) if why.contains("not enabled")
         ));
+        assert_eq!(untested_notice(&probe), None, "a version never asked");
+        let host = fake(
+            vec![("SPAWN_ENGINES", "agy")],
+            vec![
+                ("agy --version", Ok("1.6.2")),
+                ("agy models", Ok("gemini-3.8-pro")),
+            ],
+        );
+        let probe = host.probe();
         let notice = untested_notice(&probe).expect("1.6 is untested");
         assert_eq!(notice["key"], "agy_version_untested:1.6.2");
         assert_eq!(notice["kind"], "agy_version_untested");
         assert_eq!(notice["notice"], true);
+    }
+
+    /// Must-fix of review 589: a detached process (`setsid`, as agy's
+    /// background updater) that keeps the output open does not hold the
+    /// probe past its bound: the run fails near the bound, and agy is
+    /// reported down, never left unknown.
+    #[test]
+    fn a_detached_child_holding_the_output_open_fails_the_run_at_its_bound() {
+        let dir = std::env::temp_dir().join(format!("h4r-bounded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let pidfile = dir.join("pid");
+        let script = format!(
+            "echo 1.5.17; setsid sh -c 'echo $$ > {}; exec sleep 30' & sleep 0.2; exit 0",
+            pidfile.display()
+        );
+        let started = std::time::Instant::now();
+        let answer = run_bounded("sh", &["-c", &script], Duration::from_secs(1));
+        let took = started.elapsed();
+        if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+            let _ = std::process::Command::new("kill")
+                .arg(pid.trim())
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = answer.expect_err("held open past the bound");
+        assert!(why.contains("held open"), "{why}");
+        assert!(took < Duration::from_secs(3), "bounded: {took:?}");
+        // A run that ends and closes its output answers as before.
+        assert_eq!(
+            run_bounded("sh", &["-c", "echo 1.5.17"], Duration::from_secs(5)).as_deref(),
+            Ok("1.5.17\n")
+        );
+        assert!(run_bounded("sh", &["-c", "exit 3"], Duration::from_secs(5)).is_err());
     }
 }
