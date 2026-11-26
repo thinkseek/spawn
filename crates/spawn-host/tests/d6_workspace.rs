@@ -28,10 +28,11 @@ use spawn_core::port::{
 use spawn_host::d6_workspace::{
     HostMemorySample, L1Admission, L1FallbackReason, L1FlushReason, L1TmpfsPolicy,
 };
+use spawn_host::workspace::{D6ShadowOptions, D6StoreOptions, DynRefLedger};
 use spawn_host::{
     CasMerkleStore, D6RefKind, D6StoreError, D6Workspace, GitWorkspace, LedgerRef, LedgerSnapshot,
-    RefLedger, SET_ASIDE_WAITS, ShadowCheckpointOutcome, ShadowD6Workspace, ShadowTrackedSetMode,
-    format_commit_body, test_git_command,
+    LocalWorkspaceStore, RefLedger, SET_ASIDE_WAITS, ShadowCheckpointOutcome, ShadowD6Workspace,
+    ShadowTrackedSetMode, format_commit_body, test_git_command,
 };
 use spawn_postgres::{PostgresStore, RefKind};
 
@@ -1553,4 +1554,212 @@ fn d6_workspace_pg_same_second_identical_commits_are_idempotent() {
     assert_eq!(s1.id, s2.id);
     assert_eq!(s1.created_at_ms, 1_700_000_050_000);
     assert_eq!(s2.created_at_ms, 1_700_000_050_000);
+}
+
+fn setup_local_bare_repo(seed: &Path, bare: &Path) {
+    fs::create_dir_all(seed).expect("mkdir seed");
+    git_in(seed, &["init", "-q", "--initial-branch=main"]);
+    fs::write(seed.join(".gitignore"), "*.secret\n").expect("gi");
+    fs::write(seed.join("README.md"), "base line\n").expect("readme");
+    git_in(seed, &["add", "-A"]);
+    git_in(seed, &["commit", "-qm", "base"]);
+    git_in(
+        seed,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &seed.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+    );
+}
+
+fn verify_local_store_d6_shadow_strict_leak(cas: Arc<CasMerkleStore>) {
+    let scratch = Scratch::new("local_d6_shadow_strict");
+    let seed = scratch.join("seed");
+    let bare = scratch.join("bare.git");
+    setup_local_bare_repo(&seed, &bare);
+    let ledger: DynRefLedger = Arc::new(PgRefLedger::connect_isolated("local_d6_shadow_strict"));
+    let opts = D6ShadowOptions::new(scratch.join("shadow-work"), cas, ledger)
+        .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+        .with_strict_fail_closed(true);
+    let store = LocalWorkspaceStore::d6_shadow(&bare, scratch.join("git-work"), opts);
+    let branch = BranchName::new("agent_strict_leak").expect("branch");
+    store.ensure_branch(&branch, None).expect("ensure_branch");
+    let ws = store.mount(&branch).expect("mount");
+    let dir = PathBuf::from(ws.path());
+    fs::write(dir.join("tracked.txt"), "ok\n").expect("write tracked");
+    fs::write(dir.join("leak.secret"), "TOKEN=topsecret\n").expect("write secret");
+
+    let err = store
+        .checkpoint(&ws, "must fail closed on leak")
+        .expect_err("strict_fail_closed must refuse TrackedSetLeak");
+    assert!(
+        matches!(&err, WorkspaceError::Refused { code, .. } if code == "TrackedSetLeak"),
+        "unexpected error: {err:?}"
+    );
+    let metrics = store.shadow_metrics().expect("shadow metrics");
+    assert!(metrics.tracked_set_leaks >= 1, "{metrics:?}");
+    assert_eq!(metrics.shadow_errors, 0, "{metrics:?}");
+    store.discard(&ws).expect("discard");
+}
+
+#[test]
+fn local_workspace_store_d6_shadow_parity_and_strict_fail_closed_leak() {
+    let scratch = Scratch::new("local_d6_shadow");
+    let seed = scratch.join("seed");
+    let bare = scratch.join("bare.git");
+    setup_local_bare_repo(&seed, &bare);
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
+    let ledger: DynRefLedger = Arc::new(PgRefLedger::connect_isolated("local_d6_shadow"));
+
+    let mut opts = D6ShadowOptions::new(scratch.join("shadow-work"), cas.clone(), ledger)
+        .with_strict_fail_closed(true);
+    opts = opts.with_l1_policy(L1TmpfsPolicy::new(scratch.join("l1-tmpfs"), 16));
+    let store = LocalWorkspaceStore::d6_shadow(&bare, scratch.join("git-work"), opts);
+    assert_eq!(store.backend_name(), "d6-shadow");
+
+    let branch = BranchName::new("agent_local_shadow").expect("branch");
+    store.ensure_branch(&branch, None).expect("ensure_branch");
+    let ws = store.mount(&branch).expect("mount");
+    assert!(store.is_mounted(&ws));
+    let held = store.hold(&ws).expect("hold");
+    drop(held);
+
+    let dir = PathBuf::from(ws.path());
+    fs::write(dir.join("app.txt"), "hello d6 shadow\n").expect("write app");
+    fs::write(dir.join("ignored.secret"), "SECRET=1\n").expect("write ignored");
+    assert!(matches!(
+        store.checkpoint(&ws, "work commit").expect("checkpoint"),
+        Commit::Created(_)
+    ));
+
+    // Advance main in git and verify clean merge parity
+    fs::write(seed.join("upstream.txt"), "from main\n").expect("write upstream");
+    git_in(&seed, &["add", "-A"]);
+    git_in(&seed, &["commit", "-qm", "upstream"]);
+    git_in(&seed, &["push", "-q", &bare.to_string_lossy(), "main"]);
+
+    assert!(matches!(
+        store.merge_base(&ws).expect("merge_base"),
+        BaseMerge::Merged { .. }
+    ));
+    let aside = store
+        .set_aside_when(&branch, None, "pause work", &|| Ok(()))
+        .expect("set_aside_when");
+    assert!(matches!(aside, SetAside::Created { .. }));
+    assert!(store.notices(&ws).is_empty());
+    store.notices_told(&ws, &[]);
+    store.unmount(&ws).expect("unmount");
+    assert!(!store.is_mounted(&ws));
+
+    let metrics = store.shadow_metrics().expect("shadow metrics");
+    assert!(metrics.checkpoints_agreed >= 1, "{metrics:?}");
+    assert_eq!(metrics.tree_mismatches, 0, "{metrics:?}");
+    assert_eq!(metrics.tracked_set_leaks, 0, "{metrics:?}");
+    assert_eq!(metrics.merge_summary.agree_clean, 1, "{metrics:?}");
+    assert!(!metrics.has_divergences(), "{metrics:?}");
+
+    verify_local_store_d6_shadow_strict_leak(cas);
+}
+
+#[test]
+fn local_workspace_store_d6_native_lifecycle_and_l1_tmpfs() {
+    let scratch = Scratch::new("local_d6_native");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
+    let ledger_pg = Arc::new(PgRefLedger::connect_isolated("local_d6_native"));
+    let ledger: DynRefLedger = ledger_pg.clone();
+    let tmpfs_root = scratch.join("l1-tmpfs");
+
+    let opts = D6StoreOptions::new(cas.clone(), ledger)
+        .with_l1_policy(L1TmpfsPolicy::new(&tmpfs_root, 32));
+    let store = LocalWorkspaceStore::d6("proj-local-d6", scratch.join("disk-work"), opts);
+    assert_eq!(store.backend_name(), "d6");
+
+    let branch = BranchName::new("agent_local_d6").expect("branch");
+    store.ensure_branch(&branch, None).expect("ensure_branch");
+    let ws = store.mount(&branch).expect("mount");
+    assert!(store.is_mounted(&ws));
+    assert!(Path::new(ws.path()).starts_with(spawn_host::canonical_root(&tmpfs_root)));
+    assert!(store.d6_l1_reserved_bytes().is_some());
+
+    let dir = PathBuf::from(ws.path());
+    fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write");
+    assert!(matches!(
+        store.checkpoint(&ws, "first d6 commit").expect("ckpt"),
+        Commit::Created(_)
+    ));
+    assert_eq!(
+        store.checkpoint(&ws, "noop").expect("noop"),
+        Commit::Unchanged
+    );
+
+    // Advance PG main independently and test merge_base through LocalWorkspaceStore::D6
+    let d6 = store.d6_workspace().expect("d6_workspace");
+    let main_now = d6.main_snapshot().expect("main").expect("seeded");
+    let (bd, blen) = cas.put_bytes_blob(b"upstream change\n").expect("blob");
+    let next_tree = cas
+        .apply_mutations(
+            &main_now.tree,
+            &[TreeMutation::Upsert {
+                path: vec![b"UPSTREAM.md".to_vec()],
+                kind: TreeEntryKind::File,
+                id: bd.as_bytes(),
+                size: blen,
+            }],
+        )
+        .expect("tree");
+    let snap = Snapshot {
+        tree: next_tree.clone(),
+        parents: vec![main_now.id.clone()],
+        commit_body: format_commit_body(
+            "spawn <t@localhost> 1700000100 +0000",
+            "spawn <t@localhost> 1700000100 +0000",
+            "upstream\n",
+        ),
+    };
+    let snap_id = cas.cas().put_merkle_snapshot(&snap).expect("put snap");
+    let oid = cas
+        .project_snapshot_oid(&snap, &[main_now.git_oid])
+        .expect("oid");
+    ledger_pg
+        .pg
+        .record_snapshot(
+            &snap_id.to_string(),
+            &oid.to_hex(),
+            &next_tree.to_string(),
+            &[main_now.id.to_string()],
+            "proj-local-d6",
+            1_700_000_100_000,
+        )
+        .expect("record");
+    let task_id = setup_accepted_task(
+        &ledger_pg.pg,
+        "/tmp/local-d6-main.git",
+        &main_now.git_oid,
+        &oid,
+    );
+    let _ = d6
+        .land_main_snapshot(Some(&main_now.id), &snap_id, Some(task_id), "land")
+        .expect("land main");
+
+    assert!(matches!(
+        store.merge_base(&ws).expect("merge_base"),
+        BaseMerge::Merged { .. }
+    ));
+    assert!(Path::new(ws.path()).join("UPSTREAM.md").is_file());
+    assert!(matches!(
+        store
+            .set_aside_when(&branch, None, "pause d6", &|| Ok(()))
+            .expect("set_aside"),
+        SetAside::Created { .. }
+    ));
+    store.unmount(&ws).expect("unmount");
+    assert!(!store.is_mounted(&ws));
+    assert_eq!(store.d6_l1_reserved_bytes(), Some(0));
+    let refs = ledger_pg
+        .list_refs(Some("proj-local-d6"))
+        .expect("list_refs");
+    assert!(refs.iter().any(|r| r.name == "agent_local_d6"));
 }

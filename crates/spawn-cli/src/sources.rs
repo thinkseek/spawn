@@ -42,10 +42,16 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use spawn_cas::{Digest, GitOid};
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
-use spawn_host::LocalWorkspaceStore;
-use spawn_postgres::PostgresStore;
+use spawn_host::d6_workspace::D6Workspace;
+use spawn_host::workspace::DynRefLedger;
+use spawn_host::{
+    D6RefKind, D6StoreError, LedgerRef, LedgerSnapshot, LocalWorkspaceStore, RefLedger,
+    WorkspaceBackend as HostWorkspaceBackend,
+};
+use spawn_postgres::{PostgresStore, RefKind};
 
 use crate::push::{Pushed, Pusher, pushed_ref};
 
@@ -377,6 +383,369 @@ pub(crate) fn mirror_path(root: &Path, source: Option<&str>) -> Result<PathBuf, 
     }
 }
 
+/// Adapter implementing [`spawn_host::RefLedger`] directly over a shared [`PostgresStore`].
+pub(crate) struct PostgresRefLedger {
+    store: Arc<PostgresStore>,
+}
+
+impl PostgresRefLedger {
+    pub(crate) const fn new(store: Arc<PostgresStore>) -> Self {
+        Self { store }
+    }
+}
+
+/// Lazy [`RefLedger`] wrapper used by standalone `WorkspaceSettings::store` calls before a shared
+/// [`PostgresStore`] is injected (resolves via `SPAWN_DATABASE_URL` on first ledger operation).
+pub(crate) struct LazyPgRefLedger {
+    store: Mutex<Option<Arc<PostgresStore>>>,
+}
+
+impl LazyPgRefLedger {
+    pub(crate) const fn new() -> Self {
+        Self {
+            store: Mutex::new(None),
+        }
+    }
+
+    fn with_store<T>(
+        &self,
+        op: impl FnOnce(&PostgresStore) -> Result<T, D6StoreError>,
+    ) -> Result<T, D6StoreError> {
+        let store = {
+            let mut guard = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = &*guard {
+                Arc::clone(existing)
+            } else {
+                let opened = Arc::new(crate::config::open_store().map_err(D6StoreError::Ledger)?);
+                *guard = Some(Arc::clone(&opened));
+                opened
+            }
+        };
+        op(&store)
+    }
+}
+
+fn to_pg_kind(kind: D6RefKind) -> RefKind {
+    match kind {
+        D6RefKind::Main => RefKind::Main,
+        D6RefKind::Branch => RefKind::Branch,
+        D6RefKind::Wip => RefKind::Wip,
+        D6RefKind::Tag => RefKind::Tag,
+    }
+}
+
+fn from_pg_kind(kind: RefKind) -> D6RefKind {
+    match kind {
+        RefKind::Main => D6RefKind::Main,
+        RefKind::Branch => D6RefKind::Branch,
+        RefKind::Wip => D6RefKind::Wip,
+        RefKind::Tag => D6RefKind::Tag,
+    }
+}
+
+fn snapshot_row_to_ledger(
+    row: spawn_postgres::SnapshotRow,
+) -> Result<LedgerSnapshot, D6StoreError> {
+    let parents = row
+        .parents
+        .iter()
+        .map(|p| Digest::parse(p))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(LedgerSnapshot {
+        id: Digest::parse(&row.id)?,
+        git_oid: GitOid::parse_hex(&row.git_oid)?,
+        tree: Digest::parse(&row.tree)?,
+        parents,
+        project: row.project,
+        created_at_ms: row.created_at_ms,
+    })
+}
+
+fn pg_record_snapshot(
+    pg: &PostgresStore,
+    id: &Digest,
+    git_oid: &GitOid,
+    tree: &Digest,
+    parents: &[Digest],
+    project: &str,
+    created_at_ms: i64,
+) -> Result<Digest, D6StoreError> {
+    let parent_strs: Vec<String> = parents.iter().map(Digest::to_string).collect();
+    let out = pg
+        .record_snapshot(
+            &id.to_string(),
+            &git_oid.to_hex(),
+            &tree.to_string(),
+            &parent_strs,
+            project,
+            created_at_ms,
+        )
+        .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+    Ok(Digest::parse(&out)?)
+}
+
+fn pg_cas_ref(
+    pg: &PostgresStore,
+    project: &str,
+    name: &str,
+    kind: D6RefKind,
+    expected: Option<&Digest>,
+    new_snapshot: &Digest,
+    reason: &str,
+) -> Result<u64, D6StoreError> {
+    let exp_str = expected.map(Digest::to_string);
+    let new_str = new_snapshot.to_string();
+    let seq = pg
+        .cas_ref(
+            project,
+            name,
+            to_pg_kind(kind),
+            exp_str.as_deref(),
+            &new_str,
+            reason,
+        )
+        .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+    u64::try_from(seq).map_err(|_| D6StoreError::Ledger(format!("negative ref seq: {seq}")))
+}
+
+fn pg_land_main_ref(
+    pg: &PostgresStore,
+    project: &str,
+    name: &str,
+    expected_base: Option<&Digest>,
+    new_snapshot: &Digest,
+    task_id: Option<i64>,
+    reason: &str,
+) -> Result<u64, D6StoreError> {
+    let exp_str = expected_base.map(Digest::to_string);
+    let new_str = new_snapshot.to_string();
+    let seq = pg
+        .land_main_ref(project, name, exp_str.as_deref(), &new_str, task_id, reason)
+        .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+    u64::try_from(seq).map_err(|_| D6StoreError::Ledger(format!("negative ref seq: {seq}")))
+}
+
+fn pg_list_refs(pg: &PostgresStore, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
+    let rows = pg
+        .list_refs(project)
+        .map_err(|e| D6StoreError::Ledger(e.to_string()))?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(LedgerRef {
+                project: row.project,
+                name: row.name,
+                kind: from_pg_kind(row.kind),
+                snapshot: Digest::parse(&row.snapshot)?,
+                updated_at_ms: row.updated_at_ms,
+            })
+        })
+        .collect()
+}
+
+impl RefLedger for PostgresRefLedger {
+    fn record_snapshot(
+        &self,
+        id: &Digest,
+        git_oid: &GitOid,
+        tree: &Digest,
+        parents: &[Digest],
+        project: &str,
+        created_at_ms: i64,
+    ) -> Result<Digest, D6StoreError> {
+        pg_record_snapshot(
+            &self.store,
+            id,
+            git_oid,
+            tree,
+            parents,
+            project,
+            created_at_ms,
+        )
+    }
+
+    fn get_snapshot(&self, id: &Digest) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        self.store
+            .get_snapshot(&id.to_string())
+            .map_err(|e| D6StoreError::Ledger(e.to_string()))?
+            .map(snapshot_row_to_ledger)
+            .transpose()
+    }
+
+    fn get_snapshot_by_oid(
+        &self,
+        git_oid: &GitOid,
+    ) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        self.store
+            .get_snapshot_by_oid(&git_oid.to_hex())
+            .map_err(|e| D6StoreError::Ledger(e.to_string()))?
+            .map(snapshot_row_to_ledger)
+            .transpose()
+    }
+
+    fn cas_ref(
+        &self,
+        project: &str,
+        name: &str,
+        kind: D6RefKind,
+        expected: Option<&Digest>,
+        new_snapshot: &Digest,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        pg_cas_ref(
+            &self.store,
+            project,
+            name,
+            kind,
+            expected,
+            new_snapshot,
+            reason,
+        )
+    }
+
+    fn land_main_ref(
+        &self,
+        project: &str,
+        name: &str,
+        expected_base: Option<&Digest>,
+        new_snapshot: &Digest,
+        task_id: Option<i64>,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        pg_land_main_ref(
+            &self.store,
+            project,
+            name,
+            expected_base,
+            new_snapshot,
+            task_id,
+            reason,
+        )
+    }
+
+    fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
+        pg_list_refs(&self.store, project)
+    }
+}
+
+impl RefLedger for LazyPgRefLedger {
+    fn record_snapshot(
+        &self,
+        id: &Digest,
+        git_oid: &GitOid,
+        tree: &Digest,
+        parents: &[Digest],
+        project: &str,
+        created_at_ms: i64,
+    ) -> Result<Digest, D6StoreError> {
+        self.with_store(|pg| {
+            pg_record_snapshot(pg, id, git_oid, tree, parents, project, created_at_ms)
+        })
+    }
+
+    fn get_snapshot(&self, id: &Digest) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        self.with_store(|pg| {
+            pg.get_snapshot(&id.to_string())
+                .map_err(|e| D6StoreError::Ledger(e.to_string()))?
+                .map(snapshot_row_to_ledger)
+                .transpose()
+        })
+    }
+
+    fn get_snapshot_by_oid(
+        &self,
+        git_oid: &GitOid,
+    ) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        self.with_store(|pg| {
+            pg.get_snapshot_by_oid(&git_oid.to_hex())
+                .map_err(|e| D6StoreError::Ledger(e.to_string()))?
+                .map(snapshot_row_to_ledger)
+                .transpose()
+        })
+    }
+
+    fn cas_ref(
+        &self,
+        project: &str,
+        name: &str,
+        kind: D6RefKind,
+        expected: Option<&Digest>,
+        new_snapshot: &Digest,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        self.with_store(|pg| pg_cas_ref(pg, project, name, kind, expected, new_snapshot, reason))
+    }
+
+    fn land_main_ref(
+        &self,
+        project: &str,
+        name: &str,
+        expected_base: Option<&Digest>,
+        new_snapshot: &Digest,
+        task_id: Option<i64>,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        self.with_store(|pg| {
+            pg_land_main_ref(
+                pg,
+                project,
+                name,
+                expected_base,
+                new_snapshot,
+                task_id,
+                reason,
+            )
+        })
+    }
+
+    fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
+        self.with_store(|pg| pg_list_refs(pg, project))
+    }
+}
+
+fn rebuild_d6_workspace_with_ledger(
+    existing: &D6Workspace<DynRefLedger>,
+    ledger: DynRefLedger,
+) -> D6Workspace<DynRefLedger> {
+    let mut rebuilt = D6Workspace::new(
+        existing.project_name().to_string(),
+        existing.root(),
+        existing.store().clone(),
+        Arc::new(ledger),
+    )
+    .with_max_file_bytes(existing.max_file_bytes())
+    .with_extra_exclude_files(existing.extra_exclude_files().to_vec());
+    if let Some(policy) = existing.l1_policy() {
+        rebuilt = rebuilt.with_l1_policy(policy.clone());
+    }
+    rebuilt
+}
+
+fn rebind_d6_store(local: LocalWorkspaceStore, pg: &Arc<PostgresStore>) -> LocalWorkspaceStore {
+    let ledger: DynRefLedger = Arc::new(PostgresRefLedger::new(Arc::clone(pg)));
+    match local {
+        LocalWorkspaceStore::D6(store) => {
+            LocalWorkspaceStore::D6(rebuild_d6_workspace_with_ledger(&store, ledger))
+        }
+        LocalWorkspaceStore::D6Shadow(oracle) => {
+            let repo = oracle.git_repo().map_or_else(
+                || PathBuf::from(oracle.primary().project()),
+                Path::to_path_buf,
+            );
+            let rebuilt_shadow = rebuild_d6_workspace_with_ledger(oracle.shadow(), ledger);
+            let primary = spawn_host::GitWorkspace::new(&repo, oracle.primary().root());
+            LocalWorkspaceStore::D6Shadow(
+                spawn_host::ShadowD6Workspace::with_git_repo(primary, rebuilt_shadow, repo)
+                    .with_strict_fail_closed(oracle.strict_fail_closed())
+                    .with_tracked_set_mode(oracle.tracked_set_mode()),
+            )
+        }
+        other => other,
+    }
+}
+
 impl MissionWorkspaces {
     pub(crate) fn new(
         default: LocalWorkspaceStore,
@@ -384,6 +753,17 @@ impl MissionWorkspaces {
         store: Arc<PostgresStore>,
         factory: Factory,
     ) -> Self {
+        let is_d6_family = matches!(
+            default.backend(),
+            HostWorkspaceBackend::D6 | HostWorkspaceBackend::D6Shadow
+        );
+        let default = rebind_d6_store(default, &store);
+        let factory: Factory = if is_d6_family {
+            let pg = Arc::clone(&store);
+            Arc::new(move |repo: &Path| rebind_d6_store(factory(repo), &pg))
+        } else {
+            factory
+        };
         Self {
             default: Arc::new(default),
             root: root.to_path_buf(),
@@ -566,10 +946,15 @@ impl MissionWorkspaces {
         if let Some(routed) = mirrors.get(&key) {
             return Ok(routed.clone());
         }
-        let repo = ensure_mirror(&self.root, source.as_deref())?;
+        let (repo, mirror) = if self.default.backend() == HostWorkspaceBackend::D6 {
+            (mirror_path(&self.root, source.as_deref())?, None)
+        } else {
+            let repo = ensure_mirror(&self.root, source.as_deref())?;
+            (repo.clone(), source.map(|source| (repo, source)))
+        };
         let routed = Routed {
             store: Arc::new((self.factory)(&repo)),
-            mirror: source.map(|source| (repo, source)),
+            mirror,
         };
         mirrors.insert(key, routed.clone());
         Ok(routed)
@@ -2695,6 +3080,218 @@ mod tests {
             git(&["--git-dir", &source_str, "cat-file", "-t", &sha]).expect("cat-file"),
             "commit"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn verify_mission_d6_shadow_strict_leak(url: &str, base: &Path) {
+        use spawn_host::workspace::D6ShadowOptions;
+        use spawn_host::{CasMerkleStore, ShadowTrackedSetMode};
+
+        let schema = spawn_postgres::testing::TestSchema::new("mw_d6_shadow_strict");
+        let pg = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(url, &schema).expect("connect"),
+        );
+        let strict_repo = engine_repo(&base.join("strict-src"));
+        let root = base.join("shadow-strict-root");
+        let cas =
+            std::sync::Arc::new(CasMerkleStore::open(root.join(".d6-shadow/cas")).expect("cas"));
+        let ledger: super::DynRefLedger =
+            std::sync::Arc::new(super::PostgresRefLedger::new(std::sync::Arc::clone(&pg)));
+        let opts = D6ShadowOptions::new(root.join(".d6-shadow/work"), cas, ledger)
+            .with_tracked_set_mode(ShadowTrackedSetMode::SimulateUnfilteredScan)
+            .with_strict_fail_closed(true);
+        let store = super::LocalWorkspaceStore::d6_shadow(&strict_repo, &root, opts);
+        let factory: super::Factory = std::sync::Arc::new(|_| unreachable!("uses default"));
+        let workspaces = super::MissionWorkspaces::new(store, &root, pg, factory);
+
+        let branch = BranchName::new("agent_mw_shadow_leak").expect("branch");
+        workspaces
+            .ensure_branch(&branch, None)
+            .expect("ensure_branch");
+        let ws = workspaces.mount(&branch).expect("mount");
+        let dir = std::path::PathBuf::from(ws.path());
+        std::fs::write(dir.join(".gitignore"), "ignored.log\n").expect("gi");
+        std::fs::write(dir.join("tracked.txt"), "ok\n").expect("tracked");
+        std::fs::write(dir.join("ignored.log"), "secret\n").expect("ignored");
+        let err = workspaces
+            .commit(&ws, "strict leak must refuse")
+            .expect_err("TrackedSetLeak refused");
+        assert!(
+            matches!(&err, WorkspaceError::Refused { code, .. } if code == "TrackedSetLeak"),
+            "unexpected error: {err:?}"
+        );
+        let routed = workspaces.route(branch.as_str()).expect("routed");
+        let metrics = routed.store.shadow_metrics().expect("metrics");
+        assert!(metrics.tracked_set_leaks >= 1, "{metrics:?}");
+        assert_eq!(metrics.shadow_errors, 0, "{metrics:?}");
+        workspaces.unmount(&ws).expect("unmount");
+    }
+
+    #[test]
+    fn mission_workspaces_d6_shadow_runs_oracle_parity_and_strict_fail_closed() {
+        use crate::config::{D6RuntimeConfig, Probes, WorkspaceBackend, WorkspaceSettings};
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("mw_d6_shadow");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sources-d6-shadow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = engine_repo(&base);
+        let root = base.join("shadow-root");
+        let settings =
+            WorkspaceSettings::resolve(WorkspaceBackend::D6Shadow, false, &root, &Probes::host())
+                .expect("resolve")
+                .with_d6(D6RuntimeConfig::default());
+        settings.claim(&root).expect("claim d6-shadow");
+
+        let factory = settings.factory(&root);
+        let workspaces =
+            super::MissionWorkspaces::new(factory(&repo), &root, store.clone(), factory);
+        let branch = BranchName::new("agent_mw_shadow").expect("branch");
+        workspaces
+            .ensure_branch(&branch, None)
+            .expect("ensure_branch");
+        let ws = workspaces.mount_when(&branch, &|| Ok(())).expect("mount");
+        assert!(workspaces.is_mounted(&ws));
+
+        let dir = std::path::PathBuf::from(ws.path());
+        std::fs::write(dir.join(".gitignore"), "ignored.log\n").expect("gi");
+        std::fs::write(dir.join("README.md"), "branch edit\n").expect("edit");
+        std::fs::write(dir.join("ignored.log"), "ignore me\n").expect("ignored");
+        assert!(matches!(
+            workspaces.commit(&ws, "shadow work").expect("commit"),
+            Commit::Created(_)
+        ));
+        assert!(matches!(
+            workspaces
+                .set_aside_when(&branch, None, "pause", &|| Ok(()))
+                .expect("set_aside"),
+            spawn_core::port::SetAside::Created { .. }
+        ));
+        let routed = workspaces.route(branch.as_str()).expect("routed");
+        assert_eq!(routed.store.backend_name(), "d6-shadow");
+        let metrics = routed.store.shadow_metrics().expect("shadow metrics");
+        assert!(metrics.checkpoints_agreed >= 1, "{metrics:?}");
+        assert_eq!(metrics.tree_mismatches, 0, "{metrics:?}");
+        assert_eq!(metrics.tracked_set_leaks, 0, "{metrics:?}");
+        assert!(!metrics.has_divergences(), "{metrics:?}");
+        workspaces.unmount_when(&ws, &|| Ok(())).expect("unmount");
+
+        verify_mission_d6_shadow_strict_leak(&url, &base);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mission_workspaces_d6_native_lifecycle_with_l1_tmpfs_and_zero_git() {
+        use crate::config::{D6RuntimeConfig, Probes, WorkspaceBackend, WorkspaceSettings};
+
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let schema = spawn_postgres::testing::TestSchema::new("mw_d6_native");
+        let store = std::sync::Arc::new(
+            spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect"),
+        );
+        let base = std::env::temp_dir().join(format!(
+            "spawn-sources-d6-native-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let tmpfs_dir = std::path::PathBuf::from(format!(
+            "/dev/shm/spawn-d6-step7-mw-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&tmpfs_dir);
+        std::fs::create_dir_all(&base).expect("base");
+
+        let root = base.join("d6-root");
+        let settings =
+            WorkspaceSettings::resolve(WorkspaceBackend::D6, false, &root, &Probes::host())
+                .expect("resolve")
+                .with_d6(D6RuntimeConfig {
+                    cas_dir: None,
+                    tmpfs_root: Some(tmpfs_dir.clone()),
+                    tmpfs_budget_mb: Some(128),
+                    strict_fail_closed: false,
+                });
+        settings.claim(&root).expect("claim d6");
+        assert!(
+            spawn_host::claim_root(&root, spawn_host::WorkspaceBackend::Git).is_err(),
+            "claimed d6 root must refuse git"
+        );
+
+        let mission = store
+            .mission_add(
+                "d6 native mission",
+                &serde_json::json!(["https://example.invalid/d6/proj.git"]),
+                "human",
+            )
+            .expect("mission_add");
+        let _ = store
+            .task_assign(mission, "ephemeral", "agent_mw_d6", "d6 work", "default")
+            .expect("task_assign");
+
+        let default_proj = base.join("nonexistent-default.git");
+        let factory = settings.factory(&root);
+        let workspaces =
+            super::MissionWorkspaces::new(factory(&default_proj), &root, store.clone(), factory);
+        let branch = BranchName::new("agent_mw_d6").expect("branch");
+        workspaces
+            .ensure_branch(&branch, None)
+            .expect("ensure_branch");
+        let ws = workspaces.mount_when(&branch, &|| Ok(())).expect("mount");
+        assert!(workspaces.is_mounted(&ws));
+        assert!(
+            Path::new(ws.path()).starts_with(spawn_host::canonical_root(&tmpfs_dir)),
+            "expected L1 tmpfs mount under {}, got {}",
+            tmpfs_dir.display(),
+            ws.path()
+        );
+        assert!(workspaces.hold(&ws).is_some());
+
+        std::fs::write(
+            Path::new(ws.path()).join("lib.rs"),
+            "pub fn ok() -> bool { true }\n",
+        )
+        .expect("write");
+        assert!(matches!(
+            workspaces.commit(&ws, "d6 native commit").expect("commit"),
+            Commit::Created(_)
+        ));
+        assert_eq!(
+            workspaces.commit(&ws, "noop").expect("noop"),
+            Commit::Unchanged
+        );
+        let routed = workspaces.route(branch.as_str()).expect("routed");
+        assert_eq!(routed.store.backend_name(), "d6");
+        assert!(
+            routed
+                .store
+                .d6_workspace()
+                .expect("d6")
+                .l1_policy()
+                .is_some()
+        );
+        assert!(routed.store.d6_l1_reserved_bytes().is_some_and(|b| b > 0));
+        assert!(
+            !root.join(".sources").exists(),
+            "native D6 route must never clone git mirrors under .sources"
+        );
+        workspaces.unmount_when(&ws, &|| Ok(())).expect("unmount");
+        assert!(!workspaces.is_mounted(&ws));
+        assert!(!store.list_refs(None).expect("list_refs").is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmpfs_dir);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

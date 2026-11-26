@@ -43,9 +43,9 @@ use spawn_core::port::{
 
 use crate::agent_files::{AgentFileError, open_regular, read_regular, rename_within, replace_with};
 use crate::cas_merkle::{
-    BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, LedgerSnapshot,
-    PublishRequest, PublishedSnapshot, RefLedger, ScannedEntry, ScannedKind, TrackedSetPolicy,
-    format_commit_body,
+    BUILD_OUTPUT as D6_BUILD_OUTPUT, CasMerkleStore, D6RefKind, D6StoreError, LedgerRef,
+    LedgerSnapshot, PublishRequest, PublishedSnapshot, RefLedger, ScannedEntry, ScannedKind,
+    TrackedSetPolicy, format_commit_body,
 };
 use crate::cow::clone_or_copy;
 use crate::d6_layer0::{
@@ -383,6 +383,70 @@ pub struct D6Workspace<L: RefLedger> {
     stat_cache: Mutex<HashMap<StatCacheKey, HashMap<Vec<u8>, CachedStatEntry>>>,
     flatten_cache: Mutex<VecDeque<FlattenCacheEntry>>,
     verified_clean: Mutex<VecDeque<(Digest, Option<Digest>)>>,
+}
+
+impl<T: RefLedger + ?Sized> RefLedger for Arc<T> {
+    fn record_snapshot(
+        &self,
+        id: &Digest,
+        git_oid: &GitOid,
+        tree: &Digest,
+        parents: &[Digest],
+        project: &str,
+        created_at_ms: i64,
+    ) -> Result<Digest, D6StoreError> {
+        (**self).record_snapshot(id, git_oid, tree, parents, project, created_at_ms)
+    }
+
+    fn get_snapshot(&self, id: &Digest) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        (**self).get_snapshot(id)
+    }
+
+    fn get_snapshot_by_oid(
+        &self,
+        git_oid: &GitOid,
+    ) -> Result<Option<LedgerSnapshot>, D6StoreError> {
+        (**self).get_snapshot_by_oid(git_oid)
+    }
+
+    fn cas_ref(
+        &self,
+        project: &str,
+        name: &str,
+        kind: D6RefKind,
+        expected: Option<&Digest>,
+        new_snapshot: &Digest,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        (**self).cas_ref(project, name, kind, expected, new_snapshot, reason)
+    }
+
+    fn land_main_ref(
+        &self,
+        project: &str,
+        name: &str,
+        expected_base: Option<&Digest>,
+        new_snapshot: &Digest,
+        task_id: Option<i64>,
+        reason: &str,
+    ) -> Result<u64, D6StoreError> {
+        (**self).land_main_ref(project, name, expected_base, new_snapshot, task_id, reason)
+    }
+
+    fn list_refs(&self, project: Option<&str>) -> Result<Vec<LedgerRef>, D6StoreError> {
+        (**self).list_refs(project)
+    }
+}
+
+impl<L: RefLedger> std::fmt::Debug for D6Workspace<L> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("D6Workspace")
+            .field("project", &self.project)
+            .field("root", &self.root)
+            .field("l1_enabled", &self.l1_policy.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<L: RefLedger> D6Workspace<L> {

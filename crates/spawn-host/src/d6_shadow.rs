@@ -285,6 +285,33 @@ impl<W: WorkspaceStore, L: RefLedger> ShadowD6Workspace<W, L> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Whether `TrackedSetLeak` strictly fails checkpoint/commit operations.
+    pub const fn strict_fail_closed(&self) -> bool {
+        self.strict_fail_closed
+    }
+
+    /// Configured tracked-set scan mode.
+    pub const fn tracked_set_mode(&self) -> ShadowTrackedSetMode {
+        self.tracked_set_mode
+    }
+
+    /// Bare/working Git repository path paired with this shadow store, if any.
+    pub fn git_repo(&self) -> Option<&Path> {
+        self.git_repo.as_deref()
+    }
+}
+
+impl<W: WorkspaceStore, L: RefLedger> std::fmt::Debug for ShadowD6Workspace<W, L> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShadowD6Workspace")
+            .field("project", &self.primary.project())
+            .field("git_repo", &self.git_repo)
+            .field("tracked_set_mode", &self.tracked_set_mode)
+            .field("strict_fail_closed", &self.strict_fail_closed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<W: WorkspaceStore, L: RefLedger + Send + Sync> ShadowD6Workspace<W, L> {
@@ -372,6 +399,25 @@ impl<W: WorkspaceStore, L: RefLedger + Send + Sync> ShadowD6Workspace<W, L> {
         self.primary.unmount(workspace)?;
         let shadow_ws = self.shadow.workspace_id_for_branch(workspace.sandbox())?;
         self.shadow.discard(&shadow_ws)
+    }
+}
+
+impl<L: RefLedger + Send + Sync> ShadowD6Workspace<GitWorkspace, L> {
+    /// Commit `workspace` through [`GitWorkspace::commit_or_take_back`] (taking a gone branch
+    /// back from its source under branch lock when needed), then evaluate shadow parity.
+    pub fn commit_or_take_back(
+        &self,
+        workspace: &WorkspaceId,
+        message: &str,
+        take_back: &dyn Fn() -> Result<(), WorkspaceError>,
+    ) -> Result<Commit, WorkspaceError> {
+        let primary_res = self
+            .primary
+            .commit_or_take_back(workspace, message, take_back)?;
+        let branch = workspace.sandbox();
+        let primary_dir = Path::new(workspace.path());
+        let _ = self.evaluate_shadow_checkpoint(branch, primary_dir, &primary_res)?;
+        Ok(primary_res)
     }
 }
 
