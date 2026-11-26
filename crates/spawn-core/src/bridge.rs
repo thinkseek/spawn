@@ -945,6 +945,15 @@ enum Typing {
     Unknown,
 }
 
+/// The model label an execution of `engine` was launched on, as its
+/// `execution.started` records it (`launch`'s `model`): an engine besides
+/// Claude Code's only ([`SessionView::model_label`]).
+fn launched_label(engine: &str, launch: Option<&LaunchSummary>) -> Option<String> {
+    launch
+        .and_then(|launch| launch.model.clone())
+        .filter(|_| engine != crate::driver::DEFAULT)
+}
+
 impl SessionView {
     /// Start a session's view from its first event.
     fn from_event(event: &NewEvent) -> Self {
@@ -1988,10 +1997,7 @@ impl Bridge {
             } => {
                 view.model = *model;
                 view.engine.clone_from(engine);
-                view.model_label = launch
-                    .as_ref()
-                    .and_then(|launch| launch.model.clone())
-                    .filter(|_| engine != crate::driver::DEFAULT);
+                view.model_label = launched_label(engine, launch.as_ref());
                 if let Some(execution_id) = event.execution_id.clone() {
                     // As the store names it now: a record from before the
                     // root was resolved names the same directory.
