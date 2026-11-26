@@ -152,8 +152,13 @@ impl Fixture {
             extra_files: Vec::new(),
             host_tmpdir: Some(self.host_tmp()),
             private_dir: self.private(),
-            extra_writable: Vec::new(),
+            canonical_workspace: None,
+            home_isolation: spawn_host::HomeIsolation::Blacklist,
+            extra_mounts: Vec::new(),
             agy_data_dir: None,
+            isolate_workers: false,
+            isolate_brain: false,
+            agy_program: None,
         }
     }
 
@@ -242,6 +247,8 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
+            worker_id: None,
+            exit_file: None,
         })
         .expect("wrap");
     let home = fixture.home();
@@ -424,6 +431,8 @@ fn missing_and_odd_targets_are_skipped_and_said_without_aborting() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
+            worker_id: None,
+            exit_file: None,
         })
         .expect("plan");
     let why = |path: &Path| {
@@ -464,6 +473,8 @@ fn the_argv_keeps_its_invariants() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
+            worker_id: None,
+            exit_file: None,
         })
         .expect("plan");
     let words = &plan.words;
@@ -568,6 +579,8 @@ fn a_bind_that_would_uncover_a_mask_is_refused() {
             engine: "agy",
             workspace,
             engine_home,
+            worker_id: None,
+            exit_file: None,
         })
     };
     let shown = |path: PathBuf| path.display().to_string();
@@ -628,18 +641,20 @@ fn a_bind_that_would_uncover_a_mask_is_refused() {
 /// (a builtin: no child takes its place in the pane).
 const STUB_CLAUDE: &str = "#!/bin/sh\nprintf '> \\r\\n'\nwhile IFS= read -r line; do :; done\n";
 
-/// The installed `herdr`, if any answers `--version`.
+/// The installed `herdr`, checking `SPAWN_HERDR_PROGRAM` first, if any
+/// answers `--version`.
 fn herdr_program() -> Option<String> {
-    let from_env = std::env::var_os("SPAWN_HERDR_PROGRAM")
-        .map(|value| value.to_string_lossy().into_owned())
-        .filter(|value| !value.trim().is_empty());
+    let env_program = std::env::var("SPAWN_HERDR_PROGRAM")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let home = std::env::var_os("HOME").map(|home| {
         Path::new(&home)
             .join(".local/bin/herdr")
             .display()
             .to_string()
     });
-    from_env
+    env_program
         .into_iter()
         .chain(home)
         .chain(["herdr".to_string()])
@@ -740,6 +755,8 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
+            worker_id: None,
+            exit_file: None,
         })
         .expect("wrap");
     assert!(!words.iter().any(|word| word == "--new-session"));
@@ -783,8 +800,518 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
             engine: "agy",
             workspace: &workspace,
             engine_home: &engine_home,
+            worker_id: None,
+            exit_file: None,
         })
         .expect("wrap");
     fails(&check, &format!("ls '{}'", socket.display()));
     host.terminate(&terminal, &id).expect("terminate");
+}
+
+#[test]
+fn canonical_workspace_mounts_at_target_sets_env_and_keeps_root_readonly() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let mut config = fixture.config();
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    std::fs::write(fixture.workspace().join("in-workspace"), "hello").expect("ws file");
+    let exit_file = fixture.workspace().join(".spawn/exit/exec_canon");
+    std::fs::create_dir_all(exit_file.parent().expect("parent")).expect("exit dir");
+
+    let plan = view
+        .plan(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("agent_canon"),
+            exit_file: Some(&exit_file.display().to_string()),
+        })
+        .expect("plan");
+
+    let canon_ws = std::fs::canonicalize(&workspace).expect("canon ws");
+    let canon_ws_str = canon_ws.display().to_string();
+    assert_eq!(
+        triples(&plan.words, "--bind"),
+        vec![
+            (canon_ws_str.as_str(), "/workspace"),
+            (engine_home.as_str(), engine_home.as_str()),
+        ]
+    );
+    assert!(
+        plan.words
+            .windows(2)
+            .any(|w| w == ["--chdir", "/workspace"])
+    );
+    let setenvs = triples(&plan.words, "--setenv");
+    assert!(setenvs.contains(&("SPAWN_WORKSPACE", "/workspace")));
+    assert!(setenvs.contains(&("SPAWN_SANDBOX_CANONICAL_WORKSPACE", "/workspace")));
+    assert!(setenvs.contains(&("PWD", "/workspace")));
+    assert!(setenvs.contains(&("SPAWN_EXIT_FILE", "/workspace/.spawn/exit/exec_canon")));
+
+    assert_eq!(
+        ok(
+            &plan.words,
+            "printf '%s|%s|%s|%s|%s' \"$(pwd)\" \"$PWD\" \"$SPAWN_WORKSPACE\" \"$SPAWN_SANDBOX_CANONICAL_WORKSPACE\" \"$SPAWN_EXIT_FILE\""
+        ),
+        "/workspace|/workspace|/workspace|/workspace|/workspace/.spawn/exit/exec_canon"
+    );
+    assert_eq!(
+        ok(
+            &plan.words,
+            "printf '0\\n' > \"$SPAWN_EXIT_FILE\" && cat /workspace/in-workspace"
+        ),
+        "hello"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&exit_file).expect("host exit"),
+        "0\n"
+    );
+    let err = fails(&plan.words, "touch /root-write-probe");
+    assert!(err.contains("Read-only file system"), "{err}");
+}
+
+#[test]
+fn whitelist_home_hides_existing_and_dynamic_secrets_while_keeping_workspace_and_engine_home() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let kube = fixture.home().join(".kube");
+    std::fs::create_dir_all(&kube).expect("kube");
+    std::fs::write(kube.join("config"), "kube-secret").expect("kube config");
+
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("agent_wl"),
+            exit_file: None,
+        })
+        .expect("wrap");
+
+    // Simulate a sensitive file appearing in $HOME after wrap() was constructed.
+    let dynamic_dir = fixture.home().join(".dynamic-secret");
+    std::fs::create_dir_all(&dynamic_dir).expect("dynamic dir");
+    std::fs::write(dynamic_dir.join("token"), "late-secret").expect("dynamic token");
+
+    let h = |rel: &str| fixture.home().join(rel).display().to_string();
+    for hidden in [
+        h(".ssh/id_ed25519"),
+        h(".kube/config"),
+        h(".dynamic-secret/token"),
+        h(".netrc"),
+    ] {
+        fails(&words, &format!("cat '{hidden}'"));
+    }
+    assert_eq!(
+        ok(&words, &format!("cat '{engine_home}/brain/old'")),
+        "mine"
+    );
+    assert_eq!(
+        ok(
+            &words,
+            &format!(
+                "printf 'written' > '{engine_home}/brain/wl-note' && printf 'ws-ok' > /workspace/wl-ws"
+            )
+        ),
+        ""
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.engine_home().join("brain/wl-note")).expect("host eh"),
+        "written"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace().join("wl-ws")).expect("host ws"),
+        "ws-ok"
+    );
+    assert_eq!(
+        ok(&words, &format!("ls -A '{}'", fixture.keep().display())),
+        ""
+    );
+    assert_eq!(ok(&words, "ls -A /tmp"), "");
+}
+
+fn seed_agy_host_fixture(host_eh: &Path) {
+    std::fs::create_dir_all(host_eh.join("cache")).expect("cache");
+    std::fs::create_dir_all(host_eh.join("bin")).expect("bin");
+    std::fs::create_dir_all(host_eh.join("builtin")).expect("builtin");
+    std::fs::write(host_eh.join("installation_id"), "inst-1").expect("inst");
+    std::fs::write(host_eh.join("jetski_state.pbtxt"), "state-1").expect("state");
+    std::fs::write(host_eh.join("settings.json"), "host-v1").expect("settings");
+    std::fs::write(host_eh.join("cache/onboarding.json"), "{\"done\":true}").expect("onboard");
+    std::fs::write(host_eh.join("bin/tool"), "bin-v1").expect("bin tool");
+    std::fs::set_permissions(
+        host_eh.join("bin/tool"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("bin mode");
+    std::fs::write(host_eh.join("builtin/skill.md"), "builtin-v1").expect("builtin skill");
+    std::fs::write(
+        host_eh.join("antigravity-oauth-token"),
+        "SECRET_OAUTH_TOKEN",
+    )
+    .expect("oauth");
+}
+
+fn assert_isolated_worker_permissions(worker_home: &Path) {
+    let settings_mode = std::fs::metadata(worker_home.join("settings.json"))
+        .expect("w1 settings meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(settings_mode, 0o600, "seed files must be 0600");
+    let tool_mode = std::fs::metadata(worker_home.join("bin/tool"))
+        .expect("w1 tool meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(tool_mode, 0o700, "worker bin executables must be 0700");
+    let oauth_meta =
+        std::fs::metadata(worker_home.join("antigravity-oauth-token")).expect("oauth mountpoint");
+    assert_eq!(oauth_meta.permissions().mode() & 0o777, 0o600);
+    assert_eq!(oauth_meta.len(), 0);
+}
+
+#[test]
+fn agy_data_dir_isolates_worker_home_tmp_ro_creds_and_brain() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let host_eh = fixture.engine_home();
+    seed_agy_host_fixture(&host_eh);
+
+    let data_dir = fixture.scratch.join("agy-data");
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config.agy_data_dir = Some(data_dir.clone());
+    config.isolate_workers = true;
+    config.isolate_brain = true;
+
+    let Some(view_isolated) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let launch_worker = |worker_id: &str| {
+        view_isolated
+            .plan(&ViewedLaunch {
+                engine: "agy",
+                workspace: &workspace,
+                engine_home: &engine_home,
+                worker_id: Some(worker_id),
+                exit_file: None,
+            })
+            .expect("plan")
+    };
+    let plan_w1 = launch_worker("agent_w1");
+    let w1_home = std::fs::canonicalize(data_dir.join("workers/agent_w1/home")).expect("w1 home");
+    let w1_tmp = std::fs::canonicalize(data_dir.join("workers/agent_w1/tmp")).expect("w1 tmp");
+    assert_eq!(plan_w1.tmpdir, w1_tmp);
+
+    // Seeded non-secret files + RO static dirs + RO oauth token work inside bwrap.
+    let probe_cmd = format!(
+        "printf '%s|%s|%s|%s|%s|%s|%s' \"$(cat '{engine_home}/installation_id')\" \"$(cat '{engine_home}/jetski_state.pbtxt')\" \"$(cat '{engine_home}/settings.json')\" \"$(cat '{engine_home}/cache/onboarding.json')\" \"$(cat '{engine_home}/bin/tool')\" \"$(cat '{engine_home}/builtin/skill.md')\" \"$(cat '{engine_home}/antigravity-oauth-token')\""
+    );
+    assert_eq!(
+        ok(&plan_w1.words, &probe_cmd),
+        "inst-1|state-1|host-v1|{\"done\":true}|bin-v1|builtin-v1|SECRET_OAUTH_TOKEN"
+    );
+    for ro_path in ["antigravity-oauth-token", "builtin/new"] {
+        let err = fails(
+            &plan_w1.words,
+            &format!("echo x > '{engine_home}/{ro_path}'"),
+        );
+        assert!(err.contains("Read-only file system"), "{ro_path}: {err}");
+    }
+    assert_isolated_worker_permissions(&w1_home);
+
+    // Volatile writes + TMPDIR + brain/ stay 100% in worker data_dir, not host engine_home.
+    ok(
+        &plan_w1.words,
+        &format!(
+            "printf 'w1-edited' > '{engine_home}/settings.json' && \
+             mkdir -p '{engine_home}/brain/conv-1' && \
+             printf 'w1-brain' > '{engine_home}/brain/conv-1/log.txt' && \
+             printf 'w1-tmp' > \"$TMPDIR/scratch\""
+        ),
+    );
+    assert_eq!(
+        std::fs::read_to_string(w1_home.join("brain/conv-1/log.txt")).expect("w1 brain"),
+        "w1-brain"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w1_tmp.join("scratch")).expect("w1 tmp"),
+        "w1-tmp"
+    );
+    assert_eq!(
+        std::fs::read_to_string(host_eh.join("settings.json")).expect("host untouched"),
+        "host-v1"
+    );
+    assert!(!host_eh.join("brain/conv-1").exists());
+
+    // Seeding happens only once for w1, while w2 gets fresh host state and its own brain/.
+    std::fs::write(host_eh.join("settings.json"), "host-v2").expect("settings v2");
+    assert_eq!(
+        ok(
+            &launch_worker("agent_w1").words,
+            &format!("cat '{engine_home}/settings.json'")
+        ),
+        "w1-edited"
+    );
+    let plan_w2 = launch_worker("agent_w2");
+    assert_eq!(
+        ok(
+            &plan_w2.words,
+            &format!("cat '{engine_home}/settings.json'")
+        ),
+        "host-v2"
+    );
+    fails(
+        &plan_w2.words,
+        &format!("cat '{engine_home}/brain/conv-1/log.txt'"),
+    );
+}
+
+#[test]
+fn agy_data_dir_keeps_bin_and_xdg_cache_writable_per_worker() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let host_eh = fixture.engine_home();
+    seed_agy_host_fixture(&host_eh);
+
+    let data_dir = fixture.scratch.join("agy-data");
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config.agy_data_dir = Some(data_dir.clone());
+    config.isolate_workers = true;
+    config.isolate_brain = true;
+
+    let Some(view_isolated) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let plan_w1 = view_isolated
+        .plan(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("agent_w1"),
+            exit_file: None,
+        })
+        .expect("plan");
+    let w1_home = std::fs::canonicalize(data_dir.join("workers/agent_w1/home")).expect("w1 home");
+
+    ok(
+        &plan_w1.words,
+        &format!(
+            "printf 'agentapi-v1' > '{engine_home}/bin/agentapi' && \
+             mkdir -p \"$XDG_CACHE_HOME/antigravity\" && \
+             printf 'ok' > \"$XDG_CACHE_HOME/antigravity/probe\""
+        ),
+    );
+    assert_eq!(
+        std::fs::read_to_string(w1_home.join("bin/agentapi")).expect("w1 agentapi"),
+        "agentapi-v1"
+    );
+    assert!(!host_eh.join("bin/agentapi").exists());
+    assert_eq!(
+        std::fs::read_to_string(w1_home.join("xdg-cache/antigravity/probe")).expect("w1 xdg-cache"),
+        "ok"
+    );
+}
+
+#[test]
+fn agy_data_dir_shares_brain_when_isolate_brain_is_off() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let host_eh = fixture.engine_home();
+    seed_agy_host_fixture(&host_eh);
+
+    let data_dir = fixture.scratch.join("agy-data");
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    config.agy_data_dir = Some(data_dir.clone());
+    config.isolate_workers = true;
+    config.isolate_brain = false;
+
+    let Some(view_shared) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let plan_shared_w1 = view_shared
+        .plan(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("agent_w1"),
+            exit_file: None,
+        })
+        .expect("shared w1");
+    let plan_shared_w2 = view_shared
+        .plan(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("agent_w2"),
+            exit_file: None,
+        })
+        .expect("shared w2");
+    ok(
+        &plan_shared_w1.words,
+        &format!("printf 'shared-ok' > '{engine_home}/brain/shared.txt'"),
+    );
+    assert_eq!(
+        ok(
+            &plan_shared_w2.words,
+            &format!("cat '{engine_home}/brain/shared.txt'")
+        ),
+        "shared-ok"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("brain/shared.txt")).expect("host shared brain"),
+        "shared-ok"
+    );
+}
+
+#[test]
+fn extra_mounts_enforces_ro_and_rw_permissions() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let readonly_dir = fixture.scratch.join("extra-ro");
+    let writable_dir = fixture.scratch.join("extra-rw");
+    std::fs::create_dir_all(&readonly_dir).expect("ro dir");
+    std::fs::create_dir_all(&writable_dir).expect("rw dir");
+    std::fs::write(readonly_dir.join("data"), "ro-data").expect("ro file");
+    std::fs::write(writable_dir.join("data"), "rw-data").expect("rw file");
+
+    let mut config = fixture.config();
+    config.extra_mounts = spawn_host::engine_view::parse_extra_mounts(&format!(
+        "{}:ro,{}",
+        readonly_dir.display(),
+        writable_dir.display()
+    ));
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: None,
+            exit_file: None,
+        })
+        .expect("wrap");
+
+    assert_eq!(
+        ok(&words, &format!("cat '{}/data'", readonly_dir.display())),
+        "ro-data"
+    );
+    let ro_err = fails(
+        &words,
+        &format!("echo x > '{}/written'", readonly_dir.display()),
+    );
+    assert!(ro_err.contains("Read-only file system"), "{ro_err}");
+
+    assert_eq!(
+        ok(&words, &format!("cat '{}/data'", writable_dir.display())),
+        "rw-data"
+    );
+    ok(
+        &words,
+        &format!("printf 'persisted' > '{}/written'", writable_dir.display()),
+    );
+    assert_eq!(
+        std::fs::read_to_string(writable_dir.join("written")).expect("rw persisted"),
+        "persisted"
+    );
+}
+
+#[test]
+fn whitelist_ro_binds_agy_binary_inside_home_without_exposing_siblings() {
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let bin_dir = fixture.home().join(".local/bin");
+    let agy_bin = bin_dir.join("agy");
+    let sibling_secret = bin_dir.join("secret-tool");
+    write(&agy_bin, "#!/bin/sh\necho agy-ok\n");
+    write(&sibling_secret, "#!/bin/sh\necho secret\n");
+    std::fs::set_permissions(&agy_bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(&sibling_secret, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod sibling");
+
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.agy_program = Some(agy_bin.clone());
+    let Some(view) = view(config) else {
+        return;
+    };
+    let (workspace, engine_home, _) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-bin"),
+            exit_file: None,
+        })
+        .expect("wrap");
+
+    assert_eq!(ok(&words, &agy_bin.display().to_string()), "agy-ok");
+    fails(&words, &format!("cat '{}'", sibling_secret.display()));
+}
+
+#[test]
+fn bwrap_v2_preserves_host_netns_loopback() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let _serial = exclusive();
+    let fixture = Fixture::new();
+    let mut config = fixture.config();
+    config.home_isolation = spawn_host::HomeIsolation::Whitelist;
+    config.canonical_workspace = Some(PathBuf::from("/workspace"));
+    let Some(view) = view(config) else {
+        return;
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read ping");
+        assert_eq!(line, "ping\n");
+        stream.write_all(b"pong\n").expect("write pong");
+    });
+
+    let (workspace, engine_home, _) = fixture.launch();
+    let words = view
+        .wrap(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace,
+            engine_home: &engine_home,
+            worker_id: Some("w-netns"),
+            exit_file: None,
+        })
+        .expect("wrap");
+
+    let script = format!(
+        "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port} && printf \"ping\\n\" >&3 && head -n 1 <&3'"
+    );
+    assert_eq!(ok(&words, &script), "pong");
+    handle.join().expect("server thread");
 }

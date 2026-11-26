@@ -249,6 +249,8 @@ pub(crate) fn view_with(
             engine,
             workspace,
             engine_home: &home.sessions,
+            worker_id: Some("capabilities-probe"),
+            exit_file: None,
         }) {
             Ok(words) if words.len() > 1 && words.last().is_some_and(|word| word == "--") => {
                 return Boxed::Inside {
@@ -271,21 +273,31 @@ pub(crate) fn view_with(
 /// masked inside the view, so never there).
 fn view_now(engine: &str, home: &EngineHome) -> Boxed {
     let lookup = |name: &str| crate::env_value(name);
-    let mut bases = vec![PathBuf::from("/var/tmp")];
+    let mut bases = Vec::new();
+    if let Some(dir) = &home.data_dir {
+        let tmp = Path::new(dir).join("tmp");
+        let _ = std::fs::create_dir_all(&tmp);
+        bases.push(tmp);
+    }
+    bases.push(PathBuf::from("/var/tmp"));
     if let Some(dir) = lookup("HOME").filter(|dir| dir.starts_with('/')) {
         bases.push(Path::new(&dir).join(".cache"));
     }
+    let herdr_backend = crate::config::terminal_host()
+        .is_ok_and(|host| !matches!(host, spawn_host::LocalTerminalHost::Tmux(_)));
     view_with(
         &lookup,
         engine,
         home,
         &bases,
-        Box::new(|lookup| {
-            spawn_host::BwrapView::new("bwrap", spawn_host::ViewConfig::from_env(lookup)).map(
-                |view| {
-                    std::sync::Arc::new(view) as std::sync::Arc<dyn spawn_core::port::EngineView>
-                },
+        Box::new(move |lookup| {
+            spawn_host::BwrapView::new(
+                "bwrap",
+                crate::runtime::view_config_for_backend(lookup, herdr_backend),
             )
+            .map(|view| {
+                std::sync::Arc::new(view) as std::sync::Arc<dyn spawn_core::port::EngineView>
+            })
         }),
     )
 }
@@ -1185,6 +1197,15 @@ mod tests {
     /// host and builds no view; required (unset, or an invalid value) with
     /// no view, or a view that refuses the launch, is unavailable; a view
     /// wraps the probe in a scratch workspace of its own, removed on drop.
+    fn view_env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
     #[test]
     fn the_probes_view_follows_spawn_engine_view_and_cleans_its_scratch() {
         let home = EngineHome {
@@ -1192,20 +1213,13 @@ mod tests {
             sessions: "/home/a/.gemini/antigravity-cli".to_string(),
             model: None,
             data_dir: None,
+            isolate_brain: false,
         };
         let base = std::env::temp_dir().join(format!("spawn-cap-view-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("base");
         let bases = [base.join("missing"), base.clone()];
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| (*value).to_string())
-            }
-        };
-        let off = env(&[("SPAWN_ENGINE_VIEW", "off")]);
+        let off = view_env(&[("SPAWN_ENGINE_VIEW", "off")]);
         let boxed = view_with(
             &off,
             "agy",
@@ -1219,7 +1233,7 @@ mod tests {
             &[("SPAWN_ENGINE_VIEW", "required")][..],
             &[("SPAWN_ENGINE_VIEW", "maybe")][..],
         ] {
-            let lookup = env(pairs);
+            let lookup = view_env(pairs);
             let boxed = view_with(
                 &lookup,
                 "agy",
@@ -1232,7 +1246,7 @@ mod tests {
                 "{pairs:?}"
             );
         }
-        let unset = env(&[]);
+        let unset = view_env(&[]);
         let view = std::sync::Arc::new(FakeEngineView::default());
         let made = view.clone();
         let boxed = view_with(
@@ -1285,7 +1299,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(&base).expect("base").count(),
             0,
-            "no scratch left"
+            "no scratch"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

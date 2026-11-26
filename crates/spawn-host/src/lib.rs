@@ -48,7 +48,7 @@ pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
 };
-pub use engine_view::{BwrapView, ViewConfig};
+pub use engine_view::{BwrapView, ExtraMount, HomeIsolation, ViewConfig};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
 pub use git::{

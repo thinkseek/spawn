@@ -398,6 +398,7 @@ impl BridgeConfig {
                 sessions: self.claude_projects.clone(),
                 model: None,
                 data_dir: None,
+                isolate_brain: false,
             });
         }
         self.engines
@@ -413,6 +414,7 @@ impl BridgeConfig {
             sessions: self.claude_projects.clone(),
             model: None,
             data_dir: None,
+            isolate_brain: false,
         })
     }
 }
@@ -1496,6 +1498,7 @@ struct AdvancePrefetch<'a> {
     register_watch: bool,
     read: Option<FollowedRead>,
     precommitted: Option<&'a mut PrecommittedMap>,
+    newly_bound: &'a mut HashSet<String>,
 }
 
 /// Prefetched transcript read and pre-committed checkpoints passed into [`Bridge::follow_output`].
@@ -2300,6 +2303,7 @@ impl Bridge {
                     _ => item.native.clone(),
                 };
                 self.register_watch(
+                    &item.agent_id,
                     &item.session,
                     bound_native.as_deref(),
                     &mut item.active,
@@ -2312,8 +2316,12 @@ impl Bridge {
                     && !self.due_to_read(&item.active));
                 if should_read && let Some(native) = bound_native.as_deref() {
                     item.active.follow.reading(native);
-                    let path =
-                        self.transcript_of(item.active.driver, &item.active.workspace, native);
+                    let path = self.transcript_of(
+                        item.active.driver,
+                        &item.active.workspace,
+                        Some(item.agent_id.as_str()),
+                        native,
+                    );
                     let read_res =
                         self.read_followed(&item.session, &path, &mut item.active, report);
                     has_ends_turn = matches!(
@@ -2441,6 +2449,7 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<Vec<(SessionId, ExecutionId)>, StoreError> {
         let mut ended_now = Vec::new();
+        let mut newly_bound: HashSet<String> = HashSet::new();
         // Terminals whose agent the host saw change (a host that detects
         // agents, Herdr): their panes are read on this pass.
         let changed: HashSet<TerminalName> = self.terminals.agent_changes().into_iter().collect();
@@ -2458,6 +2467,7 @@ impl Bridge {
                 register_watch: !prefetched.registered.contains(&session),
                 read: prefetched.reads.remove(&session),
                 precommitted: Some(&mut prefetched.precommitted),
+                newly_bound: &mut newly_bound,
             };
             let ended = self.advance(
                 &agent_id,
@@ -2520,10 +2530,10 @@ impl Bridge {
             ));
             return Ok(false);
         }
-        let bound = self.native_of(agent_id, session, native, active)?;
+        let bound = self.native_of(agent_id, session, native, active, prefetch.newly_bound)?;
         let native = bound.as_deref();
         if prefetch.register_watch {
-            self.register_watch(session, native, active, report);
+            self.register_watch(agent_id, session, native, active, report);
         }
         self.follow_output(
             agent_id,
@@ -2826,7 +2836,12 @@ impl Bridge {
         let Some(native) = native else {
             return Ok(());
         };
-        let path = self.transcript_of(active.driver, &active.workspace, native);
+        let path = self.transcript_of(
+            active.driver,
+            &active.workspace,
+            Some(agent_id.as_str()),
+            native,
+        );
         active.follow.reading(native);
         // Read past the offset only while the file holds what was read there
         // ([`Bridge::read_followed`]); `limit`: a full read's bytes past it.
@@ -2965,6 +2980,7 @@ impl Bridge {
     /// be watched is read on every pass instead, said once.
     fn register_watch(
         &self,
+        agent_id: &AgentId,
         session: &SessionId,
         native: Option<&str>,
         active: &mut Active,
@@ -2984,7 +3000,12 @@ impl Bridge {
         }
         let mut paths = vec![exit_file(active)];
         if let Some(native) = native {
-            paths.push(self.transcript_of(active.driver, &active.workspace, native));
+            paths.push(self.transcript_of(
+                active.driver,
+                &active.workspace,
+                Some(agent_id.as_str()),
+                native,
+            ));
         }
         for path in paths {
             if let Err(error) = watch.watch(&key, &path) {
@@ -3289,13 +3310,14 @@ impl Bridge {
         session: &SessionId,
         native: Option<&str>,
         active: &mut Active,
+        newly_bound: &mut HashSet<String>,
     ) -> Result<Option<String>, StoreError> {
         if active.driver.traits().session != SessionBinding::Reported {
             return Ok(native.map(str::to_string));
         }
         match &active.follow.binding {
             Binding::Bound(bound) => Ok(bound.clone().or_else(|| native.map(str::to_string))),
-            Binding::Unbound => self.bind_reported(agent_id, session, active),
+            Binding::Unbound => self.bind_reported(agent_id, session, active, newly_bound),
         }
     }
 
@@ -3333,16 +3355,56 @@ impl Bridge {
     /// fresh start launched the engine ([`Active::preexisting_natives`]) is
     /// never scanned into; and a native session any execution in the store
     /// was already bound to is never bound again.
+    fn is_native_bound(&self, native: &str, newly_bound: &HashSet<String>) -> bool {
+        newly_bound.contains(native)
+            || self.sessions.values().any(|view| {
+                view.natives.contains(native)
+                    || view.active.as_ref().is_some_and(|active| {
+                        matches!(&active.follow.binding, Binding::Bound(Some(bound)) if bound == native)
+                    })
+            })
+    }
+
+    fn record_native_session(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &mut Active,
+        native: String,
+        path: String,
+        newly_bound: &mut HashSet<String>,
+    ) -> Result<String, StoreError> {
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:native", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine: active.driver.id().to_string(),
+                native_session_id: native.clone(),
+                transcript_path: Some(path),
+                engine_version: None,
+            },
+        )?;
+        newly_bound.insert(native.clone());
+        active.follow.binding = Binding::Bound(Some(native.clone()));
+        active.follow.offset = 0;
+        active.follow.tail.clear();
+        active.follow.watch.dirty = true;
+        Ok(native)
+    }
+
     fn bind_reported(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
         active: &mut Active,
+        newly_bound: &mut HashSet<String>,
     ) -> Result<Option<String>, StoreError> {
         let Ok(reading) = self.terminals.agent(&active.terminal(), &active.workspace) else {
             return Ok(None);
         };
-        // Another agent in the engine's pane: nothing is known.
         if reading
             .as_ref()
             .and_then(|reading| reading.agent.as_deref())
@@ -3372,21 +3434,23 @@ impl Bridge {
         let driver = active.driver;
         let workspace = active.workspace.clone();
         let home = self.config.home_of(driver);
-        let root = format!("{}/", home.transcript_root().trim_end_matches('/'));
+        let worker_id = Some(agent_id.as_str());
+        let scan_dir = driver.session_scan_dir_for(&home, worker_id);
+        let root_base = scan_dir
+            .as_deref()
+            .unwrap_or(home.sessions.as_str())
+            .trim_end_matches('/');
+        let root = if root_base.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{root_base}/")
+        };
         let not_before = active.started_at.saturating_sub(BIND_SKEW_MS);
-        // The transcript of `native`, when it is below the engine's home and
-        // a prompt in it, written since this execution started, holds a
-        // marker typed into this execution.
         let proven = |native: &str| -> Option<String> {
-            // Bound already, by any execution of any session in the store.
-            if self
-                .sessions
-                .values()
-                .any(|view| view.natives.contains(native))
-            {
+            if self.is_native_bound(native, newly_bound) {
                 return None;
             }
-            let path = driver.transcript_path(&home, &workspace, native);
+            let path = driver.transcript_path_for(&home, &workspace, worker_id, native);
             if !path.starts_with(&root) {
                 return None;
             }
@@ -3400,7 +3464,7 @@ impl Bridge {
             .and_then(|native| proven(native).map(|path| (native.to_string(), path)));
         let now = self.clock.now().0;
         if bound.is_none()
-            && let Some(dir) = driver.session_scan_dir(&home)
+            && let Some(dir) = scan_dir
             && view.is_some_and(|view| {
                 view.steps
                     .iter()
@@ -3424,24 +3488,8 @@ impl Bridge {
         let Some((native, path)) = bound else {
             return Ok(None);
         };
-        self.append(
-            agent_id,
-            session,
-            Some(&active.execution_id),
-            Source::Bridge,
-            Some(format!("{}:native", active.execution_id)),
-            EventKind::NativeSessionStarted {
-                engine: active.driver.id().to_string(),
-                native_session_id: native.clone(),
-                transcript_path: Some(path),
-                engine_version: None,
-            },
-        )?;
-        active.follow.binding = Binding::Bound(Some(native.clone()));
-        active.follow.offset = 0;
-        active.follow.tail.clear();
-        active.follow.watch.dirty = true;
-        Ok(Some(native))
+        self.record_native_session(agent_id, session, active, native, path, newly_bound)
+            .map(Some)
     }
 
     /// Kill, final checkpoint, unmount, then `execution.ended`. Returns
@@ -4330,6 +4378,32 @@ impl Bridge {
         Ok(Some(Settled::Ending(report.warnings.join("; "))))
     }
 
+    fn link_parent_session(
+        &self,
+        claimed: &Claimed,
+        parent: Option<&SessionId>,
+        workspace: &WorkspaceId,
+    ) -> Result<(), StoreError> {
+        let Some(parent_session) = parent else {
+            return Ok(());
+        };
+        let linked = self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            None,
+            Source::Bridge,
+            Some(format!("{}:linked:{parent_session}", claimed.session_id)),
+            EventKind::SessionLinked {
+                parent_session_id: parent_session.clone(),
+            },
+        );
+        if let Err(error) = linked {
+            self.give_up_mount(claimed, workspace, error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn start(
         &mut self,
         claimed: &Claimed,
@@ -4376,22 +4450,7 @@ impl Bridge {
             Ok(length) => length.flatten(),
             Err(why) => return finished(self.give_up_mount(claimed, &workspace, why)),
         };
-        if let Some(parent_session) = parent {
-            let linked = self.append(
-                &claimed.agent_id,
-                &claimed.session_id,
-                None,
-                Source::Bridge,
-                Some(format!("{}:linked:{parent_session}", claimed.session_id)),
-                EventKind::SessionLinked {
-                    parent_session_id: parent_session.clone(),
-                },
-            );
-            if let Err(error) = linked {
-                self.give_up_mount(claimed, &workspace, error.to_string());
-                return Err(error);
-            }
-        }
+        self.link_parent_session(claimed, parent, &workspace)?;
         let active = Active {
             execution_id: ExecutionId::for_command(claimed.command_id),
             workspace,
@@ -4406,7 +4465,12 @@ impl Bridge {
             started_at: u64::try_from(self.clock.now().0).unwrap_or(0),
             preexisting_natives: HashSet::new(),
         };
-        self.list_preexisting(native.is_none(), prepared.driver, &active);
+        self.list_preexisting(
+            native.is_none(),
+            &claimed.agent_id,
+            prepared.driver,
+            &active,
+        );
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
         let recorded = self.append(
@@ -4449,11 +4513,18 @@ impl Bridge {
     /// them is the execution's ([`Self::bind_reported`]). Listed before the
     /// launch and handed to the view's execution when its record is folded
     /// ([`Active::preexisting_natives`]).
-    fn list_preexisting(&mut self, fresh: bool, driver: &dyn AgentDriver, active: &Active) {
+    fn list_preexisting(
+        &mut self,
+        fresh: bool,
+        agent_id: &AgentId,
+        driver: &dyn AgentDriver,
+        active: &Active,
+    ) {
         if !fresh || driver.traits().session != SessionBinding::Reported {
             return;
         }
-        if let Some(dir) = driver.session_scan_dir(&self.config.home_of(driver))
+        if let Some(dir) =
+            driver.session_scan_dir_for(&self.config.home_of(driver), Some(agent_id.as_str()))
             && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
         {
             self.preexisting
@@ -5405,7 +5476,7 @@ impl Bridge {
         native: &str,
         report: &mut TickReport,
     ) -> Result<(), String> {
-        let path = self.transcript_of(driver, workspace, native);
+        let path = self.transcript_of(driver, workspace, Some(claimed.agent_id.as_str()), native);
         let read_before = self
             .sessions
             .get(&claimed.session_id)
@@ -5497,7 +5568,12 @@ impl Bridge {
         let (Some(archive), Some(native)) = (self.transcripts.as_deref(), native) else {
             return;
         };
-        let path = self.transcript_of(active.driver, &active.workspace, &native);
+        let path = self.transcript_of(
+            active.driver,
+            &active.workspace,
+            Some(agent_id.as_str()),
+            &native,
+        );
         let state = &mut active.follow.archiving;
         if state.due || !live {
             let pass = self.copy_transcript(
@@ -5814,6 +5890,7 @@ impl Bridge {
                 let path = self.transcript_of(
                     self.session_driver(&progress.session),
                     &progress.workspace,
+                    Some(progress.agent.as_str()),
                     &progress.native,
                 );
                 let mut known = (progress.known_ms != i64::MIN).then_some(progress.known_ms);
@@ -6025,7 +6102,7 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<Option<u64>, String> {
         self.ready_transcript(claimed, (driver, workspace), native, report)?;
-        self.transcript_length(driver, workspace, native)
+        self.transcript_length(driver, workspace, &claimed.agent_id, native)
     }
 
     /// How long the transcript of `native` is, as the engine will see it;
@@ -6034,9 +6111,10 @@ impl Bridge {
         &self,
         driver: &dyn AgentDriver,
         workspace: &WorkspaceId,
+        agent_id: &AgentId,
         native: &str,
     ) -> Result<Option<u64>, String> {
-        let path = self.transcript_of(driver, workspace, native);
+        let path = self.transcript_of(driver, workspace, Some(agent_id.as_str()), native);
         let mut length = 0u64;
         loop {
             match self.terminals.read_from(workspace, &path, length) {
@@ -6251,9 +6329,10 @@ impl Bridge {
         &self,
         driver: &dyn AgentDriver,
         workspace: &WorkspaceId,
+        worker_id: Option<&str>,
         native: &str,
     ) -> String {
-        driver.transcript_path(&self.config.home_of(driver), workspace, native)
+        driver.transcript_path_for(&self.config.home_of(driver), workspace, worker_id, native)
     }
 
     /// The driver of the engine `session` last started
@@ -6287,6 +6366,60 @@ impl Bridge {
             .filter(|dir| !dir.is_empty())
     }
 
+    fn wrap_launch_view(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        engine_home: &str,
+        exit_file_path: &str,
+        program: &mut String,
+        arguments: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if active.driver.traits().guard != crate::driver::Guard::Sandbox {
+            return Ok(());
+        }
+        match &self.config.engine_view {
+            EngineViewPolicy::Off => Ok(()),
+            EngineViewPolicy::Required(Err(why)) => Err(format!(
+                "{ENGINE_UNAVAILABLE}: engine {} runs only inside a filesystem view, \
+                 which this host has none of: {why}",
+                active.driver.id()
+            )),
+            EngineViewPolicy::Required(Ok(view)) => {
+                let words = view
+                    .wrap(&ViewedLaunch {
+                        engine: active.driver.id(),
+                        workspace: active.workspace.path(),
+                        engine_home,
+                        worker_id: Some(claimed.agent_id.as_str()),
+                        exit_file: Some(exit_file_path),
+                    })
+                    .map_err(|why| {
+                        format!(
+                            "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) \
+                             cannot be made: {why}",
+                            active.driver.id(),
+                            view.name()
+                        )
+                    })?;
+                let Some((view_program, view_arguments)) = words.split_first() else {
+                    return Err(format!(
+                        "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) gave \
+                         no program",
+                        active.driver.id(),
+                        view.name()
+                    ));
+                };
+                let mut wrapped = view_arguments.to_vec();
+                wrapped.push(std::mem::take(program));
+                wrapped.append(arguments);
+                *arguments = wrapped;
+                program.clone_from(view_program);
+                Ok(())
+            }
+        }
+    }
+
     /// The terminal launch of `active`'s engine: the runner (`spawn run`)
     /// of the engine's program, with the environment of the host, the
     /// session and the engine. An engine with no deny rules of its own
@@ -6301,7 +6434,19 @@ impl Bridge {
         run: &EngineLaunch<'_>,
     ) -> Result<Launch, String> {
         let home = self.config.home_of(active.driver);
-        let plan = active.driver.launch(&home, run);
+        let canonical_cwd = (active.driver.traits().guard == crate::driver::Guard::Sandbox)
+            .then(|| match &self.config.engine_view {
+                EngineViewPolicy::Required(Ok(view)) => {
+                    view.canonical_workspace().map(|p| p.display().to_string())
+                }
+                _ => None,
+            })
+            .flatten();
+        let driver_run = crate::driver::EngineLaunch {
+            cwd: canonical_cwd.as_deref().or(run.cwd),
+            ..*run
+        };
+        let plan = active.driver.launch(&home, &driver_run);
         let mut arguments = vec!["run".to_string(), "--".to_string(), plan.program];
         arguments.extend(plan.arguments);
         let mut environment = self.config.environment.clone();
@@ -6336,7 +6481,8 @@ impl Bridge {
         ));
         // The runner writes the exit status where the Bridge reads it: the
         // pane needs no login of its own.
-        environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
+        let exit_file_path = exit_file(active);
+        environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file_path.clone()));
         // Where the agent's answers to its messages go (`spawn ack`): its
         // workspace, which the loop reads, whatever directory its shell is
         // in. No login either.
@@ -6345,47 +6491,14 @@ impl Bridge {
             active.workspace.path().to_string(),
         ));
         let mut program = self.config.spawn_program.clone();
-        if active.driver.traits().guard == crate::driver::Guard::Sandbox {
-            match &self.config.engine_view {
-                EngineViewPolicy::Off => {}
-                EngineViewPolicy::Required(Err(why)) => {
-                    return Err(format!(
-                        "{ENGINE_UNAVAILABLE}: engine {} runs only inside a filesystem view, \
-                         which this host has none of: {why}",
-                        active.driver.id()
-                    ));
-                }
-                EngineViewPolicy::Required(Ok(view)) => {
-                    let words = view
-                        .wrap(&ViewedLaunch {
-                            engine: active.driver.id(),
-                            workspace: active.workspace.path(),
-                            engine_home: &home.sessions,
-                        })
-                        .map_err(|why| {
-                            format!(
-                                "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) \
-                                 cannot be made: {why}",
-                                active.driver.id(),
-                                view.name()
-                            )
-                        })?;
-                    let Some((view_program, view_arguments)) = words.split_first() else {
-                        return Err(format!(
-                            "{ENGINE_UNAVAILABLE}: engine {}: its filesystem view ({}) gave \
-                             no program",
-                            active.driver.id(),
-                            view.name()
-                        ));
-                    };
-                    let mut wrapped = view_arguments.to_vec();
-                    wrapped.push(std::mem::take(&mut program));
-                    wrapped.extend(arguments);
-                    arguments = wrapped;
-                    program.clone_from(view_program);
-                }
-            }
-        }
+        self.wrap_launch_view(
+            claimed,
+            active,
+            &home.sessions,
+            &exit_file_path,
+            &mut program,
+            &mut arguments,
+        )?;
         Ok(Launch {
             terminal: active.terminal(),
             workspace: active.workspace.clone(),
@@ -9779,6 +9892,7 @@ mod tests {
                 sessions: AGY_HOME.to_string(),
                 model: model.map(str::to_string),
                 data_dir: None,
+                isolate_brain: false,
             },
         )];
         config.engine_view = EngineViewPolicy::Required(Ok(Arc::new(FakeView::default())));
@@ -9790,12 +9904,18 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeView {
         refuse: Option<String>,
+        canonical_workspace: Option<std::path::PathBuf>,
         asked: std::sync::Mutex<Vec<(String, String, String)>>,
+        extras: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
     }
 
     impl crate::port::EngineView for FakeView {
         fn name(&self) -> &'static str {
             "bwrap"
+        }
+
+        fn canonical_workspace(&self) -> Option<&std::path::Path> {
+            self.canonical_workspace.as_deref()
         }
 
         fn wrap(&self, launch: &ViewedLaunch<'_>) -> Result<Vec<String>, String> {
@@ -9804,18 +9924,24 @@ mod tests {
                 launch.workspace.to_string(),
                 launch.engine_home.to_string(),
             ));
+            self.extras.lock().expect("extras").push((
+                launch.worker_id.map(str::to_string),
+                launch.exit_file.map(str::to_string),
+            ));
             if let Some(why) = &self.refuse {
                 return Err(why.clone());
             }
-            Ok([
-                "/usr/bin/bwrap",
-                "--unshare-pid",
-                "--chdir",
-                launch.workspace,
-                "--",
-            ]
-            .map(str::to_string)
-            .to_vec())
+            let chdir = self
+                .canonical_workspace
+                .as_ref()
+                .map_or_else(|| launch.workspace.to_string(), |p| p.display().to_string());
+            Ok(vec![
+                "/usr/bin/bwrap".to_string(),
+                "--unshare-pid".to_string(),
+                "--chdir".to_string(),
+                chdir,
+                "--".to_string(),
+            ])
         }
     }
 
@@ -10926,6 +11052,238 @@ mod tests {
             .map(|(_, native, _)| native)
             .collect();
         assert_eq!(natives, vec![taken.to_string(), ours.to_string()]);
+    }
+
+    #[test]
+    fn agy_canonical_workspace_passes_worker_id_exit_file_and_trusted_workspace() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start_on(&store, "hello", Some("gemini-3.8-pro"));
+        let view = Arc::new(FakeView {
+            canonical_workspace: Some(std::path::PathBuf::from("/workspace")),
+            ..FakeView::default()
+        });
+        let mut config = agy_config(None);
+        config.engine_view = EngineViewPolicy::Required(Ok(view.clone()));
+        let mut bridge = Bridge::new(store.clone(), store.clone(), store.clone(), host, config)
+            .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let launch = store.launches().pop().expect("launched");
+        assert_ne!(launch.cwd, "/workspace", "host pane cwd stays physical");
+        assert_eq!(
+            launch.arguments[..4],
+            ["--unshare-pid", "--chdir", "/workspace", "--"]
+        );
+        let settings = launch.arguments.last().expect("settings json");
+        assert!(
+            settings.contains("\"/workspace\""),
+            "agy trustedWorkspaces must trust canonical /workspace: {settings}"
+        );
+        assert!(
+            !settings.contains(&launch.cwd),
+            "agy trustedWorkspaces should use canonical target, not host cwd: {settings}"
+        );
+        let extras = view.extras.lock().expect("extras").clone();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].0.as_deref(), Some("agent_agy"));
+        let exit = extras[0].1.as_deref().expect("exit_file");
+        assert!(
+            exit.starts_with(&format!("{}/.spawn/exit-", launch.cwd)),
+            "{exit}"
+        );
+    }
+
+    fn d1_bridge_with_engine(
+        clock: &Arc<ManualClock>,
+        store: &Arc<MemoryStore>,
+        host: &Arc<Witnessed>,
+        data_dir: Option<&str>,
+        isolate_brain: bool,
+    ) -> Bridge {
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engines[0].1.data_dir = data_dir.map(str::to_string);
+        config.engines[0].1.isolate_brain = isolate_brain;
+        Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            config,
+        )
+        .with_clock(clock.clone())
+    }
+
+    fn submit_agy_start_for(store: &Arc<MemoryStore>, agent: &str, session: &str) -> CommandId {
+        let id = store
+            .submit(
+                &Principal::new("tester").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new(agent).expect("agent"),
+                    session_id: SessionId::new(session).expect("session"),
+                    idempotency_key: IdempotencyKey::new(format!("start-{agent}-{session}"))
+                        .expect("key"),
+                    action: CommandAction::Start {
+                        engine: "agy".to_string(),
+                        prompt: "hello".to_string(),
+                        parent_session_id: None,
+                        from: None,
+                        model: None,
+                        charter: None,
+                        model_label: None,
+                    },
+                },
+            )
+            .expect("submit");
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id)),
+            &agy_idle(),
+        );
+        id
+    }
+
+    #[test]
+    fn agy_isolated_worker_brain_binds_only_worker_dir_and_preserves_d1_guards() {
+        let clock = d1_clock();
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let first = submit_agy_start_for(&store, "agent_w1", "session_w1");
+        let second = submit_agy_start_for(&store, "agent_w2", "session_w2");
+        let mut bridge = d1_bridge_with_engine(&clock, &store, &host, Some("/data01/agy"), true);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, first).is_some() && command_outcome(&store, second).is_some()
+        });
+        assert_eq!(command_outcome(&store, first), Some(Outcome::Succeeded));
+        assert_eq!(command_outcome(&store, second), Some(Outcome::Succeeded));
+
+        let shared_noise = "11111111-0000-4000-8000-000000000001";
+        store.append_file(
+            &format!(
+                "/data01/agy/brain/{shared_noise}/.system_generated/logs/transcript_full.jsonl"
+            ),
+            &agy_user_line_at(
+                &crate::message::marked("hello", first, true),
+                "2026-11-26T10:00:05Z",
+            ),
+        );
+        host.set_dirs("/data01/agy/brain", &[shared_noise]);
+        store.append_file(
+            &agy_transcript(shared_noise),
+            &agy_user_line_at(
+                &crate::message::marked("hello", first, true),
+                "2026-11-26T10:00:05Z",
+            ),
+        );
+        host.set_dirs(&format!("{AGY_HOME}/brain"), &[shared_noise]);
+
+        // Isolated w1 scans only `/data01/agy/workers/agent_w1/home/brain`.
+        d1_polls(&clock, &mut bridge);
+        assert!(
+            agy_natives(&store).is_empty(),
+            "must ignore legacy home and shared brain/ when isolate_brain=true"
+        );
+
+        let w1_conv = "22222222-0000-4000-8000-000000000001";
+        let w2_conv = "33333333-0000-4000-8000-000000000002";
+        let w1_brain = "/data01/agy/workers/agent_w1/home/brain";
+        let w2_brain = "/data01/agy/workers/agent_w2/home/brain";
+        store.append_file(
+            &format!("{w1_brain}/{w1_conv}/.system_generated/logs/transcript_full.jsonl"),
+            &agy_user_line_at(
+                &crate::message::marked("hello", first, true),
+                "2026-11-26T10:00:10Z",
+            ),
+        );
+        host.set_dirs(w1_brain, &[w1_conv]);
+        d1_polls(&clock, &mut bridge);
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                w1_conv.to_string(),
+                Some(format!(
+                    "{w1_brain}/{w1_conv}/.system_generated/logs/transcript_full.jsonl"
+                )),
+            )]
+        );
+
+        // Even if the same `w1_conv` ID appears inside w2's brain dir with
+        // `second`'s marker, D1 refuses double-binding and binds w2's own `w2_conv`.
+        store.append_file(
+            &format!("{w2_brain}/{w1_conv}/.system_generated/logs/transcript_full.jsonl"),
+            &agy_user_line_at(
+                &crate::message::marked("hello", second, true),
+                "2026-11-26T10:00:20Z",
+            ),
+        );
+        store.append_file(
+            &format!("{w2_brain}/{w2_conv}/.system_generated/logs/transcript_full.jsonl"),
+            &agy_user_line_at(
+                &crate::message::marked("hello", second, true),
+                "2026-11-26T10:00:25Z",
+            ),
+        );
+        host.set_dirs(w2_brain, &[w1_conv, w2_conv]);
+        d1_polls(&clock, &mut bridge);
+        let natives = agy_natives(&store);
+        assert_eq!(natives.len(), 2, "{natives:?}");
+        assert!(
+            natives.iter().any(|(engine, native, path)| {
+                engine == "agy"
+                    && native == w2_conv
+                    && path.as_deref()
+                        == Some(
+                            format!(
+                                "{w2_brain}/{w2_conv}/.system_generated/logs/transcript_full.jsonl"
+                            )
+                            .as_str(),
+                        )
+            }),
+            "{natives:?}"
+        );
+    }
+
+    #[test]
+    fn agy_shared_data_dir_brain_falls_back_to_list_dirs_scan() {
+        let clock = d1_clock();
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let shared_brain = "/data01/agy/brain";
+        let old_conv = "44444444-0000-4000-8000-000000000001";
+        host.set_dirs(shared_brain, &[old_conv]);
+        let cmd = submit_agy_start_for(&store, "agent_shared", "session_shared");
+        let mut bridge = d1_bridge_with_engine(&clock, &store, &host, Some("/data01/agy"), false);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, cmd).is_some()
+        });
+        assert_eq!(command_outcome(&store, cmd), Some(Outcome::Succeeded));
+
+        let fresh_conv = "55555555-0000-4000-8000-000000000002";
+        store.append_file(
+            &format!("{shared_brain}/{fresh_conv}/.system_generated/logs/transcript_full.jsonl"),
+            &agy_user_line_at(
+                &crate::message::marked("hello", cmd, true),
+                "2026-11-26T10:00:05Z",
+            ),
+        );
+        host.set_dirs(shared_brain, &[fresh_conv, old_conv]);
+        d1_polls(&clock, &mut bridge);
+        assert_eq!(
+            agy_natives(&store),
+            vec![(
+                "agy".to_string(),
+                fresh_conv.to_string(),
+                Some(format!(
+                    "{shared_brain}/{fresh_conv}/.system_generated/logs/transcript_full.jsonl"
+                )),
+            )]
+        );
     }
 
     #[test]

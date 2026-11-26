@@ -62,7 +62,9 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
         eprintln!("sources: {error}; a push lost with the last process waits for its next");
     }
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
-    let mut config = bridge_config()?;
+    let mut host = crate::config::terminal_host()?;
+    let herdr_backend = !matches!(host, spawn_host::LocalTerminalHost::Tmux(_));
+    let mut config = bridge_config_for(herdr_backend)?;
     config.recover_worker_leases = recover_worker_leases;
     // The transcript archive's credential mask (objective 175): the
     // installed collector's places, or a stand-in honoured only in a gate's
@@ -76,9 +78,10 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
         std::path::PathBuf::from(&config.claude_projects),
     ];
     for (_, home) in &config.engines {
-        roots.push(std::path::PathBuf::from(&home.sessions));
-        if let Some(data_dir) = &home.data_dir {
-            roots.push(std::path::PathBuf::from(data_dir));
+        for path in home.transcript_roots(None) {
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
         }
     }
     let (archive_mask, stand_in) = spawn_host::archive_mask::CollectorMask::from_env(&roots);
@@ -91,7 +94,6 @@ fn runtime_with(flags: &Flags, recover_worker_leases: bool) -> Result<(Bridge, O
         &roots[1],
         &spawn_host::home::Home::of_account(),
     )?;
-    let mut host = crate::config::terminal_host()?;
     if let Some(projects) = pinned.projects {
         host = host.with_files_beneath(projects);
     }
@@ -162,13 +164,28 @@ fn parse_bounded_usize(
     }
 }
 
+/// Build `BwrapView` config, enabling v2 sandbox features (`canonical_workspace`,
+/// whitelist `$HOME`, per-worker `brain/`) strictly on the Herdr backend.
+pub(crate) fn view_config_for_backend(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    herdr_backend: bool,
+) -> spawn_host::ViewConfig {
+    let mut cfg = spawn_host::ViewConfig::from_env(lookup);
+    if !herdr_backend {
+        cfg.canonical_workspace = None;
+        cfg.home_isolation = spawn_host::HomeIsolation::Blacklist;
+        cfg.isolate_brain = false;
+    }
+    cfg
+}
+
 /// Programs and environment the Bridge puts into every terminal it starts.
-fn bridge_config() -> Result<BridgeConfig, String> {
+fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
     config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
-    config.engines = engines(env_value)?;
+    config.engines = engines_for(env_value, herdr_backend)?;
     config.max_commands_per_tick =
         parse_bounded_usize(&env_value, "SPAWN_BRIDGE_MAX_COMMANDS", 16, 1, 512)?;
     config.ready_attempts =
@@ -184,7 +201,7 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     // An engine with no deny rules of its own runs only inside the host's
     // filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
     let (policy, said) = engine_view(&env_value, &config.engines, |lookup| {
-        spawn_host::BwrapView::new("bwrap", spawn_host::ViewConfig::from_env(lookup))
+        spawn_host::BwrapView::new("bwrap", view_config_for_backend(lookup, herdr_backend))
             .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
     });
     if let Some(said) = said {
@@ -482,6 +499,13 @@ fn claude_config_env(
 pub(crate) fn engines(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, spawn_core::driver::EngineHome)>, String> {
+    engines_for(lookup, true)
+}
+
+fn engines_for(
+    lookup: impl Fn(&str) -> Option<String>,
+    herdr_backend: bool,
+) -> Result<Vec<(String, spawn_core::driver::EngineHome)>, String> {
     let named = lookup("SPAWN_ENGINES").unwrap_or_else(|| spawn_core::driver::DEFAULT.to_string());
     let mut engines = Vec::new();
     for name in named
@@ -527,6 +551,16 @@ pub(crate) fn engines(
             }
             _ => None,
         };
+        let isolate_brain = herdr_backend
+            && data_dir.is_some()
+            && matches!(
+                lookup("SPAWN_AGY_ISOLATE_BRAIN")
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            );
         engines.push((
             name.to_string(),
             spawn_core::driver::EngineHome {
@@ -534,6 +568,7 @@ pub(crate) fn engines(
                 sessions: home,
                 model: lookup("SPAWN_AGY_MODEL"),
                 data_dir,
+                isolate_brain,
             },
         ));
     }
@@ -651,7 +686,7 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FleetTestDatabase, auto_trust, claude_config_env, engine_view, engines,
+        FleetTestDatabase, auto_trust, claude_config_env, engine_view, engines, engines_for,
         resolve_claude_projects, resolve_model_relay, supply_pa_env,
     };
     use std::sync::Arc;
@@ -1080,6 +1115,17 @@ mod tests {
         ]))
         .expect("agy data dir");
         assert_eq!(with_data[0].1.data_dir.as_deref(), Some("/data01/agy-data"));
+        assert!(!with_data[0].1.isolate_brain);
+        let isolated = engines_for(
+            lookup(&[
+                ("SPAWN_ENGINES", "agy"),
+                ("SPAWN_AGY_DATA_DIR", "/data01/agy-data"),
+                ("SPAWN_AGY_ISOLATE_BRAIN", "1"),
+            ]),
+            true,
+        )
+        .expect("isolated agy");
+        assert!(isolated[0].1.isolate_brain);
         assert!(
             engines(lookup(&[
                 ("SPAWN_ENGINES", "agy"),
@@ -1089,6 +1135,42 @@ mod tests {
         );
         let refused = engines(lookup(&[("SPAWN_ENGINES", "claude,codex")])).expect_err("codex");
         assert!(refused.contains("codex"), "{refused}");
+    }
+
+    #[test]
+    fn bwrap_v2_features_gate_strictly_on_herdr_backend() {
+        use super::view_config_for_backend;
+        let env = environment(&[
+            ("HOME", "/home/u"),
+            ("SPAWN_ENGINES", "agy"),
+            ("SPAWN_AGY_DATA_DIR", "/data01/agy"),
+            ("SPAWN_AGY_ISOLATE_BRAIN", "1"),
+            ("SPAWN_SANDBOX_CANONICAL_WORKSPACE", "/workspace"),
+            ("SPAWN_SANDBOX_HOME_ISOLATION", "whitelist"),
+        ]);
+
+        let herdr_view = view_config_for_backend(&env, true);
+        assert_eq!(
+            herdr_view.canonical_workspace,
+            Some(std::path::PathBuf::from("/workspace"))
+        );
+        assert_eq!(
+            herdr_view.home_isolation,
+            spawn_host::HomeIsolation::Whitelist
+        );
+        assert!(herdr_view.isolate_brain);
+        let herdr_engines = engines_for(&env, true).expect("herdr engines");
+        assert!(herdr_engines[0].1.isolate_brain);
+
+        let tmux_view = view_config_for_backend(&env, false);
+        assert_eq!(tmux_view.canonical_workspace, None);
+        assert_eq!(
+            tmux_view.home_isolation,
+            spawn_host::HomeIsolation::Blacklist
+        );
+        assert!(!tmux_view.isolate_brain);
+        let tmux_engines = engines_for(&env, false).expect("tmux engines");
+        assert!(!tmux_engines[0].1.isolate_brain);
     }
 
     #[test]
