@@ -1708,7 +1708,7 @@ impl Primary {
                 },
                 (Look::Ended(state), _) => {
                     return PrimaryOutcome::Local {
-                        why: format!("{job_id} ended {}", state.as_str()),
+                        why: format!("{job_id} ended {state:?}"),
                     };
                 }
                 (Look::Completed, None) => {
