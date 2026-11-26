@@ -825,10 +825,9 @@ impl Engines {
 /// for a task on no preset or on one whose label names no registered
 /// driver (`label_only`). Claude Code takes its models from the profile.
 fn task_engine(task: &TaskRow) -> (&'static str, Option<&str>) {
-    let driver = task
-        .preset_engine
-        .as_deref()
-        .map_or(DEFAULT, |label| spawn_core::grading::preset_driver(label).driver);
+    let driver = task.preset_engine.as_deref().map_or(DEFAULT, |label| {
+        spawn_core::grading::preset_driver(label).driver
+    });
     if driver == DEFAULT {
         return (DEFAULT, None);
     }
@@ -1106,7 +1105,7 @@ fn delivery(
         // engine).
         Some(facts) if facts.execution_id.is_some() && !switches_engine(task, found) => {
             Some(task.delivery(
-            key,
+                key,
                 CommandAction::Resume {
                     prompt: Some(resume_prompt(task)),
                     model,
@@ -3174,11 +3173,8 @@ mod tests {
             ..worker(false, false)
         };
         let mut hosted = engines.clone();
-        hosted
-            .ready
-            .get_mut("agy")
-            .expect("agy")
-            .default_label = Some("gemini-3.8-flash-low".to_string());
+        hosted.ready.get_mut("agy").expect("agy").default_label =
+            Some("gemini-3.8-flash-low".to_string());
         let resumed = Work {
             engines: hosted,
             ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])

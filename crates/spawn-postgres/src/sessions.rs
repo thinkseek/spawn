@@ -152,8 +152,7 @@ pub(crate) const LATEST_TASK: &str =
 /// The engine of a session's newest `start` command: its `engine`, or
 /// Claude Code's (`claude`, the wire default) for a start that names none;
 /// no row when the session has no start. `$1` session.
-pub(crate) const LATEST_ENGINE: &str =
-    "select coalesce(action ->> 'engine', 'claude') as engine
+pub(crate) const LATEST_ENGINE: &str = "select coalesce(action ->> 'engine', 'claude') as engine
                    from spawn_commands
                   where session_id = $1 and action ->> 'type' = 'start'
                   order by id desc limit 1";

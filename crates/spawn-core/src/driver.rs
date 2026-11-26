@@ -501,10 +501,7 @@ impl AgentDriver for AgyDriver {
     /// the inline JSON the arguments carry.
     fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan {
         let arguments = agy_arguments(
-            launch
-                .model
-                .or(home.model.as_deref())
-                .unwrap_or_default(),
+            launch.model.or(home.model.as_deref()).unwrap_or_default(),
             launch.cwd.unwrap_or_default(),
             launch.native.filter(|_| launch.resume),
         );
@@ -616,9 +613,9 @@ impl AgyDriver {
             .map(|word| word.trim_start_matches('v'))
             .find(|word| {
                 word.contains('.')
-                    && word.split('.').all(|part| {
-                        !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())
-                    })
+                    && word
+                        .split('.')
+                        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
             })
             .map(str::to_string)
     }
@@ -965,7 +962,11 @@ mod tests {
                        gemini-3.8-pro\n";
         assert_eq!(
             AgyDriver::known_models(listing),
-            ["claude-sonnet-4.5", "gemini-3.8-flash-low", "gemini-3.8-pro"]
+            [
+                "claude-sonnet-4.5",
+                "gemini-3.8-flash-low",
+                "gemini-3.8-pro"
+            ]
         );
         assert!(
             AgyDriver::known_models(

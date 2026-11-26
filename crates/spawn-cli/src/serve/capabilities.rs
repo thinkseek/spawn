@@ -138,7 +138,9 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
         let id = driver.id();
         let configured = enabled.iter().find(|(name, _)| name == id);
         let program = match (id, configured) {
-            (DEFAULT, _) => (host.lookup)("SPAWN_CLAUDE_PROGRAM").unwrap_or_else(|| "claude".into()),
+            (DEFAULT, _) => {
+                (host.lookup)("SPAWN_CLAUDE_PROGRAM").unwrap_or_else(|| "claude".into())
+            }
             (_, Some((_, home))) => home.program.clone(),
             _ => (host.lookup)(&format!("SPAWN_{}_PROGRAM", id.to_ascii_uppercase()))
                 .unwrap_or_else(|| id.to_string()),
@@ -146,7 +148,10 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
         let model = configured.and_then(|(_, home)| home.model.clone());
         let is_enabled = id == DEFAULT || configured.is_some();
         let answer = (host.run)(&program, &["--version"], VERSION_LIMIT);
-        let version = answer.as_ref().ok().and_then(|text| AgyDriver::version(text));
+        let version = answer
+            .as_ref()
+            .ok()
+            .and_then(|text| AgyDriver::version(text));
         let mut unavailable = match &answer {
             Ok(_) => None,
             Err(why) => Some(format!("{program} --version: {why}")),
@@ -560,7 +565,12 @@ mod tests {
         assert_eq!(agy.version_tested, Some(true));
         assert_eq!(
             agy.known_models.as_deref(),
-            Some(&["gemini-3.8-flash-low".to_string(), "gemini-3.8-pro".to_string()][..])
+            Some(
+                &[
+                    "gemini-3.8-flash-low".to_string(),
+                    "gemini-3.8-pro".to_string()
+                ][..]
+            )
         );
         assert_eq!(agy.unavailable, None);
         assert!(probe.engines[0].login[0].present);
@@ -573,7 +583,9 @@ mod tests {
             ready.runs("agy", None),
             Runs::On("agy".to_string(), Some("gemini-3.8-flash-low".to_string()))
         );
-        assert!(matches!(ready.runs("agy", Some("gemini-9")), Runs::Unavailable(why) if why.contains("gemini-9")));
+        assert!(
+            matches!(ready.runs("agy", Some("gemini-9")), Runs::Unavailable(why) if why.contains("gemini-9"))
+        );
         assert_eq!(untested_notice(&probe), None, "1.5 is tested");
     }
 
@@ -593,7 +605,10 @@ mod tests {
             (
                 vec![
                     ("agy --version", Ok("1.5.17")),
-                    ("agy models", Ok("Error: Please sign in to view available models.")),
+                    (
+                        "agy models",
+                        Ok("Error: Please sign in to view available models."),
+                    ),
                 ],
                 "listed no model",
             ),
@@ -602,7 +617,10 @@ mod tests {
             let probe = host.probe();
             assert_eq!(probe.engines[0].unavailable, None, "Claude is never down");
             let ready = engines(&probe);
-            assert_eq!(ready.runs("claude", None), Runs::On("claude".to_string(), None));
+            assert_eq!(
+                ready.runs("claude", None),
+                Runs::On("claude".to_string(), None)
+            );
             match ready.runs("agy", Some("gemini-3.8-pro")) {
                 Runs::Unavailable(why) => assert!(why.contains(said), "{why}"),
                 other => panic!("{said}: {other:?}"),

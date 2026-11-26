@@ -357,7 +357,10 @@ mod tests {
             panic!("a start: {action:?}");
         };
         assert_eq!(model_label.as_deref(), Some("gemini-3.8-flash-low"));
-        assert_eq!(serde_json::to_string(&action).expect("serializes"), labelled);
+        assert_eq!(
+            serde_json::to_string(&action).expect("serializes"),
+            labelled
+        );
         for bad in ["", "-rf", "a b", "x;y", "$(id)"] {
             assert!(!is_model_label(bad), "{bad}");
             let json = format!(
