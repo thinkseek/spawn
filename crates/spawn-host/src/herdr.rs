@@ -155,6 +155,16 @@ fn manifest_mismatch(session: &str, pinned: &[(String, String)], listed: &Value)
 /// detection has not settled.
 const LAUNCH_SETTLE: Duration = Duration::from_secs(1);
 
+/// How long [`TerminalHost::start`] waits, at most, for the launch script
+/// to clear the line that ran it from the pane ([`CLEAR_SCREEN`]), and how
+/// often it looks.
+const LAUNCH_CLEAR_LIMIT: Duration = Duration::from_secs(3);
+const LAUNCH_CLEAR_POLL: Duration = Duration::from_millis(20);
+
+/// Lines of the pane read while waiting for that clear: more than a reader
+/// of the pane's tail reads ([`spawn_core::screen::TAIL_LINES`]).
+const LAUNCH_CLEAR_LINES: u32 = 100;
+
 /// How long the subscriber waits for an event before it looks whether its
 /// host is gone or the panes it follows changed.
 const EVENT_POLL: Duration = Duration::from_millis(500);
@@ -1063,6 +1073,50 @@ impl HerdrHost {
         }
     }
 
+    /// Wait, at most [`LAUNCH_CLEAR_LIMIT`], until the launch script ran its
+    /// first lines: it removed itself, and the pane no longer shows the line
+    /// that ran it (`$ exec /bin/sh '<script>'`), which it clears first
+    /// ([`CLEAR_SCREEN`]). A reader of the pane right after the start (the
+    /// Bridge's first look for the engine's prompt) would otherwise read
+    /// that echo as a prompt holding text, take the input box for drawn,
+    /// and never answer a trust dialog the engine draws next.
+    ///
+    /// The pane's lines are joined before the script's name is looked for:
+    /// a long path wraps. A pane that can no longer be read (its program
+    /// exited at once and Herdr closed it) has nothing left to clear. Past
+    /// the limit it returns as well: the start never fails or hangs on it.
+    fn await_launch_cleared(&self, pane: &str, script: &Path) {
+        let name = script
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let deadline = Instant::now() + LAUNCH_CLEAR_LIMIT;
+        loop {
+            if !script.exists() {
+                let Ok(read) = self.call(
+                    "pane.read",
+                    &json!({
+                        "pane_id": pane,
+                        "source": "recent",
+                        "lines": LAUNCH_CLEAR_LINES,
+                        "format": "text",
+                    }),
+                    CAPTURE_LIMIT,
+                ) else {
+                    return;
+                };
+                let text = read["read"]["text"].as_str().unwrap_or_default();
+                if !launch_echo_shown(text, &name) {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(LAUNCH_CLEAR_POLL);
+        }
+    }
+
     /// The pane's new workspace for `launch`, its shell told to run the
     /// launch script, and the record of it: what [`TerminalHost::start`]
     /// does once the server answers.
@@ -1127,6 +1181,7 @@ impl HerdrHost {
             );
             self.send_text(&pane, &line)?;
             self.press(&pane, &Press::Key("enter".to_string()))?;
+            self.await_launch_cleared(&pane, script);
             Ok(record)
         })();
         if launched.is_err() {
@@ -1364,6 +1419,14 @@ pub(crate) fn chunks(text: &str, limit: usize) -> Vec<&str> {
         rest = after;
     }
     pieces
+}
+
+/// Whether the pane text `text` still shows the line that ran the launch
+/// script named `name`: its name (looked for in the lines joined, since a
+/// long path wraps), or the command itself.
+pub(crate) fn launch_echo_shown(text: &str, name: &str) -> bool {
+    let joined: String = text.lines().collect();
+    (!name.is_empty() && joined.contains(name)) || text.contains("exec /bin/sh ")
 }
 
 /// What the launch script prints first: cursor home, clear the screen and
