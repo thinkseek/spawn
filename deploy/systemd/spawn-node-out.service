@@ -1,0 +1,22 @@
+[Unit]
+Description=Spawn: Go private outbound unary RPC relay (--serve outbound) on out.sock
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/share/spawn-rsi
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GOMEMLIMIT=128MiB
+MemoryMax=256M
+# Credential delivered by systemd into $CREDENTIALS_DIRECTORY/typesafe.api-key;
+# never placed in environment variables.
+LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key
+RestartPreventExitStatus=243 78
+Environment=TYPESAFE_BASE_URL=https://api.typesafe.ai
+Environment=SPAWN_OUT_ALLOWLIST=https://api.typesafe.ai/v1/systemone
+EnvironmentFile=-%h/.config/spawn/node-out.env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node front --serve outbound --out-sock %t/spawn/out.sock
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

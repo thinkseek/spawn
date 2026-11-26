@@ -1,0 +1,24 @@
+[Unit]
+Description=Spawn: Go signed node gateway front (--serve node) over core.sock
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/share/spawn-rsi
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GOMEMLIMIT=256MiB
+MemoryMax=512M
+# Primary Ed25519 PKCS#8 key (mode 0600, generated on first start if absent).
+Environment=SPAWN_NODE_GATEWAY_KEY_FILE=%h/.config/spawn/node-gateway.pk8
+Environment=SPAWN_CAS_DIR=%h/.local/share/spawn-rsi/cas
+Environment=SPAWN_NODE_ARTIFACTS=%h/.local/share/spawn-rsi/node-artifacts
+Environment=SPAWN_NODE_RESULTS=%h/.local/share/spawn-rsi/node-results
+Environment=SPAWN_NODE_GATEWAY_LISTEN=127.0.0.1:18096
+Environment=SPAWN_NODE_GATEWAY_CELLS=c0
+# Optional non-secret overrides (zero direct Postgres credentials in this unit).
+EnvironmentFile=-%h/.config/spawn/node-gw.env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node front --serve node --core-sock %t/spawn/core.sock --node-listen ${SPAWN_NODE_GATEWAY_LISTEN} --node-key-file ${SPAWN_NODE_GATEWAY_KEY_FILE} --cas ${SPAWN_CAS_DIR} --artifacts ${SPAWN_NODE_ARTIFACTS} --results ${SPAWN_NODE_RESULTS} --cells ${SPAWN_NODE_GATEWAY_CELLS} --bind-retry-timeout 5s
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

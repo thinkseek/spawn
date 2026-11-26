@@ -8,7 +8,14 @@ check=$here/credential-health.sh
 scratch=$(mktemp -d) || exit 2
 [ -n "$scratch" ] && [ -d "$scratch" ] || exit 2
 case $scratch in "$HOME"|"$HOME"/.config*|/run/keep*) echo "refusing scratch $scratch"; exit 2 ;; esac
-trap 'rm -rf -- "$scratch"' EXIT
+uds_dir=""
+uds_pid=""
+cleanup() {
+  [ -n "${uds_pid-}" ] && kill "$uds_pid" >/dev/null 2>&1 && wait "$uds_pid" 2>/dev/null || true
+  [ -n "${uds_dir-}" ] && rm -rf -- "$uds_dir"
+  rm -rf -- "$scratch"
+}
+trap cleanup EXIT
 fails=0
 pass() { printf 'ok   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
@@ -35,6 +42,9 @@ else grep -v '^@inv ' "$FAKE_JOURNAL"; fi
 EOF
 cat >"$bin/curl" <<'EOF'
 #!/bin/bash
+if [ "${FAKE_REAL_CURL-}" = 1 ]; then
+  exec /usr/bin/curl "$@"
+fi
 printf '%s' "$FAKE_HEALTH"
 EOF
 chmod +x "$bin"/*
@@ -199,6 +209,176 @@ bad_row "an inline # comment in a row: refused" 'demo.other|-|-|-|-|-|~/.config/
 rows=$(grep -v '^[[:space:]]*\(#\|$\)' "$here/credentials.manifest")
 [ "$(wc -l <<<"$rows")" = 1 ] && [[ $rows == "typesafe.api-key "*"| spawn-jev-relay.service "*"| ~/.config/spawn/typesafe.env "* ]] &&
   pass "the manifest holds the one live row, typesafe.api-key by spawn-jev-relay" || fail "the manifest's live row"
+
+# --- Issue #98 hardening: unix:// UDS health probe, EnvironmentFile= rollback, Go units PG isolation ---
+uds_dir=$(mktemp -d /tmp/ch-uds.XXXXXX) || exit 2
+python3 - "$uds_dir/out.sock" "$uds_dir/status" <<'PY' >/dev/null 2>&1 &
+import os, socketserver, sys
+sock_path, status_file = sys.argv[1], sys.argv[2]
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        line = self.rfile.readline(4096)
+        while self.rfile.readline(4096) not in (b"\r\n", b"\n", b""):
+            pass
+        code = open(status_file).read().strip() if os.path.exists(status_file) else "503"
+        reason = "OK" if code == "200" else "Service Unavailable"
+        body = b'{"status":"ok"}\n' if code == "200" else b'{"error":"down"}\n'
+        resp = (
+            f"HTTP/1.1 {code} {reason}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode() + body
+        self.wfile.write(resp)
+class UnixHTTPServer(socketserver.UnixStreamServer):
+    allow_reuse_address = True
+srv = UnixHTTPServer(sock_path, Handler)
+srv.serve_forever()
+PY
+uds_pid=$!
+for _ in $(seq 1 40); do [ -S "$uds_dir/out.sock" ] && break; sleep 0.05; done
+
+setup_uds_manifest() {
+  reset2
+  printf '200\n' >"$uds_dir/status"
+  printf '[Service]\nLoadCredential=typesafe.api-key:/run/keep/typesafe.api-key\nExecStart=/usr/bin/spawn-node front --serve outbound\n' >"$scratch/unit"
+  printf 'typesafe.api-key | spawn-node-out.service | unix://%s|/out/v1/health | jev-relay | ~/.config/spawn/typesafe.env | TYPESAFE_API_KEY | -\n' \
+    "$uds_dir/out.sock" >"$scratch/manifest"
+}
+run_uds() {
+  FAKE_REAL_CURL=1 CH_MANIFEST="$scratch/manifest" CH_HEALTH_URL="" FAKE_UNITS="$scratch/fakeunits" run
+}
+
+setup_uds_manifest
+out=$(run_uds)
+[ ! -s "$scratch/alerts" ] && grep -q '^credential-health: ok: typesafe.api-key' <<<"$out" &&
+  pass "unix:// UDS healthz 200: healthy, no alert" || fail "unix:// UDS healthz 200"
+
+printf '503\n' >"$uds_dir/status"
+run_uds >/dev/null
+expect_fired "unix:// UDS healthz 503: service_down" typesafe.api-key:service_down
+
+key=$(sed -n 's/.*"key":"\(credential_health:typesafe.api-key:service_down:[0-9]*\)".*/\1/p' "$scratch/alerts" | head -1)
+printf 'OPEN %s\n' "$key" >>"$scratch/alerts"
+printf '200\n' >"$uds_dir/status"
+run_uds >/dev/null
+grep -q "alert.cleared.*$key" "$scratch/alerts" &&
+  pass "unix:// UDS recovered to 200: service_down cleared" || fail "unix:// UDS recovery clear"
+
+kill "$uds_pid" >/dev/null 2>&1 && wait "$uds_pid" 2>/dev/null || true
+uds_pid=""
+rm -f "$uds_dir/out.sock"
+: >"$scratch/alerts"
+run_uds >/dev/null
+expect_fired "unix:// missing socket: service_down" typesafe.api-key:service_down
+
+bad_row "unix:// URL missing |<path>: refused" 'demo.other|spawn-x.service|unix:///tmp/missing-path|-|-|-|-'
+bad_row "unix:// URL with option injection (-K): refused" 'demo.other|spawn-x.service|unix://-K/tmp/bad|/health|-|-|-|-'
+reset2
+printf 'demo.token|spawn-node-out.service|unix://%%t/spawn/out.sock|/out/v1/health|-|~/.config/spawn/demo.env|DEMO_TOKEN|-\n' >"$scratch/manifest"
+FAKE_ACTIVE=active FAKE_HEALTH=200
+CH_MANIFEST="$scratch/manifest" FAKE_UNITS="$scratch/fakeunits" run >/dev/null 2>&1
+st=$?
+[ "$st" = 0 ] && pass "unix://%t/spawn/out.sock|/out/v1/health manifest syntax accepted" || fail "unix://%t/ manifest syntax refused ($st)"
+
+# Plaintext EnvironmentFile= rollback variants on spawn-* units (#98 item 3).
+reset2
+printf '[Service]\nEnvironmentFile=-~/.config/spawn/typesafe.env\n' >"$scratch/fakeunits/spawn-loop.service"
+run2 >/dev/null
+expect_fired "EnvironmentFile=-~/...typesafe.env rollback caught: legacy_env" typesafe.api-key:legacy_env
+
+reset2
+printf '[Service]\nEnvironmentFile=%%h/.config/spawn/typesafe.env\n' >"$scratch/fakeunits/spawn-loop.service"
+run2 >/dev/null
+expect_fired "EnvironmentFile=%h/...typesafe.env rollback caught: legacy_env" typesafe.api-key:legacy_env
+
+reset2
+printf '[Service]\n  EnvironmentFile = -%%h/.config/spawn/typesafe.env\n' >"$scratch/fakeunits/spawn-loop.service"
+out=$(run2)
+expect_fired "indented spaced EnvironmentFile = -%h/... rollback caught: legacy_env" typesafe.api-key:legacy_env
+key=$(sed -n 's/.*"key":"\(credential_health:typesafe.api-key:legacy_env:[0-9]*\)".*/\1/p' "$scratch/alerts" | head -1)
+printf 'OPEN %s\n' "$key" >>"$scratch/alerts"
+rm -f "$scratch/fakeunits/spawn-loop.service"
+run2 >/dev/null
+grep -q "alert.cleared.*$key" "$scratch/alerts" &&
+  pass "EnvironmentFile rollback removed: legacy_env cleared" || fail "EnvironmentFile rollback cleared"
+
+# Go front units (spawn-node-{edge,gw,out}.service) zero spawn.env / DATABASE_URL isolation.
+repo_root=$(cd "$here/../.." && pwd)
+setup_clean_go_deploy() {
+  reset2
+  cp "$repo_root/deploy/systemd/spawn-node-edge.service" "$scratch/deploy/"
+  cp "$repo_root/deploy/systemd/spawn-node-gw.service" "$scratch/deploy/"
+  cp "$repo_root/deploy/systemd/spawn-node-out.service" "$scratch/deploy/"
+}
+
+setup_clean_go_deploy
+CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2 >/dev/null
+expect_fired "clean Go front units under CH_DEPLOY_SYSTEMD_DIR: zero alerts"
+
+setup_clean_go_deploy
+printf 'EnvironmentFile=%%h/.local/share/spawn-rsi/spawn.env\n' >>"$scratch/deploy/spawn-node-edge.service"
+CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2 >/dev/null
+expect_fired "Go edge unit referencing spawn.env: go_unit_pg_isolation" spawn-units:go_unit_pg_isolation
+key=$(sed -n 's/.*"key":"\(credential_health:spawn-units:go_unit_pg_isolation:[0-9]*\)".*/\1/p' "$scratch/alerts" | head -1)
+printf 'OPEN %s\n' "$key" >>"$scratch/alerts"
+cp "$repo_root/deploy/systemd/spawn-node-edge.service" "$scratch/deploy/"
+CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2 >/dev/null
+grep -q "alert.cleared.*$key" "$scratch/alerts" &&
+  pass "Go edge unit spawn.env removed: go_unit_pg_isolation cleared" || fail "go_unit_pg_isolation clear (spawn.env)"
+
+setup_clean_go_deploy
+printf '%s\n' 'Environment=SPAWN_DATABASE_URL=postgres://synthetic-value-99' >>"$scratch/deploy/spawn-node-gw.service"
+out=$(CH_DEPLOY_SYSTEMD_DIR="$scratch/deploy" run2)
+expect_fired "Go gw unit referencing DATABASE_URL: go_unit_pg_isolation" spawn-units:go_unit_pg_isolation
+! grep -q 'synthetic-value-99' <<<"$out" && ! grep -q 'synthetic-value-99' "$scratch/alerts" &&
+  pass "Go unit DATABASE_URL violation prints no secret value" || fail "Go unit violation leaked value"
+
+setup_clean_go_deploy
+mkdir -p "$scratch/units/spawn-node-out.service.d"
+printf '%s\n' '[Service]' 'Environment=CUSTOM_DATABASE_URL=postgres://synthetic-dropin' >"$scratch/units/spawn-node-out.service.d/override.conf"
+printf 'OPEN credential_health:spawn-units:unit_drift:12345\n' >"$scratch/alerts"
+run2 >/dev/null
+[ "$(n_fired "spawn-units:go_unit_pg_isolation:")" = 1 ] && ! grep -q 'alert.cleared.*unit_drift' "$scratch/alerts" &&
+  pass "installed Go drop-in DATABASE_URL caught even without CH_DEPLOY_SYSTEMD_DIR while leaving unit_drift untouched" || fail "installed Go drop-in isolation"
+
+# Static compliance audit of committed deploy/systemd/spawn-{core,node-edge,node-gw,node-out}.service.
+reset2
+out=$(CH_DEPLOY_SYSTEMD_DIR="$repo_root/deploy/systemd" run2)
+[ ! -s "$scratch/alerts" ] &&
+  grep -q 'ok: Go front units (spawn-node-{edge,gw,out}) contain zero spawn.env or DATABASE_URL' <<<"$out" &&
+  pass "real repo deploy/systemd Go front units pass credential-health zero-PG audit" || fail "real repo Go units audit"
+
+core_unit=$repo_root/deploy/systemd/spawn-core.service
+[ -f "$core_unit" ] &&
+  grep -q '^WorkingDirectory=%h/\.local/share/spawn-rsi$' "$core_unit" &&
+  grep -q '^EnvironmentFile=%h/\.local/share/spawn-rsi/spawn\.env$' "$core_unit" &&
+  grep -q '^Environment=SPAWN_WEB_DIR=' "$core_unit" &&
+  grep -q '^Environment=SPAWN_FEATURE_ROOT=' "$core_unit" &&
+  grep -q '^RuntimeDirectory=spawn$' "$core_unit" &&
+  grep -q '^RuntimeDirectoryMode=0700$' "$core_unit" &&
+  grep -q '^UMask=0077$' "$core_unit" &&
+  grep -q 'spawn serve --ipc --ipc-sock %t/spawn/core\.sock' "$core_unit" &&
+  pass "deploy/systemd/spawn-core.service matches Phase 2 IPC & runtime permissions contract" || fail "spawn-core.service static audit"
+
+go_static_ok=1
+for u in spawn-node-edge.service spawn-node-gw.service spawn-node-out.service; do
+  p="$repo_root/deploy/systemd/$u"
+  [ -f "$p" ] &&
+    grep -q '^MemoryMax=[0-9]' "$p" &&
+    grep -q '^Environment=GOMEMLIMIT=' "$p" &&
+    ! grep -qiE 'spawn\.env|DATABASE_URL' "$p" || go_static_ok=""
+done
+grep -q -- '--bind-retry-timeout 5s' "$repo_root/deploy/systemd/spawn-node-edge.service" &&
+  grep -q -- '--bind-retry-timeout 5s' "$repo_root/deploy/systemd/spawn-node-gw.service" &&
+  grep -q '^LoadCredential=typesafe\.api-key:/run/keep/typesafe\.api-key$' "$repo_root/deploy/systemd/spawn-node-out.service" &&
+  grep -q '^RestartPreventExitStatus=243 78$' "$repo_root/deploy/systemd/spawn-node-out.service" || go_static_ok=""
+[ -n "$go_static_ok" ] &&
+  pass "deploy/systemd/spawn-node-{edge,gw,out}.service enforce MemoryMax, GOMEMLIMIT, bind-retry, LoadCredential, zero PG" || fail "spawn-node-*.service static audit"
 
 echo "$fails failed"
 [ "$fails" -eq 0 ]

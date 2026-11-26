@@ -24,16 +24,17 @@
 #   call_failure      the running unit's 3 newest status lines are all non-200 (fewer than 3: none)
 #   legacy_env        the row's legacy file exists again; or a user unit file or drop-in names it;
 #                     or a spawn-* unit (as systemctl --user cat shows it, drop-ins included) has an
-#                     EnvironmentFile= naming it or an Environment= setting one of its legacy keys;
-#                     or the row's own unit has any EnvironmentFile= or lacks LoadCredential=<id>
+#                     EnvironmentFile= naming it (with or without '-', '~/', or '%h/') or an
+#                     Environment= setting one of its legacy keys; or the row's own unit has any
+#                     EnvironmentFile= or lacks LoadCredential=<id>
 #   scanner_source    the row's scanner source and /run/keep/<id> are both missing after the boot
 #                     grace: secret-values.py then refuses every value scan (pushes, redaction)
 #
-# And one opt-in check of the host (subject spawn-units): with CH_DEPLOY_SYSTEMD_DIR set to a
-# deploy/systemd folder,
-#   unit_drift        an installed spawn-* unit file differs from its deploy/systemd copy (cmp; a
-#                     unit not installed, or installed but not in the folder, is not drift)
-# Unset (the timer's unit sets nothing), no drift is checked and no unit_drift alert is touched.
+# And host-wide checks (subject spawn-units):
+#   unit_drift        opt-in via CH_DEPLOY_SYSTEMD_DIR: an installed spawn-* unit file differs from
+#                     its deploy/systemd copy (cmp; uninstalled or host-only units are not drift)
+#   go_unit_pg_isolation  active when CH_DEPLOY_SYSTEMD_DIR is set or any spawn-node-{edge,gw,out}.service
+#                     unit/drop-in is present: asserts zero spawn.env or *DATABASE_URL* references
 #
 # Test seams (scripts/keep/test-credential-health.sh): CH_MANIFEST, CH_KEEP_DIR, CH_LEGACY_FILE and
 # CH_HEALTH_URL (the first row's legacy file and health URL), CH_UNIT_DIR, CH_UPTIME_S,
@@ -41,8 +42,8 @@
 # keys in, records appended). Without CH_FAKE_ALERTS it needs SPAWN_DATABASE_URL.
 # Exit 0, faults or not; 2 when the manifest cannot be read (no row checked must not look ok): not a
 # readable file, or a row with other than 7 fields, an empty field, a '#' (comments go on lines of
-# their own), the id spawn-units (unit_drift's subject), a health URL not http(s)://, or a legacy
-# file or scanner source ending in /.
+# their own), the id spawn-units (unit_drift's subject), a health URL not http(s):// or
+# unix://<socket>|<path>, or a legacy file or scanner source ending in /.
 set -u
 kind=credential_health
 here=$(cd "$(dirname "$0")" && pwd)
@@ -54,6 +55,7 @@ grace=${CH_BOOT_GRACE_S:-900}
 deploy_units=${CH_DEPLOY_SYSTEMD_DIR-}
 host_subject=spawn-units
 cred_classes="delivery_missing not_loaded service_down auth_failure call_failure legacy_env scanner_source"
+row_sep=$'\x1f'
 
 say() { printf 'credential-health: %s\n' "$*"; }
 refuse() { say "$* (in $manifest): nothing checked"; exit 2; }
@@ -64,6 +66,63 @@ uptime_s() {
 home_path() { case $1 in "~/"*) printf '%s\n' "$HOME/${1#"~/"}" ;; *) printf '%s\n' "$1" ;; esac; }
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
 
+expand_socket_path() {
+  local s=$1 rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  case $s in
+    "~/"*) printf '%s\n' "$HOME/${s#"~/"}" ;;
+    "%t/"*) printf '%s\n' "$rt/${s#"%t/"}" ;;
+    *) printf '%s\n' "$s" ;;
+  esac
+}
+
+valid_health_url() {
+  local u=$1
+  [[ $u == - || $u =~ ^https?://[^[:space:]]+$ || $u =~ ^unix://(/|~/|%t/)[^[:space:]|]+\|/[^[:space:]|]*$ ]]
+}
+
+probe_health_url() {
+  local u=$1 rest sock http_path
+  case $u in
+    unix://*)
+      rest=${u#unix://}
+      sock=${rest%%|*}
+      http_path=${rest#*|}
+      sock=$(expand_socket_path "$sock")
+      if [ ! -S "$sock" ]; then
+        printf '000'
+        return 0
+      fi
+      curl -s -m 5 --unix-socket "$sock" -o /dev/null -w '%{http_code}' "http://localhost${http_path}" 2>/dev/null
+      ;;
+    *)
+      curl -s -m 5 -o /dev/null -w '%{http_code}' -- "$u" 2>/dev/null
+      ;;
+  esac
+}
+
+unit_has_legacy_env_file() { # unit_has_legacy_env_file <unit_text> <legacy_expanded> <legacy_raw>
+  local text=$1 leg=$2 leg_raw=${3-} base leg_raw_exp line rhs
+  base=${leg##*/}
+  leg_raw_exp=$(home_path "$leg_raw")
+  while IFS= read -r line; do
+    line=$(trim "$line")
+    [[ $line =~ ^EnvironmentFile[[:space:]]*= ]] || continue
+    rhs=${line#*=}
+    rhs=$(trim "$rhs")
+    rhs=${rhs#\"}; rhs=${rhs%\"}
+    rhs=${rhs#-}
+    case $rhs in
+      "%h/"*) rhs="$HOME/${rhs#"%h/"}" ;;
+      "~/"*)  rhs="$HOME/${rhs#"~/"}" ;;
+    esac
+    if [ "$rhs" = "$leg" ] || [ "$rhs" = "$leg_raw" ] || [ "$rhs" = "$leg_raw_exp" ] ||
+       { [ -n "$base" ] && [ "${rhs##*/}" = "$base" ]; }; then
+      return 0
+    fi
+  done <<<"$text"
+  return 1
+}
+
 # --- the manifest: id|unit|health_url|status_tag|legacy_file|legacy_keys|scanner_source ---
 [ -f "$manifest" ] && [ -r "$manifest" ] || refuse "no readable manifest file"
 rows=()
@@ -71,17 +130,21 @@ while IFS= read -r line || [ -n "$line" ]; do
   case $(trim "$line") in "" | "#"*) continue ;; esac
   [[ $line != *"#"* ]] || refuse "a '#' inside a row (a comment goes on a line of its own)"
   IFS='|' read -r -a f <<<"$line"
+  if [ "${#f[@]}" = 8 ] && [[ $(trim "${f[2]}") == unix://* ]] && [[ $(trim "${f[3]}") == /* ]]; then
+    combined="$(trim "${f[2]}")|$(trim "${f[3]}")"
+    f=("${f[0]}" "${f[1]}" "$combined" "${f[4]}" "${f[5]}" "${f[6]}" "${f[7]}")
+  fi
   [ "${#f[@]}" = 7 ] || refuse "a row without 7 fields"
   for i in 0 1 2 3 4 5 6; do f[i]=$(trim "${f[i]}"); [ -n "${f[i]}" ] || refuse "a row with an empty field"; done
   [[ ${f[0]} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || refuse "an id that is not a file name"
   [ "${f[0]}" != "$host_subject" ] || refuse "the id $host_subject (the unit_drift alert's subject)"
-  [[ ${f[2]} == - || ${f[2]} =~ ^https?://[^[:space:]]+$ ]] || refuse "a health URL that is not http(s)://"
+  valid_health_url "${f[2]}" || refuse "a health URL that is not http(s):// or unix://<socket>|<path>"
   [[ ${f[4]} != */ && ${f[6]} != */ ]] || refuse "a legacy file or scanner source ending in / (a folder)"
   [[ ${f[1]} == - || ${f[1]} =~ ^[A-Za-z0-9][A-Za-z0-9@._-]*$ ]] || refuse "a unit that is not a unit name"
   [[ ${f[3]} == - || ${f[3]} =~ ^[A-Za-z0-9_-]+$ ]] || refuse "a status tag that is not a plain word"
   [[ ${f[5]} == - || ${f[5]} =~ ^[A-Za-z_][A-Za-z0-9_]*(,[A-Za-z_][A-Za-z0-9_]*)*$ ]] || refuse "legacy keys that are not env names"
-  for r in "${rows[@]}"; do [ "${r%%|*}" != "${f[0]}" ] || refuse "the id ${f[0]} twice"; done
-  rows+=("$(IFS='|'; printf '%s' "${f[*]}")")
+  for r in "${rows[@]}"; do [ "${r%%"$row_sep"*}" != "${f[0]}" ] || refuse "the id ${f[0]} twice"; done
+  rows+=("$(IFS="$row_sep"; printf '%s' "${f[*]}")")
 done <"$manifest"
 [ "${#rows[@]}" -gt 0 ] || refuse "no row"
 
@@ -100,9 +163,9 @@ done < <(systemctl --user list-unit-files --no-legend 'spawn-*' 2>/dev/null | so
 
 # --- the checks of one row: each sets a class with its reason (names and numbers only) ---
 check_row() {
-  local id=$1 unit=$2 health_url=$3 tag=$4 legacy=$5 keys=$6 scanner=$7
+  local id=$1 unit=$2 health_url=$3 tag=$4 legacy=$5 keys=$6 scanner=$7 legacy_raw=${8-}
   local file=$keep_dir/$id in_grace="" up active code started started_s delivered_s inv newest
-  local legacy_why="" named own u k base
+  local legacy_why="" named="" own u fpath k base
   local -a jsel codes
   if [ ! -f "$file" ] || [ ! -s "$file" ] || [ "$(stat -c %a "$file" 2>/dev/null)" != 600 ]; then
     up=$(uptime_s)
@@ -117,7 +180,7 @@ check_row() {
   if [ "$unit" != - ]; then
     active=$(systemctl --user is-active "$unit" 2>/dev/null)
     code=200
-    [ "$health_url" = - ] || code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$health_url" 2>/dev/null)
+    [ "$health_url" = - ] || code=$(probe_health_url "$health_url")
     if [ "$active" != active ] || [ "$code" != 200 ]; then
       if [ -n "$in_grace" ]; then
         # After a boot the unit stays failed until Keep delivers its key: a normal gap, not a fault.
@@ -159,17 +222,22 @@ check_row() {
   if [ "$legacy" != - ]; then
     [ -e "$legacy" ] && legacy_why="$legacy exists"
     base=${legacy##*/}
-    named=$(grep -lsF -- "$base" "$unit_dir"/*.service "$unit_dir"/*.path "$unit_dir"/*.d/*.conf 2>/dev/null | tr '\n' ' ')
+    for fpath in "$unit_dir"/*.service "$unit_dir"/*.path "$unit_dir"/*.d/*.conf; do
+      [ -f "$fpath" ] || continue
+      if grep -qsF -- "$base" "$fpath" || unit_has_legacy_env_file "$(cat "$fpath" 2>/dev/null)" "$legacy" "$legacy_raw"; then
+        named="${named}${fpath} "
+      fi
+    done
     [ -n "$named" ] && legacy_why=$(add "$legacy_why" "units naming $base: $named")
     for u in "${spawn_units[@]}"; do
-      grep -E '^EnvironmentFile=' <<<"${unit_text[$u]}" | grep -qF -- "$base" &&
+      unit_has_legacy_env_file "${unit_text[$u]}" "$legacy" "$legacy_raw" &&
         legacy_why=$(add "$legacy_why" "$u has an EnvironmentFile= naming $base")
     done
   fi
   if [ "$keys" != - ]; then
     for u in "${spawn_units[@]}"; do
       for k in ${keys//,/ }; do
-        grep -qE "^Environment=(.*[[:space:]\"])?$k=" <<<"${unit_text[$u]}" &&
+        grep -qE "^[[:space:]]*Environment[[:space:]]*=(.*[[:space:]\"])?$k=" <<<"${unit_text[$u]}" &&
           legacy_why=$(add "$legacy_why" "$u sets $k by Environment=")
       done
     done
@@ -177,7 +245,8 @@ check_row() {
   if [ "$unit" != - ]; then
     own=$(systemctl --user cat "$unit" 2>/dev/null)
     if [ -n "$own" ]; then
-      grep -q '^EnvironmentFile=' <<<"$own" && legacy_why=$(add "$legacy_why" "$unit has an EnvironmentFile=")
+      grep -qE '^[[:space:]]*EnvironmentFile[[:space:]]*=' <<<"$own" &&
+        legacy_why=$(add "$legacy_why" "$unit has an EnvironmentFile=")
       grep -q "^LoadCredential=${id//./\\.}:" <<<"$own" ||
         legacy_why=$(add "$legacy_why" "$unit has no LoadCredential=$id")
     fi
@@ -204,20 +273,28 @@ check_row() {
 
 first=1
 for row in "${rows[@]}"; do
-  IFS='|' read -r id unit health_url tag legacy keys scanner <<<"$row"
+  IFS="$row_sep" read -r id unit health_url tag legacy keys scanner <<<"$row"
+  legacy_raw=$legacy
   [ "$legacy" = - ] || legacy=$(home_path "$legacy")
   [ "$scanner" = - ] || scanner=$(home_path "$scanner")
   if [ -n "$first" ]; then
     legacy=${CH_LEGACY_FILE:-$legacy}
-    [ "$health_url" = - ] || health_url=${CH_HEALTH_URL:-$health_url}
+    if [ "$health_url" != - ] && [ -n "${CH_HEALTH_URL-}" ]; then
+      valid_health_url "$CH_HEALTH_URL" || refuse "CH_HEALTH_URL is not http(s):// or unix://<socket>|<path>"
+      health_url=$CH_HEALTH_URL
+    fi
     first=""
   fi
-  check_row "$id" "$unit" "$health_url" "$tag" "$legacy" "$keys" "$scanner"
+  check_row "$id" "$unit" "$health_url" "$tag" "$legacy" "$keys" "$scanner" "$legacy_raw"
 done
 
-# --- the host: unit drift, opt-in ---
+# --- the host: unit drift (opt-in) & Go units zero-PG isolation ---
 subjects=()
-for row in "${rows[@]}"; do subjects+=("${row%%|*}"); done
+for row in "${rows[@]}"; do subjects+=("${row%%"$row_sep"*}"); done
+host_classes=""
+go_units=(spawn-node-edge.service spawn-node-gw.service spawn-node-out.service)
+check_go_units=""
+
 if [ -n "$deploy_units" ]; then
   if [ -d "$deploy_units" ]; then
     drift=""
@@ -227,12 +304,58 @@ if [ -n "$deploy_units" ]; then
     done
     [ -z "$drift" ] && say "ok: installed spawn-* units match $deploy_units" ||
       fault "$host_subject" unit_drift "installed units differing from $deploy_units:$drift"
-    subjects+=("$host_subject")
+    host_classes=unit_drift
+    check_go_units=1
   else
     say "no folder $deploy_units (CH_DEPLOY_SYSTEMD_DIR): unit drift not checked"
   fi
 fi
-classes_of() { if [ "$1" = "$host_subject" ]; then echo unit_drift; else echo "$cred_classes"; fi; }
+
+if [ -z "$check_go_units" ]; then
+  for gu in "${go_units[@]}"; do
+    if [ -f "$unit_dir/$gu" ] || [ -n "${unit_text[$gu]-}" ]; then
+      check_go_units=1
+      break
+    fi
+    for drop in "$unit_dir/${gu}.d"/*.conf; do
+      if [ -f "$drop" ]; then
+        check_go_units=1
+        break 2
+      fi
+    done
+  done
+fi
+
+if [ -n "$check_go_units" ]; then
+  pg_leaks=""
+  note_pg_leak() {
+    case " $pg_leaks " in
+      *" $1 "*) ;;
+      *) pg_leaks="$pg_leaks $1" ;;
+    esac
+  }
+  for gu in "${go_units[@]}"; do
+    if [ -n "$deploy_units" ] && [ -f "$deploy_units/$gu" ]; then
+      grep -qiE 'spawn\.env|DATABASE_URL' "$deploy_units/$gu" && note_pg_leak "deploy/$gu"
+    fi
+    if [ -f "$unit_dir/$gu" ]; then
+      grep -qiE 'spawn\.env|DATABASE_URL' "$unit_dir/$gu" && note_pg_leak "installed/$gu"
+    fi
+    for drop in "$unit_dir/${gu}.d"/*.conf; do
+      [ -f "$drop" ] || continue
+      grep -qiE 'spawn\.env|DATABASE_URL' "$drop" && note_pg_leak "dropin/$gu/${drop##*/}"
+    done
+    if [ -n "${unit_text[$gu]-}" ]; then
+      grep -qiE 'spawn\.env|DATABASE_URL' <<<"${unit_text[$gu]}" && note_pg_leak "unit/$gu"
+    fi
+  done
+  [ -z "$pg_leaks" ] && say "ok: Go front units (spawn-node-{edge,gw,out}) contain zero spawn.env or DATABASE_URL" ||
+    fault "$host_subject" go_unit_pg_isolation "Go front units referencing spawn.env or DATABASE_URL:$pg_leaks"
+  host_classes=${host_classes:+$host_classes }go_unit_pg_isolation
+fi
+
+[ -z "$host_classes" ] || subjects+=("$host_subject")
+classes_of() { if [ "$1" = "$host_subject" ]; then echo "$host_classes"; else echo "$cred_classes"; fi; }
 
 for s in "${subjects[@]}"; do
   for c in $(classes_of "$s"); do [ -n "${why[$s|$c]-}" ] && say "FAULT $c: $s: ${why[$s|$c]}"; done

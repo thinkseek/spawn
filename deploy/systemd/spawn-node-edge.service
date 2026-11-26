@@ -1,0 +1,19 @@
+[Unit]
+Description=Spawn: Go HTTP/SSE edge front (--serve edge) over core.sock
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.local/share/spawn-rsi
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GOMEMLIMIT=256MiB
+MemoryMax=512M
+Environment=SPAWN_SERVE_ADDRESS=127.0.0.1:8787
+Environment=SPAWN_WEB_DIR=%h/.local/share/spawn-rsi/web
+# Optional host edge settings (must contain zero direct Postgres credentials).
+EnvironmentFile=-%h/.config/spawn/node-edge.env
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn-node front --serve edge --core-sock %t/spawn/core.sock --listen ${SPAWN_SERVE_ADDRESS} --web ${SPAWN_WEB_DIR} --bind-retry-timeout 5s
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
