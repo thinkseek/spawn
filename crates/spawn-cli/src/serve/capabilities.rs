@@ -752,26 +752,54 @@ mod tests {
                 self.stat.borrow_mut().push(path.display().to_string());
                 path.ends_with(".credentials.json")
             };
+            let view = |engine: &str, home: &EngineHome| {
+                self.viewed
+                    .borrow_mut()
+                    .push(format!("{engine} {}", home.sessions));
+                match self.view {
+                    View::Off => Boxed::Off,
+                    View::Wrap => Boxed::Inside {
+                        words: ["bwrap", "--die-with-parent", "--unshare-pid", "--"]
+                            .map(str::to_string)
+                            .to_vec(),
+                        _scratch: None,
+                    },
+                    View::Refuse(why) => Boxed::Unavailable(why.to_string()),
+                }
+            };
             probe_with(
                 &Host {
                     lookup: &lookup,
                     run: &run,
                     exists: &exists,
+                    view: &view,
                 },
                 7,
             )
         }
     }
 
+    /// A fake host whose view is off (`SPAWN_ENGINE_VIEW=off`): the probe's
+    /// own logic, its program run as is.
     fn fake(
         env: Vec<(&'static str, &'static str)>,
         answers: Vec<(&'static str, Result<&'static str, &'static str>)>,
+    ) -> Fake {
+        fake_viewed(env, answers, View::Off)
+    }
+
+    fn fake_viewed(
+        env: Vec<(&'static str, &'static str)>,
+        answers: Vec<(&'static str, Result<&'static str, &'static str>)>,
+        view: View,
     ) -> Fake {
         Fake {
             env,
             answers,
             runs: RefCell::new(Vec::new()),
             stat: RefCell::new(Vec::new()),
+            view,
+            viewed: RefCell::new(Vec::new()),
         }
     }
 
@@ -804,7 +832,7 @@ mod tests {
             *host.stat.borrow(),
             [
                 "/home/a/.claude/.credentials.json",
-                "/home/a/.gemini/oauth_creds.json",
+                "/home/a/.gemini/antigravity-cli/antigravity-oauth-token",
                 "/home/a/.gemini/antigravity-cli",
             ]
         );
