@@ -603,9 +603,10 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FleetTestDatabase, auto_trust, claude_config_env, engines, resolve_claude_projects,
-        resolve_model_relay, supply_pa_env,
+        FleetTestDatabase, auto_trust, claude_config_env, engine_view, engines,
+        resolve_claude_projects, resolve_model_relay, supply_pa_env,
     };
+    use std::sync::Arc;
 
     /// `SPAWN_AUTO_APPROVE=off` turns the Bridge's startup trust answer off;
     /// unset, `startup` and `all` keep it.
@@ -917,8 +918,8 @@ mod tests {
     #[test]
     fn the_engine_view_is_required_by_default_and_made_only_for_sandboxed_engines() {
         use spawn_core::bridge::EngineViewPolicy;
-        let claude = engines(lookup(&[("HOME", "/home/a")])).expect("claude");
-        let agy = engines(lookup(&[("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")]))
+        let claude = engines(environment(&[("HOME", "/home/a")])).expect("claude");
+        let agy = engines(environment(&[("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")]))
             .expect("agy");
         let made = std::cell::Cell::new(0);
         let works = |_: &dyn Fn(&str) -> Option<String>| {
@@ -930,17 +931,17 @@ mod tests {
             String,
         > { Err("bwrap is not installed (not found on PATH)".to_string()) };
 
-        let (policy, said) = engine_view(&lookup(&[]), &claude, works);
+        let (policy, said) = engine_view(&environment(&[]), &claude, works);
         assert!(matches!(policy, EngineViewPolicy::Required(Err(_))), "{policy:?}");
         assert_eq!(said, None);
         assert_eq!(made.get(), 0, "a Claude-only host never runs bwrap");
 
-        let (policy, said) = engine_view(&lookup(&[]), &agy, works);
+        let (policy, said) = engine_view(&environment(&[]), &agy, works);
         assert!(matches!(policy, EngineViewPolicy::Required(Ok(_))), "{policy:?}");
         assert_eq!(said, None);
         assert_eq!(made.get(), 1);
 
-        let (policy, said) = engine_view(&lookup(&[("SPAWN_ENGINE_VIEW", "required")]), &agy, fails);
+        let (policy, said) = engine_view(&environment(&[("SPAWN_ENGINE_VIEW", "required")]), &agy, fails);
         assert!(
             matches!(&policy, EngineViewPolicy::Required(Err(why)) if why.contains("bwrap")),
             "{policy:?}"
@@ -948,11 +949,11 @@ mod tests {
         let said = said.expect("said");
         assert!(said.contains("agy will not start (engine_unavailable)"), "{said}");
 
-        let (policy, said) = engine_view(&lookup(&[("SPAWN_ENGINE_VIEW", "off")]), &agy, fails);
+        let (policy, said) = engine_view(&environment(&[("SPAWN_ENGINE_VIEW", "off")]), &agy, fails);
         assert!(matches!(policy, EngineViewPolicy::Off), "{policy:?}");
         assert!(said.expect("said").contains("SPAWN_ENGINE_VIEW=off"));
 
-        let (policy, said) = engine_view(&lookup(&[("SPAWN_ENGINE_VIEW", "maybe")]), &agy, fails);
+        let (policy, said) = engine_view(&environment(&[("SPAWN_ENGINE_VIEW", "maybe")]), &agy, fails);
         assert!(matches!(policy, EngineViewPolicy::Required(Err(_))), "{policy:?}");
         assert!(said.expect("said").contains("SPAWN_ENGINE_VIEW=maybe is neither"));
     }
