@@ -403,8 +403,77 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     /// started in `workspace` ([`table_answer`] for this engine's id): a
     /// fixed table, never a guess.
     fn dialog_answer(&self, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
-        table_answer(self.id(), dialog, workspace)
+        eval_dialog_rules(self.dialog_rules(), self.id(), dialog, workspace)
     }
+
+    /// Declarative dialog resolution table entries used by
+    /// [`Self::dialog_answer`].
+    fn dialog_rules(&self) -> &'static [DialogRule] {
+        DIALOG_RULES
+    }
+
+    /// Declarative hard-block tail rules evaluated on panes from this engine.
+    fn hard_block_rules(&self) -> &'static [HardBlockRule] {
+        HARD_BLOCK_RULES
+    }
+}
+
+/// How a [`DialogRule`] matches `Dialog::rule`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleMatch {
+    /// Matches any `dialog.rule` (`Some(_)` or `None`).
+    Any,
+    /// Matches only `dialog.rule == None`.
+    None,
+    /// Matches `dialog.rule == Some(id)`.
+    Exact(&'static str),
+}
+
+/// Guard checked after matching a [`DialogRule`]'s engine/rule/kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogGuard {
+    /// Always applies once matched.
+    Always,
+    /// Applies only when `dialog.body` shows the workspace folder and
+    /// `dialog.cursor` stands on `"Yes, I trust this folder"`; otherwise
+    /// escalates with `mismatch_reason`.
+    WorkspaceTrustedFolder {
+        /// Human escalation reason returned when folder/cursor checks fail.
+        mismatch_reason: &'static str,
+    },
+}
+
+/// Outcome returned when a [`DialogRule`] passes its guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogOutcome {
+    /// Press these keys (terminal key names), in order, once.
+    Keys(&'static [&'static str]),
+    /// Escalate to a human with this reason.
+    Escalate(&'static str),
+}
+
+/// Declarative screen/dialog resolution rule (`#113` D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialogRule {
+    /// Engine identifier (`"agy"`, `"claude"`, `"codex"`, `"opencode"`).
+    pub engine: &'static str,
+    /// How `dialog.rule` is matched against the host manifest rule id.
+    pub rule: RuleMatch,
+    /// Optional prompt kind filter (`Some("trust")`, `Some("permission")`, etc.).
+    pub kind: Option<&'static str>,
+    /// Precondition guard evaluated after matching `engine`, `rule`, and `kind`.
+    pub guard: DialogGuard,
+    /// Resolution outcome applied when the guard succeeds.
+    pub outcome: DialogOutcome,
+}
+
+/// Declarative hard-block tail text rule (`#113` D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardBlockRule {
+    /// Lowercased substring matched against the trailing pane lines.
+    pub needle: &'static str,
+    /// Short human-facing reason reported when `needle` matches.
+    pub reason: &'static str,
 }
 
 /// A dialog the run-time resolver found on a pane (design section 6.3),
@@ -458,78 +527,230 @@ const UNCAPTURED: &str = "no captured screen of this dialog yet: a person answer
 /// | codex | `trust_directory`, `startup_update`, `live_strong_blocker` | — | escalate | not verified |
 /// | opencode | `permission_required` | — | escalate | not verified |
 /// | any | no row | — | escalate | — |
-pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
-    match (engine, dialog.rule, dialog.kind) {
-        ("agy", Some("trust_prompt"), _) => {
-            let folder = workspace.path().trim_end_matches('/');
-            let shown = dialog
-                .body
-                .iter()
-                .any(|line| line.trim().trim_end_matches('/') == folder);
-            let trusting = dialog
-                .cursor
-                .is_some_and(|cursor| cursor.trim() == "Yes, I trust this folder");
-            if shown && trusting {
-                Answer::Keys(&crate::screen::AGY_TRUST_KEYS)
-            } else {
-                Answer::Escalate(
-                    "agy's trust dialog names another folder, or its cursor is not on trust",
-                )
-            }
-        }
-        // The Bridge answers it before the first prompt (two keys, audited);
-        // at run time the resolver leaves it to a person.
-        ("claude", _, "trust") => Answer::Escalate(
+/// Declarative resolver rules (`#113` D1; design section 6.3). Evaluated in order
+/// by [`eval_dialog_rules`].
+pub const DIALOG_RULES: &[DialogRule] = &[
+    DialogRule {
+        engine: "agy",
+        rule: RuleMatch::Exact("trust_prompt"),
+        kind: None,
+        guard: DialogGuard::WorkspaceTrustedFolder {
+            mismatch_reason: "agy's trust dialog names another folder, or its cursor is not on trust",
+        },
+        outcome: DialogOutcome::Keys(&crate::screen::AGY_TRUST_KEYS),
+    },
+    // The Bridge answers it before the first prompt (two keys, audited);
+    // at run time the resolver leaves it to a person.
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::Any,
+        kind: Some("trust"),
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(
             "Claude Code's trust dialog is the Bridge's startup answer: a person answers it later",
         ),
-        // Rows whose screen nobody has captured working yet.
-        (
-            "claude",
-            None | Some("bash_permission_prompt" | "generic_permission_prompt"),
-            "permission",
-        )
-        | ("agy", Some("permission_prompt" | "question_prompt"), _)
-        | (
-            "claude",
-            Some("live_blocked_form" | "mcp_elicitation_prompt" | "dynamic_workflow_prompt"),
-            _,
-        )
-        | ("codex", Some("trust_directory" | "startup_update" | "live_strong_blocker"), _)
-        | ("opencode", Some("permission_required"), _) => Answer::Escalate(UNCAPTURED),
-        _ => Answer::Escalate("no row of the resolver's table covers this dialog"),
+    },
+    // Rows whose screen nobody has captured working yet.
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::None,
+        kind: Some("permission"),
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::Exact("bash_permission_prompt"),
+        kind: Some("permission"),
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::Exact("generic_permission_prompt"),
+        kind: Some("permission"),
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "agy",
+        rule: RuleMatch::Exact("permission_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "agy",
+        rule: RuleMatch::Exact("question_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::Exact("live_blocked_form"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::Exact("mcp_elicitation_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "claude",
+        rule: RuleMatch::Exact("dynamic_workflow_prompt"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "codex",
+        rule: RuleMatch::Exact("trust_directory"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "codex",
+        rule: RuleMatch::Exact("startup_update"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "codex",
+        rule: RuleMatch::Exact("live_strong_blocker"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+    DialogRule {
+        engine: "opencode",
+        rule: RuleMatch::Exact("permission_required"),
+        kind: None,
+        guard: DialogGuard::Always,
+        outcome: DialogOutcome::Escalate(UNCAPTURED),
+    },
+];
+
+/// Evaluate a slice of declarative [`DialogRule`] rows for `(engine, dialog, workspace)`.
+pub fn eval_dialog_rules(
+    rules: &[DialogRule],
+    engine: &str,
+    dialog: &Dialog<'_>,
+    workspace: &WorkspaceId,
+) -> Answer {
+    for row in rules {
+        if row.engine != engine {
+            continue;
+        }
+        let rule_matches = match row.rule {
+            RuleMatch::Any => true,
+            RuleMatch::None => dialog.rule.is_none(),
+            RuleMatch::Exact(id) => dialog.rule == Some(id),
+        };
+        if !rule_matches || row.kind.is_some_and(|kind| dialog.kind != kind) {
+            continue;
+        }
+        match row.guard {
+            DialogGuard::Always => {}
+            DialogGuard::WorkspaceTrustedFolder { mismatch_reason } => {
+                let folder = workspace.path().trim_end_matches('/');
+                let shown = dialog
+                    .body
+                    .iter()
+                    .any(|line| line.trim().trim_end_matches('/') == folder);
+                let trusting = dialog
+                    .cursor
+                    .is_some_and(|cursor| cursor.trim() == "Yes, I trust this folder");
+                if !shown || !trusting {
+                    return Answer::Escalate(mismatch_reason);
+                }
+            }
+        }
+        return match row.outcome {
+            DialogOutcome::Keys(keys) => Answer::Keys(keys),
+            DialogOutcome::Escalate(reason) => Answer::Escalate(reason),
+        };
     }
+    Answer::Escalate("no row of the resolver's table covers this dialog")
+}
+
+/// Look up `(engine, dialog)` in [`DIALOG_RULES`].
+pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) -> Answer {
+    eval_dialog_rules(DIALOG_RULES, engine, dialog, workspace)
 }
 
 /// Screens no key may answer: the engine cannot go on without a person
 /// (design section 6.3, "Hard blocks"). Lowercased text; every one is from
 /// the engines' own strings and docs, none captured on a live pane yet.
-const HARD_BLOCKS: [(&str, &str); 12] = [
-    ("please run /login", "login required"),
-    ("login required", "login required"),
-    ("not logged in", "login required"),
-    ("oauth token has expired", "login expired"),
-    ("authentication_error", "login expired"),
-    ("rate limit reached", "rate limit"),
-    ("rate_limit_error", "rate limit"),
-    ("usage limit reached", "quota reached"),
-    ("quota exceeded", "quota reached"),
-    ("resource_exhausted", "quota reached"),
-    ("update required", "update required"),
-    ("please update to continue", "update required"),
+pub const HARD_BLOCK_RULES: &[HardBlockRule] = &[
+    HardBlockRule {
+        needle: "please run /login",
+        reason: "login required",
+    },
+    HardBlockRule {
+        needle: "login required",
+        reason: "login required",
+    },
+    HardBlockRule {
+        needle: "not logged in",
+        reason: "login required",
+    },
+    HardBlockRule {
+        needle: "oauth token has expired",
+        reason: "login expired",
+    },
+    HardBlockRule {
+        needle: "authentication_error",
+        reason: "login expired",
+    },
+    HardBlockRule {
+        needle: "rate limit reached",
+        reason: "rate limit",
+    },
+    HardBlockRule {
+        needle: "rate_limit_error",
+        reason: "rate limit",
+    },
+    HardBlockRule {
+        needle: "usage limit reached",
+        reason: "quota reached",
+    },
+    HardBlockRule {
+        needle: "quota exceeded",
+        reason: "quota reached",
+    },
+    HardBlockRule {
+        needle: "resource_exhausted",
+        reason: "quota reached",
+    },
+    HardBlockRule {
+        needle: "update required",
+        reason: "update required",
+    },
+    HardBlockRule {
+        needle: "please update to continue",
+        reason: "update required",
+    },
 ];
 
-/// Why the pane's tail is a hard block, if it is one: a login required or
-/// expired, a quota or rate limit reached, an update the engine needs
-/// before it runs, or a dialog whose only choices exit. Read from the last
-/// [`crate::screen::TAIL_LINES`] lines only; the resolver escalates it at
-/// once and never presses a key.
-pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
+/// Evaluate [`HARD_BLOCK_RULES`] (or exit-only dialog choices) on `pane`.
+pub fn eval_hard_block_rules(
+    rules: &[HardBlockRule],
+    pane: &str,
+    choices: &[String],
+) -> Option<&'static str> {
     let lines: Vec<&str> = pane.lines().collect();
     let tail = lines[lines.len().saturating_sub(crate::screen::TAIL_LINES)..]
         .join("\n")
         .to_lowercase();
-    if let Some((_, why)) = HARD_BLOCKS.iter().find(|(text, _)| tail.contains(text)) {
-        return Some(why);
+    if let Some(rule) = rules.iter().find(|rule| tail.contains(rule.needle)) {
+        return Some(rule.reason);
     }
     let exits = |label: &String| {
         let lower = label.to_lowercase();
@@ -540,6 +761,15 @@ pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
         })
     };
     (!choices.is_empty() && choices.iter().all(exits)).then_some("only exit choices")
+}
+
+/// Why the pane's tail is a hard block, if it is one: a login required or
+/// expired, a quota or rate limit reached, an update the engine needs
+/// before it runs, or a dialog whose only choices exit. Read from the last
+/// [`crate::screen::TAIL_LINES`] lines only; the resolver escalates it at
+/// once and never presses a key.
+pub fn hard_block(pane: &str, choices: &[String]) -> Option<&'static str> {
+    eval_hard_block_rules(HARD_BLOCK_RULES, pane, choices)
 }
 
 /// Claude Code, interactive in a terminal: everything it does is the
@@ -1696,6 +1926,44 @@ mod tests {
         assert_eq!(
             AgyDriver.transcript_path_for(&shared, &ws, Some("agent_1"), "conv-1"),
             "/data01/agy/brain/conv-1/.system_generated/logs/transcript_full.jsonl"
+        );
+    }
+
+    #[test]
+    fn declarative_dialog_and_hard_block_tables_match_driver_defaults() {
+        use super::{
+            DIALOG_RULES, DialogGuard, DialogOutcome, HARD_BLOCK_RULES, eval_dialog_rules,
+            eval_hard_block_rules, hard_block, table_answer,
+        };
+        let agy = AgyDriver;
+        let claude = ClaudeDriver;
+        assert_eq!(agy.dialog_rules(), DIALOG_RULES);
+        assert_eq!(claude.dialog_rules(), DIALOG_RULES);
+        assert_eq!(agy.hard_block_rules(), HARD_BLOCK_RULES);
+        assert_eq!(claude.hard_block_rules(), HARD_BLOCK_RULES);
+        assert!(DIALOG_RULES.iter().any(|row| row.engine == "agy"
+            && matches!(row.guard, DialogGuard::WorkspaceTrustedFolder { .. })
+            && matches!(row.outcome, DialogOutcome::Keys(_))));
+        let choices = strings(&["Yes, I trust this folder", "No, exit"]);
+        let body = strings(&["/workspaces/agent_a"]);
+        let trust = dialog(
+            Some("trust_prompt"),
+            "trust",
+            Some("Yes, I trust this folder"),
+            &choices,
+            &body,
+        );
+        assert_eq!(
+            agy.dialog_answer(&trust, &ws()),
+            eval_dialog_rules(DIALOG_RULES, "agy", &trust, &ws())
+        );
+        assert_eq!(
+            table_answer("claude", &trust, &ws()),
+            claude.dialog_answer(&trust, &ws())
+        );
+        assert_eq!(
+            hard_block("Please run /login", &[]),
+            eval_hard_block_rules(HARD_BLOCK_RULES, "Please run /login", &[])
         );
     }
 }

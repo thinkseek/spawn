@@ -1,16 +1,11 @@
-//! Host adapters: embedded `herdr-core` / legacy `herdr` (default) and tmux terminals, the workspace stores (Git, the opt-in
+//! Host adapters: embedded `herdr-core` / legacy `herdr` terminals, the workspace stores (Git, the opt-in
 //! copy-on-write and overlay stores, behind one [`LocalWorkspaceStore`]),
 //! the artifact deduplicator, the local transcript archive, and the
 //! filesystem view (`bwrap`) an engine without deny rules runs in.
 //!
-//! The tmux and git adapters call an external program and read its exit
-//! code, so they share the same failure rules as the programs they wrap.
-//!
-//! What either program answers is read the same on every host, whatever its
-//! locale. git runs in the C locale ([`git_command`]). tmux is given none:
-//! it has no translations (its messages and the system errors it quotes
-//! are English under any `LANG`), and a locale given to the command that
-//! starts its server would reach every pane, the engine's included.
+//! The Herdr and git adapters wrap external binaries (`spawn-hc` / `herdr`,
+//! `git`) and apply uniform locale and error handling (`git` runs in the C
+//! locale via [`git_command`]).
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalError;
@@ -40,7 +35,7 @@ pub mod process;
 pub mod root;
 #[cfg(any(test, feature = "testing"))]
 pub mod scratch;
-pub mod tmux;
+mod terminal_support;
 pub mod transcripts;
 pub mod tree_path;
 pub mod watch;
@@ -106,7 +101,6 @@ pub use process::{current_uid, undumpable};
 pub use root::canonical_root;
 #[cfg(any(test, feature = "testing"))]
 pub use scratch::Scratch;
-pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
 pub use watch::InotifyWatch;
 pub use workspace::{
@@ -114,10 +108,8 @@ pub use workspace::{
 };
 
 /// The terminal host of this machine Spawn runs on: embedded `herdr-core`
-/// (`spawn-hc`), legacy `herdr`, pooled shards, or `tmux`
-/// (`SPAWN_TERMINAL_BACKEND=tmux`), told apart only here.
+/// (`spawn-hc`), legacy `herdr`, or pooled shards, told apart only here.
 pub enum LocalTerminalHost {
-    Tmux(TmuxHost),
     Herdr(HerdrHost),
     HerdrCore(HerdrCoreHost),
     HerdrPool(HerdrPool),
@@ -125,11 +117,10 @@ pub enum LocalTerminalHost {
 
 impl LocalTerminalHost {
     /// The same host, reading, restoring and replacing every file below
-    /// `projects` through it ([`TmuxHost::with_files_beneath`]).
+    /// `projects` through it.
     #[must_use]
     pub fn with_files_beneath(self, projects: beneath::Beneath) -> Self {
         match self {
-            Self::Tmux(host) => Self::Tmux(host.with_files_beneath(projects)),
             Self::Herdr(host) => Self::Herdr(host.with_files_beneath(projects)),
             Self::HerdrCore(host) => Self::HerdrCore(host.with_files_beneath(projects)),
             Self::HerdrPool(pool) => Self::HerdrPool(pool.with_files_beneath(projects)),
@@ -138,7 +129,6 @@ impl LocalTerminalHost {
 
     fn inner(&self) -> &dyn spawn_core::port::TerminalHost {
         match self {
-            Self::Tmux(host) => host,
             Self::Herdr(host) => host,
             Self::HerdrCore(host) => host,
             Self::HerdrPool(pool) => pool,

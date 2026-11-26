@@ -1,6 +1,6 @@
 [package]
 name = "spawn-host"
-description = "Host adapters for Spawn: tmux terminals, git workspaces and the transcript archive."
+description = "Host adapters for Spawn: Herdr terminals, git workspaces and the transcript archive."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

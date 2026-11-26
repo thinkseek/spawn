@@ -240,7 +240,15 @@ herdr_terminal_count() {
 }
 
 herdr_pane_pids() {
-    herdr_ls_json | jq -r '(.terminals // [])[] | .pid // empty' 2>/dev/null || true
+    herdr_resolve_bin
+    hs_sock=$(herdr_real_socket)
+    herdr_real_session
+    hs_sess=$hs_real_sess
+    [ -n "$hs_sock" ] && [ -S "$hs_sock" ] || return 0
+    for hs_a in $(herdr_ls_json | jq -r '(.terminals // [])[] | .address // empty' 2>/dev/null || true); do
+        [ -n "$hs_a" ] || continue
+        HC_SOCKET=$hs_sock HC_SESSION=$hs_sess "$SPAWN_HERDR_REAL_CORE_PROGRAM" get "$hs_a" --json 2>/dev/null | jq -r '.pid // empty' || true
+    done
 }
 
 herdr_first_terminal() {

@@ -8,7 +8,7 @@ use spawn_core::port::{TerminalHost, TranscriptArchive};
 
 use super::{Beneath, between_open_and_canonical};
 use crate::home::Home;
-use crate::{LocalTranscriptArchive, Scratch, TmuxHost};
+use crate::{HerdrCoreHost, LocalTranscriptArchive, Scratch};
 
 const NATIVE: &str = "0b7c1d2e-0000-4000-8000-000000000001";
 
@@ -367,8 +367,9 @@ fn a_copy_hard_linked_to_a_file_elsewhere_is_never_written_or_read() {
 }
 
 /// A projects root pinned in a terminal host, and a workspace for it.
-fn host_over(world: &World, projects: &Path) -> (TmuxHost, WorkspaceId) {
-    let host = TmuxHost::local("tmux")
+fn host_over(world: &World, projects: &Path) -> (HerdrCoreHost, WorkspaceId) {
+    let host = HerdrCoreHost::on_session("spawn-hc", "beneath-test")
+        .expect("session")
         .with_files_beneath(Beneath::pinned(projects, &world.home).expect("pinned"));
     let workspace = WorkspaceId::new(format!("w:{}", world.root().display())).expect("workspace");
     (host, workspace)
@@ -478,7 +479,8 @@ fn a_native_transcript_inside_the_workspace_is_read_through_the_pinned_projects_
     let transcript = projects.join("-w/n.jsonl");
     std::fs::write(&transcript, b"line\n").expect("transcript");
     std::fs::write(workspace_dir.join("status"), b"0\n").expect("status");
-    let host = TmuxHost::local("tmux")
+    let host = HerdrCoreHost::on_session("spawn-hc", "beneath-test")
+        .expect("session")
         .with_files_beneath(Beneath::pinned(&projects, &world.home).expect("pinned"));
     let workspace = WorkspaceId::new(format!("w:{}", workspace_dir.display())).expect("workspace");
     let path = transcript.display().to_string();

@@ -52,3 +52,32 @@ alerts::guardrails::tests::a_taken_judged_stretch_ends_like_any_other
 # serve::core_lines::disk::tests::the_days_fall_windows_are_six_hours_each.
 serve::core_lines::disk::tests::the_days_fall_is_from_the_latest_sample_a_day_old_not_the_oldest
 serve::core_lines::disk::tests::the_days_fall_takes_36_hours_exactly_and_nothing_older
+#
+# Single Herdr terminal backend convergence (#113): tmux.rs, TmuxHost, and TerminalBackend::Tmux removed.
+# Shared non-tmux helpers and 8 generic tests moved to terminal_support::tests::* (among them
+# terminal_support::tests::the_controllers_settings_stay_out_of_terminal_hosts); strictly tmux-specific
+# unit and integration tests were removed or migrated to HerdrCoreHost equivalents in tests/{api,runner}.rs.
+tmux::tests::a_detached_process_beneath_the_workspace_is_ended_by_pid
+tmux::tests::a_file_is_replaced_whole_only_by_more_and_only_as_it_was_read
+tmux::tests::a_leaders_directory_others_could_write_is_never_used
+tmux::tests::a_pane_hosts_its_runner_only_when_this_host_launched_it_and_it_lives
+tmux::tests::a_read_returns_at_most_the_limit_from_the_offset
+tmux::tests::a_recorded_leader_names_only_the_terminal_s_own_session
+tmux::tests::a_server_is_named_by_its_pid_and_start_time
+tmux::tests::a_workspace_file_behind_a_symlinked_directory_is_refused
+tmux::tests::an_agent_planted_fifo_or_symlink_is_refused_without_blocking
+tmux::tests::list_dirs_gives_plain_subdirectories_newest_first
+tmux::tests::only_a_narrow_directory_is_swept
+tmux::tests::the_controllers_settings_stay_out_of_tmux
+tmux::tests::tmux_says_a_terminal_is_gone_alike_in_a_translated_locale
+config::tests::the_terminal_backend_is_tmux_unless_herdr_is_asked_for
+a_capture_from_a_tmux_that_never_answers_fails_in_time
+a_host_on_a_socket_runs_tmux_on_that_server
+tmux_is_installed
+tmux_matches_the_session_name_exactly
+tmux_presses_the_digit_keys_of_a_numbered_prompt
+tmux_rejects_a_duplicate_terminal
+tmux_stages_a_text_longer_than_its_message_size
+tmux_starts_in_the_launch_directory
+tmux_types_into_a_terminal_and_sees_the_echo
+a_launch_is_asked_again_only_of_a_server_that_left

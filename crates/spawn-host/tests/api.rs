@@ -1,19 +1,22 @@
 //! Public API tests for spawn-host.
 //!
-//! The git store runs against a real repository in a scratch directory. tmux
-//! is real and runs on a private socket so the test never touches an existing
-//! server.
+//! The git store runs against a real repository in a scratch directory. Embedded
+//! `herdr-core` (`spawn-hc`) runs on isolated private sessions/runtime dirs so
+//! no test touches another server.
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use spawn_core::contract;
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
-use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
-use spawn_host::{GitWorkspace, Scratch, TmuxHost};
+use spawn_core::port::{
+    Commit, Launch, Runner, ServerSeen, TerminalError, TerminalHost, WorkspaceStore,
+};
+use spawn_host::{GitWorkspace, HerdrCoreHost, Scratch};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -27,19 +30,35 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn spawn_hc_program() -> String {
+    if let Some(prog) = std::env::var_os("SPAWN_HERDR_CORE_PROGRAM")
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+    {
+        return prog;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for dir in [exe.parent(), exe.parent().and_then(Path::parent)]
+            .into_iter()
+            .flatten()
+        {
+            let candidate = dir.join("spawn-hc");
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    "spawn-hc".to_string()
+}
+
 /// Start a session, retrying while the kernel reports `Text file busy`.
-///
-/// Under load `exec` of a script written moments earlier can fail with
-/// `Text file busy` (os error 26). The cause is not established; it is not
-/// reproducible in 20 serial or parallel runs. Only that error is retried, so
-/// every real start failure still surfaces immediately.
-fn start_session(host: &TmuxHost, launch: &Launch) -> Result<(), TerminalError> {
+fn start_session(host: &HerdrCoreHost, launch: &Launch) -> Result<(), TerminalError> {
     let mut last = None;
     for _ in 0..20 {
         match host.start(launch) {
             Err(error) if error.0.contains("Text file busy") => {
                 last = Some(error);
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(20));
             }
             other => return other,
         }
@@ -47,27 +66,35 @@ fn start_session(host: &TmuxHost, launch: &Launch) -> Result<(), TerminalError> 
     Err(last.expect("one attempt"))
 }
 
-/// `program`'s host, keeping in `scratch` what it would keep in
-/// `$XDG_RUNTIME_DIR` (backlog S20: no test writes in or removes from the
-/// real one).
-fn host_in(scratch: &Scratch, program: &str) -> TmuxHost {
-    TmuxHost::local(program).with_runtime_under(runtime(scratch))
+/// `program`'s `HerdrCoreHost`, keeping in `scratch` what it would keep in
+/// `$XDG_RUNTIME_DIR`.
+fn host_in(scratch: &Scratch, program: &str, session: &str) -> HerdrCoreHost {
+    HerdrCoreHost::on_session(program, session)
+        .expect("valid session")
+        .with_runtime_under(runtime(scratch))
 }
 
-/// The runtime directory in `scratch`, private (0700) as the real one is.
+/// The runtime directory tree in `scratch`, private (0700) as the real one is.
 fn runtime(scratch: &Scratch) -> PathBuf {
     let directory = scratch.join("run");
-    if !directory.is_dir() {
-        fs::create_dir(&directory).expect("runtime");
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("0700");
+    for sub in ["", "hcr", "hcs", "hcc"] {
+        let dir = if sub.is_empty() {
+            directory.clone()
+        } else {
+            directory.join(sub)
+        };
+        if !dir.is_dir() {
+            fs::create_dir_all(&dir).expect("runtime");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("0700");
+        }
     }
     directory
 }
 
-/// A directory of one test's own (its fake executables, its logs), removed
-/// when the test ends.
+/// A directory of one test's own (short `/var/tmp` path so UDS `sun_path` stays
+/// well within 107 bytes), removed when the test ends.
 fn scratch(tag: &str) -> Scratch {
-    Scratch::new(&format!("spawn-host-test-{tag}"))
+    Scratch::new_in(Path::new("/var/tmp"), &format!("shcapi-{tag}"))
 }
 
 /// Write an executable in `directory` without ever holding the target open.
@@ -421,47 +448,78 @@ fn a_commit_records_the_branch_from_the_identifier() {
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
-/// A tmux program pinned to a private server, which goes when the test does,
-/// even when it panics: no server or socket outlives a test run.
-struct IsolatedTmux {
+/// An embedded `herdr-core` session pinned to its own runtime dir, stopped
+/// when dropped so no daemon or socket outlives a test run.
+struct IsolatedHerdrCore {
     program: String,
-    socket: String,
-    /// The test's scratch (the fake tmux among it), removed after the server.
+    session: String,
     scratch: Scratch,
 }
 
-impl Drop for IsolatedTmux {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .stderr(std::process::Stdio::null())
+impl IsolatedHerdrCore {
+    fn new(tag: &str) -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session = format!("api-{tag}-{}-{n}", std::process::id());
+        let scratch = scratch(&format!("{tag}-{n}"));
+        let _ = runtime(&scratch);
+        Self {
+            program: spawn_hc_program(),
+            session,
+            scratch,
+        }
+    }
+
+    fn host(&self) -> HerdrCoreHost {
+        host_in(&self.scratch, &self.program, &self.session)
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        runtime(&self.scratch)
+            .join("hcs/herdr-core")
+            .join(&self.session)
+    }
+
+    fn stop_daemon(&self) {
+        let rt = runtime(&self.scratch);
+        let mut cmd = Command::new(&self.program);
+        cmd.args(["server", "stop"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_str()
+                .is_some_and(|n| n.starts_with("HERDR_") || n.starts_with("HC_"))
+            {
+                cmd.env_remove(name);
+            }
+        }
+        let _ = cmd
+            .env("XDG_RUNTIME_DIR", rt.join("hcr"))
+            .env("XDG_STATE_HOME", rt.join("hcs"))
+            .env("XDG_CONFIG_HOME", rt.join("hcc"))
+            .env("HC_SESSION", &self.session)
+            .env(
+                "HC_SOCKET",
+                rt.join("hcr").join(format!("{}.sock", self.session)),
+            )
             .status();
-        // tmux leaves the socket file behind; it is this test's own.
-        if let Ok(meta) = fs::metadata("/proc/self") {
-            use std::os::unix::fs::MetadataExt;
-            let dir = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
-            let _ = fs::remove_file(
-                std::path::Path::new(&dir)
-                    .join(format!("tmux-{}", meta.uid()))
-                    .join(&self.socket),
-            );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(self.host().server(), ServerSeen::Answers(_)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
 
-fn isolated_tmux(tag: &str) -> IsolatedTmux {
-    let socket = format!("spawn-host-test-{tag}-{}", std::process::id());
-    let scratch = scratch(tag);
-    let program = script(
-        &scratch,
-        &format!("fake-tmux-{tag}"),
-        &format!("#!/bin/sh\nexec tmux -L {socket} \"$@\"\n"),
-    );
-    IsolatedTmux {
-        program,
-        socket,
-        scratch,
+impl Drop for IsolatedHerdrCore {
+    fn drop(&mut self) {
+        self.stop_daemon();
     }
+}
+
+fn isolated_herdr_core(tag: &str) -> IsolatedHerdrCore {
+    IsolatedHerdrCore::new(tag)
 }
 
 fn terminal(name: &str) -> TerminalName {
@@ -483,11 +541,34 @@ fn launch(name: &TerminalName) -> Launch {
     }
 }
 
+fn capture_until(
+    host: &HerdrCoreHost,
+    name: &TerminalName,
+    needle: &str,
+    min_matches: usize,
+    limit: Duration,
+) -> String {
+    let deadline = Instant::now() + limit;
+    let mut pane = String::new();
+    loop {
+        if let Ok(captured) = host.capture_tail(name, &workspace(), 20) {
+            pane = captured;
+            if pane.matches(needle).count() >= min_matches {
+                return pane;
+            }
+        }
+        if Instant::now() >= deadline {
+            return pane;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
-fn tmux_types_into_a_terminal_and_sees_the_echo() {
+fn herdr_core_types_into_a_terminal_and_sees_the_echo() {
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("echo");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("echo");
+    let host = hc.host();
     let name = terminal("echo");
     start_session(&host, &launch(&name)).expect("start succeeds");
 
@@ -497,23 +578,16 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     );
     host.submit_text(&name, &workspace(), "hello from spawn")
         .expect("submit succeeds");
-    let pane = host
-        .capture_tail(&name, &workspace(), 20)
-        .expect("capture succeeds");
+    let pane = capture_until(&host, &name, "hello from spawn", 1, Duration::from_secs(5));
     assert!(pane.contains("hello from spawn"), "pane: {pane}");
 
-    // One call answers for the whole fleet: the session here, and one that
-    // is not there.
     let missing = terminal("missing");
     let states = host
         .runners(&[(name.clone(), workspace()), (missing.clone(), workspace())])
         .expect("runners succeeds");
     assert_eq!(
         states,
-        vec![
-            (name.clone(), spawn_core::port::Runner::Running),
-            (missing, spawn_core::port::Runner::Gone),
-        ]
+        vec![(name.clone(), Runner::Running), (missing, Runner::Gone),]
     );
 
     host.terminate(&name, &workspace())
@@ -527,19 +601,18 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     let states = host
         .runners(&[(name.clone(), workspace())])
         .expect("runners after terminate");
-    assert_eq!(states, vec![(name, spawn_core::port::Runner::Gone)]);
+    assert_eq!(states, vec![(name, Runner::Gone)]);
 }
 
 /// The digit keys a person presses on a numbered permission prompt (spawn-
-/// core `NamedKey::Digit1` to `Digit3`, issue #91) reach the pane through
-/// tmux's `send-keys` as the digits themselves, one per call, and Enter ends
-/// the line: `/bin/cat` echoes `123` back.
+/// core `NamedKey::Digit1` to `Digit3`) reach the pane and Enter ends the
+/// line: `/bin/cat` echoes `123` back.
 #[test]
-fn tmux_presses_the_digit_keys_of_a_numbered_prompt() {
+fn herdr_core_presses_the_digit_keys_of_a_numbered_prompt() {
     use spawn_core::command::NamedKey;
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("digits");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("digits");
+    let host = hc.host();
     let name = terminal("digits");
     start_session(&host, &launch(&name)).expect("start succeeds");
     let keys: Vec<&str> = [
@@ -553,36 +626,24 @@ fn tmux_presses_the_digit_keys_of_a_numbered_prompt() {
     .collect();
     assert_eq!(keys, ["1", "2", "3", "Enter"]);
     host.send_keys(&name, &workspace(), &keys)
-        .expect("tmux takes every digit key");
-    let mut pane = String::new();
-    for _ in 0..50 {
-        pane = host
-            .capture_tail(&name, &workspace(), 20)
-            .expect("capture succeeds");
-        if pane.matches("123").count() >= 2 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        .expect("herdr-core takes every digit key");
+    let pane = capture_until(&host, &name, "123", 2, Duration::from_secs(5));
     // The terminal's echo of the typed line, then cat's copy of it.
     assert!(pane.matches("123").count() >= 2, "pane: {pane}");
     host.terminate(&name, &workspace())
         .expect("terminate succeeds");
 }
 
-/// A prompt longer than tmux's message size (16 KiB; an objective's brief
-/// can be) is staged and pasted whole: `set-buffer <text>` refused it as
-/// "command too long", and the dispatcher retried that refusal forever.
+/// A long prompt (~41 KiB) is staged and pasted whole across chunks.
 #[test]
-fn tmux_stages_a_text_longer_than_its_message_size() {
+fn herdr_core_stages_a_text_longer_than_its_message_size() {
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("long");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("long");
+    let host = hc.host();
     let name = terminal("long");
     start_session(&host, &launch(&name)).expect("start succeeds");
 
-    // Short lines: the test's /bin/cat reads a terminal in canonical mode,
-    // which caps one line at 4 KiB; the engine reads raw, as one paste.
+    // Short lines: `/bin/cat` reads a terminal in canonical mode (4 KiB line limit).
     let text = format!(
         "{}LONG-TEXT-END",
         format!("{}\n", "x".repeat(99)).repeat(410)
@@ -591,17 +652,7 @@ fn tmux_stages_a_text_longer_than_its_message_size() {
         .expect("a 40 KiB text stages");
     host.submit_staged(&name, &workspace())
         .expect("the staged text is pasted");
-    // The pane echoes 40 KiB: wait for its end to show, at most 10 s.
-    let mut pane = String::new();
-    for _ in 0..100 {
-        pane = host
-            .capture_tail(&name, &workspace(), 20)
-            .expect("capture succeeds");
-        if pane.contains("LONG-TEXT-END") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let pane = capture_until(&host, &name, "LONG-TEXT-END", 1, Duration::from_secs(10));
     assert!(pane.contains("LONG-TEXT-END"), "pane tail: {pane}");
 
     host.terminate(&name, &workspace())
@@ -609,27 +660,26 @@ fn tmux_stages_a_text_longer_than_its_message_size() {
 }
 
 /// Audit G: a launch's environment (a database login among it) never goes
-/// on tmux's command line, which every local user reads in /proc. The pane
-/// still gets every value exactly, and the file that carried them is gone.
+/// on `spawn-hc`'s command line, which every local user reads in /proc. The
+/// pane still gets every value exactly, and the file that carried them is gone.
 #[test]
 fn a_launchs_environment_never_reaches_a_command_line() {
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("environment");
-    let argv = tmux.scratch.join("environment-argv.log");
-    let out = tmux.scratch.join("environment-out.txt");
+    let hc = isolated_herdr_core("environment");
+    let argv = hc.scratch.join("environment-argv.log");
+    let out = hc.scratch.join("environment-out.txt");
     let _ = fs::remove_file(&argv);
     let _ = fs::remove_file(&out);
-    // A tmux that records every command line it is given.
     let logging = script(
-        &tmux.scratch,
-        "logging-tmux-environment",
+        &hc.scratch,
+        "logging-hc-environment",
         &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
             argv.display(),
-            tmux.program
+            hc.program
         ),
     );
-    let host = host_in(&tmux.scratch, &logging);
+    let host = host_in(&hc.scratch, &logging, &hc.session);
     let name = terminal("environment");
     let mut launched = launch(&name);
     let secret = "postgres://spawn_supervisor_x:s3cret-0f9a@127.0.0.1:5432/spawn";
@@ -653,7 +703,7 @@ fn a_launchs_environment_never_reaches_a_command_line() {
         if !seen.is_empty() {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
     host.terminate(&name, &workspace()).expect("clean up");
     assert_eq!(
@@ -664,14 +714,13 @@ fn a_launchs_environment_never_reaches_a_command_line() {
     let lines = fs::read_to_string(&argv).expect("the command lines");
     assert!(
         !lines.contains("s3cret-0f9a"),
-        "a secret on tmux's command line"
+        "a secret on spawn-hc's command line"
     );
     assert!(
         !lines.contains("second line"),
-        "a value on tmux's command line"
+        "a value on spawn-hc's command line"
     );
-    let directory = runtime(&tmux.scratch);
-    let left: Vec<_> = fs::read_dir(&directory)
+    let left: Vec<_> = fs::read_dir(hc.state_dir())
         .expect("read the directory")
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -685,10 +734,10 @@ fn a_launchs_environment_never_reaches_a_command_line() {
 }
 
 #[test]
-fn tmux_rejects_a_duplicate_terminal() {
+fn herdr_core_rejects_a_duplicate_terminal() {
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("dup");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("dup");
+    let host = hc.host();
     let name = terminal("dup");
     start_session(&host, &launch(&name)).expect("start succeeds");
     let error = host
@@ -699,10 +748,10 @@ fn tmux_rejects_a_duplicate_terminal() {
 }
 
 #[test]
-fn tmux_matches_the_session_name_exactly() {
+fn herdr_core_matches_the_terminal_name_exactly() {
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("exact");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("exact");
+    let host = hc.host();
     let first = terminal("a");
     let second = terminal("ab");
     for name in [&first, &second] {
@@ -719,27 +768,17 @@ fn tmux_matches_the_session_name_exactly() {
 }
 
 #[test]
-fn tmux_starts_in_the_launch_directory() {
+fn herdr_core_starts_in_the_launch_directory() {
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("cwd");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("cwd");
+    let host = hc.host();
     let name = terminal("cwd");
     let mut started = launch(&name);
     started.program = "/bin/sh".to_string();
     started.arguments = vec!["-c".to_string(), "pwd; exec cat".to_string()];
     started.cwd = "/tmp".to_string();
     start_session(&host, &started).expect("start succeeds");
-    // The shell prints after tmux returns; poll instead of racing it.
-    let mut pane = String::new();
-    for _ in 0..50 {
-        pane = host
-            .capture_tail(&name, &workspace(), 20)
-            .expect("capture succeeds");
-        if pane.contains("/tmp") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(40));
-    }
+    let pane = capture_until(&host, &name, "/tmp", 1, Duration::from_secs(5));
     assert!(pane.contains("/tmp"), "pane: {pane}");
     host.terminate(&name, &workspace()).expect("clean up");
 }
@@ -751,7 +790,7 @@ fn files_are_written_new_on_the_host() {
     let scratch = scratch("write-new");
     let directory = scratch.join("write-new");
     let _ = fs::remove_dir_all(&directory);
-    let local = host_in(&scratch, "tmux");
+    let local = host_in(&scratch, &spawn_hc_program(), "api-files");
     contract::terminal_files("local", &local, &directory.to_string_lossy());
     let big: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
     let path = directory.join("local/big.jsonl");
@@ -774,59 +813,77 @@ fn files_are_written_new_on_the_host() {
     fs::remove_dir_all(&directory).expect("clean up");
 }
 
-/// A host on a socket runs every tmux call on that server (`tmux -L`).
+/// A host pinned to a named session runs `herdr-core` on that session's own
+/// socket and stays isolated from any other session under the same runtime.
 #[test]
-fn a_host_on_a_socket_runs_tmux_on_that_server() {
+fn a_host_on_a_session_runs_herdr_core_on_that_server() {
     let _exclusive = exclusive();
-    let socket = format!("spawn-host-test-socket-{}", std::process::id());
-    let server = IsolatedTmux {
-        program: String::new(),
-        socket: socket.clone(),
-        scratch: scratch("socket"),
-    };
-    let calls = server.scratch.join("tmux-socket-calls.log");
+    let hc = isolated_herdr_core("session");
+    let calls = hc.scratch.join("hc-session-calls.log");
     let _ = fs::remove_file(&calls);
     let logging = script(
-        &server.scratch,
-        "fake-tmux-socket",
+        &hc.scratch,
+        "logging-hc-session",
         &format!(
-            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux \"$@\"\n",
-            calls = calls.display()
+            "#!/bin/sh\nprintf 'session=%s %s\\n' \"$HC_SESSION\" \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            calls.display(),
+            hc.program
         ),
     );
-    let host = TmuxHost::on_socket(&logging, Some(socket.clone()))
-        .with_runtime_under(runtime(&server.scratch));
-    let name = terminal("socket");
-    start_session(&host, &launch(&name)).expect("start on the socket");
+    let host = host_in(&hc.scratch, &logging, &hc.session);
+    let other_session = format!("{}-other", hc.session);
+    let other = host_in(&hc.scratch, &hc.program, &other_session);
+    let name = terminal("session");
+    start_session(&host, &launch(&name)).expect("start on the session");
     assert!(host.is_alive(&name, &workspace()).expect("is_alive"));
+    assert!(!other.is_alive(&name, &workspace()).expect("other isolated"));
     host.terminate(&name, &workspace()).expect("terminate");
     let log = fs::read_to_string(&calls).expect("read the call log");
+    let expected_prefix = format!("session={} ", hc.session);
     assert_eq!(
         log.lines()
-            .filter(|line| !line.starts_with(&format!("tmux -L {socket} ")))
+            .filter(|line| !line.starts_with(&expected_prefix))
             .count(),
         0,
         "{log}"
     );
-    assert!(log.contains("new-session"), "{log}");
+    assert!(log.contains("server"), "{log}");
 }
 
-/// A capture from a tmux that never answers fails within its bound
-/// instead of holding the caller.
+/// A capture from a `herdr-core` socket that accepts connections without
+/// answering fails within its RPC timeout bound.
 #[test]
-fn a_capture_from_a_tmux_that_never_answers_fails_in_time() {
+fn a_capture_from_a_herdr_core_that_never_answers_fails_in_time() {
+    use std::os::unix::net::UnixListener;
     let _exclusive = exclusive();
-    let scratch = scratch("hung");
-    let hung = script(&scratch, "fake-tmux-hung", "#!/bin/sh\nexec sleep 60\n");
-    let host = host_in(&scratch, &hung);
-    let started = std::time::Instant::now();
-    let captured = host.capture_tail(&terminal("hung"), &workspace(), 20);
+    let hc = isolated_herdr_core("hung");
+    let host = hc.host();
+    let name = terminal("hung");
+    start_session(&host, &launch(&name)).expect("seed live record");
+    // Stop the real daemon while leaving its `terminals/spawn-hung` record in place,
+    // then bind a silent Unix socket so RPC requests accept and hang.
+    hc.stop_daemon();
+    let sock = runtime(&hc.scratch)
+        .join("hcr")
+        .join(format!("{}.sock", hc.session));
+    let _ = fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind silent listener");
+    let accept_thread = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(Duration::from_secs(25));
+            drop(stream);
+        }
+    });
+    let started = Instant::now();
+    let captured = host.capture_tail(&name, &workspace(), 20);
     let took = started.elapsed();
     assert!(
-        matches!(&captured, Err(TerminalError(text)) if text.contains("did not answer")),
+        matches!(&captured, Err(TerminalError(text)) if !text.is_empty()),
         "{captured:?}"
     );
-    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    assert!(took < Duration::from_secs(20), "took {took:?}");
+    let _ = fs::remove_file(&sock);
+    drop(accept_thread);
 }
 
 /// The real adapters obey the same contract as the memory fake the Bridge
@@ -836,25 +893,21 @@ fn the_adapters_pass_the_shared_contract() {
     let _exclusive = exclusive();
     let (_scratch, repo, root) = repository("contract");
     contract::workspace_store("host_ws", &GitWorkspace::new(&repo, &root));
-    let tmux = isolated_tmux("contract");
-    let host = host_in(&tmux.scratch, &tmux.program);
-    // A second session keeps the private server up: killing its last session
-    // shuts it down, and a `has-session` racing that shutdown fails with
-    // "server exited unexpectedly" instead of reporting the terminal gone.
-    let holder = terminal("contract-holder");
-    start_session(&host, &launch(&holder)).expect("start the holder");
+    let hc = isolated_herdr_core("contract");
+    let host = hc.host();
     contract::terminal("host_tty", &host);
-    host.terminate(&holder, &workspace()).expect("clean up");
 }
 
-/// tmux must exist: a silent skip would hide a broken host.
+/// `spawn-hc` must exist beside the test binaries or on `PATH`.
 #[test]
-fn tmux_is_installed() {
+fn spawn_hc_is_available() {
     let _exclusive = exclusive();
-    let status = Command::new("tmux")
-        .arg("-V")
+    let status = Command::new(spawn_hc_program())
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .expect("tmux is installed on the test machine");
+        .expect("spawn-hc is available on the test machine");
     assert!(status.success());
 }
 
@@ -864,10 +917,9 @@ fn tmux_is_installed() {
 /// starts one (objective 44).
 #[test]
 fn a_terminal_server_is_told_by_its_identity_and_asking_never_starts_one() {
-    use spawn_core::port::ServerSeen;
     let _exclusive = exclusive();
-    let tmux = isolated_tmux("server");
-    let host = host_in(&tmux.scratch, &tmux.program);
+    let hc = isolated_herdr_core("server");
+    let host = hc.host();
     assert_eq!(host.server(), ServerSeen::Gone);
     assert!(!host.server_alive());
     // Asking twice started nothing.
@@ -876,7 +928,7 @@ fn a_terminal_server_is_told_by_its_identity_and_asking_never_starts_one() {
     let name = terminal("server-first");
     start_session(&host, &launch(&name)).expect("start the first server");
     let ServerSeen::Answers(Some(first)) = host.server() else {
-        panic!("a running tmux names its server: {:?}", host.server());
+        panic!("a running herdr-core names its server: {:?}", host.server());
     };
     assert!(host.server_alive());
     assert!(first.pid > 0);
@@ -889,15 +941,15 @@ fn a_terminal_server_is_told_by_its_identity_and_asking_never_starts_one() {
     // The same server, asked again, is the same.
     assert_eq!(host.server(), ServerSeen::Answers(Some(first)));
 
-    // The server goes, as a host restart takes it; a new one starts.
-    let _ = Command::new("tmux")
-        .args(["-L", &tmux.socket, "kill-server"])
-        .status();
+    // The server stops; a new start brings up a fresh server identity.
+    host.terminate(&name, &workspace())
+        .expect("terminate first");
+    hc.stop_daemon();
     assert_eq!(host.server(), ServerSeen::Gone);
     let again = terminal("server-second");
     start_session(&host, &launch(&again)).expect("start a new server");
     let ServerSeen::Answers(Some(second)) = host.server() else {
-        panic!("the new tmux names its server: {:?}", host.server());
+        panic!("the new herdr-core names its server: {:?}", host.server());
     };
     assert_ne!(second, first, "a new server is another server");
     host.terminate(&again, &workspace()).expect("clean up");

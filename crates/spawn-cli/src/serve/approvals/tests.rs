@@ -261,7 +261,7 @@ fn pane(session: &str, text: &str, judgement: Value) -> Pane {
     Pane {
         session_id: session.to_string(),
         agent_id: session.replace("session_", "agent_"),
-        backend: Some("tmux"),
+        backend: Some("herdr"),
         text: text.to_string(),
         judgement,
     }
@@ -293,7 +293,7 @@ fn the_items_are_the_prompts_the_asking_judgements_and_the_halted_missions() {
     let first = &listed[0];
     assert_eq!(first["session_id"], "session_worker_a");
     assert_eq!(first["agent_id"], "agent_worker_a");
-    assert_eq!(first["backend"], "tmux");
+    assert_eq!(first["backend"], "herdr");
     assert_eq!(first["detected_at_ms"], 1_000);
     assert_eq!(first["options"][1]["keys"], json!(["digit2"]));
     assert_eq!(first["options"][1]["danger"], true);

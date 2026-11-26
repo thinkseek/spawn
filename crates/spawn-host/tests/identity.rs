@@ -25,7 +25,7 @@ use spawn_core::id::{AgentId, BranchName, IdempotencyKey, Principal, SessionId, 
 use spawn_core::memory::MemoryStore;
 use spawn_core::port::{CommandQueue, Commit, EventLog, TerminalHost, WorkspaceStore};
 use spawn_core::time::{ManualClock, Timestamp};
-use spawn_host::{GitWorkspace, TmuxHost};
+use spawn_host::{GitWorkspace, HerdrCoreHost, Scratch};
 
 /// Serialize the external programs of this test binary (see api.rs: a fork
 /// inherits the write handle of a script another thread is creating).
@@ -227,17 +227,94 @@ fn script(directory: &Path, name: &str, body: &str) -> String {
     target.display().to_string()
 }
 
-/// A tmux server of this test's own, killed when dropped.
+fn spawn_hc_program() -> String {
+    if let Some(prog) = std::env::var_os("SPAWN_HERDR_CORE_PROGRAM")
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+    {
+        return prog;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for dir in [exe.parent(), exe.parent().and_then(Path::parent)]
+            .into_iter()
+            .flatten()
+        {
+            let candidate = dir.join("spawn-hc");
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    "spawn-hc".to_string()
+}
+
+/// An isolated embedded `herdr-core` server of this test's own, stopped when dropped.
 struct Server {
     program: String,
-    socket: String,
+    session: String,
+    scratch: Scratch,
+}
+
+impl Server {
+    fn new(tag: &str) -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session = format!("id-{tag}-{}-{n}", std::process::id());
+        // Short `/var/tmp` path keeps Unix socket paths well below 107 bytes.
+        let scratch = Scratch::new_in(Path::new("/var/tmp"), &format!("shcid-{n}"));
+        let rt = scratch.join("run");
+        for sub in ["", "hcr", "hcs", "hcc"] {
+            let dir = if sub.is_empty() {
+                rt.clone()
+            } else {
+                rt.join(sub)
+            };
+            fs::create_dir_all(&dir).expect("runtime");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("0700");
+        }
+        Self {
+            program: spawn_hc_program(),
+            session,
+            scratch,
+        }
+    }
+
+    fn runtime(&self) -> PathBuf {
+        self.scratch.join("run")
+    }
+
+    fn host(&self) -> HerdrCoreHost {
+        HerdrCoreHost::on_session(&self.program, &self.session)
+            .expect("valid session")
+            .with_runtime_under(self.runtime())
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .stderr(std::process::Stdio::null())
+        let rt = self.runtime();
+        let mut cmd = Command::new(&self.program);
+        cmd.args(["server", "stop"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_str()
+                .is_some_and(|n| n.starts_with("HERDR_") || n.starts_with("HC_"))
+            {
+                cmd.env_remove(name);
+            }
+        }
+        let _ = cmd
+            .env("XDG_RUNTIME_DIR", rt.join("hcr"))
+            .env("XDG_STATE_HOME", rt.join("hcs"))
+            .env("XDG_CONFIG_HOME", rt.join("hcc"))
+            .env("HC_SESSION", &self.session)
+            .env(
+                "HC_SOCKET",
+                rt.join("hcr").join(format!("{}.sock", self.session)),
+            )
             .status();
     }
 }
@@ -265,23 +342,15 @@ fn events(store: &MemoryStore) -> Vec<NewEvent> {
         .collect()
 }
 
-/// The scripted engine's kit under `world`: a tmux server of the test's
-/// own, a runner standing in for `spawn run` (runs the engine, writes its
+/// The scripted engine's kit under `world`: a `herdr-core` server of the
+/// test's own, a runner standing in for `spawn run` (runs the engine, writes its
 /// exit status), and an engine that files its transcript as Claude Code
 /// does, under its resolved working directory, one turn per typed line.
 fn scripted(world: &World) -> (Server, BridgeConfig) {
     let bin = world.base.join("bin");
     fs::create_dir_all(&bin).expect("bin");
     let projects = world.base.join("projects");
-    let socket = format!("spawn-identity-{}", std::process::id());
-    let server = Server {
-        program: script(
-            &bin,
-            "tmux",
-            &format!("#!/bin/sh\nexec tmux -L {socket} -f /dev/null \"$@\"\n"),
-        ),
-        socket,
-    };
+    let server = Server::new("bridge");
     let runner = script(
         &bin,
         "runner",
@@ -318,8 +387,8 @@ done
     (server, config)
 }
 
-/// End to end through the Bridge, a real tmux and the scripted engine
-/// ([`scripted`]): the engine's turn reaches the log. Before the root was
+/// End to end through the Bridge, embedded `herdr-core` and the scripted
+/// engine ([`scripted`]): the engine's turn reaches the log. Before the root was
 /// resolved the Bridge watched the literal directory's transcript, which
 /// never received a line, and the turn was never read.
 #[test]
@@ -328,12 +397,7 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
     let world = World::new("bridge");
     let (server, config) = scripted(&world);
     let projects = PathBuf::from(&config.claude_projects);
-    // What the host keeps in $XDG_RUNTIME_DIR stays in the world's
-    // scratch (backlog S20).
-    let runtime = world.base.join("run");
-    fs::create_dir(&runtime).expect("runtime");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("0700");
-    let terminals = Arc::new(TmuxHost::local(&server.program).with_runtime_under(runtime));
+    let terminals = Arc::new(server.host());
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let memory = Arc::new(MemoryStore::new("shop", clock.clone()));
     let mut bridge = Bridge::new(

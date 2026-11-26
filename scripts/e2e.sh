@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End to end: the whole decision ladder with a scripted engine and a stub
-# Jev, on real PostgreSQL, git and tmux (docs/fleet-architecture.md).
+# Jev, on real PostgreSQL, git and embedded herdr-core (docs/fleet-architecture.md).
 #
 # It asserts every hop:
 #   1. a rule decides WORKING while a tool runs (no model call);
@@ -10,7 +10,7 @@
 #   4. a HUMAN: question reaches attention even when Jev is confident it is
 #      fine, and a human command resolves it;
 #   5. with Jev down, a stalled worker is escalated on rules alone, not nudged;
-#   6. killing the supervisor's engine, then its tmux server, then the loop,
+#   6. killing the supervisor's engine, then its herdr-core daemon, then the loop,
 #      each ends with session_supervisor live again, resumed natively;
 #   7. missions: a human mission reaches the supervisor; a resident is
 #      proposed by the supervisor and runs only after a human approves it;
@@ -27,30 +27,32 @@
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/e2e.sh
 # With SPAWN_TIMING=adversarial it runs under perturbed timing
 # (scripts/timing/timing.sh); SPAWN_TIMING_OUT keeps the perturbation log.
-# Runs in its own schema (dropped afterwards when psql is installed) and its own tmux socket.
+# Runs in its own schema (dropped afterwards when psql is installed) and its own herdr-core session.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/stage.sh
 . "$root/scripts/stage.sh"
+# shellcheck source=scripts/blackbox/lib-herdr.sh
+. "$root/scripts/blackbox/lib-herdr.sh"
 stage_start
 bin=${SPAWN_BIN:-}
 if [ -z "$bin" ]; then
-  (cd "$root" && cargo build --quiet -p spawn-cli)
+  (cd "$root" && cargo build --quiet -p spawn-cli -p spawn-hc)
   bin=${CARGO_TARGET_DIR:-$root/target}/debug/spawn
 fi
+export SPAWN_BIN=$bin
 base_url=${SPAWN_DATABASE_URL:?SPAWN_DATABASE_URL is required}
-tmux=${SPAWN_TMUX_PROGRAM:-tmux}
 work=$(mktemp -d)
 # Names unique per run. Not from $$ alone: the gate runs this in a new PID
 # namespace, where $$ is the same small number every time, and a schema
 # left by an earlier run would be reused.
 run="$$_${RANDOM}${RANDOM}"
-socket="spawn-e2e-$run"
 schema="e2e_$run"
 loop_pid=""
 jev_pid=""
 timing_out=""
+herdr_setup "$work" "e2e"
 if [ "${SPAWN_TIMING:-}" = adversarial ]; then
   # shellcheck source=scripts/timing/timing.sh
   . "$root/scripts/timing/timing.sh"
@@ -114,8 +116,7 @@ cleanup() {
   [ -n "$loop_pid" ] && kill -CONT "$loop_pid" 2>/dev/null || true
   [ -n "$loop_pid" ] && kill "$loop_pid" 2>/dev/null || true
   [ -n "$jev_pid" ] && kill "$jev_pid" 2>/dev/null || true
-  "$tmux" -L "$socket" kill-server 2>/dev/null || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$socket"
+  herdr_cleanup
   if [ "${KEEP:-0}" != 1 ] && command -v psql >/dev/null; then
     # A drop that fails is said, not hidden: the schema stays in the test
     # database until the sweep (sync/storage-testdb-bloat.md: 17 e2e
@@ -364,8 +365,6 @@ export E2E_WORK=$work E2E_SPAWN=$bin SPAWN_CLAUDE_PROJECTS=$work/claude-projects
 export SPAWN_DATABASE_URL=$url
 export SPAWN_GIT_REPO=$repo SPAWN_WORKSPACE_ROOT=$work/ws
 export SPAWN_CLAUDE_PROGRAM=$work/claude SPAWN_PROGRAM=$bin
-export SPAWN_TMUX_PROGRAM=$tmux SPAWN_TMUX_SOCKET=$socket
-export SPAWN_TERMINAL_BACKEND=tmux
 export SPAWN_WORKER=worker-e2e SPAWN_LOOP_INTERVAL_MS=300
 export SPAWN_JUDGE_MODEL=stub
 export SPAWN_SUPERVISOR=1 SPAWN_MISSION_FILE=$work/mission.md
@@ -389,10 +388,29 @@ tail_of() { SPAWN_DATABASE_URL=$sup_url "$bin" tail --session "$1"; }
 observation() { # session -> latest observation JSON
   tail_of "$1" | jq -c '.judgement // {}'
 }
+terminal_addr() { # terminal name -> live herdr-core address (e.g. t1)
+  local hs_sock
+  hs_sock=$(herdr_real_socket)
+  herdr_real_session
+  [ -n "$hs_sock" ] && [ -S "$hs_sock" ] || return 0
+  HC_SOCKET=$hs_sock HC_SESSION=$hs_real_sess "$SPAWN_HERDR_REAL_CORE_PROGRAM" ls --label "spawn_terminal=$1" --json 2>/dev/null | jq -r '(.terminals // [])[0].address // empty'
+}
 pane() { # session -> captured pane text of its latest terminal
-  local terminal
+  local terminal addr
   terminal=$(fleet | jq -r --arg s "$1" '.[] | select(.session_id == $s) | "spawn-\(.execution_id // "")"' 2>/dev/null)
-  "$tmux" -L "$socket" capture-pane -p -t "=$terminal:" -S -200 2>/dev/null || true
+  [ -n "$terminal" ] || return 0
+  addr=$(terminal_addr "$terminal")
+  [ -n "$addr" ] || return 0
+  herdr_pane_text "$addr" 200 2>/dev/null || true
+}
+runner_pid() { # execution id -> pid of the live runner process in that terminal
+  local addr hs_sock
+  addr=$(terminal_addr "spawn-$1")
+  [ -n "$addr" ] || return 0
+  hs_sock=$(herdr_real_socket)
+  herdr_real_session
+  [ -n "$hs_sock" ] && [ -S "$hs_sock" ] || return 0
+  HC_SOCKET=$hs_sock HC_SESSION=$hs_real_sess "$SPAWN_HERDR_REAL_CORE_PROGRAM" get "$addr" --json 2>/dev/null | jq -r '.pid // empty'
 }
 live() { fleet | jq -e --arg s "$1" 'any(.[]; .session_id == $s and .live)' >/dev/null; }
 execution_of() { fleet | jq -r --arg s "$1" '.[] | select(.session_id == $s) | .execution_id // ""'; }
@@ -681,7 +699,8 @@ wait_for 60 "the human message in the supervisor's digest" human_noted
 pass "a human message to a worker reached the supervisor"
 
 before=$(execution_of session_resident_core)
-runner=$("$tmux" -L "$socket" list-panes -t "=spawn-$before:" -F '#{pane_pid}')
+runner=$(runner_pid "$before")
+[ -n "$runner" ] || fail "no runner pid found for spawn-$before"
 kill -KILL "$(pgrep -P "$runner" | head -1)"
 resident_back() { live session_resident_core && [ "$(execution_of session_resident_core)" != "$before" ]; }
 wait_for 60 "the resident back after its engine was killed" resident_back
@@ -700,7 +719,8 @@ pass "a killed resident is resumed; one the supervisor stopped stays down"
 resumed_count() { grep -c -- "^session_supervisor .*--resume" "$work/argv.log" || true; }
 
 before=$(execution_of session_supervisor)
-runner=$("$tmux" -L "$socket" list-panes -t "=spawn-$before:" -F '#{pane_pid}')
+runner=$(runner_pid "$before")
+[ -n "$runner" ] || fail "no runner pid found for spawn-$before"
 engine=$(pgrep -P "$runner" | head -1)
 resumes=$(resumed_count)
 kill -KILL "$engine"
@@ -711,10 +731,10 @@ pass "engine killed -> supervisor resumed"
 
 before=$(execution_of session_supervisor)
 resumes=$(resumed_count)
-"$tmux" -L "$socket" kill-server
-wait_for 90 "the supervisor back after its tmux server was killed" new_live
-[ "$(resumed_count)" -gt "$resumes" ] || fail "the supervisor was not resumed after the tmux kill"
-pass "tmux server killed -> supervisor resumed"
+herdr_kill_server
+wait_for 90 "the supervisor back after its herdr-core daemon was killed" new_live
+[ "$(resumed_count)" -gt "$resumes" ] || fail "the supervisor was not resumed after the herdr-core kill"
+pass "herdr-core daemon killed -> supervisor resumed"
 
 before=$(execution_of session_supervisor)
 kill -KILL "$loop_pid"; wait "$loop_pid" 2>/dev/null || true
