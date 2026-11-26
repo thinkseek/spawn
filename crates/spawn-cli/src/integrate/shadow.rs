@@ -1912,14 +1912,14 @@ mod tests {
     fn the_node_sources_controller_pack_follows_scripts_and_the_web_lock() {
         use std::os::unix::fs::PermissionsExt as _;
         let world = NodeWorld::new("node-pack-key");
-        let mut nodes = world.nodes();
-        let mut offered = 0;
-        let mut pack = |nodes: &mut super::NodeShadows| -> String {
+        // Each offer from a restarted integrator (one shadow in flight
+        // each, under the cap), all sharing the one artifacts cache.
+        let pack = || -> String {
+            let mut nodes = world.nodes();
             let task = world.task();
             nodes.offer(&world.ledger.store, world.want(task));
             let waiting = nodes.waiting();
-            offered += 1;
-            assert_eq!(waiting.len(), offered, "{waiting:?}");
+            assert_eq!(waiting.len(), 1, "{waiting:?}");
             let row = world
                 .ledger
                 .store
@@ -1939,28 +1939,24 @@ mod tests {
         };
         let gate = world.ctl.join("scripts/gate.sh");
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let first = pack(&mut nodes);
-        assert_eq!(
-            pack(&mut nodes),
-            first,
-            "the same controller, the same pack"
-        );
+        let first = pack();
+        assert_eq!(pack(), first, "the same controller, the same pack");
         std::fs::write(&gate, "exit 1\n").unwrap();
-        let edited = pack(&mut nodes);
+        let edited = pack();
         assert_ne!(edited, first, "an edited gate.sh");
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let executable = pack(&mut nodes);
+        let executable = pack();
         assert!(
             ![&first, &edited].contains(&&executable),
             "an executable gate.sh"
         );
         std::fs::write(world.ctl.join("web/package-lock.json"), "{}\n").unwrap();
-        let locked = pack(&mut nodes);
+        let locked = pack();
         assert!(
             ![&first, &edited, &executable].contains(&&locked),
             "another web lock"
         );
-        assert_eq!(pack(&mut nodes), locked);
+        assert_eq!(pack(), locked);
     }
 
     /// A node shadow's valid verdict puts the node's strikes back to 0
