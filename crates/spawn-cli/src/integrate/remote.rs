@@ -1157,14 +1157,22 @@ pub(super) fn next_for(kind: RemoteJobKind, next: FaultNext) -> FaultNext {
 /// Apply a judging to the ledger: a fault (struck or not) is judged once
 /// per completion by `spawn_remote_job_fault`, which also excludes the
 /// node from the job, makes a third strike `degraded` and refunds the
-/// strike of a poison pill. A verdict and a self-fenced run change nothing
-/// here. Never anything toward a task's halts or back-offs.
+/// strike of a poison pill. A verdict (believed or not: the run was valid)
+/// is judged once per completion by `spawn_remote_job_valid`, which puts
+/// the node's strikes back to 0 and leaves `degraded` as it is; it answers
+/// `None` like a self-fenced run, which changes nothing here. Never
+/// anything toward a task's halts or back-offs.
 pub(super) fn settle(
     store: &PostgresStore,
     job: &RemoteJob,
     judged: &Judged,
 ) -> Result<Option<FaultOutcome>, String> {
     let Some(next) = judged.next else {
+        if judged.verdict.is_some() {
+            store
+                .remote_job_valid(&job.job_id, job.lease_epoch)
+                .map_err(|error| format!("its valid run not judged: {error}"))?;
+        }
         return Ok(None);
     };
     store
@@ -1746,6 +1754,11 @@ impl Primary {
         let judged = judge_stored(&stored, given);
         let node = node_name_of(store, row, &stored);
         if let Some(verdict) = judged.verdict.clone() {
+            // A valid run: the node's strikes go back to 0. A ledger error
+            // is logged, never a reason to drop the verdict.
+            if let Err(error) = settle(store, row, &judged) {
+                eprintln!("integrate: task {task}'s node gate {job_id} on {node}: {error}");
+            }
             let word = if verdict.accepted {
                 "accepted"
             } else {
