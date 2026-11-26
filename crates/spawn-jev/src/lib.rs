@@ -16,11 +16,25 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 use spawn_core::observation::{Confidence, SemanticState};
 use spawn_core::observe::{JudgeError, JudgeInput, Judgement, StateJudge};
+
+/// Environment variable naming the local outbound UDS (`out.sock`).
+pub const OUT_SOCK_ENV: &str = "SPAWN_OUT_SOCK";
+
+/// Fixed local RPC path exposed by `spawn-node front --serve outbound`.
+pub const OUT_JEV_CALL_PATH: &str = "/out/v1/jev/call";
+
+/// Response read limit (matches the 4 MiB IPC payload cap plus HTTP headers).
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024 + 64 * 1024;
 
 /// Question name of the state choice.
 pub const QUESTION: &str = "semantic_state";
@@ -168,6 +182,8 @@ pub fn parse_reply(body: &str) -> Result<Judgement, JudgeError> {
 pub struct JevConfig {
     /// Base URL, without a trailing slash.
     pub base_url: String,
+    /// Optional local `out.sock` UNIX domain socket path for outbound Jev RPC.
+    pub out_sock: Option<PathBuf>,
     /// The timeout of each connect, write and read
     /// ([`JevConfig::DEFAULT_TIMEOUT`] unless set).
     pub timeout: Duration,
@@ -189,13 +205,46 @@ impl JevConfig {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            out_sock: None,
             timeout: Self::DEFAULT_TIMEOUT,
             model: DEFAULT_MODEL.to_string(),
         }
     }
+
+    /// Configuration targeting a local `out.sock` UNIX domain socket.
+    pub fn new_out_sock(path: impl Into<PathBuf>) -> Self {
+        Self {
+            base_url: String::new(),
+            out_sock: Some(path.into()),
+            timeout: Self::DEFAULT_TIMEOUT,
+            model: DEFAULT_MODEL.to_string(),
+        }
+    }
+
+    /// Route requests through the given local `out.sock` UNIX domain socket.
+    #[must_use]
+    pub fn with_out_sock(mut self, path: impl Into<PathBuf>) -> Self {
+        self.out_sock = Some(path.into());
+        self
+    }
+
+    /// Read [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`) using the process environment.
+    pub fn from_out_sock_env() -> Option<Self> {
+        Self::from_out_sock_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Read [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`) using a custom lookup function.
+    pub fn from_out_sock_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let raw = lookup(OUT_SOCK_ENV)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(Self::new_out_sock(trimmed))
+    }
 }
 
-/// Judge that asks Jev over HTTP.
+/// Judge that asks Jev over HTTP or a local `out.sock` UNIX domain socket.
 #[derive(Debug, Clone)]
 pub struct JevJudge {
     config: JevConfig,
@@ -206,6 +255,16 @@ impl JevJudge {
     pub fn new(config: JevConfig) -> Self {
         Self { config }
     }
+
+    /// Judge using a local `out.sock` UNIX domain socket.
+    pub fn from_out_sock(path: impl Into<PathBuf>) -> Self {
+        Self::new(JevConfig::new_out_sock(path))
+    }
+
+    /// Judge configured from [`OUT_SOCK_ENV`] (`SPAWN_OUT_SOCK`), if non-empty.
+    pub fn from_out_sock_env() -> Option<Self> {
+        JevConfig::from_out_sock_env().map(Self::new)
+    }
 }
 
 impl StateJudge for JevJudge {
@@ -215,10 +274,89 @@ impl StateJudge for JevJudge {
 
     fn judge(&self, input: &JudgeInput) -> Result<Judgement, JudgeError> {
         let body = build_request_for(input, &self.config.model);
-        let text = post_json(&endpoint(&self.config.base_url), &body, self.config.timeout)
-            .map_err(JudgeError::Unavailable)?;
+        let text = match &self.config.out_sock {
+            Some(path) => post_json_unix(path, &body, self.config.timeout),
+            None => post_json(&endpoint(&self.config.base_url), &body, self.config.timeout),
+        }
+        .map_err(JudgeError::Unavailable)?;
         parse_reply(&text)
     }
+}
+
+/// Validate `path` before dialing `out.sock`: refuses symlinks, non-sockets,
+/// mismatched effective UID, and group/world permissions (`mode & 0o077 != 0`).
+#[cfg(unix)]
+pub fn validate_out_sock(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("out.sock path is empty".to_string());
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("stat out.sock {}: {error}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing out.sock {}: symlink is not allowed",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_socket() {
+        return Err(format!(
+            "refusing out.sock {}: not a UNIX domain socket",
+            path.display()
+        ));
+    }
+    let expected_uid = current_euid()?;
+    if meta.uid() != expected_uid {
+        return Err(format!(
+            "refusing out.sock {}: uid {} does not match current user {expected_uid}",
+            path.display(),
+            meta.uid()
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "refusing out.sock {}: insecure permissions {mode:04o} (group/other bits set)",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `path` before dialing `out.sock` (unsupported outside Unix).
+#[cfg(not(unix))]
+pub fn validate_out_sock(_path: &Path) -> Result<(), String> {
+    Err("out.sock UDS transport requires Unix".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn current_euid() -> Result<u32, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("read /proc/self/status: {error}"))?;
+    let uid_line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .ok_or_else(|| "missing Uid line in /proc/self/status".to_string())?;
+    let euid = uid_line
+        .strip_prefix("Uid:")
+        .and_then(|rest| rest.split_whitespace().nth(1))
+        .ok_or_else(|| "malformed Uid line in /proc/self/status".to_string())?;
+    euid.parse::<u32>()
+        .map_err(|error| format!("parse effective uid {euid:?}: {error}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn current_euid() -> Result<u32, String> {
+    let output = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|error| format!("run id -u: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("id -u exited with {}", output.status));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim()
+        .parse::<u32>()
+        .map_err(|error| format!("parse effective uid {text:?}: {error}"))
 }
 
 fn split_url(url: &str) -> Result<(String, u16, String), String> {
@@ -269,7 +407,7 @@ fn is_chunked(head: &str) -> bool {
     })
 }
 
-/// Minimal HTTP/1.1 POST over a plain socket.
+/// Minimal HTTP/1.1 POST over a plain TCP socket.
 ///
 /// The client talks to the loopback relay (`scripts/jev-relay.py`), which
 /// adds the API key and the TLS hop to the hosted service, so plain HTTP is
@@ -290,24 +428,52 @@ fn post_json(url: &str, body: &str, timeout: Duration) -> Result<String, String>
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("set write timeout: {error}"))?;
+    post_json_over_stream(stream, &host, &path, body)
+}
 
+#[cfg(unix)]
+fn post_json_unix(path: &Path, body: &str, timeout: Duration) -> Result<String, String> {
+    validate_out_sock(path)?;
+    let stream = UnixStream::connect(path)
+        .map_err(|error| format!("connect out.sock {}: {error}", path.display()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| format!("set read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("set write timeout: {error}"))?;
+    post_json_over_stream(stream, "spawn-out", OUT_JEV_CALL_PATH, body)
+}
+
+#[cfg(not(unix))]
+fn post_json_unix(_path: &Path, _body: &str, _timeout: Duration) -> Result<String, String> {
+    Err("out.sock UDS transport requires Unix".to_string())
+}
+
+/// Shared HTTP/1.1 unary POST over an established stream with explicit `Content-Length`.
+fn post_json_over_stream<S: Read + Write>(
+    mut stream: S,
+    host: &str,
+    path: &str,
+    body: &str,
+) -> Result<String, String> {
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let mut writer = stream
-        .try_clone()
-        .map_err(|error| format!("clone socket: {error}"))?;
-    writer
+    stream
         .write_all(request.as_bytes())
         .map_err(|error| format!("write request: {error}"))?;
-    writer.flush().map_err(|error| format!("flush: {error}"))?;
+    stream.flush().map_err(|error| format!("flush: {error}"))?;
 
     let mut raw = Vec::new();
-    let mut reader = stream;
-    reader
+    (&mut stream)
+        .take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut raw)
         .map_err(|error| format!("read response: {error}"))?;
+    if raw.len() as u64 == MAX_RESPONSE_BYTES {
+        return Err("response exceeded maximum size".to_string());
+    }
     let text = String::from_utf8_lossy(&raw);
     let (head, payload) = text
         .split_once("\r\n\r\n")
