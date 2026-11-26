@@ -55,6 +55,10 @@ const TRANSCRIPT_DIRECTORIES: [&str; 3] = [
     ".transcripts-sources",
 ];
 
+/// The path of the one `tree` row a Change folds into when even its
+/// top-level rows are over the cap: the root.
+pub(crate) const ROOT_PATH: &str = ".";
+
 /// The CAS under the workspace root when `--cas` is not given.
 const DEFAULT_CAS: &str = ".cas";
 
@@ -304,8 +308,12 @@ pub(crate) fn diff(before: &Manifest, after: &Manifest) -> Vec<Diff> {
 /// The entries of a Change from `before` to `after` (B2): one per path
 /// that differs, or, past [`index::FOLD_OVER`], a path at the top as its
 /// own row and one `tree` row per top-level directory, its digests that
-/// directory's manifests (absent: no file under it). `origin` goes on
-/// every entry.
+/// directory's manifests (absent: no file under it); and when even those
+/// rows are more than [`index::FOLD_OVER`], one `tree` row of the root
+/// ([`ROOT_PATH`]), its digests the two snapshots. Never more than
+/// [`index::FOLD_OVER`] rows. Each directory's manifest is one binary
+/// search and its run ([`Manifest::subtree`]), so folding costs O(N log N)
+/// at most. `origin` goes on every entry.
 pub(crate) fn entries(
     before: &Manifest,
     after: &Manifest,
@@ -342,6 +350,21 @@ pub(crate) fn entries(
                 origin,
             }),
         }
+    }
+    // Still over the cap (a flat directory, or more than FOLD_OVER
+    // top-level directories): the whole Change is one `tree` row of the
+    // root, its digests the snapshots themselves.
+    if out.len() + directories.len() > index::FOLD_OVER {
+        let whole =
+            |manifest: &Manifest| (!manifest.is_empty()).then(|| manifest.digest().to_string());
+        return vec![ProvEntryInput {
+            path: ROOT_PATH.to_string(),
+            before: whole(before),
+            after: whole(after),
+            size: None,
+            class: ProvEntryClass::Tree,
+            origin,
+        }];
     }
     for directory in directories {
         let tree = |manifest: &Manifest| {

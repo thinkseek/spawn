@@ -513,7 +513,12 @@ impl Store {
         let lock = self.lock_gc()?;
         let before = self.snapshot_pin(name)?;
         let mut manifests: BTreeSet<Digest> = before.manifests.iter().cloned().collect();
-        manifests.extend(before.snapshots.iter().map(|(snapshot, _)| snapshot.clone()));
+        manifests.extend(
+            before
+                .snapshots
+                .iter()
+                .map(|(snapshot, _)| snapshot.clone()),
+        );
         manifests.extend(snapshots.iter().cloned());
         let mut text = format!("# {MANIFEST_V1} snapshots of {name}, newest first\n");
         let mut pinned_now: BTreeSet<Digest> = manifests.clone();

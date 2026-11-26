@@ -289,7 +289,7 @@ mod data_domain {
     use spawn_postgres::provenance::ProvEntryClass;
 
     use super::super::data::{
-        change_id_of, check_ref, diff, domain_of, entries, parse_digest, snapshot_args,
+        ROOT_PATH, change_id_of, check_ref, diff, domain_of, entries, parse_digest, snapshot_args,
     };
     use super::super::index::{FOLD_OVER, change_id};
     use super::super::{Target, target};
@@ -426,5 +426,39 @@ mod data_domain {
             Some(big.subtree(b"even").digest().to_string().as_str())
         );
         assert_eq!(rows[0].before, None);
+
+        // A flat directory over the cap: one tree row of the root.
+        let flat_names: Vec<String> = (0..FOLD_OVER + 5).map(|n| format!("f{n:05}")).collect();
+        let flat = manifest(
+            &flat_names
+                .iter()
+                .map(|name| (name.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let rows = entries(&Manifest::default(), &flat, Some(3));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, ROOT_PATH);
+        assert_eq!(rows[0].class, ProvEntryClass::Tree);
+        assert_eq!(rows[0].before, None);
+        assert_eq!(rows[0].after, Some(flat.digest().to_string()));
+        assert_eq!(rows[0].origin, Some(3));
+        // Back to empty: the root row's after is absent.
+        let rows = entries(&flat, &Manifest::default(), None);
+        assert_eq!((rows.len(), rows[0].after.as_deref()), (1, None));
+
+        // More than FOLD_OVER top-level directories: never over the cap.
+        let deep_names: Vec<String> = (0..FOLD_OVER + 5).map(|n| format!("d{n:05}/x")).collect();
+        let deep = manifest(
+            &deep_names
+                .iter()
+                .map(|name| (name.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let rows = entries(&Manifest::default(), &deep, None);
+        assert!(rows.len() <= FOLD_OVER, "{} rows", rows.len());
+        assert_eq!(
+            (rows[0].path.as_str(), rows[0].class),
+            (ROOT_PATH, ProvEntryClass::Tree)
+        );
     }
 }

@@ -710,9 +710,10 @@ fn link_name(link: ProvLink) -> &'static str {
 /// - `snapshots`: the data snapshots among the Changes and their radius
 ///   (PV3b), each with its ref, nearest first.
 ///
-/// A commit or a snapshot is also followed through the edges that name it
-/// directly (`--code <commit>`, `--input sha256:<hex>`), so a code commit
-/// reaches the data snapshots made with it, recorded in Git or not.
+/// A commit or a snapshot that no recorded Change is is followed through
+/// the edges that name it directly (`--code <commit>`, `--input
+/// sha256:<hex>`), so a code commit reaches the data snapshots made with
+/// it even when no Git domain records it.
 pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, String> {
     let start = changes_of(store, target)?;
     let (after, landed_by) = later_on_paths(store, &start)?;
@@ -721,11 +722,14 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
         Target::Snapshot(snapshot) => Some(snapshot.clone()),
         Target::Change(_) | Target::Task(_) => None,
     };
+    // Only when no recorded Change is the target: a Change's own walk
+    // already follows the edges to its result (a Git commit's `land`, a
+    // snapshot's revisions), so this would walk them twice.
     let users = match &named {
-        Some(digest) => store
+        Some(digest) if start.is_empty() => store
             .prov_changes_using(digest)
             .map_err(|error| error.to_string())?,
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     let (radius, used) = dependents(store, &start, &users, named.as_deref().unwrap_or_default())?;
     let mut order: Vec<(i64, i64, &'static str)> = start
