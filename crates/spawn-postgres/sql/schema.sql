@@ -7620,6 +7620,49 @@ begin
                               'strikes', v_strikes, 'degraded', coalesce(v_strikes, 0) >= 3);
 end $$;
 
+-- The integrator's reading of a completed job whose verdict it believes
+-- (spawn-cli integrate/remote.rs `settle`): the run was valid, so the node's
+-- strikes go back to 0. `degraded` stays as it is (only `spawn node
+-- undrain` clears it). Same lock order as spawn_remote_job_fault (nodes in
+-- name order, then the job); the row stays completed and its epoch moves, so
+-- a completion is judged once: a second call, or a fault judging at the old
+-- epoch, answers ok false.
+create or replace function spawn_remote_job_valid(p_job_id text, p_lease_epoch bigint)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_j spawn_remote_jobs;
+    v_n spawn_node_state;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner judges a remote job; % may not', session_user
+            using errcode = '42501';
+    end if;
+    select j.* into v_j from spawn_remote_jobs j
+     where j.job_id = p_job_id and j.lease_epoch = p_lease_epoch and j.state = 'completed';
+    if not found then
+        return jsonb_build_object('ok', false);
+    end if;
+    perform 1 from spawn_node_state n
+     where n.node_id = v_j.node_id
+     order by n.name
+       for update;
+    select * into v_n from spawn_node_state where node_id = v_j.node_id;
+    select * into v_j from spawn_remote_jobs
+     where job_id = p_job_id and lease_epoch = p_lease_epoch and state = 'completed' for update;
+    if not found or v_j.node_id = any(v_j.excluded_nodes) then
+        return jsonb_build_object('ok', false);
+    end if;
+    update spawn_remote_jobs
+       set lease_epoch = lease_epoch + 1,
+           finished_at_ms = coalesce(finished_at_ms, spawn_now_ms())
+     where job_id = p_job_id;
+    if v_n.name is not null then
+        update spawn_node_state set host_fault_strikes = 0 where name = v_n.name;
+    end if;
+    return jsonb_build_object('ok', true, 'prior_strikes', coalesce(v_n.host_fault_strikes, 0),
+                              'strikes', 0);
+end $$;
+
 -- The gateway's login (`spawn-node-gateway`): this database's
 -- `spawn_node_gateway_<db>`, made without login like the others
 -- (PostgresStore::migrate gives it one, and its timeouts: statement 5 s,
@@ -7657,7 +7700,8 @@ begin
         'spawn_node_sweep()', 'spawn_node_enroll_token(text, text, bytea, bigint)',
         'spawn_node_admin(text, text)', 'spawn_remote_job_enqueue(jsonb)',
         'spawn_remote_job_take_local(text, bigint)',
-        'spawn_remote_job_fault(text, bigint, text, boolean, text)'] loop
+        'spawn_remote_job_fault(text, bigint, text, boolean, text)',
+        'spawn_remote_job_valid(text, bigint)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
