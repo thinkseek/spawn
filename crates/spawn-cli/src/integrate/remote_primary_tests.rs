@@ -552,7 +552,7 @@ fn valid_run_on_two_strikes(
                 &[&degraded],
             )
             .expect("two strikes");
-        let verdict = verdict_for(word, &grant);
+        let verdict = verdict_for(stated, &grant);
         node.finish(
             &results,
             &grant,
