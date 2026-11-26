@@ -487,13 +487,21 @@ fn the_argv_keeps_its_invariants() {
         .filter(|three| three[0] == "--bind")
         .map(|three| (three[1].as_str(), three[2].as_str()))
         .collect();
+    // The engine's TMPDIR lies in its home, writable through that bind:
+    // never bound a second time, only named.
     assert_eq!(
         binds,
         vec![
             (workspace.as_str(), workspace.as_str()),
             (engine_home.as_str(), engine_home.as_str()),
-            (tmpdir.as_str(), tmpdir.as_str()),
         ]
+    );
+    assert!(tmpdir.starts_with(&engine_home), "{tmpdir}");
+    assert!(
+        words
+            .windows(3)
+            .any(|three| three[0] == "--setenv" && three[1] == "TMPDIR" && three[2] == tmpdir),
+        "{words:?}"
     );
     // The symlinked canaries are masked at what they resolve to.
     let aws = fixture.scratch.join("real-aws");

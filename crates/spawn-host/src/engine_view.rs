@@ -772,8 +772,110 @@ fn find_program(program: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::ViewConfig;
-    use std::path::PathBuf;
+    use super::{BwrapView, ViewConfig};
+    use spawn_core::port::ViewedLaunch;
+    use std::path::{Path, PathBuf};
+
+    /// A view over a made-up home in `scratch` (agy's home below the masked
+    /// `~/.gemini`, a `~/.ssh`, a workspace), never run: `plan` only
+    /// resolves paths, so these need no `bwrap`.
+    fn view_in(scratch: &Path) -> (BwrapView, PathBuf, PathBuf) {
+        let home = scratch.join("home");
+        let engine_home = home.join(".gemini/antigravity-cli");
+        let workspace = scratch.join("ws");
+        for dir in [&engine_home, &home.join(".ssh"), &workspace] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        let runtime = scratch.join("run");
+        std::fs::create_dir_all(&runtime).expect("run");
+        let config = ViewConfig {
+            home,
+            xdg_config_home: None,
+            runtime_dir: runtime.clone(),
+            host_directories: Vec::new(),
+            loop_dirs: Vec::new(),
+            extra_files: Vec::new(),
+            host_tmpdir: None,
+            private_dir: runtime.join("spawn-engine-view-test"),
+        };
+        let view = BwrapView {
+            program: PathBuf::from("/usr/bin/bwrap"),
+            config,
+        };
+        (view, workspace, engine_home)
+    }
+
+    fn plan(view: &BwrapView, workspace: &Path, engine_home: &Path) -> Result<super::Plan, String> {
+        view.plan(&ViewedLaunch {
+            engine: "agy",
+            workspace: &workspace.display().to_string(),
+            engine_home: &engine_home.display().to_string(),
+        })
+    }
+
+    /// The re-bound engine home itself is planned (the baseline the next
+    /// tests break): agy's home below the masked `~/.gemini`.
+    #[test]
+    fn an_engine_home_below_another_engines_masked_home_is_re_bound() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
+        let (view, workspace, engine_home) = view_in(&scratch);
+        let planned = plan(&view, &workspace, &engine_home).expect("plan");
+        let engine_home = std::fs::canonicalize(&engine_home).expect("home");
+        assert!(
+            planned
+                .masks
+                .iter()
+                .any(|mask| *mask == super::Mask::Directory(engine_home.parent().expect("gemini").to_path_buf()))
+        );
+    }
+
+    /// A directory mask inside the re-bound engine home (the loop's TMPDIR
+    /// there) is not pruned away from the check: its writable bind would
+    /// show it, so the plan is refused.
+    #[test]
+    fn a_directory_mask_inside_a_re_bound_engine_home_is_refused() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
+        let (mut view, workspace, engine_home) = view_in(&scratch);
+        let nested = engine_home.join("shared-tmp");
+        std::fs::create_dir_all(&nested).expect("nested");
+        view.config.host_tmpdir = Some(nested);
+        let refused = plan(&view, &workspace, &engine_home).expect_err("nested directory");
+        assert!(refused.contains("overlaps"), "{refused}");
+        assert!(refused.contains("shared-tmp"), "{refused}");
+    }
+
+    /// The same for a regular-file mask inside the re-bound engine home.
+    #[test]
+    fn a_file_mask_inside_a_re_bound_engine_home_is_refused() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
+        let (mut view, workspace, engine_home) = view_in(&scratch);
+        let nested = engine_home.join("loop.env");
+        std::fs::write(&nested, "secret").expect("nested");
+        view.config.extra_files = vec![nested];
+        let refused = plan(&view, &workspace, &engine_home).expect_err("nested file");
+        assert!(refused.contains("overlaps"), "{refused}");
+        assert!(refused.contains("loop.env"), "{refused}");
+    }
+
+    /// An engine home refused for lying in a mask (`~/.ssh`) is never made
+    /// on disk: it is checked where it would resolve first.
+    #[test]
+    fn a_refused_engine_home_is_not_created() {
+        let scratch = crate::Scratch::new("spawn-view-unit");
+        let (view, workspace, _) = view_in(&scratch);
+        let inside_ssh = scratch.join("home/.ssh/agy-home/deeper");
+        let refused = plan(&view, &workspace, &inside_ssh).expect_err("in ~/.ssh");
+        assert!(refused.contains("overlaps"), "{refused}");
+        assert!(!scratch.join("home/.ssh/agy-home").exists(), "made on disk");
+        // An accepted, missing one is made, 0700.
+        let fresh = scratch.join("home/.codex/agy");
+        std::fs::create_dir_all(scratch.join("home/.codex")).expect("codex");
+        plan(&view, &workspace, &fresh).expect("below ~/.codex");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&fresh).expect("made").permissions(),
+        );
+        assert_eq!(mode & 0o777, 0o700);
+    }
 
     fn lookup(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         move |name| {
