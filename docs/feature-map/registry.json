@@ -2612,6 +2612,7 @@
         "crates/spawn-cli/src/serve.rs",
         "crates/spawn-cli/src/serve/answers.rs",
         "crates/spawn-cli/src/serve/attention.rs",
+        "crates/spawn-cli/src/serve/capabilities.rs",
         "crates/spawn-cli/src/serve/core_lines.rs",
         "crates/spawn-cli/src/serve/core_lines/disk.rs",
         "crates/spawn-cli/src/serve/core_lines/drills.rs",

@@ -517,6 +517,10 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     }
     // What only the transcript archive holds, counted beside the passes.
     cost::archive::start(root.as_deref(), &prices);
+    // What this host's engines are (versions, agy's models): probed now and
+    // hourly on a thread of its own, read by delivery and
+    // `/api/capabilities` (decision C2, N5).
+    crate::serve::capabilities::start();
     // The other Claude Code sessions on this host, counted apart from the
     // engines' record: at start, then hourly, read only, appended bytes only.
     cost::sessions::start(root.as_deref(), &prices);
@@ -690,6 +694,9 @@ impl Fleet<'_> {
             if due {
                 self.steps_at = Some(std::time::Instant::now());
                 self.steps(&open, watermark, now, &mut lines, &mut errors);
+                // An agy at a version Spawn was not checked against: one
+                // notice per version, refusing nothing.
+                lines.extend(crate::serve::capabilities::alert_untested(&open));
             }
         }
         // The screens and transcripts the Bridge reads are not announced by
@@ -1566,6 +1573,7 @@ mod tests {
                             from: None,
                             model: None,
                             charter: None,
+                            model_label: None,
                         },
                     },
                 )

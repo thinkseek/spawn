@@ -81,12 +81,17 @@ const RESTART_REASON_BYTES: usize = 2000;
 /// re-issue names the task it re-issues (`reissue_of`) and that task's
 /// spent attempts, as its `task.cancelled` record keeps them
 /// (`reissued_attempts`), for the escalation if the re-issue is spent too.
+/// A task on a graded preset names it with its `engine_label` and
+/// `model_label` (`preset_engine`, `preset_model_label`).
 pub(crate) const DELIVERY_TASKS: &str = r"
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
          k.revisions, k.review_note, k.delivered_at_ms, k.model, k.reissue_of,
          k.reassign_of, k.pinned,
+         -- The graded preset the task runs on, and the engine and model it
+         -- names: delivery starts the worker on them (design 7.1).
+         k.preset_id, gp.engine_label as preset_engine, gp.model_label as preset_model_label,
          (select o.session_id from mission_tasks o where o.id = k.reassign_of)
            as reassign_from_session,
          (select n.id from mission_tasks n where n.reassign_of = k.id order by n.id limit 1)
@@ -122,6 +127,7 @@ from (
     from mission_tasks k
     join mission_missions m on m.id = k.mission_id
     left join mission_residents r on r.agent_id = k.agent_id
+    left join grading_presets gp on gp.preset_id = k.preset_id
    where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
       or (k.state = 'accepted' and m.gate is not null)
       or (k.state in ('accepted', 'cancelled', 'landed') and k.kind = 'ephemeral'

@@ -355,6 +355,7 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         },
     );
     bridge.tick().expect("start");

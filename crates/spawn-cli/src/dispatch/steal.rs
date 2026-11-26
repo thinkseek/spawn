@@ -222,6 +222,9 @@ mod tests {
             reassigned_to_session: None,
             restart: None,
             pinned: false,
+            preset_id: None,
+            preset_engine: None,
+            preset_model_label: None,
         }
     }
 

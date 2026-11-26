@@ -1,4 +1,4 @@
-//! HTTP API and static files for the observer UI: 32 GET route patterns
+//! HTTP API and static files for the observer UI: 33 GET route patterns
 //! (`GET /api/stream` among them) and nine POST routes. Seven are a
 //! person's writes: an input to a session, a key, a restart or a reassign
 //! of a stalled worker, the resume of a halted mission, a message to the
@@ -147,6 +147,7 @@
 mod answers;
 pub(crate) mod approvals;
 pub(crate) mod attention;
+pub(crate) mod capabilities;
 pub(crate) mod core_lines;
 mod digest;
 pub(crate) mod feature_map;
@@ -973,6 +974,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/verifications"),
     ("GET", "/api/nodes"),
     ("GET", "/api/grading"),
+    ("GET", "/api/capabilities"),
     ("GET", "/api/features"),
     ("GET", "/api/features/coverage"),
     ("GET", "/api/features/coverage/projects"),
@@ -1258,6 +1260,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/verifications" => Box::new(verifications),
         "/api/nodes" => Box::new(nodes),
         "/api/grading" => Box::new(grading),
+        "/api/capabilities" => Box::new(|| Ok(capabilities::capabilities())),
         "/api/approvals" => Box::new(approvals::approvals),
         "/api/context/digest" => Box::new(digest::digest),
         "/api/prov/who" => Box::new(move || prov::who(query)),
@@ -2989,6 +2992,9 @@ fn session_list(id: &str, what: &str, query: &str) -> Result<Value, String> {
 
 /// The tail of a session's terminal, read from tmux: a live peek at compute,
 /// not storage. Capturing a pane changes nothing, so the API stays read-only.
+/// It leaves the host masked unless the session's newest start is
+/// positively Claude Code's (decision C2, N4: a failed lookup masks;
+/// `spawn_core::driver::excerpt_for`).
 /// `owner` names the session's agent when the session has no state yet (a
 /// resident before its first event).
 fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
@@ -3014,8 +3020,11 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
     let host = crate::config::terminal_host()?;
     let text = if live {
-        host.capture_tail(&terminal, &workspace, PANE_LINES)
-            .unwrap_or_default()
+        let raw = host
+            .capture_tail(&terminal, &workspace, PANE_LINES)
+            .unwrap_or_default();
+        let engine = store.latest_engine(&session).ok().flatten();
+        spawn_core::driver::excerpt_for(engine.as_deref(), &raw)
     } else {
         String::new()
     };
@@ -7261,7 +7270,7 @@ mod tests {
         );
         let gets = super::ROUTES.iter().filter(|(m, _)| *m == "GET").count();
         let posts = super::ROUTES.iter().filter(|(m, _)| *m == "POST").count();
-        assert_eq!((gets, posts), (32, 9));
+        assert_eq!((gets, posts), (33, 9));
         assert!(
             doc.contains(&format!(
                 "serves {gets} GET route patterns and {posts} POST routes"

@@ -140,6 +140,27 @@ These are not about process lifetime. They break when two versions meet.
       --test herdr`;
    3. edit `MANIFESTS`.
 
+   `GET /api/capabilities` shows the running server's protocol and active
+   manifests beside the pinned ones, and herdr's version.
+10. **`model_label` on `start`** (Herdr PR 4). `CommandAction::Start` has an
+    optional `model_label`, left out of the JSON when absent, so a Claude
+    Code start is byte for byte what it was. A Bridge built before it
+    refuses a command that carries it (`deny_unknown_fields`). Delivery
+    writes one only for a task on an agy preset, and the dispatcher and the
+    Bridge are one binary, so the exposure is a rollback with such a start
+    queued. **Before rolling back** to a Spawn without `model_label`, drain
+    the queued starts that carry it: let them finish, or cancel their tasks
+    (`select id from spawn_commands where state <> 'finished' and action ?
+    'model_label'` lists them). The Master Control wake
+    (`spawn_human_master_message`) copies `model_label` from the session's
+    newest start too, so the same rule holds for it.
+11. **agy updates itself.** agy's version is shown in `GET
+    /api/capabilities`. A `major.minor` Spawn was not checked against
+    (`AGY_TESTED`, `crates/spawn-core/src/driver.rs`) raises the notice
+    `agy_version_untested`, once per version, and refuses nothing: a screen
+    Spawn cannot read reads `Unknown`, which types nothing. After checking
+    its screens and transcript, add its `major.minor` to `AGY_TESTED`.
+
 ## What the loop may improve by itself
 
 - Integrator and dispatcher logic.
@@ -170,7 +191,13 @@ loop's environment, `SPAWN_TERMINAL_BACKEND=herdr` and `SPAWN_AGY_MODEL`
 (optionally `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
 0.9.5 with its antigravity-cli integration and a logged-in agy. Without them,
 an agy start is refused before launch, saying what is missing. Claude Code
-is unaffected.
+is unaffected. The loop probes the engines at its start and hourly
+(`<program> --version`, `agy models`; bounded, no shell, login files only
+`stat`ed; an engine `SPAWN_ENGINES` does not name is never run): an agy
+whose probe fails, or a preset's or `SPAWN_AGY_MODEL`'s
+label that `agy models` does not list, makes no start and raises
+`engine_unavailable`, while Claude Code keeps running. `GET
+/api/capabilities` shows what the probe found.
 
 `deploy/deploy.sh <verdict-file>` replaces the binary of the live fleet on
 this host. It refuses unless the verdict file is the gate's, accepted, for

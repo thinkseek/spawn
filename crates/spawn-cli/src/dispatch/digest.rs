@@ -87,6 +87,9 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::OverBudget => "a task went over its budget twice",
         Why::DrainExpired => "the integrator's drain reached its bound (gates stopped)",
         Why::ModelFinal => "the model's error ended a worker's engine for good (not revived)",
+        Why::EngineUnavailable => {
+            "a task's engine or model label is not available on this host (no start is made)"
+        }
     }
 }
 

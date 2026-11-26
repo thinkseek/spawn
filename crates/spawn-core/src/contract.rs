@@ -193,6 +193,7 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         },
     };
     let id = queue

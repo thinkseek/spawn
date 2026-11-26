@@ -711,7 +711,9 @@ fn upkeep_line(report: &Value) -> Option<String> {
 /// The catalog as `/api/grading` answers it: `{presets, profiles}`, each
 /// preset as [`GradedPreset`] serializes (so every phase-1 field is there
 /// as it was) with `routing_grade`, `profile` (its
-/// [`GradedPreset::profile_name`]) and `reprobe_due` at `now_ms`; every
+/// [`GradedPreset::profile_name`]), `driver` and `label_only` (its
+/// [`GradedPreset::driver_id`]: the engine its worker runs, and whether its
+/// labels are for people only) and `reprobe_due` at `now_ms`; every
 /// profile name the catalog runs as, sorted, once.
 pub(crate) fn api_catalog(
     catalog: &[GradedPreset],
@@ -725,6 +727,9 @@ pub(crate) fn api_catalog(
             let mut value = json!(preset);
             value["routing_grade"] = json!(preset.routing_grade());
             value["profile"] = json!(preset.profile_name());
+            let driver = preset.driver_id();
+            value["driver"] = json!(driver.driver);
+            value["label_only"] = json!(driver.label_only);
             value["reprobe_due"] = json!(spawn_core::grading::reprobe_due(
                 preset,
                 activity,
@@ -1081,6 +1086,31 @@ mod tests {
         assert_eq!(presets[1]["execution_profile"], json!("opus-max"));
         assert_eq!(presets[1]["reprobe_due"], json!(false));
         assert_eq!(answer["profiles"], json!(["default", "opus-max"]));
+    }
+
+    #[test]
+    fn the_api_catalog_names_each_presets_driver_and_whether_its_labels_are_only_labels() {
+        let claude = graded_preset(PresetState::Active, Some(SkillGrade::L2));
+        let mut agy = claude.clone();
+        agy.preset_id = "agy-flash".to_string();
+        agy.engine_label = "agy".to_string();
+        let mut codex = claude.clone();
+        codex.preset_id = "codex".to_string();
+        codex.engine_label = "codex".to_string();
+        let answer = api_catalog(&[claude, agy, codex], &[], 1_000, 1_000);
+        let presets = answer["presets"].as_array().unwrap();
+        let pairs: Vec<(Value, Value)> = presets
+            .iter()
+            .map(|preset| (preset["driver"].clone(), preset["label_only"].clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (json!("claude"), json!(false)),
+                (json!("agy"), json!(false)),
+                (json!("claude"), json!(true)),
+            ]
+        );
     }
 
     #[test]

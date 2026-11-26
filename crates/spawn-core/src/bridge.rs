@@ -163,6 +163,9 @@ struct Begin<'a> {
     from: Option<&'a str>,
     /// Models the engine runs on; unset keeps the session's last profile.
     model: Option<ModelProfile>,
+    /// The model an engine told its model at launch runs, by its own label
+    /// (`start {model_label}`); unset, the host's (`SPAWN_AGY_MODEL`).
+    model_label: Option<&'a str>,
     /// The engine's driver: the start's engine, or the session's for a
     /// resume.
     driver: &'static dyn AgentDriver,
@@ -822,6 +825,12 @@ struct SessionView {
     /// The engine the session's last execution started: what a resume
     /// runs.
     engine: String,
+    /// The model label an engine told its model at launch (agy) last
+    /// started on, as its `execution.started` records it (the launch's
+    /// `model`): what a resume runs, so a resumed worker stays on its
+    /// preset's model. None for Claude Code, and for an execution that
+    /// recorded none (the host's `SPAWN_AGY_MODEL` then).
+    model_label: Option<String>,
     active: Option<Active>,
     /// What the log last says the agent's branch points at: the commit of
     /// its last `artifact.committed`, or the fork its branch was created at.
@@ -936,6 +945,15 @@ enum Typing {
     Unknown,
 }
 
+/// The model label an execution of `engine` was launched on, as its
+/// `execution.started` records it (`launch`'s `model`): an engine besides
+/// Claude Code's only ([`SessionView::model_label`]).
+fn launched_label(engine: &str, launch: Option<&LaunchSummary>) -> Option<String> {
+    launch
+        .and_then(|launch| launch.model.clone())
+        .filter(|_| engine != crate::driver::DEFAULT)
+}
+
 impl SessionView {
     /// Start a session's view from its first event.
     fn from_event(event: &NewEvent) -> Self {
@@ -946,6 +964,7 @@ impl SessionView {
             transcript_read: false,
             model: ModelProfile::Default,
             engine: crate::driver::DEFAULT.to_string(),
+            model_label: None,
             active: None,
             recorded_head: None,
             latest: None,
@@ -1177,6 +1196,9 @@ struct PreparedStart {
     config_dir: Option<String>,
     launch: LaunchSummary,
     model: ModelProfile,
+    /// The model label the engine is launched with: the start's
+    /// `model_label`, else the host's for that engine; none for Claude Code.
+    model_label: Option<String>,
     fork: Option<Fork>,
 }
 
@@ -1970,10 +1992,12 @@ impl Bridge {
                 workspace,
                 model,
                 transcript_from,
+                launch,
                 ..
             } => {
                 view.model = *model;
                 view.engine.clone_from(engine);
+                view.model_label = launched_label(engine, launch.as_ref());
                 if let Some(execution_id) = event.execution_id.clone() {
                     // As the store names it now: a record from before the
                     // root was resolved names the same directory.
@@ -3877,6 +3901,7 @@ impl Bridge {
                 // The control layer's record of the charter it gave: nothing
                 // the Bridge does depends on it.
                 charter: _,
+                model_label,
             } => self.start(
                 claimed,
                 &Begin {
@@ -3885,6 +3910,7 @@ impl Bridge {
                     native: None,
                     from: from.as_deref(),
                     model,
+                    model_label: model_label.as_deref(),
                     driver: driver_or_default(&engine),
                 },
                 report,
@@ -4067,9 +4093,8 @@ impl Bridge {
             prompt,
             parent,
             native,
-            from,
-            model,
             driver,
+            ..
         } = *begin;
         let finished = |outcome| Ok(Handled::Finished(outcome));
         // Another Bridge may have started the session since this tick read
@@ -4079,7 +4104,7 @@ impl Bridge {
             return handled;
         }
         let branch = BranchName::for_agent(&claimed.agent_id);
-        let prepared = match self.prepare_start(claimed, &branch, (driver, model), from, report)? {
+        let prepared = match self.prepare_start(claimed, &branch, begin, report)? {
             Ok(prepared) => prepared,
             Err(why) => return finished(self.fail_prepared_start(claimed, why)),
         };
@@ -4222,16 +4247,24 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         branch: &BranchName,
-        (driver, model): (&'static dyn AgentDriver, Option<ModelProfile>),
-        from: Option<&str>,
+        begin: &Begin<'_>,
         report: &mut TickReport,
     ) -> Result<Result<PreparedStart, String>, StoreError> {
         if let Some(prepared) = self.prepared.get(&claimed.command_id) {
             return Ok(Ok(prepared.clone()));
         }
+        let Begin {
+            from,
+            model,
+            model_label,
+            driver,
+            ..
+        } = *begin;
         // Only the engines this host enables (`SPAWN_ENGINES`) start, and
-        // one other than Claude Code only with its model named: an engine
-        // left to pick its own may pick its costliest.
+        // one other than Claude Code only with its model named, by the
+        // start (`model_label`) or the host (`SPAWN_<ENGINE>_MODEL`): an
+        // engine left to pick its own may pick its costliest.
+        let mut label = None;
         if driver.id() != crate::driver::DEFAULT {
             match self.config.engine_home(driver.id()) {
                 None => {
@@ -4240,14 +4273,17 @@ impl Bridge {
                         driver.id()
                     )));
                 }
-                Some(home) if home.model.is_none() => {
-                    return Ok(Err(format!(
-                        "engine {} has no model named on this host (SPAWN_{}_MODEL)",
-                        driver.id(),
-                        driver.id().to_ascii_uppercase()
-                    )));
-                }
-                Some(_) => {}
+                Some(home) => match model_label.map(str::to_string).or(home.model.clone()) {
+                    Some(named) => label = Some(named),
+                    None => {
+                        return Ok(Err(format!(
+                            "engine {} has no model named: the start names no model_label and \
+                             this host none (SPAWN_{}_MODEL)",
+                            driver.id(),
+                            driver.id().to_ascii_uppercase()
+                        )));
+                    }
+                },
             }
         }
         let model = model.unwrap_or_else(|| {
@@ -4255,10 +4291,19 @@ impl Bridge {
                 .get(&claimed.session_id)
                 .map_or(ModelProfile::Default, |view| view.model)
         });
-        let (relay, config_dir, launch) = match self.engine_settings(claimed, model, report) {
+        let (relay, config_dir, mut launch) = match self.engine_settings(claimed, model, report) {
             Ok(settings) => settings,
             Err(why) => return Ok(Err(why)),
         };
+        // An engine told its model at launch runs on no relay of Claude
+        // Code's: its launch summary is the model it runs, which a resume
+        // of the session reads back (`SessionView::model_label`).
+        if label.is_some() {
+            launch = LaunchSummary {
+                model: label.clone(),
+                ..LaunchSummary::default()
+            };
+        }
         let fork = match self.ensure_branch(claimed, branch, from, report) {
             Ok(fork) => fork,
             Err(why) => return Ok(Err(why)),
@@ -4270,6 +4315,7 @@ impl Bridge {
             config_dir,
             launch,
             model,
+            model_label: label,
             fork,
         };
         self.prepared.insert(claimed.command_id, prepared.clone());
@@ -4978,6 +5024,7 @@ impl Bridge {
                 profile: prepared.model,
                 config_dir: prepared.config_dir.as_deref(),
                 cwd: Some(active.workspace.path()),
+                model: prepared.model_label.as_deref(),
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
@@ -6045,6 +6092,11 @@ impl Bridge {
                         return Ok(self.prompt_retry(&progress));
                     }
                 };
+            // The engine says it will not run what it was started on (agy's
+            // unknown model): the start fails now, never waits on it.
+            if let Some(why) = active.driver.start_refusal(&pane) {
+                return Ok(Handled::Finished(Outcome::Failed(why)));
+            }
             let reading = active.driver.read_screen(&pane);
             progress.prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it,
@@ -6591,11 +6643,13 @@ impl Bridge {
                 claimed.session_id
             ))));
         }
-        let Some((native, engine)) = self.sessions.get(&claimed.session_id).and_then(|view| {
-            view.native
-                .clone()
-                .map(|native| (native, view.engine.clone()))
-        }) else {
+        let Some((native, engine, label)) =
+            self.sessions.get(&claimed.session_id).and_then(|view| {
+                view.native
+                    .clone()
+                    .map(|native| (native, view.engine.clone(), view.model_label.clone()))
+            })
+        else {
             return Ok(Handled::Finished(Outcome::Failed(
                 "no native session to resume".to_string(),
             )));
@@ -6608,6 +6662,10 @@ impl Bridge {
                 native: Some(native.as_str()),
                 from: None,
                 model,
+                // A resume runs the model label its session last started on
+                // (its `execution.started`), the host's only when that
+                // recorded none.
+                model_label: label.as_deref(),
                 driver: driver_or_default(&engine),
             },
             report,
@@ -8570,6 +8628,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
+                        model_label: None,
                     },
                 },
             )
@@ -8993,6 +9052,7 @@ mod tests {
                             from: None,
                             model: None,
                             charter: None,
+                            model_label: None,
                         },
                     },
                 )
@@ -9345,6 +9405,14 @@ mod tests {
     }
 
     fn submit_agy_start(store: &Arc<MemoryStore>, prompt: &str) -> CommandId {
+        submit_agy_start_on(store, prompt, None)
+    }
+
+    fn submit_agy_start_on(
+        store: &Arc<MemoryStore>,
+        prompt: &str,
+        model_label: Option<&str>,
+    ) -> CommandId {
         let id = store
             .submit(
                 &Principal::new("tester").expect("principal"),
@@ -9359,6 +9427,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
+                        model_label: model_label.map(str::to_string),
                     },
                 },
             )
@@ -9416,6 +9485,201 @@ mod tests {
             why.contains("engine agy needs the herdr terminal backend"),
             "{why}"
         );
+    }
+
+    /// The start's `model_label` (the task's preset's) is agy's `--model`,
+    /// on a host that names none (`SPAWN_AGY_MODEL` unset) or another.
+    #[test]
+    fn agy_starts_on_the_starts_model_label_over_the_hosts() {
+        for host_model in [None, Some("gemini-3.8-flash-low")] {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+            let id = submit_agy_start_on(&store, "hello", Some("gemini-3.8-pro"));
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                host.clone(),
+                agy_config(host_model),
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+            let launch = store.launches().pop().expect("launched");
+            let arguments = launch.arguments.join(" ");
+            assert!(
+                arguments.contains("/opt/agy/bin/agy --model gemini-3.8-pro --dangerously"),
+                "{host_model:?}: {arguments}"
+            );
+        }
+    }
+
+    /// agy's "is not recognized as a known model" line fails the start at
+    /// once: it never waits on, nor types into, an engine on a model nobody
+    /// chose.
+    #[test]
+    fn agys_unknown_model_line_fails_the_start() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let host = Witnessed::over(store.clone());
+        host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+        let id = submit_agy_start_on(&store, "hello", Some("gemini-9"));
+        store.set_pane(
+            &TerminalName::for_execution(&ExecutionId::for_command(id)),
+            &format!(
+                "Warning: model \"gemini-9\" is not recognized as a known model\n{}",
+                agy_idle()
+            ),
+        );
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            host.clone(),
+            agy_config(None),
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        match command_outcome(&store, id) {
+            Some(Outcome::Failed(why)) => {
+                assert!(why.contains("is not recognized as a known model"), "{why}");
+            }
+            other => panic!("failed, not {other:?}"),
+        }
+        assert!(
+            store.submitted_held().is_empty(),
+            "nothing typed into an engine on an unchosen model"
+        );
+    }
+
+    /// An agy session whose execution started on `gemini-3.8-pro` (its
+    /// launch summary), bound to `conv-1`, and stopped.
+    fn seed_stopped_agy(store: &Arc<MemoryStore>) -> (AgentId, SessionId) {
+        let agent = AgentId::new("agent_agy").expect("agent");
+        let session = SessionId::new("session_agy").expect("session");
+        let earlier = ExecutionId::for_command(CommandId(900));
+        let event = |key: &str, kind: EventKind| NewEvent {
+            agent_id: agent.clone(),
+            session_id: session.clone(),
+            execution_id: Some(earlier.clone()),
+            source: Source::Bridge,
+            source_event_id: Some(format!("{earlier}:{key}")),
+            kind,
+        };
+        store
+            .append(event(
+                "started",
+                EventKind::ExecutionStarted {
+                    engine: "agy".to_string(),
+                    workspace: WorkspaceId::new("agent_agy:/workspaces/agent_agy")
+                        .expect("workspace"),
+                    command_id: CommandId(900),
+                    fork: None,
+                    model: crate::event::ModelProfile::Default,
+                    transcript_from: None,
+                    launch: Some(crate::event::LaunchSummary {
+                        model: Some("gemini-3.8-pro".to_string()),
+                        ..crate::event::LaunchSummary::default()
+                    }),
+                },
+            ))
+            .expect("started");
+        store
+            .append(event(
+                "native",
+                EventKind::NativeSessionStarted {
+                    engine: "agy".to_string(),
+                    native_session_id: "conv-1".to_string(),
+                    transcript_path: None,
+                    engine_version: None,
+                },
+            ))
+            .expect("native");
+        store
+            .append(event(
+                "ended",
+                EventKind::ExecutionEnded {
+                    cause: crate::event::EndCause::Stopped,
+                    exit_code: Some(0),
+                    signal: None,
+                    evidence: None,
+                },
+            ))
+            .expect("ended");
+        (agent, session)
+    }
+
+    /// Review 589, must-fix 1: a resumed agy session runs the model label
+    /// its last execution started on (its `execution.started` launch
+    /// model), over the host's `SPAWN_AGY_MODEL` and with it unset: a
+    /// revision stays on its preset's model.
+    #[test]
+    fn a_resumed_agy_session_runs_the_label_it_last_started_on() {
+        for host_model in [None, Some("gemini-3.8-flash-low")] {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+            let (agent, session) = seed_stopped_agy(&store);
+            let id = store
+                .submit(
+                    &Principal::new("tester").expect("principal"),
+                    &Submission {
+                        agent_id: agent.clone(),
+                        session_id: session.clone(),
+                        idempotency_key: IdempotencyKey::new("resume-agy").expect("key"),
+                        action: CommandAction::Resume {
+                            prompt: None,
+                            model: None,
+                        },
+                    },
+                )
+                .expect("submit");
+            store.set_pane(
+                &TerminalName::for_execution(&ExecutionId::for_command(id)),
+                &agy_idle(),
+            );
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                host.clone(),
+                agy_config(host_model),
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(
+                command_outcome(&store, id),
+                Some(Outcome::Succeeded),
+                "{host_model:?}"
+            );
+            let launch = store.launches().pop().expect("launched");
+            let arguments = launch.arguments.join(" ");
+            assert!(
+                arguments.contains("--conversation conv-1 --model gemini-3.8-pro --dangerously"),
+                "{host_model:?}: {arguments}"
+            );
+            // The resume records the label it ran on, so the next resume
+            // runs it too.
+            let resumed = records(&store)
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::ExecutionStarted { launch, .. } => launch,
+                    _ => None,
+                })
+                .next_back()
+                .expect("a launch summary");
+            assert_eq!(resumed.model.as_deref(), Some("gemini-3.8-pro"));
+            assert_eq!(resumed.relay_url, None);
+        }
     }
 
     fn records(store: &Arc<MemoryStore>) -> Vec<crate::event::EventRecord> {
@@ -12489,6 +12753,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
+                        model_label: None,
                     },
                 },
             )

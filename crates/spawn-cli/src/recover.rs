@@ -1509,6 +1509,7 @@ fn start_handoff_action(prompt: String, charter: Option<String>) -> CommandActio
         from: None,
         model: None,
         charter,
+        model_label: None,
     }
 }
 
@@ -3828,6 +3829,7 @@ mod tests {
                 from,
                 model,
                 charter,
+                model_label: None,
             } => {
                 assert_eq!(engine, ENGINE);
                 assert_eq!(prompt, expected_prompt);

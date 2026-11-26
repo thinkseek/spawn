@@ -51,6 +51,7 @@ fn start(store: &MemoryStore) {
                     from: None,
                     model: None,
                     charter: None,
+                    model_label: None,
                 },
             },
         )

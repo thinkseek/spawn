@@ -1411,7 +1411,10 @@ $$;
 --     will end the one it runs (any mode): the wake (key `<key>:wake`),
 --     `{"type":"resume"}` when a native session is bound to resume
 --     (`session.native_started`), else `{"type":"start"}` with a short
---     prompt and no charter: after a cold start the dispatcher types the
+--     prompt and no charter, on the `engine`, `model` and `model_label` of
+--     the session's newest start (each only when that start names it;
+--     engine `claude` when there is none, so a Claude session's wake is
+--     unchanged): after a cold start the dispatcher types the
 --     charter in at the supervisor's first idle prompt, as after any start
 --     that gave none (crate dispatch, `charter`). No wake is made when a
 --     start or resume is already in flight after every unfinished stop and
@@ -1549,11 +1552,23 @@ begin
                               where e.session_id = v_session
                                 and e.event_name = 'session.native_started')
                 then jsonb_build_object('type', 'resume')
-                else jsonb_build_object(
-                    'type', 'start', 'engine', 'claude',
-                    'prompt', 'The owner wrote to you from the dashboard (Master '
-                              'Control) while you were stopped; the message follows '
-                              'as your next input. Read it, then go on with your work.')
+                -- A cold start runs the engine, model profile and model label
+                -- of the session's newest start (Claude Code when it has
+                -- none); a key that start left out stays out, so a Claude
+                -- session's wake is what it always was.
+                else (select jsonb_strip_nulls(jsonb_build_object(
+                          'type', 'start',
+                          'engine', coalesce(n.action ->> 'engine', 'claude'),
+                          'model', n.action -> 'model',
+                          'model_label', n.action -> 'model_label',
+                          'prompt', 'The owner wrote to you from the dashboard (Master '
+                                    'Control) while you were stopped; the message follows '
+                                    'as your next input. Read it, then go on with your work.'))
+                        from (select 1) one
+                        left join lateral (
+                            select c.action from spawn_commands c
+                             where c.session_id = v_session and c.action ->> 'type' = 'start'
+                             order by c.id desc limit 1) n on true)
             end;
             select spawn_human_replay(s.out_id, p_key || ':wake', v_session, v_wake_action)
               into v_wake

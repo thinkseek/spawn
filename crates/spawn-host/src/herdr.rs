@@ -510,6 +510,49 @@ impl HerdrHost {
         &self.session
     }
 
+    /// The `herdr` program the host runs.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// What the session's running server says of itself, for
+    /// `GET /api/capabilities`: `{protocol, expected_protocol, manifests,
+    /// pinned_manifests}`, `protocol` as `ping` answers it and `manifests`
+    /// as `server.agent_manifests` lists them (each `{agent,
+    /// active_version}`). Two read-only calls; it never starts a server,
+    /// and fails when none answers.
+    pub fn server_facts(&self) -> Result<Value, TerminalError> {
+        let pong = self
+            .call("ping", &json!({}), CALL_LIMIT)
+            .map_err(|call| call.into_error("ping"))?;
+        let listed = self
+            .call("server.agent_manifests", &json!({}), CALL_LIMIT)
+            .map_err(|call| call.into_error("server.agent_manifests"))?;
+        let manifests: Vec<Value> = listed["manifests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|manifest| {
+                json!({
+                    "agent": manifest["agent"],
+                    "active_version": manifest["active_version"],
+                })
+            })
+            .collect();
+        let pinned: Vec<Value> = self
+            .manifests
+            .iter()
+            .map(|(agent, version)| json!({ "agent": agent, "version": version }))
+            .collect();
+        Ok(json!({
+            "protocol": pong["protocol"],
+            "expected_protocol": self.protocol,
+            "manifests": manifests,
+            "pinned_manifests": pinned,
+        }))
+    }
+
     /// Where this host keeps its files: a private directory per Herdr this
     /// host runs (its program and session) under the runtime directory, so
     /// a host on another session never reads a record of a terminal of the
