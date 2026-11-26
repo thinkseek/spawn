@@ -1,0 +1,14 @@
+[package]
+name = "ghostty-vt"
+description = "Pure-Rust VT100/xterm/OSC-7501 terminal emulator drop-in for herdr-core"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
