@@ -665,6 +665,13 @@ fn herdr_detects_an_agent_inside_the_view_that_cannot_reach_its_socket() {
         .expect("wrap");
     assert!(!words.iter().any(|word| word == "--new-session"));
     let program = words.remove(0);
+    // A parent between the view and the agent, as the runner (`spawn run`)
+    // is in a real launch: the agent is not the view's own child.
+    words.extend([
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "\"$0\"; :".to_string(),
+    ]);
     words.push(stub.display().to_string());
     let terminal = TerminalName::new("spawn-exec_v1").expect("terminal");
     let id = WorkspaceId::new(format!("agent:{workspace}")).expect("workspace");
