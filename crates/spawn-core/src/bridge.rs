@@ -448,7 +448,7 @@ impl Active {
         workspace: WorkspaceId,
         transcript_from: Option<u64>,
         driver: &'static dyn AgentDriver,
-        started_at: Timestamp,
+        started_at: crate::time::Timestamp,
     ) -> Self {
         Self {
             execution_id,
