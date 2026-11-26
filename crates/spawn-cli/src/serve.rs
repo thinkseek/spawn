@@ -1196,6 +1196,16 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
         if !access.read {
             return refuse(request, shared.token.is_some());
         }
+        if path == "/api/features/truth" {
+            if !matches!(request.method(), Method::Get | Method::Head) {
+                return request
+                    .respond(not_allowed("GET"))
+                    .map_err(|error| error.to_string());
+            }
+            let answer = feature_map::feature_truth_answer(query);
+            let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+            return answers::respond(request, &answer, if_none_match.as_deref());
+        }
         let Some((method, pattern, values)) = route(path) else {
             return static_file(request, &shared.web, path);
         };
@@ -2045,6 +2055,14 @@ fn feature_coverage_projects() -> Result<Value, String> {
     Ok(coverage_projects(&missions))
 }
 
+/// Resolve `(root, registry)` for one eligible open objective mission (used
+/// by [`coverage_projects`] and named `?project=` resolution).
+pub(super) fn coverage_mission_paths(mission: &Value, id: i64) -> Option<(PathBuf, PathBuf)> {
+    let (root, registry) = mission_paths(mission, id).ok()?;
+    coverage_registry_checked(&registry, id).ok()?;
+    Some((root, registry))
+}
+
 /// `{"projects": [{mission, text, registry_path, root}]}`: each mission of
 /// `missions` whose `--features` file is a coverage registry
 /// ([`coverage_registry_checked`]), in mission order; a mission without
@@ -2056,8 +2074,7 @@ fn coverage_projects(missions: &Value) -> Value {
         .flatten()
         .filter_map(|mission| {
             let id = mission["id"].as_i64()?;
-            let (root, registry) = mission_paths(mission, id).ok()?;
-            coverage_registry_checked(&registry, id).ok()?;
+            let (root, registry) = coverage_mission_paths(mission, id)?;
             Some(json!({
                 "mission": id,
                 "text": mission["text"],

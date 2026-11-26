@@ -661,3 +661,482 @@ export function nextCoverageScope(current: CoverageScope, mission: number | null
 export function isCurrentCoverageScope(started: CoverageScope, current: CoverageScope): boolean {
   return started.epoch === current.epoch && started.mission === current.mission;
 }
+
+export type TruthSeverity = "error" | "warn" | "info";
+
+export interface TruthEvidenceEdge {
+  from: string;
+  to: string;
+  kind: string;
+  scope: string;
+  line: number;
+  via: string | null;
+  precision: string;
+}
+
+export interface TruthSuppressedPair {
+  from_any_of: string[];
+  to_any_of: string[];
+  reason: string;
+  prod_edges: number;
+}
+
+export interface TruthSuppressed {
+  total: number;
+  file_edges: number;
+  pairs: TruthSuppressedPair[];
+}
+
+export interface TruthFinding {
+  code: string;
+  severity: TruthSeverity;
+  waived: boolean;
+  from_any_of: string[];
+  to_any_of: string[];
+  features: string[];
+  evidence_total: number;
+  evidence: TruthEvidenceEdge[];
+  fix: string;
+  suppressed: TruthSuppressed | null;
+}
+
+export interface TruthCounts {
+  error: number;
+  warn: number;
+  info: number;
+  waived: number;
+  enforced_violations: number;
+  under_declared: number;
+  implied_only: number;
+  test_only_undeclared: number;
+  ghost: number;
+  inverted: number;
+  unverifiable: number;
+  static_cycle: number;
+  basis_without_note: number;
+  kernel_leak: number;
+  entrypoint_imported: number;
+  waiver_unused: number;
+  by_code: Record<string, number>;
+}
+
+export interface PurityFinding {
+  code: string;
+  severity: TruthSeverity;
+  feature_id: string;
+  detail: string;
+  sample_paths: string[];
+  fix: string;
+}
+
+export interface PurityCounts {
+  error: number;
+  warn: number;
+  by_code: Record<string, number>;
+}
+
+export interface PurityReport {
+  schema_version: number;
+  clean: boolean;
+  counts: PurityCounts;
+  findings: PurityFinding[];
+}
+
+export interface TruthProjectionSummary {
+  file_edges: number;
+  structural: number;
+  unowned: number;
+  internal: number;
+  hierarchy: number;
+  declared: number;
+  implied: number;
+  undeclared: number;
+}
+
+export interface TruthGraphSummary {
+  units: number;
+  files: number;
+  edges: number;
+  diagnostics: number;
+}
+
+export interface FeatureTruthResponse {
+  schema_version: number;
+  project: string;
+  root: string;
+  registry_path: string;
+  git_head: string | null;
+  today: string;
+  projection: TruthProjectionSummary;
+  counts: TruthCounts;
+  enforced_violations: TruthFinding[];
+  findings: TruthFinding[];
+  purity: PurityReport;
+  graph: TruthGraphSummary;
+}
+
+const ENFORCED_TRUTH_CODES = new Set([
+  "under_declared",
+  "ghost",
+  "inverted",
+  "basis_without_note",
+  "kernel_leak",
+]);
+
+/** Matches Rust `spawn_core::feature_deps::is_enforced_truth_finding`. */
+export function isEnforcedTruthFinding(finding: TruthFinding): boolean {
+  return !finding.waived && finding.severity === "error" && ENFORCED_TRUTH_CODES.has(finding.code);
+}
+
+/** Build `/api/features/truth` URL with optional `mission` or `project` scope. */
+export function truthUrl(
+  options: { mission?: number | null; project?: string | null } = {},
+): string {
+  if (typeof options.mission === "number" && Number.isInteger(options.mission)) {
+    return `/api/features/truth?mission=${encodeURIComponent(String(options.mission))}`;
+  }
+  const project = options.project?.trim() ?? "";
+  if (project !== "") {
+    return `/api/features/truth?project=${encodeURIComponent(project)}`;
+  }
+  return "/api/features/truth";
+}
+
+function truthSeverity(value: unknown): TruthSeverity {
+  if (value === "error" || value === "warn" || value === "info") return value;
+  return "info";
+}
+
+function numRecord(value: unknown): Record<string, number> {
+  const raw = obj(value);
+  const out: Record<string, number> = {};
+  for (const [key, val] of Object.entries(raw)) {
+    if (typeof val === "number" && Number.isFinite(val)) out[key] = val;
+  }
+  return out;
+}
+
+function normalizeTruthEdge(value: unknown): TruthEvidenceEdge {
+  const raw = obj(value);
+  return {
+    from: str(raw.from),
+    to: str(raw.to),
+    kind: str(raw.kind),
+    scope: str(raw.scope, "prod"),
+    line: num(raw.line),
+    via: optStr(raw.via),
+    precision: str(raw.precision, "item"),
+  };
+}
+
+function normalizeSuppressed(value: unknown): TruthSuppressed | null {
+  if (!isPlainObject(value)) return null;
+  const pairs = arr(value.pairs).map((entry) => {
+    const raw = obj(entry);
+    return {
+      from_any_of: strList(raw.from_any_of),
+      to_any_of: strList(raw.to_any_of),
+      reason: str(raw.reason),
+      prod_edges: num(raw.prod_edges),
+    };
+  });
+  return {
+    total: num(value.total, pairs.length),
+    file_edges: num(value.file_edges),
+    pairs,
+  };
+}
+
+function normalizeTruthFinding(value: unknown): TruthFinding {
+  const raw = obj(value);
+  const evidence = arr(raw.evidence).map(normalizeTruthEdge);
+  return {
+    code: str(raw.code, "unknown"),
+    severity: truthSeverity(raw.severity),
+    waived: raw.waived === true,
+    from_any_of: strList(raw.from_any_of),
+    to_any_of: strList(raw.to_any_of),
+    features: strList(raw.features),
+    evidence_total: num(raw.evidence_total, evidence.length),
+    evidence,
+    fix: str(raw.fix),
+    suppressed: normalizeSuppressed(raw.suppressed),
+  };
+}
+
+function normalizeTruthCounts(value: unknown, findings: readonly TruthFinding[]): TruthCounts {
+  const raw = obj(value);
+  const byCode = numRecord(raw.by_code);
+  const codeCount = (code: string): number => {
+    const direct = raw[code];
+    if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+    if (code in byCode) return byCode[code];
+    return findings.filter((item) => item.code === code).length;
+  };
+  const derivedEnforced = findings.filter(isEnforcedTruthFinding).length;
+  return {
+    error: num(raw.error),
+    warn: num(raw.warn),
+    info: num(raw.info),
+    waived: num(raw.waived),
+    enforced_violations: num(raw.enforced_violations, derivedEnforced),
+    under_declared: codeCount("under_declared"),
+    implied_only: codeCount("implied_only"),
+    test_only_undeclared: codeCount("test_only_undeclared"),
+    ghost: codeCount("ghost"),
+    inverted: codeCount("inverted"),
+    unverifiable: codeCount("unverifiable"),
+    static_cycle: codeCount("static_cycle"),
+    basis_without_note: codeCount("basis_without_note"),
+    kernel_leak: codeCount("kernel_leak"),
+    entrypoint_imported: codeCount("entrypoint_imported"),
+    waiver_unused: codeCount("waiver_unused"),
+    by_code: byCode,
+  };
+}
+
+function normalizePurityReport(value: unknown): PurityReport {
+  const raw = obj(value);
+  const countsRaw = obj(raw.counts);
+  const findings = arr(raw.findings).map((entry): PurityFinding => {
+    const item = obj(entry);
+    return {
+      code: str(item.code, "unknown"),
+      severity: truthSeverity(item.severity),
+      feature_id: str(item.feature_id),
+      detail: str(item.detail),
+      sample_paths: strList(item.sample_paths),
+      fix: str(item.fix),
+    };
+  });
+  const error = num(countsRaw.error);
+  const warn = num(countsRaw.warn);
+  return {
+    schema_version: num(raw.schema_version, 1),
+    clean: typeof raw.clean === "boolean" ? raw.clean : error === 0,
+    counts: {
+      error,
+      warn,
+      by_code: numRecord(countsRaw.by_code),
+    },
+    findings,
+  };
+}
+
+export function normalizeFeatureTruth(value: unknown): FeatureTruthResponse {
+  const raw = obj(value);
+  const findings = arr(raw.findings).map(normalizeTruthFinding);
+  const enforcedRaw = Array.isArray(raw.enforced_violations)
+    ? arr(raw.enforced_violations).map(normalizeTruthFinding)
+    : findings.filter(isEnforcedTruthFinding);
+  const projRaw = obj(raw.projection);
+  const graphRaw = obj(raw.graph);
+  return {
+    schema_version: num(raw.schema_version, 1),
+    project: str(raw.project, "Spawn"),
+    root: str(raw.root),
+    registry_path: str(raw.registry_path),
+    git_head: optStr(raw.git_head),
+    today: str(raw.today),
+    projection: {
+      file_edges: num(projRaw.file_edges),
+      structural: num(projRaw.structural),
+      unowned: num(projRaw.unowned),
+      internal: num(projRaw.internal),
+      hierarchy: num(projRaw.hierarchy),
+      declared: num(projRaw.declared),
+      implied: num(projRaw.implied),
+      undeclared: num(projRaw.undeclared),
+    },
+    counts: normalizeTruthCounts(raw.counts, findings),
+    enforced_violations: enforcedRaw,
+    findings,
+    purity: normalizePurityReport(raw.purity),
+    graph: {
+      units: num(graphRaw.units),
+      files: num(graphRaw.files),
+      edges: num(graphRaw.edges),
+      diagnostics: num(graphRaw.diagnostics),
+    },
+  };
+}
+
+/** Strict validator for `GET /api/features/truth` JSON payloads: rejects
+ * malformed or incomplete objects instead of reporting a false clean state. */
+export function parseFeatureTruthResponse(value: unknown): FeatureTruthResponse {
+  if (!isPlainObject(value)) {
+    throw new Error("Invalid truth response: expected a JSON object");
+  }
+  if (typeof value.schema_version !== "number" || !Number.isFinite(value.schema_version)) {
+    throw new Error("Invalid truth response: missing numeric schema_version");
+  }
+  if (!isPlainObject(value.counts)) {
+    throw new Error("Invalid truth response: missing counts object");
+  }
+  if (!Array.isArray(value.findings)) {
+    throw new Error("Invalid truth response: missing findings array");
+  }
+  if (!isPlainObject(value.purity) || !isPlainObject(value.purity.counts)) {
+    throw new Error("Invalid truth response: missing purity object");
+  }
+  if (!Array.isArray(value.purity.findings)) {
+    throw new Error("Invalid truth response: missing purity.findings array");
+  }
+  return normalizeFeatureTruth(value);
+}
+
+export interface TruthFindingFilter {
+  code?: string;
+  severity?: "all" | TruthSeverity;
+  includeWaived?: boolean;
+  query?: string;
+}
+
+/** Filter dependency-truth findings by code, severity, waived toggle, and text search
+ * across involved feature IDs, finding code, fix advice, and evidence file paths. */
+export function filterTruthFindings(
+  findings: readonly TruthFinding[],
+  filter: TruthFindingFilter,
+): TruthFinding[] {
+  const code = filter.code && filter.code !== "all" ? filter.code : null;
+  const severity = filter.severity && filter.severity !== "all" ? filter.severity : null;
+  const includeWaived = filter.includeWaived !== false;
+  const needle = filter.query?.trim().toLowerCase() ?? "";
+
+  return findings.filter((finding) => {
+    if (!includeWaived && finding.waived) return false;
+    if (code && finding.code !== code) return false;
+    if (severity && finding.severity !== severity) return false;
+    if (needle === "") return true;
+    const fields: string[] = [
+      finding.code,
+      finding.fix,
+      ...finding.from_any_of,
+      ...finding.to_any_of,
+      ...finding.features,
+      ...finding.evidence.flatMap((edge) => [edge.from, edge.to, edge.via ?? ""]),
+    ];
+    return fields.some((field) => field.toLowerCase().includes(needle));
+  });
+}
+
+/** Filter semantic-purity findings by code, severity, and search query. */
+export function filterPurityFindings(
+  findings: readonly PurityFinding[],
+  filter: { code?: string; severity?: "all" | TruthSeverity; query?: string },
+): PurityFinding[] {
+  const code = filter.code && filter.code !== "all" ? filter.code : null;
+  const severity = filter.severity && filter.severity !== "all" ? filter.severity : null;
+  const needle = filter.query?.trim().toLowerCase() ?? "";
+
+  return findings.filter((finding) => {
+    if (code && finding.code !== code) return false;
+    if (severity && finding.severity !== severity) return false;
+    if (needle === "") return true;
+    const fields = [finding.code, finding.feature_id, finding.detail, finding.fix, ...finding.sample_paths];
+    return fields.some((field) => field.toLowerCase().includes(needle));
+  });
+}
+
+export interface FeatureTruthNodeSummary {
+  status: "clean" | "warn" | "error";
+  truthErrors: number;
+  truthWarnings: number;
+  truthInfo: number;
+  enforcedViolations: number;
+  purityErrors: number;
+  purityWarnings: number;
+  truthFindings: TruthFinding[];
+  purityFindings: PurityFinding[];
+}
+
+/** Collect read-only dependency-truth & semantic-purity status for one feature node. */
+export function featureTruthSummaryFor(
+  truth: FeatureTruthResponse | null | undefined,
+  featureId: string,
+): FeatureTruthNodeSummary | null {
+  if (!truth || !featureId) return null;
+  const truthFindings = truth.findings.filter(
+    (finding) =>
+      finding.from_any_of.includes(featureId) ||
+      finding.to_any_of.includes(featureId) ||
+      finding.features.includes(featureId),
+  );
+  const purityFindings = truth.purity.findings.filter(
+    (finding) => finding.feature_id === featureId,
+  );
+  let truthErrors = 0;
+  let truthWarnings = 0;
+  let truthInfo = 0;
+  let enforcedViolations = 0;
+  for (const finding of truthFindings) {
+    if (finding.waived) continue;
+    if (isEnforcedTruthFinding(finding)) enforcedViolations += 1;
+    if (finding.severity === "error") truthErrors += 1;
+    else if (finding.severity === "warn") truthWarnings += 1;
+    else truthInfo += 1;
+  }
+  let purityErrors = 0;
+  let purityWarnings = 0;
+  for (const finding of purityFindings) {
+    if (finding.severity === "error") purityErrors += 1;
+    else purityWarnings += 1;
+  }
+  const status: "clean" | "warn" | "error" =
+    truthErrors + purityErrors > 0 ? "error" : truthWarnings + purityWarnings > 0 ? "warn" : "clean";
+  return {
+    status,
+    truthErrors,
+    truthWarnings,
+    truthInfo,
+    enforcedViolations,
+    purityErrors,
+    purityWarnings,
+    truthFindings,
+    purityFindings,
+  };
+}
+
+export function truthCodeLabel(code: string): string {
+  switch (code) {
+    case "under_declared":
+      return "Under-declared";
+    case "implied_only":
+      return "Implied only";
+    case "test_only_undeclared":
+      return "Test-only undeclared";
+    case "ghost":
+      return "Ghost";
+    case "inverted":
+      return "Inverted";
+    case "unverifiable":
+      return "Unverifiable";
+    case "static_cycle":
+      return "Static cycle";
+    case "basis_without_note":
+      return "Basis without note";
+    case "kernel_leak":
+      return "Kernel leak";
+    case "entrypoint_imported":
+      return "Entrypoint imported";
+    case "waiver_unused":
+      return "Waiver unused";
+    default:
+      return code;
+  }
+}
+
+export function purityCodeLabel(code: string): string {
+  switch (code) {
+    case "domain_direct_files":
+      return "Domain direct files";
+    case "glob_catch_all":
+      return "Glob catch-all";
+    case "catch_all_bucket":
+      return "Catch-all bucket";
+    case "unrelated_directory_span":
+      return "Unrelated directory span";
+    default:
+      return code;
+  }
+}

@@ -219,6 +219,17 @@ fn dispatch_buffered(req: &IpcRequest, state: &IpcState) -> IpcResponse {
         return handle_node_route(static_route.pattern, req, state);
     }
 
+    if req.path == "/api/features/truth" {
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return IpcResponse::json(
+                405,
+                &json!({ "error": "method not allowed: this path takes GET only" }),
+            )
+            .with_header("Allow", "GET");
+        }
+        return handle_api_get("/api/features/truth", req, state);
+    }
+
     let Some((expected_method, pattern, values)) = route(&req.path) else {
         return IpcResponse::json(404, &json!({ "error": "not found", "code": "not_found" }));
     };
@@ -285,27 +296,33 @@ fn handle_api_get(_pattern: &str, req: &IpcRequest, state: &IpcState) -> IpcResp
         return resp;
     }
 
-    let answer = serve::with_reader_url(reader_url, || {
-        let Some(read) = serve::reader(&req.path, &req.query) else {
-            return answers::Answer {
-                status: 404,
-                body: json!({ "error": "not found" }).to_string(),
-                etag: None,
+    let answer = if req.path == "/api/features/truth" {
+        serve::with_reader_url(reader_url, || {
+            serve::feature_map::feature_truth_answer(&req.query)
+        })
+    } else {
+        serve::with_reader_url(reader_url, || {
+            let Some(read) = serve::reader(&req.path, &req.query) else {
+                return answers::Answer {
+                    status: 404,
+                    body: json!({ "error": "not found" }).to_string(),
+                    etag: None,
+                };
             };
-        };
-        let compute = || answers::answer(&req.path, read(), BAD_REQUEST);
-        if answers::shared(&req.path) {
-            answers::ANSWERS.get(
-                &answers::key(&req.path, &req.query),
-                answers::accepted_age(cache_control.as_deref()),
-                compute,
-            )
-        } else {
-            std::sync::Arc::new(compute())
-        }
-        .as_ref()
-        .clone()
-    });
+            let compute = || answers::answer(&req.path, read(), BAD_REQUEST);
+            if answers::shared(&req.path) {
+                answers::ANSWERS.get(
+                    &answers::key(&req.path, &req.query),
+                    answers::accepted_age(cache_control.as_deref()),
+                    compute,
+                )
+            } else {
+                std::sync::Arc::new(compute())
+            }
+            .as_ref()
+            .clone()
+        })
+    };
 
     if let Some(etag) = answer.etag.as_deref()
         && answers::not_modified(if_none_match.as_deref(), etag)
@@ -694,4 +711,184 @@ fn resolve_prompt_choice(
         ));
     }
     Ok(approvals::Send::Keys(parsed))
+}
+
+#[cfg(test)]
+mod truth_tests {
+    use std::path::PathBuf;
+
+    use serde_json::Value;
+
+    use super::*;
+    use crate::serve::feature_map::with_test_default_project;
+    use crate::serve::ipc::RoleUrls;
+    use crate::serve::ipc::http::IpcRequest;
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("spawn-ipc-truth-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn setup_fixture_repo(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs/feature-map")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+        std::fs::write(
+            root.join("src/a.rs"),
+            "use crate::b::val;\npub fn f() -> u32 { val() }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn val() -> u32 { 1 }\n").unwrap();
+        let registry = json!({
+            "schema_version": 1,
+            "initiative_id": "fx",
+            "boundary": {
+                "project_name": "fixture-ipc-truth",
+                "description": "test fixture",
+                "included_categories": ["tracked-source"],
+                "exclusions": []
+            },
+            "features": [
+                {
+                    "id": "cap-a",
+                    "title": "Feature A",
+                    "kind": "capability",
+                    "summary": "A",
+                    "files": ["src/a.rs"],
+                    "relations": [],
+                    "provenance": {}
+                },
+                {
+                    "id": "cap-b",
+                    "title": "Feature B",
+                    "kind": "capability",
+                    "summary": "B",
+                    "files": ["Cargo.toml", "src/b.rs", "src/lib.rs"],
+                    "relations": [],
+                    "provenance": {}
+                }
+            ]
+        });
+        std::fs::write(
+            root.join("docs/feature-map/registry.json"),
+            serde_json::to_string_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn ipc_request(
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: Vec<(&str, &str)>,
+    ) -> IpcRequest {
+        IpcRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                .collect(),
+            idempotency_key: None,
+            body: Vec::new(),
+            close: false,
+        }
+    }
+
+    #[test]
+    fn truth_route_dispatches_via_reads_pool_supports_etag_304_head_and_rejects_post() {
+        let dir = ScratchDir::new("dispatch");
+        setup_fixture_repo(&dir.0);
+        let registry_file = dir.0.join("docs/feature-map/registry.json");
+
+        with_test_default_project(&dir.0, &registry_file, || {
+            // Bind a strictly read-only role URL and unused writes/node URLs.
+            let state = IpcState::new(
+                RoleUrls::from_explicit(
+                    "postgres://spawn_reader@127.0.0.1:1/spawn".to_string(),
+                    "postgres://spawn_human@127.0.0.1:1/spawn".to_string(),
+                    "postgres://spawn_node_gateway@127.0.0.1:1/spawn".to_string(),
+                ),
+                dir.0.join("cas"),
+                None,
+            );
+
+            let resp = dispatch_buffered(
+                &ipc_request("GET", "/api/features/truth", "", vec![]),
+                &state,
+            );
+            assert_eq!(resp.status, 200);
+            let etag = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                .map(|(_, v)| v.clone())
+                .expect("weak ETag header");
+            assert!(etag.starts_with("W/\""), "expected weak ETag, got {etag}");
+            let body: Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["project"], "fixture-ipc-truth");
+            assert_eq!(body["counts"]["under_declared"], 1);
+            assert_eq!(body["counts"]["enforced_violations"], 1);
+            assert_eq!(body["purity"]["clean"], true);
+
+            // Conditional request returns 304 Not Modified with empty body.
+            let not_mod = dispatch_buffered(
+                &ipc_request(
+                    "GET",
+                    "/api/features/truth",
+                    "",
+                    vec![("If-None-Match", &etag)],
+                ),
+                &state,
+            );
+            assert_eq!(not_mod.status, 304);
+            assert!(not_mod.body.is_empty());
+
+            // HEAD returns 200 with ETag and empty body.
+            let head_resp = dispatch_buffered(
+                &ipc_request("HEAD", "/api/features/truth", "", vec![]),
+                &state,
+            );
+            assert_eq!(head_resp.status, 200);
+            assert!(head_resp.body.is_empty());
+
+            // POST is rejected with 405 Allow: GET.
+            let post_resp = dispatch_buffered(
+                &ipc_request("POST", "/api/features/truth", "", vec![]),
+                &state,
+            );
+            assert_eq!(post_resp.status, 405);
+
+            // Exhausting the reads pool saturates GET /api/features/truth (proving reads pool binding).
+            let mut permits = Vec::new();
+            for _ in 0..super::super::READS_POOL_SIZE {
+                permits.push(state.pools.reads_gate.try_acquire().unwrap());
+            }
+            let busy = dispatch_buffered(
+                &ipc_request("GET", "/api/features/truth", "", vec![]),
+                &state,
+            );
+            assert_eq!(busy.status, 503);
+            drop(permits);
+        });
+    }
 }
