@@ -49,7 +49,11 @@ pub(crate) const DOMAIN_PREFIX: &str = "data:";
 
 /// The directory names of the transcript archive and its records, which a
 /// data root never holds (`spawn_host::transcripts`).
-const TRANSCRIPT_DIRECTORIES: [&str; 3] = [".transcripts", ".transcripts-progress", ".transcripts-sources"];
+const TRANSCRIPT_DIRECTORIES: [&str; 3] = [
+    ".transcripts",
+    ".transcripts-progress",
+    ".transcripts-sources",
+];
 
 /// The CAS under the workspace root when `--cas` is not given.
 const DEFAULT_CAS: &str = ".cas";
@@ -71,7 +75,9 @@ pub(crate) fn change_id_of(name: &str) -> String {
 /// (an unprefixed digest).
 pub(crate) fn check_ref(name: &str) -> Result<(), String> {
     let bytes = name.as_bytes();
-    let good = bytes.first().is_some_and(|first| first.is_ascii_alphanumeric() || *first == b'_')
+    let good = bytes
+        .first()
+        .is_some_and(|first| first.is_ascii_alphanumeric() || *first == b'_')
         && bytes.len() <= 128
         && bytes
             .iter()
@@ -117,7 +123,9 @@ fn store_error(error: spawn_core::port::StoreError) -> String {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -166,7 +174,10 @@ pub(crate) fn check_root(dir: &Path, cas: &Path) -> Result<PathBuf, String> {
         return Err(format!("data root {} is not a directory", root.display()));
     }
     let refuse = |why: String| Err(format!("refused: data root {}: {why}", root.display()));
-    if root.components().any(|part| is_transcript_name(part.as_os_str())) {
+    if root
+        .components()
+        .any(|part| is_transcript_name(part.as_os_str()))
+    {
         return refuse("it is inside a transcript archive".to_string());
     }
     if let Some(workspace) = env_path("SPAWN_WORKSPACE_ROOT") {
@@ -250,7 +261,10 @@ pub(crate) struct Diff {
 /// The paths where `after` differs from `before`, sorted bytewise.
 pub(crate) fn diff(before: &Manifest, after: &Manifest) -> Vec<Diff> {
     let mut out = Vec::new();
-    let (mut left, mut right) = (before.entries().iter().peekable(), after.entries().iter().peekable());
+    let (mut left, mut right) = (
+        before.entries().iter().peekable(),
+        after.entries().iter().peekable(),
+    );
     loop {
         let order = match (left.peek(), right.peek()) {
             (None, None) => break,
@@ -301,7 +315,11 @@ pub(crate) fn diff(before: &Manifest, after: &Manifest) -> Vec<Diff> {
 /// own row and one `tree` row per top-level directory, its digests that
 /// directory's manifests (absent: no file under it). `origin` goes on
 /// every entry.
-pub(crate) fn entries(before: &Manifest, after: &Manifest, origin: Option<i64>) -> Vec<ProvEntryInput> {
+pub(crate) fn entries(
+    before: &Manifest,
+    after: &Manifest,
+    origin: Option<i64>,
+) -> Vec<ProvEntryInput> {
     let diffs = diff(before, after);
     let size = |size: Option<u64>| size.and_then(|size| i64::try_from(size).ok());
     if diffs.len() <= index::FOLD_OVER {
@@ -489,7 +507,10 @@ fn used_edges(store: &PostgresStore, args: &SnapshotArgs) -> Result<Vec<ProvEdge
         );
     }
     for code in &args.code {
-        let commit = code.strip_prefix("git1:").unwrap_or(code).to_ascii_lowercase();
+        let commit = code
+            .strip_prefix("git1:")
+            .unwrap_or(code)
+            .to_ascii_lowercase();
         let hex = commit.bytes().all(|byte| byte.is_ascii_hexdigit());
         if !hex || !(commit.len() == 40 || commit.len() == 64) {
             return Err(format!("--code {code}: not a full commit id"));
@@ -555,7 +576,10 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         .put_snapshot(&root, &manifest, args.digest_only)
         .map_err(|error| {
             if error.is_mismatch() {
-                format!("{}: a file changed while it was read; snapshot again", root.display())
+                format!(
+                    "{}: a file changed while it was read; snapshot again",
+                    root.display()
+                )
             } else {
                 error.to_string()
             }
@@ -598,7 +622,12 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         store
             .record_change(&change, &rows, &edges)
             .map_err(store_error)?;
-        recorded = Some((change.rev, kind, rows.len(), rows.iter().any(|row| row.class == ProvEntryClass::Tree)));
+        recorded = Some((
+            change.rev,
+            kind,
+            rows.len(),
+            rows.iter().any(|row| row.class == ProvEntryClass::Tree),
+        ));
         changes = store.prov_domain_changes(&domain).map_err(store_error)?;
     }
     let kept = cas
@@ -606,8 +635,14 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
         .map_err(cas_error)?;
     // A snapshot another ref's pin dropped meanwhile may have taken a
     // shared object: store what is missing again.
-    if !args.digest_only && !cas.snapshot_missing(&snapshot).map_err(cas_error)?.is_empty() {
-        cas.put_snapshot(&root, &manifest, false).map_err(cas_error)?;
+    if !args.digest_only
+        && !cas
+            .snapshot_missing(&snapshot)
+            .map_err(cas_error)?
+            .is_empty()
+    {
+        cas.put_snapshot(&root, &manifest, false)
+            .map_err(cas_error)?;
     }
     let digests = |list: &[Digest]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
     Ok(json!({
@@ -634,7 +669,12 @@ pub(crate) fn snapshot(store: &PostgresStore, args: &SnapshotArgs) -> Result<Val
 pub(crate) fn refs(store: &PostgresStore, cas: Option<&Store>) -> Result<Value, String> {
     let mut out = Vec::new();
     for head in store.prov_heads(DOMAIN_PREFIX).map_err(store_error)? {
-        let name = head.head.domain.strip_prefix(DOMAIN_PREFIX).unwrap_or_default().to_string();
+        let name = head
+            .head
+            .domain
+            .strip_prefix(DOMAIN_PREFIX)
+            .unwrap_or_default()
+            .to_string();
         let kept = match cas {
             Some(cas) if check_ref(&name).is_ok() => Some(
                 cas.kept_snapshots(&name)
@@ -825,13 +865,21 @@ pub(crate) fn rollback(
     newest.extend(newest_results(&rollback.changes));
     let kept = cas.keep_snapshots(name, &newest).map_err(cas_error)?;
     answer["recorded"] = json!(true);
-    answer["kept"] = json!(kept.kept.iter().map(ToString::to_string).collect::<Vec<_>>());
+    answer["kept"] = json!(
+        kept.kept
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
     Ok((0, answer))
 }
 
 /// The data snapshots among `changes` (by id), as `blast` lists them: each
 /// ref, its snapshot and the revision that made it.
-pub(crate) fn snapshot_rows(changes: &HashMap<i64, ProvChangeRecord>, order: &[(i64, i64, &'static str)]) -> Vec<Value> {
+pub(crate) fn snapshot_rows(
+    changes: &HashMap<i64, ProvChangeRecord>,
+    order: &[(i64, i64, &'static str)],
+) -> Vec<Value> {
     order
         .iter()
         .filter_map(|(id, depth, via)| {

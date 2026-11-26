@@ -55,8 +55,7 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 fn fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../spawn-node-proto/testdata/node-protocol-v1/tree")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../spawn-node-proto/testdata/node-protocol-v1/tree")
 }
 
 #[test]
@@ -189,7 +188,12 @@ fn a_snapshot_is_stored_verified_and_digest_only_stores_its_manifest_alone() {
     assert_eq!(store.verify_snapshot(&snapshot).expect("verify"), {
         Manifest::parse(&manifest.text()).expect("parsed")
     });
-    assert!(store.snapshot_missing(&snapshot).expect("missing").is_empty());
+    assert!(
+        store
+            .snapshot_missing(&snapshot)
+            .expect("missing")
+            .is_empty()
+    );
     assert_eq!(store.namespaces_of(&snapshot).expect("ns"), [NS_DATA]);
 
     write(&root, "z", "three");
@@ -235,7 +239,12 @@ fn the_pin_keeps_the_three_newest_snapshots_and_drops_the_fourth() {
     assert!(store.has(&artifact), "v1 is an artifact too");
     assert!(store.has(&sha256_of(b"in every snapshot")));
     for snapshot in &kept {
-        assert!(store.snapshot_missing(snapshot).expect("missing").is_empty());
+        assert!(
+            store
+                .snapshot_missing(snapshot)
+                .expect("missing")
+                .is_empty()
+        );
     }
     let pinned = store.pinned().expect("pinned");
     assert!(pinned.contains(&kept[0]) && !pinned.contains(dropped));
@@ -266,7 +275,9 @@ fn an_interrupted_write_leaves_a_store_that_reads_correctly_with_no_repair() {
     let store = Store::open(&cas).expect("open again, no repair step");
     let kept = store.kept_snapshots("r").expect("the pin reads whole");
     assert_eq!(kept, [manifest.digest()]);
-    store.verify_snapshot(&kept[0]).expect("every byte verifies");
+    store
+        .verify_snapshot(&kept[0])
+        .expect("every byte verifies");
     assert_eq!(store.pin_names(PROV_PIN_OWNER).expect("names"), ["r"]);
     // The next snapshot goes on as if nothing happened.
     write(&root, "c", "gamma");

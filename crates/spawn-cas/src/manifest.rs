@@ -205,6 +205,7 @@ impl Manifest {
 
     /// The files under the top-level directory `top`, their paths relative
     /// to it (a directory's own manifest).
+    #[must_use]
     pub fn subtree(&self, top: &[u8]) -> Self {
         let mut prefix = top.to_vec();
         prefix.push(b'/');
@@ -213,11 +214,14 @@ impl Manifest {
                 .entries
                 .iter()
                 .filter_map(|entry| {
-                    entry.path.strip_prefix(prefix.as_slice()).map(|rest| ManifestEntry {
-                        path: rest.to_vec(),
-                        digest: entry.digest.clone(),
-                        size: entry.size,
-                    })
+                    entry
+                        .path
+                        .strip_prefix(prefix.as_slice())
+                        .map(|rest| ManifestEntry {
+                            path: rest.to_vec(),
+                            digest: entry.digest.clone(),
+                            size: entry.size,
+                        })
                 })
                 .collect(),
         }

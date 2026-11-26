@@ -720,7 +720,10 @@ pub(crate) fn blast(store: &PostgresStore, target: &Target) -> Result<Value, Str
         None => Vec::new(),
     };
     let (radius, used) = dependents(store, &start, &users, named.as_deref().unwrap_or_default())?;
-    let mut order: Vec<(i64, i64, &'static str)> = start.iter().map(|change| (change.id, 0, "target")).collect();
+    let mut order: Vec<(i64, i64, &'static str)> = start
+        .iter()
+        .map(|change| (change.id, 0, "target"))
+        .collect();
     let mut reached: Vec<(i64, i64, &'static str)> = radius
         .iter()
         .map(|(id, value)| {
@@ -896,7 +899,12 @@ fn dependents(
             }),
             *kind == ProvEdgeKind::Used,
         );
-        walks.push((user, 1, vec![label.to_string()], *kind == ProvEdgeKind::Used));
+        walks.push((
+            user,
+            1,
+            vec![label.to_string()],
+            *kind == ProvEdgeKind::Used,
+        ));
     }
     for (change, offset, prefix, prefix_used) in walks {
         let nodes = store
