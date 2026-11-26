@@ -381,12 +381,192 @@ pub fn catalog_covers(catalog: &[GradedPreset], difficulty: TaskDifficulty) -> b
         .any(|grade| grade >= required)
 }
 
+/// Role of a tier in the top-down 3-tier grading stack:
+/// `T3` (`top-decision`, strategic & L2 escalation fallback),
+/// `T2` (`mainline`, default strong supervisor/execution mainline),
+/// `T1` (`mechanical-offload`, strictly deterministic cheap offload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TopDownTier {
+    MechanicalOffload = 1,
+    Mainline = 2,
+    TopDecision = 3,
+}
+
+impl TopDownTier {
+    /// Every tier in top-down order (`T3`, `T2`, `T1`).
+    pub const ALL: [Self; 3] = [Self::TopDecision, Self::Mainline, Self::MechanicalOffload];
+
+    /// Wire name: `top-decision`, `mainline`, or `mechanical-offload`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TopDecision => "top-decision",
+            Self::Mainline => "mainline",
+            Self::MechanicalOffload => "mechanical-offload",
+        }
+    }
+
+    /// Corresponding skill grade.
+    pub fn grade(self) -> SkillGrade {
+        match self {
+            Self::TopDecision => SkillGrade::L3,
+            Self::Mainline => SkillGrade::L2,
+            Self::MechanicalOffload => SkillGrade::L1,
+        }
+    }
+
+    /// Tier role corresponding to a [`SkillGrade`].
+    pub fn from_grade(grade: SkillGrade) -> Self {
+        match grade {
+            SkillGrade::L3 => Self::TopDecision,
+            SkillGrade::L2 => Self::Mainline,
+            SkillGrade::L1 => Self::MechanicalOffload,
+        }
+    }
+}
+
+impl fmt::Display for TopDownTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Wire tier-role name for a routing grade (`top-decision`, `mainline`, or
+/// `mechanical-offload`), when graded.
+pub fn tier_role(grade: Option<SkillGrade>) -> Option<&'static str> {
+    grade.map(|g| TopDownTier::from_grade(g).as_str())
+}
+
+/// Default T3 (`l3`) strategic decision & L2 escalation preset id.
+pub const TOPDOWN_L3_PRESET_ID: &str = "topdown-l3-fable";
+pub const TOPDOWN_L3_ENGINE_LABEL: &str = "claude";
+pub const TOPDOWN_L3_MODEL_LABEL: &str = "claude-fable-5-2";
+pub const TOPDOWN_L3_EXECUTION_PROFILE: &str = "fable-5-2";
+pub const TOPDOWN_L3_COST_RANK: u32 = 30;
+
+/// Default T2 (`l2`) strong mainline supervisor/execution preset id.
+pub const TOPDOWN_L2_PRESET_ID: &str = "topdown-l2-neon";
+pub const TOPDOWN_L2_ENGINE_LABEL: &str = "agy";
+pub const TOPDOWN_L2_MODEL_LABEL: &str = "gemini-pro-orchestrator-neon";
+pub const TOPDOWN_L2_EXECUTION_PROFILE: &str = "neon-mainline";
+pub const TOPDOWN_L2_COST_RANK: u32 = 20;
+
+/// Default T1 (`l1`) controlled deterministic mechanical offload preset id.
+pub const TOPDOWN_L1_PRESET_ID: &str = "topdown-l1-mechanical";
+pub const TOPDOWN_L1_ENGINE_LABEL: &str = "claude";
+pub const TOPDOWN_L1_MODEL_LABEL: &str = "deepseek-v4";
+pub const TOPDOWN_L1_EXECUTION_PROFILE: &str = "mechanical-l1";
+pub const TOPDOWN_L1_COST_RANK: u32 = 10;
+
+/// Specification for one preset seeded by `spawn grade init-topdown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopDownPresetSpec {
+    pub preset_id: &'static str,
+    pub tier: TopDownTier,
+    pub engine_label: &'static str,
+    pub model_label: String,
+    pub model_profile: ModelProfile,
+    pub execution_profile: &'static str,
+    pub cost_rank: u32,
+    pub initial_grade: SkillGrade,
+    pub lock_initial_grade: bool,
+}
+
+/// The default top-down stack: `T3` (`claude-fable-5-2`) and `T2`
+/// (`gemini-pro-orchestrator-neon`), plus `T1` (`deepseek-v4` or
+/// `l1_model_label`, e.g. `deepseek-v4.1-flash` / `kimi`) when
+/// `include_l1` is true.
+pub fn topdown_default_stack(
+    include_l1: bool,
+    l1_model_label: Option<&str>,
+) -> Vec<TopDownPresetSpec> {
+    let mut stack = vec![
+        TopDownPresetSpec {
+            preset_id: TOPDOWN_L3_PRESET_ID,
+            tier: TopDownTier::TopDecision,
+            engine_label: TOPDOWN_L3_ENGINE_LABEL,
+            model_label: TOPDOWN_L3_MODEL_LABEL.to_string(),
+            model_profile: ModelProfile::Default,
+            execution_profile: TOPDOWN_L3_EXECUTION_PROFILE,
+            cost_rank: TOPDOWN_L3_COST_RANK,
+            initial_grade: SkillGrade::L3,
+            lock_initial_grade: true,
+        },
+        TopDownPresetSpec {
+            preset_id: TOPDOWN_L2_PRESET_ID,
+            tier: TopDownTier::Mainline,
+            engine_label: TOPDOWN_L2_ENGINE_LABEL,
+            model_label: TOPDOWN_L2_MODEL_LABEL.to_string(),
+            model_profile: ModelProfile::Default,
+            execution_profile: TOPDOWN_L2_EXECUTION_PROFILE,
+            cost_rank: TOPDOWN_L2_COST_RANK,
+            initial_grade: SkillGrade::L2,
+            lock_initial_grade: true,
+        },
+    ];
+    if include_l1 {
+        let model = l1_model_label
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .unwrap_or(TOPDOWN_L1_MODEL_LABEL)
+            .to_string();
+        stack.push(TopDownPresetSpec {
+            preset_id: TOPDOWN_L1_PRESET_ID,
+            tier: TopDownTier::MechanicalOffload,
+            engine_label: TOPDOWN_L1_ENGINE_LABEL,
+            model_label: model,
+            model_profile: ModelProfile::Cheap,
+            execution_profile: TOPDOWN_L1_EXECUTION_PROFILE,
+            cost_rank: TOPDOWN_L1_COST_RANK,
+            initial_grade: SkillGrade::L1,
+            lock_initial_grade: false,
+        });
+    }
+    stack
+}
+
+/// Top-down difficulty resolution for an unflagged assignment:
+/// - route at `classified` when the catalog covers it;
+/// - when `classified` is `l1` and no `l1` preset is routable, fall back
+///   upward to `l2` when covered;
+/// - **never** silently downgrade `l3` to `l2` when `l3` is uncovered (`None`).
+pub fn resolve_routing_difficulty(
+    catalog: &[GradedPreset],
+    classified: TaskDifficulty,
+) -> Option<TaskDifficulty> {
+    if catalog_covers(catalog, classified) {
+        Some(classified)
+    } else if classified == TaskDifficulty::L1 && catalog_covers(catalog, TaskDifficulty::L2) {
+        Some(TaskDifficulty::L2)
+    } else {
+        None
+    }
+}
+
+/// Whether `classified` may be offloaded to an active `l1` preset: strictly
+/// deterministic `l1` with no positive risk/scope signals and an [`PresetState::Active`]
+/// preset graded `l1`.
+pub fn can_offload_to_l1(classified: &DifficultyClassification, catalog: &[GradedPreset]) -> bool {
+    classified.difficulty == TaskDifficulty::L1
+        && classified.score <= 0
+        && !classified.signals.iter().any(|signal| signal.points > 0)
+        && catalog.iter().any(|preset| {
+            preset.state == PresetState::Active && preset.routing_grade() == Some(SkillGrade::L1)
+        })
+}
+
 /// Where a task goes ([`route_preset`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingDecision {
     pub preset_id: String,
     /// The preset's [`ModelProfile`], which the task's `model` takes.
     pub model_profile: ModelProfile,
+    /// The preset's engine label, when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_label: Option<String>,
+    /// The preset's model label, when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_label: Option<String>,
     /// The task's own difficulty, as assigned.
     pub difficulty: TaskDifficulty,
     /// The difficulty routed at: stepped up for its quality rejections.
@@ -468,6 +648,8 @@ pub fn route_preset(
     let decide = |preset: &GradedPreset, grade: SkillGrade, explicit: bool| RoutingDecision {
         preset_id: preset.preset_id.clone(),
         model_profile: preset.model_profile,
+        engine_label: (!preset.engine_label.is_empty()).then(|| preset.engine_label.clone()),
+        model_label: (!preset.model_label.is_empty()).then(|| preset.model_label.clone()),
         difficulty,
         routed_difficulty,
         required_grade: required,
@@ -512,6 +694,7 @@ pub fn route_preset(
         .min_by(|(a, a_grade), (b, b_grade)| {
             a_grade
                 .cmp(b_grade)
+                .then((a.state != PresetState::Active).cmp(&(b.state != PresetState::Active)))
                 .then(a.cost_rank.cmp(&b.cost_rank))
                 .then_with(|| a.preset_id.cmp(&b.preset_id))
         })
@@ -796,7 +979,7 @@ pub fn registered_profile(
 
 /// The version of [`classify_difficulty`]'s rules, carried on every
 /// classification so a recorded one says which rules decided it.
-pub const CLASSIFIER_RULES: &str = "brief-v2";
+pub const CLASSIFIER_RULES: &str = "brief-v3";
 
 /// A classification's score at or above which a task is `l3`.
 pub const CLASSIFY_L3_AT: i32 = 4;
@@ -881,22 +1064,73 @@ const SECURITY_STEMS: &[&str] = &[
     "secret",
 ];
 
+const SECURITY_PHRASES: &[&str] = &[
+    "安全", "凭据", "密钥", "权限", "沙箱", "鉴权", "认证", "提权", "漏洞", "注入",
+];
+
 /// Migration markers: a token starting with one of these, or a phrase.
 const MIGRATION_STEMS: &[&str] = &["migrat", "schema", "backfill", "refold"];
-const MIGRATION_PHRASES: &[&str] = &["alter table", "data loss", "breaking change"];
+const MIGRATION_PHRASES: &[&str] = &[
+    "alter table",
+    "data loss",
+    "breaking change",
+    "迁移",
+    "数据库表",
+    "不可逆",
+    "破坏性变更",
+];
+
+/// Strategic / architectural markers (`+3`, cancelling low-risk).
+const ARCHITECTURE_PHRASES: &[&str] = &[
+    "architecture",
+    "architectural",
+    "rfc",
+    "adr",
+    "protocol",
+    "consensus",
+    "threat model",
+    "key rotation",
+    "重大决策",
+    "架构设计",
+    "架构重构",
+    "核心架构",
+    "协议设计",
+    "分级重构",
+    "全局重构",
+    "顶层设计",
+    "共识",
+];
 
 /// Concurrency markers.
 const CONCURRENCY_STEMS: &[&str] = &["deadlock", "concurren", "transaction", "atomic"];
-const CONCURRENCY_PHRASES: &[&str] = &["race condition", "advisory lock"];
+const CONCURRENCY_PHRASES: &[&str] = &[
+    "race condition",
+    "advisory lock",
+    "并发",
+    "死锁",
+    "竞态",
+    "锁顺序",
+    "原子性",
+];
 
 /// Cross-cutting markers.
 const CROSS_CUTTING_STEMS: &[&str] = &["refactor", "redesign", "architect", "rewrite"];
-const CROSS_CUTTING_PHRASES: &[&str] = &["across crates", "every crate", "backwards compat"];
+const CROSS_CUTTING_PHRASES: &[&str] = &[
+    "across crates",
+    "every crate",
+    "backwards compat",
+    "架构重构",
+    "全局重构",
+    "分级重构",
+    "跨模块",
+    "跨crate",
+    "全局改造",
+];
 
 /// Multi-step markers.
 const MULTI_STEP_STEMS: &[&str] = &["multi-step", "end-to-end", "phase", "pipeline"];
 
-/// Low-risk markers (`brief-v2`): mechanical, repetitive or tagging work
+/// Low-risk markers (`brief-v3`): mechanical, repetitive or tagging work
 /// only, where the result is decided by the request and not by judgement.
 /// Semantic writing (`wording`, `readme`, `docstring`, "docs only") is not
 /// one, and neither is `one-line`, which says nothing about determinism.
@@ -913,7 +1147,16 @@ const LOW_RISK_STEMS: &[&str] = &[
     "mechanical",
     "repetitive",
 ];
-const LOW_RISK_PHRASES: &[&str] = &["cargo fmt", "registry entry"];
+const LOW_RISK_PHRASES: &[&str] = &[
+    "cargo fmt",
+    "registry entry",
+    "拼写",
+    "错别字",
+    "格式化",
+    "排版",
+    "注释",
+    "重命名",
+];
 
 /// Tagging markers that count only as the brief's first word, in the
 /// imperative form that names the work: exactly `tag` or `label` ("Tag the
@@ -995,6 +1238,16 @@ const BROADENING_STEMS: &[&str] = &[
     "vanish",
     "broke",
     "corrupt",
+    // Destructive or mutating verbs cancelling low-risk mechanical offload.
+    "delete",
+    "remove",
+    "drop",
+    "replace",
+    "change",
+    "redesign",
+];
+const BROADENING_PHRASES: &[&str] = &[
+    "删除", "移除", "修复", "实现", "设计", "重构", "优化", "修改", "新增", "逻辑", "架构",
 ];
 
 /// File extensions a path token ends with.
@@ -1131,6 +1384,8 @@ fn low_risk_markers(words: &[&str], text: &str) -> Vec<String> {
 /// - `security` +4: a security marker (auth, credential, injection, ...);
 /// - `migration` +4: a schema or data migration (migrat*, schema, alter
 ///   table, backfill, data loss, ...);
+/// - `architecture` +3: strategic/architectural decisions (architecture,
+///   rfc, adr, protocol, consensus, threat model, key rotation, 重大决策, ...);
 /// - `concurrency` +2: a race, deadlock, transaction, ...;
 /// - `cross_cutting` +2: a refactor, redesign, rewrite, ...;
 /// - `multi_step` +1 for three or more enumerated steps (lines starting
@@ -1141,19 +1396,12 @@ fn low_risk_markers(words: &[&str], text: &str) -> Vec<String> {
 /// - `long_brief` +1 above 2000 characters;
 /// - `low_risk` -2: a mechanical marker (typo*, spelling*, formatting*,
 ///   whitespace*, rustfmt*, mechanical*, repetitive*, "cargo fmt",
-///   "registry entry" anywhere; `tag` or `label` only as the brief's first
-///   word followed by a determiner, `bulk-*` only as its first word; regenerat* only when its object is a
-///   generated artifact: fixture*, snapshot*, lockfile*, golden*,
-///   generated*), only when no `security`,
-///   `migration` or `concurrency` rule matched and no broadening word is
-///   there: widening (every*, whatever*, caller*, implement*, support*,
-///   feature*), authoring (writ*, rewrit*, draft*, document*, explain*,
-///   explan*, describ*, summar*, clarif*, reword*, rephras*, comment*),
-///   code to build (filter*, render*, pars*, endpoint*, api*, display*),
-///   or a defect, performance or behaviour (bug*, crash*, debug*, hang*,
-///   cause*, speed*, optimi*, perf*, slow*, retry*, validat*, dedup*,
-///   automat*, handl*, fail*, lost*, lose*, wrong*, missing*, vanish*,
-///   broke*, corrupt*). A `*` marks a prefix: every keyword is one.
+///   "registry entry", Chinese mechanical markers anywhere; `tag` or
+///   `label` only as the brief's first word followed by a determiner,
+///   `bulk-*` only as its first word; regenerat* only when its object is
+///   a generated artifact: fixture*, snapshot*, lockfile*, golden*,
+///   generated*), only when no `security`, `migration`, `architecture` or
+///   `concurrency` rule matched and no broadening word is there.
 ///
 /// `l3` from [`CLASSIFY_L3_AT`]; `l1` at or below [`CLASSIFY_L1_AT`] when
 /// no risk rule matched, at most one file is named and the brief is at
@@ -1175,12 +1423,17 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
             });
         }
     };
-    let security = matched(&words, &text, SECURITY_STEMS, &[]);
+    let security = matched(&words, &text, SECURITY_STEMS, SECURITY_PHRASES);
     let migration = matched(&words, &text, MIGRATION_STEMS, MIGRATION_PHRASES);
+    let architecture = matched(&words, &text, &[], ARCHITECTURE_PHRASES);
     let concurrency = matched(&words, &text, CONCURRENCY_STEMS, CONCURRENCY_PHRASES);
-    let risky = !(security.is_empty() && migration.is_empty() && concurrency.is_empty());
+    let risky = !(security.is_empty()
+        && migration.is_empty()
+        && architecture.is_empty()
+        && concurrency.is_empty());
     add("security", 4, security);
     add("migration", 4, migration);
+    add("architecture", 3, architecture);
     add("concurrency", 2, concurrency);
     add(
         "cross_cutting",
@@ -1226,7 +1479,7 @@ pub fn classify_difficulty(brief: &str) -> DifficultyClassification {
         i32::from(chars > 2000),
         vec![format!("{chars} chars")],
     );
-    if !risky && matched(&words, &text, BROADENING_STEMS, &[]).is_empty() {
+    if !risky && matched(&words, &text, BROADENING_STEMS, BROADENING_PHRASES).is_empty() {
         add("low_risk", -2, low_risk_markers(&words, &text));
     }
     let score: i32 = signals.iter().map(|signal| signal.points).sum();
@@ -1346,6 +1599,8 @@ pub fn route_with_reprobe(
         Some(preset) => RoutingDecision {
             preset_id: preset.preset_id.clone(),
             model_profile: preset.model_profile,
+            engine_label: (!preset.engine_label.is_empty()).then(|| preset.engine_label.clone()),
+            model_label: (!preset.model_label.is_empty()).then(|| preset.model_label.clone()),
             preset_grade: required,
             cost_rank: preset.cost_rank,
             execution_profile: preset.execution_profile.clone(),
@@ -2477,5 +2732,138 @@ mod tests {
         ] {
             assert!(!is_quality_rejection(verdict), "{verdict}");
         }
+    }
+
+    #[test]
+    fn topdown_default_stack_covers_l3_fable_l2_neon_and_optional_l1() {
+        let two = topdown_default_stack(false, None);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].preset_id, TOPDOWN_L3_PRESET_ID);
+        assert_eq!(two[0].tier, TopDownTier::TopDecision);
+        assert_eq!(two[0].model_label, "claude-fable-5-2");
+        assert!(two[0].lock_initial_grade);
+        assert_eq!(two[1].preset_id, TOPDOWN_L2_PRESET_ID);
+        assert_eq!(two[1].tier, TopDownTier::Mainline);
+        assert_eq!(two[1].engine_label, "agy");
+        assert_eq!(two[1].model_label, "gemini-pro-orchestrator-neon");
+        assert!(two[1].lock_initial_grade);
+
+        let three = topdown_default_stack(true, Some("deepseek-v4.1-flash"));
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[2].preset_id, TOPDOWN_L1_PRESET_ID);
+        assert_eq!(three[2].tier, TopDownTier::MechanicalOffload);
+        assert_eq!(three[2].model_label, "deepseek-v4.1-flash");
+        assert_eq!(three[2].model_profile, ModelProfile::Cheap);
+        assert!(!three[2].lock_initial_grade);
+
+        assert_eq!(tier_role(Some(SkillGrade::L3)), Some("top-decision"));
+        assert_eq!(tier_role(Some(SkillGrade::L2)), Some("mainline"));
+        assert_eq!(tier_role(Some(SkillGrade::L1)), Some("mechanical-offload"));
+        assert_eq!(tier_role(None), None);
+    }
+
+    #[test]
+    fn resolve_routing_difficulty_falls_back_upward_never_downward() {
+        let mut l2 = preset(TOPDOWN_L2_PRESET_ID, SkillGrade::L2, 20);
+        l2.engine_label = "agy".to_string();
+        l2.model_label = "gemini-pro-orchestrator-neon".to_string();
+        let catalog_l2_only = vec![l2.clone()];
+
+        let resolved_l1 = resolve_routing_difficulty(&catalog_l2_only, TaskDifficulty::L1);
+        assert_eq!(resolved_l1, Some(TaskDifficulty::L1));
+        // With only L2 in catalog, L1 falls back upward to the L2 Neon preset.
+        let routed_l1 = route_preset(resolved_l1.unwrap(), 0, None, &catalog_l2_only).unwrap();
+        assert_eq!(routed_l1.preset_id, TOPDOWN_L2_PRESET_ID);
+        assert_eq!(routed_l1.preset_grade, SkillGrade::L2);
+        assert_eq!(
+            resolve_routing_difficulty(&catalog_l2_only, TaskDifficulty::L2),
+            Some(TaskDifficulty::L2)
+        );
+        // Never downgrade L3 -> L2 when no L3 preset is routable.
+        assert_eq!(
+            resolve_routing_difficulty(&catalog_l2_only, TaskDifficulty::L3),
+            None
+        );
+
+        let mut l3 = preset(TOPDOWN_L3_PRESET_ID, SkillGrade::L3, 30);
+        l3.model_label = "claude-fable-5-2".to_string();
+        let catalog_with_l3 = vec![l3, l2];
+        assert_eq!(
+            resolve_routing_difficulty(&catalog_with_l3, TaskDifficulty::L3),
+            Some(TaskDifficulty::L3)
+        );
+    }
+
+    #[test]
+    fn active_preset_beats_demoted_preset_at_same_grade_and_propagates_labels() {
+        let mut demoted = preset("cheap-demoted", SkillGrade::L3, 5);
+        demoted.calibrated_grade = Some(SkillGrade::L2);
+        demoted.state = PresetState::Demoted;
+        let mut active = preset(TOPDOWN_L2_PRESET_ID, SkillGrade::L2, 20);
+        active.engine_label = "agy".to_string();
+        active.model_label = "gemini-pro-orchestrator-neon".to_string();
+
+        let decision = route_preset(TaskDifficulty::L2, 0, None, &[demoted, active]).unwrap();
+        assert_eq!(decision.preset_id, TOPDOWN_L2_PRESET_ID);
+        assert_eq!(decision.engine_label.as_deref(), Some("agy"));
+        assert_eq!(
+            decision.model_label.as_deref(),
+            Some("gemini-pro-orchestrator-neon")
+        );
+    }
+
+    #[test]
+    fn can_offload_to_l1_requires_pure_l1_and_active_l1_preset() {
+        let l1_active = preset(TOPDOWN_L1_PRESET_ID, SkillGrade::L1, 10);
+        let mut l1_demoted = preset("demoted-l1", SkillGrade::L2, 5);
+        l1_demoted.calibrated_grade = Some(SkillGrade::L1);
+        l1_demoted.state = PresetState::Demoted;
+        let l2 = preset(TOPDOWN_L2_PRESET_ID, SkillGrade::L2, 20);
+
+        let pure_l1 = classify_difficulty("Fix the typo in README.md");
+        assert!(can_offload_to_l1(
+            &pure_l1,
+            &[l1_active.clone(), l2.clone()]
+        ));
+        assert!(!can_offload_to_l1(&pure_l1, &[l1_demoted, l2]));
+
+        let real_work = classify_difficulty("Add a feature to spawn task assign");
+        assert!(!can_offload_to_l1(&real_work, &[l1_active]));
+    }
+
+    #[test]
+    fn brief_v3_classifies_multilingual_strategic_and_blocks_destructive_l1() {
+        let zh_l3 = classify_difficulty("重大决策：架构重构与跨模块安全沙箱隔离");
+        assert_eq!(zh_l3.difficulty, TaskDifficulty::L3);
+        assert_eq!(zh_l3.rules, "brief-v3");
+
+        let zh_sec = classify_difficulty("校验凭据文件权限与密钥轮转");
+        assert_eq!(zh_sec.difficulty, TaskDifficulty::L3);
+
+        let en_arch = classify_difficulty(
+            "Architecture ADR and cross_cutting protocol redesign across crates",
+        );
+        assert_eq!(en_arch.difficulty, TaskDifficulty::L3);
+
+        // Destructive English & Chinese verbs keep low_risk blocked out of L1.
+        for brief in [
+            "Run cargo fmt and delete the old dispatcher",
+            "格式化代码并修复边界逻辑",
+            "重命名配置字段并修改全部调用方",
+        ] {
+            let classified = classify_difficulty(brief);
+            assert!(
+                classified.difficulty >= TaskDifficulty::L2,
+                "{brief}: {classified:?}"
+            );
+            assert!(
+                classified.signals.iter().all(|s| s.rule != "low_risk"),
+                "{brief}: {classified:?}"
+            );
+        }
+
+        // Pure mechanical Chinese remains eligible for L1.
+        let zh_typo = classify_difficulty("修正文档中的错别字与排版");
+        assert_eq!(zh_typo.difficulty, TaskDifficulty::L1);
     }
 }

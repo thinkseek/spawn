@@ -16,9 +16,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use spawn_core::grading::{
     CalibrationDecision, DifficultyClassification, ExamCaseResult, GradedPreset, PresetState,
-    REPROBE_INTERVAL_MS, RoutingDecision, SkillGrade, TaskDifficulty, calibrate_preset,
-    catalog_covers, evaluate_onboarding, is_preset_id, is_quality_rejection, registered_profile,
-    reprobe_plan,
+    RoutingDecision, SkillGrade, TaskDifficulty, calibrate_preset, catalog_covers,
+    evaluate_onboarding, is_preset_id, is_quality_rejection, registered_profile, reprobe_plan,
+    tier_role, topdown_default_stack,
 };
 use spawn_postgres::PostgresStore;
 
@@ -62,9 +62,16 @@ pub(crate) const USAGE: &str = "usage:
       (what the fleet loop runs every SPAWN_GRADING_UPKEEP_SECS (default 21600, 0: never):
        calibrate (--apply records its decisions, as calibrate --apply), then list the presets
        due an anti-starvation re-probe: routable, not locked, and without a task first
-       assigned to them at their calibrated grade for SPAWN_GRADING_REPROBE_SECS (default
-       21600), counted from their window's start. The next unflagged assignment at that
-       grade goes to such a preset (reprobe), at most one per preset per interval)";
+       assigned to them at their calibrated grade for SPAWN_GRADING_REPROBE_SECS (default 0:
+       off, opt-in; set whole seconds to enable), counted from their window's start. When
+       enabled, the next unflagged assignment at that grade goes to such a preset (reprobe),
+       at most one per preset per interval)
+  spawn grade init-topdown [--with-l1] [--l1-model <label>] [--json]
+      (idempotently seeds the top-down 3-tier default catalog: locked l3 top-decision preset
+       topdown-l3-fable on claude / claude-fable-5-2, and locked l2 mainline preset
+       topdown-l2-neon on agy / gemini-pro-orchestrator-neon; --with-l1 also seeds and
+       onboards l1 mechanical-offload preset topdown-l1-mechanical on deepseek-v4 or
+       --l1-model, leaving existing presets untouched)";
 
 /// The onboarding suite's place in a Spawn tree.
 const SUITE: &str = "evals/onboarding";
@@ -107,6 +114,7 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             }
         }
         "upkeep" => upkeep_command(rest)?,
+        "init-topdown" => init_topdown_command(rest)?,
         "exam" => {
             let flags = Flags::parse(rest)?;
             only(&flags, &["workspaces", "suite"])?;
@@ -203,6 +211,147 @@ fn upkeep_command(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_init_topdown_flags(rest: &[String]) -> Result<(bool, Option<String>), String> {
+    let flags = Flags::parse_with_switches(rest, &["with-l1", "json"])?;
+    only(&flags, &["l1-model"])?;
+    let with_l1 = flags.switch("with-l1");
+    let l1_model = flags.get("l1-model");
+    if l1_model.is_some() && !with_l1 {
+        return Err("--l1-model requires --with-l1".to_string());
+    }
+    if let Some(label) = l1_model.as_deref()
+        && !spawn_core::command::is_model_label(label)
+    {
+        return Err(format!(
+            "--l1-model {label:?} is not a model label: 1 to 128 letters, digits, '.', '-', '_', ':' or '/', not starting with '-'"
+        ));
+    }
+    Ok((with_l1, l1_model))
+}
+
+/// `spawn grade init-topdown [--with-l1] [--l1-model <label>] [--json]`.
+fn init_topdown_command(rest: &[String]) -> Result<(), String> {
+    let flags = Flags::parse_with_switches(rest, &["with-l1", "json"])?;
+    let (with_l1, l1_model) = validate_init_topdown_flags(rest)?;
+    let store = open_store()?;
+    let answer = init_topdown(&store, with_l1, l1_model.as_deref())?;
+    if flags.switch("json") {
+        print(&answer);
+    } else {
+        println!("{}", init_topdown_summary(&answer));
+    }
+    Ok(())
+}
+
+/// Idempotently seed the top-down 3-tier default presets (`T3` Fable 5.2,
+/// `T2` Neon mainline, and optional `T1` mechanical offload).
+pub(crate) fn init_topdown(
+    store: &PostgresStore,
+    with_l1: bool,
+    l1_model: Option<&str>,
+) -> Result<Value, String> {
+    if let Some(label) = l1_model
+        && !spawn_core::command::is_model_label(label)
+    {
+        return Err(format!(
+            "--l1-model {label:?} is not a model label: 1 to 128 letters, digits, '.', '-', '_', ':' or '/', not starting with '-'"
+        ));
+    }
+    let existing = store.grading_catalog().map_err(|error| error.to_string())?;
+    let specs = topdown_default_stack(with_l1, l1_model);
+    let mut created = Vec::new();
+    let mut already_present = Vec::new();
+
+    for spec in specs {
+        if existing
+            .iter()
+            .any(|preset| preset.preset_id == spec.preset_id)
+        {
+            already_present.push(json!({
+                "preset_id": spec.preset_id,
+                "tier": spec.tier.as_str(),
+            }));
+            continue;
+        }
+        let reg = json!({
+            "type": "preset.registered",
+            "preset_id": spec.preset_id,
+            "engine_label": spec.engine_label,
+            "model_label": spec.model_label,
+            "model_profile": spec.model_profile,
+            "cost_rank": spec.cost_rank,
+            "execution_profile": spec.execution_profile,
+        });
+        store
+            .grading_record(&reg)
+            .map_err(|error| error.to_string())?;
+        let find_preset = || -> Result<GradedPreset, String> {
+            store
+                .grading_catalog()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|preset| preset.preset_id == spec.preset_id)
+                .ok_or_else(|| {
+                    format!("preset {} missing right after registration", spec.preset_id)
+                })
+        };
+        let registered_preset = find_preset()?;
+        if spec.lock_initial_grade {
+            let locked_record = grade_locked(&registered_preset, Some(spec.initial_grade))?;
+            store
+                .grading_record(&locked_record)
+                .map_err(|error| error.to_string())?;
+            let after_lock = find_preset()?;
+            let enabled_record = state_change(&after_lock, true)?;
+            store
+                .grading_record(&enabled_record)
+                .map_err(|error| error.to_string())?;
+        } else {
+            let seed_results = json!({
+                "suite": "topdown-seed",
+                "cases": [{
+                    "case_id": "l1-seed",
+                    "grade": spec.initial_grade.as_str(),
+                    "passed": true,
+                }],
+            })
+            .to_string();
+            let onboard_record = onboarded(&registered_preset, &seed_results)?;
+            store
+                .grading_record(&onboard_record)
+                .map_err(|error| error.to_string())?;
+        }
+        created.push(json!({
+            "preset_id": spec.preset_id,
+            "tier": spec.tier.as_str(),
+            "grade": spec.initial_grade,
+            "locked": spec.lock_initial_grade,
+            "engine_label": spec.engine_label,
+            "model_label": spec.model_label,
+            "model_profile": spec.model_profile,
+            "execution_profile": spec.execution_profile,
+        }));
+    }
+
+    let catalog = store.grading_catalog().map_err(|error| error.to_string())?;
+    Ok(json!({
+        "stack": "top-down-3-tier",
+        "with_l1": with_l1,
+        "created": created,
+        "already_present": already_present,
+        "catalog": catalog,
+    }))
+}
+
+fn init_topdown_summary(answer: &Value) -> String {
+    let created = answer["created"].as_array().map_or(0, Vec::len);
+    let skipped = answer["already_present"].as_array().map_or(0, Vec::len);
+    format!(
+        "top-down catalog initialized (created {created}, already present {skipped}, with_l1={})",
+        answer["with_l1"].as_bool().unwrap_or(false)
+    )
+}
+
 fn print(value: &Value) {
     println!(
         "{}",
@@ -250,6 +399,11 @@ fn registered(preset_id: &str, flags: &Flags) -> Result<Value, String> {
     )?;
     let engine_label = flags.required("engine-label")?;
     let model_label = flags.required("model-label")?;
+    if !spawn_core::command::is_model_label(&model_label) {
+        return Err(format!(
+            "--model-label {model_label:?} is not a model label: 1 to 128 letters, digits, '.', '-', '_', ':' or '/', not starting with '-'"
+        ));
+    }
     let rank_text = flags.required("cost-rank")?;
     let cost_rank: u32 = rank_text
         .parse()
@@ -493,11 +647,11 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 /// The anti-starvation re-probe's interval (`SPAWN_GRADING_REPROBE_SECS`,
-/// whole seconds, default [`REPROBE_INTERVAL_MS`]; `0`: never), in ms, and
-/// the warning a setting that is no whole number of seconds gets.
+/// whole seconds, default off [`i64::MAX`]; `0`: never), in ms, and the
+/// warning a setting that is no whole number of seconds gets.
 fn reprobe_interval_from(text: Option<&str>) -> (i64, Option<String>) {
     let Some(text) = text else {
-        return (REPROBE_INTERVAL_MS, None);
+        return (i64::MAX, None);
     };
     match text.trim().parse::<u64>() {
         Ok(0) => (i64::MAX, None),
@@ -506,10 +660,9 @@ fn reprobe_interval_from(text: Option<&str>) -> (i64, Option<String>) {
             None,
         ),
         Err(_) => (
-            REPROBE_INTERVAL_MS,
+            i64::MAX,
             Some(format!(
-                "SPAWN_GRADING_REPROBE_SECS: {text:?} is not a whole number of seconds; using {}",
-                REPROBE_INTERVAL_MS / 1000
+                "SPAWN_GRADING_REPROBE_SECS: {text:?} is not a whole number of seconds; keeping re-probe off"
             )),
         ),
     }
@@ -730,6 +883,7 @@ pub(crate) fn api_catalog(
             let driver = preset.driver_id();
             value["driver"] = json!(driver.driver);
             value["label_only"] = json!(driver.label_only);
+            value["tier_role"] = json!(tier_role(preset.routing_grade()));
             value["reprobe_due"] = json!(spawn_core::grading::reprobe_due(
                 preset,
                 activity,
@@ -1021,12 +1175,12 @@ mod tests {
 
     #[test]
     fn the_reprobe_interval_reads_whole_seconds_and_zero_turns_it_off() {
-        assert_eq!(reprobe_interval_from(None), (REPROBE_INTERVAL_MS, None));
+        assert_eq!(reprobe_interval_from(None), (i64::MAX, None));
         assert_eq!(reprobe_interval_from(Some("60")), (60_000, None));
         assert_eq!(reprobe_interval_from(Some(" 5 ")), (5_000, None));
         assert_eq!(reprobe_interval_from(Some("0")), (i64::MAX, None));
         let (ms, warning) = reprobe_interval_from(Some("soon"));
-        assert_eq!(ms, REPROBE_INTERVAL_MS);
+        assert_eq!(ms, i64::MAX);
         assert!(warning.unwrap().contains("SPAWN_GRADING_REPROBE_SECS"));
     }
 
@@ -1122,7 +1276,7 @@ mod tests {
         let record = classification_record(&classified, &decision);
         assert_eq!(record["difficulty"], json!("l3"));
         assert_eq!(record["routed_at"], json!("l2"));
-        assert_eq!(record["rules"], json!("brief-v2"));
+        assert_eq!(record["rules"], json!("brief-v3"));
         assert!(
             record["rationale"]
                 .as_str()
@@ -1380,6 +1534,70 @@ mod tests {
         assert!(!marker.exists(), "a child of the killed check outlived it");
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn register_rejects_invalid_model_label() {
+        for bad in ["bad model", "foo@bar", ""] {
+            let result = registered(
+                "p",
+                &flags(&[
+                    "--engine-label",
+                    "claude",
+                    "--model-label",
+                    bad,
+                    "--cost-rank",
+                    "10",
+                ]),
+            );
+            assert!(result.is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn api_catalog_reports_topdown_tier_role() {
+        let mut l3 = graded_preset(PresetState::Active, Some(SkillGrade::L3));
+        l3.preset_id = spawn_core::grading::TOPDOWN_L3_PRESET_ID.to_string();
+        let mut l2 = graded_preset(PresetState::Active, Some(SkillGrade::L2));
+        l2.preset_id = spawn_core::grading::TOPDOWN_L2_PRESET_ID.to_string();
+        let mut l1 = graded_preset(PresetState::Active, Some(SkillGrade::L1));
+        l1.preset_id = spawn_core::grading::TOPDOWN_L1_PRESET_ID.to_string();
+        let ungraded = graded_preset(PresetState::Unexamined, None);
+
+        let api = super::api_catalog(&[l3, l2, l1, ungraded], &[], 0, i64::MAX);
+        assert_eq!(api["presets"][0]["tier_role"], json!("top-decision"));
+        assert_eq!(api["presets"][1]["tier_role"], json!("mainline"));
+        assert_eq!(api["presets"][2]["tier_role"], json!("mechanical-offload"));
+        assert_eq!(api["presets"][3]["tier_role"], json!(null));
+    }
+
+    #[test]
+    fn init_topdown_cli_rejects_l1_model_without_with_l1_or_invalid_label() {
+        let no_flag = super::validate_init_topdown_flags(&[
+            "--l1-model".to_string(),
+            "deepseek-v4".to_string(),
+        ]);
+        assert!(
+            no_flag
+                .unwrap_err()
+                .contains("--l1-model requires --with-l1")
+        );
+
+        let bad_label = super::validate_init_topdown_flags(&[
+            "--with-l1".to_string(),
+            "--l1-model".to_string(),
+            "bad label!".to_string(),
+        ]);
+        assert!(bad_label.unwrap_err().contains("not a model label"));
+
+        let ok = super::validate_init_topdown_flags(&[
+            "--with-l1".to_string(),
+            "--l1-model".to_string(),
+            "deepseek-v4.1-flash".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(ok, (true, Some("deepseek-v4.1-flash".to_string())));
+    }
 }
 
 /// Routing, rework reroutes and calibration through the CLI's own paths,
@@ -1567,7 +1785,8 @@ mod database_tests {
         assert_eq!(
             default,
             json!({"task": default["task"], "model": "default", "difficulty": "l2",
-                   "preset_id": "mid", "preset_grade": "l2"})
+                   "preset_id": "mid", "preset_grade": "l2",
+                   "engine_label": "claude", "model_label": "mid"})
         );
         let named = assigned(&store, mission, &["--brief", "b", "--preset", "strong"]).unwrap();
         assert_eq!(named["preset_id"], json!("strong"));
@@ -1760,12 +1979,13 @@ mod database_tests {
         preset(&store, "mid", "default", 1, "l2");
         preset(&store, "strong", "default", 2, "l3");
 
-        // A brief no rule reads: the phase-1 answer, exactly.
+        // A brief no rule reads: default l2 with preset metadata.
         let plain = assigned(&store, mission, &["--brief", "a"]).unwrap();
         assert_eq!(
             plain,
             json!({"task": plain["task"], "model": "default", "difficulty": "l2",
-                   "preset_id": "mid", "preset_grade": "l2"})
+                   "preset_id": "mid", "preset_grade": "l2",
+                   "engine_label": "claude", "model_label": "mid"})
         );
         // ...and its record still says the classifier ran, and why.
         let record = logged(
@@ -1799,7 +2019,7 @@ mod database_tests {
         assert_eq!(record["difficulty"], json!("l3"));
         assert_eq!(record["preset_id"], json!("strong"));
         assert_eq!(record["classification"]["difficulty"], json!("l3"));
-        assert_eq!(record["classification"]["rules"], json!("brief-v2"));
+        assert_eq!(record["classification"]["rules"], json!("brief-v3"));
         assert!(
             record["classification"]["rationale"]
                 .as_str()
@@ -1852,24 +2072,21 @@ mod database_tests {
     }
 
     #[test]
-    fn a_classified_l3_with_no_l3_preset_runs_at_l2_and_says_so() {
+    fn a_classified_l3_with_no_l3_preset_refuses_downgrade_to_l2_and_falls_back() {
         let schema = TestSchema::new("cli_grading_classify_capped");
         let store = schema.store();
-        let mut client = admin(&schema);
         let mission = store.mission_add("Capped", &json!([]), "human").unwrap();
         preset(&store, "mid", "default", 1, "l2");
         let answer = assigned(&store, mission, &["--brief", "Write the schema migration"]).unwrap();
-        assert_eq!(answer["difficulty"], json!("l2"));
-        assert_eq!(answer["preset_id"], json!("mid"));
-        assert_eq!(answer["classification"]["difficulty"], json!("l3"));
-        assert_eq!(answer["classification"]["routed_at"], json!("l2"));
-        let record = logged(
-            &mut client,
-            "task.assigned",
-            answer["task"].as_i64().unwrap(),
-        )
-        .expect("assigned");
-        assert_eq!(record["classification"]["routed_at"], json!("l2"));
+        assert_eq!(answer["model"], json!("default"));
+        assert!(answer.get("preset_id").is_none(), "{answer}");
+        assert!(
+            answer["routing_fallback"]
+                .as_str()
+                .unwrap()
+                .contains("refusing to downgrade l3 to l2"),
+            "{answer}"
+        );
         // A resident is never classified.
         store.resident_propose("keeper", "a resident").unwrap();
         store.resident_approve("keeper").unwrap();
@@ -2110,12 +2327,48 @@ mod database_tests {
         assert_eq!(due["calibration"][0]["decision"], json!("hold"));
         // Holds record nothing: running it again finds the same.
         assert_eq!(super::upkeep(&store, true, now, 60_000).unwrap(), due);
-        // The dearer preset, starved, takes the next unflagged task.
-        let probe = assigned(&store, mission, &["--brief", "a"]).unwrap();
+        // With opt-in re-probe OFF by default, default assignment stays on minimum-sufficient `mid`.
+        let default_run = assigned(&store, mission, &["--brief", "a-default"]).unwrap();
+        assert_eq!(default_run["preset_id"], json!("mid"));
+        assert!(default_run.get("reprobe").is_none(), "{default_run}");
+
+        // With opt-in re-probe enabled (60s), the dearer preset, starved, takes the next unflagged task.
+        let m_str = mission.to_string();
+        let probe = crate::missions::assign_with_options(
+            &store,
+            &flags(&[
+                "--mission",
+                &m_str,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w",
+                "--brief",
+                "a",
+            ]),
+            &mut std::io::Cursor::new(b""),
+            60_000,
+        )
+        .unwrap();
         assert_eq!(probe["preset_id"], json!("mid-dear"));
         assert_eq!(probe["reprobe"], json!(true));
         // Once: the next goes to the minimum-sufficient preset again.
-        let next = assigned(&store, mission, &["--brief", "b"]).unwrap();
+        let next = crate::missions::assign_with_options(
+            &store,
+            &flags(&[
+                "--mission",
+                &m_str,
+                "--kind",
+                "ephemeral",
+                "--worker",
+                "w",
+                "--brief",
+                "b",
+            ]),
+            &mut std::io::Cursor::new(b""),
+            60_000,
+        )
+        .unwrap();
         assert_eq!(next["preset_id"], json!("mid"));
         assert!(next.get("reprobe").is_none(), "{next}");
         let after = super::upkeep(&store, false, super::now_ms(), 60_000).unwrap();
@@ -2266,5 +2519,62 @@ mod database_tests {
         let back = assigned(&store, mission, &["--brief", "g"]).unwrap();
         assert_eq!(back["preset_id"], json!("mid"));
         assert_eq!(back["difficulty"], json!("l2"));
+    }
+
+    #[test]
+    fn init_topdown_seeds_default_two_tiers_and_is_idempotent() {
+        let schema = TestSchema::new("cli_grading_init_topdown_two");
+        let store = schema.store();
+
+        let first = super::init_topdown(&store, false, None).unwrap();
+        assert_eq!(first["stack"], json!("top-down-3-tier"));
+        assert_eq!(first["with_l1"], json!(false));
+        assert_eq!(first["created"].as_array().unwrap().len(), 2);
+        assert_eq!(first["already_present"].as_array().unwrap().len(), 0);
+
+        let catalog = store.grading_catalog().unwrap();
+        assert_eq!(catalog.len(), 2);
+        let l3 = catalog
+            .iter()
+            .find(|p| p.preset_id == spawn_core::grading::TOPDOWN_L3_PRESET_ID)
+            .unwrap();
+        assert_eq!(l3.state, PresetState::Active);
+        assert_eq!(l3.locked_grade, Some(SkillGrade::L3));
+        assert_eq!(l3.model_label, "claude-fable-5-2");
+        assert_eq!(l3.engine_label, "claude");
+        let l2 = catalog
+            .iter()
+            .find(|p| p.preset_id == spawn_core::grading::TOPDOWN_L2_PRESET_ID)
+            .unwrap();
+        assert_eq!(l2.state, PresetState::Active);
+        assert_eq!(l2.locked_grade, Some(SkillGrade::L2));
+        assert_eq!(l2.model_label, "gemini-pro-orchestrator-neon");
+        assert_eq!(l2.engine_label, "agy");
+
+        let second = super::init_topdown(&store, false, None).unwrap();
+        assert_eq!(second["created"].as_array().unwrap().len(), 0);
+        assert_eq!(second["already_present"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn init_topdown_with_l1_onboards_mechanical_tier_with_custom_model() {
+        let schema = TestSchema::new("cli_grading_init_topdown_three");
+        let store = schema.store();
+
+        let seeded = super::init_topdown(&store, true, Some("deepseek-v4.1-flash")).unwrap();
+        assert_eq!(seeded["with_l1"], json!(true));
+        assert_eq!(seeded["created"].as_array().unwrap().len(), 3);
+
+        let catalog = store.grading_catalog().unwrap();
+        let l1 = catalog
+            .iter()
+            .find(|p| p.preset_id == spawn_core::grading::TOPDOWN_L1_PRESET_ID)
+            .unwrap();
+        assert_eq!(l1.state, PresetState::Active);
+        assert_eq!(l1.onboarded_grade, Some(SkillGrade::L1));
+        assert_eq!(l1.calibrated_grade, Some(SkillGrade::L1));
+        assert_eq!(l1.locked_grade, None);
+        assert_eq!(l1.model_label, "deepseek-v4.1-flash");
+        assert_eq!(l1.model_profile, spawn_core::event::ModelProfile::Cheap);
     }
 }
