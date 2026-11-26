@@ -10,6 +10,12 @@ import type { TaskActivity } from "./taskActivity.ts";
 import type { RsiSummary } from "./api";
 import { normalizeHolds } from "./attention";
 import type { SourceHold } from "./attention";
+import {
+  normalizeSkillGrade,
+  normalizeTierRole,
+  type SkillGrade,
+  type TierRole,
+} from "./grading.ts";
 
 export type { SourceHold } from "./attention";
 
@@ -141,6 +147,13 @@ export interface MissionTask extends Labels {
   stages: TaskStage[];
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
   model: string | null;
+  /** Optional grading metadata, omitted gracefully by servers before projection. */
+  difficulty?: SkillGrade | null;
+  preset_id?: string | null;
+  first_preset_id?: string | null;
+  tier_role?: TierRole | null;
+  quality_rejections?: number | null;
+  execution_profile?: string | null;
   /** The owner's hold its landing last waited behind, if any. */
   held_by: number | null;
   /** Parked by the load-sensitive bound; null for any other task, and
@@ -316,6 +329,12 @@ function normalizeTask(value: unknown): MissionTask | null {
       .map(normalizeStage)
       .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
+    difficulty: normalizeSkillGrade(value.difficulty),
+    preset_id: optionalText(value.preset_id),
+    first_preset_id: optionalText(value.first_preset_id),
+    tier_role: normalizeTierRole(value.tier_role),
+    quality_rejections: optionalNumber(value.quality_rejections),
+    execution_profile: optionalText(value.execution_profile),
     held_by: optionalNumber(value.held_by),
     parked: normalizeParked(value.parked),
     created_by: optionalText(value.created_by),

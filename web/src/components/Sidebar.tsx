@@ -1,4 +1,4 @@
-import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, House, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
+import { Activity, BellRing, Boxes, CircleDollarSign, FolderSearch, Gauge, House, Layers, Monitor, Moon, Orbit, Rows3, Search, Sun, Target, Waypoints, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
@@ -41,6 +41,7 @@ interface SidebarProps {
   openAlerts: number;
   onShowFleet: () => void;
   onShowMissions: () => void;
+  onShowGrading: () => void;
   onShowFeatures: () => void;
   onShowCoverage: () => void;
   onShowRsi: () => void;
@@ -77,6 +78,7 @@ export function Sidebar({
   openAlerts,
   onShowFleet,
   onShowMissions,
+  onShowGrading,
   onShowFeatures,
   onShowCoverage,
   onShowRsi,
@@ -123,6 +125,12 @@ export function Sidebar({
           onClick={onShowMissions}
           icon={<Target size={15} />}
           label="Missions"
+        />
+        <NavItem
+          active={view === "grading"}
+          onClick={onShowGrading}
+          icon={<Layers size={15} />}
+          label="Grading"
         />
         <NavItem
           active={view === "features"}
@@ -557,6 +565,7 @@ export function MobileNav({
   openAlerts,
   onShowFleet,
   onShowMissions,
+  onShowGrading,
   onShowFeatures,
   onShowCoverage,
   onShowRsi,
@@ -571,6 +580,7 @@ export function MobileNav({
   | "attention"
   | "onShowFleet"
   | "onShowMissions"
+  | "onShowGrading"
   | "onShowFeatures"
   | "onShowCoverage"
   | "onShowRsi"
@@ -589,6 +599,7 @@ export function MobileNav({
           [
             ["fleet", "Home", <House key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
+            ["grading", "Grading", <Layers key="gr" size={13} />, onShowGrading],
             ["features", "Map", <Boxes key="f" size={13} />, onShowFeatures],
             ["coverage", "Coverage", <FolderSearch key="cov" size={13} />, onShowCoverage],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
