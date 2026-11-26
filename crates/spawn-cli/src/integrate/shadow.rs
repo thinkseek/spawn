@@ -1941,6 +1941,55 @@ mod tests {
         );
     }
 
+    /// A node shadow's rejection naming only test-database errors (maybe
+    /// the node's own test server crashed) resets no strikes, and leaves
+    /// the job's epoch; it is still recorded.
+    #[test]
+    fn a_node_shadows_database_error_only_rejection_resets_no_strikes() {
+        let world = NodeWorld::new("node-db-only");
+        let mut nodes = world.nodes();
+        let task = world.task();
+        nodes.offer(&world.ledger.store, world.want(task));
+        let job_id = nodes.waiting()[0].clone();
+        let row = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        let node = world.ledger.enroll("n252", 9, &row.requires);
+        let grants = world.ledger.beat(&node);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        let verdict = json!({"v": 1, "verdict": "rejected",
+                             "reason": crate::integrate::host::CHECK_TESTS_REGRESSION,
+                             "base": world.base, "candidate": world.candidate})
+        .to_string();
+        let (meta, log) = super::super::remote::tests::meta(
+            &job_id,
+            grants[0].1,
+            Some(0),
+            Some(&verdict),
+            "| == regression: check-tests.sh must still pass\n\
+             | FAILED api::tests::one: error connecting to server: Connection refused (os \
+             error 111)\n",
+            "",
+            Some(&NodeWorld::given(&row)),
+        );
+        world.ledger.complete(&world.results(), &node, &meta, &log);
+        world
+            .ledger
+            .admin()
+            .execute(
+                "update spawn_node_state set host_fault_strikes = 2 where name = 'n252'",
+                &[],
+            )
+            .unwrap();
+        let written = Written::new();
+        nodes.poll(&world.ledger.store, &|record| {
+            written.write(record);
+            Ok(())
+        });
+        assert_eq!(written.all().len(), 1, "still recorded");
+        assert_eq!(world.ledger.strikes("n252"), (2, false));
+        let after = world.ledger.store.remote_job(&job_id).unwrap().unwrap();
+        assert_eq!(after.lease_epoch, grants[0].1, "not judged");
+    }
+
     /// A node's fault is struck on the ledger and the job queued again,
     /// nothing recorded for the task; one no node leases in time is taken
     /// back, nothing recorded; and every N-th verdict is shadowed.
