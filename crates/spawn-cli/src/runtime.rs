@@ -204,12 +204,21 @@ fn bridge_config_for(herdr_backend: bool) -> Result<BridgeConfig, String> {
         parse_bounded_usize(&env_value, "SPAWN_BRIDGE_BACKSTOPS_PER_PASS", 2, 1, 64)?;
     config.session_scan_limit =
         parse_bounded_usize(&env_value, "SPAWN_LIST_DIRS_LIMIT", 64, 64, 4096)?;
-    // An engine with no deny rules of its own runs only inside the host's
-    // filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
-    let (policy, said) = engine_view(&env_value, &config.engines, |lookup| {
-        spawn_host::BwrapView::new("bwrap", view_config_for_backend(lookup, herdr_backend))
-            .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
-    });
+    // An engine with no deny rules of its own (or Claude with SPAWN_CLAUDE_SANDBOX=1)
+    // runs inside the host's filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
+    config.claude_sandbox = claude_sandbox_enabled(&env_value);
+    let (policy, said) = engine_view_with(
+        &env_value,
+        &config.engines,
+        |lookup| {
+            spawn_host::BwrapView::new("bwrap", view_config_for_backend(lookup, herdr_backend))
+                .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
+        },
+        |lookup| {
+            spawn_host::ContainerView::new(view_config_for_backend(lookup, herdr_backend))
+                .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
+        },
+    );
     if let Some(said) = said {
         eprintln!("{said}");
     }
@@ -602,10 +611,41 @@ pub(crate) fn engine_view(
         &dyn Fn(&str) -> Option<String>,
     ) -> Result<Arc<dyn spawn_core::port::EngineView>, String>,
 ) -> (spawn_core::bridge::EngineViewPolicy, Option<String>) {
+    engine_view_with(lookup, enabled, make, |l| {
+        spawn_host::ContainerView::new(spawn_host::ViewConfig::from_env(l))
+            .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
+    })
+}
+
+/// Whether Claude Code runs inside the host filesystem view (`SPAWN_CLAUDE_SANDBOX=1`).
+pub(crate) fn claude_sandbox_enabled(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    matches!(
+        lookup("SPAWN_CLAUDE_SANDBOX")
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+pub(crate) fn engine_view_with(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    enabled: &[(String, spawn_core::driver::EngineHome)],
+    make: impl FnOnce(
+        &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Arc<dyn spawn_core::port::EngineView>, String>,
+    make_container: impl FnOnce(
+        &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Arc<dyn spawn_core::port::EngineView>, String>,
+) -> (spawn_core::bridge::EngineViewPolicy, Option<String>) {
     use spawn_core::bridge::EngineViewPolicy;
+    let claude_sandbox = claude_sandbox_enabled(lookup);
     let value = lookup("SPAWN_ENGINE_VIEW");
-    let mut said = match value.as_deref().map(str::trim) {
-        None | Some("" | "required") => None,
+    let trimmed = value.as_deref().map(str::trim);
+    let container_mode = trimmed == Some("container");
+    let mut said = match trimmed {
+        None | Some("" | "required" | "container") => None,
         Some("off") => {
             return (
                 EngineViewPolicy::Off,
@@ -617,10 +657,10 @@ pub(crate) fn engine_view(
             );
         }
         Some(other) => Some(format!(
-            "spawn: SPAWN_ENGINE_VIEW={other} is neither required nor off: read as required"
+            "spawn: SPAWN_ENGINE_VIEW={other} is neither required, container, nor off: read as required"
         )),
     };
-    let sandboxed: Vec<&str> = enabled
+    let mut sandboxed: Vec<&str> = enabled
         .iter()
         .filter(|(id, _)| {
             spawn_core::driver::driver(id)
@@ -628,6 +668,9 @@ pub(crate) fn engine_view(
         })
         .map(|(id, _)| id.as_str())
         .collect();
+    if claude_sandbox && !sandboxed.contains(&spawn_core::driver::DEFAULT) {
+        sandboxed.push(spawn_core::driver::DEFAULT);
+    }
     if sandboxed.is_empty() {
         return (
             EngineViewPolicy::Required(Err(
@@ -636,11 +679,33 @@ pub(crate) fn engine_view(
             said,
         );
     }
-    let view = make(lookup);
+    let view = match make(lookup) {
+        Ok(view) => Ok(view),
+        Err(why) if container_mode && spawn_host::container::is_container_namespace_block(&why) => {
+            match make_container(lookup) {
+                Ok(container_view) => {
+                    let note = format!(
+                        "spawn: bwrap blocked by outer container ({why}); falling back to \
+                         container view (no inner mount isolation) for {}",
+                        sandboxed.join(", ")
+                    );
+                    said = Some(said.map_or(note.clone(), |before| format!("{before}\n{note}")));
+                    Ok(container_view)
+                }
+                Err(container_err) => Err(format!("{why}; {container_err}")),
+            }
+        }
+        Err(why) => Err(why),
+    };
     if let Err(why) = &view {
+        let suffix = if sandboxed.contains(&spawn_core::driver::DEFAULT) {
+            ""
+        } else {
+            "; Claude Code is unaffected"
+        };
         let line = format!(
             "spawn: no filesystem view on this host ({why}): {} will not start \
-             (engine_unavailable); Claude Code is unaffected",
+             (engine_unavailable){suffix}",
             sandboxed.join(", ")
         );
         said = Some(said.map_or(line.clone(), |before| format!("{before}\n{line}")));
@@ -1069,6 +1134,81 @@ mod tests {
             said.expect("said")
                 .contains("SPAWN_ENGINE_VIEW=maybe is neither")
         );
+    }
+
+    #[test]
+    fn claude_sandbox_enables_engine_view_for_claude_only_host() {
+        use super::engine_view_with;
+        use spawn_core::bridge::EngineViewPolicy;
+        let claude_only = engines(environment(&[("HOME", "/home/a")])).expect("claude only");
+        let made = std::cell::Cell::new(0);
+        let works = |_: &dyn Fn(&str) -> Option<String>| {
+            made.set(made.get() + 1);
+            Ok(Arc::new(NoView) as Arc<dyn spawn_core::port::EngineView>)
+        };
+        let no_ctr = |_: &dyn Fn(&str) -> Option<String>| Err("no container".to_string());
+        let (policy, said) = engine_view_with(
+            &environment(&[("SPAWN_CLAUDE_SANDBOX", "1")]),
+            &claude_only,
+            works,
+            no_ctr,
+        );
+        assert!(
+            matches!(policy, EngineViewPolicy::Required(Ok(_))),
+            "{policy:?}"
+        );
+        assert_eq!(said, None);
+        assert_eq!(made.get(), 1);
+    }
+
+    #[test]
+    fn container_engine_view_falls_back_only_on_container_namespace_block_and_fails_closed_otherwise()
+     {
+        use super::engine_view_with;
+        use spawn_core::bridge::EngineViewPolicy;
+        let agy = engines(environment(&[
+            ("HOME", "/home/a"),
+            ("SPAWN_ENGINES", "claude,agy"),
+        ]))
+        .expect("agy");
+        let perm_err = "/usr/bin/bwrap does not work on this host (exit status: 1): bwrap: No permissions to create a new namespace";
+        let missing_err = "bwrap is not installed (not found on PATH)";
+
+        // Missing bwrap must NEVER fall back to ContainerView, even with SPAWN_ENGINE_VIEW=container.
+        let ctr_called = std::cell::Cell::new(0);
+        let (policy_missing, _) = engine_view_with(
+            &environment(&[("SPAWN_ENGINE_VIEW", "container")]),
+            &agy,
+            |_| Err(missing_err.to_string()),
+            |_| {
+                ctr_called.set(ctr_called.get() + 1);
+                Ok(Arc::new(NoView) as Arc<dyn spawn_core::port::EngineView>)
+            },
+        );
+        assert!(matches!(policy_missing, EngineViewPolicy::Required(Err(_))));
+        assert_eq!(ctr_called.get(), 0);
+
+        // Bare host with EPERM: make_container fails closed.
+        let (policy_bare, _) = engine_view_with(
+            &environment(&[("SPAWN_ENGINE_VIEW", "container")]),
+            &agy,
+            |_| Err(perm_err.to_string()),
+            |_| Err("refusing ContainerView on a bare host".to_string()),
+        );
+        assert!(
+            matches!(&policy_bare, EngineViewPolicy::Required(Err(why)) if why.contains("bare host")),
+            "{policy_bare:?}"
+        );
+
+        // Container namespace block inside container: falls back with clear notice.
+        let (policy_ok, said_ok) = engine_view_with(
+            &environment(&[("SPAWN_ENGINE_VIEW", "container")]),
+            &agy,
+            |_| Err(perm_err.to_string()),
+            |_| Ok(Arc::new(NoView) as Arc<dyn spawn_core::port::EngineView>),
+        );
+        assert!(matches!(policy_ok, EngineViewPolicy::Required(Ok(_))));
+        assert!(said_ok.expect("notice").contains("container view"));
     }
 
     /// Claude Code alone unless `SPAWN_ENGINES` names agy; agy's home,

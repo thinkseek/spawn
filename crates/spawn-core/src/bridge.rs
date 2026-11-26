@@ -316,8 +316,16 @@ pub struct BridgeConfig {
     /// (`SPAWN_LIST_DIRS_LIMIT`).
     pub session_scan_limit: usize,
     /// Whether an engine with no deny rules of its own
-    /// engine sees whatever its uid sees, as before N6.
+    /// ([`crate::driver::Guard::Sandbox`]) runs inside a filesystem view
+    /// (decision C2, N6; `SPAWN_ENGINE_VIEW`). Required by default, and
+    /// with no view: such an engine is refused (`engine_unavailable`)
+    /// until the host hands one over. Claude Code runs in one only when
+    /// `claude_sandbox` (`SPAWN_CLAUDE_SANDBOX=1`) is set.
     pub engine_view: EngineViewPolicy,
+    /// Opt-in filesystem view (`BwrapView` / `ContainerView`) wrapping for
+    /// Claude Code (`SPAWN_CLAUDE_SANDBOX`). Default `false` so Claude Code's
+    /// built-in deny rules stay self-contained unless explicitly sandboxed.
+    pub claude_sandbox: bool,
     /// Maximum release interval for an input waiting on a busy pane (#109).
     pub input_wait_max_retry: Duration,
     /// Maximum claim attempts before an unready waiting input expires (#109).
@@ -388,6 +396,7 @@ impl BridgeConfig {
             backstops_per_pass: BACKSTOPS_PER_PASS,
             session_scan_limit: crate::port::LIST_DIRS_LIMIT,
             engine_view: EngineViewPolicy::unconfigured(),
+            claude_sandbox: false,
             input_wait_max_retry: Duration::from_mins(1),
             input_wait_max_attempts: 30,
             input_wait_ttl: Duration::from_mins(15),
@@ -3516,11 +3525,12 @@ impl Bridge {
             format!("{root_base}/")
         };
         let not_before = active.started_at.saturating_sub(BIND_SKEW_MS);
+        let transcript_ws = self.effective_transcript_workspace(driver, &workspace);
         let proven = |native: &str| -> Option<String> {
             if self.is_native_bound(native, newly_bound) {
                 return None;
             }
-            let path = driver.transcript_path_for(&home, &workspace, worker_id, native);
+            let path = driver.transcript_path_for(&home, &transcript_ws, worker_id, native);
             if !path.starts_with(&root) {
                 return None;
             }
@@ -4602,6 +4612,32 @@ impl Bridge {
         }
     }
 
+    /// Whether launches of `driver` must be wrapped in [`BridgeConfig::engine_view`]:
+    /// true for `Guard::Sandbox` engines (`agy`) and for Claude Code when
+    /// `BridgeConfig::claude_sandbox` is enabled (`SPAWN_CLAUDE_SANDBOX=1`).
+    fn uses_engine_view(&self, driver: &dyn AgentDriver) -> bool {
+        driver.traits().guard == crate::driver::Guard::Sandbox
+            || (driver.id() == crate::driver::DEFAULT && self.config.claude_sandbox)
+    }
+
+    /// Workspace ID rewritten to [`EngineView::canonical_workspace`] when active
+    /// for `driver`, matching the working directory the sandboxed engine hashes
+    /// for session transcripts (`ClaudeDriver::transcript_path`).
+    fn effective_transcript_workspace(
+        &self,
+        driver: &dyn AgentDriver,
+        workspace: &WorkspaceId,
+    ) -> WorkspaceId {
+        if self.uses_engine_view(driver)
+            && let EngineViewPolicy::Required(Ok(view)) = &self.config.engine_view
+            && let Some(cw) = view.canonical_workspace()
+        {
+            return WorkspaceId::new(format!("{}:{}", workspace.sandbox(), cw.display()))
+                .unwrap_or_else(|_| workspace.clone());
+        }
+        workspace.clone()
+    }
+
     /// Why `driver`'s engine cannot start on this host for want of a
     /// filesystem view: it has no deny rules of its own
     /// ([`crate::driver::Guard::Sandbox`]), the host requires a view for
@@ -4609,12 +4645,12 @@ impl Bridge {
     /// anything is mounted; the view of the launch itself is made at the
     /// launch ([`Self::launch`]).
     fn no_engine_view(&self, driver: &dyn AgentDriver) -> Option<String> {
-        if driver.traits().guard != crate::driver::Guard::Sandbox {
+        if !self.uses_engine_view(driver) {
             return None;
         }
         match &self.config.engine_view {
             EngineViewPolicy::Required(Err(why)) => Some(format!(
-                "{ENGINE_UNAVAILABLE}: engine {} has no deny rules of its own and runs only inside \
+                "{ENGINE_UNAVAILABLE}: engine {} runs only inside \
                  a filesystem view (SPAWN_ENGINE_VIEW=required), which this host has none of: {why}",
                 driver.id()
             )),
@@ -6376,6 +6412,7 @@ impl Bridge {
             return Ok(None);
         };
         let home = self.config.home_of(active.driver);
+        let transcript_ws = self.effective_transcript_workspace(active.driver, &active.workspace);
         self.append(
             &claimed.agent_id,
             &claimed.session_id,
@@ -6385,7 +6422,7 @@ impl Bridge {
             EventKind::NativeSessionStarted {
                 engine: active.driver.id().to_string(),
                 native_session_id: id.clone(),
-                transcript_path: Some(active.driver.transcript_path(&home, &active.workspace, &id)),
+                transcript_path: Some(active.driver.transcript_path(&home, &transcript_ws, &id)),
                 engine_version: None,
             },
         )?;
@@ -6402,7 +6439,13 @@ impl Bridge {
         worker_id: Option<&str>,
         native: &str,
     ) -> String {
-        driver.transcript_path_for(&self.config.home_of(driver), workspace, worker_id, native)
+        let transcript_ws = self.effective_transcript_workspace(driver, workspace);
+        driver.transcript_path_for(
+            &self.config.home_of(driver),
+            &transcript_ws,
+            worker_id,
+            native,
+        )
     }
 
     /// The driver of the engine `session` last started
@@ -6445,7 +6488,7 @@ impl Bridge {
         program: &mut String,
         arguments: &mut Vec<String>,
     ) -> Result<(), String> {
-        if active.driver.traits().guard != crate::driver::Guard::Sandbox {
+        if !self.uses_engine_view(active.driver) {
             return Ok(());
         }
         match &self.config.engine_view {
@@ -6504,7 +6547,8 @@ impl Bridge {
         run: &EngineLaunch<'_>,
     ) -> Result<Launch, String> {
         let home = self.config.home_of(active.driver);
-        let canonical_cwd = (active.driver.traits().guard == crate::driver::Guard::Sandbox)
+        let canonical_cwd = self
+            .uses_engine_view(active.driver)
             .then(|| match &self.config.engine_view {
                 EngineViewPolicy::Required(Ok(view)) => {
                     view.canonical_workspace().map(|p| p.display().to_string())
@@ -6560,11 +6604,27 @@ impl Bridge {
             "SPAWN_WORKSPACE".to_string(),
             active.workspace.path().to_string(),
         ));
+        let view_engine_home =
+            if active.driver.id() == crate::driver::DEFAULT && self.config.claude_sandbox {
+                self.claude_config_dir(&claimed.session_id)
+                    .unwrap_or_else(|| {
+                        let sessions = std::path::Path::new(&home.sessions);
+                        if sessions.file_name().and_then(|s| s.to_str()) == Some("projects") {
+                            sessions
+                                .parent()
+                                .map_or_else(|| home.sessions.clone(), |p| p.display().to_string())
+                        } else {
+                            home.sessions.clone()
+                        }
+                    })
+            } else {
+                home.sessions.clone()
+            };
         let mut program = self.config.spawn_program.clone();
         self.wrap_launch_view(
             claimed,
             active,
-            &home.sessions,
+            &view_engine_home,
             &exit_file_path,
             &mut program,
             &mut arguments,
@@ -13100,6 +13160,50 @@ mod tests {
             assert_eq!(launch.program, "spawn");
             assert_eq!(launch.arguments[..2], ["run", "--"]);
         }
+    }
+
+    #[test]
+    fn claude_sandbox_wraps_launch_and_hashes_canonical_workspace_transcript() {
+        let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+        let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+        let id = submit_resumable_start(&store, 1, "hello sandbox claude", READY);
+        let view = Arc::new(FakeView {
+            canonical_workspace: Some(std::path::PathBuf::from("/workspace")),
+            ..Default::default()
+        });
+        let mut config = BridgeConfig::new("tester");
+        config.claude_projects = "/home/tester/.claude/projects".to_string();
+        config.claude_sandbox = true;
+        config.engine_view = EngineViewPolicy::Required(Ok(view.clone()));
+        let mut bridge = Bridge::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            config,
+        )
+        .with_clock(clock);
+        drive_work(&mut bridge, &store, || {
+            command_outcome(&store, id).is_some()
+        });
+        assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+        let launch = store.launches().pop().expect("launched");
+        assert_eq!(launch.program, "/usr/bin/bwrap");
+        assert!(launch.arguments.iter().any(|arg| arg == "/workspace"));
+        let asked = view.asked.lock().expect("asked");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].0, "claude");
+        assert_eq!(asked[0].2, "/home/tester/.claude");
+        let transcript = bridge.transcript_of(
+            crate::driver::driver_or_default("claude"),
+            &launch.workspace,
+            Some("agent_1"),
+            "sess-1",
+        );
+        assert!(
+            transcript.contains("/-workspace/sess-1.jsonl"),
+            "expected canonical /workspace hash in {transcript}"
+        );
     }
 
     #[test]

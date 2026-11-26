@@ -20,6 +20,7 @@ pub mod archive_mask;
 pub mod beneath;
 pub mod cas_dedup;
 pub mod cas_merkle;
+pub mod container;
 pub mod cow;
 pub mod d6_cutover;
 pub mod d6_layer0;
@@ -56,6 +57,7 @@ pub use cas_merkle::{
     LedgerRef, LedgerSnapshot, MaterializeReport, PublishRequest, PublishedSnapshot, RefLedger,
     ScannedEntry, ScannedKind, TrackedSetPolicy, format_commit_body,
 };
+pub use container::{BwrapCapability, ContainerEnv, detect_container, probe_bwrap};
 pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
@@ -78,7 +80,9 @@ pub use d6_shadow::{
     ShadowTrackedSetMode,
 };
 pub use d6_workspace::D6Workspace;
-pub use engine_view::{BwrapView, ExtraMount, HomeIsolation, ViewConfig};
+pub use engine_view::{
+    BwrapView, ContainerView, ExtraMount, HomeIsolation, HostInheritMode, ViewConfig,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
 pub use git::{
