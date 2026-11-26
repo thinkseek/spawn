@@ -3016,6 +3016,195 @@ mod tests {
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
     }
 
+    /// A task on an agy preset, and a host whose probe found agy ready
+    /// with `known` listed.
+    fn agy_task(id: i64, kind: &str, label: &str) -> TaskRow {
+        TaskRow {
+            preset_id: Some("agy-flash".to_string()),
+            preset_engine: Some("agy".to_string()),
+            preset_model_label: Some(label.to_string()),
+            ..task(id, TaskState::Assigned, kind)
+        }
+    }
+
+    fn agy_ready(known: &[&str]) -> super::Engines {
+        let mut engines = super::Engines {
+            probed: true,
+            ..super::Engines::default()
+        };
+        engines.ready.insert(
+            "agy".to_string(),
+            super::EngineReady {
+                known: known.iter().map(|label| (*label).to_string()).collect(),
+                default_label: None,
+            },
+        );
+        engines
+    }
+
+    fn unavailable(work: &Work, rows: &[Facts]) -> Vec<String> {
+        news_items(work, rows)
+            .into_iter()
+            .filter(|item| item.why == Why::EngineUnavailable)
+            .map(|item| item.line)
+            .collect()
+    }
+
+    /// Design 7.1: a worker that never ran starts on its preset's engine,
+    /// told the preset's model label; a Claude preset (or one whose engine
+    /// label names no driver) starts Claude Code byte for byte as before.
+    #[test]
+    fn a_new_worker_starts_on_its_presets_engine_and_model_label() {
+        let work = Work {
+            engines: agy_ready(&["gemini-3.8-flash-low"]),
+            ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
+        };
+        let plan = orders(&work, &[]);
+        assert_eq!(plan.len(), 1);
+        let CommandAction::Start {
+            engine,
+            model_label,
+            ..
+        } = &plan[0].action
+        else {
+            panic!("a start: {:?}", plan[0].action);
+        };
+        assert_eq!(engine, "agy");
+        assert_eq!(model_label.as_deref(), Some("gemini-3.8-flash-low"));
+        assert!(unavailable(&work, &[]).is_empty());
+        for label in [None, Some("claude"), Some("codex")] {
+            let mut claude = agy_task(5, "ephemeral", "opus");
+            claude.preset_engine = label.map(str::to_string);
+            let plan = orders(&work(vec![claude]), &[]);
+            let action = serde_json::to_value(&plan[0].action).expect("serializes");
+            assert_eq!(action["engine"], "claude", "{label:?}");
+            assert!(action.get("model_label").is_none(), "{label:?}: {action}");
+        }
+    }
+
+    /// No silent fall back: an engine this host cannot run, or a label its
+    /// listing does not name, makes no command, and one `engine_unavailable`
+    /// names the engine or the label. Before any probe the task waits
+    /// silently.
+    #[test]
+    fn an_unavailable_engine_or_unlisted_label_makes_no_start_and_is_escalated() {
+        let task = agy_task(4, "ephemeral", "gemini-3.8-flash-low");
+        let cases = [
+            (super::Engines::default(), None),
+            (
+                super::Engines {
+                    probed: true,
+                    ..super::Engines::default()
+                },
+                Some("engine agy is not enabled"),
+            ),
+            (
+                {
+                    let mut down = super::Engines {
+                        probed: true,
+                        ..super::Engines::default()
+                    };
+                    down.down
+                        .insert("agy".to_string(), "agy --version failed".to_string());
+                    down
+                },
+                Some("engine agy is not available on this host: agy --version failed"),
+            ),
+            (
+                agy_ready(&["gemini-3.8-pro"]),
+                Some("agy model label gemini-3.8-flash-low is not one `agy models` lists"),
+            ),
+        ];
+        for (engines, said) in cases {
+            let work = Work {
+                engines,
+                ..work(vec![task.clone()])
+            };
+            assert!(orders(&work, &[]).is_empty(), "{said:?}: no command");
+            let lines = unavailable(&work, &[]);
+            match said {
+                None => assert!(lines.is_empty(), "{lines:?}"),
+                Some(said) => {
+                    assert_eq!(lines.len(), 1, "{lines:?}");
+                    assert!(lines[0].contains(said), "{}", lines[0]);
+                    assert!(lines[0].contains("never on Claude Code"), "{}", lines[0]);
+                }
+            }
+        }
+        let item = news_items(
+            &Work {
+                engines: agy_ready(&[]),
+                ..work(vec![task])
+            },
+            &[],
+        )
+        .into_iter()
+        .find(|item| item.why == Why::EngineUnavailable)
+        .expect("escalated");
+        assert_eq!(item.id, "engine_unavailable-4-0");
+        assert!(!Why::EngineUnavailable.is_news(), "a condition");
+    }
+
+    /// An ephemeral worker that ran on another engine is stopped, then
+    /// started afresh (never resumed) on its task's; a resident keeps the
+    /// engine it ran on.
+    #[test]
+    fn an_ephemeral_worker_switches_engine_by_stop_then_start_and_a_resident_keeps_its_own() {
+        let engines = agy_ready(&["gemini-3.8-flash-low"]);
+        let work = Work {
+            engines: engines.clone(),
+            ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
+        };
+        let plan = orders(&work, &[worker(true, true)]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, CommandAction::Stop);
+        assert_eq!(plan[0].key, "switch-engine-4-0");
+        assert_eq!(plan[0].task, None, "a stop delivers nothing");
+        let plan = orders(&work, &[worker(false, false)]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].key, "deliver-4-0");
+        assert!(
+            matches!(&plan[0].action, CommandAction::Start { engine, .. } if engine == "agy"),
+            "{:?}",
+            plan[0].action
+        );
+        // Already on agy: resumed on it, on the host's label.
+        let on_agy = Facts {
+            engine: Some("agy".to_string()),
+            ..worker(false, false)
+        };
+        let mut hosted = engines.clone();
+        hosted
+            .ready
+            .get_mut("agy")
+            .expect("agy")
+            .default_label = Some("gemini-3.8-flash-low".to_string());
+        let resumed = Work {
+            engines: hosted,
+            ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
+        };
+        let plan = orders(&resumed, std::slice::from_ref(&on_agy));
+        assert!(
+            matches!(plan[0].action, CommandAction::Resume { .. }),
+            "{:?}",
+            plan[0].action
+        );
+        // A resume whose host label agy does not list is no resume either.
+        assert!(orders(&work, &[on_agy]).is_empty());
+        // A resident on Claude Code keeps it: the task is typed in.
+        let resident = Work {
+            engines,
+            ..work(vec![agy_task(4, "resident", "gemini-3.8-flash-low")])
+        };
+        let plan = orders(&resident, &[worker(true, true)]);
+        assert!(
+            matches!(plan[0].action, CommandAction::Input { .. }),
+            "{:?}",
+            plan[0].action
+        );
+        assert!(unavailable(&resident, &[worker(true, true)]).is_empty());
+    }
+
     #[test]
     fn a_model_switch_stops_the_worker_then_resumes_it_with_the_task() {
         let cheap = TaskRow {
