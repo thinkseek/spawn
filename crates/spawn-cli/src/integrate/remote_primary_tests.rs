@@ -187,6 +187,7 @@ impl Fixture {
             scenarios: &self.scenarios,
             scenario: None,
             gate_env: &[],
+            test_database: self.test_database,
         }
     }
 
@@ -1012,7 +1013,7 @@ fn a_take_back_that_loses_to_a_lease_waits_for_the_nodes_result() {
 fn follow(world: &Fixture, job: &GateJob) -> PrimaryOutcome {
     world
         .primary
-        .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, &|| false)
+        .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, false, &|| false)
 }
 
 /// An owner's urgent landing stops the judging while it waits: a queued
@@ -1027,7 +1028,7 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
     let stop = || since.elapsed() > Duration::from_millis(200);
     let outcome = world
         .primary
-        .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, &stop);
+        .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, false, &stop);
     assert!(matches!(outcome, PrimaryOutcome::Stopped), "{outcome:?}");
     assert!(
         since.elapsed() < Duration::from_secs(10),
@@ -1047,7 +1048,7 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
     let stop = || since.elapsed() > Duration::from_millis(200);
     let outcome = leased
         .primary
-        .follow(&leased.ledger.store, 7, &job.job_id, &job.inputs, &stop);
+        .follow(&leased.ledger.store, 7, &job.job_id, &job.inputs, false, &stop);
     assert!(matches!(outcome, PrimaryOutcome::Stopped), "{outcome:?}");
     assert_eq!(leased.job().state, RemoteJobState::Leased);
     leased.no_task_record();

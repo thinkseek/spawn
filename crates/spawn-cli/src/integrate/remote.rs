@@ -1637,14 +1637,22 @@ impl Primary {
             "integrate: task {task}: its gate queued for a node as {job_id} (a lease within {} s)",
             self.settings.queue_wait.as_secs()
         );
-        self.follow(store, task, &job_id, &job.inputs, stopped)
+        self.follow(
+            store,
+            task,
+            &job_id,
+            &job.inputs,
+            request.test_database,
+            stopped,
+        )
     }
 
     /// Follow queued job `job_id` (granted `given`) to its end: a job no
     /// node leased within the queue wait is taken back and judged here
     /// (only when the take-back wins: a node granted it meanwhile keeps
     /// it, and its result is waited for); a lease fenced back to the queue
-    /// gets a whole wait again; a completed run is judged ([`Self::completed`]).
+    /// gets a whole wait again; a completed run is judged ([`Self::completed`];
+    /// `test_database` as [`PrimaryRequest::test_database`]).
     /// The nodes' sweep is the integrator pass's own, never run here.
     pub(super) fn follow(
         &self,
@@ -1652,6 +1660,7 @@ impl Primary {
         task: i64,
         job_id: &str,
         given: &Value,
+        test_database: bool,
         stopped: &dyn Fn() -> bool,
     ) -> PrimaryOutcome {
         let started = Instant::now();
@@ -1728,7 +1737,7 @@ impl Primary {
                     task,
                     &row,
                     given,
-                    request.test_database,
+                    test_database,
                 ) {
                     Settled::Believed(outcome) => return outcome,
                     Settled::Requeued => since = Instant::now(),
