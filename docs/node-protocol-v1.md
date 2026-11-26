@@ -168,7 +168,7 @@ The gateway drops a lease whose grant cannot be built, and logs it. The node nev
 Every refusal whose reaction is "backoff" (section 2.4), and every transport failure (no answer, an unsigned answer, or one whose signature does not verify), is retried with **Full Jitter**: the n-th retry waits a uniformly random time in `[0, min(cap, base · 2^n))`. The daemon owns `base` and `cap` (design §3.2), and a signed success resets `n`.
 `429` and `503` are always `busy`, so a node cannot tell pacing from an outage, and backs off from both the same way.
 
-The gateway bounds every wait, so slow or idle peers cannot hold its 16 workers:
+The gateway bounds every wait, so slow or idle peers cannot hold a worker for more than 15 s; enough of them can still fill the 16 workers and the 64-connection backlog:
 
 | Wait | Bound |
 | --- | --- |
@@ -209,7 +209,7 @@ The gateway:
 5. syncs `log.part` and renames it to `log`, then writes `meta.json` (the line as received; synced, renamed), **before** the ledger call. The same result sent again rewrites nothing. A different result already stored for that epoch is `409 lease_fenced`, and its files are left untouched;
 6. calls `spawn_node_gw_result` with the metadata plus `result_sha256` (SHA-256 of the line). True means this call, or an identical earlier one, completed the job; the answer is `200 {"v":1,"server_time_ms":N,"job_id":"...","lease_epoch":E}`. False means the lease moved: the files this request wrote are removed, and the answer is `409 lease_fenced`.
 
-A node never sends a log over 32 MiB. It truncates each stream, stdout and stderr, to its first 4 MiB and last 4 MiB, with a marker line between them saying how much was cut, and sets `truncated: true`. `log_bytes`, `log_sha256` and `stdout_bytes` describe the bytes actually sent. A `413 too_large` (section 2.4) means the node did not truncate, and it truncates and resends.
+A node never sends a log over 32 MiB. For each stream, stdout and stderr, it keeps its first 4 MiB and its last part (up to ~12 MiB per stream when both are large), so that the whole log fits in 32 MiB. A marker line between the two parts says how much was cut, and the node sets `truncated: true`. `log_bytes`, `log_sha256` and `stdout_bytes` describe the bytes actually sent. A `413 too_large` (section 2.4) means the node did not truncate, and it truncates and resends.
 
 ### 3.6 Artifacts and the registry manifest
 
