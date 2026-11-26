@@ -171,8 +171,11 @@ phase 1 only a review did.
 ## Storage (`crates/spawn-postgres/sql/schema.sql`)
 
 - `grading_presets`: the catalog, the fold of `grading.recorded` events of
-  the control session (agent `agent_control`, source `control`), the
-  convention of the nodes' `node.recorded`. Every change is appended and
+  the control session (agent `agent_control`, source `control`; defined beside
+  the 67-variant `ControlRecord` ADT as statically typed `GradingRecord` ADTs in
+  `crates/spawn-core/src/control.rs` with `ControlRecordError` strict
+  validation), the convention of the nodes' `node.recorded`. Every change is
+  appended and
   folded in one transaction by the owner-only `spawn_grading_record`, which
   checks the record against the catalog first: its shape, its
   `from_state` (and `from_grade`) against the preset now, its `to_state`
@@ -252,6 +255,7 @@ spawn grade enable|disable <preset_id>
 spawn grade calibrate [--apply] [--json]
 spawn grade upkeep [--apply] [--json]
 spawn mission list [--limit N] [--json | --table]        # --json default; enriches tasks with grading & rework_step_up
+spawn mission episodes [--mission <id>] [--strict] [--verify-parity] [--json]   # replays typed ControlRecord task episodes and checks SQL projection parity
 spawn task assign ... (--brief <text|-> | --brief-file <path>) [--difficulty l1|l2|l3] [--preset <preset_id>]
 spawn task reassign --id N [--reason <text|-> | --reason-file <path>]
 spawn task reject --id N --note <text>        # reroutes stepped-up rework in the same statement
@@ -409,6 +413,13 @@ the API now tell apart as many profiles as presets name.
 - `GET /api/grading`: `{presets: [... every catalog field, routing_grade,
   profile, driver, label_only, tier_role, reprobe_due], profiles: [sorted names]}`,
   read-only, rendered by the web UI's `#/grading` view (`GradingView`).
+- `GET|HEAD /api/episodes[?mission=<id>]` (contract-locked read-only route on
+  `reads` / `spawn_reader`): replays typed `ControlRecord` events into
+  per-task `TaskEpisode` timelines (including `difficulty`, `preset_id`, rework /
+  rejection / reroute counts, review/gate sync points, and live SQL
+  projection parity status), rendered alongside `#/grading` (`GradingView`) in
+  the "Control-stream Episode Replay & Sync Points" panel and queried on the CLI
+  via `spawn mission episodes [--mission <id>] [--strict] [--verify-parity] [--json]`.
 - `MISSION_BOARD`, `MISSION_BY_ID`, `GET /api/missions`, `spawn mission list
   [--limit N] [--json | --table]`, and `spawn mission show`: natively project
   each task's `difficulty`, `routed_difficulty`, `preset_id`, `first_preset_id`,

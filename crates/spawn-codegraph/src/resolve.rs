@@ -9,7 +9,7 @@
 //! is given and never probes a disk, so it cannot read an excluded or
 //! secret file and is testable from string tables.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1074,12 +1074,119 @@ fn pattern_match<'t>(pattern: &str, text: &'t str) -> Option<&'t str> {
     text.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
+/// Per-package pre-indexed `exports` / `imports` lookup table.
+enum ExportIndex {
+    /// Non-subpath map (`"./src/index.js"`, `[...]`, or condition object without `.`/`#` keys).
+    RootOnly(Rc<[String]>),
+    /// Subpath map with O(log N) exact key lookup and isolated wildcard rules.
+    Subpaths {
+        exact: BTreeMap<String, usize>,
+        wildcards: Vec<(usize, usize, Rc<[String]>)>,
+    },
+}
+
+impl ExportIndex {
+    fn build(map: &manifest::Json) -> Self {
+        use manifest::Json;
+        let Json::Obj(entries) = map else {
+            let mut out = Vec::new();
+            conditions(map, 0, &mut out);
+            return Self::RootOnly(Rc::from(out));
+        };
+        let is_subpaths = entries
+            .iter()
+            .any(|(k, _)| k.starts_with('.') || k.starts_with('#'));
+        if !is_subpaths {
+            let mut out = Vec::new();
+            conditions(map, 0, &mut out);
+            return Self::RootOnly(Rc::from(out));
+        }
+        let mut exact = BTreeMap::new();
+        let mut wildcards = Vec::new();
+        for (idx, (pattern, value)) in entries.iter().enumerate() {
+            // `manifest::Json::get` scans in reverse so the last written key wins.
+            exact.insert(pattern.clone(), idx);
+            if let Some((prefix, suffix)) = pattern.split_once('*')
+                && !suffix.contains('*')
+            {
+                let mut template = Vec::new();
+                conditions(value, 0, &mut template);
+                wildcards.push((prefix.len(), idx, Rc::from(template)));
+            }
+        }
+        Self::Subpaths { exact, wildcards }
+    }
+
+    fn resolve(&self, map: &manifest::Json, key: &str) -> Rc<[String]> {
+        match self {
+            Self::RootOnly(targets) => {
+                if key == "." {
+                    Rc::clone(targets)
+                } else {
+                    Rc::from([])
+                }
+            }
+            Self::Subpaths { exact, wildcards } => {
+                let manifest::Json::Obj(entries) = map else {
+                    return Rc::from([]);
+                };
+                if let Some(&idx) = exact.get(key) {
+                    let mut out = Vec::new();
+                    conditions(&entries[idx].1, 0, &mut out);
+                    return Rc::from(out);
+                }
+                let Some((_, template, star)) = wildcards
+                    .iter()
+                    .filter_map(|(rank, idx, template)| {
+                        let (pattern, _) = &entries[*idx];
+                        pattern_match(pattern, key).map(|star| (*rank, template, star))
+                    })
+                    .max_by_key(|(rank, _, _)| *rank)
+                else {
+                    return Rc::from([]);
+                };
+                Rc::from(
+                    template
+                        .iter()
+                        .map(|target| target.replace('*', star))
+                        .collect::<Vec<_>>(),
+                )
+            }
+        }
+    }
+}
+
+/// Lazily indexed + per-subpath memoized `exports` / `imports` resolver.
+#[derive(Default)]
+struct ExportLookup {
+    index: OnceCell<ExportIndex>,
+    cache: RefCell<BTreeMap<String, Rc<[String]>>>,
+}
+
+impl ExportLookup {
+    fn targets(&self, map: &manifest::Json, key: &str) -> Rc<[String]> {
+        if let Some(cached) = self.cache.borrow().get(key) {
+            return Rc::clone(cached);
+        }
+        let index = self.index.get_or_init(|| ExportIndex::build(map));
+        let resolved = index.resolve(map, key);
+        self.cache
+            .borrow_mut()
+            .insert(key.to_string(), Rc::clone(&resolved));
+        resolved
+    }
+}
+
 /// A named `package.json` (an npm unit) or a nameless one (its `imports`
 /// and directory entry still count).
 struct NpmManifest {
     manifest: manifest::PackageJson,
     /// The unit id when the package has a name no other package has.
     unit: Option<String>,
+    /// Lazy index + `(subpath -> targets)` cache for `manifest.exports`.
+    exports_lookup: ExportLookup,
+    /// Lazy index + `(#import -> targets)` cache for `manifest.imports`.
+    imports_lookup: ExportLookup,
 }
 
 /// The `paths` and `baseUrl` a `tsconfig.json` ends with after its
@@ -1087,7 +1194,7 @@ struct NpmManifest {
 #[derive(Debug, Clone, Default)]
 struct TsPaths {
     base_url: Option<String>,
-    paths: Arc<[manifest::TsPathEntry]>,
+    paths: Option<Arc<manifest::TsPathMap>>,
     /// The directory `paths` targets are relative to without a `baseUrl`.
     paths_dir: String,
 }
@@ -1113,9 +1220,6 @@ enum Follow {
     TooDeep,
 }
 
-type ExportCacheKey = (String, bool, String);
-type ExportCache = RefCell<BTreeMap<ExportCacheKey, Rc<[String]>>>;
-
 struct EcmaGraph<'a> {
     inventory: &'a BTreeSet<String>,
     facts: BTreeMap<String, crate::ecma::EcmaFacts>,
@@ -1126,8 +1230,6 @@ struct EcmaGraph<'a> {
     /// Directory of each `tsconfig.json` / `jsconfig.json` to its merged
     /// paths.
     tsconfigs: BTreeMap<String, Arc<TsPaths>>,
-    /// Per `(package_root, is_imports, key)` memoized `export_targets`.
-    export_cache: ExportCache,
     edges: BTreeSet<FileEdge>,
     diagnostics: Vec<Diagnostic>,
     external_imports: usize,
@@ -1146,7 +1248,6 @@ pub(crate) fn build_ecma(
         packages: BTreeMap::new(),
         by_name: BTreeMap::new(),
         tsconfigs: BTreeMap::new(),
-        export_cache: RefCell::new(BTreeMap::new()),
         edges: BTreeSet::new(),
         diagnostics: Vec::new(),
         external_imports: 0,
@@ -1204,6 +1305,8 @@ impl EcmaGraph<'_> {
                         NpmManifest {
                             manifest,
                             unit: None,
+                            exports_lookup: ExportLookup::default(),
+                            imports_lookup: ExportLookup::default(),
                         },
                     );
                 }
@@ -1288,6 +1391,8 @@ impl EcmaGraph<'_> {
         };
         chain.push(path.to_string());
         let mut seen = BTreeSet::new();
+        let mut resolved_parents = 0usize;
+        let mut last_parent: Option<Arc<TsPaths>> = None;
         for extends in config
             .extends
             .iter()
@@ -1333,20 +1438,32 @@ impl EcmaGraph<'_> {
                 continue;
             }
             let parent = self.merge_tsconfig(configs, &target, depth + 1, chain, memo);
+            resolved_parents += 1;
             if parent.base_url.is_some() {
                 merged.base_url.clone_from(&parent.base_url);
             }
-            if !parent.paths.is_empty() {
-                merged.paths = Arc::clone(&parent.paths);
+            if let Some(paths) = &parent.paths
+                && !paths.is_empty()
+            {
+                merged.paths = Some(Arc::clone(paths));
                 merged.paths_dir.clone_from(&parent.paths_dir);
             }
+            last_parent = Some(parent);
         }
         chain.pop();
+        if resolved_parents == 1
+            && config.base_url.is_none()
+            && config.paths.is_none()
+            && let Some(parent) = last_parent
+        {
+            memo.insert(path.to_string(), Arc::clone(&parent));
+            return parent;
+        }
         if let Some(base_url) = &config.base_url {
             merged.base_url = normalize(&join(dir_of(path), base_url));
         }
         if let Some(paths) = &config.paths {
-            merged.paths = Arc::clone(paths);
+            merged.paths = Some(Arc::clone(paths));
             merged.paths_dir = dir_of(path).to_string();
         }
         let shared = Arc::new(merged);
@@ -1416,34 +1533,19 @@ impl EcmaGraph<'_> {
             .or_else(|| self.index(&path))
     }
 
-    fn cached_export_targets(
-        &self,
-        root: &str,
-        is_imports: bool,
-        map: &manifest::Json,
-        key: &str,
-    ) -> Rc<[String]> {
-        let cache_key = (root.to_string(), is_imports, key.to_string());
-        if let Some(cached) = self.export_cache.borrow().get(&cache_key) {
-            return Rc::clone(cached);
-        }
-        let targets: Rc<[String]> = Rc::from(export_targets(map, key));
-        self.export_cache
-            .borrow_mut()
-            .insert(cache_key, Rc::clone(&targets));
-        targets
-    }
-
     /// The file package `root` gives for `subpath` (`None`: the package
     /// itself). A target that is not in scope (a `dist/` build) falls back
     /// to `<root>/src/index.*`, then to the package's `package.json`, both
     /// at `package` precision.
     fn package_target(&self, root: &str, subpath: Option<&str>) -> Option<(String, Precision)> {
-        let package = &self.packages.get(root)?.manifest;
+        let entry = self.packages.get(root)?;
+        let package = &entry.manifest;
         let found = if let Some(exports) = &package.exports {
             let key = subpath.map_or_else(|| ".".to_string(), |sub| format!("./{sub}"));
             // Every condition's target in order: the first in scope wins.
-            self.cached_export_targets(root, false, exports, &key)
+            entry
+                .exports_lookup
+                .targets(exports, &key)
                 .iter()
                 .find_map(|target| self.in_package(root, target))
                 .or_else(|| subpath.and_then(|sub| self.in_package(root, sub)))
@@ -1486,7 +1588,7 @@ impl EcmaGraph<'_> {
                 .manifest
                 .imports
                 .as_ref()
-                .map(|imports| self.cached_export_targets(root, true, imports, spec))
+                .map(|imports| package.imports_lookup.targets(imports, spec))
                 .unwrap_or_default();
             // The first target that is in scope, in condition order.
             for target in targets.iter() {
@@ -1511,20 +1613,9 @@ impl EcmaGraph<'_> {
     fn bare(&self, dir: &str, spec: &str) -> Target {
         let mut matched = false;
         if let Some((_, config)) = Self::nearest(&self.tsconfigs, dir) {
-            let mut best: Option<(usize, &[String], &str)> = None;
-            for (pattern, targets) in config.paths.iter() {
-                let candidate = if pattern == spec {
-                    Some((usize::MAX, ""))
-                } else {
-                    pattern_match(pattern, spec).map(|star| (pattern.find('*').unwrap_or(0), star))
-                };
-                if let Some((rank, star)) = candidate
-                    && best.is_none_or(|(best_rank, _, _)| rank > best_rank)
-                {
-                    best = Some((rank, targets, star));
-                }
-            }
-            if let Some((rank, targets, star)) = best {
+            if let Some(paths) = &config.paths
+                && let Some((rank, targets, star)) = paths.match_specifier(spec)
+            {
                 // A lone `*` maps every bare name: a miss there is a package.
                 matched = rank > 0;
                 for target in targets {
@@ -1807,11 +1898,9 @@ impl EcmaGraph<'_> {
     }
 }
 
-/// The targets `exports` (or `imports`) gives `key` (`.`, `./sub`,
-/// `#name`), in the order to try them: an exact key, else the `*` pattern
-/// with the longest prefix; within it, every condition's target, the
-/// [`EXPORT_CONDITIONS`] first, then the others as written. The caller
-/// takes the first that is in scope.
+/// Uncached reference implementation of `export_targets`, kept under
+/// `cfg(test)` to verify exact equivalence with [`ExportLookup`].
+#[cfg(test)]
 fn export_targets(map: &manifest::Json, key: &str) -> Vec<String> {
     use manifest::Json;
     let mut out = Vec::new();
@@ -2758,6 +2847,7 @@ fn merge(mut first: CodeGraph, second: CodeGraph) -> CodeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn paths_normalize_inside_the_repository_only() {
@@ -2766,5 +2856,301 @@ mod tests {
         assert_eq!(dir_of("a/b/c.rs"), "a/b");
         assert_eq!(dir_of("c.rs"), "");
         assert_eq!(join("", "x"), "x");
+    }
+
+    #[test]
+    fn export_lookup_matches_uncached_semantics_and_scales_on_wide_maps() {
+        let pkg_text = r##"{
+            "name": "@n1/wide",
+            "exports": {
+                ".": { "custom": "./c.js", "default": "./d.js", "import": "./i.mjs" },
+                "./dup": "./first-dup.js",
+                "./dup": "./second-dup.js",
+                "./w/*": "./wild-first/*.js",
+                "./w/*": "./wild-last/*.js",
+                "./w/deep/*": "./deep/*.js"
+            },
+            "imports": {
+                "#internal": { "types": "./types.d.ts", "import": "./internal.mjs" },
+                "#wild/*": "./priv/*.js"
+            }
+        }"##;
+        let pkg = manifest::read_package_json(pkg_text).expect("package");
+        let exports = pkg.exports.as_ref().expect("exports");
+        let exports_lookup = ExportLookup::default();
+        for key in [".", "./dup", "./w/item", "./w/deep/x", "./w/*", "./missing"] {
+            let indexed = exports_lookup.targets(exports, key);
+            let oracle = export_targets(exports, key);
+            assert_eq!(indexed.as_ref(), oracle.as_slice(), "export key={key}");
+        }
+        assert_eq!(
+            exports_lookup.targets(exports, "./dup").as_ref(),
+            ["./second-dup.js"]
+        );
+        assert_eq!(
+            exports_lookup.targets(exports, "./w/item").as_ref(),
+            ["./wild-last/item.js"]
+        );
+        assert_eq!(
+            exports_lookup.targets(exports, ".").as_ref(),
+            ["./i.mjs", "./d.js", "./c.js"]
+        );
+        assert!(Rc::ptr_eq(
+            &exports_lookup.targets(exports, "./dup"),
+            &exports_lookup.targets(exports, "./dup"),
+        ));
+
+        let imports = pkg.imports.as_ref().expect("imports");
+        let imports_lookup = ExportLookup::default();
+        for key in ["#internal", "#wild/util", "#missing"] {
+            assert_eq!(
+                imports_lookup.targets(imports, key).as_ref(),
+                export_targets(imports, key).as_slice(),
+                "import key={key}"
+            );
+        }
+
+        // Non-subpath condition object and string export cases + target cap.
+        let cond_only = manifest::read_package_json(
+            r#"{ "exports": { "default": "./a.js", "import": "./b.mjs" } }"#,
+        )
+        .expect("cond_only")
+        .exports
+        .expect("exports");
+        let cond_lookup = ExportLookup::default();
+        for key in [".", "./sub"] {
+            assert_eq!(
+                cond_lookup.targets(&cond_only, key).as_ref(),
+                export_targets(&cond_only, key).as_slice()
+            );
+        }
+        let many_conds: Vec<String> = (0..90)
+            .map(|i| format!("\"c{i}\": \"./out/{i}.js\""))
+            .collect();
+        let wide_cond = manifest::read_package_json(&format!(
+            "{{ \"exports\": {{ \".\": {{ {} }} }} }}",
+            many_conds.join(", ")
+        ))
+        .expect("wide_cond")
+        .exports
+        .expect("exports");
+        let wide_cond_lookup = ExportLookup::default();
+        assert_eq!(
+            wide_cond_lookup.targets(&wide_cond, ".").as_ref(),
+            export_targets(&wide_cond, ".").as_slice()
+        );
+        assert_eq!(
+            wide_cond_lookup.targets(&wide_cond, ".").len(),
+            MAX_EXPORT_TARGETS
+        );
+
+        // Scale test: 500 distinct subpaths imported across 500 files plus a wildcard export.
+        let mut export_entries: Vec<String> = (0..500)
+            .map(|i| {
+                format!(
+                    "\"./m{i}\": {{ \"types\": \"./dist/m{i}.d.ts\", \"default\": \"./src/m{i}.ts\" }}"
+                )
+            })
+            .collect();
+        export_entries.push("\"./wild/*\": \"./src/wild/*.ts\"".to_string());
+        let wide_pkg_json = format!(
+            "{{ \"name\": \"@n1/scale\", \"exports\": {{ {} }} }}",
+            export_entries.join(", ")
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert("packages/scale/package.json".to_string(), wide_pkg_json);
+        sources.insert(
+            "packages/scale/src/wild/extra.ts".to_string(),
+            "export const extra = 1;\n".to_string(),
+        );
+        for i in 0..500 {
+            sources.insert(
+                format!("packages/scale/src/m{i}.ts"),
+                format!("export const v{i} = {i};\n"),
+            );
+            sources.insert(
+                format!("app/use{i}.ts"),
+                format!(
+                    "import {{ v{i} }} from '@n1/scale/m{i}';\nimport '@n1/scale/wild/extra';\n"
+                ),
+            );
+        }
+        let inventory: BTreeSet<String> = sources.keys().cloned().collect();
+        let started = Instant::now();
+        let graph = build_ecma(&inventory, &sources);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "wide export lookup took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(graph.edges.len(), 1000);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "app/use499.ts"
+                && edge.to == "packages/scale/src/m499.ts"
+                && edge.kind == EdgeKind::Import
+                && edge.line == 1
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "app/use0.ts"
+                && edge.to == "packages/scale/src/wild/extra.ts"
+                && edge.kind == EdgeKind::Import
+                && edge.line == 2
+        }));
+    }
+
+    #[test]
+    fn deep_tsconfig_extends_tree_reuses_arc_paths_without_cloning() {
+        let mut sources = BTreeMap::new();
+        let mut base_paths: Vec<String> = (0..200)
+            .map(|i| format!("\"@p{i}/*\": [\"src/p{i}/*\"]"))
+            .collect();
+        base_paths.push("\"@target/*\": [\"src/*\"]".to_string());
+        sources.insert(
+            "deep/l0/tsconfig.json".to_string(),
+            format!(
+                "{{ \"compilerOptions\": {{ \"baseUrl\": \".\", \"paths\": {{ {} }} }} }}",
+                base_paths.join(", ")
+            ),
+        );
+        for level in 1..=10 {
+            sources.insert(
+                format!("deep/l{level}/tsconfig.json"),
+                format!("{{ \"extends\": \"../l{}/tsconfig.json\" }}\n", level - 1),
+            );
+        }
+        sources.insert(
+            "deep/base_override/tsconfig.json".to_string(),
+            "{ \"extends\": \"../l10/tsconfig.json\", \"compilerOptions\": { \"baseUrl\": \"alt\" } }\n".to_string(),
+        );
+        sources.insert(
+            "deep/paths_override/tsconfig.json".to_string(),
+            "{ \"extends\": \"../l10/tsconfig.json\", \"compilerOptions\": { \"paths\": { \"@custom/*\": [\"lib/*\"] } } }\n".to_string(),
+        );
+        for mod_idx in 0..5 {
+            sources.insert(
+                format!("deep/l0/src/mod{mod_idx}.ts"),
+                format!("export const m = {mod_idx};\n"),
+            );
+        }
+        sources.insert(
+            "deep/base_override/alt/src/mod1.ts".to_string(),
+            "export const alt = 1;\n".to_string(),
+        );
+        sources.insert(
+            "deep/l0/lib/entry.ts".to_string(),
+            "export const custom = 1;\n".to_string(),
+        );
+        sources.insert(
+            "deep/l10/entry.ts".to_string(),
+            "import '@target/mod0';\n".to_string(),
+        );
+        sources.insert(
+            "deep/base_override/entry.ts".to_string(),
+            "import '@target/mod1';\n".to_string(),
+        );
+        sources.insert(
+            "deep/paths_override/entry.ts".to_string(),
+            "import '@custom/entry';\n".to_string(),
+        );
+        for pkg in 0..48 {
+            sources.insert(
+                format!("apps/pkg{pkg}/tsconfig.json"),
+                "{ \"extends\": \"../../deep/l10/tsconfig.json\" }\n".to_string(),
+            );
+            sources.insert(
+                format!("apps/pkg{pkg}/main.ts"),
+                format!("import '@target/mod{}';\n", pkg % 5),
+            );
+        }
+
+        let inventory: BTreeSet<String> = sources.keys().cloned().collect();
+        let mut inspector = EcmaGraph {
+            inventory: &inventory,
+            facts: BTreeMap::new(),
+            packages: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+            tsconfigs: BTreeMap::new(),
+            edges: BTreeSet::new(),
+            diagnostics: Vec::new(),
+            external_imports: 0,
+        };
+        inspector.read_manifests(&sources);
+        let root_cfg = inspector.tsconfigs.get("deep/l0").expect("root cfg");
+        let root_paths = root_cfg.paths.as_ref().expect("root paths");
+        for level in 1..=10 {
+            let child = inspector
+                .tsconfigs
+                .get(&format!("deep/l{level}"))
+                .expect("chain cfg");
+            assert!(
+                Arc::ptr_eq(child, root_cfg),
+                "pass-through tsconfig deep/l{level} must reuse parent Arc<TsPaths>"
+            );
+        }
+        for pkg in 0..48 {
+            let sibling = inspector
+                .tsconfigs
+                .get(&format!("apps/pkg{pkg}"))
+                .expect("sibling cfg");
+            assert!(
+                Arc::ptr_eq(sibling, root_cfg),
+                "sibling apps/pkg{pkg} must reuse Arc<TsPaths>"
+            );
+        }
+        let base_override = inspector
+            .tsconfigs
+            .get("deep/base_override")
+            .expect("base_override");
+        assert!(!Arc::ptr_eq(base_override, root_cfg));
+        assert_eq!(
+            base_override.base_url.as_deref(),
+            Some("deep/base_override/alt")
+        );
+        assert!(Arc::ptr_eq(
+            base_override.paths.as_ref().expect("inherited paths"),
+            root_paths
+        ));
+        let paths_override = inspector
+            .tsconfigs
+            .get("deep/paths_override")
+            .expect("paths_override");
+        assert!(!Arc::ptr_eq(
+            paths_override.paths.as_ref().expect("overridden paths"),
+            root_paths
+        ));
+        assert_eq!(paths_override.paths_dir, "deep/paths_override");
+
+        let started = Instant::now();
+        let graph = build_ecma(&inventory, &sources);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deep tsconfig resolution took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(graph.edges.len(), 51);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "deep/l10/entry.ts"
+                && edge.to == "deep/l0/src/mod0.ts"
+                && edge.kind == EdgeKind::Import
+                && edge.line == 1
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "deep/base_override/entry.ts"
+                && edge.to == "deep/base_override/alt/src/mod1.ts"
+                && edge.kind == EdgeKind::Import
+                && edge.line == 1
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "deep/paths_override/entry.ts"
+                && edge.to == "deep/l0/lib/entry.ts"
+                && edge.kind == EdgeKind::Import
+                && edge.line == 1
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "apps/pkg47/main.ts"
+                && edge.to == "deep/l0/src/mod2.ts"
+                && edge.kind == EdgeKind::Import
+                && edge.line == 1
+        }));
     }
 }

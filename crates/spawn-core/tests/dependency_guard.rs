@@ -624,12 +624,22 @@ fn production_std_net_ratchet_matches_phase2d_allowlist() {
     }
 }
 
-/// Issue #98 boundary guard: pure/leaf library crates explicitly declare
-/// `#![forbid(unsafe_code)]` and contain zero `unsafe` tokens in `src/`.
+/// Issue #98 boundary guard: all six audited core/data library crates
+/// explicitly declare `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]`,
+/// and contain zero non-test `unsafe` tokens in `src/`.
 #[test]
 fn pure_crates_forbid_unsafe_code() {
+    const AUDITED_SAFE_CRATES: [&str; 6] = [
+        "spawn-core",
+        "spawn-postgres",
+        "spawn-cas",
+        "spawn-kdf",
+        "spawn-codegraph",
+        "spawn-jev",
+    ];
+
     let root = repo_root();
-    for krate in ["spawn-cas", "spawn-kdf", "spawn-codegraph", "spawn-jev"] {
+    for krate in AUDITED_SAFE_CRATES {
         let src_root = root.join("crates").join(krate).join("src");
         let lib_rs = fs::read_to_string(src_root.join("lib.rs")).expect("read crate lib.rs");
         assert!(
@@ -638,14 +648,25 @@ fn pure_crates_forbid_unsafe_code() {
                 .any(|line| line.trim() == "#![forbid(unsafe_code)]"),
             "{krate}/src/lib.rs must declare #![forbid(unsafe_code)]"
         );
+        assert!(
+            lib_rs
+                .lines()
+                .any(|line| line.trim() == "#![warn(missing_docs)]"),
+            "{krate}/src/lib.rs must declare #![warn(missing_docs)]"
+        );
         let mut files = Vec::new();
         collect_rs_files(&src_root, &mut files);
+        files.sort();
         assert!(!files.is_empty(), "expected files under {krate}/src");
         for path in files {
+            if is_test_only_src_file(&src_root, &path) {
+                continue;
+            }
             let text = fs::read_to_string(&path).expect("read src file");
+            let prod = strip_cfg_test_blocks(&text);
             assert!(
-                !contains_unsafe_token(&text),
-                "{} must contain zero unsafe blocks/items",
+                !contains_unsafe_token(&prod),
+                "{} must contain zero non-test unsafe blocks/items",
                 rel_path_unix(&root, &path)
             );
         }
