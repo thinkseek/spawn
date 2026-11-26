@@ -1053,10 +1053,7 @@ impl NodeShadows {
         // A rejection naming only test-database errors is no valid run:
         // the node's strikes are not reset (nor struck); still recorded.
         let no_work_failure = judged.verdict.as_ref().is_some_and(|verdict| {
-            remote::names_no_work_failure(
-                verdict,
-                super::needs_test_database(&job.want.scenarios),
-            )
+            remote::names_no_work_failure(verdict, super::needs_test_database(&job.want.scenarios))
         });
         let settled = if no_work_failure {
             Ok(None)

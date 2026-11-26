@@ -1732,13 +1732,7 @@ impl Primary {
                         ),
                     };
                 }
-                Look::Completed => match self.completed(
-                    store,
-                    task,
-                    &row,
-                    given,
-                    test_database,
-                ) {
+                Look::Completed => match self.completed(store, task, &row, given, test_database) {
                     Settled::Believed(outcome) => return outcome,
                     Settled::Requeued => since = Instant::now(),
                     Settled::Local(why) => return PrimaryOutcome::Local { why },
@@ -1843,9 +1837,7 @@ impl Primary {
                 }
             ),
             Ok(None) => {}
-            Err(error) => eprintln!(
-                "integrate: task {task}'s node gate {job_id}: {error}"
-            ),
+            Err(error) => eprintln!("integrate: task {task}'s node gate {job_id}: {error}"),
         }
         match settled {
             Ok(Some(outcome)) if outcome.ok && outcome.next == Some(FaultNext::Queued) => {

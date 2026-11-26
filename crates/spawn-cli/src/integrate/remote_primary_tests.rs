@@ -154,6 +154,8 @@ struct Fixture {
     scenarios: PathBuf,
     primary: Primary,
     seed: std::cell::Cell<u8>,
+    /// The request's [`PrimaryRequest::test_database`] (false unless set).
+    test_database: bool,
 }
 
 impl Fixture {
@@ -174,6 +176,7 @@ impl Fixture {
             scenarios,
             primary,
             seed: std::cell::Cell::new(10),
+            test_database: false,
         }
     }
 
@@ -529,21 +532,65 @@ fn m3a_judges_a_rejection_again_here_and_m3b_believes_it() {
     }
 }
 
-/// A node with 2 strikes (and `degraded` as given, set once it holds its
-/// lease) finishes the primary path's job with exit 0 and a `stated` verdict
-/// on the job's own inputs, self-fenced or not: the outcome, and the
-/// node's strikes and `degraded` after it.
-fn valid_run_on_two_strikes(
-    case: &str,
+/// A node's valid-looking run for [`valid_run_on_two_strikes`]: exit 0,
+/// a verdict `stated` with `reason`, its `stdout`, self-fenced or not, on a
+/// node `degraded` or not, judged with `test_database` as given.
+struct ValidRun {
+    case: &'static str,
     believe_reject: bool,
     stated: &'static str,
+    reason: &'static str,
+    stdout: &'static str,
     self_fenced: bool,
     degraded: bool,
+    test_database: bool,
+}
+
+impl ValidRun {
+    fn new(case: &'static str, believe_reject: bool, stated: &'static str) -> Self {
+        Self {
+            case,
+            believe_reject,
+            stated,
+            reason: "r",
+            stdout: "| no\n",
+            self_fenced: false,
+            degraded: false,
+            test_database: false,
+        }
+    }
+}
+
+/// What gate.sh prints when check-tests.sh fails on the candidate with
+/// only test-database connection errors (no failure of the work's).
+const DB_ONLY_STDOUT: &str = "| == regression: check-tests.sh must still pass\n\
+     | FAILED api::tests::one: error connecting to server: Connection refused (os error 111)\n\
+     | stage gate rejected 1200ms regression: check-tests.sh must still pass\n";
+
+/// The same failure, with a failure of the work's beside it.
+const WORK_STDOUT: &str = "| == regression: check-tests.sh must still pass\n\
+     | FAILED api::tests::one: error connecting to server: Connection refused (os error 111)\n\
+     | FAILED api::tests::two: assertion `left == right` failed: the landing moved main\n\
+     | stage gate rejected 1200ms regression: check-tests.sh must still pass\n";
+
+/// A node with 2 strikes (and `degraded` as given, set once it holds its
+/// lease) finishes the primary path's job as `run` says: the outcome, the
+/// node's strikes and `degraded` after it, and the job's row.
+fn valid_run_on_two_strikes(
+    run: &ValidRun,
 ) -> (PrimaryOutcome, (i32, bool), spawn_postgres::RemoteJob) {
-    let world = Fixture::new(case, believe_reject, Duration::from_secs(30));
+    let mut world = Fixture::new(run.case, run.believe_reject, Duration::from_secs(30));
+    world.test_database = run.test_database;
     let mut node = world.node("n1");
     let results = world.results();
     let mut admin = world.ledger.admin();
+    let (stated, reason, stdout, self_fenced, degraded) = (
+        run.stated,
+        run.reason,
+        run.stdout,
+        run.self_fenced,
+        run.degraded,
+    );
     let ran = std::thread::spawn(move || {
         let grant = node.lease(Duration::from_secs(30)).expect("a grant");
         admin
@@ -553,17 +600,13 @@ fn valid_run_on_two_strikes(
                 &[&degraded],
             )
             .expect("two strikes");
-        let verdict = verdict_for(stated, &grant);
-        node.finish(
-            &results,
-            &grant,
-            Some(0),
-            Some(&verdict),
-            "| no\n",
-            |meta| {
-                meta.self_fenced = self_fenced;
-            },
-        );
+        let given = granted_inputs(&grant);
+        let verdict = json!({"v": 1, "verdict": stated, "reason": reason,
+                             "base": given["base"], "candidate": given["candidate"]})
+        .to_string();
+        node.finish(&results, &grant, Some(0), Some(&verdict), stdout, |meta| {
+            meta.self_fenced = self_fenced;
+        });
     });
     let outcome = world
         .primary
@@ -580,7 +623,7 @@ fn valid_run_on_two_strikes(
 fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
     // (a) M3a: an acceptance, believed.
     let (outcome, strikes, row) =
-        valid_run_on_two_strikes("valid_m3a_accepts", false, "accepted", false, false);
+        valid_run_on_two_strikes(&ValidRun::new("valid_m3a_accepts", false, "accepted"));
     assert_eq!(believed(outcome).belief, "M3a");
     assert_eq!(strikes, (0, false), "an M3a acceptance resets the strikes");
     assert_eq!(row.state, RemoteJobState::Completed);
@@ -590,7 +633,7 @@ fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
     );
     // (b) M3a: a rejection, a valid run judged again here.
     let (outcome, strikes, _) =
-        valid_run_on_two_strikes("valid_m3a_rejects", false, "rejected", false, false);
+        valid_run_on_two_strikes(&ValidRun::new("valid_m3a_rejects", false, "rejected"));
     assert!(local_why(&outcome).contains("valid run"));
     assert_eq!(
         strikes,
@@ -599,7 +642,7 @@ fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
     );
     // (c) M3b: a rejection, believed.
     let (outcome, strikes, _) =
-        valid_run_on_two_strikes("valid_m3b_rejects", true, "rejected", false, false);
+        valid_run_on_two_strikes(&ValidRun::new("valid_m3b_rejects", true, "rejected"));
     let believed_rejection = believed(outcome);
     assert_eq!(believed_rejection.belief, "M3b");
     assert!(!believed_rejection.verdict.accepted);
@@ -609,16 +652,51 @@ fn a_valid_run_resets_the_nodes_strikes_and_a_self_fenced_one_does_not() {
         "an M3b believed rejection resets the strikes"
     );
     // A degraded node: its strikes go, `degraded` stays.
-    let (outcome, strikes, _) =
-        valid_run_on_two_strikes("valid_degraded", true, "accepted", false, true);
+    let (outcome, strikes, _) = valid_run_on_two_strikes(&ValidRun {
+        degraded: true,
+        ..ValidRun::new("valid_degraded", true, "accepted")
+    });
     assert!(believed(outcome).verdict.accepted);
     assert_eq!(strikes, (0, true), "only an undrain clears degraded");
     // Self-fenced: no verdict, nothing reset.
-    let (outcome, strikes, row) =
-        valid_run_on_two_strikes("valid_self_fenced", false, "accepted", true, false);
+    let (outcome, strikes, row) = valid_run_on_two_strikes(&ValidRun {
+        self_fenced: true,
+        ..ValidRun::new("valid_self_fenced", false, "accepted")
+    });
     local_why(&outcome);
     assert_eq!(strikes, (2, false), "a self-fenced run resets nothing");
     assert_eq!(row.lease_epoch, 1, "nothing judged it");
+}
+
+/// A rejection on a test database naming only its connection errors may
+/// be the node's own test server crashing: no valid run, so under M3a and
+/// M3b alike the node keeps its 2 strikes and the job its epoch (neither
+/// struck nor reset). The same rejection with a failure of the work's, or
+/// on a gate without a test database, is a valid run: strikes back to 0.
+#[test]
+fn a_rejection_naming_only_test_database_errors_resets_no_strikes() {
+    for believe_reject in [false, true] {
+        let db_only = |case, stdout, test_database| ValidRun {
+            reason: crate::integrate::host::CHECK_TESTS_REGRESSION,
+            stdout,
+            test_database,
+            ..ValidRun::new(case, believe_reject, "rejected")
+        };
+        let (cases, rule) = if believe_reject {
+            (["db_only_m3b", "work_m3b", "no_db_m3b"], "M3b")
+        } else {
+            (["db_only_m3a", "work_m3a", "no_db_m3a"], "M3a")
+        };
+        let (_, strikes, row) = valid_run_on_two_strikes(&db_only(cases[0], DB_ONLY_STDOUT, true));
+        assert_eq!(strikes, (2, false), "{rule}: a DB-error-only rejection");
+        assert_eq!(row.lease_epoch, 1, "{rule}: the completion is not judged");
+        assert_eq!(row.state, RemoteJobState::Completed);
+        let (_, strikes, row) = valid_run_on_two_strikes(&db_only(cases[1], WORK_STDOUT, true));
+        assert_eq!(strikes, (0, false), "{rule}: a failure of the work's");
+        assert_eq!(row.lease_epoch, 2);
+        let (_, strikes, _) = valid_run_on_two_strikes(&db_only(cases[2], DB_ONLY_STDOUT, false));
+        assert_eq!(strikes, (0, false), "{rule}: no test database, a valid run");
+    }
 }
 
 /// A verdict on other commits or inputs is the node's fault: struck,
@@ -1011,9 +1089,14 @@ fn a_take_back_that_loses_to_a_lease_waits_for_the_nodes_result() {
 }
 
 fn follow(world: &Fixture, job: &GateJob) -> PrimaryOutcome {
-    world
-        .primary
-        .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, false, &|| false)
+    world.primary.follow(
+        &world.ledger.store,
+        7,
+        &job.job_id,
+        &job.inputs,
+        false,
+        &|| false,
+    )
 }
 
 /// An owner's urgent landing stops the judging while it waits: a queued
@@ -1026,9 +1109,14 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
     remote::enqueue(&world.ledger.store, &job).expect("queued");
     let since = Instant::now();
     let stop = || since.elapsed() > Duration::from_millis(200);
-    let outcome = world
-        .primary
-        .follow(&world.ledger.store, 7, &job.job_id, &job.inputs, false, &stop);
+    let outcome = world.primary.follow(
+        &world.ledger.store,
+        7,
+        &job.job_id,
+        &job.inputs,
+        false,
+        &stop,
+    );
     assert!(matches!(outcome, PrimaryOutcome::Stopped), "{outcome:?}");
     assert!(
         since.elapsed() < Duration::from_secs(10),
@@ -1046,9 +1134,14 @@ fn a_judging_stopped_while_it_waits_takes_its_queued_job_back() {
     assert_eq!(node.beat().len(), 1);
     let since = Instant::now();
     let stop = || since.elapsed() > Duration::from_millis(200);
-    let outcome = leased
-        .primary
-        .follow(&leased.ledger.store, 7, &job.job_id, &job.inputs, false, &stop);
+    let outcome = leased.primary.follow(
+        &leased.ledger.store,
+        7,
+        &job.job_id,
+        &job.inputs,
+        false,
+        &stop,
+    );
     assert!(matches!(outcome, PrimaryOutcome::Stopped), "{outcome:?}");
     assert_eq!(leased.job().state, RemoteJobState::Leased);
     leased.no_task_record();
