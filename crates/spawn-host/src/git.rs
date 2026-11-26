@@ -3904,10 +3904,7 @@ mod tests {
         std::fs::write(directory.join("big.bin"), &changed).expect("write");
         store.commit(&workspace, "two").expect("commit");
         let record = super::oversized_record(&root, "agent_a");
-        assert_eq!(
-            record[0].digest,
-            Some(sha(&changed))
-        );
+        assert_eq!(record[0].digest, Some(sha(&changed)));
 
         // A record of the earlier format: no digest, still told.
         let notices = store.notices(&workspace);
@@ -3928,10 +3925,7 @@ mod tests {
         store.commit(&workspace, "three").expect("commit");
         let record = super::oversized_record(&root, "agent_a");
         assert!(record[0].told);
-        assert_eq!(
-            record[0].digest,
-            Some(sha(&changed))
-        );
+        assert_eq!(record[0].digest, Some(sha(&changed)));
         // A malformed digest is no digest; a name that is no branch reads
         // nothing.
         std::fs::write(

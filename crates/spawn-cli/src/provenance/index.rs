@@ -1337,11 +1337,7 @@ fn supersedes(
         return Ok(Vec::new());
     };
     let mut edges = Vec::new();
-    for Directive {
-        kind,
-        task: target,
-    } in directives(brief)
-    {
+    for Directive { kind, task: target } in directives(brief) {
         if target == task {
             continue;
         }

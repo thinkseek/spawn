@@ -462,3 +462,367 @@ mod data_domain {
         );
     }
 }
+
+/// PV4: the dispatcher's directive lines, and the durability report's rules
+/// (decisions B6, D4) on rows made by hand.
+mod pv4 {
+    use serde_json::{Value, json};
+    use spawn_postgres::provenance::{
+        ProvAttributionSource, ProvBoundary, ProvChangeKind, ProvChangeRecord, ProvEdgeKind,
+        ProvEdgeRecord, ProvEntryClass, ProvEntryRecord, ProvSupersedes,
+    };
+
+    use super::super::durability::{Input, Window, tally, text};
+    use super::super::index::{Directive, DirectiveKind, SupersedeReason, directives};
+
+    #[test]
+    fn only_whole_directive_lines_of_a_brief_are_directives() {
+        let brief = "Objective 7: undo the bad change\n\
+                     \n\
+                     Reverts: task 11\n\
+                     - fixes: task #12.\n\
+                     * SUPERSEDES:  TASK 13 (Refactor)\n\
+                     supersedes: task 14 (planned)\n\
+                     supersedes: task 15 (requirement)\n\
+                     supersedes: task 16 (format)\n\
+                     reverts: task 11\n\
+                     supersedes: task 17\n\
+                     supersedes: task 18 (defect)\n\
+                     The worker said `reverts: task 19` in its report.\n\
+                     reverts: task 20 and 21\n\
+                     fixes: task 0\n\
+                     fixes: task 22x\n\
+                     fixes: tasks 23\n\
+                     reverts task 24\n\
+                     > reverts: task 25\n";
+        let found = directives(brief);
+        assert_eq!(
+            found,
+            [
+                Directive {
+                    kind: DirectiveKind::Reverts,
+                    task: 11
+                },
+                Directive {
+                    kind: DirectiveKind::Fixes,
+                    task: 12
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Refactor),
+                    task: 13
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Planned),
+                    task: 14
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Requirement),
+                    task: 15
+                },
+                Directive {
+                    kind: DirectiveKind::Supersedes(SupersedeReason::Format),
+                    task: 16
+                },
+            ],
+            "a repeat is once; no reason, a defect reason, prose and junk are none"
+        );
+        assert!(directives("").is_empty());
+        assert!(directives("reverts:").is_empty());
+        assert!(directives("reverts: task").is_empty());
+    }
+
+    const DOMAIN: &str = "git:/srv/durability.git";
+
+    fn change(
+        id: i64,
+        kind: ProvChangeKind,
+        task: Option<i64>,
+        preset: Option<&str>,
+    ) -> ProvChangeRecord {
+        ProvChangeRecord {
+            id,
+            change_id: format!("c{id}"),
+            rev: 1,
+            kind,
+            domain: DOMAIN.to_string(),
+            agent_id: format!("agent_{}", task.unwrap_or(0)),
+            execution_id: None,
+            task_id: task,
+            preset_id: preset.map(str::to_string),
+            model_label: None,
+            transcript_ref: None,
+            attributed: ProvAttributionSource::Host,
+            base: "git1:b".to_string(),
+            result: format!("git1:{id}"),
+            boundary: if kind == ProvChangeKind::Land {
+                ProvBoundary::Land
+            } else {
+                ProvBoundary::Checkpoint
+            },
+            at_ms: id * 1000,
+        }
+    }
+
+    fn land(id: i64, task: i64, preset: &str) -> ProvChangeRecord {
+        change(id, ProvChangeKind::Land, Some(task), Some(preset))
+    }
+
+    fn entry(change: i64, path: &str, origin: Option<i64>) -> ProvEntryRecord {
+        ProvEntryRecord {
+            change,
+            path: path.to_string(),
+            before: None,
+            after: Some(format!("git1:{change}{path}")),
+            size: Some(1),
+            class: ProvEntryClass::Content,
+            origin,
+        }
+    }
+
+    fn edge(id: i64, src: &ProvChangeRecord, detail: Value) -> ProvSupersedes {
+        ProvSupersedes {
+            edge: ProvEdgeRecord {
+                id,
+                kind: ProvEdgeKind::Supersedes,
+                src: src.id,
+                dst: "c0".to_string(),
+                detail,
+                at_ms: src.at_ms,
+            },
+            src: src.clone(),
+        }
+    }
+
+    fn defect(target: i64, evidence: &str) -> Value {
+        json!({"reason": "defect", "evidence": evidence, "target_task": target})
+    }
+
+    fn row<'a>(report: &'a Value, preset: &str) -> &'a Value {
+        report["presets"]
+            .as_array()
+            .expect("presets")
+            .iter()
+            .find(|row| row["preset_id"] == preset)
+            .unwrap_or_else(|| panic!("no row for {preset}: {report}"))
+    }
+
+    /// Rules 1 to 4 and 6: the task is the unit, charged to the preset of
+    /// its landing; at most one liability per task; only level 1 and 2
+    /// count, `fixes:` is reported apart, non-defect reasons and unverified
+    /// reverts never count; a task's own edge is no liability.
+    #[test]
+    fn only_confirmed_defects_count_once_per_task_on_the_preset_of_its_landing() {
+        let l11 = land(1, 11, "opus");
+        let l12 = land(2, 12, "sonnet");
+        let l13 = land(3, 13, "sonnet");
+        let l20 = land(4, 20, "opus");
+        let l21 = land(5, 21, "haiku");
+        let l22 = land(6, 22, "haiku");
+        let mut input = Input {
+            lands: vec![
+                l11.clone(),
+                l12.clone(),
+                l13.clone(),
+                l20.clone(),
+                l21.clone(),
+                l22.clone(),
+            ],
+            ..Input::default()
+        };
+        input
+            .entries
+            .insert(1, vec![entry(1, "a.rs", None), entry(1, "b.rs", None)]);
+        input.entries.insert(2, vec![entry(2, "c.rs", None)]);
+        input.entries.insert(3, vec![entry(3, "d.rs", None)]);
+        input.supersedes = vec![
+            // Task 11: reverted (level 1) twice and bisected once: one.
+            edge(1, &l20, defect(11, "level1_revert")),
+            edge(2, &l21, defect(11, "level1_revert")),
+            edge(3, &l22, defect(11, "level2_bisect")),
+            // Task 12: a level-2 defect, and a fixes: reported apart.
+            edge(4, &l20, defect(12, "level2_bisect")),
+            edge(5, &l21, defect(12, "dispatcher_fixes")),
+            // Task 13: fixes only, a refactor, an unverified revert.
+            edge(6, &l20, defect(13, "dispatcher_fixes")),
+            edge(
+                7,
+                &l21,
+                json!({"reason": "refactor", "evidence": "dispatcher_supersedes", "target_task": 13}),
+            ),
+            edge(8, &l22, defect(13, "unverified_revert")),
+            // A task's own: nothing.
+            edge(9, &l22, defect(22, "level1_revert")),
+        ];
+        let report = tally(&input, Window::default());
+        assert_eq!(report["shadow"], true);
+        assert_eq!(report["window"], json!({"landings": 50, "days": 14}));
+        let opus = row(&report, "opus");
+        assert_eq!(
+            (
+                &opus["landed_tasks"],
+                &opus["confirmed_defects"],
+                &opus["reverted_tasks"],
+                &opus["fixes_reported"]
+            ),
+            (&json!(2), &json!(1), &json!(1), &json!(0)),
+            "{report}"
+        );
+        let sonnet = row(&report, "sonnet");
+        assert_eq!(
+            (
+                &sonnet["landed_tasks"],
+                &sonnet["confirmed_defects"],
+                &sonnet["reverted_tasks"],
+                &sonnet["fixes_reported"]
+            ),
+            (&json!(2), &json!(1), &json!(0), &json!(2)),
+            "{report}"
+        );
+        let haiku = row(&report, "haiku");
+        assert_eq!(haiku["confirmed_defects"], 0, "{report}");
+        assert_eq!(report["unattributed"], 0);
+        assert_eq!(
+            report["not_scored"],
+            json!({"refactor": 1, "unverified_revert": 1, "same_task": 1})
+        );
+        assert_eq!(report["defects"].as_array().map(Vec::len), Some(4));
+        // No score of lines, files or Changes, and no survival.
+        for row in report["presets"].as_array().expect("rows") {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("a row")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "confirmed_defects",
+                    "fixes_reported",
+                    "landed_tasks",
+                    "preset_id",
+                    "reverted_tasks"
+                ]
+            );
+        }
+        assert!(text(&report).contains("shadow only"));
+    }
+
+    /// D4: 50 landings or 14 days after the task's landing, whichever ends
+    /// first; both are flags.
+    #[test]
+    fn the_window_is_fifty_landings_or_fourteen_days_whichever_ends_first() {
+        let day = 86_400_000;
+        let target = land(1, 11, "opus");
+        let mut lands = vec![target.clone()];
+        for id in 2..=60 {
+            lands.push(land(id, 100 + id, "other"));
+        }
+        let late = {
+            let mut late = land(3, 103, "other");
+            late.at_ms = target.at_ms + 15 * day;
+            late
+        };
+        lands[2] = late.clone();
+        let mut input = Input {
+            lands: lands.clone(),
+            ..Input::default()
+        };
+        input.entries.insert(1, vec![entry(1, "a.rs", None)]);
+        // The 51st landing after it: out; the 15th day: out.
+        input.supersedes = vec![
+            edge(1, &lands[51], defect(11, "level1_revert")),
+            edge(2, &late, defect(11, "level1_revert")),
+        ];
+        let report = tally(&input, Window::default());
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 0, "{report}");
+        assert_eq!(report["not_scored"], json!({"out_of_window": 2}));
+        // The 50th landing, on day 1: in.
+        input.supersedes = vec![edge(1, &lands[50], defect(11, "level1_revert"))];
+        let report = tally(&input, Window::default());
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 1, "{report}");
+        // A narrower window by flag.
+        let report = tally(
+            &input,
+            Window {
+                landings: 10,
+                days: 14,
+            },
+        );
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 0, "{report}");
+        let report = tally(
+            &input,
+            Window {
+                landings: 100,
+                days: 20,
+            },
+        );
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 1);
+        let mut later = input;
+        later.supersedes = vec![edge(2, &late, defect(11, "level1_revert"))];
+        let report = tally(
+            &later,
+            Window {
+                landings: 50,
+                days: 20,
+            },
+        );
+        assert_eq!(row(&report, "opus")["confirmed_defects"], 1, "{report}");
+    }
+
+    /// Rule 5: a composed landing's liability follows `origin` to the task
+    /// whose revision the content came from; when the paths name more than
+    /// one task (or a revision with no task), nobody is charged and the
+    /// event is unattributed.
+    #[test]
+    fn a_composed_landing_is_charged_through_origin_or_to_nobody() {
+        let edit_31 = change(10, ProvChangeKind::Edit, Some(31), Some("sonnet"));
+        let edit_32 = change(11, ProvChangeKind::Edit, Some(32), Some("haiku"));
+        let edit_none = change(12, ProvChangeKind::Edit, None, None);
+        let composed = land(20, 30, "opus");
+        let mixed = land(21, 33, "opus");
+        let orphan = land(22, 34, "opus");
+        let fixer = land(23, 40, "opus");
+        let mut input = Input {
+            lands: vec![
+                composed.clone(),
+                mixed.clone(),
+                orphan.clone(),
+                fixer.clone(),
+            ],
+            ..Input::default()
+        };
+        for change in [&edit_31, &edit_32, &edit_none] {
+            input.origins.insert(change.id, change.clone());
+        }
+        // Task 30 composed task 31's revision alone: charged to 31, whose
+        // preset its revision captured (31 never landed itself).
+        input.entries.insert(20, vec![entry(20, "x.rs", Some(10))]);
+        // Task 33 holds 31's and 32's: ambiguous.
+        input.entries.insert(
+            21,
+            vec![entry(21, "x.rs", Some(10)), entry(21, "y.rs", Some(11))],
+        );
+        // Task 34 holds a revision with no task: ambiguous.
+        input.entries.insert(22, vec![entry(22, "z.rs", Some(12))]);
+        input.supersedes = vec![
+            edge(1, &fixer, defect(30, "level1_revert")),
+            edge(2, &fixer, defect(33, "level1_revert")),
+            edge(3, &fixer, defect(34, "level2_bisect")),
+        ];
+        let report = tally(&input, Window::default());
+        assert_eq!(report["unattributed"], 2, "{report}");
+        let defects = report["defects"].as_array().expect("defects");
+        assert_eq!(defects.len(), 1);
+        assert_eq!(defects[0]["charged_task"], 31);
+        assert_eq!(defects[0]["preset_id"], "sonnet");
+        assert_eq!(row(&report, "sonnet")["confirmed_defects"], 1);
+        assert_eq!(
+            row(&report, "opus")["confirmed_defects"],
+            0,
+            "nobody else is charged"
+        );
+        assert_eq!(row(&report, "opus")["landed_tasks"], 4);
+    }
+}

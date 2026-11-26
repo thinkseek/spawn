@@ -74,8 +74,8 @@ impl Default for Window {
 
 /// `spawn prov durability ...`.
 pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
-    let flags = Flags::parse_with_switches(rest, &["json"])
-        .map_err(|error| format!("{error}\n{USAGE}"))?;
+    let flags =
+        Flags::parse_with_switches(rest, &["json"]).map_err(|error| format!("{error}\n{USAGE}"))?;
     if let Some(name) = flags
         .names()
         .find(|name| !matches!(*name, "source" | "window-landings" | "window-days"))
@@ -97,7 +97,9 @@ pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
             .map_err(|_| "--window-landings is too large".to_string())?,
         days: positive("window-days", WINDOW_DAYS)?,
     };
-    let domain = flags.get("source").map(|source| super::index::domain_of(&source));
+    let domain = flags
+        .get("source")
+        .map(|source| super::index::domain_of(&source));
     let store = crate::open_store()?;
     let report = report(&store, domain.as_deref(), window)?;
     if flags.switch("json") {
