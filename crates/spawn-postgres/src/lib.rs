@@ -2,7 +2,26 @@
 //!
 //! Times travel as epoch milliseconds, so this crate needs no date library.
 //! Every write goes through the SQL functions in `sql/schema.sql`; the
-//! ordering guarantees live there and are shared by every writer.
+//! ordering guarantees, role gates, and schema-local advisory locks live there
+//! and are shared by every writer.
+//!
+//! # Security & Role Model
+//!
+//! Connections either authenticate as the schema **owner** (for migrations,
+//! dispatcher/integrator mutations, alerts, backups, and D6/provenance ledger
+//! writes) or as one of four database-scoped least-privilege logins derived by
+//! [`role_url`]:
+//! - `spawn_supervisor`: decision/mission actions and supervised table reads.
+//! - `spawn_reader`: read-only queries (`spawn_read_*` functions and relation `SELECT`).
+//! - `spawn_human`: `SECURITY DEFINER` human-gateway entrypoints (`spawn_human_*`).
+//! - `spawn_node_gateway`: verify-then-commit node gateway RPCs (`spawn_node_gw_*`).
+//!
+//! Read helpers run single SQL statements (or prepared index-backed reads) and
+//! map PostgreSQL errors into [`StoreError`]: privilege / exclusion checks map
+//! to [`StoreError::Rejected`], transient disconnects or shutdowns map to
+//! [`StoreError::Unreachable`], corrupt domain values map to
+//! [`StoreError::Corrupt`], and unexpected SQL errors map to
+//! [`StoreError::Backend`].
 //!
 //! Layout: each module holds its SQL next to the code that binds its
 //! parameters and maps its rows (`row` holds the shared column decoders).
@@ -21,6 +40,9 @@
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -138,7 +160,6 @@ pub use row::RETIRED_EVENTS;
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
-pub use verifications::verified_by_line;
 pub use wake::Listener;
 
 /// Schema installed by [`PostgresStore::migrate`].
@@ -639,7 +660,9 @@ pub fn cluster_identity(url: &str) -> Result<String, StoreError> {
 /// error it met. Neither names the URL, so neither holds its password.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeFailure {
+    /// Human-readable description of the probe step that failed.
     pub probe: String,
+    /// Diagnostic error message (sanitized; never includes connection credentials).
     pub error: String,
 }
 

@@ -83,7 +83,7 @@ impl EventLog for PostgresStore {
         })
     }
 
-    /// Records this build cannot read ([`event_record`]) are skipped, and
+    /// Records this build cannot read (`event_record`) are skipped, and
     /// the read goes on past them: fewer than `limit` records still means
     /// the end of the log, however long a run of skipped ones.
     fn read_global(

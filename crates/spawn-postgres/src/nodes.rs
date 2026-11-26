@@ -185,18 +185,18 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// Every node joined and not removed ([`NODES`]), an array.
+    /// Every node joined and not removed (`NODES`), an array.
     pub fn nodes(&self) -> Result<Value, StoreError> {
         self.query_json(NODES, &[])
     }
 
-    /// The joined nodes' membership ([`MEMBERS`]), an array; prepared
+    /// The joined nodes' membership (`MEMBERS`), an array; prepared
     /// once, since the heartbeat worker reads it again and again.
     pub fn node_members(&self) -> Result<Value, StoreError> {
         self.query_json_prepared(MEMBERS, &[])
     }
 
-    /// The open `node_lost` alerts ([`NODE_ALERTS`]), `{key: subject}`.
+    /// The open `node_lost` alerts (`NODE_ALERTS`), `{key: subject}`.
     pub fn node_alerts(&self) -> Result<Value, StoreError> {
         self.query_json(NODE_ALERTS, &[])
     }

@@ -357,7 +357,7 @@ impl PostgresStore {
     }
 
     /// The scorecard's facts recorded before `until_ms`, in one snapshot:
-    /// `{control: [...], commands: [...]}` ([`FACTS`]). `commands` holds the
+    /// `{control: [...], commands: [...]}` (`FACTS`). `commands` holds the
     /// rows a measure reads: the owner's (`human`, `spawn`), every failed
     /// one, the dispatcher's deliveries (`deliver-<task>-<revision>` and their
     /// retries; `error` only on a failed one) and its digests that carry a
@@ -373,22 +373,22 @@ impl PostgresStore {
     /// `owner_runs_from_ms` (the first owner judging with its gate's wall
     /// clock, whatever `until_ms`) are taken from the control facts, which
     /// hold every such record before `until_ms`, not read again; the latter
-    /// is read ([`OWNER_RUNS_FROM`]) only when none is before `until_ms`.
+    /// is read (`OWNER_RUNS_FROM`) only when none is before `until_ms`.
     ///
     /// The facts are kept in this process, by store: a reading at or after
-    /// the kept one's end reads only what is new since ([`FACTS_SINCE`]); an
+    /// the kept one's end reads only what is new since (`FACTS_SINCE`); an
     /// earlier end, a first reading or one after a failed one reads them all
-    /// ([`FACTS`]), and an earlier end leaves the kept facts as they were.
+    /// (`FACTS`), and an earlier end leaves the kept facts as they were.
     /// Kept facts are read again whole when their whole reading's end is an
-    /// hour ([`FULL_EVERY_MS`]) behind, or when the newest event the last
-    /// reading saw is no longer there ([`Mark`]: a restore in place).
+    /// hour (`FULL_EVERY_MS`) behind, or when the newest event the last
+    /// reading saw is no longer there (`Mark`: a restore in place).
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
         self.scorecard_facts_with_overlap(until_ms, OVERLAP)
     }
 
     /// [`Self::scorecard_facts`] with the window's overlap given: the tests'
     /// seam, so a short history still has rows below the window (rev-e's
-    /// F1). Every other caller uses [`OVERLAP`].
+    /// F1). Every other caller uses `OVERLAP`.
     #[doc(hidden)]
     pub fn scorecard_facts_with_overlap(
         &self,
@@ -490,10 +490,10 @@ impl PostgresStore {
         Ok(facts)
     }
 
-    /// The statement a kept reading runs ([`FACTS_SINCE`]): `$1` the end,
+    /// The statement a kept reading runs (`FACTS_SINCE`): `$1` the end,
     /// `$2` the kept reading's end, `$3` and `$4` the last kept seq and
     /// command id less the overlap, `$5` to `$8` the kept mark's id,
-    /// recorded_at, session and seq ([`Mark`]). For timing it at live size, and for the
+    /// recorded_at, session and seq (`Mark`). For timing it at live size, and for the
     /// tests that read its plan.
     pub fn scorecard_facts_since_statement() -> &'static str {
         &FACTS_SINCE
@@ -534,7 +534,7 @@ impl PostgresStore {
         Ok((hasher.finish(), place))
     }
 
-    /// The ids of the missions no deploy ships ([`UNDEPLOYED_MISSIONS`]),
+    /// The ids of the missions no deploy ships (`UNDEPLOYED_MISSIONS`),
     /// sorted, as a JSON array: their landings are live when they land.
     pub fn scorecard_undeployed_missions(&self) -> Result<Value, StoreError> {
         self.query_json(UNDEPLOYED_MISSIONS, &[])

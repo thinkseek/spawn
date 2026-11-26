@@ -78,19 +78,19 @@ select coalesce(jsonb_agg(jsonb_build_object(
 impl PostgresStore {
     /// The newest `deploy.finished` records, newest first, at most `limit`
     /// (clamped to 1..=100), each `{event, at_ms, ok, head, by, reason}`
-    /// ([`DEPLOY_RECORDS`]).
+    /// (`DEPLOY_RECORDS`).
     pub fn deploy_facts(&self, limit: i64) -> Result<Value, StoreError> {
         self.query_json(DEPLOY_RECORDS, &[&limit.clamp(1, 100)])
     }
 
     /// The newest successful `deploy.finished` over the whole log, or
-    /// `null` ([`LIVE_DEPLOY`]): `{event, at_ms, ok, head, by, reason}`.
+    /// `null` (`LIVE_DEPLOY`): `{event, at_ms, ok, head, by, reason}`.
     pub fn live_deploy_fact(&self) -> Result<Value, StoreError> {
         self.query_json(LIVE_DEPLOY, &[])
     }
 
     /// Every open or active mission's blocker, by mission
-    /// ([`MISSION_BLOCKERS`]): `[{id, halt, paused, main_red}]`.
+    /// (`MISSION_BLOCKERS`): `[{id, halt, paused, main_red}]`.
     pub fn mission_blockers(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_BLOCKERS, &[])
     }

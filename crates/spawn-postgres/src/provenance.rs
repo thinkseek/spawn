@@ -151,34 +151,50 @@ text_enum! {
 /// One change to record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvChangeInput {
+    /// Stable external identifier for the change (commit OID or logical change id).
     pub change_id: String,
+    /// Monotonic revision number within `(change_id, domain)`.
     pub rev: i32,
+    /// Classification of the change (`edit`, `derive`, `land`, `revert`, `import`).
     pub kind: ProvChangeKind,
+    /// Namespace/domain (`git:<source>`, `data:<ref>`, etc.).
     pub domain: String,
+    /// Agent identifier that authored or recorded the change.
     pub agent_id: String,
+    /// Execution identifier associated with the change, if recorded inside an execution.
     pub execution_id: Option<String>,
+    /// Mission task id associated with the change, if any.
     pub task_id: Option<i64>,
+    /// Grading preset id active when the change was made, if any.
     pub preset_id: Option<String>,
+    /// Model label recorded for attribution, if any.
     pub model_label: Option<String>,
+    /// Transcript reference linking back to the archived session message, if any.
     pub transcript_ref: Option<String>,
+    /// How attribution was determined (`host`, `inferred`, `imported`).
     pub attributed: ProvAttributionSource,
     /// The tree digest before the change.
     pub base: String,
     /// The tree digest after it.
     pub result: String,
+    /// Capture boundary at which the change was recorded (`checkpoint`, `submit`, `land`, `job`, `backfill`).
     pub boundary: ProvBoundary,
+    /// Timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
 }
 
 /// One path a change touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvEntryInput {
+    /// Domain-relative path touched by the change.
     pub path: String,
     /// The content digest before (`None`: the path was absent).
     pub before: Option<String>,
     /// The content digest after (`None`: the change removed it).
     pub after: Option<String>,
+    /// Byte size after the change, if present.
     pub size: Option<i64>,
+    /// Classification of the file/tree entry (`content`, `mechanical`, `generated`, `tree`).
     pub class: ProvEntryClass,
     /// The recorded change (its id) this content came from.
     pub origin: Option<i64>,
@@ -187,6 +203,7 @@ pub struct ProvEntryInput {
 /// One edge from the change being recorded to what it names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvEdgeInput {
+    /// Relationship kind (`used`, `includes`, `supersedes`, `redacts`).
     pub kind: ProvEdgeKind,
     /// A change's `change_id`, a tree digest or a content digest.
     pub dst: String,
@@ -199,44 +216,73 @@ pub struct ProvEdgeInput {
 /// A recorded change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvChangeRecord {
+    /// Primary key id in `prov_changes`.
     pub id: i64,
+    /// External change identifier (`change_id`).
     pub change_id: String,
+    /// Revision number within `change_id`.
     pub rev: i32,
+    /// Classification of the change (`edit`, `derive`, `land`, `revert`, `import`).
     pub kind: ProvChangeKind,
+    /// Namespace/domain (`git:<source>`, `data:<ref>`, etc.).
     pub domain: String,
+    /// Agent identifier recorded for the change.
     pub agent_id: String,
+    /// Execution identifier associated with the change, if any.
     pub execution_id: Option<String>,
+    /// Mission task id associated with the change, if any.
     pub task_id: Option<i64>,
+    /// Grading preset id recorded for the change, if any.
     pub preset_id: Option<String>,
+    /// Model label recorded for the change, if any.
     pub model_label: Option<String>,
+    /// Transcript reference linking to archived context, if any.
     pub transcript_ref: Option<String>,
+    /// How attribution was determined (`host`, `inferred`, `imported`).
     pub attributed: ProvAttributionSource,
+    /// Tree digest before the change.
     pub base: String,
+    /// Tree/commit digest produced by the change.
     pub result: String,
+    /// Capture boundary at which the change was recorded.
     pub boundary: ProvBoundary,
+    /// Recorded timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
 }
 
 /// A recorded entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvEntryRecord {
+    /// Foreign key referencing `prov_changes.id`.
     pub change: i64,
+    /// Domain-relative path touched by the change.
     pub path: String,
+    /// Content digest before the change (`None` if created).
     pub before: Option<String>,
+    /// Content digest after the change (`None` if deleted).
     pub after: Option<String>,
+    /// Byte size after the change, if present.
     pub size: Option<i64>,
+    /// Classification of the entry (`content`, `mechanical`, `generated`, `tree`).
     pub class: ProvEntryClass,
+    /// Upstream `prov_changes.id` that introduced this content, if known.
     pub origin: Option<i64>,
 }
 
 /// A recorded edge.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvEdgeRecord {
+    /// Primary key id in `prov_edges`.
     pub id: i64,
+    /// Relationship kind (`used`, `includes`, `supersedes`, `redacts`).
     pub kind: ProvEdgeKind,
+    /// Source `prov_changes.id`.
     pub src: i64,
+    /// Target identifier (change id, tree digest, or content digest).
     pub dst: String,
+    /// Structured metadata attached to the edge.
     pub detail: Value,
+    /// Recorded timestamp in Unix epoch milliseconds.
     pub at_ms: i64,
 }
 
@@ -261,9 +307,13 @@ pub enum ProvLink {
 /// One change in a blast radius.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvBlastRadiusNode {
+    /// Primary key id in `prov_changes`.
     pub id: i64,
+    /// External change identifier (`change_id`).
     pub change_id: String,
+    /// Revision number of the reached change.
     pub rev: i32,
+    /// Agent identifier attributed to this change.
     pub agent_id: String,
     /// Steps from the start (1: a direct dependency or dependent).
     pub depth: i32,
@@ -641,10 +691,15 @@ impl PostgresStore {
 /// only; `None`: the history rewrite dropped the commit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvRecorded {
+    /// Primary key id in `prov_changes`.
     pub id: i64,
+    /// External change identifier (`change_id`).
     pub change_id: String,
+    /// Revision number within `change_id`.
     pub rev: i32,
+    /// Classification of the change.
     pub kind: ProvChangeKind,
+    /// Current mapped `result` digest (`None` if a rewritten `git1:` commit was dropped).
     pub result_now: Option<String>,
 }
 
@@ -653,8 +708,11 @@ pub struct ProvRecorded {
 /// they are now (copied into the change by value).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvTaskFacts {
+    /// Agent assigned to the task.
     pub agent_id: String,
+    /// Grading preset id recorded on the task, if any.
     pub preset_id: Option<String>,
+    /// Model label resolved from `grading_presets` for that preset, if any.
     pub model_label: Option<String>,
 }
 
@@ -850,7 +908,9 @@ impl PostgresStore {
 /// (`data:<ref>`), with how many revisions the domain holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvHead {
+    /// Latest recorded change in the domain (by `rev desc, id desc`).
     pub head: ProvChangeRecord,
+    /// Total number of revisions recorded in the domain.
     pub revisions: i64,
 }
 
@@ -935,7 +995,9 @@ impl PostgresStore {
 /// durability` reads it: the edge, and the change it leaves from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvSupersedes {
+    /// The `supersedes` edge pointing at the target change/commit.
     pub edge: ProvEdgeRecord,
+    /// The `land` change record that emitted `edge`.
     pub src: ProvChangeRecord,
 }
 

@@ -78,14 +78,21 @@ select k.id, (k.state in ('landed', 'accepted') and k.quality_rejections = 0) as
 /// What a rework reroute reads of a task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RoutedTask {
+    /// Task id in `mission_tasks`.
     pub task: i64,
+    /// Current lifecycle state (`assigned`, `delivered`, `revise`, etc.).
     pub state: String,
+    /// Number of revisions already completed on this task.
     pub revisions: i32,
     /// Sends-back for quality (a review's `revise`, a gate's `rejected`).
     pub quality_rejections: i32,
+    /// Difficulty assigned for the current routing step.
     pub difficulty: TaskDifficulty,
+    /// Preset id currently assigned to this task, if graded.
     pub preset_id: Option<String>,
+    /// Initial preset id recorded when the task chain first started.
     pub first_preset_id: Option<String>,
+    /// Model profile string stored on the task row.
     pub model: String,
 }
 
@@ -155,7 +162,7 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// `preset`'s calibration window ([`OUTCOMES`]): its closed tasks at
+    /// `preset`'s calibration window (`OUTCOMES`): its closed tasks at
     /// `difficulty` assigned at or after `since_ms`, newest first.
     pub fn grading_outcomes(
         &self,
@@ -200,7 +207,7 @@ impl PostgresStore {
     }
 
     /// When each preset last had a task first assigned to it, by
-    /// difficulty ([`ACTIVITY`]).
+    /// difficulty (`ACTIVITY`).
     pub fn grading_activity(&self) -> Result<Vec<PresetActivity>, StoreError> {
         self.query(ACTIVITY, &[])?
             .iter()

@@ -132,7 +132,7 @@ impl PostgresStore {
     }
 
     /// The reports recorded at or after `since_ms` whose delivery, a
-    /// tracked message, has no answer yet ([`REPORT_ANSWERS`]).
+    /// tracked message, has no answer yet (`REPORT_ANSWERS`).
     pub fn report_answers(&self, since_ms: i64) -> Result<Vec<ReportAnswer>, StoreError> {
         Ok(self
             .query(REPORT_ANSWERS, &[&since_ms])?

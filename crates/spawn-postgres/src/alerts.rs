@@ -573,50 +573,50 @@ impl PostgresStore {
     }
 
     /// The newest event id and the database's clock, in one statement
-    /// ([`CLOCK`]).
+    /// (`CLOCK`).
     pub fn alert_clock(&self) -> Result<(i64, i64), StoreError> {
         let row = self.query_one(CLOCK, &[])?;
         Ok((row.get(0), row.get(1)))
     }
 
-    /// The database's clock in epoch ms ([`NOW`]).
+    /// The database's clock in epoch ms (`NOW`).
     pub fn now_ms(&self) -> Result<i64, StoreError> {
         Ok(self.query_one(NOW, &[])?.get(0))
     }
 
-    /// The open and active missions' sources ([`MISSION_SOURCES`]).
+    /// The open and active missions' sources (`MISSION_SOURCES`).
     pub fn alert_mission_sources(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_SOURCES, &[])
     }
 
     /// The open and active missions' gate directories and first sources
-    /// ([`MISSION_GATES`]).
+    /// (`MISSION_GATES`).
     pub fn alert_mission_gates(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_GATES, &[])
     }
 
-    /// The missions and tasks the loop compares records against ([`MIRROR`]).
+    /// The missions and tasks the loop compares records against (`MIRROR`).
     pub fn alert_mirror(&self) -> Result<Value, StoreError> {
         self.query_json(MIRROR, &[])
     }
 
-    /// Every alert row and the newest transition's event id ([`ROWS`]).
+    /// Every alert row and the newest transition's event id (`ROWS`).
     pub fn alert_rows(&self) -> Result<Value, StoreError> {
         self.query_json(ROWS, &[])
     }
 
-    /// The control records after `after` ([`CONTROL`]).
+    /// The control records after `after` (`CONTROL`).
     pub fn alert_control(&self, after: i64, limit: i64) -> Result<Value, StoreError> {
         self.query_json(CONTROL, &[&after, &limit])
     }
 
-    /// The alert-family records since `since_ms` ([`HISTORY`]).
+    /// The alert-family records since `since_ms` (`HISTORY`).
     pub fn alert_history(&self, since_ms: i64, limit: i64) -> Result<Value, StoreError> {
         self.query_json(HISTORY, &[&since_ms, &limit])
     }
 
     /// The `deploy.finished` records after the event `after` and up to
-    /// `upto`, recorded since `since_ms` ([`DEPLOYS`]).
+    /// `upto`, recorded since `since_ms` (`DEPLOYS`).
     pub fn alert_deploys(
         &self,
         after: i64,
@@ -628,18 +628,18 @@ impl PostgresStore {
     }
 
     /// The transcript archive's events after the event id `after`, oldest
-    /// first ([`ARCHIVES`]).
+    /// first (`ARCHIVES`).
     pub fn alert_archives(&self, after: i64) -> Result<Value, StoreError> {
         self.query_json(ARCHIVES, &[&after])
     }
 
-    /// Every session's latest judgement ([`OBSERVATIONS`]).
+    /// Every session's latest judgement (`OBSERVATIONS`).
     pub fn alert_observations(&self) -> Result<Value, StoreError> {
         self.query_json(OBSERVATIONS, &[])
     }
 
     /// Which of `sessions` ended their stuck stretch after the judgement
-    /// `after` names for each ([`STUCK_ENDED`]), a score under `likely`.
+    /// `after` names for each (`STUCK_ENDED`), a score under `likely`.
     pub fn alert_stuck_ended(
         &self,
         sessions: &[String],
@@ -650,7 +650,7 @@ impl PostgresStore {
     }
 
     /// The messages the `message_not_taken` alert's start reads
-    /// ([`MESSAGES_ALL`]): `bound_ms` is SPAWN_MESSAGE_TAKEN_SECS, `open` the
+    /// (`MESSAGES_ALL`): `bound_ms` is SPAWN_MESSAGE_TAKEN_SECS, `open` the
     /// commands of the open alerts.
     pub fn alert_messages_all(&self, bound_ms: i64, open: &[i64]) -> Result<Value, StoreError> {
         self.query_json(MESSAGES_ALL, &[&bound_ms, &open])
@@ -659,7 +659,7 @@ impl PostgresStore {
     /// The messages of the commands after `after`, of the pending `due`
     /// ones, and of the `open` alerts' whose session took a message, ended an
     /// execution or recorded a transcript event at or after `since_ms`
-    /// ([`MESSAGES_SINCE`]).
+    /// (`MESSAGES_SINCE`).
     pub fn alert_messages_since(
         &self,
         bound_ms: i64,
@@ -671,35 +671,35 @@ impl PostgresStore {
         self.query_json_prepared(MESSAGES_SINCE, &[&bound_ms, &after, &due, &open, &since_ms])
     }
 
-    /// Commands that finished failed after `since_ms` ([`FAILED_COMMANDS`]).
+    /// Commands that finished failed after `since_ms` (`FAILED_COMMANDS`).
     pub fn alert_failed_commands(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(FAILED_COMMANDS, &[&since_ms])
     }
 
     /// Whether an integrator holds its lock, and the reported work that
-    /// waits for one ([`INTEGRATOR`]).
+    /// waits for one (`INTEGRATOR`).
     pub fn alert_integrator(&self) -> Result<Value, StoreError> {
         self.query_json(INTEGRATOR, &[&crate::missions::INTEGRATOR_LOCK_KEY])
     }
 
     /// The missions whose controller the `controller_behind` alert
-    /// compares with the owner's latest landing ([`CONTROLLERS`]).
+    /// compares with the owner's latest landing (`CONTROLLERS`).
     pub fn alert_controllers(&self) -> Result<Value, StoreError> {
         self.query_json(CONTROLLERS, &[])
     }
 
-    /// The alerts the window shows ([`ALERTS`]).
+    /// The alerts the window shows (`ALERTS`).
     pub fn alerts(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(ALERTS, &[&since_ms])
     }
 
     /// The needs fired since `since_ms`: `{fired, judged, right}`
-    /// ([`NEEDS_JUDGED`], objective 148).
+    /// (`NEEDS_JUDGED`, objective 148).
     pub fn needs_judged(&self, since_ms: i64) -> Result<Value, StoreError> {
         self.query_json(NEEDS_JUDGED, &[&since_ms])
     }
 
-    /// The transitions recorded after event `since` ([`TRANSITIONS`]).
+    /// The transitions recorded after event `since` (`TRANSITIONS`).
     pub fn alert_transitions(&self, since: i64, limit: i64) -> Result<Value, StoreError> {
         self.query_json(TRANSITIONS, &[&since, &limit])
     }

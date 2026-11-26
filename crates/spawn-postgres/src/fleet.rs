@@ -625,19 +625,19 @@ select jsonb_build_object(
                         order by e.session_seq desc limit 1))";
 
 impl PostgresStore {
-    /// When each of `tags` was first delivered into `session` ([`TOLD_AT`]).
+    /// When each of `tags` was first delivered into `session` (`TOLD_AT`).
     pub fn told_at(&self, session: &str, tags: &[String]) -> Result<Value, StoreError> {
         self.query_json(TOLD_AT, &[&session, &tags])
     }
 
     /// `session`'s transcript, workspace and latest turn's end
-    /// ([`LATEST_TURN`]).
+    /// (`LATEST_TURN`).
     pub fn latest_turn(&self, session: &str) -> Result<Value, StoreError> {
         self.query_json(LATEST_TURN, &[&session])
     }
 
     /// Files main's merges changed in `session`'s branch since the last
-    /// delivery the worker was typed ([`UNTOLD_MERGES`]).
+    /// delivery the worker was typed (`UNTOLD_MERGES`).
     pub fn untold_merges(&self, session: &str) -> Result<Vec<String>, StoreError> {
         let files = self.query_json(UNTOLD_MERGES, &[&session])?;
         Ok(serde_json::from_value(files).unwrap_or_default())
