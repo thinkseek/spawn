@@ -31,6 +31,9 @@ fn the_usage_asked_for_is_printed_with_rc_0_and_opens_no_store() {
         &["submit", "--help"],
         &["task", "--help"],
         &["task", "accept", "--help"],
+        &["task", "commits", "--help"],
+        &["task", "diff", "--help"],
+        &["task", "land", "--help"],
         &["fleet", "--help"],
         &["mission", "--help"],
     ] {
@@ -770,6 +773,394 @@ fn operator_cli_status_say_and_submit_smart_resolution_contracts() {
     verify_say_contracts(&env);
     verify_submit_contracts(&env);
     verify_stopped_session_and_explicit_override_contracts(&env);
+
+    drop(store);
+    drop(schema);
+}
+
+#[test]
+fn task_review_and_land_help_contracts_are_locked() {
+    let top = spawn(&["--help"], &[]);
+    assert_eq!(top.status.code(), Some(0));
+    let top_out = String::from_utf8_lossy(&top.stdout);
+    assert!(
+        top_out.contains("spawn task assign|accept|")
+            && top_out.contains("stages|commits|diff|land"),
+        "{top_out}"
+    );
+
+    let task_help = spawn(&["task", "--help"], &[]);
+    assert_eq!(task_help.status.code(), Some(0));
+    let task_out = String::from_utf8_lossy(&task_help.stdout);
+    for expected in [
+        "spawn task assign",
+        "spawn task accept",
+        "spawn task stages",
+        "spawn task commits <id> [--json]",
+        "spawn task diff <id> [--stat]",
+        "spawn task land <id> [--ff-only | --squash] [--dry-run] [--json]",
+    ] {
+        assert!(task_out.contains(expected), "{expected}: {task_out}");
+    }
+}
+
+fn run_test_git(cwd: Option<&std::path::Path>, args: &[&str]) -> String {
+    let mut cmd = spawn_host::test_git_command();
+    if let Some(path) = cwd {
+        cmd.arg("-C").arg(path);
+    }
+    let out = cmd.args(args).output().expect("run test git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn bare_ref_sha(bare_repo: &std::path::Path, reference: &str) -> String {
+    run_test_git(
+        None,
+        &[
+            "--git-dir",
+            bare_repo.to_str().expect("utf8"),
+            "rev-parse",
+            reference,
+        ],
+    )
+}
+
+fn push_branch_from_base(
+    work: &std::path::Path,
+    base_sha: &str,
+    file: &str,
+    content: &str,
+    message: &str,
+    checkpoint_msg: Option<&str>,
+    dest_ref: &str,
+) -> String {
+    run_test_git(Some(work), &["checkout", "-B", "work-branch", base_sha]);
+    std::fs::write(work.join(file), content).expect("write file");
+    run_test_git(Some(work), &["add", file]);
+    run_test_git(Some(work), &["commit", "-m", message]);
+    if let Some(ckpt) = checkpoint_msg {
+        std::fs::write(work.join(format!("{file}.ckpt")), "ckpt\n").expect("write ckpt");
+        run_test_git(Some(work), &["add", "."]);
+        run_test_git(Some(work), &["commit", "-m", ckpt]);
+    }
+    let sha = run_test_git(Some(work), &["rev-parse", "HEAD"]);
+    run_test_git(
+        Some(work),
+        &["push", "origin", &format!("{sha}:{dest_ref}")],
+    );
+    sha
+}
+
+struct TaskLandFixture {
+    bare: std::path::PathBuf,
+    work: std::path::PathBuf,
+    base_sha: String,
+    t1: i64,
+    t2: i64,
+    t3: i64,
+    t4: i64,
+    t5_unpinned: i64,
+    agent2: String,
+    agent3: String,
+}
+
+fn setup_mission_repo_and_tasks(
+    store: &spawn_postgres::PostgresStore,
+    root: &std::path::Path,
+) -> TaskLandFixture {
+    let bare = root.join("mission.git");
+    let work = root.join("seed");
+    run_test_git(None, &["init", "--bare", bare.to_str().expect("utf8")]);
+    run_test_git(
+        None,
+        &[
+            "clone",
+            bare.to_str().expect("utf8"),
+            work.to_str().expect("utf8"),
+        ],
+    );
+    run_test_git(Some(&work), &["checkout", "-B", "main"]);
+    std::fs::write(work.join("README.md"), "base\n").expect("write readme");
+    run_test_git(Some(&work), &["add", "README.md"]);
+    run_test_git(Some(&work), &["commit", "-m", "initial commit"]);
+    let base_sha = run_test_git(Some(&work), &["rev-parse", "HEAD"]);
+    run_test_git(Some(&work), &["push", "origin", "main:refs/heads/main"]);
+
+    let sources = serde_json::json!([bare.to_str().expect("utf8")]);
+    let mission_id = store
+        .mission_add("Task review and land E2E", &sources, "human")
+        .expect("mission_add");
+    let assign = |worker: &str, brief: &str| {
+        store
+            .task_assign_with(
+                mission_id,
+                "ephemeral",
+                worker,
+                brief,
+                "default",
+                false,
+                false,
+            )
+            .expect("task_assign_with")
+    };
+    let t1 = assign("w1", "Implement feature one");
+    let t2 = assign("w2", "Implement feature two");
+    let t3 = assign("w3", "Fallback branch read");
+    let t4 = assign("w4", "Conflicting update");
+    let t5_unpinned = assign("w5", "Task without preserved ref");
+    let agent_of = |task_id: i64| -> String {
+        store.objective_task(task_id).unwrap().unwrap()["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    TaskLandFixture {
+        bare,
+        work,
+        base_sha,
+        t1,
+        t2,
+        t3,
+        t4,
+        t5_unpinned,
+        agent2: agent_of(t2),
+        agent3: agent_of(t3),
+    }
+}
+
+fn verify_commits_and_diff_contracts(
+    env: &[(&str, &str)],
+    fx: &TaskLandFixture,
+) -> (String, String) {
+    let t1_str = fx.t1.to_string();
+    let t2_str = fx.t2.to_string();
+    let t3_str = fx.t3.to_string();
+
+    let head1 = push_branch_from_base(
+        &fx.work,
+        &fx.base_sha,
+        "feat1.txt",
+        "feature one\n",
+        "Add feature one",
+        Some("spawn checkpoint exec_1"),
+        &spawn_host::git::task_head_ref(fx.t1, "head"),
+    );
+    let head2 = push_branch_from_base(
+        &fx.work,
+        &fx.base_sha,
+        "feat2.txt",
+        "feature two\n",
+        "Add feature two",
+        Some("spawn checkpoint exec_2"),
+        &spawn_host::git::worker_head_ref(&fx.agent2),
+    );
+    let _head3 = push_branch_from_base(
+        &fx.work,
+        &fx.base_sha,
+        "feat3.txt",
+        "feature three\n",
+        "Add feature three",
+        None,
+        &format!("refs/heads/spawn/{}", fx.agent3),
+    );
+
+    let commits_json = spawn_json(&["task", "commits", &t1_str, "--json"], env);
+    assert_eq!(commits_json["schema_version"], 1);
+    assert_eq!(commits_json["task_id"], fx.t1);
+    assert_eq!(
+        commits_json["resolved_ref"],
+        spawn_host::git::task_head_ref(fx.t1, "head")
+    );
+    assert_eq!(commits_json["base_sha"], fx.base_sha);
+    assert_eq!(commits_json["head_sha"], head1);
+    assert_eq!(commits_json["commit_count"], 2);
+    assert_eq!(commits_json["author_commit_count"], 1);
+    assert_eq!(commits_json["checkpoint_commit_count"], 1);
+    assert_eq!(commits_json["commits"][0]["kind"], "checkpoint");
+    assert_eq!(commits_json["commits"][1]["kind"], "author");
+
+    let commits_table = spawn(&["task", "commits", &t1_str], env);
+    assert_eq!(commits_table.status.code(), Some(0));
+    let table_out = String::from_utf8_lossy(&commits_table.stdout);
+    assert!(table_out.contains("1 author, 1 checkpoint"), "{table_out}");
+    assert!(table_out.contains("Add feature one"), "{table_out}");
+    assert!(!table_out.contains("postgres://"), "{table_out}");
+
+    let t2_json = spawn_json(&["task", "commits", &t2_str, "--json"], env);
+    assert_eq!(
+        t2_json["resolved_ref"],
+        spawn_host::git::worker_head_ref(&fx.agent2)
+    );
+    let t3_json = spawn_json(&["task", "commits", &t3_str, "--json"], env);
+    assert_eq!(
+        t3_json["resolved_ref"],
+        format!("refs/heads/spawn/{}", fx.agent3)
+    );
+
+    let diff_out = spawn(&["task", "diff", &t1_str], env);
+    assert_eq!(diff_out.status.code(), Some(0));
+    let diff_text = String::from_utf8_lossy(&diff_out.stdout);
+    assert!(
+        diff_text.contains("feat1.txt") && diff_text.contains("+feature one"),
+        "{diff_text}"
+    );
+
+    let stat_out = spawn(&["task", "diff", &t1_str, "--stat"], env);
+    assert_eq!(stat_out.status.code(), Some(0));
+    let stat_text = String::from_utf8_lossy(&stat_out.stdout);
+    assert!(
+        stat_text.contains("feat1.txt") && stat_text.contains("insertions(+)"),
+        "{stat_text}"
+    );
+
+    assert_eq!(bare_ref_sha(&fx.bare, "refs/heads/main"), fx.base_sha);
+    (head1, head2)
+}
+
+fn verify_land_contracts(env: &[(&str, &str)], fx: &TaskLandFixture, head1: &str) -> String {
+    let t1_str = fx.t1.to_string();
+    let t2_str = fx.t2.to_string();
+
+    let dry_ff = spawn_json(&["task", "land", &t1_str, "--dry-run", "--json"], env);
+    assert_eq!(dry_ff["mode"], "ff-only");
+    assert_eq!(dry_ff["dry_run"], true);
+    assert_eq!(dry_ff["landed"], false);
+    assert_eq!(dry_ff["can_land"], true);
+    assert_eq!(bare_ref_sha(&fx.bare, "refs/heads/main"), fx.base_sha);
+
+    let ff = spawn_json(&["task", "land", &t1_str, "--ff-only", "--json"], env);
+    assert_eq!(ff["mode"], "ff-only");
+    assert_eq!(ff["landed"], true);
+    assert_eq!(ff["new_main_sha"], head1);
+    assert_eq!(bare_ref_sha(&fx.bare, "refs/heads/main"), head1);
+
+    let div_ff = spawn(&["task", "land", &t2_str, "--ff-only"], env);
+    assert_eq!(div_ff.status.code(), Some(1));
+    let both_flags = spawn(&["task", "land", &t2_str, "--ff-only", "--squash"], env);
+    assert_eq!(both_flags.status.code(), Some(1));
+    assert_eq!(bare_ref_sha(&fx.bare, "refs/heads/main"), head1);
+
+    let dry_sq = spawn_json(
+        &["task", "land", &t2_str, "--squash", "--dry-run", "--json"],
+        env,
+    );
+    assert_eq!(dry_sq["mode"], "squash");
+    assert_eq!(dry_sq["dry_run"], true);
+    assert_eq!(dry_sq["landed"], false);
+    assert!(dry_sq["new_main_sha"].is_null(), "{dry_sq}");
+    assert_eq!(bare_ref_sha(&fx.bare, "refs/heads/main"), head1);
+
+    let sq = spawn_json(&["task", "land", &t2_str, "--squash", "--json"], env);
+    assert_eq!(sq["mode"], "squash");
+    assert_eq!(sq["landed"], true);
+    let new_main = bare_ref_sha(&fx.bare, "refs/heads/main");
+    assert_ne!(new_main, head1);
+    assert_eq!(sq["new_main_sha"], new_main);
+    let bare_str = fx.bare.to_str().expect("utf8");
+    let log_msg = run_test_git(
+        None,
+        &["--git-dir", bare_str, "log", "-1", "--format=%B", &new_main],
+    );
+    assert!(
+        log_msg.contains("Add feature two") && log_msg.contains(&format!("Spawn-Task: {}", fx.t2)),
+        "{log_msg}"
+    );
+    assert!(!log_msg.contains("spawn checkpoint"), "{log_msg}");
+    let parents = run_test_git(
+        None,
+        &[
+            "--git-dir",
+            bare_str,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            &new_main,
+        ],
+    );
+    assert_eq!(parents.split_whitespace().count(), 2, "{parents}");
+    let all_refs = run_test_git(
+        None,
+        &["--git-dir", bare_str, "for-each-ref", "--format=%(refname)"],
+    );
+    assert!(!all_refs.contains("spawn-land"), "{all_refs}");
+    new_main
+}
+
+fn verify_conflict_and_error_contracts(env: &[(&str, &str)], fx: &TaskLandFixture, new_main: &str) {
+    let t4_str = fx.t4.to_string();
+    let t5_str = fx.t5_unpinned.to_string();
+
+    let _c_head = push_branch_from_base(
+        &fx.work,
+        &fx.base_sha,
+        "README.md",
+        "worker change\n",
+        "Conflicting readme change",
+        None,
+        &spawn_host::git::task_head_ref(fx.t4, "head"),
+    );
+    run_test_git(Some(&fx.work), &["fetch", "origin", "main"]);
+    run_test_git(Some(&fx.work), &["checkout", "-B", "main_adv", new_main]);
+    std::fs::write(fx.work.join("README.md"), "main change\n").expect("write conflict main");
+    run_test_git(Some(&fx.work), &["add", "README.md"]);
+    run_test_git(Some(&fx.work), &["commit", "-m", "main readme change"]);
+    let conflict_base = run_test_git(Some(&fx.work), &["rev-parse", "HEAD"]);
+    run_test_git(
+        Some(&fx.work),
+        &[
+            "push",
+            "origin",
+            &format!("{conflict_base}:refs/heads/main"),
+        ],
+    );
+
+    for args in [
+        &["task", "land", &t4_str, "--squash", "--dry-run"][..],
+        &["task", "land", &t4_str, "--squash"],
+    ] {
+        let out = spawn(args, env);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(bare_ref_sha(&fx.bare, "refs/heads/main"), conflict_base);
+    }
+
+    let missing = spawn(&["task", "commits", "999999"], env);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not found"));
+
+    let no_ref = spawn(&["task", "commits", &t5_str], env);
+    assert_eq!(no_ref.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&no_ref.stderr).contains("no preserved ref"));
+}
+
+#[test]
+fn task_commits_diff_and_land_postgres_and_bare_git_contracts() {
+    let schema = spawn_postgres::testing::TestSchema::new("help_task_land");
+    let store = schema.store();
+    let db_url = schema_url(&schema);
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let env = [
+        ("SPAWN_DATABASE_URL", db_url.as_str()),
+        ("PATH", path_env.as_str()),
+        ("TMPDIR", "/tmp"),
+    ];
+
+    let scratch = ScratchDir(
+        std::path::PathBuf::from("/tmp")
+            .join(format!("spawn-help-task-land-{}", std::process::id())),
+    );
+    let _ = std::fs::remove_dir_all(&scratch.0);
+    std::fs::create_dir_all(&scratch.0).expect("scratch dir");
+
+    let fx = setup_mission_repo_and_tasks(&store, &scratch.0);
+    let (head1, _head2) = verify_commits_and_diff_contracts(&env, &fx);
+    let new_main = verify_land_contracts(&env, &fx, &head1);
+    verify_conflict_and_error_contracts(&env, &fx, &new_main);
 
     drop(store);
     drop(schema);
