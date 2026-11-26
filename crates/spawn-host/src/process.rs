@@ -233,6 +233,7 @@ mod tests {
             return;
         }
         undumpable().expect("not dumpable");
+        let hz = rustix::param::clock_ticks_per_second();
         let tcp = std::fs::read_to_string("/proc/net/tcp").map_or_else(
             |error| format!("tcp error {error}"),
             |table| format!("tcp read {}", table.lines().count()),
@@ -245,6 +246,7 @@ mod tests {
             .expect("sleep");
         // On a line of its own: libtest's "test ... " has no newline yet.
         println!();
+        println!("hz {hz}");
         println!("{tcp}");
         println!("exec {}", sleep.id());
         println!("ready {}", std::process::id());
@@ -283,13 +285,20 @@ mod tests {
             .to_string()
     }
 
+    fn stop_helper(mut child: Child, lines: &[String]) {
+        let sleep = said(lines, "exec");
+        let _ = Command::new("kill").arg(&sleep).status();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn an_undumpable_process_hides_its_environment_and_its_children_do_not() {
         // As root the checks prove nothing: root reads it anyway.
         if current_uid() == 0 {
             return;
         }
-        let (mut child, lines) = helper();
+        let (child, lines) = helper();
         let pid = said(&lines, "ready");
         let sleep = said(&lines, "exec");
         // Only whether it was readable, never what it holds: a failure
@@ -298,9 +307,7 @@ mod tests {
         let execd = std::fs::read(format!("/proc/{sleep}/environ"));
         let ours =
             std::fs::read(format!("/proc/{}/environ", std::process::id())).map(|bytes| bytes.len());
-        let _ = Command::new("kill").arg(&sleep).status();
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_helper(child, &lines);
 
         let error = hidden.expect_err("the helper's environment is unreadable (bytes read)");
         assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error}");
@@ -324,6 +331,16 @@ mod tests {
         // It still reads the socket table (the server tells the owner's
         // connections by it).
         assert!(said(&lines, "tcp").starts_with("read "), "{lines:?}");
+    }
+
+    #[test]
+    fn undumpable_process_reads_clock_ticks_without_panicking() {
+        let (child, lines) = helper();
+        stop_helper(child, &lines);
+        let hz: u64 = said(&lines, "hz")
+            .parse()
+            .expect("hz must be a positive integer");
+        assert!(hz > 0, "expected positive clock ticks, got {hz}");
     }
 
     #[test]

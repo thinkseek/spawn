@@ -66,7 +66,11 @@ impl Fixture {
             ".config/cloudflare",
             ".config/observe3-private",
             ".config/herdr/sessions/spawn",
+            ".config/herdr-core/spawn",
+            ".local/state/herdr-core/spawn",
             "cfg/herdr",
+            "cfg/herdr-core",
+            "state/herdr-core",
         ] {
             write(&home.join(dir).join("canary"), "secret");
         }
@@ -141,6 +145,7 @@ impl Fixture {
         ViewConfig {
             home: self.home(),
             xdg_config_home: Some(self.home().join("cfg")),
+            xdg_state_home: Some(self.home().join("state")),
             runtime_dir: self.runtime(),
             host_directories,
             loop_dirs: vec![self.home().join(".local/share/spawn-rsi")],
@@ -259,7 +264,11 @@ fn inside_the_view_the_masks_are_empty_and_only_the_three_binds_write() {
         h(".config/cloudflare"),
         h(".config/observe3-private"),
         h(".config/herdr"),
+        h(".config/herdr-core"),
+        h(".local/state/herdr-core"),
         h("cfg/herdr"),
+        h("cfg/herdr-core"),
+        h("state/herdr-core"),
         fixture.runtime().display().to_string(),
         fixture.keep().display().to_string(),
     ] {

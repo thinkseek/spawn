@@ -168,8 +168,10 @@ pub const LOOP_DIRECTORY: &str = ".local/share/spawn-rsi";
 pub struct ViewConfig {
     /// The user's home (`$HOME`).
     pub home: PathBuf,
-    /// `$XDG_CONFIG_HOME`, when set: its `herdr` is masked too.
+    /// `$XDG_CONFIG_HOME`, when set: its `herdr` and `herdr-core` are masked too.
     pub xdg_config_home: Option<PathBuf>,
+    /// `$XDG_STATE_HOME`, when set: its `herdr-core` is masked too.
+    pub xdg_state_home: Option<PathBuf>,
     /// The runtime directory (`$XDG_RUNTIME_DIR`, else `/run/user/<uid>`).
     pub runtime_dir: PathBuf,
     /// The directories masked wherever the home is ([`HOST_DIRECTORIES`];
@@ -227,6 +229,9 @@ impl ViewConfig {
             xdg_config_home: lookup("XDG_CONFIG_HOME")
                 .filter(|dir| dir.starts_with('/'))
                 .map(PathBuf::from),
+            xdg_state_home: lookup("XDG_STATE_HOME")
+                .filter(|dir| dir.starts_with('/'))
+                .map(PathBuf::from),
             host_directories: HOST_DIRECTORIES.iter().map(PathBuf::from).collect(),
             loop_dirs: vec![home.join(LOOP_DIRECTORY)],
             extra_files: Vec::new(),
@@ -249,12 +254,35 @@ impl ViewConfig {
         if let Some(tmpdir) = &self.host_tmpdir {
             targets.push(tmpdir.clone());
         }
-        targets.push(self.home.join(".config/herdr"));
+        for target in [
+            self.home.join(".config/herdr"),
+            self.home.join(".config/herdr-core"),
+            self.home.join(".local/state/herdr-core"),
+        ] {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
         if let Some(config) = &self.xdg_config_home {
-            targets.push(config.join("herdr"));
+            for name in ["herdr", "herdr-core"] {
+                let target = config.join(name);
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        if let Some(state) = &self.xdg_state_home {
+            let target = state.join("herdr-core");
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
         }
         for dir in HOME_DIRECTORIES {
-            targets.extend(self.below_home(dir));
+            for target in self.below_home(dir) {
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
         }
         targets
     }
@@ -1064,6 +1092,7 @@ mod tests {
         let config = ViewConfig {
             home,
             xdg_config_home: None,
+            xdg_state_home: None,
             runtime_dir: runtime.clone(),
             host_directories: Vec::new(),
             loop_dirs: Vec::new(),
@@ -1163,6 +1192,7 @@ mod tests {
             ("HOME", "/home/u"),
             ("XDG_RUNTIME_DIR", "/run/user/7"),
             ("XDG_CONFIG_HOME", "/home/u/cfg"),
+            ("XDG_STATE_HOME", "/home/u/st"),
             ("TMPDIR", "/var/tmp/spawn"),
         ]));
         assert_eq!(config.home, PathBuf::from("/home/u"));
@@ -1188,7 +1218,11 @@ mod tests {
             "/tmp",
             "/run/user/7",
             "/home/u/.config/herdr",
+            "/home/u/.config/herdr-core",
+            "/home/u/.local/state/herdr-core",
             "/home/u/cfg/herdr",
+            "/home/u/cfg/herdr-core",
+            "/home/u/st/herdr-core",
             "/home/u/.claude",
             "/home/u/.gemini",
             "/home/u/.config/antigravity",
