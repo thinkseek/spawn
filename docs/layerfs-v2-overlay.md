@@ -81,8 +81,8 @@ the files it changes, and a checkpoint reads only those files.
   A new state is built beside it and renamed into place, so a state that
   exists always has its `lower`.
   - Processes enter the workspace with `OverlayWorkspace::command(ws,
-    program)`, or by prefixing a terminal launch (tmux, when wired) with
-    the whole `launch_arguments(ws)`:
+    program)`, or by prefixing a terminal launch (Herdr / `herdr-core`,
+    when wired) with the whole `launch_arguments(ws)`:
     `flock --shared --nonblock <root>/.locks/<hex>.lease sh -c <enter>
     <state>/holder <merged> <program>`. `flock` takes the lease first and
     stays as the program's supervisor, holding it until the program exits,
@@ -349,9 +349,10 @@ the holder and tearing down its namespace). Profiling it is left open.
   through the holder.
 - **Large-file cap and notices.** None yet: `SPAWN_MAX_FILE_MB` applies to
   Git and Cow checkpoints only.
-- **Wiring into `spawn-cli` and the tmux launch.** This needs the terminal
-  host to prefix launches with the whole `launch_arguments` (which takes
-  the lease first), and a store root of its own.
+- **Wiring into `spawn-cli` and the Herdr terminal launch.** This needs the
+  terminal host (`herdr-core` / `spawn-hc`, or `herdr`) to prefix launches
+  with the whole `launch_arguments` (which takes the lease first), and a
+  store root of its own.
 - **Track B: FUSE CAS.** Out of scope.
 
 ## Tests

@@ -50,7 +50,7 @@
 
 Records written by the observer, the bridge or the gateway never make an agent `working`. They can be written while the agent itself is silent. `/api/fleet`'s `last_event_at_ms` counts them, so it is not used (cc-astra A89).
 
-Never used: the judge model's state (WAITING / WORKING / BLOCKED ...), which is inferred; the existence of a tmux session or process; screen text; task text.
+Never used: the judge model's state (WAITING / WORKING / BLOCKED ...), which is inferred; the existence of a Herdr terminal/pane or OS process; screen text; task text.
 
 **Known limit: `idle` means "the last recorded state", not real-time liveness.** If Spawn stops following an agent's transcript (incident I-006, 2026-11-15), an agent whose last record was the end of a turn still shows `idle`. A fresh read proves that the page service answered, not that every follower is current. Objective 205 makes such a failure visible to Spawn; mapping it to `unknown` is a later change. **The viewer must show this caveat too**, not only this document.
 
