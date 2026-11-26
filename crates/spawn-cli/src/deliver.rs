@@ -17,10 +17,14 @@
 //!   names the preset's engine ([`spawn_core::grading::preset_driver`]:
 //!   Claude Code for a label that names no registered driver) and, for an
 //!   engine told its model at launch (agy), the preset's `model_label`. An
-//!   ephemeral worker that ran on another engine is stopped, then started
+//!   ephemeral worker that ran on another engine, or on agy with another
+//!   model label than its task's preset names, is stopped, then started
 //!   afresh on the task's (a resume would keep the old one); a resident
-//!   keeps the one engine it ran on. A resume runs the host's model label
-//!   for its engine (`SPAWN_AGY_MODEL`). When the engine cannot run here
+//!   keeps the one engine it ran on. A resume runs the model label its
+//!   session last started on (its `execution.started`, which the Bridge
+//!   reads too), the host's (`SPAWN_AGY_MODEL`) only when that recorded
+//!   none, and is checked against `agy models` as a start is. When the
+//!   engine cannot run here
 //!   (not enabled, not installed, its probe failed, or the label is not one
 //!   `agy models` lists: [`Engines`], from the capability probe), **no
 //!   command is made**: the task waits and one `engine_unavailable`
@@ -848,27 +852,36 @@ fn worker_engine(facts: &Facts) -> Option<&str> {
 }
 
 /// Whether `task`'s delivery switches its worker's engine: an ephemeral
-/// worker that ran on another engine than the task's (a resident keeps
-/// its one engine).
+/// worker that ran on another engine than the task's, or on the task's
+/// engine (besides Claude Code) with another model label than the task's
+/// preset names, so its preset is never credited with a model it did not
+/// run (a resident keeps its one engine and label).
 fn switches_engine(task: &TaskRow, found: Option<&Facts>) -> bool {
+    let (engine, label) = task_engine(task);
     task.kind == "ephemeral"
-        && found
-            .and_then(worker_engine)
-            .is_some_and(|worker| worker != task_engine(task).0)
+        && found.is_some_and(|facts| {
+            worker_engine(facts).is_some_and(|worker| {
+                worker != engine
+                    || (engine != DEFAULT
+                        && label.is_some()
+                        && facts.model_label.as_deref() != label)
+            })
+        })
 }
 
 /// What `task`'s delivery to its worker (`found`) runs on: a live worker's
 /// own engine for the same engine (nothing to check, it runs), the task's
-/// for a worker that never ran or switches, the worker's own on the host's
-/// label for a resume.
+/// for a worker that never ran or switches, and for a resume the worker's
+/// own engine on the label its last execution was launched on (the host's
+/// when that recorded none), checked as a start's is.
 pub(crate) fn delivery_runs(task: &TaskRow, found: Option<&Facts>, engines: &Engines) -> Runs {
     let (engine, label) = task_engine(task);
     if switches_engine(task, found) {
         return engines.runs(engine, label);
     }
-    match found.and_then(|facts| worker_engine(facts).map(|worker| (facts.live, worker))) {
-        Some((true, worker)) => Runs::On(worker.to_string(), None),
-        Some((false, worker)) => engines.runs(worker, None),
+    match found.and_then(|facts| worker_engine(facts).map(|worker| (facts, worker))) {
+        Some((facts, worker)) if facts.live => Runs::On(worker.to_string(), None),
+        Some((facts, worker)) => engines.runs(worker, facts.model_label.as_deref()),
         None => engines.runs(engine, label),
     }
 }

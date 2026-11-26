@@ -259,6 +259,9 @@ select jsonb_build_object(
 /// `engine` is the engine of the session's latest execution (its
 /// `execution.started`), null when it never ran: delivery switches an
 /// ephemeral worker's engine to its task's by a stop, then a start.
+/// `model_label` is the model label that execution's engine was launched
+/// on (its launch summary's `model`), for an engine besides Claude Code
+/// only: what a resume of it runs (the Bridge reads the same record).
 ///
 /// `charter`, for the supervisor only (null for every other session), is
 /// what decides which charter its running native session holds: `start`,
@@ -291,6 +294,7 @@ from (
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
     coalesce(mo.model, 'default') as model,
     mo.engine as engine,
+    case when mo.engine <> 'claude' then mo.launch_model end as model_label,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'id', c.id,
               'key', c.idempotency_key,
@@ -462,7 +466,8 @@ from (
   left join (
     select distinct on (e.session_id) e.session_id,
            e.kind -> 'detail' ->> 'model' as model,
-           e.kind -> 'detail' ->> 'engine' as engine
+           e.kind -> 'detail' ->> 'engine' as engine,
+           e.kind -> 'detail' -> 'launch' ->> 'model' as launch_model
       from spawn_events e
      where e.event_name = 'execution.started'
      order by e.session_id, e.session_seq desc) mo on mo.session_id = s.session_id

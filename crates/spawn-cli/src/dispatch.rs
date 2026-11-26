@@ -264,6 +264,11 @@ pub(crate) struct Facts {
     /// none when it never ran (or a record names none: Claude Code's).
     #[serde(default)]
     pub(crate) engine: Option<String>,
+    /// The model label that execution's engine was launched on, for an
+    /// engine besides Claude Code (agy): what a resume runs; none when it
+    /// recorded none (the host's `SPAWN_AGY_MODEL` then).
+    #[serde(default)]
+    pub(crate) model_label: Option<String>,
     /// Executions the dispatcher's resumes started that were lost (or
     /// exited non-zero) within a minute, since the session's last execution
     /// that stayed up.
