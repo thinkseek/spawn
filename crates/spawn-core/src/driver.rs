@@ -23,8 +23,8 @@ use crate::event::ModelProfile;
 use crate::id::{ExecutionId, WorkspaceId};
 use crate::ingest::{Normalized, agy_line, claude_line, claude_usage, claude_version};
 use crate::screen::{
-    AGY_TRUST_KEYS, ScreenReading, TRUST_KEYS, drop_agy_account_lines, is_agy_trust_dialog,
-    is_trust_dialog, read_agy_screen, read_claude_screen,
+    AGY_TRUST_KEYS, ScreenReading, TRUST_KEYS, agy_unknown_model, drop_agy_account_lines,
+    is_agy_trust_dialog, is_trust_dialog, read_agy_screen, read_claude_screen,
 };
 
 /// The engine a record or a command that names none runs, and the one an
@@ -103,6 +103,10 @@ pub struct EngineLaunch<'a> {
     /// The directory it starts in (the workspace), which an engine that
     /// asks whether it trusts it is told it does (agy).
     pub cwd: Option<&'a str>,
+    /// The model it runs, by the engine's own label, for an engine told
+    /// its model at launch: the start's `model_label` (the task's graded
+    /// preset's), else [`EngineHome::model`]. Claude Code never reads it.
+    pub model: Option<&'a str>,
 }
 
 /// How to start an engine: the Bridge runs `program` with `arguments`
@@ -208,6 +212,14 @@ pub trait AgentDriver: Send + Sync + std::fmt::Debug {
     /// line).
     fn excerpt_source(&self, pane: &str) -> String {
         pane.to_string()
+    }
+
+    /// Why a start whose pane shows `pane` fails at once instead of waiting
+    /// for the engine's prompt: the engine said it will not run what it was
+    /// asked to (agy's unknown model, [`agy_unknown_model`]). None for a
+    /// pane that says nothing of the kind.
+    fn start_refusal(&self, _pane: &str) -> Option<String> {
+        None
     }
 
     /// How the run-time resolver answers `dialog`, shown by this engine
@@ -484,11 +496,15 @@ impl AgentDriver for AgyDriver {
         }
     }
 
-    /// The model is the home's (the Bridge refuses a start with none);
-    /// the settings are the inline JSON the arguments carry.
+    /// The model is the launch's (the start's `model_label`), else the
+    /// home's (the Bridge refuses a start with neither); the settings are
+    /// the inline JSON the arguments carry.
     fn launch(&self, home: &EngineHome, launch: &EngineLaunch<'_>) -> LaunchPlan {
         let arguments = agy_arguments(
-            home.model.as_deref().unwrap_or_default(),
+            launch
+                .model
+                .or(home.model.as_deref())
+                .unwrap_or_default(),
             launch.cwd.unwrap_or_default(),
             launch.native.filter(|_| launch.resume),
         );
@@ -537,6 +553,103 @@ impl AgentDriver for AgyDriver {
     fn excerpt_source(&self, pane: &str) -> String {
         drop_agy_account_lines(pane)
     }
+
+    fn start_refusal(&self, pane: &str) -> Option<String> {
+        agy_unknown_model(pane).map(|line| {
+            format!("agy does not know the model it was started on, and would run its own: {line}")
+        })
+    }
+}
+
+/// The `major.minor` versions of agy Spawn's readings were checked against
+/// (1.5.14 probed, 1.5.17 seen on the VM). agy updates itself: another one
+/// is reported (`agy_version_untested`, `GET /api/capabilities`) and refuses
+/// nothing, since a screen Spawn cannot read reads `Unknown`, which types
+/// nothing.
+pub const AGY_TESTED: [&str; 1] = ["1.5"];
+
+impl AgyDriver {
+    /// The model labels an `agy models` listing names, sorted, once each.
+    /// A pure reading of its output: each line's first word, past a list
+    /// mark (`-`, `*`, `•`, `>`) and before a `(default)`-like note or a
+    /// `:`, is a label when it is a model label
+    /// ([`crate::command::is_model_label`]) holding a digit or a `-` (a
+    /// header or a sentence holds neither in its first word). The status
+    /// lines agy prints around the list (`Fetching available models...`,
+    /// `Error: ...`) and a column header are no labels.
+    pub fn known_models(listing: &str) -> Vec<String> {
+        let mut known = std::collections::BTreeSet::new();
+        for line in listing.lines() {
+            let line = crate::screen::strip_ansi_text(line);
+            let line = line
+                .trim()
+                .trim_start_matches(['-', '*', '•', '>', '│', '|'])
+                .trim();
+            let Some(first) = line.split_whitespace().next() else {
+                continue;
+            };
+            let word = first.trim_end_matches([':', ',', '*']);
+            let lower = line.to_lowercase();
+            if lower.starts_with("error")
+                || lower.starts_with("fetching")
+                || lower.starts_with("available")
+                || lower.starts_with("usage")
+            {
+                continue;
+            }
+            if crate::command::is_model_label(word)
+                && word.chars().any(|c| c.is_ascii_digit() || c == '-')
+                && word.chars().any(|c| c.is_ascii_alphabetic())
+            {
+                known.insert(word.to_string());
+            }
+        }
+        known.into_iter().collect()
+    }
+
+    /// The version an `agy --version` answer names (`1.5.17`): its first
+    /// word that is digits and dots with at least one dot, a leading `v`
+    /// dropped.
+    pub fn version(answer: &str) -> Option<String> {
+        answer
+            .split_whitespace()
+            .map(|word| word.trim_start_matches('v'))
+            .find(|word| {
+                word.contains('.')
+                    && word.split('.').all(|part| {
+                        !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())
+                    })
+            })
+            .map(str::to_string)
+    }
+
+    /// Whether `version`'s `major.minor` is one Spawn was checked against
+    /// ([`AGY_TESTED`]).
+    pub fn version_tested(version: &str) -> bool {
+        let mut parts = version.split('.');
+        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        AGY_TESTED.contains(&format!("{major}.{minor}").as_str())
+    }
+}
+
+/// The pane as an excerpt that leaves the host may quote it, for an
+/// execution whose engine the log names `engine` (`None`: the lookup failed
+/// or found nothing). **Fail-closed** (decision C2, N4): only an engine
+/// positively known as Claude Code keeps its pane byte for byte; a
+/// registered engine's pane goes through its driver's
+/// [`AgentDriver::excerpt_source`], and an unknown engine's, or an unknown
+/// one, through agy's mask ([`drop_agy_account_lines`]), the one Spawn has.
+pub fn excerpt_for(engine: Option<&str>, pane: &str) -> String {
+    match engine {
+        Some(DEFAULT) => pane.to_string(),
+        Some(id) => match driver(id) {
+            Some(driver) if driver.id() != DEFAULT => driver.excerpt_source(pane),
+            _ => drop_agy_account_lines(pane),
+        },
+        None => drop_agy_account_lines(pane),
+    }
 }
 
 static CLAUDE: ClaudeDriver = ClaudeDriver;
@@ -566,7 +679,7 @@ mod tests {
     use super::{
         AgentDriver, AgyDriver, ClaudeDriver, DEFAULT, DriverTraits, EngineHome, EngineLaunch,
         Guard, LineCursor, SessionBinding, TurnSource, agy_arguments, driver, driver_or_default,
-        drivers, plain_session_id,
+        drivers, excerpt_for, plain_session_id,
     };
     use crate::bridge::{
         ModelRelay, claude_arguments, claude_session_id, claude_settings, claude_settings_in,
@@ -626,6 +739,7 @@ mod tests {
                                 profile,
                                 config_dir,
                                 cwd: Some("/workspaces/agent_a"),
+                                model: Some("ignored-by-claude"),
                             },
                         );
                         let settings = claude_settings_in(relay.as_ref(), profile, config_dir);
@@ -799,6 +913,7 @@ mod tests {
                     profile: ModelProfile::Cheap,
                     config_dir: Some("/x"),
                     cwd: Some("/workspaces/agent_a"),
+                    model: None,
                 },
             );
             assert_eq!(plan.program, "/opt/agy/bin/agy");
@@ -817,6 +932,83 @@ mod tests {
             agy_arguments("m", "/w", Some("c"))[..4],
             ["--conversation", "c", "--model", "m"]
         );
+    }
+
+    /// A start's `model_label` reaches agy as `--model`, over the home's.
+    #[test]
+    fn agy_launch_passes_the_starts_model_label_over_the_homes() {
+        let plan = AgyDriver.launch(
+            &agy_home(),
+            &EngineLaunch {
+                native: None,
+                resume: false,
+                relay: None,
+                profile: ModelProfile::Default,
+                config_dir: None,
+                cwd: Some("/workspaces/agent_a"),
+                model: Some("gemini-3.8-pro"),
+            },
+        );
+        assert_eq!(plan.arguments[..2], ["--model", "gemini-3.8-pro"]);
+    }
+
+    #[test]
+    fn agy_known_models_reads_a_listing_and_skips_status_lines() {
+        let listing = "Fetching available models...\n\
+                       Available models:\n\
+                       \u{1b}[1m* gemini-3.8-flash-low (default)\u{1b}[0m\n\
+                         - gemini-3.8-pro: the strongest\n\
+                       claude-sonnet-4.5\n\
+                       MODEL    DESCRIPTION\n\
+                       Use one with --model\n\
+                       \n\
+                       gemini-3.8-pro\n";
+        assert_eq!(
+            AgyDriver::known_models(listing),
+            ["claude-sonnet-4.5", "gemini-3.8-flash-low", "gemini-3.8-pro"]
+        );
+        assert!(
+            AgyDriver::known_models(
+                "Fetching available models...\nError: Please sign in to view available models.\n"
+            )
+            .is_empty()
+        );
+        assert!(AgyDriver::known_models("").is_empty());
+    }
+
+    #[test]
+    fn agy_version_is_read_and_only_tested_major_minors_are_tested() {
+        assert_eq!(AgyDriver::version("1.5.17\n").as_deref(), Some("1.5.17"));
+        assert_eq!(
+            AgyDriver::version("agy version v1.6.0 (abc)").as_deref(),
+            Some("1.6.0")
+        );
+        assert_eq!(AgyDriver::version("no version here"), None);
+        assert!(AgyDriver::version_tested("1.5.14"));
+        assert!(AgyDriver::version_tested("1.5.17"));
+        assert!(!AgyDriver::version_tested("1.6.0"));
+        assert!(!AgyDriver::version_tested("2"));
+    }
+
+    #[test]
+    fn agy_refuses_a_start_on_its_unknown_model_line_and_claude_never_does() {
+        let pane = "Warning: model \"x-1\" is not recognized as a known model\n>\n";
+        let why = AgyDriver.start_refusal(pane).expect("refused");
+        assert!(why.contains("is not recognized as a known model"), "{why}");
+        assert_eq!(ClaudeDriver.start_refusal(pane), None);
+        assert_eq!(AgyDriver.start_refusal(">\n"), None);
+    }
+
+    /// Fail-closed (N4): only a pane positively Claude Code's stays as it
+    /// is; agy's, an unknown engine's and an unknown one's lose the
+    /// account line.
+    #[test]
+    fn excerpt_for_masks_unless_the_engine_is_positively_claude() {
+        let pane = "▀▀▀▀▀▀ someone@example.invalid (Pro)\nok\n";
+        assert_eq!(excerpt_for(Some("claude"), pane), pane);
+        for engine in [Some("agy"), Some("codex"), Some(""), None] {
+            assert_eq!(excerpt_for(engine, pane), "ok\n", "{engine:?}");
+        }
     }
 
     /// The full transcript, never the short one agy truncates.
