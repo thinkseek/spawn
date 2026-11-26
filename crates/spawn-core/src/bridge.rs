@@ -163,6 +163,9 @@ struct Begin<'a> {
     from: Option<&'a str>,
     /// Models the engine runs on; unset keeps the session's last profile.
     model: Option<ModelProfile>,
+    /// The model an engine told its model at launch runs, by its own label
+    /// (`start {model_label}`); unset, the host's (`SPAWN_AGY_MODEL`).
+    model_label: Option<&'a str>,
     /// The engine's driver: the start's engine, or the session's for a
     /// resume.
     driver: &'static dyn AgentDriver,
@@ -1177,6 +1180,9 @@ struct PreparedStart {
     config_dir: Option<String>,
     launch: LaunchSummary,
     model: ModelProfile,
+    /// The model label the engine is launched with: the start's
+    /// `model_label`, else the host's for that engine; none for Claude Code.
+    model_label: Option<String>,
     fork: Option<Fork>,
 }
 
@@ -3877,7 +3883,7 @@ impl Bridge {
                 // The control layer's record of the charter it gave: nothing
                 // the Bridge does depends on it.
                 charter: _,
-                model_label: _,
+                model_label,
             } => self.start(
                 claimed,
                 &Begin {
@@ -3886,6 +3892,7 @@ impl Bridge {
                     native: None,
                     from: from.as_deref(),
                     model,
+                    model_label: model_label.as_deref(),
                     driver: driver_or_default(&engine),
                 },
                 report,
@@ -4070,6 +4077,7 @@ impl Bridge {
             native,
             from,
             model,
+            model_label,
             driver,
         } = *begin;
         let finished = |outcome| Ok(Handled::Finished(outcome));
@@ -4080,7 +4088,13 @@ impl Bridge {
             return handled;
         }
         let branch = BranchName::for_agent(&claimed.agent_id);
-        let prepared = match self.prepare_start(claimed, &branch, (driver, model), from, report)? {
+        let prepared = match self.prepare_start(
+            claimed,
+            &branch,
+            (driver, model, model_label),
+            from,
+            report,
+        )? {
             Ok(prepared) => prepared,
             Err(why) => return finished(self.fail_prepared_start(claimed, why)),
         };
@@ -4223,7 +4237,11 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         branch: &BranchName,
-        (driver, model): (&'static dyn AgentDriver, Option<ModelProfile>),
+        (driver, model, model_label): (
+            &'static dyn AgentDriver,
+            Option<ModelProfile>,
+            Option<&str>,
+        ),
         from: Option<&str>,
         report: &mut TickReport,
     ) -> Result<Result<PreparedStart, String>, StoreError> {
@@ -4231,8 +4249,10 @@ impl Bridge {
             return Ok(Ok(prepared.clone()));
         }
         // Only the engines this host enables (`SPAWN_ENGINES`) start, and
-        // one other than Claude Code only with its model named: an engine
-        // left to pick its own may pick its costliest.
+        // one other than Claude Code only with its model named, by the
+        // start (`model_label`) or the host (`SPAWN_<ENGINE>_MODEL`): an
+        // engine left to pick its own may pick its costliest.
+        let mut label = None;
         if driver.id() != crate::driver::DEFAULT {
             match self.config.engine_home(driver.id()) {
                 None => {
@@ -4241,14 +4261,17 @@ impl Bridge {
                         driver.id()
                     )));
                 }
-                Some(home) if home.model.is_none() => {
-                    return Ok(Err(format!(
-                        "engine {} has no model named on this host (SPAWN_{}_MODEL)",
-                        driver.id(),
-                        driver.id().to_ascii_uppercase()
-                    )));
-                }
-                Some(_) => {}
+                Some(home) => match model_label.map(str::to_string).or(home.model.clone()) {
+                    Some(named) => label = Some(named),
+                    None => {
+                        return Ok(Err(format!(
+                            "engine {} has no model named: the start names no model_label and \
+                             this host none (SPAWN_{}_MODEL)",
+                            driver.id(),
+                            driver.id().to_ascii_uppercase()
+                        )));
+                    }
+                },
             }
         }
         let model = model.unwrap_or_else(|| {
@@ -4271,6 +4294,7 @@ impl Bridge {
             config_dir,
             launch,
             model,
+            model_label: label,
             fork,
         };
         self.prepared.insert(claimed.command_id, prepared.clone());
@@ -4979,6 +5003,7 @@ impl Bridge {
                 profile: prepared.model,
                 config_dir: prepared.config_dir.as_deref(),
                 cwd: Some(active.workspace.path()),
+                model: prepared.model_label.as_deref(),
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
@@ -6609,6 +6634,9 @@ impl Bridge {
                 native: Some(native.as_str()),
                 from: None,
                 model,
+                // A resume runs the host's model for its engine: the label
+                // of the start it resumes is not kept.
+                model_label: None,
                 driver: driver_or_default(&engine),
             },
             report,
