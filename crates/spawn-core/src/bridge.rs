@@ -9523,7 +9523,131 @@ mod tests {
                 model: model.map(str::to_string),
             },
         )];
+        config.engine_view = EngineViewPolicy::Required(Ok(Arc::new(FakeView::default())));
         config
+    }
+
+    /// A filesystem view that wraps every launch in a made-up `bwrap`
+    /// (or refuses it), and keeps what it was asked.
+    #[derive(Debug, Default)]
+    struct FakeView {
+        refuse: Option<String>,
+        asked: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl crate::port::EngineView for FakeView {
+        fn name(&self) -> &'static str {
+            "bwrap"
+        }
+
+        fn wrap(&self, launch: &ViewedLaunch<'_>) -> Result<Vec<String>, String> {
+            self.asked
+                .lock()
+                .expect("asked")
+                .push((
+                    launch.engine.to_string(),
+                    launch.workspace.to_string(),
+                    launch.engine_home.to_string(),
+                ));
+            if let Some(why) = &self.refuse {
+                return Err(why.clone());
+            }
+            Ok(["/usr/bin/bwrap", "--unshare-pid", "--chdir", launch.workspace, "--"]
+                .map(str::to_string)
+                .to_vec())
+        }
+    }
+
+    /// agy has no deny rules of its own (`Guard::Sandbox`): with the view
+    /// required (the default) and none on the host, its start is refused
+    /// as `engine_unavailable` before anything is mounted or launched.
+    #[test]
+    fn agy_without_a_filesystem_view_is_refused_as_engine_unavailable() {
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engine_view = EngineViewPolicy::unconfigured();
+        let why = agy_failure(config, true);
+        assert!(why.starts_with(ENGINE_UNAVAILABLE), "{why}");
+        assert!(why.contains("filesystem view"), "{why}");
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engine_view =
+            EngineViewPolicy::Required(Err("bwrap is not installed".to_string()));
+        let why = agy_failure(config, true);
+        assert!(why.contains("bwrap is not installed"), "{why}");
+    }
+
+    /// A view that cannot be made for one launch fails that start as
+    /// `engine_unavailable`: the terminal is never started.
+    #[test]
+    fn a_view_refused_at_the_launch_starts_nothing() {
+        let mut config = agy_config(Some("gemini-3.8-flash-low"));
+        config.engine_view = EngineViewPolicy::Required(Ok(Arc::new(FakeView {
+            refuse: Some("the workspace holds a mask".to_string()),
+            ..FakeView::default()
+        })));
+        let why = agy_failure(config, true);
+        assert!(why.starts_with(ENGINE_UNAVAILABLE), "{why}");
+        assert!(why.contains("the workspace holds a mask"), "{why}");
+    }
+
+    /// agy runs inside the view: the launch's program is the view's, and
+    /// the runner with agy's own words follows its `--`; the view is asked
+    /// for agy's workspace and home. Under `SPAWN_ENGINE_VIEW=off` it runs
+    /// as before, with no view.
+    #[test]
+    fn agy_runs_inside_the_filesystem_view_unless_it_is_off() {
+        for off in [false, true] {
+            let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let host = Witnessed::over(store.clone());
+            host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 1));
+            let id = submit_agy_start_on(&store, "hello", Some("gemini-3.8-pro"));
+            let view = Arc::new(FakeView::default());
+            let mut config = agy_config(None);
+            config.engine_view = if off {
+                EngineViewPolicy::Off
+            } else {
+                EngineViewPolicy::Required(Ok(view.clone()))
+            };
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                host.clone(),
+                config,
+            )
+            .with_clock(clock);
+            drive_work(&mut bridge, &store, || {
+                command_outcome(&store, id).is_some()
+            });
+            assert_eq!(command_outcome(&store, id), Some(Outcome::Succeeded));
+            let launch = store.launches().pop().expect("launched");
+            if off {
+                assert_eq!(launch.program, "spawn");
+                assert_eq!(launch.arguments[..3], ["run", "--", "/opt/agy/bin/agy"]);
+                assert!(view.asked.lock().expect("asked").is_empty());
+                continue;
+            }
+            assert_eq!(launch.program, "/usr/bin/bwrap");
+            assert_eq!(
+                launch.arguments[..7],
+                [
+                    "--unshare-pid",
+                    "--chdir",
+                    launch.cwd.as_str(),
+                    "--",
+                    "spawn",
+                    "run",
+                    "--"
+                ]
+            );
+            assert_eq!(launch.arguments[7], "/opt/agy/bin/agy");
+            assert!(!launch.arguments.iter().any(|word| word == "--new-session"));
+            let asked = view.asked.lock().expect("asked").clone();
+            assert_eq!(
+                asked,
+                vec![("agy".to_string(), launch.cwd.clone(), AGY_HOME.to_string())]
+            );
+        }
     }
 
     fn submit_agy_start(store: &Arc<MemoryStore>, prompt: &str) -> CommandId {
