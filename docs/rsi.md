@@ -9,7 +9,7 @@
 | 目标 | `rsi/backlog/NNN.json` | `id`、`prompt`，可选 `title`；循环目标另有 `recurring`、`metric`、`unit`、`direction`、`target`；`owner_judged: true` 的目标由所有者在门禁外判定（见下），舰队从不派它 |
 | 目标场景 | `rsi/scenarios/NNN.sh` | 判定一个目标的黑盒脚本 |
 | 检查场景 | `rsi/scenarios/check-*.sh` | 每次落地都必须通过：clippy、测试、e2e、黑盒、web 构建 |
-| 构建钩子 | `rsi/scenarios/build` | 在被测树里构建 `spawn` |
+| 构建钩子 | `rsi/scenarios/build` | 在被测树里构建 `spawn` 与同级 `spawn-hc`（嵌入 `herdr-core` 守护进程） |
 | 受保护路径 | `rsi/scenarios/protected` | 候选不能改的路径 |
 | 门禁 | `scripts/rsi/gate.sh` | 判定候选，输出一行 JSON 裁决；舰队与 RSI 共用 |
 | 门禁自测 | `scripts/rsi/test-gate.sh` | 门禁本身的测试 |
@@ -30,7 +30,7 @@ backlog、场景和门禁都从控制器按绝对路径读取，agent 改不到�
 
 ## 3. 黑盒验收
 
-**判据是一个可执行的场景脚本，不是一个测试名字。** 场景把 `spawn` 当黑盒驱动，只看外部可观测的事实：输出、退出码、数据库行、文件。例如 `rsi/scenarios/001.sh`：
+**判据是一个可执行的场景脚本，不是一个测试名字。** 场景把 `spawn` 当黑盒驱动，只看外部可观测的事实：输出、退出码、数据库行、文件（终端与端到端场景经 `scripts/blackbox/lib-herdr.sh` 与故障注入代理 `scripts/blackbox/herdr-fault-proxy.py` 驱动嵌入式 `herdr-core` `spawn-hc`）。例如 `rsi/scenarios/001.sh`：
 
 ```sh
 [ -x "${SPAWN_BIN:-}" ] || exit 2
@@ -65,9 +65,9 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 **剩余风险。** 沙箱与积分器同一个 uid，没有用户命名空间。门禁还拒绝改 `rsi/`、`scripts/rsi/`、`scripts/blackbox/`、`scripts/e2e.sh`、任何 `build.rs`、`.cargo/` 和 Cargo.toml 里的 `build` 键。落地只移动任务源的 `main`；线上二进制只在 owner 运行 `deploy/deploy.sh` 时更换。黑盒场景只证明被覆盖的行为正确，不证明无恶意，缓解只能是人审抽样。
 
-**agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（fleet-architecture.md §8）。
+**agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（[fleet-architecture.md](fleet-architecture.md) §8）；无内置 deny 规则的引擎（以及启用 `SPAWN_CLAUDE_SANDBOX=1` 的 Claude Code）默认运行于 `BwrapView`（容器环境下可通过 `SPAWN_ENGINE_VIEW=container` 使用 `ContainerView`，裸宿主机 fail-closed 拒绝），并以 `inherit_host=auto` 安全只读白名单继承宿主工具链（见 [upgrading.md](upgrading.md) 第 12 节）。
 
-**不给 `SYS_ADMIN`，不用 FUSE，不用 overlay。** 工作区由 `git archive` 导出，已经够用。实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；而且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
+**不给 `SYS_ADMIN`，不用 FUSE，不用 overlay（门禁沙箱）。** 门禁工作区由 `git archive` 导出，已经够用（运行时工作区另支持默认 `git` 以及 opt-in `cow` / `d6-shadow` / `d6`，见 [storage.md](./storage.md)、[d6-cas-v1.md](./d6-cas-v1.md)）。实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；而且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
 
 ## 5. 落地与停机
 
@@ -102,7 +102,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 - **不加新的事件种类。** `EventKind` 是封闭枚举；任务与落地都是 `control.recorded` 事件，类型在 detail 里。
 - **不从事件里取 commit id。** 积分器在宿主侧提交工作区。
-- **不做不可重启的 daemon。** `spawn loop`（Bridge、Observer、派发、存活规则）与 `spawn integrate`（门禁与落地）各是一个进程，状态全在事件日志里，杀掉即重启，不丢工作。拉起交给 systemd（`deploy/systemd/`：`spawn-loop`、`spawn-integrate`、`spawn-serve`、`spawn-jev-relay`、`spawn-model-relay`、`spawn-backup.timer`）；运行 Spawn 的单元直接执行 `spawn`，不经包装脚本：`KillMode=process` 只杀主进程，主进程若是脚本，被替换的 `spawn loop` 会留下来跟新的并跑。哪些部分能边跑边换、哪些必须停机，见 [upgrading.md](upgrading.md)。
+- **不做不可重启的 daemon。** `spawn loop`（Bridge、Observer、派发、存活规则）与 `spawn integrate`（门禁与落地）各是一个进程，状态全在事件日志里，杀掉即重启，不丢工作。拉起交给 systemd（`deploy/systemd/`：`spawn-loop`、`spawn-integrate`、`spawn-serve`、`spawn-jev-relay`、`spawn-model-relay`、`spawn-backup.timer`，以及 Phase 2 opt-in 拆分的 `spawn-core` 与 `spawn-node-{edge,gw,out}`，另有脱离 `spawn-loop` 独立运行的同级 `spawn-hc`）；运行 Spawn 的单元直接执行 `spawn`，不经包装脚本：`KillMode=process` 只杀主进程，主进程若是脚本，被替换的 `spawn loop` 会留下来跟新的并跑。哪些部分能边跑边换、哪些必须停机，见 [upgrading.md](upgrading.md)。
 - **不做并行种群。** 门禁是 pass/fail，选不出更好的那个；一个目标任务一次只有一个任务在做。
 - **不让 agent 改 backlog、场景或门禁脚本。**
 - **不在 agent 的工作区里判定。** 门禁把基线与候选导出到自己的临时目录里构建和运行。

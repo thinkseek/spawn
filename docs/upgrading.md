@@ -7,7 +7,7 @@ be replaced while it runs and which need the engine to stop.
 
 | Process | Started by | Lifetime | In-memory state |
 | --- | --- | --- | --- |
-| engine | `spawn run` in a tmux pane | one execution | native session context |
+| engine | `spawn run` in a Herdr terminal (`spawn-hc` / legacy `herdr`) | one execution | native session context |
 | runner | Bridge `launch` | parent of the engine; writes its exit file | none |
 | Bridge | `spawn tick` or `spawn loop` | one tick or the loop | session map, log cursor, transcript read offsets, last screen reading |
 | Observer | same process as the Bridge | same | log cursor, per-session tracking |
@@ -21,8 +21,8 @@ be replaced while it runs and which need the engine to stop.
 These hold no state that is not rebuildable.
 
 - **Bridge and Observer.** `recover()` replays `spawn_events` and rebuilds the
-  cursor and the session map. A running execution keeps running in its tmux
-  pane while the Bridge is down; the next tick reads its transcript from the
+  cursor and the session map. A running execution keeps running in its
+  detached Herdr (`spawn-hc` / `herdr`) terminal while the Bridge is down; the next tick reads its transcript from the
   start (event keys make a second read a no-op) and its exit file, if the
   engine ended meanwhile.
 - **Dispatcher and liveness rule.** They decide from the log on every pass;
@@ -31,7 +31,10 @@ These hold no state that is not rebuildable.
 - **Integrator.** Its state is the control stream of the event log (task and
   mission rows are folds of it). It records a verdict before it moves git, so
   a killed integrator resumes from the recorded state.
-- **UI server.** Read-only. No writes exist in `spawn serve`.
+- **UI server.** Holds no durable in-memory state (`spawn serve`, or split
+  `spawn-core` + `spawn-node-edge`). Human writes execute directly as
+  idempotent SQL calls (`spawn_human_*`), and SSE streams resume cleanly via
+  `Last-Event-ID`.
 - **Model relay.** `scripts/model-relay.py` keeps nothing between requests.
   Install the new script over the old one
   (`install -m 755 scripts/model-relay.py ~/.local/share/spawn-rsi/bin/`)
@@ -88,16 +91,17 @@ These are not about process lifetime. They break when two versions meet.
    with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
    in the workspace); the Bridge reads it, so its path and format must stay
    the same across versions. An execution with no exit file is
-   ended as `Lost` once no runner the Bridge launched runs it: its pane is
-   gone, dead, or does not hold the launch (issue #15). The tmux host tells
-   its own launch by the pane's start command, which names the launch's
-   environment file (`spawn-launch-<terminal>-...`); every launch since
-   6f677b4 (2026-11-05) has one. A runner launched by an older binary that
-   is still running when this one is deployed carries no such name and is
-   ended as lost (its terminal killed, its final checkpoint taken) at the
-   first tick: stop such executions before the deploy, or let the normal
-   paths resume them (the liveness rule for the supervisor and residents,
-   the dispatcher's one resume of a lost worker).
+   ended as `Lost` once no runner the Bridge launched runs it: its terminal
+   is gone, dead, or does not hold the launch (issue #15). `HerdrCoreHost` and
+   `HerdrHost` verify their own launch via the daemon's terminal list,
+   private host owner records, and the launch environment file name
+   (`spawn-launch-<terminal>-...`; historically introduced alongside the
+   legacy launcher since `6f677b4` on 2026-11-05). A runner launched before
+   launch-file attribution carries no such name and is ended as lost (its
+   terminal killed, its final checkpoint taken) at the first tick: stop such
+   executions before the deploy, or let the normal paths resume them (the
+   liveness rule for the supervisor and residents, the dispatcher's one resume
+   of a lost worker).
 5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
    lines it does not know, so an engine release that adds line types causes
    no failure, but a renamed field silently drops the events it carried.
@@ -114,34 +118,37 @@ These are not about process lifetime. They break when two versions meet.
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.
-9. **Herdr and agy** (issue #91 P2 PR 2). The Herdr host speaks protocol 22
-   (herdr 0.9.5) and refuses a server that speaks another, naming both. A
-   herdr upgrade is therefore cold: stop the executions on it, upgrade herdr,
-   then deploy a Spawn that speaks its protocol. The server Spawn starts reads
-   no update and no new agent manifest (`[update] version_check = false`,
-   `manifest_check = false`). The rules it reads agy's screen by stay at the
-   ones checked (2026.10.05.1) until the owner moves them, together with the
-   tests in `crates/spawn-host/tests/herdr.rs`. agy's transcript format is
-   agy's, as Claude Code's is Claude Code's (boundary 5). `agy_line` skips
-   what it does not know, and it reads `transcript_full.jsonl`; a renamed
-   field drops the events it carried. Nothing of this runs until
-   `SPAWN_ENGINES` names `agy`, which is unset (`claude`) by default. Landing
-   the change enables nothing.
+9. **Herdr (`spawn-hc` / legacy `herdr`) and agy** (issue #91 P2 PR 2, single-Herdr PR #150).
+   The default `SPAWN_HERDR_MODE=core` drives the in-repo embedded
+   `herdr-core` daemon through sibling `spawn-hc` (expected OpenRPC generation
+   `EXPECTED_GENERATION = 1`, `crates/spawn-host/src/herdr_core.rs`) and
+   performs agent detection out of sandbox on the host (`herdr_witness`). Because
+   `spawn-hc serve` / `spawn-hc hold` run in their own session independently
+   of `spawn-loop`, restarting `spawn-loop` keeps running Agent PTYs alive;
+   upgrading `spawn-hc` across incompatible generations requires stopping
+   active executions first. External legacy `herdr 0.9.5` (opt-in via
+   `SPAWN_HERDR_MODE=legacy`) speaks protocol 22 and refuses a server speaking
+   another, naming both (`[update] version_check = false`,
+   `manifest_check = false` for servers Spawn starts). The rules reading agy's
+   screen stay at `2026.10.05.1` alongside `spawn-host`'s `herdr_core` /
+   `herdr` tests. agy's transcript format is agy's, as Claude Code's is Claude
+   Code's (boundary 5). `agy_line` skips what it does not know, and reads
+   `transcript_full.jsonl`; a renamed field drops the events it carried.
+   Nothing of this runs until `SPAWN_ENGINES` names `agy`, which is unset
+   (`claude`) by default.
 
-   The `[update]` pin holds only for a server Spawn started itself (Herdr PR
-   3, carry list N8). So every server, whoever started it, is also checked
-   against the agent detection manifests in `MANIFESTS`
+   On `SPAWN_HERDR_MODE=legacy`, every server is also checked against the
+   pinned agent detection manifests in `MANIFESTS`
    (`crates/spawn-host/src/herdr.rs`): agy `2026.10.05.1` and claude
-   `2026.10.11.1`. A server whose active version of either differs, or that
-   has none, is refused before anything starts, with a message naming the
-   pinned and the actual version. To move a pin:
+   `2026.10.11.1`. A server whose active version differs, or has none, is
+   refused before anything starts. To move a legacy pin:
    1. run `herdr server update-agent-manifests`;
-   2. re-run the fixtures and `SPAWN_REQUIRE_HERDR=1 cargo test -p spawn-host
-      --test herdr`;
+   2. re-run the fixtures and `spawn-host` `herdr` tests;
    3. edit `MANIFESTS`.
 
-   `GET /api/capabilities` shows the running server's protocol and active
-   manifests beside the pinned ones, and herdr's version.
+   `GET /api/capabilities` shows the active Herdr engine (`herdr-core` or legacy
+   `herdr`), binary version, expected generation or protocol/manifests, and
+   shard count (`SPAWN_HERDR_SHARDS`).
 10. **`model_label` on `start`** (Herdr PR 4). `CommandAction::Start` has an
     optional `model_label`, left out of the JSON when absent, so a Claude
     Code start is byte for byte what it was. A Bridge built before it
@@ -161,23 +168,27 @@ These are not about process lifetime. They break when two versions meet.
     Spawn cannot read reads `Unknown`, which types nothing. After checking
     its screens and transcript, add its `major.minor` to `AGY_TESTED`.
 
-12. **The filesystem view of agy** (H5, decision C2 N6;
-    docs/fleet-architecture.md §3.9). From this version an engine with no
-    deny rules of its own (agy) starts only inside a `bwrap` view
-    (`SPAWN_ENGINE_VIEW=required`, the default). A host that enables agy
-    needs `bwrap` (bubblewrap 0.9.0 was checked) on the loop's `PATH`;
-    without a working one every agy start is refused (`engine_unavailable:`
-    in the start's outcome) and Claude Code runs on. `SPAWN_ENGINE_VIEW=off`
-    restores the old behaviour, on the owner's explicit choice. Inside the
-    view `~/.gemini` holds only agy's home (`SPAWN_AGY_HOME`): anything agy
-    reads elsewhere below `~/.gemini` is gone for it. agy's `TMPDIR` is
-    `<agy home>/.spawn-tmp`, not the loop's (`/var/tmp/spawn` is masked).
-    A `SPAWN_AGY_HOME` that is, or holds, a masked path (`~/.gemini`
-    itself, `~/.claude`, `/run/keep`, …) refuses every agy start. The view is resolved
-    at each launch, so an agy already running keeps the view it started
-    with; and a masked path missing at its launch that appears later is
-    visible to it (`--ro-bind / /` is live) until its next launch. A
-    rollback to a Spawn without the view simply starts agy without one.
+12. **The filesystem view of engines (`BwrapView` / `ContainerView`)** (H5,
+    decision C2 N6, PR #126; docs/fleet-architecture.md §3.9). Engines without
+    deny rules of their own (agy) start inside a `bwrap` view
+    (`SPAWN_ENGINE_VIEW=required`, the default; Claude Code can also opt in
+    with `SPAWN_CLAUDE_SANDBOX=1`). A bare host that enables agy needs a working
+    `bwrap` (bubblewrap 0.9.0 was checked) on the loop's `PATH`; without one,
+    every agy start is refused (`engine_unavailable:` in the start's outcome)
+    while Claude Code runs on. Inside container runtimes, `SPAWN_ENGINE_VIEW=container`
+    uses `ContainerView` (failing closed on bare hosts and never falling back
+    to `ContainerView` when the `bwrap` binary is missing). Safe read-only
+    host toolchain inheritance defaults to `auto` (`SPAWN_SANDBOX_INHERIT_HOST=auto`,
+    or `[sandbox].inherit_host = "auto"` in `spawn.toml`, binding standard
+    toolchains read-only while refusing secret paths; `off` disables).
+    `SPAWN_ENGINE_VIEW=off` disables the view only on the owner's explicit
+    choice. Inside `BwrapView`, `~/.gemini` holds only agy's home
+    (`SPAWN_AGY_HOME`), agy's `TMPDIR` is `<agy home>/.spawn-tmp`, and masked
+    paths (`~/.gemini` outside `SPAWN_AGY_HOME`, `~/.claude`, `/run/keep`, …)
+    are refused if configured as writable or engine home. The view is resolved
+    at each launch, so a running execution keeps its view until its next
+    launch. A rollback to a Spawn without the view simply starts agy without
+    one.
 
 ## What the loop may improve by itself
 
@@ -204,17 +215,94 @@ only where they exercise it.
 
 ## Deploying
 
-Herdr (`SPAWN_TERMINAL_BACKEND=herdr`, protocol 22) is now the default terminal
-backend; set `SPAWN_TERMINAL_BACKEND=tmux` to explicitly fall back to tmux
-(all tmux-backed scenarios and hosts without herdr 0.9.5 need it explicitly set
-before restarting `spawn-loop`).
+### Single-Herdr migration (`tmux` removal)
+
+`tmux` support has been removed (PR #150); `herdr` is now the sole terminal
+backend:
+
+- Setting `SPAWN_TERMINAL_BACKEND` to `"tmux"` (env) or `[terminal].backend = "tmux"`
+  in `spawn.toml` is **explicitly refused fail-closed** at startup (unset/empty
+  or `"herdr"` is required).
+- **Pre-upgrade steps**:
+  1. Remove any legacy `tmux` configuration (`SPAWN_TERMINAL_BACKEND`,
+     `SPAWN_TMUX_PROGRAM`, `SPAWN_TMUX_SOCKET`, `[terminal].backend = "tmux"`),
+     and stop any pre-upgrade tmux-hosted executions cleanly before restarting
+     `spawn-loop`.
+  2. Ensure sibling `spawn-hc` is installed next to `spawn` (`cargo install --path crates/spawn-hc`;
+     `deploy/deploy.sh` and `rsi/scenarios/build` build/install both `spawn` and `spawn-hc`).
+  3. Default runtime uses embedded `herdr-core` via `spawn-hc` (`SPAWN_HERDR_MODE=core`,
+     `SPAWN_HERDR_SHARDS=1..=64`); set `SPAWN_HERDR_MODE=legacy` (with
+     `SPAWN_HERDR_PROGRAM=herdr`, protocol 22) only if an explicit external
+     `herdr` fallback is needed.
+
+### Phase 2 opt-in UDS + Go front cutover (`SPAWN_DEPLOY_EDGE_MODE=go-uds`) & rollback
+
+`deploy/deploy.sh` defaults to `SPAWN_DEPLOY_EDGE_MODE=legacy` and keeps single-process
+`spawn serve` / `spawn-node-gateway` / `spawn-jev-relay` unless opt-in `go-uds`
+is requested (PR #159; see [deploy/systemd/README.md](../deploy/systemd/README.md#deploying)):
+
+1. **Read-only preflight check (zero host mutation, zero secret echo)**:
+   ```sh
+   bash deploy/deploy.sh --check-phase2-cutover [<units-dir>]
+   ```
+   Verifies executable `spawn-node` (`~/.local/share/spawn-rsi/bin/spawn-node`),
+   all four regular unit files (`spawn-core.service`, `spawn-node-edge.service`,
+   `spawn-node-gw.service`, `spawn-node-out.service`), zero `spawn.env` /
+   `*DATABASE_URL*` references in the 3 Go units and their drop-ins, and
+   `LoadCredential=typesafe.api-key:/run/keep/typesafe.api-key` +
+   `RestartPreventExitStatus=243 78` on `spawn-node-out.service`.
+2. **Opt-in cutover**:
+   ```sh
+   SPAWN_DEPLOY_EDGE_MODE=go-uds bash deploy/deploy.sh <verdict-file>   # or --main / --landed
+   ```
+   Runs preflight first, applies units, starts `spawn-core.service`, and waits up to
+   `SPAWN_PHASE2_CORE_SOCK_TIMEOUT_SECS` (default `15`, valid `1..=300`) for
+   `${XDG_RUNTIME_DIR}/spawn/core.sock` (`-S`). If `core.sock` is not ready in
+   time, it **aborts fail-closed without stopping any legacy unit**. Once ready,
+   it stops legacy `spawn-serve`, `spawn-node-gateway`, `spawn-jev-relay.path`,
+   and `spawn-jev-relay`, starts `spawn-node-{edge,gw,out}`, restarts
+   `spawn-loop` / `spawn-integrate`, and verifies all 4 Phase 2 units are active.
+3. **Post-cutover verification**:
+   `systemctl --user status spawn-core spawn-node-edge spawn-node-gw spawn-node-out`,
+   `curl -fsS --unix-socket "${XDG_RUNTIME_DIR}/spawn/core.sock" http://localhost/ipc/v1/hello`,
+   and `scripts/keep/credential-health.sh`.
+4. **One-step reversible rollback (`go-uds` -> `legacy`)**:
+   ```sh
+   SPAWN_DEPLOY_EDGE_MODE=legacy bash deploy/deploy.sh <verdict-file>   # or --main
+   ```
+   When `legacy` runs (or `SPAWN_DEPLOY_EDGE_MODE` is omitted), `deploy.sh`
+   stops active Phase 2 units **before** restarting legacy `spawn-loop`,
+   `spawn-integrate`, `spawn-serve`, `spawn-node-gateway`, and `spawn-jev-relay`
+   (preventing `:8787` / `:18096` port conflicts). For an immediate manual
+   unit rollback without rebuilding:
+   ```sh
+   systemctl --user stop spawn-node-edge spawn-node-gw spawn-node-out spawn-core
+   systemctl --user restart spawn-loop spawn-integrate spawn-serve spawn-node-gateway spawn-jev-relay.path spawn-jev-relay
+   ```
+
+### Opt-in D6 workspace backend (`SPAWN_WORKSPACE_BACKEND=d6-shadow|d6`) & rollback
+
+- **Default & `auto`**: `SPAWN_WORKSPACE_BACKEND` defaults to `git`.
+  `SPAWN_WORKSPACE_BACKEND=auto` selects only `cow` (when CoW clones are supported)
+  or `git`; it never auto-selects `overlay`, `d6-shadow`, or `d6`.
+- **`d6-shadow` (reversible dual-track mode)**: Runs shadow `D6Workspace` verification
+  over an authoritative `git` root (`<root>/.d6-shadow/`, plus optional
+  `SPAWN_D6_CAS_DIR`, `SPAWN_D6_TMPFS_ROOT`, `SPAWN_D6_TMPFS_BUDGET_MB=2048`,
+  `SPAWN_D6_STRICT_FAIL_CLOSED=1`). **Rollback to `git`**: unset
+  `SPAWN_WORKSPACE_BACKEND` (or set `git`) and restart `spawn-loop` — the `git`
+  root marker and branches remain intact.
+- **Pure `d6` (`D6Workspace`)**: Requires a dedicated root (`.d6/`) or explicit
+  cutover (`claim_root` refuses mixing `d6` with `git|cow|overlay|d6-shadow`
+  fail-closed). **Rollback**: switch `SPAWN_WORKSPACE_ROOT` back to the `git`
+  root or execute the reverse cutover documented in [d6-cas-v1.md](./d6-cas-v1.md).
 
 A deploy that enables agy (`SPAWN_ENGINES=claude,agy`) also needs, in the
-loop's environment, `SPAWN_AGY_MODEL` (Herdr is already default; optionally set
-`SPAWN_TERMINAL_BACKEND=herdr`, `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and on the host herdr
-0.9.5 with its antigravity-cli integration, a logged-in agy and a working
-`bwrap` on the loop's `PATH` (agy runs only inside its filesystem view,
-`SPAWN_ENGINE_VIEW=required` by default; item 12 above). Without them,
+loop's environment, `SPAWN_AGY_MODEL` (Herdr is default via sibling `spawn-hc`,
+or legacy `herdr 0.9.5` under `SPAWN_HERDR_MODE=legacy`; optionally set
+`SPAWN_TERMINAL_BACKEND=herdr`, `SPAWN_AGY_PROGRAM`, `SPAWN_AGY_HOME`), and a
+working `bwrap` (or `SPAWN_ENGINE_VIEW=container` inside a container runtime;
+item 12 above), a logged-in agy, and Host/Herdr detection (`herdr_witness` for
+`herdr-core`, or legacy `herdr 0.9.5` integration). Without them,
 an agy start is refused before launch, saying what is missing. Claude Code
 is unaffected. The loop probes the engines at its start and hourly
 (`<program> --version`, `agy models`; bounded, no shell, login files only
