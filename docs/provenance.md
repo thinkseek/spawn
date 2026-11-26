@@ -454,7 +454,8 @@ when, for every path N's `land` Changes touched (`content`, `mechanical`
 or folded `tree` rows; `generated` paths such as `Cargo.lock` are made
 again, not restored), the landing's commit holds what N's earliest landing
 found there (absent where it was absent), and the landing itself touched
-at least one of them. A path stored quoted cannot be read back and makes
+at least one of them (either side may be folded into a top-level
+`tree` row: a folded directory matches the files under it). A path stored quoted cannot be read back and makes
 it `unverified_revert`. Level 2 (`level2_bisect`, a regression test
 bisected on first parents) has no writer yet; the report counts it.
 
@@ -474,7 +475,11 @@ symlink, and read again only when the file's size changed or it was
 modified after the record was written). Its bytes stay out of git and out
 of every store. A record without a digest (written before) still reads,
 and an older reader drops an entry it cannot parse, which at worst tells
-the agent of it again. The overlay store sets no cap and is not touched
+the agent of it again. An entry with an empty path is dropped without
+shifting the rest. The reader (`spawn_host::git::oversized_record`) reads
+only a regular file directly under `<root>/.oversized/`: the agent name
+must be one plain path component (no `/`, `\\`, `.`, `..`, root), and no
+symbolic link is followed on the way. The overlay store sets no cap and is not touched
 (its missing cap is its own issue).
 
 With a workspace root (`spawn prov index --root <dir>`, else
