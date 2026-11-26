@@ -2177,42 +2177,63 @@ resolver uses the approvals page's detection and dialog id
 (`serve/approvals.rs`, `detect`), so a person and the resolver see one
 dialog under one id.
 
-The table answers only the rows whose screen was seen working: agy's
-`trust_prompt` for its own workspace (probed), and Claude Code's trust
-dialog (in production) and numbered permission whose first choice is "Yes"
-(approvals fixtures). Every other row escalates. So does a hard block
-(`spawn_core::driver::hard_block`): a login, a quota, a rate limit, a needed
-update, or exit-only choices.
+The table never holds an answer nobody has seen work. Today one row
+answers, with one key: agy's `trust_prompt` for its own workspace, cursor on
+trust, Enter (probed). Every other row escalates:
 
-Before any key, every guard must hold:
+- Claude Code's numbered permission: its only screens are the approvals
+  page's hand-written fixtures;
+- Claude Code's trust dialog: the Bridge answers it at startup, and the
+  resolver leaves it to a person later;
+- agy's permission and question prompts, Claude Code's question forms,
+  Codex, OpenCode, and any dialog no row covers.
+
+So does a hard block (`spawn_core::driver::hard_block`): a login, a quota,
+a rate limit, a needed update, or exit-only choices.
+
+Before a key is submitted, every guard must hold:
 
 - two equal pane reads in a row;
 - for an engine other than Claude Code, Herdr reads it `blocked` by a named
   rule, with the blocker visible;
-- the driver reads the pane as `Permission`;
+- the driver's own reading of both panes shows the dialog: `Permission`, or,
+  for `trust_prompt`, its startup trust dialog (Herdr's rule alone is never
+  enough);
 - the row's own guard holds;
 - no command of the session is unfinished;
 - the breaker is closed.
 
+The Bridge checks again when it presses a key of `spawn-resolve`. It reads
+the pane first and presses only if the driver still reads the dialog and no
+other command of the session was recorded `pressed` or `typed` since this
+key was accepted. Otherwise the key ends `Failed` ("the dialog this answer
+was for is gone: nothing pressed"), with no `pressing` step. So when a
+person answers first, the resolver's key presses nothing.
+
 The breaker is folded from the log, never kept in memory alone. Its counts
 come from the commands of `spawn-resolve`, plus `submit`'s idempotency on
-the key `resolve:<execution>:<dialog id>:<n>:<k>`. It opens:
+the key `resolve:<execution>:<dialog id>:1:1`.
 
-- for a dialog that still shows 5 to 30 s after its answer;
-- for a dialog on its third answer (a second comes only from 30 s on);
-- for an execution after 5 answers in 10 minutes;
-- for the host after 20 answers across the fleet in a minute.
+- A dialog gets at most one automatic answer per execution. If it still
+  shows 5 s after its answer, it is escalated once ("still shows after its
+  answer") and never pressed again.
+- An execution with 5 answers in 10 minutes gets no more.
+- The host gets no more after 20 answers across the fleet in a minute.
 
 **The switch.** `SPAWN_AUTO_APPROVE = off | startup | all`, default
 `startup`, which changes nothing. Landing PR 3 is inert until the owner sets
 `all`, and a test pins that the resolver reads and submits nothing
-otherwise. `off` stops the resolver too. The Bridge's startup trust answer is
-part of a start, and `off` does not switch it.
+otherwise. `off` means no automatic answer at all, the startup trust dialog
+included (`BridgeConfig::auto_trust`, set by `runtime.rs`). A start that
+shows the dialog under `off` waits for a person. If nobody answers, its wait
+fails with a message naming the trust dialog and `SPAWN_AUTO_APPROVE=off`.
 
 **The audit trail.** Each automatic answer is on the record with kinds that
-exist: `screen.observed permission`, `command.accepted` (principal
-`spawn-resolve`), `command.step pressing` and `pressed`, `command.finished`,
-then the next `screen.observed`. The Bridge's startup trust answer was
+exist: `command.accepted` (principal `spawn-resolve`), `command.step
+pressing` and `pressed`, `command.finished`, then the next
+`screen.observed`. The Bridge records `screen.observed permission` on its
+own pass, normally before the answer. The resolver does not wait for that
+record: it reads the pane twice itself. The Bridge's startup trust answer was
 unrecorded before and now goes the same way:
 
 1. It submits one key command per key, keyed
@@ -2276,12 +2297,18 @@ anything starts, and the message names the pinned and the actual version.
 The `[update]` pin holds only for a server this host started; this check
 holds for any server.
 
-**agy's transcript does not rotate (N10, probed).** One scratch conversation
-on agy 1.5.17 was driven past 6.44 MB of `transcript_full.jsonl` with cheap
-tool calls. The file kept its inode and only grew by appends
-(`NO_ROTATION`), and no `chunks/` directory appeared. The reader keeps
-following the one file. The existing rule for a shrunk or replaced file
-stays as the safety net.
+**agy's transcript does not rotate (N10, probed).**
+`brain/<id>/.system_generated/logs/transcript_full.jsonl` is one append-only
+file with no size cap. It kept the same inode past 6 MB over seven turns
+(agy 1.5.14 for turns 1 to 6, 1.5.17 for turn 7).
+
+agy also writes `logs/chunks/.../NNNNNNNN.jsonl` from the first turn: a
+redundant mirror cut at 100 KiB by bytes, not by lines. The reader ignores
+it.
+
+The file's last line may lack its trailing newline; the reader takes a line
+only once it ends. It keeps following the one file, and the existing rule
+for a shrunk or replaced file stays as the safety net.
 
 **A wrapped draft.** A draft wider than agy's prompt box wraps onto the
 lines under the prompt line, which moves the lower rule down.
