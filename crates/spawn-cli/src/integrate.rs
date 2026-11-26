@@ -5078,8 +5078,8 @@ impl Judge {
                     .is_some()
                 {
                     println!(
-                        "integrate: task {}: the node's rejection on {job_id} reads as its test \
-                         database's fault ({belief} not applied): judged on this host",
+                        "integrate: task {}: the node's rejection on {job_id} names no failure \
+                         of the work's ({belief} not applied): judged on this host",
                         task.id
                     );
                     return None;
