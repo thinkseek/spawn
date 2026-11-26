@@ -1540,7 +1540,14 @@ fn claude_bwrap_sandbox_isolates_home_and_shares_projects_with_host() {
             &words,
             &format!("cat '{}'", fixture.home().join(".claude.json").display())
         ),
-        "{}"
+        "{\"hasCompletedOnboarding\":true,\"theme\":\"dark\"}"
+    );
+    assert_eq!(
+        ok(
+            &words,
+            &format!("cat '{}'", claude_home.join(".claude.json").display())
+        ),
+        "{\"hasCompletedOnboarding\":true,\"theme\":\"dark\"}"
     );
     // Settings & credentials are readable but read-only.
     assert_eq!(

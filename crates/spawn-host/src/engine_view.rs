@@ -1021,7 +1021,12 @@ impl BwrapView {
         let host_projects_raw = host_engine_home.join("projects");
         let host_projects = ensure_dir_0700(&host_projects_raw, "claude host projects")?;
         let claude_json = worker_base.join("claude.json");
-        write_file_atomic_noclobber(&claude_json, b"{}\n", 0o600)?;
+        write_file_atomic_noclobber(
+            &claude_json,
+            b"{\"hasCompletedOnboarding\":true,\"theme\":\"dark\"}\n",
+            0o600,
+        )?;
+        ensure_empty_mount_file(&worker_home.join(".claude.json"))?;
 
         let mut ro_overlays = Vec::new();
         for rel in ["settings.json", "settings.local.json", ".credentials.json"] {
@@ -1477,6 +1482,9 @@ impl BwrapView {
             "--bind".to_string(),
             path_word(&plan.claude_json),
             path_word(&home.join(".claude.json")),
+            "--bind".to_string(),
+            path_word(&plan.claude_json),
+            path_word(&engine_home.join(".claude.json")),
             "--bind".to_string(),
             path_word(tmpdir),
             path_word(tmpdir),
