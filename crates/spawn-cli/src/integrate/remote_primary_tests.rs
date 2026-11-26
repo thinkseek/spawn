@@ -1468,3 +1468,66 @@ fn the_node_shadow_is_orthogonal_to_the_primary_path() {
     assert!(shadow::node_settings(both).expect("shadow").is_some());
     assert!(remote::primary_settings(both).expect("primary").is_some());
 }
+
+/// A red main: its gate runs the red check on the base first
+/// (`SPAWN_GATE_BASE_CHECK`), which no grant can carry, so a probe of a red
+/// main with the primary path on queues no job: the gate runs here, given
+/// the check, and its pass on the base records `source.main_green`.
+#[test]
+fn a_gate_on_a_red_main_is_judged_here_and_finds_it_green() {
+    let gate = "echo \"base_check=${SPAWN_GATE_BASE_CHECK-}\" >>\"$(dirname \"$0\")/runs\"\n\
+                printf '{\"verdict\":\"accepted\",\"base_check\":\"check-tests.sh\"}\\n' \
+                >\"$SPAWN_GATE_VERDICT\"\n";
+    let mut world = World::new("red_main", gate, Some((false, Duration::from_secs(30))));
+    let main =
+        crate::sources::test_git(&["--git-dir", &world.source, "rev-parse", "refs/heads/main"])
+            .expect("main")
+            .trim()
+            .to_string();
+    world
+        .ledger
+        .store
+        .integrator_record(&json!({
+            "type": "source.main_red", "source": world.source, "main": main,
+            "scenario": "check-tests.sh", "runs": "1, 1",
+            "failures": [{"test": "api::tests::adds", "message": "m", "class": "work"}],
+            "task": world.task, "mission": world.mission,
+        }))
+        .expect("main is red");
+    // The probe is due at once.
+    world.integrator.red_probe_ms = 1;
+    std::thread::sleep(Duration::from_millis(5));
+    // A node that would take any job is beating beside the pass.
+    let mut node = world.node("n1");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let beating = std::thread::spawn(move || {
+        let mut granted = Vec::new();
+        while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            granted.extend(node.beat());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        granted
+    });
+    world.pass();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        beating.join().expect("the node").is_empty(),
+        "nothing granted"
+    );
+    assert!(world.gate_jobs().is_empty(), "no gate job queued");
+    let runs = std::fs::read_to_string(world.dir.0.join("runs")).unwrap_or_default();
+    assert_eq!(
+        runs.lines().collect::<Vec<_>>(),
+        ["base_check=check-tests.sh"],
+        "the local gate, given the red check"
+    );
+    let greens = world.ledger.records("source.main_green");
+    assert_eq!(greens.len(), 1, "{greens:?}");
+    assert_eq!(greens[0]["scenario"], "check-tests.sh");
+    let gated = world.gated();
+    assert_eq!(gated.len(), 1, "{gated:?}");
+    assert_eq!(gated[0]["verdict"], "accepted");
+    assert_eq!(gated[0]["probe"], true);
+    assert_eq!(gated[0]["env"]["runner"], Value::Null, "judged here");
+}
