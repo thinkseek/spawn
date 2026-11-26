@@ -10272,8 +10272,18 @@ mod tests {
             &brain,
             &[stale, "..", "../evil", forged, "empty-0", conversation],
         );
+        clock.advance(Duration::from_secs(3));
+        bridge.poll().expect("poll");
+        let scans = host.listed.lock().expect("listed").len();
+        assert!(scans > 0, "the brain was scanned");
+        // At most one scan per interval.
         bridge.poll().expect("poll");
         bridge.poll().expect("poll");
+        assert_eq!(
+            host.listed.lock().expect("listed").len(),
+            scans,
+            "throttled"
+        );
         assert!(agy_natives(&store).is_empty(), "no transcript of ours yet");
         assert!(
             host.listed
@@ -10288,6 +10298,7 @@ mod tests {
             &path,
             &agy_user_line(&crate::message::marked("hello", id, true)),
         );
+        clock.advance(Duration::from_secs(3));
         bridge.poll().expect("poll");
         assert_eq!(
             agy_natives(&store),
@@ -10415,6 +10426,7 @@ mod tests {
         let names: Vec<&str> = decoys.iter().map(|(name, _)| *name).collect();
         host.set_dirs(&brain, &names);
         for _ in 0..4 {
+            clock.advance(Duration::from_secs(3));
             bridge.poll().expect("poll");
         }
         assert!(agy_natives(&store).is_empty(), "no decoy binds");
@@ -10440,6 +10452,7 @@ mod tests {
         ));
         host.listed.lock().expect("listed").clear();
         for _ in 0..4 {
+            clock.advance(Duration::from_secs(3));
             bridge.poll().expect("poll");
         }
         assert!(
@@ -10452,6 +10465,7 @@ mod tests {
         );
         // The engine's own pane again: its conversation binds.
         host.set(agy_reading(Some("agy"), crate::port::AgentStatus::Idle, 3));
+        clock.advance(Duration::from_secs(3));
         bridge.poll().expect("poll");
         assert_eq!(
             agy_natives(&store),
