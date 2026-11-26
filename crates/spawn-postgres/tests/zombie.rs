@@ -63,6 +63,7 @@ fn start(prompt: &str) -> CommandAction {
         from: None,
         model: None,
         charter: None,
+        model_label: None,
     }
 }
 

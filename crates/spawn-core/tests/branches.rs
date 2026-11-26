@@ -94,6 +94,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
             from: from.map(str::to_string),
             model: None,
             charter: None,
+            model_label: None,
         },
     );
 }
@@ -774,6 +775,7 @@ fn a_record_the_log_keeps_refusing_holds_up_only_its_session() {
                     from: None,
                     model: None,
                     charter: None,
+                    model_label: None,
                 },
             },
         )

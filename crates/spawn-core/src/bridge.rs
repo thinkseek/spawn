@@ -3877,6 +3877,7 @@ impl Bridge {
                 // The control layer's record of the charter it gave: nothing
                 // the Bridge does depends on it.
                 charter: _,
+                model_label: _,
             } => self.start(
                 claimed,
                 &Begin {
@@ -8570,6 +8571,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
+                        model_label: None,
                     },
                 },
             )
@@ -8993,6 +8995,7 @@ mod tests {
                             from: None,
                             model: None,
                             charter: None,
+                            model_label: None,
                         },
                     },
                 )
@@ -9359,6 +9362,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
+                        model_label: None,
                     },
                 },
             )
@@ -12489,6 +12493,7 @@ mod tests {
                         from: None,
                         model: None,
                         charter: None,
+                        model_label: None,
                     },
                 },
             )

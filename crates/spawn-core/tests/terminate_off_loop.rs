@@ -198,6 +198,7 @@ impl Rig {
                 from: None,
                 model: None,
                 charter: None,
+                model_label: None,
             },
         );
         for attempt in 0..1_024 {
@@ -493,6 +494,7 @@ fn a_start_after_a_stop_waits_for_the_end_and_goes_on() {
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         },
     );
     for _ in 0..3 {

@@ -273,6 +273,7 @@ Enter to confirm · Esc to cancel
             from: None,
             model: None,
             charter: None,
+            model_label: None,
         }
     }
 

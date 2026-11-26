@@ -944,6 +944,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 from: None,
                 model,
                 charter: None,
+                model_label: None,
             },
         )),
     }

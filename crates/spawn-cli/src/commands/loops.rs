@@ -1566,6 +1566,7 @@ mod tests {
                             from: None,
                             model: None,
                             charter: None,
+                            model_label: None,
                         },
                     },
                 )
