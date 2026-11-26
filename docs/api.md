@@ -6,7 +6,7 @@ Every route `spawn serve` answers under `/api/`, on one page. The router is
 dispatch on one table, `ROUTES`; what each answer holds is documented on its
 handler there. Words are as in the [glossary](./glossary.md).
 
-`main` serves 31 GET route patterns and 9 POST routes. (Before issue 98's
+`main` serves 32 GET route patterns and 9 POST routes. (Before issue 98's
 canonical names it was 28 GET patterns: a session's commands and
 judgements were one pattern, `/api/fleet/<session>/<view>`, and are two
 routes now.) A `<name>` in a path is one non-empty segment: `<id>` a
@@ -72,6 +72,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/context/digest` | The fleet in one small answer: states, nodes with power and the low-battery soft drain, open missions with their last gate failure, pending approvals, the supervisor's notes for the owner, and a Markdown `digest_text` under 4000 bytes ([`serve/digest.rs`](../crates/spawn-cli/src/serve/digest.rs)) | – | web (Home, `digest.ts`: the digest line and drawer) |
 | GET | `/api/prov/who` | Who made a file as the last recorded first-parent commit of `main` that touched it left it: that `land` or `import` Change, its entry, the `edit` revision the content came from (`origin`) and the path's history, oldest first; `?path=` (required), `?source=` (the domain `git:<source>`; every domain when empty); a `line` is 400 (a line's blame needs the repository) ([`serve/prov.rs`](../crates/spawn-cli/src/serve/prov.rs), [provenance](./provenance.md)) | `spawn prov who <path>[:<line>] --source <source>` (file-level from git's `main`, and a line's blame) | no web page yet |
 | GET | `/api/prov/change/<id>` | Every revision of a Change (`<id>` its `change_id`), every Change of a task (digits) or the Change recorded for a commit (40 hex characters, read through the commit map both ways), each with its entries and edges; `{changes: []}` when none is recorded | `spawn prov show <id>`: the same JSON | no web page yet |
+| GET | `/api/prov/blast` | The blast radius of a Change (`?target=` its `change_id`), of a task (digits) or of the Change recorded for a commit (40 hex characters): the Changes it names, every later Change with an entry on one of their paths (each with those paths), the landings that include them (`landed_by`), every Change that depends on them by an edge or an entry's `origin` (`radius`, nearest first, with one shortest path) and the part reached by `used` edges alone (`used`); from the database alone, on the reader login; 400 without a valid `target` ([`serve/prov.rs`](../crates/spawn-cli/src/serve/prov.rs), [provenance](./provenance.md)) | `spawn prov blast <target>`: the same JSON | no web page yet |
 
 ## Writes
 
