@@ -282,3 +282,144 @@ fn a_missing_top_level_directory_with_spaces_in_its_name_is_absent() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// PV3b: a data ref's identity, its names, and the diff of two manifests.
+mod data_domain {
+    use spawn_cas::{Manifest, ManifestEntry, sha256_of};
+    use spawn_postgres::provenance::ProvEntryClass;
+
+    use super::super::data::{
+        change_id_of, check_ref, diff, domain_of, entries, parse_digest, snapshot_args,
+    };
+    use super::super::index::{FOLD_OVER, change_id};
+    use super::super::{Target, target};
+
+    fn manifest(files: &[(&str, &str)]) -> Manifest {
+        Manifest::from_entries(
+            files
+                .iter()
+                .map(|(path, text)| ManifestEntry {
+                    path: path.as_bytes().to_vec(),
+                    digest: sha256_of(text.as_bytes()),
+                    size: Some(text.len() as u64),
+                })
+                .collect(),
+        )
+        .expect("a manifest")
+    }
+
+    #[test]
+    fn a_data_refs_change_id_has_domain_and_key_data_ref() {
+        assert_eq!(domain_of("clean"), "data:clean");
+        assert_eq!(change_id_of("clean"), change_id("data:clean", "data:clean"));
+        assert_ne!(change_id_of("clean"), change_id_of("merge"));
+        assert_eq!(
+            target("data:clean"),
+            Ok(Target::Change(change_id_of("clean")))
+        );
+    }
+
+    #[test]
+    fn refs_are_plain_names_and_unprefixed_digests_are_refused_everywhere() {
+        for good in ["clean", "merge-3", "shards_v2.1", "_x"] {
+            check_ref(good).expect(good);
+        }
+        let hex = "ab".repeat(32);
+        for bad in ["", "-x", "a:b", "a/b", "../x", hex.as_str()] {
+            assert!(check_ref(bad).is_err(), "{bad:?}");
+        }
+        assert!(
+            parse_digest(&hex)
+                .expect_err("unprefixed")
+                .contains("unprefixed")
+        );
+        assert!(target(&hex).expect_err("unprefixed").contains("unprefixed"));
+        let snapshot = format!("sha256:{hex}");
+        assert_eq!(target(&snapshot), Ok(Target::Snapshot(snapshot.clone())));
+        assert_eq!(
+            parse_digest(&snapshot).expect("prefixed").to_string(),
+            snapshot
+        );
+        assert!(target("md5:abc").is_err());
+    }
+
+    #[test]
+    fn snapshot_takes_one_directory_one_ref_and_repeated_inputs() {
+        let words = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let args = snapshot_args(&words(&[
+            "data/clean",
+            "--ref",
+            "clean",
+            "--input",
+            "raw",
+            "--input",
+            "sha256:00",
+            "--code",
+            "abc",
+            "--config",
+            "a.toml",
+            "--task",
+            "7",
+            "--digest-only",
+        ]))
+        .expect("parsed");
+        assert_eq!(args.dir, "data/clean");
+        assert_eq!(args.name, "clean");
+        assert_eq!(args.inputs, ["raw", "sha256:00"]);
+        assert_eq!((args.code.len(), args.config.len()), (1, 1));
+        assert_eq!(args.task, Some(7));
+        assert!(args.digest_only);
+        assert!(snapshot_args(&words(&["d"])).is_err(), "--ref is required");
+        assert!(snapshot_args(&words(&["--ref", "x"])).is_err());
+        assert!(snapshot_args(&words(&["a", "b", "--ref", "x"])).is_err());
+        assert!(snapshot_args(&words(&["a", "--ref", "x", "--bogus", "1"])).is_err());
+    }
+
+    #[test]
+    fn entries_are_the_paths_that_differ_and_fold_past_the_limit() {
+        let before = manifest(&[("a", "1"), ("b", "2"), ("d/x", "3")]);
+        let after = manifest(&[("a", "1"), ("c", "4"), ("d/x", "5")]);
+        let found = diff(&before, &after);
+        let paths: Vec<&[u8]> = found.iter().map(|diff| diff.path.as_slice()).collect();
+        assert_eq!(paths, [&b"b"[..], b"c", b"d/x"]);
+        assert_eq!(found[0].after, None);
+        assert_eq!(found[1].before, None);
+        assert_eq!(found[2].size, Some(1));
+        let rows = entries(&before, &after, Some(9));
+        assert!(
+            rows.iter()
+                .all(|row| row.origin == Some(9) && row.class == ProvEntryClass::Content)
+        );
+        assert!(diff(&after, &after).is_empty());
+
+        // Past FOLD_OVER: one tree row per top-level directory, its digests
+        // the directory's own manifests.
+        let names: Vec<(String, String)> = (0..=FOLD_OVER)
+            .map(|n| (format!("{}/{n}", if n % 2 == 0 { "even" } else { "odd" }), n.to_string()))
+            .collect();
+        let mut files: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        files.push(("top", "t"));
+        let big = manifest(&files);
+        let rows = entries(&Manifest::default(), &big, None);
+        let shown: Vec<(&str, ProvEntryClass)> = rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.class))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("even", ProvEntryClass::Tree),
+                ("odd", ProvEntryClass::Tree),
+                ("top", ProvEntryClass::Content)
+            ]
+        );
+        assert_eq!(
+            rows[0].after.as_deref(),
+            Some(big.subtree(b"even").digest().to_string().as_str())
+        );
+        assert_eq!(rows[0].before, None);
+    }
+}
