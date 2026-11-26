@@ -1,9 +1,11 @@
 //! The `spawn` binary: assembles stores, host adapters and the Bridge.
 //!
-//! Subcommands, all 30, one row each of [`COMMANDS`] (`spawn <command>
-//! --help` prints a command's verbs and flags, from its module's own usage):
+//! Subcommands, one row each of [`COMMANDS`] (`spawn <command> --help` prints
+//! a command's verbs and flags, from its module's own usage):
 //!
 //! - `init-db` installs the SQL schema.
+//! - `status` prints a single-command fleet/task/alert overview (`--json` for JSON).
+//! - `say` sends human intervention input to an agent with auto-resolved session and key.
 //! - `submit` writes one command to the queue; `ack` answers one from inside
 //!   an agent's pane.
 //! - `tick` runs one Bridge and Observer pass.
@@ -155,7 +157,9 @@ const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] 
      spawn config effective [--config <path>] [--json]\n       \
      spawn config init --data-dir <dir> [--name <name>] [--output <file>] [--from-host]\n       \
      spawn config docker-plan [--config <path>] [--data-dir <dir>] [--image <image>] [--json]\n       \
-     spawn doctor [--config <path>] [--root <dir>] [--json]";
+     spawn doctor [--config <path>] [--root <dir>] [--json]\n       \
+     spawn status [--json]\n       \
+     spawn say <agent> <message> [--session <sid>] [--key <idempotency-key>] [--json]";
 
 /// What the whole usage says last, after the commands.
 const HELP_HINT: &str =
@@ -185,7 +189,7 @@ struct Command {
 
 /// Every command, in one table: [`dispatch`] looks the first word up in it,
 /// and help reads each command's usage from it. None of the retired words
-/// (`status`, `judge`, `hook`, `dispatch`, `charter`, `corpus`) is a name or
+/// (`judge`, `hook`, `dispatch`, `charter`, `corpus`) is a name or
 /// an alias here, so each stays an unknown command.
 const COMMANDS: &[Command] = &[
     Command {
@@ -193,6 +197,18 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         usage: &[INIT_DB_USAGE],
         run: init_db,
+    },
+    Command {
+        name: "status",
+        aliases: &[],
+        usage: &[inspect::STATUS_USAGE],
+        run: |rest| inspect::status(&Flags::parse_with_switches(rest, &["json"])?),
+    },
+    Command {
+        name: "say",
+        aliases: &[],
+        usage: &[queue::SAY_USAGE],
+        run: queue::say,
     },
     Command {
         name: "submit",
@@ -818,7 +834,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), words.len(), "a command listed twice: {list}");
-        for removed in ["status", "dispatch", "charter", "hook", "corpus", "judge"] {
+        for removed in ["dispatch", "charter", "hook", "corpus", "judge"] {
             assert!(
                 !words.contains(&removed),
                 "{removed} is no longer a command"
@@ -918,13 +934,28 @@ mod tests {
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), all, "a word names two rows: {words:?}");
-        for removed in ["status", "dispatch", "charter", "hook", "corpus", "judge"] {
+        for removed in ["dispatch", "charter", "hook", "corpus", "judge"] {
             assert!(
                 find(removed).is_none(),
                 "{removed} stays an unknown command"
             );
         }
-        assert_eq!(COMMANDS.len(), 33, "the commands: {words:?}");
+        assert_eq!(COMMANDS.len(), 35, "the commands: {words:?}");
+    }
+
+    #[test]
+    fn the_usage_names_status_and_say_after_the_contracts_line() {
+        assert!(MORE_USAGE.contains("spawn status [--json]"), "{MORE_USAGE}");
+        assert!(
+            MORE_USAGE.contains(
+                "spawn say <agent> <message> [--session <sid>] [--key <idempotency-key>] [--json]"
+            ),
+            "{MORE_USAGE}"
+        );
+        assert!(
+            !USAGE.contains("status") && !USAGE.contains("say"),
+            "the contract's line stays as it was: {USAGE}"
+        );
     }
 
     #[test]
