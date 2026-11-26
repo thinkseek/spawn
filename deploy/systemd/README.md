@@ -17,6 +17,7 @@ main, changes nothing live until that commit is gated and deployed.
 | `spawn-serve` | `spawn serve`: UI and API, read as `spawn_reader`, and a person's input to a session typed as `spawn_human` (the one write, `POST /api/session/<id>/input`); the UI is the build `deploy.sh` installs in `~/.local/share/spawn-rsi/web` (`SPAWN_WEB_DIR`), on `SPAWN_SERVE_ADDRESS` (default `127.0.0.1:8787`). Off loopback (e.g. `0.0.0.0:8787` for the LAN) it refuses to start without `SPAWN_SERVE_TOKEN`; open the UI once as `http://<host>:8787/?token=<token>` | never; without the token it exits and restarts every 3 s |
 | `spawn-jev-relay` (and `.path`) | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key (Keep's `/run/keep/typesafe.api-key`, by `LoadCredential`; objective 201). Without the file (after a reboot, until Keep delivers again) it fails with 243 and stays stopped; `spawn-jev-relay.path` starts it when Keep writes the file | never; stopped while the key file is absent or empty, until Keep writes it |
 | `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.config/spawn/model-relay.env`, 0600, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
+| `spawn-node-gateway` | `spawn-node-gateway` on `SPAWN_NODE_GATEWAY_LISTEN` (default 127.0.0.1:18096): the signed HTTP front of the node ledger for spawn-node v1 ([node-protocol-v1.md](../../docs/node-protocol-v1.md)), logged in as the restricted `spawn_node_gateway` login from `~/.config/spawn/node-gateway.env` (0600), never `spawn.env`; installed by hand (below) | never (`Restart=always`) |
 | `spawn-fleet-test-db` | PostgreSQL 16 on a Unix socket only (`~/.local/share/spawn-rsi/fleet-pg`): the fleet's test server, which engines get as `SPAWN_TEST_DATABASE_URL` once it checks out (below) | never (`Restart=on-failure`) |
 | `spawn-backup` (`.timer`) | `spawn backup dump`: the hourly encrypted `pg_dump` of the event log to R2, bucket-locked, expired by R2's lifecycle; install, keys, windows and cost in [deploy/backup](../backup/README.md) | oneshot, hourly at :00 + up to 5 min |
 | `spawn-backup-bundle` (`.timer`) | `spawn backup bundle`: the daily encrypted bundle of the mission sources and the 14-day transcript window — a full bundle the ISO week's first (or when none is within 7 days), an increment against its base otherwise; with `SPAWN_BACKUP_SYNC_DIR` (the unit sets `/var/tmp/spawn/sync`) the notes folder too, read only, staged on the workspace's disk (never /tmp), its new or changed files scanned for credential values first (a hit, a place the scan could not search or a file it cannot read drops that part, never the rest); a failed run retries twice (15 min apart) | oneshot, daily at 04:00 + up to 1 h |
@@ -105,6 +106,28 @@ with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
 lets the owner's intranet read without the token, by the server's address
 (`http://192.168.31.112:8787/`); a client elsewhere (Tailscale, a container)
 still needs it.
+
+The node gateway (`spawn-node-gateway.service`) runs the binary `deploy.sh`
+builds with `spawn` and installs as `~/.local/share/spawn-rsi/bin/spawn-node-gateway`
+(rollback copy `spawn-node-gateway.prev`); a deploy try-restarts it when the
+binary or its unit changed, and skips it while the unit is not installed. Its
+one secret is `SPAWN_NODE_GATEWAY_DATABASE_URL`, the restricted
+`spawn_node_gateway` login `spawn init-db` creates (it may only call the
+`spawn_node_gw_*` functions), in `~/.config/spawn/node-gateway.env` (0600,
+written without echoing it); never `spawn.env`, so the gateway never holds the
+owner's database URL. Per-host overrides (`SPAWN_NODE_GATEWAY_LISTEN`,
+`SPAWN_NODE_GATEWAY_CELLS`, `SPAWN_NODE_GATEWAY_PUBLIC_PREFIX`) go in the same
+file, read after the unit's defaults. The primary key
+(`~/.config/spawn/node-gateway.pk8`, 0600) is created on first start.
+
+```sh
+mkdir -p -m 755 ~/.local/share/spawn-rsi/node-artifacts ~/.local/share/spawn-rsi/node-results
+# write ~/.config/spawn/node-gateway.env (0600): SPAWN_NODE_GATEWAY_DATABASE_URL=...
+cp deploy/systemd/spawn-node-gateway.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-node-gateway
+journalctl --user -u spawn-node-gateway -n 5   # listen address, cells, public primary key
+```
 
 ## Session backups
 
