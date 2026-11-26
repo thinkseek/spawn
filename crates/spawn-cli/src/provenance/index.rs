@@ -27,10 +27,22 @@
 //! trailers are the integrator's own (`landing_message` indents every line
 //! of a report that could read as one), and only the last paragraph of a
 //! message is read as trailers.
+//!
+//! PV4 adds two things to a landing's `land` Change, the same in the
+//! indexer and the landing hook (which runs this walk):
+//! - `supersedes` edges from the dispatcher's brief of the landing's task
+//!   (its `task.assigned` record, never agent text): `reverts: task N`,
+//!   `fixes: task N`, `supersedes: task N (<reason>)` ([`directives`],
+//!   [`supersedes`]);
+//! - with a workspace root, the files over the cap the task's workspace
+//!   left out (`<root>/.oversized/<agent>`, decision D6), as `content`
+//!   entries with their `sha256:` digest and size, for the landing that is
+//!   main's newest commit ([`oversized_entries`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write as _};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 use serde_json::json;
@@ -224,6 +236,129 @@ pub(crate) fn trailers(message: &str) -> Trailers {
         }
     }
     found
+}
+
+/// What a dispatcher's directive line says of an earlier task (PV4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DirectiveKind {
+    /// `reverts: task N`: this task undoes task N.
+    Reverts,
+    /// `fixes: task N`: this task fixes task N (reported, never scored).
+    Fixes,
+    /// `supersedes: task N (<reason>)`, a reason that is no defect.
+    Supersedes(SupersedeReason),
+}
+
+/// The reasons a `supersedes:` line may give: none is a defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SupersedeReason {
+    Refactor,
+    Format,
+    Planned,
+    Requirement,
+}
+
+impl SupersedeReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Refactor => "refactor",
+            Self::Format => "format",
+            Self::Planned => "planned",
+            Self::Requirement => "requirement",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "refactor" => Self::Refactor,
+            "format" => Self::Format,
+            "planned" => Self::Planned,
+            "requirement" => Self::Requirement,
+            _ => return None,
+        })
+    }
+}
+
+/// One directive of a dispatcher's brief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Directive {
+    pub(crate) kind: DirectiveKind,
+    pub(crate) task: i64,
+}
+
+/// The `defect` reason of a `supersedes` edge.
+pub(crate) const REASON_DEFECT: &str = "defect";
+
+/// Evidence of level 1 (decisions B6, item 2): the dispatcher's `reverts:`
+/// landing restores the paths of the task it names to their `before`.
+pub(crate) const EVIDENCE_LEVEL1: &str = "level1_revert";
+
+/// Evidence of level 2: a regression test bisected to the landing. No
+/// writer yet; `spawn prov durability` counts it when one exists.
+pub(crate) const EVIDENCE_LEVEL2: &str = "level2_bisect";
+
+/// A `reverts:` whose landing does not restore those paths.
+pub(crate) const EVIDENCE_UNVERIFIED: &str = "unverified_revert";
+
+/// A dispatcher's `fixes:`: reported, never scored.
+pub(crate) const EVIDENCE_FIXES: &str = "dispatcher_fixes";
+
+/// A dispatcher's `supersedes: task N (<reason>)`.
+pub(crate) const EVIDENCE_SUPERSEDES: &str = "dispatcher_supersedes";
+
+/// The directives of a dispatcher's brief, in order, each once: every line
+/// that is, whole, `reverts: task N`, `fixes: task N` or `supersedes: task
+/// N (refactor|format|planned|requirement)`, any case, with optional
+/// spaces, an optional `#` before N, an optional list marker (`-`, `*`)
+/// and an optional final `.`. Anything else on the line (quotes, words
+/// around it) makes it no directive, so prose that mentions one is none.
+pub(crate) fn directives(brief: &str) -> Vec<Directive> {
+    let mut found: Vec<Directive> = Vec::new();
+    for line in brief.lines() {
+        let Some(directive) = directive(line) else {
+            continue;
+        };
+        if !found.contains(&directive) {
+            found.push(directive);
+        }
+    }
+    found
+}
+
+/// One line as a [`Directive`], if it is one.
+fn directive(line: &str) -> Option<Directive> {
+    let mut text = line.trim();
+    if let Some(rest) = text.strip_prefix(['-', '*'])
+        && rest.starts_with(char::is_whitespace)
+    {
+        text = rest.trim_start();
+    }
+    let text = text.strip_suffix('.').unwrap_or(text).trim_end();
+    let (word, rest) = text.split_once(':')?;
+    let word = word.trim().to_ascii_lowercase();
+    let rest = rest.trim_start();
+    let task_word = rest.get(..4)?;
+    if !task_word.eq_ignore_ascii_case("task") {
+        return None;
+    }
+    let rest = rest[4..].trim_start();
+    let rest = rest.strip_prefix('#').unwrap_or(rest);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || (digits < rest.len() && !rest[digits..].starts_with([' ', '\t', '('])) {
+        return None;
+    }
+    let task: i64 = rest[..digits].parse().ok().filter(|task| *task > 0)?;
+    let tail = rest[digits..].trim();
+    let kind = match word.as_str() {
+        "reverts" if tail.is_empty() => DirectiveKind::Reverts,
+        "fixes" if tail.is_empty() => DirectiveKind::Fixes,
+        "supersedes" => {
+            let reason = tail.strip_prefix('(')?.strip_suffix(')')?.trim();
+            DirectiveKind::Supersedes(SupersedeReason::parse(reason)?)
+        }
+        _ => return None,
+    };
+    Some(Directive { kind, task })
 }
 
 /// One path of `git diff-tree -r -z --no-renames`.
@@ -595,6 +730,18 @@ impl Repo {
             Some((_, kind, size)) if kind == "blob" => i64::try_from(size).ok(),
             _ => None,
         })
+    }
+
+    /// The object `commit` holds at `path` (a blob, a tree, a submodule's
+    /// commit), `None` when it holds nothing there.
+    pub(crate) fn object_at(&mut self, commit: &str, path: &str) -> Result<Option<String>, String> {
+        if path.is_empty() || path.starts_with('"') {
+            return Ok(None);
+        }
+        Ok(self
+            .objects
+            .info(&format!("{commit}:{path}"))?
+            .map(|(oid, _, _)| oid))
     }
 
     /// The tree `commit` holds at the top-level directory `name`, if any.
