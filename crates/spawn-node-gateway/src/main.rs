@@ -1,6 +1,9 @@
 //! `spawn-node-gateway`: configured by its environment (see
 //! `spawn_node_gateway::config`), serves until killed.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::Arc;

@@ -103,7 +103,12 @@ pub enum Range {
     /// ranges, another unit, a malformed one).
     Whole,
     /// `[start, end]`, inclusive.
-    Part { start: u64, end: u64 },
+    Part {
+        /// Inclusive start byte offset.
+        start: u64,
+        /// Inclusive end byte offset.
+        end: u64,
+    },
     /// Starts past the end: `416`.
     Unsatisfiable,
 }

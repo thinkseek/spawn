@@ -19,7 +19,9 @@ pub const MAX_KEYS: usize = 4096;
 /// A node's verified key and the boot it was last verified for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedKey {
+    /// Verified Ed25519 public key for the node.
     pub key: PublicKey,
+    /// Boot identifier associated with the verified key.
     pub boot_id: String,
 }
 
@@ -44,6 +46,7 @@ impl Default for KeyCache {
 }
 
 impl KeyCache {
+    /// Creates an empty key cache with entry lifetime `ttl` and maximum capacity `cap`.
     pub fn new(ttl: Duration, cap: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
@@ -100,14 +103,17 @@ impl KeyCache {
         );
     }
 
+    /// Removes any cached public key for `node_id`.
     pub fn evict(&self, node_id: &str) {
         self.lock().remove(node_id);
     }
 
+    /// Returns the number of entries currently in the cache (including unexpired and uncollected ones).
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
+    /// Returns `true` when the cache holds no entries.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

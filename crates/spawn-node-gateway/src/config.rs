@@ -14,15 +14,24 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// Environment variable holding the restricted `spawn_node_gateway` PostgreSQL connection URL.
 pub const ENV_DATABASE_URL: &str = "SPAWN_NODE_GATEWAY_DATABASE_URL";
+/// Environment variable holding the path to the primary's PKCS#8 Ed25519 key file.
 pub const ENV_KEY_FILE: &str = "SPAWN_NODE_GATEWAY_KEY_FILE";
+/// Environment variable overriding the HTTP listen socket address.
 pub const ENV_LISTEN: &str = "SPAWN_NODE_GATEWAY_LISTEN";
+/// Environment variable holding the artifact storage root directory.
 pub const ENV_ARTIFACTS: &str = "SPAWN_NODE_ARTIFACTS";
+/// Environment variable holding the job result directory.
 pub const ENV_RESULTS: &str = "SPAWN_NODE_RESULTS";
+/// Environment variable listing the comma-separated cell names served by this gateway.
 pub const ENV_CELLS: &str = "SPAWN_NODE_GATEWAY_CELLS";
+/// Environment variable setting an optional reverse-proxy URL path prefix.
 pub const ENV_PUBLIC_PREFIX: &str = "SPAWN_NODE_GATEWAY_PUBLIC_PREFIX";
 
+/// Default listen socket address when [`ENV_LISTEN`] is unset.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:18096";
+/// Default cell name when [`ENV_CELLS`] is unset.
 pub const DEFAULT_CELL: &str = "c0";
 
 /// Everything the gateway reads at start.
@@ -30,10 +39,15 @@ pub const DEFAULT_CELL: &str = "c0";
 pub struct Config {
     /// Never printed: it holds the login's password.
     pub database_url: String,
+    /// Path to the primary's PKCS#8 Ed25519 key file.
     pub key_file: PathBuf,
+    /// TCP socket address the HTTP server binds to.
     pub listen: SocketAddr,
+    /// Root directory storing content-addressed artifact blobs and manifests.
     pub artifacts: PathBuf,
+    /// Directory storing execution log and metadata files.
     pub results: PathBuf,
+    /// Cell identifiers served by this gateway instance.
     pub cells: Vec<String>,
     /// Empty, or `/` and path characters without a trailing `/`.
     pub public_prefix: String,

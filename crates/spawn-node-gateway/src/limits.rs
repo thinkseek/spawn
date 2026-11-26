@@ -22,7 +22,9 @@ const MAX_BUCKETS: usize = 64 * 1024;
 /// Which allowance a request draws on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
+    /// Control-plane and ledger-backed JSON API requests.
     Api,
+    /// Artifact blob and registry manifest download requests.
     Artifact,
 }
 
@@ -38,7 +40,9 @@ impl Class {
 /// Who a bucket paces.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Subject {
+    /// Rate limit bucket keyed by client IP address.
     Source(IpAddr),
+    /// Rate limit bucket keyed by node identifier.
     Node(String),
 }
 
