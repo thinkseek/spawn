@@ -1334,12 +1334,15 @@
         "crates/spawn-host/src/cow.rs",
         "crates/spawn-host/src/d6_cutover.rs",
         "crates/spawn-host/src/d6_layer0.rs",
+        "crates/spawn-host/src/d6_shadow.rs",
+        "crates/spawn-host/src/d6_workspace.rs",
         "crates/spawn-host/src/git_border.rs",
         "crates/spawn-host/src/merkle_merge.rs",
         "crates/spawn-host/tests/cow.rs",
         "crates/spawn-host/tests/d6_border.rs",
         "crates/spawn-host/tests/d6_layer0_cutover.rs",
         "crates/spawn-host/tests/d6_merge_oracle.rs",
+        "crates/spawn-host/tests/d6_workspace.rs",
         "docs/cross-os-cow-storage.md",
         "docs/d6-cas-v1.md"
       ],
@@ -1369,7 +1372,8 @@
           "crates/spawn-cas/tests/d6_journal_gc.rs",
           "crates/spawn-cas/tests/store.rs",
           "crates/spawn-host/tests/cow.rs",
-          "crates/spawn-host/tests/d6_layer0_cutover.rs"
+          "crates/spawn-host/tests/d6_layer0_cutover.rs",
+          "crates/spawn-host/tests/d6_workspace.rs"
         ],
         "deploys": [],
         "artifacts": [

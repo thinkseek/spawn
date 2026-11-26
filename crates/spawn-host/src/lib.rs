@@ -23,6 +23,8 @@ pub mod cas_merkle;
 pub mod cow;
 pub mod d6_cutover;
 pub mod d6_layer0;
+pub mod d6_shadow;
+pub mod d6_workspace;
 pub mod engine_view;
 pub mod git;
 pub mod git_border;
@@ -71,6 +73,11 @@ pub use d6_layer0::{
     Layer0MaterializeReport, Layer0Options, audit_export_attributes, materialize_layer0,
     materialize_workspace_from_tree,
 };
+pub use d6_shadow::{
+    SetAsideWhen, ShadowCheckpointOutcome, ShadowD6Workspace, ShadowOracleMetrics,
+    ShadowTrackedSetMode,
+};
+pub use d6_workspace::D6Workspace;
 pub use engine_view::{BwrapView, ExtraMount, HomeIsolation, ViewConfig};
 #[cfg(any(test, feature = "testing"))]
 pub use git::test_git_command;
