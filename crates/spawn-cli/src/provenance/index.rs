@@ -1468,7 +1468,9 @@ pub(crate) fn oversized_entries(
 }
 
 /// Index `repo`'s history into `domain`: everything not recorded yet, in
-/// the walk's order (module doc). Returns what it recorded.
+/// the walk's order (module doc), with no workspace root
+/// ([`index_with`]). Returns what it recorded.
+#[cfg(test)]
 pub(crate) fn index(
     store: &PostgresStore,
     repo: &mut Repo,
