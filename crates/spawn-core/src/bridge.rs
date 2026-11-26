@@ -4075,8 +4075,6 @@ impl Bridge {
             prompt,
             parent,
             native,
-            from,
-            model,
             driver,
             ..
         } = *begin;
