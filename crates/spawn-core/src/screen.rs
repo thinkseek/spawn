@@ -598,7 +598,8 @@ fn agy_prompt(line: &str) -> Option<&str> {
 /// placeholder for an empty prompt: the hint of its permission mode, as
 /// agy 1.5.17 draws it after a turn (`Auto mode: edits & safe commands
 /// auto-approved (shift+tab to cycle)`), never something typed. A mode's
-/// name, `mode:`, its description, and the cycle hint last.
+/// name (capitalized words), `mode:`, its description, and the cycle hint
+/// last.
 fn agy_mode_placeholder(text: &str) -> bool {
     let Some(described) = text.trim().strip_suffix("(shift+tab to cycle)") else {
         return false;
@@ -609,7 +610,12 @@ fn agy_mode_placeholder(text: &str) -> bool {
     let words: Vec<&str> = head.split_whitespace().collect();
     words.len() <= 3
         && words.last().is_some_and(|word| word.eq_ignore_ascii_case("mode"))
-        && head.chars().all(|c| c.is_alphabetic() || c == ' ' || c == '-')
+        && words
+            .iter()
+            .all(|word| word.chars().all(char::is_alphabetic))
+        && words
+            .first()
+            .is_some_and(|word| word.starts_with(char::is_uppercase))
         && !description.trim().is_empty()
 }
 
