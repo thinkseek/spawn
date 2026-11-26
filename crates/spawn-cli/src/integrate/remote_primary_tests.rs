@@ -127,7 +127,7 @@ fn settings(dir: &Path, believe_reject: bool, wait: Duration) -> PrimarySettings
         cargo_home: cargo_home(dir),
         queue_wait: wait,
         every: Duration::from_millis(20),
-        limit: Duration::from_secs(120),
+        limit: Duration::from_mins(2),
     }
 }
 
@@ -242,6 +242,14 @@ impl Fixture {
     }
 }
 
+/// The node's verdict the primary path believed.
+fn believed(outcome: PrimaryOutcome) -> remote::Believed {
+    match outcome {
+        PrimaryOutcome::Believed(believed) => *believed,
+        other => panic!("not believed: {other:?}"),
+    }
+}
+
 fn local_why(outcome: &PrimaryOutcome) -> &str {
     match outcome {
         PrimaryOutcome::Local { why } => why,
@@ -291,6 +299,24 @@ fn the_primary_path_is_off_unless_node_and_refuses_what_it_does_not_know() {
         .expect_err(unknown);
         assert!(refused.contains("SPAWN_GATE_REMOTE"), "{refused}");
     }
+}
+
+/// `node` needs its directories; M3b is off unless set to 1, and refused
+/// when it is anything but 1 or 0.
+#[test]
+fn the_primary_path_on_needs_its_directories_and_m3b_is_its_own_switch() {
+    let env = |pairs: &[(&str, &str)]| {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    };
     // `node` without its directories, or with relative ones.
     assert!(remote::primary_settings(env(&[("SPAWN_GATE_REMOTE", "node")])).is_err());
     assert!(
@@ -390,17 +416,14 @@ fn m3a_an_acceptance_on_the_jobs_own_inputs_is_believed() {
         .primary
         .judge(&world.ledger.store, &world.request(), &|| false);
     let grant = ran.join().expect("the node");
-    let PrimaryOutcome::Believed {
+    let remote::Believed {
         verdict,
         given,
         env,
         belief,
         job_id,
         base_check,
-    } = outcome
-    else {
-        panic!("not believed: {outcome:?}");
-    };
+    } = believed(outcome);
     assert!(verdict.accepted);
     assert_eq!(belief, "M3a");
     assert_eq!(base_check, None);
@@ -489,12 +512,9 @@ fn m3a_judges_a_rejection_again_here_and_m3b_believes_it() {
             .judge(&world.ledger.store, &world.request(), &|| false);
         ran.join().expect("the node");
         if believe_reject {
-            let PrimaryOutcome::Believed {
+            let remote::Believed {
                 verdict, belief, ..
-            } = outcome
-            else {
-                panic!("M3b believes a rejection: {outcome:?}");
-            };
+            } = believed(outcome);
             assert!(!verdict.accepted);
             assert_eq!(belief, "M3b");
         } else {
@@ -538,9 +558,7 @@ fn unequal_inputs_strike_and_the_job_goes_to_another_node() {
         .primary
         .judge(&world.ledger.store, &world.request(), &|| false);
     ran.join().expect("the nodes");
-    let PrimaryOutcome::Believed { env, .. } = outcome else {
-        panic!("believed on the second node: {outcome:?}");
-    };
+    let env = believed(outcome).env;
     assert_eq!(env["runner"], "node:nb");
     assert_eq!(world.ledger.strikes("na"), (1, false));
     assert_eq!(world.ledger.strikes("nb"), (0, false));
@@ -896,7 +914,7 @@ fn a_take_back_that_loses_to_a_lease_waits_for_the_nodes_result() {
     let outcome = follow(&world, &job);
     ran.join().expect("the node");
     assert!(
-        matches!(outcome, PrimaryOutcome::Believed { ref verdict, .. } if verdict.accepted),
+        matches!(&outcome, PrimaryOutcome::Believed(believed) if believed.verdict.accepted),
         "{outcome:?}"
     );
 }
@@ -977,9 +995,7 @@ fn a_lease_fenced_back_to_the_queue_is_waited_for_again() {
     });
     let outcome = follow(&world, &job);
     ran.join().expect("the node");
-    let PrimaryOutcome::Believed { env, .. } = outcome else {
-        panic!("believed after the fence: {outcome:?}");
-    };
+    let env = believed(outcome).env;
     assert_eq!(env["runner"], "node:nb");
 }
 
