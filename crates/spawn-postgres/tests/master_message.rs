@@ -453,3 +453,118 @@ fn a_derived_steer_or_stop_key_another_request_used_is_refused() {
         "only the second key was made"
     );
 }
+
+/// Submit `action` to the supervisor's session as the owner, and finish it
+/// (an earlier start that ran and ended).
+fn finished_start(store: &PostgresStore, schema: &str, name: &str, action: CommandAction) {
+    use spawn_core::command::Submission;
+    use spawn_core::id::Principal;
+    use spawn_core::port::CommandQueue;
+    let id = store
+        .submit(
+            &Principal::new("owner").expect("valid principal"),
+            &Submission {
+                agent_id: AgentId::new(AGENT).expect("valid agent"),
+                session_id: SessionId::new(SESSION).expect("valid session"),
+                idempotency_key: key(name),
+                action,
+            },
+        )
+        .expect("submit succeeds");
+    admin(schema)
+        .execute(
+            "update spawn_commands set state = 'finished' where id = $1",
+            &[&i64::try_from(id.0).expect("an id")],
+        )
+        .expect("finish it");
+}
+
+/// H4r (decision C2, SQL wake): a supervisor that never bound a native
+/// session is woken by a start on the engine, model profile and model label
+/// of its newest start, each only when that start names it; with no start
+/// at all (or a Claude start without them) the wake is what it always was.
+/// `latest_engine` reads the same newest start (N4's lookup).
+#[test]
+fn a_cold_wake_takes_the_engine_model_and_label_of_the_newest_start() {
+    let (store, schema) = store("master_wake_engine");
+    let session = SessionId::new(SESSION).expect("valid session");
+    assert_eq!(store.latest_engine(&session).expect("reads"), None);
+    finished_start(
+        &store,
+        &schema,
+        "first-claude",
+        CommandAction::Start {
+            engine: ENGINE.to_string(),
+            prompt: "p".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: None,
+            charter: None,
+            model_label: None,
+        },
+    );
+    assert_eq!(
+        store.latest_engine(&session).expect("reads").as_deref(),
+        Some("claude")
+    );
+    let page = human(&schema);
+    let claude = sent(&page, "c1", "Hello.", "auto");
+    let listed = commands(&schema);
+    let wake = &listed
+        .iter()
+        .find(|command| command.1 == "c1:wake")
+        .expect("a wake")
+        .3;
+    assert_eq!(
+        wake,
+        &json!({"type": "start", "engine": "claude",
+                "prompt": "The owner wrote to you from the dashboard (Master Control) while you \
+                           were stopped; the message follows as your next input. Read it, then \
+                           go on with your work."}),
+        "a Claude session's wake is unchanged: {claude}"
+    );
+    admin(&schema)
+        .execute("update spawn_commands set state = 'finished'", &[])
+        .expect("finish them");
+    finished_start(
+        &store,
+        &schema,
+        "then-agy",
+        CommandAction::Start {
+            engine: "agy".to_string(),
+            prompt: "p".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: Some(ModelProfile::Cheap),
+            charter: None,
+            model_label: Some("gemini-3.8-pro".to_string()),
+        },
+    );
+    assert_eq!(
+        store.latest_engine(&session).expect("reads").as_deref(),
+        Some("agy")
+    );
+    let agy = sent(&page, "a1", "Hello again.", "auto");
+    let listed = commands(&schema);
+    let wake = &listed
+        .iter()
+        .find(|command| command.1 == "a1:wake")
+        .expect("a wake")
+        .3;
+    assert_eq!(wake["engine"], "agy", "{agy}");
+    assert_eq!(wake["model"], "cheap");
+    assert_eq!(wake["model_label"], "gemini-3.8-pro");
+    let parsed: CommandAction = serde_json::from_value(wake.clone()).expect("parses");
+    let CommandAction::Start {
+        engine,
+        model,
+        model_label,
+        ..
+    } = parsed
+    else {
+        panic!("a start: {wake}");
+    };
+    assert_eq!(engine, "agy");
+    assert_eq!(model, Some(ModelProfile::Cheap));
+    assert_eq!(model_label.as_deref(), Some("gemini-3.8-pro"));
+}
