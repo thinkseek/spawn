@@ -1938,6 +1938,7 @@
         "crates/spawn-postgres/src/remote_jobs.rs",
         "crates/spawn-postgres/tests/nodes.rs",
         "crates/spawn-postgres/tests/remote_jobs.rs",
+        "deploy/systemd/spawn-node-gateway.service",
         "docs/fleet-architecture.md",
         "docs/node-protocol-v1.md",
         "web/src/components/fleet/NodeRows.tsx",
@@ -1977,7 +1978,9 @@
           "crates/spawn-postgres/tests/nodes.rs",
           "web/test/nodes.test.ts"
         ],
-        "deploys": [],
+        "deploys": [
+          "deploy/systemd/spawn-node-gateway.service"
+        ],
         "artifacts": [
           "docs/fleet-architecture.md",
           "docs/node-protocol-v1.md"
@@ -2531,6 +2534,7 @@
         "deploy/systemd/spawn-nightly-stale@.timer",
         "deploy/systemd/spawn-nightly@.service",
         "deploy/systemd/spawn-nightly@.timer",
+        "deploy/systemd/spawn-node-gateway.service",
         "deploy/systemd/spawn-serve.service",
         "deploy/systemd/spawn-shadow-observe.service",
         "deploy/systemd/spawn-shadow-observe.timer",
