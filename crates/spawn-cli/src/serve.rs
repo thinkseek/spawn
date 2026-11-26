@@ -1260,7 +1260,7 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
         "/api/verifications" => Box::new(verifications),
         "/api/nodes" => Box::new(nodes),
         "/api/grading" => Box::new(grading),
-        "/api/capabilities" => Box::new(capabilities::capabilities),
+        "/api/capabilities" => Box::new(|| Ok(capabilities::capabilities())),
         "/api/approvals" => Box::new(approvals::approvals),
         "/api/context/digest" => Box::new(digest::digest),
         "/api/prov/who" => Box::new(move || prov::who(query)),

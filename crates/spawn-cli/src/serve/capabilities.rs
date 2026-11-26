@@ -47,7 +47,7 @@ const VERSION_LIMIT: Duration = Duration::from_secs(10);
 const MODELS_LIMIT: Duration = Duration::from_secs(30);
 
 /// How long a probe stays the answer: an hour.
-const PROBE_AGE: Duration = Duration::from_secs(3600);
+const PROBE_AGE: Duration = Duration::from_hours(1);
 
 /// The most of a program's output a probe reads.
 const OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -95,12 +95,16 @@ pub(crate) struct Probe {
     pub(crate) engines: Vec<EngineProbe>,
 }
 
+/// A bounded run of `program` with `arguments` within a limit: its
+/// standard output, or why not ([`run_bounded`]).
+pub(crate) type Run<'a> = &'a dyn Fn(&str, &[&str], Duration) -> Result<String, String>;
+
 /// What a probe reads from its host: the environment, a bounded run of a
 /// program (its standard output, or why not), and whether a path exists
 /// (`stat`, never `open`).
 pub(crate) struct Host<'a> {
     pub(crate) lookup: &'a dyn Fn(&str) -> Option<String>,
-    pub(crate) run: &'a dyn Fn(&str, &[&str], Duration) -> Result<String, String>,
+    pub(crate) run: Run<'a>,
     pub(crate) exists: &'a dyn Fn(&Path) -> bool,
 }
 
@@ -455,13 +459,13 @@ fn terminal_backend() -> Value {
 /// host's label, why it is unavailable), and the terminal backend
 /// ([`terminal_backend`]). The probe is the cached one, made now when none
 /// is younger than an hour.
-pub(crate) fn capabilities() -> Result<Value, String> {
+pub(crate) fn capabilities() -> Value {
     let probe = cached();
-    Ok(json!({
+    json!({
         "probed_at_ms": probe.at_ms,
         "engines": probe.engines,
         "terminal": terminal_backend(),
-    }))
+    })
 }
 
 #[cfg(test)]
