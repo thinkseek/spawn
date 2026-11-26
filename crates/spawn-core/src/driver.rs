@@ -254,15 +254,17 @@ const UNCAPTURED: &str = "no captured screen of this dialog yet: a person answer
 /// was never seen working live (manifest text only, not captured, not
 /// verified) escalates: it gets keys only in a later change that adds the
 /// captured screen as a test. The table never holds an answer nobody has
-/// seen work.
+/// seen work. Every keyed row is one key: the Bridge presses a resolver's
+/// key only while its dialog shows and nothing else went to the pane since,
+/// so a second key of the same answer would find the first already pressed.
 ///
 /// | engine | dialog | guard | answer | evidence |
 /// |---|---|---|---|---|
 /// | agy | `trust_prompt` | the folder shown is the workspace, cursor on "Yes, I trust this folder" | Enter | probed |
 /// | agy | `permission_prompt` | — | escalate | manifest text only |
 /// | agy | `question_prompt` | — | escalate | manifest text only |
-/// | claude | trust | Spawn's `is_trust_dialog` (kind `trust`) | y, Enter | production |
-/// | claude | numbered permission | choice 1 reads "Yes" | 1 | approvals fixtures |
+/// | claude | trust | — | escalate (the Bridge's startup answer, `y` Enter) | production, at startup |
+/// | claude | numbered permission | — | escalate | approvals fixtures only (hand-written) |
 /// | claude | question form, MCP elicitation, dynamic workflow | — | escalate | not captured |
 /// | codex | `trust_directory`, `startup_update`, `live_strong_blocker` | — | escalate | not verified |
 /// | opencode | `permission_required` | — | escalate | not verified |
@@ -286,20 +288,18 @@ pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) 
                 )
             }
         }
-        ("claude", _, "trust") => Answer::Keys(&crate::screen::TRUST_KEYS),
+        // The Bridge answers it before the first prompt (two keys, audited);
+        // at run time the resolver leaves it to a person.
+        ("claude", _, "trust") => Answer::Escalate(
+            "Claude Code's trust dialog is the Bridge's startup answer: a person answers it later",
+        ),
+        // Rows whose screen nobody has captured working yet.
         (
             "claude",
             None | Some("bash_permission_prompt" | "generic_permission_prompt"),
             "permission",
-        ) if dialog
-            .choices
-            .first()
-            .is_some_and(|first| first.trim() == "Yes") =>
-        {
-            Answer::Keys(&CLAUDE_YES)
-        }
-        // Rows whose screen nobody has captured working yet.
-        ("agy", Some("permission_prompt" | "question_prompt"), _)
+        )
+        | ("agy", Some("permission_prompt" | "question_prompt"), _)
         | (
             "claude",
             Some("live_blocked_form" | "mcp_elicitation_prompt" | "dynamic_workflow_prompt"),
@@ -310,9 +310,6 @@ pub fn table_answer(engine: &str, dialog: &Dialog<'_>, workspace: &WorkspaceId) 
         _ => Answer::Escalate("no row of the resolver's table covers this dialog"),
     }
 }
-
-/// Claude Code's first numbered choice ("1. Yes").
-const CLAUDE_YES: [&str; 1] = ["1"];
 
 /// Screens no key may answer: the engine cannot go on without a person
 /// (design section 6.3, "Hard blocks"). Lowercased text; every one is from
@@ -962,42 +959,61 @@ mod tests {
     }
 
     #[test]
-    fn row_claude_trust_dialog_in_production_answers_trust_keys() {
+    fn row_claude_trust_dialog_is_the_bridges_startup_answer_and_escalates_at_run_time() {
         use super::{Answer, table_answer};
         let shown = dialog(None, "trust", None, &[], &[]);
-        assert_eq!(
-            table_answer("claude", &shown, &ws()),
-            Answer::Keys(&TRUST_KEYS)
-        );
-        assert_eq!(
-            ClaudeDriver.dialog_answer(&shown, &ws()),
-            Answer::Keys(&TRUST_KEYS)
-        );
+        assert!(matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)));
+        assert!(matches!(ClaudeDriver.dialog_answer(&shown, &ws()), Answer::Escalate(_)));
+        // The Bridge's own startup answer is unchanged.
+        let trust = "Do you trust the files in this folder?\n\ny. Yes, I trust this folder\n\
+                     n. No, exit\nEnter y/n:\nEnter to confirm · Esc to cancel\n";
+        assert_eq!(ClaudeDriver.startup_answer(trust), Some(&TRUST_KEYS[..]));
     }
 
     #[test]
-    fn row_claude_numbered_permission_approvals_fixture_answers_1_when_choice_1_is_yes() {
+    fn row_claude_numbered_permission_not_captured_escalates() {
         use super::{Answer, table_answer};
         let yes = strings(&["Yes", "Yes, and don't ask again", "No"]);
-        for rule in [
-            None,
-            Some("bash_permission_prompt"),
-            Some("generic_permission_prompt"),
-        ] {
+        for rule in [None, Some("bash_permission_prompt"), Some("generic_permission_prompt")] {
             let shown = dialog(rule, "permission", Some("Yes"), &yes, &[]);
-            assert_eq!(table_answer("claude", &shown, &ws()), Answer::Keys(&["1"]));
+            assert!(
+                matches!(table_answer("claude", &shown, &ws()), Answer::Escalate(_)),
+                "{rule:?}"
+            );
         }
-        let no_first = strings(&["No", "Yes"]);
-        let shown = dialog(None, "permission", None, &no_first, &[]);
-        assert!(matches!(
-            table_answer("claude", &shown, &ws()),
-            Answer::Escalate(_)
-        ));
-        let choice = dialog(None, "choice", None, &yes, &[]);
-        assert!(matches!(
-            table_answer("claude", &choice, &ws()),
-            Answer::Escalate(_)
-        ));
+    }
+
+    /// Every row that answers with keys answers with one key.
+    #[test]
+    fn every_keyed_row_of_the_table_is_one_key() {
+        use super::{Answer, table_answer};
+        let choices = strings(&["Yes, I trust this folder", "No, exit", "Yes", "No"]);
+        let body = strings(&["Accessing workspace:", "/workspaces/agent_a"]);
+        let mut keyed = 0;
+        for engine in ["agy", "claude", "codex", "opencode", "other"] {
+            for rule in [
+                None,
+                Some("trust_prompt"),
+                Some("permission_prompt"),
+                Some("question_prompt"),
+                Some("bash_permission_prompt"),
+                Some("generic_permission_prompt"),
+                Some("live_blocked_form"),
+                Some("trust_directory"),
+                Some("permission_required"),
+            ] {
+                for kind in ["trust", "permission", "choice", "yes_no", "confirm"] {
+                    for cursor in [None, Some("Yes, I trust this folder"), Some("Yes")] {
+                        let shown = dialog(rule, kind, cursor, &choices, &body);
+                        if let Answer::Keys(keys) = table_answer(engine, &shown, &ws()) {
+                            keyed += 1;
+                            assert_eq!(keys.len(), 1, "{engine} {rule:?} {kind}: {keys:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(keyed > 0, "the agy trust row answers");
     }
 
     #[test]
