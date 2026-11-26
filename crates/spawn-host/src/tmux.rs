@@ -1501,8 +1501,8 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 #[cfg(test)]
 mod tests {
     use super::{
-        READ_LIMIT, end_stragglers, read_in_workspace, read_local, replace_local, runner_of,
-        stragglers_beneath, sweepable,
+        READ_LIMIT, end_stragglers, list_dirs_files, read_in_workspace, read_local, replace_local,
+        runner_of, stragglers_beneath, sweepable,
     };
     use spawn_core::id::TerminalName;
     use spawn_core::port::Runner;
@@ -1542,6 +1542,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn touch_dir(dir: &std::path::Path, seconds: u64) {
+        let opened = std::fs::File::open(dir).unwrap();
+        opened
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    /// F5: a directory's subdirectories, newest first, never a file, a
+    /// symlink to a directory, or anything through a symlinked directory;
+    /// at most 64; the same below a `Beneath`.
+    #[test]
+    fn list_dirs_gives_plain_subdirectories_newest_first() {
+        let dir = scratch("list-dirs");
+        let brain = dir.join("brain");
+        std::fs::create_dir_all(&brain).unwrap();
+        for (name, seconds) in [("old", 1_000), ("newest", 3_000), ("middle", 2_000)] {
+            std::fs::create_dir(brain.join(name)).unwrap();
+            touch_dir(&brain.join(name), seconds);
+        }
+        std::fs::write(brain.join("a-file"), b"x").unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        touch_dir(&elsewhere, 9_000);
+        std::os::unix::fs::symlink(&elsewhere, brain.join("linked")).unwrap();
+        let path = brain.to_str().unwrap();
+        assert_eq!(
+            list_dirs_files(None, path).unwrap(),
+            vec!["newest", "middle", "old"]
+        );
+        let beneath = crate::beneath::Beneath::new(&dir);
+        assert_eq!(
+            list_dirs_files(Some(&beneath), path).unwrap(),
+            vec!["newest", "middle", "old"]
+        );
+        // Missing: empty. A symlinked directory is never listed through.
+        let missing = dir.join("missing");
+        assert!(list_dirs_files(None, missing.to_str().unwrap()).unwrap().is_empty());
+        assert!(list_dirs_files(Some(&beneath), missing.to_str().unwrap()).unwrap().is_empty());
+        let link = dir.join("brain-link");
+        std::os::unix::fs::symlink(&brain, &link).unwrap();
+        assert!(list_dirs_files(None, link.to_str().unwrap()).is_err());
+        assert!(list_dirs_files(Some(&beneath), link.to_str().unwrap()).is_err());
+        // Bounded.
+        let many = dir.join("many");
+        std::fs::create_dir(&many).unwrap();
+        for at in 0..70_u64 {
+            let sub = many.join(format!("c{at:02}"));
+            std::fs::create_dir(&sub).unwrap();
+            touch_dir(&sub, 10_000 + at);
+        }
+        let listed = list_dirs_files(None, many.to_str().unwrap()).unwrap();
+        assert_eq!(listed.len(), spawn_core::port::LIST_DIRS_LIMIT);
+        assert_eq!(listed.first().map(String::as_str), Some("c69"));
+        assert_eq!(listed.last().map(String::as_str), Some("c06"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// S16: a transcript is replaced only by a longer file, only while it
