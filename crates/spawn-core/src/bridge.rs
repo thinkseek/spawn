@@ -3136,15 +3136,27 @@ impl Bridge {
     }
 
     /// Bind the native session an engine named itself
-    /// ([`SessionBinding::Reported`]): the host reports it for the
-    /// execution's own pane ([`TerminalHost::agent`]), as the engine's own
-    /// agent's (`agent` is the driver's id), its transcript is there below
-    /// the engine's home, and a prompt in it holds the marker of a command
-    /// Spawn typed into this session (its `typing` step is this session's)
-    /// for this execution or later (its start or after). A session reported
-    /// for the pane by anything else (`pane.report_agent_session` is open to
-    /// any client of the server) whose transcript quotes another session's
-    /// marker, or one never typed, is never bound. Then
+    /// ([`SessionBinding::Reported`]): its transcript is there below the
+    /// engine's home, and a prompt in it holds the marker of a command Spawn
+    /// typed into this session (its `typing` step is this session's) for
+    /// this execution or later (its start or after).
+    ///
+    /// The candidate sessions are, first, the one the host reports for the
+    /// execution's own pane ([`TerminalHost::agent`]) as the engine's own
+    /// agent's (`agent` is the driver's id); then, when the host reports
+    /// none (or the one it reports is not this execution's) and something
+    /// was typed into this execution, the conversations below the engine's
+    /// home ([`AgentDriver::session_scan_dir`], [`TerminalHost::list_dirs`],
+    /// newest first). That fallback is what binds agy inside its filesystem
+    /// view, where its hooks (`~/.gemini/config/hooks.json`) and the host's
+    /// socket stay masked, so it never reports a session to the host. A
+    /// pane the host says runs another agent binds nothing.
+    ///
+    /// The marker is the proof, whichever way a candidate came: a session
+    /// reported for the pane by anything else (`pane.report_agent_session`
+    /// is open to any client of the server), or a conversation directory
+    /// another execution or anything else made, whose transcript quotes
+    /// another session's marker, or one never typed, is never bound. Then
     /// `session.native_started` is recorded, and the transcript is read from
     /// its start. Until then nothing is bound, and asked again next pass.
     fn bind_reported(
@@ -3153,51 +3165,83 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<Option<String>, StoreError> {
-        let Ok(Some(reading)) = self.terminals.agent(&active.terminal(), &active.workspace) else {
-            return Ok(None);
+        let reading = match self.terminals.agent(&active.terminal(), &active.workspace) {
+            Ok(reading) => reading,
+            Err(_) => return Ok(None),
         };
-        if reading.agent.as_deref() != Some(active.driver.id()) {
+        // Another agent in the engine's pane: nothing is known.
+        if reading
+            .as_ref()
+            .and_then(|reading| reading.agent.as_deref())
+            .is_some_and(|agent| agent != active.driver.id())
+        {
             return Ok(None);
         }
-        let Some(native) = reading.session.filter(|native| plain_session_id(native)) else {
-            return Ok(None);
-        };
-        let home = self.config.home_of(active.driver);
-        let path = active
-            .driver
-            .transcript_path(&home, &active.workspace, &native);
-        let root = format!("{}/", home.sessions.trim_end_matches('/'));
-        if !path.starts_with(&root) {
-            return Ok(None);
-        }
-        let Ok(Some(bytes)) = self.terminals.read_from(&active.workspace, &path, 0) else {
-            return Ok(None);
-        };
+        let reported = reading
+            .filter(|reading| reading.agent.as_deref() == Some(active.driver.id()))
+            .and_then(|reading| reading.session)
+            .filter(|native| plain_session_id(native));
         let first = active
             .execution_id
             .as_str()
             .strip_prefix("exec_")
             .and_then(|command| command.parse::<u64>().ok())
             .unwrap_or(u64::MAX);
+        let view = self.sessions.get(session);
         let ours = |command: &CommandId| {
             command.0 >= first
-                && self.sessions.get(session).is_some_and(|view| {
+                && view.is_some_and(|view| {
                     view.steps
                         .get(command)
                         .is_some_and(|steps| steps.typing_at.is_some())
                 })
         };
-        let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
-            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
-                value["type"] == "USER_INPUT"
-                    && value["content"]
-                        .as_str()
-                        .is_some_and(|content| crate::message::markers(content).iter().any(ours))
+        let home = self.config.home_of(active.driver);
+        let root = format!("{}/", home.sessions.trim_end_matches('/'));
+        // The transcript of `native`, when it is below the engine's home and
+        // a prompt in it holds a marker typed into this execution.
+        let proven = |native: &str| -> Option<String> {
+            let path = active
+                .driver
+                .transcript_path(&home, &active.workspace, native);
+            if !path.starts_with(&root) {
+                return None;
+            }
+            let Ok(Some(bytes)) = self.terminals.read_from(&active.workspace, &path, 0) else {
+                return None;
+            };
+            let typed = String::from_utf8_lossy(&bytes).lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                    value["type"] == "USER_INPUT"
+                        && value["content"].as_str().is_some_and(|content| {
+                            crate::message::markers(content).iter().any(ours)
+                        })
+                })
+            });
+            typed.then_some(path)
+        };
+        let mut bound = reported
+            .as_deref()
+            .and_then(|native| proven(native).map(|path| (native.to_string(), path)));
+        if bound.is_none()
+            && let Some(dir) = active.driver.session_scan_dir(&home)
+            && view.is_some_and(|view| {
+                view.steps.iter().any(|(command, steps)| {
+                    command.0 >= first && steps.typing_at.is_some()
+                })
             })
-        });
-        if !typed {
-            return Ok(None);
+            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+        {
+            bound = names
+                .iter()
+                .filter(|native| plain_session_id(native))
+                .filter(|native| reported.as_deref() != Some(native.as_str()))
+                .take(crate::port::LIST_DIRS_LIMIT)
+                .find_map(|native| proven(native).map(|path| (native.clone(), path)));
         }
+        let Some((native, path)) = bound else {
+            return Ok(None);
+        };
         self.append(
             agent_id,
             session,
