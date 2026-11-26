@@ -320,6 +320,22 @@ pub struct PresetDriver {
     pub label_only: bool,
 }
 
+/// The engine a preset whose `engine_label` is `engine_label` runs
+/// ([`GradedPreset::driver_id`]): delivery reads it from a task row, which
+/// carries the label, not the whole preset.
+pub fn preset_driver(engine_label: &str) -> PresetDriver {
+    match crate::driver::driver(engine_label) {
+        Some(driver) => PresetDriver {
+            driver: driver.id(),
+            label_only: false,
+        },
+        None => PresetDriver {
+            driver: crate::driver::DEFAULT,
+            label_only: true,
+        },
+    }
+}
+
 impl GradedPreset {
     /// The engine its worker runs (design 7.1, "the one link"): its
     /// `engine_label` when that names a registered driver, else Claude Code
@@ -327,16 +343,7 @@ impl GradedPreset {
     /// never reads whether the host can run the engine (delivery does, and
     /// makes no start for an engine the host cannot run).
     pub fn driver_id(&self) -> PresetDriver {
-        match crate::driver::driver(&self.engine_label) {
-            Some(driver) => PresetDriver {
-                driver: driver.id(),
-                label_only: false,
-            },
-            None => PresetDriver {
-                driver: crate::driver::DEFAULT,
-                label_only: true,
-            },
-        }
+        preset_driver(&self.engine_label)
     }
 
     /// The grade routing reads: none unless the state is routed, else the
