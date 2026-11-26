@@ -7,8 +7,9 @@
 //! here (the judge's evidence, the attention view's read back), so it is
 //! masked here first: as it is only for a session whose newest start is
 //! positively Claude Code's, through its engine's mask otherwise, a failed
-//! lookup included (decision C2, N4; `spawn_core::driver::excerpt_for`). The reply is read from the engine's
-//! transcript, from where the last read ended.
+//! lookup included (decision C2, N4; `spawn_core::driver::excerpt_for`).
+//! The reply is read from the engine's transcript, from where the last read
+//! ended.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
