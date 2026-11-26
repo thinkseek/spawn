@@ -969,6 +969,10 @@ fn planned_change(
     let error = |error: spawn_core::port::StoreError| error.to_string();
     let in_domain = |change: &ProvChangeRecord| change.domain == domain;
     match target {
+        Target::Snapshot(snapshot) => Err(format!(
+            "{snapshot} is a data snapshot: a Git plan applies commits (spawn prov rollback \
+             --plan <ref> <snapshot> plans a data ref's)"
+        )),
         Target::Commit(commit) => change_for_commit(store, domain, commit)?.ok_or_else(|| {
             format!("{commit} has no Change in {domain} (spawn prov index records it)")
         }),
