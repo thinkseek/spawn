@@ -176,8 +176,8 @@ pub(crate) struct Host<'a> {
     pub(crate) view: &'a dyn Fn(&str, &EngineHome) -> Boxed,
 }
 
-/// The words that make a view, as [`spawn_core::port::EngineView`] builds
-/// them.
+/// What builds the host's filesystem view ([`spawn_core::port::EngineView`])
+/// from the environment, as [`crate::runtime::engine_view`] takes it.
 type MakeView<'a> = Box<
     dyn FnOnce(
             &dyn Fn(&str) -> Option<String>,
