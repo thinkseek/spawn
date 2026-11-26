@@ -21,6 +21,8 @@ pub mod beneath;
 pub mod cas_dedup;
 pub mod cas_merkle;
 pub mod cow;
+pub mod d6_cutover;
+pub mod d6_layer0;
 pub mod engine_view;
 pub mod git;
 pub mod git_border;
@@ -55,6 +57,19 @@ pub use cas_merkle::{
 pub use cow::{
     CloneKind, CowStats, CowWorkspace, DirectoryOccupancy, WorkspaceLease, clone_or_copy,
     cow_clone_supported, directory_occupancy, live_users, reflink_file,
+};
+pub use d6_cutover::{
+    BackfillReport, BundleDrillReport, CutoverEvent, CutoverParityReport, CutoverPhase,
+    CutoverRefParity, GcFenceStatus, LocalOnlyLargeFile, PendingMergeAudit, PreCutoverCleanReport,
+    ProjectCutover, ProjectStorageMode, ReconcileReport, RollbackReport,
+    assert_zero_pending_merges, bind_store_gc_fence, check_gc_fence, reconcile_refs_journal,
+    run_persistent_gc_for_ledger, verify_bundle_snapshot_roundtrip, verify_cutover_parity,
+    verify_zero_pending_merges,
+};
+pub use d6_layer0::{
+    EolPathFinding, ExistingDestPolicy, ExportAttrRuleFinding, ExportAttributesAudit,
+    Layer0MaterializeReport, Layer0Options, audit_export_attributes, materialize_layer0,
+    materialize_workspace_from_tree,
 };
 pub use engine_view::{BwrapView, ExtraMount, HomeIsolation, ViewConfig};
 #[cfg(any(test, feature = "testing"))]
