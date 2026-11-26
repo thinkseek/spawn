@@ -73,7 +73,7 @@ Four ideas carry the design:
  │               (queue), grants, views; the control stream (§10.1)      │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 1 Runtime     Bridge: start / input / resume / stop                   │
- │               Claude Code engines in tmux + git workspaces            │
+ │               Claude Code engines in Herdr + git workspaces           │
  │               transcripts, screen, exit files → events                │
  └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -83,7 +83,7 @@ No layer calls another layer's process directly; they meet in the log.
 
 | Layer | Parts |
 | --- | --- |
-| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, transcripts and exit files; the nodes Spawn may use (§1.2) |
+| 1 Runtime | Bridge, Herdr (`spawn-hc` / legacy `herdr`), git workspaces and mission mirrors, transcripts and exit files; the nodes Spawn may use (§1.2) |
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
@@ -1174,9 +1174,9 @@ the system. Its continuity is a design requirement, not a best effort:
 
 | Threat | What keeps the session |
 | --- | --- |
-| `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
+| `spawn loop` restarts or is replaced | The engine runs inside the detached Herdr daemon (`spawn-hc` / legacy `herdr`) outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
 | The engine process exits or crashes | The **recovery** (control layer, facts only, no model): the end is an `exited` or `crashed` interruption — a signal, a non-zero status or a terminal gone while its server lives — recorded once and `resume`d in the same native session at once, then after 10, 20, 40, 80 … s as resumes fail, capped at 640 s. A resume whose execution ends within a minute before any progress failed; three in a row hand off |
-| The machine reboots | tmux is gone, so every terminal in it died: the recovery records `host_restart` and resumes each execution by its key, within one pass of the loop's start |
+| The machine reboots | The Herdr daemon is gone, so every terminal in it died: the recovery records `host_restart` and resumes each execution by its key, within one pass of the loop's start |
 | The model API is overloaded, rate limited or unreachable, or the login expired | No execution ends: Claude Code writes its API error line and waits at its prompt. The recovery records `model_unavailable` or `model_auth` as the interruption and `wait`s: a retry after 60 s doubling to 4 minutes (or at the time a 429's text names), a probe of the credentials file every 10 s and one retry every 30 minutes while it does not change. The wait clears on the model's answer or the changed file, and the same native session goes on. An engine that ends after the error is resumed after the backoff at most `SPAWN_RECOVER_MODEL_RETRIES` (3) times in a row, then the supervisor is told; one that ends after a request the model will never accept (`model_error`) is never revived, and the supervisor is told |
 | The context window is spent | `Prompt is too long` in an API error line: `context_exhausted`, and the handoff path below |
 | The engine's resource envelope kills it, or the disk fills | `memory_limit` (objective 029) resumes at once; `disk_full` waits until a reading of the workspace's filesystem is at or above `SPAWN_DISK_FLOOR_GB` |
@@ -2038,19 +2038,20 @@ it per execution and prices it (objective 041;
 The Bridge stays the single state machine of every execution. What an engine
 does comes from its transcript, which the Bridge follows, and from its pane,
 which the engine's driver reads (`AgentDriver::read_screen`). On the Herdr
-terminal host (the default, or `SPAWN_TERMINAL_BACKEND=herdr`; `SPAWN_TERMINAL_BACKEND=tmux` selects tmux) a third reader is added: Herdr
+terminal host (the only supported backend: unset or `SPAWN_TERMINAL_BACKEND=herdr`,
+defaulting to embedded `spawn-hc` via `SPAWN_HERDR_MODE=core`, or `legacy` for external `herdr`; `tmux` has been removed and is explicitly refused) a second witness is available: Herdr
 detects the agent a pane runs and reads its state with rules of its own (its
-agent manifests). That reading is a **second witness**
-(`TerminalHost::agent`, an `AgentReading`). It never takes over. A host
-without one (tmux, the in-memory host) answers `None`, and nothing changes:
-Claude Code on tmux records the same events, byte for byte. A test pins the
+agent manifests; in `spawn-hc` mode, `herdr_witness` provides the host-side reading).
+That reading is a **second witness** (`TerminalHost::agent`, an `AgentReading`). It never takes over. A test host
+without one (the in-memory host) answers `None`, and nothing changes:
+Claude Code without witness readings records the same events, byte for byte. A test pins the
 whole sequence a2f1ab397 recorded
 (`claude_on_a_host_without_agent_readings_records_what_it_did_before`).
 
 For now the witness is asked only for engines other than Claude Code (agy).
 Claude Code's screen-reader screens have not yet been captured under Herdr
 against its claude manifest (design §9.2). Until they are, Claude Code on
-Herdr goes by its own readings, as on tmux: no merge, no keyed screen, and no
+Herdr goes by its own readings: no merge, no keyed screen, and no
 `agent()` call (`claude_on_an_agent_host_stays_on_its_own_readings_for_now`).
 
 **The merge** (`Bridge::follow_screen`, `merge_witness`). Normally a screen
@@ -2178,15 +2179,11 @@ transcript archive's mask roots.
   account and plan, so every line holding an e-mail address is dropped from
   evidence and from excerpts.
 
-**Sandbox and deploy.** The gate's `bwrap` sandbox binds no `herdr`, so the
-Herdr tests skip there. On a host with herdr,
-`SPAWN_REQUIRE_HERDR=1 cargo test -p spawn-host --test herdr` runs them
-against a stub `agy`, and fails rather than skips when herdr is missing.
+**Sandbox and deploy.** The gate's `bwrap` sandbox binds `spawn-hc` or legacy `herdr` from the host when present (`SPAWN_REQUIRE_HERDR=1`).
 Running agy in the fleet needs, on the host:
-- herdr 0.9.5 (protocol 22) with its antigravity-cli integration installed,
-  so it reports agy's session;
+- embedded `spawn-hc` (default `SPAWN_HERDR_MODE=core`, with host-side `herdr_witness`) or legacy `herdr` 0.9.5 (protocol 22, `SPAWN_HERDR_MODE=legacy`) with its antigravity-cli integration installed;
 - agy logged in;
-- `SPAWN_TERMINAL_BACKEND=herdr` (the default; omit or set explicitly, or use `tmux` to roll back), `SPAWN_ENGINES=claude,agy` and
+- `SPAWN_TERMINAL_BACKEND=herdr` (or unset; `tmux` is removed and explicitly refused), `SPAWN_ENGINES=claude,agy` and
   `SPAWN_AGY_MODEL` in the loop's environment.
 
 The SQL gateway's own command checks are unchanged by this PR.
@@ -2427,8 +2424,8 @@ The masks, resolved again at every launch. Each target is canonicalized
 resolves to:
 
 - directories, each an empty `--tmpfs`: `/run/keep`, `/run/keep-test`, the
-  whole `$XDG_RUNTIME_DIR` (else `/run/user/<uid>`), the whole `/tmp` (the
-  fleet's tmux sockets), the loop's shared `TMPDIR`, the Herdr session
+  whole `$XDG_RUNTIME_DIR` (else `/run/user/<uid>`), the whole `/tmp` (any
+  sockets or temporary files in `/tmp`), the loop's shared `TMPDIR`, the Herdr session
   directory
   (`$XDG_CONFIG_HOME/herdr` and `~/.config/herdr`), `~/.claude`, the other
   engines' homes (`~/.gemini` but for agy's own home below it, re-bound
@@ -2453,8 +2450,8 @@ resolves to:
 **Herdr's socket and `/tmp` are not kept.** A probe canary showed that a
 client inside the view could connect to Herdr's Unix socket, open a pane
 outside the view and read the masked files through it; the same holds for
-the tmux sockets in `/tmp`. Both are masked, so the engine's own Herdr
-calls are none: Herdr detects it from outside. The network stays.
+any `herdr-core` / host sockets under `$XDG_RUNTIME_DIR` or `/tmp`. Both are masked, so the engine's own Herdr
+calls are none: `herdr_witness` / Herdr detects it from outside. The network stays.
 
 **No writable bind overlaps a mask or the private directory.** A workspace
 that holds or lies in a masked path, or reaches the private directory, is
@@ -2659,7 +2656,7 @@ it, and while it is not armed Esc closes the drawer and the arrows scroll.
 
 Issue #91 P1a adds four endpoints for the dashboard, with no agent
 protocol (no ACP): what an engine shows is read from its pane in the
-terminal host (`tmux` or Herdr), and every answer is a command on the
+Herdr terminal host (`spawn-hc` or legacy `herdr`), and every answer is a command on the
 record.
 
 - `GET /api/stream`: the event log as Server-Sent Events, with the read
@@ -2753,7 +2750,7 @@ Known edges, each with its rule:
 
 | Edge | Rule |
 | --- | --- |
-| The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
+| The UI's live terminal reads Herdr | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
 | The supervisor's native transcript lives on the host (`~/.claude`, copied to the host's transcript archive) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
 | The attention queue reads the supervisor's question and its "For the owner:" lines from its transcript | A compute peek at the transcript the log names (`session.native_started`), read by the Observer's own reply reader; where it cannot be read, the screen tail stored with the judgement stands in for the question, labelled as such, and no line for the owner is listed |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
@@ -2789,7 +2786,7 @@ Every decision is in the log with its evidence and what followed it.
 ### 7.1 The end-to-end check
 
 `scripts/e2e.sh` runs the whole loop with a scripted engine and a stub Jev,
-on real PostgreSQL, git and tmux, in its own schema and tmux socket (about
+on real PostgreSQL, git and embedded `herdr-core` (`spawn-hc`), in its own schema and Herdr session (about
 20 s). The gate runs it as `rsi/scenarios/check-e2e.sh` on every landing. It
 asserts:
 
@@ -2813,18 +2810,18 @@ asserts:
    lands it, and a solved objective is not assigned again.
 8. A human message to a worker reaches the supervisor; a killed resident is
    resumed; one the supervisor stopped stays down.
-9. Killing the supervisor's engine, then its tmux server, ends with the same
+9. Killing the supervisor's engine, then its `herdr-core` daemon, ends with the same
    `session_supervisor` resumed natively; killing the loop leaves the same
    supervisor execution running.
 
 ## 8. Known limit: one uid
 
-Every engine runs as the owner's Unix user, and all panes share one tmux server. The database boundary holds
-(no pane can write the log), but the file boundary does not: an agent can
-read another process's environment through `/proc` or tmux (including the
+Every engine runs as the owner's Unix user, and unsandboxed panes can reach the shared terminal host. The database boundary holds
+(no pane can write the log), but the file boundary does not: an unsandboxed agent can
+read another process's environment through `/proc` or the terminal host (including the
 supervisor pane's login), write the files the Bridge reads for another
 session (a transcript, an exit file), which the Bridge then reads as that
-session's facts, or simply `tmux send-keys` into another pane. The Bridge
+session's facts, or inject text into another pane via the terminal host socket. The Bridge
 reads those files without following symlinks, refuses anything but a regular
 file and caps each read, so a planted FIFO or an endless file cannot stall
 or exhaust it. Holding no login stops a worker from forging facts through
