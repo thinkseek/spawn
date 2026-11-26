@@ -411,6 +411,8 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             // its program at launch, as it always did.
             unavailable: unavailable.filter(|_| id != DEFAULT),
         });
+        // The view's scratch workspace goes once both runs are done.
+        drop(boxed);
     }
     Probe { at_ms, engines }
 }
