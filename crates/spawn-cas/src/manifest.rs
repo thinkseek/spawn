@@ -28,7 +28,7 @@
 //! names any more and which no namespace but `data` records, are removed
 //! right away ([`Store::keep_snapshots`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -473,20 +473,20 @@ impl Store {
             kept: kept.clone(),
             ..KeepReport::default()
         };
-        let mut candidates: BTreeMap<Digest, ()> = BTreeMap::new();
+        let mut candidates: BTreeSet<Digest> = BTreeSet::new();
         for (snapshot, digests) in before {
             if kept.contains(&snapshot) {
                 continue;
             }
             report.dropped.push(snapshot.clone());
-            candidates.insert(snapshot, ());
+            candidates.insert(snapshot);
             for digest in digests {
-                candidates.insert(digest, ());
+                candidates.insert(digest);
             }
         }
         if !candidates.is_empty() {
             let pinned = self.pinned()?;
-            for digest in candidates.into_keys() {
+            for digest in candidates {
                 if pinned.contains(&digest) || pinned_now.contains(&digest) {
                     continue;
                 }
