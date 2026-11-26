@@ -867,8 +867,9 @@ pub(super) struct Judged {
     pub(super) stated: Option<String>,
     /// A node strike (three make it degraded).
     pub(super) strike: bool,
-    /// Where the job goes (`spawn_remote_job_fault`): None for a verdict or
-    /// a self-fenced run, which is judged by nothing here.
+    /// Where the job goes (`spawn_remote_job_fault`): None for a verdict
+    /// (a valid run, judged by `spawn_remote_job_valid`) or a self-fenced
+    /// run (judged by nothing).
     pub(super) next: Option<FaultNext>,
     /// In words, for the log.
     pub(super) reason: String,
@@ -1286,6 +1287,10 @@ pub(super) struct PrimaryRequest<'a> {
     pub(super) scenarios: &'a Path,
     pub(super) scenario: Option<&'a Path>,
     pub(super) gate_env: &'a [(String, String)],
+    /// The gate runs on a test database ([`super::needs_test_database`]):
+    /// a rejection naming only its connection or database errors is no
+    /// verdict on the work ([`names_no_work_failure`]).
+    pub(super) test_database: bool,
 }
 
 /// What the primary path came to.
@@ -1427,6 +1432,21 @@ pub(super) fn belief(judged: &Judged, believe_reject: bool) -> Option<&'static s
     } else {
         None
     }
+}
+
+/// A node's rejection of a gate on a test database that names no failure
+/// of the work's (connection or database errors only): maybe the node's
+/// own test server crashed. Neither believed (M3b) nor a valid run that
+/// resets the node's strikes; judged here. The crash window the host-fault
+/// rule reads is this host's test server's, which says nothing of the
+/// node's, so the sentinel stands for "maybe the node's server crashed".
+pub(super) fn names_no_work_failure(verdict: &gate::Verdict, test_database: bool) -> bool {
+    !verdict.accepted
+        && test_database
+        && super::host::host_fault(&verdict.reason, &verdict.output, || {
+            vec!["the node's test server (not this host's log)".to_string()]
+        })
+        .is_some()
 }
 
 /// The primary path (design §12.2 S5, §12.4 M3a/M3b): a task's candidate
@@ -1703,7 +1723,13 @@ impl Primary {
                         ),
                     };
                 }
-                Look::Completed => match self.completed(store, task, &row, given) {
+                Look::Completed => match self.completed(
+                    store,
+                    task,
+                    &row,
+                    given,
+                    request.test_database,
+                ) {
                     Settled::Believed(outcome) => return outcome,
                     Settled::Requeued => since = Instant::now(),
                     Settled::Local(why) => return PrimaryOutcome::Local { why },
@@ -1739,6 +1765,7 @@ impl Primary {
         task: i64,
         row: &RemoteJob,
         given: &Value,
+        test_database: bool,
     ) -> Settled {
         let job_id = &row.job_id;
         let stored = match read_stored(&self.settings.results, job_id, row.lease_epoch) {
@@ -1755,8 +1782,15 @@ impl Primary {
         let node = node_name_of(store, row, &stored);
         if let Some(verdict) = judged.verdict.clone() {
             // A valid run: the node's strikes go back to 0. A ledger error
-            // is logged, never a reason to drop the verdict.
-            if let Err(error) = settle(store, row, &judged) {
+            // is logged, never a reason to drop the verdict. A rejection
+            // naming only test-database errors is no valid run: the strikes
+            // and the epoch stay as they are (neither struck nor reset).
+            if names_no_work_failure(&verdict, test_database) {
+                println!(
+                    "integrate: task {task}: node {node}'s rejection on {job_id} names no \
+                     failure of the work's: its strikes are not reset"
+                );
+            } else if let Err(error) = settle(store, row, &judged) {
                 eprintln!("integrate: task {task}'s node gate {job_id} on {node}: {error}");
             }
             let word = if verdict.accepted {

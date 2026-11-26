@@ -7620,13 +7620,14 @@ begin
                               'strikes', v_strikes, 'degraded', coalesce(v_strikes, 0) >= 3);
 end $$;
 
--- The integrator's reading of a completed job whose verdict it believes
--- (spawn-cli integrate/remote.rs `settle`): the run was valid, so the node's
--- strikes go back to 0. `degraded` stays as it is (only `spawn node
--- undrain` clears it). Same lock order as spawn_remote_job_fault (nodes in
--- name order, then the job); the row stays completed and its epoch moves, so
--- a completion is judged once: a second call, or a fault judging at the old
--- epoch, answers ok false.
+-- The integrator's reading of a completed job whose node gave a verdict on
+-- the job's own inputs, believed or not (spawn-cli integrate/remote.rs
+-- `settle`; never a rejection naming only test-database errors): the run
+-- was valid, so the node's strikes go back to 0. `degraded` stays as it is
+-- (only `spawn node undrain` clears it). Same lock order as
+-- spawn_remote_job_fault (nodes in name order, then the job); the row stays
+-- completed and its epoch moves, so a completion is judged once: a second
+-- call, or a fault judging at the old epoch, answers ok false.
 create or replace function spawn_remote_job_valid(p_job_id text, p_lease_epoch bigint)
 returns jsonb language plpgsql security definer as $$
 declare
