@@ -150,6 +150,16 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.claude_projects = claude_projects();
     config.engines = engines(env_value)?;
+    // An engine with no deny rules of its own runs only inside the host's
+    // filesystem view (decision C2, N6; SPAWN_ENGINE_VIEW).
+    let (policy, said) = engine_view(&env_value, &config.engines, |lookup| {
+        spawn_host::BwrapView::new("bwrap", spawn_host::ViewConfig::from_env(lookup))
+            .map(|view| Arc::new(view) as Arc<dyn spawn_core::port::EngineView>)
+    });
+    if let Some(said) = said {
+        eprintln!("{said}");
+    }
+    config.engine_view = policy;
     config.model_relay = model_relay();
     // SPAWN_AUTO_APPROVE=off: not even the startup trust dialog is answered
     // automatically (`crate::resolve`).
@@ -479,6 +489,74 @@ pub(crate) fn engines(
         ));
     }
     Ok(engines)
+}
+
+/// The filesystem view policy (`SPAWN_ENGINE_VIEW`) for the engines
+/// `enabled`, and one line to say, if any.
+///
+/// - `required` (also unset or empty, the default): an engine with no deny
+///   rules of its own ([`spawn_core::driver::Guard::Sandbox`], agy) runs
+///   only inside the view `make` builds (`bwrap`, checked to work on this
+///   host). When it cannot be built, such an engine is refused
+///   (`engine_unavailable`) and Claude Code runs on unaffected. The view
+///   is built only when such an engine is enabled: a Claude-only host
+///   (the default) never runs `bwrap`.
+/// - `off`: the owner's explicit choice, such an engine runs with no view,
+///   as before N6; said once.
+/// - Anything else: read as `required` (the safe side), said once, as an
+///   invalid `SPAWN_AUTO_APPROVE` is read as its default.
+pub(crate) fn engine_view(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    enabled: &[(String, spawn_core::driver::EngineHome)],
+    make: impl FnOnce(
+        &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Arc<dyn spawn_core::port::EngineView>, String>,
+) -> (spawn_core::bridge::EngineViewPolicy, Option<String>) {
+    use spawn_core::bridge::EngineViewPolicy;
+    let value = lookup("SPAWN_ENGINE_VIEW");
+    let mut said = match value.as_deref().map(str::trim) {
+        None | Some("" | "required") => None,
+        Some("off") => {
+            return (
+                EngineViewPolicy::Off,
+                Some(
+                    "spawn: SPAWN_ENGINE_VIEW=off: engines with no deny rules of their own run \
+                     with no filesystem view, and can read whatever this user can"
+                        .to_string(),
+                ),
+            );
+        }
+        Some(other) => Some(format!(
+            "spawn: SPAWN_ENGINE_VIEW={other} is neither required nor off: read as required"
+        )),
+    };
+    let sandboxed: Vec<&str> = enabled
+        .iter()
+        .filter(|(id, _)| {
+            spawn_core::driver::driver(id).is_some_and(|driver| {
+                driver.traits().guard == spawn_core::driver::Guard::Sandbox
+            })
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if sandboxed.is_empty() {
+        return (
+            EngineViewPolicy::Required(Err(
+                "no enabled engine needs one, so none was made".to_string()
+            )),
+            said,
+        );
+    }
+    let view = make(lookup);
+    if let Err(why) = &view {
+        let line = format!(
+            "spawn: no filesystem view on this host ({why}): {} will not start \
+             (engine_unavailable); Claude Code is unaffected",
+            sandboxed.join(", ")
+        );
+        said = Some(said.map_or(line.clone(), |before| format!("{before}\n{line}")));
+    }
+    (EngineViewPolicy::Required(view), said)
 }
 
 /// Claude Code's transcript directory, which is where the Bridge reads it.
@@ -814,6 +892,69 @@ mod tests {
             assert!(reason.contains(what), "{reason}");
             assert!(!reason.contains("pw"), "no password in {reason}");
         }
+    }
+
+    #[derive(Debug)]
+    struct NoView;
+
+    impl spawn_core::port::EngineView for NoView {
+        fn name(&self) -> &'static str {
+            "bwrap"
+        }
+
+        fn wrap(
+            &self,
+            _launch: &spawn_core::port::ViewedLaunch<'_>,
+        ) -> Result<Vec<String>, String> {
+            Ok(vec!["bwrap".to_string(), "--".to_string()])
+        }
+    }
+
+    /// SPAWN_ENGINE_VIEW: required by default (and for an invalid value,
+    /// said), off only when named; the view is made only when an enabled
+    /// engine has no deny rules of its own, and a host that cannot make
+    /// one refuses that engine, saying so.
+    #[test]
+    fn the_engine_view_is_required_by_default_and_made_only_for_sandboxed_engines() {
+        use spawn_core::bridge::EngineViewPolicy;
+        let claude = engines(lookup(&[("HOME", "/home/a")])).expect("claude");
+        let agy = engines(lookup(&[("HOME", "/home/a"), ("SPAWN_ENGINES", "claude,agy")]))
+            .expect("agy");
+        let made = std::cell::Cell::new(0);
+        let works = |_: &dyn Fn(&str) -> Option<String>| {
+            made.set(made.get() + 1);
+            Ok(Arc::new(NoView) as Arc<dyn spawn_core::port::EngineView>)
+        };
+        let fails = |_: &dyn Fn(&str) -> Option<String>| -> Result<
+            Arc<dyn spawn_core::port::EngineView>,
+            String,
+        > { Err("bwrap is not installed (not found on PATH)".to_string()) };
+
+        let (policy, said) = engine_view(&lookup(&[]), &claude, works);
+        assert!(matches!(policy, EngineViewPolicy::Required(Err(_))), "{policy:?}");
+        assert_eq!(said, None);
+        assert_eq!(made.get(), 0, "a Claude-only host never runs bwrap");
+
+        let (policy, said) = engine_view(&lookup(&[]), &agy, works);
+        assert!(matches!(policy, EngineViewPolicy::Required(Ok(_))), "{policy:?}");
+        assert_eq!(said, None);
+        assert_eq!(made.get(), 1);
+
+        let (policy, said) = engine_view(&lookup(&[("SPAWN_ENGINE_VIEW", "required")]), &agy, fails);
+        assert!(
+            matches!(&policy, EngineViewPolicy::Required(Err(why)) if why.contains("bwrap")),
+            "{policy:?}"
+        );
+        let said = said.expect("said");
+        assert!(said.contains("agy will not start (engine_unavailable)"), "{said}");
+
+        let (policy, said) = engine_view(&lookup(&[("SPAWN_ENGINE_VIEW", "off")]), &agy, fails);
+        assert!(matches!(policy, EngineViewPolicy::Off), "{policy:?}");
+        assert!(said.expect("said").contains("SPAWN_ENGINE_VIEW=off"));
+
+        let (policy, said) = engine_view(&lookup(&[("SPAWN_ENGINE_VIEW", "maybe")]), &agy, fails);
+        assert!(matches!(policy, EngineViewPolicy::Required(Err(_))), "{policy:?}");
+        assert!(said.expect("said").contains("SPAWN_ENGINE_VIEW=maybe is neither"));
     }
 
     /// Claude Code alone unless `SPAWN_ENGINES` names agy; agy's home,
