@@ -146,7 +146,7 @@ candidates as (
   select k.* from spawn_commands k join live l
       on k.session_id = l.session_id and k.id >= l.from_command
   union
-  select k.* from spawn_commands k where k.state <> 'finished'
+  select k.* from spawn_commands k where k.state not in ('finished', 'failed', 'cancelled')
   union
   select k.* from spawn_commands k where k.id = any($2))
 select jsonb_build_object(
@@ -382,13 +382,21 @@ select coalesce(jsonb_agg(jsonb_build_object(
       'session_id', o.session_id, 'agent_id', o.agent_id, 'event_id', o.id,
       'at_ms', o.recorded_at_ms, 'observation', o.observation,
       'ended_event', o.ended_event, 'ended_cause', o.ended_cause,
-      'execution_event', o.execution_event)
+      'execution_event', o.execution_event,
+      'progress_event', o.progress_event)
     order by o.session_id), '[]'::jsonb)
 from (select l.session_id, l.agent_id, l.id, l.recorded_at_ms, l.observation,
              case when x.event_name = 'execution.ended' then x.id end as ended_event,
              case when x.event_name = 'execution.ended'
                   then x.kind -> 'detail' ->> 'cause' end as ended_cause,
-             case when x.event_name = 'execution.started' then x.id end as execution_event
+             case when x.event_name = 'execution.started' then x.id end as execution_event,
+             (select max(p.id) from spawn_events p
+               where p.session_id = l.session_id
+                 and p.id > l.id
+                 and (p.event_name in ('message.received', 'tool.started', 'tool.completed',
+                                       'turn.stopped', 'job.started', 'job.ended')
+                      or (p.event_name = 'artifact.committed'
+                          and coalesce(p.kind -> 'detail' ->> 'reason', '') <> 'base_merged'))) as progress_event
         from latest l
         left join current x using (session_id)
        order by l.session_id) o";

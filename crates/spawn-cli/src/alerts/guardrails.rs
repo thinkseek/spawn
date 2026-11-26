@@ -102,8 +102,8 @@ pub(super) const READ_LIMIT_MS: i64 = crate::core_lines_sample::READ_LIMIT_MS;
 /// A reading's answer with how long each of its parts took.
 type Timed = (Value, Parts);
 
-/// How soon the step looks again while a reading runs.
-pub(super) const POLL_MS: i64 = 5_000;
+/// How soon the step looks again while a reading runs (#111).
+pub(super) const POLL_MS: i64 = 250;
 
 /// The step's Core lines readings: the one in flight (when it started, by
 /// the step's clock and the host's), and one given up whose thread may
@@ -1982,6 +1982,18 @@ mod tests {
         assert_eq!(
             step(&mut monitor, t7 + RAISE, answer("out", &json!(OUT))),
             [key_at(t7)]
+        );
+    }
+
+    #[test]
+    fn in_flight_poll_interval_is_sub_second() {
+        const { assert!(POLL_MS <= 250) };
+        let mut monitor = monitor();
+        monitor.start_guardrails_with(1_000, || Pending::spawn(|| unreachable!()));
+        let due = monitor.guardrail_reads.poll_ms().expect("poll scheduled");
+        assert!(
+            due <= 1_250,
+            "expected sub-second poll due <= 1250, got {due}"
         );
     }
 }

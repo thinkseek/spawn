@@ -212,3 +212,63 @@ fn a_waiting_step_is_not_evidence_the_judgement_must_cover() {
         .expect("append");
     assert_ne!(evidence(), before, "the typing is");
 }
+
+#[test]
+fn cancelled_and_non_human_failed_commands_keep_human_contract() {
+    let (store, schema) = store("cancelled_states");
+    let ttl = Duration::from_mins(1);
+    let human_fail = submit(&store, "human", "h-fail", input("hi"));
+    let loop_fail = submit(&store, "spawn-dispatch", "l-fail", input("continue"));
+    let stale_nudge = submit(&store, "spawn-dispatch", "l-cont", input("continue"));
+
+    let c1 = store.claim("w1", ttl).expect("claim").expect("human");
+    assert!(c1.created_at_ms > 0);
+    store
+        .finish(&c1, &Outcome::Failed("no exec".into()))
+        .expect("finish human");
+    let c2 = store.claim("w1", ttl).expect("claim").expect("loop");
+    store
+        .finish(&c2, &Outcome::Failed("terminal gone".into()))
+        .expect("finish loop");
+
+    let open = store
+        .open_continue_commands(SESSION)
+        .expect("open continues");
+    assert_eq!(open, vec![i64::try_from(stale_nudge.0).expect("id")]);
+    assert!(
+        store
+            .cancel_open_command(open[0], "superseded")
+            .expect("cancel"),
+        "open continue cancelled"
+    );
+    assert!(
+        store
+            .open_continue_commands(SESSION)
+            .expect("after")
+            .is_empty()
+    );
+
+    let mut client = admin(&schema);
+    let mut row_state = |id: CommandId| -> (String, Option<bool>) {
+        let row = client
+            .query_one(
+                "select state, succeeded from spawn_commands where id = $1",
+                &[&i64::try_from(id.0).expect("id")],
+            )
+            .expect("row");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(row_state(human_fail), ("finished".into(), Some(false)));
+    assert_eq!(row_state(loop_fail), ("failed".into(), Some(false)));
+    assert_eq!(row_state(stale_nudge), ("cancelled".into(), None));
+
+    let failed = store.alert_failed_commands(0).expect("alert failed");
+    let keys: Vec<&str> = failed
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|v| v["key"].as_str())
+        .collect();
+    assert!(keys.contains(&"h-fail") && keys.contains(&"l-fail"));
+    assert!(!keys.contains(&"l-cont"));
+}

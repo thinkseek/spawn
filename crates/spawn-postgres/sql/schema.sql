@@ -436,9 +436,10 @@ create table if not exists spawn_commands (
     unique (principal, idempotency_key)
 );
 
-create index if not exists spawn_commands_open
+drop index if exists spawn_commands_open;
+create index spawn_commands_open
     on spawn_commands (session_id, id)
-    where state <> 'finished';
+    where state not in ('finished', 'failed', 'cancelled');
 
 -- A session's latest commands, finished or not: the fleet board's task.
 create index if not exists spawn_commands_session
@@ -534,18 +535,19 @@ begin
     return query select v_id;
 end $$;
 
--- The first version returned no principal.
+-- The first version returned no principal; newer adds out_created_at_ms.
 drop function if exists spawn_claim(text, bigint);
 create or replace function spawn_claim(
     p_worker text,
     p_ttl_ms bigint
 ) returns table (
-    out_id        bigint,
-    out_attempt   integer,
-    out_agent     text,
-    out_session   text,
-    out_action    jsonb,
-    out_principal text
+    out_id            bigint,
+    out_attempt       integer,
+    out_agent         text,
+    out_session       text,
+    out_action        jsonb,
+    out_principal     text,
+    out_created_at_ms bigint
 ) language sql as $$
     -- One command per session at a time: nothing earlier in the session
     -- may be unfinished, but an input that waits for its turn (the Bridge
@@ -559,12 +561,12 @@ create or replace function spawn_claim(
     with candidate as (
         select c.id
         from spawn_commands c
-        where c.state <> 'finished'
+        where c.state not in ('finished', 'failed', 'cancelled')
           and (c.lease_until_ms is null or c.lease_until_ms <= spawn_now_ms())
           and not exists (
               select 1 from spawn_commands o
               where o.session_id = c.session_id
-                and o.state <> 'finished'
+                and o.state not in ('finished', 'failed', 'cancelled')
                 and o.id < c.id
                 and not exists (
                     select 1 from spawn_events w
@@ -581,7 +583,7 @@ create or replace function spawn_claim(
         lease_until_ms = spawn_now_ms() + p_ttl_ms
     from candidate
     where c.id = candidate.id
-    returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal;
+    returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal, c.created_at_ms;
 $$;
 
 -- Leave a claimed command unfinished and claimable again in `p_ms`: an
@@ -594,7 +596,9 @@ create or replace function spawn_release(
 ) returns boolean language sql as $$
     update spawn_commands c
        set lease_until_ms = spawn_now_ms() + greatest(p_ms, 0)
-     where c.id = p_command and c.state <> 'finished' and c.lease_attempt = p_attempt
+     where c.id = p_command
+       and c.state not in ('finished', 'failed', 'cancelled')
+       and c.lease_attempt = p_attempt
     returning true;
 $$;
 
@@ -603,6 +607,58 @@ create or replace function spawn_finish(
     p_attempt   integer,
     p_succeeded boolean,
     p_error     text
+) returns text language plpgsql as $$
+declare
+    v_state     text;
+    v_attempt   integer;
+    v_agent     text;
+    v_session   text;
+    v_principal text;
+begin
+    select c.state, c.lease_attempt, c.agent_id, c.session_id, c.principal
+        into v_state, v_attempt, v_agent, v_session, v_principal
+        from spawn_commands c
+        where c.id = p_command
+        for update;
+
+    if v_state is null then
+        return 'missing';
+    end if;
+    if v_state in ('finished', 'failed', 'cancelled') then
+        return 'already';
+    end if;
+    if v_attempt <> p_attempt then
+        return 'stale';
+    end if;
+
+    -- Non-human failed commands transition to 'failed' (#108/#109); human
+    -- commands keep state = 'finished' so mission news/human history views stay intact.
+    update spawn_commands c
+        set state = case
+                when p_succeeded then 'finished'
+                when v_principal = 'human' then 'finished'
+                else 'failed'
+            end,
+            succeeded = p_succeeded,
+            error = p_error,
+            finished_at_ms = spawn_now_ms()
+        where c.id = p_command;
+
+    perform spawn_append(
+        v_agent, v_session, null, 'gateway', 'cmd_' || p_command || ':finished',
+        jsonb_build_object('name', 'command.finished',
+            'detail', jsonb_build_object(
+                'command_id', p_command,
+                'succeeded', p_succeeded,
+                'error', p_error)));
+
+    return 'done';
+end $$;
+
+create or replace function spawn_cancel(
+    p_command bigint,
+    p_attempt integer,
+    p_reason  text
 ) returns text language plpgsql as $$
 declare
     v_state   text;
@@ -619,17 +675,17 @@ begin
     if v_state is null then
         return 'missing';
     end if;
-    if v_state = 'finished' then
+    if v_state in ('finished', 'failed', 'cancelled') then
         return 'already';
     end if;
-    if v_attempt <> p_attempt then
+    if p_attempt is not null and v_attempt <> p_attempt then
         return 'stale';
     end if;
 
     update spawn_commands c
-        set state = 'finished',
-            succeeded = p_succeeded,
-            error = p_error,
+        set state = 'cancelled',
+            succeeded = null,
+            error = p_reason,
             finished_at_ms = spawn_now_ms()
         where c.id = p_command;
 
@@ -638,8 +694,8 @@ begin
         jsonb_build_object('name', 'command.finished',
             'detail', jsonb_build_object(
                 'command_id', p_command,
-                'succeeded', p_succeeded,
-                'error', p_error)));
+                'succeeded', false,
+                'error', 'cancelled: ' || coalesce(p_reason, ''))));
 
     return 'done';
 end $$;
@@ -1006,6 +1062,7 @@ revoke execute on function spawn_submit(text, text, text, text, jsonb) from publ
 revoke execute on function spawn_claim(text, bigint) from public;
 revoke execute on function spawn_release(bigint, integer, bigint) from public;
 revoke execute on function spawn_finish(bigint, integer, boolean, text) from public;
+revoke execute on function spawn_cancel(bigint, integer, text) from public;
 
 -- A security definer function must not resolve names through the caller's
 -- search_path, or a caller's temporary table could stand in for
@@ -1521,7 +1578,7 @@ begin
     -- A stop or discard not finished yet ends the execution it runs: the
     -- message needs a wake after it.
     select max(c.id) into v_ahead from spawn_commands c
-     where c.session_id = v_session and c.state <> 'finished'
+     where c.session_id = v_session and c.state not in ('finished', 'failed', 'cancelled')
        and c.action ->> 'type' in ('stop', 'discard');
     if v_ahead is not null then
         v_live := false;
@@ -1542,7 +1599,7 @@ begin
     if not v_live then
         -- A start or resume in flight after every stop ahead wakes it.
         select c.id into v_wake from spawn_commands c
-         where c.session_id = v_session and c.state <> 'finished'
+         where c.session_id = v_session and c.state not in ('finished', 'failed', 'cancelled')
            and c.action ->> 'type' in ('start', 'resume')
            and c.id > coalesce(v_ahead, 0)
          order by c.id desc limit 1;
@@ -8076,7 +8133,7 @@ begin
          order by s.id desc limit 1;
         -- An unfinished one has not ended: the Bridge finishes it, and a
         -- start or resume before it may give it an execution yet.
-        v_ended := p_state = 'finished'
+        v_ended := p_state in ('finished', 'failed', 'cancelled')
                    and (v_live_since is null or v_live_since > coalesce(p_finished, p_now));
     end if;
     -- Its answer (objective 046): the agent's ack, or the report of the

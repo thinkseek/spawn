@@ -322,6 +322,8 @@ pub struct Claimed {
     /// Who submitted the command: an input from outside Spawn's own loops
     /// waits for its turn instead of being refused (`crate::bridge`).
     pub principal: String,
+    /// When the command row was created, in Unix epoch milliseconds (`0` in legacy tests).
+    pub created_at_ms: i64,
     /// Raw action as stored. Parse with [`Claimed::action`].
     pub action: serde_json::Value,
 }
@@ -340,6 +342,8 @@ pub enum Outcome {
     Succeeded,
     /// The command was rejected or failed.
     Failed(String),
+    /// The command was auto-cancelled as stale, coalesced, or superseded.
+    Cancelled(String),
 }
 
 #[cfg(test)]

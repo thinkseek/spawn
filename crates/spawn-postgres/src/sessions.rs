@@ -114,7 +114,7 @@ pub(crate) const LIVENESS_FACTS: &str = concat!(
     "
                  )
                  select
-                    exists (select 1 from cmds c where c.state <> 'finished') as open_command,
+                    exists (select 1 from cmds c where c.state not in ('finished', 'failed', 'cancelled')) as open_command,
                     (select execution_id from last_exec) as execution_id,
                     coalesce((select ended_at_ms is null from last_exec), false) as live,
                     (select cause from last_exec) as cause,

@@ -979,10 +979,62 @@ fn text(lines: &[Line<'_>], spawn: &str) -> String {
     text
 }
 
-/// The digest order for the pending escalations, if the supervisor can
-/// take one now.
-pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> Option<Order> {
+/// Backoff wait `(last_finished_ms, wait_ms)` after trailing `PANE_NOT_READY`
+/// failures on `dispatch-digest-*` commands.
+fn busy_retry_wait_ms(supervisor: &Facts) -> Option<(i64, i64)> {
+    let mut consecutive = 0_usize;
+    let mut last_finished_ms: Option<i64> = None;
+    for sent in supervisor.dispatched.iter().rev() {
+        if !sent.key.starts_with("dispatch-digest-") {
+            continue;
+        }
+        let not_ready = sent.succeeded == Some(false)
+            && sent
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains(spawn_core::bridge::PANE_NOT_READY));
+        if not_ready {
+            consecutive += 1;
+            if last_finished_ms.is_none() {
+                last_finished_ms = Some(sent.finished_at_ms.unwrap_or(sent.created_at_ms));
+            }
+        } else {
+            break;
+        }
+    }
+    let last_ms = last_finished_ms?;
+    let doublings = u32::try_from(consecutive.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(6);
+    let wait_ms = 5_000_i64.saturating_mul(1_i64 << doublings).min(60_000);
+    Some((last_ms, wait_ms))
+}
+
+/// Remaining backoff duration in milliseconds if the supervisor digest is
+/// currently cooled down by prior `PANE_NOT_READY` failures.
+pub(super) fn due_in(supervisor: &Facts, now_ms: i64) -> Option<i64> {
+    if !supervisor_idle(supervisor) {
+        return None;
+    }
+    let (last_ms, wait_ms) = busy_retry_wait_ms(supervisor)?;
+    let left = last_ms.saturating_add(wait_ms).saturating_sub(now_ms);
+    (left > 0).then_some(left)
+}
+
+/// Time-aware digest order: applies bounded exponential backoff when recent
+/// `dispatch-digest-*` commands failed with `PANE_NOT_READY`.
+pub(super) fn order_at(
+    supervisor: &Facts,
+    pending: &[Escalation],
+    spawn: &str,
+    now_ms: i64,
+) -> Option<Order> {
     if pending.is_empty() || !supervisor_idle(supervisor) {
+        return None;
+    }
+    if let Some((last_ms, wait_ms)) = busy_retry_wait_ms(supervisor)
+        && now_ms < last_ms.saturating_add(wait_ms)
+    {
         return None;
     }
     let (lines, tags): (Vec<Line<'_>>, Vec<Vec<String>>) =
