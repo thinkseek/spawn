@@ -35,9 +35,11 @@
 //! - Never `--unshare-net`, `--unshare-all` nor `--as-pid-1`.
 //! - **Masks first, writable binds last**: everything is read-only
 //!   (`--ro-bind / /`), each mask hides one path, and only then are the
-//!   workspace, the engine's home and its `TMPDIR` bound writable, each at
-//!   its own exact path, so the Bridge reads the transcripts from the host
-//!   where the engine writes them.
+//!   workspace and the engine's home (its `TMPDIR` inside) bound writable,
+//!   each at its own exact path, so the Bridge reads the transcripts from
+//!   the host where the engine writes them. Every writable bind is checked
+//!   against every mask target, a nested one included; only the words leave
+//!   out a mask inside another.
 //! - **No writable bind overlaps a mask or the view's private directory**:
 //!   a workspace that holds or lies in a masked path is refused, and so is
 //!   an engine home that is or holds one (a misconfigured `SPAWN_AGY_HOME`
