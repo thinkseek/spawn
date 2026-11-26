@@ -10,9 +10,16 @@ repository.workspace = true
 [dependencies]
 # SHA-256 content addresses (already linked through the PostgreSQL driver).
 sha2.workspace = true
+# Deterministic 40-hex Git OID projection for D6 snapshots (`commit` / `tree` / `blob`).
+sha1.workspace = true
 thiserror.workspace = true
 # O_NOFOLLOW | O_NONBLOCK on object opens.
 libc.workspace = true
+# Safe `syncfs` durability barrier for persistent D6 CAS writes.
+rustix.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

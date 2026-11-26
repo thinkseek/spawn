@@ -17,6 +17,14 @@ pub const NS_BASE_CACHE: &str = "base-cache";
 pub const NS_BACKUP: &str = "backup";
 /// Data snapshots.
 pub const NS_DATA: &str = "data";
+/// Persistent Merkle tree & snapshot metadata objects (D6, never LRU-evicted).
+pub const NS_TREE: &str = "tree";
+/// Persistent file & chunk blobs referenced by trees (D6, never LRU-evicted).
+pub const NS_BLOB: &str = "blob";
+
+fn is_persistent_namespace(name: &str) -> bool {
+    name == NS_TREE || name == NS_BLOB
+}
 
 /// Byte quotas by namespace; a namespace without one is never evicted.
 pub type Quotas = BTreeMap<String, u64>;
@@ -133,7 +141,9 @@ impl Store {
             let name = namespace.file_name().to_string_lossy().into_owned();
             let mut records = self.records(&namespace.path())?;
             let mut total: u64 = records.iter().map(|record| record.size).sum();
-            if let Some(&quota) = quotas.get(&name) {
+            if let Some(&quota) = quotas.get(&name)
+                && !is_persistent_namespace(&name)
+            {
                 records.sort_by(|left, right| {
                     (left.used, &left.digest).cmp(&(right.used, &right.digest))
                 });

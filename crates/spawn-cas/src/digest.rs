@@ -1,6 +1,6 @@
-//! Algorithm-prefixed content addresses: `sha256:<64 hex>` or
-//! `blake3:<64 hex>`, lowercase. An unprefixed digest is refused
-//! everywhere.
+//! Algorithm-prefixed content addresses: `sha256:<64 hex>`, lowercase.
+//! An unprefixed digest or any algorithm other than SHA-256 is refused
+//! everywhere (D6 Phase 0 freeze).
 
 use std::fmt;
 use std::io::{self, Read};
@@ -10,26 +10,21 @@ use sha2::{Digest as _, Sha256};
 
 use crate::CasError;
 
-/// An algorithm a digest may name. Both parse; only SHA-256 can be
-/// computed until the `blake3` crate lands (ST2, design F14).
+/// The single frozen CAS content-address algorithm (`sha256`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Algo {
-    /// SHA-256, the v1 wire's algorithm.
+    /// Hardware-accelerated SHA-256 (`sha256:<64 hex>`).
     Sha256,
-    /// BLAKE3: parsed, never verified in this build
-    /// ([`CasError::AlgoUnavailable`]).
-    Blake3,
 }
 
 impl Algo {
-    /// Every algorithm, in the order of their directory names.
-    pub const ALL: [Self; 2] = [Self::Blake3, Self::Sha256];
+    /// Every supported algorithm, in directory order.
+    pub const ALL: [Self; 1] = [Self::Sha256];
 
-    /// The prefix and the directory name under `objects/`.
+    /// The prefix and the directory name under `objects/` and `chunk-index/`.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Sha256 => "sha256",
-            Self::Blake3 => "blake3",
         }
     }
 
@@ -38,11 +33,10 @@ impl Algo {
         Self::ALL.into_iter().find(|algo| algo.name() == name)
     }
 
-    /// A hasher of this algorithm, or [`CasError::AlgoUnavailable`].
-    pub fn hasher(self) -> Result<Hasher, CasError> {
+    /// An incremental hasher for this algorithm.
+    pub fn hasher(self) -> Hasher {
         match self {
-            Self::Sha256 => Ok(Hasher(Sha256::new())),
-            Self::Blake3 => Err(CasError::AlgoUnavailable(self)),
+            Self::Sha256 => Hasher(Sha256::new()),
         }
     }
 }
@@ -53,7 +47,7 @@ impl fmt::Display for Algo {
     }
 }
 
-/// An incremental hash of an available algorithm.
+/// An incremental SHA-256 hasher.
 #[derive(Debug, Clone)]
 pub struct Hasher(Sha256);
 
@@ -63,9 +57,19 @@ impl Hasher {
         self.0.update(bytes);
     }
 
+    /// The digest bytes of everything fed.
+    pub fn finish_bytes(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+
     /// The digest of everything fed, in lowercase hex.
     pub fn finish_hex(self) -> String {
         to_hex(&self.0.finalize())
+    }
+
+    /// Finalize into a [`Digest`].
+    pub fn finish(self) -> Digest {
+        Digest::from_raw_sha256(self.finish_bytes())
     }
 }
 
@@ -87,7 +91,29 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// An algorithm-prefixed content address.
+pub(crate) fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+pub(crate) fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        out[index] = (high << 4) | low;
+    }
+    Some(out)
+}
+
+/// An algorithm-prefixed content address (`sha256:<64 hex>`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest {
     algo: Algo,
@@ -95,7 +121,7 @@ pub struct Digest {
 }
 
 impl Digest {
-    /// Exactly `sha256:<64 hex>` or `blake3:<64 hex>`, lowercase.
+    /// Exactly `sha256:<64 hex>`, lowercase.
     pub fn parse(text: &str) -> Result<Self, CasError> {
         let bad = |reason| CasError::BadDigest {
             input: text.to_string(),
@@ -115,6 +141,19 @@ impl Digest {
             algo,
             hex: hex.to_string(),
         })
+    }
+
+    /// Construct a SHA-256 [`Digest`] from raw 32 bytes.
+    pub fn from_raw_sha256(bytes: [u8; 32]) -> Self {
+        Self {
+            algo: Algo::Sha256,
+            hex: to_hex(&bytes),
+        }
+    }
+
+    /// Raw 32 digest bytes.
+    pub fn as_bytes(&self) -> [u8; 32] {
+        decode_hex_32(&self.hex).expect("Digest always stores 64 lowercase hex digits")
     }
 
     /// The digest of `algo` and `hex` (64 lowercase hex digits).
@@ -137,9 +176,8 @@ impl Digest {
         &self.hex[..2]
     }
 
-    /// A hasher of the digest's algorithm, or
-    /// [`CasError::AlgoUnavailable`].
-    pub fn hasher(&self) -> Result<Hasher, CasError> {
+    /// An incremental hasher for this digest's algorithm.
+    pub fn hasher(&self) -> Hasher {
         self.algo.hasher()
     }
 }
@@ -160,20 +198,14 @@ impl FromStr for Digest {
 
 /// The SHA-256 digest of `bytes`.
 pub fn sha256_of(bytes: &[u8]) -> Digest {
-    Digest {
-        algo: Algo::Sha256,
-        hex: to_hex(&Sha256::digest(bytes)),
-    }
+    Digest::from_raw_sha256(Sha256::digest(bytes).into())
 }
 
 /// The SHA-256 digest of everything `reader` yields.
 pub fn sha256_reader(reader: &mut impl Read) -> io::Result<Digest> {
     let mut hasher = Hasher(Sha256::new());
     feed(&mut hasher, reader)?;
-    Ok(Digest {
-        algo: Algo::Sha256,
-        hex: hasher.finish_hex(),
-    })
+    Ok(hasher.finish())
 }
 
 fn feed(hasher: &mut Hasher, reader: &mut impl Read) -> io::Result<()> {
@@ -201,11 +233,9 @@ impl Verified {
 }
 
 /// Hash everything `reader` yields and compare it with `want`:
-/// [`CasError::Mismatch`] when it differs, [`CasError::AlgoUnavailable`]
-/// when `want`'s algorithm cannot be computed (unverifiable bytes are never
-/// used).
+/// [`CasError::Mismatch`] when it differs.
 pub fn verify_reader(reader: &mut impl Read, want: &Digest) -> Result<Verified, CasError> {
-    let mut hasher = want.hasher()?;
+    let mut hasher = want.hasher();
     feed(&mut hasher, reader)?;
     let got = hasher.finish_hex();
     if got == want.hex {
