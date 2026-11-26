@@ -20,10 +20,13 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::json;
 use spawn_cas::{Digest, GitOid, Snapshot, Tree, TreeEntry, TreeEntryKind, TreeMutation};
-use spawn_core::id::{BranchName, CommitId};
+use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
     BaseMerge, Branch, Commit, MERGE_WAITS, MOUNT_CANCELLED, SetAside, UNMOUNT_IN_USE,
     WorkspaceError, WorkspaceStore,
+};
+use spawn_host::d6_workspace::{
+    HostMemorySample, L1Admission, L1FallbackReason, L1FlushReason, L1TmpfsPolicy,
 };
 use spawn_host::{
     CasMerkleStore, D6RefKind, D6StoreError, D6Workspace, GitWorkspace, LedgerRef, LedgerSnapshot,
@@ -63,18 +66,26 @@ struct PgRefLedger {
 }
 
 impl PgRefLedger {
-    fn connect_isolated(case: &str) -> Self {
+    fn unique_schema(case: &str) -> String {
         static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
-        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
-            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
-        );
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
         let seq = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
-        let schema = format!("spawn_test_{}_{nanos:x}_{seq}_{case}", std::process::id());
-        let pg = PostgresStore::connect_in_schema(&url, &schema).expect("connect_in_schema");
+        format!("spawn_test_{}_{nanos:x}_{seq}_{case}", std::process::id())
+    }
+
+    fn connect_in_schema_name(schema: &str) -> Self {
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let pg = PostgresStore::connect_in_schema(&url, schema).expect("connect_in_schema");
         Self { pg }
+    }
+
+    fn connect_isolated(case: &str) -> Self {
+        let schema = Self::unique_schema(case);
+        Self::connect_in_schema_name(&schema)
     }
 }
 
@@ -1035,4 +1046,511 @@ fn shadow_d6_workspace_pg_negative_tracked_set_leak_fails_closed() {
         pg_ref_snapshot(&ledger, "proj-leak", "agent_sec"),
         head_before.to_string()
     );
+}
+
+fn seed_l1_main_with_blob(
+    store: &D6Workspace<PgRefLedger>,
+    ledger: &PgRefLedger,
+    cas: &CasMerkleStore,
+    project: &str,
+    source: &str,
+    blob_size: usize,
+) {
+    let base_branch = BranchName::new("seed_bootstrap").expect("branch");
+    store.ensure_branch(&base_branch, None).expect("bootstrap");
+    let main0 = store.main_snapshot().expect("main0").expect("present");
+    let (blob_d, blob_len) = cas
+        .put_bytes_blob(&vec![b'k'; blob_size])
+        .expect("put blob");
+    let tree = cas
+        .put_tree_cached(
+            &Tree::from_entries(vec![TreeEntry::file(
+                b"base.bin".to_vec(),
+                &blob_d,
+                blob_len,
+            )])
+            .expect("tree"),
+        )
+        .expect("put tree");
+    let ts_ms = 1_700_000_005_000_i64;
+    let body = format_commit_body(
+        "spawn <s@l> 1700000005 +0000",
+        "spawn <s@l> 1700000005 +0000",
+        "seed l1 main\n",
+    );
+    let snap = Snapshot {
+        tree: tree.clone(),
+        parents: vec![main0.id.clone()],
+        commit_body: body,
+    };
+    let snap_id = cas.cas().put_merkle_snapshot(&snap).expect("put snap");
+    let git_oid = cas
+        .project_snapshot_oid(&snap, &[main0.git_oid])
+        .expect("project");
+    ledger
+        .record_snapshot(&snap_id, &git_oid, &tree, &snap.parents, project, ts_ms)
+        .expect("record snap");
+    let task_id = setup_accepted_task(&ledger.pg, source, &main0.git_oid, &git_oid);
+    store
+        .land_main_snapshot(Some(&main0.id), &snap_id, Some(task_id), "seed l1 main")
+        .expect("land main");
+}
+
+fn verify_l1_host_memory_reserve_fallbacks(
+    cas: &Arc<CasMerkleStore>,
+    ledger: &Arc<PgRefLedger>,
+    disk_root: &Path,
+    tmpfs_root: &Path,
+) {
+    let gib = 1024_u64 * 1024 * 1024;
+    // 1a) 128 GiB host with only 50 GiB available (< 64 GiB absolute floor) -> fallback to disk
+    let low_abs_store = D6Workspace::new("proj-l1", disk_root, cas.clone(), ledger.clone())
+        .with_l1_policy(L1TmpfsPolicy::new(tmpfs_root, 16))
+        .with_l1_memory_probe(Arc::new(move |_| {
+            Some(HostMemorySample {
+                total_bytes: 128 * gib,
+                available_bytes: 50 * gib,
+                tmpfs_available_bytes: Some(gib),
+            })
+        }));
+    let b_low_abs = BranchName::new("agent_low64").expect("branch");
+    low_abs_store
+        .ensure_branch(&b_low_abs, None)
+        .expect("ensure");
+    let ws_low_abs = low_abs_store.mount(&b_low_abs).expect("mount fallback");
+    assert!(matches!(
+        low_abs_store.l1_admission("agent_low64"),
+        Some(L1Admission::FallbackDisk {
+            reason: L1FallbackReason::HostMemoryBelowReserve { .. },
+            ..
+        })
+    ));
+    assert!(Path::new(ws_low_abs.path()).starts_with(low_abs_store.root()));
+    low_abs_store.discard(&ws_low_abs).expect("discard");
+
+    // 1b) 1 TiB host with 100 GiB available (> 64 GiB, but < 15% of 1 TiB = 153.6 GiB) -> fallback
+    let low_pct_store = D6Workspace::new("proj-l1", disk_root, cas.clone(), ledger.clone())
+        .with_l1_policy(L1TmpfsPolicy::new(tmpfs_root, 16))
+        .with_l1_memory_probe(Arc::new(move |_| {
+            Some(HostMemorySample {
+                total_bytes: 1024 * gib,
+                available_bytes: 100 * gib,
+                tmpfs_available_bytes: Some(gib),
+            })
+        }));
+    let b_low_pct = BranchName::new("agent_low15pct").expect("branch");
+    low_pct_store
+        .ensure_branch(&b_low_pct, None)
+        .expect("ensure");
+    let ws_low_pct = low_pct_store.mount(&b_low_pct).expect("mount fallback");
+    assert!(matches!(
+        low_pct_store.l1_admission("agent_low15pct"),
+        Some(L1Admission::FallbackDisk {
+            reason: L1FallbackReason::HostMemoryBelowReserve { .. },
+            ..
+        })
+    ));
+    assert_eq!(low_pct_store.l1_total_reserved_bytes(), 0);
+    low_pct_store.discard(&ws_low_pct).expect("discard");
+}
+
+fn verify_l1_interval_and_pressure_flush(
+    store: &D6Workspace<PgRefLedger>,
+    cas: &CasMerkleStore,
+    ws1: &WorkspaceId,
+    ws1_dir: &Path,
+    clock_ms: &AtomicI64,
+) {
+    // Dirty 20 KiB (< 80%), advance 65s -> triggers 60s interval flush into PG while staying in L1
+    fs::write(ws1_dir.join("dirty1.bin"), vec![b'd'; 20 * 1024]).expect("write dirty1");
+    assert_eq!(store.l1_needs_flush(ws1).expect("under 80%"), None);
+    clock_ms.fetch_add(65_000, Ordering::Relaxed);
+    assert!(matches!(
+        store.l1_needs_flush(ws1).expect("interval elapsed"),
+        Some(L1FlushReason::IntervalElapsed { .. })
+    ));
+    let interval_out = store
+        .flush_l1_if_needed(ws1, "l1 interval flush")
+        .expect("flush interval")
+        .expect("triggered");
+    assert!(matches!(interval_out.commit, Commit::Created(_)));
+    assert_eq!(interval_out.demoted_to_disk, None);
+    assert_eq!(interval_out.reclaimed_bytes, 0);
+    assert_eq!(
+        store
+            .l1_accounting("agent_l1_one")
+            .expect("acc")
+            .flush_count,
+        1
+    );
+
+    // Write another 60 KiB -> >= 560 KiB (80% threshold) -> pressure flush + demote to disk + reclaim L1
+    fs::write(ws1_dir.join("pressure.bin"), vec![b'p'; 60 * 1024]).expect("write pressure");
+    assert!(matches!(
+        store.l1_needs_flush(ws1).expect("pressure threshold"),
+        Some(L1FlushReason::UsageThreshold {
+            threshold_pct: 80,
+            ..
+        })
+    ));
+    let pressure_out = store
+        .flush_l1_if_needed(ws1, "l1 pressure reclaim")
+        .expect("flush pressure")
+        .expect("triggered");
+    assert!(matches!(pressure_out.commit, Commit::Created(_)));
+    assert!(pressure_out.reclaimed_bytes >= 600 * 1024);
+    let disk_ws = pressure_out.demoted_to_disk.expect("demoted to disk");
+    assert!(!store.is_mounted(ws1));
+    assert!(store.is_mounted(&disk_ws));
+    assert_eq!(store.l1_total_reserved_bytes(), 0);
+    assert!(Path::new(disk_ws.path()).join("dirty1.bin").is_file());
+    assert!(Path::new(disk_ws.path()).join("pressure.bin").is_file());
+    let pg_head = store
+        .branch_snapshot("agent_l1_one")
+        .expect("head")
+        .expect("some");
+    let pg_flat = cas.flatten_tree(&pg_head.tree).expect("flatten");
+    assert!(pg_flat.contains_key(b"pressure.bin".as_slice()));
+
+    store.discard(&disk_ws).expect("discard demoted");
+    assert_eq!(store.l1_total_reserved_bytes(), 0);
+}
+
+#[test]
+fn d6_workspace_pg_l1_tmpfs_admission_fallback_pressure_flush_and_reclaim() {
+    let scratch = Scratch::new("pg_l1_tmpfs");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
+    let ledger = Arc::new(PgRefLedger::connect_isolated("l1_tmpfs"));
+    let disk_root = scratch.join("disk-work");
+    let tmpfs_root = scratch.join("tmpfs-l1");
+    let gib = 1024_u64 * 1024 * 1024;
+
+    let clock_ms = Arc::new(AtomicI64::new(1_700_000_010_000));
+    let clk = clock_ms.clone();
+    let policy = L1TmpfsPolicy::new(&tmpfs_root, 1).with_per_workspace_quota_bytes(700 * 1024);
+    let store = D6Workspace::new("proj-l1", &disk_root, cas.clone(), ledger.clone())
+        .with_clock_ms(Arc::new(move || clk.fetch_add(1_000, Ordering::Relaxed)))
+        .with_l1_policy(policy)
+        .with_l1_memory_probe(Arc::new(move |_| {
+            Some(HostMemorySample {
+                total_bytes: 512 * gib,
+                available_bytes: 400 * gib,
+                tmpfs_available_bytes: Some(gib),
+            })
+        }));
+
+    // Seed 520 KiB baseline file onto PG main (within 700 KiB quota, < 80% = 560 KiB)
+    seed_l1_main_with_blob(
+        &store,
+        &ledger,
+        &cas,
+        "proj-l1",
+        "/tmp/proj-l1-seed.git",
+        520 * 1024,
+    );
+
+    verify_l1_host_memory_reserve_fallbacks(&cas, &ledger, &disk_root, &tmpfs_root);
+
+    // Admit branch 1 onto L1 tmpfs
+    let b1 = BranchName::new("agent_l1_one").expect("b1");
+    store.ensure_branch(&b1, None).expect("ensure b1");
+    let ws1 = store.mount(&b1).expect("mount b1 on L1");
+    assert!(matches!(
+        store.l1_admission("agent_l1_one"),
+        Some(L1Admission::AdmittedTmpfs { .. })
+    ));
+    let ws1_dir = PathBuf::from(ws1.path());
+    assert!(ws1_dir.starts_with(store.l1_policy().expect("policy").tmpfs_root.clone()));
+    assert!(store.l1_total_reserved_bytes() >= 520 * 1024);
+    assert_eq!(store.l1_needs_flush(&ws1).expect("probe"), None);
+
+    // Branch 2 would push total past 1 MiB budget (520 + 520 > 1024 KiB) -> falls back to disk
+    let b2 = BranchName::new("agent_l1_two").expect("b2");
+    store.ensure_branch(&b2, None).expect("ensure b2");
+    let ws2 = store.mount(&b2).expect("mount b2 fallback");
+    assert!(matches!(
+        store.l1_admission("agent_l1_two"),
+        Some(L1Admission::FallbackDisk {
+            reason: L1FallbackReason::BudgetExceeded { .. },
+            ..
+        })
+    ));
+    assert!(Path::new(ws2.path()).starts_with(store.root()));
+    store.discard(&ws2).expect("discard b2");
+
+    verify_l1_interval_and_pressure_flush(&store, &cas, &ws1, &ws1_dir, &clock_ms);
+
+    // Subsequent mount after reclaim succeeds on L1 and discard frees quota cleanly
+    let b3 = BranchName::new("agent_l1_three").expect("b3");
+    store.ensure_branch(&b3, None).expect("ensure b3");
+    let ws3 = store.mount(&b3).expect("mount b3 on L1");
+    assert!(matches!(
+        store.l1_admission("agent_l1_three"),
+        Some(L1Admission::AdmittedTmpfs { .. })
+    ));
+    store.discard(&ws3).expect("discard b3");
+    assert_eq!(store.l1_total_reserved_bytes(), 0);
+}
+
+fn advance_concurrent_main_steps(
+    coord_store: &D6Workspace<PgRefLedger>,
+    coord_ledger: &PgRefLedger,
+    cas: &CasMerkleStore,
+) {
+    for step in 0..3_usize {
+        let main_now = coord_store.main_snapshot().expect("main").expect("some");
+        let (bd, blen) = cas
+            .put_bytes_blob(format!("main-step-{step}\n").as_bytes())
+            .expect("blob");
+        let next_tree = cas
+            .apply_mutations(
+                &main_now.tree,
+                &[TreeMutation::Upsert {
+                    path: vec![
+                        b"main_updates".to_vec(),
+                        format!("m{step}.txt").into_bytes(),
+                    ],
+                    kind: TreeEntryKind::File,
+                    id: bd.as_bytes(),
+                    size: blen,
+                }],
+            )
+            .expect("mutate");
+        let ts_ms = 1_700_000_100_000_i64 + i64::try_from(step).unwrap() * 1_000;
+        let body = format_commit_body(
+            "spawn <s@l> 1700000100 +0000",
+            "spawn <s@l> 1700000100 +0000",
+            &format!("main advance {step}\n"),
+        );
+        let snap = Snapshot {
+            tree: next_tree.clone(),
+            parents: vec![main_now.id.clone()],
+            commit_body: body,
+        };
+        let sid = cas.cas().put_merkle_snapshot(&snap).expect("snap");
+        let goid = cas
+            .project_snapshot_oid(&snap, &[main_now.git_oid])
+            .expect("oid");
+        coord_ledger
+            .record_snapshot(&sid, &goid, &next_tree, &snap.parents, "proj-conc", ts_ms)
+            .expect("record");
+        let task_id = setup_accepted_task(
+            &coord_ledger.pg,
+            &format!("/tmp/proj-conc-{step}.git"),
+            &main_now.git_oid,
+            &goid,
+        );
+        coord_store
+            .land_main_snapshot(Some(&main_now.id), &sid, Some(task_id), "concurrent main")
+            .expect("land main");
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+fn verify_concurrent_pg_branches(
+    coord_store: &D6Workspace<PgRefLedger>,
+    cas: &CasMerkleStore,
+    disk_root: &Path,
+    mounted_branches: &[BranchName],
+    unmounted_branches: &[BranchName],
+) {
+    for b in mounted_branches {
+        let dir = disk_root.join(b.as_str());
+        let ws = spawn_core::id::WorkspaceId::new(format!("{b}:{}", dir.display())).expect("id");
+        assert!(!matches!(
+            coord_store.merge_base(&ws).expect("final merge_base"),
+            BaseMerge::Conflicted { .. }
+        ));
+    }
+    for b in unmounted_branches {
+        assert!(!matches!(
+            coord_store
+                .merge_main_clean(b)
+                .expect("final merge_main_clean"),
+            BaseMerge::Conflicted { .. }
+        ));
+        assert!(!disk_root.join(b.as_str()).exists());
+    }
+    for (idx, b) in mounted_branches.iter().enumerate() {
+        let head = coord_store
+            .branch_snapshot(b.as_str())
+            .expect("get")
+            .expect("head");
+        let flat = cas.flatten_tree(&head.tree).expect("flatten");
+        for step in 0..3_usize {
+            assert!(flat.contains_key(format!("main_updates/m{step}.txt").as_bytes()));
+        }
+        for round in 0..4_usize {
+            assert!(flat.contains_key(format!("workers/w{idx}/r{round}.txt").as_bytes()));
+        }
+    }
+    for b in unmounted_branches {
+        let head = coord_store
+            .branch_snapshot(b.as_str())
+            .expect("get")
+            .expect("head");
+        let flat = cas.flatten_tree(&head.tree).expect("flatten");
+        for step in 0..3_usize {
+            assert!(flat.contains_key(format!("main_updates/m{step}.txt").as_bytes()));
+        }
+    }
+    let journal = cas.cas().read_ref_journal().expect("read refs.journal");
+    assert!(
+        journal.len() >= 20,
+        "expected >= 20 ref journal transitions, got {}",
+        journal.len()
+    );
+}
+
+#[test]
+fn d6_workspace_pg_concurrent_8_branches_checkpoint_and_merge_main_clean() {
+    use std::sync::Barrier;
+
+    let scratch = Scratch::new("pg_concurrent_8");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
+    let disk_root = scratch.join("work");
+    let schema = PgRefLedger::unique_schema("concurrent8");
+    let coord_ledger = Arc::new(PgRefLedger::connect_in_schema_name(&schema));
+    let coord_store = D6Workspace::new("proj-conc", &disk_root, cas.clone(), coord_ledger.clone());
+
+    seed_l1_main_with_blob(
+        &coord_store,
+        &coord_ledger,
+        &cas,
+        "proj-conc",
+        "/tmp/proj-conc-init.git",
+        1024,
+    );
+
+    let mounted_branches: Vec<BranchName> = (0..8)
+        .map(|i| BranchName::new(format!("agent_c{i}")).expect("branch"))
+        .collect();
+    let unmounted_branches: Vec<BranchName> = (0..4)
+        .map(|i| BranchName::new(format!("unmounted_c{i}")).expect("branch"))
+        .collect();
+    for b in mounted_branches.iter().chain(&unmounted_branches) {
+        coord_store.ensure_branch(b, None).expect("ensure branch");
+    }
+
+    let worker_stores: Vec<_> = (0..8)
+        .map(|_| {
+            let l = Arc::new(PgRefLedger::connect_in_schema_name(&schema));
+            D6Workspace::new("proj-conc", &disk_root, cas.clone(), l)
+        })
+        .collect();
+    let merger_stores: Vec<_> = (0..4)
+        .map(|_| {
+            let l = Arc::new(PgRefLedger::connect_in_schema_name(&schema));
+            D6Workspace::new("proj-conc", &disk_root, cas.clone(), l)
+        })
+        .collect();
+
+    let barrier = Arc::new(Barrier::new(13));
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let b_main = barrier.clone();
+        let cs = &coord_store;
+        let cl = &coord_ledger;
+        let cas_ref = &cas;
+        handles.push(scope.spawn(move || {
+            b_main.wait();
+            advance_concurrent_main_steps(cs, cl, cas_ref);
+        }));
+
+        for (idx, (store, branch)) in worker_stores.into_iter().zip(&mounted_branches).enumerate() {
+            let b_w = barrier.clone();
+            handles.push(scope.spawn(move || {
+                b_w.wait();
+                let ws = store.mount(branch).expect("mount");
+                let dir = PathBuf::from(ws.path());
+                fs::create_dir_all(dir.join(format!("workers/w{idx}"))).expect("mkdir");
+                for round in 0..4_usize {
+                    fs::write(
+                        dir.join(format!("workers/w{idx}/r{round}.txt")),
+                        format!("worker={idx} round={round}\n"),
+                    )
+                    .expect("write");
+                    assert!(matches!(
+                        store
+                            .checkpoint(&ws, &format!("w{idx} r{round}"))
+                            .expect("ckpt"),
+                        Commit::Created(_)
+                    ));
+                    assert_eq!(
+                        store.checkpoint(&ws, "noop").expect("noop"),
+                        Commit::Unchanged
+                    );
+                    let m = store.merge_base(&ws).expect("merge_base");
+                    assert!(!matches!(m, BaseMerge::Conflicted { .. }));
+                }
+            }));
+        }
+
+        for (store, branch) in merger_stores.into_iter().zip(&unmounted_branches) {
+            let b_u = barrier.clone();
+            handles.push(scope.spawn(move || {
+                b_u.wait();
+                for _ in 0..6 {
+                    let res = store.merge_main_clean(branch).expect("merge_main_clean");
+                    assert!(!matches!(res, BaseMerge::Conflicted { .. }));
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread succeeded cleanly");
+        }
+    });
+
+    verify_concurrent_pg_branches(
+        &coord_store,
+        &cas,
+        &disk_root,
+        &mounted_branches,
+        &unmounted_branches,
+    );
+}
+
+#[test]
+fn d6_workspace_pg_same_second_identical_commits_are_idempotent() {
+    let scratch = Scratch::new("pg_same_second_idempotent");
+    let cas = Arc::new(CasMerkleStore::open(scratch.join("cas")).expect("cas"));
+    let ledger = Arc::new(PgRefLedger::connect_isolated("same_sec_idempotent"));
+    let disk_root = scratch.join("disk-work");
+
+    let store_a = D6Workspace::new("proj-sec", &disk_root, cas.clone(), ledger.clone())
+        .with_clock_ms(Arc::new(|| 1_700_000_050_111));
+    let store_b = D6Workspace::new("proj-sec", &disk_root, cas, ledger)
+        .with_clock_ms(Arc::new(|| 1_700_000_050_987));
+
+    let b1 = BranchName::new("agent_sec_a").expect("b1");
+    let b2 = BranchName::new("agent_sec_b").expect("b2");
+    store_a.ensure_branch(&b1, None).expect("ensure b1");
+    store_b.ensure_branch(&b2, None).expect("ensure b2");
+
+    let ws1 = store_a.mount(&b1).expect("mount b1");
+    let ws2 = store_b.mount(&b2).expect("mount b2");
+    fs::write(Path::new(ws1.path()).join("same.txt"), b"identical\n").expect("write w1");
+    fs::write(Path::new(ws2.path()).join("same.txt"), b"identical\n").expect("write w2");
+
+    let c1 = store_a
+        .checkpoint(&ws1, "identical commit")
+        .expect("checkpoint w1");
+    let c2 = store_b
+        .checkpoint(&ws2, "identical commit")
+        .expect("checkpoint w2 same second must not hit 23505");
+    assert_eq!(c1, c2);
+    assert!(matches!(c1, Commit::Created(_)));
+
+    let s1 = store_a
+        .branch_snapshot("agent_sec_a")
+        .expect("s1")
+        .expect("some s1");
+    let s2 = store_b
+        .branch_snapshot("agent_sec_b")
+        .expect("s2")
+        .expect("some s2");
+    assert_eq!(s1.id, s2.id);
+    assert_eq!(s1.created_at_ms, 1_700_000_050_000);
+    assert_eq!(s2.created_at_ms, 1_700_000_050_000);
 }
