@@ -523,6 +523,7 @@ pub(crate) fn probe_now() -> Probe {
             lookup: &lookup,
             run: &run_bounded,
             exists: &exists,
+            view: &view_now,
         },
         crate::grading::now_ms(),
     )
