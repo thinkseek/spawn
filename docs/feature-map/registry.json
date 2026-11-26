@@ -1496,6 +1496,7 @@
         "crates/spawn-jev/Cargo.toml",
         "crates/spawn-jev/src/lib.rs",
         "crates/spawn-jev/tests/api.rs",
+        "crates/spawn-jev/tests/out_sock.rs",
         "crates/spawn-jev/tests/relay.rs",
         "deploy/systemd/spawn-agent-presence-upload.service",
         "deploy/systemd/spawn-agent-presence-upload.timer",
@@ -2043,7 +2044,9 @@
         "docs/node-protocol-v1.md",
         "docs/spawn-e2e-v2.md",
         "web/src/components/fleet/NodeRows.tsx",
+        "web/src/e2e.ts",
         "web/src/nodes.ts",
+        "web/test/e2e.test.ts",
         "web/test/nodes.test.ts"
       ],
       "relations": [

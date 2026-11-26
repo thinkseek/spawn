@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -26,8 +27,26 @@ function contrast(): Plugin {
   };
 }
 
+// Emit the single-source PWA assets (`web/src/pwa/*`) into `web/dist/`
+// during build so external static servers (e.g. `spawn-node front --serve edge`)
+// can serve them alongside the UI bundle without duplicating source files.
+const PWA_ASSETS = ["sw.js", "manifest.webmanifest", "icon.svg"] as const;
+
+function pwaAssets(): Plugin {
+  return {
+    name: "spawn-pwa-assets",
+    apply: "build",
+    generateBundle() {
+      for (const fileName of PWA_ASSETS) {
+        const source = readFileSync(new URL(`./src/pwa/${fileName}`, import.meta.url), "utf8");
+        this.emitFile({ type: "asset", fileName, source });
+      }
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [contrast(), react(), tailwindcss()],
+  plugins: [contrast(), pwaAssets(), react(), tailwindcss()],
   // Inline, so vite never loads a postcss.config.js or .postcssrc from the
   // tree (deploy.sh builds the UI with `--config vite.config.ts`, so no
   // vite.config.js is loaded either). Tailwind runs as the plugin above.
