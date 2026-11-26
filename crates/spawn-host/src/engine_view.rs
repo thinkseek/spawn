@@ -480,7 +480,7 @@ impl BwrapView {
                 target.display()
             ));
         }
-        if engine_home == Path::new("/") || home.starts_with(&engine_home) {
+        if engine_home == Path::new("/") || home.starts_with(engine_home) {
             return Err(format!(
                 "the engine's home {} holds the user's home",
                 engine_home.display()
@@ -524,7 +524,6 @@ impl BwrapView {
         let workspace = canonical_directory(Path::new(launch.workspace), "the workspace", false)?;
         let engine_home =
             canonical_directory(Path::new(launch.engine_home), "the engine's home", true)?;
-        let home = std::fs::canonicalize(&self.config.home).unwrap_or(self.config.home.clone());
         let private = self.private_dir()?;
 
         let (directories, files, skipped) = self.targets();
