@@ -3055,11 +3055,11 @@ mod tests {
     /// label names no driver) starts Claude Code byte for byte as before.
     #[test]
     fn a_new_worker_starts_on_its_presets_engine_and_model_label() {
-        let work = Work {
+        let planned = Work {
             engines: agy_ready(&["gemini-3.8-flash-low"]),
             ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
         };
-        let plan = orders(&work, &[]);
+        let plan = orders(&planned, &[]);
         assert_eq!(plan.len(), 1);
         let CommandAction::Start {
             engine,
@@ -3071,7 +3071,7 @@ mod tests {
         };
         assert_eq!(engine, "agy");
         assert_eq!(model_label.as_deref(), Some("gemini-3.8-flash-low"));
-        assert!(unavailable(&work, &[]).is_empty());
+        assert!(unavailable(&planned, &[]).is_empty());
         for label in [None, Some("claude"), Some("codex")] {
             let mut claude = agy_task(5, "ephemeral", "opus");
             claude.preset_engine = label.map(str::to_string);
@@ -3116,12 +3116,12 @@ mod tests {
             ),
         ];
         for (engines, said) in cases {
-            let work = Work {
+            let planned = Work {
                 engines,
                 ..work(vec![task.clone()])
             };
-            assert!(orders(&work, &[]).is_empty(), "{said:?}: no command");
-            let lines = unavailable(&work, &[]);
+            assert!(orders(&planned, &[]).is_empty(), "{said:?}: no command");
+            let lines = unavailable(&planned, &[]);
             match said {
                 None => assert!(lines.is_empty(), "{lines:?}"),
                 Some(said) => {
@@ -3151,16 +3151,16 @@ mod tests {
     #[test]
     fn an_ephemeral_worker_switches_engine_by_stop_then_start_and_a_resident_keeps_its_own() {
         let engines = agy_ready(&["gemini-3.8-flash-low"]);
-        let work = Work {
+        let planned = Work {
             engines: engines.clone(),
             ..work(vec![agy_task(4, "ephemeral", "gemini-3.8-flash-low")])
         };
-        let plan = orders(&work, &[worker(true, true)]);
+        let plan = orders(&planned, &[worker(true, true)]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].action, CommandAction::Stop);
         assert_eq!(plan[0].key, "switch-engine-4-0");
         assert_eq!(plan[0].task, None, "a stop delivers nothing");
-        let plan = orders(&work, &[worker(false, false)]);
+        let plan = orders(&planned, &[worker(false, false)]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].key, "deliver-4-0");
         assert!(
@@ -3190,7 +3190,7 @@ mod tests {
             plan[0].action
         );
         // A resume whose host label agy does not list is no resume either.
-        assert!(orders(&work, &[on_agy]).is_empty());
+        assert!(orders(&planned, &[on_agy]).is_empty());
         // A resident on Claude Code keeps it: the task is typed in.
         let resident = Work {
             engines,
