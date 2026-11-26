@@ -408,6 +408,42 @@ fn a_call_the_gateway_does_not_commit_changes_nothing() {
     assert_eq!(grants(&granted).len(), 1, "the same beat, believed, grants");
 }
 
+/// An enrolled node with nothing to do (no lease, no pending result, no
+/// queued job in its cell) is still told to beat every 5 s: with ±20%
+/// jitter a 30 s idle beat slept past `DEFAULT_QUEUE_WAIT` (30 s), and a
+/// wave queued just after it fell back to local (N252 Wave D, task #595).
+#[test]
+fn an_idle_node_still_beats_every_five_seconds() {
+    let (store, schema) = store("rj_idle_beat");
+    let mut client = admin(&schema);
+    let node = enroll(&store, "n252", 21, &json!({"pg": "16"}));
+    let queued: i64 = client
+        .query_one(
+            "select count(*) from spawn_remote_jobs where state = 'queued'",
+            &[],
+        )
+        .expect("count the queue")
+        .get(0);
+    assert_eq!(queued, 0, "nothing is queued");
+    let b1 = boot(1);
+    for seq in 1..=2 {
+        let idle = beat_once(&store, &node, &b1, seq, &beat(&[], &[], 4, 262_144));
+        assert_eq!(idle["ok"], true, "beat {seq}: {idle}");
+        assert_eq!(grants(&idle), [], "beat {seq}: nothing to grant");
+        assert_eq!(idle["renewed"], json!([]), "beat {seq}: no lease held");
+        assert_eq!(idle["acked_results"], json!([]), "beat {seq}: no result");
+        assert_eq!(idle["fenced"], json!([]), "beat {seq}: nothing fenced");
+        assert_eq!(
+            idle["next_beat_ms"], 5000,
+            "beat {seq}: an idle node beats every 5 s, inside the 30 s queue wait"
+        );
+        assert_eq!(
+            idle["lease_ttl_s"], 90,
+            "beat {seq}: the lease TTL is unchanged"
+        );
+    }
+}
+
 /// Two nodes beat at once, again and again, over one queue: SKIP LOCKED
 /// hands each job to exactly one of them.
 #[test]
