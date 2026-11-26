@@ -939,8 +939,11 @@ fn a_detached_daemon_beneath_the_workspace_is_ended_by_terminate() {
 
 /// `submit_staged` hands a staged text to the pane's detected agent (the
 /// stub agy) through `agent.prompt`, which submits it: the stub reads the
-/// line and draws the state it names. A text past the request line cap,
-/// and a pane with no agent, still arrive (chunked `pane.send_text`).
+/// line and draws the state it names. A pane with no agent Herdr detects
+/// takes chunked `pane.send_text` instead (`agent_not_found`): the plain
+/// shell panes of the tests above type their staged texts that way. Only
+/// the choice of the path for a text past the request line cap is tested,
+/// by `prompt_fits`'s unit test in `src/herdr.rs`.
 #[test]
 fn a_staged_text_reaches_a_detected_agent_through_agent_prompt() {
     let _serial = exclusive();
