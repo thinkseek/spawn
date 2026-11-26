@@ -1050,7 +1050,19 @@ impl NodeShadows {
             }
         };
         let judged = remote::judge_stored(&stored, &job.given);
-        let settled = remote::settle(store, row, &judged);
+        // A rejection naming only test-database errors is no valid run:
+        // the node's strikes are not reset (nor struck); still recorded.
+        let no_work_failure = judged.verdict.as_ref().is_some_and(|verdict| {
+            remote::names_no_work_failure(
+                verdict,
+                super::needs_test_database(&job.want.scenarios),
+            )
+        });
+        let settled = if no_work_failure {
+            Ok(None)
+        } else {
+            remote::settle(store, row, &judged)
+        };
         let requeued = matches!(
             &settled,
             Ok(Some(outcome)) if outcome.ok && outcome.next == Some(spawn_postgres::FaultNext::Queued)
@@ -1071,7 +1083,7 @@ impl NodeShadows {
             ),
             Ok(None) => {}
             Err(error) => eprintln!(
-                "integrate: task {task}'s node shadow {}: its fault not judged: {error}",
+                "integrate: task {task}'s node shadow {}: {error}",
                 row.job_id
             ),
         }

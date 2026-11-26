@@ -1185,7 +1185,7 @@ pub(super) fn settle(
             next_for(job.kind, next),
         )
         .map(Some)
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("its fault not judged: {error}"))
 }
 
 /// Where a task's candidate gate is judged (design §12.2 S5): unset, empty
@@ -1835,7 +1835,7 @@ impl Primary {
             ),
             Ok(None) => {}
             Err(error) => eprintln!(
-                "integrate: task {task}'s node gate {job_id}: its fault not judged: {error}"
+                "integrate: task {task}'s node gate {job_id}: {error}"
             ),
         }
         match settled {
