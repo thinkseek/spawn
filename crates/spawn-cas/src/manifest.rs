@@ -43,7 +43,7 @@ use crate::store::{check_name, open_nofollow, plain_dir, remove_missing_ok, uniq
 use crate::{Algo, CasError, Digest, NS_DATA, Store, is_hex64, sha256_of, sha256_reader};
 
 /// The format's name.
-pub const MANIFEST_V1: &str = "manifest-v1";
+pub(crate) const MANIFEST_V1: &str = "manifest-v1";
 
 /// The pin owner of the data snapshots: `pins/prov/<ref>`.
 pub const PROV_PIN_OWNER: &str = "prov";

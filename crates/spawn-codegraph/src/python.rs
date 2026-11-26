@@ -12,13 +12,13 @@ use std::collections::BTreeSet;
 use spawn_core::feature_deps::{EdgeKind, Language, Scope};
 
 /// Maximum bracket nesting depth accepted by the Python lexer.
-pub const MAX_BRACKET_DEPTH: usize = 256;
+pub(crate) const MAX_BRACKET_DEPTH: usize = 256;
 
 /// Maximum nested f-string depth accepted by the Python lexer.
-pub const MAX_FSTRING_DEPTH: usize = 32;
+pub(crate) const MAX_FSTRING_DEPTH: usize = 32;
 
 /// Extensions read as Python sources or stub files.
-pub const SOURCE_EXTENSIONS: [&str; 2] = ["py", "pyi"];
+pub(crate) const SOURCE_EXTENSIONS: [&str; 2] = ["py", "pyi"];
 
 fn extension(path: &str) -> Option<&str> {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -28,24 +28,19 @@ fn extension(path: &str) -> Option<&str> {
 }
 
 /// Whether `path` is a Python source or stub file (`.py`, `.pyi`).
-pub fn is_python_source(path: &str) -> bool {
+pub(crate) fn is_python_source(path: &str) -> bool {
     extension(path).is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
 }
 
-/// Whether `path` is a Python type stub (`.pyi`).
-pub fn is_stub_file(path: &str) -> bool {
-    extension(path) == Some("pyi")
-}
-
 /// Whether `path` is a package `__init__.py` or `__init__.pyi`.
-pub fn is_package_init(path: &str) -> bool {
+pub(crate) fn is_package_init(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name == "__init__.py" || name == "__init__.pyi"
 }
 
 /// Whether `path` is a Python test file (`test/`, `tests/`, `__tests__/`,
 /// `conftest.py`, `test_*.py`, `test-*.py`, `*_test.py`, `*-test.py`).
-pub fn is_test_path(path: &str) -> bool {
+pub(crate) fn is_test_path(path: &str) -> bool {
     let mut parts: Vec<&str> = path.split('/').collect();
     let name = parts.pop().unwrap_or_default();
     if parts
@@ -68,7 +63,7 @@ pub fn is_test_path(path: &str) -> bool {
 }
 
 /// The scope of every edge from `path`.
-pub fn scope_of(path: &str) -> Scope {
+pub(crate) fn scope_of(path: &str) -> Scope {
     if is_test_path(path) {
         Scope::Test
     } else {
@@ -77,7 +72,7 @@ pub fn scope_of(path: &str) -> Scope {
 }
 
 /// The language for a Python file.
-pub const fn language() -> Language {
+pub(crate) const fn language() -> Language {
     Language::Python
 }
 
@@ -88,8 +83,11 @@ pub enum PyImported {
     /// written: PEP 484 treats explicit redundant `from .x import Y as Y` in
     /// `__init__.py` as an explicit re-export).
     Named {
+        /// Original symbol name exported by the target module.
         orig: String,
+        /// Local binding name introduced in this module (`orig` when unaliased).
         alias: String,
+        /// Whether an explicit `as` clause was written in source.
         explicit_alias: bool,
     },
     /// `from pkg import *`.
@@ -122,6 +120,7 @@ pub struct PyImport {
 /// Static facts extracted from one `.py` or `.pyi` file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PyFacts {
+    /// Parsed `import` and `from ... import ...` statements in source order.
     pub imports: Vec<PyImport>,
     /// Top-level symbols defined, assigned, or imported in the module.
     pub exports: BTreeSet<String>,
@@ -1594,6 +1593,10 @@ fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
 
 /// Extract static module imports, exports, and dynamic unresolved lines from a
 /// Python source or `.pyi` stub.
+///
+/// Rejects sources larger than [`crate::MAX_SOURCE_BYTES`] or exceeding
+/// internal bracket/f-string nesting caps, and strips any leading UTF-8 BOM
+/// before iterative lexing.
 pub fn parse(text: &str) -> Result<PyFacts, String> {
     if text.len() as u64 > crate::MAX_SOURCE_BYTES {
         return Err(format!(

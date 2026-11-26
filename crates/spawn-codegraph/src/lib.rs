@@ -2,14 +2,14 @@
 //! issue #100): the code graph a repository's files make, in the model of
 //! [`spawn_core::feature_deps`].
 //!
-//! - [`manifest`]: a strict built-in reader for the TOML subset of
+//! - `manifest`: a strict built-in reader for the TOML subset of
 //!   `Cargo.toml` and `pyproject.toml` (no `toml` crate: the gate builds offline);
 //! - [`rust`]: what one Rust file says, read with `syn`;
-//! - [`ecma`]: what one TypeScript / JavaScript file says, read with a
+//! - `ecma`: what one TypeScript / JavaScript file says, read with a
 //!   hand-written lexer (`package.json` and `tsconfig.json` are read by
-//!   [`manifest`]);
+//!   `manifest`);
 //! - [`python`]: what one Python `.py` / `.pyi` file says, read with a
-//!   hand-written lexer (`pyproject.toml` is read by [`manifest`]);
+//!   hand-written lexer (`pyproject.toml` is read by `manifest`);
 //! - [`resolve`]: units, targets, module trees, and every reference resolved
 //!   to a file of the in-scope inventory.
 //!
@@ -17,12 +17,15 @@
 //! graph` command) is the only reader of files; it passes the in-scope
 //! inventory and the texts of the files [`wants`] accepts.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use spawn_core::feature_deps::CodeGraph;
 
-pub mod ecma;
-pub mod manifest;
+mod ecma;
+mod manifest;
 pub mod python;
 pub mod resolve;
 pub mod rust;
@@ -71,18 +74,18 @@ fn file_name(path: &str) -> &str {
 }
 
 /// A `pyproject.toml`, at the root or in a directory.
-pub fn is_pyproject_toml(path: &str) -> bool {
+pub(crate) fn is_pyproject_toml(path: &str) -> bool {
     file_name(path) == "pyproject.toml"
 }
 
 /// A `package.json`, at the root or in a directory.
-pub fn is_package_json(path: &str) -> bool {
+pub(crate) fn is_package_json(path: &str) -> bool {
     file_name(path) == "package.json"
 }
 
 /// A `tsconfig*.json` or `jsconfig*.json` (an `extends` target may be
 /// `tsconfig.base.json`).
-pub fn is_tsconfig(path: &str) -> bool {
+pub(crate) fn is_tsconfig(path: &str) -> bool {
     let name = file_name(path);
     (name.starts_with("tsconfig") || name.starts_with("jsconfig"))
         && std::path::Path::new(name)
@@ -91,14 +94,14 @@ pub fn is_tsconfig(path: &str) -> bool {
 }
 
 /// A `.rs` file (the compiler reads no other spelling).
-pub fn is_rust_source(path: &str) -> bool {
+pub(crate) fn is_rust_source(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
         .is_some_and(|extension| extension == "rs")
 }
 
 /// A `Cargo.toml`, at the root or in a directory.
-pub fn is_cargo_manifest(path: &str) -> bool {
+pub(crate) fn is_cargo_manifest(path: &str) -> bool {
     path == "Cargo.toml" || path.ends_with("/Cargo.toml")
 }
 

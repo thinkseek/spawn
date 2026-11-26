@@ -41,6 +41,9 @@
 //! `tree_sha256_v1` line list of a directory; the snapshot's identity is
 //! `sha256:<tree_sha256_v1>`.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 mod chunker;
 mod digest;
 mod gc;
@@ -51,14 +54,14 @@ mod legacy;
 mod manifest;
 mod merkle;
 mod store;
-pub mod tree;
+mod tree;
 
 use std::io;
 use std::path::PathBuf;
 
 pub use chunker::{
-    CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, CHUNKER_FASTCDC_V1, CHUNKS_MAGIC, ChunkIndex, ChunkRef,
-    StoredBlob, fastcdc_gear_table, next_chunk_len,
+    CHUNK_AVG, CHUNK_MAX, CHUNK_MIN, CHUNKER_FASTCDC_V1, ChunkIndex, ChunkRef, StoredBlob,
+    fastcdc_gear_table, next_chunk_len,
 };
 pub use digest::{
     Algo, Digest, Hasher, Verified, is_hex64, sha256_of, sha256_reader, verify_reader,
@@ -68,21 +71,18 @@ pub use gc::{
     TMP_MAX_AGE, default_quotas,
 };
 pub use gc_fence::{
-    DEFAULT_PERSISTENT_GC_GRACE, GC_FENCE_FILE, GC_UNREACH_STATE_FILE, GcFenceBinding,
-    PersistentGcReport, bind_gc_fence, verify_gc_fence,
+    DEFAULT_PERSISTENT_GC_GRACE, GC_UNREACH_STATE_FILE, GcFenceBinding, PersistentGcReport,
+    bind_gc_fence, verify_gc_fence,
 };
 pub use git_oid::{
     GIT_POINTER_THRESHOLD, GitOid, GitOidCache, git_blob_oid_of_bytes, git_pointer_bytes,
     project_blob_oid, project_snapshot_oid, project_tree_oid,
 };
-pub use journal::{JournalEntry, REFS_JOURNAL, RefJournal};
+pub use journal::{JournalEntry, RefJournal};
 pub use legacy::AdoptReport;
-pub use manifest::{
-    KEEP_SNAPSHOTS, KeepReport, MANIFEST_V1, Manifest, ManifestEntry, PROV_PIN_OWNER,
-};
+pub use manifest::{KEEP_SNAPSHOTS, KeepReport, Manifest, ManifestEntry, PROV_PIN_OWNER};
 pub use merkle::{
-    SNAPSHOT_MAGIC, Snapshot, TREE_MAGIC, Tree, TreeEntry, TreeEntryKind, TreeMutation,
-    empty_tree_digest, is_valid_entry_name,
+    Snapshot, Tree, TreeEntry, TreeEntryKind, TreeMutation, empty_tree_digest, is_valid_entry_name,
 };
 pub use store::{
     CAS_MARKER, Clock, GcLock, GcSharedLock, ObjectEntry, Publish, Store, is_valid_name,

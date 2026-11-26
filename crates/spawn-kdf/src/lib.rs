@@ -20,10 +20,22 @@
 //! (the workspace's Cargo.toml), they take a fraction of a second. Release
 //! builds were optimised already, and the output is the same.
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use hmac::{Hmac, KeyInit, Mac};
 
-/// The first 32-byte block of PBKDF2-HMAC-SHA256 of `password` over
-/// `salt`, `rounds` rounds (0 is taken as 1).
+/// Compute the first 32-byte block of PBKDF2-HMAC-SHA256 of `password` over
+/// `salt` using `rounds` iterations (`dkLen = 32`, RFC 8018 §5.2).
+///
+/// # Invariants & Guarantees
+/// - `rounds == 0` is normalized to `1` (`rounds.max(1)`), matching legacy
+///   `1..rounds` behavior and preventing a zero-iteration bypass.
+/// - Output is bit-for-bit frozen across releases; any change would invalidate
+///   derived PostgreSQL role passwords (`spawn_supervisor`, `spawn_reader`,
+///   `spawn_human`) across all existing databases.
+/// - Runs in pure safe Rust (`#![forbid(unsafe_code)]`) and never panics for
+///   any byte slices or round count.
 #[must_use]
 pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], rounds: u32) -> [u8; 32] {
     let keyed =

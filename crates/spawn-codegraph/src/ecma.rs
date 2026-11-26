@@ -19,13 +19,14 @@ use spawn_core::feature_deps::{EdgeKind, Language, Scope};
 
 /// Template literals nest at most this deep (`${ `${ ... }` }`); a deeper
 /// file is unparsed.
-pub const MAX_TEMPLATE_DEPTH: usize = 32;
+pub(crate) const MAX_TEMPLATE_DEPTH: usize = 32;
 
 /// The extensions read as TypeScript or JavaScript (`.d.ts` ends in `.ts`).
-pub const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+pub(crate) const SOURCE_EXTENSIONS: [&str; 8] =
+    ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 /// Component files no extractor reads: listed `unsupported`, never guessed.
-pub const UNSUPPORTED_EXTENSIONS: [&str; 2] = ["vue", "svelte"];
+pub(crate) const UNSUPPORTED_EXTENSIONS: [&str; 2] = ["vue", "svelte"];
 
 fn extension(path: &str) -> Option<&str> {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -36,17 +37,17 @@ fn extension(path: &str) -> Option<&str> {
 
 /// A TypeScript or JavaScript source (`.ts`, `.tsx`, `.mts`, `.cts`,
 /// `.js`, `.jsx`, `.mjs`, `.cjs`, `.d.ts`).
-pub fn is_ecma_source(path: &str) -> bool {
+pub(crate) fn is_ecma_source(path: &str) -> bool {
     extension(path).is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
 }
 
 /// A `.vue` or `.svelte` component.
-pub fn is_unsupported_component(path: &str) -> bool {
+pub(crate) fn is_unsupported_component(path: &str) -> bool {
     extension(path).is_some_and(|ext| UNSUPPORTED_EXTENSIONS.contains(&ext))
 }
 
 /// The language `path` is read as.
-pub fn language_of(path: &str) -> Language {
+pub(crate) fn language_of(path: &str) -> Language {
     match extension(path) {
         Some("ts" | "tsx" | "mts" | "cts") => Language::Typescript,
         _ => Language::Javascript,
@@ -55,7 +56,7 @@ pub fn language_of(path: &str) -> Language {
 
 /// A test file: `*.test.*`, `*.spec.*`, or under a `test/`, `tests/` or
 /// `__tests__/` directory.
-pub fn is_test_path(path: &str) -> bool {
+pub(crate) fn is_test_path(path: &str) -> bool {
     let mut parts: Vec<&str> = path.split('/').collect();
     let name = parts.pop().unwrap_or_default();
     parts
@@ -66,7 +67,7 @@ pub fn is_test_path(path: &str) -> bool {
 }
 
 /// The scope of every edge from `path`.
-pub fn scope_of(path: &str) -> Scope {
+pub(crate) fn scope_of(path: &str) -> Scope {
     if is_test_path(path) {
         Scope::Test
     } else {
@@ -75,7 +76,7 @@ pub fn scope_of(path: &str) -> Scope {
 }
 
 /// `specifier` without its `?query` or `#hash` suffix (`./a.svg?raw`).
-pub fn strip_query(specifier: &str) -> &str {
+pub(crate) fn strip_query(specifier: &str) -> &str {
     let cut = specifier
         .char_indices()
         .skip(1)
@@ -87,13 +88,13 @@ pub fn strip_query(specifier: &str) -> &str {
 /// A file a module specifier resolves to as code: a TypeScript or
 /// JavaScript source, or a `.vue` / `.svelte` component. Any other file an
 /// import reaches (`.css`, `.svg`, `.json`, ...) is an asset.
-pub fn is_code_file(path: &str) -> bool {
+pub(crate) fn is_code_file(path: &str) -> bool {
     is_ecma_source(path) || is_unsupported_component(path)
 }
 
 /// A declaration file (`.d.ts`, `.d.mts`, `.d.cts`): every `import(...)`
 /// in it is a type.
-pub fn is_declaration_file(path: &str) -> bool {
+pub(crate) fn is_declaration_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     [".d.ts", ".d.mts", ".d.cts"]
         .iter()
@@ -102,7 +103,7 @@ pub fn is_declaration_file(path: &str) -> bool {
 
 /// What one import binds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Imported {
+pub(crate) enum Imported {
     /// `{ name }` or `{ name as local }`: the exported name.
     Named(String),
     /// `local` (the default export).
@@ -113,7 +114,7 @@ pub enum Imported {
 
 /// One reference to another module.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleRef {
+pub(crate) struct ModuleRef {
     pub specifier: String,
     /// The statement's kind; the resolver makes it [`EdgeKind::Asset`]
     /// when the specifier reaches a non-code file.
@@ -128,7 +129,7 @@ pub struct ModuleRef {
 
 /// One `export ... from` a barrel makes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Reexport {
+pub(crate) enum Reexport {
     /// `export { orig as name } from 'specifier'` (also an imported name
     /// exported again: `import { A } from './a'; export { A };`).
     Named {
@@ -142,7 +143,7 @@ pub enum Reexport {
 
 /// The facts of one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EcmaFacts {
+pub(crate) struct EcmaFacts {
     pub refs: Vec<ModuleRef>,
     /// Names the file declares and exports itself (`default` included).
     pub exports: BTreeSet<String>,
@@ -209,7 +210,7 @@ struct Lexer<'a> {
 }
 
 /// Failed regular expression scans allowed on one line.
-pub const MAX_REGEX_RETRIES: usize = 16;
+pub(crate) const MAX_REGEX_RETRIES: usize = 16;
 
 /// Tokens looked at after `import('x',` for the call's `)`.
 const CALL_LOOKAHEAD: usize = 64;
@@ -874,16 +875,11 @@ impl Reader {
     }
 }
 
-/// Read one file. `Err` (an `unparsed` diagnostic) when the lexer meets a
-/// shape past its bounds, or a comment or template literal that never
-/// closes (which would hide the rest of the file).
-pub fn parse(text: &str) -> Result<EcmaFacts, String> {
-    parse_at("", text)
-}
-
-/// [`parse`] for the file at `path`: in a declaration file every
+/// Read one file at `path`. `Err` (an `unparsed` diagnostic) when the lexer
+/// meets a shape past its bounds, or a comment or template literal that never
+/// closes (which would hide the rest of the file); in a declaration file every
 /// `import(...)` is a type.
-pub fn parse_at(path: &str, text: &str) -> Result<EcmaFacts, String> {
+pub(crate) fn parse_at(path: &str, text: &str) -> Result<EcmaFacts, String> {
     let tokens = lex(text)?;
     Ok(Reader {
         tokens,
@@ -898,6 +894,10 @@ pub fn parse_at(path: &str, text: &str) -> Result<EcmaFacts, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(text: &str) -> Result<EcmaFacts, String> {
+        parse_at("", text)
+    }
 
     fn refs(text: &str) -> Vec<(String, EdgeKind, u32)> {
         parse(text)

@@ -7,10 +7,10 @@ use crate::chunker::CHUNK_MAX;
 use crate::{CasError, Digest, NS_TREE, Store, sha256_of};
 
 /// Magic header for `spawn-tree-v1` canonical tree objects.
-pub const TREE_MAGIC: &[u8] = b"spawn-tree-v1\n";
+pub(crate) const TREE_MAGIC: &[u8] = b"spawn-tree-v1\n";
 
 /// Magic header for `spawn-snapshot-v1` canonical commit-envelope objects.
-pub const SNAPSHOT_MAGIC: &[u8] = b"spawn-snapshot-v1\n";
+pub(crate) const SNAPSHOT_MAGIC: &[u8] = b"spawn-snapshot-v1\n";
 
 const GIT_OID_SHA1_LEN: u64 = 20;
 const GIT_OID_SHA256_LEN: u64 = 32;

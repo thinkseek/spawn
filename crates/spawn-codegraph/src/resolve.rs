@@ -22,7 +22,8 @@ use spawn_core::feature_deps::{
 use crate::manifest::{self, CargoManifest};
 use crate::rust::{self, FileFacts, ModuleFacts, UseEntry};
 
-/// Re-exports are followed at most this deep.
+/// Maximum number of re-export hops followed through Rust `pub use`,
+/// JS/TS barrel files, or Python `__init__.py` packages before stopping.
 pub const MAX_REEXPORT_DEPTH: u8 = 8;
 
 /// The directory of a repository-relative path (`""` at the root).
@@ -184,7 +185,7 @@ struct Graph<'a> {
 /// to text): Rust and `Cargo.toml`, JavaScript / TypeScript and
 /// `package.json` / `tsconfig.json`, and Python and `pyproject.toml`.
 /// References resolve only to paths in `inventory`, the in-scope file set.
-pub fn build(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
+pub(crate) fn build(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
     let rust_ecma = merge(
         build_rust(inventory, sources),
         build_ecma(inventory, sources),
@@ -194,7 +195,10 @@ pub fn build(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -
 
 /// Build the code graph of the Rust sources and `Cargo.toml` manifests in
 /// `sources`.
-pub fn build_rust(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
+pub(crate) fn build_rust(
+    inventory: &BTreeSet<String>,
+    sources: &BTreeMap<String, String>,
+) -> CodeGraph {
     let mut graph = Graph {
         inventory,
         facts: BTreeMap::new(),
@@ -1132,7 +1136,10 @@ struct EcmaGraph<'a> {
 /// Build the code graph of the JavaScript and TypeScript sources and their
 /// manifests in `sources`; `.vue` and `.svelte` files of `inventory` are
 /// listed `unsupported`.
-pub fn build_ecma(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
+pub(crate) fn build_ecma(
+    inventory: &BTreeSet<String>,
+    sources: &BTreeMap<String, String>,
+) -> CodeGraph {
     let mut graph = EcmaGraph {
         inventory,
         facts: BTreeMap::new(),
@@ -1931,7 +1938,10 @@ enum PyModuleTarget {
 
 /// Build the code graph of the Python sources (`.py` / `.pyi`) and
 /// `pyproject.toml` manifests in `sources`.
-pub fn build_python(inventory: &BTreeSet<String>, sources: &BTreeMap<String, String>) -> CodeGraph {
+pub(crate) fn build_python(
+    inventory: &BTreeSet<String>,
+    sources: &BTreeMap<String, String>,
+) -> CodeGraph {
     let mut pkg_dirs = BTreeSet::new();
     for path in inventory {
         if crate::python::is_package_init(path) {
