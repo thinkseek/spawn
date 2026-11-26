@@ -30,6 +30,7 @@
 //!    column.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 
 use serde_json::{Value, json};
 use spawn_postgres::PostgresStore;
@@ -212,83 +213,104 @@ fn charge(input: &Input, target: i64, lands: &[&ProvChangeRecord]) -> Charge {
     }
 }
 
-/// The report from what was read (module doc for the rules).
-pub(crate) fn tally(input: &Input, window: Window) -> Value {
-    // Each task's landings, and each landing's place in its domain.
-    let mut lands_of: HashMap<i64, Vec<&ProvChangeRecord>> = HashMap::new();
-    let mut place: HashMap<i64, usize> = HashMap::new();
-    let mut per_domain: HashMap<&str, usize> = HashMap::new();
-    for land in &input.lands {
-        let counter = per_domain.entry(land.domain.as_str()).or_insert(0);
-        place.insert(land.id, *counter);
-        *counter += 1;
-        if let Some(task) = land.task_id {
-            lands_of.entry(task).or_default().push(land);
+/// Each task's landings and each landing's place in its domain (the order
+/// of `prov_changes.id`).
+struct Landings<'a> {
+    of_task: HashMap<i64, Vec<&'a ProvChangeRecord>>,
+    place: HashMap<i64, usize>,
+}
+
+impl<'a> Landings<'a> {
+    fn new(lands: &'a [ProvChangeRecord]) -> Self {
+        let mut of_task: HashMap<i64, Vec<&ProvChangeRecord>> = HashMap::new();
+        let mut place = HashMap::new();
+        let mut per_domain: HashMap<&str, usize> = HashMap::new();
+        for land in lands {
+            let counter = per_domain.entry(land.domain.as_str()).or_insert(0);
+            place.insert(land.id, *counter);
+            *counter += 1;
+            if let Some(task) = land.task_id {
+                of_task.entry(task).or_default().push(land);
+            }
         }
+        Self { of_task, place }
     }
-    // A task's preset: the one captured in its first landing.
-    let preset_of = |task: i64| -> Option<String> {
-        lands_of
+
+    /// A task's preset: the one captured in its first landing that has one.
+    fn preset_of(&self, task: i64) -> Option<String> {
+        self.of_task
             .get(&task)
             .and_then(|lands| lands.iter().find_map(|land| land.preset_id.clone()))
-    };
-    let mut rows: BTreeMap<Option<String>, Row> = BTreeMap::new();
-    for task in lands_of.keys() {
-        rows.entry(preset_of(*task))
-            .or_default()
-            .landed
-            .insert(*task);
     }
-    let mut not_scored: BTreeMap<String, u64> = BTreeMap::new();
-    let mut unattributed = Vec::new();
-    let mut defects = Vec::new();
-    let mut fixes = Vec::new();
-    for ProvSupersedes { edge, src } in &input.supersedes {
-        let mut skip = |why: &str| *not_scored.entry(why.to_string()).or_insert(0) += 1;
-        let Some(target) = target_task(&edge.detail) else {
-            skip("no_target_task");
-            continue;
-        };
-        if src.task_id == Some(target) {
-            skip("same_task");
-            continue;
-        }
-        let reason = edge.detail.get("reason").and_then(Value::as_str);
-        let evidence = edge.detail.get("evidence").and_then(Value::as_str);
-        let confirmed = reason == Some(REASON_DEFECT)
-            && matches!(evidence, Some(EVIDENCE_LEVEL1 | EVIDENCE_LEVEL2));
-        let fixed = reason == Some(REASON_DEFECT) && evidence == Some(EVIDENCE_FIXES);
-        if !confirmed && !fixed {
-            skip(match (reason, evidence) {
-                (Some(REASON_DEFECT), Some(EVIDENCE_UNVERIFIED)) => EVIDENCE_UNVERIFIED,
-                (Some(REASON_DEFECT), _) => "defect_without_evidence",
-                (Some(reason), _) => reason,
-                (None, _) => "no_reason",
-            });
-            continue;
-        }
-        // The target's landings in the edge's domain, and the window from
-        // the first.
-        let lands: Vec<&ProvChangeRecord> = lands_of
-            .get(&target)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|land| land.domain == src.domain && land.id < src.id)
-            .collect();
-        let Some(first) = lands.first() else {
-            skip("target_not_landed_before");
-            continue;
-        };
-        let after = place[&src.id].saturating_sub(place[&first.id]);
-        let days_ms = i64::try_from(window.days)
-            .unwrap_or(i64::MAX / DAY_MS)
-            .saturating_mul(DAY_MS);
-        if after > window.landings || src.at_ms.saturating_sub(first.at_ms) > days_ms {
-            skip("out_of_window");
-            continue;
-        }
-        let event = json!({
+}
+
+/// An edge that is scored or reported: a confirmed defect or a dispatcher's
+/// `fixes:`, inside the window.
+struct Event<'a> {
+    confirmed: bool,
+    level1: bool,
+    target: i64,
+    /// The target's landings in the edge's domain before the edge.
+    lands: Vec<&'a ProvChangeRecord>,
+    shown: Value,
+}
+
+/// What `edge` of the landing `src` is (rules 2 to 4): an [`Event`], or why
+/// it is neither scored nor reported.
+fn event<'a>(
+    landings: &Landings<'a>,
+    edge: &spawn_postgres::provenance::ProvEdgeRecord,
+    src: &ProvChangeRecord,
+    window: Window,
+) -> Result<Event<'a>, &'static str> {
+    let target = target_task(&edge.detail).ok_or("no_target_task")?;
+    if src.task_id == Some(target) {
+        return Err("same_task");
+    }
+    let reason = edge.detail.get("reason").and_then(Value::as_str);
+    let evidence = edge.detail.get("evidence").and_then(Value::as_str);
+    let confirmed = reason == Some(REASON_DEFECT)
+        && matches!(evidence, Some(EVIDENCE_LEVEL1 | EVIDENCE_LEVEL2));
+    let reported = reason == Some(REASON_DEFECT) && evidence == Some(EVIDENCE_FIXES);
+    if !confirmed && !reported {
+        return Err(match (reason, evidence) {
+            (Some(REASON_DEFECT), Some(EVIDENCE_UNVERIFIED)) => EVIDENCE_UNVERIFIED,
+            (Some(REASON_DEFECT), _) => "defect_without_evidence",
+            (Some("refactor"), _) => "refactor",
+            (Some("format"), _) => "format",
+            (Some("planned"), _) => "planned",
+            (Some("requirement"), _) => "requirement",
+            (Some(_), _) => "other_reason",
+            (None, _) => "no_reason",
+        });
+    }
+    let lands: Vec<&ProvChangeRecord> = landings
+        .of_task
+        .get(&target)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|land| land.domain == src.domain && land.id < src.id)
+        .collect();
+    let first = lands.first().ok_or("target_not_landed_before")?;
+    let after = landings
+        .place
+        .get(&src.id)
+        .zip(landings.place.get(&first.id))
+        .map_or(usize::MAX, |(src, first)| src.saturating_sub(*first));
+    let window_ms = i64::try_from(window.days)
+        .unwrap_or(i64::MAX / DAY_MS)
+        .saturating_mul(DAY_MS);
+    let ms_after = src.at_ms.saturating_sub(first.at_ms);
+    if after > window.landings || ms_after > window_ms {
+        return Err("out_of_window");
+    }
+    Ok(Event {
+        confirmed,
+        level1: evidence == Some(EVIDENCE_LEVEL1),
+        target,
+        lands,
+        shown: json!({
             "edge": edge.id,
             "target_task": target,
             "by_task": src.task_id,
@@ -296,43 +318,76 @@ pub(crate) fn tally(input: &Input, window: Window) -> Value {
             "reason": reason,
             "evidence": evidence,
             "landings_after": after,
-            "ms_after": src.at_ms.saturating_sub(first.at_ms),
-        });
-        match charge(input, target, &lands) {
+            "ms_after": ms_after,
+        }),
+    })
+}
+
+/// The preset a liability charged to `task` goes to: the one its landing
+/// captured; for a task that never landed itself (its revision came in
+/// through another's landing, `lands`), the one its revision captured.
+fn charged_preset(
+    input: &Input,
+    landings: &Landings,
+    task: i64,
+    lands: &[&ProvChangeRecord],
+) -> Option<String> {
+    landings.preset_of(task).or_else(|| {
+        lands.iter().find_map(|land| {
+            input
+                .entries
+                .get(&land.id)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| input.origins.get(&entry.origin?))
+                .find(|change| change.task_id == Some(task))
+                .and_then(|change| change.preset_id.clone())
+        })
+    })
+}
+
+/// The report from what was read (module doc for the rules).
+pub(crate) fn tally(input: &Input, window: Window) -> Value {
+    let landings = Landings::new(&input.lands);
+    let mut rows: BTreeMap<Option<String>, Row> = BTreeMap::new();
+    for task in landings.of_task.keys() {
+        rows.entry(landings.preset_of(*task))
+            .or_default()
+            .landed
+            .insert(*task);
+    }
+    let mut not_scored: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut unattributed = Vec::new();
+    let mut defects = Vec::new();
+    let mut reported = Vec::new();
+    for ProvSupersedes { edge, src } in &input.supersedes {
+        let event = match event(&landings, edge, src, window) {
+            Ok(event) => event,
+            Err(why) => {
+                *not_scored.entry(why).or_insert(0) += 1;
+                continue;
+            }
+        };
+        let mut shown = event.shown;
+        match charge(input, event.target, &event.lands) {
             Charge::Unattributed(candidates) => {
-                let mut event = event;
-                event["candidates"] = json!(candidates);
-                unattributed.push(event);
+                shown["candidates"] = json!(candidates);
+                unattributed.push(shown);
             }
             Charge::Task(task) => {
-                let preset = preset_of(task).or_else(|| {
-                    // A task that never landed itself (its revision came in
-                    // through another's landing): the preset its revision
-                    // captured.
-                    lands.iter().find_map(|land| {
-                        input
-                            .entries
-                            .get(&land.id)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|entry| input.origins.get(&entry.origin?))
-                            .find(|change| change.task_id == Some(task))
-                            .and_then(|change| change.preset_id.clone())
-                    })
-                });
-                let row = rows.entry(preset.clone()).or_default();
-                let mut event = event;
-                event["charged_task"] = json!(task);
-                event["preset_id"] = json!(preset);
-                if confirmed {
+                let preset = charged_preset(input, &landings, task, &event.lands);
+                shown["charged_task"] = json!(task);
+                shown["preset_id"] = json!(preset);
+                let row = rows.entry(preset).or_default();
+                if event.confirmed {
                     row.defects.insert(task);
-                    if evidence == Some(EVIDENCE_LEVEL1) {
+                    if event.level1 {
                         row.reverted.insert(task);
                     }
-                    defects.push(event);
+                    defects.push(shown);
                 } else {
                     row.fixes.insert(task);
-                    fixes.push(event);
+                    reported.push(shown);
                 }
             }
         }
@@ -357,7 +412,7 @@ pub(crate) fn tally(input: &Input, window: Window) -> Value {
         "unattributed": unattributed.len(),
         "unattributed_events": unattributed,
         "defects": defects,
-        "fixes": fixes,
+        "fixes": reported,
         "not_scored": not_scored,
     })
 }
@@ -368,20 +423,22 @@ pub(crate) fn text(report: &Value) -> String {
         "durability (shadow only, never routes): window {} landings or {} days, {} landings\n",
         report["window"]["landings"], report["window"]["days"], report["landings"]
     );
-    out.push_str(&format!(
-        "{:<32} {:>8} {:>9} {:>9} {:>7}\n",
+    let _ = writeln!(
+        out,
+        "{:<32} {:>8} {:>9} {:>9} {:>7}",
         "preset_id", "landed", "defects", "reverted", "fixes"
-    ));
+    );
     for row in report["presets"].as_array().into_iter().flatten() {
-        out.push_str(&format!(
-            "{:<32} {:>8} {:>9} {:>9} {:>7}\n",
+        let _ = writeln!(
+            out,
+            "{:<32} {:>8} {:>9} {:>9} {:>7}",
             row["preset_id"].as_str().unwrap_or("(none)"),
-            row["landed_tasks"],
-            row["confirmed_defects"],
-            row["reverted_tasks"],
-            row["fixes_reported"],
-        ));
+            row["landed_tasks"].to_string(),
+            row["confirmed_defects"].to_string(),
+            row["reverted_tasks"].to_string(),
+            row["fixes_reported"].to_string(),
+        );
     }
-    out.push_str(&format!("unattributed: {}\n", report["unattributed"]));
+    let _ = writeln!(out, "unattributed: {}", report["unattributed"]);
     out
 }
