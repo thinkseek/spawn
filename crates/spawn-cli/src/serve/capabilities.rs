@@ -100,6 +100,32 @@ pub(crate) struct EngineProbe {
     pub(crate) unavailable: Option<String>,
 }
 
+impl EngineProbe {
+    /// An engine whose program the probe never ran (`program`, and whether
+    /// it is enabled), with why it cannot start.
+    fn not_run(
+        driver: &dyn spawn_core::driver::AgentDriver,
+        (program, enabled): (String, bool),
+        login: Vec<LoginFile>,
+        model: Option<String>,
+        why: String,
+    ) -> Self {
+        Self {
+            engine: driver.id().to_string(),
+            title: driver.title().to_string(),
+            program,
+            enabled,
+            installed: None,
+            version: None,
+            version_tested: None,
+            login,
+            known_models: None,
+            model,
+            unavailable: Some(why),
+        }
+    }
+}
+
 /// One probe of every registered engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Probe {
@@ -318,21 +344,13 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
         if !is_enabled {
             // Decision C3: an engine the host does not enable is never run,
             // not even for its version.
-            engines.push(EngineProbe {
-                engine: id.to_string(),
-                title: driver.title().to_string(),
-                program,
-                enabled: false,
-                installed: None,
-                version: None,
-                version_tested: None,
+            engines.push(EngineProbe::not_run(
+                *driver,
+                (program, false),
                 login,
-                known_models: None,
                 model,
-                unavailable: Some(format!(
-                    "SPAWN_ENGINES does not name {id}: it is not enabled on this host"
-                )),
-            });
+                format!("SPAWN_ENGINES does not name {id}: it is not enabled on this host"),
+            ));
             continue;
         }
         // An engine with no deny rules of its own runs inside its view, or
@@ -345,22 +363,16 @@ pub(crate) fn probe_with(host: &Host<'_>, at_ms: i64) -> Probe {
             Boxed::Off => Vec::new(),
             Boxed::Inside { words, .. } => words.iter().map(String::as_str).collect(),
             Boxed::Unavailable(why) => {
-                engines.push(EngineProbe {
-                    engine: id.to_string(),
-                    title: driver.title().to_string(),
-                    program,
-                    enabled: true,
-                    installed: None,
-                    version: None,
-                    version_tested: None,
+                engines.push(EngineProbe::not_run(
+                    *driver,
+                    (program, true),
                     login,
-                    known_models: None,
                     model,
-                    unavailable: Some(format!(
+                    format!(
                         "{id} is probed and run only inside its filesystem view, and {why}: \
                          it will not start (engine_unavailable)"
-                    )),
-                });
+                    ),
+                ));
                 continue;
             }
         };
