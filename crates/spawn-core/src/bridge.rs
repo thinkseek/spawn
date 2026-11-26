@@ -1965,10 +1965,23 @@ impl Bridge {
             // After a restart, the last recorded screen. The Bridge's own
             // readings keep its own clock, which the refresh is timed by.
             EventKind::ScreenObserved { state, .. } if current => {
-                if let Some(active) = view.active.as_mut()
-                    && active.follow.screen.map(|(known, _)| known) != Some(*state)
-                {
-                    active.follow.screen = Some((*state, record.recorded_at.0));
+                if let Some(active) = view.active.as_mut() {
+                    if active.follow.screen.map(|(known, _)| known) != Some(*state) {
+                        active.follow.screen = Some((*state, record.recorded_at.0));
+                    }
+                    // The host reading the newest keyed screen was keyed by
+                    // (carry list N12): a restarted Bridge never keys that
+                    // reading again, so a screen recorded unkeyed under it
+                    // before the restart (a draft over a ready pane, the same
+                    // `seq`) is followed by one recorded unkeyed after it,
+                    // not by a keyed one the log refuses as a repeat.
+                    if let Some(seq) = event
+                        .source_event_id
+                        .as_deref()
+                        .and_then(|key| keyed_screen_seq(key, &active.execution_id))
+                    {
+                        active.follow.keyed_seq = Some(seq);
+                    }
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
@@ -6594,6 +6607,15 @@ pub fn trust_answer_key(execution: &ExecutionId, n: usize) -> String {
 /// refused while the pane cannot take it.
 pub fn waits(principal: &str) -> bool {
     !LOOP_PRINCIPALS.contains(&principal)
+}
+
+/// The host reading's `seq` a keyed `screen.observed` of `execution` was
+/// recorded under: its key is `<execution>:hs:<server pid>.<server start>:<seq>`
+/// ([`Bridge::follow_screen`]).
+fn keyed_screen_seq(key: &str, execution: &ExecutionId) -> Option<u64> {
+    let rest = key.strip_prefix(execution.as_str())?.strip_prefix(":hs:")?;
+    let (_, seq) = rest.rsplit_once(':')?;
+    seq.parse().ok()
 }
 
 /// The wire name of an end's cause.
