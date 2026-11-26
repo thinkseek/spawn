@@ -49,7 +49,7 @@ to a second ago ([`serve/answers.rs`](../crates/spawn-cli/src/serve/answers.rs))
 | GET | `/api/sessions/<id>` | One session: state, executions (with `restart_of`), its events after `?after=`, `reassigned_to` and `reassigned_from` | `spawn tail --session <id>` (overlapping) | web (agent detail) |
 | GET | `/api/sessions/<id>/commands` | One session's commands, each with `waiting` while the Bridge holds it for the turn; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
 | GET | `/api/sessions/<id>/judgements` | One session's judgements, newest first; `?limit=` (50, at most 500) | `spawn tail --session <id>` (overlapping, not compared field by field) | web (agent detail) |
-| GET | `/api/sessions/<id>/pane` | The tail of the session's live terminal, read from tmux | – | web (agent detail) |
+| GET | `/api/sessions/<id>/pane` | The tail of the session's live terminal, read from its terminal host; as it is only when the session's newest start is positively Claude Code's, else without its account lines (a failed lookup masks too) | – | web (agent detail) |
 | GET | `/api/tasks/<n>` | One task's brief, report and review note in full | – | web (Missions) |
 | GET | `/api/tasks/<n>/gate` | One objective task in full: brief, report, latest gate log, every gate verdict with its log | `spawn task stages --id N` (its stages alone) | web (RSI) |
 | GET | `/api/objectives` | Every open objective mission: its backlog's objectives, tasks, gate verdicts, metrics and resident | `spawn mission objectives` (the backlog alone) | web (RSI) |
