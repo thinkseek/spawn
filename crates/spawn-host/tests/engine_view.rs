@@ -207,6 +207,15 @@ fn fails(words: &[String], script: &str) -> String {
     text(&output)
 }
 
+/// The two words after each `flag` in `words`.
+fn triples<'a>(words: &'a [String], flag: &str) -> Vec<(&'a str, &'a str)> {
+    words
+        .windows(3)
+        .filter(|three| three[0] == flag)
+        .map(|three| (three[1].as_str(), three[2].as_str()))
+        .collect()
+}
+
 /// Every masked place reads empty, every masked file reads 0 bytes and
 /// refuses a write (read-only); `/` and the home are read-only; the
 /// workspace, agy's home (re-bound inside the masked `~/.gemini`) and
@@ -483,25 +492,14 @@ fn the_argv_keeps_its_invariants() {
         .rposition(|word| word == "--tmpfs" || word == "--ro-bind")
         .expect("mask");
     assert!(last_mask < first_bind, "{words:?}");
-    let binds: Vec<(&str, &str)> = words
-        .windows(3)
-        .filter(|three| three[0] == "--bind")
-        .map(|three| (three[1].as_str(), three[2].as_str()))
-        .collect();
+    let binds = triples(words, "--bind");
+    let home_bind = (engine_home.as_str(), engine_home.as_str());
     assert_eq!(
         binds,
-        vec![
-            (workspace.as_str(), workspace.as_str()),
-            (engine_home.as_str(), engine_home.as_str()),
-        ]
+        vec![(workspace.as_str(), workspace.as_str()), home_bind]
     );
     assert!(tmpdir.starts_with(&engine_home), "{tmpdir}");
-    assert!(
-        words
-            .windows(3)
-            .any(|three| three[0] == "--setenv" && three[1] == "TMPDIR" && three[2] == tmpdir),
-        "{words:?}"
-    );
+    assert!(triples(words, "--setenv").contains(&("TMPDIR", tmpdir.as_str())));
     // The symlinked canaries are masked at what they resolve to.
     let aws = fixture.scratch.join("real-aws");
     let netrc = fixture.scratch.join("real-netrc");
