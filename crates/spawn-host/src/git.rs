@@ -245,6 +245,9 @@ fn parse_oversized(bytes: &[u8]) -> BTreeMap<TreePath, Oversized> {
                 None => (sized, None),
             };
             let size = size.parse().ok()?;
+            if entry[2].is_empty() {
+                return None;
+            }
             Some((
                 TreePath::from_bytes(entry[2]),
                 Oversized {
@@ -260,7 +263,10 @@ fn parse_oversized(bytes: &[u8]) -> BTreeMap<TreePath, Oversized> {
 /// The files over the cap ([`max_file_bytes`]) that checkpoints of
 /// `branch` left out, as the record under the workspace root `root` holds
 /// them, by path; empty when there is none, it cannot be read, or `branch`
-/// is no branch name.
+/// is not one plain file name (one normal path component: no `/`, `\\`,
+/// `.`, `..`, root or prefix), so the record read is always a file directly
+/// under `<root>/.oversized/`. The record is opened without following a
+/// symlink on the way (`.oversized` included) and must be a regular file.
 ///
 /// The record, `<root>/.oversized/<branch>`, is NUL-separated, three fields
 /// each: `told` or `untold`, the size in bytes, the path. Since PV4
@@ -269,10 +275,16 @@ fn parse_oversized(bytes: &[u8]) -> BTreeMap<TreePath, Oversized> {
 /// kept nowhere, but what it was is known. A record written before has no
 /// digest and still reads (`digest: None`).
 pub fn oversized_record(root: &Path, branch: &str) -> Vec<OversizedFile> {
-    if BranchName::new(branch).is_err() {
+    if !is_plain_name(branch) {
         return Vec::new();
     }
-    let Ok(bytes) = std::fs::read(oversized_file(root, branch)) else {
+    let mut relative = b".oversized/".to_vec();
+    relative.extend_from_slice(branch.as_bytes());
+    let Ok(Some((bytes, _, false))) = crate::agent_files::read_regular(
+        root,
+        &TreePath::from_bytes(relative),
+        OVERSIZED_RECORD_LIMIT,
+    ) else {
         return Vec::new();
     };
     parse_oversized(&bytes)
@@ -284,6 +296,24 @@ pub fn oversized_record(root: &Path, branch: &str) -> Vec<OversizedFile> {
             told: entry.told,
         })
         .collect()
+}
+
+/// The most bytes [`oversized_record`] reads of a record: one larger is
+/// no record of this store's and reads as none.
+const OVERSIZED_RECORD_LIMIT: u64 = 64 << 20;
+
+/// Whether `name` is exactly one normal path component: not empty, no
+/// `/` or `\\`, not `.` or `..`, no root or prefix.
+fn is_plain_name(name: &str) -> bool {
+    use std::path::Component;
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(part)), None) if part == std::ffi::OsStr::new(name)
+    )
 }
 
 /// The `sha256:` digest of the file over the cap at `path` under
@@ -3934,8 +3964,62 @@ mod tests {
         )
         .expect("a bad digest");
         assert_eq!(super::oversized_record(&root, "agent_a")[0].digest, None);
-        assert!(super::oversized_record(&root, "../agent_a").is_empty());
+        // An entry with an empty path is left out; the rest still reads.
+        std::fs::write(
+            root.join(".oversized/agent_a"),
+            format!("untold\0{size}\0\0told\0{size}\0big.bin\0"),
+        )
+        .expect("an empty path");
+        let read = super::oversized_record(&root, "agent_a");
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].path.as_bytes(), b"big.bin");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The record read is always a regular file directly under
+    /// `<root>/.oversized/`: a name that would leave it (`..`, an absolute
+    /// path, a separator) reads nothing even where a valid record lies, and
+    /// so does a record reached through a symbolic link.
+    #[test]
+    fn an_oversized_record_is_read_only_from_under_its_own_directory() {
+        let base = crate::Scratch::new("spawn-git-oversized-confined");
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join(".oversized")).expect("the records");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let record = format!("untold\x007 {digest}\0x.bin\0");
+        // A valid record outside `.oversized`, at `<root>/outside`.
+        std::fs::write(root.join("outside"), &record).expect("outside");
+        std::fs::write(root.join(".oversized/agent_a"), &record).expect("inside");
+        let inside = super::oversized_record(&root, "agent_a");
+        assert_eq!(inside.len(), 1, "a legitimate record reads");
+        assert_eq!(inside[0].digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(inside[0].size, 7);
+        let outside = root.join("outside");
+        for name in [
+            "../outside",
+            outside.to_str().expect("utf-8"),
+            "",
+            ".",
+            "..",
+            "a/b",
+            "agent_a/",
+            "..\\outside",
+            "/agent_a",
+        ] {
+            assert!(super::oversized_record(&root, name).is_empty(), "{name:?}");
+        }
+        // A record that is a symbolic link, even to a valid record, and a
+        // `.oversized` that is one: nothing.
+        std::os::unix::fs::symlink(&outside, root.join(".oversized/linked")).expect("a link");
+        assert!(super::oversized_record(&root, "linked").is_empty());
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).expect("another root");
+        std::os::unix::fs::symlink(root.join(".oversized"), other.join(".oversized"))
+            .expect("a linked directory");
+        assert!(super::oversized_record(&other, "agent_a").is_empty());
+        // A directory where the record would be: nothing.
+        std::fs::create_dir_all(root.join(".oversized/dir")).expect("a directory");
+        assert!(super::oversized_record(&root, "dir").is_empty());
     }
 
     /// A file over the cap that `main` holds as a blob (it came from the
