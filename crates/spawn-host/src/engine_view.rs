@@ -821,12 +821,8 @@ mod tests {
         let (view, workspace, engine_home) = view_in(&scratch);
         let planned = plan(&view, &workspace, &engine_home).expect("plan");
         let engine_home = std::fs::canonicalize(&engine_home).expect("home");
-        assert!(
-            planned
-                .masks
-                .iter()
-                .any(|mask| *mask == super::Mask::Directory(engine_home.parent().expect("gemini").to_path_buf()))
-        );
+        assert!(planned.masks.iter().any(|mask| *mask
+            == super::Mask::Directory(engine_home.parent().expect("gemini").to_path_buf())));
     }
 
     /// A directory mask inside the re-bound engine home (the loop's TMPDIR
