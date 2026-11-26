@@ -441,20 +441,24 @@ struct Active {
 }
 
 impl Active {
-    /// An execution as its `execution.started` record has it, recorded at
-    /// `started_at`.
-    fn started(
-        execution_id: ExecutionId,
-        workspace: WorkspaceId,
-        transcript_from: Option<u64>,
-        driver: &'static dyn AgentDriver,
-        started_at: crate::time::Timestamp,
-    ) -> Self {
-        Self {
-            execution_id,
+    /// An execution as its `execution.started` `record` has it (its
+    /// workspace as the store names it now), with the record's time; `None`
+    /// for any other record.
+    fn started(record: &EventRecord, workspace: WorkspaceId) -> Option<Self> {
+        let EventKind::ExecutionStarted {
+            engine,
+            transcript_from,
+            ..
+        } = &record.event.kind
+        else {
+            return None;
+        };
+        let transcript_from = *transcript_from;
+        Some(Self {
+            execution_id: record.event.execution_id.clone()?,
             workspace,
-            driver,
-            started_at: u64::try_from(started_at.0).unwrap_or(0),
+            driver: driver_or_default(engine),
+            started_at: u64::try_from(record.recorded_at.0).unwrap_or(0),
             preexisting_natives: HashSet::new(),
             checkpoint: None,
             reported_end: None,
@@ -467,7 +471,7 @@ impl Active {
                 binding: Binding::resumed(transcript_from.is_some()),
                 ..Follow::default()
             },
-        }
+        })
     }
 
     /// The terminal that hosts the execution: always `spawn-<execution>`,
@@ -2165,30 +2169,23 @@ impl Bridge {
                 engine,
                 workspace,
                 model,
-                transcript_from,
                 launch,
                 ..
             } => {
                 view.model = *model;
                 view.engine.clone_from(engine);
                 view.model_label = launched_label(engine, launch.as_ref());
-                if let Some(execution_id) = event.execution_id.clone() {
-                    // As the store names it now: a record from before the
-                    // root was resolved names the same directory.
-                    let workspace = self.workspaces.canonical(workspace);
+                // As the store names it now: a record from before the root
+                // was resolved names the same directory.
+                let workspace = self.workspaces.canonical(workspace);
+                if let Some(mut active) = Active::started(record, workspace) {
                     // What a fresh start of this Bridge's own listed before
                     // its launch; a restart has no such list.
-                    let preexisting = self.preexisting.remove(&execution_id);
-                    view.active = Some(Active {
-                        preexisting_natives: preexisting.unwrap_or_default(),
-                        ..Active::started(
-                            execution_id,
-                            workspace,
-                            *transcript_from,
-                            driver_or_default(engine),
-                            record.recorded_at,
-                        )
-                    });
+                    active.preexisting_natives = self
+                        .preexisting
+                        .remove(&active.execution_id)
+                        .unwrap_or_default();
+                    view.active = Some(active);
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
@@ -4207,22 +4204,10 @@ impl Bridge {
     /// `execution.started`), put into the session's view as the fold would
     /// have: the view follows the log again.
     fn track_from_log(&mut self, session: &SessionId, record: &EventRecord) -> Option<Active> {
-        let EventKind::ExecutionStarted {
-            engine,
-            workspace,
-            transcript_from,
-            ..
-        } = &record.event.kind
-        else {
+        let EventKind::ExecutionStarted { workspace, .. } = &record.event.kind else {
             return None;
         };
-        let active = Active::started(
-            record.event.execution_id.clone()?,
-            self.workspaces.canonical(workspace),
-            *transcript_from,
-            driver_or_default(engine),
-            record.recorded_at,
-        );
+        let active = Active::started(record, self.workspaces.canonical(workspace))?;
         if let Some(view) = self.sessions.get_mut(session) {
             view.active = Some(active.clone());
         }
@@ -4404,11 +4389,7 @@ impl Bridge {
             started_at: u64::try_from(self.clock.now().0).unwrap_or(0),
             preexisting_natives: HashSet::new(),
         };
-        if native.is_none()
-            && let Some(names) = self.preexisting_natives(prepared.driver, &active.workspace)
-        {
-            self.preexisting.insert(active.execution_id.clone(), names);
-        }
+        self.list_preexisting(native.is_none(), prepared.driver, &active);
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
         let recorded = self.append(
@@ -4446,22 +4427,21 @@ impl Bridge {
         self.launch_and_prompt(claimed, &active, native, &prepared, prompt, report)
     }
 
-    /// Before a fresh start of an engine that names its own session, the
-    /// conversations already below its home: none of them is the
-    /// execution's ([`Self::bind_reported`]). Listed before the launch and
-    /// handed to the view's execution when its record is folded
+    /// Before a `fresh` start (not a resume) of an engine that names its
+    /// own session, list the conversations already below its home: none of
+    /// them is the execution's ([`Self::bind_reported`]). Listed before the
+    /// launch and handed to the view's execution when its record is folded
     /// ([`Active::preexisting_natives`]).
-    fn preexisting_natives(
-        &self,
-        driver: &dyn AgentDriver,
-        workspace: &WorkspaceId,
-    ) -> Option<HashSet<String>> {
-        if driver.traits().session != SessionBinding::Reported {
-            return None;
+    fn list_preexisting(&mut self, fresh: bool, driver: &dyn AgentDriver, active: &Active) {
+        if !fresh || driver.traits().session != SessionBinding::Reported {
+            return;
         }
-        let dir = driver.session_scan_dir(&self.config.home_of(driver))?;
-        let names = self.terminals.list_dirs(workspace, &dir).ok()?;
-        Some(names.into_iter().collect())
+        if let Some(dir) = driver.session_scan_dir(&self.config.home_of(driver))
+            && let Ok(names) = self.terminals.list_dirs(&active.workspace, &dir)
+        {
+            self.preexisting
+                .insert(active.execution_id.clone(), names.into_iter().collect());
+        }
     }
 
     /// Why `driver`'s engine cannot start on this host for want of a
